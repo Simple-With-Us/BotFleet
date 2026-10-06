@@ -37,7 +37,7 @@ describe("ACP to MSP", () => {
     expect(message.params).toMatchObject({ workspaceRoot: "/tmp/project" });
     // `commandId` is REQUIRED by MSP and is its own correlation token — not the
     // ACP request id.
-    expect((message.params as any).commandId).toBeTruthy();
+    expect(message.params?.commandId).toBeTruthy();
     // The id must NOT be the ACP id:  the two are different id spaces and a
     // collision silently attributes one call's answer to another.
     expect(message.id).not.toBe(7);
@@ -50,7 +50,7 @@ describe("ACP to MSP", () => {
       method: "session/new",
       params: { cwd: "/tmp/project", mcpServers: [{ name: "composio", command: "node" }] },
     });
-    expect((message.params as any).config.mcpServers).toHaveLength(1);
+    expect(message.params?.config?.mcpServers).toHaveLength(1);
   });
 
   it("maps session/load to session/resume", () => {
@@ -61,14 +61,14 @@ describe("ACP to MSP", () => {
       params: { sessionId: "sess-7", cwd: "/tmp/p", mcpServers: [] },
     });
     expect(message.method).toBe("session/resume");
-    expect((message.params as any).sessionId).toBe("sess-7");
+    expect(message.params?.sessionId).toBe("sess-7");
   });
 
   it("flattens the ACP prompt block list into MSP input", () => {
     const [message] = translateAcpToMsp(acpPrompt(10));
     expect(message.method).toBe("turn/start");
-    expect((message.params as any).input).toBe("hello");
-    expect((message.params as any).sessionId).toBe("sess-1");
+    expect(message.params?.input).toBe("hello");
+    expect(message.params?.sessionId).toBe("sess-1");
   });
 
   it("never leaves an unimplemented ACP request hanging", () => {
@@ -76,7 +76,7 @@ describe("ACP to MSP", () => {
     // default must be an error, not silence.
     const [message] = translateAcpToMsp({ jsonrpc: "2.0", id: 11, method: "session/fork", params: {} });
     expect(message.id).toBe(11);
-    expect((message.error as any).code).toBe(-32601);
+    expect(message.error?.code).toBe(-32601);
   });
 
   it("maps model and effort config options onto MSP's dedicated methods", () => {
@@ -90,7 +90,7 @@ describe("ACP to MSP", () => {
       params: { sessionId: "s1", category: "model", configId: "model", value: "muse-spark-1.3" },
     });
     expect(model.method).toBe("session/setModel");
-    expect((model.params as any).modelId).toBe("muse-spark-1.3");
+    expect(model.params?.modelId).toBe("muse-spark-1.3");
 
     const [effort] = translateAcpToMsp({
       jsonrpc: "2.0",
@@ -99,7 +99,7 @@ describe("ACP to MSP", () => {
       params: { sessionId: "s1", category: "thought_level", configId: "thinkingEffort", value: "high" },
     });
     expect(effort.method).toBe("session/setReasoningEffort");
-    expect((effort.params as any).effort).toBe("high");
+    expect(effort.params?.effort).toBe("high");
   });
 
   it("ignores an ACP config option it cannot honour", () => {
@@ -124,7 +124,7 @@ describe("MSP to ACP", () => {
       params: { sessionId: "sess-1", turnId: "t1", terminal: true, error: null },
     });
     expect(completed.id).toBe(20);
-    expect((completed.result as any).stopReason).toBe("end_turn");
+    expect(completed.result?.stopReason).toBe("end_turn");
   });
 
   it("answers once, and reports a refused turn as a refusal", () => {
@@ -134,7 +134,7 @@ describe("MSP to ACP", () => {
       method: "turn/completed",
       params: { sessionId: "s", turnId: "t", terminal: true, error: { code: 1, message: "boom" } },
     });
-    expect((first.result as any).stopReason).toBe("refusal");
+    expect(first.result?.stopReason).toBe("refusal");
     // A second terminal event must not answer a prompt nobody is holding.
     expect(
       translateMspToAcp({ jsonrpc: "2.0", method: "turn/completed", params: { sessionId: "s", terminal: true } }),
@@ -147,15 +147,15 @@ describe("MSP to ACP", () => {
       method: "item/delta",
       params: { sessionId: "sess-1", itemId: "i1", field: "text", delta: "hi" },
     });
-    expect((text.params as any).update.sessionUpdate).toBe("agent_message_chunk");
-    expect((text.params as any).update.content.text).toBe("hi");
+    expect(text.params?.update?.sessionUpdate).toBe("agent_message_chunk");
+    expect(text.params?.update && "content" in text.params.update ? text.params.update.content.text : "").toBe("hi");
 
     const [thought] = translateMspToAcp({
       jsonrpc: "2.0",
       method: "item/delta",
       params: { sessionId: "sess-1", itemId: "i1", field: "thinking", delta: "hmm" },
     });
-    expect((thought.params as any).update.sessionUpdate).toBe("agent_thought_chunk");
+    expect(thought.params?.update?.sessionUpdate).toBe("agent_thought_chunk");
   });
 
   it("announces a tool call and asks for permission, both with allow and reject options", () => {
@@ -175,9 +175,9 @@ describe("MSP to ACP", () => {
         availableChoices: [{ id: "allow" }, { id: "deny" }],
       },
     });
-    expect(update.params!.update.sessionUpdate).toBe("tool_call");
+    expect(update?.params?.update?.sessionUpdate).toBe("tool_call");
     expect(request.method).toBe("session/request_permission");
-    const kinds = (request.params!.options as any[]).map((o) => o.kind);
+    const kinds = (request.params?.options ?? []).map((option) => option.kind);
     expect(kinds.some((k: string) => k.startsWith("allow"))).toBe(true);
     expect(kinds.some((k: string) => k.startsWith("reject"))).toBe(true);
   });
@@ -228,8 +228,10 @@ describe("MSP to ACP", () => {
       method: "approval/resolved",
       params: { sessionId: "s", approvalId: "ap-3" },
     });
-    expect((resolved.params as any).update.sessionUpdate).toBe("tool_call_update");
-    expect((resolved.params as any).update.status).toBe("completed");
+    expect(resolved.params?.update?.sessionUpdate).toBe("tool_call_update");
+    expect(resolved.params?.update && "status" in resolved.params.update ? resolved.params.update.status : "").toBe(
+      "completed",
+    );
   });
 
   it("ignores MSP traffic it does not translate", () => {

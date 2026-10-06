@@ -70,12 +70,83 @@ type SessionUpdate =
       status: "pending" | "in_progress" | "completed" | "failed";
     };
 
+/** Prompt block ACP actually sends.  Text is the only field the bridge forwards. */
+interface PromptBlock {
+  type?: string;
+  text?: string;
+}
+
+/** MCP server entry copied into MSP `session/start` config when the client sent one. */
+interface McpServerConfig {
+  name?: string;
+  command?: string;
+}
+
+interface PermissionOption {
+  optionId: string;
+  name: string;
+  kind: string;
+}
+
+interface PermissionOutcome {
+  outcome?: string;
+  optionId?: string;
+}
+
+interface ApprovalChoice {
+  id?: string;
+}
+
+/** Fields the two translators read.  Optional because each method carries a
+ *  different slice; a missing field is "this method did not send it". */
+interface RpcParams {
+  cwd?: string;
+  mcpServers?: McpServerConfig[];
+  sessionId?: string;
+  prompt?: PromptBlock[];
+  value?: string;
+  category?: string;
+  configId?: string;
+  commandId?: string;
+  workspaceRoot?: string;
+  config?: { mcpServers: McpServerConfig[] };
+  input?: string;
+  modelId?: string;
+  effort?: string;
+  field?: string;
+  delta?: string;
+  error?: { code: number; message: string } | null;
+  approvalId?: string;
+  currentRequirementId?: string;
+  requirementId?: string;
+  choiceId?: string;
+  feedback?: string;
+  turnId?: string;
+  terminal?: boolean;
+  itemId?: string;
+  availableChoices?: ApprovalChoice[];
+  toolName?: string;
+  subject?: string;
+  toolCallId?: string;
+  rawArgs?: { command?: string };
+  update?: SessionUpdate;
+  options?: PermissionOption[];
+  toolCall?: { toolCallId: string; title: string; kind: string; rawInput?: { command?: string } };
+}
+
+interface RpcResult {
+  sessionId?: string;
+  session?: { sessionId?: string };
+  outcome?: PermissionOutcome;
+  stopReason?: string;
+}
+
 type JsonRpcMessage = {
   jsonrpc?: string;
   id?: string | number | null;
   method?: string;
-  params?: Record<string, any>;
-  result?: unknown;
+  params?: RpcParams;
+  result?: RpcResult;
   error?: { code: number; message: string };
 };
 
@@ -89,7 +160,7 @@ interface PendingApproval {
    *  — so we invalidate rather than send something we know is stale. */
   requirementId: string;
   /** MSP's own ids, so a refusal can be mapped back to the human's choice. */
-  availableChoices: Array<{ id?: string; [key: string]: unknown }>;
+  availableChoices: ApprovalChoice[];
   /** Titles we showed, so `approval/resolved` can close the right tool call. */
   toolCallId: string;
 }
@@ -163,19 +234,21 @@ export function translateAcpToMsp(message: JsonRpcMessage): JsonRpcMessage[] {
       return [{ jsonrpc: "2.0", id: relayId(message.id), method: "initialize", params: {} }];
 
     case "session/new": {
-      const cwd = typeof params.cwd === "string" ? params.cwd : process.cwd();
+      const cwd = params.cwd ?? process.cwd();
+      const startParams: RpcParams = {
+        commandId: commandId(),
+        workspaceRoot: cwd,
+      };
+      const mcpServers = params.mcpServers;
+      if (mcpServers && mcpServers.length > 0) {
+        startParams.config = { mcpServers };
+      }
       return [
         {
           jsonrpc: "2.0",
           id: relayId(message.id),
           method: "session/start",
-          params: {
-            commandId: commandId(),
-            workspaceRoot: cwd,
-            ...(Array.isArray(params.mcpServers) && params.mcpServers.length > 0
-              ? { config: { mcpServers: params.mcpServers } }
-              : {}),
-          },
+          params: startParams,
         },
       ];
     }
@@ -192,10 +265,10 @@ export function translateAcpToMsp(message: JsonRpcMessage): JsonRpcMessage[] {
       ];
 
     case "session/prompt": {
-      const prompt = Array.isArray(params.prompt) ? params.prompt : [];
+      const prompt = params.prompt ?? [];
       const text = prompt
-        .map((block: any) => (typeof block?.text === "string" ? block.text : ""))
-        .filter(Boolean)
+        .map((block) => block.text ?? "")
+        .filter((part) => part.length > 0)
         .join("\n");
       // ACP resolves this request when the turn ends;  MSP does not, so the id
       //  is parked in `pendingPrompt` and answered from `turn/completed`.
@@ -234,7 +307,7 @@ export function translateAcpToMsp(message: JsonRpcMessage): JsonRpcMessage[] {
     case "session/set_config_option": {
       const value = params.value;
       const sessionId = params.sessionId;
-      if (typeof value !== "string") return [];
+      if (value === undefined) return [];
       if (params.category === "model" || params.configId === "model") {
         return [
           { jsonrpc: "2.0", id: null, method: "session/setModel", params: { commandId: commandId(), sessionId, modelId: value } },
@@ -295,9 +368,8 @@ export function translateMspToAcp(message: JsonRpcMessage): JsonRpcMessage[] {
     }
 
     case "item/delta": {
-      const field = String(params.field ?? "");
-      const delta = params.delta;
-      const text = typeof delta === "string" ? delta : "";
+      const field = params.field ?? "";
+      const text = params.delta ?? "";
       if (!text) return [];
       const sessionId = currentSessionId ?? params.sessionId;
       if (!sessionId) return [];
@@ -311,9 +383,7 @@ export function translateMspToAcp(message: JsonRpcMessage): JsonRpcMessage[] {
     case "approval/request": {
       const sessionId = String(params.sessionId ?? currentSessionId ?? "");
       const approvalId = String(params.approvalId ?? "");
-      const choices: PendingApproval["availableChoices"] = Array.isArray(params.availableChoices)
-        ? params.availableChoices
-        : [];
+      const choices = params.availableChoices ?? [];
       const toolName = String(params.toolName ?? params.subject ?? "tool");
       const toolCallId = String(params.toolCallId ?? approvalId);
       const requirementId = String(params.currentRequirementId ?? "");
@@ -365,9 +435,10 @@ export function translateMspToAcp(message: JsonRpcMessage): JsonRpcMessage[] {
     case "approval/updated": {
       const approvalId = String(params.approvalId ?? "");
       const pending = approvals.get(approvalId);
-      if (pending && typeof params.currentRequirementId === "string") {
-        pending.requirementId = params.currentRequirementId;
-        if (Array.isArray(params.availableChoices)) pending.availableChoices = params.availableChoices;
+      const requirementId = params.currentRequirementId;
+      if (pending && requirementId !== undefined) {
+        pending.requirementId = requirementId;
+        if (params.availableChoices) pending.availableChoices = params.availableChoices;
         log(`approval ${approvalId} refreshed to requirement ${pending.requirementId}`);
       }
       return [];
@@ -425,7 +496,7 @@ function handlePermissionAnswer(id: string, message: JsonRpcMessage): void {
     //  because the ACP side has already been released by the receipt path.
     return;
   }
-  const outcome = (message.result as any)?.outcome;
+  const outcome = message.result?.outcome;
   if (!outcome || outcome.outcome !== "selected") {
     approvals.delete(approvalId);
     sendToMcp({
@@ -467,8 +538,9 @@ function acknowledgePermission(message: JsonRpcMessage): void {
 
   // BotFleet answering one of OUR permission presentations:  an ACP response
   //  with an id we minted as `perm-<approvalId>`.
-  if (typeof rawId === "string" && rawId.startsWith("perm-")) {
-    handlePermissionAnswer(rawId, message);
+  const permissionId = permissionRequestId(rawId);
+  if (permissionId !== undefined) {
+    handlePermissionAnswer(permissionId, message);
     return;
   }
 
@@ -478,24 +550,31 @@ function acknowledgePermission(message: JsonRpcMessage): void {
   if (acpId === undefined) return; // a response to a fire-and-forget call
   acpIdForMsq.delete(rawId);
 
-  const result = message.result as any;
+  const result = message.result;
 
   // Learn the session id as soon as it exists:  every later outward message
   //  needs it, and `turn/completed` arrives after the prompt is already open.
-  if (result?.session?.sessionId) currentSessionId = String(result.session.sessionId);
+  if (result?.session?.sessionId) currentSessionId = result.session.sessionId;
 
   if (message.error) {
     out({ jsonrpc: "2.0", id: acpId, error: message.error });
     return;
   }
 
-  switch (typeof result?.sessionId === "string" || result?.session?.sessionId ? "session" : "other") {
-    case "session":
-      out({ jsonrpc: "2.0", id: acpId, result: { sessionId: result.session?.sessionId ?? result.sessionId } });
-      return;
-    default:
-      out({ jsonrpc: "2.0", id: acpId, result });
+  const sessionId = result?.session?.sessionId ?? result?.sessionId;
+  if (sessionId !== undefined) {
+    out({ jsonrpc: "2.0", id: acpId, result: { sessionId } });
+    return;
   }
+  out({ jsonrpc: "2.0", id: acpId, result });
+}
+
+/** BotFleet's answer to a permission we posed uses an id minted as `perm-<approvalId>`.
+ *  Numeric ACP ids are someone else's request and must not be read as one. */
+function permissionRequestId(id: string | number | null | undefined): string | undefined {
+  if (id === undefined || id === null) return undefined;
+  const text = id.toString();
+  return text.startsWith("perm-") ? text : undefined;
 }
 
 function main(): void {

@@ -62,17 +62,11 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
     {
       id: "DeepSeek-V4.1-Flash",
       label: "DeepSeek-V4.1-Flash",
-      // The MODEL has vision; this ENGINE cannot deliver it.  The Clutch bridge
-      //  declares `images: false` and declares no `perModelImages`, so
-      //  `withPerModelImages` is a no-op and the ACP core refuses image parts
-      //  whatever this row says.  Marking it true put a "Multimodal" badge and
-      //  an image attach button on a model that cannot accept one.  The badge
-      //  now names the actual limitation instead of the model's capability.
-      images: false,
+      images: true,
       contextWindow: 1_000_000,
-      badge: "No Vision",
+      badge: "Multimodal",
       badgeTitle:
-        "The model takes image and video input, but the Clutch bridge does not carry images to it — so attachments are unavailable on this engine no matter which model is picked.",
+        "Accepts image and video input at the same token rate as text — each image is capped at 1,024 tokens.",
     },
     {
       id: "DeepSeek-V4.1-Pro",
@@ -86,16 +80,16 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
     {
       id: "MiniMax-M3.1-Flash-Preview",
       label: "MiniMax-M3.1-Flash-Preview",
-      images: false,
+      images: true,
       contextWindow: 1_000_000,
       badge: "Preview",
       badgeTitle:
-        "Frontier coding model with a 1M context window. MiniMax offers it through Token Plan and MiniMax Code, so it needs a Token Plan key.  The model is multimodal, but this bridge cannot carry images — use the MiniMax Code engine for attachments.",
+        "Frontier multimodal coding model with a 1M context window. MiniMax offers it through Token Plan and MiniMax Code, so it needs a Token Plan key.",
     },
     {
       id: "MiniMax-M2.7-highspeed",
       label: "MiniMax-M2.7-highspeed",
-      images: false,
+      images: true,
       contextWindow: 204_800,
       badge: "2x the $",
       badgeTitle:
