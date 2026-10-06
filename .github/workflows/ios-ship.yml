@@ -68,6 +68,8 @@ jobs:
     if: github.event.repository.fork == false
     runs-on: macos-latest
     timeout-minutes: 90
+    outputs:
+      sentry_receipt: ${{ steps.ship.outputs.sentry_receipt }}
     env:
       DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
     steps:
@@ -183,7 +185,16 @@ jobs:
       # merge on the next eligible hour; same-HEAD ticks still exit 0
       # without shipping.
       - name: Ship BotFleet to TestFlight
+        id: ship
         if: steps.gate.outputs.should_ship == '1'
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
         run: bash scripts/ios-ship-testflight.sh
+
+  report-sentry-deployment:
+    needs: ship
+    if: needs.ship.outputs.sentry_receipt != '' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/sentry-deploy.yml
+    with:
+      receipt: ${{ needs.ship.outputs.sentry_receipt }}
+    secrets: inherit

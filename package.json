@@ -39,7 +39,7 @@
     "test:lint-gate": "node --test scripts/lint-pr-gate.node-test.mjs scripts/check-lint-baseline.node-test.mjs",
     "test:e2e": "playwright test",
     "e2e:update": "playwright test --update-snapshots=changed",
-    "test:ios-ship": "node --test scripts/ios-ship-workflow.node-test.mjs",
+    "test:ios-ship": "node --test scripts/ios-ship-workflow.node-test.mjs scripts/sentry-testflight.node-test.mjs",
     "test:infisical-fetch": "node --test scripts/infisical-fetch.node-test.mjs",
     "test:release-workflow": "node --test scripts/release-workflow.node-test.mjs",
     "test:updater": "node --test electron/updater-coordinator.node-test.mjs electron/updater-throttle.node-test.mjs",

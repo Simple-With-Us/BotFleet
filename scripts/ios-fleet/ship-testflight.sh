@@ -995,6 +995,7 @@ release_archive_lock() {
 # ITSAppUsesNonExemptEncryption. Otherwise TestFlight stays
 # MISSING_EXPORT_COMPLIANCE and the phone never sees the build (ST 1.0.1/2
 # on 2026-08-12).
+TF_READY_CONFIRMED=0
 ensure_tf_ready() {
   log "verifying TestFlight ready-to-install for ${BUNDLE_ID} build ${BUILD_NUM}"
   set +e
@@ -1016,6 +1017,7 @@ ensure_tf_ready() {
   fi
   if [[ $rc -eq 0 ]]; then
     log "TestFlight internal testers can install this build"
+    TF_READY_CONFIRMED=1
     return 0
   fi
   if [[ $rc -eq 3 ]]; then
@@ -1043,6 +1045,23 @@ ensure_tf_ready() {
     echo "::warning::ensure-tf-ready failed (rc=${rc}) for ${BUNDLE_ID} build ${BUILD_NUM}; export compliance not declared"
   fi
   return 0
+}
+
+# Freeze source identity before building.  A later checkout change invalidates
+# the reporting receipt rather than associating an archive with the wrong SHA.
+SENTRY_ARCHIVE_COMMIT="$(repo_head_sha)"
+emit_sentry_deployment_receipt() {
+  # Hosted BotFleet iOS only.  Skips, export-only, upload-only and pending ASC
+  # processing are not deployments and must never manufacture a receipt.
+  [[ "$APP_KEY" == "botfleet" && -n "${GITHUB_OUTPUT:-}" ]] || return 0
+  if [[ "$TF_READY_CONFIRMED" != "1" ]]; then
+    echo "::warning::No confirmed TestFlight readiness; Sentry deployment was not recorded."
+    return 0
+  fi
+  SENTRY_ARCHIVE_PATH="$ARCHIVE_PATH" SENTRY_READY_FILE="${LOG_DIR}/ensure-tf-ready.json" \
+  SENTRY_REPO_ROOT="$REPO_ROOT" SENTRY_ARCHIVE_COMMIT="$SENTRY_ARCHIVE_COMMIT" \
+  SENTRY_BUNDLE_ID="$BUNDLE_ID" SENTRY_MARKETING_VERSION="$MARKETING" SENTRY_BUILD_NUMBER="$BUILD_NUM" \
+    node "${REPO_ROOT}/scripts/sentry-testflight-receipt.mjs"
 }
 
 acquire_archive_lock
@@ -1129,6 +1148,7 @@ if [[ $EXPORT_RC -eq 0 ]]; then
   release_archive_lock
   ensure_tf_ready
   record_successful_ship
+  emit_sentry_deployment_receipt
   log "logs: ${LOG_DIR}"
   exit 0
 fi
@@ -1186,6 +1206,7 @@ fi
 release_archive_lock
 ensure_tf_ready
 record_successful_ship
+emit_sentry_deployment_receipt
 log "upload submitted; watch TestFlight processing for ${BUNDLE_ID} build ${BUILD_NUM}"
 log "logs: ${LOG_DIR}"
 exit 0
