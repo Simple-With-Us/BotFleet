@@ -38,7 +38,7 @@ function store(explicit?: Storage): Storage | undefined {
   }
 }
 
-function parseConnectorStatus(value: JsonValue | undefined): ConnectorStatus | null {
+function parseConnectorStatus(value: unknown): ConnectorStatus | null {
   if (!isJsonObject(value) || !isJsonBoolean(value.connected)) return null;
   if (value.pending !== undefined && !isJsonBoolean(value.pending)) return null;
   if (value.status !== undefined && !isJsonString(value.status)) return null;
@@ -76,7 +76,7 @@ export function readCachedInventory(explicit?: Storage): CachedInventory | null 
     if (!isJsonObject(parsed) || !isJsonObject(parsed.services)) return null;
     const services: Record<string, ConnectorStatus> = {};
     for (const [slug, value] of Object.entries(parsed.services)) {
-      const status = parseConnectorStatus(value as JsonValue);
+      const status = parseConnectorStatus(value);
       if (!status) return null;
       services[slug] = status;
     }
