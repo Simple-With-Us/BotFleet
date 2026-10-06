@@ -192,6 +192,10 @@ export function parseBotProfilePatch(input: BotProfilePatchInput, strict = false
     return { ok: false, error: issue?.message ?? "invalid profile patch" };
   }
 
+  if (strict && Object.prototype.hasOwnProperty.call(parsed.data, "bypassPermissions")) {
+    return { ok: false, error: "unsupported profile field: bypassPermissions" };
+  }
+
   const { avatarUrl, cwd, connectorTools, maxToolRounds: _maxToolRounds, ...fields } = parsed.data;
   const patch: BotProfilePatch = fields;
   if (avatarUrl !== undefined) patch.avatarUrl = avatarUrl || undefined;

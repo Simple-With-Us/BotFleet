@@ -20,6 +20,8 @@ export function BypassPermissionsWarning({
   busy?: boolean;
 }) {
   const confirmRef = useRef<HTMLButtonElement>(null);
+  const onCancelRef = useRef(onCancel);
+  onCancelRef.current = onCancel;
   const evaluation = evaluateModelRiskForBypass(model, engineId);
 
   useEffect(() => {
@@ -28,12 +30,12 @@ export function BypassPermissionsWarning({
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onCancel();
+        onCancelRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onCancel, busy]);
+  }, [open, busy]);
 
   if (!open) return null;
 

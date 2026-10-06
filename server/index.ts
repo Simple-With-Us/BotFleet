@@ -11932,11 +11932,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         : body.computer !== undefined
           ? (body.computer === "off" ? [] : [body.computer])
           : storedComputerGrants(existingBot);
-      const wantsAuto = body.autoApprove !== undefined
-        ? body.autoApprove
-        : body.bypassPermissions !== undefined
-          ? body.bypassPermissions
-          : (existingBot?.autoApprove === true || existingBot?.bypassPermissions === true);
+      const wantsAuto =
+        (body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true) ||
+        (body.bypassPermissions !== undefined ? body.bypassPermissions : existingBot?.bypassPermissions === true);
       const ackError = localAutoAcknowledgementError(
         existingBot,
         wantsComputers,
