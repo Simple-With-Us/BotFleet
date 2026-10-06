@@ -77,6 +77,7 @@ jobs:
     timeout-minutes: 90
     outputs:
       sentry_receipt: ${{ steps.ship.outputs.sentry_receipt }}
+      sentry_receipt_error: ${{ steps.ship.outputs.sentry_receipt_error }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
@@ -230,8 +231,11 @@ jobs:
 
   report-sentry-deployment:
     needs: ship
-    if: needs.ship.outputs.sentry_receipt != '' && github.ref == 'refs/heads/main'
+    if: >-
+      (needs.ship.outputs.sentry_receipt != '' || needs.ship.outputs.sentry_receipt_error == 'true') &&
+      github.ref == 'refs/heads/main'
     uses: ./.github/workflows/sentry-testflight.yml
     with:
       receipt: ${{ needs.ship.outputs.sentry_receipt }}
+      receipt_error: ${{ needs.ship.outputs.sentry_receipt_error == 'true' }}
     secrets: inherit

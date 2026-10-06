@@ -51,5 +51,5 @@ function main(env) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { main(process.env); }
-  catch { console.error("::error::Could not verify TestFlight release receipt; no Sentry deploy will be recorded.  The successful upload remains recorded by the ship gate."); process.exitCode = 1; }
+  catch { console.error("::warning::Could not verify TestFlight release receipt; the separate reporting job will fail without recording a deploy.  The successful upload remains recorded by the ship gate."); process.exitCode = 1; }
 }
