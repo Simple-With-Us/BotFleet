@@ -17,18 +17,24 @@
 // The phone only ever renders configured-or-not, so it gets exactly that:
 // `{configured: true}` survives, the host label does not.
 
+import { isJsonObject, type JsonObject, type JsonValue } from "./json.ts";
+
+const asJsonValue = <T>(value: T): JsonValue => value as JsonValue;
+
 /** Keys that are the harness's business, never a device's. */
 const WITHHELD_KEYS = new Set(["resumeCursors", "sshAlias"]);
 
 /** Recursively drop the withheld keys, wherever they appear. */
 export function scrub<T>(value: T): T {
   if (Array.isArray(value)) return value.map(scrub) as unknown as T;
-  if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+  const jsonValue = asJsonValue(value);
+  if (isJsonObject(jsonValue)) {
+    const out: JsonObject = {};
+    for (const [key, inner] of Object.entries(jsonValue)) {
       if (WITHHELD_KEYS.has(key)) continue;
-      out[key] = scrub(inner);
+      out[key] = scrub(inner) as JsonValue;
     }
+    // SAFETY: scrub only rewrites JSON-shaped trees; output matches input shape.
     return out as T;
   }
   return value;

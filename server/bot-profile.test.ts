@@ -14,6 +14,11 @@ describe("parseBotProfilePatch (strict — the paired boundary)", () => {
     expect(result2).toEqual({ ok: false, error: "unsupported profile field: unknownProperty" });
   });
 
+  it("refuses bypassPermissions on the paired profile boundary", () => {
+    const result = parseBotProfilePatch({ bypassPermissions: true }, true);
+    expect(result).toEqual({ ok: false, error: "unsupported profile field: bypassPermissions" });
+  });
+
   it("accepts the full identity and configuration surface", () => {
     const result = parseBotProfilePatch(
       {

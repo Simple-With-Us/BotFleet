@@ -887,3 +887,30 @@ describe("file writes in auto mode", () => {
     expect(autoVerdict(auto, "Write", sensitiveSummary, { fileWrite: outside })).toMatchObject({ source: "sensitive-guard" });
   });
 });
+
+describe("bypassPermissions", () => {
+  it("auto-approves even destructive, sensitive, and unattended commands when bypass is enabled", () => {
+    const bypassBot = { bypassPermissions: true };
+    expect(autoVerdict(bypassBot, "shell", "/bin/zsh -lc 'git clean -fdx'")).toEqual({
+      approve: "auto-approved shell:zsh (permission bypass)",
+      source: "auto-mode",
+      rule: "permission-bypass",
+    });
+    expect(autoVerdict(bypassBot, "bash", "cat ~/.ssh/id_rsa", { unattended: true })).toEqual({
+      approve: "auto-approved bash:cat (permission bypass)",
+      source: "auto-mode",
+      rule: "permission-bypass",
+    });
+    expect(autoVerdict(bypassBot, "Write", '{"file_path":"/etc/hosts"}', { unattended: true })).toEqual({
+      approve: "auto-approved Write (permission bypass)",
+      source: "auto-mode",
+      rule: "permission-bypass",
+    });
+  });
+
+  it("does not bypass local-computer scope without explicit auto approval", () => {
+    const bypassBot = { bypassPermissions: true };
+    const verdict = autoVerdict(bypassBot, "mouse_click", "click at 100, 200", { scope: "local-computer" });
+    expect(verdict.approve).toBeNull();
+  });
+});

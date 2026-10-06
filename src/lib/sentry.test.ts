@@ -368,15 +368,19 @@ describe("renderer diagnostics refresh", () => {
     expect(() => decodeURIComponent(loneUrl)).not.toThrow();
 
     // Verify without native toWellFormed (Safari < 16.4 fallback path)
-    const orig = (String.prototype as unknown as Record<string, unknown>).toWellFormed;
+    interface StringPrototypeWithWellFormed {
+      toWellFormed?: () => string;
+    }
+    const patched = String.prototype as unknown as StringPrototypeWithWellFormed;
+    const orig = patched.toWellFormed;
     try {
-      delete (String.prototype as unknown as Record<string, unknown>).toWellFormed;
+      delete patched.toWellFormed;
       const fallbackUrl = buildFallbackIssueUrl("Fallback \uD800", "Lone \uDC00 and pair \uD83D\uDE00");
       expect(() => decodeURIComponent(fallbackUrl)).not.toThrow();
       expect(fallbackUrl).toContain(encodeURIComponent("\uFFFD"));
       expect(fallbackUrl).toContain(encodeURIComponent("😀"));
     } finally {
-      (String.prototype as unknown as Record<string, unknown>).toWellFormed = orig;
+      patched.toWellFormed = orig;
     }
   });
 

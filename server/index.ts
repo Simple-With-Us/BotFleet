@@ -1660,6 +1660,7 @@ type ComputerGrantSubject = {
   /** The pre-array spelling some stored bots still carry. */
   computer?: unknown;
   autoApprove?: boolean;
+  bypassPermissions?: boolean;
   modelSelection?: ModelSelection;
 };
 
@@ -1801,7 +1802,7 @@ function localAutoAcknowledgementError(
   // A bot that ALREADY holds the pair keeps it: the warning was answered
   // once, and re-saving an unrelated field must not demand it again.
   const capability = botLocalAutoCapability(existing);
-  const alreadyGranted = existing?.autoApprove === true && requiresLocalAutoConsent(
+  const alreadyGranted = (existing?.autoApprove === true || existing?.bypassPermissions === true) && requiresLocalAutoConsent(
     storedComputerGrants(existing),
     context.currentDefault,
     context.currentAllowed,
@@ -11945,7 +11946,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         : body.computer !== undefined
           ? (body.computer === "off" ? [] : [body.computer])
           : storedComputerGrants(existingBot);
-      const wantsAuto = body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true;
+      const wantsAuto =
+        (body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true) ||
+        (body.bypassPermissions !== undefined ? body.bypassPermissions : existingBot?.bypassPermissions === true);
       const ackError = localAutoAcknowledgementError(
         existingBot,
         wantsComputers,
@@ -12597,6 +12600,99 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!owner && !pending) return json(res, 404, { error: "nothing is waiting on an answer in this conversation" });
       const outcome = await answerRequest(threadId, owner?.modelSelection.instanceId ?? "", requestId, behavior, body.message, owner ? { id: owner.id, name: owner.name } : undefined);
       return json(res, 200, { ok: true, outcome });
+    }
+    const approveAllForThread = async (
+      targetThreadId: string,
+    ): Promise<{ ok: boolean; approvedCount: number }> => {
+      const pending = store.messagesFor(targetThreadId).filter(
+        (message) =>
+          message.kind === "options" &&
+          message.card?.requestId &&
+          message.card.tool &&
+          !message.card.answered &&
+          !message.card.dismissed,
+      );
+
+      let approvedCount = 0;
+      for (const message of pending) {
+        const card = message.card;
+        if (!card?.requestId) continue;
+        const requestId = card.requestId;
+
+        if (card.routineRequest) {
+          const routineBotId = message.from?.botId ?? store.botByThread(targetThreadId)?.id;
+          if (routineBotId) {
+            const routineOwner = store.bot(routineBotId);
+            const result = routineRequests.resolve({
+              botId: routineBotId,
+              threadId: targetThreadId,
+              requestId,
+              behavior: "allow",
+            });
+            if (result.claimed && (result.state === "applied" || result.state === "denied")) {
+              appendDecision(DATA_DIR, {
+                threadId: targetThreadId,
+                requestId,
+                botId: routineBotId,
+                botName: routineOwner?.name,
+                tool: card.tool,
+                summary: card.subtitle,
+                decision: result.state === "applied" ? "user-approved" : "user-denied",
+                source: "user",
+              });
+            }
+            approvedCount++;
+          }
+          continue;
+        }
+
+        if (resolvePeerComms(approvalBus, requestId, "allow", targetThreadId)) {
+          approvedCount++;
+          continue;
+        }
+
+        const group = store.groupByThread(targetThreadId);
+        const owner = group
+          ? (group.busyBotId ? store.bot(group.busyBotId) : undefined) ??
+            (message.from ? store.bot(message.from.botId) : undefined)
+          : store.botByThread(targetThreadId);
+
+        const outcome = await answerRequest(
+          targetThreadId,
+          owner?.modelSelection.instanceId ?? "",
+          requestId,
+          "allow",
+          undefined,
+          owner ? { id: owner.id, name: owner.name } : undefined,
+        );
+        if (outcome !== "unavailable") {
+          approvedCount++;
+        }
+      }
+
+      return { ok: true, approvedCount };
+    };
+    m = path.match(/^\/api\/bots\/([^/]+)\/approve-all$/);
+    if (m && method === "POST") {
+      const botIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
+      const parsedBotId = botIdSchema.safeParse(m[1]);
+      if (!parsedBotId.success) {
+        return json(res, 400, { error: "invalid bot id" });
+      }
+      const bot = store.bot(parsedBotId.data);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      const result = await approveAllForThread(bot.threadId);
+      return json(res, 200, result);
+    }
+    m = path.match(/^\/api\/threads\/([^/]+)\/approve-all$/);
+    if (m && method === "POST") {
+      const threadIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
+      const parsedThreadId = threadIdSchema.safeParse(m[1]);
+      if (!parsedThreadId.success) {
+        return json(res, 400, { error: "invalid thread id" });
+      }
+      const result = await approveAllForThread(parsedThreadId.data);
+      return json(res, 200, result);
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/interrupt$/);
     if (m && method === "POST") {
