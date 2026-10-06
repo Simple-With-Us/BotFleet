@@ -777,6 +777,7 @@ describe("Cua integration", () => {
 
   it("builds an exact, checksum-verified Cua Driver 0.20.0 image", () => {
     const dockerfile = managedImageDockerfile();
+    expect(dockerfile.startsWith("# syntax=docker/dockerfile:1\n")).toBe(true);
     expect(BASE_IMAGE).toMatch(/@sha256:[a-f0-9]{64}$/);
     expect(dockerfile).toContain(`FROM ${BASE_IMAGE}`);
     expect(dockerfile).toContain("cua_driver-0.20.0-py3-none-manylinux_2_31_x86_64.whl");

@@ -4,10 +4,12 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  allowedCliGuestDestinations,
   DockerConfigSchema,
   hostCliCredentialMounts,
   manifestCredentialCandidates,
   planCredentialSync,
+  resolveCredentialMountSource,
   sanitizeDockerConfigForLinux,
 } from "./vm-cli-credentials.ts";
 
@@ -36,6 +38,29 @@ describe("vm CLI credential sync", () => {
 
   it("rejects malformed docker config at the trust boundary", () => {
     expect(() => sanitizeDockerConfigForLinux("null")).toThrow();
+  });
+
+  it("allows legacy guest mount destinations for existing containers", () => {
+    const allowed = allowedCliGuestDestinations();
+    expect(allowed.has("/home/cua/.oci")).toBe(true);
+    expect(allowed.has("/home/cua/.terraform.d")).toBe(true);
+    expect(allowed.has("/home/cua/.sentryclirc")).toBe(true);
+  });
+
+  it("skips malformed docker config instead of aborting credential mounts", () => {
+    const home = mkdtempSync(join(tmpdir(), "bf-cred-docker-"));
+    mkdirSync(join(home, ".docker"), { recursive: true });
+    writeFileSync(join(home, ".docker", "config.json"), "[]");
+    try {
+      const dockerCandidate = manifestCredentialCandidates().find((entry) => entry.transform === "docker-linux-config");
+      expect(dockerCandidate).toBeDefined();
+      const stagingRoot = mkdtempSync(join(tmpdir(), "bf-staging-docker-"));
+      const source = resolveCredentialMountSource(home, dockerCandidate!, stagingRoot, {});
+      expect(source).toBeNull();
+      expect(() => hostCliCredentialMounts("darwin", home)).not.toThrow();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("reports synced and skipped tools without requiring every path to exist", () => {

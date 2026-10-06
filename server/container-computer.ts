@@ -372,7 +372,8 @@ const LINUX_WHEELS = {
  * loading shared libraries … file too short" that reads as a network fault.
  * The gate names the actual problem at the step that can act on it. */
 export function managedImageDockerfile(): string {
-  return `FROM ${BASE_IMAGE}
+  return `# syntax=docker/dockerfile:1
+FROM ${BASE_IMAGE}
 USER root
 RUN set -eux; \\
     arch="$(uname -m)"; \\
@@ -1415,12 +1416,14 @@ async function ensureVmWorkspace(platform: NodeJS.Platform, target: LocalVmTarge
   if (platform !== "win32") await chmod(target.workspaceDir, 0o700);
 }
 
+const MANAGED_IMAGE_BUILD_TIMEOUT_MS = 45 * 60_000;
+
 async function prepareManagedImage(runtime: Runtime, runner: CommandRunner): Promise<void> {
   await runner(runtime, ["pull", BASE_IMAGE], 10 * 60_000);
   const context = await mkdtemp(join(tmpdir(), "botfleet-cua-image-"));
   try {
     await writeFile(join(context, "Dockerfile"), managedImageDockerfile(), { mode: 0o600 });
-    await runner(runtime, ["build", "-t", IMAGE, context], 10 * 60_000);
+    await runner(runtime, ["build", "-t", IMAGE, context], MANAGED_IMAGE_BUILD_TIMEOUT_MS);
   } finally {
     await rm(context, { recursive: true, force: true });
   }

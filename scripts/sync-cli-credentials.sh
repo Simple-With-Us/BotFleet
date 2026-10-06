@@ -136,21 +136,22 @@ SHARE_GPG_PRIVATE_KEYS="${BOTFLEET_SHARE_GPG_PRIVATE_KEYS:-0}"
 
 # Candidate developer credentials to sync (manifest-driven)
 FOUND=()
-CREDENTIAL_LIST="$(
+TAR_ROOT=""
+CREDENTIAL_PLAN="$(
   cd "$REPO_ROOT" && SRC_HOME="$SRC_HOME" SHARE_GPG_PRIVATE_KEYS="$SHARE_GPG_PRIVATE_KEYS" node --experimental-strip-types - <<'NODE'
 import { prepareCredentialSyncWorkspace } from "./server/vm-cli-credentials.ts";
 const homeDir = process.env.SRC_HOME ?? "";
 const shareGpgPrivateKeys = process.env.SHARE_GPG_PRIVATE_KEYS === "1";
-const { plan, cleanup } = await prepareCredentialSyncWorkspace(homeDir, { shareGpgPrivateKeys });
-for (const rel of [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])].sort()) {
-  console.log(rel);
-}
-await cleanup();
+const { plan } = await prepareCredentialSyncWorkspace(homeDir, { shareGpgPrivateKeys });
+const root = plan.stagingDir ?? homeDir;
+const rels = [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])].sort();
+console.log(JSON.stringify({ root, rels }));
 NODE
 )" || { echo "Error: manifest-driven credential discovery failed." >&2; exit 1; }
+TAR_ROOT="$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
 while IFS= read -r rel; do
   [ -n "$rel" ] && FOUND+=("$rel")
-done <<< "$CREDENTIAL_LIST"
+done <<< "$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["rels"]))')"
 
 if [ ${#FOUND[@]} -eq 0 ]; then
   log "No matching CLI credentials found in $SRC_HOME."
@@ -218,8 +219,8 @@ sync_to_container() {
 
   log "Syncing ${#FOUND[@]} credential path(s) to '$c_name' ($mode)..."
 
-  # Stream tar archive into container
-  COPYFILE_DISABLE=1 tar --format=ustar -C "$SRC_HOME" --no-xattrs \
+  # Stream tar archive into container (staged docker/gnupg transforms use TAR_ROOT)
+  COPYFILE_DISABLE=1 tar --format=ustar -C "$TAR_ROOT" --no-xattrs \
     --exclude="*/virtenv*" \
     --exclude="*/agent/*" \
     --exclude="*.sock" \
@@ -276,6 +277,10 @@ if [ "$TARGET" = "local" ] || [ "$TARGET" = "all" ]; then
   if sync_to_container "local" "$LOCAL_CONTAINER"; then
     SYNCED_TARGETS+=("local:$LOCAL_CONTAINER")
   fi
+fi
+
+if [ -n "$TAR_ROOT" ] && [ "$TAR_ROOT" != "$SRC_HOME" ]; then
+  rm -rf "$TAR_ROOT"
 fi
 
 if [ "$JSON_OUTPUT" -eq 1 ]; then

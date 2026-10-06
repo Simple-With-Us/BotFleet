@@ -16,7 +16,7 @@
 botfleet-vm-cli-verify
 ```
 
-After Box bootstrap, the same verifier is also installed under `/opt/ogb/`.
+After Box bootstrap, the same verifier is also available in the managed desktop environment.
 
 In a checkout, run `node scripts/computer-vm-cli/verify.mjs cloud` or `local-vm`.
 

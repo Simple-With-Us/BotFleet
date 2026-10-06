@@ -88,6 +88,16 @@ const GPG_PUBLIC_FILES = new Set([
   "openpgp-revocs.d",
 ]);
 
+/** Destinations dropped from the manifest but still mounted on older Local VMs. */
+const LEGACY_ALLOWED_CLI_GUEST_DESTINATIONS = [
+  "/home/cua/.oci",
+  "/home/cua/.terraform.d",
+  "/home/cua/.config/stripe",
+  "/home/cua/.config/supabase",
+  "/home/cua/.config/huggingface",
+  "/home/cua/.sentryclirc",
+] as const;
+
 function guestPath(rel: string): string {
   // Linux container paths must stay POSIX even when planning mounts on Windows hosts.
   return posix.join(VM_CLI_GUEST_HOME, rel);
@@ -127,7 +137,10 @@ let cachedAllowedGuestDestinations: ReadonlySet<string> | null = null;
 
 export function allowedCliGuestDestinations(): ReadonlySet<string> {
   if (!cachedAllowedGuestDestinations) {
-    cachedAllowedGuestDestinations = new Set(cliCredentialCandidates().map((candidate) => candidate.guest));
+    cachedAllowedGuestDestinations = new Set([
+      ...cliCredentialCandidates().map((candidate) => candidate.guest),
+      ...LEGACY_ALLOWED_CLI_GUEST_DESTINATIONS,
+    ]);
   }
   return cachedAllowedGuestDestinations;
 }
@@ -162,17 +175,28 @@ function listGpgPublicRelPaths(homeDir: string): string[] {
   if (!existsSync(root)) return [];
   const rels: string[] = [];
   const walk = (dir: string, prefix: string) => {
-    for (const entry of readdirSync(dir)) {
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
       const full = join(dir, entry);
       const rel = prefix ? `${prefix}/${entry}` : entry;
       const hostRel = `.gnupg/${rel}`;
-      const stat = lstatSync(full);
+      let stat;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue;
+      }
       if (stat.isDirectory()) {
         if (entry === "private-keys-v1.d") continue;
         walk(full, rel);
         continue;
       }
-      if (GPG_PUBLIC_FILES.has(entry) || entry.endsWith(".gpg") && !hostRel.includes("private-keys")) {
+      if (GPG_PUBLIC_FILES.has(entry) || (entry.endsWith(".gpg") && !hostRel.includes("private-keys"))) {
         rels.push(hostRel);
       }
     }
@@ -184,9 +208,58 @@ function listGpgPublicRelPaths(homeDir: string): string[] {
 function listGpgPrivateRelPaths(homeDir: string): string[] {
   const privateDir = join(homeDir, ".gnupg", "private-keys-v1.d");
   if (!existsSync(privateDir)) return [];
-  return readdirSync(privateDir)
+  let names: string[];
+  try {
+    names = readdirSync(privateDir);
+  } catch {
+    return [];
+  }
+  return names
     .filter((name) => !name.startsWith("."))
     .map((name) => `.gnupg/private-keys-v1.d/${name}`);
+}
+
+function gnupgRelWithinStagingTree(hostRel: string): string {
+  return hostRel.startsWith(".gnupg/") ? hostRel.slice(".gnupg/".length) : hostRel;
+}
+
+function pruneStaleGnupgStagingEntries(stagedDir: string, hostRels: string[]): void {
+  const desired = new Set(hostRels.map((rel) => gnupgRelWithinStagingTree(rel)));
+  const walk = (dir: string, prefix: string) => {
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const rel = prefix ? `${prefix}/${entry}` : entry;
+      const full = join(dir, entry);
+      let stat;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) {
+        walk(full, rel);
+        try {
+          if (readdirSync(full).length === 0) rmSync(full, { recursive: true, force: true });
+        } catch {
+          // Directory may disappear while gpg-agent mutates ~/.gnupg.
+        }
+        continue;
+      }
+      if (!desired.has(rel)) {
+        try {
+          rmSync(full, { force: true });
+        } catch {
+          // Best-effort prune for stale staged public material.
+        }
+      }
+    }
+  };
+  walk(stagedDir, "");
 }
 
 function resolveTransformPaths(
@@ -221,9 +294,13 @@ function stageTransformedFile(
   const target = join(stagingDir, rel);
   mkdirSync(dirname(target), { recursive: true });
   if (transform === "docker-linux-config") {
-    const body = sanitizeDockerConfigForLinux(readFileSync(source, "utf8"));
-    writeFileSync(target, body, { mode: 0o600 });
-    return true;
+    try {
+      const body = sanitizeDockerConfigForLinux(readFileSync(source, "utf8"));
+      writeFileSync(target, body, { mode: 0o600 });
+      return true;
+    } catch {
+      return false;
+    }
   }
   copyFileSync(source, target);
   const mode = statSync(source).mode & 0o777;
@@ -300,11 +377,10 @@ export function resolveCredentialMountSource(
   const materialize = options.materializeCredentials !== false;
   const rel = candidate.relPath.join("/");
   if (candidate.transform === "docker-linux-config") {
-    if (!materialize) {
-      const host = join(homeDir, rel);
-      return existsSync(host) ? host : null;
-    }
     const staged = join(stagingRoot, rel);
+    if (!materialize) {
+      return existsSync(staged) ? staged : null;
+    }
     if (stageTransformedFile(homeDir, rel, candidate.transform, stagingRoot)) return staged;
     return null;
   }
@@ -320,13 +396,10 @@ export function resolveCredentialMountSource(
     const privatePaths = options.shareGpgPrivateKeys ? listGpgPrivateRelPaths(homeDir) : [];
     if (publicPaths.length === 0 && privatePaths.length === 0) return null;
     if (!materialize) {
-      const hostGnupg = join(homeDir, ".gnupg");
-      return existsSync(hostGnupg) ? hostGnupg : null;
+      return existsSync(stagedDir) ? stagedDir : null;
     }
-    if (existsSync(stagedDir)) {
-      rmSync(stagedDir, { recursive: true, force: true });
-    }
-    mkdirSync(stagedDir, { recursive: true });
+    mkdirSync(stagedDir, { recursive: true, mode: 0o700 });
+    pruneStaleGnupgStagingEntries(stagedDir, [...publicPaths, ...privatePaths]);
     for (const publicRel of [...publicPaths, ...privatePaths]) {
       stageTransformedFile(homeDir, publicRel, undefined, stagingRoot);
     }
@@ -424,8 +497,8 @@ export async function prepareCredentialSyncWorkspace(
     };
   }
   const stagingDir = await mkdtemp(join(tmpdir(), "bf-cli-cred-stage-"));
-  const plan = planCredentialSync({ ...options, homeDir, stagingDir });
   try {
+    const plan = planCredentialSync({ ...options, homeDir, stagingDir });
     for (const rel of plan.archiveRelPaths) {
       const source = join(homeDir, rel);
       const target = join(stagingDir, rel);
@@ -436,16 +509,16 @@ export async function prepareCredentialSyncWorkspace(
         copyFileSync(source, target);
       }
     }
+    return {
+      plan: { ...plan, stagingDir },
+      cleanup: async () => {
+        await rm(stagingDir, { recursive: true, force: true });
+      },
+    };
   } catch (error) {
     await rm(stagingDir, { recursive: true, force: true });
     throw error;
   }
-  return {
-    plan: { ...plan, stagingDir },
-    cleanup: async () => {
-      await rm(stagingDir, { recursive: true, force: true });
-    },
-  };
 }
 
 export function listCredentialRelPathsForShell(): string[] {
