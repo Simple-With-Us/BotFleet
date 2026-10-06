@@ -270,20 +270,30 @@ export function cuaPermissionsStatus() {
   if (!binary) return { available: false };
   // Parse stdout even when the driver exits non-zero for denied permissions —
   // the JSON payload is the product, not exit status 0.
+  const timeoutMs = 15_000;
   const result = spawnSync(binary, ["permissions", "status", "--json"], {
     encoding: "utf8",
     windowsHide: true,
     env: { ...process.env, ...CUA_ENV },
-    timeout: 15_000,
+    timeout: timeoutMs,
   });
   const parsed = parseCuaPermissionsStdout(result.stdout ?? "");
   if (parsed.ok) return { available: true, ...parsed.data };
-  if (result.error || result.signal) {
+  const probe = {
+    ...classifyNativeProbe(result, () => null),
+    result,
+    attempt: 1,
+    attempts: 1,
+    timeoutMs,
+  };
+  // Incomplete probe (error/signal/non-zero) reports status evidence; only an
+  // exit-0 unparseable body is "invalid CUA permissions status".
+  if (result.error || result.signal || result.status !== 0) {
     return {
       available: false,
       reason: nativeProbeFailureMessage(
         "cua-driver permissions status did not complete",
-        classifyNativeProbe(result, () => null),
+        probe,
       ),
     };
   }

@@ -41,13 +41,17 @@ export function oneLine(value, limit = PROBE_DETAIL_LIMIT) {
  * tell apart from a genuine mismatch. */
 export function classifyNativeProbe(result = {}, matchVersion) {
   const stdout = String(result.stdout ?? "");
+  const stderr = String(result.stderr ?? "");
   if (result.error) {
     const message = String(result.error.message ?? result.error);
     const timedOut = result.error.code === "ETIMEDOUT" || /ETIMEDOUT/i.test(message);
     return { ok: false, reason: timedOut ? "timeout" : "spawn", version: null };
   }
   if (result.status === 0) {
-    const version = matchVersion(stdout);
+    // Prefer stdout; fall back to stderr — some natives print --version there.
+    // Callers still match lines (not whole-buffer equality), so a glibc banner
+    // on the other stream cannot fake a pin.
+    const version = matchVersion(stdout) || matchVersion(stderr);
     return version
       ? { ok: true, reason: "version", version }
       : { ok: false, reason: "version", version: null };
