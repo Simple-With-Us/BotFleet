@@ -3,6 +3,7 @@ import {
   applySentryConfig,
   isSentryActive,
   resetSentryForTests,
+  sentryTestLoader,
   setSentryLoaderForTests,
   type SentryNode,
 } from "./sentry.ts";
@@ -14,8 +15,11 @@ import {
 } from "./sentry-crons.ts";
 import type { Routine, RoutineRun } from "./routines.ts";
 
+type SentryCheckIn = Parameters<SentryNode["captureCheckIn"]>[0];
+type SentryMonitorConfig = Parameters<SentryNode["captureCheckIn"]>[1];
+
 interface FakeSentryClient {
-  getDsn(): unknown;
+  getDsn(): { host?: string } | undefined;
   getOptions(): { enabled: boolean };
   getTransport(): undefined;
 }
@@ -25,7 +29,7 @@ interface FakeSentrySdk {
   close(): Promise<boolean>;
   addIntegration(): void;
   consoleLoggingIntegration(): { name: string };
-  captureCheckIn(checkIn: unknown, monitorConfig?: unknown): string;
+  captureCheckIn(checkIn: SentryCheckIn, monitorConfig?: SentryMonitorConfig): string;
   isEnabled?(): boolean;
   getClient?(): FakeSentryClient;
 }
@@ -117,7 +121,7 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
   });
 
   async function activateFakeSentry() {
-    const checkIns: Array<{ checkIn: unknown; monitorConfig?: unknown }> = [];
+    const checkIns: Array<{ checkIn: SentryCheckIn; monitorConfig?: SentryMonitorConfig }> = [];
     // SAFETY: empty object shell — runtime only calls the members stamped below.
     const sdk = Object.assign({} as FakeSentrySdk, {
       init() {},
@@ -128,12 +132,12 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
       consoleLoggingIntegration() {
         return { name: "ConsoleLogs" };
       },
-      captureCheckIn(checkIn: unknown, monitorConfig?: unknown) {
+      captureCheckIn(checkIn: SentryCheckIn, monitorConfig?: SentryMonitorConfig) {
         checkIns.push({ checkIn, monitorConfig });
         return "check-in-id-1";
       },
     });
-    setSentryLoaderForTests(async () => sdk as SentryNode);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -200,7 +204,7 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
         return "fabricated-check-in-id";
       },
     });
-    setSentryLoaderForTests(async () => sdk as SentryNode);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -227,7 +231,7 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
         throw new Error("ingest unreachable");
       },
     });
-    setSentryLoaderForTests(async () => sdk as SentryNode);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,

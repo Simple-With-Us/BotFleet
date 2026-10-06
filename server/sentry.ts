@@ -664,6 +664,38 @@ export function getSentry(): SentryNode | null {
   return sentrySdk;
 }
 
+/** Partial @sentry/node surface implemented by vitest stand-ins. */
+export type SentrySdkTestStandIn = {
+  init: (...opts: Parameters<SentryNode["init"]>) => ReturnType<SentryNode["init"]> | void;
+  close: (...args: Parameters<SentryNode["close"]>) => ReturnType<SentryNode["close"]>;
+  addIntegration: (...args: Parameters<SentryNode["addIntegration"]>) => void;
+  consoleLoggingIntegration: (
+    ...args: Parameters<SentryNode["consoleLoggingIntegration"]>
+  ) => { name: string };
+  captureCheckIn?: SentryNode["captureCheckIn"];
+  isEnabled?: () => boolean;
+  getClient?: () => {
+    getDsn(): { host?: string } | undefined;
+    getOptions(): { enabled: boolean };
+    getTransport(): undefined | Record<string, never>;
+  };
+  httpIntegration?: (
+    options: Parameters<NonNullable<SentryNode["httpIntegration"]>>[0],
+  ) => { name: string; options: Parameters<NonNullable<SentryNode["httpIntegration"]>>[0] };
+};
+
+/** Coerce a partial SDK stand-in to the lazy-loaded module type for test loaders. */
+export function asSentryNodeTestStandIn(standIn: SentrySdkTestStandIn): SentryNode {
+  // SAFETY: stand-ins stamp only members applySentryConfig and cron check-ins
+  // call; the real SDK stays dynamically imported so vitest never loads it.
+  return standIn as unknown as SentryNode;
+}
+
+/** Loader wrapper for `setSentryLoaderForTests` that accepts a partial stand-in. */
+export function sentryTestLoader(standIn: SentrySdkTestStandIn): () => Promise<SentryNode> {
+  return async () => asSentryNodeTestStandIn(standIn);
+}
+
 /** Install a stand-in for @sentry/node so a test can exercise the init,
  * close and re-init path without a network client.  Pass null to restore
  * the real loader. */

@@ -10,27 +10,32 @@ import {
   scrubSentryPayload,
   scrubWebhookSecrets,
   sentryDsnFromEnv,
+  asSentryNodeTestStandIn,
+  sentryTestLoader,
   setSentryLoaderForTests,
   type SentryNode,
 } from "./sentry.ts";
 
+type SentryInitOptions = Parameters<SentryNode["init"]>[0];
+type SentryHttpIntegrationOptions = Parameters<NonNullable<SentryNode["httpIntegration"]>>[0];
+
 interface FakeSentryClient {
-  getDsn(): unknown;
+  getDsn(): { host?: string } | undefined;
   getOptions(): { enabled: boolean };
-  getTransport(): unknown;
+  getTransport(): Record<string, never> | undefined;
 }
 
 interface FakeSentrySdk {
-  init(opts?: unknown): void;
+  init(opts?: SentryInitOptions): void;
   close(): Promise<boolean>;
   addIntegration(): void;
   consoleLoggingIntegration(): { name: string };
   isEnabled?(): boolean;
   getClient?(): FakeSentryClient;
-  httpIntegration?(options: {
-    ignoreIncomingRequests?: (url: string) => boolean;
-    maxIncomingRequestBodySize?: string;
-  }): { name: string; options: Record<string, unknown> };
+  httpIntegration?(options: SentryHttpIntegrationOptions): {
+    name: string;
+    options: SentryHttpIntegrationOptions;
+  };
 }
 
 afterEach(() => {
@@ -77,7 +82,7 @@ describe("server Sentry init", () => {
         getTransport: () => ({}),
       }),
     });
-    setSentryLoaderForTests(async () => sdk as SentryNode);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     const base = {
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -120,7 +125,7 @@ describe("server Sentry init", () => {
         getTransport: () => ({}),
       }),
     });
-    setSentryLoaderForTests(async () => sdk as SentryNode);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     const base = {
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -156,7 +161,7 @@ describe("server Sentry init", () => {
       maxInflight = Math.max(maxInflight, inflight);
       await new Promise((resolve) => setTimeout(resolve, 25));
       inflight -= 1;
-      return sdk as SentryNode;
+      return asSentryNodeTestStandIn(sdk);
     });
     const input = {
       dsn: "https://abc123@o0.ingest.sentry.io/1",
@@ -206,7 +211,7 @@ describe("Sentry AI data collection kill-switch", () => {
         return { name: "ConsoleLogs" };
       },
     });
-    setSentryLoaderForTests(async () => sdk as SentryNode);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     process.env.SENTRY_AI_DATA_COLLECTION = "1";
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
@@ -222,7 +227,7 @@ describe("Sentry AI data collection kill-switch", () => {
     });
 
     resetSentryForTests();
-    setSentryLoaderForTests(async () => sdk as SentryNode);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     process.env.SENTRY_AI_DATA_COLLECTION = "0";
     initOpts = null;
     await applySentryConfig({
@@ -256,7 +261,7 @@ describe("Sentry tracesSampler dynamic rates", () => {
         return { name: "ConsoleLogs" };
       },
     });
-    setSentryLoaderForTests(async () => sdk as SentryNode);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -327,7 +332,7 @@ describe("webhook secrets never reach Sentry", () => {
         return { name: "Http", options };
       },
     });
-    setSentryLoaderForTests(async () => sdk as SentryNode);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
