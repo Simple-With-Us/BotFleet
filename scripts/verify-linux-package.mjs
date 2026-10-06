@@ -351,12 +351,10 @@ function verifyCloudflaredResources(resources, label, { directoryMode = 0o755 } 
   if (executableTarget(readFileSync(executable)) !== "linux-x64") {
     fail(`${label} cloudflared does not contain the reviewed Linux x64 executable`);
   }
+  // probePinnedVersion hard-sets matchVersion to matchCloudflaredVersionLine
+  // (prepare-cloudflared.mjs); a caller matcher here would be silently discarded.
   const cloudflaredProbe = probePinnedVersion(executable, {
     log: () => {},
-    matchVersion: (output) =>
-      String(output ?? "").startsWith(`cloudflared version ${CLOUDFLARED_VERSION} `)
-        ? CLOUDFLARED_VERSION
-        : null,
   });
   if (!cloudflaredProbe.ok) {
     fail(`${label}: ${versionProbeFailureMessage("linux-x64", cloudflaredProbe)}`);

@@ -16,7 +16,6 @@
 //     exist.
 
 import { spawnSync } from "node:child_process";
-import { isFunction } from "node:util/types";
 
 /** `cloudflared version` runs in ~0.2s warm / ~1.5s cold, so the original 10s
  * looked generous.  It is not: a child waiting for a CPU on a saturated host
@@ -71,7 +70,7 @@ export function probeNativeVersion(binary, options = {}) {
     log = console.error,
     probeLabel = "version probe",
   } = options;
-  if (!isFunction(matchVersion)) {
+  if (!(matchVersion instanceof Function)) {
     throw new TypeError("probeNativeVersion requires a matchVersion function");
   }
   let last;
