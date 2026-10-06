@@ -78,16 +78,35 @@ describe("DshAgentDriver config", () => {
     ]);
   });
 
+  it("agrees with the driver's own image capability on every row", () => {
+    // The durable invariant, and the one this catalog used to violate.  Three
+    // rows claimed `images: true` with a "Multimodal" badge — and one asserted
+    // "accepts image and video input at the same token rate as text, each image
+    // capped at 1,024 tokens" — while the bridge declares `images: false` and
+    // no `perModelImages`, so `withPerModelImages` is a no-op and the ACP core
+    // refuses image parts regardless.  The model having vision and the engine
+    // being able to deliver it are different questions, and only the second one
+    // is what a picker row can promise.
+    const images = DshAgentDriver.metadata.channelWiring?.images;
+    expect(images, "DSH must publish channelWiring for this to be checkable").toBe(false);
+    for (const option of STATIC_DSH_MODELS.options) {
+      expect(option.images ?? false, `${option.id} must not advertise images the bridge refuses`).toBe(images);
+    }
+  });
+
   it("badges rows where the choice has a capability, cost, or availability consequence", () => {
     const byId = new Map(STATIC_DSH_MODELS.options.map((option) => [option.id, option]));
-    // Image + Video: same token rate as text, so the capability is the point,
-    // not a price.
-    expect(byId.get("DeepSeek-V4.1-Flash")?.badge).toBe("Multimodal");
+    // DeepSeek-V4.1-Flash is the multimodal MODEL, but the bridge carries no
+    // images to it, so its badge says what the user can actually do.
+    expect(byId.get("DeepSeek-V4.1-Flash")?.badge).toBe("No Vision");
     // DeepSeek-V4.1-Pro lacks vision and warns of auto-switch to Flash on visual input.
     expect(byId.get("DeepSeek-V4.1-Pro")?.badge).toBe("No Vision");
     expect(byId.get("DeepSeek-V4.1-Pro")?.badgeTitle).toContain("lacks vision");
     expect(byId.get("DeepSeek-V4.1-Pro")?.badgeTitle).toContain("Switch to DeepSeek-V4.1-Flash to attach an image");
-    expect(byId.get("DeepSeek-V4.1-Flash")?.images).toBe(true);
+    // Every row agrees with the bridge's own `images: false` — see the
+    // invariant test above.  These two used to assert `true` for Flash, which
+    // is what put an image attach button on an engine that refuses one.
+    expect(byId.get("DeepSeek-V4.1-Flash")?.images).toBe(false);
     expect(byId.get("DeepSeek-V4.1-Pro")?.images).toBe(false);
     // Preview: Token Plan / MiniMax Code only, so it needs a Token Plan key.
     expect(byId.get("MiniMax-M3.1-Flash-Preview")?.badge).toBe("Preview");
@@ -666,7 +685,9 @@ describe("readDshModelCatalog", () => {
     writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n          name: Renamed By Profile\n"));
     const row = readDshModelCatalog({ HOME: home }).options.find((option) => option.id === "MiniMax-M3.1-Flash-Preview");
     expect(row?.label).toBe(known.label);
-    expect(row?.images).toBe(true);
+    // A settings profile may rename a model and set its own flags, but it
+    // cannot grant image support the bridge does not carry.
+    expect(row?.images).toBe(false);
   });
 
   it("still drops MiniMax-M2.7 and MiniMax-M3 when the settings file offers them", () => {
