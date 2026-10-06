@@ -87,10 +87,13 @@ describe("the shared native version probe", () => {
   });
 
   it("reads the version from either stream and names all four failure causes", () => {
-    expect(classifyNativeProbe(probeResult({ stderr: "cua-driver 2.0.0\n" }), matchCua)).toMatchObject({
+    expect(
+      classifyNativeProbe(probeResult({ stderr: "cua-driver 2.0.0\n" }), matchCua, { matchStderr: true }),
+    ).toMatchObject({
       ok: true,
       version: "2.0.0",
     });
+    expect(classifyNativeProbe(probeResult({ stderr: "cua-driver 2.0.0\n" }), matchCua).ok).toBe(false);
     expect(classifyNativeProbe(timedOutResult(), matchCua).reason).toBe("timeout");
     expect(classifyNativeProbe(probeResult({ status: 7 }), matchCua).reason).toBe("status");
     expect(classifyNativeProbe(probeResult({ status: null, signal: "SIGTERM" }), matchCua).reason).toBe("signal");

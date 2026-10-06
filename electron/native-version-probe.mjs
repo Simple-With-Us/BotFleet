@@ -39,7 +39,7 @@ export function oneLine(value, limit = PROBE_DETAIL_LIMIT) {
  * arrives as `error.code === "ETIMEDOUT"` with the child already killed, so
  * `status` is null and `signal` is set -- none of which a single boolean can
  * tell apart from a genuine mismatch. */
-export function classifyNativeProbe(result = {}, matchVersion) {
+export function classifyNativeProbe(result = {}, matchVersion, { matchStderr = false } = {}) {
   const stdout = String(result.stdout ?? "");
   const stderr = String(result.stderr ?? "");
   if (result.error) {
@@ -48,10 +48,11 @@ export function classifyNativeProbe(result = {}, matchVersion) {
     return { ok: false, reason: timedOut ? "timeout" : "spawn", version: null };
   }
   if (result.status === 0) {
-    // Prefer stdout; fall back to stderr — some natives print --version there.
-    // Callers still match lines (not whole-buffer equality), so a glibc banner
-    // on the other stream cannot fake a pin.
-    const version = matchVersion(stdout) || matchVersion(stderr);
+    // Version identity is read from stdout only by default: every matcher in
+    // this repo is written against stdout, and stderr is diagnostics.
+    // nativeProbeFailureMessage still reports stderr in the failure excerpt.
+    // Opt in with matchStderr when a binary is known to print --version there.
+    const version = matchVersion(stdout) || (matchStderr ? matchVersion(stderr) : null);
     return version
       ? { ok: true, reason: "version", version }
       : { ok: false, reason: "version", version: null };
@@ -67,6 +68,7 @@ export function probeNativeVersion(binary, options = {}) {
   const {
     args = ["version"],
     matchVersion,
+    matchStderr = false,
     spawn = spawnSync,
     spawnOptions = {},
     timeoutMs = NATIVE_PROBE_TIMEOUT_MS,
@@ -85,7 +87,13 @@ export function probeNativeVersion(binary, options = {}) {
       timeout: timeoutMs,
       ...spawnOptions,
     });
-    last = { ...classifyNativeProbe(result, matchVersion), result, attempt, attempts, timeoutMs };
+    last = {
+      ...classifyNativeProbe(result, matchVersion, { matchStderr }),
+      result,
+      attempt,
+      attempts,
+      timeoutMs,
+    };
     if (last.ok) return last;
     if (last.reason !== "timeout" || attempt === attempts) break;
     log(
