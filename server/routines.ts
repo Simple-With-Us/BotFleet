@@ -1182,8 +1182,14 @@ export class RoutineManager {
       // a person's turn never asks: this loop only admits routine receipts.
       // Read lazily so an idle harness never pays for the host probe.
       let hostHotReason: string | null | undefined;
-      const readHostHot = (): string | null =>
-        (hostHotReason ??= this.options.hostHot?.() ?? null);
+      let hostHotRead = false;
+      const readHostHot = (): string | null => {
+        if (!hostHotRead) {
+          hostHotReason = this.options.hostHot?.() ?? null;
+          hostHotRead = true;
+        }
+        return hostHotReason ?? null;
+      };
       for (const run of [...this.runs].reverse()) {
         if (run.status !== "queued") continue;
         // `holdReason` is a cached verdict from the last time canStart ran, and
@@ -1231,6 +1237,8 @@ export class RoutineManager {
               continue;
             }
             hotDeferExpiredReason = hotReason;
+          } else {
+            run.hotDeferredAt = undefined;
           }
         }
         // A trigger with a minimum gap stays quiet after it runs.  The
@@ -1356,7 +1364,7 @@ export class RoutineManager {
           // pushing duplicate SSE and replay frames on every tick — 8,640 no-op
           // writes a day for one sustained hold, scaling with queue depth.
           // A client that already has this run is already showing this reason.
-          this.setHoldReason(run, reason);
+          this.setHoldReason(run, reason, { bucket: false });
           continue;
         }
         if (stampResolvedThread && threadId) this.options.stampKey?.(run.botId, threadId, key);
@@ -1451,6 +1459,8 @@ export class RoutineManager {
           // "completed" — and `copyCombinedOutcome` does not overwrite the
           // field. Cleared where the fold happens.
           folded.holdReason = undefined;
+          folded.hotDeferredAt = undefined;
+          this.publishedHoldBuckets.delete(folded.id);
           folded.threadId = threadId;
           folded.startedAt = run.startedAt;
           folded.finishedAt = undefined;
@@ -1630,8 +1640,9 @@ export class RoutineManager {
    *  mechanism.  A no-op when there was nothing to clear, so a run that was
    *  never held does not emit on every tick. */
   private clearHoldReason(run: RoutineRun): void {
-    if (run.holdReason === undefined) return;
+    if (run.holdReason === undefined && run.hotDeferredAt === undefined) return;
     run.holdReason = undefined;
+    run.hotDeferredAt = undefined;
     this.publishedHoldBuckets.delete(run.id);
     this.save();
     this.emitRun(run);
@@ -1639,14 +1650,19 @@ export class RoutineManager {
 
   /** Publish a hold reason only when it changed.  The scheduler ticks every
    *  ten seconds, so an unchanged reason must not rewrite the state file. */
-  private setHoldReason(run: RoutineRun, reason: string): void {
-    const bucket = holdReasonBucket(reason);
-    const seen = this.publishedHoldBuckets.get(run.id);
-    if (seen === bucket) {
-      if (run.holdReason !== reason) run.holdReason = reason;
+  private setHoldReason(run: RoutineRun, reason: string, options?: { bucket?: boolean }): void {
+    const useBucket = options?.bucket !== false;
+    if (useBucket) {
+      const bucket = holdReasonBucket(reason);
+      const seen = this.publishedHoldBuckets.get(run.id);
+      if (seen === bucket) {
+        if (run.holdReason !== reason) run.holdReason = reason;
+        return;
+      }
+      this.publishedHoldBuckets.set(run.id, bucket);
+    } else if (reason === run.holdReason) {
       return;
     }
-    this.publishedHoldBuckets.set(run.id, bucket);
     run.holdReason = reason;
     this.save();
     this.emitRun(run);
