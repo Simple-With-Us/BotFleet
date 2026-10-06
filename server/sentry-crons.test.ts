@@ -8,6 +8,8 @@ import {
 } from "./sentry-crons.ts";
 import type { Routine, RoutineRun } from "./routines.ts";
 
+type SentryNode = typeof import("@sentry/node");
+
 function routine(over: Partial<Routine> = {}): Routine {
   return {
     id: "routine-1",
@@ -157,27 +159,27 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
   });
 
   it("returns undefined when captureCheckIn would fabricate an id on a disabled client", async () => {
-    setSentryLoaderForTests(async () =>
-      ({
-        init() {},
-        close() {
-          return Promise.resolve(true);
-        },
-        addIntegration() {},
-        consoleLoggingIntegration() {
-          return { name: "ConsoleLogs" };
-        },
-        isEnabled: () => false,
-        getClient: () => ({
-          getDsn: () => ({}),
-          getOptions: () => ({ enabled: true }),
-          getTransport: () => undefined,
-        }),
-        captureCheckIn() {
-          return "fabricated-check-in-id";
-        },
-      }) as unknown as typeof import("@sentry/node"),
-    );
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
+    const sdk = Object.assign({} as SentryNode, {
+      init() {},
+      close() {
+        return Promise.resolve(true);
+      },
+      addIntegration() {},
+      consoleLoggingIntegration() {
+        return { name: "ConsoleLogs" };
+      },
+      isEnabled: () => false,
+      getClient: () => ({
+        getDsn: () => ({}),
+        getOptions: () => ({ enabled: true }),
+        getTransport: () => undefined,
+      }),
+      captureCheckIn() {
+        return "fabricated-check-in-id";
+      },
+    });
+    setSentryLoaderForTests(async () => sdk);
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,

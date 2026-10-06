@@ -13,6 +13,8 @@ import {
   setSentryLoaderForTests,
 } from "./sentry.ts";
 
+type SentryNode = typeof import("@sentry/node");
+
 afterEach(() => {
   resetSentryForTests();
   delete process.env.SENTRY_DSN;
@@ -40,7 +42,8 @@ describe("server Sentry init", () => {
   });
 
   it("survives a synchronous throw from sdk.close during re-init", async () => {
-    const sdk = {
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
+    const sdk = Object.assign({} as SentryNode, {
       init() {},
       close() {
         throw new Error("close blew up synchronously");
@@ -55,7 +58,7 @@ describe("server Sentry init", () => {
         getOptions: () => ({ enabled: true }),
         getTransport: () => ({}),
       }),
-    } as unknown as typeof import("@sentry/node");
+    });
     setSentryLoaderForTests(async () => sdk);
     const base = {
       dsn: "https://abc123@o0.ingest.sentry.io/1",
@@ -74,7 +77,8 @@ describe("server Sentry init", () => {
   it("does not call init until the previous client has finished closing", async () => {
     let closing = false;
     let initWhileClosing = false;
-    const sdk = {
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
+    const sdk = Object.assign({} as SentryNode, {
       init() {
         if (closing) initWhileClosing = true;
       },
@@ -97,7 +101,7 @@ describe("server Sentry init", () => {
         getOptions: () => ({ enabled: true }),
         getTransport: () => ({}),
       }),
-    } as unknown as typeof import("@sentry/node");
+    });
     setSentryLoaderForTests(async () => sdk);
     const base = {
       dsn: "https://abc123@o0.ingest.sentry.io/1",
