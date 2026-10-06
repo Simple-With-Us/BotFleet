@@ -4004,6 +4004,7 @@ describe("harness HTTP API", () => {
       mode: "shared",
       maxInstances: 2,
       shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
       allowHostTerminal: false,
     });
 
@@ -4019,6 +4020,7 @@ describe("harness HTTP API", () => {
       mode: "per-bot",
       maxInstances: 3,
       shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
       allowHostTerminal: false,
     });
 
