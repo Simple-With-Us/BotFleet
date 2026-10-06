@@ -49,6 +49,12 @@ public enum TVFaceAssetSource: Sendable {
     }
 }
 
+private enum TVFaceFetchResult: Sendable {
+    case hit(Data)
+    case missing
+    case failed
+}
+
 @MainActor
 final class TVFacePlayer: ObservableObject {
     @Published var imageData: Data?
@@ -58,11 +64,13 @@ final class TVFacePlayer: ObservableObject {
     private var color: String
     private var source: TVFaceAssetSource
     private var task: Task<Void, Never>?
-    /// One cache for every player: each row used to hold its own copy of the
-    /// same packs (N× the bytes, N× the fetches in a fleet list).  The URL
-    /// space is finite (skins × expressions × kinds), so sharing bounds it by
-    /// content rather than by row count.  @MainActor-isolated like the rest.
-    private static var sharedCache: [URL: Data] = [:]
+    /// One bounded cache for every player: each row used to hold its own copy
+    /// of the same packs (N× the bytes, N× the fetches in a fleet list).
+    private static let sharedCache: NSCache<NSURL, NSData> = {
+        let cache = NSCache<NSURL, NSData>()
+        cache.totalCostLimit = 48 * 1024 * 1024
+        return cache
+    }()
 
     init(color: String, source: TVFaceAssetSource = .fleetLink) {
         self.color = color
@@ -107,50 +115,69 @@ final class TVFacePlayer: ObservableObject {
         }
     }
 
+    private func cachedData(for url: URL) -> Data? {
+        Self.sharedCache.object(forKey: url as NSURL) as Data?
+    }
+
+    private func storeCache(url: URL, data: Data) {
+        Self.sharedCache.setObject(data as NSData, forKey: url as NSURL, cost: data.count)
+    }
+
     private func show(expression: TVFaceExpression, kind: TVFaceFrameKind) async {
         let url = source.url(color: color, expression: expression, kind: kind == .still ? .still : kind)
-        if let cached = Self.sharedCache[url] {
+        if let cached = cachedData(for: url) {
             imageData = cached
             return
         }
         // Fallback chain: requested → still of same expression → resting still.
-        if let data = await fetch(url) {
-            Self.sharedCache[url] = data
+        let primary = await fetch(url)
+        switch primary {
+        case .hit(let data):
+            storeCache(url: url, data: data)
             imageData = data
             return
+        case .missing, .failed:
+            break
         }
         let still = source.url(color: color, expression: expression, kind: .still)
-        if let data = await fetch(still) {
-            Self.sharedCache[still] = data
-            // Resolve the missing GIF to its still so the guaranteed 404 is
-            // not re-fetched on every subsequent state change.
-            Self.sharedCache[url] = data
+        switch await fetch(still) {
+        case .hit(let data):
+            storeCache(url: still, data: data)
+            if case .missing = primary { storeCache(url: url, data: data) }
             imageData = data
             return
+        case .missing:
+            break
+        case .failed:
+            if case .failed = primary { return }
         }
         let rest = source.url(color: color, expression: .resting, kind: .still)
-        if let data = await fetch(rest) {
-            Self.sharedCache[rest] = data
-            Self.sharedCache[url] = data
+        switch await fetch(rest) {
+        case .hit(let data):
+            storeCache(url: rest, data: data)
+            if case .missing = primary { storeCache(url: url, data: data) }
             imageData = data
+        case .missing, .failed:
+            break
         }
     }
 
-    private func fetch(_ url: URL) async -> Data? {
+    private func fetch(_ url: URL) async -> TVFaceFetchResult {
         if url.isFileURL {
-            return try? Data(contentsOf: url)
+            if let data = try? Data(contentsOf: url) { return .hit(data) }
+            return .missing
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 12
         request.setValue("GrokBot-iOS-TVFace/1.0", forHTTPHeaderField: "User-Agent")
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                return nil
-            }
-            return data
+            guard let http = response as? HTTPURLResponse else { return .failed }
+            if http.statusCode == 404 { return .missing }
+            guard (200..<300).contains(http.statusCode) else { return .failed }
+            return .hit(data)
         } catch {
-            return nil
+            return .failed
         }
     }
 }

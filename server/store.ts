@@ -31,7 +31,9 @@ export type BotColor =
   | "pink"
   | "yellow"
   | "teal"
-  | "coral";
+  | "coral"
+  | "white"
+  | "black";
 
 /**
  * The face a bot rests on, as one of the engine's state names. Kept as a plain
@@ -669,6 +671,8 @@ const COLORS: BotColor[] = [
   "yellow",
   "teal",
   "coral",
+  "white",
+  "black",
 ];
 
 /** Sections are persisted as display labels, so exact trimmed labels are

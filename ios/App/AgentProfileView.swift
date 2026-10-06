@@ -780,7 +780,7 @@ struct AgentProfileView: View {
             uploadData = jpeg
             uploadMIME = "image/jpeg"
         }
-        let intendedCrop = crop == .mascot ? AvatarCrop.circle : crop
+        let intendedCrop = crop == .mascot || crop == .tvface ? AvatarCrop.circle : crop
         if let updated = await session.uploadAvatar(uploadData, mime: uploadMIME, for: current, crop: intendedCrop) {
             crop = updated.avatarCrop ?? intendedCrop
             baseline.crop = crop
@@ -790,7 +790,7 @@ struct AgentProfileView: View {
     private func generateImage() async {
         busy = true
         defer { busy = false }
-        let intendedCrop = crop == .mascot ? AvatarCrop.circle : crop
+        let intendedCrop = crop == .mascot || crop == .tvface ? AvatarCrop.circle : crop
         guard let generated = await session.generateAvatar(
             prompt: String(prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400)),
             for: current

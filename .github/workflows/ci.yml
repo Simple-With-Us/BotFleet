@@ -260,3 +260,17 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
+      - name: TV-Face preview screenshot (simulator)
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
+        run: |
+          corepack enable && corepack prepare pnpm@10.33.0 --activate
+          pnpm install --frozen-lockfile
+          bash scripts/ios-tvface-screenshot.sh
+      - name: Upload TV-Face screenshot diff on failure
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true' && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-tvface-screenshot-failure
+          path: |
+            artifacts/ios-tvface-preview.png
+          retention-days: 7

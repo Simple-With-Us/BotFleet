@@ -38,6 +38,7 @@ extension BotState {
         if matches(["git", "github", "pull request", "pr", "commit", "merge", "deploy", "compiler", "build", "ci", "testflight"]) { return .git }
         if matches(["webhook", "hooks", "callback", "event stream"]) { return .webhook }
         if matches(["fleet", "director", "coordinator", "orchestrat"]) { return .fleet }
+        if matches(["sneak", "stealth", "quiet"]) { return .sneaking }
         if matches(["memory", "rag", "vector", "embedding", "recall"]) { return .memory }
         if matches(["tool", "tools", "adapter", "plumber", "connector", "skill"]) { return .tools }
         if matches(["computer", "desktop", "shell", "terminal", "ssh"]) { return .computer }
@@ -53,7 +54,6 @@ extension BotState {
         if matches(["security", "secure", "compliance", "risk", "privacy", "finance", "financial"]) { return .scared }
         if matches(["design", "creative", "brainstorm", "art", "illustration", "music", "story"]) { return .playful }
         if matches(["support", "help", "success", "onboarding", "coach", "teacher", "guide", "welcome"]) { return .happy }
-        if matches(["sneak", "stealth", "quiet"]) { return .sneaking }
         return .idle
     }
 

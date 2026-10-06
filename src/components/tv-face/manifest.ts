@@ -106,6 +106,7 @@ export const TVFACE_SHEET_EXPRESSIONS: readonly TVFaceExpression[] = [
   "happy", "laughing", "listening", "loading", "memory", "notifying",
   "orbit", "playful", "powering_down", "progress", "proud", "radar",
   "receiving", "resting", "routine", "sad", "scared", "screen",
-  "searching", "shy", "sleeping", "sneaking", "surprised", "thinking",
-  "tools", "typing", "uploading", "webhook", "working",
+  "searching", "sending", "shy", "sleeping", "sneaking", "spawning",
+  "speaking", "suspicious", "surprised", "thinking", "tools", "typing",
+  "uploading", "waking", "webhook", "working",
 ] as const;
