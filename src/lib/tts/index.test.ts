@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   groupForPersonalVoice,
+  MAX_LOCAL_SPEECH_CHARS,
   personalVoiceErrorMessage,
   PERSONAL_VOICE_GROUP_CHARS,
   PERSONAL_VOICE_NOT_ON_THIS_MAC,
@@ -414,6 +415,62 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
 
     expect(speak).toHaveBeenCalledWith("Short version.", "personal:mac-voice");
     expect(speaker.state).toEqual({ status: "idle" });
+  });
+
+  it("shows a reply that is too long instead of reading it here when the harness answers 413", async () => {
+    const { speak } = stubPersonalVoice();
+    stubFetch(() => json({ error: "reply exceeds voice clip limit", total: 400, maxUtterances: 160, maxCharacters: 12_000 }, 413));
+    const speaker = new Speaker();
+    await speaker.speak("A long reply with `code` and https://example.com/a/very/long/link in it.", {
+      ...messageOpts,
+      voiceId: "personal:mac-voice",
+    });
+
+    expect(speak).not.toHaveBeenCalled();
+    expect(speaker.state).toEqual({ status: "idle", botId: "bot_1", messageId: "msg_1", error: REPLY_TOO_LONG });
+  });
+
+  it("shows the harness's own sentence for any other refusal instead of reading the reply here", async () => {
+    const { speak } = stubPersonalVoice();
+    stubFetch(() => json({ error: "no such reply" }, 404));
+    const speaker = new Speaker();
+    await speaker.speak("Hello there.", { ...messageOpts, voiceId: "personal:mac-voice" });
+
+    expect(speak).not.toHaveBeenCalled();
+    expect(speaker.state).toEqual({ status: "idle", botId: "bot_1", messageId: "msg_1", error: "no such reply" });
+  });
+
+  it("projects the reply with the harness's rules when the harness cannot be reached", async () => {
+    const { speak } = stubPersonalVoice();
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+    const speaker = new Speaker();
+    const reply = [
+      "## Done",
+      "",
+      "I updated **two files**.  See https://github.com/example/repo/pull/12 for the diff.",
+      "",
+      "```ts",
+      "const answer = 42;",
+      "```",
+    ].join("\n");
+    await speaker.speak(reply, { ...messageOpts, voiceId: "personal:mac-voice" });
+
+    const spoken = speak.mock.calls.map(([text]) => String(text)).join(" ");
+    expect(spoken).toContain("two files");
+    expect(spoken).not.toMatch(/https?:|`|\*\*|##|const answer/);
+    expect(speaker.state).toEqual({ status: "idle" });
+  });
+
+  it("holds a reply it projects itself to the harness's length bound", async () => {
+    const { speak } = stubPersonalVoice();
+    stubFetch(() => json({ error: "harness unavailable" }, 503));
+    const speaker = new Speaker();
+    const sentence = "This sentence is long enough to count toward the spoken character bound.";
+    const reply = Array.from({ length: Math.ceil(MAX_LOCAL_SPEECH_CHARS / sentence.length) + 10 }, () => sentence).join(" ");
+    await speaker.speak(reply, { ...messageOpts, voiceId: "personal:mac-voice" });
+
+    expect(speak).not.toHaveBeenCalled();
+    expect(speaker.state).toMatchObject({ status: "idle", error: REPLY_TOO_LONG });
   });
 
   it("names a Personal Voice that is not on this Mac instead of the helper's code", async () => {

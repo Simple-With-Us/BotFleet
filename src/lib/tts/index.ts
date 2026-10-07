@@ -1,5 +1,8 @@
 import { spokenReply } from "../../../shared/voice-summary";
 import { isPersonalVoiceId, type SpeechDevice } from "../../../shared/bot-voice";
+// The harness's own projection rules (pure, no Node APIs), so a reply this
+// Mac speaks without the harness drops code, links, and markdown the same way.
+import { toUtterances } from "../../../server/tts/speech-text";
 import { z } from "zod";
 import { TtsAudioBodySchema, type TtsAudioBody } from "./schema";
 // The speaker — one voice for the whole window.
@@ -80,10 +83,35 @@ const DEFAULT_RETRY_MS = 1_000;
 
 export const PERSONAL_VOICE_UNSUPPORTED = "Apple Personal Voice speaks on authorized Apple devices (macOS / iOS).";
 export const PERSONAL_VOICE_NOT_ON_THIS_MAC =
-  "This bot's Personal Voice is not on this Mac.  Pick a voice for this Mac in the bot's Voice settings.";
+  "This bot's Personal Voice is not on this Mac.\u00A0 Pick a voice for this Mac in the bot's Voice settings.";
 export const PERSONAL_VOICE_NOT_AUTHORIZED =
-  "Personal Voice is not authorized on this Mac.  Allow it in System Settings under Accessibility, Personal Voice, or pick another voice for this Mac.";
+  "Personal Voice is not authorized on this Mac.\u00A0 Allow it in System Settings under Accessibility, Personal Voice, or pick another voice for this Mac.";
 export const REPLY_TOO_LONG = "This reply is too long to read aloud.";
+
+/** The harness's spoken-character cap (MAX_SPEAKABLE_CHARS in
+ * server/tts/message-audio.ts).  A reply this Mac projects for itself is
+ * held to the same bound, so a harness that cannot answer does not turn
+ * into an unbounded run of speech-helper calls. */
+export const MAX_LOCAL_SPEECH_CHARS = 12_000;
+
+/** A non-2xx answer from the message audio route, with its status, so the
+ * caller can tell the harness refusing (4xx) from the harness failing. */
+export class AudioRequestError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "AudioRequestError";
+    this.status = status;
+  }
+}
+
+/** The harness could not be asked: the request never got an answer, or the
+ * answer was a server failure.  A 4xx (413 too long, 404, 409) is the
+ * harness deciding, and is shown rather than worked around. */
+function harnessUnavailable(error: unknown): boolean {
+  if (error instanceof AudioRequestError) return error.status >= 500;
+  return !(error instanceof DOMException && error.name === "AbortError");
+}
 
 /** Pack sentences (or paragraphs) into helper-call-sized groups, in order.
  * A single part longer than `max` is its own group; the helper chunks it. */
@@ -272,10 +300,15 @@ export class Speaker {
     } catch (error) {
       if (!live()) return;
       // A Personal Voice costs nothing and needs no harness to be heard.
-      // When the projection request fails, speak the reply here as written
-      // rather than leave the owner with silence.
-      if (isPersonalVoiceId(opts.voiceId) && personalVoiceBridge()) {
-        await this.speakOnDevice(paragraphs(spokenReply(text)), opts.voiceId ?? "", opts, live);
+      // When the harness cannot be asked at all, project the reply here with
+      // its own rules and the same length bound, rather than leave the owner
+      // with silence.  A refusal (413, 4xx) is shown instead.
+      if (isPersonalVoiceId(opts.voiceId) && personalVoiceBridge() && harnessUnavailable(error)) {
+        const utterances = toUtterances(spokenReply(text));
+        if (!utterances.length) throw error;
+        const spoken = utterances.join(" ");
+        if (spoken.length > MAX_LOCAL_SPEECH_CHARS) throw new Error(REPLY_TOO_LONG);
+        await this.speakOnDevice(utterances, opts.voiceId ?? "", opts, live, spoken);
         return;
       }
       throw error;
@@ -300,8 +333,8 @@ export class Speaker {
       signal,
     });
     if (!response.ok) {
-      if (response.status === 413) throw new Error(REPLY_TOO_LONG);
-      throw new Error((await responseError(response)) ?? `Voice service returned ${response.status}`);
+      if (response.status === 413) throw new AudioRequestError(REPLY_TOO_LONG, 413);
+      throw new AudioRequestError((await responseError(response)) ?? `Voice service returned ${response.status}`, response.status);
     }
     const parsed = TtsAudioBodySchema.safeParse(await response.json().catch(() => ({})));
     if (!parsed.success) throw new Error("Voice service returned an invalid response.");

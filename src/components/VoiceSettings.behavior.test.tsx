@@ -120,14 +120,38 @@ vi.mock("./DesktopCapabilities", () => {
   };
 });
 
-import { PERSONAL_VOICE_LIST_TIMEOUT_MS, PERSONAL_VOICE_NOT_ON_MAC, VoiceSettings, type VoiceSettingsPatch } from "./VoiceSettings";
+import {
+  DEVICE_VOICES_NEED_UPDATE,
+  PERSONAL_VOICE_LIST_TIMEOUT_MS,
+  PERSONAL_VOICE_NOT_ON_MAC,
+  VoiceSettings,
+  type VoiceSettingsPatch,
+} from "./VoiceSettings";
 import { applyBotPatch } from "@/state/bot-patch-queue";
 import type { Bot } from "@/state/store";
 
 const MACOS_14 = "Personal Voices need macOS 14 or later, or an iPhone";
 const OTHER_COMPUTER = "Personal Voice is not available on this computer";
 
-function sampleBot(voice?: string, voices?: Bot["voices"]): Bot {
+/** `voices` defaults to null, as a current harness sends it.  Pass
+ * LEGACY_HARNESS for a harness that predates per-device voices. */
+const LEGACY_HARNESS = Symbol("legacy harness");
+function sampleBot(voice?: string, voices: Bot["voices"] | typeof LEGACY_HARNESS = null): Bot {
+  if (voices === LEGACY_HARNESS) {
+    return {
+      id: "bot-1",
+      name: "Assistant",
+      threadId: "t1",
+      title: "",
+      description: "",
+      notifications: false,
+      color: "blue",
+      unread: false,
+      modelSelection: { instanceId: "fixture", model: "default" },
+      messages: [],
+      voice,
+    };
+  }
   return {
     id: "bot-1",
     name: "Assistant",
@@ -683,6 +707,53 @@ describe("VoiceSettings rendered voice commit", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("still offers a Personal Voice list that arrives after the spinner gave up", async () => {
+    // The helper can park on the authorization prompt while the owner reads
+    // it.  The answer that follows must still reach the Mac picker.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let answer: (voices: Array<{ id: string; name: string }>) => void = () => {};
+    try {
+      installPersonalVoices(() => new Promise((resolve) => {
+        answer = resolve;
+      }));
+      await act(async () => {
+        container = document.createElement("div");
+        document.body.appendChild(container);
+        root = createRoot(container);
+        apiMock.mockResolvedValue({ voices: [] });
+        root.render(createElement(Harness));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(PERSONAL_VOICE_LIST_TIMEOUT_MS + 1);
+      });
+      expect(container.textContent).not.toContain("Loading Personal Voices on this Mac…");
+      expect(optionValues(select())).not.toContain("personal:late-1");
+
+      await act(async () => {
+        answer([{ id: "personal:late-1", name: "Jay, Answered Late" }]);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(optionValues(select())).toContain("personal:late-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("writes the shared voice and offers no iPhone picker against a harness without per-device voices", async () => {
+    // Its non-strict PATCH would strip `voices` and answer 200 with the bot
+    // unchanged, so the picker would snap back with no error.
+    startingBot = sampleBot("", LEGACY_HARNESS);
+    await mount();
+
+    expect(container.querySelector('select[aria-label="Assistant\'s voice on iPhone"]')).toBeNull();
+    expect(container.textContent).toContain(DEVICE_VOICES_NEED_UPDATE);
+    await act(async () => {
+      setSelectValue(select(), "custom-1");
+    });
+    expect(patches).toEqual([{ voice: "custom-1" }]);
+    expect(select().value).toBe("custom-1");
   });
 
   it("offers this Mac's Personal Voices for the Mac only", async () => {

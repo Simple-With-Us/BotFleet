@@ -58,7 +58,8 @@ import { personalVoiceDesktopBridge } from "./VoiceSettingsVisualFixture";
 import type { Bot, ConfigStatus } from "@/state/store";
 
 describe("VoiceSettings", () => {
-  const sampleBot = (voice?: string, voices?: Bot["voices"]): Bot => ({
+  // A current harness always sends `voices` (null when unset).
+  const sampleBot = (voice?: string, voices: Bot["voices"] = null): Bot => ({
     id: "bot-1",
     name: "Assistant",
     threadId: "t1",
@@ -198,9 +199,14 @@ describe("VoiceSettings voice loading", () => {
     // Listing waits on the macOS 14 Personal Voice gate, read at call time,
     // and gives up on a helper that never answers.
     expect(personal).toContain("personalVoiceAllowedRef.current");
-    expect(personal).toContain("withTimeout(list(), PERSONAL_VOICE_LIST_TIMEOUT_MS)");
+    // The deadline only clears the spinner: the list itself is never
+    // dropped, so one that arrives after an authorization prompt still lands.
+    expect(personal).toContain("PERSONAL_VOICE_LIST_TIMEOUT_MS");
+    expect(personal).toContain("const listed = list()");
+    expect(personal).toContain("Promise.race([listed, gaveUp])");
+    expect(personal).not.toContain("reject(");
     expect(personal).toContain("parsePersonalVoiceList(raw)");
-    expect(personal).toContain("requestId !== personalRequestRef.current");
+    expect(personal).toContain("requestId === personalRequestRef.current");
     expect(SRC).not.toContain("Promise.all([");
     expect(SRC).toContain("capabilities.dictation.personalVoice === true");
   });
@@ -239,8 +245,10 @@ describe("VoiceSettings personal voice selection guard", () => {
     expect(guard).toContain("if (isPersonalVoice(next) && !allowed)");
     expect(guard).toContain("if (ready && reportDenial) setPersonalVoiceDenied(true);");
     expect(guard).not.toContain("current === personalVoiceDisabledReason");
-    // The Mac picker writes only the Mac's override, never the shared voice.
-    expect(guard).toContain("onPatch({ voices: { mac: next || null } })");
+    // The Mac picker writes only the Mac's override, never the shared voice,
+    // unless the harness predates per-device voices and would drop it.
+    expect(guard).toContain("if (deviceVoicesSupported(bot)) onPatch({ voices: { mac: next || null } })");
+    expect(guard).toContain("else onPatch({ voice: next })");
 
     // The typed id is cleared only after commitVoice accepts.  A refusal
     // returns first and leaves the form fields alone.
@@ -265,7 +273,7 @@ describe("VoiceSettings personal voice selection guard", () => {
 
     // The iPhone picker never saves a Personal Voice from this Mac.
     const iphone = between("const commitIphoneVoice", "const loadVoices");
-    expect(iphone).toContain("if (isPersonalVoice(next)) return;");
+    expect(iphone).toContain("if (isPersonalVoice(next) || !deviceVoicesSupported(bot)) return;");
     expect(iphone).toContain("onPatch({ voices: { iphone: next || null } })");
     // No path sends the wire's voices: null, which would clear both devices.
     expect(SRC).not.toMatch(/voices: null\s*[,}]/);

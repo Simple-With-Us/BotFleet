@@ -56,15 +56,17 @@ export type VoiceSettingsPatch = Partial<Pick<Bot, "voice" | "speakReplies" | "s
   voices?: DeviceVoicesPatch;
 };
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error("timed out")), ms);
-  });
-  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
-}
-
 const personalName = (id: string) => id.replace(/^(personal|apple-personal):/, "");
+
+/** The harness behind this card stores per-device voices.  A current
+ * harness always sends `voices` (null when unset); one that predates them
+ * sends no key at all, and its non-strict PATCH would drop a `voices` change
+ * without an error.  Against that harness the Mac picker writes the shared
+ * voice, as it always did, and the iPhone picker is not offered. */
+export const deviceVoicesSupported = (bot: Bot): boolean => bot.voices !== undefined;
+
+export const DEVICE_VOICES_NEED_UPDATE =
+  "The iPhone uses this voice too.\u00A0 A separate iPhone voice needs an update to the bot server on this computer.";
 
 /** A per-device override counts only when it is a non-blank string, the
  * same rule voiceForDevice applies. */
@@ -165,14 +167,15 @@ export function VoiceSettings({
       return false;
     }
     setPersonalVoiceDenied(false);
-    onPatch({ voices: { mac: next || null } });
+    if (deviceVoicesSupported(bot)) onPatch({ voices: { mac: next || null } });
+    else onPatch({ voice: next });
     return true;
   };
 
   // The iPhone picker offers MiniMax voices only.  A Personal Voice for the
   // iPhone is chosen on the iPhone, which can list its own.
   const commitIphoneVoice = (next: string) => {
-    if (isPersonalVoice(next)) return;
+    if (isPersonalVoice(next) || !deviceVoicesSupported(bot)) return;
     onPatch({ voices: { iphone: next || null } });
   };
 
@@ -201,8 +204,10 @@ export function VoiceSettings({
   };
 
   // This Mac's Personal Voices, on their own clock.  The gate is read at
-  // call time, and a helper that never answers is given up on after
-  // PERSONAL_VOICE_LIST_TIMEOUT_MS, leaving the list unknown.
+  // call time.  The helper can park on the authorization prompt, which the
+  // owner may take a while to answer: after PERSONAL_VOICE_LIST_TIMEOUT_MS
+  // the picker stops showing a spinner, but the list is still applied when
+  // it arrives, as long as no newer request has started.
   const loadPersonalVoices = () => {
     const requestId = ++personalRequestRef.current;
     const list = window.ogb?.personalVoice?.list;
@@ -212,20 +217,34 @@ export function VoiceSettings({
       return Promise.resolve();
     }
     setLoadingPersonalVoices(true);
-    return withTimeout(list(), PERSONAL_VOICE_LIST_TIMEOUT_MS)
+    const current = () => requestId === personalRequestRef.current;
+    let stopWaiting: () => void = () => {};
+    const gaveUp = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        if (current()) setLoadingPersonalVoices(false);
+        resolve();
+      }, PERSONAL_VOICE_LIST_TIMEOUT_MS);
+      stopWaiting = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    const listed = list()
       .then((raw) => {
-        if (requestId !== personalRequestRef.current) return;
+        if (!current()) return;
         try {
           setPersonalVoices(parsePersonalVoiceList(raw));
         } catch {
           setPersonalVoices(null);
         }
       }, () => {
-        if (requestId === personalRequestRef.current) setPersonalVoices(null);
+        if (current()) setPersonalVoices(null);
       })
       .finally(() => {
-        if (requestId === personalRequestRef.current) setLoadingPersonalVoices(false);
+        stopWaiting();
+        if (current()) setLoadingPersonalVoices(false);
       });
+    return Promise.race([listed, gaveUp]);
   };
 
   // Two sources, settled independently: neither list waits for the other.
@@ -327,7 +346,7 @@ export function VoiceSettings({
         );
         setCustomError(
           cleanupFailed
-            ? `${reason}.  The saved voice could not be removed; remove it from the list.`
+            ? `${reason}.\u00A0 The saved voice could not be removed; remove it from the list.`
             : reason,
         );
         return;
@@ -457,7 +476,10 @@ export function VoiceSettings({
       : "Workspace default";
 
   // ── Voice on This Mac ──
-  const macOverride = overrideFor(bot, "mac");
+  // Against a harness that predates per-device voices, the Mac picker shows
+  // and writes the shared voice, exactly as it did before.
+  const perDevice = deviceVoicesSupported(bot);
+  const macOverride = perDevice ? overrideFor(bot, "mac") : bot.voice?.trim() ? bot.voice : "";
   const macVoice = voiceForDevice(bot, "mac") || tts.voice;
   const isMacPersonal = isPersonalVoice(macVoice);
   const macPersonalMissing = isMacPersonal && personalVoiceAllowed && notOnThisMac(macVoice);
@@ -485,7 +507,7 @@ export function VoiceSettings({
   const sharedVoice = bot.voice?.trim() ? bot.voice : "";
   const macSharedLabel = loadingVoices
     ? "Loading voices…"
-    : sharedVoice
+    : sharedVoice && perDevice
       ? `${macLabelFor(sharedVoice)} (bot default)`
       : defaultVoiceDisplay;
 
@@ -750,6 +772,10 @@ export function VoiceSettings({
       {/* ── Voice on iPhone ── */}
       <div className="mt-4">
         <div className="mb-1.5 text-[13px] text-ink-secondary">Voice on iPhone</div>
+        {!perDevice ? (
+          <div role="status" className="text-[12px] text-ink-secondary">{DEVICE_VOICES_NEED_UPDATE}</div>
+        ) : (
+        <>
         <div className="flex gap-2">
           <select
             value={iphoneOverride}
@@ -789,6 +815,8 @@ export function VoiceSettings({
           <div id={`${bot.id}-iphone-voice-reason`} className="mt-2 text-[12px] text-ink-secondary">
             {iphonePersonalReason}
           </div>
+        )}
+        </>
         )}
       </div>
 

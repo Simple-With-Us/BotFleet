@@ -80,19 +80,20 @@ export function speakButtonState(input: {
   const preparing = mine && speech.status === "preparing";
   const failed = speech.status === "idle" && speech.messageId === messageId && Boolean(speech.error);
   const replay = Boolean(hasAudio) && !readiness.personal;
+  const action = replay ? "Play Audio" : "Play (Speak Aloud)";
+  // A failure keeps the action in the name, so a screen reader still hears
+  // what the button does before why the last try did not work.
   const label = mine
     ? replay ? "Stop Audio" : "Stop Speaking"
     : failed
-      ? speech.error ?? ""
+      ? `${action} failed: ${speech.error ?? ""}`
       : readiness.reason === "personal-unavailable"
         ? PLAY_PERSONAL_UNAVAILABLE
         : readiness.reason === "no-engine"
           ? "Add a voice engine key in settings to play audio"
           : readiness.reason === "no-voice"
             ? "Pick a voice in settings to play audio"
-            : replay
-              ? "Play Audio"
-              : "Play (Speak Aloud)";
+            : action;
   return { macVoice, ready: readiness.ready, mine, preparing, failed, label };
 }
 
