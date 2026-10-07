@@ -630,6 +630,24 @@ async function main() {
       console.error("Usage: node asc-api.mjs ensure-appstore-profiles <path-to-appstore-profiles.json>");
       process.exit(2);
     }
+    // Hand-written boundary checks rather than zod, on purpose: this client is
+    // dependency-free (see header) and hosted ios-ship runs it with plain
+    // `node` before any `pnpm install`, so `import "zod"` would fail with
+    // ERR_MODULE_NOT_FOUND and break every ship.  Same reasoning as
+    // scripts/ci-build-resolver.mjs and scripts/update-botfleet-mac.mjs.
+    /* oxlint-disable anti-slop/no-runtime-typeof -- hand-written boundary parse; zod is not installed on the ios-ship runner (see comment above). */
+    const BUNDLE_ID_RE = /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
+    const isPlainObject = (v) => Object.prototype.toString.call(v) === "[object Object]";
+    const isNonEmptyString = (v) => typeof v === "string" && v.trim().length > 0;
+    const apiRows = (res, key) => {
+      const rows = isPlainObject(res.parsed) ? res.parsed[key] : undefined;
+      if (rows === undefined) return [];
+      if (!Array.isArray(rows)) {
+        console.error(`ensure-appstore-profiles: unexpected App Store Connect response shape (${key} is not an array)`);
+        process.exit(2);
+      }
+      return rows.filter(isPlainObject);
+    };
     let want;
     try {
       want = JSON.parse(readFileSync(mapPath, "utf8"));
@@ -637,10 +655,19 @@ async function main() {
       console.error(`ensure-appstore-profiles: cannot read map: ${err && err.message ? err.message : err}`);
       process.exit(2);
     }
-    if (!want || typeof want !== "object" || !Object.keys(want).length) {
+    if (!isPlainObject(want) || !Object.keys(want).length) {
       console.error("ensure-appstore-profiles: map must be a non-empty {bundleId: profileName} object");
       process.exit(2);
     }
+    for (const [bundleId, profileName] of Object.entries(want)) {
+      if (!BUNDLE_ID_RE.test(bundleId) || !isNonEmptyString(profileName)) {
+        console.error(
+          `ensure-appstore-profiles: invalid map entry ${JSON.stringify(bundleId)}: keys must be bundle ids and values non-empty profile names`
+        );
+        process.exit(2);
+      }
+    }
+    /* oxlint-enable anti-slop/no-runtime-typeof */
 
     function installedCodesigningSha1s() {
       try {
@@ -682,7 +709,7 @@ async function main() {
       process.exit(2);
     }
     let distCertId = null;
-    for (const row of certRes.parsed.data || []) {
+    for (const row of apiRows(certRes, "data")) {
       const sha = certSha1FromContent(row.attributes?.certificateContent);
       if (sha && installed.has(sha)) {
         distCertId = row.id;
@@ -701,13 +728,13 @@ async function main() {
       process.exit(2);
     }
     const bundleIdByResource = new Map();
-    for (const inc of profRes.parsed.included || []) {
+    for (const inc of apiRows(profRes, "included")) {
       if (inc.type === "bundleIds") {
         bundleIdByResource.set(inc.id, inc.attributes?.identifier);
       }
     }
     const activeByBundleAndName = new Map();
-    for (const row of profRes.parsed.data || []) {
+    for (const row of apiRows(profRes, "data")) {
       const rel = row.relationships?.bundleId?.data?.id;
       const identifier = bundleIdByResource.get(rel);
       const attrs = row.attributes || {};
@@ -727,7 +754,7 @@ async function main() {
         console.error(`ensure-appstore-profiles: bundleId lookup failed for ${bundleId} (HTTP ${bidRes.status})`);
         process.exit(2);
       }
-      const bundleRow = (bidRes.parsed.data || []).find((r) => r.attributes?.identifier === bundleId);
+      const bundleRow = apiRows(bidRes, "data").find((r) => r.attributes?.identifier === bundleId);
       if (!bundleRow) {
         console.error(`ensure-appstore-profiles: bundle id ${bundleId} not registered in App Store Connect`);
         process.exit(2);

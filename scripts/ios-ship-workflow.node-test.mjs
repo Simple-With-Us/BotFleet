@@ -79,7 +79,7 @@ test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => 
   assert.match(project, /configs:\s*\n\s*Release:\s*\n\s*CODE_SIGN_STYLE:\s*Manual/);
   assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet iOS App Store \(API\)"/);
   assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet Widgets App Store \(API\)"/);
-  assert.match(project, /INFOPLIST_KEY_CFBundleDisplayName:\s*BotFleet\n/);
+  assert.match(project, /INFOPLIST_KEY_CFBundleDisplayName:\s*BotFleet\r?\n/);
   assert.match(project, /INFOPLIST_KEY_CFBundleDisplayName:\s*BotFleet Widgets/);
   assert.match(yml, /IOS_MANUAL_SIGN:\s*"1"/);
   assert.match(yml, /scripts\/ios-install-appstore-profiles\.sh/);
