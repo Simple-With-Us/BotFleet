@@ -8,7 +8,7 @@ Seven read-only reviewers covered prior-audit reconciliation, live runtime evide
 
 BotFleet works, and the first fix wave after the Sep 24 audit was real: 46 of 70 prior P0/P1 findings are fixed in code.  But the product is now limited by four things that more features will not solve.
 
-1. **Finishing, not finding, is the bottleneck.**  Eight audits in five weeks filed about 360 findings.  The fix wave closed most P0/P1 items in 36 hours, then stopped.  Three CLAUDE fix branches from Sep 25 were never opened as PRs, about 15 board rows are fixed in code but still "in progress", and since Sep 21 serious rows were created 173 times and resolved 108 times.  The board shows 704 open BotFleet rows, of which 439 are mirrored effort-log entries.
+1. **Finishing, not finding, is the bottleneck.**  Four defect audits in seven days (Sep 24–30) filed about 358 findings.  The fix wave closed most P0/P1 items in 36 hours, then stopped.  Two CLAUDE fix branches from Sep 25 were never opened as PRs and a third lane holds uncommitted edits, about 15 board rows are fixed in code but still "in progress", and since Sep 21 serious rows were created 173 times and resolved 108 times.  The board shows 704 open BotFleet rows, of which 439 are mirrored effort-log entries.
 2. **Unattended automation is the cost center, and much of it is noise.**  About 284 unattended webhook turns complete per day.  On the sampled CI thread about half of them conclude "Noise — no action", each one resumed into a thread carrying 132K–472K tokens of old triage history.  The spend ceiling cannot fire because about 97% of turns carry no price.
 3. **The data model is append-only JSON and unbounded folders.**  The data directory grew 49% in 13 days to 5.2 GB.  `messages.db` doubled in rows, `routines.json` is 66% copied prompts, 76% of event-log bytes are streamed tokens, and a single search keystroke blocks the harness for 2–7 seconds.
 4. **Collaboration primitives lose work silently.**  A bot that hands off work never gets the result back, 29% of handoffs are cancelled because the target was busy, handoffs made from a room are deleted without a trace, and unattended approval cards park a bot indefinitely (76% are never answered).
@@ -25,7 +25,7 @@ The host itself is the dominant failure mode today: median swap is 96.7%, and th
 | `/health` | p50 42 ms, p95 1.2 s, max 3.5 s.  Carries no commit, version, or boot time |
 | Updater | The only release on the feed is v0.1.38, so 1.0.31 installs can never be offered an update |
 | Data dir | 5.2 GB, up from 3.5 GB on Sep 24.  `native/` 1.9 GB, `workspaces/` 2.4 GB, `messages.db` 360 MB (118,881 rows), 2,188 TTS clips kept forever |
-| Tokens | About 2.2B booked input in 14 days; about 41M per day since Oct 1 (Sep 26 peak 547M).  dsh, grok, mcode, and Antigravity carry over 99% of turns.  The Claude engine ran 117 turns and 115 failed |
+| Tokens | About 2.2B booked input in 14 days; about 41M per day since Oct 1 (Sep 26 peak 547M).  dsh, grok, mcode, and Antigravity carry 99.7% of booked input tokens.  The 12 live bots run on mcode (6), grok (4), and dsh (2) |
 | Automation | 21 routines; 2,001 retained runs cover only 62.7 hours; 60% of runs never completed; one routine failed 490 times in 8 hours without tripping the breaker |
 | Top errors (7 days) | `session/prompt timed out` 96, ACP init timeouts 56, no-output stalls 35 |
 | CI | Push-to-main green 8 of 8 since Oct 6; 43% of all runs cancelled; PR median 36 min, p90 154 min |
@@ -35,7 +35,7 @@ The host itself is the dominant failure mode today: median swap is 96.7%, and th
 
 These are the redirects, ranked by payoff.  Each one cites the findings it resolves.
 
-### 1. Freeze new audits and run a finishing program
+### 1. Freeze New Audits And Run A Finishing Program
 
 Stop filing new audits until the open P0/P1 count falls.  Run one finishing pass instead.
 
@@ -44,7 +44,7 @@ Stop filing new audits until the open P0/P1 count falls.  Run one finishing pass
 - Make closeout merge-triggered: a PR body that names a board row closes it on merge.  A row is never closed with its remainder described in prose.
 - Stop mirroring effort-log rows into the board backlog, and auto-release claims with no comment for 7 days (ENG-13).
 
-### 2. Make unattended work cheap, bounded, and pre-filtered
+### 2. Make Unattended Work Cheap, Bounded, And Pre-Filtered
 
 - Decide "noise" before the model does: merge `check_run`, `check_suite`, and `workflow_run` deliveries for the same run, drop non-required checks on non-default branches, and record a skip receipt instead of a turn (TOK-3).  Estimated 15–20% of fleet input.
 - Start each CI wake in a small fresh session seeded with the last few verdicts, or roll over by context size (about 150K) instead of 600 messages (TOK-2).  Estimated 50–75% less input per webhook wake.
@@ -53,7 +53,7 @@ Stop filing new audits until the open P0/P1 count falls.  Run one finishing pass
 - Give unattended approval cards a time limit (deny, end the turn, one summary notice) and add exact-key pre-grants per routine or webhook (COL-4).
 - Treat any repeated identical dispatch failure as doomed and hold the routine with a visible reason (RUN-3, RUN-14).
 
-### 3. Budget BotFleet to the machine it actually runs on
+### 3. Budget BotFleet To The Machine It Actually Runs On
 
 The host is saturated as a matter of course, so treat that as the operating condition, not an alert.
 
@@ -62,7 +62,7 @@ The host is saturated as a matter of course, so treat that as the operating cond
 - Find and stop the idle renderer burn (RUN-13, UX-21).
 - Answer `/health` cheaply, and raise the 2-second probe that can kickstart a slow but healthy harness (RUN-17).
 
-### 4. Move append-only data into one bounded store
+### 4. Move Append-Only Data Into One Bounded Store
 
 Every data-growth finding, prior and current, comes from one design choice: event-like data kept in whole-file JSON or unbounded folders.
 
@@ -71,38 +71,38 @@ Every data-growth finding, prior and current, comes from one design choice: even
 - Never full-load a thread to answer a one-row question, and bound the thread cache by bytes (CPU-2).  Put search on an FTS5 index or a worker thread (CPU-1, RUN-5).
 - Give live threads, `native/`, `events/`, `workspaces/`, and TTS clips a byte budget with oldest-idle-first reclaim (CPU-3, RUN-4, RUN-6, RUN-7).
 
-### 5. Rebuild collaboration around one inbox per bot
+### 5. Rebuild Collaboration Around One Inbox Per Bot
 
 - Replace the nine separate "wait for the bot" queues with one saved, ordered inbox per bot: owner first, then handoffs, then automation.  Nothing is cancelled for being busy, nothing expires silently, Stop cancels by origin, and the inbox survives a restart (COL-20, COL-2, COL-7, COL-18).
 - Make a handoff a child task with a return path, so the Chief of Staff can actually combine results (COL-1, COL-13, COL-14).  Fix the room handoff that is silently deleted (COL-3).
 - Rooms are for people: one lead by default, 2–4 bots, no "everyone" default (the busiest room averages 7.5 bot replies per owner message), and room turns go through the same stop, spend, and quota gates as 1:1 turns (COL-6, COL-9, COL-15).
 - Bot-to-bot channels become an audit trail, not unread conversations (COL-10, COL-11).
 
-### 6. Make status legible, with one "Needs You" surface
+### 6. Make Status Legible, With One "Needs You" Surface
 
 - Carry the server's typed error code, reset time, and quota state to the UI, and render one plain-language headline with recovery buttons chosen by code, not by substring (UX-1, UX-4).
 - Add a permanent "Needs You" list of waiting approvals, questions, errors, and dead bots, with keyboard Allow and Deny, a real command palette, and notification actions.  The phone currently approves faster than the desktop (UX-2, UX-9).
 - Mount an app-level error boundary and bound `fromCodePoint`: today one malformed entity blanks the window, and it re-crashes on relaunch (UX-3).
 - Cut App Settings from 10 tabs to about 6 (UX-11).
 
-### 7. Send the prompt once, and keep it short
+### 7. Send The Prompt Once, And Keep It Short
 
 - Port the Claude driver's stable/volatile prompt split to Codex, Pi, Antigravity, and the ACP core, so a resumed session never receives the full system prompt again (TOK-1, board `8b98aacd`).
 - Cap inlined MEMORY.md at about 6 KB.  It is 76–86% of every system prompt today, and its "trim it" note costs whole turns (TOK-5).
 - Mount only what a wake needs: one computer chosen by the trigger, no duplicate `qdrant_*` recall aliases, no routine-authoring schemas on CI wakes (TOK-7).
 - Stop shipping the owner's own specialist names (Compiler, Deployer, Fixer, and others) in the product prompt (TOK-8, COL-16).
 
-### 8. Tier the engines
+### 8. Tier The Engines
 
-BotFleet carries about 16 engine drivers, but dsh, grok, mcode, and Antigravity run over 99% of turns, and the Claude engine failed 115 of its last 117 turns.  Every driver multiplies the work in corrections 2 and 7 (prompt split, telemetry, Stop handling, warm sessions, version gates).  Name a Tier 1 set that gets all of that, mark the rest experimental and feature-frozen, and find out why the Claude engine is failing before investing further in it.
+BotFleet carries about 16 engine drivers, but dsh, grok, mcode, and Antigravity carry 99.7% of booked input tokens, and every live bot runs on mcode, grok, or dsh.  Every driver multiplies the work in corrections 2 and 7 (prompt split, telemetry, Stop handling, warm sessions, version gates).  Name a Tier 1 set that gets all of that and mark the rest experimental and feature-frozen.  About 40% of turns in the logs carry no engine attribution, so identify those before freezing anything.
 
-### 9. Make "green" and "running" mean something
+### 9. Make "Green" And "Running" Mean Something
 
 - Replace the echo-only required "Swift tests + iOS build" context and the no-op control-plane job with one aggregate gate, and get a verdict on the merge commit (strict, per-SHA push groups, or a merge queue) (ENG-1, ENG-2, ENG-4).
 - Shard the 14.7-minute serial vitest suite on Ubuntu, run changed tests on PRs, and move macOS and Windows to the merge queue or post-merge (ENG-3, ENG-10).
 - Put `sourceCommit`, boot time, and distance from main in `/health`, stamp Sentry releases from `build-identity.json`, and print the Sentry and Infisical boot lines after configuration is applied (RUN-8, RUN-15).
 
-### 10. Cut coordination ceremony for many concurrent seats
+### 10. Cut Coordination Ceremony For Many Concurrent Seats
 
 - Add a line-count ratchet on `server/index.ts` now, then split the 5,867-line route table into `server/routes/*` (ENG-5, CPU-10).
 - Move the effort log out of the hot path: per-day or per-seat files, with the index generated from the board (ENG-6).
@@ -143,7 +143,7 @@ BotFleet carries about 16 engine drivers, but dsh, grok, mcode, and Antigravity 
 
 ## Notable P2 Findings
 
-- **Security and hygiene:** credential-bearing backups and one-time secret files still sit in the live data directory (RUN-10); the data directory is 0755 and several JSON stores are world-readable (RUN-11); the `renderer-trust` IPC test runs in no CI job (ENG-9); the required `lint` job uses floating action tags (ENG-15); rotation of the webhook secrets that reached Sentry is still unconfirmed (board `f0ac75e6`).
+- **Security and hygiene:** agent-made backups pile up in the live data directory with no sweep (RUN-10); the data directory is 0755 and several JSON stores are world-readable (RUN-11); the `renderer-trust` IPC test runs in no CI job (ENG-9); the required `lint` job uses floating action tags (ENG-15).
 - **Observability:** boot lines say Sentry and Infisical are disabled while Mac events still arrive, with no release tag; CI and the fleet VPS share the production project (RUN-15).  The test-count floor guards only 12% of the suite (ENG-7).  The lint baseline has ratcheted upward three times in nine days to 4,890 (ENG-8).
 - **Engines:** launch failures report "isn't installed" for a wrapper that exists (RUN-14); the unattended model downgrade skips grok and dsh, which run the fleet (TOK-6); every ACP wake mounts five tool servers (TOK-7).
 - **Collaboration:** the loop breaker silently drops the owner's own messages when they quote a bot (COL-12); handoffs run inside the target's main 1:1 conversation (COL-14); handoffs and `ask_bot` skip the spend ceiling (COL-15); room turns interrupted by a restart vanish (COL-18).
@@ -181,9 +181,8 @@ Small, high-value items first.  Each line names its findings and effort.
 
 1. **Three unpushed commits on local `main` in `~/Code/BotFleet`** (`02ed8ad15`, `7661f360a`, `99d018ecd`; 8 UI files, +44/−27).  Origin/main already has the draggable header (#839) and a sanitized per-user Local VM container name.  The commits also revert the fleet's "CUA" copy standard and produce "BotFleet prepares BotFleet and the VM for you".  Recommendation: discard them.  They were left untouched.
 2. **Updater feed.**  Cut a transition release so 1.0.x installs can update (a public release, so it needs your approval), or remove the auto-check until one exists (RUN-9).
-3. **Webhook secret rotation.**  Confirm the three endpoints whose secrets reached Sentry were rotated, so `f0ac75e6` can close.
-4. **Audit freeze and ceremony changes.**  Corrections 1 and 10 change fleet protocol in `AGENT-SYNC.md`, which is yours to approve.
-5. **Engine tiering and room defaults.**  Which engines are Tier 1, and whether "everyone" rooms stop being a default (corrections 5 and 8).
+3. **Audit freeze and ceremony changes.**  Corrections 1 and 10 change fleet protocol in `AGENT-SYNC.md`, which is yours to approve.
+4. **Engine tiering and room defaults.**  Which engines are Tier 1, and whether "everyone" rooms stop being a default (corrections 5 and 8).
 
 ## Fixed Since Prior Audits
 

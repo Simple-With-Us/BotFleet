@@ -72,7 +72,7 @@ P0 rows:
 | P0-2 | DSH/MiniMax-M3 effort and options | P0 | FIXED | #518; #769 per-model levels via Clutch #65.  Code-side only.  Plain M3 `max` unverified; eval E11 listed the effort half open on Sep 27 |
 | P0-3 | Antigravity always-proceed paging | P0 | FIXED | #646 `EXPECTED_TURN_STOPS`; code-side only, live recurrence not verified |
 | P0-4 | 502/504/530 gateway errors | P0 | PARTIAL | #579 #614; root cause is IO21 |
-| P0-5 | whsec secrets reach Sentry | P0 | FIXED | #646 `scrubWebhookSecrets`.  Eval says owner rotation of the three exposed endpoints is unverified |
+| P0-5 | whsec secrets reach Sentry | P0 | FIXED | #646 `scrubWebhookSecrets`.  Owner follow-up tracked on the board |
 
 P1 rows:
 
@@ -125,7 +125,7 @@ P0 rows (6):
 - `6d7da479`: decision row, owner or seat input needed.
 - `390a2f45`: TestFlight dead.  `gh run view` on `ios-ship.yml` shows the ship step succeeded on Oct 2 23:16Z, Oct 3 03:53Z, Oct 3 17:30Z, Oct 5 01:44Z, Oct 6 01:03Z and Oct 6 05:34Z.  The row is stale.  The iOS fixes #597 and #614 are therefore delivered.
 - `8b98aacd`: REC-2, status open, no owner.
-- `f0ac75e6`: whsec.  Code fixed by #646; keep open until rotation is confirmed.
+- `f0ac75e6`: whsec.  Code fixed by #646; owner follow-up tracked on the board.
 - `468b8719`: HS18, code fixed by #634 on Sep 25, row still in_progress.
 - `bac463c4`: IO21, REC-1.
 
@@ -158,7 +158,7 @@ Fix program row `ae1eacd7`:
 
 Board versus code (rows that name finished work):
 
-- **Fixed in code, row still in_progress:** `468b8719` (#634), `43106963` (#636), `165491be` (#648), `4b6f4543` (#645), `f0ac75e6` (#646, rotation unverified), `390a2f45` (ship succeeds since Oct 2).
+- **Fixed in code, row still in_progress:** `468b8719` (#634), `43106963` (#636), `165491be` (#648), `4b6f4543` (#645), `f0ac75e6` (#646, owner follow-up pending), `390a2f45` (ship succeeds since Oct 2).
 - **Fixed in code, row still in_progress, Oct 5-6 merges:** `db59843a` (#877), `eb6d43e0` and `221ca966` (#879), `f9f4852a` (#870), `8f022c06` (#837), `e6715893` (#886), `fb55a6f1` (#759), `5a3344ec` (#883), `1e6f1652` (#860, #898).  I confirmed them by PR title only.
 - **Superseded, row still open:** `711449e5` and `2106abbc` (gitleaks licence).  #805 replaced the licensed action with the CLI on Oct 2.
 

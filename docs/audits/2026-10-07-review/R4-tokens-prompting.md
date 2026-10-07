@@ -11,6 +11,7 @@ Scope: `origin/main` d2bc60257, read-only.  Live data comes from `~/.botfleet` e
   - grokAgent: 895 turns, 128M.
   - minimax (the HTTP lane): 194 turns, 9.8M, 55% cached.
   - claudeAgent: 117 turns, 0.1M (115 of them failed).
+    - Synthesis note: no live bot is configured on claudeAgent and `errors.log` has no claudeAgent entries, so these are likely failover or reviewer calls.  Not cross-checked.
   - Rooms: 69 turns, 8.3M.
 - **Current rate:** since Oct 1, 1,495 turns and 266M tokens, about 41M a day or 178K a turn.  The Sep 25–28 peak was 357–547M a day.
 - **Caveat:** for the ACP engines the booked "input" is how full the context is at the end of the turn, not what was billed (TOK-4).  Billed input is roughly that figure times the number of model calls in the turn.
@@ -189,7 +190,7 @@ Scope: `origin/main` d2bc60257, read-only.  Live data comes from `~/.botfleet` e
    - Record per-turn start and end context use and the number of model calls; set a token ceiling and a per-turn cap.  That turns the Sep 26–28 spikes (60–68M tokens in one turn, 547M in one day) into blocked runs.
 5. **Stop putting HTTP-lane work first (TOK-10, TOK-11).**
    - The framework evaluation's top fix (`cache_control`) and schema trimming target 0.4% of input.
-   - Spend the effort on the native-session engines, which account for over 99% of turns since Oct 1.
+   - Spend the effort on the native-session engines, which account for over 99% of booked input since Oct 1.
 
 ## Fixed Since Prior Audits
 

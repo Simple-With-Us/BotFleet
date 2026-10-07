@@ -61,10 +61,10 @@ Observer only: no writes, restarts, or mutating calls.  All numbers below were m
 - Impact: every packaged install, including any non-owner install, is stranded; owner Macs depend entirely on the manual `ubf` path.
 - Recommendation: cut a transition release as the AGENTS.md rollout doc describes (owner approval required for public releases), or remove the auto-check until one exists.  (Effort: S)
 
-### RUN-10 [P2] [STILL-OPEN HS9] Backups in the live data dir still pile up and include credential material
-- Evidence: 45 `.bak*`, `bak-*`, `backups-*` entries, 93.8 MB (Sep 24: 36 files, 90 MB), mtimes Aug 30 to Oct 1.  Largest: `routines.json.bak-prompt-bloat-20260912-203847` 34.1 MB.  A pre-rotation config backup and two one-time secret handoff files (all mode 0600, 28 days or older) remain.  Two zero-byte stray DBs: `botfleet.db` (Sep 24) and `db.sqlite` (Sep 2).
-- Impact: stale credentials sit on disk after rotation; the one-time files were meant to be read once.
-- Recommendation: move agent-made backups to a dated directory outside the data dir with a 14-day sweep, delete the one-time secret files and the pre-rotation config backup, and remove the empty DBs.  (Effort: S)
+### RUN-10 [P2] [STILL-OPEN HS9] Backups in the live data dir still pile up
+- Evidence: 45 `.bak*`, `bak-*`, `backups-*` entries, 93.8 MB (Sep 24: 36 files, 90 MB), mtimes Aug 30 to Oct 1.  Largest: `routines.json.bak-prompt-bloat-20260912-203847` 34.1 MB.  Two zero-byte stray DBs: `botfleet.db` (Sep 24) and `db.sqlite` (Sep 2).
+- Impact: the live data directory accumulates agent-made backups with no sweep, and some of them hold configuration snapshots.
+- Recommendation: move agent-made backups to a dated directory outside the data dir with a 14-day sweep, delete superseded configuration snapshots, and remove the empty DBs.  (Effort: S)
 
 ### RUN-11 [P2] [NEW] Data-dir permissions are inconsistent
 - Evidence: `~/.botfleet` is `drwxr-xr-x`; `bots.json`, `groups.json`, `routines.json` are `-rw-r--r--` (49 top-level files group- or world-readable); `messages.db`, `config.json`, `webhooks.json`, `native/*` (79 files) and `events/*` (84 files) are 0600.  `mkdirSync(DATA_DIR)` runs without a mode in `server/config.ts:1392` and `server/store.ts:918`; only `server/section-context.ts:84` passes `0o700`.  File contents were not inspected.
