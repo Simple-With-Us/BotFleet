@@ -96,7 +96,8 @@ export function VoiceSettings({
   const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
   // This Mac's Personal Voices.  null is "not known": not allowed here, not
-  // loaded yet, or the helper failed or timed out.  An empty list is known.
+  // loaded yet, or the helper failed or timed out.  The helper also answers
+  // an empty list for every failure, so only a non-empty list is evidence.
   const [personalVoices, setPersonalVoices] = useState<PersonalVoiceInfo[] | null>(null);
   const [loadingPersonalVoices, setLoadingPersonalVoices] = useState(false);
 
@@ -440,7 +441,9 @@ export function VoiceSettings({
   // A Personal Voice cannot be spoken on a device that did not make it, so
   // the iPhone picker offers hosted voices only.
   const iphoneOptions = voices.filter((voice) => !isPersonalVoice(voice.id));
-  const personalKnown = personalVoiceAllowed && personalVoices !== null;
+  // The helper reports a failure or a timeout as an empty list, so only a
+  // list with voices in it says which Personal Voices this Mac has.
+  const personalKnown = personalVoiceAllowed && Boolean(personalVoices?.length);
   /** A Personal Voice this Mac is known not to have.  `personal:` alone means
    * "the first Personal Voice on the device", which any device can satisfy. */
   const notOnThisMac = (id: string) =>
@@ -459,13 +462,13 @@ export function VoiceSettings({
   const isMacPersonal = isPersonalVoice(macVoice);
   const macPersonalMissing = isMacPersonal && personalVoiceAllowed && notOnThisMac(macVoice);
   const macReady = configured && Boolean(macVoice);
-  const previewDisabled = isMacPersonal ? !canSpeakPersonal || macPersonalMissing : !macReady;
+  // Try stays available on a missing-voice guess: if the voice really is not
+  // here, the helper's own refusal says so.
+  const previewDisabled = isMacPersonal ? !canSpeakPersonal : !macReady;
   const previewTitle = isMacPersonal
     ? !canSpeakPersonal
       ? personalVoiceDisabledReason
-      : macPersonalMissing
-        ? PERSONAL_VOICE_NOT_ON_MAC
-        : "Hear this Apple Personal Voice"
+      : "Hear this Apple Personal Voice"
     : macReady
       ? "Hear this voice"
       : "Pick a voice first";
