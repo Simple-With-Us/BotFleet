@@ -225,6 +225,28 @@ describe("live cues", () => {
     hl.dispose();
   });
 
+  it("keeps the real spacing when ranges arrive in one batch", () => {
+    const fake = fakeEnv();
+    const hl = createKaraokeHighlighter(mount("<p>alpha beta gamma</p>"), { env: fake.env });
+    // both ranges are delivered at 650, but were spoken at 300 and 600
+    fake.setNow(650);
+    hl.cue(0, 250, 300);
+    hl.cue(1, 250, 600);
+    hl.renderAt(450);
+    expect(hl.currentIndex).toBe(0);
+    hl.renderAt(540);
+    expect(hl.currentIndex).toBe(0);
+    hl.renderAt(575); // the pause between the words: nothing current
+    expect(hl.currentIndex).toBe(-1);
+    hl.renderAt(700);
+    expect(hl.currentIndex).toBe(1);
+    // a time in the future is now, and never before the previous word
+    hl.cue(2, 250, 10_000);
+    hl.renderAt(651);
+    expect(hl.currentIndex).toBe(2);
+    hl.dispose();
+  });
+
   it("extends the same word when it is cued again", () => {
     const fake = fakeEnv();
     const hl = createKaraokeHighlighter(mount("<p>749 flights</p>"), { env: fake.env });

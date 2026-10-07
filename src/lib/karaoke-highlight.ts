@@ -262,10 +262,18 @@ export interface KaraokeHighlighter {
   play(timeline: ArrayLike<number>, clock: () => number): void;
   /** Replace the timeline while playing (clip durations became known). */
   setTimeline(timeline: ArrayLike<number>): void;
-  /** Live mode: word `index` starts now and lasts `durationMs`.  Earlier
-   * unspoken words are swept quickly first.  Calling it again for the same
-   * word extends it. */
-  cue(index: number, durationMs?: number): void;
+  /** Live mode: word `index` starts at `atMs` (default: now) and lasts
+   * `durationMs`.  Earlier unspoken words are swept quickly first.  Calling it
+   * again for the same word extends it.
+   *
+   * `atMs` is in the highlighter's clock (`now()` of the environment, which
+   * is performance.now() in the app).  Personal Voice ranges can arrive in a
+   * batch (the main process polls the helper's output), so pass the time the
+   * word really started: on the first range take
+   * `t0 = performance.now() - range.elapsedMs`, then `atMs = t0 +
+   * range.elapsedMs` for every range.  A time in the future is treated as
+   * now, and a word never starts before the previous one. */
+  cue(index: number, durationMs?: number, atMs?: number): void;
   /** Paint one frame for time `timeMs` (also what the frame loop calls). */
   renderAt(timeMs: number): void;
   /** Index of the word painted as current, or -1. */
@@ -530,7 +538,7 @@ export function createKaraokeHighlighter(
       setTimeline(next);
       ensureLoop();
     },
-    cue(index, durationMs = LIVE_DEFAULT_MS) {
+    cue(index, durationMs = LIVE_DEFAULT_MS, atMs) {
       if (disposed || index < 0 || index >= count) return;
       const now = env.now();
       if (!live) {
@@ -542,8 +550,10 @@ export function createKaraokeHighlighter(
         resetPaint();
       }
       const duration = Math.max(0, durationMs);
+      let at = atMs !== undefined && Number.isFinite(atMs) ? Math.min(now, atMs) : now;
+      if (liveIndex >= 0 && index >= liveIndex) at = Math.max(at, timeline[2 * liveIndex]);
       if (index === liveIndex) {
-        timeline[2 * index + 1] = Math.max(timeline[2 * index + 1], now + duration);
+        timeline[2 * index + 1] = Math.max(timeline[2 * index + 1], at + duration);
       } else {
         if (index < liveIndex) {
           // A restart or seek backwards: everything after it is unspoken again.
@@ -551,18 +561,18 @@ export function createKaraokeHighlighter(
             timeline[2 * i] = Number.POSITIVE_INFINITY;
             timeline[2 * i + 1] = Number.POSITIVE_INFINITY;
           }
-        } else if (liveIndex >= 0 && timeline[2 * liveIndex + 1] > now) {
-          timeline[2 * liveIndex + 1] = now;
+        } else if (liveIndex >= 0 && timeline[2 * liveIndex + 1] > at) {
+          timeline[2 * liveIndex + 1] = at;
         }
         const from = Math.max(0, index < liveIndex ? index : liveIndex + 1);
         const run = index - from;
         const budget = Math.min(skipMax, run * skipStep);
         for (let k = 0; k < run; k += 1) {
-          timeline[2 * (from + k)] = now + (budget * k) / run;
-          timeline[2 * (from + k) + 1] = now + (budget * (k + 1)) / run;
+          timeline[2 * (from + k)] = at + (budget * k) / run;
+          timeline[2 * (from + k) + 1] = at + (budget * (k + 1)) / run;
         }
-        timeline[2 * index] = now + budget;
-        timeline[2 * index + 1] = now + budget + duration;
+        timeline[2 * index] = at + budget;
+        timeline[2 * index + 1] = at + budget + duration;
         liveIndex = index;
       }
       ensureLoop();
