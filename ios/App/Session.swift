@@ -320,14 +320,15 @@ final class Session: ObservableObject {
         body(&state)
     }
 
-    /// `-preview-voice`: the first preview bot speaks a MiniMax voice on this
+    /// `-preview-voice`: every preview bot speaks a MiniMax voice on this
     /// iPhone and a Mac Personal Voice on the Mac, with the voice engine
     /// configured, so the profile's two voice pickers can be screenshotted.
     private func seedVoicePreview(_ fleet: inout Fleet) {
-        guard !fleet.bots.isEmpty else { return }
-        fleet.bots[0].voice = "English_Graceful_Lady"
-        fleet.bots[0].voices = BotVoices(mac: "personal:com.apple.speech.personalvoice.preview-mac")
-        fleet.bots[0].speechDevices = ["mac", "iphone"]
+        for index in fleet.bots.indices {
+            fleet.bots[index].voice = "English_Graceful_Lady"
+            fleet.bots[index].voices = BotVoices(mac: "personal:com.apple.speech.personalvoice.preview-mac")
+            fleet.bots[index].speechDevices = ["mac", "iphone"]
+        }
         config = try? JSONDecoder().decode(
             ConfigStatus.self,
             from: Data(#"{"tts":{"configured":true,"voice":"English_Graceful_Lady","provider":"minimax"}}"#.utf8)
@@ -1945,11 +1946,19 @@ final class Session: ObservableObject {
         var segments: [SpeechSegment]?
         var speakWith = voiceId
         if let client {
+            // Only the request may fall back to the local projection.  A
+            // failure while playing hosted clips below is a playback failure.
+            var answer: MessageVoice?
             do {
-                let answer = try await client.messageVoice(
+                answer = try await client.messageVoice(
                     threadId: threadId, messageId: message.id, device: .iphone, progressive: true
                 )
-                try Task.checkCancellation()
+            } catch {
+                if isCancellation(error) || Task.isCancelled { throw error }
+                VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .personal)
+            }
+            try Task.checkCancellation()
+            if let answer {
                 guard answer.speaksOnDevice else {
                     // The computer resolved a hosted voice for this iPhone;
                     // this phone's copy of the bot is older.  Play its clips.
@@ -1958,9 +1967,6 @@ final class Session: ObservableObject {
                 }
                 segments = answer.utterances.map { SpeechProjection.segments(fromUtterances: $0) }
                 if let resolved = answer.voice, BotVoice.isPersonalVoiceId(resolved) { speakWith = resolved }
-            } catch {
-                if isCancellation(error) || Task.isCancelled { throw error }
-                VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .personal)
             }
         }
         try await speakPersonal(
