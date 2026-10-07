@@ -12,6 +12,7 @@ import {
   MAX_UTTERANCES,
   MAX_UTTERANCES_PROGRESSIVE,
   MessageAudio,
+  PERSONAL_VOICE_NEEDS_UPDATE,
   PROGRESSIVE_RESPONSE_BUDGET_MS,
   parseAudioRequest,
   parseClipDevice,
@@ -392,19 +393,102 @@ describe("per-device voices", () => {
     expect(fixture.speakCalls).toHaveLength(3);
   });
 
-  it("runs one voice at a time on a message", async () => {
+  it("runs different voices side by side, so one device never waits on the other's whole reply", async () => {
     const fixture = setup({ manual: true });
     const shared = post(fixture, owner);
     const phone = post(fixture, owner, { device: "iphone" });
     await fixture.settle();
-    expect(fixture.speakCalls.map((call) => call.voice)).toEqual(["vA"]);
-    await fixture.release(3);
-    await shared;
-    expect(fixture.speakCalls.map((call) => call.voice)).toEqual(["vA", "vA", "vA", "vB"]);
-    await fixture.release(3);
-    await phone;
+    // Both jobs start at once.  The iPhone's first clip does not queue
+    // behind every clip of the Mac's voice.
+    expect(fixture.speakCalls.map((call) => call.voice).sort()).toEqual(["vA", "vB"]);
+    const firstPhone = fixture.pending.findIndex((call) => call.voice === "vB");
+    fixture.pending.splice(firstPhone, 1)[0]!.resolve();
+    await fixture.settle();
+    expect(fixture.row.audioByVoice?.vB).toHaveLength(1);
+    expect(fixture.row.audio ?? []).toHaveLength(0);
+    expect(clipText(await get(fixture, owner, 0, { device: "iphone" }))).toBe("vB|First sentence here.");
+
+    // Each job writes only its own list; neither loses the other's clips.
+    while (fixture.pending.length) await fixture.release(1);
+    await Promise.all([shared, phone]);
     expect(fixture.row.audio).toHaveLength(3);
+    expect(fixture.row.audioVoice).toBe("vA");
     expect(fixture.row.audioByVoice?.vB).toHaveLength(3);
+    expect(fixture.speakCalls).toHaveLength(6);
+  });
+
+  it("still joins the running job for the same voice instead of billing twice", async () => {
+    const fixture = setup({ manual: true });
+    const first = post(fixture, owner, { device: "iphone", progressive: true });
+    const second = post(fixture, owner, { device: "iphone" });
+    await fixture.release(3);
+    await Promise.all([first, second]);
+    expect(fixture.speakCalls.map((call) => call.voice)).toEqual(["vB", "vB", "vB"]);
+  });
+});
+
+describe("which voice owns the main clip list", () => {
+  it("finishes a partial main list for a device voice once, not on every play", async () => {
+    // The shared voice was V and the reply got two of four clips (a
+    // mid-reply engine error).  The iPhone then chose Workspace default,
+    // which moved the shared voice to "" (the default W) and pinned the
+    // Mac to V.
+    const fixture = setup({ text: sentences(4), failOn: 3 });
+    const before: AudioOwner = { voice: "vV" };
+    const failed = await post(fixture, before);
+    expect(failed.status).toBe(502);
+    expect(fixture.row.audio).toHaveLength(2);
+    expect(fixture.row.audioVoice).toBe("vV");
+
+    const after: AudioOwner = { voice: "", voices: { mac: "vV" } };
+    const setupDefault = setup({ text: sentences(4), defaultVoice: "vW" });
+    Object.assign(setupDefault.row, fixture.row);
+    for (const [name, file] of fixture.files) setupDefault.files.set(name, file);
+
+    const first = await post(setupDefault, after, { device: "mac" });
+    expect(first.status).toBe(200);
+    expect(first.body.audio).toHaveLength(4);
+    expect(setupDefault.speakCalls).toHaveLength(2);
+    for (let play = 0; play < 2; play++) {
+      const again = await post(setupDefault, after, { device: "mac" });
+      expect(again.body).toMatchObject({ complete: true, voice: "vV" });
+    }
+    // Two clips billed in all, then none: not 2, 4, 6.
+    expect(setupDefault.speakCalls).toHaveLength(2);
+    // Every clip of the plan is served, not just the first two.
+    expect(clipText(await get(setupDefault, after, 3, { device: "mac" }))).toBe("vV|Line 4 is a sentence that a voice reads aloud.");
+  });
+
+  it("serves a no-device GET the owner voice's clips while the main list holds another voice", async () => {
+    const fixture = setup({ defaultVoice: "vW" });
+    // V was the shared voice and the iPhone had W of its own.
+    const before: AudioOwner = { voice: "vV", voices: { iphone: "vW" } };
+    await post(fixture, before);
+    await post(fixture, before, { device: "iphone" });
+    expect(fixture.row.audioVoice).toBe("vV");
+    expect(fixture.row.audioByVoice?.vW).toHaveLength(3);
+
+    // The shared voice is now the default W, and the Mac kept V.  A shipped
+    // app (no device) is served W's stored clips, and its index GETs must
+    // read the same list rather than V's clips from the main list.
+    const after: AudioOwner = { voice: "", voices: { mac: "vV", iphone: "vW" } };
+    const legacy = await post(fixture, after);
+    expect(legacy.body).toMatchObject({ voice: "vW", complete: true });
+    expect(clipText(await get(fixture, after, 0))).toBe("vW|First sentence here.");
+    expect(clipText(await get(fixture, after, 0, { device: "mac" }))).toBe("vV|First sentence here.");
+    expect(fixture.speakCalls).toHaveLength(6);
+  });
+
+  it("moves another voice's main list aside when the owner's voice takes it back", async () => {
+    const fixture = setup();
+    await post(fixture, { voice: "vA" });
+    await post(fixture, { voice: "vC" });
+    expect(fixture.row.audioVoice).toBe("vC");
+    expect(fixture.row.audioByVoice?.vA).toHaveLength(3);
+    // A device still on vA plays its clips without paying for them again.
+    const mac = await post(fixture, { voice: "vC", voices: { mac: "vA" } }, { device: "mac" });
+    expect(mac.body).toMatchObject({ voice: "vA", complete: true });
+    expect(fixture.speakCalls).toHaveLength(6);
   });
 });
 
@@ -435,10 +519,18 @@ describe("Personal Voice", () => {
     expect(result.body).toMatchObject({ onDevice: true, voice: "apple-personal:shared" });
   });
 
-  it("treats a Personal Voice workspace default as on-device", async () => {
+  it("treats a Personal Voice workspace default as on-device for a client that names its device", async () => {
+    const fixture = setup({ defaultVoice: "personal:default" });
+    const result = await post(fixture, { voice: "" }, { device: "iphone", progressive: true });
+    expect(result.body).toMatchObject({ onDevice: true, voice: "personal:default" });
+    expect(fixture.speakCalls).toHaveLength(0);
+  });
+
+  it("tells a shipped app (no device) to update instead of an empty success it cannot play", async () => {
     const fixture = setup({ defaultVoice: "personal:default" });
     const result = await post(fixture, { voice: "" });
-    expect(result.body).toMatchObject({ onDevice: true, voice: "personal:default" });
+    expect(result.status).toBe(409);
+    expect(result.body.error).toBe(PERSONAL_VOICE_NEEDS_UPDATE);
     expect(fixture.speakCalls).toHaveLength(0);
   });
 

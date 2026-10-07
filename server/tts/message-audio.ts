@@ -18,6 +18,11 @@
 // - Synthesis is one detached job per message and voice.  It outlives the
 //   request, saves each clip as it lands, and is joined (never duplicated) by
 //   a second device asking for the same voice, so a reply is billed once.
+//   Jobs for different voices run side by side: each write re-reads the row
+//   and patches it in the same tick, and each voice writes only its own list.
+// - One rule says which voice owns the main `audio` list (mainVoice), and
+//   every read and write of a voice's clips goes through it.  Reading one
+//   list and writing another re-bills the missing clips on every play.
 // - A request without `device` or `progressive` behaves exactly as the route
 //   always has, because shipped TestFlight builds send neither.
 import { z } from "zod";
@@ -57,6 +62,10 @@ export const CLIP_RETRY_AFTER_SECONDS = 1;
 /** A failed job is remembered this long so clip GETs can report its error
  * instead of a bare 404.  A new POST replaces it immediately. */
 export const FAILED_JOB_TTL_MS = 60_000;
+/** A request with no `device` (a shipped app) for a bot whose voice is a
+ * Personal Voice only through the workspace default. */
+export const PERSONAL_VOICE_NEEDS_UPDATE =
+  "Update BotFleet on this device to read replies with the workspace's Personal Voice.";
 /** Per-voice clip lists kept on one message besides the owner's own. */
 export const MAX_EXTRA_VOICE_SLOTS = 4;
 
@@ -163,11 +172,15 @@ function attachmentName(clip: VoiceClip): string | null {
   return clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1] ?? null;
 }
 
+/** Keep the newest MAX_EXTRA_VOICE_SLOTS entries (insertion order). */
+function boundSlots(map: Record<string, VoiceClip[]>): Record<string, VoiceClip[]> {
+  const keys = Object.keys(map);
+  while (keys.length > MAX_EXTRA_VOICE_SLOTS) delete map[keys.shift()!];
+  return map;
+}
+
 export class MessageAudio {
   private readonly jobs = new Map<string, ClipJob>();
-  /** One synthesis at a time per message, so two voices never interleave
-   * their writes to the same row. */
-  private readonly tails = new Map<string, Promise<unknown>>();
   private readonly deps: MessageAudioDeps;
 
   constructor(deps: MessageAudioDeps) {
@@ -188,23 +201,39 @@ export class MessageAudio {
     return this.effective(owner.voice);
   }
 
-  /** The clips stored for `voice`.  The main `audio` list belongs to
-   * `audioVoice`, or to the owner's voice on rows older than that field. */
+  /** The voice the main `audio` list holds: `audioVoice`, or the owner's
+   * voice on rows older than that field.  The one ownership rule for both
+   * reading (slotClips) and writing (slotPatch). */
+  private mainVoice(message: AudioMessage | undefined, ownerVoice: string): string {
+    return message?.audioVoice ?? ownerVoice;
+  }
+
+  /** The clips stored for `voice`: the main list when it holds that voice,
+   * otherwise the voice's entry in the side map. */
   private slotClips(message: AudioMessage, voice: string, ownerVoice: string): VoiceClip[] | undefined {
-    if ((message.audioVoice ?? ownerVoice) === voice) return message.audio;
+    if (this.mainVoice(message, ownerVoice) === voice) return message.audio;
     return message.audioByVoice?.[voice];
   }
 
-  /** Where clips for `voice` are written: the main list for the owner's own
-   * voice (so old clients keep reading it), a bounded side map otherwise. */
+  /** Where clips for `voice` are written: wherever slotClips reads them.
+   * The owner's own voice also takes the main list back from another voice,
+   * because clients that send no device read only that list; the voice it
+   * held moves to the side map, so its device does not pay for it again. */
   private slotPatch(message: AudioMessage | undefined, voice: string, ownerVoice: string, clips: VoiceClip[]): Partial<AudioMessage> {
-    if (voice === ownerVoice) return { audio: [...clips], audioVoice: voice };
+    const main = this.mainVoice(message, ownerVoice);
+    if (main === voice) return { audio: [...clips], audioVoice: voice };
     const map = { ...message?.audioByVoice };
+    const put = (key: string, list: VoiceClip[]) => {
+      delete map[key];
+      map[key] = [...list];
+    };
+    if (voice !== ownerVoice) {
+      put(voice, clips);
+      return { audioByVoice: boundSlots(map) };
+    }
     delete map[voice];
-    map[voice] = [...clips];
-    const keys = Object.keys(map);
-    while (keys.length > MAX_EXTRA_VOICE_SLOTS) delete map[keys.shift()!];
-    return { audioByVoice: map };
+    if (message?.audio?.length) put(main, message.audio);
+    return { audio: [...clips], audioVoice: voice, audioByVoice: boundSlots(map) };
   }
 
   private notify(job: ClipJob): void {
@@ -247,8 +276,6 @@ export class MessageAudio {
     const running = this.jobs.get(key);
     if (running && !running.error) return running;
 
-    const messageKey = `${threadId}:${messageId}`;
-    const previous = this.tails.get(messageKey);
     const job: ClipJob = {
       voice,
       utterances,
@@ -259,7 +286,6 @@ export class MessageAudio {
       done: Promise.resolve([]),
     };
     job.done = (async () => {
-      if (previous) await previous;
       const message = this.deps.message(threadId, messageId);
       if (!message) throw new Error("The reply is no longer available.");
       const kept: VoiceClip[] = [];
@@ -283,12 +309,6 @@ export class MessageAudio {
       }
       return job.clips;
     })();
-
-    const tail = job.done.then(() => undefined, () => undefined);
-    this.tails.set(messageKey, tail);
-    void tail.then(() => {
-      if (this.tails.get(messageKey) === tail) this.tails.delete(messageKey);
-    });
 
     this.jobs.set(key, job);
     job.done.then(
@@ -350,6 +370,13 @@ export class MessageAudio {
     }
 
     if (isPersonalVoiceId(voice)) {
+      // Shipped clients send no device and read only `audio`.  They speak a
+      // bot whose own voice is a Personal Voice without asking, so the one
+      // they can reach here came from the workspace default, and an empty
+      // success would leave them silent with no error.
+      if (!device && !isPersonalVoiceId(owner.voice)) {
+        return { kind: "json", status: 409, body: { error: PERSONAL_VOICE_NEEDS_UPDATE } };
+      }
       return {
         kind: "json",
         status: 200,
@@ -440,9 +467,10 @@ export class MessageAudio {
     const ownerVoice = this.ownerVoice(owner);
     const device = parsedDevice.device;
     const voice = this.effective(device ? voiceForDevice(owner, device) : owner.voice);
-    // No device is the legacy request: whatever the main list holds, exactly
-    // as before.  A device names its own voice's clips.
-    const stored = device ? this.slotClips(message, voice, ownerVoice) : message.audio;
+    // No device is the legacy request, which means the owner's voice.  It
+    // reads through the same rule as the POST that planned it, so its index
+    // GETs never get another voice's clips from the main list.
+    const stored = this.slotClips(message, voice, ownerVoice);
     const storedClip = stored?.[index];
     if (storedClip) {
       const served = this.serveClip(storedClip, input.ifNoneMatch);
