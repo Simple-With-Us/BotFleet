@@ -737,8 +737,22 @@ describe("VoiceSettings rendered voice commit", () => {
     expect([...select().options].find((option) => option.value === "personal:iphone-only")?.textContent).toBe(
       "Personal Voice not on this Mac",
     );
-    const tryButton = container.querySelector<HTMLButtonElement>(`button[title="${PERSONAL_VOICE_NOT_ON_MAC}"]`);
-    expect(tryButton?.disabled).toBe(true);
+    // Try stays on: if the voice really is missing, the helper says so.
+    const tryButton = container.querySelector<HTMLButtonElement>('button[title="Hear this Apple Personal Voice"]');
+    expect(tryButton?.disabled).toBe(false);
+  });
+
+  it("does not call a Personal Voice missing when the helper's list is empty", async () => {
+    // The helper answers [] for a failure or a timeout, not only for a Mac
+    // with no Personal Voices, so an empty list is no evidence.
+    installPersonalVoices(async () => []);
+    startingBot = sampleBot("", { mac: "personal:mac-voice" });
+    await mount();
+
+    expect(container.textContent).not.toContain(PERSONAL_VOICE_NOT_ON_MAC);
+    expect(container.textContent).toContain("It plays on-device on this Mac.");
+    const tryButton = container.querySelector<HTMLButtonElement>('button[title="Hear this Apple Personal Voice"]');
+    expect(tryButton?.disabled).toBe(false);
   });
 
   it("clears every device that named a deleted voice", async () => {
