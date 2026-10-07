@@ -30,6 +30,22 @@ describe("TtsAudioBodySchema", () => {
     expect(parsed.success && parsed.data.audio).toHaveLength(1);
   });
 
+  it("keeps the progressive fields: total, complete, and the resolved voice", () => {
+    const parsed = TtsAudioBodySchema.safeParse({
+      audio: [],
+      voiceText: "One. Two.",
+      utterances: ["One.", "Two."],
+      total: 2,
+      complete: false,
+      voice: "minimax-warm",
+    });
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data).toMatchObject({ total: 2, complete: false, voice: "minimax-warm" });
+    expect(parsed.success && parsed.data.onDevice).toBeUndefined();
+    expect(TtsAudioBodySchema.safeParse({ audio: [], total: -1 }).success).toBe(false);
+    expect(TtsAudioBodySchema.safeParse({ audio: [], total: 1.5 }).success).toBe(false);
+  });
+
   it("rejects a body whose fields are the wrong type", () => {
     // The pre-parse failure this exists to prevent: `onDevice` arriving as a
     // string used to be read as truthy and take the on-device branch.

@@ -12,6 +12,7 @@ import { track } from "@/lib/analytics";
 import { normalizeState } from "@/lib/mascot";
 import { speaker } from "@/lib/tts";
 import { spokenReply } from "../../shared/voice-summary";
+import { voiceForDevice } from "../../shared/bot-voice";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
@@ -35,8 +36,8 @@ export function GroupCallButton({ group, members }: { group: Group; members: Bot
     <CallTargetButton
       targetId={group.id}
       targetName={group.name}
-      voices={members.map((member) => member.voice)}
-      setupBotId={members.find((member) => !member.voice)?.id ?? members[0]?.id}
+      voices={members.map((member) => voiceForDevice(member, "mac"))}
+      setupBotId={members.find((member) => !voiceForDevice(member, "mac"))?.id ?? members[0]?.id}
       requireExplicitVoices
       onStart={() => track("group_call_started", { memberCount: members.length })}
     />
@@ -161,7 +162,8 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       move("speaking");
       setSpeakingMemberId(member?.id ?? null);
       hush();
-      await speaker.speak(text, { botId: member?.id, voiceId: member?.voice, ...(messageId ? { messageId, threadId: group.threadId } : {}) });
+      // Each member speaks with its voice for this Mac.
+      await speaker.speak(text, { botId: member?.id, voiceId: member ? voiceForDevice(member, "mac") : undefined, ...(messageId ? { messageId, threadId: group.threadId } : {}) });
       return alive.current && currentCall() === group.id && sayGeneration.current === mine;
     },
     [group.id, group.threadId, hush, move],

@@ -10,11 +10,20 @@ import { z } from "zod";
  * clips, speak the caption" — into a reported error.
  */
 
-/** `POST /api/threads/:id/messages/:id/audio` as `Speaker.speak` consumes it. */
+/** `POST /api/threads/:id/messages/:id/audio` as `Speaker.speak` consumes it.
+ *
+ * A progressive answer (`progressive: true` in the request) carries the clips
+ * that are ready so far plus `total`, so `audio` can be shorter than
+ * `utterances` and even empty.  An empty `audio` is never a signal to speak
+ * on-device; only `onDevice: true` is.  `voice` is the id the harness
+ * resolved for the requesting device, after the workspace default. */
 export const TtsAudioBodySchema = z.object({
   audio: z.array(z.object({ path: z.string(), mime: z.string() }).strict()),
   voiceText: z.string().optional(),
   utterances: z.array(z.string()).optional(),
+  total: z.number().int().nonnegative().optional(),
+  complete: z.boolean().optional(),
+  voice: z.string().optional(),
   onDevice: z.boolean().optional(),
   personalVoice: z.boolean().optional(),
 });
