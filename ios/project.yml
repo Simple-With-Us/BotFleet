@@ -55,6 +55,9 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: false
         ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: false
+        # Mirrors info.properties for Xcode's General > App Category picker only.
+        # The shipped value is LSApplicationCategoryType in App/Info.plist below
+        # (INFOPLIST_KEY_* is ignored without GENERATE_INFOPLIST_FILE).
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         # Xcode General → Display Name reads INFOPLIST_KEY_* from build settings.
         INFOPLIST_KEY_CFBundleDisplayName: BotFleet

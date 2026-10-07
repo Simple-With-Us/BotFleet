@@ -93,6 +93,9 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(project, /postGenCommand:\s*bash \.\.\/scripts\/ios-xcodegen-post\.sh/);
   assert.match(project, /IPHONEOS_DEPLOYMENT_TARGET:\s*'27\.0'/);
   assert.match(project, /INFOPLIST_KEY_LSApplicationCategoryType:\s*public\.app-category\.developer-tools/);
+  // The shipped category is info.properties (XcodeGen writes App/Info.plist);
+  // INFOPLIST_KEY_* only mirrors it for Xcode's General > App Category picker.
+  assert.match(project, /^\s+LSApplicationCategoryType:\s*public\.app-category\.developer-tools\s*$/m);
   assert.match(read("scripts/ios-xcodegen-post.sh"), /objectVersion = 100/);
   assert.match(read("scripts/ios-xcodegen-post.sh"), /Xcode 27\.0/);
 
