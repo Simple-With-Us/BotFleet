@@ -1,9 +1,16 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
   summarizeForVoice,
+  summarizeForVoiceDetailed,
+  summaryLooksTruncated,
   normalizeDeepSeekChatUrl,
   resolveDeepSeekKey,
+  voiceSummaryMaxTokens,
+  voiceSummaryWorthStoring,
   DEEPSEEK_FLASH_TTS_PROMPT,
+  SUMMARY_MAX_TOKENS,
+  SUMMARY_MIN_TOKENS,
+  SUMMARY_RATIO_MIN_CHARS,
 } from "./speech-summary.ts";
 
 describe("summarizeForVoice", () => {
@@ -271,3 +278,115 @@ describe("summarizeForVoice", () => {
 });
 
 
+
+describe("summarizeForVoiceDetailed: long replies are never cut short", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  /** A long, plain reply: about 3,000 characters of prose with a link so it
+   * is not short-circuited. */
+  const longReply = Array.from(
+    { length: 30 },
+    (_, i) => `Paragraph ${i + 1} explains one more step of the deploy, and why it matters for the release.`,
+  ).join("\n\n") + "\n\nDetails are at https://example.com/release.";
+
+  const answer = (content: string, finish_reason: string | null = "stop") => ({
+    ok: true,
+    json: async () => ({ choices: [{ message: { content }, finish_reason }] }),
+  });
+
+  it("scales max_tokens with the reply, within a bound", () => {
+    expect(voiceSummaryMaxTokens(100)).toBe(SUMMARY_MIN_TOKENS);
+    expect(voiceSummaryMaxTokens(3_000)).toBe(1_000);
+    expect(voiceSummaryMaxTokens(1_000_000)).toBe(SUMMARY_MAX_TOKENS);
+  });
+
+  it("sends the scaled budget to both models", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: false, json: async () => ({}) });
+    globalThis.fetch = fetchSpy;
+    await summarizeForVoiceDetailed(longReply, "fake-key");
+    const budgets = fetchSpy.mock.calls.map(([, init]) => JSON.parse((init as { body: string }).body).max_tokens);
+    expect(budgets).toEqual([voiceSummaryMaxTokens(longReply.length), voiceSummaryMaxTokens(longReply.length)]);
+    expect(budgets[0]).toBeGreaterThan(500);
+  });
+
+  it("uses a complete rewrite and marks it as a summary", async () => {
+    const rewrite = longReply.replace("https://example.com/release", "example dot com slash release");
+    globalThis.fetch = vi.fn().mockResolvedValue(answer(rewrite));
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result.source).toBe("summary");
+    expect(result.text).toContain("Paragraph 30");
+    expect(voiceSummaryWorthStoring(result)).toBe(true);
+  });
+
+  it("falls back to the full deterministic text when the rewrite hit max_tokens", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(answer("Paragraph 1 explains one more step of the", "length"));
+    globalThis.fetch = fetchSpy;
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result).toMatchObject({ source: "fallback", reason: "truncated" });
+    expect(result.text).toContain("Paragraph 30");
+    expect(result.text).not.toBe("Paragraph 1 explains one more step of the");
+    // A cut-off answer is not retried on the second model at the same budget.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // The stand-in is the full text, so it is safe (and cheaper) to keep.
+    expect(voiceSummaryWorthStoring(result)).toBe(true);
+  });
+
+  it("treats any finish other than stop as incomplete", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(answer("Paragraph one.", "content_filter"));
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result).toMatchObject({ source: "fallback", reason: "incomplete" });
+    expect(result.text).toContain("Paragraph 30");
+  });
+
+  it("falls back when the rewrite is far shorter than the reply", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(answer("The deploy has thirty steps.", "stop"));
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result).toMatchObject({ source: "fallback", reason: "too-short" });
+    expect(result.text).toContain("Paragraph 30");
+  });
+
+  it("accepts a short rewrite when the caller asked for a condensed summary", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(answer("The deploy has thirty steps.", "stop"));
+    const result = await summarizeForVoiceDetailed(longReply, { key: "fake-key", condense: true });
+    expect(result).toMatchObject({ source: "summary", text: "The deploy has thirty steps." });
+  });
+
+  it("does not store a transient provider failure", async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error("network down"));
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result).toMatchObject({ source: "fallback", reason: "unavailable" });
+    expect(result.text).toContain("Paragraph 30");
+    expect(voiceSummaryWorthStoring(result)).toBe(false);
+  });
+
+  it("keeps storing the deterministic text when there is no key or the reply is short", async () => {
+    vi.stubEnv("DEEPSEEK_VOICE_API_KEY", "");
+    vi.stubEnv("DEEPSEEK_API_KEY", "");
+    try {
+      const noKey = await summarizeForVoiceDetailed(longReply, { key: "" });
+      expect(noKey).toMatchObject({ source: "fallback", reason: "no-key" });
+      expect(voiceSummaryWorthStoring(noKey)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    const short = await summarizeForVoiceDetailed("A short plain reply.", "fake-key");
+    expect(short.source).toBe("short");
+    expect(voiceSummaryWorthStoring(short)).toBe(true);
+  });
+
+  it("only calls a rewrite too short on replies long enough to judge", () => {
+    expect(summaryLooksTruncated("x".repeat(10), "y".repeat(SUMMARY_RATIO_MIN_CHARS - 1))).toBe(false);
+    expect(summaryLooksTruncated("x".repeat(10), "y".repeat(SUMMARY_RATIO_MIN_CHARS))).toBe(true);
+    expect(summaryLooksTruncated("x".repeat(400), "y".repeat(1_000))).toBe(false);
+  });
+
+  it("keeps summarizeForVoice returning plain text", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(answer("Paragraph 1 explains one more step of the", "length"));
+    const text = await summarizeForVoice(longReply, "fake-key");
+    expect(typeof text).toBe("string");
+    expect(text).toContain("Paragraph 30");
+  });
+});

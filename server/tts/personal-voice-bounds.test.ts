@@ -5,64 +5,88 @@
 // evaluated above that early return or a Personal Voice owner gets an
 // unbounded spawn that a MiniMax owner would have been refused.
 //
-// The route itself is inline in the 20k-line `server/index.ts` behind a bot
-// with a personal voice plus a persisted bot message, which is a fixture this
-// suite deliberately does not build.  What actually regressed was the ordering
-// of two branches, so the ordering is what is pinned here — matching the
-// existing source-wiring assertions in `usage-telemetry.test.ts`.
+// The route's rules live in server/tts/message-audio.ts, where
+// message-audio.test.ts exercises them against fakes.  This file pins the
+// ORDER of the three checks in the source as well, because the order is what
+// regressed before and a reordering can still pass a behavioral test that
+// happens not to cover it:
+//   1. the clip bound (413),
+//   2. the Personal Voice early return (on-device speech, no key needed),
+//   3. the hosted-voice credential check (409).
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
+import { MAX_SPEAKABLE_CHARS, MAX_UTTERANCES, MAX_UTTERANCES_PROGRESSIVE, MessageAudio } from "./message-audio.ts";
 import { toUtterances } from "./speech-text.ts";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const indexSource = readFileSync(join(ROOT, "server", "index.ts"), "utf8");
+const HERE = dirname(fileURLToPath(import.meta.url));
+const source = readFileSync(join(HERE, "message-audio.ts"), "utf8");
 
-const MAX_UTTERANCES = 64;
-const MAX_CHARS = 12_000;
-
-/** The reply-shape block of the audio route: from the utterance split to the
- * first synthesis job.  Anchored on the split, which is unique to this route. */
-function routeSource(): string {
-  const start = indexSource.indexOf("const utterances = toUtterances(textToSpeak);");
+/** The POST body: from the utterance split to the synthesis job. */
+function postSource(): string {
+  const start = source.indexOf("const utterances = toUtterances(textToSpeak);");
   expect(start).toBeGreaterThan(-1);
-  return indexSource.slice(start, start + 1_200);
+  const end = source.indexOf("this.ensureJob(", start);
+  expect(end).toBeGreaterThan(start);
+  return source.slice(start, end);
 }
 
 describe("Personal Voice reply bounds", () => {
-  it("evaluates the clip bound before the personal-voice early return", () => {
-    const source = routeSource();
-    const bound = source.indexOf("reply exceeds voice clip limit");
-    const personalVoice = source.indexOf("tts.isPersonalVoice(owner.voice)");
-
+  it("evaluates the clip bound before the Personal Voice early return", () => {
+    const route = postSource();
+    const bound = route.indexOf("reply exceeds voice clip limit");
+    const personalVoice = route.indexOf("isPersonalVoiceId(voice)");
     expect(bound).toBeGreaterThan(-1);
     expect(personalVoice).toBeGreaterThan(-1);
     expect(bound).toBeLessThan(personalVoice);
   });
 
-  it("keeps the empty-reply rejection in force for every voice owner", () => {
-    const source = routeSource();
-    const emptyBound = source.indexOf("!utterances.length");
-    const personalVoice = source.indexOf("tts.isPersonalVoice(owner.voice)");
-
-    expect(emptyBound).toBeGreaterThan(-1);
-    expect(personalVoice).toBeGreaterThan(-1);
-    expect(emptyBound).toBeLessThan(personalVoice);
-    // The empty check must still reject, not soft-return: a 200 sends
-    // `voiceText` to the desktop helper (src/lib/tts/index.ts:157-161).
-    expect(source.slice(emptyBound, personalVoice)).toMatch(/return json\(res, 413/);
-    expect(source.match(/reply exceeds voice clip limit/g)).toHaveLength(1);
-    expect(source).toMatch(/if \(!utterances\.length \|\|/);
+  it("returns Personal Voice speech before the hosted-voice credential check", () => {
+    const route = postSource();
+    const personalVoice = route.indexOf("isPersonalVoiceId(voice)");
+    const credential = route.indexOf("this.deps.credentialPending()");
+    expect(credential).toBeGreaterThan(-1);
+    expect(personalVoice).toBeLessThan(credential);
   });
 
-  it("bounds the reply text a Personal Voice owner can reach the helper with", () => {
-    // The two limits the route asserts, exercised against the real splitter.
-    const tooManyUtterances = toUtterances(Array.from({ length: 70 }, (_, i) => `Sentence number ${i} here.`).join(" "));
-    expect(tooManyUtterances.length).toBeGreaterThan(MAX_UTTERANCES);
+  it("keeps the empty-reply rejection in force for every voice owner", () => {
+    const route = postSource();
+    const emptyBound = route.indexOf("!utterances.length");
+    const personalVoice = route.indexOf("isPersonalVoiceId(voice)");
+    expect(emptyBound).toBeGreaterThan(-1);
+    expect(emptyBound).toBeLessThan(personalVoice);
+    // The empty check must reject, not soft-return: a 200 sends `voiceText`
+    // to the on-device speaker.
+    expect(route.slice(emptyBound, personalVoice)).toMatch(/status: 413/);
+    expect(route.match(/reply exceeds voice clip limit/g)).toHaveLength(1);
+  });
 
-    const tooLong = toUtterances("word ".repeat(MAX_CHARS + 100));
-    expect(tooLong.join("").length).toBeGreaterThan(MAX_CHARS);
+  it("refuses an over-long reply for a Personal Voice owner, legacy or progressive", async () => {
+    const tooManyUtterances = Array.from({ length: MAX_UTTERANCES_PROGRESSIVE + 10 }, (_, i) => `Sentence number ${i} here.`).join(" ");
+    expect(toUtterances(tooManyUtterances).length).toBeGreaterThan(MAX_UTTERANCES_PROGRESSIVE);
+    const tooLong = "word ".repeat(MAX_SPEAKABLE_CHARS + 100);
+    expect(toUtterances(tooLong).join(" ").length).toBeGreaterThan(MAX_SPEAKABLE_CHARS);
+
+    for (const text of [tooManyUtterances, tooLong]) {
+      const audio = new MessageAudio({
+        message: () => ({ id: "m", text }),
+        patchMessage: () => {},
+        summarize: async (_t, _m, value) => value,
+        speak: () => Promise.reject(new Error("must not synthesize")),
+        saveClip: () => ({ path: "/api/attachments/x.mp3", mime: "audio/mpeg" }),
+        clipExists: () => false,
+        readClip: () => null,
+        defaultVoice: () => "",
+        credentialPending: () => false,
+        isNoVoiceConfigured: () => false,
+      });
+      for (const body of [{}, { progressive: true }]) {
+        const result = await audio.post({ threadId: "t", messageId: "m", owner: { voice: "personal:x", voiceSummaryMode: "off" }, body });
+        expect(result.status).toBe(413);
+      }
+    }
+    expect(MAX_UTTERANCES).toBeLessThan(MAX_UTTERANCES_PROGRESSIVE);
   });
 });

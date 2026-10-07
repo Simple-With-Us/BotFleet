@@ -17,6 +17,7 @@ import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { withoutNestedFallbacks } from "../shared/model-limits.ts";
+import type { BotVoices } from "../shared/bot-voice.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
@@ -126,8 +127,16 @@ export interface Message {
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
-  /** Persisted audio clips for this exact reply, in playback order. */
+  /** Persisted audio clips for this exact reply, in playback order.  They
+   * belong to `audioVoice`, or to the owner's shared voice on rows written
+   * before audioVoice existed (server/tts/message-audio.ts). */
   audio?: Array<{ path: string; mime: string }>;
+  /** The voice `audio` was synthesized with. */
+  audioVoice?: string;
+  /** Clips for a device voice that differs from the owner's shared voice,
+   * keyed by voice id, so a Mac and an iPhone with different hosted voices
+   * do not overwrite (and re-bill) each other's clips. */
+  audioByVoice?: Record<string, Array<{ path: string; mime: string }>>;
   /** Distilled speech-friendly text generated for TTS synthesis. */
   voiceText?: string;
   /** Original incoming microphone recording and recognizer output never change. */
@@ -631,6 +640,10 @@ export interface BotRecord {
   /** This bot's own voice id, so a room of bots doesn't sound like one
    * person. Falls back to the app-wide voice in config. */
   voice?: string;
+  /** Per-device overrides of `voice` (shared/bot-voice.ts): an Apple
+   * Personal Voice only exists on the device that made it, so the Mac and
+   * the iPhone each pick their own.  A device without one uses `voice`. */
+  voices?: BotVoices;
   /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
    * "on_demand" (default/opt-in) runs only on manual speak; "always" runs on every turn. */
   voiceSummaryMode?: "off" | "on_demand" | "always";
