@@ -19,7 +19,7 @@ import {
   type SpeechSpan,
   type SpokenScript,
   type SpokenUtterance,
-} from "./speech-spans";
+} from "./speech-spans.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "..", "ios", "Tests", "CompanionCoreTests", "Fixtures", "speech-spans.json");
