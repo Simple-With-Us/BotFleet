@@ -47,6 +47,9 @@ struct ChatView: View {
     /// reading; `BottomFollow` holds the rules.
     @State private var follow = BottomFollow()
     @State private var scrollTracker = TranscriptScrollTracker()
+    /// Bumped to ask the transcript for the newest message from outside the
+    /// scroll reader, such as a send that never gets as far as a pending row.
+    @State private var bottomScrollRequest = 0
 
     /// The live bubble's scroll target. A constant because there is at most
     /// one per chat and it has no message id to borrow.
@@ -60,7 +63,10 @@ struct ChatView: View {
 
     /// iOS 17 lacks scroll phases and per-role anchors, so it follows with a
     /// drag gesture and a content probe instead.  `-legacy-follow` forces
-    /// that path on a newer simulator so it can be exercised.
+    /// that path on a newer simulator, but only the opening position and the
+    /// repin can be checked that way: from iOS 18 on, a simultaneous drag
+    /// gesture stops the scroll view itself from scrolling, so stopping
+    /// follow and scrolling up need a real iOS 17 runtime or device.
     private var useLegacyFollow: Bool {
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("-legacy-follow") { return true }
@@ -412,6 +418,10 @@ struct ChatView: View {
                     guard follow.isFollowing else { return }
                     scrollToBottom(proxy)
                 }
+                .onChange(of: bottomScrollRequest) { _, _ in
+                    guard follow.isFollowing else { return }
+                    scrollToBottom(proxy)
+                }
                 // Follow the text as it arrives, at most ten times a second
                 // and without animation.  Animating every token turns a
                 // smooth stream into a stutter, because each scroll
@@ -464,9 +474,11 @@ struct ChatView: View {
 
     /// Back to the newest message after layout left a following reader
     /// short of it.  Checked again here because the request was queued.
+    /// While a reply streams the size anchor does not hold on every token,
+    /// so this shares the streaming throttle rather than adding scrolls.
     private func repinToBottom(_ proxy: ScrollViewProxy) {
         guard follow.isFollowing else { return }
-        scrollToBottom(proxy)
+        followStream(proxy)
     }
 
     /// Straight to the end, with no animation.
@@ -890,8 +902,10 @@ struct ChatView: View {
         dictation.discardRecording()
         showCommandHUD = false
         // Sending is the reader asking to be at the newest message again,
-        // like Messages: the pending row is followed into view.
+        // like Messages: the pending row is followed into view.  The request
+        // covers a send that fails before that row exists.
         follow.resume()
+        bottomScrollRequest &+= 1
         SoundEffects.playSent()
         Haptics.impact(.medium)
         let threadId = current.threadId
