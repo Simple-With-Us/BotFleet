@@ -33,6 +33,11 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   const syncStep = yml.slice(yml.indexOf("name: Sync standing TestFlight testers"));
   assert.match(syncStep, /continue-on-error:\s*true/);
   assert.match(read("scripts/ios-fleet/asc-api.mjs"), /method === "ensure-standing-testers"/);
+  // Safety rails against a misconfigured secret: cap the list, reject malformed
+  // entries, and never fail the ship when the appleId lookup breaks.
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /emails\.length\s*>\s*5/);
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /EMAIL_RE\s*=/);
+  assert.match(syncStep, /appleid_rc/);
   assert.match(read("scripts/ios-fleet/ship-testflight.sh"), /sentry_redact/);
   const ci = read(".github/workflows/ci.yml");
   assert.match(ci, /\|\| 'xcode-27' \}\}/);

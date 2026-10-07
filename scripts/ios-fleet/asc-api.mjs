@@ -869,6 +869,10 @@ async function main() {
 
     // 2) Testers: add each standing email to the group, reusing tester records.
     const inGroupRes = await api("GET", `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email`);
+    if (!inGroupRes.ok) {
+      warn(`could not list testers in group "${group.attributes?.name}" (${errText(inGroupRes)}); not re-adding anyone`);
+      process.exit(3);
+    }
     const inGroup = new Set(rows(inGroupRes).map((t) => String(t.attributes?.email || "").toLowerCase()));
     for (const email of emails) {
       if (inGroup.has(email)) {

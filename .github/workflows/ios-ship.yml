@@ -209,7 +209,14 @@ jobs:
           for e in $(printf '%s' "${ASC_STANDING_TESTERS:-}" | tr ',;' '  '); do
             echo "::add-mask::${e}"
           done
+          set +e
           appleid="$(python3 -c 'import json;print(json.load(open("scripts/ios-fleet/apps.json"))["apps"]["botfleet"]["appleId"])')"
+          appleid_rc=$?
+          set -e
+          if [ "$appleid_rc" -ne 0 ] || [ -z "$appleid" ]; then
+            echo "::warning title=TestFlight standing testers::could not read the botfleet appleId from scripts/ios-fleet/apps.json (rc=${appleid_rc}); tester sync skipped.  The TestFlight upload itself succeeded."
+            exit 0
+          fi
           set +e
           node scripts/ios-fleet/asc-api.mjs ensure-standing-testers "$appleid"
           rc=$?
