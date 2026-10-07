@@ -76,6 +76,8 @@ describe("ACP to MSP", () => {
     expect(message.method).toBe("turn/start");
     expect(message.params?.input).toBe("hello");
     expect(message.params?.sessionId).toBe("sess-1");
+    translateMspToAcp({ jsonrpc: "2.0", method: "turn/completed",
+      params: { sessionId: "sess-1", terminal: "completed" } });
   });
 
   it("never leaves an unimplemented ACP request hanging", () => {
@@ -128,7 +130,7 @@ describe("MSP to ACP", () => {
     const [completed] = translateMspToAcp({
       jsonrpc: "2.0",
       method: "turn/completed",
-      params: { sessionId: "sess-1", turnId: "t1", terminal: true, error: null },
+      params: { sessionId: "sess-1", turnId: "t1", terminal: "completed", error: null },
     });
     expect(completed.id).toBe(20);
     expect(completed.result?.stopReason).toBe("end_turn");
@@ -139,13 +141,36 @@ describe("MSP to ACP", () => {
     const [first] = translateMspToAcp({
       jsonrpc: "2.0",
       method: "turn/completed",
-      params: { sessionId: "s", turnId: "t", terminal: true, error: { code: 1, message: "boom" } },
+      params: { sessionId: "s", turnId: "t", terminal: "failed", error: { code: 1, message: "boom" } },
     });
     expect(first.result?.stopReason).toBe("refusal");
     // A second terminal event must not answer a prompt nobody is holding.
     expect(
-      translateMspToAcp({ jsonrpc: "2.0", method: "turn/completed", params: { sessionId: "s", terminal: true } }),
+      translateMspToAcp({ jsonrpc: "2.0", method: "turn/completed", params: { sessionId: "s", terminal: "completed" } }),
     ).toEqual([]);
+  });
+
+  it("rejects a second prompt without orphaning or cancelling the first", () => {
+    translateAcpToMsp(acpPrompt(901));
+    const [rejected] = translateAcpToMsp(acpPrompt(902));
+    expect(rejected.id).toBe(902);
+    expect(rejected.error?.code).toBe(-32600);
+    expect(rejected.method).toBeUndefined();
+    const [completed] = translateMspToAcp({ jsonrpc: "2.0", method: "turn/completed",
+      params: { sessionId: "sess-1", terminal: "completed" } });
+    expect(completed.id).toBe(901);
+    expect(completed.result?.stopReason).toBe("end_turn");
+  });
+
+  it.each([
+    ["cancelled", "cancelled"],
+    ["failed", "refusal"],
+  ] as const)("maps MSP %s without an error object to ACP %s", (terminal, stopReason) => {
+    translateAcpToMsp(acpPrompt(903));
+    const [completed] = translateMspToAcp({ jsonrpc: "2.0", method: "turn/completed",
+      params: { sessionId: "sess-1", terminal } });
+    expect(completed.id).toBe(903);
+    expect(completed.result?.stopReason).toBe(stopReason);
   });
 
   it("maps an item/delta onto an assistant or reasoning chunk by field", () => {

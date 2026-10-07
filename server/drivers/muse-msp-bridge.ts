@@ -137,7 +137,7 @@ interface RpcParams {
   choiceId?: string;
   feedback?: string;
   turnId?: string;
-  terminal?: boolean;
+  terminal?: "completed" | "failed" | "cancelled";
   itemId?: string;
   availableChoices?: ApprovalChoice[];
   toolName?: string;
@@ -399,6 +399,14 @@ export function translateAcpToMsp(message: JsonRpcMessage): JsonRpcMessage[] {
       ];
 
     case "session/prompt": {
+      // Keep the existing request bound to its turn.  Cancelling it here would
+      // let that turn's completion answer a newer request.
+      if (pendingPrompt) {
+        if (message.id === undefined || message.id === null) return [];
+        return [{ jsonrpc: "2.0", id: message.id, error: {
+          code: -32600, message: "muse bridge: a session/prompt is already pending",
+        } }];
+      }
       const prompt = params.prompt ?? [];
       const text = prompt
         .map((block) => block.text ?? "")
@@ -496,8 +504,10 @@ export function translateMspToAcp(message: JsonRpcMessage): JsonRpcMessage[] {
       if (!pendingPrompt) return [];
       const { id } = pendingPrompt;
       pendingPrompt = null;
-      const errored = Boolean(params.error);
-      return [{ jsonrpc: "2.0", id, result: { stopReason: errored ? "refusal" : "end_turn" } }];
+      // MSP completion is a terminal record, not a boolean checkpoint.
+      const stopReason = params.terminal === "cancelled" ? "cancelled"
+        : params.terminal === "failed" || params.error ? "refusal" : "end_turn";
+      return [{ jsonrpc: "2.0", id, result: { stopReason } }];
     }
 
     case "item/delta": {
@@ -798,7 +808,11 @@ function main(): void {
       acknowledgePermission(parsed);
       return;
     }
-    for (const outbound of translateAcpToMsp(parsed)) sendToMcp(outbound);
+    for (const outbound of translateAcpToMsp(parsed)) {
+      // Translator-generated RPC errors answer the ACP caller, not MSP.
+      if (outbound.error) out(outbound);
+      else sendToMcp(outbound);
+    }
   });
 
   // MSP in.
