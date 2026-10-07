@@ -1373,9 +1373,11 @@ struct MessageRow: View {
     /// arrival; one condition keeps the two from drifting apart.
     static func offersVoice(from bot: Bot?, hasAudio: Bool, config: ConfigStatus?) -> Bool {
         guard let bot else { return false }
+        // Read Aloud is offered by this iPhone's voice, not the Mac's.
+        let voice = bot.voice(for: .iphone)
         return hasAudio
-            || PersonalVoiceContract.isPersonalVoice(bot.voice)
-            || config?.canSpeak(agentVoice: bot.voice) == true
+            || PersonalVoiceContract.isPersonalVoice(voice)
+            || config?.canSpeak(agentVoice: voice) == true
     }
 
     private var senderDriverKind: String? {

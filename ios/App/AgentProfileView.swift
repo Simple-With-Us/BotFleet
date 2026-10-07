@@ -17,7 +17,10 @@ struct AgentProfileView: View {
     @State private var description: String
     @State private var notifications: Bool
     @State private var crop: AvatarCrop
-    @State private var voice: String
+    /// The voice each device actually uses (`Bot.voice(for:)`).  A save
+    /// turns these back into the shared voice plus overrides.
+    @State private var iphoneVoice: String
+    @State private var macVoice: String
     @State private var speechDevices: Set<String>
     @State private var instanceId: String
     @State private var modelId: String
@@ -50,7 +53,8 @@ struct AgentProfileView: View {
         _description = State(initialValue: bot.description)
         _notifications = State(initialValue: bot.notifications)
         _crop = State(initialValue: bot.avatarCrop ?? .mascot)
-        _voice = State(initialValue: bot.voice ?? "")
+        _iphoneVoice = State(initialValue: bot.voice(for: .iphone) ?? "")
+        _macVoice = State(initialValue: bot.voice(for: .mac) ?? "")
         _speechDevices = State(initialValue: Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : [])))
         _instanceId = State(initialValue: bot.modelSelection.instanceId)
         _modelId = State(initialValue: bot.modelSelection.model)
@@ -69,9 +73,34 @@ struct AgentProfileView: View {
     private var imageGenerationReady: Bool { config?.imageGen?.configured == true }
     private var voiceConfigured: Bool { config?.isTTSConfigured == true }
     private var hasWorkspaceDefaultVoice: Bool { config?.hasWorkspaceDefaultVoice == true }
-    private var isPersonalVoiceSelected: Bool { PersonalVoiceContract.isPersonalVoice(voice) }
-    private var hasAvailableVoices: Bool { voiceConfigured || !personalVoice.personalVoices.isEmpty || isPersonalVoiceSelected }
-    private var selectedVoiceCanSpeak: Bool { isPersonalVoiceSelected || config?.canSpeak(agentVoice: voice) == true }
+    private var iphoneVoiceIsPersonal: Bool { BotVoice.isPersonalVoiceId(iphoneVoice) }
+    private var macVoiceIsPersonal: Bool { BotVoice.isPersonalVoiceId(macVoice) }
+    /// The iPhone is set to a Personal Voice this iPhone does not have.
+    /// Only knowable once Personal Voice is authorized.
+    private var iphoneVoiceMissing: Bool {
+        iphoneVoiceIsPersonal && personalVoice.authorizationStatus == .authorized && !personalVoice.hasVoice(iphoneVoice)
+    }
+    private var hasAvailableVoices: Bool {
+        voiceConfigured || !personalVoice.personalVoices.isEmpty || iphoneVoiceIsPersonal || macVoiceIsPersonal
+    }
+    /// A Personal Voice speaks on its own device without the computer's
+    /// voice engine; anything else needs it.
+    private func voiceCanSpeak(_ voiceId: String, with config: ConfigStatus?) -> Bool {
+        BotVoice.isPersonalVoiceId(voiceId) || config?.canSpeak(agentVoice: voiceId) == true
+    }
+    private var iphoneVoiceCanSpeak: Bool { voiceCanSpeak(iphoneVoice, with: config) }
+    private var macVoiceCanSpeak: Bool { voiceCanSpeak(macVoice, with: config) }
+    /// Hosted voices only.  Personal Voices come from the device itself.
+    private var hostedVoices: [Voice] { voices.filter { !BotVoice.isPersonalVoiceId($0.id) } }
+    /// DEBUG `-store-preview -preview-voice`: the voice section comes first,
+    /// for a screenshot of the two pickers.
+    private static var voiceSectionFirst: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-preview-voice")
+        #else
+        false
+        #endif
+    }
     private var voiceProvider: VoiceProvider { config?.voiceProvider ?? .minimax }
 
     private var unavailableVoiceLabel: String {
@@ -117,6 +146,8 @@ struct AgentProfileView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if Self.voiceSectionFirst { voiceSection }
+
                 Section {
                     HStack {
                         Spacer()
@@ -275,7 +306,7 @@ struct AgentProfileView: View {
                 computersSection
                 workingDirectorySection
 
-                voiceSection
+                if !Self.voiceSectionFirst { voiceSection }
 
                 Section("Speech to text") {
                     Label("Apple on-device dictation", systemImage: "waveform")
@@ -355,8 +386,11 @@ struct AgentProfileView: View {
                     instances = profileEngines(from: rawInstances)
                 }
                 instancesLoaded = true
-                if let loadedConfig, !loadedConfig.canSpeak(agentVoice: voice) {
-                    speechDevices.removeAll()
+                // Each device is judged by its own voice.  A Personal Voice
+                // never turns the other device off.
+                if let loadedConfig {
+                    if !voiceCanSpeak(iphoneVoice, with: loadedConfig) { speechDevices.remove("iphone") }
+                    if !voiceCanSpeak(macVoice, with: loadedConfig) { speechDevices.remove("mac") }
                 }
             }
             .onChange(of: session.cachedInstances) { _, roster in
@@ -368,14 +402,6 @@ struct AgentProfileView: View {
             .onChange(of: photo) { _, item in
                 guard let item else { return }
                 Task { await upload(item) }
-            }
-            .onChange(of: voice) { _, newVoice in
-                if PersonalVoiceContract.isPersonalVoice(newVoice) {
-                    if !speechDevices.contains("iphone") {
-                        speechDevices.insert("iphone")
-                    }
-                    speechDevices.remove("mac")
-                }
             }
         }
     }
@@ -445,7 +471,21 @@ struct AgentProfileView: View {
     }
 
     private func profilePatch() -> BotProfilePatch {
-        let savedDevices = config.map { $0.canSpeak(agentVoice: voice) ? speechDevices : [] } ?? speechDevices
+        let savedDevices = config.map { loaded in
+            speechDevices.filter { device in
+                switch device {
+                case "iphone": return voiceCanSpeak(iphoneVoice, with: loaded)
+                case "mac": return voiceCanSpeak(macVoice, with: loaded)
+                default: return true
+                }
+            }
+        } ?? speechDevices
+        let voiceEdit = BotVoiceEdit.plan(
+            sharedVoice: baseline.sharedVoice,
+            voices: baseline.voices,
+            iphone: iphoneVoice,
+            mac: macVoice
+        )
         let newModelSelection = ModelSelection(
             instanceId: instanceId,
             model: modelId,
@@ -465,7 +505,8 @@ struct AgentProfileView: View {
                 ? nil : description.trimmingCharacters(in: .whitespacesAndNewlines),
             notifications: notifications == baseline.notifications ? nil : notifications,
             avatarCrop: crop == baseline.crop ? nil : crop,
-            voice: voice == baseline.voice ? nil : voice,
+            voice: voiceEdit.voice,
+            voices: voiceEdit.voices,
             speechDevices: savedDevices == baseline.speechDevices ? nil : ["mac", "iphone"].filter { savedDevices.contains($0) },
             modelSelection: newModelSelection == baseline.modelSelection ? nil : newModelSelection,
             maxToolRounds: maxToolRoundsPatch,
@@ -580,8 +621,13 @@ struct AgentProfileView: View {
     private var voiceSection: some View {
         Section {
             if hasAvailableVoices {
-                Picker("Voice", selection: $voice) {
-                    voicePickerOptions
+                Picker("Voice on This iPhone", selection: $iphoneVoice) {
+                    iphoneVoiceOptions
+                }
+                if iphoneVoiceMissing {
+                    Label("That Personal Voice is not on this iPhone.\u{00A0} Choose a voice for this iPhone.", systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 if personalVoice.authorizationStatus == .notDetermined {
                     Button {
@@ -597,23 +643,31 @@ struct AgentProfileView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+                Picker("Voice on Mac", selection: $macVoice) {
+                    macVoiceOptions
+                }
+                if macVoiceIsPersonal {
+                    Text(macPersonalVoiceReason)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 Toggle("Play on Mac", isOn: Binding(
                     get: { speechDevices.contains("mac") },
                     set: { if $0 { speechDevices.insert("mac") } else { speechDevices.remove("mac") } }
                 ))
-                .disabled(!selectedVoiceCanSpeak || isPersonalVoiceSelected)
+                .disabled(!macVoiceCanSpeak)
                 Toggle("Play on iPhone (while app is open)", isOn: Binding(
                     get: { speechDevices.contains("iphone") },
                     set: { if $0 { speechDevices.insert("iphone") } else { speechDevices.remove("iphone") } }
                 ))
-                .disabled(!selectedVoiceCanSpeak)
+                .disabled(!iphoneVoiceCanSpeak)
                 Button("Preview Voice", systemImage: "speaker.wave.2") {
                     Task { await previewVoice() }
                 }
-                .disabled(busy || !selectedVoiceCanSpeak)
+                .disabled(busy || !iphoneVoiceCanSpeak)
 
-                if !hasWorkspaceDefaultVoice, voice.isEmpty {
-                    Label("Pick a voice for this agent before enabling speech.", systemImage: "info.circle")
+                if !hasWorkspaceDefaultVoice, iphoneVoice.isEmpty || macVoice.isEmpty {
+                    Label("Pick a voice for each device before turning on speech.", systemImage: "info.circle")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -633,29 +687,41 @@ struct AgentProfileView: View {
         } header: {
             Text("Voice")
         } footer: {
-            if isPersonalVoiceSelected {
-                Text("This agent speaks aloud using Apple Personal Voice directly on this device.  No audio or voice data is sent over the network.")
-            } else if !voiceConfigured {
+            if !voiceConfigured && !iphoneVoiceIsPersonal && !macVoiceIsPersonal {
                 Text(unavailableVoiceGuidance)
             } else if !hasWorkspaceDefaultVoice {
                 Text(missingDefaultVoiceGuidance)
             } else {
-                Text("The voice choice belongs to this agent. Workspace default uses the shared voice selected on your computer.")
+                Text("Each device speaks with its own voice.\u{00A0} A Personal Voice stays on the device that made it and speaks there, with no audio sent over the network.\u{00A0} MiniMax voices work on both, and Workspace default uses the voice selected on your computer.")
             }
         }
     }
 
     @ViewBuilder
-    private var voicePickerOptions: some View {
+    private var defaultVoiceOption: some View {
         if hasWorkspaceDefaultVoice {
             Text("Workspace default").tag("")
         } else {
-            Text("Choose an agent voice").tag("").disabled(true)
+            Text("Choose a voice").tag("").disabled(true)
         }
-        if !voice.isEmpty,
-           !voices.contains(where: { $0.id == voice }),
-           !personalVoice.personalVoiceOptions.contains(where: { $0.id == voice }) {
-            Text(isPersonalVoiceSelected ? "Personal Voice (\(PersonalVoiceContract.rawIdentifier(voice)))" : "Current agent voice").tag(voice)
+    }
+
+    /// This iPhone's Personal Voices and the computer's hosted voices.
+    @ViewBuilder
+    private var iphoneVoiceOptions: some View {
+        defaultVoiceOption
+        if !iphoneVoice.isEmpty,
+           !hostedVoices.contains(where: { $0.id == iphoneVoice }),
+           !personalVoice.personalVoiceOptions.contains(where: { $0.id == iphoneVoice }) {
+            if iphoneVoiceIsPersonal {
+                // Another device's Personal Voice: shown so the current value
+                // reads, but greyed, because it cannot be chosen here.
+                Text(personalVoice.authorizationStatus == .authorized ? "Personal Voice from another device" : "Personal Voice")
+                    .tag(iphoneVoice)
+                    .disabled(true)
+            } else {
+                Text("Current voice").tag(iphoneVoice)
+            }
         }
         if !personalVoice.personalVoiceOptions.isEmpty {
             Section("Apple Personal Voice") {
@@ -664,13 +730,38 @@ struct AgentProfileView: View {
                 }
             }
         }
-        if !voices.isEmpty {
+        if !hostedVoices.isEmpty {
             Section(personalVoice.personalVoiceOptions.isEmpty ? "Voices" : "Server & System Voices") {
-                ForEach(voices) { option in
+                ForEach(hostedVoices) { option in
                     Text(option.label).tag(option.id)
                 }
             }
         }
+    }
+
+    /// Hosted voices only: a Personal Voice is chosen on the device that
+    /// has it, so the Mac's own is shown greyed and this iPhone's are never
+    /// offered for the Mac.
+    @ViewBuilder
+    private var macVoiceOptions: some View {
+        defaultVoiceOption
+        if macVoiceIsPersonal {
+            Text(personalVoice.hasVoice(macVoice) ? "This iPhone's Personal Voice" : "Personal Voice on Mac")
+                .tag(macVoice)
+                .disabled(true)
+        } else if !macVoice.isEmpty, !hostedVoices.contains(where: { $0.id == macVoice }) {
+            Text("Current voice").tag(macVoice)
+        }
+        ForEach(hostedVoices) { option in
+            Text(option.label).tag(option.id)
+        }
+    }
+
+    private var macPersonalVoiceReason: String {
+        if personalVoice.hasVoice(macVoice) {
+            return "This iPhone's Personal Voice cannot speak on the Mac.\u{00A0} Choose a voice for the Mac here, or a Mac Personal Voice on the Mac."
+        }
+        return "Personal Voice from your Mac.\u{00A0} Choose it on the Mac."
     }
 
     /// Shared with `shared/model-limits.ts` `MAX_MODEL_FALLBACKS`.  Only the Add
@@ -819,23 +910,24 @@ struct AgentProfileView: View {
         }
     }
 
+    /// Previews the voice this iPhone speaks with.
     private func previewVoice() async {
-        guard selectedVoiceCanSpeak else {
+        guard iphoneVoiceCanSpeak else {
             session.actionError = "Pick an agent voice or configure a workspace default on your computer first."
             return
         }
         busy = true
         defer { busy = false }
-        if PersonalVoiceContract.isPersonalVoice(voice) {
+        if iphoneVoiceIsPersonal {
             let sampleText = "Hello! This is a preview of your Personal Voice with BotFleet."
             do {
-                try await PersonalVoiceService.shared.speak(text: sampleText, voiceId: voice)
+                try await PersonalVoiceService.shared.speak(text: sampleText, voiceId: iphoneVoice)
             } catch {
                 session.actionError = error.localizedDescription
             }
             return
         }
-        guard let data = await session.previewVoice(voice, for: current) else { return }
+        guard let data = await session.previewVoice(iphoneVoice, for: current) else { return }
         do {
             let audioSession = AVAudioSession.sharedInstance()
             try audioSession.setCategory(.playback, mode: .spokenAudio)
@@ -887,7 +979,8 @@ struct AgentProfileView: View {
         description = bot.description
         notifications = bot.notifications
         crop = bot.avatarCrop ?? .mascot
-        voice = bot.voice ?? ""
+        iphoneVoice = bot.voice(for: .iphone) ?? ""
+        macVoice = bot.voice(for: .mac) ?? ""
         speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         instanceId = bot.modelSelection.instanceId
         modelId = bot.modelSelection.model
@@ -909,7 +1002,9 @@ private struct ProfileFormSnapshot {
     var description: String
     var notifications: Bool
     var crop: AvatarCrop
-    var voice: String
+    /// The stored shape, which a save plans its voice changes against.
+    var sharedVoice: String?
+    var voices: BotVoices?
     var speechDevices: Set<String>
     var modelSelection: ModelSelection
     var maxToolRoundsText: String
@@ -925,7 +1020,8 @@ private struct ProfileFormSnapshot {
         description = bot.description
         notifications = bot.notifications
         crop = bot.avatarCrop ?? .mascot
-        voice = bot.voice ?? ""
+        sharedVoice = bot.voice
+        voices = bot.voices
         speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         modelSelection = bot.modelSelection
         maxToolRoundsText = bot.maxToolRounds.map(String.init) ?? ""

@@ -107,6 +107,20 @@ final class Session: ObservableObject {
     private var voiceTask: Task<Void, Never>?
     private var voiceGeneration = UUID()
     private var voicePlayer: AVAudioPlayer?
+    /// Completion of the hosted clip that is playing.  Held so stopVoice()
+    /// can end the wait: AVAudioPlayer.stop() sends no delegate callback.
+    private var voicePlayback: ClipPlayback?
+    /// The next hosted clip, fetched while the current one plays.
+    private var voicePrefetch: Task<Data, Error>?
+    /// Bots (and voices) already told this iPhone lacks their Personal Voice
+    /// this session.  Auto-play must not raise the same alert every reply.
+    private var personalVoiceMissingNoted: Set<String> = []
+    private var voiceAudioObservers: [NSObjectProtocol] = []
+    /// A read was playing when the current audio interruption began.
+    private var voiceInterrupted = false
+    /// DEBUG `-store-preview -preview-voice` only: voices for a profile
+    /// screenshot with no paired computer.  Nil everywhere else.
+    private var previewVoiceOptions: [Voice]?
     @Published private(set) var speakingMessageId: String?
 
     private var client: CompanionClient?
@@ -258,6 +272,7 @@ final class Session: ObservableObject {
 
     init() {
         _ = NotificationCoordinator.shared
+        observeVoiceAudioSession()
         NotificationCoordinator.shared.responseHandler = { [weak self] target in
             Task { @MainActor in await self?.openNotification(target) }
         }
@@ -275,8 +290,11 @@ final class Session: ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("-store-preview"),
            let url = Bundle.main.url(forResource: "StorePreview", withExtension: "json"),
            let data = try? Data(contentsOf: url),
-           let fleet = try? JSONDecoder().decode(Fleet.self, from: data) {
+           var fleet = try? JSONDecoder().decode(Fleet.self, from: data) {
             connection = Connection(name: "Preview Mac", host: "preview.tailnet.ts.net", port: 8810)
+            if ProcessInfo.processInfo.arguments.contains("-preview-voice") {
+                seedVoicePreview(&fleet)
+            }
             state.hydrate(fleet)
             // StorePreview bots all select instanceId "preview"; seed the
             // driver map so the chat-header provider mark appears in the
@@ -300,6 +318,25 @@ final class Session: ObservableObject {
     /// had delivered a frame.  `state` is otherwise written only here.
     func debugMutateState(_ body: (inout CompanionState) -> Void) {
         body(&state)
+    }
+
+    /// `-preview-voice`: the first preview bot speaks a MiniMax voice on this
+    /// iPhone and a Mac Personal Voice on the Mac, with the voice engine
+    /// configured, so the profile's two voice pickers can be screenshotted.
+    private func seedVoicePreview(_ fleet: inout Fleet) {
+        guard !fleet.bots.isEmpty else { return }
+        fleet.bots[0].voice = "English_Graceful_Lady"
+        fleet.bots[0].voices = BotVoices(mac: "personal:com.apple.speech.personalvoice.preview-mac")
+        fleet.bots[0].speechDevices = ["mac", "iphone"]
+        config = try? JSONDecoder().decode(
+            ConfigStatus.self,
+            from: Data(#"{"tts":{"configured":true,"voice":"English_Graceful_Lady","provider":"minimax"}}"#.utf8)
+        )
+        previewVoiceOptions = [
+            Voice(id: "English_Graceful_Lady", label: "Graceful Lady"),
+            Voice(id: "English_Persuasive_Man", label: "Persuasive Man"),
+            Voice(id: "English_Wise_Woman", label: "Wise Woman"),
+        ]
     }
 #endif
 
@@ -1804,7 +1841,7 @@ final class Session: ObservableObject {
     }
 
     func voiceOptions() async -> [Voice] {
-        guard let client else { return [] }
+        guard let client else { return previewVoiceOptions ?? [] }
         do { return try await client.voices() }
         catch { recordActionError(error); return [] }
     }
@@ -1814,60 +1851,273 @@ final class Session: ObservableObject {
         voiceGeneration = UUID()
         voiceTask?.cancel()
         voiceTask = nil
+        voicePrefetch?.cancel()
+        voicePrefetch = nil
         voicePlayer?.stop()
         voicePlayer = nil
+        voicePlayback?.finish(false)
+        voicePlayback = nil
         PersonalVoiceService.shared.stop()
         speakingMessageId = nil
         if wasPlaying { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
     }
 
+    /// Read a bot reply aloud with the voice this bot uses on the iPhone.
+    ///
+    /// The harness projects the reply for speech either way.  A Personal
+    /// Voice speaks those utterances here; a hosted (MiniMax) voice plays the
+    /// clips progressively, the first while the next is fetched, so a long
+    /// reply starts in seconds instead of waiting on every clip (which the
+    /// companion's 30-second header deadline used to turn into a 504).
     func playVoice(_ message: Message, threadId: String) {
         if speakingMessageId == message.id { stopVoice(); return }
         stopVoice()
-        let botVoice = state.bot(forThread: threadId)?.voice
-        if let botVoice, PersonalVoiceContract.isPersonalVoice(botVoice) {
-            guard let text = message.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                speakingMessageId = nil
-                return
-            }
-            speakingMessageId = message.id
-            let generation = voiceGeneration
-            voiceTask = Task { [weak self] in
-                do {
-                    try await PersonalVoiceService.shared.speak(text: text, voiceId: botVoice)
-                } catch {
-                    if !Task.isCancelled { self?.recordActionError(error) }
-                }
-                if self?.voiceGeneration == generation { self?.stopVoice() }
-            }
-            return
-        }
-        guard let client else { return }
+        let bot = state.bot(forThread: threadId)
+        let voiceId = bot?.voice(for: .iphone)
+        let personal = BotVoice.isPersonalVoiceId(voiceId)
+        // A Personal Voice can still read from the local projection without
+        // a client; a hosted voice cannot.
+        guard personal || client != nil else { return }
         speakingMessageId = message.id
         let generation = voiceGeneration
+        let client = self.client
         voiceTask = Task { [weak self] in
-            do {
-                let clips = try await client.messageVoice(threadId: threadId, messageId: message.id)
-                try Task.checkCancellation()
-                let audioSession = AVAudioSession.sharedInstance()
-                try audioSession.setCategory(.playback, mode: .spokenAudio)
-                try audioSession.setActive(true)
-                for index in clips.indices {
-                    let data = try await client.voiceClip(threadId: threadId, messageId: message.id, index: index)
-                    try Task.checkCancellation()
-                    let player = try AVAudioPlayer(data: data)
-                    guard player.prepareToPlay(), player.play() else { throw APIError.transport("Voice clip could not be played.") }
-                    self?.voicePlayer = player
-                    while player.isPlaying && !Task.isCancelled {
-                        try await Task.sleep(nanoseconds: 100_000_000)
-                    }
-                    try Task.checkCancellation()
-                }
-            } catch {
-                if !Task.isCancelled { self?.recordActionError(error) }
-            }
+            await self?.readAloud(message, threadId: threadId, botId: bot?.id, voiceId: voiceId, client: client)
             if self?.voiceGeneration == generation { self?.stopVoice() }
         }
+    }
+
+    private func readAloud(
+        _ message: Message,
+        threadId: String,
+        botId: String?,
+        voiceId: String?,
+        client: CompanionClient?
+    ) async {
+        let engine: VoiceTelemetry.Engine = BotVoice.isPersonalVoiceId(voiceId) ? .personal : .hosted
+        do {
+            if let voiceId, engine == .personal {
+                try await speakOnDevice(message, threadId: threadId, botId: botId, voiceId: voiceId, client: client)
+                return
+            }
+            guard let client else { return }
+            let answer: MessageVoice
+            do {
+                answer = try await client.messageVoice(
+                    threadId: threadId, messageId: message.id, device: .iphone, progressive: true
+                )
+            } catch {
+                if !isCancellation(error) { VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .hosted) }
+                throw error
+            }
+            try Task.checkCancellation()
+            if answer.speaksOnDevice {
+                // The harness resolved a Personal Voice this phone did not
+                // know about (a workspace default, or a newer choice).
+                let segments = answer.utterances.map { SpeechProjection.segments(fromUtterances: $0) }
+                    ?? SpeechProjection.segments(fromReply: message.text ?? "")
+                try await speakPersonal(segments, voiceId: answer.voice ?? voiceId ?? "", botId: botId)
+            } else {
+                try await playHostedClips(answer, threadId: threadId, messageId: message.id, client: client)
+            }
+        } catch {
+            guard !isCancellation(error), !Task.isCancelled else { return }
+            VoiceTelemetry.playbackFailed(error, engine: engine)
+            recordActionError(error)
+        }
+    }
+
+    /// A Personal Voice reads the harness's projection of the reply (no
+    /// markdown, URLs, or code), falling back to the same rules on this
+    /// phone only when the computer cannot answer.  Speaking on the device
+    /// never bills, so a reply over the hosted clip limit (413) is still
+    /// read in full from the local projection.
+    private func speakOnDevice(
+        _ message: Message,
+        threadId: String,
+        botId: String?,
+        voiceId: String,
+        client: CompanionClient?
+    ) async throws {
+        var segments: [SpeechSegment]?
+        var speakWith = voiceId
+        if let client {
+            do {
+                let answer = try await client.messageVoice(
+                    threadId: threadId, messageId: message.id, device: .iphone, progressive: true
+                )
+                try Task.checkCancellation()
+                guard answer.speaksOnDevice else {
+                    // The computer resolved a hosted voice for this iPhone;
+                    // this phone's copy of the bot is older.  Play its clips.
+                    try await playHostedClips(answer, threadId: threadId, messageId: message.id, client: client)
+                    return
+                }
+                segments = answer.utterances.map { SpeechProjection.segments(fromUtterances: $0) }
+                if let resolved = answer.voice, BotVoice.isPersonalVoiceId(resolved) { speakWith = resolved }
+            } catch {
+                if isCancellation(error) || Task.isCancelled { throw error }
+                VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .personal)
+            }
+        }
+        try await speakPersonal(
+            segments ?? SpeechProjection.segments(fromReply: message.text ?? ""),
+            voiceId: speakWith,
+            botId: botId
+        )
+    }
+
+    private func speakPersonal(_ segments: [SpeechSegment], voiceId: String, botId: String?) async throws {
+        let service = PersonalVoiceService.shared
+        if service.authorizationStatus == .notDetermined {
+            _ = await service.requestAuthorization()
+            try Task.checkCancellation()
+        }
+        if !service.hasVoice(voiceId) { notePersonalVoiceMissing(botId: botId, voiceId: voiceId) }
+        _ = try await service.speak(segments: segments, voiceId: voiceId)
+    }
+
+    /// Say once per bot and voice why a different voice is reading, and
+    /// where to fix it.  Playback goes on with this iPhone's own voice.
+    private func notePersonalVoiceMissing(botId: String?, voiceId: String) {
+        guard personalVoiceMissingNoted.insert("\(botId ?? "")|\(voiceId)").inserted else { return }
+        VoiceTelemetry.personalVoiceMissing()
+        let service = PersonalVoiceService.shared
+        if service.authorizationStatus != .authorized {
+            actionError = "BotFleet cannot use Personal Voice on this iPhone, so the standard voice is reading instead.\u{00A0} Allow it in Settings > Accessibility > Personal Voice, or choose another voice for this iPhone in the bot's profile."
+        } else if service.personalVoices.isEmpty {
+            actionError = "This bot's iPhone voice is a Personal Voice from another device, so the standard voice is reading instead.\u{00A0} Choose a voice for this iPhone in the bot's profile."
+        } else {
+            actionError = "This bot's iPhone voice is a Personal Voice from another device, so your Personal Voice on this iPhone is reading instead.\u{00A0} Choose a voice for this iPhone in the bot's profile."
+        }
+    }
+
+    /// Plays every clip of a hosted reply in order, fetching the next clip
+    /// while the current one plays.  Walks `0..<total`, not the clips that
+    /// were ready when the harness answered.
+    private func playHostedClips(
+        _ answer: MessageVoice,
+        threadId: String,
+        messageId: String,
+        client: CompanionClient
+    ) async throws {
+        let total = answer.clipCount
+        guard total > 0 else { return }
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playback, mode: .spokenAudio)
+        try audioSession.setActive(true)
+        var next = prefetchClip(0, threadId: threadId, messageId: messageId, client: client)
+        for index in 0..<total {
+            let data: Data
+            do {
+                data = try await next.value
+            } catch {
+                if !isCancellation(error) { VoiceTelemetry.audioRequestFailed(error, stage: "clip", engine: .hosted) }
+                throw error
+            }
+            try Task.checkCancellation()
+            if index + 1 < total {
+                next = prefetchClip(index + 1, threadId: threadId, messageId: messageId, client: client)
+            }
+            try await playClip(data)
+        }
+    }
+
+    private func prefetchClip(_ index: Int, threadId: String, messageId: String, client: CompanionClient) -> Task<Data, Error> {
+        let task = Task { [weak self] () async throws -> Data in
+            guard let self else { throw CancellationError() }
+            return try await self.fetchClip(index, threadId: threadId, messageId: messageId, client: client)
+        }
+        voicePrefetch = task
+        return task
+    }
+
+    /// One clip, with the bounded retries the harness asks for: a clip still
+    /// being made answers 425, and a job the harness forgot answers 404 and
+    /// is resumed with one more progressive POST.
+    private func fetchClip(_ index: Int, threadId: String, messageId: String, client: CompanionClient) async throws -> Data {
+        var policy = VoiceClipFetchPolicy()
+        while true {
+            do {
+                return try await client.voiceClip(threadId: threadId, messageId: messageId, index: index, device: .iphone)
+            } catch {
+                if isCancellation(error) { throw error }
+                switch policy.decide(statusCode: (error as? APIError)?.statusCode) {
+                case let .retry(after):
+                    try await Task.sleep(nanoseconds: UInt64(after * 1_000_000_000))
+                case .resume:
+                    _ = try await client.messageVoice(threadId: threadId, messageId: messageId, device: .iphone, progressive: true)
+                case .fail:
+                    throw error
+                }
+            }
+        }
+    }
+
+    /// Plays one clip to its end.  Waits on the player's delegate rather
+    /// than polling isPlaying, which an interruption also turns false.
+    private func playClip(_ data: Data) async throws {
+        let player = try AVAudioPlayer(data: data)
+        let playback = ClipPlayback()
+        player.delegate = playback
+        guard player.prepareToPlay(), player.play() else { throw APIError.transport("Voice clip could not be played.") }
+        voicePlayer = player
+        voicePlayback = playback
+        let finished = await withTaskCancellationHandler {
+            await playback.wait()
+        } onCancel: {
+            Task { @MainActor in playback.finish(false) }
+        }
+        if voicePlayback === playback {
+            voicePlayback = nil
+            voicePlayer = nil
+        }
+        try Task.checkCancellation()
+        guard finished else { throw APIError.transport("Voice clip could not be played.") }
+    }
+
+    /// Calls, Siri, and alarms pause playback; unplugged headphones stop it.
+    /// A Personal Voice read also handles these in PersonalVoiceService.
+    private func observeVoiceAudioSession() {
+        let center = NotificationCenter.default
+        voiceAudioObservers.append(center.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let optionsRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
+            MainActor.assumeIsolated { self?.handleVoiceInterruption(typeRaw: typeRaw, optionsRaw: optionsRaw) }
+        })
+        voiceAudioObservers.append(center.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let reasonRaw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            MainActor.assumeIsolated {
+                guard let self, self.speakingMessageId != nil,
+                      reasonRaw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:)) == .oldDeviceUnavailable
+                else { return }
+                self.stopVoice()
+            }
+        })
+    }
+
+    private func handleVoiceInterruption(typeRaw: UInt?, optionsRaw: UInt?) {
+        guard let type = typeRaw.flatMap(AVAudioSession.InterruptionType.init(rawValue:)) else { return }
+        if type == .began {
+            voiceInterrupted = speakingMessageId != nil
+            return
+        }
+        // Only an interruption a read saw begin; a stale end must not stop
+        // a read that started after it.
+        guard type == .ended, voiceInterrupted else { return }
+        voiceInterrupted = false
+        guard speakingMessageId != nil else { return }
+        // The system already paused the player when the interruption began.
+        guard AVAudioSession.InterruptionOptions(rawValue: optionsRaw ?? 0).contains(.shouldResume) else {
+            stopVoice()
+            return
+        }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        voicePlayer?.play()
     }
 
     func playRecording(_ message: Message, threadId: String) {
@@ -1925,7 +2175,7 @@ final class Session: ObservableObject {
                 break
             }
         }
-        guard let client else { return nil }
+        guard let client else { return previewVoiceOptions == nil ? nil : config }
         let status = try? await client.config()
         guard let status else { return nil }
         guard settingsUpdateGeneration == generation else { return nil }
@@ -3128,5 +3378,35 @@ extension CompanionState {
         case .screen: return "Screenshot"
         case .unknown: return last.text ?? ""
         }
+    }
+}
+
+/// Turns AVAudioPlayer's completion callback into something a voice task can
+/// await.  `finish` is idempotent, so a stop and a late callback cannot both
+/// resume the waiter.
+@MainActor
+private final class ClipPlayback: NSObject, AVAudioPlayerDelegate {
+    private var result: Bool?
+    private var waiter: CheckedContinuation<Bool, Never>?
+
+    func wait() async -> Bool {
+        if let result { return result }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func finish(_ succeeded: Bool) {
+        guard result == nil else { return }
+        result = succeeded
+        let waiter = waiter
+        self.waiter = nil
+        waiter?.resume(returning: succeeded)
+    }
+
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor in self.finish(flag) }
+    }
+
+    nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        Task { @MainActor in self.finish(false) }
     }
 }
