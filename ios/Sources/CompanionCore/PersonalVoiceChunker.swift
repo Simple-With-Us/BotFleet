@@ -3,16 +3,18 @@
 //  CompanionCore
 //
 //  Sentence and clause chunking for Apple Personal Voice synthesis.
-//  Enforces utterance length boundaries (600-800 characters) across
-//  macOS desktop and iOS companion speech paths to prevent synthesis
-//  cancellations and buffer overruns on long bot replies.
+//  Keeps each utterance near the harness's own 320-character utterance cap
+//  (`toUtterances` in server/tts/speech-text.ts), because one long utterance
+//  is where Personal Voice drops out, and a cancel then costs the least.
+//  Paragraph boundaries are handled one level up, in `SpeechProjection`.
 //
 
 import Foundation
 
 public enum PersonalVoiceChunker {
-    /// Default target maximum character length per chunk (600-800 character window).
-    public static let defaultMaxCharacters = 750
+    /// Default target maximum character length per chunk, matching the
+    /// harness's utterance cap.
+    public static let defaultMaxCharacters = 320
 
     /// Absolute maximum character ceiling.
     public static let absoluteMaxCharacters = 900
@@ -24,7 +26,7 @@ public enum PersonalVoiceChunker {
     ///
     /// - Parameters:
     ///   - text: The input text to chunk.
-    ///   - maxCharacters: The target maximum length per chunk (defaults to 750).
+    ///   - maxCharacters: The target maximum length per chunk (defaults to 320).
     /// - Returns: An array of trimmed chunk strings suitable for sequential `AVSpeechUtterance` playback.
     public static func chunk(
         text: String,
@@ -73,6 +75,36 @@ public enum PersonalVoiceChunker {
             chunks.append(currentChunk)
         }
 
+        return chunks
+    }
+
+    /// Greedily joins already-split sentences (the harness's utterances) into
+    /// chunks of at most `maxCharacters`, so a voice keeps its prosody across
+    /// short sentences.  A sentence longer than the cap is split on its own.
+    public static func pack(
+        _ sentences: [String],
+        maxCharacters: Int = defaultMaxCharacters
+    ) -> [String] {
+        var chunks: [String] = []
+        var current = ""
+        for raw in sentences {
+            let sentence = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sentence.isEmpty else { continue }
+            let pieces = sentence.count <= maxCharacters
+                ? [sentence]
+                : chunk(text: sentence, maxCharacters: maxCharacters)
+            for piece in pieces {
+                if current.isEmpty {
+                    current = piece
+                } else if current.count + 1 + piece.count <= maxCharacters {
+                    current += " " + piece
+                } else {
+                    chunks.append(current)
+                    current = piece
+                }
+            }
+        }
+        if !current.isEmpty { chunks.append(current) }
         return chunks
     }
 
