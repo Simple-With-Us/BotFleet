@@ -53,6 +53,16 @@ final class BottomFollowTests: XCTestCase {
         XCTAssertFalse(short.isScrollable)
     }
 
+    func testGeometryFromSwiftUIsVisibleRectUnderTheChatHeader() {
+        // Recorded in the simulator after the 118pt header inset arrived:
+        // visibleRect 4851.67...5599.33 over 5695.33pt of content, and the
+        // screenshot showed the newest bubble cut off by about 96pt.
+        let sample = TranscriptScrollSample.geometry(
+            contentOffsetY: 4851.67, contentHeight: 5695.33, containerHeight: 5599.33 - 4851.67, insetTop: 118, insetBottom: 0
+        )
+        XCTAssertEqual(sample.distanceFromBottom, 96, accuracy: 0.5)
+    }
+
     func testGeometryRoundsSubPointNoise() {
         let a = TranscriptScrollSample.geometry(
             contentOffsetY: 1200.1, contentHeight: 2000, containerHeight: 800, insetTop: 0, insetBottom: 0
@@ -245,6 +255,36 @@ final class BottomFollowTests: XCTestCase {
         // reset how many messages they have missed.
         follow.leaveBottom(newestSettledId: "m12")
         XCTAssertEqual(follow.anchorMessageId, "m9")
+    }
+
+    // MARK: - Repinning
+
+    func testRepinsWhenLayoutLeavesAFollowingReaderShortOfTheBottom() {
+        let follow = BottomFollow()
+        XCTAssertTrue(follow.shouldRepin(at: sample(offset: 4851.5, distance: 96), driver: .system))
+        XCTAssertFalse(follow.shouldRepin(at: sample(offset: 4947.5, distance: 0), driver: .system))
+        XCTAssertFalse(follow.shouldRepin(at: sample(offset: 4947.5, distance: 1), driver: .system))
+    }
+
+    func testNeverRepinsAgainstTheReaderOrTheAppsOwnAnimation() {
+        let follow = BottomFollow()
+        let short = sample(offset: 4851.5, distance: 96)
+        XCTAssertFalse(follow.shouldRepin(at: short, driver: .finger))
+        XCTAssertFalse(follow.shouldRepin(at: short, driver: .momentum))
+        XCTAssertFalse(follow.shouldRepin(at: short, driver: .animation))
+    }
+
+    func testNeverRepinsAReaderWhoLeftOrATranscriptThatFits() {
+        var follow = BottomFollow()
+        XCTAssertFalse(follow.shouldRepin(at: sample(offset: 0, distance: 20, scrollable: false), driver: .system))
+        follow.leaveBottom(newestSettledId: "m9")
+        XCTAssertFalse(follow.shouldRepin(at: sample(offset: 4851.5, distance: 96), driver: .system))
+    }
+
+    func testTheAppsAnimatedScrollNeverStopsFollowing() {
+        var follow = BottomFollow()
+        follow.observe(from: sample(offset: 1200, distance: 0), to: sample(offset: 900, distance: 300), driver: .animation, newestSettledId: "m9")
+        XCTAssertTrue(follow.isFollowing)
     }
 
     // MARK: - Unseen count

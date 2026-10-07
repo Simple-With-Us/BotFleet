@@ -33,11 +33,17 @@ public struct TranscriptScrollSample: Equatable, Sendable {
         self.isScrollable = isScrollable
     }
 
-    /// Build a sample from scroll-view geometry, in the same terms UIKit and
-    /// SwiftUI's `ScrollGeometry` use: the offset is `-insetTop` at the top
-    /// of the content and `contentHeight + insetBottom - containerHeight` at
-    /// the bottom.  The chat header is a top safe-area inset, so it shows up
-    /// in `insetTop` and is not part of the readable area.
+    /// Build a sample from scroll-view geometry in UIKit's terms: the
+    /// container is the whole frame, including the parts under insets, and
+    /// the offset is `-insetTop` at the top of the content and
+    /// `contentHeight + insetBottom - containerHeight` at the bottom.  The
+    /// chat header is a top safe-area inset, so it shows up in `insetTop` and
+    /// is not part of the readable area.
+    ///
+    /// SwiftUI's `ScrollGeometry` matches this when fed `visibleRect`
+    /// (`minY` and `height`).  Its `containerSize` is not the whole frame:
+    /// it leaves out the top inset, and using it put the bottom 118pt (the
+    /// header's height) away from where it really was.
     public static func geometry(
         contentOffsetY: Double,
         contentHeight: Double,
@@ -65,8 +71,11 @@ public enum TranscriptScrollDriver: Equatable, Sendable {
     /// pulling past an edge.
     case momentum
     /// Nobody: content growth, keyboard and layout changes, the app's own
-    /// `scrollTo` calls, or a system without scroll phases (iOS 17).
+    /// unanimated `scrollTo` calls, or a system without scroll phases
+    /// (iOS 17) when no drag is under way.
     case system
+    /// The app's own animated scroll, such as Jump to Latest.
+    case animation
 }
 
 /// Per-gesture bookkeeping that turns a raw scroll phase into a driver.
@@ -93,8 +102,9 @@ public struct TranscriptScrollMotion: Equatable, Sendable {
                 reboundingFromBottom = true
             }
             return reboundingFromBottom ? .system : .momentum
-        case .finger, .system:
-            // A new touch, or the scroll came to rest: the rebound is over.
+        case .finger, .system, .animation:
+            // A new touch, the scroll came to rest, or the app took over: the
+            // rebound is over.
             reboundingFromBottom = false
             return driver
         }
@@ -143,7 +153,7 @@ public struct BottomFollow: Equatable, Sendable {
         newestSettledId: String?
     ) -> Bool {
         if isFollowing {
-            guard let previous, driver != .system, current.isScrollable else { return false }
+            guard let previous, driver == .finger || driver == .momentum, current.isScrollable else { return false }
             // Moved toward older messages and is actually above the bottom.
             // The second half matters while pulling past the bottom edge:
             // the offset falls back, but nobody left.
@@ -167,6 +177,22 @@ public struct BottomFollow: Equatable, Sendable {
             return true
         }
         return false
+    }
+
+    /// Whether to scroll back to the newest message without anyone asking.
+    ///
+    /// Following means staying on the newest message.  The anchors keep it
+    /// there as content grows, but some changes still leave it short: the
+    /// header's inset arriving after the opening position was set (measured:
+    /// 96pt short), a coast that stops just above the bottom, a composer
+    /// that grows.  When nobody is scrolling (`.system`) and the bottom is out
+    /// of view, put it back.  Never during a finger, a coast, or the app's
+    /// own animated scroll.
+    public func shouldRepin(at sample: TranscriptScrollSample, driver: TranscriptScrollDriver) -> Bool {
+        isFollowing
+            && driver == .system
+            && sample.isScrollable
+            && sample.distanceFromBottom > Self.bottomTolerance
     }
 
     /// The reader stopped scrolling.  Resting on the bottom itself counts as

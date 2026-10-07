@@ -29,9 +29,10 @@ final class TranscriptScrollTracker {
     var driver: TranscriptScrollDriver = .system
     /// Tells a fling's coast from the spring back off the bottom edge.
     var motion = TranscriptScrollMotion()
-    /// The scroll view's top inset, for the iOS 17 probe: the header plus
-    /// the status bar.  iOS 18 reads it from `ScrollGeometry` instead.
-    var insetTop: Double = 0
+    /// iOS 17: a drag is under way, as far as the drag gesture knows.
+    var dragActive = false
+    /// A scroll back to the newest message is already queued.
+    var repinScheduled = false
     /// When the transcript last followed a streaming reply.
     var lastStreamingScroll: Double?
     /// A trailing follow scroll is already scheduled.
@@ -41,18 +42,34 @@ final class TranscriptScrollTracker {
         lastSample = nil
         driver = .system
         motion = TranscriptScrollMotion()
+        dragActive = false
+        repinScheduled = false
         lastStreamingScroll = nil
         trailingScrollScheduled = false
+    }
+
+    /// Queue one scroll back to the newest message, outside the current
+    /// layout pass, however many samples ask for it.
+    func scheduleRepin(_ repin: @escaping () -> Void) {
+        guard !repinScheduled else { return }
+        repinScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.repinScheduled = false
+            repin()
+        }
     }
 }
 
 @available(iOS 18.0, *)
 extension TranscriptScrollSample {
+    /// `visibleRect` is the whole frame in content coordinates, header area
+    /// included, which is what `geometry` expects.  `containerSize` is not:
+    /// it leaves out the top inset.
     init(_ geometry: ScrollGeometry) {
         self = .geometry(
-            contentOffsetY: geometry.contentOffset.y,
+            contentOffsetY: geometry.visibleRect.minY,
             contentHeight: geometry.contentSize.height,
-            containerHeight: geometry.containerSize.height,
+            containerHeight: geometry.visibleRect.height,
             insetTop: geometry.contentInsets.top,
             insetBottom: geometry.contentInsets.bottom
         )
@@ -66,6 +83,8 @@ struct TranscriptFollowModifier: ViewModifier {
     let tracker: TranscriptScrollTracker
     let newestSettledId: String?
     let legacy: Bool
+    /// Scroll to the newest message, unanimated.
+    let repin: () -> Void
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *), !legacy {
@@ -90,6 +109,7 @@ struct TranscriptFollowModifier: ViewModifier {
                 switch phase {
                 case .tracking, .interacting: tracker.driver = .finger
                 case .decelerating: tracker.driver = .momentum
+                case .animating: tracker.driver = .animation
                 default: tracker.driver = .system
                 }
                 guard phase == .idle else { return }
@@ -98,10 +118,14 @@ struct TranscriptFollowModifier: ViewModifier {
                 if next.settled(at: sample) {
                     follow = next
                     TranscriptScrollLog.event("settled on bottom, following", sample)
+                } else if follow.shouldRepin(at: sample, driver: .system) {
+                    TranscriptScrollLog.event("settled short of bottom while following, repinning", sample)
+                    tracker.scheduleRepin(repin)
                 }
             }
             .onScrollGeometryChange(for: TranscriptScrollSample.self) { geometry in
-                TranscriptScrollSample(geometry)
+                TranscriptScrollLog.raw(geometry)
+                return TranscriptScrollSample(geometry)
             } action: { previous, current in
                 let driver = tracker.motion.classify(tracker.driver, from: previous, to: current)
                 fold(previous: previous, current: current, driver: driver)
@@ -115,16 +139,10 @@ struct TranscriptFollowModifier: ViewModifier {
             // (open at the bottom, follow growth); drop it while the reader
             // is away, so growth below them keeps their position.
             .defaultScrollAnchor(follow.isFollowing ? .bottom : nil)
-            .background {
-                Color.clear.onGeometryChange(for: Double.self) { proxy in
-                    Double(proxy.safeAreaInsets.top)
-                } action: { inset in
-                    tracker.insetTop = inset
-                }
-            }
             .simultaneousGesture(
-                DragGesture(minimumDistance: 6)
+                DragGesture(minimumDistance: 2)
                     .onChanged { value in
+                        tracker.dragActive = true
                         // A finger moving down shows older messages.
                         var next = follow
                         if next.dragged(
@@ -136,6 +154,9 @@ struct TranscriptFollowModifier: ViewModifier {
                             TranscriptScrollLog.event("drag toward older, stopped following", tracker.lastSample)
                         }
                     }
+                    .onEnded { _ in
+                        tracker.dragActive = false
+                    }
             )
     }
 
@@ -146,21 +167,26 @@ struct TranscriptFollowModifier: ViewModifier {
             follow = next
             TranscriptScrollLog.event(next.isFollowing ? "following" : "stopped following", current)
         }
+        if follow.shouldRepin(at: current, driver: driver) {
+            TranscriptScrollLog.event("layout left the bottom while following, repinning", current)
+            tracker.scheduleRepin(repin)
+        }
         TranscriptScrollLog.sample(current, following: follow.isFollowing, driver: driver)
     }
 }
 
 /// Applied to the transcript's content on iOS 17: measures where the reader
 /// is from the content's frame inside the scroll view, so reaching the bottom
-/// again resumes following.
+/// again resumes following, and layout that leaves a following reader short
+/// of the bottom is put right.
 struct LegacyTranscriptProbe: ViewModifier {
     let enabled: Bool
     @Binding var follow: BottomFollow
     let tracker: TranscriptScrollTracker
     let newestSettledId: String?
+    /// Scroll to the newest message, unanimated.
+    let repin: () -> Void
 
-    /// What the probe reads off the layout; the inset is added on the main
-    /// actor, where the tracker lives.
     private struct ContentGeometry: Equatable {
         var visibleMinY: Double
         var visibleHeight: Double
@@ -170,8 +196,9 @@ struct LegacyTranscriptProbe: ViewModifier {
     func body(content: Content) -> some View {
         if enabled {
             content.onGeometryChange(for: ContentGeometry.self) { proxy in
-                // The scroll view's bounds in the content's own coordinates:
-                // its top is how far the reader has scrolled.
+                // The scroll view's bounds in the content's own coordinates.
+                // These are the readable area, below the header inset, so no
+                // inset is added back.
                 let visible = proxy.bounds(of: .scrollView) ?? CGRect(origin: .zero, size: proxy.size)
                 return ContentGeometry(
                     visibleMinY: Double(visible.minY),
@@ -183,7 +210,7 @@ struct LegacyTranscriptProbe: ViewModifier {
                     contentOffsetY: geometry.visibleMinY,
                     contentHeight: geometry.contentHeight,
                     containerHeight: geometry.visibleHeight,
-                    insetTop: tracker.insetTop,
+                    insetTop: 0,
                     insetBottom: 0
                 )
                 guard current != tracker.lastSample else { return }
@@ -196,7 +223,12 @@ struct LegacyTranscriptProbe: ViewModifier {
                     follow = next
                     TranscriptScrollLog.event(next.isFollowing ? "following" : "stopped following", current)
                 }
-                TranscriptScrollLog.sample(current, following: follow.isFollowing, driver: .system)
+                let driver: TranscriptScrollDriver = tracker.dragActive ? .finger : .system
+                if follow.shouldRepin(at: current, driver: driver) {
+                    TranscriptScrollLog.event("layout left the bottom while following, repinning", current)
+                    tracker.scheduleRepin(repin)
+                }
+                TranscriptScrollLog.sample(current, following: follow.isFollowing, driver: driver)
             }
         } else {
             content
@@ -270,6 +302,14 @@ enum TranscriptScrollLog {
 #if DEBUG
         guard enabled else { return }
         logger.debug("sample offset=\(sample.offset) distance=\(sample.distanceFromBottom) following=\(following) driver=\(String(describing: driver), privacy: .public)")
+#endif
+    }
+
+    @available(iOS 18.0, *)
+    static func raw(_ g: ScrollGeometry) {
+#if DEBUG
+        guard enabled else { return }
+        logger.debug("raw offset=\(g.contentOffset.y) size=\(g.contentSize.height) container=\(g.containerSize.height) insets=\(g.contentInsets.top),\(g.contentInsets.bottom) visible=\(g.visibleRect.minY),\(g.visibleRect.maxY) bounds=\(g.bounds.minY),\(g.bounds.maxY)")
 #endif
     }
 

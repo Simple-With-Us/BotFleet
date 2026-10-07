@@ -381,7 +381,8 @@ struct ChatView: View {
                         enabled: useLegacyFollow,
                         follow: $follow,
                         tracker: scrollTracker,
-                        newestSettledId: newestSettled
+                        newestSettledId: newestSettled,
+                        repin: { repinToBottom(proxy) }
                     ))
                 }
                 // Opaque header: the transcript starts below the tabs and
@@ -397,7 +398,8 @@ struct ChatView: View {
                     follow: $follow,
                     tracker: scrollTracker,
                     newestSettledId: newestSettled,
-                    legacy: useLegacyFollow
+                    legacy: useLegacyFollow,
+                    repin: { repinToBottom(proxy) }
                 ))
                 .overlay(alignment: .bottom) {
                     jumpToLatest(transcript: transcript, proxy: proxy)
@@ -458,6 +460,13 @@ struct ChatView: View {
             }
         }
         .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: follow.isFollowing)
+    }
+
+    /// Back to the newest message after layout left a following reader
+    /// short of it.  Checked again here because the request was queued.
+    private func repinToBottom(_ proxy: ScrollViewProxy) {
+        guard follow.isFollowing else { return }
+        scrollToBottom(proxy)
     }
 
     /// Straight to the end, with no animation.
