@@ -45,7 +45,8 @@ import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
 import { spokenReply } from "../../shared/voice-summary";
-import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
+import { applyBotPatch, createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
+import { voiceForDevice, type BotVoices } from "../../shared/bot-voice";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 
 export type { BotColor, MausColor } from "@/lib/mascot";
@@ -372,6 +373,9 @@ export interface Bot {
   speechDevices?: Array<"mac" | "iphone">;
   /** this bot's own voice id (falls back to the app-wide one) */
   voice?: string;
+  /** Per-device overrides of `voice`.  The wire sends null when neither
+   * device has one.  Resolve with voiceForDevice (shared/bot-voice.ts). */
+  voices?: BotVoices | null;
   /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
    * "on_demand" runs only on manual speak; "always" runs on every turn; "off" uses raw answer. */
   voiceSummaryMode?: "off" | "on_demand" | "always";
@@ -1149,8 +1153,8 @@ export function mergeHydrateBots(
     const local = localById.get(serverBot.id);
     const started = epochAtFetch[serverBot.id] ?? 0;
     const now = localEpoch[serverBot.id] ?? 0;
-    if (local && now > started) return { ...local, ...overlay };
-    return { ...serverBot, ...overlay };
+    if (local && now > started) return applyBotPatch(local, overlay);
+    return applyBotPatch(serverBot, overlay);
   });
 }
 
@@ -1762,8 +1766,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ),
           }
         : animated;
-      const { acknowledgeLocalAuto: _ack, ...botPatch } = action.patch;
-      const patched = updateBot(next, action.botId, (b) => ({ ...b, ...botPatch }));
+      const patched = updateBot(next, action.botId, (b) => applyBotPatch(b, action.patch));
       return { ...patched, botEpoch: bumpEpoch(patched.botEpoch, action.botId) };
     }
     case "threadActive": {
@@ -2401,7 +2404,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return result.bots.find((candidate) => candidate.id === botId) ?? null;
         },
         onAuthoritative: (bot, optimisticOverlay) => {
-          rawDispatch({ type: "botPatched", bot: { ...bot, ...optimisticOverlay } });
+          rawDispatch({ type: "botPatched", bot: applyBotPatch(bot, optimisticOverlay) });
         },
         onError: (error) => {
           rawDispatch({ type: "error", message: error.message });
@@ -3090,7 +3093,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 botId: owner.id,
                 messageId: frame.message.id,
                 threadId: frame.threadId,
-                voiceId: owner.voice,
+                // This Mac's own voice: its override, else the shared one.
+                voiceId: voiceForDevice(owner, "mac"),
               });
             }
           }
@@ -3121,7 +3125,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           rawDispatch({
             type: "botPatched",
-            bot: { ...bot, ...botPatchQueue.overlayFor(bot.id) },
+            bot: applyBotPatch(bot, botPatchQueue.overlayFor(bot.id)),
           });
           break;
         }
