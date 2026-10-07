@@ -99,14 +99,9 @@ class TrackedBuilder {
 
 function fromSource(text: string): Tracked {
   const n = text.length;
-  const srcStart = new Array<number>(n);
-  const srcEnd = new Array<number>(n);
-  const kind = new Array<number>(n);
-  for (let i = 0; i < n; i += 1) {
-    srcStart[i] = i;
-    srcEnd[i] = i + 1;
-    kind[i] = KIND_COPY;
-  }
+  const srcStart = Array.from({ length: n }, (_, i) => i);
+  const srcEnd = Array.from({ length: n }, (_, i) => i + 1);
+  const kind = Array.from({ length: n }, () => KIND_COPY);
   return { text, srcStart, srcEnd, kind };
 }
 
@@ -257,32 +252,49 @@ function segmentsOf(t: Tracked): SpeechSpan[] {
 
 // ── the rules, in speakable()'s order ──────────────────────────────────────
 
+const SPOKEN_LANGUAGES = new Map<string, string>([
+  ["ts", "TypeScript"],
+  ["tsx", "TypeScript"],
+  ["js", "JavaScript"],
+  ["jsx", "JavaScript"],
+  ["py", "Python"],
+  ["sh", "shell"],
+  ["bash", "shell"],
+  ["zsh", "shell"],
+  ["json", "JSON"],
+  ["yml", "YAML"],
+  ["yaml", "YAML"],
+  ["sql", "SQL"],
+  ["rs", "Rust"],
+  ["go", "Go"],
+  ["swift", "Swift"],
+  ["diff", "diff"],
+]);
+
 /** Identical to speech-text.ts describeCodeBlock. */
 function describeCodeBlock(fence: string): string {
   const lang = fence.trim().split(/\s+/)[0]?.replace(/[^a-z0-9+#]/gi, "") ?? "";
-  const spoken: Record<string, string> = {
-    ts: "TypeScript",
-    tsx: "TypeScript",
-    js: "JavaScript",
-    jsx: "JavaScript",
-    py: "Python",
-    sh: "shell",
-    bash: "shell",
-    zsh: "shell",
-    json: "JSON",
-    yml: "YAML",
-    yaml: "YAML",
-    sql: "SQL",
-    rs: "Rust",
-    go: "Go",
-    swift: "Swift",
-    diff: "diff",
-  };
-  const name = spoken[lang.toLowerCase()];
+  const name = SPOKEN_LANGUAGES.get(lang.toLowerCase());
   return name ? `. (a ${name} code block) ` : ". (a code block) ";
 }
 
 const ENDS_SENTENCE = /[.!?:;]\s*$/;
+
+/** speakable()'s emoji and pictograph ranges, including the variation
+ * selectors U+FE00-U+FE0F.  Assembled from code points so the class is read
+ * as ranges, not as a combining sequence. */
+const EMOJI = new RegExp(
+  `[${[
+    [0x1f000, 0x1faff],
+    [0x2600, 0x27bf],
+    [0xfe00, 0xfe0f],
+    [0x2190, 0x21ff],
+    [0x2b00, 0x2bff],
+  ]
+    .map(([a, b]) => `\\u{${a.toString(16)}}-\\u{${b.toString(16)}}`)
+    .join("")}]`,
+  "dgu",
+);
 
 function speakableTracked(input: string): Tracked {
   let t = fromSource(input);
@@ -344,11 +356,7 @@ function speakableTracked(input: string): Tracked {
   // shortenPaths
   t = replaceTracked(t, /(?:[\w.@-]+\/){1,}([\w.-]+\.\w{1,6})\b/dg, (m) => group(m, 1));
 
-  t = replaceTracked(
-    t,
-    /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/dgu,
-    () => [],
-  );
+  t = replaceTracked(t, EMOJI, () => []);
 
   t = replaceTracked(t, /\n{2,}/dg, () => [". "]);
   t = replaceTracked(t, /\n/dg, () => [". "]);

@@ -41,11 +41,14 @@ export interface WordToken {
  * so "twenty-three" is two words and "3.5" is "3" and "5" on both sides. */
 const WORD = /[\p{L}\p{M}\p{N}]+(?:['\u2019\u02BC][\p{L}\p{M}\p{N}]+)*/gu;
 
-const ASCII_ONLY = /^[\x00-\x7f]*$/;
+function isAscii(raw: string): boolean {
+  for (let i = 0; i < raw.length; i += 1) if (raw.charCodeAt(i) > 0x7f) return false;
+  return true;
+}
 
 export function wordKey(raw: string): string {
   // ASCII has nothing to decompose and no marks: same result, much cheaper.
-  if (ASCII_ONLY.test(raw)) return raw.toLowerCase().replace(/'/g, "");
+  if (isAscii(raw)) return raw.toLowerCase().replace(/'/g, "");
   return raw.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().replace(/['\u2019\u02BC]/g, "");
 }
 
@@ -65,19 +68,22 @@ export function tokenizeWords(text: string): WordToken[] {
 
 // ── numbers ────────────────────────────────────────────────────────────────
 
-const UNITS: Record<string, number> = {
-  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
-};
-const TEENS: Record<string, number> = {
-  ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17,
-  eighteen: 18, nineteen: 19,
-};
-const TENS: Record<string, number> = {
-  twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
-};
-const SCALES: Record<string, number> = { thousand: 1_000, million: 1_000_000, billion: 1_000_000_000 };
+const UNITS = new Map<string, number>([
+  ["zero", 0], ["one", 1], ["two", 2], ["three", 3], ["four", 4], ["five", 5], ["six", 6], ["seven", 7], ["eight", 8],
+  ["nine", 9],
+]);
+const TEENS = new Map<string, number>([
+  ["ten", 10], ["eleven", 11], ["twelve", 12], ["thirteen", 13], ["fourteen", 14], ["fifteen", 15], ["sixteen", 16],
+  ["seventeen", 17], ["eighteen", 18], ["nineteen", 19],
+]);
+const TENS = new Map<string, number>([
+  ["twenty", 20], ["thirty", 30], ["forty", 40], ["fifty", 50], ["sixty", 60], ["seventy", 70], ["eighty", 80],
+  ["ninety", 90],
+]);
+const SCALES = new Map<string, number>([["thousand", 1_000], ["million", 1_000_000], ["billion", 1_000_000_000]]);
 const ASCII_DIGITS = /^[0-9]+$/;
-const has = (table: Record<string, number>, key: string): boolean => Object.prototype.hasOwnProperty.call(table, key);
+const has = (table: Map<string, number>, key: string): boolean => table.has(key);
+const value = (table: Map<string, number>, key: string): number => table.get(key) ?? 0;
 
 /** Value of a single word as a decimal string: "749" -> "749", "007" -> "7",
  * "seven" -> "7", "twenty" -> "20".  Null for anything else. */
@@ -86,16 +92,16 @@ export function numberKey(key: string): string | null {
     const trimmed = key.replace(/^0+(?=[0-9])/, "");
     return trimmed;
   }
-  if (has(UNITS, key)) return String(UNITS[key]);
-  if (has(TEENS, key)) return String(TEENS[key]);
-  if (has(TENS, key)) return String(TENS[key]);
+  if (has(UNITS, key)) return String(value(UNITS, key));
+  if (has(TEENS, key)) return String(value(TEENS, key));
+  if (has(TENS, key)) return String(value(TENS, key));
   return null;
 }
 
 /** "seven four nine", "zero oh seven": one digit per word.  "oh" is zero. */
 function digitOf(key: string): string | null {
   if (key === "oh") return "0";
-  if (has(UNITS, key)) return String(UNITS[key]);
+  if (has(UNITS, key)) return String(value(UNITS, key));
   if (key.length === 1 && key >= "0" && key <= "9") return key;
   return null;
 }
@@ -109,15 +115,15 @@ function parseCardinal(keys: readonly string[]): string | null {
   for (const key of keys) {
     if (has(UNITS, key) && key !== "zero") {
       if (last !== "none" && last !== "tens" && last !== "hundred" && last !== "scale" && last !== "and") return null;
-      current += UNITS[key];
+      current += value(UNITS, key);
       last = "unit";
     } else if (has(TEENS, key)) {
       if (last !== "none" && last !== "hundred" && last !== "scale" && last !== "and") return null;
-      current += TEENS[key];
+      current += value(TEENS, key);
       last = "teen";
     } else if (has(TENS, key)) {
       if (last !== "none" && last !== "hundred" && last !== "scale" && last !== "and") return null;
-      current += TENS[key];
+      current += value(TENS, key);
       last = "tens";
     } else if (key === "hundred") {
       if (current <= 0 || current >= 100 || last === "hundred" || last === "and") return null;
@@ -125,7 +131,7 @@ function parseCardinal(keys: readonly string[]): string | null {
       last = "hundred";
     } else if (has(SCALES, key)) {
       if (current <= 0 || last === "and") return null;
-      total += current * SCALES[key];
+      total += current * value(SCALES, key);
       current = 0;
       last = "scale";
     } else if (key === "and") {
@@ -151,20 +157,20 @@ function parseGrouped(keys: readonly string[]): string | null {
     const next = keys[i + 1];
     if (has(TENS, key)) {
       if (next !== undefined && has(UNITS, next) && next !== "zero") {
-        out += String(TENS[key] + UNITS[next]);
+        out += String(value(TENS, key) + value(UNITS, next));
         i += 2;
       } else {
-        out += String(TENS[key]);
+        out += String(value(TENS, key));
         i += 1;
       }
     } else if (has(TEENS, key)) {
-      out += String(TEENS[key]);
+      out += String(value(TEENS, key));
       i += 1;
     } else if (key === "oh" && groups > 0 && next !== undefined && has(UNITS, next) && next !== "zero") {
-      out += `0${UNITS[next]}`;
+      out += `0${value(UNITS, next)}`;
       i += 2;
     } else if (groups === 0 && has(UNITS, key) && key !== "zero") {
-      out += String(UNITS[key]);
+      out += String(value(UNITS, key));
       i += 1;
     } else {
       return null;
@@ -180,7 +186,7 @@ const MAX_EXPANSION = 8;
  * there can stand for, with the run lengths.  Covers digits read one by one,
  * cardinals, paired years, and letters spelled out ("a p i" for "API"). */
 function spokenExpansions(words: readonly WordToken[]): Array<Map<string, number[]> | undefined> {
-  const out: Array<Map<string, number[]> | undefined> = new Array(words.length);
+  const out: Array<Map<string, number[]> | undefined> = Array.from({ length: words.length }, () => undefined);
   const add = (i: number, value: string | null, k: number): void => {
     if (value === null) return;
     let map = out[i];
@@ -317,8 +323,8 @@ export function fuzzyWordMatch(a: string, b: string): boolean {
   if (a.charCodeAt(0) !== b.charCodeAt(0)) return false;
   if (commonPrefix(a, b) >= 5) return true;
   const limit = Math.max(a.length, b.length) >= 8 ? 2 : 1;
-  let prev = new Array<number>(b.length + 1);
-  let cur = new Array<number>(b.length + 1);
+  let prev = new Int32Array(b.length + 1);
+  let cur = new Int32Array(b.length + 1);
   for (let j = 0; j <= b.length; j += 1) prev[j] = j;
   for (let i = 1; i <= a.length; i += 1) {
     cur[0] = i;
@@ -341,7 +347,7 @@ export function fuzzyWordMatch(a: string, b: string): boolean {
 function anchorChain(rows: number[], cols: number[]): Array<[number, number]> {
   const n = rows.length;
   const tails: number[] = [];
-  const prev = new Array<number>(n);
+  const prev = new Int32Array(n);
   for (let a = 0; a < n; a += 1) {
     let lo = 0;
     let hi = tails.length;
@@ -493,7 +499,7 @@ function alignCore(
     for (let j = 0; j < C; j += 1) colNum[j] = internNum(numberKey(cols[j].key));
   }
   // Expansions keyed by the display key's id; values no display word has are dropped.
-  const expansions: Array<Map<number, number[]> | undefined> = new Array(R);
+  const expansions: Array<Map<number, number[]> | undefined> = Array.from({ length: R }, () => undefined);
   if (params.numbers) {
     const raw = spokenExpansions(rows);
     for (let i = 0; i < R; i += 1) {

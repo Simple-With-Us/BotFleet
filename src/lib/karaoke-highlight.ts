@@ -174,14 +174,14 @@ export function graphemeBoundaries(text: string): number[] {
 
 interface HighlightLike {
   priority: number;
-  add(range: AbstractRange): unknown;
+  add(range: AbstractRange): void;
   delete(range: AbstractRange): boolean;
   clear(): void;
 }
 
 interface HighlightRegistryLike {
-  set(name: string, highlight: HighlightLike): unknown;
-  get(name: string): unknown;
+  set(name: string, highlight: HighlightLike): void;
+  get(name: string): HighlightLike | undefined;
   delete(name: string): boolean;
 }
 
@@ -294,8 +294,8 @@ export function createKaraokeHighlighter(
   const skipStep = options.skipStepMs ?? 40;
   const skipMax = options.skipMaxMs ?? 320;
 
-  const wordRanges: Array<Range | null | undefined> = new Array<Range | null | undefined>(count).fill(undefined);
-  const graphemes: Array<number[] | undefined> = new Array(count);
+  const wordRanges: Array<Range | null | undefined> = Array.from({ length: count }, () => undefined);
+  const graphemes: Array<number[] | undefined> = Array.from({ length: count }, () => undefined);
   const wordRange = (index: number): Range | null => {
     if (wordRanges[index] === undefined) {
       const w = words[index];
