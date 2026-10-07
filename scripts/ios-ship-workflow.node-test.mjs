@@ -12,7 +12,7 @@ function read(rel) {
   return readFileSync(join(ROOT, rel), "utf8");
 }
 
-test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => {
+test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", () => {
   const yml = read(".github/workflows/ios-ship.yml");
   const wrapper = read("scripts/ios-ship-testflight.sh");
   const prepare = read("scripts/ios-appstore-gm-prepare.sh");
@@ -20,9 +20,14 @@ test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => 
   assert.match(yml, /ios\/\*\*/);
   assert.match(yml, /--path-prefix 'ios\/'/);
   assert.match(yml, /scripts\/ios-fleet\/\*\*/);
-  assert.match(yml, /runs-on:\s*macos-latest/);
+  assert.match(yml, /runs-on:\s*xcode-27\s*$/m);
+  assert.doesNotMatch(yml, /runs-on:\s*macos-latest/);
   assert.doesNotMatch(yml, /runs-on:\s*\[self-hosted/);
-  assert.match(yml, /DEVELOPER_DIR:\s*\/Applications\/Xcode\.app\/Contents\/Developer/);
+  assert.match(yml, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
+  assert.match(yml, /bash scripts\/ios-assert-xcode\.sh 27\.0/);
+  const ci = read(".github/workflows/ci.yml");
+  assert.match(ci, /\|\| 'xcode-27' \}\}/);
+  assert.match(ci, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
   assert.match(yml, /fetch-depth:\s*0/);
   assert.match(yml, /cancel-in-progress:\s*false/);
   assert.match(yml, /github\.event\.repository\.fork == false/);

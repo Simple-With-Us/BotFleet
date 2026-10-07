@@ -69,10 +69,14 @@ jobs:
   ship:
     name: TestFlight archive + upload
     if: github.event.repository.fork == false
-    runs-on: macos-latest
+    # GitHub-hosted `xcode-27` image (actions/runner-images#14404): the iOS 27
+    # deployment floor needs the iOS 27 SDK, which macos-latest (Xcode 26.x)
+    # lacks.  DEVELOPER_DIR pins stable Xcode 27.0; the image also carries
+    # 27.1/27.2 betas, which App Store review rejects.
+    runs-on: xcode-27
     timeout-minutes: 90
     env:
-      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
       # fetch-depth: 0 is load-bearing, not hygiene. The default depth-1
       # checkout leaves the runner workspace with exactly ONE commit, so
@@ -106,6 +110,7 @@ jobs:
       - name: Assert stable Xcode (never beta)
         if: steps.gate.outputs.should_ship == '1'
         run: |
+          bash scripts/ios-assert-xcode.sh 27.0
           echo "DEVELOPER_DIR=${DEVELOPER_DIR}"
           xcodebuild -version
           ver=$(xcodebuild -version | awk 'NR==1{print $2}')
