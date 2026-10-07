@@ -140,8 +140,11 @@ describe("speakButtonState", () => {
     const speech = { status: "idle" as const, messageId: "m1", error: "This bot's Personal Voice is not on this Mac." };
     expect(speakButtonState({ ...base, owner: { voices: { mac: "personal:x" } }, speech })).toMatchObject({
       failed: true,
-      label: "This bot's Personal Voice is not on this Mac.",
+      label: "Play (Speak Aloud) failed: This bot's Personal Voice is not on this Mac.",
     });
+    expect(speakButtonState({ ...base, owner: { voice: "minimax-shared" }, hasAudio: true, speech }).label).toBe(
+      "Play Audio failed: This bot's Personal Voice is not on this Mac.",
+    );
     expect(speakButtonState({ ...base, messageId: "m2", owner: { voices: { mac: "personal:x" } }, speech }).failed).toBe(false);
   });
 
