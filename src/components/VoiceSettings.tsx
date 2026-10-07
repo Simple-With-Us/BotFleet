@@ -1,17 +1,33 @@
-// Per-bot voice profile.  The key is shared; the voice and autoplay choice
+// Per-bot voice profile.  The key is shared; the voices and autoplay choice
 // belong to the selected bot.
 //
-// The voice list comes from the harness, which holds the key — the
-// renderer never talks to MiniMax itself.
+// A bot has a voice per device (shared/bot-voice.ts): "Voice on This Mac"
+// writes voices.mac and "Voice on iPhone" writes voices.iphone, and either
+// falls back to the bot's shared `voice`, which older apps still write.  An
+// Apple Personal Voice belongs to the device that made it, so this Mac lists
+// only its own; the iPhone's Personal Voice is shown greyed with the reason,
+// and a MiniMax voice can be chosen for either device from here.
+//
+// The MiniMax list comes from the harness, which holds the key — the
+// renderer never talks to MiniMax itself.  The Personal Voice list comes
+// from this Mac's speech helper.  The two load independently, so a helper
+// that never answers cannot hold the MiniMax list back.
 import { useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, Loader2, Mic, Plus, Trash2, Volume2, X } from "lucide-react";
 
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
+import type { DeviceVoicesPatch } from "@/state/bot-patch-queue";
 import { speaker } from "@/lib/tts";
-import { CustomVoiceResponseSchema, parsePersonalVoiceList, parseTtsVoicesResponse } from "@/lib/tts/schema";
+import {
+  CustomVoiceResponseSchema,
+  parsePersonalVoiceList,
+  parseTtsVoicesResponse,
+  type PersonalVoiceInfo,
+} from "@/lib/tts/schema";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
+import { isPersonalVoiceId, voiceForDevice } from "../../shared/bot-voice";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
 
@@ -24,12 +40,45 @@ function personalVoiceDisabledReasonFor(ready: boolean, reasonCode: string | und
 
 const MINIMAX_KEY_URL = "https://platform.minimax.io/user/basic-information/interface-key";
 
+/** The speech helper's Personal Voice list can park on an authorization
+ * prompt that never shows.  Past this, the picker stops waiting for it. */
+export const PERSONAL_VOICE_LIST_TIMEOUT_MS = 8_000;
+
+export const IPHONE_PERSONAL_VOICE_REASON = "Personal Voice from your iPhone.\u00A0 Choose it on the iPhone.";
+export const MAC_PERSONAL_VOICE_ON_IPHONE_REASON =
+  "This Personal Voice is from this Mac.\u00A0 Choose a Personal Voice on the iPhone.";
+export const PERSONAL_VOICE_NOT_ON_MAC = "This Personal Voice is not on this Mac.\u00A0 Pick a voice for this Mac.";
+
+type VoiceOption = { id: string; label: string; description?: string };
+
+export type VoiceSettingsPatch = Partial<Pick<Bot, "voice" | "speakReplies" | "speechDevices" | "voiceSummaryMode">> & {
+  /** Only the device being changed; never the wire's `voices: null`. */
+  voices?: DeviceVoicesPatch;
+};
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("timed out")), ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+const personalName = (id: string) => id.replace(/^(personal|apple-personal):/, "");
+
+/** A per-device override counts only when it is a non-blank string, the
+ * same rule voiceForDevice applies. */
+const overrideFor = (bot: Bot, device: "mac" | "iphone"): string => {
+  const own = bot.voices?.[device];
+  return typeof own === "string" && own.trim() ? own : "";
+};
+
 export function VoiceSettings({
   bot,
   onPatch,
 }: {
   bot: Bot;
-  onPatch: (patch: Partial<Pick<Bot, "voice" | "speakReplies" | "speechDevices" | "voiceSummaryMode">>) => void;
+  onPatch: (patch: VoiceSettingsPatch) => void;
 }) {
   const { state, dispatch } = useStore();
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
@@ -44,8 +93,12 @@ export function VoiceSettings({
   // the previous sentence stuck, and a later accepted voice clears it
   // without comparing those strings.
   const [personalVoiceDenied, setPersonalVoiceDenied] = useState(false);
-  const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
+  const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
+  // This Mac's Personal Voices.  null is "not known": not allowed here, not
+  // loaded yet, or the helper failed or timed out.  An empty list is known.
+  const [personalVoices, setPersonalVoices] = useState<PersonalVoiceInfo[] | null>(null);
+  const [loadingPersonalVoices, setLoadingPersonalVoices] = useState(false);
 
   // ── custom voice identifier state ───────────────────────────────────
   const [customOpen, setCustomOpen] = useState(false);
@@ -70,7 +123,7 @@ export function VoiceSettings({
   // that cannot speak here.
   const personalVoiceAllowed = capabilities.dictation.personalVoice === true;
 
-  const isPersonalVoice = (id: string) => id.startsWith("personal:") || id.startsWith("apple-personal:");
+  const isPersonalVoice = isPersonalVoiceId;
   // `requires-macos-14` means this computer is a Mac, just not new enough.
   // Naming only "Mac or iPhone" is false there, and naming any platform
   // before capabilities arrive is a guess.  The code, not a previously
@@ -94,13 +147,15 @@ export function VoiceSettings({
   const capabilitiesRef = useRef(capabilities);
   capabilitiesRef.current = capabilities;
   const loadRequestRef = useRef(0);
+  const personalRequestRef = useRef(0);
 
-  // One gate for every way a voice id becomes this bot's voice: the picker,
-  // a typed custom id, and a clone result.  Free text can start with
+  // One gate for every way a voice id becomes this bot's Mac voice: the
+  // picker, a typed custom id, and a clone result.  Free text can start with
   // personal: or apple-personal:, and saving that on a computer that cannot
   // speak it is the same refusal as picking it.  False means the id was
   // refused.  The picker reports that on the shared banner.  Add Voice ID
   // passes reportDenial false and keeps the message in the still-open form.
+  // "" clears the Mac override, so the Mac uses the shared voice again.
   const commitVoice = (next: string, reportDenial = true): boolean => {
     const allowed = personalVoiceAllowedRef.current;
     const ready = capabilitiesReadyRef.current;
@@ -109,67 +164,77 @@ export function VoiceSettings({
       return false;
     }
     setPersonalVoiceDenied(false);
-    onPatch({ voice: next });
+    onPatch({ voices: { mac: next || null } });
     return true;
   };
 
-  // The single loader.  Every refresh path (mount, key save, add, clone,
-  // delete) goes through here, so the Personal Voice merge can never be
-  // dropped by a refresh that only reloads the harness list.
-  //
-  // Read the gate at call time so a clone or add that started on the
-  // optimistic false still merges, and ignore every result but the latest
-  // so a slow first response cannot overwrite that merge or wipe the list
-  // from its catch.
-
-  const loadVoices = () => {
-    const requestId = ++loadRequestRef.current;
-    const allowPersonal = personalVoiceAllowedRef.current;
-    setLoadingVoices(true);
-    const personalVoices = allowPersonal && window.ogb?.personalVoice?.list
-      ? window.ogb.personalVoice.list().catch(() => [])
-      : Promise.resolve([]);
-    return Promise.all([
-      api("/api/tts/voices").catch(() => ({})),
-      personalVoices,
-    ]).then(([raw, personal]) => {
-      if (requestId !== loadRequestRef.current) return;
-      let r: { voices?: Array<{ id: string; label: string; description?: string }>; error?: string };
-      try {
-        r = parseTtsVoicesResponse(raw);
-      } catch {
-        r = { voices: [] };
-      }
-      const apiVoices = r.voices ?? [];
-      // Entries the harness already knows about win, so a Personal Voice that
-      // the server also lists is never shown twice under two labels.
-      const existing = new Set(apiVoices.map((voice) => voice.id));
-      let parsedPersonal: ReturnType<typeof parsePersonalVoiceList> = [];
-      try {
-        parsedPersonal = parsePersonalVoiceList(personal);
-      } catch {
-        parsedPersonal = [];
-      }
-      const personalEntries = parsedPersonal
-        .filter((voice) => !existing.has(voice.id))
-        .map((voice) => ({
-          id: voice.id,
-          label: voice.name,
-          description: `Apple Personal Voice (${voice.locale ?? "en-US"})`,
-        }));
-      setVoices([...personalEntries, ...apiVoices]);
-      if (r.error) setError(r.error);
-    }).catch(() => {
-      if (requestId !== loadRequestRef.current) return;
-      setVoices([]);
-    }).finally(() => {
-      if (requestId === loadRequestRef.current) setLoadingVoices(false);
-    });
+  // The iPhone picker offers MiniMax voices only.  A Personal Voice for the
+  // iPhone is chosen on the iPhone, which can list its own.
+  const commitIphoneVoice = (next: string) => {
+    if (isPersonalVoice(next)) return;
+    onPatch({ voices: { iphone: next || null } });
   };
 
+  // The harness list.  Every refresh path (mount, key save, add, clone,
+  // delete) goes through here.  Only the latest request may write, so a slow
+  // first response cannot overwrite a newer list or wipe it from its catch.
+  const loadVoices = () => {
+    const requestId = ++loadRequestRef.current;
+    setLoadingVoices(true);
+    return api("/api/tts/voices")
+      .catch(() => ({}))
+      .then((raw) => {
+        if (requestId !== loadRequestRef.current) return;
+        let r: { voices?: VoiceOption[]; error?: string };
+        try {
+          r = parseTtsVoicesResponse(raw);
+        } catch {
+          r = { voices: [] };
+        }
+        setVoices(r.voices ?? []);
+        if (r.error) setError(r.error);
+      })
+      .finally(() => {
+        if (requestId === loadRequestRef.current) setLoadingVoices(false);
+      });
+  };
+
+  // This Mac's Personal Voices, on their own clock.  The gate is read at
+  // call time, and a helper that never answers is given up on after
+  // PERSONAL_VOICE_LIST_TIMEOUT_MS, leaving the list unknown.
+  const loadPersonalVoices = () => {
+    const requestId = ++personalRequestRef.current;
+    const list = window.ogb?.personalVoice?.list;
+    if (!personalVoiceAllowedRef.current || !list) {
+      setPersonalVoices(null);
+      setLoadingPersonalVoices(false);
+      return Promise.resolve();
+    }
+    setLoadingPersonalVoices(true);
+    return withTimeout(list(), PERSONAL_VOICE_LIST_TIMEOUT_MS)
+      .then((raw) => {
+        if (requestId !== personalRequestRef.current) return;
+        try {
+          setPersonalVoices(parsePersonalVoiceList(raw));
+        } catch {
+          setPersonalVoices(null);
+        }
+      }, () => {
+        if (requestId === personalRequestRef.current) setPersonalVoices(null);
+      })
+      .finally(() => {
+        if (requestId === personalRequestRef.current) setLoadingPersonalVoices(false);
+      });
+  };
+
+  // Two sources, settled independently: neither list waits for the other.
   useEffect(() => {
     void loadVoices();
-  }, [configured, personalVoiceAllowed]);
+  }, [configured]);
+
+  useEffect(() => {
+    void loadPersonalVoices();
+  }, [personalVoiceAllowed]);
 
   // personalVoiceDenied is only cleared by a later accepted voice or a
   // delete.  A capability event can open the gate while this card stays
@@ -283,9 +348,14 @@ export function VoiceSettings({
       // Deleting is not a voice save, but it does leave the previous
       // Personal Voice refusal behind if nothing clears that condition.
       setPersonalVoiceDenied(false);
-      if (bot.voice === voiceId) {
-        onPatch({ voice: "" });
-      }
+      // Clear every place this bot still names the deleted voice.
+      const patch: VoiceSettingsPatch = {};
+      if (bot.voice === voiceId) patch.voice = "";
+      const cleared: DeviceVoicesPatch = {};
+      if (bot.voices?.mac === voiceId) cleared.mac = null;
+      if (bot.voices?.iphone === voiceId) cleared.iphone = null;
+      if (Object.keys(cleared).length) patch.voices = cleared;
+      if (Object.keys(patch).length) onPatch(patch);
       await loadVoices();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to delete voice.");
@@ -347,20 +417,34 @@ export function VoiceSettings({
 
   if (!tts) return null;
 
-  const selectedVoice = bot.voice ?? "";
-  const isSelectedPersonal = isPersonalVoice(selectedVoice);
   const canSpeakPersonal =
     capabilities.dictation.personalVoice === true &&
     Boolean(typeof window !== "undefined" && window.ogb?.personalVoice?.speak);
-  const ready = configured && Boolean(selectedVoice || tts.voice);
-  const previewDisabled = isSelectedPersonal ? !canSpeakPersonal : !ready;
-  const previewTitle = isSelectedPersonal
-    ? canSpeakPersonal
-      ? "Hear this Apple Personal Voice"
-      : personalVoiceDisabledReason
-    : ready
-      ? "Hear this voice"
-      : "Pick a voice first";
+
+  // This Mac's Personal Voices, offered only where they can speak.  The
+  // harness entries win, so a Personal Voice the server also lists is never
+  // shown twice under two labels.
+  const macPersonal = personalVoiceAllowed ? personalVoices ?? [] : [];
+  const macPersonalIds = new Set(macPersonal.map((voice) => voice.id));
+  const harnessIds = new Set(voices.map((voice) => voice.id));
+  const macOptions: VoiceOption[] = [
+    ...macPersonal
+      .filter((voice) => !harnessIds.has(voice.id))
+      .map((voice) => ({
+        id: voice.id,
+        label: voice.name,
+        description: `Apple Personal Voice (${voice.locale ?? "en-US"})`,
+      })),
+    ...voices,
+  ];
+  // A Personal Voice cannot be spoken on a device that did not make it, so
+  // the iPhone picker offers hosted voices only.
+  const iphoneOptions = voices.filter((voice) => !isPersonalVoice(voice.id));
+  const personalKnown = personalVoiceAllowed && personalVoices !== null;
+  /** A Personal Voice this Mac is known not to have.  `personal:` alone means
+   * "the first Personal Voice on the device", which any device can satisfy. */
+  const notOnThisMac = (id: string) =>
+    isPersonalVoice(id) && personalName(id) !== "" && personalKnown && !macPersonalIds.has(id);
 
   const defaultVoiceRecord = tts.voice ? voices.find((v) => v.id === tts.voice) : null;
   const defaultVoiceDisplay = defaultVoiceRecord
@@ -369,13 +453,72 @@ export function VoiceSettings({
       ? `${tts.voice} (default)`
       : "Workspace default";
 
+  // ── Voice on This Mac ──
+  const macOverride = overrideFor(bot, "mac");
+  const macVoice = voiceForDevice(bot, "mac") || tts.voice;
+  const isMacPersonal = isPersonalVoice(macVoice);
+  const macPersonalMissing = isMacPersonal && personalVoiceAllowed && notOnThisMac(macVoice);
+  const macReady = configured && Boolean(macVoice);
+  const previewDisabled = isMacPersonal ? !canSpeakPersonal || macPersonalMissing : !macReady;
+  const previewTitle = isMacPersonal
+    ? !canSpeakPersonal
+      ? personalVoiceDisabledReason
+      : macPersonalMissing
+        ? PERSONAL_VOICE_NOT_ON_MAC
+        : "Hear this Apple Personal Voice"
+    : macReady
+      ? "Hear this voice"
+      : "Pick a voice first";
+  // How the Mac picker names a voice it shows but does not list.
+  const macLabelFor = (id: string): string => {
+    const listed = macOptions.find((voice) => voice.id === id);
+    if (listed) return listed.label;
+    if (!isPersonalVoice(id)) return id;
+    // A Personal Voice this Mac lists is in macOptions.  One it does not
+    // list is named without claiming a device until the list is known.
+    if (notOnThisMac(id)) return "Personal Voice not on this Mac";
+    return `Apple Personal Voice: ${personalName(id)}`;
+  };
+  const sharedVoice = bot.voice?.trim() ? bot.voice : "";
+  const macSharedLabel = loadingVoices
+    ? "Loading voices…"
+    : sharedVoice
+      ? `${macLabelFor(sharedVoice)} (bot default)`
+      : defaultVoiceDisplay;
+
+  // ── Voice on iPhone ──
+  const iphoneOverride = overrideFor(bot, "iphone");
+  const iphoneVoice = voiceForDevice(bot, "iphone") || tts.voice;
+  const isIphonePersonal = isPersonalVoice(iphoneVoice);
+  // A Personal Voice for the iPhone is the iPhone's own, unless this Mac
+  // made it, which the iPhone cannot speak.
+  const iphonePersonalReason = !isIphonePersonal
+    ? null
+    : macPersonalIds.has(iphoneVoice)
+      ? MAC_PERSONAL_VOICE_ON_IPHONE_REASON
+      : IPHONE_PERSONAL_VOICE_REASON;
+  const iphoneLabelFor = (id: string): string => {
+    const listed = iphoneOptions.find((voice) => voice.id === id);
+    if (listed) return listed.label;
+    if (!isPersonalVoice(id)) return id;
+    return macPersonalIds.has(id) ? "Personal Voice from this Mac" : "Personal Voice from your iPhone";
+  };
+  const iphoneSharedLabel = loadingVoices
+    ? "Loading voices…"
+    : sharedVoice
+      ? `${iphoneLabelFor(sharedVoice)} (bot default)`
+      : defaultVoiceDisplay;
+  const iphoneReady = configured && Boolean(iphoneVoice);
+  const iphonePreviewDisabled = isIphonePersonal || !iphoneReady;
+  const iphonePreviewTitle = iphonePersonalReason ?? (iphoneReady ? "Hear this voice" : "Pick a voice first");
+
   const customVoices = voices.filter((v) => v.description === "Custom");
 
   return (
     <div className="rounded-xl bg-card p-4">
       <div className="text-[15px] font-medium text-ink">Voice</div>
       <div className="mt-0.5 text-[13px] text-ink-secondary">
-        Give this bot a voice for calls and spoken replies using MiniMax.{"\u00A0 "}The voice choice belongs to this bot; the MiniMax key is shared by the workspace.
+        Give this bot a voice for calls and spoken replies.{"\u00A0 "}Each device can use its own voice: an Apple Personal Voice stays on the device that made it, and a MiniMax voice plays anywhere.{"\u00A0 "}The voices belong to this bot; the MiniMax key is shared by the workspace.
       </div>
 
       {/* ── MiniMax Key Input ── */}
@@ -417,10 +560,10 @@ export function VoiceSettings({
         )}
       </div>
 
-      {/* ── Voice Dropdown ── */}
+      {/* ── Voice on This Mac ── */}
       <div className="mt-4">
         <div className="mb-1.5 flex items-center justify-between text-[13px] text-ink-secondary">
-          <span>Voice</span>
+          <span>Voice on This Mac</span>
           <div className="flex items-center gap-3">
             <button
               type="button"
@@ -551,28 +694,20 @@ export function VoiceSettings({
 
         <div className="flex gap-2">
           <select
-            value={selectedVoice}
+            value={macOverride}
             onChange={(e) => {
               commitVoice(e.target.value);
             }}
-            aria-label={`${bot.name}'s voice`}
+            aria-label={`${bot.name}'s voice on this Mac`}
             className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
           >
-            <option value="">
-              {loadingVoices
-                ? "Loading voices…"
-                : defaultVoiceDisplay}
-            </option>
-            {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && (
-              <option value={selectedVoice}>
-                {isSelectedPersonal
-                  ? personalVoiceAllowed
-                    ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device Mac / iOS)`
-                    : `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")}`
-                  : `${selectedVoice} (Current)`}
+            <option value="">{macSharedLabel}</option>
+            {macOverride && !macOptions.some((voice) => voice.id === macOverride) && (
+              <option value={macOverride}>
+                {isPersonalVoice(macOverride) ? macLabelFor(macOverride) : `${macOverride} (Current)`}
               </option>
             )}
-            {voices.map((v) => (
+            {macOptions.map((v) => (
               <option key={v.id} value={v.id}>
                 {v.label}
                 {v.description ? ` — ${v.description}` : ""}
@@ -580,7 +715,7 @@ export function VoiceSettings({
             ))}
           </select>
           <button
-            onClick={() => void speaker.speak(SAMPLE, { voiceId: selectedVoice || tts?.voice, botId: bot.id })}
+            onClick={() => void speaker.speak(SAMPLE, { voiceId: macVoice, botId: bot.id })}
             disabled={previewDisabled}
             title={previewTitle}
             aria-label={previewTitle}
@@ -589,12 +724,67 @@ export function VoiceSettings({
             <Volume2 size={14} /> Try
           </button>
         </div>
-        {isSelectedPersonal && (
-          <div className="mt-2 text-[12px] text-ink-secondary">
-            This bot uses an Apple Personal Voice.
-            {canSpeakPersonal
-              ? <>{"\u00A0 "}Synthesis runs on-device on your authorized Mac or iPhone.</>
-              : <>{"\u00A0 "}{personalVoiceDisabledReason}.</>}
+        {isMacPersonal && (
+          macPersonalMissing ? (
+            <div role="status" className="mt-2 text-[12px] text-warning">{PERSONAL_VOICE_NOT_ON_MAC}</div>
+          ) : (
+            <div className="mt-2 text-[12px] text-ink-secondary">
+              This bot uses an Apple Personal Voice.
+              {canSpeakPersonal
+                ? <>{"\u00A0 "}It plays on-device on this Mac.</>
+                : <>{"\u00A0 "}{personalVoiceDisabledReason}.</>}
+            </div>
+          )
+        )}
+        {personalVoiceAllowed && loadingPersonalVoices && (
+          <div className="mt-1.5 flex items-center gap-1.5 text-[11.5px] text-ink-secondary">
+            <Loader2 size={11} className="animate-spin" aria-hidden="true" />
+            Loading Personal Voices on this Mac…
+          </div>
+        )}
+      </div>
+
+      {/* ── Voice on iPhone ── */}
+      <div className="mt-4">
+        <div className="mb-1.5 text-[13px] text-ink-secondary">Voice on iPhone</div>
+        <div className="flex gap-2">
+          <select
+            value={iphoneOverride}
+            onChange={(e) => commitIphoneVoice(e.target.value)}
+            aria-label={`${bot.name}'s voice on iPhone`}
+            aria-describedby={iphonePersonalReason ? `${bot.id}-iphone-voice-reason` : undefined}
+            className={cn(
+              "w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] focus:border-hairline focus:outline-none",
+              // The iPhone's own Personal Voice is shown, not offered: greyed.
+              isIphonePersonal ? "text-ink-secondary" : "text-ink",
+            )}
+          >
+            <option value="">{iphoneSharedLabel}</option>
+            {iphoneOverride && !iphoneOptions.some((voice) => voice.id === iphoneOverride) && (
+              <option value={iphoneOverride} disabled={isPersonalVoice(iphoneOverride)}>
+                {isPersonalVoice(iphoneOverride) ? iphoneLabelFor(iphoneOverride) : `${iphoneOverride} (Current)`}
+              </option>
+            )}
+            {iphoneOptions.map((v) => (
+              <option key={v.id} value={v.id}>
+                {v.label}
+                {v.description ? ` — ${v.description}` : ""}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={() => void speaker.speak(SAMPLE, { voiceId: iphoneVoice, botId: bot.id })}
+            disabled={iphonePreviewDisabled}
+            title={iphonePreviewTitle}
+            aria-label={iphonePersonalReason ?? (iphoneReady ? "Hear the iPhone voice" : "Pick a voice first")}
+            className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Volume2 size={14} /> Try
+          </button>
+        </div>
+        {iphonePersonalReason && (
+          <div id={`${bot.id}-iphone-voice-reason`} className="mt-2 text-[12px] text-ink-secondary">
+            {iphonePersonalReason}
           </div>
         )}
       </div>

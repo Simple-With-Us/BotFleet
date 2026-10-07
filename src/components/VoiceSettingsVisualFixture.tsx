@@ -1,13 +1,22 @@
 // Test harness for tests/e2e/voice-settings-personal-voice.visual.spec.ts.
 //
-// Mounts the real VoiceSettings card with the desktop bridge reporting that
-// Personal Voice cannot be spoken (macOS older than 14).  The spec then
-// submits a personal: voice id through Add Voice ID.  commitVoice is what
-// paints the denial; this file does not pre-render that error.
+// Default: mounts the real VoiceSettings card with the desktop bridge
+// reporting that Personal Voice cannot be spoken (macOS older than 14).  The
+// spec then submits a personal: voice id through Add Voice ID.  commitVoice
+// is what paints the denial; this file does not pre-render that error.
+//
+// `&variant=per-device`: a macOS 14 Mac that lists one Personal Voice, and a
+// bot that speaks it on the Mac while the iPhone uses its own Personal
+// Voice.  The spec screenshots the two pickers, the iPhone one greyed with
+// its reason.
 import { useEffect, useState } from "react";
 import { DesktopCapabilitiesProvider, useDesktopCapabilities } from "./DesktopCapabilities";
 import { VoiceSettings } from "./VoiceSettings";
 import { StoreProvider, useStore, type Bot, type ConfigStatus } from "@/state/store";
+import { applyBotPatch } from "@/state/bot-patch-queue";
+
+const perDevice =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).get("variant") === "per-device";
 
 const deniedCapabilities: DesktopCapabilities = {
   host: {
@@ -38,6 +47,19 @@ const deniedCapabilities: DesktopCapabilities = {
   },
 };
 
+const allowedCapabilities: DesktopCapabilities = {
+  ...deniedCapabilities,
+  dictation: {
+    available: true,
+    engine: "apple-speech",
+    onDevice: true,
+    personalVoice: true,
+  },
+};
+
+/** This Mac's Personal Voice in the per-device variant. */
+export const FIXTURE_MAC_PERSONAL_VOICE = { id: "personal:fixture-mac-voice", name: "Jay", locale: "en-US" };
+
 const unavailableLocalControl = {
   enabled: false,
   status: "unavailable" as const,
@@ -49,6 +71,7 @@ const unavailableLocalControl = {
 export function personalVoiceDesktopBridge(over: {
   capabilities?: DesktopCapabilities;
   speak?: (text: string, voiceId?: string) => Promise<void>;
+  list?: () => Promise<Array<{ id: string; name: string; locale?: string }>>;
 } = {}): NonNullable<Window["ogb"]> {
   const capabilities = over.capabilities ?? deniedCapabilities;
   const unsubscribe = () => {};
@@ -70,7 +93,7 @@ export function personalVoiceDesktopBridge(over: {
     onSpeechEnd: () => unsubscribe,
     personalVoice: {
       isAvailable: () => Promise.resolve(capabilities.dictation.personalVoice === true),
-      list: () => Promise.resolve([]),
+      list: over.list ?? (() => Promise.resolve([])),
       speak: over.speak ?? (() => Promise.resolve()),
       stop: () => Promise.resolve(),
     },
@@ -84,7 +107,12 @@ export function personalVoiceDesktopBridge(over: {
 // lane has no Electron bridge, so without this stub the card would deny with
 // the browser reason instead of the macOS 14 sentence this path exists for.
 if (typeof window !== "undefined" && !window.ogb) {
-  window.ogb = personalVoiceDesktopBridge();
+  window.ogb = perDevice
+    ? personalVoiceDesktopBridge({
+        capabilities: allowedCapabilities,
+        list: () => Promise.resolve([FIXTURE_MAC_PERSONAL_VOICE]),
+      })
+    : personalVoiceDesktopBridge();
 }
 
 const configuredTts: ConfigStatus = {
@@ -111,19 +139,9 @@ function CapabilitiesFlag() {
 
 function VoiceCard() {
   const { state, dispatch } = useStore();
-  const [voice, setVoice] = useState("");
-
-  useEffect(() => {
-    dispatch({ type: "configStatus", config: configuredTts });
-  }, [dispatch]);
-
-  if (!state.config?.tts) {
-    return <div data-testid="voice-settings-board">Loading voice settings…</div>;
-  }
-
   // satisfies Bot checks the fixture against the app's Bot contract.
   // `as Bot` would let a missing or mistyped field through.
-  const bot = {
+  const [bot, setBot] = useState<Bot>(() => ({
     id: "bot-visual",
     name: "Assistant",
     threadId: "t-visual",
@@ -134,8 +152,17 @@ function VoiceCard() {
     unread: false,
     modelSelection: { instanceId: "fixture", model: "default" },
     messages: [],
-    voice,
-  } satisfies Bot;
+    voice: "",
+    voices: perDevice ? { mac: FIXTURE_MAC_PERSONAL_VOICE.id, iphone: "personal:fixture-iphone-voice" } : null,
+  } satisfies Bot));
+
+  useEffect(() => {
+    dispatch({ type: "configStatus", config: configuredTts });
+  }, [dispatch]);
+
+  if (!state.config?.tts) {
+    return <div data-testid="voice-settings-board">Loading voice settings…</div>;
+  }
 
   return (
     <div
@@ -145,9 +172,7 @@ function VoiceCard() {
       <CapabilitiesFlag />
       <VoiceSettings
         bot={bot}
-        onPatch={(patch) => {
-          if (typeof patch.voice === "string") setVoice(patch.voice);
-        }}
+        onPatch={(patch) => setBot((current) => applyBotPatch(current, patch))}
       />
     </div>
   );
