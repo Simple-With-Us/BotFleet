@@ -113,9 +113,19 @@ play_turn() {
 
 lines_since() { tail -n +"$1" "$out/scroll.log"; }
 
+# Debug lines can be dropped by `log stream` on a loaded Mac.  A window with
+# no samples proves nothing either way, so it fails rather than passing.
+require_samples() {
+  if ! lines_since "$1" | grep -q "sample offset"; then
+    echo "FAIL: the log stream dropped the scroll samples for the $2 turn; rerun on a quieter Mac" >&2
+    exit 1
+  fi
+}
+
 shot open
 mark=$(($(wc -l <"$out/scroll.log") + 1))
 play_turn pinned
+require_samples "$mark" pinned
 if lines_since "$mark" | grep -q "follow: stopped following"; then
   echo "FAIL: following stopped during a turn the reader did not touch" >&2
   exit 1
@@ -133,6 +143,7 @@ if [ "$wait_for_scroll" -gt 0 ]; then
   shot scrolled-before-turn
   mark=$(($(wc -l <"$out/scroll.log") + 1))
   play_turn scrolled
+  require_samples "$mark" scrolled
   if lines_since "$mark" | grep -qE "follow: following|repinning"; then
     echo "FAIL: the transcript moved back to the bottom while the reader was scrolled up" >&2
     exit 1
