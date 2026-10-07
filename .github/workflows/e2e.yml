@@ -21,7 +21,7 @@ jobs:
     outputs:
       web_changed: ${{ steps.scope.outputs.web_changed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
@@ -66,14 +66,14 @@ jobs:
       - run: pnpm exec playwright test
       - name: Upload screenshot diffs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-visual-failures
           path: test-results/
           retention-days: 7
       - name: Upload App task context screenshots
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: task-app-context-screenshots
           path: test-results/**/task-app-context-*.png
