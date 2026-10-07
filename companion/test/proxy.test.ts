@@ -408,6 +408,54 @@ describe("the sidecar in front of an unmodified harness", () => {
     }
   });
 
+  it("carries the phone's audio request body to the harness intact", async () => {
+    // The iPhone names its device and asks for progressive clips in the
+    // POST body.  Dropped on the way, the harness would read `{}`, speak the
+    // shared voice, and block on every clip again, with nothing failing.
+    let seen: { method?: string; url?: string; contentType?: string; body: string } = { body: "" };
+    const audioHarness = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        seen = {
+          method: req.method,
+          url: req.url,
+          contentType: req.headers["content-type"],
+          body: Buffer.concat(chunks).toString("utf8"),
+        };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ audio: [], voiceText: "Hi.", utterances: ["Hi."], total: 1, complete: false, voice: "vx" }));
+      });
+    });
+    await new Promise<void>((resolve) => audioHarness.listen(0, "127.0.0.1", resolve));
+    const audioHarnessPort = (audioHarness.address() as { port: number }).port;
+    const audioProxy = createServer(createProxyHandler({
+      harnessPort: audioHarnessPort,
+      authenticate: () => ({ id: "phone-audio", cloudDesktopAccess: false }),
+      redeem: () => ({ error: "not pairing" }),
+      serverName: () => "Test computer",
+    }));
+    await new Promise<void>((resolve) => audioProxy.listen(0, "127.0.0.1", resolve));
+    const audioProxyPort = (audioProxy.address() as { port: number }).port;
+    try {
+      const response = await fetch(`http://127.0.0.1:${audioProxyPort}/api/threads/th_1/messages/msg_1/audio`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ device: "iphone", progressive: true }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ total: 1, complete: false, voice: "vx" });
+      expect(seen.method).toBe("POST");
+      expect(seen.url).toBe("/api/threads/th_1/messages/msg_1/audio");
+      // The harness 415s a JSON body without its content type.
+      expect(seen.contentType).toBe("application/json");
+      expect(JSON.parse(seen.body)).toEqual({ device: "iphone", progressive: true });
+    } finally {
+      await new Promise<void>((resolve) => audioProxy.close(() => resolve()));
+      await new Promise<void>((resolve) => audioHarness.close(() => resolve()));
+    }
+  });
+
   it("rejects non-object profile bodies at the sidecar boundary", async () => {
     const fleet = await device("GET", "/api/bots");
     const botId = fleet.body.bots[0].id;

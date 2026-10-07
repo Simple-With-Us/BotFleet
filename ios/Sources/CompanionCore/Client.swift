@@ -1464,4 +1464,3 @@ public struct CompanionClient: Sendable {
         return eventStream(request: streamRequest, session: Self.streaming)
     }
 }
-
