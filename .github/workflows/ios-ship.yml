@@ -22,7 +22,7 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 # Leftover GitHub APPLE_/IOS_ secrets stay for a later cleanup.
 #
 # The in-repo wrapper prefers scripts/ios-fleet/, then
-# /Users/jay/apps/ios-fleet. App key `botfleet`, bundle `app.botfleet`,
+# /Users/jay/apps/ios-fleet. App key `botfleet`, bundle `app.botfleet.ios`,
 # team `CC8UTF7ATG`. Marketing train is 1.0.N; build is UTC YYYYMMDDHHMM.
 
 on:
@@ -176,7 +176,7 @@ jobs:
 
       # Route through the in-repo wrapper. scripts/ios-ship-testflight.sh
       # execs scripts/ios-fleet/ship-testflight.sh (BotFleet apps.json is
-      # app.botfleet, 1.0.N).
+      # app.botfleet.ios, 1.0.N).
       #
       # No extra flags. Standing gate is DEFAULT_MIN_INTERVAL_SEC=3600
       # (1 hour) in the fleet script. The 30-minute cron picks up an unbuilt

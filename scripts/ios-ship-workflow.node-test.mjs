@@ -127,16 +127,16 @@ test("retired ios-testflight.yml is gone so hosted ships do not double-upload", 
   assert.equal(existed, false);
 });
 
-test("vendored ios-fleet ships app.botfleet on the 1.0.N train", () => {
+test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   const apps = JSON.parse(read("scripts/ios-fleet/apps.json"));
   const botfleet = apps.apps.botfleet;
   assert.equal(apps.teamId, "CC8UTF7ATG");
-  assert.equal(botfleet.bundleId, "app.botfleet");
+  assert.equal(botfleet.bundleId, "app.botfleet.ios");
   assert.equal(botfleet.scheme, "BotFleet");
-  assert.equal(botfleet.appleId, 6806379515);
+  assert.equal(botfleet.appleId, 6820175685);
   assert.equal(botfleet.xcodegenDir, "ios");
   assert.match(botfleet.marketingVersionDefault, /^1\.0\.\d+$/);
-  assert.deepEqual(botfleet.extraBundleIds, ["app.botfleet.widgets"]);
+  assert.deepEqual(botfleet.extraBundleIds, ["app.botfleet.ios.widgets"]);
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
@@ -212,7 +212,7 @@ test("asc-api.mjs says what it tried instead of failing on a missing file", () =
   try {
     const clean = { PATH: process.env.PATH || "", HOME: tmp };
     // No credential anywhere: name every source rather than dying on ENOENT.
-    const none = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet", "1.0"], {
+    const none = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: clean,
     });
@@ -221,7 +221,7 @@ test("asc-api.mjs says what it tried instead of failing on a missing file", () =
     assert.match(none.stderr, /APPLE_API_KEY_P8_BASE64/);
 
     // APPLE_API_* present but undecodable: proves the env IS read, and says so.
-    const bad = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet", "1.0"], {
+    const bad = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: {
         ...clean,
