@@ -129,11 +129,7 @@ jobs:
         if: steps.gate.outputs.should_ship == '1'
         run: |
           # ios/BotFleet.xcodeproj is gitignored. Hosted ships must generate it.
-          if command -v xcodegen >/dev/null 2>&1; then
-            xcodegen --version
-          else
-            brew install xcodegen
-          fi
+          bash scripts/ios-install-xcodegen.sh
 
 
       # Identity stays on GitHub.  Apple/iOS signing material and the Cocoa

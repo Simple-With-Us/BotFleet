@@ -77,6 +77,13 @@ test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => 
   assert.match(project, /PRODUCT_BUNDLE_IDENTIFIER:\s*app\.botfleet/);
   assert.match(project, /MARKETING_VERSION:\s*"1\.0\.\d+"/);
   assert.match(project, /CODE_SIGN_STYLE:\s*Automatic/);
+  assert.match(project, /projectFormat:\s*xcode16_3/);
+  assert.match(project, /xcodeVersion:\s*'27\.0'/);
+  assert.match(project, /postGenCommand:\s*bash \.\.\/scripts\/ios-xcodegen-post\.sh/);
+  assert.match(project, /IPHONEOS_DEPLOYMENT_TARGET:\s*'27\.0'/);
+  assert.match(project, /INFOPLIST_KEY_LSApplicationCategoryType:\s*public\.app-category\.developer-tools/);
+  assert.match(read("scripts/ios-xcodegen-post.sh"), /objectVersion = 100/);
+  assert.match(read("scripts/ios-xcodegen-post.sh"), /Xcode 27\.0/);
 
   assert.match(wrapper, /scripts\/ios-fleet\/ship-testflight\.sh/);
   assert.match(wrapper, /IN_REPO="\$\{ROOT\}\/scripts\/ios-fleet\/ship-testflight\.sh"/);

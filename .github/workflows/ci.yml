@@ -254,7 +254,7 @@ jobs:
       - name: Generate the Xcode project
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: |
-          brew install xcodegen
+          bash scripts/ios-install-xcodegen.sh
           cd ios
           xcodegen generate
       - name: Build the iOS app (unsigned)
