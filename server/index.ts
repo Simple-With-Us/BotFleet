@@ -378,7 +378,7 @@ import {
 import { summarizeForVoice } from "./tts/speech-summary.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { fitListToBudget, serializedPreview } from "./serialized-preview.ts";
-import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh } from "./turn-context.ts";
+import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh, ROOM_REPLY_PREFIX } from "./turn-context.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import {
   ensureWorkspace,
@@ -5677,6 +5677,7 @@ async function startTurn(
         system: prompt.text,
         systemStable: prompt.stable,
         systemVolatile: prompt.volatile,
+        systemSections: prompt.sections.map(({ id, text, volatile }) => ({ id, text, volatile })),
         volatileDigest: prompt.volatileDigest,
         // the mentions section describes this turn: identical consecutive
         // tags must still deliver their note (SendTurnInput.mentionTurn)
@@ -7419,7 +7420,7 @@ async function runGroupMemberTurn(
     .filter(Boolean)
     .join("\n");
 
-  const text = `${serializeRoomContext(threadId, userName, !cardContinuation)}\n\n(Reply to the conversation above as ${bot.name}.)${
+  const text = `${serializeRoomContext(threadId, userName, !cardContinuation)}\n\n${ROOM_REPLY_PREFIX}${bot.name}.)${
     cardContinuation ? `\n\n${cardContinuation}` : ""
   }`;
 
@@ -7765,6 +7766,7 @@ async function runGroupMemberTurn(
         system: roomSystem.text,
         systemStable: roomSystem.stable,
         systemVolatile: roomSystem.volatile,
+        systemSections: roomSystem.sections.map(({ id, text, volatile }) => ({ id, text, volatile })),
         volatileDigest: roomSystem.volatileDigest,
         cwd,
         integrations,
