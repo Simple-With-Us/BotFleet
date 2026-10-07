@@ -3,8 +3,8 @@
   "apps": {
     "botfleet": {
       "displayName": "BotFleet",
-      "bundleId": "app.botfleet",
-      "appleId": 6806379515,
+      "bundleId": "app.botfleet.ios",
+      "appleId": 6820175685,
       "platform": "iOS",
       "scheme": "BotFleet",
       "projectRel": "ios/BotFleet.xcodeproj",
@@ -12,9 +12,9 @@
       "worktreeHint": "~/apps/botfleet-grok",
       "marketingVersionDefault": "1.0.30",
       "extraBundleIds": [
-        "app.botfleet.widgets"
+        "app.botfleet.ios.widgets"
       ],
-      "notes": "BotFleet companion iOS app.  AppleId 6806379515 (ASC bundle app.botfleet \u2014 app.botfleet.ios is NOT registered yet; keep ship IDs on app.botfleet until owner creates the ASC App ID).  Team CC8UTF7ATG.  ASC SKU botfleet.  Marketing train is 1.0.N; build is UTC YYYYMMDDHHMM.  Hosted ships use GitHub Actions secrets APPLE_API_* and IOS_CERT_*; do not mint a new key."
+      "notes": "BotFleet companion iOS app.  AppleId 6820175685 (ASC bundle app.botfleet.ios).  Legacy app.botfleet / 6806379515 is retired for uploads.  Widget extension targets app.botfleet.ios.widgets; register that App ID in ASC before shipping widgets.  Team CC8UTF7ATG.  ASC SKU botfleet.  Marketing train is 1.0.N; build is UTC YYYYMMDDHHMM.  Hosted ships use GitHub Actions secrets APPLE_API_* and IOS_CERT_*; do not mint a new key."
     }
   }
 }

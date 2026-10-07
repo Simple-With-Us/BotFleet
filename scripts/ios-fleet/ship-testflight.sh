@@ -747,12 +747,13 @@ if [[ "$APP_KEY" == "dealdex" && "$BUNDLE_ID" != "net.dealdex" ]]; then
   die "DealDex live bundle is net.dealdex, not ${BUNDLE_ID}"
 fi
 
-# BotFleet ASC App ID for app.botfleet.ios was never created (owner action from
-# the 2026-09-22 bundle rename). Ships must stay on the live ASC record
-# app.botfleet / appleId 6806379515 or the asc-seq gate fails with rc=2
-# (observed schedule run 36839653889).
-if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" != "app.botfleet" ]]; then
-  die "BotFleet ASC app is app.botfleet (appleId 6806379515); refusing bundleId=${BUNDLE_ID} until that App ID exists in App Store Connect"
+# BotFleet ships only the ASC record app.botfleet.ios / appleId 6820175685.
+# Legacy app.botfleet / 6806379515 must not receive uploads.
+if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" == "app.botfleet" ]]; then
+  die "refusing legacy BotFleet bundleId app.botfleet (appleId 6806379515); use app.botfleet.ios (6820175685)"
+fi
+if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" != "app.botfleet.ios" ]]; then
+  die "BotFleet ASC app is app.botfleet.ios (appleId 6820175685); refusing bundleId=${BUNDLE_ID}"
 fi
 
 if [[ -z "$UPLOAD_ONLY_IPA" && "$DRY_RUN" -eq 0 ]]; then
