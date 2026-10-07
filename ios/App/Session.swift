@@ -283,6 +283,7 @@ final class Session: ObservableObject {
             // screenshot harness (no live client to warm from).
             instanceDriverKinds = ["preview": "claude"]
             status = .live
+            TranscriptScrollDemo.startIfRequested(self)
             return
         }
 #endif
@@ -293,6 +294,14 @@ final class Session: ObservableObject {
         restore()
         Task { await refreshNotificationAuthorization() }
     }
+
+#if DEBUG
+    /// Scroll harness only (`-scroll-demo`): change state as if the stream
+    /// had delivered a frame.  `state` is otherwise written only here.
+    func debugMutateState(_ body: (inout CompanionState) -> Void) {
+        body(&state)
+    }
+#endif
 
     /// Drop coalesced settings PATCHes when the paired computer changes so a
     /// queued mode, terminology, name, email, toggle, or timeout cannot land
