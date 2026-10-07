@@ -669,8 +669,11 @@ final class Session: ObservableObject {
     /// Called when the app leaves the screen. iOS will kill the connection
     /// anyway; dropping it deliberately means the cursor is written down at
     /// a known point instead of wherever the socket happened to die.
+    ///
+    /// A reply being read aloud is left alone: its clips come over their own
+    /// requests, not this stream, and the `audio` background mode keeps it
+    /// playing after the linger window closes.  Sign-out still stops it.
     func disconnect() {
-        stopVoice()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
