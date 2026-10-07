@@ -1,4 +1,7 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.4
+// 6.4 is the first PackageDescription with `.iOS(.v27)` (Xcode 27.0).
+// swiftLanguageModes keeps the Swift 5 language mode the package had under
+// tools 5.9, so the bump does not also switch on Swift 6 strict concurrency.
 import PackageDescription
 
 // CompanionCore is everything the phone knows that is not a view: the wire
@@ -23,5 +26,6 @@ let package = Package(
             dependencies: ["CompanionCore"],
             resources: [.copy("Fixtures")]
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v5]
 )
