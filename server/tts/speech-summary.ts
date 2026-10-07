@@ -247,10 +247,8 @@ export async function summarizeForVoiceDetailed(
 
   /** A usable rewrite, a reason to stop with the deterministic text, or
    * null to try the next model. */
-  const judge = (rawData: unknown): VoiceSummaryResult | null => {
-    const parsed = DeepSeekChatResponseSchema.safeParse(rawData);
-    if (!parsed.success) return null;
-    const choice = parsed.data.choices?.[0];
+  const judge = (data: DeepSeekChatResponse | null): VoiceSummaryResult | null => {
+    const choice = data?.choices?.[0];
     const content = choice?.message?.content?.trim();
     if (!content) return null;
     // finish_reason "length" means max_tokens cut the rewrite off mid-reply.
@@ -286,7 +284,8 @@ export async function summarizeForVoiceDetailed(
     });
 
     if (response.ok) {
-      const verdict = judge(await response.json());
+      const parsed = DeepSeekChatResponseSchema.safeParse(await response.json());
+      const verdict = judge(parsed.success ? parsed.data : null);
       if (verdict) return verdict;
     }
 
@@ -310,7 +309,8 @@ export async function summarizeForVoiceDetailed(
     });
 
     if (fallbackResponse.ok) {
-      const verdict = judge(await fallbackResponse.json());
+      const parsed = DeepSeekChatResponseSchema.safeParse(await fallbackResponse.json());
+      const verdict = judge(parsed.success ? parsed.data : null);
       if (verdict) return verdict;
     }
   } catch {

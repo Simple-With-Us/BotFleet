@@ -64,7 +64,7 @@ describe("bot-voice helpers", () => {
   it("recognizes only the two speech devices", () => {
     expect(isSpeechDevice("mac")).toBe(true);
     expect(isSpeechDevice("iphone")).toBe(true);
-    for (const value of ["ipad", "Mac", "", null, undefined, 1]) expect(isSpeechDevice(value)).toBe(false);
+    for (const value of ["ipad", "Mac", "", null, undefined]) expect(isSpeechDevice(value)).toBe(false);
   });
 
   it("does not mutate the stored record when merging", () => {

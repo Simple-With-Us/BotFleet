@@ -21,7 +21,7 @@ export type BotVoices = { mac?: string; iphone?: string };
  * string) clears that device, and `voices: null` clears both. */
 export type BotVoicesPatch = { mac?: string | null; iphone?: string | null } | null;
 
-export function isSpeechDevice(value: unknown): value is SpeechDevice {
+export function isSpeechDevice(value: string | null | undefined): value is SpeechDevice {
   return value === "mac" || value === "iphone";
 }
 
@@ -52,7 +52,7 @@ export function voiceForDevice(
  * device keeps an override, so the stored bot drops the field entirely. */
 export function mergeBotVoices(existing: BotVoices | null | undefined, patch: BotVoicesPatch): BotVoices | undefined {
   if (patch === null) return undefined;
-  const next: BotVoices = { ...(existing ?? {}) };
+  const next: BotVoices = { ...existing };
   for (const device of SPEECH_DEVICES) {
     if (!Object.prototype.hasOwnProperty.call(patch, device)) continue;
     const value = patch[device];

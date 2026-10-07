@@ -20,7 +20,9 @@
 //   a second device asking for the same voice, so a reply is billed once.
 // - A request without `device` or `progressive` behaves exactly as the route
 //   always has, because shipped TestFlight builds send neither.
-import { isPersonalVoiceId, isSpeechDevice, voiceForDevice, type BotVoices, type SpeechDevice } from "../../shared/bot-voice.ts";
+import { z } from "zod";
+
+import { isPersonalVoiceId, isSpeechDevice, SPEECH_DEVICES, voiceForDevice, type BotVoices, type SpeechDevice } from "../../shared/bot-voice.ts";
 import { resolveVoiceSummaryMode, writtenReply, type VoiceSummaryMode } from "../../shared/voice-summary.ts";
 import { toUtterances } from "./speech-text.ts";
 
@@ -90,11 +92,28 @@ export interface MessageAudioDeps {
   /** A hosted-voice key is saved but has not reached the harness yet. */
   credentialPending(): boolean;
   /** tts.NoVoiceConfigured, which the route reports as 409, not 502. */
-  isNoVoiceConfigured(error: unknown): boolean;
+  isNoVoiceConfigured(error: Error): boolean;
   now?(): number;
 }
 
-export type AudioJsonResult = { kind: "json"; status: number; body: Record<string, unknown>; headers?: Record<string, string> };
+/** Every field either JSON answer can carry; see the POST and GET below. */
+export type AudioResponseBody = {
+  error?: string;
+  audio?: VoiceClip[];
+  voiceText?: string;
+  utterances?: string[];
+  total?: number;
+  complete?: boolean;
+  voice?: string;
+  onDevice?: boolean;
+  personalVoice?: boolean;
+  retryable?: boolean;
+  ready?: number;
+  maxUtterances?: number;
+  maxCharacters?: number;
+};
+
+export type AudioJsonResult = { kind: "json"; status: number; body: AudioResponseBody; headers?: Record<string, string> };
 export type AudioClipResult = { kind: "clip"; status: 200 | 304; headers: Record<string, string>; bytes?: Uint8Array };
 export type AudioRouteResult = AudioJsonResult | AudioClipResult;
 
@@ -102,15 +121,23 @@ export type AudioRequest = { device?: SpeechDevice; progressive: boolean };
 
 /** Body of the POST.  Both fields are optional; unknown fields are ignored so
  * a newer client can add one without breaking an older harness. */
-export function parseAudioRequest(body: unknown): { ok: true; request: AudioRequest } | { ok: false; error: string } {
+const AudioRequestSchema = z.object(
+  {
+    device: z.enum(SPEECH_DEVICES, { error: "device must be mac or iphone" }).nullish(),
+    progressive: z.boolean({ error: "progressive must be true or false" }).nullish(),
+  },
+  { error: "the audio request must be a JSON object" },
+);
+
+export type AudioRequestBody = z.input<typeof AudioRequestSchema>;
+
+export function parseAudioRequest(body: AudioRequestBody | null | undefined): { ok: true; request: AudioRequest } | { ok: false; error: string } {
   if (body === undefined || body === null) return { ok: true, request: { progressive: false } };
-  if (typeof body !== "object" || Array.isArray(body)) return { ok: false, error: "the audio request must be a JSON object" };
-  const { device, progressive } = body as { device?: unknown; progressive?: unknown };
-  if (device !== undefined && device !== null && !isSpeechDevice(device)) return { ok: false, error: "device must be mac or iphone" };
-  if (progressive !== undefined && progressive !== null && typeof progressive !== "boolean") {
-    return { ok: false, error: "progressive must be true or false" };
-  }
-  return { ok: true, request: { ...(isSpeechDevice(device) ? { device } : {}), progressive: progressive === true } };
+  const parsed = AudioRequestSchema.safeParse(body);
+  if (!parsed.success) return { ok: false, error: parsed.error.issues[0]?.message ?? "invalid audio request" };
+  const request: AudioRequest = { progressive: parsed.data.progressive === true };
+  if (parsed.data.device) request.device = parsed.data.device;
+  return { ok: true, request };
 }
 
 /** `?device=` on the clip GET.  Absent means the legacy owner voice. */
@@ -125,13 +152,9 @@ interface ClipJob {
   voiceText: string;
   clips: VoiceClip[];
   settled: boolean;
-  error?: unknown;
+  error?: Error;
   listeners: Set<() => void>;
   done: Promise<VoiceClip[]>;
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function attachmentName(clip: VoiceClip): string | null {
@@ -174,7 +197,7 @@ export class MessageAudio {
    * voice (so old clients keep reading it), a bounded side map otherwise. */
   private slotPatch(message: AudioMessage | undefined, voice: string, ownerVoice: string, clips: VoiceClip[]): Partial<AudioMessage> {
     if (voice === ownerVoice) return { audio: [...clips], audioVoice: voice };
-    const map: Record<string, VoiceClip[]> = { ...(message?.audioByVoice ?? {}) };
+    const map = { ...message?.audioByVoice };
     delete map[voice];
     map[voice] = [...clips];
     const keys = Object.keys(map);
@@ -183,29 +206,36 @@ export class MessageAudio {
   }
 
   private notify(job: ClipJob): void {
-    for (const listener of [...job.listeners]) listener();
+    // A listener may delete itself; deleting the entry being visited is safe
+    // while iterating a Set.
+    for (const listener of job.listeners) listener();
   }
 
   private waitFor(job: ClipJob, ready: (job: ClipJob) => boolean, ms: number): Promise<void> {
     if (ready(job) || job.settled || ms <= 0) return Promise.resolve();
     return new Promise((resolve) => {
+      // No timer for an unbounded wait: setTimeout treats Infinity as 1 ms.
+      const timer = Number.isFinite(ms) ? setTimeout(() => finish(), ms) : undefined;
+      timer?.unref?.();
       const finish = () => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         job.listeners.delete(check);
         resolve();
       };
       const check = () => {
         if (ready(job) || job.settled) finish();
       };
-      const timer = setTimeout(finish, ms);
-      timer.unref?.();
       job.listeners.add(check);
     });
   }
 
-  private failure(error: unknown): AudioJsonResult {
-    if (this.deps.isNoVoiceConfigured(error)) return { kind: "json", status: 409, body: { error: errorText(error) } };
-    return { kind: "json", status: 502, body: { error: errorText(error) } };
+  private failure(error: Error): AudioJsonResult {
+    return { kind: "json", status: this.deps.isNoVoiceConfigured(error) ? 409 : 502, body: { error: error.message } };
+  }
+
+  /** Resolves once the job has finished, either way. */
+  private settled(job: ClipJob): Promise<void> {
+    return this.waitFor(job, () => false, Number.POSITIVE_INFINITY);
   }
 
   /** Start the job for (message, voice), or return the one already running.
@@ -265,9 +295,9 @@ export class MessageAudio {
         if (this.jobs.get(key) === job) this.jobs.delete(key);
         this.notify(job);
       },
-      (error: unknown) => {
+      (reason) => {
         job.settled = true;
-        job.error = error;
+        job.error = reason instanceof Error ? reason : new Error(String(reason));
         this.notify(job);
         const timer = setTimeout(() => {
           if (this.jobs.get(key) === job) this.jobs.delete(key);
@@ -282,7 +312,7 @@ export class MessageAudio {
     threadId: string;
     messageId: string;
     owner: AudioOwner;
-    body: unknown;
+    body: AudioRequestBody | null | undefined;
     /** When the request arrived; the progressive budget counts from here. */
     startedAt?: number;
   }): Promise<AudioJsonResult> {
@@ -340,21 +370,18 @@ export class MessageAudio {
 
     const job = this.ensureJob(threadId, messageId, voice, ownerVoice, utterances, textToSpeak);
     if (!progressive) {
-      try {
-        const clips = await job.done;
-        return {
-          kind: "json",
-          status: 200,
-          body: { audio: clips, voiceText: job.voiceText, utterances: job.utterances, total: job.utterances.length, complete: true, voice },
-        };
-      } catch (error) {
-        return this.failure(error);
-      }
+      await this.settled(job);
+      if (job.error) return this.failure(job.error);
+      return {
+        kind: "json",
+        status: 200,
+        body: { audio: [...job.clips], voiceText: job.voiceText, utterances: job.utterances, total: job.utterances.length, complete: true, voice },
+      };
     }
 
     const remaining = startedAt + PROGRESSIVE_RESPONSE_BUDGET_MS - this.now();
     await this.waitFor(job, (current) => current.clips.length > 0, remaining);
-    if (job.error !== undefined && job.clips.length === 0) return this.failure(job.error);
+    if (job.error && job.clips.length === 0) return this.failure(job.error);
     const total = job.utterances.length;
     return {
       kind: "json",
@@ -432,7 +459,7 @@ export class MessageAudio {
       const served = this.serveClip(ready, input.ifNoneMatch);
       if (served) return served;
     }
-    if (job.error !== undefined) return this.failure(job.error);
+    if (job.error) return this.failure(job.error);
     if (job.settled) return notFound;
     return {
       kind: "json",
