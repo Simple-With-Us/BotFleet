@@ -14,7 +14,7 @@
       "extraBundleIds": [
         "app.botfleet.ios.widgets"
       ],
-      "notes": "BotFleet companion iOS app.  AppleId 6820175685 (ASC bundle app.botfleet.ios).  Legacy app.botfleet / 6806379515 is retired for uploads.  Widget extension targets app.botfleet.ios.widgets; register that App ID in ASC before shipping widgets.  Team CC8UTF7ATG.  ASC SKU botfleet.  Marketing train is 1.0.N; build is UTC YYYYMMDDHHMM.  Hosted ships use GitHub Actions secrets APPLE_API_* and IOS_CERT_*; do not mint a new key."
+      "notes": "BotFleet companion iOS app.  AppleId 6820175685 (ASC bundle app.botfleet.ios, SKU botfleet-ios).  Legacy app.botfleet / 6806379515 is retired for uploads.  Widget extension app.botfleet.ios.widgets.  Team CC8UTF7ATG.  Marketing train is 1.0.N; build is UTC YYYYMMDDHHMM.  Hosted ships use APPLE_API_* and IOS_CERT_* with manual App Store profiles (ios/appstore-profiles.json)."
     }
   }
 }

@@ -74,9 +74,15 @@ test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => 
 
   const project = read("ios/project.yml");
   assert.match(project, /DEVELOPMENT_TEAM:\s*CC8UTF7ATG/);
-  assert.match(project, /PRODUCT_BUNDLE_IDENTIFIER:\s*app\.botfleet/);
+  assert.match(project, /PRODUCT_BUNDLE_IDENTIFIER:\s*app\.botfleet\.ios/);
   assert.match(project, /MARKETING_VERSION:\s*"1\.0\.\d+"/);
-  assert.match(project, /CODE_SIGN_STYLE:\s*Automatic/);
+  assert.match(project, /configs:\s*\n\s*Release:\s*\n\s*CODE_SIGN_STYLE:\s*Manual/);
+  assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet iOS App Store \(API\)"/);
+  assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet Widgets App Store \(API\)"/);
+  assert.match(project, /INFOPLIST_KEY_CFBundleDisplayName:\s*BotFleet\n/);
+  assert.match(project, /INFOPLIST_KEY_CFBundleDisplayName:\s*BotFleet Widgets/);
+  assert.match(yml, /IOS_MANUAL_SIGN:\s*"1"/);
+  assert.match(yml, /scripts\/ios-install-appstore-profiles\.sh/);
 
   assert.match(wrapper, /scripts\/ios-fleet\/ship-testflight\.sh/);
   assert.match(wrapper, /IN_REPO="\$\{ROOT\}\/scripts\/ios-fleet\/ship-testflight\.sh"/);
@@ -145,9 +151,25 @@ test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   assert.match(ship, /botfleet/);
   assert.match(ship, /DEFAULT_MIN_INTERVAL_SEC=3600/);
   assert.match(ship, /FORCE_SHIP=0/);
-  assert.match(ship, /CODE_SIGN_STYLE=Automatic/);
+  assert.match(ship, /MANUAL_SIGN/);
+  assert.match(ship, /ios-install-appstore-profiles\.sh/);
+  assert.match(ship, /write_manual_export_plists/);
   assert.match(ship, /date -u \+%Y%m%d%H%M/);
   assert.match(ship, /-allowProvisioningUpdates/);
+
+  const profileMap = JSON.parse(read("ios/appstore-profiles.json"));
+  assert.deepEqual(profileMap, {
+    "app.botfleet.ios": "BotFleet iOS App Store (API)",
+    "app.botfleet.ios.widgets": "BotFleet Widgets App Store (API)",
+  });
+
+  const installer = read("scripts/ios-install-appstore-profiles.sh");
+  assert.match(installer, /ensure-appstore-profiles/);
+  assert.match(installer, /com\.apple\.security\.application-groups/);
+  assert.match(installer, /IOS_REQUIRED_APP_GROUP/);
+
+  const asc = read("scripts/ios-fleet/asc-api.mjs");
+  assert.match(asc, /ensure-appstore-profiles/);
 });
 
 test("ship-testflight.sh --help lists botfleet and the case accepts it", () => {
