@@ -139,16 +139,22 @@ FOUND=()
 TAR_ROOT=""
 CREDENTIAL_PLAN="$(
   cd "$REPO_ROOT" && SRC_HOME="$SRC_HOME" SHARE_GPG_PRIVATE_KEYS="$SHARE_GPG_PRIVATE_KEYS" node --experimental-strip-types - <<'NODE'
-import { prepareCredentialSyncWorkspace } from "./server/vm-cli-credentials.ts";
+import { credentialSyncExcludePatterns, prepareCredentialSyncWorkspace } from "./server/vm-cli-credentials.ts";
 const homeDir = process.env.SRC_HOME ?? "";
 const shareGpgPrivateKeys = process.env.SHARE_GPG_PRIVATE_KEYS === "1";
 const { plan } = await prepareCredentialSyncWorkspace(homeDir, { shareGpgPrivateKeys });
 const root = plan.stagingDir ?? homeDir;
 const rels = [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])].sort();
-console.log(JSON.stringify({ root, rels }));
+console.log(JSON.stringify({ root, rels, excludes: credentialSyncExcludePatterns() }));
 NODE
 )" || { echo "Error: manifest-driven credential discovery failed." >&2; exit 1; }
 TAR_ROOT="$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+
+# tar --exclude flags, sourced from the manifest plan (never print contents).
+TAR_EXCLUDES=()
+while IFS= read -r pattern; do
+  [ -n "$pattern" ] && TAR_EXCLUDES+=("--exclude=$pattern")
+done <<< "$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["excludes"]))')"
 
 cleanup_staging() {
   if [ -n "$TAR_ROOT" ] && [ "$TAR_ROOT" != "$SRC_HOME" ] && [ -d "$TAR_ROOT" ]; then
@@ -230,12 +236,10 @@ sync_to_container() {
   log "Syncing ${#FOUND[@]} credential path(s) to '$c_name' ($mode)..."
 
   # Stream tar archive into container (staged docker/gnupg transforms use TAR_ROOT)
+  # Excludes come from the manifest plan (credentialSyncExcludePatterns) so the
+  # shell path and the server path never drift.
   COPYFILE_DISABLE=1 tar --format=ustar -C "$TAR_ROOT" --no-xattrs \
-    --exclude="*/virtenv*" \
-    --exclude="*/agent/*" \
-    --exclude="*.sock" \
-    --exclude="*cm-*" \
-    --exclude="*.DS_Store" \
+    "${TAR_EXCLUDES[@]}" \
     -cf - \
     "${FOUND[@]}" | \
     "${docker_cmd[@]}" exec -i -u "$CONTAINER_USER" "$c_name" tar -xf - -C "/home/$CONTAINER_USER"

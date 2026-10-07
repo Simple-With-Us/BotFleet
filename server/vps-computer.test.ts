@@ -793,6 +793,67 @@ describe("VPS computer", () => {
       expect(tarCalls(replaced.calls)).toHaveLength(1);
     });
 
+    it("keeps the sync successful when tar errors but every credential destination landed", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-partial-"));
+      try {
+        mkdirSync(join(tempDir, ".ssh"), { recursive: true });
+        writeFileSync(join(tempDir, ".ssh", "config"), "Host *\n");
+
+        const fake = fixture({ container: true, running: true });
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        try {
+          // tar exits non-zero because one member could not be written, and the
+          // probe confirms nothing is actually missing (the gcloud case).
+          const partial: VpsCommandRunner = async (args, options) => {
+            if (args.includes("tar") && args.includes("-xf")) {
+              fake.calls.push({ args, options });
+              throw new Error("tar: .config/gcloud/logs: Cannot mkdir: Permission denied");
+            }
+            if (args.includes("sh") && args.includes("-c")) {
+              fake.calls.push({ args, options });
+              return { stdout: "", stderr: "" }; // probe: nothing is missing
+            }
+            return fake.runner(args, options);
+          };
+
+          const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, partial, tempDir);
+          expect(result.ok).toBe(true);
+          expect(result.syncedTools.some((entry) => entry.name === "ssh")).toBe(true);
+        } finally {
+          warn.mockRestore();
+        }
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("still fails the sync when a credential destination is genuinely missing", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-missing-"));
+      try {
+        mkdirSync(join(tempDir, ".ssh"), { recursive: true });
+        writeFileSync(join(tempDir, ".ssh", "config"), "Host *\n");
+
+        const fake = fixture({ container: true, running: true });
+        const missing: VpsCommandRunner = async (args, options) => {
+          if (args.includes("tar") && args.includes("-xf")) {
+            fake.calls.push({ args, options });
+            throw new Error("tar extract failed");
+          }
+          if (args.includes("sh") && args.includes("-c")) {
+            fake.calls.push({ args, options });
+            return { stdout: "/home/cua/.ssh\n", stderr: "" };
+          }
+          return fake.runner(args, options);
+        };
+
+        await expect(vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, missing, tempDir)).rejects.toThrow(
+          /destination\(s\) are missing/,
+        );
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
     it("backs off after a failed automatic sync instead of retrying on every turn", async () => {
       const base = fixture({ containerName: SHARED_VPS_TARGET.containerName });
       const failing: VpsCommandRunner = async (args, options) => {

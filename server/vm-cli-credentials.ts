@@ -467,6 +467,36 @@ export function credentialPermissionHardeningShell(user = "cua"): string {
   ].join("; ");
 }
 
+/**
+ * Host paths under a credential root that must never be archived.  Each entry
+ * is a tar `--exclude` pattern, scoped to the credential root it sits under so
+ * a broad name like `logs` cannot silence an unrelated tool's credential.
+ *
+ * These are tool-maintained, not credential: gcloud writes a dated debug tree
+ * under `logs/`, blobs under `cache/`, and CLI state under `data/`.  The
+ * guest's `~/.config/gcloud` is root-owned, so shipping that churn made the
+ * guest-side `tar -x` exit non-zero and took every other tool's credentials
+ * down with it.
+ */
+const CREDENTIAL_EXCLUDE_PATTERNS: string[] = [
+  ".config/gcloud/logs",
+  ".config/gcloud/cache",
+  ".config/gcloud/data",
+];
+
+/** Pre-existing generic excludes: interpreter venvs, sockets, editor droppings. */
+const GENERIC_EXCLUDE_PATTERNS: string[] = [
+  "*/virtenv*",
+  "*/agent/*",
+  "*.sock",
+  "*cm-*",
+  "*.DS_Store",
+];
+
+export function credentialSyncExcludePatterns(): string[] {
+  return [...GENERIC_EXCLUDE_PATTERNS, ...CREDENTIAL_EXCLUDE_PATTERNS].sort();
+}
+
 export async function packageCredentialArchive(
   homeDir: string,
   plan: CredentialSyncPlan,
@@ -474,6 +504,7 @@ export async function packageCredentialArchive(
   const paths = [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])];
   if (paths.length === 0) return null;
   const tarRoot = plan.stagingDir ?? homeDir;
+  const excludes = credentialSyncExcludePatterns().map((pattern) => `--exclude=${pattern}`);
   return await new Promise<Buffer>((resolve, reject) => {
     const tar = spawn(
       "tar",
@@ -482,11 +513,7 @@ export async function packageCredentialArchive(
         "-C",
         tarRoot,
         "--no-xattrs",
-        "--exclude=*/virtenv*",
-        "--exclude=*/agent/*",
-        "--exclude=*.sock",
-        "--exclude=*cm-*",
-        "--exclude=*.DS_Store",
+        ...excludes,
         "-cf",
         "-",
         ...paths,

@@ -51,6 +51,7 @@ import {
 import { augmentedPath } from "./env-path.ts";
 import {
   credentialPermissionHardeningShell,
+  guestPathForCredentialRel,
   packageCredentialArchive,
   prepareCredentialSyncWorkspace,
   type CredentialSyncResult,
@@ -1159,11 +1160,33 @@ export async function vpsSyncCliCredentials(
       };
     }
 
-    await run(
-      ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", "/home/cua"],
-      60_000,
-      tarArchive,
-    );
+    const plannedGuestPaths = [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])]
+      .map((rel) => guestPathForCredentialRel(rel))
+      .sort();
+
+    try {
+      await run(
+        ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", "/home/cua"],
+        60_000,
+        tarArchive,
+      );
+    } catch {
+      // GNU tar reports per-member errors only after extracting everything it
+      // can, so a non-zero exit does not mean the credentials are missing — it
+      // means at least one member could not be written.  Verify before failing
+      // the whole sync, otherwise one unwritable path on the guest silently
+      // denies every other tool its credentials (observed: gcloud's root-owned
+      // ~/.config/gcloud, which cost the shared VPS a sync every ~5 minutes).
+      const missing = await missingGuestCredentialPaths(run, target.containerName, plannedGuestPaths);
+      if (missing.length > 0) {
+        throw new Error(
+          `credential extract failed and ${missing.length} destination(s) are missing: ${missing.slice(0, 5).join(", ")}`,
+        );
+      }
+      console.warn(
+        `[vps] credential extract reported errors but all ${plannedGuestPaths.length} destination(s) are present`,
+      );
+    }
 
     await run(["exec", "-u", "cua", target.containerName, "sh", "-c", credentialPermissionHardeningShell()], 15_000).catch(
       () => {},
@@ -1177,6 +1200,32 @@ export async function vpsSyncCliCredentials(
     };
   } finally {
     await cleanup();
+  }
+}
+
+/**
+ * Which of the planned guest credential destinations are absent after a
+ * failed extract.  Best-effort: a verification probe that itself fails reports
+ * everything as missing so the caller still surfaces the original failure
+ * instead of claiming a partial sync succeeded.
+ */
+async function missingGuestCredentialPaths(
+  run: (args: string[], timeoutMs?: number, input?: string | Buffer) => Promise<{ stdout: string; stderr: string }>,
+  containerName: string,
+  guestPaths: string[],
+): Promise<string[]> {
+  if (guestPaths.length === 0) return [];
+  const probe = guestPaths
+    .map((path) => `[ -e '${path.replace(/'/g, "'\\''")}' ] || echo '${path.replace(/'/g, "'\\''")}'`)
+    .join("; ");
+  try {
+    const { stdout } = await run(
+      ["exec", "-u", "cua", containerName, "sh", "-c", probe],
+      20_000,
+    );
+    return stdout.split("\n").map((line) => line.trim()).filter((line) => guestPaths.includes(line));
+  } catch {
+    return [...guestPaths];
   }
 }
 
