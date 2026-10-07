@@ -25,6 +25,15 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(yml, /runs-on:\s*\[self-hosted/);
   assert.match(yml, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
   assert.match(yml, /bash scripts\/ios-assert-xcode\.sh 27\.0/);
+  // Standing TestFlight testers: emails only from the secret, never a red ship.
+  assert.match(yml, /name: Sync standing TestFlight testers/);
+  assert.match(yml, /ASC_STANDING_TESTERS:\s*\$\{\{\s*secrets\.ASC_STANDING_TESTERS\s*\}\}/);
+  assert.match(yml, /ensure-standing-testers "\$appleid"/);
+  assert.match(yml, /::add-mask::/);
+  const syncStep = yml.slice(yml.indexOf("name: Sync standing TestFlight testers"));
+  assert.match(syncStep, /continue-on-error:\s*true/);
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /method === "ensure-standing-testers"/);
+  assert.match(read("scripts/ios-fleet/ship-testflight.sh"), /sentry_redact/);
   const ci = read(".github/workflows/ci.yml");
   assert.match(ci, /\|\| 'xcode-27' \}\}/);
   assert.match(ci, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
