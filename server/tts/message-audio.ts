@@ -45,8 +45,10 @@ export const MAX_UTTERANCES_PROGRESSIVE = 160;
  * companion's 30-second headers deadline. */
 export const PROGRESSIVE_RESPONSE_BUDGET_MS = 20_000;
 /** How long a clip GET waits for an in-flight clip before answering
- * CLIP_NOT_READY_STATUS.  Also inside the companion's 30 seconds. */
-export const CLIP_WAIT_MS = 20_000;
+ * CLIP_NOT_READY_STATUS.  Under the iOS client's default 20-second request
+ * timeout (CompanionClient.makeRequest) as well as the companion's 30, so the
+ * phone hears the retryable answer instead of timing out first. */
+export const CLIP_WAIT_MS = 15_000;
 /** Neither 2xx (a client would play the JSON as audio) nor 5xx (iOS reports
  * every 5xx to Sentry, and this is normal polling).  425 Too Early: the clip
  * exists in the plan but not yet on disk. */
