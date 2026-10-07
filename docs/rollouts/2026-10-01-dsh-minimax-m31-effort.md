@@ -1,12 +1,14 @@
 # 2026-10-01 — MiniMax M3.1 Reasoning Effort On Harness (DSH)
 
+## Context
+
 Board row `873f0bbe`, branch `claude/dsh-m31-effort`.  Owner approval 2026-10-01: enable MiniMax M3.1 on the Harness (DSH) engine with the `settings.yaml` entry, a Harness change for effort levels plus this BotFleet bump, and one paid MiniMax call to confirm it works.  This follows PR #756 (MiniMax Code and the direct HTTP engine), whose rollout doc `2026-09-30-minimax-m31-effort.md` lives in that PR until it merges and whose "Harness (DSH): What Unlocks M3.1" section listed these three steps.
 
 ## What Ships
 
 - **Harness (Clutch) #65**, merged as `2d57ec5`: `EffortLevel` gains `xhigh`, `dshSupport.perModelEffortLevels` publishes `MiniMax-M3.1-Flash-Preview: [low, medium, high, xhigh, max]`, `dshInstalledEffortLevels(settings)` narrows that to what an install's `settings.yaml` declares, and Default on a row with per-model levels sends dsh's provider-default value `""`.  Harness doc: `docs/dsh-reasoning-effort.md` in that repo.
 - **Harness (Clutch) #66**, merged as `7fbd88d`, the corrective the #769 review asked for: `dshInstalledEffortLevels` also requires `compat.forceAdaptiveThinking: true` on the entry, the Default `""` request swallows only dsh's invalid-params refusal (`-32602`) so a timeout or internal error still surfaces, and the effort-mismatch error says "Engine" instead of "DeepSeek Harness".
-- **BotFleet** moves the `clutch` pin from `6edb253` (#764) to `github:jaywedgeworth22/Clutch#7fbd88d…`, which brings Clutch #63, #65 and #66, and:
+- **BotFleet** moves the `clutch` pin from `6edb253` (#764) to `github:Simple-With-Us/Clutch#7fbd88d…`, which brings Clutch #63, #65 and #66, and:
   - `readDshModelCatalog` sets the M3.1 row's `effortLevels` from the installed settings, so the picker offers Default, Low, Medium, High, X-High and Max only when dsh will take them and pi-ai will send them as distinct adaptive levels, and an explicit `[]` otherwise.
   - `readDshSettingsPath` treats `$DSH_HOME` as dsh's engine home itself, the way dsh and `dshCredentialCandidates` do, so it reads `$DSH_HOME/settings.yaml`.  It used to look in `$DSH_HOME/.dsh/settings.yaml`, one folder too deep, which hid M3.1's levels whenever `DSH_HOME` was set.  The default, `~/.dsh/settings.yaml`, is unchanged.
   - The DSH `configureSession` delegates to Clutch instead of keeping its own copy.  The old copy returned early whenever a turn had no effort, which left a level an earlier turn pinned on a resumed session in force.
@@ -53,9 +55,13 @@ All tests use temporary homes and the fake ACP CLI.  No test reads `~/.botfleet`
 - `src/lib/model-effort.test.ts`: the DSH M3.1 picker shows only when its row carries levels.
 - Offline payload check against the installed dsh and pi-ai with a blocked `fetch`: Default sends no thinking field, and Low, X-High and Max send `thinking: {type: "adaptive", display: "summarized"}` with `output_config.effort` set to the level.  Zero network calls.
 
-## Still To Do
+## Owner Action Items
 
-One paid MiniMax call (owner-approved) to confirm MiniMax accepts pi-ai's `thinking.display: "summarized"` with an effort, on the live harness after this lands.
+One paid MiniMax call (owner-approved) to confirm MiniMax accepts pi-ai's `thinking.display: "summarized"` with an effort, on the live harness after this lands.  Nothing else in this note waits on a person; every other check above is automated and green.
+
+## Rollback
+
+Revert the Clutch pin.  The M3.1 row simply loses its effort levels and the picker row disappears; M2.7 Highspeed stays hidden either way, and no stored setting becomes invalid, because the levels were never persisted.  Reverting also restores the previous `readDshSettingsPath` behaviour, which means a `$DSH_HOME` set by hand goes back to reading the wrong folder — so prefer the forward fix over the revert unless Clutch is unusable.
 
 ## Merge Order
 

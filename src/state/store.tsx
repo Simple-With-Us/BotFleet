@@ -357,6 +357,8 @@ export interface Bot {
   cwd?: string;
   /** auto mode: the bot approves its own tool permissions */
   autoApprove?: boolean;
+  /** permission bypass mode: automatically approve all tools, commands, and routines without halting */
+  bypassPermissions?: boolean;
   /** optional model review for otherwise undecided, attended approvals */
   autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
@@ -512,6 +514,7 @@ export interface ConfigStatus {
     mode: "shared" | "per-bot";
     maxInstances: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
   };
   opencodeGo?: { configured: boolean };
@@ -768,6 +771,7 @@ export interface InstanceInfo {
       supportsEffort?: boolean;
       /** Absent inherits the instance-wide image capability. */
       images?: boolean;
+      contextWindow?: number;
     }>;
   };
   capabilities?: {
@@ -1040,6 +1044,11 @@ export type Action =
       /** remember this exact grant (the server's allowKey) for the bot */
       alwaysAllow?: { botId: string; key: string };
       /** Local UI recovery hook for voice flows. Never sent to the server. */
+      onError?: (message: string) => void;
+    }
+  | {
+      type: "approveAllRequests";
+      threadId: string;
       onError?: (message: string) => void;
     }
   | { type: "requestNewTask"; botId: string }
@@ -1475,6 +1484,7 @@ export function reducer(state: AppState, action: Action): AppState {
     case "dismissCard":
       return patchCard(state, action.botId, action.messageId, { dismissed: true });
     case "decideRequest":
+    case "approveAllRequests":
       return state; // the server's request.resolved patch settles the card
     case "botAdded": {
       // An HTTP create/import response and a second fold of the same bot can
@@ -2616,6 +2626,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             break;
           }
           void respond();
+          break;
+        }
+        case "approveAllRequests": {
+          api(`/api/threads/${action.threadId}/approve-all`, {
+            method: "POST",
+          }).catch((error) => {
+            showError(error);
+            action.onError?.(error instanceof Error ? error.message : String(error));
+          });
           break;
         }
         case "answerCard": {

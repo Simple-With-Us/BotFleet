@@ -3470,6 +3470,31 @@ describe("harness HTTP API", () => {
     expect(nothing.status).toBe(404);
   });
 
+  it("approves all pending approvals for a thread or bot", async () => {
+    const listRes = await api("GET", "/api/bots");
+    const bot = listRes.body.bots[0];
+
+    // non-existent bot returns 404
+    const notFound = await api("POST", "/api/bots/non-existent-bot-id/approve-all");
+    expect(notFound.status).toBe(404);
+
+    // bot with no pending approvals returns ok with approvedCount: 0
+    const emptyApprove = await api("POST", `/api/bots/${bot.id}/approve-all`);
+    expect(emptyApprove.status).toBe(200);
+    expect(emptyApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // thread approve-all endpoint
+    const threadApprove = await api("POST", `/api/threads/${bot.threadId}/approve-all`);
+    expect(threadApprove.status).toBe(200);
+    expect(threadApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // invalid route parameters return 400
+    const invalidBot = await api("POST", "/api/bots/bad%20bot%20id/approve-all");
+    expect(invalidBot.status).toBe(400);
+    const invalidThread = await api("POST", "/api/threads/bad%20thread%20id/approve-all");
+    expect(invalidThread.status).toBe(400);
+  });
+
   it("closes the approvals a cancelled turn can no longer answer", async () => {
     // "Cancel turn" is a button ON the approval card, and a pending approval
     // owns the composer. Stopping the turn without closing its card leaves the
@@ -4004,6 +4029,7 @@ describe("harness HTTP API", () => {
       mode: "shared",
       maxInstances: 2,
       shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
       allowHostTerminal: false,
     });
 
@@ -4019,6 +4045,7 @@ describe("harness HTTP API", () => {
       mode: "per-bot",
       maxInstances: 3,
       shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
       allowHostTerminal: false,
     });
 
@@ -4049,24 +4076,45 @@ describe("harness HTTP API", () => {
     // credentials into a container.
     try {
       const saved = await api("PUT", "/api/config", {
-        localVm: { shareCliCredentials: true, allowHostTerminal: true },
+        localVm: { shareCliCredentials: true, shareGpgPrivateKeys: true, allowHostTerminal: true },
       });
       expect(saved.status).toBe(200);
-      expect(saved.body.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: true });
+      expect(saved.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
 
       const reread = await api("GET", "/api/config");
-      expect(reread.body.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: true });
+      expect(reread.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
+
+      const status = await api("GET", "/api/config");
+      expect(status.body.localVm).toMatchObject({ shareGpgPrivateKeys: true });
 
       // Turning one off must not disturb the other.
       const half = await api("PUT", "/api/config", { localVm: { allowHostTerminal: false } });
-      expect(half.body.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: false });
+      expect(half.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
 
       // The in-memory status above is served from the same `cfg` the PUT
       // wrote, so only the file on disk proves the save round trip.
       const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
-      expect(disk.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: false });
+      expect(disk.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
     } finally {
-      await api("PUT", "/api/config", { localVm: { shareCliCredentials: false, allowHostTerminal: false } });
+      await api("PUT", "/api/config", {
+        localVm: { shareCliCredentials: false, shareGpgPrivateKeys: false, allowHostTerminal: false },
+      });
     }
   });
 
@@ -4735,11 +4783,16 @@ describe("harness HTTP API", () => {
       });
       expect(renamed.body.task).not.toHaveProperty("resumeCursors");
 
-      // and the same on the wire, not just in the HTTP responses
+      // and the same on the wire, not just in the HTTP responses.  Wait for
+      // hello before the unread nudge — every other SSE test in this file does
+      // the same, and under windows-latest parallel suite load the unread PATCH
+      // can otherwise land before the client has proved it can receive frames
+      // (seen as a bare 20s vitest timeout rather than until's own message).
       const stream = await openSse(`${BASE}/api/events`);
       try {
+        await stream.until((f) => f.kind === "hello");
         await api("PATCH", `/api/bots/${botId}`, { unread: true });
-        const frame = await stream.until((f) => f.kind === "bot");
+        const frame = await stream.until((f) => f.kind === "bot" && f.bot?.id === botId);
         expect(frame.bot).not.toHaveProperty("resumeCursors");
         expect(JSON.stringify(frame)).not.toContain("resumeCursors");
       } finally {
@@ -4748,7 +4801,9 @@ describe("harness HTTP API", () => {
     } finally {
       await api("DELETE", `/api/bots/${botId}`);
     }
-  });
+    // Bot create + task + SSE + delete; windows-latest is about a third slower
+    // and overlaps its files more, so the default 20s budget is a coin flip.
+  }, 30_000);
 
   it("validates the event inspector limit at the HTTP boundary", async () => {
     const bot = (await api("GET", "/api/bots")).body.bots[0];

@@ -296,7 +296,7 @@ export async function provisionBox(cfg: AppConfig, botId: string, botName: strin
     const ready = await waitReady(cfg, box.id);
     if (!ready) throw new Error("box did not become ready within 90s — retry in a minute");
 
-    // Install the exact Cua Driver executable in the background, keep its
+    // Install the exact CUA Driver executable in the background, keep its
     // daemon private to the VM, and retain X11 tooling as a degraded fallback.
     const bootstrap = remoteComputerBootstrapCommand(botName);
     let boot;

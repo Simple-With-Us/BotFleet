@@ -131,45 +131,37 @@ if [ -z "$SSH_ALIAS" ]; then
   SSH_ALIAS="$(resolve_config_alias)"
 fi
 
-# Candidate developer credentials to sync
-CANDIDATES=(
-  ".infisical"
-  ".config/infisical"
-  ".ssh"
-  ".gitconfig"
-  ".config/git"
-  ".config/gh"
-  ".netrc"
-  ".aws"
-  ".config/gcloud"
-  ".azure"
-  ".oci"
-  ".docker/config.json"
-  ".kube"
-  ".npmrc"
-  ".cargo/credentials.toml"
-  ".cargo/credentials"
-  ".cargo/config.toml"
-  ".cargo/config"
-  ".pypirc"
-  ".vercel"
-  ".fly"
-  ".config/cloudflare"
-  ".wrangler"
-  ".config/stripe"
-  ".config/supabase"
-  ".config/huggingface"
-  ".sentryclirc"
-  ".terraform.d"
-)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SHARE_GPG_PRIVATE_KEYS="${BOTFLEET_SHARE_GPG_PRIVATE_KEYS:-0}"
 
-# Detect which candidates exist in the source home
+# Candidate developer credentials to sync (manifest-driven)
 FOUND=()
-for rel in "${CANDIDATES[@]}"; do
-  if [ -e "$SRC_HOME/$rel" ]; then
-    FOUND+=("$rel")
+TAR_ROOT=""
+CREDENTIAL_PLAN="$(
+  cd "$REPO_ROOT" && SRC_HOME="$SRC_HOME" SHARE_GPG_PRIVATE_KEYS="$SHARE_GPG_PRIVATE_KEYS" node --experimental-strip-types - <<'NODE'
+import { prepareCredentialSyncWorkspace } from "./server/vm-cli-credentials.ts";
+const homeDir = process.env.SRC_HOME ?? "";
+const shareGpgPrivateKeys = process.env.SHARE_GPG_PRIVATE_KEYS === "1";
+const { plan } = await prepareCredentialSyncWorkspace(homeDir, { shareGpgPrivateKeys });
+const root = plan.stagingDir ?? homeDir;
+const rels = [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])].sort();
+console.log(JSON.stringify({ root, rels }));
+NODE
+)" || { echo "Error: manifest-driven credential discovery failed." >&2; exit 1; }
+TAR_ROOT="$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+
+cleanup_staging() {
+  if [ -n "$TAR_ROOT" ] && [ "$TAR_ROOT" != "$SRC_HOME" ] && [ -d "$TAR_ROOT" ]; then
+    rm -rf "$TAR_ROOT"
   fi
-done
+}
+trap cleanup_staging EXIT
+trap 'cleanup_staging; exit 130' INT
+trap 'cleanup_staging; exit 143' TERM
+
+while IFS= read -r rel; do
+  [ -n "$rel" ] && FOUND+=("$rel")
+done <<< "$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["rels"]))')"
 
 if [ ${#FOUND[@]} -eq 0 ]; then
   log "No matching CLI credentials found in $SRC_HOME."
@@ -237,8 +229,8 @@ sync_to_container() {
 
   log "Syncing ${#FOUND[@]} credential path(s) to '$c_name' ($mode)..."
 
-  # Stream tar archive into container
-  COPYFILE_DISABLE=1 tar --format=ustar -C "$SRC_HOME" --no-xattrs \
+  # Stream tar archive into container (staged docker/gnupg transforms use TAR_ROOT)
+  COPYFILE_DISABLE=1 tar --format=ustar -C "$TAR_ROOT" --no-xattrs \
     --exclude="*/virtenv*" \
     --exclude="*/agent/*" \
     --exclude="*.sock" \

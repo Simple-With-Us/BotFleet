@@ -3,12 +3,14 @@ import { chmod, copyFile, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { downloadBuiltBundle, ResolutionError } from "./ci-build-resolver.mjs";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
 import {
   applicationAttachmentError,
   applicationIdentitiesCanTransition,
+  classifySmokeFailure,
   SAFE_STORAGE_EXPORT_FLAG,
   shouldExportSafeStorageBeforeRename,
   authenticatedRuntimeError,
@@ -16,6 +18,7 @@ import {
   credentialPreparationReceiptPath,
   DEFAULT_PORTS,
   dependencyFingerprint,
+  isRecoverableResolutionFailure,
   designatedRequirementFromOutput,
   fenceRuntimeAdmission,
   healthTopologyResult,
@@ -26,15 +29,19 @@ import {
   loadPrepared,
   main,
   parseArguments,
+  parseHealthBody,
   pendingRecoveryReceiptPath,
   quiesceBootoutLabels,
   rollbackHarnessBootoutLabels,
   rollbackHarnessBootstrapPlists,
   rollbackReadinessError,
   run,
+  runStagedSmokeTest,
   runtimePreflight,
   settledRunOutcome,
   signalProcess,
+  smokeFailureMessage,
+  smokeTestEnabled,
   stableApplicationProcessError,
   startedHarnessLabel,
   swapPreparedFiles,
@@ -44,6 +51,10 @@ import {
 } from "./update-botfleet-mac.mjs";
 
 const scripts = dirname(fileURLToPath(import.meta.url));
+
+// A real 40-char commit, so the resolver is driven with a target it will accept.
+const COMMIT = "c".repeat(40);
+
 
 test("a detached run is given a progress file and a run id to report under", () => {
   const parsed = parseArguments(["update", "--progress", "/tmp/state/run.json", "--run-id", "run_one"]);
@@ -266,6 +277,8 @@ test("the stable wrapper bootstraps updater policy from the fetched target", asy
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -334,6 +347,8 @@ test("the stable wrapper rejects an unmerged --target before running any of its 
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -386,6 +401,8 @@ test("the stable wrapper resolves a revision-expression --target instead of fetc
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -437,6 +454,8 @@ test("unquiesce ignores update targets and bootstraps the recovery from origin/m
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -493,6 +512,8 @@ test("the stable wrapper resolves env and equals-form targets to the pinned vali
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -544,6 +565,8 @@ test("the stable wrapper builds the commit it validated, even when main moves mi
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -617,6 +640,8 @@ test("the stable wrapper runs with no arguments and no update target", { skip: p
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -658,6 +683,8 @@ test("the stable wrapper detects a linked worktree checkout, where .git is a fil
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -706,6 +733,8 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -794,6 +823,8 @@ test("apply bootstraps the updater recorded in the stage manifest, not a newer o
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -1754,6 +1785,8 @@ test("the updater runs its entry point when invoked through a symlinked director
   const { linked, root } = await symlinkedCopy(t, [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]);
@@ -1788,4 +1821,246 @@ test("another script with the same entry guard runs through a symlinked director
   // a network request without a token.
   assert.notEqual(result.code, 0);
   assert.match(result.stderr, /GH_TOKEN is required to verify the release tag/);
+});
+
+// --- Pre-activation smoke test ------------------------------------------------
+//
+// The Sep 17 and Oct 1 outages were both a healthy binary plus a starved CPU,
+// and the first version of this gate would have called both of them a corrupt
+// build.  These cases exist to keep that mistake from returning: a timeout and
+// a real failure must stay distinguishable, and only a timeout may be retried.
+// The diagnosis is not re-derived here either — fleet recall ("busy host update
+// timeout classified as corrupt artifact not a failure", 2026-10-04) returns the
+// Oct 1 cloudflared probe incident (PR #780, board fd1736f8) and the open board
+// sweep for the same failure in six other probes.
+test("the smoke test is on unless it is explicitly switched off", () => {
+  assert.equal(smokeTestEnabled({}), true);
+  assert.equal(smokeTestEnabled({ BOTFLEET_UPDATE_SMOKE: "1" }), true);
+  for (const value of ["0", "off", "FALSE", "no", " off "]) {
+    assert.equal(smokeTestEnabled({ BOTFLEET_UPDATE_SMOKE: value }), false, `${value} should disable the probe`);
+  }
+});
+
+test("a boot that never became ready is a busy host, not a corrupt candidate", () => {
+  assert.equal(classifySmokeFailure({ exitCode: null, signal: null }), "server-never-ready");
+  assert.equal(classifySmokeFailure({ spawnTimedOut: true }), "sqlite-probe-timed-out");
+  const timeoutMessage = smokeFailureMessage({
+    cause: "server-never-ready",
+    exitCode: null,
+    signal: null,
+    targetCommit: "b".repeat(40),
+  });
+  assert.match(timeoutMessage, /too busy/);
+  assert.match(timeoutMessage, /commit=b{12}\b/);
+  // The whole point: a starved host must not be reported as a broken build.
+  assert.doesNotMatch(timeoutMessage, /corrupt|invalid|bad build/i);
+});
+
+test("a candidate that exits or cannot spawn is named as a real failure", () => {
+  assert.equal(classifySmokeFailure({ exitCode: 1, signal: null }), "server-exited");
+  assert.equal(classifySmokeFailure({ exitCode: null, signal: "SIGSEGV" }), "server-killed-SIGSEGV");
+  assert.equal(classifySmokeFailure({ spawnError: new Error("ENOENT") }), "spawn-failed");
+  const exited = smokeFailureMessage({
+    cause: "server-exited",
+    exitCode: 1,
+    signal: null,
+    targetCommit: "b".repeat(40),
+    output: "Error: Cannot find package 'zod'",
+  });
+  assert.match(exited, /exited during boot/);
+  assert.match(exited, /exit=1/);
+  assert.match(exited, /Cannot find package/);
+  assert.match(smokeFailureMessage({ cause: "spawn-failed", spawnError: "EACCES", targetCommit: "b".repeat(40) }), /spawn=EACCES/);
+});
+
+test("candidate output is capped in the failure message", () => {
+  const message = smokeFailureMessage({
+    cause: "server-exited",
+    exitCode: 1,
+    targetCommit: "b".repeat(40),
+    output: "x".repeat(50_000),
+  });
+  assert.ok(message.length < 4_000, `message should stay small, got ${message.length}`);
+});
+
+const smokeOk = { ready: true, output: "", sqlite: { ok: true, timedOut: false, detail: null } };
+const smokeNeverReady = { ready: false, output: "", exitCode: null, signal: null };
+const smokeExited = { ready: false, output: "boom", exitCode: 1, signal: null };
+
+test("a candidate that starts and initializes SQLite passes without a retry", async () => {
+  let calls = 0;
+  const result = await runStagedSmokeTest({
+    builtBundle: "/stage/BotFleet.app",
+    targetCommit: "b".repeat(40),
+    smokeImpl: async () => {
+      calls += 1;
+      return smokeOk;
+    },
+  });
+  assert.deepEqual(result, { ok: true, attempts: 1 });
+  assert.equal(calls, 1);
+});
+
+test("a readiness timeout is retried once, and a second timeout is reported as a busy host", async () => {
+  let calls = 0;
+  const retries = [];
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return smokeNeverReady;
+      },
+      onRetry: (event) => retries.push(event),
+    }),
+    /too busy/,
+  );
+  assert.equal(calls, 2, "exactly one retry, never a loop");
+  assert.deepEqual(retries, [{ attempt: 1, attempts: 2 }]);
+});
+
+test("a busy first attempt followed by a healthy candidate succeeds", async () => {
+  let calls = 0;
+  const result = await runStagedSmokeTest({
+    builtBundle: "/stage/BotFleet.app",
+    targetCommit: "b".repeat(40),
+    smokeImpl: async () => {
+      calls += 1;
+      return calls === 1 ? smokeNeverReady : smokeOk;
+    },
+  });
+  assert.deepEqual(result, { ok: true, attempts: 2 });
+  assert.equal(calls, 2);
+});
+
+test("a candidate that exits is never retried, because waiting cannot change the answer", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return smokeExited;
+      },
+    }),
+    /exited during boot/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("a missing node:sqlite binding is a real failure, not a slow host", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return { ready: true, output: "", sqlite: { ok: false, timedOut: false, detail: "node:sqlite did not initialize (exit=1)" } };
+      },
+    }),
+    /node:sqlite did not initialize/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("a probe-reported cause wins over the busy-host default", async () => {
+  // A live child that never reported readiness would normally classify as
+  // "too busy" and be retried.  When the probe knows better — the owner record
+  // named a different pid — that is a real defect, and saying "too busy" would
+  // send the operator after the wrong problem entirely.
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return {
+          ready: false,
+          cause: "owner-mismatch",
+          output: "owner record pid 1 does not match the staged server pid 2",
+          exitCode: null,
+          signal: null,
+        };
+      },
+    }),
+    /owner record naming a different process/,
+  );
+  assert.equal(calls, 1, "a real defect must not be retried as a slow host");
+});
+
+test("only a well-formed health body establishes readiness", () => {
+  // `body?.ready !== false` accepts every one of these, because each is "not
+  // false" — including a truncated body, an HTML error page, and a bare `{}`.
+  // Any of them would have declared a candidate ready.
+  assert.equal(parseHealthBody({ app: "botfleet", ready: true }), true);
+  assert.equal(parseHealthBody({ app: "botfleet", ready: false }), false);
+  for (const body of [null, undefined, "ready", 42, [], {}, { ready: true }, { app: "botfleet" },
+    { app: "botfleet", ready: "true" }, { app: "botfleet", ready: 1 }]) {
+    assert.equal(parseHealthBody(body), false, `${JSON.stringify(body)} must not establish readiness`);
+  }
+});
+
+test("only an expected cancellation justifies packaging on this Mac", async () => {
+  // The real class: the check is an instanceof, so a stand-in would make the
+  // test pass for the wrong reason.
+
+  // The `auto` policy exists for "this commit was not built".  A build that
+  // actually FAILED is a signal — its signature gate, tests, or packaging step
+  // rejected the commit — and quietly building it locally for 15 minutes would
+  // turn a broken pipeline into a deceptively successful install.
+  // This used to construct a `ResolutionError("x")` and hand-assign `cause` and
+  // `conclusion` onto it — which is a restatement of the function's own body.
+  // It would still pass if ci-build-resolver.mjs were deleted outright, so it
+  // could not catch the bug it was written for: the resolver reporting
+  // "still running" while the consumer tests for "in_progress".
+  //
+  // So the error is produced by the RESOLVER, from a real workflow status, and
+  // the assertion is on the value the consumer actually reads — not on the
+  // prose, which is identical for "in_progress" and "still running".
+  const fromResolver = async (status, conclusion) => {
+    const fetchImpl = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        workflow_runs: [{ id: 1, head_sha: COMMIT, status, conclusion, event: "push" }],
+      }),
+    });
+    try {
+      await downloadBuiltBundle({ commit: COMMIT, destination: "/tmp/unused-by-this-test", fetchImpl });
+    } catch (error) {
+      return error;
+    }
+    throw new Error(`expected the resolver to refuse a run with status=${status}`);
+  };
+
+  // Sanity: the run really is refused, with the cause the consumer branches on.
+  const stillRunning = await fromResolver("in_progress", null);
+  assert.equal(stillRunning.cause, "build-failed");
+  // THE BUG.  The prose says "still running"; the value is the raw status.
+  assert.equal(stillRunning.conclusion, "in_progress",
+    "the resolver must carry the raw workflow status, because the consumer compares against that literal");
+  assert.equal(isRecoverableResolutionFailure(stillRunning), true, "a build still running is worth a moment");
+
+  const cancelled = await fromResolver("completed", "cancelled");
+  assert.equal(cancelled.conclusion, "cancelled");
+  assert.equal(isRecoverableResolutionFailure(cancelled), true, "a superseded build is expected, not a failure");
+
+  const failed = await fromResolver("completed", "failure");
+  assert.equal(isRecoverableResolutionFailure(failed), false,
+    "a build that actually rejected the commit must surface, not fall back to a local package");
+  assert.equal(isRecoverableResolutionFailure(await fromResolver("completed", "timed_out")), false);
+
+  assert.equal(isRecoverableResolutionFailure(new ResolutionError("x", "no-build")), true,
+    "the commit predates the workflow");
+  for (const cause of ["network-failed", "network-timed-out", "rate-limited", "checksum-mismatch", "bad-manifest", "unauthorized", "pointer-lost"]) {
+    assert.equal(
+      isRecoverableResolutionFailure(new ResolutionError("x", cause)),
+      false,
+      `${cause} must surface rather than fall back`,
+    );
+  }
 });

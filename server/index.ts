@@ -351,7 +351,7 @@ import { KNOB_FIELDS, knobSource, readKnobField } from "./knob-map.ts";
 import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
 import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
-import { ProviderRegistry } from "./harness/registry.ts";
+import { ProviderRegistry, type DescribedInstance } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import {
   mentionedBots,
@@ -364,6 +364,7 @@ import {
   type GroupRecord,
   type GroupTaskRecord,
   type Message,
+  type BotRecord,
   type TaskRecord,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
@@ -425,14 +426,16 @@ import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
+import { fleetSeatPromptPart } from "./seat-prompt.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
-import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import { DEFAULT_WEBHOOK_HOT_DEFER_MS, RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import {
   automationRolloverCaps,
   shouldRolloverAutomationThread,
 } from "./automation-rollover.ts";
+import { formatEphemeralResultMessage } from "./ephemeral-dispatch.ts";
 import { RoutineRequestError, RoutineRequestService } from "./routine-requests.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
 import { scoutProject, suggestTeam } from "./project-scout.ts";
@@ -446,9 +449,8 @@ import { resolveLinqBinding } from "./linq/dispatch.ts";
 import { bindLinqChatToTurn, deliverLinqOutboundIfNeeded, releaseLinqChat, stopLinqTypingForThread } from "./linq/outbound.ts";
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
-import { ResourceTriggerManager, webhookDispatchHot } from "./resource-triggers.ts";
-import { createHostProbe, type HostProbe } from "./jobs/admission.ts";
-import { readHostLoad } from "./drivers/acp/init-deadline.ts";
+import { ResourceTriggerManager } from "./resource-triggers.ts";
+import { readHostDispatchHoldReason, readHostDispatchHot } from "./host-dispatch-hot.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
@@ -761,7 +763,7 @@ telemetry.configure(() => ({
   ingestToken: cfg.usage?.ingestToken,
   projects: usageProjectRules(cfg),
 }));
-const registry = new ProviderRegistry(BUILT_IN_DRIVERS);
+const registry = new ProviderRegistry(BUILT_IN_DRIVERS, { hostHot: readHostDispatchHot });
 await registry.load(instanceConfigs(cfg));
 registry.setDiskCachePath(join(DATA_DIR, "engine-cache.json"));
 // The credential fingerprint the provider fleet was actually BUILT with, kept
@@ -1448,6 +1450,14 @@ function presentInstances<T extends Parameters<typeof presentDescribedInstances>
   return presented;
 }
 
+function instancesPayload(described: DescribedInstance[]) {
+  return {
+    instances: presentInstances(described),
+    describedAt: registry.describedAtOf(described),
+    ...(registry.describeWasStale() ? { stale: true } : {}),
+  };
+}
+
 function lineageContextForInstance(instanceId: string): LineageContext | undefined {
   const instance = registry.get(instanceId);
   if (!instance) {
@@ -1650,6 +1660,7 @@ type ComputerGrantSubject = {
   /** The pre-array spelling some stored bots still carry. */
   computer?: unknown;
   autoApprove?: boolean;
+  bypassPermissions?: boolean;
   modelSelection?: ModelSelection;
 };
 
@@ -1791,7 +1802,7 @@ function localAutoAcknowledgementError(
   // A bot that ALREADY holds the pair keeps it: the warning was answered
   // once, and re-saving an unrelated field must not demand it again.
   const capability = botLocalAutoCapability(existing);
-  const alreadyGranted = existing?.autoApprove === true && requiresLocalAutoConsent(
+  const alreadyGranted = (existing?.autoApprove === true || existing?.bypassPermissions === true) && requiresLocalAutoConsent(
     storedComputerGrants(existing),
     context.currentDefault,
     context.currentAllowed,
@@ -3050,8 +3061,6 @@ bus.subscribe((event: RuntimeEvent) => {
 // mark at all (autoVerdict).
 type UnattendedSource = "job" | "outside";
 const unattendedBots = new Map<string, { at: number; source: UnattendedSource }>();
-/** Built on first webhook admission so importing this module does not probe. */
-let unattendedHostProbe: HostProbe | undefined;
 const NON_THINKING_MINIMAX_FLASH = "MiniMax-M3.1-Flash-Preview";
 
 /** A catalog row for non-thinking Flash, preferring the seat's own engine.
@@ -3235,7 +3244,7 @@ function releaseTurnWorktreeLease(threadId: string, botId: string, dispatchId?: 
 }
 
 async function applyTurnWorktreeAdmission(
-  bot: NonNullable<ReturnType<typeof store.bot>>,
+  bot: BotRecord,
   threadId: string,
   dispatchId: number,
   cwd: string | null | undefined,
@@ -4722,6 +4731,8 @@ async function startTurn(
     automationSource?: TurnAutomationSource;
     /** the caller was already running unattended, so this turn is too */
     unattended?: boolean;
+    /** One-shot automation wake: no transcript replay and a fresh session. */
+    ephemeralDispatch?: boolean;
     /** Resume an agent after the user completed an inline connection or credential card.
      * The prompt is control-plane context: it reaches the provider without
      * masquerading as another message authored by the user. */
@@ -4985,13 +4996,17 @@ async function startTurn(
   // Resolve its quote from full storage, while the replay itself remains
   // strictly limited to the selected branch below.
   const messagesById = new Map(store.messagesFor(threadId).map((message) => [message.id, message]));
-  const transcript = activeMessages
+  let transcript = activeMessages
     .filter((m) => m.kind === "text" && m.text && !skipTranscript.has(m.id))
     .slice(-40)
     .map((m) => ({
       role: m.role === "user" || m.role === "system" ? ("user" as const) : ("assistant" as const),
       text: transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"),
     }));
+  if (opts?.ephemeralDispatch) {
+    store.setResumeCursor(bot.id, selection.instanceId, undefined, threadId);
+    transcript = [];
+  }
 
   // After a rewind (edit / branch switch) the provider's native session
   // still contains the abandoned branch: start a fresh session instead of
@@ -4999,15 +5014,16 @@ async function startTurn(
   // inline (transcript-replay drivers get it via transcript). The flag is
   // cleared only once the turn is actually dispatched — clearing it here
   // would cost the next attempt its history if this dispatch fails.
-  const rewound = threadId === bot.threadId && Boolean(bot.rewound);
+  const rewound = !opts?.ephemeralDispatch && threadId === bot.threadId && Boolean(bot.rewound);
   // A fresh engine — the user switched this bot's model mid-thread — has no
   // current session here either, so it gets the same replay. Distinct from
   // rewound: the OTHER instances' cursors are left alone (a rewind wipes
   // them all), and "fresh" is decided by who ran the last turn, not by
   // whether we hold a cursor — see engineIsFresh.
   const fresh =
-    !rewound &&
-    engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript });
+    opts?.ephemeralDispatch === true ||
+    (!rewound &&
+      engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript }));
   // the message with a reply's framing and quoted excerpt, as the model gets it
   const replyBase = promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User");
   const { turnText, resume } = buildTurnContext({
@@ -5428,8 +5444,10 @@ async function startTurn(
       // changed them, and the rest stays the stable prefix a warm CLI or a
       // provider cache is keyed on (docs/prompt-prefix.md).
       const promptFileTools = hasFileTools(worksInWorkspace, httpOnlyToolSurface, hasHostComputer);
+      const fleetSeat = fleetSeatPromptPart(bot);
       const prompt = buildSystemPrompt([
         { id: "persona", label: "Identity", text: persona },
+        ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
         { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
         {
           id: "computer",
@@ -5795,6 +5813,7 @@ async function startTurn(
 // The scheduler owns timing and receipts; the existing harness remains the
 // only owner of provider sessions, approvals, tools, computers and messages.
 const routineTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+let webhookOneShotWakeLookup: ((webhookId: string) => boolean) | undefined;
 routines = new RoutineManager({
   emit: broadcast,
   timeZone: routineTimeZone,
@@ -5802,15 +5821,17 @@ routines = new RoutineManager({
   // queued routine receipts durable while the registry is being rebuilt,
   // then tick them after the authenticated credential has landed.
   admit: () => !runtimeQuiescing && !providerConfigBusy,
-  // Defer new webhook wakes while the host is hot.  The probe is the jobs
-  // admission swap cache (non-blocking) plus the ACP init load reading.
-  // Resource wakes are not shed: that is how Housekeeper still runs.
-  hostHot: () => {
-    unattendedHostProbe ??= createHostProbe();
-    return webhookDispatchHot({
-      swapUsedPercent: unattendedHostProbe.swapUsedPercent(),
-      load: readHostLoad(),
-    });
+  // Defer new webhook wakes while the host is hot, and say so on the
+  // receipt.  The probe is the jobs admission swap cache (non-blocking)
+  // plus the ACP init load reading.  Resource wakes are not shed: that is
+  // how Housekeeper still runs.  A person's turn never consults this.
+  hostHot: readHostDispatchHoldReason,
+  // Live read so an Infisical refresh of jobs.webhookHotDeferMinutes
+  // applies on the next tick.  Absent keeps the 20 minute default.
+  webhookHotDeferMaxMs: () => {
+    const minutes = cfg.jobs?.webhookHotDeferMinutes;
+    if (minutes === undefined || !Number.isFinite(minutes) || minutes <= 0) return DEFAULT_WEBHOOK_HOT_DEFER_MS;
+    return minutes * 60_000;
   },
   canStart: (botId, threadId, runOn) => {
     const hold = dispatchHoldFor(botId, threadId, runOn, { count: true });
@@ -5897,8 +5918,42 @@ routines = new RoutineManager({
     if (task && bot) broadcast({ kind: "bot", bot: publicBot(bot) });
     return task;
   },
-  startTurn: (botId, threadId, prompt, runOn, triggerSource, onDispatchError) =>
-    startTurn(botId, prompt, { threadId, runOn, automationSource: triggerSource, onDispatchError }),
+  oneShotWakeForRun: (run): boolean => {
+    if (run.triggerSource === "webhook" && run.webhookId) {
+      return webhookOneShotWakeLookup?.(run.webhookId) === true;
+    }
+    if (run.triggerSource === "schedule") {
+      return routines!.listRoutines().find((routine) => routine.id === run.routineId)?.oneShotWake === true;
+    }
+    return false;
+  },
+  deliverEphemeralResult: ({ ownerThreadId, run, ok, output, error }) => {
+    const text = formatEphemeralResultMessage({
+      ownerThreadId,
+      ephemeralThreadId: run.threadId ?? ownerThreadId,
+      routineName: run.routineName,
+      triggerSource: run.triggerSource,
+      ok,
+      output,
+      error,
+    });
+    store.appendMessage(ownerThreadId, {
+      role: "bot",
+      kind: "text",
+      text,
+      automationSource: run.triggerSource === "manual" ? "manual" : run.triggerSource,
+    });
+    const bot = store.bot(run.botId);
+    if (bot) broadcast({ kind: "bot", bot: publicBot(bot) });
+  },
+  startTurn: (botId, threadId, prompt, runOn, triggerSource, onDispatchError, turnOpts) =>
+    startTurn(botId, prompt, {
+      threadId,
+      runOn,
+      automationSource: triggerSource,
+      onDispatchError,
+      ephemeralDispatch: turnOpts?.ephemeralDispatch,
+    }),
   interruptTurn: async (botId, threadId, runOn) => {
     const bot = store.bot(botId);
     const instance = bot && cloudRunUsesBoxAgent(runOn, bot.cloudBackend, cfg.botDefaults?.cloudBackend)
@@ -6117,6 +6172,8 @@ const webhooks = new WebhookManager({
   cancelQueued: (webhookId, message) => routines!.cancelQueuedWebhook(webhookId, message),
   pendingRuns: (webhookId) => routines!.activeWebhookRunCount(webhookId),
 });
+webhookOneShotWakeLookup = (webhookId) =>
+  webhooks.list().find((hook) => hook.id === webhookId)?.oneShotWake === true;
 
 let webhookIngress: WebhookIngress | null = null;
 let webhookIngressError: string | null = null;
@@ -7390,7 +7447,7 @@ async function runGroupMemberTurn(
   ) ?? cwd;
   // The same computers as a 1:1 turn, through the same helper.  A room used
   // to resolve none of this: `integrations.computer` / `computers` /
-  // `localComputer` were never set here, so a bot holding Cua, a Box, a Local
+  // `localComputer` were never set here, so a bot holding CUA, a Box, a Local
   // VM or a VPS in a direct chat lost every one of them the moment it spoke
   // in a room — while the HTTP lane in that same room kept host tools through
   // `hasHostComputer` below.  A room is a different conversation, not a
@@ -7548,8 +7605,10 @@ async function runGroupMemberTurn(
     hasHostComputer &&
     instance.adapter.capabilities.backgroundJobs === "emulated" &&
     jobSettings().enabled;
+  const fleetSeat = fleetSeatPromptPart(bot);
   const roomSystem = buildSystemPrompt([
     { id: "persona", label: "Identity", text: system },
+    ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
     { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
     // Same sentence the 1:1 lane sends, in the same position: a computer the
     // bot is never told about is one it reaches for by accident.
@@ -8290,10 +8349,18 @@ async function localVmPayload(target: LocalVmTarget) {
   };
 }
 
-function localComputerActionError(error: unknown): { status: number; error: string } {
-  const status = typeof (error as { status?: unknown }).status === "number"
-    ? (error as { status: number }).status
-    : 500;
+type LocalComputerActionFailure = { status: number; error: string };
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- computer routes throw at the handler boundary
+function localComputerActionError(error: unknown): LocalComputerActionFailure {
+  // SAFETY: computer proxy failures may attach a numeric HTTP status on a plain object.
+  const statusField = (error as { status?: unknown }).status;
+  const status =
+    statusField === undefined
+      ? 500
+      : Number.isFinite(Number(statusField))
+        ? Number(statusField)
+        : 500;
   const raw = error instanceof Error ? error.message : String(error);
   return { status, error: redactSecrets(raw) };
 }
@@ -8502,6 +8569,7 @@ function configStatus() {
       mode: cfg.localVm?.mode ?? "shared",
       maxInstances: localVmMaxInstances(cfg),
       shareCliCredentials: Boolean(cfg.localVm?.shareCliCredentials),
+      shareGpgPrivateKeys: Boolean(cfg.localVm?.shareGpgPrivateKeys),
       allowHostTerminal: Boolean(cfg.localVm?.allowHostTerminal),
     },
     // No invented endpoint or collection: the operator's own values or
@@ -11872,7 +11940,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         patch.autoApprove = body.autoApprove;
       }
       if (body.gitWorktreeLeases !== undefined) {
-        if (typeof body.gitWorktreeLeases !== "boolean") {
+        if (body.gitWorktreeLeases !== true && body.gitWorktreeLeases !== false) {
           return json(res, 400, { error: "gitWorktreeLeases must be true or false" });
         }
         patch.gitWorktreeLeases = body.gitWorktreeLeases;
@@ -11889,7 +11957,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         : body.computer !== undefined
           ? (body.computer === "off" ? [] : [body.computer])
           : storedComputerGrants(existingBot);
-      const wantsAuto = body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true;
+      const wantsAuto =
+        (body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true) ||
+        (body.bypassPermissions !== undefined ? body.bypassPermissions : existingBot?.bypassPermissions === true);
       const ackError = localAutoAcknowledgementError(
         existingBot,
         wantsComputers,
@@ -12541,6 +12611,99 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!owner && !pending) return json(res, 404, { error: "nothing is waiting on an answer in this conversation" });
       const outcome = await answerRequest(threadId, owner?.modelSelection.instanceId ?? "", requestId, behavior, body.message, owner ? { id: owner.id, name: owner.name } : undefined);
       return json(res, 200, { ok: true, outcome });
+    }
+    const approveAllForThread = async (
+      targetThreadId: string,
+    ): Promise<{ ok: boolean; approvedCount: number }> => {
+      const pending = store.messagesFor(targetThreadId).filter(
+        (message) =>
+          message.kind === "options" &&
+          message.card?.requestId &&
+          message.card.tool &&
+          !message.card.answered &&
+          !message.card.dismissed,
+      );
+
+      let approvedCount = 0;
+      for (const message of pending) {
+        const card = message.card;
+        if (!card?.requestId) continue;
+        const requestId = card.requestId;
+
+        if (card.routineRequest) {
+          const routineBotId = message.from?.botId ?? store.botByThread(targetThreadId)?.id;
+          if (routineBotId) {
+            const routineOwner = store.bot(routineBotId);
+            const result = routineRequests.resolve({
+              botId: routineBotId,
+              threadId: targetThreadId,
+              requestId,
+              behavior: "allow",
+            });
+            if (result.claimed && (result.state === "applied" || result.state === "denied")) {
+              appendDecision(DATA_DIR, {
+                threadId: targetThreadId,
+                requestId,
+                botId: routineBotId,
+                botName: routineOwner?.name,
+                tool: card.tool,
+                summary: card.subtitle,
+                decision: result.state === "applied" ? "user-approved" : "user-denied",
+                source: "user",
+              });
+            }
+            approvedCount++;
+          }
+          continue;
+        }
+
+        if (resolvePeerComms(approvalBus, requestId, "allow", targetThreadId)) {
+          approvedCount++;
+          continue;
+        }
+
+        const group = store.groupByThread(targetThreadId);
+        const owner = group
+          ? (group.busyBotId ? store.bot(group.busyBotId) : undefined) ??
+            (message.from ? store.bot(message.from.botId) : undefined)
+          : store.botByThread(targetThreadId);
+
+        const outcome = await answerRequest(
+          targetThreadId,
+          owner?.modelSelection.instanceId ?? "",
+          requestId,
+          "allow",
+          undefined,
+          owner ? { id: owner.id, name: owner.name } : undefined,
+        );
+        if (outcome !== "unavailable") {
+          approvedCount++;
+        }
+      }
+
+      return { ok: true, approvedCount };
+    };
+    m = path.match(/^\/api\/bots\/([^/]+)\/approve-all$/);
+    if (m && method === "POST") {
+      const botIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
+      const parsedBotId = botIdSchema.safeParse(m[1]);
+      if (!parsedBotId.success) {
+        return json(res, 400, { error: "invalid bot id" });
+      }
+      const bot = store.bot(parsedBotId.data);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      const result = await approveAllForThread(bot.threadId);
+      return json(res, 200, result);
+    }
+    m = path.match(/^\/api\/threads\/([^/]+)\/approve-all$/);
+    if (m && method === "POST") {
+      const threadIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
+      const parsedThreadId = threadIdSchema.safeParse(m[1]);
+      if (!parsedThreadId.success) {
+        return json(res, 400, { error: "invalid thread id" });
+      }
+      const result = await approveAllForThread(parsedThreadId.data);
+      return json(res, 200, result);
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/interrupt$/);
     if (m && method === "POST") {
@@ -13540,14 +13703,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // actions and right after a CLI/fullAuto override is saved — bypasses
       // it so the user's own action is never served a stale answer.
       const described = await registry.describe(
-        fresh ? undefined : { maxAgeMs: 15_000, staleWhileRevalidate: true },
+        fresh ? { force: true } : { maxAgeMs: 15_000, staleWhileRevalidate: true },
       );
-      // presentInstances moves saved selections forward against what the
-      // engines offer now.  describedAt is the stamp of the raw list: a client
-      // holding a newer answer (from the `instances` push or another request)
-      // can drop this one.
-      const instances = presentInstances(described);
-      return json(res, 200, { instances, describedAt: registry.describedAtOf(described) });
+      return json(res, 200, instancesPayload(described));
     }
 
     // ── CLI binary discovery for the Engines "detected" dropdown ──
@@ -13694,10 +13852,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           drainDeferredBootRecoveries();
           void routines?.tick();
         });
-        return json(res, 200, {
-          instances: presentInstances(instances),
-          describedAt: registry.describedAtOf(instances),
-        });
+        return json(res, 200, instancesPayload(instances));
       } finally {
         providerConfigBusy = false;
       }
@@ -13873,8 +14028,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 201, {
           ok: true,
           instanceId,
-          instances: presentInstances(instances),
-          describedAt: registry.describedAtOf(instances),
+          ...instancesPayload(instances),
         });
       } finally {
         providerConfigBusy = false;
@@ -13997,8 +14151,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const instances = await registry.describe();
         return json(res, 200, {
           ok: true,
-          instances: presentInstances(instances),
-          describedAt: registry.describedAtOf(instances),
+          ...instancesPayload(instances),
         });
       } finally {
         providerConfigBusy = false;

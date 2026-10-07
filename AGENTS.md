@@ -2,7 +2,7 @@
 
 This file is the **authoritative coordination manifest for AI agent fleets** working on the BotFleet repository.  Human contributors should read [CONTRIBUTING.md](CONTRIBUTING.md) instead.  Read this file fully before touching any code.
 
-GitHub: `jaywedgeworth22/BotFleet`.  Integration tree: `/Users/jay/Code/BotFleet` (read-only for every seat; never a working lane).  Seat worktrees: `~/apps/botfleet-<seat>[-<lane>]`.  Slack `repo:` name: **`BotFleet`**.  Acronym: **`BF`**.
+GitHub: `Simple-With-Us/BotFleet`.  Integration tree: `/Users/jay/Code/BotFleet` (read-only for every seat; never a working lane).  Seat worktrees: `~/apps/botfleet-<seat>[-<lane>]`.  Slack `repo:` name: **`BotFleet`**.  Acronym: **`BF`**.
 
 Consult the private operations inventory for hosting and routing details.
 
@@ -51,7 +51,7 @@ Every claim of "it works" points at a recipe that proves it in an isolated fixtu
 
 ## No New GitHub Repositories (owner directive, 2026-09-02)
 
-**Never create a GitHub repository — no forks, no release repos, no site or docs repos, no scratch repos — unless the owner asks for that repository by name.**  One repository per app: BotFleet's releases, site, docs, and CI all live in `jaywedgeworth22/BotFleet`.  Need to send a change upstream?  Ask the owner first, and delete the fork when the PR closes.  Need a public update feed?  This repo's own Releases.  Found an extra repo no directive created?  Surface it to the owner; do not delete it yourself.  Canonical: `AGENT-SYNC.md` § Owner Directives → No new GitHub repositories.
+**Never create a GitHub repository — no forks, no release repos, no site or docs repos, no scratch repos — unless the owner asks for that repository by name.**  One repository per app: BotFleet's releases, site, docs, and CI all live in `Simple-With-Us/BotFleet`.  Need to send a change upstream?  Ask the owner first, and delete the fork when the PR closes.  Need a public update feed?  This repo's own Releases.  Found an extra repo no directive created?  Surface it to the owner; do not delete it yourself.  Canonical: `AGENT-SYNC.md` § Owner Directives → No new GitHub repositories.
 
 ## Always Commit And Land Finished Work (owner preference — ALL platforms)
 
@@ -117,7 +117,7 @@ macOS signing uses `build/entitlements.mac.plist` for the main app and `build/en
 ## Clutch Package
 
 DSH engine shape (catalog, version gate, error classifier, model-id
-round-trip, credentials) lives in `jaywedgeworth22/Clutch` and is
+round-trip, credentials) lives in `Simple-With-Us/Clutch` and is
 imported as `clutch/dsh/acp`.  **Never edit that shape in
 `server/drivers/acp/dsh.ts`.**  Edit Clutch, then bump the git
 dependency.  ACP runtime (`acp/core.ts`, `dshWrapSpawn`, the Node

@@ -39,6 +39,9 @@ export interface WebhookTrigger {
    * arrive inside the gap wait and run together when it closes, rather than
    * waking the bot once each.  Absent or 0 runs every delivery. */
   minGapMinutes?: number;
+  /** Run each delivery on a fresh thread and post one summary line back to
+   *  the owning automation thread. */
+  oneShotWake?: boolean;
 }
 
 export interface WebhookTriggerInput {
@@ -50,6 +53,7 @@ export interface WebhookTriggerInput {
   verificationPending?: boolean;
   eventTypes?: string[];
   minGapMinutes?: number;
+  oneShotWake?: boolean;
 }
 
 type CleanWebhookInput = Omit<
@@ -188,6 +192,7 @@ const triggerInputSchema = z.object({
   verificationPending: z.boolean().optional(),
   eventTypes: eventTypesSchema,
   minGapMinutes: minGapSchema,
+  oneShotWake: z.boolean().optional(),
 });
 const triggerPatchSchema = triggerInputSchema.partial();
 const verificationSampleSchema = z.object({
@@ -214,6 +219,7 @@ const storedWebhookSchema = z.object({
   verificationSample: verificationSampleSchema.optional(),
   eventTypes: eventTypesSchema,
   minGapMinutes: minGapSchema,
+  oneShotWake: z.boolean().optional(),
   secretHash: z.string().regex(/^[a-f0-9]{64}$/),
 });
 const deliveryReceiptSchema = z.object({
@@ -295,6 +301,7 @@ function cleanInput(input: WebhookTriggerInput): CleanWebhookInput {
   // 0 means "no gap", which is also the absent value — keep the record small
   const minGapMinutes = Math.max(0, Math.min(1440, Math.round(input.minGapMinutes ?? 0)));
   if (minGapMinutes > 0) clean.minGapMinutes = minGapMinutes;
+  if (input.oneShotWake === true) clean.oneShotWake = true;
   return clean;
 }
 
@@ -1071,11 +1078,13 @@ export class WebhookManager {
       verificationPending: patch.verificationPending ?? trigger.verificationPending,
       eventTypes: patch.eventTypes ?? trigger.eventTypes,
       minGapMinutes: patch.minGapMinutes ?? trigger.minGapMinutes,
+      oneShotWake: patch.oneShotWake ?? trigger.oneShotWake,
     });
     if (this.options.botState(clean.botId) === "missing") fail(400, "That Bot no longer exists");
     Object.assign(trigger, clean, { updatedAt: this.now() });
     if (!clean.eventTypes?.length) delete trigger.eventTypes;
     if (!clean.minGapMinutes) delete trigger.minGapMinutes;
+    if (!clean.oneShotWake) delete trigger.oneShotWake;
     if (patch.enabled === false) {
       this.options.cancelQueued?.(trigger.id, "The webhook was paused before this delivery started");
     }

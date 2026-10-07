@@ -9,6 +9,7 @@ import {
   classifyNativeProbe,
   nativeProbeFailureMessage,
   oneLine,
+  probeNativeSync,
   probeNativeVersion,
 } from "./native-version-probe.mjs";
 import {
@@ -86,10 +87,13 @@ describe("the shared native version probe", () => {
   });
 
   it("reads the version from either stream and names all four failure causes", () => {
-    expect(classifyNativeProbe(probeResult({ stderr: "cua-driver 2.0.0\n" }), matchCua)).toMatchObject({
+    expect(
+      classifyNativeProbe(probeResult({ stderr: "cua-driver 2.0.0\n" }), matchCua, { matchStderr: true }),
+    ).toMatchObject({
       ok: true,
       version: "2.0.0",
     });
+    expect(classifyNativeProbe(probeResult({ stderr: "cua-driver 2.0.0\n" }), matchCua).ok).toBe(false);
     expect(classifyNativeProbe(timedOutResult(), matchCua).reason).toBe("timeout");
     expect(classifyNativeProbe(probeResult({ status: 7 }), matchCua).reason).toBe("status");
     expect(classifyNativeProbe(probeResult({ status: null, signal: "SIGTERM" }), matchCua).reason).toBe("signal");
@@ -117,6 +121,21 @@ describe("the shared native version probe", () => {
       causes: { version: () => "it ran but did not report the pinned version" },
     });
     expect(message).toContain("it ran but did not report the pinned version");
+  });
+
+  it("exposes the sync entry point under the name execFileSync call sites expect", () => {
+    expect(probeNativeSync).toBe(probeNativeVersion);
+  });
+
+  it("forwards spawnOptions such as env into the child", () => {
+    const { spawn, calls } = fakeSpawn([probeResult({ stdout: "cua-driver 1.2.3\n" })]);
+    probeNativeVersion("/staged/binary", {
+      spawn,
+      matchVersion: matchCua,
+      spawnOptions: { env: { LANG: "C" } },
+      ...quiet,
+    });
+    expect(calls[0].options.env).toEqual({ LANG: "C" });
   });
 
   it("announces the retry so a stalled build says why it paused", () => {

@@ -17,9 +17,20 @@ describe("observabilityBadge", () => {
   });
 
   it("says Sending diagnostics only when a DSN is on file and enabled", () => {
-    expect(observabilityBadge({ configured: true, enabled: true, lastError: null })).toEqual({
+    expect(
+      observabilityBadge({ configured: true, enabled: true, delivering: true, lastError: null }),
+    ).toEqual({
       label: "Sending diagnostics",
       tone: "active",
+    });
+  });
+
+  it("shows Starting client while configured but the harness SDK is between close and init", () => {
+    expect(
+      observabilityBadge({ configured: true, enabled: true, delivering: false, lastError: null }),
+    ).toEqual({
+      label: "Starting client",
+      tone: "waiting",
     });
   });
 

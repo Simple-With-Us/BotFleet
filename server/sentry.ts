@@ -122,6 +122,12 @@ export const MALFORMED_DSN_MESSAGE = "The stored DSN is not a Sentry https:// DS
 export const SDK_REJECTED_DSN_MESSAGE =
   "Sentry refused this DSN, so nothing is being reported.  Check it in Settings > Observability.";
 
+/** Shown when configuration looks healthy but the SDK client is closed or has
+ * no transport — for example after a config refresh closed the old client
+ * before the replacement finished starting. */
+export const SENTRY_DELIVERY_NOT_READY_MESSAGE =
+  "Sentry is configured but not delivering events yet.  Save Settings or wait for the client to finish restarting.";
+
 /** Split a DSN into the two halves that are safe to show.  Returns null for
  * anything that is not a DSN, which is how a malformed stored value becomes
  * a visible `lastError` instead of a silently inert SDK. */
@@ -206,21 +212,33 @@ async function loadSdk(): Promise<SentrySdkLoad> {
   }
 }
 
-/** Stop the running client.  The close is deliberately not awaited: this
- * runs on the PATCH /api/config path, and a hung flush must not hold a
- * request open.  `initialized` drops first, so `isSentryActive()` gates
- * captures off the instant the switch flips, flush or no flush. */
-function shutdown(): void {
+/** Best-effort flush budget when swapping clients.  Buffered events are
+ * discarded after this cap so `PATCH /api/config` is not held open for two
+ * seconds on every observability save. */
+const SENTRY_CLIENT_CLOSE_MS = 500;
+
+/** Stop the running client.  `initialized` drops first, so `isSentryActive()`
+ * gates captures off the instant the switch flips.  Only the re-init path
+ * awaits the close so `init()` never races a stale global client; turning
+ * diagnostics off keeps the historical fire-and-forget close. */
+async function closeRunningClient(options?: { awaitFlush?: boolean }): Promise<void> {
   const sdk = sentrySdk;
   sentrySdk = null;
   initialized = false;
   activeFingerprint = null;
   if (!sdk) return;
+  let close: Promise<unknown>;
   try {
-    void Promise.resolve(sdk.close(2000)).catch(() => {});
+    close = Promise.resolve(sdk.close(SENTRY_CLIENT_CLOSE_MS)).catch(() => {});
   } catch {
     /* an SDK that cannot close must not take the harness down with it */
+    return;
   }
+  if (options?.awaitFlush) {
+    await close;
+    return;
+  }
+  void close;
 }
 
 /** @sentry/profiling-node is in neither package.json nor the lockfile, so
@@ -424,7 +442,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   };
 
   if (!input.enabled || !input.dsn || !parsed) {
-    shutdown();
+    await closeRunningClient({ awaitFlush: false });
     killed = !input.enabled;
     runtimeState = {
       ...base,
@@ -461,7 +479,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
     return runtimeState;
   }
 
-  shutdown();
+  await closeRunningClient({ awaitFlush: true });
   const { sdk, error } = await loadSdk();
   if (!sdk) {
     runtimeState = { ...base, active: false, lastError: error };
@@ -564,7 +582,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   // module exists to prevent.  A stand-in SDK without `getClient` answers
   // "unknown" and is left alone.
   if (acceptedDsn(sdk) === "rejected") {
-    shutdown();
+    await closeRunningClient({ awaitFlush: false });
     runtimeState = { ...base, active: false, lastError: SDK_REJECTED_DSN_MESSAGE };
     return runtimeState;
   }
@@ -577,11 +595,30 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   return runtimeState;
 }
 
+/** True when the SDK can actually send events.  `@sentry/core`'s
+ * `captureCheckIn` returns a uuid even when there is no live client, so
+ * callers must gate on this — not merely on `initialized`. */
+export function isSentryDeliveryReady(): boolean {
+  if (!initialized || killed) return false;
+  const sdk = sentrySdk;
+  if (!sdk) return false;
+  if (sdk.isEnabled === undefined && sdk.getClient === undefined) return true;
+  try {
+    if (sdk.isEnabled !== undefined) return sdk.isEnabled();
+    const client = sdk.getClient?.();
+    if (!client) return false;
+    if (client.getOptions?.().enabled === false) return false;
+    return Boolean(client.getTransport?.());
+  } catch {
+    return false;
+  }
+}
+
 /** True only while a client is running and nobody has turned it off.  Every
  * capture site gates on this, not on `isSentryInitialized`, so flipping the
  * switch stops reporting immediately instead of at the next restart. */
 export function isSentryActive(): boolean {
-  return initialized && !killed;
+  return isSentryDeliveryReady();
 }
 
 export function sentryRuntimeState(): SentryRuntimeState {
@@ -625,6 +662,38 @@ export function isSentryInitialized(): boolean {
 
 export function getSentry(): SentryNode | null {
   return sentrySdk;
+}
+
+/** Partial @sentry/node surface implemented by vitest stand-ins. */
+export type SentrySdkTestStandIn = {
+  init: (...opts: Parameters<SentryNode["init"]>) => ReturnType<SentryNode["init"]> | void;
+  close: (...args: Parameters<SentryNode["close"]>) => ReturnType<SentryNode["close"]>;
+  addIntegration: (...args: Parameters<SentryNode["addIntegration"]>) => void;
+  consoleLoggingIntegration: (
+    ...args: Parameters<SentryNode["consoleLoggingIntegration"]>
+  ) => { name: string };
+  captureCheckIn?: SentryNode["captureCheckIn"];
+  isEnabled?: () => boolean;
+  getClient?: () => {
+    getDsn(): { host?: string } | undefined;
+    getOptions(): { enabled: boolean };
+    getTransport(): undefined | Record<string, never>;
+  };
+  httpIntegration?: (
+    options: Parameters<NonNullable<SentryNode["httpIntegration"]>>[0],
+  ) => { name: string; options: Parameters<NonNullable<SentryNode["httpIntegration"]>>[0] };
+};
+
+/** Coerce a partial SDK stand-in to the lazy-loaded module type for test loaders. */
+export function asSentryNodeTestStandIn(standIn: SentrySdkTestStandIn): SentryNode {
+  // SAFETY: stand-ins stamp only members applySentryConfig and cron check-ins
+  // call; the real SDK stays dynamically imported so vitest never loads it.
+  return standIn as unknown as SentryNode;
+}
+
+/** Loader wrapper for `setSentryLoaderForTests` that accepts a partial stand-in. */
+export function sentryTestLoader(standIn: SentrySdkTestStandIn): () => Promise<SentryNode> {
+  return async () => asSentryNodeTestStandIn(standIn);
 }
 
 /** Install a stand-in for @sentry/node so a test can exercise the init,

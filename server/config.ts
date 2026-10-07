@@ -223,6 +223,7 @@ const localVmConfigSchema = z.object({
     .max(MAX_LOCAL_VM_MAX_INSTANCES)
     .optional(),
   shareCliCredentials: z.boolean().optional(),
+  shareGpgPrivateKeys: z.boolean().optional(),
   allowHostTerminal: z.boolean().optional(),
   /** Optional ceilings for the Local VM container.  Absent means "request about
    * 2 CPUs and 3 GiB, then adapt to what the container runtime actually has,
@@ -403,6 +404,11 @@ const appConfigSchema = z.object({
       maxSwapPercent: z.number().min(1).max(100).optional(),
       minFreeDiskMb: z.number().min(0).optional(),
     }).optional(),
+    // How long a webhook may sit queued while the host is hot before the
+    // scheduler dispatches it anyway.  Absent means 20 minutes
+    // (DEFAULT_WEBHOOK_HOT_DEFER_MINUTES).  The vault knob of the same
+    // field overrides the file.
+    webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
   }).optional(),
   // Error and performance reporting.  The kill switch is explicit: a DSN
   // with no `enabled` flag reports.  Only a stored `false` stops it, so an
@@ -540,6 +546,7 @@ export interface AppConfig {
     mode?: "shared" | "per-bot";
     maxInstances?: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
     cpus?: number;
     memoryGib?: number;
@@ -569,6 +576,9 @@ export interface AppConfig {
     maxMinutes?: number;
     cpuCores?: number;
     admission?: { maxSwapPercent?: number; minFreeDiskMb?: number };
+    /** Minutes a hot host may park a webhook before the wake dispatches
+     *  anyway.  Absent means 20. */
+    webhookHotDeferMinutes?: number;
   };
   usage?: {
     ingestUrl?: string;

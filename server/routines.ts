@@ -17,6 +17,7 @@ import {
 } from "../shared/conversation-mode.ts";
 import { foldPrompts, gapEndsAt, withinGap } from "./trigger-gap.ts";
 import { routineFailureCode, routineFailurePhase, type RoutineOutcomeCode, type RoutineFailurePhase } from "../shared/routine-outcomes.ts";
+import { botAutomationsPausedMessage } from "./bot-stop-policy.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
 
@@ -30,6 +31,17 @@ export type RoutineSchedule =
 export type { RoutineRunOn } from "../shared/run-on.ts";
 
 export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
+
+/** Bucket numeric telemetry in hold reasons so load drift does not rewrite state. */
+function holdReasonBucket(reason: string): string {
+  return reason.replace(/\d+(?:\.\d+)?/g, "#");
+}
+
+/** Dedup key for hold-reason publishes.  Failure counts stay exact; telemetry buckets. */
+function holdReasonDedupKey(reason: string): string {
+  if (reason.includes(" times in a row")) return reason;
+  return holdReasonBucket(reason);
+}
 
 /** One shared task per bot for incoming events, one for calendar work. */
 export type AutomationLane = "trigger" | "schedule";
@@ -97,6 +109,9 @@ export interface Routine {
    * recurrence or supplied from the current harness for display only. */
   scheduleTimeZoneSource?: "stored" | "host";
   durationMinutes: number;
+  /** When true, each wake runs on a fresh thread with no transcript replay;
+   *  the owner automation thread receives one summary message. */
+  oneShotWake?: boolean;
   nextRunAt: number | null;
   createdAt: number;
   updatedAt: number;
@@ -123,6 +138,9 @@ export interface RoutineRun {
   webhookId?: string;
   deliveryId?: string;
   threadId?: string;
+  /** Automation home thread for a one-shot wake; `threadId` is the ephemeral
+   *  workspace while the run is in flight. */
+  ownerThreadId?: string;
   startedAt?: number;
   finishedAt?: number;
   output?: string;
@@ -141,10 +159,14 @@ export interface RoutineRun {
    *  way.  Carried on the run so it survives from the `runtime.error` to the
    *  `turn.completed` that closes it. */
   setupFailed?: boolean;
-  /** Why this run is sitting QUEUED instead of dispatching.  Set by the
-   *  scheduler when `canStart` refuses the dispatch (see `dispatchHoldReason`);
-   *  cleared on dispatch and on any skip path that bypasses `canStart`. */
+  /** Why this run is sitting QUEUED instead of dispatching.  Set when
+   *  `canStart` refuses (see `dispatchHoldReason`) and when a hot host
+   *  defers a webhook.  Cleared on dispatch and on any skip that is not
+   *  itself a hold. */
   holdReason?: string;
+  /** When this webhook was first parked on a hot host; the max deferral age
+   *  is measured from here, not from `createdAt`. */
+  hotDeferredAt?: number;
   engineId?: string;
   driver?: string;
   model?: string;
@@ -189,6 +211,7 @@ export interface RoutineInput {
   schedule: RoutineSchedule;
   scheduleTimeZoneSource?: "stored" | "host";
   durationMinutes?: number;
+  oneShotWake?: boolean;
 }
 
 interface RoutineFile {
@@ -217,11 +240,19 @@ export interface RoutineManagerOptions {
   botState: (botId: string) => BotDispatchState;
   /** Synchronous admission fence used during an update boundary. */
   admit?: () => boolean;
-  /** True when the host is too hot for a new unattended webhook wake.
-   *  Absent never sheds, so tests and older wiring keep dispatching.
-   *  Does not apply to resource, schedule, or manual runs, and never
-   *  touches a run that is already going. */
-  hostHot?: () => boolean;
+  /** Why a new webhook wake should wait, or null when the host can take it.
+   *  The string is the hold reason ("Host is busy (load X per core, swap
+   *  Y%)").  Absent never sheds, so tests and older wiring keep dispatching.
+   *  Resource, schedule, and manual runs are not asked, a run that is
+   *  already going is not asked, and a person's turn never reaches this. */
+  hostHot?: () => string | null;
+  /** How long a queued webhook may wait on `hostHot` before it dispatches
+   *  anyway.  Measured from the receipt's `createdAt`.  Absent uses
+   *  `DEFAULT_WEBHOOK_HOT_DEFER_MS` (20 minutes).  Read on each tick so a
+   *  live config refresh applies without rebuilding the scheduler. */
+  webhookHotDeferMaxMs?: () => number;
+  /** One-line operational log.  Absent writes with `console.log`. */
+  log?: (line: string) => void;
   /** Per-run readiness gate.  False leaves the durable run queued; callers
    * invoke tick() again when the missing runtime prerequisite arrives. */
   canStart?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => boolean;
@@ -272,6 +303,18 @@ export interface RoutineManagerOptions {
     title: string,
     activate: boolean,
   ) => { threadId: string } | null;
+  /** True when this run should use a fresh ephemeral workspace (see
+   *  `server/ephemeral-dispatch.ts`). */
+  oneShotWakeForRun?: (run: RoutineRun) => boolean;
+  /** Post the one-shot summary onto the owner automation thread. */
+  deliverEphemeralResult?: (input: {
+    ownerThreadId: string;
+    ephemeralThreadId: string;
+    run: RoutineRun;
+    ok: boolean;
+    output?: string;
+    error?: string;
+  }) => void;
   startTurn: (
     botId: string,
     threadId: string,
@@ -279,6 +322,7 @@ export interface RoutineManagerOptions {
     runOn: RoutineRunOn,
     triggerSource: RoutineRunTrigger,
     onDispatchError: (message: string) => void,
+    turnOpts?: { ephemeralDispatch?: boolean },
   ) => Promise<void>;
   interruptTurn?: (botId: string, threadId: string, runOn: RoutineRunOn) => Promise<void>;
   onRunFailed?: (run: RoutineRun) => void;
@@ -303,6 +347,11 @@ export interface RoutineManagerOptions {
 
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
 const CATCH_UP_MS = 12 * 60 * 60_000;
+/** A webhook shed for a hot host dispatches anyway after this long, so a
+ *  Mac that stays hot cannot park the receipt for hours.  The harness
+ *  overrides it with `jobs.webhookHotDeferMinutes` when that knob is set. */
+export const DEFAULT_WEBHOOK_HOT_DEFER_MINUTES = 20;
+export const DEFAULT_WEBHOOK_HOT_DEFER_MS = DEFAULT_WEBHOOK_HOT_DEFER_MINUTES * 60_000;
 const MAX_RUNS = 2_000;
 /** What acknowledging the backlog is allowed to clear — see markAllSeen. */
 const ATTENTION_STATUSES: ReadonlySet<RoutineRunStatus> = new Set(ROUTINE_ATTENTION_STATUSES);
@@ -395,6 +444,7 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
     enabled: input.enabled !== false,
     schedule: cleanSchedule(schedule),
     durationMinutes: Math.min(240, Math.max(15, Math.round(Number(input.durationMinutes) || 30))),
+    ...(input.oneShotWake === true ? { oneShotWake: true } : {}),
   };
 }
 
@@ -427,6 +477,8 @@ export class RoutineManager {
   /** When a user manually interrupts/stops a bot, automated runs for that bot
    * are snoozed so background webhooks and routines do not restart it. */
   private readonly botSnoozeUntil = new Map<string, number>();
+  /** Coarse hold-reason signatures already persisted and broadcast. */
+  private readonly publishedHoldBuckets = new Map<string, string>();
 
   constructor(options: RoutineManagerOptions) {
     this.options = options;
@@ -535,6 +587,9 @@ export class RoutineManager {
     return run ? { ...run } : null;
   }
 
+  /** Pause webhook, resource, and schedule dispatch for this bot.  Default
+   *  duration is until a person wakes the bot (a message, respond, or Run
+   *  now clears the snooze via `clearBotSnooze`). */
   snoozeBot(botId: string, durationMs = Infinity): void {
     this.botSnoozeUntil.set(botId, durationMs === Infinity ? Infinity : this.now() + durationMs);
     this.save();
@@ -719,6 +774,7 @@ export class RoutineManager {
       // routine remains zone-less because there is no zone to carry forward.
       schedule: nextSchedule,
       durationMinutes: patch.durationMinutes ?? routine.durationMinutes,
+      oneShotWake: patch.oneShotWake ?? routine.oneShotWake,
     });
     if (this.options.botState(clean.botId) === "missing") throw new Error("That Bot no longer exists");
     const cancelledRuns: RoutineRun[] = [];
@@ -729,6 +785,7 @@ export class RoutineManager {
         // confirmation cards. Keep it monotonic even for two writes in one ms.
         updatedAt: Math.max(now, routine.updatedAt + 1),
       });
+      if (patch.oneShotWake === false) delete routine.oneShotWake;
       if (patch.enabled === false) {
         for (const run of this.runs) {
           if (run.routineId !== routine.id || run.status !== "queued") continue;
@@ -1090,10 +1147,23 @@ export class RoutineManager {
       this.reconcileOrphanedRuns(now);
       let changed = false;
       for (const routine of this.routines) {
-        if (!routine.enabled || routine.nextRunAt == null || routine.nextRunAt > now || this.isBotSnoozed(routine.botId)) continue;
+        if (!routine.enabled || routine.nextRunAt == null || routine.nextRunAt > now) continue;
         const scheduledFor = routine.nextRunAt;
         const late = now - scheduledFor;
-        if (late > CATCH_UP_MS) {
+        const snoozed = this.isBotSnoozed(routine.botId);
+        if (snoozed) {
+          const skipped = this.newRun(routine, scheduledFor, false);
+          skipped.status = "missed";
+          skipped.finishedAt = now;
+          skipped.error = botAutomationsPausedMessage();
+          skipped.outcomeCode = "bot_stopped";
+          skipped.failurePhase = "lifecycle";
+          this.emitRun(skipped);
+          if (routine.schedule.type === "daily") {
+            const checkInId = this.options.checkInStart?.(skipped, routine);
+            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
+          }
+        } else if (late > CATCH_UP_MS) {
           const missed = this.newRun(routine, scheduledFor, false);
           missed.status = "missed";
           missed.finishedAt = now;
@@ -1114,6 +1184,18 @@ export class RoutineManager {
       }
       if (changed) this.save();
 
+      // One reading for the whole tick.  Every queued webhook shares it, and
+      // a person's turn never asks: this loop only admits routine receipts.
+      // Read lazily so an idle harness never pays for the host probe.
+      let hostHotReason: string | null | undefined;
+      let hostHotRead = false;
+      const readHostHot = (): string | null => {
+        if (!hostHotRead) {
+          hostHotReason = this.options.hostHot?.() ?? null;
+          hostHotRead = true;
+        }
+        return hostHotReason ?? null;
+      };
       for (const run of [...this.runs].reverse()) {
         if (run.status !== "queued") continue;
         // `holdReason` is a cached verdict from the last time canStart ran, and
@@ -1125,11 +1207,13 @@ export class RoutineManager {
         // that reaches canStart sets it again if it still holds.
         if (this.isBotSnoozed(run.botId)) {
           this.clearHoldReason(run);
+          run.hotDeferredAt = undefined;
           continue;
         }
         const state = this.options.botState(run.botId);
         if (state === "busy") {
           this.clearHoldReason(run);
+          run.hotDeferredAt = undefined;
           continue;
         }
         if (state === "missing") {
@@ -1138,15 +1222,32 @@ export class RoutineManager {
         }
         // Defer, don't drop.  A hot host (swap at the jobs admission
         // ceiling, or load per core at the ACP init ceiling) skips a new
-        // webhook wake and leaves the receipt queued.  The 10s scheduler
-        // tick tries again.  In-flight runs are not in this loop's queued
-        // set, and resource wakes still start so Housekeeper can run.
-        if (run.triggerSource === "webhook" && this.options.hostHot?.()) {
-          // Same as snooze, busy, and the min-gap skip below.  A hot host is
-          // a deferral, not a hold, and a reason verified while the engine
-          // was dead must not keep rendering for the whole shed window.
-          this.clearHoldReason(run);
-          continue;
+        // webhook wake and leaves the receipt queued with a hold reason, so
+        // the automations receipt says why.  The 10s scheduler tick tries
+        // again.  Past the max deferral age the wake dispatches anyway: a
+        // Mac that stays hot must not park a webhook for hours.  In-flight
+        // runs are not in this loop's queued set.  Resource, schedule, and
+        // manual runs still start, and a person's turn is not in this loop.
+        let hotDeferExpiredReason: string | undefined;
+        if (run.triggerSource === "webhook") {
+          const hotReason = readHostHot();
+          if (hotReason) {
+            // Measured from the tick that first parked this run on the host, not
+            // from createdAt: a receipt that already waited on a busy bot or a
+            // dead engine must still get its own full shed window.
+            const hotSince = run.hotDeferredAt ?? this.now();
+            run.hotDeferredAt = hotSince;
+            const hotAgeMs = this.now() - hotSince;
+            if (Number.isFinite(hotAgeMs) && hotAgeMs < this.webhookHotDeferMaxMs()) {
+              // Replaces a stale engine reason.  The host is why this tick is
+              // waiting, and the receipt should say that.
+              this.setHoldReason(run, hotReason);
+              continue;
+            }
+            hotDeferExpiredReason = hotReason;
+          } else {
+            run.hotDeferredAt = undefined;
+          }
         }
         // A trigger with a minimum gap stays quiet after it runs.  The
         // deliveries that arrive meanwhile are not dropped: they stay queued
@@ -1163,6 +1264,7 @@ export class RoutineManager {
             // Same as the skip paths above: the gap is a quiet cooldown, not
             // a hold, so a stale reason must not render for the whole window.
             this.clearHoldReason(run);
+            run.hotDeferredAt = undefined;
             continue;
           }
         }
@@ -1271,11 +1373,7 @@ export class RoutineManager {
           // pushing duplicate SSE and replay frames on every tick — 8,640 no-op
           // writes a day for one sustained hold, scaling with queue depth.
           // A client that already has this run is already showing this reason.
-          if (reason !== run.holdReason) {
-            run.holdReason = reason;
-            this.save();
-            this.emitRun(run);
-          }
+          this.setHoldReason(run, reason);
           continue;
         }
         if (stampResolvedThread && threadId) this.options.stampKey?.(run.botId, threadId, key);
@@ -1291,26 +1389,56 @@ export class RoutineManager {
             continue;
           }
           threadId = task.threadId;
-        } else if (
-          allowsMultipleBotThreads(mode) &&
-          (run.triggerSource === "webhook" || run.triggerSource === "resource")
-        ) {
-          this.options.activateTask?.(run.botId, threadId);
-        }
-        if (
-          (run.triggerSource === "webhook" || run.triggerSource === "resource") &&
-          !allowsMultipleBotThreads(mode)
-        ) {
-          this.options.activateTask?.(run.botId, threadId);
         }
         if (!threadId) {
           this.failRun(run, "Could not create a task for this run");
           continue;
         }
+        if (
+          this.options.oneShotWakeForRun?.(run) &&
+          (run.triggerSource === "webhook" || run.triggerSource === "resource" || run.triggerSource === "schedule")
+        ) {
+          const ownerThreadId = threadId;
+          const ephemeralKey = `${key}:one-shot`;
+          const existingEphemeral = this.options.taskForKey?.(run.botId, ephemeralKey);
+          const ephemeral = existingEphemeral
+            ? { threadId: existingEphemeral }
+            : this.options.createTask?.(run.botId, `${title} (one-shot)`, false, ephemeralKey);
+          if (!ephemeral) {
+            this.failRun(run, "Could not create a one-shot workspace for this run");
+            continue;
+          }
+          run.ownerThreadId = ownerThreadId;
+          threadId = ephemeral.threadId;
+        }
+        const ownerThreadId =
+          run.ownerThreadId ??
+          threadId;
+        if (
+          allowsMultipleBotThreads(mode) &&
+          (run.triggerSource === "webhook" || run.triggerSource === "resource")
+        ) {
+          this.options.activateTask?.(run.botId, ownerThreadId);
+        }
+        if (
+          (run.triggerSource === "webhook" || run.triggerSource === "resource") &&
+          !allowsMultipleBotThreads(mode)
+        ) {
+          this.options.activateTask?.(run.botId, ownerThreadId);
+        }
         run.threadId = threadId;
         run.startedAt = this.now();
         run.status = "running";
         run.holdReason = undefined;
+        run.hotDeferredAt = undefined;
+        this.publishedHoldBuckets.delete(run.id);
+        if (hotDeferExpiredReason) {
+          const hotSince = run.hotDeferredAt ?? run.createdAt;
+          const waitedMin = Math.max(0, Math.round((this.now() - hotSince) / 60_000));
+          this.writeLog(
+            `[routines] webhook "${run.routineName}" (${run.id}) waited ${waitedMin} min for a busy host and is dispatching anyway.  ${hotDeferExpiredReason}`,
+          );
+        }
         this.lastStartedByKey.set(key, run.startedAt);
         // A genuine recurring firing, not "Run now" or a webhook/resource
         // trigger riding the same dispatch path — those have no calendar
@@ -1340,6 +1468,8 @@ export class RoutineManager {
           // "completed" — and `copyCombinedOutcome` does not overwrite the
           // field. Cleared where the fold happens.
           folded.holdReason = undefined;
+          folded.hotDeferredAt = undefined;
+          this.publishedHoldBuckets.delete(folded.id);
           folded.threadId = threadId;
           folded.startedAt = run.startedAt;
           folded.finishedAt = undefined;
@@ -1372,6 +1502,7 @@ export class RoutineManager {
             normalizeRunOn(run.runOn),
             scheduledTriggerSource,
             (message) => this.failThread(threadId, message, "dispatch_failed"),
+            { ephemeralDispatch: Boolean(run.ownerThreadId) },
           );
         } catch (error) {
           this.failThread(threadId, error instanceof Error ? error.message : String(error), "dispatch_failed");
@@ -1430,6 +1561,16 @@ export class RoutineManager {
         if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
       } else if (!event.ok) {
         this.failRun(run, reason ?? "The bot did not complete this run", code);
+        if (run.ownerThreadId && run.threadId) {
+          this.options.deliverEphemeralResult?.({
+            ownerThreadId: run.ownerThreadId,
+            ephemeralThreadId: run.threadId,
+            run,
+            ok: false,
+            output: run.output,
+            error: run.error,
+          });
+        }
         queueMicrotask(() => void this.tick());
         return { ...run };
       } else {
@@ -1440,6 +1581,16 @@ export class RoutineManager {
         run.finishedAt = this.now();
         run.error = undefined;
         if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, true);
+      }
+      if (run.ownerThreadId && run.threadId && event.ok) {
+        this.options.deliverEphemeralResult?.({
+          ownerThreadId: run.ownerThreadId,
+          ephemeralThreadId: run.threadId,
+          run,
+          ok: true,
+          output: run.output,
+          error: run.error,
+        });
       }
     } else {
       return null;
@@ -1454,7 +1605,20 @@ export class RoutineManager {
     const run = this.runs.find((r) => !r.coalescedInto && r.threadId === threadId && ["running", "waiting"].includes(r.status));
     if (!run) return;
     this.failRun(run, message, code);
+    this.deliverEphemeralFailure(run, message);
     queueMicrotask(() => void this.tick());
+  }
+
+  private deliverEphemeralFailure(run: RoutineRun, message: string) {
+    if (!run.ownerThreadId || !run.threadId) return;
+    this.options.deliverEphemeralResult?.({
+      ownerThreadId: run.ownerThreadId,
+      ephemeralThreadId: run.threadId,
+      run,
+      ok: false,
+      output: run.output,
+      error: message,
+    });
   }
 
   /** Fail runs whose turn is no longer in flight. `turnLive` is the harness's
@@ -1487,8 +1651,34 @@ export class RoutineManager {
   private clearHoldReason(run: RoutineRun): void {
     if (run.holdReason === undefined) return;
     run.holdReason = undefined;
+    this.publishedHoldBuckets.delete(run.id);
     this.save();
     this.emitRun(run);
+  }
+
+  /** Publish a hold reason only when it changed.  The scheduler ticks every
+   *  ten seconds, so an unchanged reason must not rewrite the state file. */
+  private setHoldReason(run: RoutineRun, reason: string): void {
+    const key = holdReasonDedupKey(reason);
+    const seen = this.publishedHoldBuckets.get(run.id);
+    if (seen === key) {
+      if (run.holdReason !== reason) run.holdReason = reason;
+      return;
+    }
+    this.publishedHoldBuckets.set(run.id, key);
+    run.holdReason = reason;
+    this.save();
+    this.emitRun(run);
+  }
+
+  private webhookHotDeferMaxMs(): number {
+    const value = this.options.webhookHotDeferMaxMs?.();
+    if (value === undefined || !Number.isFinite(value) || value < 0) return DEFAULT_WEBHOOK_HOT_DEFER_MS;
+    return value;
+  }
+
+  private writeLog(line: string): void {
+    (this.options.log ?? console.log)(line);
   }
 
   /** Move a run out of `queued` and drop the reason it was being held.
@@ -1502,6 +1692,8 @@ export class RoutineManager {
   private leaveQueued(run: RoutineRun, status: "cancelled" | "failed"): void {
     run.status = status;
     run.holdReason = undefined;
+    run.hotDeferredAt = undefined;
+    this.publishedHoldBuckets.delete(run.id);
   }
 
   private failRun(run: RoutineRun, message: string, code = routineFailureCode(message)) {

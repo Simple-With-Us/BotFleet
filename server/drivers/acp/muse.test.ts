@@ -4,7 +4,7 @@
 // picker offers, and which effort rungs we advertise.  Each one is a place
 // where an optimistic edit would overclaim a capability the engine does not
 // actually have.
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { BUILT_IN_DRIVERS } from "../builtIn.ts";
 import {
   MUSE_EFFORT_LEVELS,
+  MUSE_LOGIN_NOTE,
   MuseAgentDriver,
   STATIC_MUSE_MODELS,
   museAuthenticated,
@@ -70,7 +71,7 @@ describe("Muse Code driver", () => {
     // would install the adapter and skip the binary (or the reverse) and the
     // user would only find out on their first turn.
     expect(install?.command?.win32).toContain("npm install -g @bex-co/muse-code-acp");
-    expect(install?.signInCommand).toBe("muse-code-acp --cli login");
+    expect(install?.signInCommand).toBe("muse auth set --provider meta --api-key-stdin");
   });
 
   it("offers the CLI's own default model, not the best model on the card", () => {
@@ -108,13 +109,88 @@ describe("Muse Code driver", () => {
     expect(museAuthenticated({ META_API_KEY: "   " })).toBe(false);
   });
 
-  it("falls back to the stored auth file, and never reads the credential", () => {
-    const dir = scratch();
-    const authPath = join(dir, "auth.json");
-    expect(museAuthenticated({ MUSE_AUTH_PATH: authPath })).toBe(false);
-    // `{}` on purpose:  the assertion is about the file existing, so there is
-    // no reason to put a credential-shaped string into committed source.
-    writeFileSync(authPath, "{}", "utf8");
-    expect(museAuthenticated({ MUSE_AUTH_PATH: authPath })).toBe(true);
+  it("separates a keychain session from a file-backed credential", () => {
+    // Every fixture goes where the REAL index lives — `$HOME/.config/muse/`,
+    // not `dir/auth.json` — so these are genuine regression guards.  The first
+    // version of this test wrote elsewhere and passed for the wrong reason:  an
+    // implementation reading the file would not have found it.
+    const keychainHome = scratch();
+    const keychainDir = join(keychainHome, ".config", "muse");
+    mkdirSync(keychainDir, { recursive: true });
+    writeFileSync(
+      join(keychainDir, "auth.json"),
+      // The observed macOS shape:  an index with no credential in it, naming
+      // the keychain as the place the token went.
+      JSON.stringify({
+        schema_version: 1,
+        providers: {
+          meta: {
+            mechanism: "oauth",
+            storage: "keychain",
+            obtained_via: "device_code",
+            api_base_url: "https://api.meta.ai/v1",
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    // A browser session signed into the keychain is real, and the CLI uses it —
+    // `muse exec` works on that account — but this engine's adapter cannot
+    // read it, so counting it would put a setup-complete badge over an engine
+    // that fails every turn.  Unproven, not signed in.
+    expect(museAuthenticated({ HOME: keychainHome })).toBe(false);
+    expect(
+      museAuthenticated({ HOME: keychainHome, MUSE_AUTH_PATH: join(keychainDir, "auth.json") }),
+    ).toBe(false);
+
+    // A file-backed credential is the NORMAL case on Linux and Windows, where
+    // there is no macOS Keychain to put it in.  Treating that as "not signed
+    // in" would strand every user on those platforms, so `storage` is the
+    // discriminator and only `keychain` is unproven.
+    const fileHome = scratch();
+    const fileDir = join(fileHome, ".config", "muse");
+    mkdirSync(fileDir, { recursive: true });
+    writeFileSync(
+      join(fileDir, "auth.json"),
+      JSON.stringify({
+        schema_version: 1,
+        providers: {
+          meta: { mechanism: "api_key", storage: "file", api_base_url: "https://api.meta.ai/v1" },
+        },
+      }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: fileHome })).toBe(true);
+
+    // No index at all is plainly not signed in.
+    expect(museAuthenticated({ HOME: scratch() })).toBe(false);
+    // And the env key outranks everything.
+    expect(museAuthenticated({ META_API_KEY: "set", HOME: keychainHome })).toBe(true);
+    // A malformed index must not throw out of a snapshot path.
+    const brokenHome = scratch();
+    const brokenDir = join(brokenHome, ".config", "muse");
+    mkdirSync(brokenDir, { recursive: true });
+    writeFileSync(join(brokenDir, "auth.json"), "{ not json", "utf8");
+    expect(museAuthenticated({ HOME: brokenHome })).toBe(false);
+  });
+
+  it("names the same sign-in path the auth check can actually see", () => {
+    // The bug this guards:  `loginNote` and `signInCommand` pointed at
+    // `muse-code-acp --cli login`, which completes a device-code session into
+    // the keychain — a credential this engine cannot read.  A user who followed
+    // the card exactly stayed `authenticated: false` forever, the setup card
+    // never cleared, and `turn-safety.ts` kept the instance out of the failover
+    // chain.  If the two ever drift apart again, the card stops working.
+    const signIn = MuseAgentDriver.install?.signInCommand ?? "";
+    expect(signIn).toBe("muse auth set --provider meta --api-key-stdin");
+    expect(signIn).not.toContain("--cli login");
+    expect(MUSE_LOGIN_NOTE).toContain("API key");
+    // The command reads the key from stdin, so it BLOCKS.  Without the key and
+    // the EOF named in the note, a user following the setup card sits in a
+    // terminal that looks hung and the card never clears.
+    expect(MUSE_LOGIN_NOTE).toContain("--api-key-stdin");
+    expect(MUSE_LOGIN_NOTE).toMatch(/paste the key/i);
+    expect(MUSE_LOGIN_NOTE).toMatch(/ctrl-d/i);
   });
 });

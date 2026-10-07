@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
+import { botAutomationsPausedMessage, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 
 // The rule under test, in one sentence: a bot a person stopped stays stopped
 // until a person asks for it again.  The regression this file exists for is
@@ -56,5 +56,12 @@ describe("botStopRefusalMessage", () => {
   it("tells the person how to undo it", () => {
     expect(botStopRefusalMessage()).toMatch(/stopped/i);
     expect(botStopRefusalMessage()).toMatch(/start it again/i);
+  });
+});
+
+describe("botAutomationsPausedMessage", () => {
+  it("names a stop, not an offline harness", () => {
+    expect(botAutomationsPausedMessage()).toMatch(/Automations paused/i);
+    expect(botAutomationsPausedMessage()).not.toMatch(/offline/i);
   });
 });

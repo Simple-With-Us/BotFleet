@@ -8,7 +8,7 @@ export type LocalComputerDestination = "cloud" | "vm" | "local";
 /** The four computer providers the operator can enable. Each maps to one or
  * more legacy `LocalComputerDestination`s (see
  * `migrateAllowedComputersToProviders`). `localMac` is the host running the
- * app ("This Computer"); `localVm` is a containerized Cua desktop the
+ * app ("This Computer"); `localVm` is a containerized CUA desktop the
  * operator has prepared on this machine; `asciiBox` is the hosted
  * ASCII.dev Box; `selfHostedVps` is a container on the operator's own
  * server, reached over SSH. */

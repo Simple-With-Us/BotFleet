@@ -67,6 +67,11 @@ export function botStopRefusalMessage(): string {
   return "This bot is stopped. Start it again to let this work continue.";
 }
 
+/** Receipt text when a scheduled routine fires while the bot is stopped. */
+export function botAutomationsPausedMessage(): string {
+  return "Automations paused because this bot is stopped";
+}
+
 /** Whether a dispatch failure was this policy refusing, not a real error.
  *
  * Callers that retry on failure (a card continuation, a boot resume) must be

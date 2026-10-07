@@ -17,6 +17,8 @@ import { StoreContext, initialState, type Action, type Bot, type Group } from "@
 import { FleetMatrixView } from "./FleetMatrixView";
 import type { RoutineRun } from "@/lib/routines";
 
+const noopDispatch: Dispatch<Action> = () => {};
+
 const viewModeSchema = z.enum(["matrix", "kanban"]);
 
 const PINNED_TS = 1_730_000_000_000; // 2024-10-27T16:53:20Z
@@ -144,7 +146,7 @@ export default function FleetMatrixViewVisualFixture() {
     const seeded = matrixState();
     return {
       state: { ...base, ...seeded },
-      dispatch: (() => {}) as Dispatch<Action>,
+      dispatch: noopDispatch,
       flushBotPatches: async () => {},
       refreshInstances: async () => {},
     };

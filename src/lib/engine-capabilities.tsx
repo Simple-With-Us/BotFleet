@@ -543,11 +543,11 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       terminal: "yes",
       thisComputer: "yes",
       webAccess: "yes",
-      // DSH driver's adapter contract (`server/drivers/acp/dsh.test.ts`)
-      // pins `instance.adapter.capabilities.images` to `false`, so the
-      // composer rejects image input.  Render "no" rather than "yes" so
-      // the matrix doesn't overclaim — Codex caught this in the review.
-      imageAttachments: "no",
+      // The DSH ACP adapter declares images support (`server/drivers/acp/dsh.ts`
+      // sets `images: true`, and `dsh.test.ts` pins the adapter capability),
+      // so the composer accepts image input on this engine.  Whether a given
+      // model takes the image is per model — see the prose below.
+      imageAttachments: "yes",
       // The DSH ACP adapter declares composioMcp
       // (server/drivers/acp/dsh.test.ts) — the matrix used to render
       // "-" here because the registry omitted it.
@@ -564,17 +564,14 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       liveResearch: "unknown",
     },
     capabilityNotes: {
-      imageAttachments:
-        "The bridge pins image input to false, so the composer rejects an image on this engine.  That is a limit on the bridge BotFleet ships, not on what the model can read.",
       crossBotCoordination:
         "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
     },
     whyThisEngine: {
       headline: "DeepSeek models over the Clutch ACP bridge, billed pay-as-you-go.",
       prose: [
-        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
+        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments are per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4.1-Pro carries a No Vision badge.",
         "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "Image attachments are not available on the Clutch engine yet.",
       ],
     },
     defaultModels: [
@@ -747,7 +744,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
           "Muse Code subscription.  Meta publishes plan names and quotas but no monthly price, so BotFleet does not state one.  PAYG rates below are the public Model API catalog, not an invoice.",
       },
       api: {
-        // Muse Spark Standard tier, per 1M tokens: $1.25 in / $0.15 cached /
+        // Muse Spark STANDARD tier, per 1M tokens: $1.25 in / $0.15 cached /
         // $4.25 out.  Divided by 1000 for the per-1k shape the projection
         // uses.  No long-context tier: Meta bills the same rate whether the
         // window is nearly empty or nearly full, which is unusual enough to
@@ -756,7 +753,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         outputPer1k: 0.00425,
         cachedInputPer1k: 0.00015,
         notes:
-          "Muse Spark Standard pay-as-you-go rates.  No long-context premium — a full 1M window costs the same per token as an empty one.  Catalog reference for the what-if projection, not an invoice.  Source:  https://dev.meta.ai/docs/pricing-rate-limits",
+          "Muse Spark Standard pay-as-you-go rates.  These are Standard, not Contributor:  a live run on a Contributor account reported its model as muse-spark-1.3-contributor, and Contributor is roughly an order of magnitude cheaper per token, so treat this as an upper bound rather than your bill.  No long-context premium — a full 1M window costs the same per token as an empty one.  Catalog reference for the what-if projection, not an invoice.  Source:  https://dev.meta.ai/docs/pricing-rate-limits",
       },
       notes: "Subscription is the pricing mode.  API rates are a what-if catalog, not an invoice.",
     },
@@ -802,8 +799,10 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       headline: "Meta's coding CLI, over a 1M-token window with no long-context premium.",
       prose: [
         "Muse Code runs inside BotFleet through Meta's Muse Spark models.  Files, terminal, this computer, image attachments, and long context are available.",
-        "Connected apps, cross-bot coordination, rooms, and computer use are mounted through the adapter but have not been run on a real turn yet, so the matrix marks them unaudited rather than claiming them.",
+        "The model a turn actually uses is your account's startup model, which the engine does not control yet; the matrix names Muse Spark 1.2 because that is the one this driver can point at.",
+        "Connected apps, cross-bot coordination, rooms, and computer use are mounted through the adapter but have not completed a real turn yet, so the matrix marks them unaudited rather than claiming them.",
         "Voice chat is not available on this engine.  BotFleet drives Muse Code through a community ACP adapter, because Muse Code speaks its own session protocol rather than ACP.",
+        "Signing in needs an API key:  a browser session stored in the Mac keychain is not readable by the adapter, so a keychain-only account cannot run a turn.",
       ],
     },
     defaultModels: [

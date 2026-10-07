@@ -31,6 +31,7 @@ import {
   LastKnownAnswer,
   logProbeFailure,
   spawnCli,
+  trackCliGroup,
 } from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
@@ -111,8 +112,8 @@ export function acpMcpServers(turn: Pick<SendTurnInput, "integrations">): AcpStd
     });
   }
   // The bot's computers, mounted exactly like the Claude driver does.
-  // Cloud boxes use the REST adapter; host, sandbox, and VPS Cua
-  // connections expose Cua Driver's official MCP server directly. Every
+  // Cloud boxes use the REST adapter; host, sandbox, and VPS CUA
+  // connections expose CUA Driver's official MCP server directly. Every
   // grant gets its own server — this was an if/else if that dropped the
   // second computer a bot had been given.
   for (const mount of turnComputerMounts(turn.integrations)) {
@@ -813,6 +814,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           });
         }
 
+        // Armed at spawn so the group is probed in the same tick its leader
+        // is reaped: that is what lets stop() keep reaping a lingering MCP
+        // descendant after the leader has gone, without ever signalling a
+        // process-group id the OS may have handed to someone else.
+        const group = trackCliGroup(child);
+
         // `sawOutput` is the replay-safety gate, and it is PROTOCOL state, not
         // a reading of the error text: it flips the moment this child put
         // something on the bus that a relaunch would duplicate or contradict —
@@ -932,17 +939,63 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             send({ jsonrpc: "2.0", id, method, params });
           });
 
-        const stop = () => killCliTree(child);
+        // One force-kill per child, however many paths call stop().
+        let forceKillArmed = false;
+        const stop = () => {
+          // SIGTERM the whole group while the leader is alive.  A no-op once
+          // the leader has exited: killCliTree early-returns then.
+          killCliTree(child);
+          const leaderAlive = child.exitCode === null && child.signalCode === null;
+          if (process.platform === "win32") {
+            // No process groups here; taskkill /T /F already forced the
+            // tree.  Keep a direct kill for a leader taskkill missed.
+            if (!leaderAlive || forceKillArmed) return;
+            forceKillArmed = true;
+            const forceTimer = setTimeout(() => {
+              if (child.exitCode !== null || child.signalCode !== null) return;
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+            }, FORCE_EXIT_AFTER_MS);
+            forceTimer.unref?.();
+            return;
+          }
+          // The leader already exited before anyone asked it to stop, so
+          // killCliTree sent nothing, but an MCP descendant may still be
+          // alive in the group holding the session lock.  Ask it to go
+          // first.  `group.signal` only sends while the group id is still
+          // provably this child's (see trackCliGroup), never to a pgid the OS
+          // may have recycled.
+          if (!leaderAlive) group.signal("SIGTERM");
+          // Group already empty: a clean teardown, nothing left to force.
+          if (!group.owned || forceKillArmed) return;
+          forceKillArmed = true;
+          // Then force it.  This must NOT be gated on the leader still being
+          // alive: on a normal completion the leader dies on the SIGTERM
+          // above within milliseconds, while a SIGTERM-ignoring descendant
+          // lives on, and settle() has already dropped this turn from
+          // `active`, so stopAll/dispose can no longer reach it.  It is gated
+          // on the group instead: if the group empties first, trackCliGroup
+          // disowns it and this send is a no-op.
+          const forceTimer = setTimeout(() => group.signal("SIGKILL"), FORCE_EXIT_AFTER_MS);
+          forceTimer.unref?.();
+        };
         const stopAndWaitForExit = async () => {
           state.deadlineTerminating = true;
-          const pid = child.pid;
           const forceExit = () => {
-            try {
-              if (process.platform !== "win32" && pid) process.kill(-pid, "SIGKILL");
-              else child.kill("SIGKILL");
-            } catch {
-              // already gone
+            if (process.platform === "win32") {
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+              return;
             }
+            // Same ownership rule as stop(): reap a lingering descendant, but
+            // never signal a group id that has emptied and may be recycled.
+            group.signal("SIGKILL");
           };
           if (child.exitCode !== null || child.signalCode !== null) {
             forceExit();

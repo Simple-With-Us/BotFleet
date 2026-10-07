@@ -78,7 +78,14 @@ export function checkInRoutineStart(run: RoutineRun, routine: Routine): string |
   const monitorConfig = routineMonitorConfig(routine);
   if (!monitorConfig) return undefined;
   try {
-    return sdk.captureCheckIn({ monitorSlug: routineMonitorSlug(run), status: "in_progress" }, monitorConfig);
+    const checkInId = sdk.captureCheckIn(
+      { monitorSlug: routineMonitorSlug(run), status: "in_progress" },
+      monitorConfig,
+    );
+    // The SDK fabricates a uuid when the client is missing or closed; never
+    // store that as a real Crons check-in id on the run record.
+    if (!checkInId || !isSentryActive()) return undefined;
+    return checkInId;
   } catch {
     return undefined;
   }

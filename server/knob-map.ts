@@ -97,6 +97,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     min: 0,
   },
   {
+    id: "jobs.webhookHotDeferMinutes",
+    label: "Webhook hot-host deferral limit",
+    section: "jobs",
+    path: ["webhookHotDeferMinutes"],
+    infisicalName: "BOTFLEET_WEBHOOK_HOT_DEFER_MINUTES",
+    kind: "int",
+    min: 1,
+    max: 720,
+  },
+  {
     id: "observability.tracesSampleRate",
     label: "Sentry traces sample rate",
     section: "observability",

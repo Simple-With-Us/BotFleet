@@ -466,7 +466,9 @@ test("two processes doing locked read-modify-writes on one file never lose an up
   const { dir, path } = tempConfig();
   const N = 40;
   try {
-    const env = { CFL_PATH: path, CFL_N: String(N) };
+    // windows-latest under parallel CI load can keep a peer lock held longer than
+    // the default 5s acquire timeout while each side does N read-modify-writes.
+    const env = { CFL_PATH: path, CFL_N: String(N), CFL_TIMEOUT_MS: "30000" };
     await Promise.all([
       runWorker(COUNTER_SOURCE, { ...env, CFL_SECTION: "server" }),
       runWorker(COUNTER_SOURCE, { ...env, CFL_SECTION: "electron" }),

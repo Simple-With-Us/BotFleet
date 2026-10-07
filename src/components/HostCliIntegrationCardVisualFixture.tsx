@@ -7,6 +7,8 @@ import { useMemo, type Dispatch } from "react";
 import { HostCliIntegrationCard } from "./HostCliIntegrationCard";
 import { initialState, StoreContext, type Action, type ConfigStatus } from "@/state/store";
 
+const noopDispatch: Dispatch<Action> = () => {};
+
 export default function HostCliIntegrationCardVisualFixture() {
   const value = useMemo(
     () => ({
@@ -19,9 +21,10 @@ export default function HostCliIntegrationCardVisualFixture() {
             shareCliCredentials: true,
             allowHostTerminal: false,
           },
+          // SAFETY: visual fixture only needs localVm; other ConfigStatus sections stay at store defaults via spread.
         } as ConfigStatus,
       },
-      dispatch: (() => {}) as Dispatch<Action>,
+      dispatch: noopDispatch,
       flushBotPatches: async () => {},
       refreshInstances: async () => {},
     }),

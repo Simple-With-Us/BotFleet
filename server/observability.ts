@@ -17,6 +17,7 @@ import {
   getSentry,
   isSentryActive,
   MALFORMED_DSN_MESSAGE,
+  SENTRY_DELIVERY_NOT_READY_MESSAGE,
   sentryDsnFromEnv,
   sentryRuntimeState,
   type SentryRuntimeInput,
@@ -24,9 +25,12 @@ import {
 } from "./sentry.ts";
 
 export interface ObservabilityStatusView {
-  /** Reporting is actually meant to be happening: a DSN is stored and the
-   * kill switch is on.  The Settings pill reads straight off this. */
+  /** Configuration fact: a valid DSN is on file and the kill switch is on.
+   *  The renderer uses this to decide whether it should keep a browser
+   *  client — not whether the Node SDK has finished restarting. */
   enabled: boolean;
+  /** Whether the harness Node SDK can deliver events right now. */
+  delivering: boolean;
   /** The stored switch before DSN/configuration validity is folded in. */
   requestedEnabled: boolean;
   configured: boolean;
@@ -122,8 +126,11 @@ class ObservabilityManager {
     // is on file — that is what makes a malformed DSN legible rather than
     // looking like nothing was set.
     const malformed = input.dsn !== null && parsed === null;
+    const wantsReporting = input.enabled && input.dsn !== null && !malformed;
+    const delivering = wantsReporting && isSentryActive();
     return {
-      enabled: input.enabled && input.dsn !== null && !malformed,
+      enabled: wantsReporting,
+      delivering,
       requestedEnabled: input.enabled,
       configured: input.dsn !== null,
       source: this.dsnFromVault() ? "infisical" : input.source,
@@ -168,7 +175,7 @@ class ObservabilityManager {
     if (!status.configured) {
       return { ok: false, error: "Set a Sentry DSN first.", eventId: null };
     }
-    if (!status.enabled) {
+    if (!status.requestedEnabled) {
       return {
         ok: false,
         error: "Diagnostics are turned off.  Turn them on to send a test event.",
@@ -229,6 +236,9 @@ export function observabilityBootLine(view: ObservabilityStatusView): string {
   }
   if (!view.enabled) {
     return "[sentry] disabled by settings: a DSN is stored, diagnostics are turned off";
+  }
+  if (!view.delivering) {
+    return `[sentry] starting (${view.source}): ${SENTRY_DELIVERY_NOT_READY_MESSAGE.slice(0, 120)}`;
   }
   const parts = [
     `[sentry] enabled (${view.source})`,

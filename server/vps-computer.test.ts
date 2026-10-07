@@ -35,6 +35,7 @@ import {
   vpsDockerArgs,
   vpsDriverError,
   vpsSshTunnelArgs,
+  perBotVpsTarget,
   vpsSyncCliCredentials,
   resetVpsCliSyncThrottle,
   reuseVps,
@@ -287,7 +288,7 @@ describe("VPS computer", () => {
     for (const probe of probes) expect(probe.options?.timeoutMs).toBe(30_000);
   });
 
-  it("reports a ready container only when image, labels, limits, mounts, network, and Cua pass", async () => {
+  it("reports a ready container only when image, labels, limits, mounts, network, and CUA pass", async () => {
     const fake = fixture();
     const status = await vpsComputerStatus(CONFIG, BOT_ID, fake.runner);
     expect(status).toMatchObject({
@@ -475,7 +476,7 @@ describe("VPS computer", () => {
     expect(fake.calls.filter(({ args }) => args[2] === "run")).toHaveLength(1);
   });
 
-  it("mounts the official Cua MCP server through the tiny remote exec bridge", () => {
+  it("mounts the official CUA MCP server through the tiny remote exec bridge", () => {
     const connection = vpsComputerMcp(CONFIG, BOT_ID);
     expect(connection.command).toBe(process.execPath);
     expect(connection.args.slice(1, 3)).toEqual(["production-vps", vpsContainerName(BOT_ID)]);
@@ -505,7 +506,7 @@ describe("VPS computer", () => {
     ]);
   });
 
-  it("captures screenshots through Cua Driver and validates the returned image", async () => {
+  it("captures screenshots through CUA Driver and validates the returned image", async () => {
     const fake = fixture();
     const frame = await vpsComputerScreenshot(CONFIG, BOT_ID, fake.runner);
     expect(frame).toMatchObject({ png: screenshot.toString("base64"), format: "png" });
@@ -686,7 +687,7 @@ describe("VPS computer", () => {
         const fake = fixture({ container: true, running: true });
         const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner, tempDir);
         expect(result.ok).toBe(true);
-        expect(result.synced).toEqual([]);
+        expect(result.syncedTools).toEqual([]);
         expect(result.containerName).toBe(SHARED_VPS_TARGET.containerName);
         expect(fake.calls.some(({ args }) => args.includes("tar"))).toBe(false);
       } finally {
@@ -704,8 +705,8 @@ describe("VPS computer", () => {
         const fake = fixture({ container: true, running: true });
         const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner, tempDir);
         expect(result.ok).toBe(true);
-        expect(result.synced).toContain(".ssh");
-        expect(result.synced).toContain(".gitconfig");
+        expect(result.syncedTools.some((entry) => entry.name === "ssh")).toBe(true);
+        expect(result.syncedTools.some((entry) => entry.name === "git")).toBe(true);
         expect(result.containerName).toBe(SHARED_VPS_TARGET.containerName);
 
         const tarCall = fake.calls.find(({ args }) => args.includes("tar") && args.includes("-xf"));
@@ -714,6 +715,20 @@ describe("VPS computer", () => {
 
         const chmodCall = fake.calls.find(({ args }) => args.some((arg) => arg.includes("chmod")));
         expect(chmodCall).toBeDefined();
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("uses the per-bot container name when target is per-bot", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-per-bot-"));
+      const botTarget = perBotVpsTarget("bot-sync-test");
+      try {
+        const fake = fixture({ container: true, running: true, containerName: botTarget.containerName });
+        const result = await vpsSyncCliCredentials(CONFIG, botTarget, fake.runner, tempDir);
+        expect(result.containerName).toBe(botTarget.containerName);
+        const execArgs = fake.calls.flatMap(({ args }) => args);
+        expect(execArgs).toContain(botTarget.containerName);
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
       }
