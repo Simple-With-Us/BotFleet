@@ -1772,10 +1772,20 @@ final class Session: ObservableObject {
     }
 
     @MainActor
-    func updateProfile(_ patch: BotProfilePatch, for bot: Bot) async -> Bot? {
+    /// `withoutDeviceVoices` is the same save for a computer that predates
+    /// per-device voices.  Such a computer refuses the whole PATCH over the
+    /// `voices` key, so it is sent once more without it, rather than losing a
+    /// rename or a model change made in the same sheet.
+    func updateProfile(_ patch: BotProfilePatch, for bot: Bot, withoutDeviceVoices: BotProfilePatch? = nil) async -> Bot? {
         guard let client else { return nil }
         do {
-            let updated = try await client.updateProfile(botId: bot.id, patch: patch)
+            let updated: Bot
+            do {
+                updated = try await client.updateProfile(botId: bot.id, patch: patch)
+            } catch let refusal where withoutDeviceVoices != nil && BotVoiceEdit.isDeviceVoicesUnsupported(refusal) {
+                guard let fallback = withoutDeviceVoices, !Task.isCancelled else { return nil }
+                updated = try await client.updateProfile(botId: bot.id, patch: fallback)
+            }
             guard !Task.isCancelled else { return nil }
             state.apply(.bot(updated))
             return updated
@@ -1863,7 +1873,20 @@ final class Session: ObservableObject {
         voicePlayback = nil
         PersonalVoiceService.shared.stop()
         speakingMessageId = nil
+        // The interruption belonged to the read that just ended.  Left set,
+        // its late end would stop the next read.
+        voiceInterrupted = false
         if wasPlaying { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
+    }
+
+    /// Runs `work` with background execution time.  The `audio` background
+    /// mode keeps the app running only while something plays, so a locked
+    /// phone could be suspended in the silent waits of a read: the request
+    /// that plans it, and a clip that is not ready when the last one ends.
+    private func withVoiceBackgroundTime<T>(_ work: () async throws -> T) async rethrows -> T {
+        let time = VoiceBackgroundTime()
+        defer { time.end() }
+        return try await work()
     }
 
     /// Read a bot reply aloud with the voice this bot uses on the iPhone.
@@ -1907,9 +1930,11 @@ final class Session: ObservableObject {
             guard let client else { return }
             let answer: MessageVoice
             do {
-                answer = try await client.messageVoice(
-                    threadId: threadId, messageId: message.id, device: .iphone, progressive: true
-                )
+                answer = try await withVoiceBackgroundTime {
+                    try await client.messageVoice(
+                        threadId: threadId, messageId: message.id, device: .iphone, progressive: true
+                    )
+                }
             } catch {
                 if !isCancellation(error) { VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .hosted) }
                 throw error
@@ -1950,9 +1975,11 @@ final class Session: ObservableObject {
             // failure while playing hosted clips below is a playback failure.
             var answer: MessageVoice?
             do {
-                answer = try await client.messageVoice(
-                    threadId: threadId, messageId: message.id, device: .iphone, progressive: true
-                )
+                answer = try await withVoiceBackgroundTime {
+                    try await client.messageVoice(
+                        threadId: threadId, messageId: message.id, device: .iphone, progressive: true
+                    )
+                }
             } catch {
                 if isCancellation(error) || Task.isCancelled { throw error }
                 VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .personal)
@@ -2019,7 +2046,10 @@ final class Session: ObservableObject {
         for index in 0..<total {
             let data: Data
             do {
-                data = try await next.value
+                // Usually already fetched while the last clip played.  When
+                // it is not, nothing plays during this wait.
+                let pending = next
+                data = try await withVoiceBackgroundTime { try await pending.value }
             } catch {
                 if !isCancellation(error) { VoiceTelemetry.audioRequestFailed(error, stage: "clip", engine: .hosted) }
                 throw error
@@ -3387,6 +3417,26 @@ extension CompanionState {
         case .screen: return "Screenshot"
         case .unknown: return last.text ?? ""
         }
+    }
+}
+
+/// One stretch of background execution time for a read.  Ends exactly once:
+/// when the work finishes, or when iOS says the time is up.  The expiration
+/// handler holds the object strongly so the task is always ended.
+@MainActor
+private final class VoiceBackgroundTime {
+    private var id: UIBackgroundTaskIdentifier = .invalid
+
+    init() {
+        id = UIApplication.shared.beginBackgroundTask(withName: "Read Aloud") {
+            MainActor.assumeIsolated { self.end() }
+        }
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }
 

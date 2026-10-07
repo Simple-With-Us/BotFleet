@@ -89,7 +89,13 @@ struct AgentProfileView: View {
         BotVoice.isPersonalVoiceId(voiceId) || config?.canSpeak(agentVoice: voiceId) == true
     }
     private var iphoneVoiceCanSpeak: Bool { voiceCanSpeak(iphoneVoice, with: config) }
-    private var macVoiceCanSpeak: Bool { voiceCanSpeak(macVoice, with: config) }
+    /// The Mac is set to this iPhone's own Personal Voice (an older iPhone
+    /// build wrote it as the shared voice).  The Mac cannot speak it.
+    private var macVoiceIsThisIphones: Bool { macVoiceIsPersonal && personalVoice.hasVoice(macVoice) }
+    private func macVoiceCanSpeak(with config: ConfigStatus?) -> Bool {
+        !macVoiceIsThisIphones && voiceCanSpeak(macVoice, with: config)
+    }
+    private var macVoiceCanSpeak: Bool { macVoiceCanSpeak(with: config) }
     /// Hosted voices only.  Personal Voices come from the device itself.
     private var hostedVoices: [Voice] { voices.filter { !BotVoice.isPersonalVoiceId($0.id) } }
     /// DEBUG `-store-preview -preview-voice`: the voice section comes first,
@@ -116,30 +122,30 @@ struct AgentProfileView: View {
     private var unavailableVoiceGuidance: String {
         switch voiceProvider {
         case .minimax:
-            return "Add the shared MiniMax key in this agent's profile on the computer. The key is never returned to iOS."
+            return "Add the shared MiniMax key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .elevenlabs:
-            return "Add the shared ElevenLabs key in this agent's profile on the computer. The key is never returned to iOS."
+            return "Add the shared ElevenLabs key in a bot's Voice settings on the computer.\u{00A0} The key is never returned to iOS."
         case .system:
-            return "Built-in Mac voices need no key, and this computer has none available. Switch the voice engine in this agent's profile on the computer to keep using voice."
+            return "Built-in Mac voices need no key, and this computer has none available.\u{00A0} Switch the voice engine in a bot's Voice settings on the computer to keep using voice."
         case .personal:
             return "Apple Personal Voice speaks directly on this iOS device and requires authorization."
         case .unknown:
-            return "Configure the selected voice engine in this agent's profile on the computer. Provider keys are never returned to iOS."
+            return "Configure the selected voice engine in a bot's Voice settings on the computer.\u{00A0} Provider keys are never returned to iOS."
         }
     }
 
     private var missingDefaultVoiceGuidance: String {
         switch voiceProvider {
         case .minimax:
-            return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the shared MiniMax key on your computer."
+            return "No workspace default voice is selected.\u{00A0} Choose a voice for each device above; synthesis still uses the shared MiniMax key on your computer."
         case .elevenlabs:
-            return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the shared ElevenLabs key on your computer."
+            return "No workspace default voice is selected.\u{00A0} Choose a voice for each device above; synthesis still uses the shared ElevenLabs key on your computer."
         case .system:
-            return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the built-in Mac voices on your computer."
+            return "No workspace default voice is selected.\u{00A0} Choose a voice for each device above; synthesis still uses the built-in Mac voices on your computer."
         case .personal:
-            return "No workspace default voice is selected. Choose an Apple Personal Voice above to synthesize on this device."
+            return "No workspace default voice is selected.\u{00A0} Choose an Apple Personal Voice for this iPhone above to speak on this device."
         case .unknown:
-            return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the selected voice engine on your computer."
+            return "No workspace default voice is selected.\u{00A0} Choose a voice for each device above; synthesis still uses the selected voice engine on your computer."
         }
     }
 
@@ -390,7 +396,7 @@ struct AgentProfileView: View {
                 // never turns the other device off.
                 if let loadedConfig {
                     if !voiceCanSpeak(iphoneVoice, with: loadedConfig) { speechDevices.remove("iphone") }
-                    if !voiceCanSpeak(macVoice, with: loadedConfig) { speechDevices.remove("mac") }
+                    if !macVoiceCanSpeak(with: loadedConfig) { speechDevices.remove("mac") }
                 }
             }
             .onChange(of: session.cachedInstances) { _, roster in
@@ -475,7 +481,7 @@ struct AgentProfileView: View {
             speechDevices.filter { device in
                 switch device {
                 case "iphone": return voiceCanSpeak(iphoneVoice, with: loaded)
-                case "mac": return voiceCanSpeak(macVoice, with: loaded)
+                case "mac": return macVoiceCanSpeak(with: loaded)
                 default: return true
                 }
             }
@@ -639,10 +645,14 @@ struct AgentProfileView: View {
                     }
                 }
                 if personalVoice.authorizationStatus == .denied || personalVoice.authorizationStatus == .unsupported {
-                    Text("Personal Voice access is disabled.  You can allow BotFleet in iOS Settings > Accessibility > Personal Voice.")
+                    Text("Personal Voice access is disabled.\u{00A0} You can allow BotFleet in iOS Settings > Accessibility > Personal Voice.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+                Button("Preview iPhone Voice", systemImage: "speaker.wave.2") {
+                    Task { await previewVoice() }
+                }
+                .disabled(busy || !iphoneVoiceCanSpeak)
                 Picker("Voice on Mac", selection: $macVoice) {
                     macVoiceOptions
                 }
@@ -661,10 +671,6 @@ struct AgentProfileView: View {
                     set: { if $0 { speechDevices.insert("iphone") } else { speechDevices.remove("iphone") } }
                 ))
                 .disabled(!iphoneVoiceCanSpeak)
-                Button("Preview Voice", systemImage: "speaker.wave.2") {
-                    Task { await previewVoice() }
-                }
-                .disabled(busy || !iphoneVoiceCanSpeak)
 
                 if !hasWorkspaceDefaultVoice, iphoneVoice.isEmpty || macVoice.isEmpty {
                     Label("Pick a voice for each device before turning on speech.", systemImage: "info.circle")
@@ -845,9 +851,30 @@ struct AgentProfileView: View {
         busy = true
         defer { busy = false }
         return await ProfileSaveGate.run(
-            save: { await session.updateProfile(profilePatch(), for: current) },
+            save: {
+                await session.updateProfile(
+                    profilePatch(),
+                    for: current,
+                    withoutDeviceVoices: profilePatchWithoutDeviceVoices()
+                )
+            },
             accept: synchronizeForm(with:)
         )
+    }
+
+    /// The same save for a computer that predates per-device voices and so
+    /// keeps one voice per bot.  Nil when the save sends no `voices`.
+    private func profilePatchWithoutDeviceVoices() -> BotProfilePatch? {
+        var patch = profilePatch()
+        guard patch.voices != nil else { return nil }
+        patch.voices = nil
+        patch.voice = BotVoiceEdit.sharedVoiceFallback(
+            sharedVoice: baseline.sharedVoice,
+            voices: baseline.voices,
+            iphone: iphoneVoice,
+            mac: macVoice
+        )
+        return patch
     }
 
     private func clearImage() async {
@@ -913,7 +940,7 @@ struct AgentProfileView: View {
     /// Previews the voice this iPhone speaks with.
     private func previewVoice() async {
         guard iphoneVoiceCanSpeak else {
-            session.actionError = "Pick an agent voice or configure a workspace default on your computer first."
+            session.actionError = "Pick a voice for this iPhone, or set a workspace default voice on your computer first."
             return
         }
         busy = true

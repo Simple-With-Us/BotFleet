@@ -293,6 +293,11 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
         }
         isSpeaking = false
         stopWatchdog()
+        // An interruption belongs to the read it paused.  Left set, the next
+        // read would wait out `interruptionLimit` in silence for an end that
+        // already came (or never will), with the watchdog switched off.
+        interrupted = false
+        pausedAt = nil
         let cont = chunkContinuation
         chunkContinuation = nil
         cont?.resume(returning: .cancelled)
@@ -345,11 +350,11 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
 
     private func handleInterruption(_ note: Notification) {
         guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSession.InterruptionType(rawValue: raw),
-              isSpeaking
+              let type = AVAudioSession.InterruptionType(rawValue: raw)
         else { return }
         switch type {
         case .began:
+            guard isSpeaking else { return }
             interrupted = true
             pausedAt = Date()
             if synthesizer.isSpeaking { synthesizer.pauseSpeaking(at: .word) }
@@ -359,8 +364,11 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
             guard interrupted else { return }
             let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
                 .map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
+            // Cleared even when the read already stopped (Session's own
+            // observer can stop it first): only resuming needs a live read.
             interrupted = false
             resumeClock()
+            guard isSpeaking else { return }
             guard options.contains(.shouldResume) else {
                 // Another app kept the audio.  End the read cleanly rather
                 // than leave it paused with nothing to resume it.

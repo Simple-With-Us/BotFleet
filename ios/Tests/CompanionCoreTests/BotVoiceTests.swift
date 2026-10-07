@@ -193,4 +193,36 @@ final class BotVoiceTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - A computer that predates per-device voices
+
+    func testRecognizesAnOlderSidecarOrHarnessRefusingVoices() {
+        XCTAssertTrue(BotVoiceEdit.isDeviceVoicesUnsupported(
+            APIError.status(code: 403, message: "voices can only be changed in BotFleet on your computer")
+        ))
+        XCTAssertTrue(BotVoiceEdit.isDeviceVoicesUnsupported(
+            APIError.status(code: 400, message: "unsupported profile field: voices")
+        ))
+        // Any other refusal is a real failure, not a reason to retry.
+        XCTAssertFalse(BotVoiceEdit.isDeviceVoicesUnsupported(
+            APIError.status(code: 403, message: "modelSelection can only be changed in BotFleet on your computer")
+        ))
+        XCTAssertFalse(BotVoiceEdit.isDeviceVoicesUnsupported(
+            APIError.status(code: 400, message: "unsupported profile field: bypassPermissions")
+        ))
+        XCTAssertFalse(BotVoiceEdit.isDeviceVoicesUnsupported(APIError.status(code: 403, message: nil)))
+        XCTAssertFalse(BotVoiceEdit.isDeviceVoicesUnsupported(APIError.transport("offline")))
+    }
+
+    func testTheFallbackSavesTheIphoneChoiceAsTheSharedVoice() {
+        // What this app wrote before per-device voices: the iPhone's pick.
+        XCTAssertEqual(BotVoiceEdit.sharedVoiceFallback(sharedVoice: "va", voices: nil, iphone: "vb", mac: "va"), "vb")
+        XCTAssertEqual(BotVoiceEdit.sharedVoiceFallback(sharedVoice: "va", voices: nil, iphone: "vb", mac: "vc"), "vb")
+        // Only the Mac changed: the one shared voice becomes the Mac's pick.
+        XCTAssertEqual(BotVoiceEdit.sharedVoiceFallback(sharedVoice: "va", voices: nil, iphone: "va", mac: "vc"), "vc")
+        // Workspace default is the empty voice, as before.
+        XCTAssertEqual(BotVoiceEdit.sharedVoiceFallback(sharedVoice: "va", voices: nil, iphone: "", mac: "va"), "")
+        // Nothing changed: no voice in the fallback either.
+        XCTAssertNil(BotVoiceEdit.sharedVoiceFallback(sharedVoice: "va", voices: BotVoices(mac: "vm"), iphone: "va", mac: "vm"))
+    }
 }
