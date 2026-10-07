@@ -136,7 +136,11 @@ export const SUMMARY_RATIO_MIN_CHARS = 400;
 
 /** Whether voiceSummaryFor should store this result as message.voiceText.
  * A transient provider failure (network error, non-200, empty answer) is not
- * stored, so the next play can still get the rewrite.  A cut-off rewrite is never returned as text (the full
+ * stored here, so a play on an on-device voice can still get the rewrite
+ * later.  A hosted voice's clip job does store the text it speaks, whatever
+ * its source: its clips are matched to that text by count alone, so a later
+ * rewrite would pair the old clips with new sentences (server/tts/
+ * message-audio.ts).  A cut-off rewrite is never returned as text (the full
  * deterministic text stands in), and that stand-in is stored, because asking
  * again would only be cut off again and billed again. */
 export function voiceSummaryWorthStoring(result: VoiceSummaryResult): boolean {
