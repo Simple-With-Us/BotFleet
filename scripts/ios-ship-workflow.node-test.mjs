@@ -12,7 +12,7 @@ function read(rel) {
   return readFileSync(join(ROOT, rel), "utf8");
 }
 
-test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => {
+test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", () => {
   const yml = read(".github/workflows/ios-ship.yml");
   const wrapper = read("scripts/ios-ship-testflight.sh");
   const prepare = read("scripts/ios-appstore-gm-prepare.sh");
@@ -20,9 +20,14 @@ test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => 
   assert.match(yml, /ios\/\*\*/);
   assert.match(yml, /--path-prefix 'ios\/'/);
   assert.match(yml, /scripts\/ios-fleet\/\*\*/);
-  assert.match(yml, /runs-on:\s*macos-latest/);
+  assert.match(yml, /runs-on:\s*xcode-27\s*$/m);
+  assert.doesNotMatch(yml, /runs-on:\s*macos-latest/);
   assert.doesNotMatch(yml, /runs-on:\s*\[self-hosted/);
-  assert.match(yml, /DEVELOPER_DIR:\s*\/Applications\/Xcode\.app\/Contents\/Developer/);
+  assert.match(yml, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
+  assert.match(yml, /bash scripts\/ios-assert-xcode\.sh 27\.0/);
+  const ci = read(".github/workflows/ci.yml");
+  assert.match(ci, /\|\| 'xcode-27' \}\}/);
+  assert.match(ci, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
   assert.match(yml, /fetch-depth:\s*0/);
   assert.match(yml, /cancel-in-progress:\s*false/);
   assert.match(yml, /github\.event\.repository\.fork == false/);
@@ -83,6 +88,16 @@ test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => 
   assert.match(project, /INFOPLIST_KEY_CFBundleDisplayName:\s*BotFleet Widgets/);
   assert.match(yml, /IOS_MANUAL_SIGN:\s*"1"/);
   assert.match(yml, /scripts\/ios-install-appstore-profiles\.sh/);
+  assert.match(project, /projectFormat:\s*xcode16_3/);
+  assert.match(project, /xcodeVersion:\s*'27\.0'/);
+  assert.match(project, /postGenCommand:\s*bash \.\.\/scripts\/ios-xcodegen-post\.sh/);
+  assert.match(project, /IPHONEOS_DEPLOYMENT_TARGET:\s*'27\.0'/);
+  assert.match(project, /INFOPLIST_KEY_LSApplicationCategoryType:\s*public\.app-category\.developer-tools/);
+  // The shipped category is info.properties (XcodeGen writes App/Info.plist);
+  // INFOPLIST_KEY_* only mirrors it for Xcode's General > App Category picker.
+  assert.match(project, /^\s+LSApplicationCategoryType:\s*public\.app-category\.developer-tools\s*$/m);
+  assert.match(read("scripts/ios-xcodegen-post.sh"), /objectVersion = 100/);
+  assert.match(read("scripts/ios-xcodegen-post.sh"), /Xcode 27\.0/);
 
   assert.match(wrapper, /scripts\/ios-fleet\/ship-testflight\.sh/);
   assert.match(wrapper, /IN_REPO="\$\{ROOT\}\/scripts\/ios-fleet\/ship-testflight\.sh"/);
