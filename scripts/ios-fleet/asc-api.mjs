@@ -23,7 +23,7 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { createSign } from "node:crypto";
+import { createHash, createSign } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -431,6 +431,7 @@ async function main() {
   if (!method || !path) {
     console.error("Usage: node asc-api.mjs <METHOD> <PATH> [JSON_BODY]");
     console.error("       node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion] [appleId]");
+    console.error("       node asc-api.mjs ensure-appstore-profiles <path-to-appstore-profiles.json>");
     console.error("       node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]");
     process.exit(1);
   }
@@ -623,6 +624,168 @@ async function main() {
   // Exit codes: 0 ready | 2 usage/API error | 3 readiness timeout (build found,
   // still processing) | 4 the uploaded build never appeared within the discovery
   // budget, so compliance was NOT declared on it.
+  if (method === "ensure-appstore-profiles") {
+    const mapPath = path;
+    if (!mapPath) {
+      console.error("Usage: node asc-api.mjs ensure-appstore-profiles <path-to-appstore-profiles.json>");
+      process.exit(2);
+    }
+    // Hand-written boundary checks rather than zod, on purpose: this client is
+    // dependency-free (see header) and hosted ios-ship runs it with plain
+    // `node` before any `pnpm install`, so `import "zod"` would fail with
+    // ERR_MODULE_NOT_FOUND and break every ship.  Same reasoning as
+    // scripts/ci-build-resolver.mjs and scripts/update-botfleet-mac.mjs.
+    /* oxlint-disable anti-slop/no-runtime-typeof -- hand-written boundary parse; zod is not installed on the ios-ship runner (see comment above). */
+    const BUNDLE_ID_RE = /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
+    const isPlainObject = (v) => Object.prototype.toString.call(v) === "[object Object]";
+    const isNonEmptyString = (v) => typeof v === "string" && v.trim().length > 0;
+    const apiRows = (res, key) => {
+      const rows = isPlainObject(res.parsed) ? res.parsed[key] : undefined;
+      if (rows === undefined) return [];
+      if (!Array.isArray(rows)) {
+        console.error(`ensure-appstore-profiles: unexpected App Store Connect response shape (${key} is not an array)`);
+        process.exit(2);
+      }
+      return rows.filter(isPlainObject);
+    };
+    let want;
+    try {
+      want = JSON.parse(readFileSync(mapPath, "utf8"));
+    } catch (err) {
+      console.error(`ensure-appstore-profiles: cannot read map: ${err && err.message ? err.message : err}`);
+      process.exit(2);
+    }
+    if (!isPlainObject(want) || !Object.keys(want).length) {
+      console.error("ensure-appstore-profiles: map must be a non-empty {bundleId: profileName} object");
+      process.exit(2);
+    }
+    for (const [bundleId, profileName] of Object.entries(want)) {
+      if (!BUNDLE_ID_RE.test(bundleId) || !isNonEmptyString(profileName)) {
+        console.error(
+          `ensure-appstore-profiles: invalid map entry ${JSON.stringify(bundleId)}: keys must be bundle ids and values non-empty profile names`
+        );
+        process.exit(2);
+      }
+    }
+    /* oxlint-enable anti-slop/no-runtime-typeof */
+
+    function installedCodesigningSha1s() {
+      try {
+        const out = execFileSync("security", ["find-identity", "-v", "-p", "codesigning"], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 30000
+        });
+        const shas = [];
+        for (const line of out.split("\n")) {
+          const m = line.match(/^\s*\d+\)\s+([0-9A-F]{40})\s+"/i);
+          if (m) shas.push(m[1].toUpperCase());
+        }
+        return shas;
+      } catch {
+        return [];
+      }
+    }
+
+    function certSha1FromContent(b64) {
+      if (!b64) return null;
+      try {
+        const der = Buffer.from(b64, "base64");
+        return createHash("sha1").update(der).digest("hex").toUpperCase();
+      } catch {
+        return null;
+      }
+    }
+
+    const installed = new Set(installedCodesigningSha1s());
+    if (installed.size === 0) {
+      console.error("ensure-appstore-profiles: no codesigning identities in keychain (import IOS_CERT_* first)");
+      process.exit(2);
+    }
+
+    const certRes = await api("GET", "/v1/certificates?filter[certificateType]=DISTRIBUTION&limit=200");
+    if (!certRes.ok) {
+      console.error(`ensure-appstore-profiles: certificate list failed (HTTP ${certRes.status})`);
+      process.exit(2);
+    }
+    let distCertId = null;
+    for (const row of apiRows(certRes, "data")) {
+      const sha = certSha1FromContent(row.attributes?.certificateContent);
+      if (sha && installed.has(sha)) {
+        distCertId = row.id;
+        console.error(`ensure-appstore-profiles: using distribution certificate id=${distCertId} (sha1=${sha})`);
+        break;
+      }
+    }
+    if (!distCertId) {
+      console.error("ensure-appstore-profiles: no App Store Connect DISTRIBUTION certificate matches an installed identity");
+      process.exit(2);
+    }
+
+    const profRes = await api("GET", "/v1/profiles?filter[profileType]=IOS_APP_STORE&limit=200&include=bundleId");
+    if (!profRes.ok) {
+      console.error(`ensure-appstore-profiles: profile list failed (HTTP ${profRes.status})`);
+      process.exit(2);
+    }
+    const bundleIdByResource = new Map();
+    for (const inc of apiRows(profRes, "included")) {
+      if (inc.type === "bundleIds") {
+        bundleIdByResource.set(inc.id, inc.attributes?.identifier);
+      }
+    }
+    const activeByBundleAndName = new Map();
+    for (const row of apiRows(profRes, "data")) {
+      const rel = row.relationships?.bundleId?.data?.id;
+      const identifier = bundleIdByResource.get(rel);
+      const attrs = row.attributes || {};
+      if (!identifier || attrs.profileState !== "ACTIVE") continue;
+      activeByBundleAndName.set(`${identifier}\0${attrs.name}`, row);
+    }
+
+    for (const [bundleId, profileName] of Object.entries(want)) {
+      const key = `${bundleId}\0${profileName}`;
+      if (activeByBundleAndName.has(key)) {
+        console.error(`ensure-appstore-profiles: reusing ACTIVE profile name=${profileName} bundle=${bundleId}`);
+        continue;
+      }
+
+      const bidRes = await api("GET", `/v1/bundleIds?filter[identifier]=${encodeURIComponent(bundleId)}&limit=5`);
+      if (!bidRes.ok) {
+        console.error(`ensure-appstore-profiles: bundleId lookup failed for ${bundleId} (HTTP ${bidRes.status})`);
+        process.exit(2);
+      }
+      const bundleRow = apiRows(bidRes, "data").find((r) => r.attributes?.identifier === bundleId);
+      if (!bundleRow) {
+        console.error(`ensure-appstore-profiles: bundle id ${bundleId} not registered in App Store Connect`);
+        process.exit(2);
+      }
+
+      const body = JSON.stringify({
+        data: {
+          type: "profiles",
+          attributes: {
+            name: profileName,
+            profileType: "IOS_APP_STORE"
+          },
+          relationships: {
+            bundleId: { data: { type: "bundleIds", id: bundleRow.id } },
+            certificates: { data: [{ type: "certificates", id: distCertId }] }
+          }
+        }
+      });
+      const created = await api("POST", "/v1/profiles", body);
+      if (!created.ok) {
+        const err = (created.parsed.errors || [])[0] || {};
+        console.error(
+          `ensure-appstore-profiles: create failed for ${bundleId} name=${profileName} (HTTP ${created.status} ${err.code || err.title || ""})`
+        );
+        process.exit(2);
+      }
+      console.error(`ensure-appstore-profiles: created profile name=${profileName} bundle=${bundleId}`);
+    }
+    process.exit(0);
+  }
+
   if (method === "ensure-tf-ready") {
     const bundleId = path;
     const wantBuildVersion = body;

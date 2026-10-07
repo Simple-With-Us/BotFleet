@@ -51,6 +51,13 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: false
         ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: false
+        # Xcode General → Display Name reads INFOPLIST_KEY_* from build settings.
+        INFOPLIST_KEY_CFBundleDisplayName: BotFleet
+      configs:
+        Release:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "Apple Distribution"
+          PROVISIONING_PROFILE_SPECIFIER: "BotFleet iOS App Store (API)"
     info:
       path: App/Info.plist
       properties:
@@ -132,10 +139,16 @@ targets:
         ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: false
         ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: false
         SKIP_INSTALL: true
+        INFOPLIST_KEY_CFBundleDisplayName: BotFleet Widgets
+      configs:
+        Release:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: "Apple Distribution"
+          PROVISIONING_PROFILE_SPECIFIER: "BotFleet Widgets App Store (API)"
     info:
       path: Widgets/Info.plist
       properties:
-        CFBundleDisplayName: BotFleet
+        CFBundleDisplayName: BotFleet Widgets
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSExtension:
