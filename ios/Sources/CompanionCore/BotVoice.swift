@@ -153,3 +153,40 @@ public struct BotVoiceEdit: Equatable, Sendable {
         return BotVoiceEdit(voices: patch.isEmpty ? nil : patch)
     }
 }
+
+// MARK: - A computer that predates per-device voices
+
+extension BotVoiceEdit {
+    /// True when the computer refused `voices` because it predates
+    /// per-device voices.  The phone ships to TestFlight on its own clock, so
+    /// it can be paired with an older companion sidecar, whose field
+    /// allowlist answers 403 "voices can only be changed in BotFleet on your
+    /// computer", or an older harness, whose strict parser answers 400
+    /// "unsupported profile field: voices".  Either refuses the whole save.
+    public static func isDeviceVoicesUnsupported(_ error: Error) -> Bool {
+        guard case let .status(code, message)? = error as? APIError, let message else { return false }
+        switch code {
+        case 403: return message.hasPrefix("voices ")
+        case 400: return message == "unsupported profile field: voices"
+        default: return false
+        }
+    }
+
+    /// The shared voice to save in place of `voices` for such a computer,
+    /// which keeps one voice per bot: the iPhone's choice (what this app
+    /// always wrote), or the Mac's when only the Mac changed.  Nil when
+    /// neither device changed.
+    public static func sharedVoiceFallback(
+        sharedVoice: String?,
+        voices: BotVoices?,
+        iphone desiredIphone: String,
+        mac desiredMac: String
+    ) -> String? {
+        func current(_ device: SpeechDevice) -> String {
+            BotVoice.resolve(voice: sharedVoice, voices: voices, device: device) ?? ""
+        }
+        if desiredIphone != current(.iphone) { return desiredIphone }
+        if desiredMac != current(.mac) { return desiredMac }
+        return nil
+    }
+}
