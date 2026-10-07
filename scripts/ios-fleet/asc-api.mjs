@@ -842,7 +842,7 @@ async function main() {
 
     // 1) External beta group: reuse "Public Beta" or the first external group;
     //    create a private "Public Beta" (public link off) only when none exists.
-    const groupsRes = await api("GET", `/v1/apps/${appId}/betaGroups?limit=200`);
+    const groupsRes = await api("GET", `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,publicLinkEnabled`);
     if (!groupsRes.ok) {
       console.error(`${prefix}: beta group list failed (${errText(groupsRes)})`);
       process.exit(3);
@@ -880,11 +880,12 @@ async function main() {
         continue;
       }
       const found = await api("GET", `/v1/betaTesters?filter[email]=${encodeURIComponent(email)}&limit=5`);
-      const existing = rows(found).find((t) => String(t.attributes?.email || "").toLowerCase() === email);
+      let existing = rows(found).find((t) => String(t.attributes?.email || "").toLowerCase() === email);
+      const addExisting = (tester) => api("POST", `/v1/betaGroups/${group.id}/relationships/betaTesters`,
+        JSON.stringify({ data: [{ type: "betaTesters", id: tester.id }] }));
       let res;
       if (existing) {
-        res = await api("POST", `/v1/betaGroups/${group.id}/relationships/betaTesters`,
-          JSON.stringify({ data: [{ type: "betaTesters", id: existing.id }] }));
+        res = await addExisting(existing);
       } else {
         res = await api("POST", "/v1/betaTesters", JSON.stringify({
           data: {
@@ -893,6 +894,14 @@ async function main() {
             relationships: { betaGroups: { data: [{ type: "betaGroups", id: group.id }] } }
           }
         }));
+        // filter[email] is an exact match, so a tester stored with different
+        // letter case is missed and the create answers 409.  Find the record
+        // among this app's testers case-insensitively and reuse it.
+        if (res.status === 409) {
+          const appTesters = await api("GET", `/v1/betaTesters?filter[apps]=${appId}&limit=200&fields[betaTesters]=email`);
+          existing = rows(appTesters).find((t) => String(t.attributes?.email || "").toLowerCase() === email);
+          if (existing) res = await addExisting(existing);
+        }
       }
       if (res.ok || res.status === 204) {
         console.error(`${prefix}: added ${mask(email)} to group (${existing ? "existing tester" : "new tester"})`);
@@ -926,6 +935,10 @@ async function main() {
 
     // 4) Beta App Review: external testers only get a build Apple approved.
     const detail = await api("GET", `/v1/builds/${build.id}/buildBetaDetail`);
+    if (!detail.ok) {
+      warn(`could not read buildBetaDetail for ${buildLabel} (${errText(detail)}); Beta App Review submission skipped`);
+      process.exit(3);
+    }
     const ext = detail.parsed?.data?.attributes?.externalBuildState || "unknown";
     console.error(`${prefix}: ${buildLabel} externalBuildState=${ext}`);
     if (ext === "READY_FOR_BETA_SUBMISSION") {
