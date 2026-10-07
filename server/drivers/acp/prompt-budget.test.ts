@@ -39,7 +39,7 @@ function userText(): string {
   return `${historyOld}\n${historyNew}\n\n${TURN_REPLY_CUE}\n\n${current}`;
 }
 
-function prompt(): { composed: string; userText: string; sections: AcpPromptSection[] } {
+function prompt() {
   const listed = sections();
   const user = userText();
   return {

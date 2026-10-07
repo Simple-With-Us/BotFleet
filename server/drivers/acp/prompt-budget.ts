@@ -185,7 +185,7 @@ function lastRoomReplyBoundaryAt(userText: string): number {
 }
 
 /** Preamble and omission markers from `buildTurnContext` — not trimmable. */
-function peelInlineHarnessPrefix(region: string): { prefix: string; body: string } {
+function peelInlineHarnessPrefix(region: string) {
   const preamble =
     region.startsWith(REWOUND_PREAMBLE) ? REWOUND_PREAMBLE
     : region.startsWith(FRESH_PREAMBLE) ? FRESH_PREAMBLE
