@@ -16,6 +16,7 @@ import {
   parseClipDevice,
   type AudioMessage,
   type AudioOwner,
+  type AudioRequestBody,
   type AudioRouteResult,
 } from "./message-audio.ts";
 
@@ -113,7 +114,7 @@ function setup(options: {
   };
 }
 
-const post = (fixture: ReturnType<typeof setup>, owner: AudioOwner, body: unknown = {}, startedAt?: number) =>
+const post = (fixture: ReturnType<typeof setup>, owner: AudioOwner, body: AudioRequestBody = {}, startedAt?: number) =>
   fixture.audio.post({ threadId: THREAD, messageId: MESSAGE, owner, body, ...(startedAt !== undefined ? { startedAt } : {}) });
 
 const get = (
@@ -135,7 +136,8 @@ describe("parseAudioRequest", () => {
   });
 
   it("accepts device and progressive and ignores unknown fields", () => {
-    expect(parseAudioRequest({ device: "iphone", progressive: true, later: 1 })).toEqual({
+    const withExtra: AudioRequestBody = JSON.parse('{"device":"iphone","progressive":true,"later":1}');
+    expect(parseAudioRequest(withExtra)).toEqual({
       ok: true,
       request: { device: "iphone", progressive: true },
     });
@@ -143,10 +145,12 @@ describe("parseAudioRequest", () => {
   });
 
   it("rejects an unknown device, a non-boolean progressive, and a non-object body", () => {
-    expect(parseAudioRequest({ device: "ipad" })).toEqual({ ok: false, error: "device must be mac or iphone" });
-    expect(parseAudioRequest({ progressive: "yes" })).toEqual({ ok: false, error: "progressive must be true or false" });
-    expect(parseAudioRequest([1])).toMatchObject({ ok: false });
-    expect(parseAudioRequest("mac")).toMatchObject({ ok: false });
+    // Bodies arrive as parsed JSON of any shape; JSON.parse stands in for readBody.
+    const wire = (text: string): AudioRequestBody => JSON.parse(text);
+    expect(parseAudioRequest(wire('{"device":"ipad"}'))).toEqual({ ok: false, error: "device must be mac or iphone" });
+    expect(parseAudioRequest(wire('{"progressive":"yes"}'))).toEqual({ ok: false, error: "progressive must be true or false" });
+    expect(parseAudioRequest(wire("[1]"))).toEqual({ ok: false, error: "the audio request must be a JSON object" });
+    expect(parseAudioRequest(wire('"mac"'))).toEqual({ ok: false, error: "the audio request must be a JSON object" });
   });
 
   it("parses the clip GET device query", () => {
