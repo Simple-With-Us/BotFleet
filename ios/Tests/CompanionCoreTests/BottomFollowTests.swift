@@ -158,6 +158,25 @@ final class BottomFollowTests: XCTestCase {
         XCTAssertFalse(follow.isFollowing)
     }
 
+    func testAReboundIsOverOnceTheScrollRests() {
+        // Recorded in the simulator: a pull past the bottom sprang back and
+        // came to rest with no sample after it, then a fling toward older
+        // arrived as a coast alone, with no finger samples first.
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        let pull: [(Double, Double, TranscriptScrollDriver)] = [
+            (6527.5, -46.5, .finger), (6504.5, -23, .momentum), (6490.5, -9.5, .momentum), (6481.5, 0, .momentum),
+        ]
+        let rest = play(pull, into: &follow, motion: &motion, from: sample(offset: 6481.5, distance: 0))
+        XCTAssertTrue(follow.isFollowing)
+        motion.scrollEnded()
+        let fling: [(Double, Double, TranscriptScrollDriver)] = [
+            (6366, 115.5, .momentum), (6340.5, 141, .momentum), (6334.5, 147, .momentum),
+        ]
+        _ = play(fling, into: &follow, motion: &motion, from: rest)
+        XCTAssertFalse(follow.isFollowing)
+    }
+
     func testMotionReportsAFlingCoastAsMomentumButAReboundAsSystem() {
         var motion = TranscriptScrollMotion()
         XCTAssertEqual(motion.classify(.momentum, from: sample(offset: 1199, distance: 1), to: sample(offset: 1150, distance: 50)), .momentum)
@@ -435,6 +454,68 @@ final class BottomFollowTests: XCTestCase {
         var follow = BottomFollow()
         follow.observe(from: sample(offset: 1200, distance: 0), to: sample(offset: 900, distance: 300), driver: .animation, newestSettledId: "m9")
         XCTAssertTrue(follow.isFollowing)
+    }
+
+    func testAStatusBarTapWithNoScrollPhaseStopsFollowing() {
+        // Recorded in the iOS 27 simulator: a status-bar tap scrolled a
+        // following reader from the bottom to the top in two samples, with
+        // no scroll phase and nothing else changing size.  It used to be
+        // repinned straight back to the bottom.
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        var previous = sample(offset: 4947.5, distance: 0)
+        for (current, now) in [(sample(offset: 193.5, distance: 4754.5), 15.79), (sample(offset: -118, distance: 5065.5), 16.84)] {
+            let driver = motion.classify(.system, scrolledOnly: true, at: now, from: previous, to: current)
+            XCTAssertEqual(driver, .momentum)
+            follow.observe(from: previous, to: current, driver: driver, gestureNewestOffset: motion.gestureNewestOffset, newestSettledId: "m9")
+            XCTAssertFalse(follow.shouldRepin(at: current, driver: driver))
+            previous = current
+        }
+        XCTAssertFalse(follow.isFollowing)
+    }
+
+    func testTheAppsStaleScrollToTheBottomIsNotTheReader() {
+        // Recorded while a reply streamed: a 20.5pt line grew the content
+        // and the anchor kept the bottom, then the app's scroll to the
+        // bottom, resolved against the layout before the line, put the
+        // offset back 20.5pt with nothing else changing.  That is layout to
+        // repin, not the reader leaving.
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        let a = sample(offset: 5892.5, distance: 0)
+        let b = sample(offset: 5913, distance: 0)
+        let c = sample(offset: 5892.5, distance: 20.5)
+        XCTAssertEqual(motion.classify(.system, scrolledOnly: false, at: 35.047, from: a, to: b), .system)
+        let driver = motion.classify(.system, scrolledOnly: true, at: 35.050, from: b, to: c)
+        XCTAssertEqual(driver, .system)
+        follow.observe(from: b, to: c, driver: driver, gestureNewestOffset: motion.gestureNewestOffset, newestSettledId: "m9")
+        XCTAssertTrue(follow.isFollowing)
+        XCTAssertTrue(follow.shouldRepin(at: c, driver: driver))
+    }
+
+    func testAStatusBarTapRightAfterGrowthStillStopsFollowing() {
+        var motion = TranscriptScrollMotion()
+        _ = motion.classify(.system, scrolledOnly: false, at: 10, from: sample(offset: 1200, distance: 0), to: sample(offset: 1220, distance: 0))
+        XCTAssertEqual(motion.classify(.system, scrolledOnly: true, at: 10.02, from: sample(offset: 1220, distance: 0), to: sample(offset: 400, distance: 820)), .momentum)
+        // And a move back by the growth after the window has passed is the
+        // reader too.
+        var later = TranscriptScrollMotion()
+        _ = later.classify(.system, scrolledOnly: false, at: 10, from: sample(offset: 1200, distance: 0), to: sample(offset: 1220, distance: 0))
+        XCTAssertEqual(later.classify(.system, scrolledOnly: true, at: 11, from: sample(offset: 1220, distance: 0), to: sample(offset: 1200, distance: 20)), .momentum)
+    }
+
+    func testLayoutAndScrollsTowardNewerStaySystem() {
+        var motion = TranscriptScrollMotion()
+        let bottom = sample(offset: 1200, distance: 0)
+        // The keyboard hiding or the header inset arriving changes a size or
+        // an inset, so it is not a scroll even though the offset fell.
+        XCTAssertEqual(motion.classify(.system, scrolledOnly: false, at: 1, from: bottom, to: sample(offset: 900, distance: 300)), .system)
+        // The app's own repin moves toward newer.
+        XCTAssertEqual(motion.classify(.system, scrolledOnly: true, at: 2, from: sample(offset: 900, distance: 300), to: bottom), .system)
+        // Sub-threshold noise.
+        XCTAssertEqual(motion.classify(.system, scrolledOnly: true, at: 3, from: bottom, to: sample(offset: 1199, distance: 1)), .system)
+        // An animation is already accounted for.
+        XCTAssertEqual(motion.classify(.animation, scrolledOnly: true, at: 4, from: bottom, to: sample(offset: 900, distance: 300)), .animation)
     }
 
     func testAnUnaskedScrollThatRestsAboveTheBottomStopsFollowing() {

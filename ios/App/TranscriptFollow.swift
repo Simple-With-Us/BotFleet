@@ -112,6 +112,36 @@ extension TranscriptScrollSample {
     }
 }
 
+/// One iOS 18 geometry reading: the follow sample, plus the sizes and
+/// insets that tell a scroll apart from layout.
+@available(iOS 18.0, *)
+struct TranscriptGeometry: Equatable {
+    var sample: TranscriptScrollSample
+    var contentHeight: Double
+    var frameHeight: Double
+    var insetTop: Double
+    var insetBottom: Double
+
+    init(_ geometry: ScrollGeometry) {
+        func pixel(_ value: CGFloat) -> Double { (Double(value) * 2).rounded() / 2 }
+        sample = TranscriptScrollSample(geometry)
+        contentHeight = pixel(geometry.contentSize.height)
+        frameHeight = pixel(geometry.visibleRect.height)
+        insetTop = pixel(geometry.contentInsets.top)
+        insetBottom = pixel(geometry.contentInsets.bottom)
+    }
+
+    /// Only the offset changed: a scroll, not growth, a keyboard, or an
+    /// inset arriving.
+    func scrolledOnly(to next: TranscriptGeometry) -> Bool {
+        contentHeight == next.contentHeight
+            && frameHeight == next.frameHeight
+            && insetTop == next.insetTop
+            && insetBottom == next.insetBottom
+            && sample.offset != next.sample.offset
+    }
+}
+
 /// Applied to the transcript `ScrollView`: the anchors, and the iOS 18
 /// phase and geometry observers (or the iOS 17 drag observer).
 struct TranscriptFollowModifier: ViewModifier {
@@ -161,6 +191,11 @@ struct TranscriptFollowModifier: ViewModifier {
                 default: tracker.driver = .system
                 }
                 TranscriptScrollLog.note("phase \(oldPhase) -> \(phase)")
+                // A new touch or the scroll coming to rest ends the last
+                // gesture and any rebound, even if no sample followed it.
+                if phase == .idle || (tracker.driver == .finger && oldPhase != .tracking && oldPhase != .interacting) {
+                    tracker.motion.scrollEnded()
+                }
                 guard phase == .idle else { return }
                 let sample = TranscriptScrollSample(context.geometry)
                 // A status-bar tap, a VoiceOver page or a keyboard scroll is
@@ -180,12 +215,21 @@ struct TranscriptFollowModifier: ViewModifier {
                     tracker.scheduleRepin(repin)
                 }
             }
-            .onScrollGeometryChange(for: TranscriptScrollSample.self) { geometry in
+            .onScrollGeometryChange(for: TranscriptGeometry.self) { geometry in
                 TranscriptScrollLog.raw(geometry)
-                return TranscriptScrollSample(geometry)
+                return TranscriptGeometry(geometry)
             } action: { previous, current in
-                let driver = tracker.motion.classify(tracker.driver, from: previous, to: current)
-                fold(previous: previous, current: current, driver: driver)
+                guard previous.sample != current.sample else { return }
+                // A status-bar tap or VoiceOver scrolls with no phase; only
+                // the shape of the change gives it away.
+                let driver = tracker.motion.classify(
+                    tracker.driver,
+                    scrolledOnly: previous.scrolledOnly(to: current),
+                    at: TranscriptScrollTracker.now,
+                    from: previous.sample,
+                    to: current.sample
+                )
+                fold(previous: previous.sample, current: current.sample, driver: driver)
             }
     }
 
@@ -204,8 +248,15 @@ struct TranscriptFollowModifier: ViewModifier {
                 DragGesture(minimumDistance: 2)
                     .updating($dragging) { _, state, _ in state = true }
                     .onChanged { _ in
+                        let now = TranscriptScrollTracker.now
+                        // A fresh touch, not the next move of one already
+                        // under way: the last gesture and any rebound are
+                        // over.
+                        if !tracker.dragActive, !tracker.legacy.readerActive(at: now, fingerDown: false) {
+                            tracker.motion.scrollEnded()
+                        }
                         tracker.dragActive = true
-                        tracker.legacy.touched(at: TranscriptScrollTracker.now)
+                        tracker.legacy.touched(at: now)
                     }
             )
             .onChange(of: dragging) { _, isDragging in
@@ -287,13 +338,14 @@ struct LegacyTranscriptProbe: ViewModifier {
                 tracker.lastSample = current
                 // No scroll phases: a finger, the coast it leaves, and the
                 // app's own glide come from the drag gesture and the clock.
+                let now = TranscriptScrollTracker.now
                 let raw = tracker.legacy.driver(
-                    at: TranscriptScrollTracker.now,
+                    at: now,
                     fingerDown: tracker.dragActive,
                     scrolledOnly: scrolledOnly,
                     appScrollUntil: tracker.appScrollUntil
                 )
-                let driver = tracker.motion.classify(raw, from: previous, to: current)
+                let driver = tracker.motion.classify(raw, scrolledOnly: scrolledOnly, at: now, from: previous, to: current)
                 var next = follow
                 if next.observe(
                     from: previous,

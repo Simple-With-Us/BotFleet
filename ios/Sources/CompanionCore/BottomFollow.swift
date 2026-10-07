@@ -92,6 +92,16 @@ public enum TranscriptScrollDriver: Equatable, Sendable {
 /// leaving is measured over the whole gesture.  Judged frame to frame, a slow
 /// drag that moves a point or two per frame never counted as leaving.
 ///
+/// And it picks out the reader scrolling with no finger and no scroll phase.
+/// Recorded in the iOS 27 simulator, a status-bar tap scrolls to the top
+/// with no phase at all; VoiceOver and a hardware keyboard scroll the same
+/// way.  When only the offset moved (the content, the viewport and the
+/// insets kept their size) and it moved toward older messages, that is the
+/// reader, reported as `.momentum`: following stops and nothing repins.  One
+/// look-alike is ruled out: the app's own scroll to the bottom can land on
+/// the bottom as it was before the last growth, a move toward older of
+/// exactly that growth (recorded: 20.5pt, right after a 20.5pt line).
+///
 /// Kept apart from `BottomFollow` because it changes on every scrolled frame
 /// and must not live in view state.
 public struct TranscriptScrollMotion: Equatable, Sendable {
@@ -102,14 +112,30 @@ public struct TranscriptScrollMotion: Equatable, Sendable {
     /// go is not travel.  Pass it to `BottomFollow.observe`.  `nil` when no
     /// finger or coast is moving the transcript.
     public private(set) var gestureNewestOffset: Double?
+    /// How far the content's bottom moved out in the growth just seen, and
+    /// when, so a scroll that only undoes it is not taken for the reader.
+    private var recentGrowth: Double = 0
+    private var lastGrowthAt: Double = -.infinity
+
+    /// How long after growth a move back by that much counts as layout.
+    public static let revertWindow: Double = 0.25
 
     public init() {}
 
+    /// - Parameters:
+    ///   - driver: what the scroll phase (or, on iOS 17, the drag gesture)
+    ///     says is moving the transcript.
+    ///   - scrolledOnly: only the offset changed since `previous`: the
+    ///     content, the viewport and the insets kept their size.
+    ///   - now: seconds on a steady clock.
     public mutating func classify(
         _ driver: TranscriptScrollDriver,
+        scrolledOnly: Bool = false,
+        at now: Double = 0,
         from previous: TranscriptScrollSample?,
         to current: TranscriptScrollSample
     ) -> TranscriptScrollDriver {
+        let driver = noticeUnphasedScroll(driver, scrolledOnly: scrolledOnly, at: now, from: previous, to: current)
         trackGesture(driver, from: previous, to: current)
         switch driver {
         case .momentum:
@@ -123,6 +149,44 @@ public struct TranscriptScrollMotion: Equatable, Sendable {
             reboundingFromBottom = false
             return driver
         }
+    }
+
+    /// The scroll came to rest, or a new touch began: whatever gesture or
+    /// rebound was running is over.  Without this, a rebound that ended with
+    /// no further sample was still in force at the next gesture, and a fling
+    /// toward older that the scroll view reported only as a coast was taken
+    /// for the spring back and repinned (recorded in the simulator).
+    public mutating func scrollEnded() {
+        reboundingFromBottom = false
+        gestureNewestOffset = nil
+        lastDriver = .system
+    }
+
+    private mutating func noticeUnphasedScroll(
+        _ driver: TranscriptScrollDriver,
+        scrolledOnly: Bool,
+        at now: Double,
+        from previous: TranscriptScrollSample?,
+        to current: TranscriptScrollSample
+    ) -> TranscriptScrollDriver {
+        guard let previous else { return driver }
+        if !scrolledOnly {
+            let grew = Self.bottom(current) - Self.bottom(previous)
+            if grew > 0.5 {
+                recentGrowth = (now - lastGrowthAt < Self.revertWindow ? recentGrowth : 0) + grew
+                lastGrowthAt = now
+            }
+            return driver
+        }
+        let towardOlder = previous.offset - current.offset
+        guard driver == .system, towardOlder > BottomFollow.leaveDistance else { return driver }
+        let undoesGrowth = now - lastGrowthAt < Self.revertWindow && towardOlder <= recentGrowth + 1
+        return undoesGrowth ? driver : .momentum
+    }
+
+    /// Where the bottom of the content sits, as an offset.
+    private static func bottom(_ sample: TranscriptScrollSample) -> Double {
+        sample.offset + sample.distanceFromBottom
     }
 
     private mutating func trackGesture(
@@ -377,9 +441,8 @@ public enum StreamingFollowThrottle {
 /// arrive as `onEnded`.  So the reader's turn is not tied to the gesture's
 /// end: it also lasts while the transcript keeps scrolling by itself after
 /// the touch (the coast), and lapses once it has held still for `lapse`
-/// seconds.  Movement with nobody touching is `.system`, because without
-/// phases a falling offset cannot be told apart from a keyboard or layout
-/// change.
+/// seconds.  Movement with nobody touching is `.system` here, and
+/// `TranscriptScrollMotion` then tells a scroll from layout by what changed.
 public struct LegacyScrollActivity: Equatable, Sendable {
     /// How long the transcript may hold still before the reader's turn ends.
     public static let lapse: Double = 0.25
