@@ -57,6 +57,50 @@ public struct TranscriptScrollSample: Equatable, Sendable {
     }
 }
 
+/// What is moving the transcript when a scroll sample is taken.
+public enum TranscriptScrollDriver: Equatable, Sendable {
+    /// A finger is on the screen (tracking or dragging).
+    case finger
+    /// The coast after the finger lifted, including the spring back from
+    /// pulling past an edge.
+    case momentum
+    /// Nobody: content growth, keyboard and layout changes, the app's own
+    /// `scrollTo` calls, or a system without scroll phases (iOS 17).
+    case system
+}
+
+/// Per-gesture bookkeeping that turns a raw scroll phase into a driver.
+///
+/// Pulling past the bottom and letting go springs the content back, and the
+/// spring can carry it well above the bottom (recorded in the simulator: 77pt
+/// past, coasting to 115pt above).  That coast is the edge pushing back, not
+/// the reader leaving, so it is reported as `.system`.  Kept apart from
+/// `BottomFollow` because it changes on every scrolled frame and must not
+/// live in view state.
+public struct TranscriptScrollMotion: Equatable, Sendable {
+    private var reboundingFromBottom = false
+
+    public init() {}
+
+    public mutating func classify(
+        _ driver: TranscriptScrollDriver,
+        from previous: TranscriptScrollSample?,
+        to current: TranscriptScrollSample
+    ) -> TranscriptScrollDriver {
+        switch driver {
+        case .momentum:
+            if current.distanceFromBottom < 0 || (previous?.distanceFromBottom ?? 0) < 0 {
+                reboundingFromBottom = true
+            }
+            return reboundingFromBottom ? .system : .momentum
+        case .finger, .system:
+            // A new touch, or the scroll came to rest: the rebound is over.
+            reboundingFromBottom = false
+            return driver
+        }
+    }
+}
+
 /// Whether the transcript follows the newest message, and what the reader
 /// has missed while it did not.
 public struct BottomFollow: Equatable, Sendable {
@@ -85,23 +129,24 @@ public struct BottomFollow: Equatable, Sendable {
     /// Fold one scroll sample into the follow state.  Returns true when
     /// `isFollowing` changed.
     ///
-    /// - Parameter userDriven: whether the reader's finger is behind this
-    ///   movement (dragging, or the fling after a drag).  Content growth,
-    ///   keyboard and layout changes, and the app's own `scrollTo` calls are
-    ///   not, and they never stop following.  Only a person scrolling away
-    ///   from the bottom does.
+    /// - Parameter driver: what is moving the transcript, as classified by
+    ///   `TranscriptScrollMotion`.  Only a person scrolling away from the
+    ///   bottom stops following: a finger dragging toward older messages, or
+    ///   the coast of a fling that did.  Content growth, layout changes, the
+    ///   app's own scrolls and the spring back after pulling past the bottom
+    ///   (all `.system`) never do.
     @discardableResult
     public mutating func observe(
         from previous: TranscriptScrollSample?,
         to current: TranscriptScrollSample,
-        userDriven: Bool,
+        driver: TranscriptScrollDriver,
         newestSettledId: String?
     ) -> Bool {
         if isFollowing {
-            guard let previous, userDriven, current.isScrollable else { return false }
+            guard let previous, driver != .system, current.isScrollable else { return false }
             // Moved toward older messages and is actually above the bottom.
-            // The second half matters for the bounce after pulling past the
-            // bottom edge: the offset falls back, but nobody left.
+            // The second half matters while pulling past the bottom edge:
+            // the offset falls back, but nobody left.
             let movedUp = previous.offset - current.offset > Self.leaveDistance
             guard movedUp, current.distanceFromBottom > Self.bottomTolerance else { return false }
             stop(newestSettledId: newestSettledId)

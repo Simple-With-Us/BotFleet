@@ -73,7 +73,7 @@ final class BottomFollowTests: XCTestCase {
         let changed = follow.observe(
             from: sample(offset: 1200, distance: 0),
             to: sample(offset: 1200, distance: 140),
-            userDriven: false,
+            driver: .system,
             newestSettledId: "m9"
         )
         XCTAssertFalse(changed)
@@ -84,7 +84,7 @@ final class BottomFollowTests: XCTestCase {
         var follow = BottomFollow()
         // Keyboard hides, the settled bubble is shorter than the live one,
         // or the app's own scroll moves up: none of it is the reader.
-        follow.observe(from: sample(offset: 1200, distance: 0), to: sample(offset: 1100, distance: 60), userDriven: false, newestSettledId: "m9")
+        follow.observe(from: sample(offset: 1200, distance: 0), to: sample(offset: 1100, distance: 60), driver: .system, newestSettledId: "m9")
         XCTAssertTrue(follow.isFollowing)
     }
 
@@ -93,7 +93,7 @@ final class BottomFollowTests: XCTestCase {
         let changed = follow.observe(
             from: sample(offset: 1200, distance: 0),
             to: sample(offset: 1180, distance: 20),
-            userDriven: true,
+            driver: .finger,
             newestSettledId: "m9"
         )
         XCTAssertTrue(changed)
@@ -104,18 +104,64 @@ final class BottomFollowTests: XCTestCase {
     func testJitterAndTheBounceFromPullingPastTheBottomDoNotStopFollowing() {
         var follow = BottomFollow()
         // One point of jitter.
-        follow.observe(from: sample(offset: 1200, distance: 0), to: sample(offset: 1199, distance: 1), userDriven: true, newestSettledId: "m9")
+        follow.observe(from: sample(offset: 1200, distance: 0), to: sample(offset: 1199, distance: 1), driver: .finger, newestSettledId: "m9")
         XCTAssertTrue(follow.isFollowing)
         // Pulled 40pt past the bottom, springing back: the offset falls, but
         // the reader never went above the bottom.
-        follow.observe(from: sample(offset: 1240, distance: -40), to: sample(offset: 1220, distance: -20), userDriven: true, newestSettledId: "m9")
-        follow.observe(from: sample(offset: 1220, distance: -20), to: sample(offset: 1200, distance: 0), userDriven: true, newestSettledId: "m9")
+        follow.observe(from: sample(offset: 1240, distance: -40), to: sample(offset: 1220, distance: -20), driver: .finger, newestSettledId: "m9")
+        follow.observe(from: sample(offset: 1220, distance: -20), to: sample(offset: 1200, distance: 0), driver: .finger, newestSettledId: "m9")
         XCTAssertTrue(follow.isFollowing)
+    }
+
+    func testAFlingTowardOlderStopsFollowingDuringTheCoast() {
+        var follow = BottomFollow()
+        // A flick so short the finger barely moved; the coast carries it.
+        follow.observe(from: sample(offset: 1200, distance: 0), to: sample(offset: 1199, distance: 1), driver: .finger, newestSettledId: "m9")
+        XCTAssertTrue(follow.isFollowing)
+        follow.observe(from: sample(offset: 1199, distance: 1), to: sample(offset: 1150, distance: 50), driver: .momentum, newestSettledId: "m9")
+        XCTAssertFalse(follow.isFollowing)
+    }
+
+    func testTheReboundFromPullingPastTheBottomDoesNotStopFollowing() {
+        // Recorded in the simulator: pulled 74pt past the bottom, and the
+        // release sprang back with enough speed to coast 118pt above it.
+        // The scroll phase reports the first spring-back frame late, while
+        // it still says the finger is down.
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        let path: [(Double, Double, TranscriptScrollDriver)] = [
+            (5060.5, 5.5, .finger), (5068.5, -2.5, .finger), (5143, -77.5, .finger),
+            (5117.5, -52, .finger), (5095.5, -29.5, .momentum), (5076, -10.5, .momentum),
+            (5059, 6.5, .momentum), (5009.5, 56.5, .momentum), (4950, 115.5, .momentum),
+        ]
+        var previous: TranscriptScrollSample?
+        for (offset, distance, phase) in path {
+            let current = sample(offset: offset, distance: distance)
+            let driver = motion.classify(phase, from: previous, to: current)
+            follow.observe(from: previous, to: current, driver: driver, newestSettledId: "m9")
+            previous = current
+        }
+        XCTAssertTrue(follow.isFollowing)
+        // The next deliberate drag toward older still counts.
+        let drag = sample(offset: 4940, distance: 125.5)
+        follow.observe(from: previous, to: drag, driver: motion.classify(.finger, from: previous, to: drag), newestSettledId: "m9")
+        XCTAssertFalse(follow.isFollowing)
+    }
+
+    func testMotionReportsAFlingCoastAsMomentumButAReboundAsSystem() {
+        var motion = TranscriptScrollMotion()
+        XCTAssertEqual(motion.classify(.momentum, from: sample(offset: 1199, distance: 1), to: sample(offset: 1150, distance: 50)), .momentum)
+        XCTAssertEqual(motion.classify(.momentum, from: sample(offset: 1250, distance: -50), to: sample(offset: 1230, distance: -30)), .system)
+        // Still the rebound once it carries above the bottom...
+        XCTAssertEqual(motion.classify(.momentum, from: sample(offset: 1230, distance: -30), to: sample(offset: 1190, distance: 10)), .system)
+        // ...until a finger touches down or the scroll rests.
+        XCTAssertEqual(motion.classify(.finger, from: sample(offset: 1190, distance: 10), to: sample(offset: 1180, distance: 20)), .finger)
+        XCTAssertEqual(motion.classify(.momentum, from: sample(offset: 1180, distance: 20), to: sample(offset: 1150, distance: 50)), .momentum)
     }
 
     func testDraggingAShortTranscriptDoesNotStopFollowing() {
         var follow = BottomFollow()
-        follow.observe(from: sample(offset: 0, distance: 0, scrollable: false), to: sample(offset: -30, distance: 30, scrollable: false), userDriven: true, newestSettledId: "m1")
+        follow.observe(from: sample(offset: 0, distance: 0, scrollable: false), to: sample(offset: -30, distance: 30, scrollable: false), driver: .finger, newestSettledId: "m1")
         XCTAssertTrue(follow.isFollowing)
         XCTAssertFalse(follow.dragged(towardOlder: 30, isScrollable: false, newestSettledId: "m1"))
         XCTAssertTrue(follow.isFollowing)
@@ -123,7 +169,7 @@ final class BottomFollowTests: XCTestCase {
 
     func testTheFirstSampleCannotStopFollowing() {
         var follow = BottomFollow()
-        follow.observe(from: nil, to: sample(offset: 0, distance: 900), userDriven: true, newestSettledId: "m9")
+        follow.observe(from: nil, to: sample(offset: 0, distance: 900), driver: .finger, newestSettledId: "m9")
         XCTAssertTrue(follow.isFollowing)
     }
 
@@ -141,7 +187,7 @@ final class BottomFollowTests: XCTestCase {
     func testMovingDownWithinTheThresholdResumes() {
         var follow = BottomFollow()
         follow.leaveBottom(newestSettledId: "m9")
-        let changed = follow.observe(from: sample(offset: 1100, distance: 100), to: sample(offset: 1160, distance: 40), userDriven: true, newestSettledId: "m9")
+        let changed = follow.observe(from: sample(offset: 1100, distance: 100), to: sample(offset: 1160, distance: 40), driver: .finger, newestSettledId: "m9")
         XCTAssertTrue(changed)
         XCTAssertTrue(follow.isFollowing)
         XCTAssertNil(follow.anchorMessageId)
@@ -150,28 +196,28 @@ final class BottomFollowTests: XCTestCase {
     func testMovingUpInsideTheThresholdDoesNotResume() {
         var follow = BottomFollow()
         follow.leaveBottom(newestSettledId: "m9")
-        follow.observe(from: sample(offset: 1190, distance: 10), to: sample(offset: 1170, distance: 30), userDriven: true, newestSettledId: "m9")
+        follow.observe(from: sample(offset: 1190, distance: 10), to: sample(offset: 1170, distance: 30), driver: .finger, newestSettledId: "m9")
         XCTAssertFalse(follow.isFollowing)
     }
 
     func testMovingDownButStillFarAwayDoesNotResume() {
         var follow = BottomFollow()
         follow.leaveBottom(newestSettledId: "m9")
-        follow.observe(from: sample(offset: 100, distance: 1100), to: sample(offset: 400, distance: 800), userDriven: true, newestSettledId: "m9")
+        follow.observe(from: sample(offset: 100, distance: 1100), to: sample(offset: 400, distance: 800), driver: .finger, newestSettledId: "m9")
         XCTAssertFalse(follow.isFollowing)
     }
 
     func testGrowthBelowAScrolledUpReaderDoesNotResume() {
         var follow = BottomFollow()
         follow.leaveBottom(newestSettledId: "m9")
-        follow.observe(from: sample(offset: 400, distance: 30), to: sample(offset: 400, distance: 170), userDriven: false, newestSettledId: "m9")
+        follow.observe(from: sample(offset: 400, distance: 30), to: sample(offset: 400, distance: 170), driver: .system, newestSettledId: "m9")
         XCTAssertFalse(follow.isFollowing)
     }
 
     func testContentThatFitsResumes() {
         var follow = BottomFollow()
         follow.leaveBottom(newestSettledId: "m9")
-        XCTAssertTrue(follow.observe(from: nil, to: sample(offset: 0, distance: 0, scrollable: false), userDriven: false, newestSettledId: "m9"))
+        XCTAssertTrue(follow.observe(from: nil, to: sample(offset: 0, distance: 0, scrollable: false), driver: .system, newestSettledId: "m9"))
         XCTAssertTrue(follow.isFollowing)
     }
 

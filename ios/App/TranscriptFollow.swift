@@ -25,8 +25,10 @@ import os
 final class TranscriptScrollTracker {
     /// The last sample folded into the follow state.
     var lastSample: TranscriptScrollSample?
-    /// Whether a finger is behind the current movement (iOS 18 scroll phase).
-    var userDriven = false
+    /// What is moving the transcript, from the iOS 18 scroll phase.
+    var driver: TranscriptScrollDriver = .system
+    /// Tells a fling's coast from the spring back off the bottom edge.
+    var motion = TranscriptScrollMotion()
     /// The scroll view's top inset, for the iOS 17 probe: the header plus
     /// the status bar.  iOS 18 reads it from `ScrollGeometry` instead.
     var insetTop: Double = 0
@@ -37,7 +39,8 @@ final class TranscriptScrollTracker {
 
     func reset() {
         lastSample = nil
-        userDriven = false
+        driver = .system
+        motion = TranscriptScrollMotion()
         lastStreamingScroll = nil
         trailingScrollScheduled = false
     }
@@ -84,7 +87,11 @@ struct TranscriptFollowModifier: ViewModifier {
             // below them does not slide what they are reading.
             .defaultScrollAnchor(follow.isFollowing ? .bottom : .top, for: .sizeChanges)
             .onScrollPhaseChange { _, phase, context in
-                tracker.userDriven = phase == .tracking || phase == .interacting || phase == .decelerating
+                switch phase {
+                case .tracking, .interacting: tracker.driver = .finger
+                case .decelerating: tracker.driver = .momentum
+                default: tracker.driver = .system
+                }
                 guard phase == .idle else { return }
                 let sample = TranscriptScrollSample(context.geometry)
                 var next = follow
@@ -96,7 +103,8 @@ struct TranscriptFollowModifier: ViewModifier {
             .onScrollGeometryChange(for: TranscriptScrollSample.self) { geometry in
                 TranscriptScrollSample(geometry)
             } action: { previous, current in
-                fold(previous: previous, current: current, userDriven: tracker.userDriven)
+                let driver = tracker.motion.classify(tracker.driver, from: previous, to: current)
+                fold(previous: previous, current: current, driver: driver)
             }
     }
 
@@ -131,14 +139,14 @@ struct TranscriptFollowModifier: ViewModifier {
             )
     }
 
-    private func fold(previous: TranscriptScrollSample, current: TranscriptScrollSample, userDriven: Bool) {
+    private func fold(previous: TranscriptScrollSample, current: TranscriptScrollSample, driver: TranscriptScrollDriver) {
         tracker.lastSample = current
         var next = follow
-        if next.observe(from: previous, to: current, userDriven: userDriven, newestSettledId: newestSettledId) {
+        if next.observe(from: previous, to: current, driver: driver, newestSettledId: newestSettledId) {
             follow = next
             TranscriptScrollLog.event(next.isFollowing ? "following" : "stopped following", current)
         }
-        TranscriptScrollLog.sample(current, following: follow.isFollowing, userDriven: userDriven)
+        TranscriptScrollLog.sample(current, following: follow.isFollowing, driver: driver)
     }
 }
 
@@ -184,11 +192,11 @@ struct LegacyTranscriptProbe: ViewModifier {
                 // iOS 17 cannot tell a finger from growth here, so this only
                 // ever resumes; leaving is the drag gesture's job.
                 var next = follow
-                if next.observe(from: previous, to: current, userDriven: false, newestSettledId: newestSettledId) {
+                if next.observe(from: previous, to: current, driver: .system, newestSettledId: newestSettledId) {
                     follow = next
                     TranscriptScrollLog.event(next.isFollowing ? "following" : "stopped following", current)
                 }
-                TranscriptScrollLog.sample(current, following: follow.isFollowing, userDriven: false)
+                TranscriptScrollLog.sample(current, following: follow.isFollowing, driver: .system)
             }
         } else {
             content
@@ -258,10 +266,10 @@ enum TranscriptScrollLog {
 #endif
     }
 
-    static func sample(_ sample: TranscriptScrollSample, following: Bool, userDriven: Bool) {
+    static func sample(_ sample: TranscriptScrollSample, following: Bool, driver: TranscriptScrollDriver) {
 #if DEBUG
         guard enabled else { return }
-        logger.debug("sample offset=\(sample.offset) distance=\(sample.distanceFromBottom) following=\(following) user=\(userDriven)")
+        logger.debug("sample offset=\(sample.offset) distance=\(sample.distanceFromBottom) following=\(following) driver=\(String(describing: driver), privacy: .public)")
 #endif
     }
 
