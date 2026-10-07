@@ -38,6 +38,12 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(read("scripts/ios-fleet/asc-api.mjs"), /emails\.length\s*>\s*5/);
   assert.match(read("scripts/ios-fleet/asc-api.mjs"), /EMAIL_RE\s*=/);
   assert.match(syncStep, /appleid_rc/);
+  // Reuse a tester stored with different letter case (create answers 409), and
+  // never skip the review submission silently when buildBetaDetail can't be read.
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /res\.status === 409[\s\S]*filter\[apps\]=/);
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /buildBetaDetail`\);\s*if \(!detail\.ok\)/);
+  // Every group/tester/build mutation is gated on a successful tester listing.
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /if \(!inGroupRes\.ok\)/);
   assert.match(read("scripts/ios-fleet/ship-testflight.sh"), /sentry_redact/);
   const ci = read(".github/workflows/ci.yml");
   assert.match(ci, /\|\| 'xcode-27' \}\}/);
