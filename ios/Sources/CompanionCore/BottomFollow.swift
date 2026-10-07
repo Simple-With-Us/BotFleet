@@ -74,7 +74,10 @@ public enum TranscriptScrollDriver: Equatable, Sendable {
     /// unanimated `scrollTo` calls, or a system without scroll phases
     /// (iOS 17) when no drag is under way.
     case system
-    /// The app's own animated scroll, such as Jump to Latest.
+    /// An animated scroll: the app's own, such as Jump to Latest, or one the
+    /// system runs for the reader, such as a status-bar tap or a VoiceOver
+    /// page.  Which of the two it was matters only once it comes to rest
+    /// (see `BottomFollow.unaskedScrollEnded`).
     case animation
 }
 
@@ -83,11 +86,22 @@ public enum TranscriptScrollDriver: Equatable, Sendable {
 /// Pulling past the bottom and letting go springs the content back, and the
 /// spring can carry it well above the bottom (recorded in the simulator: 77pt
 /// past, coasting to 115pt above).  That coast is the edge pushing back, not
-/// the reader leaving, so it is reported as `.system`.  Kept apart from
-/// `BottomFollow` because it changes on every scrolled frame and must not
-/// live in view state.
+/// the reader leaving, so it is reported as `.system`.
+///
+/// It also remembers the newest point the reader's gesture has reached, so
+/// leaving is measured over the whole gesture.  Judged frame to frame, a slow
+/// drag that moves a point or two per frame never counted as leaving.
+///
+/// Kept apart from `BottomFollow` because it changes on every scrolled frame
+/// and must not live in view state.
 public struct TranscriptScrollMotion: Equatable, Sendable {
     private var reboundingFromBottom = false
+    private var lastDriver: TranscriptScrollDriver = .system
+    /// The newest point the reader's current gesture has reached, counted no
+    /// further than the bottom edge, so pulling past the bottom and letting
+    /// go is not travel.  Pass it to `BottomFollow.observe`.  `nil` when no
+    /// finger or coast is moving the transcript.
+    public private(set) var gestureNewestOffset: Double?
 
     public init() {}
 
@@ -96,6 +110,7 @@ public struct TranscriptScrollMotion: Equatable, Sendable {
         from previous: TranscriptScrollSample?,
         to current: TranscriptScrollSample
     ) -> TranscriptScrollDriver {
+        trackGesture(driver, from: previous, to: current)
         switch driver {
         case .momentum:
             if current.distanceFromBottom < 0 || (previous?.distanceFromBottom ?? 0) < 0 {
@@ -108,6 +123,32 @@ public struct TranscriptScrollMotion: Equatable, Sendable {
             reboundingFromBottom = false
             return driver
         }
+    }
+
+    private mutating func trackGesture(
+        _ driver: TranscriptScrollDriver,
+        from previous: TranscriptScrollSample?,
+        to current: TranscriptScrollSample
+    ) {
+        defer { lastDriver = driver }
+        switch driver {
+        case .finger, .momentum:
+            // A new touch starts a new gesture, measured from where the
+            // transcript sat just before it.  A coast carries on the gesture
+            // that set it going.
+            if gestureNewestOffset == nil || (driver == .finger && lastDriver != .finger) {
+                gestureNewestOffset = Self.reach(previous ?? current)
+            }
+            gestureNewestOffset = max(gestureNewestOffset ?? Self.reach(current), Self.reach(current))
+        case .system, .animation:
+            gestureNewestOffset = nil
+        }
+    }
+
+    /// The offset to measure travel from: the sample's own, or the bottom
+    /// edge while it is pulled past it.
+    private static func reach(_ sample: TranscriptScrollSample) -> Double {
+        sample.offset + min(sample.distanceFromBottom, 0)
     }
 }
 
@@ -139,17 +180,22 @@ public struct BottomFollow: Equatable, Sendable {
     /// Fold one scroll sample into the follow state.  Returns true when
     /// `isFollowing` changed.
     ///
-    /// - Parameter driver: what is moving the transcript, as classified by
-    ///   `TranscriptScrollMotion`.  Only a person scrolling away from the
-    ///   bottom stops following: a finger dragging toward older messages, or
-    ///   the coast of a fling that did.  Content growth, layout changes, the
-    ///   app's own scrolls and the spring back after pulling past the bottom
-    ///   (all `.system`) never do.
+    /// - Parameters:
+    ///   - driver: what is moving the transcript, as classified by
+    ///     `TranscriptScrollMotion`.  Only a person scrolling away from the
+    ///     bottom stops following: a finger dragging toward older messages,
+    ///     or the coast of a fling that did.  Content growth, layout changes,
+    ///     animated scrolls and the spring back after pulling past the bottom
+    ///     never do.
+    ///   - gestureNewestOffset: `TranscriptScrollMotion.gestureNewestOffset`.
+    ///     Travel toward older messages is measured from it, so a slow drag
+    ///     adds up.  Without it, only the move since `previous` counts.
     @discardableResult
     public mutating func observe(
         from previous: TranscriptScrollSample?,
         to current: TranscriptScrollSample,
         driver: TranscriptScrollDriver,
+        gestureNewestOffset: Double? = nil,
         newestSettledId: String?
     ) -> Bool {
         if isFollowing {
@@ -157,8 +203,8 @@ public struct BottomFollow: Equatable, Sendable {
             // Moved toward older messages and is actually above the bottom.
             // The second half matters while pulling past the bottom edge:
             // the offset falls back, but nobody left.
-            let movedUp = previous.offset - current.offset > Self.leaveDistance
-            guard movedUp, current.distanceFromBottom > Self.bottomTolerance else { return false }
+            let travel = (gestureNewestOffset ?? previous.offset) - current.offset
+            guard travel > Self.leaveDistance, current.distanceFromBottom > Self.bottomTolerance else { return false }
             stop(newestSettledId: newestSettledId)
             return true
         }
@@ -206,12 +252,13 @@ public struct BottomFollow: Equatable, Sendable {
         return true
     }
 
-    /// A drag toward older messages, for systems without scroll phases
-    /// (iOS 17).  `towardOlder` is how far the finger moved down since the
-    /// last report.  Returns true when `isFollowing` changed.
+    /// An animated scroll the app did not start came to rest away from the
+    /// bottom: a status-bar tap, a VoiceOver page, a keyboard's Page Up.  The
+    /// reader asked to be there, so following stops instead of pulling them
+    /// back.  Returns true when `isFollowing` changed.
     @discardableResult
-    public mutating func dragged(towardOlder: Double, isScrollable: Bool, newestSettledId: String?) -> Bool {
-        guard isFollowing, isScrollable, towardOlder > Self.leaveDistance else { return false }
+    public mutating func unaskedScrollEnded(at sample: TranscriptScrollSample, newestSettledId: String?) -> Bool {
+        guard isFollowing, sample.isScrollable, sample.distanceFromBottom > Self.bottomTolerance else { return false }
         stop(newestSettledId: newestSettledId)
         return true
     }
@@ -304,14 +351,75 @@ public enum StreamingFollowThrottle {
         case skip
     }
 
+    /// - Parameter notBefore: hold every scroll until then, such as the end
+    ///   of the app's own animated scroll, which an unanimated one would cut
+    ///   short.  The held scroll becomes the trailing one.
     public static func decide(
         now: Double,
         lastScroll: Double?,
         trailingScheduled: Bool,
+        notBefore: Double? = nil,
         interval: Double = BottomFollow.streamingScrollInterval
     ) -> Action {
+        if let notBefore, now < notBefore {
+            return trailingScheduled ? .skip : .after(notBefore - now)
+        }
         guard let lastScroll, now - lastScroll < interval else { return .now }
         if trailingScheduled { return .skip }
         return .after(max(0, interval - (now - lastScroll)))
+    }
+}
+
+/// What is moving the transcript on iOS 17, which has no scroll phases.
+///
+/// A simultaneous drag gesture says when a finger is down, but the scroll
+/// view can take the touch over and the gesture's end or cancel may never
+/// arrive as `onEnded`.  So the reader's turn is not tied to the gesture's
+/// end: it also lasts while the transcript keeps scrolling by itself after
+/// the touch (the coast), and lapses once it has held still for `lapse`
+/// seconds.  Movement with nobody touching is `.system`, because without
+/// phases a falling offset cannot be told apart from a keyboard or layout
+/// change.
+public struct LegacyScrollActivity: Equatable, Sendable {
+    /// How long the transcript may hold still before the reader's turn ends.
+    public static let lapse: Double = 0.25
+
+    private var readerUntil: Double = -.infinity
+
+    public init() {}
+
+    /// The drag gesture reported a finger moving on the transcript.
+    public mutating func touched(at now: Double) {
+        readerUntil = now + Self.lapse
+    }
+
+    /// Classify one geometry sample.
+    ///
+    /// - Parameters:
+    ///   - fingerDown: the drag gesture is under way.
+    ///   - scrolledOnly: only the offset changed since the last sample, with
+    ///     the content and the viewport the same size.  Only that keeps a
+    ///     coast going; growth from a streaming reply does not.
+    ///   - appScrollUntil: the app's own animated scroll runs until then.
+    public mutating func driver(
+        at now: Double,
+        fingerDown: Bool,
+        scrolledOnly: Bool,
+        appScrollUntil: Double
+    ) -> TranscriptScrollDriver {
+        if fingerDown {
+            readerUntil = now + Self.lapse
+            return .finger
+        }
+        if now < appScrollUntil { return .animation }
+        guard now < readerUntil else { return .system }
+        if scrolledOnly { readerUntil = now + Self.lapse }
+        return .momentum
+    }
+
+    /// Whether a finger, or the coast it left behind, is still moving the
+    /// transcript.
+    public func readerActive(at now: Double, fingerDown: Bool) -> Bool {
+        fingerDown || now < readerUntil
     }
 }

@@ -80,6 +80,63 @@ public func transcriptRowId(containing messageId: String, in items: [TranscriptI
     items.first { item in item.messages.contains { $0.id == messageId } }?.id
 }
 
+/// A gap in a conversation long enough to mark with a time stamp.
+public let transcriptStretchGap: TimeInterval = 30 * 60
+
+/// True when the row at `index` opens a fresh stretch of conversation: the
+/// first row, or one that follows a gap of more than `transcriptStretchGap`.
+public func transcriptRowStartsAStretch(at index: Int, in items: [TranscriptItem]) -> Bool {
+    guard index > 0 else { return true }
+    return opensAStretch(previous: items[index - 1].date, at: items[index].date)
+}
+
+/// True when a reply arriving at `now` would open a fresh stretch.  The live
+/// row shows the stamp now, so the settled row does not add it on arrival;
+/// both decide with the same gap.
+public func liveReplyStartsAStretch(after items: [TranscriptItem], now: Date) -> Bool {
+    opensAStretch(previous: items.last?.date, at: now)
+}
+
+private func opensAStretch(previous: Date?, at date: Date) -> Bool {
+    guard let previous else { return true }
+    return date.timeIntervalSince(previous) > transcriptStretchGap
+}
+
+/// True when the row at `index` ends a run of bubbles from one sender, which
+/// is where the run gets its tail and avatar: one per run, like every
+/// messaging app, rather than one per bubble.
+///
+/// A reply being typed below the last row counts as the next message.
+/// Otherwise the bubble above it keeps its tail and avatar until the reply
+/// settles, then loses them and shrinks, which moves everything below it.
+///
+/// - Parameters:
+///   - liveReply: a bot reply (text or reasoning) is being typed after the
+///     last row.
+///   - liveSpeaker: the name the settled reply will carry: the room member
+///     holding the turn, or `nil` in a bot chat, where replies carry none.
+public func transcriptRowEndsRun(
+    at index: Int,
+    in items: [TranscriptItem],
+    liveReply: Bool,
+    liveSpeaker: String?
+) -> Bool {
+    guard index + 1 < items.count else {
+        guard liveReply, case let .message(this) = items[index],
+              this.role == .bot, this.kind == .text
+        else { return true }
+        return this.from?.name != liveSpeaker
+    }
+    guard case let .message(this) = items[index],
+          case let .message(next) = items[index + 1] else {
+        return true
+    }
+    if this.role != next.role { return true }
+    if this.from?.name != next.from?.name { return true }
+    // a card or a tool chip between two texts breaks the run visually
+    return next.kind != .text
+}
+
 /// Describes a folded activity run with tool breakdown and failure count.
 public func describeActivityRun(_ messages: [Message]) -> (headline: String, summary: String, failedCount: Int) {
     var counts: [(name: String, count: Int)] = []

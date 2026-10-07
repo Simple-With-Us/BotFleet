@@ -173,8 +173,87 @@ final class BottomFollowTests: XCTestCase {
         var follow = BottomFollow()
         follow.observe(from: sample(offset: 0, distance: 0, scrollable: false), to: sample(offset: -30, distance: 30, scrollable: false), driver: .finger, newestSettledId: "m1")
         XCTAssertTrue(follow.isFollowing)
-        XCTAssertFalse(follow.dragged(towardOlder: 30, isScrollable: false, newestSettledId: "m1"))
+    }
+
+    /// Feeds a path of (offset, distance, raw driver) through the motion
+    /// classifier and the follow state, the way the scroll view glue does.
+    private func play(
+        _ path: [(Double, Double, TranscriptScrollDriver)],
+        into follow: inout BottomFollow,
+        motion: inout TranscriptScrollMotion,
+        from start: TranscriptScrollSample? = nil
+    ) -> TranscriptScrollSample? {
+        var previous = start
+        for (offset, distance, phase) in path {
+            let current = sample(offset: offset, distance: distance)
+            let driver = motion.classify(phase, from: previous, to: current)
+            follow.observe(from: previous, to: current, driver: driver, gestureNewestOffset: motion.gestureNewestOffset, newestSettledId: "m9")
+            previous = current
+        }
+        return previous
+    }
+
+    func testASlowDragTowardOlderStopsFollowing() {
+        // About 60pt/s at 60Hz: one point per frame, under the per-frame
+        // jitter threshold every time, but it adds up.
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        let path = (1...50).map { step in (1200 - Double(step), Double(step), TranscriptScrollDriver.finger) }
+        _ = play(path, into: &follow, motion: &motion, from: sample(offset: 1200, distance: 0))
+        XCTAssertFalse(follow.isFollowing)
+        XCTAssertEqual(follow.anchorMessageId, "m9")
+        // And nothing pulls the reader back when the finger lifts.
+        XCTAssertFalse(follow.shouldRepin(at: sample(offset: 1150, distance: 50), driver: .system))
+    }
+
+    func testHoldingAFingerAtTheBottomWithJitterKeepsFollowing() {
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        let path: [(Double, Double, TranscriptScrollDriver)] = [
+            (1199, 1, .finger), (1200, 0, .finger), (1199.5, 0.5, .finger), (1199, 1, .finger), (1200, 0, .finger),
+        ]
+        _ = play(path, into: &follow, motion: &motion, from: sample(offset: 1200, distance: 0))
         XCTAssertTrue(follow.isFollowing)
+    }
+
+    func testPullingPastTheBottomIsNotTravelTowardOlder() {
+        // Pulled 60pt past the bottom, then eased back down slowly to rest
+        // on it: the offset fell 60pt during the gesture, but none of it was
+        // above the bottom.
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        var path: [(Double, Double, TranscriptScrollDriver)] = (1...60).map { step in (1200 + Double(step), -Double(step), .finger) }
+        path += (0..<60).reversed().map { step in (1200 + Double(step), -Double(step), .finger) }
+        let end = play(path, into: &follow, motion: &motion, from: sample(offset: 1200, distance: 0))
+        XCTAssertTrue(follow.isFollowing)
+        // Carrying on past the bottom toward older still counts from the
+        // bottom edge.
+        let more = (1...5).map { step in (1200 - Double(step), Double(step), TranscriptScrollDriver.finger) }
+        _ = play(more, into: &follow, motion: &motion, from: end)
+        XCTAssertFalse(follow.isFollowing)
+    }
+
+    func testANewTouchMeasuresFromWhereTheTranscriptSat() {
+        // The spring back off the bottom edge coasts 80pt above it, and a
+        // new touch catches it with a point of drift.  Only the new touch's
+        // own travel counts, not the 80pt the rebound carried it.
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        let path: [(Double, Double, TranscriptScrollDriver)] = [
+            (1230, -30, .finger), (1260, -60, .finger),
+            (1240, -40, .momentum), (1210, -10, .momentum), (1180, 20, .momentum), (1120, 80, .momentum),
+            (1119, 81, .finger),
+        ]
+        _ = play(path, into: &follow, motion: &motion, from: sample(offset: 1200, distance: 0))
+        XCTAssertTrue(follow.isFollowing)
+    }
+
+    func testTheGestureEndsWhenTheScrollRests() {
+        var motion = TranscriptScrollMotion()
+        _ = motion.classify(.finger, from: sample(offset: 1200, distance: 0), to: sample(offset: 1199, distance: 1))
+        XCTAssertEqual(motion.gestureNewestOffset, 1200)
+        _ = motion.classify(.system, from: sample(offset: 1199, distance: 1), to: sample(offset: 1199, distance: 40))
+        XCTAssertNil(motion.gestureNewestOffset)
     }
 
     func testTheFirstSampleCannotStopFollowing() {
@@ -183,13 +262,84 @@ final class BottomFollowTests: XCTestCase {
         XCTAssertTrue(follow.isFollowing)
     }
 
+    // MARK: - iOS 17
+
     func testAnIOS17DragTowardOlderStopsFollowing() {
         var follow = BottomFollow()
-        XCTAssertFalse(follow.dragged(towardOlder: 1, isScrollable: true, newestSettledId: "m9"))
-        XCTAssertTrue(follow.isFollowing)
-        XCTAssertTrue(follow.dragged(towardOlder: 12, isScrollable: true, newestSettledId: "m9"))
+        var motion = TranscriptScrollMotion()
+        var activity = LegacyScrollActivity()
+        activity.touched(at: 10)
+        var previous = sample(offset: 1200, distance: 0)
+        for (step, now) in [(1.0, 10.01), (2, 10.02), (6, 10.03), (12, 10.04)] {
+            let current = sample(offset: 1200 - step, distance: step)
+            let raw = activity.driver(at: now, fingerDown: true, scrolledOnly: true, appScrollUntil: 0)
+            XCTAssertEqual(raw, .finger)
+            let driver = motion.classify(raw, from: previous, to: current)
+            follow.observe(from: previous, to: current, driver: driver, gestureNewestOffset: motion.gestureNewestOffset, newestSettledId: "m9")
+            previous = current
+        }
         XCTAssertFalse(follow.isFollowing)
         XCTAssertEqual(follow.anchorMessageId, "m9")
+    }
+
+    func testAnIOS17TouchThatDoesNotScrollNeverStopsFollowing() {
+        // A finger resting on the transcript while it streams, drifting a
+        // few points as a tap or a long press does: the drag gesture fires,
+        // the scroll view does not move, and the only samples are growth.
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        var activity = LegacyScrollActivity()
+        activity.touched(at: 10)
+        var previous = sample(offset: 1200, distance: 0)
+        for (distance, now) in [(40.0, 10.05), (80, 10.10), (120, 10.15)] {
+            let current = sample(offset: 1200, distance: distance)
+            let raw = activity.driver(at: now, fingerDown: true, scrolledOnly: false, appScrollUntil: 0)
+            let driver = motion.classify(raw, from: previous, to: current)
+            follow.observe(from: previous, to: current, driver: driver, gestureNewestOffset: motion.gestureNewestOffset, newestSettledId: "m9")
+            XCTAssertFalse(follow.shouldRepin(at: current, driver: driver))
+            previous = current
+        }
+        XCTAssertTrue(follow.isFollowing)
+    }
+
+    func testAnIOS17DragTheScrollViewTookOverStillStopsFollowing() {
+        // The gesture reported one change and then nothing, not even its
+        // end, once the scroll view claimed the touch.  The transcript kept
+        // scrolling, and that keeps the reader's turn going.
+        var follow = BottomFollow()
+        var motion = TranscriptScrollMotion()
+        var activity = LegacyScrollActivity()
+        activity.touched(at: 10)
+        var previous = sample(offset: 1200, distance: 0)
+        for (step, now) in [(4.0, 10.1), (20, 10.3), (60, 10.5)] {
+            let current = sample(offset: 1200 - step, distance: step)
+            let raw = activity.driver(at: now, fingerDown: false, scrolledOnly: true, appScrollUntil: 0)
+            XCTAssertEqual(raw, .momentum)
+            let driver = motion.classify(raw, from: previous, to: current)
+            follow.observe(from: previous, to: current, driver: driver, gestureNewestOffset: motion.gestureNewestOffset, newestSettledId: "m9")
+            previous = current
+        }
+        XCTAssertFalse(follow.isFollowing)
+    }
+
+    func testAnIOS17ReadersTurnLapsesOnceTheTranscriptHoldsStill() {
+        var activity = LegacyScrollActivity()
+        activity.touched(at: 10)
+        XCTAssertTrue(activity.readerActive(at: 10.2, fingerDown: false))
+        // Growth does not keep the turn going...
+        XCTAssertEqual(activity.driver(at: 10.2, fingerDown: false, scrolledOnly: false, appScrollUntil: 0), .momentum)
+        XCTAssertEqual(activity.driver(at: 10.3, fingerDown: false, scrolledOnly: false, appScrollUntil: 0), .system)
+        XCTAssertFalse(activity.readerActive(at: 10.3, fingerDown: false))
+        // ...and a gesture state stuck on after a cancel is not consulted
+        // here: only the live gesture state is.
+        XCTAssertTrue(activity.readerActive(at: 99, fingerDown: true))
+    }
+
+    func testAnIOS17AppAnimationIsNotTheReaderButAFingerIs() {
+        var activity = LegacyScrollActivity()
+        XCTAssertEqual(activity.driver(at: 10, fingerDown: false, scrolledOnly: true, appScrollUntil: 10.4), .animation)
+        XCTAssertEqual(activity.driver(at: 10.1, fingerDown: true, scrolledOnly: true, appScrollUntil: 10.4), .finger)
+        XCTAssertEqual(activity.driver(at: 10.5, fingerDown: false, scrolledOnly: false, appScrollUntil: 10.4), .system)
     }
 
     // MARK: - Coming back
@@ -285,6 +435,28 @@ final class BottomFollowTests: XCTestCase {
         var follow = BottomFollow()
         follow.observe(from: sample(offset: 1200, distance: 0), to: sample(offset: 900, distance: 300), driver: .animation, newestSettledId: "m9")
         XCTAssertTrue(follow.isFollowing)
+    }
+
+    func testAnUnaskedScrollThatRestsAboveTheBottomStopsFollowing() {
+        // A status-bar tap or a VoiceOver page took a following reader up
+        // the thread: they stay there, with the pill, instead of being
+        // pulled back.
+        var follow = BottomFollow()
+        XCTAssertTrue(follow.unaskedScrollEnded(at: sample(offset: -118, distance: 5000), newestSettledId: "m9"))
+        XCTAssertFalse(follow.isFollowing)
+        XCTAssertEqual(follow.anchorMessageId, "m9")
+        XCTAssertFalse(follow.shouldRepin(at: sample(offset: -118, distance: 5000), driver: .system))
+    }
+
+    func testAnUnaskedScrollThatRestsOnTheBottomKeepsFollowing() {
+        var follow = BottomFollow()
+        XCTAssertFalse(follow.unaskedScrollEnded(at: sample(offset: 1200, distance: 1), newestSettledId: "m9"))
+        XCTAssertFalse(follow.unaskedScrollEnded(at: sample(offset: 0, distance: 30, scrollable: false), newestSettledId: "m9"))
+        XCTAssertTrue(follow.isFollowing)
+        // Already away: the first anchor stays.
+        follow.leaveBottom(newestSettledId: "m3")
+        XCTAssertFalse(follow.unaskedScrollEnded(at: sample(offset: 100, distance: 1100), newestSettledId: "m9"))
+        XCTAssertEqual(follow.anchorMessageId, "m3")
     }
 
     // MARK: - Unseen count
@@ -397,6 +569,17 @@ final class BottomFollowTests: XCTestCase {
         }
         XCTAssertEqual(delay, 0.07, accuracy: 0.0001)
         XCTAssertEqual(StreamingFollowThrottle.decide(now: 10.05, lastScroll: 10, trailingScheduled: true), .skip)
+    }
+
+    func testTheAppsAnimationHoldsTheStreamingScrollUntilItEnds() {
+        // Jump to Latest glides until 10.45.  A token at 10.1 must not cut it
+        // short with an unanimated jump, but is still followed afterwards.
+        guard case let .after(delay) = StreamingFollowThrottle.decide(now: 10.1, lastScroll: nil, trailingScheduled: false, notBefore: 10.45) else {
+            return XCTFail("expected a held scroll")
+        }
+        XCTAssertEqual(delay, 0.35, accuracy: 0.0001)
+        XCTAssertEqual(StreamingFollowThrottle.decide(now: 10.2, lastScroll: nil, trailingScheduled: true, notBefore: 10.45), .skip)
+        XCTAssertEqual(StreamingFollowThrottle.decide(now: 10.5, lastScroll: 9, trailingScheduled: false, notBefore: 10.45), .now)
     }
 
     func testATokenBurstScrollsAtMostTenTimesASecond() {
