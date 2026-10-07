@@ -8,10 +8,12 @@
 //   movement, `onScrollGeometryChange` gives the distance from the bottom, and
 //   the size-change anchor is split from the initial one, so content added
 //   below a reader who scrolled up leaves them where they are.
-// - iOS 17: a simultaneous drag gesture notices the reader moving toward
-//   older messages, a geometry probe on the content measures the distance
-//   from the bottom, and the single bottom anchor is dropped while the reader
-//   is away from the bottom, for the same reason.
+// - iOS 17: a simultaneous drag gesture says when a finger is down, a
+//   geometry probe on the content measures the distance from the bottom and
+//   decides when the reader has scrolled away, and the single bottom anchor
+//   is dropped while the reader is away from the bottom, for the same
+//   reason.  This path has not been run on an iOS 17 runtime or device; see
+//   docs/verification/ios-companion.md.
 import SwiftUI
 import CompanionCore
 #if DEBUG
@@ -27,10 +29,22 @@ final class TranscriptScrollTracker {
     var lastSample: TranscriptScrollSample?
     /// What is moving the transcript, from the iOS 18 scroll phase.
     var driver: TranscriptScrollDriver = .system
-    /// Tells a fling's coast from the spring back off the bottom edge.
+    /// Tells a fling's coast from the spring back off the bottom edge, and
+    /// measures how far the reader's gesture has gone.
     var motion = TranscriptScrollMotion()
-    /// iOS 17: a drag is under way, as far as the drag gesture knows.
+    /// iOS 17: a drag is under way.  Mirrored from gesture state, which
+    /// also resets when the drag is cancelled.
     var dragActive = false
+    /// iOS 17: what is moving the transcript, from the drag and the probe.
+    var legacy = LegacyScrollActivity()
+    /// iOS 17: the probe's last reading, to tell a scroll from growth.
+    var legacyGeometry: LegacyContentGeometry?
+    /// The app's own animated scroll (Jump to Latest) runs until this
+    /// `systemUptime`.  Follow scrolls wait for it, and on iOS 18 the
+    /// `.animating` phase it causes is known to be the app's.
+    var appScrollUntil: Double = 0
+    /// iOS 18: the animated scroll now running was not started by the app.
+    var animationUnasked = false
     /// A scroll back to the newest message is already queued.
     var repinScheduled = false
     /// When the transcript last followed a streaming reply.
@@ -43,9 +57,31 @@ final class TranscriptScrollTracker {
         driver = .system
         motion = TranscriptScrollMotion()
         dragActive = false
+        legacy = LegacyScrollActivity()
+        legacyGeometry = nil
+        appScrollUntil = 0
+        animationUnasked = false
         repinScheduled = false
         lastStreamingScroll = nil
         trailingScrollScheduled = false
+    }
+
+    static var now: Double { ProcessInfo.processInfo.systemUptime }
+
+    /// A finger, its coast, or an animated scroll is moving the transcript,
+    /// so a follow scroll would pull the content out from under the reader
+    /// or cut the animation short.  Follow scrolls wait until it ends.
+    func holdsFollow(at now: Double) -> Bool {
+        switch driver {
+        case .finger, .momentum, .animation: return true
+        case .system: break
+        }
+        return legacy.readerActive(at: now, fingerDown: dragActive)
+    }
+
+    /// The app is about to glide to the newest message.
+    func appScrollStarted(duration: Double) {
+        appScrollUntil = Self.now + duration
     }
 
     /// Queue one scroll back to the newest message, outside the current
@@ -83,8 +119,13 @@ struct TranscriptFollowModifier: ViewModifier {
     let tracker: TranscriptScrollTracker
     let newestSettledId: String?
     let legacy: Bool
+    /// Older messages are being added above.
+    let prepending: Bool
     /// Scroll to the newest message, unanimated.
     let repin: () -> Void
+    /// iOS 17: a drag is under way.  Gesture state resets on cancel as well
+    /// as on end, where `onEnded` alone would leave it stuck on.
+    @GestureState private var dragging = false
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *), !legacy {
@@ -104,21 +145,37 @@ struct TranscriptFollowModifier: ViewModifier {
             // Growth keeps the bottom in view only while following.  A reader
             // who scrolled up keeps the top-relative position, so text added
             // below them does not slide what they are reading.
-            .defaultScrollAnchor(follow.isFollowing ? .bottom : .top, for: .sizeChanges)
-            .onScrollPhaseChange { _, phase, context in
+            // Older messages loading above keep the rows on screen where
+            // they are only with the bottom anchor, so it holds while they
+            // land.
+            .defaultScrollAnchor(follow.isFollowing || prepending ? .bottom : .top, for: .sizeChanges)
+            .onScrollPhaseChange { oldPhase, phase, context in
                 switch phase {
                 case .tracking, .interacting: tracker.driver = .finger
                 case .decelerating: tracker.driver = .momentum
-                case .animating: tracker.driver = .animation
+                case .animating:
+                    tracker.driver = .animation
+                    if oldPhase != .animating {
+                        tracker.animationUnasked = TranscriptScrollTracker.now >= tracker.appScrollUntil
+                    }
                 default: tracker.driver = .system
                 }
+                TranscriptScrollLog.note("phase \(oldPhase) -> \(phase)")
                 guard phase == .idle else { return }
                 let sample = TranscriptScrollSample(context.geometry)
+                // A status-bar tap, a VoiceOver page or a keyboard scroll is
+                // the reader moving, even with no finger on the transcript.
+                let unasked = oldPhase == .animating && tracker.animationUnasked
+                tracker.animationUnasked = false
+                if oldPhase == .animating { tracker.appScrollUntil = 0 }
                 var next = follow
                 if next.settled(at: sample) {
                     follow = next
                     TranscriptScrollLog.event("settled on bottom, following", sample)
-                } else if follow.shouldRepin(at: sample, driver: .system) {
+                } else if unasked, next.unaskedScrollEnded(at: sample, newestSettledId: newestSettledId) {
+                    follow = next
+                    TranscriptScrollLog.event("scroll the app did not start rested above the bottom, stopped following", sample)
+                } else if next.shouldRepin(at: sample, driver: .system) {
                     TranscriptScrollLog.event("settled short of bottom while following, repinning", sample)
                     tracker.scheduleRepin(repin)
                 }
@@ -138,36 +195,38 @@ struct TranscriptFollowModifier: ViewModifier {
             // iOS 17 has one anchor for every role.  Keep it while following
             // (open at the bottom, follow growth); drop it while the reader
             // is away, so growth below them keeps their position.
-            .defaultScrollAnchor(follow.isFollowing ? .bottom : nil)
+            .defaultScrollAnchor(follow.isFollowing || prepending ? .bottom : nil)
+            // Only says a finger is down.  Whether the reader left the
+            // bottom is the probe's call, from how far the transcript
+            // actually moved, so a tap or a long press that drifts a few
+            // points without scrolling never stops following.
             .simultaneousGesture(
                 DragGesture(minimumDistance: 2)
-                    .onChanged { value in
+                    .updating($dragging) { _, state, _ in state = true }
+                    .onChanged { _ in
                         tracker.dragActive = true
-                        // A finger moving down shows older messages.
-                        var next = follow
-                        if next.dragged(
-                            towardOlder: Double(value.translation.height),
-                            isScrollable: tracker.lastSample?.isScrollable ?? true,
-                            newestSettledId: newestSettledId
-                        ) {
-                            follow = next
-                            TranscriptScrollLog.event("drag toward older, stopped following", tracker.lastSample)
-                        }
-                    }
-                    .onEnded { _ in
-                        tracker.dragActive = false
+                        tracker.legacy.touched(at: TranscriptScrollTracker.now)
                     }
             )
+            .onChange(of: dragging) { _, isDragging in
+                tracker.dragActive = isDragging
+            }
     }
 
     private func fold(previous: TranscriptScrollSample, current: TranscriptScrollSample, driver: TranscriptScrollDriver) {
         tracker.lastSample = current
         var next = follow
-        if next.observe(from: previous, to: current, driver: driver, newestSettledId: newestSettledId) {
+        if next.observe(
+            from: previous,
+            to: current,
+            driver: driver,
+            gestureNewestOffset: tracker.motion.gestureNewestOffset,
+            newestSettledId: newestSettledId
+        ) {
             follow = next
             TranscriptScrollLog.event(next.isFollowing ? "following" : "stopped following", current)
         }
-        if follow.shouldRepin(at: current, driver: driver) {
+        if next.shouldRepin(at: current, driver: driver) {
             TranscriptScrollLog.event("layout left the bottom while following, repinning", current)
             tracker.scheduleRepin(repin)
         }
@@ -175,10 +234,24 @@ struct TranscriptFollowModifier: ViewModifier {
     }
 }
 
+/// The iOS 17 probe's reading of the content inside the scroll view.
+struct LegacyContentGeometry: Equatable {
+    var visibleMinY: Double
+    var visibleHeight: Double
+    var contentHeight: Double
+
+    /// Only the offset changed: a scroll, not growth or a viewport change.
+    func scrolledOnly(to next: LegacyContentGeometry) -> Bool {
+        abs(next.contentHeight - contentHeight) < 0.5
+            && abs(next.visibleHeight - visibleHeight) < 0.5
+            && abs(next.visibleMinY - visibleMinY) >= 0.5
+    }
+}
+
 /// Applied to the transcript's content on iOS 17: measures where the reader
-/// is from the content's frame inside the scroll view, so reaching the bottom
-/// again resumes following, and layout that leaves a following reader short
-/// of the bottom is put right.
+/// is from the content's frame inside the scroll view, so scrolling toward
+/// older messages stops following, reaching the bottom again resumes it, and
+/// layout that leaves a following reader short of the bottom is put right.
 struct LegacyTranscriptProbe: ViewModifier {
     let enabled: Bool
     @Binding var follow: BottomFollow
@@ -187,20 +260,14 @@ struct LegacyTranscriptProbe: ViewModifier {
     /// Scroll to the newest message, unanimated.
     let repin: () -> Void
 
-    private struct ContentGeometry: Equatable {
-        var visibleMinY: Double
-        var visibleHeight: Double
-        var contentHeight: Double
-    }
-
     func body(content: Content) -> some View {
         if enabled {
-            content.onGeometryChange(for: ContentGeometry.self) { proxy in
+            content.onGeometryChange(for: LegacyContentGeometry.self) { proxy in
                 // The scroll view's bounds in the content's own coordinates.
                 // These are the readable area, below the header inset, so no
                 // inset is added back.
                 let visible = proxy.bounds(of: .scrollView) ?? CGRect(origin: .zero, size: proxy.size)
-                return ContentGeometry(
+                return LegacyContentGeometry(
                     visibleMinY: Double(visible.minY),
                     visibleHeight: Double(visible.height),
                     contentHeight: Double(proxy.size.height)
@@ -213,18 +280,32 @@ struct LegacyTranscriptProbe: ViewModifier {
                     insetTop: 0,
                     insetBottom: 0
                 )
+                let scrolledOnly = tracker.legacyGeometry?.scrolledOnly(to: geometry) ?? false
+                tracker.legacyGeometry = geometry
                 guard current != tracker.lastSample else { return }
                 let previous = tracker.lastSample
                 tracker.lastSample = current
-                // iOS 17 cannot tell a finger from growth here, so this only
-                // ever resumes; leaving is the drag gesture's job.
+                // No scroll phases: a finger, the coast it leaves, and the
+                // app's own glide come from the drag gesture and the clock.
+                let raw = tracker.legacy.driver(
+                    at: TranscriptScrollTracker.now,
+                    fingerDown: tracker.dragActive,
+                    scrolledOnly: scrolledOnly,
+                    appScrollUntil: tracker.appScrollUntil
+                )
+                let driver = tracker.motion.classify(raw, from: previous, to: current)
                 var next = follow
-                if next.observe(from: previous, to: current, driver: .system, newestSettledId: newestSettledId) {
+                if next.observe(
+                    from: previous,
+                    to: current,
+                    driver: driver,
+                    gestureNewestOffset: tracker.motion.gestureNewestOffset,
+                    newestSettledId: newestSettledId
+                ) {
                     follow = next
                     TranscriptScrollLog.event(next.isFollowing ? "following" : "stopped following", current)
                 }
-                let driver: TranscriptScrollDriver = tracker.dragActive ? .finger : .system
-                if follow.shouldRepin(at: current, driver: driver) {
+                if next.shouldRepin(at: current, driver: driver) {
                     TranscriptScrollLog.event("layout left the bottom while following, repinning", current)
                     tracker.scheduleRepin(repin)
                 }
@@ -267,7 +348,7 @@ struct JumpToLatestPill: View {
             .foregroundStyle(Color.primary)
             .padding(.leading, 14)
             .padding(.trailing, count > 0 ? 8 : 14)
-            .frame(minHeight: 40)
+            .frame(minHeight: 44)
             // Glass alone lets the bubble text behind it read through the
             // label; a nearly solid base keeps the pill legible over prose.
             .background(Capsule().fill(Color(uiColor: .systemBackground).opacity(0.88)))
@@ -278,6 +359,12 @@ struct JumpToLatestPill: View {
         .shadow(color: Color.black.opacity(0.12), radius: 8, y: 2)
         .accessibilityLabel(accessibilityText)
         .accessibilityIdentifier("jump-to-latest")
+        // The pill sits after the whole transcript in reading order, so a
+        // VoiceOver reader would not otherwise hear that replies arrived.
+        .onChange(of: count) { old, new in
+            guard new > old else { return }
+            AccessibilityNotification.Announcement(new == 1 ? "1 new message" : "\(new) new messages").post()
+        }
     }
 }
 

@@ -50,6 +50,10 @@ struct ChatView: View {
     /// Bumped to ask the transcript for the newest message from outside the
     /// scroll reader, such as a send that never gets as far as a pending row.
     @State private var bottomScrollRequest = 0
+    /// Older messages are loading above the reader.  The size-change anchor
+    /// stays on the bottom while they land, which is what keeps the rows on
+    /// screen in place.
+    @State private var prepending = false
 
     /// The live bubble's scroll target. A constant because there is at most
     /// one per chat and it has no message id to borrow.
@@ -331,11 +335,22 @@ struct ChatView: View {
                                 // keep the reader where they were: after older
                                 // messages are prepended, sit back on the row
                                 // that used to be at the top
-                                let anchor = items.first?.id
+                                let firstMessageId = transcript.first?.id
                                 follow.leaveBottom(newestSettledId: newestSettled)
+                                prepending = true
                                 Task {
                                     await session.loadOlder(threadId: threadId)
-                                    if let anchor { proxy.scrollTo(anchor, anchor: .top) }
+                                    // Found again in the new rows: the old top
+                                    // row may have joined a longer tool run
+                                    // from the loaded page, under a new id.
+                                    if let firstMessageId,
+                                       let row = transcriptRowId(containing: firstMessageId, in: groupActivityRuns(messages)) {
+                                        proxy.scrollTo(row, anchor: .top)
+                                    }
+                                    // Let the prepended rows lay out under the
+                                    // bottom anchor before handing it back.
+                                    try? await Task.sleep(for: .milliseconds(250))
+                                    prepending = false
                                 }
                             }
                             .font(.footnote)
@@ -347,7 +362,7 @@ struct ChatView: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 // a gap in time is worth marking; a timestamp
                                 // on every message is just noise
-                                if startsANewStretch(at: index, in: items) {
+                                if transcriptRowStartsAStretch(at: index, in: items) {
                                     stretchSeparator(item.date)
                                 }
                                 switch item {
@@ -405,6 +420,7 @@ struct ChatView: View {
                     tracker: scrollTracker,
                     newestSettledId: newestSettled,
                     legacy: useLegacyFollow,
+                    prepending: prepending,
                     repin: { repinToBottom(proxy) }
                 ))
                 .overlay(alignment: .bottom) {
@@ -416,7 +432,14 @@ struct ChatView: View {
                 // so a pending send's id swap does not count as new.
                 .onChange(of: BottomFollow.followKey(for: transcript, live: live)) { _, _ in
                     guard follow.isFollowing else { return }
-                    scrollToBottom(proxy)
+                    let now = TranscriptScrollTracker.now
+                    if scrollTracker.holdsFollow(at: now) || scrollTracker.appScrollUntil > now {
+                        // Something else is moving the transcript; follow
+                        // once it has finished.
+                        followStream(proxy)
+                    } else {
+                        scrollToBottom(proxy)
+                    }
                 }
                 .onChange(of: bottomScrollRequest) { _, _ in
                     guard follow.isFollowing else { return }
@@ -460,6 +483,9 @@ struct ChatView: View {
             if !follow.isFollowing {
                 JumpToLatestPill(count: follow.unseenCount(in: transcript)) {
                     follow.resume()
+                    // Follow scrolls wait for the glide rather than cutting
+                    // it short with a jump.
+                    if !reduceMotion { scrollTracker.appScrollStarted(duration: 0.45) }
                     withAnimation(reduceMotion ? nil : .snappy(duration: 0.3)) {
                         proxy.scrollTo(Self.bottomId, anchor: .bottom)
                     }
@@ -492,12 +518,27 @@ struct ChatView: View {
 
     /// One follow scroll per streaming interval, plus a trailing one so the
     /// last tokens of a burst are not left below the fold.
+    ///
+    /// Never while a finger, its coast, or an animated scroll is moving the
+    /// transcript: the scroll waits, checking again each interval, so it
+    /// neither pulls text out from under the reader nor cuts the glide to
+    /// the newest message short.  The trailing scroll checks again when it
+    /// fires, since a touch can begin after it was queued.
     private func followStream(_ proxy: ScrollViewProxy) {
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = TranscriptScrollTracker.now
+        let notBefore: Double?
+        if scrollTracker.holdsFollow(at: now) {
+            notBefore = now + BottomFollow.streamingScrollInterval
+        } else if scrollTracker.appScrollUntil > now {
+            notBefore = scrollTracker.appScrollUntil
+        } else {
+            notBefore = nil
+        }
         switch StreamingFollowThrottle.decide(
             now: now,
             lastScroll: scrollTracker.lastStreamingScroll,
-            trailingScheduled: scrollTracker.trailingScrollScheduled
+            trailingScheduled: scrollTracker.trailingScrollScheduled,
+            notBefore: notBefore
         ) {
         case .now:
             scrollTracker.lastStreamingScroll = now
@@ -507,9 +548,8 @@ struct ChatView: View {
             let tracker = scrollTracker
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 tracker.trailingScrollScheduled = false
-                tracker.lastStreamingScroll = ProcessInfo.processInfo.systemUptime
                 guard follow.isFollowing else { return }
-                scrollToBottom(proxy)
+                followStream(proxy)
             }
         case .skip:
             break
@@ -535,7 +575,7 @@ struct ChatView: View {
                 // The settled message gets a stretch separator when it
                 // follows a long gap; show it now so it is not added on
                 // arrival.
-                if items.last.map({ Date().timeIntervalSince($0.date) > 30 * 60 }) ?? true {
+                if liveReplyStartsAStretch(after: items, now: Date()) {
                     stretchSeparator(Date())
                 }
                 LiveReplyRow(
@@ -822,40 +862,20 @@ struct ChatView: View {
         return out
     }
 
-    /// True when this message opens a fresh stretch of conversation — the
-    /// first one, or one that follows a gap of half an hour or more.
-    private func startsANewStretch(at index: Int, in items: [TranscriptItem]) -> Bool {
-        guard index > 0 else { return true }
-        return items[index].date.timeIntervalSince(items[index - 1].date) > 30 * 60
-    }
-
-    /// True when the next message is from someone else (or there is none),
-    /// which is where a run of bubbles gets its tail — one per run, like
-    /// every messaging app, rather than one per bubble.
-    ///
-    /// A reply being typed counts as the next message.  Otherwise the bubble
-    /// above it keeps its tail and avatar until the reply settles, then
-    /// loses them and shrinks, which moves everything below it.
+    /// Where a run of bubbles gets its tail; `transcriptRowEndsRun` holds
+    /// the rule, including the reply being typed counting as the next
+    /// message.
     private func endsRun(at index: Int, in items: [TranscriptItem], live: BottomFollow.LiveRow) -> Bool {
-        guard index + 1 < items.count else {
-            guard live == .text || live == .reasoning,
-                  case let .message(this) = items[index],
-                  this.role == .bot, this.kind == .text
-            else { return true }
-            // In a room the settled reply is attributed to the member
-            // holding the turn; in a bot chat it carries no speaker.
-            let liveSpeaker: String?
-            if case .room = current { liveSpeaker = liveSender?.name } else { liveSpeaker = nil }
-            return this.from?.name != liveSpeaker
-        }
-        guard case let .message(this) = items[index],
-              case let .message(next) = items[index + 1] else {
-            return true
-        }
-        if this.role != next.role { return true }
-        if this.from?.name != next.from?.name { return true }
-        // a card or a tool chip between two texts breaks the run visually
-        return next.kind != .text
+        // In a room the settled reply is attributed to the member holding
+        // the turn; in a bot chat it carries no speaker.
+        let liveSpeaker: String?
+        if case .room = current { liveSpeaker = liveSender?.name } else { liveSpeaker = nil }
+        return transcriptRowEndsRun(
+            at: index,
+            in: items,
+            liveReply: live == .text || live == .reasoning,
+            liveSpeaker: liveSpeaker
+        )
     }
 
     private var canSend: Bool {
