@@ -57,6 +57,10 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "avatarUrl",
   "avatarCrop",
   "voice",
+  // Per-device overrides of voice ({ mac?, iphone? }).  The phone sets its
+  // own Personal Voice here and may pick a hosted voice for the Mac; the
+  // harness validates the shape and merges it with the stored record.
+  "voices",
   "speakReplies",
   "speechDevices",
   "modelSelection",

@@ -344,6 +344,70 @@ describe("the sidecar in front of an unmodified harness", () => {
     expect(unchanged.body.bots.find((bot: { id: string }) => bot.id === botId).title).toBe("Paired title");
   });
 
+  it("lets the phone set its own voice without wiping the Mac's", async () => {
+    const fleet = await device("GET", "/api/bots");
+    const botId = fleet.body.bots[0].id;
+    try {
+      // The Mac (straight to the harness) picks a Personal Voice for itself.
+      const mac = await fetch(`${HARNESS}/api/bots/${botId}/profile`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ voices: { mac: "personal:mac-voice" } }),
+      });
+      expect(mac.status).toBe(200);
+
+      // The phone sets only its own device through the sidecar.
+      const phone = await device("PATCH", `/api/bots/${botId}/profile`, {
+        body: { voices: { iphone: "English_Graceful_Lady" } },
+      });
+      expect(phone.status).toBe(200);
+      expect(phone.body.bot.voices).toEqual({ mac: "personal:mac-voice", iphone: "English_Graceful_Lady" });
+
+      const malformed = await device("PATCH", `/api/bots/${botId}/profile`, { body: { voices: { watch: "vx" } } });
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error).toBe("voices only accepts mac and iphone, not watch");
+
+      const cleared = await device("PATCH", `/api/bots/${botId}/profile`, { body: { voices: null } });
+      expect(cleared.status).toBe(200);
+      // null on the wire, so a client merging bot frames drops its stale copy
+      expect(cleared.body.bot.voices).toBeNull();
+    } finally {
+      await device("PATCH", `/api/bots/${botId}/profile`, { body: { voices: null } });
+    }
+  });
+
+  it("carries a clip that is not ready yet back to the phone as retryable", async () => {
+    let seenUrl = "";
+    const clipHarness = createServer((req, res) => {
+      seenUrl = req.url ?? "";
+      res.writeHead(425, { "content-type": "application/json", "retry-after": "1", "cache-control": "no-store" });
+      res.end(JSON.stringify({ error: "This voice clip is still being prepared.", retryable: true, ready: 1, total: 3 }));
+    });
+    await new Promise<void>((resolve) => clipHarness.listen(0, "127.0.0.1", resolve));
+    const clipHarnessPort = (clipHarness.address() as { port: number }).port;
+    const clipProxy = createServer(createProxyHandler({
+      harnessPort: clipHarnessPort,
+      authenticate: () => ({ id: "phone-clip", cloudDesktopAccess: false }),
+      redeem: () => ({ error: "not pairing" }),
+      serverName: () => "Test computer",
+    }));
+    await new Promise<void>((resolve) => clipProxy.listen(0, "127.0.0.1", resolve));
+    const clipProxyPort = (clipProxy.address() as { port: number }).port;
+    try {
+      const response = await fetch(`http://127.0.0.1:${clipProxyPort}/api/threads/th_1/messages/msg_1/audio/1?device=iphone`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(response.status).toBe(425);
+      expect(response.headers.get("retry-after")).toBe("1");
+      expect(await response.json()).toMatchObject({ retryable: true, ready: 1, total: 3 });
+      // The device query reaches the harness intact.
+      expect(seenUrl).toBe("/api/threads/th_1/messages/msg_1/audio/1?device=iphone");
+    } finally {
+      await new Promise<void>((resolve) => clipProxy.close(() => resolve()));
+      await new Promise<void>((resolve) => clipHarness.close(() => resolve()));
+    }
+  });
+
   it("rejects non-object profile bodies at the sidecar boundary", async () => {
     const fleet = await device("GET", "/api/bots");
     const botId = fleet.body.bots[0].id;

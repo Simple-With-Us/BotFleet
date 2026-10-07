@@ -73,6 +73,51 @@ describe("parseBotProfilePatch (both modes)", () => {
     }
   });
 
+  it("accepts per-device voices on both boundaries and merges them into the stored record", () => {
+    for (const strict of [true, false]) {
+      expect(parseBotProfilePatch({ voices: { iphone: "English_Graceful_Lady" } }, strict)).toEqual({
+        ok: true,
+        patch: { voices: { iphone: "English_Graceful_Lady" } },
+      });
+      // A phone saving its own voice keeps the Mac's.
+      const merged = parseBotProfilePatch({ voices: { iphone: "vx" } }, strict, { voices: { mac: "personal:mac" } });
+      expect(merged).toEqual({ ok: true, patch: { voices: { mac: "personal:mac", iphone: "vx" } } });
+    }
+  });
+
+  it("clears one device with null or an empty string, and every device with voices: null", () => {
+    const current = { voices: { mac: "personal:mac", iphone: "vx" } };
+    expect(parseBotProfilePatch({ voices: { mac: null } }, true, current)).toEqual({ ok: true, patch: { voices: { iphone: "vx" } } });
+    expect(parseBotProfilePatch({ voices: { iphone: "" } }, true, current)).toEqual({ ok: true, patch: { voices: { mac: "personal:mac" } } });
+    const cleared = parseBotProfilePatch({ voices: null }, true, current);
+    expect(cleared.ok && "voices" in cleared.patch && cleared.patch.voices === undefined).toBe(true);
+    const lastCleared = parseBotProfilePatch({ voices: { mac: null, iphone: null } }, true, current);
+    expect(lastCleared.ok && "voices" in lastCleared.patch && lastCleared.patch.voices === undefined).toBe(true);
+  });
+
+  it("leaves voices alone when a PATCH does not name them", () => {
+    const result = parseBotProfilePatch({ name: "Mira" }, true, { voices: { mac: "personal:mac" } });
+    expect(result.ok && "voices" in result.patch).toBe(false);
+  });
+
+  it("rejects malformed per-device voices", () => {
+    expect(parseBotProfilePatch({ voices: { ipad: "vx" } } as never, true)).toEqual({
+      ok: false,
+      error: "voices only accepts mac and iphone, not ipad",
+    });
+    expect(parseBotProfilePatch({ voices: { mac: 7 } } as never, true)).toEqual({ ok: false, error: "voices.mac must be a voice id or null" });
+    expect(parseBotProfilePatch({ voices: { iphone: "v".repeat(201) } }, true)).toEqual({
+      ok: false,
+      error: "voices.iphone must be at most 200 characters",
+    });
+    for (const voices of ["vx", ["vx"], 3]) {
+      expect(parseBotProfilePatch({ voices } as never, true)).toEqual({
+        ok: false,
+        error: "voices must be an object with mac and iphone voice ids",
+      });
+    }
+  });
+
   it("rejects a blank or oversized name", () => {
     expect(parseBotProfilePatch({ name: "   " }, true).ok).toBe(false);
     expect(parseBotProfilePatch({ name: "x".repeat(101) }, true).ok).toBe(false);

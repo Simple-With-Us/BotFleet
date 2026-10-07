@@ -166,6 +166,18 @@ describe("what it may not", () => {
     }
   });
 
+  it("lets the phone write per-device voices", () => {
+    expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("voices");
+    expect(companionProfilePatchDenial({ voices: { iphone: "English_Graceful_Lady" } })).toBeNull();
+    expect(companionProfilePatchDenial({ voices: null, speechDevices: ["mac", "iphone"] })).toBeNull();
+  });
+
+  it("permits a device-qualified clip GET", () => {
+    // The sidecar matches the path with the query removed and forwards the
+    // query untouched, so `?device=` needs no allowlist entry of its own.
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/audio/0")).toBeNull();
+  });
+
   it("permits message-linked audio but not arbitrary attachment audio", () => {
     expect(ask("POST", "/api/threads/th_1/messages/msg_1/audio")).toBeNull();
     expect(ask("GET", "/api/threads/th_1/messages/msg_1/audio/0")).toBeNull();

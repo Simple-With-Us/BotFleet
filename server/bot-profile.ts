@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { botAvatarCropSchema, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { BOT_PROFILE_LIMITS, MAX_TOOL_ROUNDS } from "../shared/bot-profile.ts";
+import { mergeBotVoices, type BotVoices } from "../shared/bot-voice.ts";
 import {
   CONNECTOR_SLUGS_MAX,
   CONNECTOR_SLUG_PATTERN,
@@ -19,6 +20,7 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "avatarUrl",
   "avatarCrop",
   "voice",
+  "voices",
   "speakReplies",
   "speechDevices",
   "voiceSummaryMode",
@@ -75,6 +77,26 @@ const connectorToolsSchema = z
   });
 
 
+/** One device's voice override: a voice id, or null / "" to clear it. */
+const deviceVoiceSchema = (device: "mac" | "iphone") =>
+  z
+    .string({ error: `voices.${device} must be a voice id or null` })
+    .max(BOT_PROFILE_LIMITS.voice, { error: `voices.${device} must be at most ${BOT_PROFILE_LIMITS.voice} characters` })
+    .nullable()
+    .optional();
+
+/** Per-device voices (shared/bot-voice.ts).  A PATCH names only the devices
+ * it changes; the merge with the stored record happens in
+ * parseBotProfilePatch so a phone saving its own voice cannot wipe the
+ * Mac's.  `null` clears every override. */
+const voicesSchema = z
+  .object(
+    { mac: deviceVoiceSchema("mac"), iphone: deviceVoiceSchema("iphone") },
+    { error: "voices must be an object with mac and iphone voice ids" },
+  )
+  .strict()
+  .nullable();
+
 const maxToolRoundsValueSchema = z.number().int().min(1).max(MAX_TOOL_ROUNDS);
 
 /** Integer 1..MAX_TOOL_ROUNDS, else absent. Empty/null/invalid all mean unset. */
@@ -110,6 +132,7 @@ const profilePatchSchema = z.object({
     .string({ error: "voice must be a string" })
     .max(BOT_PROFILE_LIMITS.voice, { error: "voice must be at most 200 characters" })
     .optional(),
+  voices: voicesSchema.optional(),
   speakReplies: z.boolean({ error: "speakReplies must be true or false" }).optional(),
   speechDevices: z.array(z.enum(["mac", "iphone"])).max(2).refine((v) => new Set(v).size === v.length, "speechDevices must not repeat a device").optional(),
   voiceSummaryMode: z.enum(["off", "on_demand", "always"], { error: "voiceSummaryMode must be off, on_demand, or always" }).optional(),
@@ -144,6 +167,7 @@ export type BotProfilePatch = Partial<
     | "avatarUrl"
     | "avatarCrop"
     | "voice"
+    | "voices"
     | "speakReplies"
     | "speechDevices"
     | "modelSelection"
@@ -177,12 +201,23 @@ export type BotProfilePatchResult =
  * avatarUrl deliberately uses `undefined` as the normalized clear value.
  * Store persistence already omits undefined fields, while wireBot sends null
  * back to clients so Codable and object-spread clients both clear stale data.
+ *
+ * `current` is the stored bot, when there is one.  `voices` is merged into
+ * its existing overrides (an absent device is left alone), so the returned
+ * patch carries the complete record to store, or `undefined` to drop it.
  */
-export function parseBotProfilePatch(input: BotProfilePatchInput, strict = false): BotProfilePatchResult {
+export function parseBotProfilePatch(
+  input: BotProfilePatchInput,
+  strict = false,
+  current?: { voices?: BotVoices } | null,
+): BotProfilePatchResult {
   const parsed = (strict ? profilePatchSchema.strict() : profilePatchSchema).safeParse(input);
   if (!parsed.success) {
     const unsupported = parsed.error.issues.find((issue) => issue.code === "unrecognized_keys");
     if (unsupported?.code === "unrecognized_keys") {
+      if (unsupported.path[0] === "voices") {
+        return { ok: false, error: `voices only accepts mac and iphone, not ${unsupported.keys[0] ?? "unknown"}` };
+      }
       return { ok: false, error: `unsupported profile field: ${unsupported.keys[0] ?? "unknown"}` };
     }
     const issue = parsed.error.issues[0];
@@ -196,8 +231,9 @@ export function parseBotProfilePatch(input: BotProfilePatchInput, strict = false
     return { ok: false, error: "unsupported profile field: bypassPermissions" };
   }
 
-  const { avatarUrl, cwd, connectorTools, maxToolRounds: _maxToolRounds, ...fields } = parsed.data;
+  const { avatarUrl, cwd, connectorTools, voices, maxToolRounds: _maxToolRounds, ...fields } = parsed.data;
   const patch: BotProfilePatch = fields;
+  if (voices !== undefined) patch.voices = mergeBotVoices(current?.voices, voices);
   if (avatarUrl !== undefined) patch.avatarUrl = avatarUrl || undefined;
   if (cwd !== undefined) patch.cwd = cwd || undefined;
   // null is the API-edge clear (matches avatarUrl/cwd): it returns the bot

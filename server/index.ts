@@ -372,10 +372,10 @@ import { speechUsageTotals } from "./tts/usage.ts";
 import {
   VOICE_SUMMARY_PROMPT,
   spokenReply,
-  writtenReply,
   resolveVoiceSummaryMode,
 } from "../shared/voice-summary.ts";
-import { summarizeForVoice } from "./tts/speech-summary.ts";
+import { summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
+import { MessageAudio } from "./tts/message-audio.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { fitListToBudget, serializedPreview } from "./serialized-preview.ts";
 import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh, ROOM_REPLY_PREFIX } from "./turn-context.ts";
@@ -2153,7 +2153,15 @@ const wireGroupTask = (task: GroupTaskRecord) => {
 
 const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
   const { resumeCursors, tasks, ...rest } = bot;
-  return { ...rest, avatarUrl: rest.avatarUrl ?? null, ...(tasks ? { tasks: tasks.map(wireTask) } : {}) };
+  // avatarUrl and voices go out as null when unset, so a client that merges
+  // bot frames into what it holds (object spread, Codable defaults) clears a
+  // value another device removed instead of keeping the stale one.
+  return {
+    ...rest,
+    avatarUrl: rest.avatarUrl ?? null,
+    voices: rest.voices ?? null,
+    ...(tasks ? { tasks: tasks.map(wireTask) } : {}),
+  };
 };
 
 /** Profile URLs are app-owned references, not merely strings with a trusted
@@ -9782,9 +9790,6 @@ function endRuntimeQuiesce() {
   return { ...currentRuntimeReadiness(), quiescing: false };
 }
 
-// A concurrent Mac/iPhone request must never bill twice for the same reply.
-// The lock is process-local; the persisted message's audio list survives restarts.
-const voiceJobs = new Map<string, Promise<Array<{ path: string; mime: string }>>>();
 // One paid summary request per message: the background prewarm and the audio
 // route share this promise instead of each asking the provider.
 const voiceSummaryJobs = new Map<string, Promise<string>>();
@@ -9804,12 +9809,12 @@ function voiceSummaryFor(
       if (existing) return existing;
       try {
         const scrubbedInput = redactSecretsInText(text);
-        const summary = await summarizeForVoice(scrubbedInput, {
+        const summary = await summarizeForVoiceDetailed(scrubbedInput, {
           key: currentCfg.deepseek?.key,
           baseUrl: currentCfg.deepseek?.url,
         });
-        const safeSummary = summary ? redactSecretsInText(summary) : "";
-        if (safeSummary && safeSummary !== text) {
+        const safeSummary = summary.text ? redactSecretsInText(summary.text) : "";
+        if (voiceSummaryWorthStoring(summary) && safeSummary && safeSummary !== text) {
           store.patchMessage(threadId, messageId, { voiceText: safeSummary });
         }
         return safeSummary || spokenReply(text);
@@ -9822,6 +9827,33 @@ function voiceSummaryFor(
   }
   return job;
 }
+
+// Message-linked speech (server/tts/message-audio.ts).  One detached job per
+// message and voice, so a Mac and an iPhone asking at once never bill twice.
+// The lock is process-local; the persisted clip lists survive restarts.
+const messageAudio = new MessageAudio({
+  message: (threadId, messageId) => store.messagesFor(threadId).find((row) => row.id === messageId),
+  patchMessage: (threadId, messageId, patch) => {
+    store.patchMessage(threadId, messageId, patch);
+  },
+  summarize: (threadId, messageId, text) => voiceSummaryFor(threadId, messageId, text, cfg),
+  speak: (text, voice) => tts.speak(cfg, text, voice),
+  saveClip: (bytes, mime) => {
+    const saved = saveAttachment(Buffer.from(bytes), mime);
+    return { path: `/api/attachments/${saved.path.split(/[\/]/).pop()}`, mime: saved.mime };
+  },
+  clipExists: (clip) => {
+    const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
+    return Boolean(name && attachmentExists(name));
+  },
+  readClip: (clip) => {
+    const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
+    return name ? readAttachment(name) : null;
+  },
+  defaultVoice: () => cfg.tts?.voice ?? "",
+  credentialPending: () => cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey"),
+  isNoVoiceConfigured: (error) => error instanceof tts.NoVoiceConfigured,
+});
 
 handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
   let url: URL;
@@ -11700,7 +11732,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!existingBot) return json(res, 404, { error: "no such bot" });
 
       const body = await readBody(req);
-      const parsed = parseBotProfilePatch(body, true);
+      // existingBot lets a one-device `voices` change keep the other device's.
+      const parsed = parseBotProfilePatch(body, true, existingBot);
       if (!parsed.ok) return json(res, 400, { error: parsed.error });
       if (localAutoConsentConfigBusy && parsed.patch.name !== undefined) {
         return json(res, 409, { error: localAutoConsentConfigBusyError });
@@ -11858,7 +11891,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // Persona/profile fields reach prompts and paired clients. Both this
       // broad desktop endpoint and the paired-safe profile endpoint pass
       // through the same validation and clear-value normalization.
-      const profile = parseBotProfilePatch(body);
+      const profile = parseBotProfilePatch(body, false, existingBot);
       if (!profile.ok) return json(res, 400, { error: profile.error });
       if (profile.patch.avatarUrl && !storedAvatarExists(profile.patch.avatarUrl)) {
         return json(res, 400, { error: "avatarUrl must reference an existing stored image" });
@@ -15172,78 +15205,38 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
 
-    // Message-linked speech is generated only once, then served as immutable
-    // clips. The thread/message guard prevents guessed ids from creating work.
+    // Message-linked speech: the rules live in server/tts/message-audio.ts.
+    // The thread/message guard prevents guessed ids from creating work.
     m = path.match(/^\/api\/threads\/([\w-]+)\/messages\/([\w-]+)\/audio(?:\/(\d+))?$/);
     if (m && (method === "POST" || method === "GET")) {
+      const startedAt = Date.now();
       const [, threadId, messageId, clipIndex] = m;
       if (!store.botByThread(threadId) && !store.groupByThread(threadId)) return json(res, 404, { error: "no such conversation" });
       const message = store.messagesFor(threadId).find((row) => row.id === messageId);
       if (message?.role !== "bot" || message.kind !== "text" || !message.text?.trim()) return json(res, 404, { error: "no such reply" });
+      const owner = message.from?.botId ? store.bot(message.from.botId) : store.botByThread(threadId);
       if (method === "GET") {
         if (clipIndex === undefined) return json(res, 405, { error: "clip index required" });
-        const clip = message.audio?.[Number(clipIndex)];
-        const stored = clip?.path.match(/^\/api\/attachments\/([\w.-]+)$/);
-        const audio = stored ? readAttachment(stored[1]!) : null;
-        if (!audio || !clip || !["audio/mpeg", "audio/wav"].includes(audio.mime)) return json(res, 404, { error: "no such voice clip" });
-        res.writeHead(200, { "content-type": audio.mime, "content-length": String(audio.bytes.byteLength), "cache-control": "private, max-age=31536000, immutable", "x-content-type-options": "nosniff" });
-        return res.end(audio.bytes);
+        const result = await messageAudio.get({
+          threadId,
+          messageId,
+          owner: owner ?? {},
+          index: Number(clipIndex),
+          device: url.searchParams.get("device"),
+          ifNoneMatch: typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : undefined,
+        });
+        if (result.kind === "json") {
+          if (result.headers) for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
+          return json(res, result.status, result.body);
+        }
+        res.writeHead(result.status, result.headers);
+        return res.end(result.bytes ? Buffer.from(result.bytes) : undefined);
       }
       if (clipIndex !== undefined) return json(res, 405, { error: "POST the message audio route" });
-      const owner = message.from?.botId ? store.bot(message.from.botId) : store.botByThread(threadId);
       if (!owner) return json(res, 404, { error: "no voice owner" });
-      if (cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey")) return json(res, 409, { error: "Voice synthesis is waiting for its encrypted credential" });
-      const summaryMode = resolveVoiceSummaryMode(owner);
-      let textToSpeak = spokenReply(message.text);
-      const audioIntact = () => !!message.audio?.length && message.audio.every((clip) => {
-        const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
-        return name && attachmentExists(name);
-      });
-      if (summaryMode === "off") {
-        textToSpeak = writtenReply(message.text);
-      } else if (message.voiceText) {
-        textToSpeak = message.voiceText;
-      } else {
-        textToSpeak = await voiceSummaryFor(threadId, messageId, message.text, cfg);
-      }
-      const utterances = toUtterances(textToSpeak);
-      if (!utterances.length || utterances.length > 64 || utterances.join("").length > 12000 || textToSpeak.length > 12000) {
-        return json(res, 413, { error: "reply exceeds voice clip limit" });
-      }
-      if (tts.isPersonalVoice(owner.voice)) {
-        return json(res, 200, { audio: [], voiceText: utterances.join(" "), utterances, onDevice: true, personalVoice: true });
-      }
-      if (audioIntact() && message.audio!.length === utterances.length) {
-        return json(res, 200, { audio: message.audio, voiceText: textToSpeak, utterances });
-      }
-      const key = `${threadId}:${messageId}`;
-      let job = voiceJobs.get(key);
-      if (!job) {
-        job = (async () => {
-          const clips: Array<{ path: string; mime: string }> = [];
-          for (const clip of message.audio ?? []) {
-            const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
-            if (!name || !attachmentExists(name)) break;
-            clips.push(clip);
-          }
-          if (clips.length !== (message.audio?.length ?? 0)) store.patchMessage(threadId, messageId, { audio: [...clips], voiceText: textToSpeak });
-          for (const utterance of utterances.slice(clips.length)) {
-            const audio = await tts.speak(cfg, utterance, owner.voice);
-            if (!["audio/mpeg", "audio/wav"].includes(audio.mime)) throw new Error("The voice engine returned an unsupported audio format.");
-            const saved = saveAttachment(Buffer.from(audio.bytes), audio.mime);
-            clips.push({ path: `/api/attachments/${saved.path.split(/[\/]/).pop()}`, mime: saved.mime });
-            store.patchMessage(threadId, messageId, { audio: [...clips], voiceText: textToSpeak });
-          }
-          return clips;
-        })();
-        voiceJobs.set(key, job);
-        void job.finally(() => voiceJobs.delete(key)).catch(() => {});
-      }
-      try { return json(res, 200, { audio: await job, voiceText: textToSpeak, utterances }); }
-      catch (error) {
-        if (error instanceof tts.NoVoiceConfigured) return json(res, 409, { error: error.message });
-        return json(res, 502, { error: error instanceof Error ? error.message : String(error) });
-      }
+      const body = await readBody(req);
+      const result = await messageAudio.post({ threadId, messageId, owner, body, startedAt });
+      return json(res, result.status, result.body);
     }
 
     // ── voice ─────────────────────────────────────────────────────────
