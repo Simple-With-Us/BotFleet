@@ -18,6 +18,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   childExitAction,
+  permissionRequestId,
   consumeMspMessage,
   translateAcpToMsp,
   translateMspToAcp,
@@ -186,6 +187,68 @@ describe("MSP to ACP", () => {
     const kinds = (request.params?.options ?? []).map((option) => option.kind);
     expect(kinds.some((k: string) => k.startsWith("allow"))).toBe(true);
     expect(kinds.some((k: string) => k.startsWith("reject"))).toBe(true);
+  });
+
+  it.each(["ap#segment", "ap#1", "ap#0", "ap#01", "ap%23#2", "ap#part#3", "ap-é#4"])(
+    "round-trips opaque approval id %s through initial and re-asked wire ids",
+    (approvalId) => {
+      const [, initial] = translateMspToAcp({
+        jsonrpc: "2.0", method: "approval/request",
+        params: { sessionId: "s", approvalId, currentRequirementId: "req-1", availableChoices: [{ id: "allow" }] },
+      });
+      expect(initial.id).toBe(`perm-${encodeURIComponent(approvalId)}`);
+      expect(permissionRequestId(initial.id)).toBe(approvalId);
+      translateMspToAcp({
+        jsonrpc: "2.0", method: "approval/updated",
+        params: { approvalId, currentRequirementId: "req-2" },
+      });
+      const answer = (id: string | number | null | undefined) => ({
+        jsonrpc: "2.0", id, result: { outcome: { outcome: "selected", optionId: "allow" } },
+      });
+      const reasked = translatePermissionAnswer(permissionRequestId(initial.id)!, answer(initial.id));
+      expect(reasked.toMsp).toEqual([]);
+      const nextId = reasked.toAcp[0]?.id;
+      expect(nextId).toBe(`perm-${encodeURIComponent(approvalId)}#1`);
+      expect(permissionRequestId(nextId)).toBe(approvalId);
+      // A repeated old answer must not authorize the newly presented stage.
+      expect(translatePermissionAnswer(approvalId, answer(initial.id))).toEqual({ toMsp: [], toAcp: [] });
+      const decided = translatePermissionAnswer(permissionRequestId(nextId)!, answer(nextId));
+      expect(decided.toMsp[0]?.params).toMatchObject({ approvalId, requirementId: "req-2", choiceId: "allow" });
+      translateMspToAcp({ jsonrpc: "2.0", method: "approval/resolved", params: { approvalId } });
+    },
+  );
+
+  it("keeps a numeric-ending bare id distinct from another approval's generation", () => {
+    const ask = (approvalId: string) => translateMspToAcp({
+      jsonrpc: "2.0", method: "approval/request",
+      params: { sessionId: "s", approvalId, currentRequirementId: "req-1", availableChoices: [{ id: "allow" }] },
+    })[1];
+    const bare = ask("collision#1");
+    const other = ask("collision");
+    // Exercise the producer/parser round-trip without assuming an encoding.
+    expect(permissionRequestId(bare.id)).toBe("collision#1");
+    translateMspToAcp({ jsonrpc: "2.0", method: "approval/updated", params: { approvalId: "collision", currentRequirementId: "req-2" } });
+    const answer = (id: string | number | null | undefined) => ({
+      jsonrpc: "2.0", id, result: { outcome: { outcome: "selected", optionId: "allow" } },
+    });
+    const reasked = translatePermissionAnswer("collision", answer(other.id)).toAcp[0];
+    expect(bare.id).not.toBe(reasked.id);
+    expect(permissionRequestId(reasked.id)).toBe("collision");
+    expect(translatePermissionAnswer(permissionRequestId(bare.id)!, answer(bare.id)).toMsp[0]?.params?.approvalId).toBe("collision#1");
+    expect(translatePermissionAnswer("collision", answer(other.id))).toEqual({ toMsp: [], toAcp: [] });
+    expect(translatePermissionAnswer("collision", answer(reasked.id)).toMsp[0]?.params?.requirementId).toBe("req-2");
+    for (const approvalId of ["collision", "collision#1"]) {
+      translateMspToAcp({ jsonrpc: "2.0", method: "approval/resolved", params: { approvalId } });
+    }
+  });
+
+  it("rejects malformed or foreign permission wire ids", () => {
+    for (const id of [null, undefined, 12, "bf-r1", "perm-ap#text", "perm-ap#0", "perm-ap#01", "perm-ap#-1", "perm-ap#1.5", "perm-ap%ZZ", "perm-ap%23#1#2"]) {
+      expect(permissionRequestId(id)).toBeUndefined();
+    }
+    expect(permissionRequestId("perm-ap")).toBe("ap");
+    expect(permissionRequestId("perm-ap#1")).toBe("ap");
+    expect(permissionRequestId("perm-ap%231")).toBe("ap#1");
   });
 
   it("treats an approval refresh as new information rather than a new request", () => {

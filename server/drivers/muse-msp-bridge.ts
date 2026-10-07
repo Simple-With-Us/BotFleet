@@ -326,8 +326,8 @@ function acpPermissionOptions(): PermissionOption[] {
 }
 
 function permissionWireId(pending: PendingApproval): string {
-  if (pending.generation === 0) return `perm-${pending.approvalId}`;
-  return `perm-${pending.approvalId}#${pending.generation}`;
+  if (pending.generation === 0) return `perm-${encodeURIComponent(pending.approvalId)}`;
+  return `perm-${encodeURIComponent(pending.approvalId)}#${pending.generation}`;
 }
 
 function permissionRequestMessage(pending: PendingApproval): JsonRpcMessage {
@@ -635,7 +635,7 @@ interface PermissionAnswerEffect {
  *  asked is not decided:  the new requirement is presented instead. */
 export function translatePermissionAnswer(approvalId: string, message: JsonRpcMessage): PermissionAnswerEffect {
   const pending = approvals.get(approvalId);
-  if (!pending) return { toMsp: [], toAcp: [] };
+  if (!pending || message.id !== permissionWireId(pending)) return { toMsp: [], toAcp: [] };
   if (pending.supersededRequirement !== null) {
     pending.requirementId = pending.supersededRequirement;
     pending.supersededRequirement = null;
@@ -725,16 +725,22 @@ function acknowledgePermission(message: JsonRpcMessage): void {
   for (const outbound of relayMspResponse(message)) out(outbound);
 }
 
-/** BotFleet's answer to a permission we posed uses an id minted as `perm-<approvalId>`.
- *  A re-ask appends `#<generation>`.  Numeric ACP ids are someone else's request
- *  and must not be read as one.  Returns the approval id. */
-function permissionRequestId(id: string | number | null | undefined): string | undefined {
-  if (id === undefined || id === null) return undefined;
-  const text = id.toString();
-  if (!text.startsWith("perm-")) return undefined;
-  const body = text.slice("perm-".length);
+/** Permission wire ids encode the opaque approval id before appending a re-ask
+ *  generation.  Thus a literal '#' (including '#1') is never a suffix.  Only
+ *  canonical positive-integer generations minted by the bridge are stripped. */
+export function permissionRequestId(id: string | number | null | undefined): string | undefined {
+  if (typeof id !== "string" || !id.startsWith("perm-")) return undefined;
+  const body = id.slice("perm-".length);
   const mark = body.lastIndexOf("#");
-  return mark === -1 ? body : body.slice(0, mark);
+  if (mark !== -1 && !/^[1-9]\d*$/.test(body.slice(mark + 1))) return undefined;
+  const encoded = mark === -1 ? body : body.slice(0, mark);
+  try {
+    const approvalId = decodeURIComponent(encoded);
+    // Accept only the domain our wire-id producer emits, not ambiguous raw ids.
+    return encodeURIComponent(approvalId) === encoded ? approvalId : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** How the bridge should die when `muse serve` does.  A signal is a crash
