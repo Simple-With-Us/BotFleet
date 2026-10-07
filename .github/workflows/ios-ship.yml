@@ -17,9 +17,11 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 #   a synced GitHub secret as GH_FALLBACK_*; an inert Sentry beats a red ship).
 # scripts/ios-appstore-gm-prepare.sh maps the five signing names onto
 # ~/.secrets/appstore-connect.env and imports the Distribution identity.
-# Values are never printed. Do not mint a new key. Do not create a new
-# provisioning profile (fleet automatic signing + -allowProvisioningUpdates).
-# Leftover GitHub APPLE_/IOS_ secrets stay for a later cleanup.
+# Hosted ships use MANUAL Release signing: scripts/ios-install-appstore-profiles.sh
+# reuses or creates IOS_APP_STORE profiles over the App Store Connect API
+# (asc-api.mjs ensure-appstore-profiles), installs them, and archives with the
+# profile names in ios/appstore-profiles.json.  Values are never printed.
+# Do not mint a new API key.  Leftover GitHub APPLE_/IOS_ secrets stay for cleanup.
 #
 # The in-repo wrapper prefers scripts/ios-fleet/, then
 # /Users/jay/apps/ios-fleet. App key `botfleet`, bundle `app.botfleet.ios`,
@@ -34,6 +36,7 @@ on:
       - 'scripts/ios-fleet/**'
       - 'scripts/ios-ship-testflight.sh'
       - 'scripts/ios-appstore-gm-prepare.sh'
+      - 'scripts/ios-install-appstore-profiles.sh'
   workflow_dispatch:
   schedule:
     # Twice an hour, offset from Socratic.Trade ('*/30'), Congress.Trade
@@ -182,4 +185,5 @@ jobs:
         if: steps.gate.outputs.should_ship == '1'
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
+          IOS_MANUAL_SIGN: "1"  # 2026-10-07: API profiles; no Xcode provisioning service
         run: bash scripts/ios-ship-testflight.sh
