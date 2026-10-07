@@ -43,7 +43,7 @@ final class ActivityRunsTests: XCTestCase {
         let items = groupActivityRuns(messages)
         XCTAssertEqual(items.count, 2)
         if case let .run(id, runMsgs) = items[0] {
-            XCTAssertEqual(id, "run:1")
+            XCTAssertEqual(id, "1")
             XCTAssertEqual(runMsgs.count, 3)
             let desc = describeActivityRun(runMsgs)
             XCTAssertEqual(desc.headline, "3 tool calls")
@@ -56,6 +56,48 @@ final class ActivityRunsTests: XCTestCase {
         } else {
             XCTFail("Expected text message")
         }
+    }
+
+    func testARunKeepsTheIdOfTheActivityItGrewFrom() {
+        // One activity is a plain row; a second folds both into a run.  The
+        // row id must not change at that moment, or the transcript row is
+        // rebuilt and any scroll aimed at it lands nowhere.
+        let one = groupActivityRuns([makeToolMessage(id: "a1", name: "view_file")])
+        let two = groupActivityRuns([
+            makeToolMessage(id: "a1", name: "view_file"),
+            makeToolMessage(id: "a2", name: "run_command"),
+        ])
+        let five = groupActivityRuns((1...5).map { makeToolMessage(id: "a\($0)", name: "run_command") })
+        XCTAssertEqual(one.map(\.id), ["a1"])
+        XCTAssertEqual(two.map(\.id), ["a1"])
+        XCTAssertEqual(five.map(\.id), ["a1"])
+    }
+
+    func testItemIdsStayUniqueWithRuns() {
+        let items = groupActivityRuns([
+            makeTextMessage(id: "t1", text: "Looking"),
+            makeToolMessage(id: "a1", name: "view_file"),
+            makeToolMessage(id: "a2", name: "run_command"),
+            makeTextMessage(id: "t2", text: "Done"),
+            makeToolMessage(id: "a3", name: "run_command"),
+        ])
+        XCTAssertEqual(items.map(\.id), ["t1", "a1", "t2", "a3"])
+        XCTAssertEqual(Set(items.map(\.id)).count, items.count)
+    }
+
+    func testRowIdForAMessageFoldedIntoARunIsTheRunsId() {
+        let items = groupActivityRuns([
+            makeTextMessage(id: "t1", text: "Looking"),
+            makeToolMessage(id: "a1", name: "view_file"),
+            makeToolMessage(id: "a2", name: "run_command"),
+            makeToolMessage(id: "a3", name: "run_command"),
+            makeTextMessage(id: "t2", text: "Done"),
+        ])
+        XCTAssertEqual(transcriptRowId(containing: "t1", in: items), "t1")
+        XCTAssertEqual(transcriptRowId(containing: "a1", in: items), "a1")
+        XCTAssertEqual(transcriptRowId(containing: "a3", in: items), "a1")
+        XCTAssertEqual(transcriptRowId(containing: "t2", in: items), "t2")
+        XCTAssertNil(transcriptRowId(containing: "missing", in: items))
     }
 
     func testTextMessagesBreakRuns() {

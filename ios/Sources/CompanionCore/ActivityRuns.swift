@@ -1,6 +1,11 @@
 import Foundation
 
 /// A grouped item in a chat transcript — either a single message or a folded run of tool activities.
+///
+/// A run's id is its first message's id, with no prefix.  A lone activity is
+/// `.message(X)` until a second one joins it and it becomes `.run(id: X)`;
+/// keeping the id lets the transcript row, and any scroll aimed at it,
+/// survive that change instead of being torn down and rebuilt.
 public enum TranscriptItem: Identifiable, Hashable, Sendable {
     case message(Message)
     case run(id: String, messages: [Message])
@@ -41,7 +46,7 @@ public func groupActivityRuns(_ messages: [Message]) -> [TranscriptItem] {
 
     func flush() {
         if run.count > 1 {
-            items.append(.run(id: "run:\(run[0].id)", messages: run))
+            items.append(.run(id: run[0].id, messages: run))
         } else {
             for msg in run {
                 items.append(.message(msg))
@@ -66,6 +71,13 @@ public func groupActivityRuns(_ messages: [Message]) -> [TranscriptItem] {
     }
     flush()
     return items
+}
+
+/// The id of the transcript row that shows `messageId`.  Only rows carry a
+/// scroll id, so a message folded into an activity run is reached through
+/// its run; aiming a scroll at the message itself silently does nothing.
+public func transcriptRowId(containing messageId: String, in items: [TranscriptItem]) -> String? {
+    items.first { item in item.messages.contains { $0.id == messageId } }?.id
 }
 
 /// Describes a folded activity run with tool breakdown and failure count.
