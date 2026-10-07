@@ -362,6 +362,28 @@ describe("summarizeForVoiceDetailed: long replies are never cut short", () => {
     expect(voiceSummaryWorthStoring(result)).toBe(false);
   });
 
+  it("stores the stand-in when the rewrite ran out of time, since it would again", async () => {
+    globalThis.fetch = vi.fn((_url, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    })) as unknown as typeof fetch;
+    const result = await summarizeForVoiceDetailed(longReply, { key: "fake-key", timeoutMs: 20 });
+    expect(result).toMatchObject({ source: "fallback", reason: "timeout" });
+    expect(result.text).toContain("Paragraph 30");
+    expect(voiceSummaryWorthStoring(result)).toBe(true);
+  });
+
+  it("does not call a caller's cancel a timeout", async () => {
+    globalThis.fetch = vi.fn((_url, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    })) as unknown as typeof fetch;
+    const controller = new AbortController();
+    const pending = summarizeForVoiceDetailed(longReply, { key: "fake-key", timeoutMs: 5_000, signal: controller.signal });
+    controller.abort(new Error("caller went away"));
+    const result = await pending;
+    expect(result).toMatchObject({ source: "fallback", reason: "unavailable" });
+    expect(voiceSummaryWorthStoring(result)).toBe(false);
+  });
+
   it("keeps storing the deterministic text when there is no key or the reply is short", async () => {
     vi.stubEnv("DEEPSEEK_VOICE_API_KEY", "");
     vi.stubEnv("DEEPSEEK_API_KEY", "");

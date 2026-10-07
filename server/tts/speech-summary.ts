@@ -100,10 +100,12 @@ export interface SummarizeVoiceOptions {
  * the deterministic pass standing in for a rewrite that was not usable. */
 export type VoiceSummarySource = "summary" | "short" | "fallback";
 
-/** Why a rewrite was not used.  "unavailable" is transient (timeout, network,
- * non-200, empty answer) and worth retrying later; the others reproduce on a
- * retry, so the deterministic text can be stored in place of the rewrite. */
-export type VoiceSummaryFallbackReason = "no-key" | "truncated" | "incomplete" | "too-short" | "unavailable";
+/** Why a rewrite was not used.  "unavailable" is transient (network error,
+ * non-200, empty answer) and worth retrying later.  The others reproduce on
+ * a retry, so the deterministic text can be stored in place of the rewrite.
+ * That includes "timeout": the same long reply at the same budget runs out of
+ * time again, and each retry would cost the full deadline before speech. */
+export type VoiceSummaryFallbackReason = "no-key" | "truncated" | "incomplete" | "too-short" | "timeout" | "unavailable";
 
 export interface VoiceSummaryResult {
   text: string;
@@ -133,8 +135,8 @@ export const SUMMARY_MIN_RATIO = 0.35;
 export const SUMMARY_RATIO_MIN_CHARS = 400;
 
 /** Whether voiceSummaryFor should store this result as message.voiceText.
- * A transient provider failure is not stored, so the next play can still get
- * the rewrite.  A cut-off rewrite is never returned as text (the full
+ * A transient provider failure (network error, non-200, empty answer) is not
+ * stored, so the next play can still get the rewrite.  A cut-off rewrite is never returned as text (the full
  * deterministic text stands in), and that stand-in is stored, because asking
  * again would only be cut off again and billed again. */
 export function voiceSummaryWorthStoring(result: VoiceSummaryResult): boolean {
@@ -314,7 +316,9 @@ export async function summarizeForVoiceDetailed(
       if (verdict) return verdict;
     }
   } catch {
-    // Graceful fallback to deterministic spoken text
+    // Graceful fallback to deterministic spoken text.  Our own deadline (not
+    // the caller cancelling) is the one failure that will repeat.
+    if (timeoutController.signal.aborted && !effectiveSignal?.aborted) return fallback("timeout");
   } finally {
     clearTimeout(timer);
     if (options.signal) {

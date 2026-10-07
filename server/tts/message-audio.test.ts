@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CLIP_NOT_READY_STATUS,
+  CLIP_WAIT_MS,
   MAX_SPEAKABLE_CHARS,
   MAX_UTTERANCES,
   MAX_UTTERANCES_PROGRESSIVE,
@@ -283,6 +284,12 @@ describe("POST /audio, progressive", () => {
 });
 
 describe("GET /audio/:i", () => {
+  it("answers before the phone's 20-second request timeout and the companion's 30-second deadline", () => {
+    expect(CLIP_WAIT_MS).toBeLessThan(20_000);
+    expect(PROGRESSIVE_RESPONSE_BUDGET_MS).toBeLessThan(30_000);
+  });
+
+
   it("waits for an in-flight clip and serves it", async () => {
     const fixture = setup({ manual: true });
     const first = post(fixture, { voice: "vA" }, { progressive: true });
