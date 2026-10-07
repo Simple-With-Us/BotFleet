@@ -3024,6 +3024,27 @@ describe("harness HTTP API", () => {
         }, { timeout: 5_000 }).toBe(true);
 
         if (reloadInstanceId === "gatedQuota") {
+          // Assistant text precedes the result frame.  Reloading after text alone
+          // can interrupt a still-active turn instead of its deferred terminal
+          // fold, correctly clearing busy before the successor is posted.
+          // Wait for the terminal event, then prove the held health probe still
+          // owns busy before exercising the targeted reload.
+          await expect.poll(() => {
+            const file = join(home, ".botfleet", "events", `${bot.threadId}.ndjson`);
+            if (!existsSync(file)) return false;
+            return readFileSync(file, "utf8").split("\n").some((line) => {
+              if (!line.trim()) return false;
+              try {
+                return JSON.parse(line).type === "turn.completed";
+              } catch {
+                return false; // The asynchronous log writer may be mid-append.
+              }
+            });
+          }, { timeout: 5_000 }).toBe(true);
+          expect((await api("GET", "/api/bots?messages=0")).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          )?.busy).toBe(true);
+
           reload = api("PATCH", `/api/instances/${reloadInstanceId}`, { fullAuto: true });
           await expect.poll(async () => {
             const transcript = await api("GET", `/api/threads/${bot.threadId}/messages?limit=200`);
