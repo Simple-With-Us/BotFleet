@@ -18,7 +18,7 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@10.33.0",
+  "packageManager": "pnpm@10.34.6",
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "lint": "node scripts/check-lint-baseline.mjs",
@@ -98,11 +98,11 @@
     "@openfeature/server-sdk": "^1.23.0",
     "@sentry/node": "^10.73.0",
     "@sentry/react": "^10.73.0",
-    "@trycua/cua-driver": "0.20.0",
+    "@trycua/cua-driver": "0.32.0",
     "clsx": "^2.1.1",
     "clutch": "github:Simple-With-Us/Clutch#7fbd88d89625402a8b47631dd207045482236837",
     "harness": "github:Simple-With-Us/Clutch#93bbbfdb26a84970dc9083a887dad93ca3eee0cf",
-    "lucide-react": "^0.539.0",
+    "lucide-react": "^0.577.0",
     "mermaid": "^12.0.0",
     "posthog-js": "^1.415.6",
     "qrcode.react": "^4.2.0",
@@ -113,32 +113,32 @@
     "shiki": "^4.4.3",
     "tailwind-merge": "^3.3.1",
     "yaml": "^2.9.0",
-    "zod": "4.4.3"
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.0",
-    "@oxlint/plugins": "1.78.0",
+    "@oxlint/plugins": "1.86.0",
     "@tailwindcss/vite": "^4.1.11",
     "@types/node": "^26.2.0",
     "@types/react": "^19.1.9",
     "@types/react-dom": "^19.1.7",
     "@vitejs/plugin-react": "^4.7.0",
     "electron": "^44.0.0",
-    "electron-builder": "26.16.1",
+    "electron-builder": "26.17.0",
     "electron-updater": "^6.8.9",
     "esbuild": "^0.28.2",
     "happy-dom": "^20.14.5",
-    "oxlint": "1.78.0",
+    "oxlint": "1.86.0",
     "tailwindcss": "^4.1.11",
-    "typebox": "1.3.7",
+    "typebox": "1.3.34",
     "typescript": "^5.8.3",
     "vite": "^8.0.0",
     "vitest": "^4.1.11",
-    "wrangler": "4.123.0"
+    "wrangler": "4.147.0"
   },
   "pnpm": {
     "overrides": {
-      "@xmldom/xmldom@0.8.13": "0.8.15",
+      "@xmldom/xmldom@0.8.13": "0.9.12",
       "js-yaml@4.3.1": "5.4.2",
       "lodash-es": "4.18.1",
       "sharp@0.35.2": "0.35.5",

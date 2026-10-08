@@ -89,7 +89,7 @@ jobs:
         run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.outputs.docs_only != 'true'
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: needs.changes.outputs.docs_only != 'true'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: needs.changes.outputs.docs_only != 'true'
@@ -128,7 +128,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
@@ -161,7 +161,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
