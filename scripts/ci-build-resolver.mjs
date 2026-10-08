@@ -682,6 +682,20 @@ export async function listArchiveEntries(archivePath) {
 const MAX_SYMLINK_ENTRIES = 256;
 // PATH_MAX is 1024 on macOS, so a longer target is not a target.
 const SYMLINK_TARGET_MAX_BYTES = 4096;
+/**
+ * The TOTAL wall-clock budget for reading every target, plus a per-read cap
+ * and a concurrency limit.  A per-read timeout alone bounds nothing useful:
+ * 256 links read one after another at 30 seconds each would hold the updater
+ * lock for over two hours.  The real bundle's fourteen reads take about three
+ * seconds in all, even on a heavily loaded Mac.
+ */
+const SYMLINK_READ_BUDGET_MS = 60_000;
+const SYMLINK_READ_TIMEOUT_MS = 30_000;
+const SYMLINK_READ_CONCURRENCY = 8;
+
+function readTargetWithUnzip(archivePath, name, timeoutMs) {
+  return runBoundedText("unzip", ["-p", archivePath, name], { timeoutMs, maxBytes: SYMLINK_TARGET_MAX_BYTES });
+}
 
 /**
  * Read each symlink entry's target from the archive, before anything is
@@ -697,8 +711,18 @@ const SYMLINK_TARGET_MAX_BYTES = 4096;
  * The bytes are decoded as UTF-8.  Decoding never creates or hides a `/`, a
  * `.`, or a NUL, because ASCII bytes always decode as themselves.  So the
  * checks on the decoded string hold for the bytes ditto will write.
+ *
+ * At most `concurrency` reads run at once, and no read is given longer than
+ * what is left of `budgetMs`.  Each read also races one overall deadline, so
+ * even a read that ignored its own timeout cannot stretch the wait.  Running
+ * out of budget refuses the archive outright.  `readTarget` is injectable only
+ * so a test can stand in a read that hangs.
  */
-async function readSymlinkTargets(archivePath, entries) {
+export async function readSymlinkTargets(archivePath, entries, {
+  budgetMs = SYMLINK_READ_BUDGET_MS,
+  concurrency = SYMLINK_READ_CONCURRENCY,
+  readTarget = readTargetWithUnzip,
+} = {}) {
   const links = entries.filter(({ mode }) => String(mode).startsWith("l"));
   if (links.length > MAX_SYMLINK_ENTRIES) {
     throw new ResolutionError(
@@ -706,16 +730,48 @@ async function readSymlinkTargets(archivePath, entries) {
       "unsafe-archive",
     );
   }
-  for (const entry of links) {
-    if (/[[\]*?\\]/.test(entry.name) || entry.name.startsWith("-")) continue;
-    try {
-      entry.target = await runBoundedText("unzip", ["-p", archivePath, entry.name], {
-        timeoutMs: 30_000,
-        maxBytes: SYMLINK_TARGET_MAX_BYTES,
-      });
-    } catch {
-      // Left unread on purpose.  An unread target is a refusal, not a pass.
+  const queue = links.filter(({ name }) => !/[[\]*?\\]/.test(name) && !name.startsWith("-"));
+  const deadline = Date.now() + budgetMs;
+  const EXPIRED = Symbol("expired");
+  let timer;
+  const overall = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(EXPIRED), budgetMs);
+  });
+  let expired = false;
+  const worker = async () => {
+    while (queue.length && !expired) {
+      const entry = queue.shift();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        expired = true;
+        return;
+      }
+      const outcome = await Promise.race([
+        // A failed read is left unread on purpose.  An unread target is a
+        // refusal, not a pass.
+        readTarget(archivePath, entry.name, Math.min(SYMLINK_READ_TIMEOUT_MS, remaining)).then(
+          (target) => ({ target }),
+          () => ({}),
+        ),
+        overall,
+      ]);
+      if (outcome === EXPIRED) {
+        expired = true;
+        return;
+      }
+      if ("target" in outcome) entry.target = outcome.target;
     }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), queue.length) }, worker));
+  } finally {
+    clearTimeout(timer);
+  }
+  if (expired) {
+    throw new ResolutionError(
+      `Reading the hosted artifact's ${links.length} symlink targets took longer than ${budgetMs >= 1000 ? `${Math.round(budgetMs / 1000)}s` : `${budgetMs}ms`}; refusing to extract an archive that cannot be inspected in time`,
+      "unsafe-archive",
+    );
   }
   return entries;
 }

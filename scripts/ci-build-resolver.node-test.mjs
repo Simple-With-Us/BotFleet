@@ -17,6 +17,7 @@ import {
   findCommitArtifact,
   inspectArchive,
   manifestArtifactName,
+  readSymlinkTargets,
   maskedKeyPreview,
   materializeBuild,
   ResolutionError,
@@ -578,6 +579,84 @@ test("duplicates, climbing directories, and special files are refused", () => {
   assertRefused([...base, dirEntry(`${BUNDLE_ROOT}/../../escape/`)], /traverses out of the destination/, "a climbing directory");
   assertRefused([...base, dirEntry("/abs/dir/")], /absolute path/, "an absolute directory");
   assertRefused([...base, { name: `${BUNDLE_ROOT}/Contents/fifo`, mode: "prw-r--r--" }], /FIFO/, "a FIFO entry");
+});
+
+// Reading targets.  A per-read timeout alone let 256 links read one after
+// another hold the updater lock for over two hours, so the reads share one
+// wall-clock budget and run a few at a time.
+
+const manyLinks = (count) => Array.from({ length: count }, (_, index) => linkEntry(`${FW}/L${index}.framework/Versions/Current`, undefined));
+
+/** A stand-in reader that records how many reads are in flight at once. */
+function trackingReader(settle) {
+  const seen = { calls: 0, inFlight: 0, maxInFlight: 0, timeouts: [] };
+  const read = (_archive, name, timeoutMs) => {
+    seen.calls += 1;
+    seen.inFlight += 1;
+    seen.maxInFlight = Math.max(seen.maxInFlight, seen.inFlight);
+    seen.timeouts.push(timeoutMs);
+    return settle(name, timeoutMs).finally(() => {
+      seen.inFlight -= 1;
+    });
+  };
+  return { read, seen };
+}
+
+test("a read that hangs forever still hits the overall budget, and the archive is refused", async () => {
+  // This reader ignores its timeout entirely and never settles.  Only the
+  // shared deadline can end the wait.
+  const { read, seen } = trackingReader(() => new Promise(() => {}));
+  const started = Date.now();
+  await assert.rejects(
+    readSymlinkTargets("unused.zip", manyLinks(256), { budgetMs: 150, readTarget: read }),
+    (error) => {
+      assert.equal(error.cause, "unsafe-archive");
+      assert.match(error.message, /256 symlink targets took longer than 150ms/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 5_000, "the budget, not 256 per-read timeouts, bounds the wait");
+  assert.equal(seen.maxInFlight, 8, "no more than eight reads run at once");
+  assert.equal(seen.calls, 8, "no new read starts once the budget is spent");
+});
+
+test("slow reads that honour their timeouts cannot stretch the budget either", async () => {
+  // This reader behaves like runBoundedText: it gives up when its timeout
+  // passes.  Every timeout it is handed must fit inside what is left of the
+  // budget, so the last read cannot run past the deadline.
+  const { read, seen } = trackingReader((_name, timeoutMs) => new Promise((_resolve, reject) => {
+    setTimeout(() => reject(new Error("killed at its timeout")), timeoutMs);
+  }));
+  const started = Date.now();
+  await assert.rejects(
+    readSymlinkTargets("unused.zip", manyLinks(256), { budgetMs: 200, readTarget: read }),
+    (error) => error.cause === "unsafe-archive" && /took longer than 200ms/.test(error.message),
+  );
+  assert.ok(Date.now() - started < 5_000);
+  assert.ok(seen.maxInFlight <= 8);
+  assert.ok(seen.timeouts.every((ms) => ms > 0 && ms <= 200), `every read fits inside the budget: ${seen.timeouts}`);
+});
+
+test("link targets are read in parallel, and a pattern-shaped name is never handed to unzip", async () => {
+  const { read, seen } = trackingReader(async (name) => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return `target-of-${name.split("/").at(-3)}`;
+  });
+  const entries = [...manyLinks(20), linkEntry(`${FW}/W[1].framework/Versions/Current`, undefined), fileEntry(`${FW}/plain`)];
+  await readSymlinkTargets("unused.zip", entries, { readTarget: read });
+  assert.equal(seen.calls, 20, "the wildcard-named link is not read, and plain files never are");
+  assert.equal(seen.maxInFlight, 8);
+  assert.equal(entries[0].target, "target-of-L0.framework");
+  assert.equal(entries[19].target, "target-of-L19.framework");
+  assert.equal(entries[20].target, undefined, "an unread link stays unread, which the checker refuses");
+
+  // Over the cap, nothing is read at all.
+  const capped = trackingReader(async () => "A");
+  await assert.rejects(
+    readSymlinkTargets("unused.zip", manyLinks(257), { readTarget: capped.read }),
+    (error) => error.cause === "unsafe-archive" && /257 symlink entries, more than the 256/.test(error.message),
+  );
+  assert.equal(capped.seen.calls, 0);
 });
 
 const posixOnly = process.platform === "win32" ? "symlinks need privileges on Windows" : false;
