@@ -376,7 +376,7 @@ import {
   spokenReply,
   resolveVoiceSummaryMode,
 } from "../shared/voice-summary.ts";
-import { summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
+import { deterministicSpokenText, summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
 import { MessageAudio } from "./tts/message-audio.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { fitListToBudget, serializedPreview } from "./serialized-preview.ts";
@@ -9819,8 +9819,11 @@ function voiceSummaryFor(
   if (!job) {
     job = (async () => {
       const row = store.messagesFor(threadId).find((candidate) => candidate.id === messageId);
-      // A written-mode script (voiceTextKind "written") is the reply as
-      // written, not a summary, so it is never handed back as one.
+      // A distilled script stored before or after karaoke (no voiceTextKind,
+      // or "summary") is reused as it is: no second paid rewrite, and its
+      // clips stay valid.  A written-mode script (voiceTextKind "written",
+      // the "off" mode, or any reply played while #952 made that the
+      // default) is the reply as written, so it is distilled now.
       if (row?.voiceText && row.voiceTextKind !== "written") return row.voiceText;
       try {
         const scrubbedInput = redactSecretsInText(text);
@@ -9841,9 +9844,11 @@ function voiceSummaryFor(
             audioByVoice: undefined,
           });
         }
-        return safeSummary || spokenReply(text);
+        return safeSummary || deterministicSpokenText(spokenReply(text));
       } catch {
-        return spokenReply(text);
+        // The deterministic script, as the summarizer's own fallback is, so
+        // the karaoke highlight still gets its spans.
+        return deterministicSpokenText(spokenReply(text));
       }
     })();
     voiceSummaryJobs.set(key, job);

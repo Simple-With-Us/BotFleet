@@ -1,5 +1,8 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { utterancesWithSpans } from "../../shared/speech-spans.ts";
+import { sanitizeForTTS } from "./minimax.ts";
 import {
+  deterministicSpokenText,
   summarizeForVoice,
   summarizeForVoiceDetailed,
   summaryLooksTruncated,
@@ -195,9 +198,14 @@ describe("summarizeForVoice", () => {
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT use em-dashes");
   });
 
-  it("sanitizes em-dashes, en-dashes, and floating hyphens on short replies", async () => {
-    const res = await summarizeForVoice("Quick check—looks good - done... ready");
-    expect(res).toBe("Quick check, looks good, done. ready");
+  it("keeps a short reply's deterministic script, and MiniMax still gets the acoustic pass", async () => {
+    // The short-reply text is the span-aligned written script, so karaoke
+    // gets its spans; synthesize() applies sanitizeForTTS per utterance.
+    const raw = "Quick check—looks good - done... ready";
+    const res = await summarizeForVoice(raw);
+    expect(res).toBe(deterministicSpokenText(raw));
+    expect(res).toBe(utterancesWithSpans(raw).map((u) => u.text).join(" "));
+    expect(sanitizeForTTS(res)).toBe("Quick check, looks good, done. ready");
   });
 
   it("sanitizes em-dashes and ellipses returned by model", async () => {

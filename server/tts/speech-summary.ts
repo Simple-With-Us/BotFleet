@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { utterancesWithSpans } from "../../shared/speech-spans.ts";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
 import { sanitizeForTTS } from "./minimax.ts";
 import { speakable } from "./speech-text.ts";
@@ -83,6 +84,20 @@ INPUT: "Here are your options for the flight: * Flight AA2314 -> Departs at 3:15
 OUTPUT: "Here are your options for the flight. <#0.3#> First, American Airlines flight twenty-three fourteen departs at three fifteen p m, costing two hundred and fifty dollars, which is the fastest option. <#0.3#> Next, Delta flight nine eighty-two departs at six p m, costing three hundred and ten dollars. You can check the details at jet blue dot com slash status."
 </example_transformation>
 </system_prompt>`;
+
+/**
+ * The deterministic spoken text for `text`: speakable()'s rules, split into
+ * utterances and joined with single spaces.  This is exactly the written-mode
+ * script (shared/speech-spans.ts utterancesWithSpans), so when the distiller
+ * is skipped (a short plain reply) or falls back (no key, timeout, a cut-off
+ * or far-too-short rewrite), server/tts/message-audio.ts can recognize the
+ * text it stored and hand clients the source spans that guide the karaoke
+ * highlight.  MiniMax still gets its acoustic pass: synthesize() runs
+ * sanitizeForTTS on every utterance.
+ */
+export function deterministicSpokenText(text: string): string {
+  return utterancesWithSpans(text).map((u) => u.text).join(" ");
+}
 
 export interface SummarizeVoiceOptions {
   key?: string;
@@ -212,11 +227,10 @@ export async function summarizeForVoiceDetailed(
     /[*#_\[\]]/.test(cleanInput);
 
   if (cleanInput.length <= 120 && !hasTechnicalContent) {
-    // Normalize the markdown and paragraph structure *before* the acoustic
-    // pass: sanitizeForTTS collapses newlines, and the line anchors that
-    // strip list markers and add audible paragraph pauses only match on the
-    // original text.
-    return { text: sanitizeForTTS(speakable(cleanInput)), source: "short" };
+    // The deterministic script, span-aligned to the reply (see
+    // deterministicSpokenText); its markdown and paragraph rules run on the
+    // original text, before synthesize()'s acoustic pass collapses newlines.
+    return { text: deterministicSpokenText(cleanInput), source: "short" };
   }
 
   const options: SummarizeVoiceOptions =
@@ -224,7 +238,7 @@ export async function summarizeForVoiceDetailed(
       ? { key: optionsOrKey, signal: legacySignal }
       : (optionsOrKey ?? {});
 
-  const deterministic = () => sanitizeForTTS(speakable(spokenReply(rawText)));
+  const deterministic = () => deterministicSpokenText(spokenReply(rawText));
   const fallback = (reason: VoiceSummaryFallbackReason): VoiceSummaryResult => ({ text: deterministic(), source: "fallback", reason });
 
   const key = resolveDeepSeekKey(options.key);

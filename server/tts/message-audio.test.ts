@@ -25,6 +25,7 @@ import {
   type AudioRequestBody,
   type AudioRouteResult,
 } from "./message-audio.ts";
+import { deterministicSpokenText } from "./speech-summary.ts";
 import { toUtterances } from "./speech-text.ts";
 import { karaokeScriptFromWire } from "../../shared/spoken-script.ts";
 import { writtenReply } from "../../shared/voice-summary.ts";
@@ -247,11 +248,12 @@ describe("POST /audio, legacy request (no device, not progressive)", () => {
     expect(fixture.speakCalls).toHaveLength(3);
   });
 
-  it("reads an unset-mode bot's reply as written, under the historical 64-clip cap", async () => {
-    // A shipped build used to get a model summary for any long reply; the
-    // default is now the reply as written (board 8cc3c806: no summarizing).
+  it("reads an off-mode bot's reply as written, under the historical 64-clip cap", async () => {
+    // A written reply can be much longer than a distilled one, so a shipped
+    // build's cap is the limit that bites.
+    const off: AudioOwner = { voice: "vA", voiceSummaryMode: "off" };
     const fixture = setup({ text: sentences(MAX_UTTERANCES) });
-    const fits = await post(fixture, { voice: "vA" });
+    const fits = await post(fixture, off);
     expect(fits.status).toBe(200);
     expect(fits.body.total).toBe(MAX_UTTERANCES);
     expect(fits.body.complete).toBe(true);
@@ -259,19 +261,19 @@ describe("POST /audio, legacy request (no device, not progressive)", () => {
     expect(fixture.row.voiceTextKind).toBe("written");
 
     const long = setup({ text: sentences(MAX_UTTERANCES + 1) });
-    const refused = await post(long, { voice: "vA" });
+    const refused = await post(long, off);
     expect(refused.status).toBe(413);
     // The shipped app shows the error text: tell the owner what fixes it.
     expect(refused.body).toMatchObject({ error: LEGACY_REPLY_TOO_LONG, total: MAX_UTTERANCES + 1, maxUtterances: MAX_UTTERANCES });
     expect(long.summarized).toEqual([]);
     expect(long.speakCalls).toHaveLength(0);
     // A current build plays the same reply.
-    const progressive = await post(long, { voice: "vA" }, { progressive: true, device: "iphone" });
+    const progressive = await post(long, off, { progressive: true, device: "iphone" });
     expect(progressive.status).toBe(200);
     expect(progressive.body.total).toBe(MAX_UTTERANCES + 1);
 
     // A reply with nothing to say is not something an update fixes.
-    const silent = await post(setup({ text: "---" }), { voice: "vA" });
+    const silent = await post(setup({ text: "---" }), off);
     expect(silent.status).toBe(413);
     expect(silent.body.error).toBe("reply exceeds voice clip limit");
   });
@@ -663,7 +665,129 @@ describe("speech text", () => {
   });
 });
 
-describe("the spoken script: as written by default, span-aligned for karaoke", () => {
+describe("the spoken script: distilled by default (owner correction, 2026-10-08)", () => {
+  const REPLY = [
+    "The deploy finished.  Here is what changed:",
+    "",
+    "- Bumped the API timeout to 3.5 seconds",
+    "- Fixed issue #749 in the webhook retry loop",
+    "",
+    "```sh",
+    "pnpm test --filter server",
+    "```",
+    "",
+    "Details are in [the rollout doc](https://example.com/docs/rollout.md).",
+  ].join("\n");
+  const DISTILLED =
+    "The deploy finished. Here is what changed. <#0.3#> First, the A P I timeout was bumped to three point five seconds. " +
+    "<#0.3#> Next, issue seven four nine in the webhook retry loop was fixed. The details are in the rollout doc.";
+
+  it("distills an unset-mode reply for a voice bot and a text-only bot, and speaks the distilled text", async () => {
+    for (const owner of [{ voice: "vA", speakReplies: true }, { voice: "vA", speechDevices: ["iphone"] }, { voice: "vA" }]) {
+      const fixture = setup({ text: REPLY, summary: () => DISTILLED });
+      const result = await post(fixture, owner, { device: "mac", progressive: true, spans: true });
+      expect(result.status).toBe(200);
+      expect(fixture.summarized).toEqual([REPLY]);
+      const expected = toUtterances(DISTILLED);
+      expect(result.body.utterances).toEqual(expected);
+      expect(result.body.voiceText).toBe(DISTILLED);
+      await fixture.settle();
+      // MiniMax gets the distilled words, pause tags and all.
+      expect(fixture.speakCalls.map((call) => call.text)).toEqual(expected);
+      expect(fixture.speakCalls.some((call) => call.text.includes("<#0.3#>"))).toBe(true);
+      expect(fixture.speakCalls.some((call) => call.text.includes("seven four nine"))).toBe(true);
+      expect(result.body.script).toBe("summary");
+      expect(result.body).not.toHaveProperty("spans");
+      expect(fixture.row.voiceTextKind).toBe("summary");
+      expect(fixture.row.voiceText).toBe(DISTILLED);
+    }
+  });
+
+  it("gives Personal Voice the distilled utterances, without the MiniMax pause tags", async () => {
+    for (const device of ["mac", "iphone"] as const) {
+      const fixture = setup({ text: REPLY, summary: () => DISTILLED });
+      const result = await post(fixture, { voice: "personal:x" }, { device, progressive: true, spans: true });
+      expect(result.status).toBe(200);
+      expect(result.body.onDevice).toBe(true);
+      expect(fixture.summarized).toHaveLength(1);
+      expect(fixture.speakCalls).toHaveLength(0);
+      const utterances = result.body.utterances ?? [];
+      expect(utterances.join(" ")).not.toContain("<#");
+      expect(utterances.join(" ")).toContain("three point five seconds");
+      expect(result.body.voiceText).toBe(utterances.join(" "));
+      expect(result.body.total).toBe(utterances.length);
+      expect(result.body.script).toBe("summary");
+    }
+  });
+
+  it("labels the distiller's deterministic fallback as written, with spans for karaoke", async () => {
+    // No key, a timeout, or a cut-off rewrite: the stand-in is the
+    // span-aligned deterministic script (speech-summary.ts).
+    const fixture = setup({ text: REPLY, summary: (text) => deterministicSpokenText(text) });
+    const result = await post(fixture, { voice: "vA", speakReplies: true }, { device: "mac", progressive: true, spans: true });
+    expect(fixture.summarized).toHaveLength(1);
+    expect(result.body.script).toBe("written");
+    expect(result.body.spans).toMatchObject({ format: 1, source: "written", sourceLength: writtenReply(REPLY).length });
+    expect(result.body.utterances).toEqual(toUtterances(writtenReply(REPLY)));
+    // The clips stay stamped as the distiller path's, so the mode is unchanged.
+    expect(fixture.row.voiceTextKind).toBe("summary");
+    const script = karaokeScriptFromWire(result.body.utterances ?? [], result.body.spans);
+    expect(script.segments.length).toBeGreaterThan(0);
+  });
+
+  it("reuses distilled text stored before karaoke, with its clips, without asking again or billing", async () => {
+    // A row from before #952: voiceText is the distilled rewrite and there
+    // is no voiceTextKind.
+    const fixture = setup({ text: REPLY, voiceText: DISTILLED, summary: () => "Should not be asked." });
+    const stored = toUtterances(DISTILLED);
+    fixture.row.audio = stored.map((_, i) => {
+      fixture.files.set(`old-${i}.mp3`, { bytes: new Uint8Array([i]), mime: "audio/mpeg" });
+      return { path: `/api/attachments/old-${i}.mp3`, mime: "audio/mpeg" };
+    });
+    const clips = [...fixture.row.audio];
+    for (const body of [{}, { device: "mac" as const, progressive: true, spans: true }]) {
+      const result = await post(fixture, { voice: "vA", speakReplies: true }, body);
+      expect(result.status).toBe(200);
+      expect(result.body.utterances).toEqual(stored);
+      expect(result.body.audio).toEqual(clips);
+    }
+    expect(fixture.summarized).toEqual([]);
+    expect(fixture.speakCalls).toEqual([]);
+    expect(fixture.row.audio).toEqual(clips);
+
+    // Personal Voice reads the same stored text, minus the pause tags.
+    const phone = await post(fixture, { voice: "personal:x" }, { device: "iphone", progressive: true, spans: true });
+    expect(fixture.summarized).toEqual([]);
+    expect(phone.body.utterances?.join(" ")).toBe(stored.join(" ").replace(/ ?<#0\.3#> ?/g, " ").replace(/ {2,}/g, " "));
+    expect(phone.body.script).toBe("summary");
+  });
+
+  it("distills a reply #952 read as written, replacing its word-for-word clips", async () => {
+    // Played while #952 made the written script the default: stamped
+    // "written".  The owner wants the distilled reading, so it is made once.
+    const written = toUtterances(writtenReply(REPLY));
+    const fixture = setup({ text: REPLY, summary: () => DISTILLED });
+    fixture.row.voiceText = written.join(" ");
+    fixture.row.voiceTextKind = "written";
+    fixture.row.audio = written.map((_, i) => {
+      fixture.files.set(`w-${i}.mp3`, { bytes: new Uint8Array([i]), mime: "audio/mpeg" });
+      return { path: `/api/attachments/w-${i}.mp3`, mime: "audio/mpeg" };
+    });
+    const result = await post(fixture, { voice: "vA", speakReplies: true });
+    expect(fixture.summarized).toHaveLength(1);
+    expect(result.body.utterances).toEqual(toUtterances(DISTILLED));
+    expect(fixture.speakCalls.map((call) => call.text)).toEqual(toUtterances(DISTILLED));
+    expect(result.body.audio?.some((clip) => clip.path.startsWith("/api/attachments/w-"))).toBe(false);
+    expect(fixture.row.voiceTextKind).toBe("summary");
+    // And the next play is served from the distilled clips.
+    const calls = fixture.speakCalls.length;
+    await post(fixture, { voice: "vA", speakReplies: true });
+    expect(fixture.speakCalls).toHaveLength(calls);
+  });
+});
+
+describe("the spoken script: as written in off mode, span-aligned for karaoke", () => {
+  const OFF: AudioOwner = { voice: "vA", voiceSummaryMode: "off" };
   const MARKDOWN = [
     "The build number is **749** and the tests pass.",
     "",
@@ -674,9 +798,9 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
     "See [the guide](https://example.com/guide) for more.",
   ].join("\n");
 
-  it("reads the reply as written and never asks for a summary", async () => {
+  it("reads the reply as written and never asks the distiller", async () => {
     const fixture = setup({ text: MARKDOWN, summary: () => "Seven four nine.  A paraphrase." });
-    const result = await post(fixture, { voice: "vA" });
+    const result = await post(fixture, OFF);
     expect(result.status).toBe(200);
     expect(fixture.summarized).toHaveLength(0);
     const expected = toUtterances(writtenReply(MARKDOWN));
@@ -698,7 +822,7 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
 
   it("carries per-utterance spans into the written reply, for hosted and on-device voices", async () => {
     const source = writtenReply(MARKDOWN);
-    for (const owner of [{ voice: "vA" }, { voice: "personal:x" }]) {
+    for (const owner of [OFF, { voice: "personal:x", voiceSummaryMode: "off" as const }]) {
       const fixture = setup({ text: MARKDOWN });
       const result = await post(fixture, owner, { device: "mac", progressive: true, spans: true });
       expect(result.status).toBe(200);
@@ -720,7 +844,7 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
     }
   });
 
-  it("speaks a summary only for an explicit summary mode, and carries no spans for it", async () => {
+  it("speaks the distilled script for a summary mode, and carries no spans for it", async () => {
     const fixture = setup({ text: MARKDOWN, summary: () => "A short spoken version." });
     const result = await post(fixture, { voice: "vA", voiceSummaryMode: "on_demand" }, { device: "mac", progressive: true, spans: true });
     expect(fixture.summarized).toHaveLength(1);
@@ -732,7 +856,7 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
 
   it("does not take a written script for a summary", async () => {
     const fixture = setup({ text: MARKDOWN, summary: () => "A short spoken version." });
-    await post(fixture, { voice: "vA" });
+    await post(fixture, OFF);
     expect(fixture.row.voiceTextKind).toBe("written");
     const summary = await post(fixture, { voice: "vA", voiceSummaryMode: "always" });
     expect(fixture.summarized).toHaveLength(1);
@@ -746,12 +870,12 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
     const fixture = setup({ summary: () => "A short spoken version." });
     await post(fixture, { voice: "vA", voiceSummaryMode: "always" });
     expect(fixture.speakCalls).toHaveLength(1);
-    const written = await post(fixture, { voice: "vA" }, { spans: true });
+    const written = await post(fixture, OFF, { spans: true });
     expect(written.body.script).toBe("written");
     expect(written.body.utterances).toEqual(["First sentence here.", "Second sentence here.", "Third sentence here."]);
     expect(fixture.speakCalls).toHaveLength(4);
     // Played again: served from the stored written clips, nothing billed.
-    await post(fixture, { voice: "vA" });
+    await post(fixture, OFF);
     expect(fixture.speakCalls).toHaveLength(4);
   });
 
@@ -762,7 +886,7 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
       fixture.files.set(`old-${i}.mp3`, { bytes: new Uint8Array([i]), mime: "audio/mpeg" });
       return { path: `/api/attachments/old-${i}.mp3`, mime: "audio/mpeg" };
     });
-    const result = await post(fixture, { voice: "vA" }, { device: "mac", progressive: true, spans: true });
+    const result = await post(fixture, OFF, { device: "mac", progressive: true, spans: true });
     expect(result.status).toBe(200);
     expect(result.body.utterances).toEqual(legacy);
     expect(result.body.audio).toEqual(fixture.row.audio);
@@ -777,7 +901,7 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
       fixture.files.set(`old-${i}.mp3`, { bytes: new Uint8Array([i]), mime: "audio/mpeg" });
       return { path: `/api/attachments/old-${i}.mp3`, mime: "audio/mpeg" };
     });
-    const result = await post(fixture, { voice: "vA" }, { spans: true });
+    const result = await post(fixture, OFF, { spans: true });
     expect(result.body.script).toBe("written");
     expect(result.body.spans?.utterances).toHaveLength(3);
     expect(fixture.speakCalls).toHaveLength(0);
@@ -790,7 +914,7 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
     fixture.files.set("side-0.mp3", { bytes: new Uint8Array([1]), mime: "audio/mpeg" });
     fixture.row.audio = [{ path: "/api/attachments/old-0.mp3", mime: "audio/mpeg" }];
     fixture.row.audioByVoice = { vB: [{ path: "/api/attachments/side-0.mp3", mime: "audio/mpeg" }] };
-    const result = await post(fixture, { voice: "vA" }, { spans: true });
+    const result = await post(fixture, OFF, { spans: true });
     expect(result.body.script).toBe("written");
     expect(fixture.speakCalls.map((call) => call.text)).toEqual(["First sentence here.", "Second sentence here.", "Third sentence here."]);
     expect(result.body.audio?.map((clip) => clip.path)).not.toContain("/api/attachments/old-0.mp3");
@@ -801,7 +925,7 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
     const fixture = setup({ manual: true, summary: () => "A short spoken version that is long enough." });
     const summary = post(fixture, { voice: "vA", voiceSummaryMode: "always" });
     await fixture.settle();
-    const written = post(fixture, { voice: "vA" });
+    const written = post(fixture, OFF);
     await fixture.settle();
     await fixture.release(1);
     const failed = await summary;
@@ -818,7 +942,7 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
   it("stops another voice's job once the reply's script changed, so it cannot stamp the old script back", async () => {
     const fixture = setup({ manual: true, summary: () => "A short spoken version of the reply." });
     // The Mac speaks the bot's own voice (the main list); the iPhone has its own.
-    const owner: AudioOwner = { voice: "vA", voices: { iphone: "vB" } };
+    const owner: AudioOwner = { voice: "vA", voices: { iphone: "vB" }, voiceSummaryMode: "off" };
     const resolveFor = async (voice: string, text?: string) => {
       await fixture.settle();
       const at = fixture.pending.findIndex((call) => call.voice === voice && (text === undefined || call.text === text));
@@ -834,7 +958,7 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
     await Promise.all([mac, phone]);
     expect(fixture.row.voiceTextKind).toBe("written");
 
-    // The owner picks Summary Every Reply, and the iPhone plays the reply.
+    // The owner picks All Messages, and the iPhone plays the reply.
     const summaryOwner: AudioOwner = { ...owner, voiceSummaryMode: "always" };
     const phoneAgain = post(fixture, summaryOwner, { progressive: true, device: "iphone" });
     await fixture.settle();
