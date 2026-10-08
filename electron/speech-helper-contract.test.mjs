@@ -112,7 +112,8 @@ describe("Personal Voice helper contract", () => {
       speechSource.indexOf("export function listPersonalVoicesResult("),
       speechSource.indexOf("export async function listPersonalVoices("),
     );
-    expect(list).toContain('"--list-personal-voices",\n          "--stop-file",');
+    // \s+, not a literal newline and indent: a Windows checkout has CRLF here.
+    expect(list).toMatch(/"--list-personal-voices",\s+"--stop-file",/);
     expect(list).toContain('settle({ voices: [], status: "timeout", timedOut: true });');
     // The helper's stop timer is installed before the list branch runs.
     expect(helperSource.indexOf("if let stopFile {")).toBeLessThan(helperSource.indexOf('contains("--list-personal-voices")'));
