@@ -69,6 +69,8 @@ const SPEECH_SPAN_CORPUS: Array<{ name: string; input: string }> = [
   { name: "voice summary tags", input: "[voice_summary]\nIt is done.\n[/voice_summary]\n[written_answer]\nThe PR is open.\n[/written_answer]" },
   { name: "attachment marker", input: 'Look at this\n\n<attached-image path="/a/b/one.png" />\n\nThoughts?' },
   { name: "html entity text", input: "Tom &amp; Jerry use a &lt;div&gt; here." },
+  { name: "sentence gap entities", input: "The build passed.&nbsp; I pushed the fix to **main**.&nbsp; Want me to open the PR?" },
+  { name: "entity forms", input: "One.&#160; Two.&#xA0; Three &NBSP; four &amp;nbsp; five &quot;six&quot; it&#39;s &apos;seven&apos;." },
   { name: "quotes", input: "He said “hello” and ‘bye’; it's fine." },
   { name: "punctuation pileup", input: "Done.\n\n\n- one\n\n- two" },
   { name: "comma period", input: "First, , then.\n\nSecond ,." },
@@ -134,6 +136,7 @@ const FRAGMENTS = [
   "Dr.", "...", "…", "—", "–", " - ", ",", ".", "!", "?", ";", ":", "\n", "\n\n", "\r\n", "\t", "  ", " ", "﻿",
   "749", "twenty-three", "it's", "don’t", "“quoted”", "naïve", "日本", "word", "another word", "(paren)",
   "[voice_summary]", "[/written_answer]", "&amp;", "<attached-file path=\"/a/b.txt\" />", "***", "---", "___",
+  "&nbsp; ", ".&nbsp; ", "&#160;", "&#xA0;", "&lt;", "&GT;", "&amp;nbsp;",
 ];
 
 function fuzzCase(seed: number): string {

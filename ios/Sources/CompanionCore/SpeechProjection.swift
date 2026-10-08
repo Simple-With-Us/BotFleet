@@ -212,6 +212,12 @@ public enum SpeechProjection {
             in: text, template: ""
         )
 
+        // HTML entities read as the character the bubble shows; the
+        // sentence gap `.&nbsp; ` is a pause, not the word "nbsp"
+        text = replace(#"(?i)&(nbsp|#160|#xa0|amp|lt|gt|quot|apos|#39);"#, in: text) { groups in
+            SpeechSpans.spokenEntity(groups[1] ?? "")
+        }
+
         // line breaks become audible pauses
         text = replace(#"\n{2,}"#, in: text, template: ". ")
         text = replace(#"\n"#, in: text, template: ". ")

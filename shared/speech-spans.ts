@@ -280,6 +280,25 @@ function describeCodeBlock(fence: string): string {
 
 const ENDS_SENTENCE = /[.!?:;]\s*$/;
 
+/** The HTML entities a model actually writes, which the chat renders as the
+ * character (ChatMarkdown, notify.summarize).  Every no-break-space form
+ * becomes a plain space, so the fleet's sentence gap (`.&nbsp; `) is a
+ * pause and a sentence boundary instead of the word "nbsp".  One pass, so
+ * `&amp;nbsp;` decodes once, to the text `&nbsp;`, as a browser shows it.
+ * speakable() (server/tts/speech-text.ts) imports this table; the Swift
+ * mirrors (SpeechSpans.swift, SpeechProjection.swift) copy it. */
+export const SPOKEN_ENTITY = /&(nbsp|#160|#xa0|amp|lt|gt|quot|apos|#39);/gi;
+export function spokenEntity(name: string): string {
+  const key = name.toLowerCase();
+  if (key === "nbsp" || key === "#160" || key === "#xa0") return " ";
+  if (key === "amp") return "&";
+  if (key === "lt") return "<";
+  if (key === "gt") return ">";
+  if (key === "quot") return '"';
+  return "'";
+}
+const SPOKEN_ENTITY_TRACKED = new RegExp(SPOKEN_ENTITY.source, "dgi");
+
 /** speakable()'s emoji and pictograph ranges, including the variation
  * selectors U+FE00-U+FE0F.  Assembled from code points so the class is read
  * as ranges, not as a combining sequence. */
@@ -357,6 +376,8 @@ function speakableTracked(input: string): Tracked {
   t = replaceTracked(t, /(?:[\w.@-]+\/){1,}([\w.-]+\.\w{1,6})\b/dg, (m) => group(m, 1));
 
   t = replaceTracked(t, EMOJI, () => []);
+
+  t = replaceTracked(t, SPOKEN_ENTITY_TRACKED, (m) => [spokenEntity(m[1] ?? "")]);
 
   t = replaceTracked(t, /\n{2,}/dg, () => [". "]);
   t = replaceTracked(t, /\n/dg, () => [". "]);

@@ -63,6 +63,20 @@ public struct SpokenUtterance: Equatable, Sendable {
 }
 
 public enum SpeechSpans {
+    /// speech-spans.ts spokenEntity: what an HTML entity's name (`nbsp`,
+    /// `#39`, any case) reads as.  Every no-break-space form is a plain
+    /// space, so the fleet's sentence gap is a pause, not the word "nbsp".
+    public static func spokenEntity(_ name: String) -> String {
+        switch name.lowercased() {
+        case "nbsp", "#160", "#xa0": return " "
+        case "amp": return "&"
+        case "lt": return "<"
+        case "gt": return ">"
+        case "quot": return "\""
+        default: return "'"
+        }
+    }
+
     /// speakable(displayText) plus the source span behind every spoken unit.
     public static func speakableWithSpans(_ displayText: String) -> SpokenScript {
         let tracked = speakableTracked(displayText)
@@ -425,6 +439,8 @@ private enum Rules {
     static let checkbox = re("\\[[ xX]\\]\(JS.s)*")
     static let path = re("(?:[A-Za-z0-9_.@\\-]+/){1,}([A-Za-z0-9_.\\-]+\\.\(JS.w){1,6})\(JS.b)")
     static let emoji = re(#"[\x{1F000}-\x{1FAFF}\x{2600}-\x{27BF}\x{FE00}-\x{FE0F}\x{2190}-\x{21FF}\x{2B00}-\x{2BFF}]"#)
+    /// speech-spans.ts SPOKEN_ENTITY, case-insensitive like its `i` flag.
+    static let entity = re(#"(?i)&(nbsp|#160|#xa0|amp|lt|gt|quot|apos|#39);"#)
     static let paragraph = re(#"\n{2,}"#)
     static let newline = re(#"\n"#)
     static let spaces = re("\(JS.s)+")
@@ -533,6 +549,10 @@ func speakableTracked(_ input: String) -> Tracked {
     t = replace(t, Rules.path) { m, _ in group(m, 1) }
 
     t = replace(t, Rules.emoji) { _, _ in [] }
+
+    t = replace(t, Rules.entity) { m, t in
+        [.literal(SpeechSpans.spokenEntity(String(decoding: groupText(m, 1, t) ?? [], as: UTF16.self)))]
+    }
 
     t = replace(t, Rules.paragraph) { _, _ in [.literal(". ")] }
     t = replace(t, Rules.newline) { _, _ in [.literal(". ")] }

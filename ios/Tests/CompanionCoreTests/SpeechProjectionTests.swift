@@ -19,6 +19,18 @@ final class SpeechProjectionTests: XCTestCase {
         XCTAssertEqual(SpeechProjection.speakable("Shipped 🚀"), "Shipped")
     }
 
+    func testHTMLEntitiesReadAsTheCharacterTheBubbleShows() {
+        // The fleet sentence gap is `.&nbsp; `; read verbatim it was the
+        // word "nbsp" after every sentence.
+        XCTAssertEqual(
+            SpeechProjection.speakable("The build passed.&nbsp; I pushed the fix to **main**.&nbsp; Want me to open the PR?"),
+            "The build passed. I pushed the fix to main. Want me to open the PR?"
+        )
+        XCTAssertEqual(SpeechProjection.speakable("One.&#160; Two.&#xA0; Three &NBSP; four"), "One. Two. Three four")
+        XCTAssertEqual(SpeechProjection.speakable("Tom &amp; Jerry use a &lt;div&gt; and &quot;it&#39;s&quot;"), "Tom & Jerry use a <div> and \"it's\"")
+        XCTAssertEqual(SpeechProjection.speakable("Write &amp;nbsp; for the gap"), "Write &nbsp; for the gap")
+    }
+
     func testNothingSpeakableIsEmpty() {
         XCTAssertEqual(SpeechProjection.speakable("   \n\n  "), "")
         XCTAssertEqual(SpeechProjection.speakable("---"), "")
