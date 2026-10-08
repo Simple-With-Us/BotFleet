@@ -5,8 +5,11 @@
 //
 // - Display words are the rendered text, read from the DOM, not the markdown.
 // - The script's spans guide the alignment when they index this message's
-//   written text (same length as writtenReply(message.text)); otherwise the
-//   aligner anchors on words that occur once on each side.
+//   written text (same length as writtenReply(message.text)); otherwise (a
+//   distilled script, the default) the aligner anchors on words that occur
+//   once on each side and tolerates skipped, added and spelled-out words.
+// - A script that does not line up with the message (a brief summary) gets
+//   no highlight at all (alignment.followable, shared/karaoke-align.ts).
 // - Hosted voice: display-word times come from clip windows, proportional to
 //   character offsets within each clip, and the highlighter reads the audio
 //   clock every animation frame.  New clip durations re-time the rest.
@@ -86,6 +89,8 @@ export function attachKaraoke(
     sourceText: guided ? sourceText : null,
     displayWords: [...highlighter.words],
   });
+  // Lighting scattered words would be worse than lighting none.
+  if (!alignment.followable) return { highlighter, alignment, dispose };
   const { spokenWords, mapping } = alignment;
 
   const end = (reason: "finished" | "stopped"): void => {

@@ -143,8 +143,11 @@ describe("karaoke feed for a hosted voice", () => {
     expect(speaker.karaoke).toBeNull();
   });
 
-  it("publishes nothing for a summary or for a harness that does not say", async () => {
-    for (const body of [written({ script: "summary", spans: undefined }), written({ script: undefined, spans: undefined })]) {
+  it("publishes an unguided feed for a distilled script and for a harness that does not say", async () => {
+    // Spans that came with a distilled script would index the wrong text, so
+    // they are ignored unless the script is the written one.
+    const distilled = written({ script: "summary" });
+    for (const body of [distilled, written({ script: undefined, spans: undefined })]) {
       FakeAudio.instances = [];
       stubFetch((url) => (url === endpoint ? jsonResponse(body) : mp3()));
       const speaker = new Speaker();
@@ -152,11 +155,16 @@ describe("karaoke feed for a hosted voice", () => {
       speaker.subscribeKaraoke((feed) => seen.push(feed));
       const speaking = speaker.speak("raw text", { ...messageOpts, voiceId: "minimax-warm" });
       await vi.waitFor(() => expect(FakeAudio.instances.length).toBe(1));
+      const feed = speaker.karaoke;
+      expect(feed?.mode).toBe("clips");
+      expect(feed?.script.spokenText).toBe(body.utterances?.join(" "));
+      expect(feed?.script.segments).toEqual([]);
       FakeAudio.instances[0].onended?.();
       await vi.waitFor(() => expect(FakeAudio.instances.length).toBe(2));
       FakeAudio.instances[1].onended?.();
       await speaking;
-      expect(seen).toEqual([null]);
+      expect(seen.at(-1)).toBeNull();
+      expect(seen.filter((f) => f !== null)).toHaveLength(1);
     }
   });
 
