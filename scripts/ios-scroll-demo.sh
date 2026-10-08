@@ -25,7 +25,7 @@ out=""
 build=1
 wait_for_scroll=0
 derived="${DERIVED_DATA:-$HOME/Library/Developer/Xcode/DerivedData/bf-scroll-demo}"
-bundle_id="app.botfleet"
+bundle_id="app.botfleet.ios"
 
 while [ $# -gt 0 ]; do
   case "$1" in

@@ -2,7 +2,7 @@
 // A scripted busy thread for checking transcript scrolling in the simulator
 // without a harness.  DEBUG builds only.
 //
-//   xcrun simctl launch booted app.botfleet \
+//   xcrun simctl launch booted app.botfleet.ios \
 //     -store-preview -open-first -scroll-demo [-scroll-demo-delay 20] [-scroll-demo-cycles 3]
 //
 // `-scroll-demo` seeds every preview bot with a long thread, waits
