@@ -12,6 +12,11 @@
 // `&theme=dark` renders the Midnight skin.  The page marks itself ready once
 // the highlighter has painted, and records the bubble height before and
 // during reading so the spec can check that nothing re-flows.
+//
+// The fonts are pinned here, before the first layout, rather than by the
+// spec after navigation: a style the spec adds can land between the two
+// height measurements and look like a re-flow.  The "before" height is taken
+// once the fonts are ready, and only then does the voice start.
 import { useEffect, useRef, useState } from "react";
 
 import { utterancesWithSpans } from "../../shared/speech-spans";
@@ -80,6 +85,26 @@ function audioAnswer(): Response {
   return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
 }
 
+/** The same pin as the spec's pinFonts, applied before anything renders. */
+const PINNED_FONTS = `
+  *, *::before, *::after {
+    font-family: "DejaVu Sans", sans-serif !important;
+  }
+  code, kbd, pre, samp, tt {
+    font-family: "DejaVu Sans Mono", monospace !important;
+  }
+`;
+
+function pinFonts(): void {
+  if (document.getElementById("karaoke-fixture-fonts")) return;
+  const style = document.createElement("style");
+  style.id = "karaoke-fixture-fonts";
+  style.textContent = PINNED_FONTS;
+  document.head.appendChild(style);
+}
+
+pinFonts();
+
 let installed = false;
 
 function installStandIns(): void {
@@ -107,8 +132,8 @@ export default function KaraokeVisualFixture() {
   useEffect(() => {
     if (DARK) document.documentElement.dataset.skin = "midnight";
     installStandIns();
-    setHeightBefore(bubbleRef.current?.offsetHeight ?? null);
     let frame = 0;
+    let cancelled = false;
     const unsubscribe = speaker.subscribeKaraoke((feed) => {
       if (!feed) return;
       // Two frames: the highlighter paints from its own frame loop.
@@ -116,8 +141,13 @@ export default function KaraokeVisualFixture() {
         frame = requestAnimationFrame(() => setHeightAfter(bubbleRef.current?.offsetHeight ?? null));
       });
     });
-    void speaker.speak(KARAOKE_FIXTURE_REPLY, { botId: "karaoke-fixture-bot", threadId: THREAD, messageId: MESSAGE, voiceId: "fixture-voice" });
+    void document.fonts.ready.then(() => {
+      if (cancelled) return;
+      setHeightBefore(bubbleRef.current?.offsetHeight ?? null);
+      void speaker.speak(KARAOKE_FIXTURE_REPLY, { botId: "karaoke-fixture-bot", threadId: THREAD, messageId: MESSAGE, voiceId: "fixture-voice" });
+    });
     return () => {
+      cancelled = true;
       cancelAnimationFrame(frame);
       unsubscribe();
       speaker.stop();
