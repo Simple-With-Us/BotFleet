@@ -69,12 +69,12 @@ export function localVmGhContainerEnv(): string[] {
 /** Host variables that would make `gh auth token` answer with the harness's
  *  own token instead of the signed-in user's login.  Cleared for that one call:
  *  this feature carries the owner's CLI login, not whatever the harness holds. */
-const HOST_GH_TOKEN_ENV_OVERRIDES: Record<string, undefined> = {
+const HOST_GH_TOKEN_ENV_OVERRIDES = {
   GH_TOKEN: undefined,
   GITHUB_TOKEN: undefined,
   GH_ENTERPRISE_TOKEN: undefined,
   GITHUB_ENTERPRISE_TOKEN: undefined,
-};
+} satisfies Record<string, undefined>;
 
 /** The host's github.com token, or null when gh is missing, signed out, or the
  *  Keychain refuses.  The value is returned to the caller and goes nowhere
