@@ -26,6 +26,7 @@ import {
   forgetLocalVmGhToken,
   localVmGhContainerEnv,
   syncLocalVmGhToken,
+  syncLocalVmGhTokenWithin,
   type GhSyncOutcome,
 } from "./local-vm-gh-credentials.ts";
 import {
@@ -43,6 +44,8 @@ import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 
 const run = promisify(execFile);
 const SCREENSHOT_STATUS_TTL_MS = 10_000;
+/** How long create waits for the gh login before leaving it to finish behind. */
+const CREATE_GH_SYNC_MAX_WAIT_MS = 20_000;
 
 /** Extras a caller can hand a command.  Both are optional and ignored by
  *  runners that predate them, so existing fakes keep working unchanged. */
@@ -1627,8 +1630,9 @@ export async function containerComputerAction(
     }
     if (action === "run" && shareCliCredentials) {
       // Right after create, so a human opening the viewer finds gh signed in
-      // before any bot turn.  Best-effort: the sync never throws.
-      await syncLocalVmGhToken({ runtime, containerName: target.containerName, runner });
+      // before any bot turn.  Best-effort: the sync never throws, and the wake
+      // path runs inside a bot's turn, so a slow login finishes behind it.
+      await syncLocalVmGhTokenWithin({ runtime, containerName: target.containerName, runner }, CREATE_GH_SYNC_MAX_WAIT_MS);
     }
   }
   return containerComputerStatus(runner, platform, target);
@@ -1655,18 +1659,8 @@ export async function refreshLocalVmGhCredentials(
   options: { maxWaitMs?: number } = {},
 ): Promise<GhSyncOutcome | "disabled" | "pending"> {
   if (!shareCliCredentialsConfigured()) return "disabled";
-  const syncing = syncLocalVmGhToken({ runtime, containerName: target.containerName, runner });
-  if (options.maxWaitMs === undefined) return syncing;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<"pending">((resolve) => {
-    timer = setTimeout(() => resolve("pending"), options.maxWaitMs);
-    timer.unref?.();
-  });
-  try {
-    return await Promise.race([syncing, deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
+  const deps = { runtime, containerName: target.containerName, runner };
+  return options.maxWaitMs === undefined ? syncLocalVmGhToken(deps) : syncLocalVmGhTokenWithin(deps, options.maxWaitMs);
 }
 
 /** Recreate a stopped Local VM container (the auto-wake), or fail truthfully.

@@ -209,6 +209,25 @@ export function syncLocalVmGhToken(deps: GhSyncDeps): Promise<GhSyncOutcome> {
   return promise;
 }
 
+/** `syncLocalVmGhToken`, but the caller stops waiting after `maxWaitMs` and
+ *  gets "pending".  The login keeps running and is recorded when it finishes,
+ *  and the next call joins it rather than starting another.  For paths a bot's
+ *  turn is waiting on: a nice-to-have credential sync (GitHub unreachable, a
+ *  loaded host) must not hold the turn. */
+export async function syncLocalVmGhTokenWithin(deps: GhSyncDeps, maxWaitMs: number): Promise<GhSyncOutcome | "pending"> {
+  const syncing = syncLocalVmGhToken(deps);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"pending">((resolve) => {
+    timer = setTimeout(() => resolve("pending"), maxWaitMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([syncing, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function runSync(deps: GhSyncDeps, generation: number): Promise<GhSyncOutcome> {
   const { containerName, runner } = deps;
   const now = deps.now ?? Date.now;
