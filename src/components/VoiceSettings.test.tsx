@@ -167,6 +167,18 @@ describe("VoiceSettings", () => {
     expect(html).not.toContain("Apple Personal Voice");
   });
 
+  it("greys Mac playback with a reason when Personal Voice is unavailable on this computer", () => {
+    mockPersonalVoice = false;
+    const html = renderToStaticMarkup(
+      createElement(VoiceSettings, {
+        bot: { ...sampleBot("personal:pv-1"), speechDevices: ["mac"] },
+        onPatch: () => {},
+      }),
+    );
+    expect(html).toContain("disabled");
+    expect(html).toMatch(/Play on iPhone/i);
+  });
+
   it("renders voice summary mode options and benchmark findings button", () => {
     const html = renderToStaticMarkup(
       createElement(VoiceSettings, {

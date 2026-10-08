@@ -38,7 +38,6 @@ struct AgentProfileView: View {
     @State private var autoApprove: Bool
     @State private var autoReview: String
     @State private var approvePeerComms: Bool
-    @State private var computers: Set<String>
     @State private var cwd: String
     @State private var baseline: ProfileFormSnapshot
     @ObservedObject private var personalVoice = PersonalVoiceService.shared
@@ -60,7 +59,6 @@ struct AgentProfileView: View {
         _autoApprove = State(initialValue: bot.autoApprove ?? false)
         _autoReview = State(initialValue: bot.autoReview ?? "off")
         _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
-        _computers = State(initialValue: Set(bot.computers ?? []))
         _cwd = State(initialValue: bot.cwd ?? "")
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
     }
@@ -457,7 +455,6 @@ struct AgentProfileView: View {
             guard cwd != baseline.cwd else { return nil }
             return trimmedCwd.isEmpty ? .clear : .set(trimmedCwd)
         }()
-        let computersArray = ["cloud", "vm", "local"].filter { computers.contains($0) }
         return BotProfilePatch(
             name: name == baseline.name ? nil : name.trimmingCharacters(in: .whitespacesAndNewlines),
             title: title == baseline.title ? nil : title.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -472,7 +469,6 @@ struct AgentProfileView: View {
             autoApprove: autoApprove == baseline.autoApprove ? nil : autoApprove,
             autoReview: autoReview == baseline.autoReview ? nil : autoReview,
             approvePeerComms: approvePeerComms == baseline.approvePeerComms ? nil : approvePeerComms,
-            computers: computers == baseline.computers ? nil : computersArray,
             cwd: cwdPatch
         )
     }
@@ -534,8 +530,13 @@ struct AgentProfileView: View {
 
     @ViewBuilder
     private var computersSection: some View {
+        let rows = CrossPlatformProfileSettings.computerGrantRows(computers: current.computers)
         Section {
-            if computers.isEmpty {
+            if current.computers == nil {
+                Text(CrossPlatformProfileSettings.computersAutoCaption)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if (current.computers ?? []).isEmpty {
                 HStack {
                     Text("Assigned computers")
                     Spacer()
@@ -544,22 +545,14 @@ struct AgentProfileView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Toggle("Local Mac desktop", isOn: Binding(
-                get: { computers.contains("local") },
-                set: { if $0 { computers.insert("local") } else { computers.remove("local") } }
-            ))
-            Toggle("Self-hosted VPS / Box", isOn: Binding(
-                get: { computers.contains("cloud") },
-                set: { if $0 { computers.insert("cloud") } else { computers.remove("cloud") } }
-            ))
-            Toggle("Local VM", isOn: Binding(
-                get: { computers.contains("vm") },
-                set: { if $0 { computers.insert("vm") } else { computers.remove("vm") } }
-            ))
+            ForEach(rows, id: \.id) { row in
+                Toggle(row.label, isOn: .constant(row.selected))
+                    .disabled(true)
+            }
         } header: {
             Text("Computers")
         } footer: {
-            Text("Controls which execution environments this bot can mount for shell commands, browser tools, and desktop control.")
+            Text("\(CrossPlatformProfileSettings.computersMacOnlyReason)  Controls which execution environments this bot can mount for shell commands, browser tools, and desktop control.")
         }
     }
 
@@ -597,16 +590,30 @@ struct AgentProfileView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Toggle("Play on Mac", isOn: Binding(
-                    get: { speechDevices.contains("mac") },
-                    set: { if $0 { speechDevices.insert("mac") } else { speechDevices.remove("mac") } }
-                ))
-                .disabled(!selectedVoiceCanSpeak || isPersonalVoiceSelected)
-                Toggle("Play on iPhone (while app is open)", isOn: Binding(
-                    get: { speechDevices.contains("iphone") },
-                    set: { if $0 { speechDevices.insert("iphone") } else { speechDevices.remove("iphone") } }
-                ))
-                .disabled(!selectedVoiceCanSpeak)
+                speechDeviceToggle(
+                    device: "mac",
+                    title: "Play on Mac",
+                    row: CrossPlatformProfileSettings.speechDeviceRow(
+                        device: "mac",
+                        voice: voice,
+                        speakReplies: current.speakReplies,
+                        speechDevices: speechDevices,
+                        agentVoiceCanSpeakOnClient: selectedVoiceCanSpeak,
+                        personalVoiceSelected: isPersonalVoiceSelected
+                    )
+                )
+                speechDeviceToggle(
+                    device: "iphone",
+                    title: "Play on iPhone (while app is open)",
+                    row: CrossPlatformProfileSettings.speechDeviceRow(
+                        device: "iphone",
+                        voice: voice,
+                        speakReplies: current.speakReplies,
+                        speechDevices: speechDevices,
+                        agentVoiceCanSpeakOnClient: selectedVoiceCanSpeak,
+                        personalVoiceSelected: isPersonalVoiceSelected
+                    )
+                )
                 Button("Preview Voice", systemImage: "speaker.wave.2") {
                     Task { await previewVoice() }
                 }
@@ -642,6 +649,27 @@ struct AgentProfileView: View {
             } else {
                 Text("The voice choice belongs to this agent. Workspace default uses the shared voice selected on your computer.")
             }
+        }
+    }
+
+    @ViewBuilder
+    private func speechDeviceToggle(
+        device: String,
+        title: String,
+        row: CrossPlatformProfileSettings.SpeechDeviceRow
+    ) -> some View {
+        Toggle(title, isOn: Binding(
+            get: { row.selected },
+            set: { enabled in
+                guard row.editable else { return }
+                if enabled { speechDevices.insert(device) } else { speechDevices.remove(device) }
+            }
+        ))
+        .disabled(!row.editable)
+        if let reason = row.disabledReason {
+            Text(reason)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -897,7 +925,6 @@ struct AgentProfileView: View {
         autoApprove = bot.autoApprove ?? false
         autoReview = bot.autoReview ?? "off"
         approvePeerComms = bot.approvePeerComms ?? false
-        computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
         baseline = ProfileFormSnapshot(bot: bot)
     }
@@ -916,7 +943,6 @@ private struct ProfileFormSnapshot {
     var autoApprove: Bool
     var autoReview: String
     var approvePeerComms: Bool
-    var computers: Set<String>
     var cwd: String
 
     init(bot: Bot) {
@@ -932,7 +958,6 @@ private struct ProfileFormSnapshot {
         autoApprove = bot.autoApprove ?? false
         autoReview = bot.autoReview ?? "off"
         approvePeerComms = bot.approvePeerComms ?? false
-        computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
     }
 }
