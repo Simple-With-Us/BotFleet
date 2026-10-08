@@ -23,8 +23,16 @@
 // - One rule says which voice owns the main `audio` list (mainVoice), and
 //   every read and write of a voice's clips goes through it.  Reading one
 //   list and writing another re-bills the missing clips on every play.
-// - A request without `device` or `progressive` behaves exactly as the route
-//   always has, because shipped TestFlight builds send neither.
+// - A request without `progressive` is a shipped TestFlight build (every
+//   current client sends it).  It keeps its contract: one answer with every
+//   clip, the historical MAX_UTTERANCES cap, and the shared voice when it
+//   sends no `device`.  What it reads changed with the default script below,
+//   and a written reply can be much longer than the model summary it used to
+//   get, so two limits answer it with something it can show instead of
+//   failing: a reply over its cap gets LEGACY_REPLY_TOO_LONG (still 413), and
+//   a reply not ready within BLOCKING_RESPONSE_BUDGET_MS gets STILL_PREPARING
+//   (425, retryable) instead of the companion's 504.  The job keeps going, so
+//   the next tap is served from the finished clips.
 // - What the voice reads (shared/voice-summary.ts voiceScriptKind): by default
 //   the reply as written, through the deterministic speakable pass, with the
 //   source span of every spoken character (shared/speech-spans.ts).  A model
@@ -65,6 +73,18 @@ export const MAX_UTTERANCES_PROGRESSIVE = 160;
  * not.  The summary await counts against it, and it stays well inside the
  * companion's 30-second headers deadline. */
 export const PROGRESSIVE_RESPONSE_BUDGET_MS = 20_000;
+/** A blocking POST (no `progressive`: a shipped build) answers within this
+ * long of arriving: with every clip when they are ready, otherwise with
+ * STILL_PREPARING.  The summary await counts against it.  Under the
+ * companion's 30-second headers deadline, so the phone hears an answer it
+ * can show instead of a 504 (which iOS also reports to Sentry). */
+export const BLOCKING_RESPONSE_BUDGET_MS = 25_000;
+/** A blocking request whose reply was not ready within the budget.  The
+ * shipped app shows the error text; the job keeps going. */
+export const STILL_PREPARING = "This reply is still being prepared for the voice.\u00A0 Play it again in a moment.";
+/** A blocking request (a shipped build) for a reply over its 64-clip cap that
+ * a current build can play progressively. */
+export const LEGACY_REPLY_TOO_LONG = "Update BotFleet on this device to hear replies this long read aloud.";
 /** How long a clip GET waits for an in-flight clip before answering
  * CLIP_NOT_READY_STATUS.  Under the iOS client's default 20-second request
  * timeout (CompanionClient.makeRequest) as well as the companion's 30, so the
@@ -293,11 +313,6 @@ export class MessageAudio {
     return { kind: "json", status: this.deps.isNoVoiceConfigured(error) ? 409 : 502, body: { error: error.message } };
   }
 
-  /** Resolves once the job has finished, either way. */
-  private settled(job: ClipJob): Promise<void> {
-    return this.waitFor(job, () => false, Number.POSITIVE_INFINITY);
-  }
-
   /** Whether the message's stored clips were made from this script. */
   private ownsClips(message: AudioMessage, voiceText: string, kind: SpokenScriptKind): boolean {
     if (message.voiceTextKind) return message.voiceTextKind === kind && message.voiceText === voiceText;
@@ -309,7 +324,11 @@ export class MessageAudio {
   /** Start the job for (message, voice), or return the one already running.
    * A failed job is replaced: asking again is how a client retries.  So is a
    * job for another script (the bot's Voice Summary mode changed mid-way); the
-   * old one stops at its next clip without writing. */
+   * old one stops at its next clip without writing.  The script stamp is one
+   * per message while jobs are per voice, so a job also stops once the stored
+   * stamp is no longer its script: another voice's job for the new script
+   * reset the clips, and writing its own stamp back would make that job's
+   * finished clips look foreign and get them billed again. */
   private ensureJob(
     threadId: string,
     messageId: string,
@@ -334,6 +353,13 @@ export class MessageAudio {
       done: Promise.resolve([]),
     };
     const current = () => this.jobs.get(key) === job;
+    /** Still the running job for its key, and no other script's stamp is on
+     * the message.  Checked before every paid call and every write. */
+    const ours = () => {
+      if (!current()) return false;
+      const latest = this.deps.message(threadId, messageId);
+      return !latest?.voiceTextKind || (latest.voiceTextKind === voiceTextKind && latest.voiceText === voiceText);
+    };
     const stamp = { voiceText, voiceTextKind };
     // Registered before the body runs: the body checks current() each clip.
     this.jobs.set(key, job);
@@ -355,9 +381,9 @@ export class MessageAudio {
       this.deps.patchMessage(threadId, messageId, { ...this.slotPatch(message, voice, ownerVoice, kept), ...stamp });
       this.notify(job);
       for (const utterance of utterances.slice(kept.length)) {
-        if (!current()) throw new Error(SCRIPT_CHANGED);
+        if (!ours()) throw new Error(SCRIPT_CHANGED);
         const audio = await this.deps.speak(utterance, voice || undefined);
-        if (!current()) throw new Error(SCRIPT_CHANGED);
+        if (!ours()) throw new Error(SCRIPT_CHANGED);
         if (!SUPPORTED_MIME.has(audio.mime)) throw new Error("The voice engine returned an unsupported audio format.");
         const saved = this.deps.saveClip(audio.bytes, audio.mime);
         job.clips = [...job.clips, saved];
@@ -438,10 +464,18 @@ export class MessageAudio {
     // block becomes "a code block" and must not push a short spoken reply
     // over the limit.  It runs before the Personal Voice return on purpose.
     if (!utterances.length || utterances.length > maxUtterances || spoken.length > MAX_SPEAKABLE_CHARS) {
+      // A shipped build over its own cap could play this reply after an
+      // update; say so instead of the bare limit.
+      const updateWouldHelp = !progressive && utterances.length <= MAX_UTTERANCES_PROGRESSIVE && spoken.length <= MAX_SPEAKABLE_CHARS;
       return {
         kind: "json",
         status: 413,
-        body: { error: "reply exceeds voice clip limit", total: utterances.length, maxUtterances, maxCharacters: MAX_SPEAKABLE_CHARS },
+        body: {
+          error: updateWouldHelp ? LEGACY_REPLY_TOO_LONG : "reply exceeds voice clip limit",
+          total: utterances.length,
+          maxUtterances,
+          maxCharacters: MAX_SPEAKABLE_CHARS,
+        },
       };
     }
 
@@ -507,8 +541,16 @@ export class MessageAudio {
 
     const job = this.ensureJob(threadId, messageId, voice, ownerVoice, utterances, textToSpeak, kind);
     if (!progressive) {
-      await this.settled(job);
+      await this.waitFor(job, () => false, startedAt + BLOCKING_RESPONSE_BUDGET_MS - this.now());
       if (job.error) return this.failure(job.error);
+      if (!job.settled) {
+        return {
+          kind: "json",
+          status: CLIP_NOT_READY_STATUS,
+          body: { error: STILL_PREPARING, retryable: true, ready: job.clips.length, total: job.utterances.length },
+          headers: { "retry-after": String(CLIP_RETRY_AFTER_SECONDS), "cache-control": "no-store" },
+        };
+      }
       return {
         kind: "json",
         status: 200,

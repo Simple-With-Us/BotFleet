@@ -6,8 +6,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  BLOCKING_RESPONSE_BUDGET_MS,
   CLIP_NOT_READY_STATUS,
   CLIP_WAIT_MS,
+  LEGACY_REPLY_TOO_LONG,
   MAX_SPEAKABLE_CHARS,
   MAX_UTTERANCES,
   MAX_UTTERANCES_PROGRESSIVE,
@@ -15,6 +17,7 @@ import {
   PERSONAL_VOICE_NEEDS_UPDATE,
   PROGRESSIVE_RESPONSE_BUDGET_MS,
   SCRIPT_CHANGED,
+  STILL_PREPARING,
   parseAudioRequest,
   parseClipDevice,
   type AudioMessage,
@@ -241,6 +244,48 @@ describe("POST /audio, legacy request (no device, not progressive)", () => {
     await fixture.release(3);
     const [a, b] = await Promise.all([first, second]);
     expect(a.body.audio).toEqual(b.body.audio);
+    expect(fixture.speakCalls).toHaveLength(3);
+  });
+
+  it("reads an unset-mode bot's reply as written, under the historical 64-clip cap", async () => {
+    // A shipped build used to get a model summary for any long reply; the
+    // default is now the reply as written (board 8cc3c806: no summarizing).
+    const fixture = setup({ text: sentences(MAX_UTTERANCES) });
+    const fits = await post(fixture, { voice: "vA" });
+    expect(fits.status).toBe(200);
+    expect(fits.body.total).toBe(MAX_UTTERANCES);
+    expect(fits.body.complete).toBe(true);
+    expect(fixture.summarized).toEqual([]);
+    expect(fixture.row.voiceTextKind).toBe("written");
+
+    const long = setup({ text: sentences(MAX_UTTERANCES + 1) });
+    const refused = await post(long, { voice: "vA" });
+    expect(refused.status).toBe(413);
+    // The shipped app shows the error text: tell the owner what fixes it.
+    expect(refused.body).toMatchObject({ error: LEGACY_REPLY_TOO_LONG, total: MAX_UTTERANCES + 1, maxUtterances: MAX_UTTERANCES });
+    expect(long.summarized).toEqual([]);
+    expect(long.speakCalls).toHaveLength(0);
+    // A current build plays the same reply.
+    const progressive = await post(long, { voice: "vA" }, { progressive: true, device: "iphone" });
+    expect(progressive.status).toBe(200);
+    expect(progressive.body.total).toBe(MAX_UTTERANCES + 1);
+  });
+
+  it("answers within its budget while the clips are still being made, and the next tap gets them", async () => {
+    const fixture = setup({ manual: true });
+    // The companion gives up after 30 seconds without headers.
+    expect(BLOCKING_RESPONSE_BUDGET_MS).toBeLessThan(30_000);
+    const waiting = await post(fixture, { voice: "vA" }, {}, Date.now() - BLOCKING_RESPONSE_BUDGET_MS + 20);
+    expect(waiting.status).toBe(CLIP_NOT_READY_STATUS);
+    expect(waiting.body).toMatchObject({ error: STILL_PREPARING, retryable: true, ready: 0, total: 3 });
+    expect(waiting.kind === "json" && waiting.headers?.["retry-after"]).toBe("1");
+
+    // The job kept going after the answer.
+    await fixture.release(3);
+    const again = await post(fixture, { voice: "vA" });
+    expect(again.status).toBe(200);
+    expect(again.body.complete).toBe(true);
+    expect(again.body.audio).toHaveLength(3);
     expect(fixture.speakCalls).toHaveLength(3);
   });
 
@@ -763,5 +808,51 @@ describe("the spoken script: as written by default, span-aligned for karaoke", (
     expect(done.body.audio).toHaveLength(3);
     expect(fixture.row.audio).toHaveLength(3);
     expect(fixture.row.voiceTextKind).toBe("written");
+  });
+
+  it("stops another voice's job once the reply's script changed, so it cannot stamp the old script back", async () => {
+    const fixture = setup({ manual: true, summary: () => "A short spoken version of the reply." });
+    // The Mac speaks the bot's own voice (the main list); the iPhone has its own.
+    const owner: AudioOwner = { voice: "vA", voices: { iphone: "vB" } };
+    const resolveFor = async (voice: string, text?: string) => {
+      await fixture.settle();
+      const at = fixture.pending.findIndex((call) => call.voice === voice && (text === undefined || call.text === text));
+      if (at < 0) throw new Error(`no synthesis is waiting for ${voice}`);
+      fixture.pending.splice(at, 1)[0].resolve();
+      await fixture.settle();
+    };
+
+    const mac = post(fixture, owner, { progressive: true, device: "mac" });
+    const phone = post(fixture, owner, { progressive: true, device: "iphone" });
+    await resolveFor("vA");
+    await resolveFor("vB");
+    await Promise.all([mac, phone]);
+    expect(fixture.row.voiceTextKind).toBe("written");
+
+    // The owner picks Summary Every Reply, and the iPhone plays the reply.
+    const summaryOwner: AudioOwner = { ...owner, voiceSummaryMode: "always" };
+    const phoneAgain = post(fixture, summaryOwner, { progressive: true, device: "iphone" });
+    await fixture.settle();
+    expect(fixture.row.voiceTextKind).toBe("summary");
+    expect(fixture.row.audio).toBeUndefined();
+
+    // The Mac's written job finishes its second clip.  It must not write.
+    const billedBefore = fixture.speakCalls.length;
+    await resolveFor("vA");
+    expect(fixture.row.voiceTextKind).toBe("summary");
+    expect(fixture.row.voiceText).toBe("A short spoken version of the reply.");
+    expect(fixture.row.audio).toBeUndefined();
+    // ...and it bills nothing more.
+    expect(fixture.speakCalls.filter((call, i) => i >= billedBefore && call.voice === "vA")).toEqual([]);
+
+    await resolveFor("vB", "A short spoken version of the reply.");
+    const done = await phoneAgain;
+    expect(done.status).toBe(200);
+    expect(done.body.complete).toBe(true);
+    // The finished summary clips are this script's: the next play is free.
+    const calls = fixture.speakCalls.length;
+    const replay = await post(fixture, summaryOwner, { progressive: true, device: "iphone" });
+    expect(replay.body.complete).toBe(true);
+    expect(fixture.speakCalls).toHaveLength(calls);
   });
 });
