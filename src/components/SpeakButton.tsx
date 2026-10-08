@@ -1,5 +1,6 @@
 import { Loader2, Play, Square } from "lucide-react";
 
+import { voiceScriptKind } from "../../shared/voice-summary";
 import { speaker } from "@/lib/tts";
 import { speakButtonState } from "@/lib/tts/readiness";
 import { useSpeech } from "@/lib/tts/useSpeech";
@@ -38,8 +39,9 @@ export function SpeakButton({
   const { state } = useStore();
   const { capabilities } = useDesktopCapabilities();
   const speech = useSpeech();
+  const owner = botId ? state.bots?.find((bot) => bot.id === botId) : undefined;
   const { macVoice, ready, mine, preparing, failed, label } = speakButtonState({
-    owner: botId ? state.bots?.find((bot) => bot.id === botId) : undefined,
+    owner,
     voiceId,
     tts: state.config?.tts,
     personalVoiceAvailable: capabilities.dictation.personalVoice === true,
@@ -51,7 +53,7 @@ export function SpeakButton({
     <button
       onClick={() => {
         if (mine) return speaker.stop();
-        void speaker.speak(text, { botId, messageId, threadId, voiceId: macVoice });
+        void speaker.speak(text, { botId, messageId, threadId, voiceId: macVoice, scriptKind: voiceScriptKind(owner) });
       }}
       disabled={!ready}
       aria-label={label}

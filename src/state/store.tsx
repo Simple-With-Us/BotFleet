@@ -44,7 +44,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
-import { spokenReply } from "../../shared/voice-summary";
+import { voiceScriptKind } from "../../shared/voice-summary";
 import { applyBotPatch, createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { voiceForDevice, type BotVoices } from "../../shared/bot-voice";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
@@ -3090,12 +3090,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // singleton speaker and microphone ordering for its whole lifetime.
             const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId || b.tasks?.some((t) => t.threadId === frame.threadId));
             if (owner && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
-              void speaker.speak(spokenReply(frame.message.text), {
+              // The reply as stored: the harness owns what is read, and the
+              // speaker's local fallback picks the written or voice half
+              // by the bot's mode.
+              void speaker.speak(frame.message.text, {
                 botId: owner.id,
                 messageId: frame.message.id,
                 threadId: frame.threadId,
                 // This Mac's own voice: its override, else the shared one.
                 voiceId: voiceForDevice(owner, "mac"),
+                scriptKind: voiceScriptKind(owner),
               });
             }
           }

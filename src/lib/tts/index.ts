@@ -1,4 +1,4 @@
-import { spokenReply } from "../../../shared/voice-summary";
+import { spokenReply, writtenReply, type VoiceScriptKind } from "../../../shared/voice-summary";
 import { isPersonalVoiceId, type SpeechDevice } from "../../../shared/bot-voice";
 import { estimatedClips } from "../../../shared/karaoke-align";
 // The harness's own projection rules (pure, no Node APIs), so a reply this
@@ -63,6 +63,10 @@ interface SpeakOptions {
   botId?: string;
   messageId?: string;
   threadId?: string;
+  /** What the bot's voice reads, voiceScriptKind(bot).  Only the local
+   * Personal Voice fallback uses it (the harness decides for itself);
+   * unset means "written", the default. */
+  scriptKind?: VoiceScriptKind;
 }
 
 export interface SpeakerOptions {
@@ -339,12 +343,16 @@ export class Speaker {
       // its own rules and the same length bound, rather than leave the owner
       // with silence.  A refusal (413, 4xx) is shown instead.
       if (isPersonalVoiceId(opts.voiceId) && personalVoiceBridge() && harnessUnavailable(error)) {
-        // The harness's own rules, with their spans.  For an ordinary reply
-        // spokenReply is the reply as written, which the bubble follows.
-        const { utterances, script } = localKaraokeScript(spokenReply(text));
+        // The harness's own rules, with their spans.  Written (the default):
+        // the reply as written, the text the harness would read and the
+        // bubble's spans index, so karaoke follows it.  A summary mode has
+        // no model here, so it reads the reply's own voice half (or the
+        // reply) and, like any summary, publishes no karaoke.
+        const written = (opts.scriptKind ?? "written") === "written";
+        const { utterances, script } = localKaraokeScript(written ? writtenReply(text) : spokenReply(text));
         if (!utterances.length) throw error;
         if (script.spokenText.length > MAX_LOCAL_SPEECH_CHARS) throw new Error(REPLY_TOO_LONG);
-        await this.speakOnDevice(utterances, opts.voiceId ?? "", opts, live, script.spokenText, script);
+        await this.speakOnDevice(utterances, opts.voiceId ?? "", opts, live, script.spokenText, written ? script : null);
         return;
       }
       throw error;

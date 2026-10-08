@@ -9,7 +9,9 @@ import {
   REPLY_TOO_LONG,
   Speaker,
 } from "./index";
+import type { KaraokeFeed } from "./karaoke-feed";
 import type { TtsAudioBody } from "./schema";
+import { writtenReply } from "../../../shared/voice-summary";
 
 class FakeAudio {
   static instances: FakeAudio[] = [];
@@ -381,16 +383,52 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
     expect(speaker.state).toEqual({ status: "idle" });
   });
 
-  it("falls back to the reply's spoken text when the harness cannot be asked", async () => {
+  it("reads the reply as written when the harness cannot be asked, with spans the bubble trusts", async () => {
     const { speak } = stubPersonalVoice();
     stubFetch(() => json({ error: "harness unavailable" }, 503));
     const speaker = new Speaker();
+    const feeds: Array<KaraokeFeed | null> = [];
+    speaker.subscribeKaraoke((feed) => feeds.push(feed));
+    // The written half is what the harness reads in written mode, and the
+    // text the bubble validates the spans against (writtenReply).
+    const reply = "[voice_summary]Short version.[/voice_summary][written_answer]Long written version.[/written_answer]\n";
+    await speaker.speak(reply, { ...messageOpts, voiceId: "personal:mac-voice" });
+
+    expect(speak).toHaveBeenCalledWith("Long written version.", "personal:mac-voice", { onRange: expect.any(Function) });
+    const feed = feeds.find((f): f is KaraokeFeed => f !== null);
+    expect(feed?.mode).toBe("live");
+    expect(feed?.script.sourceLength).toBe(writtenReply(reply).length);
+    expect(speaker.state).toEqual({ status: "idle" });
+  });
+
+  it("keeps the spans for a reply ending in a line break", async () => {
+    stubPersonalVoice();
+    stubFetch(() => json({ error: "harness unavailable" }, 503));
+    const speaker = new Speaker();
+    const feeds: Array<KaraokeFeed | null> = [];
+    speaker.subscribeKaraoke((feed) => feeds.push(feed));
+    const reply = "The build passed on the first try today.\n";
+    await speaker.speak(reply, { ...messageOpts, voiceId: "personal:mac-voice" });
+
+    const feed = feeds.find((f): f is KaraokeFeed => f !== null);
+    expect(feed?.script.sourceLength).toBe(writtenReply(reply).length);
+    expect(feed?.script.segments.length).toBeGreaterThan(0);
+  });
+
+  it("reads the voice half without karaoke for a bot whose voice reads a summary", async () => {
+    const { speak } = stubPersonalVoice();
+    stubFetch(() => json({ error: "harness unavailable" }, 503));
+    const speaker = new Speaker();
+    const feeds: Array<KaraokeFeed | null> = [];
+    speaker.subscribeKaraoke((feed) => feeds.push(feed));
     await speaker.speak("[voice_summary]Short version.[/voice_summary][written_answer]Long written version.[/written_answer]", {
       ...messageOpts,
       voiceId: "personal:mac-voice",
+      scriptKind: "summary",
     });
 
-    expect(speak).toHaveBeenCalledWith("Short version.", "personal:mac-voice", { onRange: expect.any(Function) });
+    expect(speak).toHaveBeenCalledWith("Short version.", "personal:mac-voice");
+    expect(feeds.filter((f) => f !== null)).toEqual([]);
     expect(speaker.state).toEqual({ status: "idle" });
   });
 
