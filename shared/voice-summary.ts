@@ -17,9 +17,10 @@ export type VoiceSummaryMode = "off" | "on_demand" | "always";
  * and code skipped.  That is what the owner wants spoken (owner correction,
  * 2026-10-08: "Why would I want to spend a bunch of time and energy and money
  * having an llm distill speech to optimize for spoken word if I didn't want
- * to use it").  It reverses #952, which had made "off" the default on a
- * misreading of board 8cc3c806; that ruling is withdrawn.  "off" reads the
- * reply as written, through the deterministic speakable pass.  Karaoke
+ * to use it", and "I never said I wanted it read word for word").  It
+ * reverses #952, which had made "off" the default citing board 8cc3c806.
+ * "off" reads the reply as written, through the deterministic speakable
+ * pass.  Karaoke
  * follows the main message text in every mode (shared/karaoke-align.ts).
  */
 export function resolveVoiceSummaryMode(bot?: {
