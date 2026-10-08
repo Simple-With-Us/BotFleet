@@ -187,6 +187,13 @@ function tokenHash(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
+/** A stable, non-reversible label for a token: the first 8 hex characters of
+ *  its SHA-256.  Safe to log; it identifies the credential, it never reveals
+ *  any of it. */
+function tokenFingerprint(hash: string): string {
+  return hash.slice(0, 8);
+}
+
 /** GitHub token shapes (classic, OAuth, app, refresh, fine-grained), scrubbed
  *  wherever a caller holds no token to compare against. */
 const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,})/g;
@@ -290,7 +297,13 @@ async function runSync(deps: GhSyncDeps, generation: number): Promise<GhSyncOutc
       if ((generations.get(containerName) ?? 0) === generation) {
         entries.set(containerName, { hash, ok: false, at: now() });
       }
-      logOnce("warn", `[local-vm] ${containerName}: gh login failed: ${ghSyncFailureReason(error, token)}`);
+      // The fingerprint names WHICH credential failed without revealing any of
+      // it: the first 8 hex characters of the SHA-256 are one-way, whereas any
+      // token characters (masked or not) would be a partial credential in a log.
+      logOnce(
+        "warn",
+        `[local-vm] ${containerName}: gh login failed (token fp ${tokenFingerprint(hash)}): ${ghSyncFailureReason(error, token)}`,
+      );
       return "failed";
     }
     // A container replaced mid-sync is not the one this login went into.

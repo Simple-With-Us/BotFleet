@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -219,6 +220,43 @@ describe("a refresh that throws is reported, not swallowed", () => {
       }
     }
     expect(ghSyncFailureReason(new Error(`login ${FAKE_TOKEN}`), FAKE_TOKEN)).toBe("login <redacted>");
+  });
+});
+
+describe("the failed-login warning names the credential without revealing any of it", () => {
+  // Not FAKE_TOKEN: its letters spell ordinary words ("Token", "Test") that the
+  // warning legitimately contains, which would blur a substring check.
+  const unspellable = "gho_Zq7Xv3Lp9Rk2Wm8Ns4Bt6Yc1Hd5Jf0Gx";
+
+  it("carries a sha256 fingerprint and no run of four or more token characters", async () => {
+    const fake = ghFake({ token: unspellable, loginError: Object.assign(new Error("Command failed"), { stderr: "HTTP 401: Bad credentials\n" }) });
+    const lines: string[] = [];
+    await expect(sync(fake.run, { log: (level, message) => lines.push(`${level}: ${message}`) })).resolves.toBe("failed");
+
+    expect(lines).toHaveLength(1);
+    const fingerprint = createHash("sha256").update(unspellable).digest("hex").slice(0, 8);
+    expect(fingerprint).toMatch(/^[0-9a-f]{8}$/);
+    expect(lines[0]).toContain(`token fp ${fingerprint}`);
+    expect(lines[0]).toContain("HTTP 401");
+    for (let length = 4; length <= unspellable.length; length += 1) {
+      for (let start = 0; start + length <= unspellable.length; start += 1) {
+        expect(lines[0]).not.toContain(unspellable.slice(start, start + length));
+      }
+    }
+  });
+
+  it("gives two different tokens different fingerprints, so the operator can tell them apart", async () => {
+    const lines: string[] = [];
+    const log = (_level: "info" | "warn", message: string) => lines.push(message);
+    const fake = ghFake({ token: unspellable, loginError: new Error("HTTP 401") });
+    await sync(fake.run, { log });
+    fake.state.token = OTHER_TOKEN;
+    await sync(fake.run, { log });
+    expect(lines).toHaveLength(2);
+    const fingerprints = lines.map((line) => /token fp ([0-9a-f]{8})/.exec(line)?.[1]);
+    expect(fingerprints[0]).toBeDefined();
+    expect(fingerprints[1]).toBeDefined();
+    expect(fingerprints[0]).not.toBe(fingerprints[1]);
   });
 });
 
