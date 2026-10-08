@@ -248,6 +248,17 @@ load_sentry_auth() {
   fi
 }
 
+# Strip anything token-shaped from sentry-cli output before it reaches a
+# (public) CI log: the live token value, sntrys_/sntryu_ tokens, bearer headers.
+sentry_redact() {
+  local tok="${SENTRY_AUTH_TOKEN:-}"
+  if [[ -n "$tok" ]]; then
+    TOK="$tok" perl -pe 'BEGIN{$t=$ENV{TOK}} s/\Q$t\E/[redacted]/g; s/sntry[su]_[A-Za-z0-9+\/=_.-]+/[redacted]/g; s/(Bearer\s+)\S+/${1}[redacted]/gi'
+  else
+    perl -pe 's/sntry[su]_[A-Za-z0-9+\/=_.-]+/[redacted]/g; s/(Bearer\s+)\S+/${1}[redacted]/gi'
+  fi
+}
+
 # After a successful archive: upload dSYMs and Size Analysis.  Never fail the
 # TestFlight ship if Sentry is missing or the upload errors.
 upload_sentry_artifacts() {
@@ -279,6 +290,15 @@ upload_sentry_artifacts() {
     log "warning: sentry-cli still missing; skipping artifact upload"
     return 0
   fi
+  # Both uploads failed silently on 2026-10-07 (rc=1, logs left in the runner's
+  # temp dir).  Print what sentry-cli says about auth/org first, and on any
+  # failure print the tail of its log, with every token shape redacted, so
+  # the hosted ship log carries the real error.
+  log "sentry: sentry-cli $(sentry-cli --version 2>/dev/null | awk '{print $NF}'); org=simple-with-us project=${project}"
+  set +e
+  SENTRY_ORG=simple-with-us SENTRY_PROJECT="$project" sentry-cli info 2>&1 \
+    | sentry_redact | sed 's/^/[ios-ship] sentry-info: /'
+  set -e
   log "sentry: uploading debug files for project=${project} (token length ${#SENTRY_AUTH_TOKEN})"
   set +e
   SENTRY_ORG=simple-with-us SENTRY_PROJECT="$project" \
@@ -289,7 +309,8 @@ upload_sentry_artifacts() {
   if [[ $dif_rc -eq 0 ]]; then
     log "sentry: debug-files upload ok"
   else
-    log "warning: sentry debug-files upload rc=${dif_rc}; see ${LOG_DIR}/sentry-debug-files.log"
+    log "warning: sentry debug-files upload rc=${dif_rc}; tail of ${LOG_DIR}/sentry-debug-files.log:"
+    tail -n 25 "${LOG_DIR}/sentry-debug-files.log" | sentry_redact | sed 's/^/[ios-ship]   sentry-dif: /'
   fi
   log "sentry: Size Analysis build upload for project=${project}"
   set +e
@@ -301,7 +322,8 @@ upload_sentry_artifacts() {
   if [[ $build_rc -eq 0 ]]; then
     log "sentry: build upload ok"
   else
-    log "warning: sentry build upload rc=${build_rc}; see ${LOG_DIR}/sentry-build-upload.log"
+    log "warning: sentry build upload rc=${build_rc}; tail of ${LOG_DIR}/sentry-build-upload.log:"
+    tail -n 25 "${LOG_DIR}/sentry-build-upload.log" | sentry_redact | sed 's/^/[ios-ship]   sentry-build: /'
   fi
   return 0
 }

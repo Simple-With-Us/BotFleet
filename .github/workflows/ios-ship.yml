@@ -192,3 +192,35 @@ jobs:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
           IOS_MANUAL_SIGN: "1"  # 2026-10-07: API profiles; no Xcode provisioning service
         run: bash scripts/ios-ship-testflight.sh
+
+      # Standing TestFlight testers (asc-standing-testers skill): make sure the
+      # three standing emails are in BotFleet's external beta group and the new
+      # build is assigned (and submitted for Beta App Review when Apple needs
+      # it).  Emails come from the ASC_STANDING_TESTERS secret, never from a
+      # file in this public repo, and are masked in the log.  Idempotent, adds
+      # only those emails, and a tester-sync problem is a loud warning, never a
+      # red ship.  Uses the same APPLE_API_* key the ship step used.
+      - name: Sync standing TestFlight testers
+        if: success() && steps.gate.outputs.should_ship == '1'
+        continue-on-error: true
+        env:
+          ASC_STANDING_TESTERS: ${{ secrets.ASC_STANDING_TESTERS }}
+        run: |
+          for e in $(printf '%s' "${ASC_STANDING_TESTERS:-}" | tr ',;' '  '); do
+            echo "::add-mask::${e}"
+          done
+          set +e
+          appleid="$(python3 -c 'import json;print(json.load(open("scripts/ios-fleet/apps.json"))["apps"]["botfleet"]["appleId"])')"
+          appleid_rc=$?
+          set -e
+          if [ "$appleid_rc" -ne 0 ] || [ -z "$appleid" ]; then
+            echo "::warning title=TestFlight standing testers::could not read the botfleet appleId from scripts/ios-fleet/apps.json (rc=${appleid_rc}); tester sync skipped.  The TestFlight upload itself succeeded."
+            exit 0
+          fi
+          set +e
+          node scripts/ios-fleet/asc-api.mjs ensure-standing-testers "$appleid"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=TestFlight standing testers::tester sync exited ${rc}; see the standing-testers lines above.  The TestFlight upload itself succeeded."
+          fi

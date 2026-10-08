@@ -25,6 +25,26 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.doesNotMatch(yml, /runs-on:\s*\[self-hosted/);
   assert.match(yml, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
   assert.match(yml, /bash scripts\/ios-assert-xcode\.sh 27\.0/);
+  // Standing TestFlight testers: emails only from the secret, never a red ship.
+  assert.match(yml, /name: Sync standing TestFlight testers/);
+  assert.match(yml, /ASC_STANDING_TESTERS:\s*\$\{\{\s*secrets\.ASC_STANDING_TESTERS\s*\}\}/);
+  assert.match(yml, /ensure-standing-testers "\$appleid"/);
+  assert.match(yml, /::add-mask::/);
+  const syncStep = yml.slice(yml.indexOf("name: Sync standing TestFlight testers"));
+  assert.match(syncStep, /continue-on-error:\s*true/);
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /method === "ensure-standing-testers"/);
+  // Safety rails against a misconfigured secret: cap the list, reject malformed
+  // entries, and never fail the ship when the appleId lookup breaks.
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /emails\.length\s*>\s*5/);
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /EMAIL_RE\s*=/);
+  assert.match(syncStep, /appleid_rc/);
+  // Reuse a tester stored with different letter case (create answers 409), and
+  // never skip the review submission silently when buildBetaDetail can't be read.
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /res\.status === 409[\s\S]*filter\[apps\]=/);
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /buildBetaDetail`\);\s*if \(!detail\.ok\)/);
+  // Every group/tester/build mutation is gated on a successful tester listing.
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /if \(!inGroupRes\.ok\)/);
+  assert.match(read("scripts/ios-fleet/ship-testflight.sh"), /sentry_redact/);
   const ci = read(".github/workflows/ci.yml");
   assert.match(ci, /\|\| 'xcode-27' \}\}/);
   assert.match(ci, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
