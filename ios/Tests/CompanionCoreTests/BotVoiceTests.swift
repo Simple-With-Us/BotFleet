@@ -214,6 +214,22 @@ final class BotVoiceTests: XCTestCase {
         XCTAssertFalse(BotVoiceEdit.isDeviceVoicesUnsupported(APIError.transport("offline")))
     }
 
+    func testTheRealRefusalBodiesDecodeToTheRecognizedError() throws {
+        // The bodies an older sidecar and an older harness actually send,
+        // through the client's own non-2xx decoding.
+        let url = try XCTUnwrap(URL(string: "https://preview.tailnet.ts.net:8810/api/bots/b1/profile"))
+        let refusals: [(Int, String)] = [
+            (403, #"{"error":"voices can only be changed in BotFleet on your computer"}"#),
+            (400, #"{"error":"unsupported profile field: voices"}"#),
+        ]
+        for (status, body) in refusals {
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil))
+            XCTAssertThrowsError(try CompanionClient.check(response, Data(body.utf8))) { error in
+                XCTAssertTrue(BotVoiceEdit.isDeviceVoicesUnsupported(error), "\(status) \(body)")
+            }
+        }
+    }
+
     func testTheFallbackSavesTheIphoneChoiceAsTheSharedVoice() {
         // What this app wrote before per-device voices: the iPhone's pick.
         XCTAssertEqual(BotVoiceEdit.sharedVoiceFallback(sharedVoice: "va", voices: nil, iphone: "vb", mac: "va"), "vb")
