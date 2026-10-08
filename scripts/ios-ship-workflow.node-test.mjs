@@ -12,7 +12,7 @@ function read(rel) {
   return readFileSync(join(ROOT, rel), "utf8");
 }
 
-test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => {
+test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", () => {
   const yml = read(".github/workflows/ios-ship.yml");
   const wrapper = read("scripts/ios-ship-testflight.sh");
   const prepare = read("scripts/ios-appstore-gm-prepare.sh");
@@ -20,9 +20,14 @@ test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => 
   assert.match(yml, /ios\/\*\*/);
   assert.match(yml, /--path-prefix 'ios\/'/);
   assert.match(yml, /scripts\/ios-fleet\/\*\*/);
-  assert.match(yml, /runs-on:\s*macos-latest/);
+  assert.match(yml, /runs-on:\s*xcode-27\s*$/m);
+  assert.doesNotMatch(yml, /runs-on:\s*macos-latest/);
   assert.doesNotMatch(yml, /runs-on:\s*\[self-hosted/);
-  assert.match(yml, /DEVELOPER_DIR:\s*\/Applications\/Xcode\.app\/Contents\/Developer/);
+  assert.match(yml, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
+  assert.match(yml, /bash scripts\/ios-assert-xcode\.sh 27\.0/);
+  const ci = read(".github/workflows/ci.yml");
+  assert.match(ci, /\|\| 'xcode-27' \}\}/);
+  assert.match(ci, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);
   assert.match(yml, /fetch-depth:\s*0/);
   assert.match(yml, /cancel-in-progress:\s*false/);
   assert.match(yml, /github\.event\.repository\.fork == false/);
@@ -74,9 +79,25 @@ test("ios-ship.yml targets botfleet / ios on GitHub-hosted macos-latest", () => 
 
   const project = read("ios/project.yml");
   assert.match(project, /DEVELOPMENT_TEAM:\s*CC8UTF7ATG/);
-  assert.match(project, /PRODUCT_BUNDLE_IDENTIFIER:\s*app\.botfleet/);
+  assert.match(project, /PRODUCT_BUNDLE_IDENTIFIER:\s*app\.botfleet\.ios/);
   assert.match(project, /MARKETING_VERSION:\s*"1\.0\.\d+"/);
-  assert.match(project, /CODE_SIGN_STYLE:\s*Automatic/);
+  assert.match(project, /configs:\s*\n\s*Release:\s*\n\s*CODE_SIGN_STYLE:\s*Manual/);
+  assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet iOS App Store \(API\)"/);
+  assert.match(project, /PROVISIONING_PROFILE_SPECIFIER:\s*"BotFleet Widgets App Store \(API\)"/);
+  assert.match(project, /INFOPLIST_KEY_CFBundleDisplayName:\s*BotFleet\r?\n/);
+  assert.match(project, /INFOPLIST_KEY_CFBundleDisplayName:\s*BotFleet Widgets/);
+  assert.match(yml, /IOS_MANUAL_SIGN:\s*"1"/);
+  assert.match(yml, /scripts\/ios-install-appstore-profiles\.sh/);
+  assert.match(project, /projectFormat:\s*xcode16_3/);
+  assert.match(project, /xcodeVersion:\s*'27\.0'/);
+  assert.match(project, /postGenCommand:\s*bash \.\.\/scripts\/ios-xcodegen-post\.sh/);
+  assert.match(project, /IPHONEOS_DEPLOYMENT_TARGET:\s*'27\.0'/);
+  assert.match(project, /INFOPLIST_KEY_LSApplicationCategoryType:\s*public\.app-category\.developer-tools/);
+  // The shipped category is info.properties (XcodeGen writes App/Info.plist);
+  // INFOPLIST_KEY_* only mirrors it for Xcode's General > App Category picker.
+  assert.match(project, /^\s+LSApplicationCategoryType:\s*public\.app-category\.developer-tools\s*$/m);
+  assert.match(read("scripts/ios-xcodegen-post.sh"), /objectVersion = 100/);
+  assert.match(read("scripts/ios-xcodegen-post.sh"), /Xcode 27\.0/);
 
   assert.match(wrapper, /scripts\/ios-fleet\/ship-testflight\.sh/);
   assert.match(wrapper, /IN_REPO="\$\{ROOT\}\/scripts\/ios-fleet\/ship-testflight\.sh"/);
@@ -127,16 +148,16 @@ test("retired ios-testflight.yml is gone so hosted ships do not double-upload", 
   assert.equal(existed, false);
 });
 
-test("vendored ios-fleet ships app.botfleet on the 1.0.N train", () => {
+test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   const apps = JSON.parse(read("scripts/ios-fleet/apps.json"));
   const botfleet = apps.apps.botfleet;
   assert.equal(apps.teamId, "CC8UTF7ATG");
-  assert.equal(botfleet.bundleId, "app.botfleet");
+  assert.equal(botfleet.bundleId, "app.botfleet.ios");
   assert.equal(botfleet.scheme, "BotFleet");
-  assert.equal(botfleet.appleId, 6806379515);
+  assert.equal(botfleet.appleId, 6820175685);
   assert.equal(botfleet.xcodegenDir, "ios");
   assert.match(botfleet.marketingVersionDefault, /^1\.0\.\d+$/);
-  assert.deepEqual(botfleet.extraBundleIds, ["app.botfleet.widgets"]);
+  assert.deepEqual(botfleet.extraBundleIds, ["app.botfleet.ios.widgets"]);
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
@@ -145,9 +166,25 @@ test("vendored ios-fleet ships app.botfleet on the 1.0.N train", () => {
   assert.match(ship, /botfleet/);
   assert.match(ship, /DEFAULT_MIN_INTERVAL_SEC=3600/);
   assert.match(ship, /FORCE_SHIP=0/);
-  assert.match(ship, /CODE_SIGN_STYLE=Automatic/);
+  assert.match(ship, /MANUAL_SIGN/);
+  assert.match(ship, /ios-install-appstore-profiles\.sh/);
+  assert.match(ship, /write_manual_export_plists/);
   assert.match(ship, /date -u \+%Y%m%d%H%M/);
   assert.match(ship, /-allowProvisioningUpdates/);
+
+  const profileMap = JSON.parse(read("ios/appstore-profiles.json"));
+  assert.deepEqual(profileMap, {
+    "app.botfleet.ios": "BotFleet iOS App Store (API)",
+    "app.botfleet.ios.widgets": "BotFleet Widgets App Store (API)",
+  });
+
+  const installer = read("scripts/ios-install-appstore-profiles.sh");
+  assert.match(installer, /ensure-appstore-profiles/);
+  assert.match(installer, /com\.apple\.security\.application-groups/);
+  assert.match(installer, /IOS_REQUIRED_APP_GROUP/);
+
+  const asc = read("scripts/ios-fleet/asc-api.mjs");
+  assert.match(asc, /ensure-appstore-profiles/);
 });
 
 test("ship-testflight.sh --help lists botfleet and the case accepts it", () => {
@@ -212,7 +249,7 @@ test("asc-api.mjs says what it tried instead of failing on a missing file", () =
   try {
     const clean = { PATH: process.env.PATH || "", HOME: tmp };
     // No credential anywhere: name every source rather than dying on ENOENT.
-    const none = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet", "1.0"], {
+    const none = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: clean,
     });
@@ -221,7 +258,7 @@ test("asc-api.mjs says what it tried instead of failing on a missing file", () =
     assert.match(none.stderr, /APPLE_API_KEY_P8_BASE64/);
 
     // APPLE_API_* present but undecodable: proves the env IS read, and says so.
-    const bad = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet", "1.0"], {
+    const bad = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet.ios", "1.0"], {
       encoding: "utf8",
       env: {
         ...clean,

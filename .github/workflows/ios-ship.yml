@@ -17,12 +17,14 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 #   a synced GitHub secret as GH_FALLBACK_*; an inert Sentry beats a red ship).
 # scripts/ios-appstore-gm-prepare.sh maps the five signing names onto
 # ~/.secrets/appstore-connect.env and imports the Distribution identity.
-# Values are never printed. Do not mint a new key. Do not create a new
-# provisioning profile (fleet automatic signing + -allowProvisioningUpdates).
-# Leftover GitHub APPLE_/IOS_ secrets stay for a later cleanup.
+# Hosted ships use MANUAL Release signing: scripts/ios-install-appstore-profiles.sh
+# reuses or creates IOS_APP_STORE profiles over the App Store Connect API
+# (asc-api.mjs ensure-appstore-profiles), installs them, and archives with the
+# profile names in ios/appstore-profiles.json.  Values are never printed.
+# Do not mint a new API key.  Leftover GitHub APPLE_/IOS_ secrets stay for cleanup.
 #
 # The in-repo wrapper prefers scripts/ios-fleet/, then
-# /Users/jay/apps/ios-fleet. App key `botfleet`, bundle `app.botfleet`,
+# /Users/jay/apps/ios-fleet. App key `botfleet`, bundle `app.botfleet.ios`,
 # team `CC8UTF7ATG`. Marketing train is 1.0.N; build is UTC YYYYMMDDHHMM.
 
 on:
@@ -34,6 +36,7 @@ on:
       - 'scripts/ios-fleet/**'
       - 'scripts/ios-ship-testflight.sh'
       - 'scripts/ios-appstore-gm-prepare.sh'
+      - 'scripts/ios-install-appstore-profiles.sh'
   workflow_dispatch:
   schedule:
     # Twice an hour, offset from Socratic.Trade ('*/30'), Congress.Trade
@@ -66,10 +69,14 @@ jobs:
   ship:
     name: TestFlight archive + upload
     if: github.event.repository.fork == false
-    runs-on: macos-latest
+    # GitHub-hosted `xcode-27` image (actions/runner-images#14404): the iOS 27
+    # deployment floor needs the iOS 27 SDK, which macos-latest (Xcode 26.x)
+    # lacks.  DEVELOPER_DIR pins stable Xcode 27.0; the image also carries
+    # 27.1/27.2 betas, which App Store review rejects.
+    runs-on: xcode-27
     timeout-minutes: 90
     env:
-      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
       # fetch-depth: 0 is load-bearing, not hygiene. The default depth-1
       # checkout leaves the runner workspace with exactly ONE commit, so
@@ -103,6 +110,7 @@ jobs:
       - name: Assert stable Xcode (never beta)
         if: steps.gate.outputs.should_ship == '1'
         run: |
+          bash scripts/ios-assert-xcode.sh 27.0
           echo "DEVELOPER_DIR=${DEVELOPER_DIR}"
           xcodebuild -version
           ver=$(xcodebuild -version | awk 'NR==1{print $2}')
@@ -129,11 +137,7 @@ jobs:
         if: steps.gate.outputs.should_ship == '1'
         run: |
           # ios/BotFleet.xcodeproj is gitignored. Hosted ships must generate it.
-          if command -v xcodegen >/dev/null 2>&1; then
-            xcodegen --version
-          else
-            brew install xcodegen
-          fi
+          bash scripts/ios-install-xcodegen.sh
 
 
       # Identity stays on GitHub.  Apple/iOS signing material and the Cocoa
@@ -176,7 +180,7 @@ jobs:
 
       # Route through the in-repo wrapper. scripts/ios-ship-testflight.sh
       # execs scripts/ios-fleet/ship-testflight.sh (BotFleet apps.json is
-      # app.botfleet, 1.0.N).
+      # app.botfleet.ios, 1.0.N).
       #
       # No extra flags. Standing gate is DEFAULT_MIN_INTERVAL_SEC=3600
       # (1 hour) in the fleet script. The 30-minute cron picks up an unbuilt
@@ -186,4 +190,5 @@ jobs:
         if: steps.gate.outputs.should_ship == '1'
         env:
           IOS_TF_RELEASE_NOTES: "1"  # Jay 2026-09-08: publish ASC What to Test
+          IOS_MANUAL_SIGN: "1"  # 2026-10-07: API profiles; no Xcode provisioning service
         run: bash scripts/ios-ship-testflight.sh

@@ -72,7 +72,7 @@ function testConfig(overrides: Partial<ApnsConfig> = {}): ApnsConfig {
   return {
     keyId: "ABC123",
     teamId: "TEAMID1",
-    bundleId: "app.botfleet",
+    bundleId: "app.botfleet.ios",
     p8: testP8(),
     production: true,
     ...overrides,
@@ -300,7 +300,7 @@ describe("sendApnsAlert", () => {
     expect(result).toEqual({ ok: true, status: 200, attempts: 1, failureKind: "none" });
     expect(url).toBe(`https://api.push.apple.com/3/device/${token}`);
     expect(headers?.get("apns-push-type")).toBe("alert");
-    expect(headers?.get("apns-topic")).toBe("app.botfleet");
+    expect(headers?.get("apns-topic")).toBe("app.botfleet.ios");
     expect(body.aps?.alert).toEqual({ title: "Scout finished", body: "done" });
     expect(body.aps?.["content-available"]).toBe(1);
     expect(body.aps?.category).toBe("BOTFLEET_UPDATE");

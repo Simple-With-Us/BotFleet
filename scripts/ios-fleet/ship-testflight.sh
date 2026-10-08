@@ -747,12 +747,13 @@ if [[ "$APP_KEY" == "dealdex" && "$BUNDLE_ID" != "net.dealdex" ]]; then
   die "DealDex live bundle is net.dealdex, not ${BUNDLE_ID}"
 fi
 
-# BotFleet ASC App ID for app.botfleet.ios was never created (owner action from
-# the 2026-09-22 bundle rename). Ships must stay on the live ASC record
-# app.botfleet / appleId 6806379515 or the asc-seq gate fails with rc=2
-# (observed schedule run 36839653889).
-if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" != "app.botfleet" ]]; then
-  die "BotFleet ASC app is app.botfleet (appleId 6806379515); refusing bundleId=${BUNDLE_ID} until that App ID exists in App Store Connect"
+# BotFleet ships only the ASC record app.botfleet.ios / appleId 6820175685.
+# Legacy app.botfleet / 6806379515 must not receive uploads.
+if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" == "app.botfleet" ]]; then
+  die "refusing legacy BotFleet bundleId app.botfleet (appleId 6806379515); use app.botfleet.ios (6820175685)"
+fi
+if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" != "app.botfleet.ios" ]]; then
+  die "BotFleet ASC app is app.botfleet.ios (appleId 6820175685); refusing bundleId=${BUNDLE_ID}"
 fi
 
 if [[ -z "$UPLOAD_ONLY_IPA" && "$DRY_RUN" -eq 0 ]]; then
@@ -970,6 +971,65 @@ if [[ -n "${ASC_KEY_PATH:-}" && -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" 
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# MANUAL APP STORE SIGNING (2026-10-07, BotFleet app.botfleet.ios first ship)
+# ---------------------------------------------------------------------------
+# Xcode 26 automatic signing (-allowProvisioningUpdates) calls
+# developerservices2.apple.com, and the fleet ASC API key gets HTTP 401 there.
+# Manual mode installs App Store profiles over the REST API and archives with
+# CODE_SIGN_STYLE=Manual from ios/project.yml Release settings.
+MANUAL_SIGN=0
+PROVISION_UPDATE_FLAGS=(-allowProvisioningUpdates)
+_profile_map_dir="ios"
+if [[ -n "$XCODEGEN_DIR" && "$XCODEGEN_DIR" != "null" ]]; then
+  _profile_map_dir="$XCODEGEN_DIR"
+fi
+PROFILE_MAP="${IOS_APPSTORE_PROFILES_MAP:-${REPO_ROOT}/${_profile_map_dir}/appstore-profiles.json}"
+if [[ "$PLATFORM" != "macOS" ]]; then
+  case "${IOS_MANUAL_SIGN:-}" in
+    1) MANUAL_SIGN=1 ;;
+    0) MANUAL_SIGN=0 ;;
+    *) [[ -f "$PROFILE_MAP" ]] && MANUAL_SIGN=1 ;;
+  esac
+fi
+
+write_manual_export_plists() {
+  EXPORT_PLIST_UPLOAD="${LOG_DIR}/ExportOptions-manual-upload.plist"
+  EXPORT_PLIST_IPA="${LOG_DIR}/ExportOptions-manual-ipa.plist"
+  python3 - "$PROFILE_MAP" "$TEAM_ID" "$EXPORT_PLIST_UPLOAD" "$EXPORT_PLIST_IPA" <<'PY'
+import json, plistlib, sys
+profiles = json.load(open(sys.argv[1], encoding="utf-8"))
+common = {
+    "method": "app-store-connect",
+    "teamID": sys.argv[2],
+    "signingStyle": "manual",
+    "signingCertificate": "Apple Distribution",
+    "provisioningProfiles": profiles,
+    "uploadSymbols": True,
+    "manageAppVersionAndBuildNumber": False,
+    "stripSwiftSymbols": True,
+}
+for path, destination in ((sys.argv[3], "upload"), (sys.argv[4], "export")):
+    opts = dict(common)
+    opts["destination"] = destination
+    with open(path, "wb") as handle:
+        plistlib.dump(opts, handle, fmt=plistlib.FMT_XML)
+PY
+  log "manual export options written (profiles from ${PROFILE_MAP##*/})"
+}
+
+if [[ "$MANUAL_SIGN" -eq 1 ]]; then
+  [[ -f "$PROFILE_MAP" ]] || die "IOS_MANUAL_SIGN=1 but the profile map is missing: ${PROFILE_MAP}"
+  _installer="${IOS_INSTALL_PROFILES_SCRIPT:-${REPO_ROOT}/scripts/ios-install-appstore-profiles.sh}"
+  [[ -f "$_installer" ]] || die "manual signing needs ${_installer}"
+  log "manual App Store signing: skipping Xcode's provisioning service"
+  IOS_APPSTORE_PROFILES_MAP="$PROFILE_MAP" bash "$_installer" \
+    || die "could not install the App Store profiles named in ${PROFILE_MAP}"
+  PROVISION_UPDATE_FLAGS=()
+  ASC_AUTH_FLAGS=()
+  write_manual_export_plists
+fi
+
 # One Mac hosts three Actions runners. Serialize archive/export so two
 # xcodebuild archives cannot thrash DerivedData / codesign at once.
 ARCHIVE_LOCK_DIR="${STATE_DIR}/archive.lockdir"
@@ -1065,28 +1125,52 @@ else
   fi
 fi
 
-xcodebuild archive \
-  -project "$PROJECT_PATH" \
-  -scheme "$SCHEME" \
-  -configuration Release \
-  "${ARCHIVE_PLATFORM_FLAGS[@]}" \
-  -archivePath "$ARCHIVE_PATH" \
-  -allowProvisioningUpdates \
-  -allowProvisioningDeviceRegistration \
-  ${ASC_AUTH_FLAGS[@]:+"${ASC_AUTH_FLAGS[@]}"} \
-  DEVELOPMENT_TEAM="$TEAM_ID" \
-  CODE_SIGN_STYLE=Automatic \
-  MARKETING_VERSION="$MARKETING" \
-  CURRENT_PROJECT_VERSION="$BUILD_NUM" \
-  ${SENTRY_DSN_FLAGS[@]:+"${SENTRY_DSN_FLAGS[@]}"} \
-  2>&1 | tee "${LOG_DIR}/archive.log"
-ARCHIVE_RC="${PIPESTATUS[0]:-$?}"
+if [[ "$MANUAL_SIGN" -eq 1 ]]; then
+  xcodebuild archive \
+    -project "$PROJECT_PATH" \
+    -scheme "$SCHEME" \
+    -configuration Release \
+    "${ARCHIVE_PLATFORM_FLAGS[@]}" \
+    -archivePath "$ARCHIVE_PATH" \
+    DEVELOPMENT_TEAM="$TEAM_ID" \
+    MARKETING_VERSION="$MARKETING" \
+    CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+    ${SENTRY_DSN_FLAGS[@]:+"${SENTRY_DSN_FLAGS[@]}"} \
+    2>&1 | tee "${LOG_DIR}/archive.log"
+  ARCHIVE_RC="${PIPESTATUS[0]:-$?}"
+else
+  xcodebuild archive \
+    -project "$PROJECT_PATH" \
+    -scheme "$SCHEME" \
+    -configuration Release \
+    "${ARCHIVE_PLATFORM_FLAGS[@]}" \
+    -archivePath "$ARCHIVE_PATH" \
+    -allowProvisioningUpdates \
+    -allowProvisioningDeviceRegistration \
+    ${ASC_AUTH_FLAGS[@]:+"${ASC_AUTH_FLAGS[@]}"} \
+    DEVELOPMENT_TEAM="$TEAM_ID" \
+    CODE_SIGN_STYLE=Automatic \
+    MARKETING_VERSION="$MARKETING" \
+    CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+    ${SENTRY_DSN_FLAGS[@]:+"${SENTRY_DSN_FLAGS[@]}"} \
+    2>&1 | tee "${LOG_DIR}/archive.log"
+  ARCHIVE_RC="${PIPESTATUS[0]:-$?}"
+fi
 set -e
 [[ $ARCHIVE_RC -eq 0 ]] || die "archive failed (rc=$ARCHIVE_RC); see ${LOG_DIR}/archive.log"
+if [[ "$MANUAL_SIGN" -eq 1 ]]; then
+  _archived_app="$(ls -d "${ARCHIVE_PATH}/Products/Applications/"*.app 2>/dev/null | head -1 || true)"
+  if [[ -n "$_archived_app" ]]; then
+    _authority="$(codesign -dvv "$_archived_app" 2>&1 | sed -n 's/^Authority=//p' | head -1 || true)"
+    log "archived app signed by: ${_authority:-unknown}"
+  fi
+fi
 upload_sentry_artifacts
 
-EXPORT_PLIST_UPLOAD="${FLEET_DIR}/ExportOptions-appstore.plist"
-EXPORT_PLIST_IPA="${FLEET_DIR}/ExportOptions-export-ipa.plist"
+if [[ "$MANUAL_SIGN" -eq 0 ]]; then
+  EXPORT_PLIST_UPLOAD="${FLEET_DIR}/ExportOptions-appstore.plist"
+  EXPORT_PLIST_IPA="${FLEET_DIR}/ExportOptions-export-ipa.plist"
+fi
 
 if [[ "$EXPORT_ONLY" -eq 1 ]]; then
   log "exporting package only..."
@@ -1096,7 +1180,7 @@ if [[ "$EXPORT_ONLY" -eq 1 ]]; then
     -archivePath "$ARCHIVE_PATH" \
     -exportPath "$EXPORT_DIR" \
     -exportOptionsPlist "$EXPORT_PLIST_IPA" \
-    -allowProvisioningUpdates \
+    ${PROVISION_UPDATE_FLAGS[@]:+"${PROVISION_UPDATE_FLAGS[@]}"} \
     ${ASC_AUTH_FLAGS[@]:+"${ASC_AUTH_FLAGS[@]}"} \
     2>&1 | tee "${LOG_DIR}/export.log"
   EXPORT_RC=${PIPESTATUS[0]}
@@ -1109,6 +1193,10 @@ if [[ "$EXPORT_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
+if [[ "$MANUAL_SIGN" -eq 1 ]]; then
+  log "manual signing: exporting the IPA locally, then uploading with altool (api key)"
+  : >"${LOG_DIR}/export-upload.log"
+else
 # Prefer: export with destination=upload (uses Xcode session OR ASC if configured in Xcode)
 log "exporting + uploading to App Store Connect..."
 mkdir -p "$EXPORT_DIR"
@@ -1134,6 +1222,7 @@ if [[ $EXPORT_RC -eq 0 ]]; then
 fi
 
 log "xcodebuild upload export failed (rc=$EXPORT_RC); trying local export + altool"
+fi
 
 mkdir -p "$EXPORT_DIR"
 set +e
@@ -1141,7 +1230,7 @@ xcodebuild -exportArchive \
   -archivePath "$ARCHIVE_PATH" \
   -exportPath "$EXPORT_DIR" \
   -exportOptionsPlist "$EXPORT_PLIST_IPA" \
-  -allowProvisioningUpdates \
+  ${PROVISION_UPDATE_FLAGS[@]:+"${PROVISION_UPDATE_FLAGS[@]}"} \
   ${ASC_AUTH_FLAGS[@]:+"${ASC_AUTH_FLAGS[@]}"} \
   2>&1 | tee "${LOG_DIR}/export-ipa.log"
 EXPORT_RC=${PIPESTATUS[0]}

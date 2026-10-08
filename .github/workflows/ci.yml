@@ -237,8 +237,13 @@ jobs:
     if: ${{ !cancelled() }}
     # Fast-path (docs-only or no ios/ changes) reports the required check on
     # ubuntu-latest so we do not burn a macOS concurrent slot for an echo.
-    runs-on: ${{ (needs.changes.outputs.docs_only == 'true' || needs.changes.outputs.ios_changed != 'true') && 'ubuntu-latest' || 'macos-latest' }}
+    # iOS 27 deployment floor needs the iOS 27 SDK.  macos-latest ships Xcode
+    # 26.x only, so the full path runs on GitHub's hosted `xcode-27` image
+    # (actions/runner-images#14404) pinned to stable Xcode 27.0, never a beta.
+    runs-on: ${{ (needs.changes.outputs.docs_only == 'true' || needs.changes.outputs.ios_changed != 'true') && 'ubuntu-latest' || 'xcode-27' }}
     timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
       - name: Documentation-only fast path
         if: needs.changes.outputs.docs_only == 'true'
@@ -248,13 +253,16 @@ jobs:
         run: echo "No ios/, ios script, or CI workflow paths changed; the iOS build was skipped."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
+      - name: Assert stable Xcode 27.0
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
+        run: bash scripts/ios-assert-xcode.sh 27.0
       - name: Swift package tests
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: swift test --package-path ios
       - name: Generate the Xcode project
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: |
-          brew install xcodegen
+          bash scripts/ios-install-xcodegen.sh
           cd ios
           xcodegen generate
       - name: Build the iOS app (unsigned)
