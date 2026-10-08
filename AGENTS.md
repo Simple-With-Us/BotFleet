@@ -104,7 +104,7 @@ Naming convention `app.<name>.<platform>` for executables, `app.<name>` for the 
 | macOS Speech helper | `app.botfleet.speech.macos` | `electron/resources/speech-helper-Info.plist` |
 | Always-on LaunchAgent (harness) | `app.botfleet.server` | `~/Library/LaunchAgents/app.botfleet.server.plist` `Label` |
 | iOS app | `app.botfleet.ios` (ASC appleId `6820175685`) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `ios/Sources/CompanionCore/TestFlightUpdateCheck.swift`, `scripts/ios-fleet/apps.json` |
-| iOS widgets | `app.botfleet.ios.widgets` (register in ASC before widget ships) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |
+| iOS widgets | `app.botfleet.ios.widgets` (registered in Developer Portal) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |
 | App group | `group.app.botfleet` | `ios/App/BotFleet.entitlements`, `ios/Widgets/BotFleetWidgets.entitlements` |
 | Associated domain | `botfleet.app` (Universal Links + web credentials) | `ios/project.yml` `com.apple.developer.associated-domains` |
 
