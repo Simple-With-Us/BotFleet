@@ -4,7 +4,7 @@ import { estimatedClips } from "../../../shared/karaoke-align";
 // The harness's own projection rules (pure, no Node APIs), so a reply this
 // Mac speaks without the harness drops code, links, and markdown the same way,
 // and carries the same source spans for karaoke.
-import { karaokeScriptFromWire, localKaraokeScript, type KaraokeScript } from "../../../shared/spoken-script";
+import { karaokeScriptFromWire, localKaraokeScript, stripPauseTags, type KaraokeScript } from "../../../shared/spoken-script";
 import { z } from "zod";
 import { ClipsKaraoke, LiveKaraoke, type KaraokeEndReason, type KaraokeFeed } from "./karaoke-feed";
 import { TtsAudioBodySchema, type TtsAudioBody } from "./schema";
@@ -401,7 +401,8 @@ export class Speaker {
   ): Promise<void> {
     const total = first.total ?? first.audio.length;
     const utterances = first.utterances ?? [];
-    const voiceText = first.voiceText;
+    // The call caption shows these; MiniMax pause tags are for the voice.
+    const voiceText = first.voiceText === undefined ? undefined : stripPauseTags(first.voiceText);
     // One window per clip on a single audio timeline.  Durations start as
     // estimates and become real as each clip's metadata arrives.
     const feed = script && opts.messageId && script.utterances.length === total
@@ -429,7 +430,7 @@ export class Speaker {
       if (!live()) return;
       if ("error" in loaded) throw loaded.error;
       next = index + 1 < total ? load(index + 1) : null;
-      const caption = utterances[index] ?? voiceText;
+      const caption = utterances[index] === undefined ? voiceText : stripPauseTags(utterances[index]);
       this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption, voiceText });
       const clip = index;
       const finished = await this.play(loaded.blob, live, feed

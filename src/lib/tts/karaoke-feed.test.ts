@@ -168,6 +168,21 @@ describe("karaoke feed for a hosted voice", () => {
     }
   });
 
+  it("captions a distilled clip without its MiniMax pause tags, and keeps them in the karaoke script", async () => {
+    const utterances = ["The deploy finished. <#0.3#> First, the A P I timeout is three point five seconds.", "That is all."];
+    const body = written({ script: "summary", spans: undefined, utterances, total: 2, voiceText: utterances.join(" ") });
+    stubFetch((url) => (url === endpoint ? jsonResponse(body) : mp3()));
+    const speaker = new Speaker();
+    const speaking = speaker.speak("raw text", { ...messageOpts, voiceId: "minimax-warm" });
+    await vi.waitFor(() => expect(FakeAudio.instances.length).toBe(1));
+    expect(speaker.state.caption).toBe("The deploy finished. First, the A P I timeout is three point five seconds.");
+    expect(speaker.state.voiceText).not.toContain("<#");
+    // Clip offsets index what MiniMax spoke, tags included.
+    expect(speaker.karaoke?.script.spokenText).toBe(utterances.join(" "));
+    speaker.stop();
+    await speaking;
+  });
+
   it("keeps the utterances and plays on when the spans are malformed", async () => {
     stubFetch((url) => (url === endpoint ? jsonResponse({ ...written(), spans: { format: 9 } }) : mp3()));
     const speaker = new Speaker();
