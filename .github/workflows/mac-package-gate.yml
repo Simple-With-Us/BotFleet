@@ -169,11 +169,15 @@ jobs:
             exit 1
           fi
           plutil -lint "$app/Contents/Info.plist"
-          # An unsigned build must genuinely be unsigned.  If this ever reports
-          # a signature, the gate is no longer proving the unsigned path and a
-          # certificate leaked into the runner environment.
-          if codesign -dv "$app" >/dev/null 2>&1; then
-            echo "::error::the gate build is signed; it must exercise the unsigned path"
+          # An arm64 bundle is ALWAYS signed -- the linker requires at least an
+          # ad-hoc signature for arm64 code to execute -- so `codesign -dv`
+          # succeeding proves nothing and this gate's first draft wrongly failed
+          # on it.  What must be absent is the real Developer ID identity: if the
+          # team shows up here, a certificate leaked into the runner and this
+          # job has stopped exercising the unsigned path it exists to test.
+          team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          if [ "${team:-}" = "CC8UTF7ATG" ]; then
+            echo "::error::the gate bundle carries Developer ID team ${team}; it must exercise the unsigned path"
             exit 1
           fi
-          echo "unsigned arm64 bundle present at $app"
+          echo "unsigned arm64 bundle at ${app}${team:+ (ad-hoc, team ${team})}"

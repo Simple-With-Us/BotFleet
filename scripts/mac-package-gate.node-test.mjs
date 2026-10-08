@@ -106,9 +106,14 @@ test("the workflow classifies cheaply and packages only when told to", () => {
   assert.match(yml, /if: \$\{\{ needs\.scope\.outputs\.run == 'true' && !cancelled\(\) \}\}/);
   assert.match(yml, /runs-on: macos-14/);
 
-  // Unsigned, and provably so.
+  // Unsigned, and provably so.  Note that arm64 bundles are always ad-hoc
+  // signed, so the assertion has to be about the Developer ID team, never
+  // about codesign succeeding -- the first draft of this gate asserted the
+  // latter and failed on a correctly unsigned-free build.
   assert.match(body, /CSC_IDENTITY_AUTO_DISCOVERY:\s*"false"/);
-  assert.match(body, /the gate build is signed/);
+  assert.match(body, /TeamIdentifier=/);
+  assert.match(body, /must exercise the unsigned path/);
+  assert.doesNotMatch(body, /if codesign -dv "\$app" >\/dev\/null/);
   // No certificate, no notarization, no artifact publication.
   assert.doesNotMatch(body, /security import/);
   assert.doesNotMatch(body, /notariz/i);
