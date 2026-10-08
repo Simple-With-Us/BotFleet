@@ -15,7 +15,7 @@ import { resolveCuaMacArches } from "./cua-mac-arches.mjs";
 import { nativeProbeFailureMessage, probeNativeVersion } from "./native-version-probe.mjs";
 
 export const CUA_RELEASE = Object.freeze({
-  version: "0.20.0",
+  version: "0.19.0",
   file: "cua-driver-rs-0.20.0-darwin-universal-binary.tar.gz",
   sha256: "07a88ea2c28a9ead66b2d9f6f93fab4b1189a1f7c704d2cd7b6d12c30eee9984",
 });
