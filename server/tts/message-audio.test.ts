@@ -269,6 +269,11 @@ describe("POST /audio, legacy request (no device, not progressive)", () => {
     const progressive = await post(long, { voice: "vA" }, { progressive: true, device: "iphone" });
     expect(progressive.status).toBe(200);
     expect(progressive.body.total).toBe(MAX_UTTERANCES + 1);
+
+    // A reply with nothing to say is not something an update fixes.
+    const silent = await post(setup({ text: "---" }), { voice: "vA" });
+    expect(silent.status).toBe(413);
+    expect(silent.body.error).toBe("reply exceeds voice clip limit");
   });
 
   it("answers within its budget while the clips are still being made, and the next tap gets them", async () => {

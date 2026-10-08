@@ -466,7 +466,10 @@ export class MessageAudio {
     if (!utterances.length || utterances.length > maxUtterances || spoken.length > MAX_SPEAKABLE_CHARS) {
       // A shipped build over its own cap could play this reply after an
       // update; say so instead of the bare limit.
-      const updateWouldHelp = !progressive && utterances.length <= MAX_UTTERANCES_PROGRESSIVE && spoken.length <= MAX_SPEAKABLE_CHARS;
+      const updateWouldHelp = !progressive
+        && utterances.length > MAX_UTTERANCES
+        && utterances.length <= MAX_UTTERANCES_PROGRESSIVE
+        && spoken.length <= MAX_SPEAKABLE_CHARS;
       return {
         kind: "json",
         status: 413,
