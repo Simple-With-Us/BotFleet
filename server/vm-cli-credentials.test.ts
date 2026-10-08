@@ -8,6 +8,7 @@ import {
   allowedCliGuestDestinations,
   credentialSyncExcludePatterns,
   DockerConfigSchema,
+  guestCredentialOwnershipRepairShell,
   hostCliCredentialMounts,
   manifestCredentialCandidates,
   packageCredentialArchive,
@@ -104,6 +105,27 @@ describe("vm CLI credential sync", () => {
     for (const pattern of [".config/gcloud/logs", ".config/gcloud/cache", ".config/gcloud/data"]) {
       expect(excludes).toContain(pattern);
     }
+  });
+
+  it("repairs guest ownership by removing only paths the guest user does not own", () => {
+    const shell = guestCredentialOwnershipRepairShell(["/home/cua/.config/gcloud/logs", "/home/cua/.ssh"]);
+    expect(shell).toContain(`id -u cua`);
+    expect(shell).toContain("stat -c %u");
+    expect(shell).toContain("rm -rf");
+    // Both destinations are named, and nothing else is: this runs as root, so
+    // an over-broad pattern would delete a guest's own state.
+    expect(shell).toContain("'/home/cua/.config/gcloud/logs'");
+    expect(shell).toContain("'/home/cua/.ssh'");
+    expect(shell).toContain("|| true");
+  });
+
+  it("quotes a guest path that carries a single quote", () => {
+    const shell = guestCredentialOwnershipRepairShell(["/home/cua/.config/o'brien"]);
+    expect(shell).toContain(`'/home/cua/.config/o'\\''brien'`);
+  });
+
+  it("does no guest work at all when there is nothing to repair", () => {
+    expect(guestCredentialOwnershipRepairShell([])).toBe("exit 0");
   });
 
   it("packs gcloud credentials without its log and cache churn", async () => {
