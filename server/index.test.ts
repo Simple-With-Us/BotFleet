@@ -16,6 +16,7 @@ import { z } from "zod";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
+import { CONTAINER_RUNTIME_DISABLED_MESSAGE } from "./container-runtime-guard.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 import { DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
@@ -7319,9 +7320,14 @@ describe("Local VM lifecycle routes honor the provider toggle", () => {
       expect(on.status).toBe(200);
       // Shared mode allows the bot endpoint to run or create the shared container;
       // it is not blocked by the provider gate or by a legacy App Settings referral.
+      // This harness runs with container runtimes switched off (spawnDetached),
+      // so the request must reach the runtime layer and be refused THERE, with
+      // exactly that message — nothing is created on the machine running the
+      // suite.  An unqualified "no gate text" assertion once let a real
+      // `docker run` through and orphaned the owner's real Local VM container.
       const perBot = await api("POST", `/api/bots/${bot.id}/local-computer/run`, {});
-      expect(String(perBot.body.error ?? "")).not.toContain("turned off in Computer settings");
-      expect(String(perBot.body.error ?? "")).not.toContain("Shared mode manages this desktop in App Settings");
+      expect(perBot.status).toBe(409);
+      expect(perBot.body.error).toBe(CONTAINER_RUNTIME_DISABLED_MESSAGE);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }

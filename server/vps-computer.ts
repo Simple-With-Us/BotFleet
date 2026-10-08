@@ -29,6 +29,7 @@ import {
   MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   MANAGED_LABEL,
 } from "./container-computer.ts";
+import { resolveRuntimeCommand } from "./container-runtime-guard.ts";
 import {
   ensureSharedVpsSessionExecArgs,
   isSharedVpsMode,
@@ -428,7 +429,10 @@ function tailCollector() {
 
 export function defaultRunner(args: string[], options: VpsCommandOptions = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("docker", args, {
+    // `docker -H ssh://…` ignores DOCKER_HOST, so the container-runtime kill
+    // switch is enforced here, before the spawn.  A throw in this executor
+    // rejects the promise.
+    const child = spawn(resolveRuntimeCommand("docker"), args, {
       shell: false,
       env: { ...process.env, PATH: augmentedPath() },
       stdio: ["pipe", "pipe", "pipe"],
