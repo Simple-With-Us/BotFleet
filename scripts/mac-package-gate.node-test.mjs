@@ -10,7 +10,12 @@ import { shouldRunMacPackageGate } from "./mac-package-gate.mjs";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 function read(rel) {
-  return readFileSync(join(ROOT, rel), "utf8");
+  // Normalise line endings.  This suite runs on the windows-latest matrix leg,
+  // where a default Git for Windows checkout rewrites the working tree to CRLF,
+  // and an assertion anchored to `\n` after a colon then stops matching.  The
+  // repo's .gitattributes pins no eol, so that rewrite is real rather than
+  // hypothetical.
+  return readFileSync(join(ROOT, rel), "utf8").replace(/\r\n/g, "\n");
 }
 
 const run = (changedPaths, extra = {}) =>
