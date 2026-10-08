@@ -4,6 +4,8 @@
 //
 //   xcrun simctl launch booted app.botfleet.ios \
 //     -store-preview -open-first -karaoke-demo [-karaoke-demo-word passed] [-karaoke-demo-fraction 0.5]
+//   xcrun simctl launch booted app.botfleet.ios \
+//     -store-preview -open-first -karaoke-demo -karaoke-demo-feed
 //
 // Adds a markdown reply to the first preview bot's thread and follows it
 // with the same script, spans, alignment and timing a hosted voice uses
@@ -11,6 +13,13 @@
 // clock is pinned partway through the first display word with that text
 // (`-karaoke-demo-fraction`, default 0.5), so a screenshot is the same
 // every time.  Without it, the reply plays through once.
+//
+// `-karaoke-demo-feed` follows the reply the way a Personal Voice read
+// does instead: it packs the utterances into chunks as the phone does, and
+// reports each word of each chunk, as willSpeakRange would, to a live
+// karaoke, starting after `-karaoke-demo-delay` seconds (default 3).  The
+// simulator has no Personal Voice, so whether a real one
+// reports words still needs a device.
 import CompanionCore
 import Foundation
 import QuartzCore
@@ -59,6 +68,25 @@ enum KaraokeDemo {
             utterances: spoken.map(\.text),
             wire: SpokenSpansWire.encode(sourceText: source, utterances: spoken)
         )
+        if arguments.contains("-karaoke-demo-feed") {
+            let chunks = SpeechProjection.segments(fromUtterances: spoken.map(\.text)).map(\.text)
+            guard let karaoke = KaraokeCenter.shared.begin(messageId: messageId, messageText: reply, script: script, mode: .live) else { return }
+            karaoke.setChunks(chunks)
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(number(after: "-karaoke-demo-delay") ?? 3))
+                for (chunk, text) in chunks.enumerated() {
+                    for word in KaraokeAlign.tokenize(text) {
+                        guard KaraokeCenter.shared.active === karaoke else { return }
+                        karaoke.liveWord(chunk: chunk, location: word.start, at: CACurrentMediaTime())
+                        let ms = max(140, Double(word.end - word.start) * KaraokeAlign.defaultMsPerChar)
+                        try? await Task.sleep(for: .milliseconds(Int(ms)))
+                    }
+                }
+                KaraokeCenter.shared.finish(karaoke)
+                session.debugSetSpeaking(nil)
+            }
+            return
+        }
         guard let karaoke = KaraokeCenter.shared.begin(messageId: messageId, messageText: reply, script: script, mode: .clips) else { return }
 
         if let index = arguments.firstIndex(of: "-karaoke-demo-word"), index + 1 < arguments.count {
