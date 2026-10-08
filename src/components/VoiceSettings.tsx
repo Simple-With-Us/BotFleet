@@ -23,6 +23,7 @@ import {
   parsePersonalVoiceList,
   parseTtsVoicesResponse,
   type PersonalVoiceInfo,
+  type TtsVoicesResponse,
 } from "@/lib/tts/schema";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
@@ -189,7 +190,7 @@ export function VoiceSettings({
       .catch(() => ({}))
       .then((raw) => {
         if (requestId !== loadRequestRef.current) return;
-        let r: { voices?: VoiceOption[]; error?: string };
+        let r: TtsVoicesResponse;
         try {
           r = parseTtsVoicesResponse(raw);
         } catch {
