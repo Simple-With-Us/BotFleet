@@ -940,6 +940,7 @@ export function VoiceSettings({
               <button
                 key={mode.id}
                 type="button"
+                aria-pressed={isSelected}
                 onClick={() => onPatch({ voiceSummaryMode: mode.id })}
                 className={cn(
                   "flex flex-col items-start rounded-lg border p-2.5 text-left transition-colors",

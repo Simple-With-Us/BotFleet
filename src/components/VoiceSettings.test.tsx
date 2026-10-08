@@ -172,6 +172,11 @@ describe("VoiceSettings", () => {
     const selected = html.indexOf("border-accent bg-accent/5");
     expect(selected).toBeGreaterThan(-1);
     expect(html.slice(selected, html.indexOf("</button>", selected))).toContain("Read As Written");
+    // The choice is announced, not only colored: one pressed mode button.
+    expect(html.match(/aria-pressed="true"/g)).toHaveLength(1);
+    expect(html.match(/aria-pressed="false"/g)).toHaveLength(2);
+    const pressed = html.indexOf('aria-pressed="true"');
+    expect(html.slice(pressed, html.indexOf("</button>", pressed))).toContain("Read As Written");
   });
 });
 
