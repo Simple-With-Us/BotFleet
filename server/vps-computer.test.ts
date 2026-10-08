@@ -878,6 +878,39 @@ describe("VPS computer", () => {
       }
     });
 
+    // Kody's high finding on #936: a directory can exist on the guest while the
+    // credential file inside it was refused.  Probing only the top-level
+    // destination reports that as a complete sync.
+    it("fails when the destination directory exists but the packed file inside it is missing", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-member-"));
+      try {
+        mkdirSync(join(tempDir, ".ssh"), { recursive: true });
+        writeFileSync(join(tempDir, ".ssh", "config"), "Host *\n");
+
+        const fake = fixture({ container: true, running: true });
+        const member: VpsCommandRunner = async (args, options) => {
+          if (args.includes("tar") && args.includes("-xf")) {
+            fake.calls.push({ args, options });
+            throw new Error("tar: .ssh/config: Cannot open: Permission denied");
+          }
+          if (args.includes("sh") && args.includes("-c")) {
+            fake.calls.push({ args, options });
+            // Every top-level directory is present; only the file is not.
+            const probe = String(args[args.length - 1] ?? "");
+            if (probe.includes("rm -rf")) return { stdout: "", stderr: "" };
+            return { stdout: probe.includes(".ssh/config") ? "/home/cua/.ssh/config\n" : "", stderr: "" };
+          }
+          return fake.runner(args, options);
+        };
+
+        await expect(vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, member, tempDir)).rejects.toThrow(
+          /are missing/,
+        );
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
     it("still fails the sync when a credential destination is genuinely missing", async () => {
       const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-missing-"));
       try {
@@ -898,7 +931,7 @@ describe("VPS computer", () => {
         };
 
         await expect(vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, missing, tempDir)).rejects.toThrow(
-          /destination\(s\) are missing/,
+          /are missing/,
         );
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
