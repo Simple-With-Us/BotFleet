@@ -1,0 +1,179 @@
+# Pre-merge Mac packaging gate.
+#
+# Why this exists: the "Mac Commit Build" workflow runs on push to main and is
+# deliberately not a required check, which made it the last place a Mac
+# packaging break could surface.  Renovate #919 merged with every required check
+# green and broke Mac packaging twice in one dependency bump:
+#
+#   1. @trycua/cua-driver 0.20.0 -> 0.32.0 had no pinned executable asset in
+#      scripts/prepare-cua.mjs ("CUA SDK 0.32.0 has no pinned executable
+#      asset"), fixed in #943.
+#   2. The pnpm override @xmldom/xmldom@0.8.13 went to 0.9.12 and
+#      electron-builder's plist parser then died with
+#      `DOMParser.parseFromString: the provided mimeType "undefined" is not
+#      valid`, fixed in #946.
+#
+# Because the Mac updater installs from the hosted build of main's tip, a
+# post-merge discovery blocks every Mac update until someone fixes it
+# retroactively.  This runs the same packaging path *before* the merge instead,
+# unsigned, so the two failure modes above fail a pull request instead of a
+# release.
+#
+# What it deliberately does NOT do: sign, notarize, staple, or build x64.  The
+# certificate import, the `codesign --verify` team gate, `ditto`, the build
+# manifest, and the artifact upload all belong to Mac Commit Build, which still
+# owns the real artifact and the signature boundary.  This only has to reach the
+# point where prepare-cua resolves and electron-builder has produced and parsed
+# a plist.  `--dir` gives the .app bundle without the DMG, and
+# CSC_IDENTITY_AUTO_DISCOVERY=false keeps electron-builder out of the keychain
+# entirely, so no secret is needed and nothing here can leak one.
+#
+# On required-ness: this is deliberately NOT required, and the reasoning is in
+# the pull request.  Two reasons.  First, a path-filtered required check is a
+# trap -- when the filter skips the workflow the check never reports and the pull
+# request blocks forever -- and this workflow runs on every pull request with a
+# cheap classifier deciding the expensive job, which is the safe shape but the
+# only job that could be required is the classifier, which proves nothing about
+# packaging.  Second, it is a macOS runner: making it required would make every
+# packaging-touching pull request wait on the slowest, scarcest runner class in
+# the fleet.  Renovate pull requests always run it, which is where both real
+# failures came from, and Mac Commit Build stays the post-merge backstop.
+name: Mac Package Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-package-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scope:
+    name: Classify Mac packaging scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Enough history to diff against.  A shallow fetch would report zero
+          # changed paths, which the classifier treats as "no information" and
+          # answers by running the gate -- correct, but an expensive way to say
+          # the diff was unavailable.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Diff against the base ref
+        id: base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          base="${BASE_SHA:-}"
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git merge-base HEAD origin/"${GITHUB_REF_NAME}")"
+          fi
+          if [ -z "$base" ]; then
+            # No base at all: emit nothing and let the classifier fail closed.
+            echo "base_sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --no-renames --name-only -z "$base" HEAD > changed-paths.z
+          echo "base_sha=$base" >> "$GITHUB_OUTPUT"
+          echo "changed $(tr -cd '\0' < changed-paths.z | wc -c | tr -d ' ') path(s) against ${base:0:9}"
+      - name: Decide whether to package
+        id: scope
+        env:
+          # Two identities, because Renovate opens pull requests as a GitHub
+          # App: PR #919's author was `app/renovate` while the event actor was
+          # the app's bot login.  Pass both so either shape matches.
+          GATE_ACTORS: ${{ github.actor }},${{ github.event.pull_request.user.login }}
+          GATE_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          if [ -s changed-paths.z ]; then
+            node scripts/mac-package-gate.mjs < changed-paths.z | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "No base SHA to diff against; running the gate fail-closed." >&2
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "reason=no-base-sha" >> "$GITHUB_OUTPUT"
+          fi
+
+  package:
+    name: Unsigned arm64 package (prepare-cua + plist)
+    needs: scope
+    if: ${{ needs.scope.outputs.run == 'true' && !cancelled() }}
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # A lockfile that disagrees with package.json fails here rather than
+      # halfway through a package run.  Renovate occasionally lands exactly
+      # that, so it is worth keeping as its own visible step.
+      - name: Install exactly what is committed
+        run: pnpm install --frozen-lockfile
+
+      # Same reason Mac Commit Build does this: stale output ships an app that
+      # looks corrupt because it is actually assembled from an older build.
+      - name: Clean generated output
+        run: rm -rf dist dist-server dist-native release
+
+      # Gate 1, deliberately first and on its own.  scripts/prepare-cua.mjs
+      # compares the SDK package version against its pinned release before it
+      # downloads anything, so a missing pin fails in seconds here instead of
+      # after package:prepare has already spent minutes on tsc and vite.  This
+      # is the #943 failure mode.
+      - name: "Gate 1: prepare-cua resolves a pinned driver for the installed SDK"
+        run: pnpm build:cua
+
+      # Gate 2: the unsigned arm64 package path.  Same script Mac Commit Build
+      # uses, minus signing.  `--dir` stops before the DMG, and
+      # CSC_IDENTITY_AUTO_DISCOVERY=false keeps electron-builder out of the
+      # keychain, so this needs no certificate and cannot publish one.
+      #
+      # This is where electron-builder reads electron-builder.yml, assembles
+      # BotFleet.app, and writes and parses Info.plist with the resolved
+      # dependency tree.  That plist parse is the #946 failure mode: the
+      # @xmldom/xmldom override reached 0.9.12 and every build died inside
+      # DOMParser.
+      - name: "Gate 2: unsigned arm64 package reaches electron-builder's plist handling"
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          OMB_CLOUDFLARED_CURRENT: "1"
+        run: pnpm package:mac:local
+
+      # Gate 3: prove the artifact that gate 2 produced is a real bundle with a
+      # plist the OS itself accepts.  `plutil -lint` is the platform parser, not
+      # the same library electron-builder used, so this catches a plist that
+      # "parsed" in Node but is not valid on the way out.
+      - name: "Gate 3: the packaged bundle exists and its plist lints clean"
+        run: |
+          set -euo pipefail
+          app=release/mac-arm64/BotFleet.app
+          if [ ! -d "$app" ]; then
+            echo "::error::electron-builder reported success but $app is missing"
+            exit 1
+          fi
+          plutil -lint "$app/Contents/Info.plist"
+          # An unsigned build must genuinely be unsigned.  If this ever reports
+          # a signature, the gate is no longer proving the unsigned path and a
+          # certificate leaked into the runner environment.
+          if codesign -dv "$app" >/dev/null 2>&1; then
+            echo "::error::the gate build is signed; it must exercise the unsigned path"
+            exit 1
+          fi
+          echo "unsigned arm64 bundle present at $app"
