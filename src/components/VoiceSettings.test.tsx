@@ -158,14 +158,20 @@ describe("VoiceSettings", () => {
     expect(html).toContain("Personal Voice from your iPhone.\u00A0 Choose it on the iPhone.");
   });
 
-  it("renders voice summary mode options and benchmark findings button", () => {
+  it("renders the spoken text options with Read As Written as the default", () => {
     const html = render(sampleBot("voice-1"));
 
-    expect(html).toContain("Voice Summary");
+    expect(html).toContain("Spoken Text");
     expect(html).toContain("Benchmark Findings");
-    expect(html).toContain("On-Demand");
-    expect(html).toContain("All Messages");
-    expect(html).toContain("Off");
+    expect(html).toContain("Read As Written");
+    expect(html).toContain("Summary On Play");
+    expect(html).toContain("Summary Every Reply");
+    expect(html).toContain("highlights each word in the message as it is spoken.  A summary is shorter");
+    expect(html).not.toContain("Voice Summary");
+    // No saved mode: the first option is the selected one.
+    const selected = html.indexOf("border-accent bg-accent/5");
+    expect(selected).toBeGreaterThan(-1);
+    expect(html.slice(selected, html.indexOf("</button>", selected))).toContain("Read As Written");
   });
 });
 

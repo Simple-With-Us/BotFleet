@@ -9805,8 +9805,10 @@ function voiceSummaryFor(
   let job = voiceSummaryJobs.get(key);
   if (!job) {
     job = (async () => {
-      const existing = store.messagesFor(threadId).find((row) => row.id === messageId)?.voiceText;
-      if (existing) return existing;
+      const row = store.messagesFor(threadId).find((candidate) => candidate.id === messageId);
+      // A written-mode script (voiceTextKind "written") is the reply as
+      // written, not a summary, so it is never handed back as one.
+      if (row?.voiceText && row.voiceTextKind !== "written") return row.voiceText;
       try {
         const scrubbedInput = redactSecretsInText(text);
         const summary = await summarizeForVoiceDetailed(scrubbedInput, {
@@ -9815,7 +9817,16 @@ function voiceSummaryFor(
         });
         const safeSummary = summary.text ? redactSecretsInText(summary.text) : "";
         if (voiceSummaryWorthStoring(summary) && safeSummary && safeSummary !== text) {
-          store.patchMessage(threadId, messageId, { voiceText: safeSummary });
+          // Stored clips were made from another script (the written one, or
+          // a row's raw text), so they go with it: voiceText always names the
+          // script of the clips beside it (server/tts/message-audio.ts).
+          store.patchMessage(threadId, messageId, {
+            voiceText: safeSummary,
+            voiceTextKind: "summary",
+            audio: undefined,
+            audioVoice: undefined,
+            audioByVoice: undefined,
+          });
         }
         return safeSummary || spokenReply(text);
       } catch {
@@ -9837,7 +9848,9 @@ const messageAudio = new MessageAudio({
     store.patchMessage(threadId, messageId, patch);
   },
   summarize: (threadId, messageId, text) => voiceSummaryFor(threadId, messageId, text, cfg),
-  speak: (text, voice) => tts.speak(cfg, text, voice),
+  // The written script is the reply itself, not a model rewrite of a
+  // scrubbed copy, so scrub each utterance on its way to a hosted voice.
+  speak: (text, voice) => tts.speak(cfg, redactSecretsInText(text), voice),
   saveClip: (bytes, mime) => {
     const saved = saveAttachment(Buffer.from(bytes), mime);
     return { path: `/api/attachments/${saved.path.split(/[\/]/).pop()}`, mime: saved.mime };

@@ -111,6 +111,7 @@ export interface Message {
   modelSelection?: { instanceId: string; model: string };
   audio?: Array<{ path: string; mime: string }>;
   voiceText?: string;
+  voiceTextKind?: "written" | "summary";
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   recordingReview?: { correction?: string; comment?: string; updatedAt: number };
   translation?: { language: string; text: string; provider: string };

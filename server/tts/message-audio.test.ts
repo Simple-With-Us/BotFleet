@@ -14,6 +14,7 @@ import {
   MessageAudio,
   PERSONAL_VOICE_NEEDS_UPDATE,
   PROGRESSIVE_RESPONSE_BUDGET_MS,
+  SCRIPT_CHANGED,
   parseAudioRequest,
   parseClipDevice,
   type AudioMessage,
@@ -21,6 +22,9 @@ import {
   type AudioRequestBody,
   type AudioRouteResult,
 } from "./message-audio.ts";
+import { toUtterances } from "./speech-text.ts";
+import { karaokeScriptFromWire } from "../../shared/spoken-script.ts";
+import { writtenReply } from "../../shared/voice-summary.ts";
 
 class NoVoice extends Error {}
 
@@ -133,17 +137,21 @@ function clipText(result: AudioRouteResult): string {
 
 describe("parseAudioRequest", () => {
   it("treats a bodyless request as the legacy request", () => {
-    expect(parseAudioRequest({})).toEqual({ ok: true, request: { progressive: false } });
-    expect(parseAudioRequest(undefined)).toEqual({ ok: true, request: { progressive: false } });
+    expect(parseAudioRequest({})).toEqual({ ok: true, request: { progressive: false, spans: false } });
+    expect(parseAudioRequest(undefined)).toEqual({ ok: true, request: { progressive: false, spans: false } });
   });
 
   it("accepts device and progressive and ignores unknown fields", () => {
     const withExtra: AudioRequestBody = JSON.parse('{"device":"iphone","progressive":true,"later":1}');
     expect(parseAudioRequest(withExtra)).toEqual({
       ok: true,
-      request: { device: "iphone", progressive: true },
+      request: { device: "iphone", progressive: true, spans: false },
     });
-    expect(parseAudioRequest({ device: null, progressive: null })).toEqual({ ok: true, request: { progressive: false } });
+    expect(parseAudioRequest({ device: null, progressive: null, spans: null })).toEqual({ ok: true, request: { progressive: false, spans: false } });
+    expect(parseAudioRequest({ device: "mac", progressive: true, spans: true })).toEqual({
+      ok: true,
+      request: { device: "mac", progressive: true, spans: true },
+    });
   });
 
   it("rejects an unknown device, a non-boolean progressive, and a non-object body", () => {
@@ -151,6 +159,7 @@ describe("parseAudioRequest", () => {
     const wire = (text: string): AudioRequestBody => JSON.parse(text);
     expect(parseAudioRequest(wire('{"device":"ipad"}'))).toEqual({ ok: false, error: "device must be mac or iphone" });
     expect(parseAudioRequest(wire('{"progressive":"yes"}'))).toEqual({ ok: false, error: "progressive must be true or false" });
+    expect(parseAudioRequest(wire('{"spans":1}'))).toEqual({ ok: false, error: "spans must be true or false" });
     expect(parseAudioRequest(wire("[1]"))).toEqual({ ok: false, error: "the audio request must be a JSON object" });
     expect(parseAudioRequest(wire('"mac"'))).toEqual({ ok: false, error: "the audio request must be a JSON object" });
   });
@@ -601,5 +610,158 @@ describe("speech text", () => {
     });
     const result = await post(fixture, { voice: "personal:x", voiceSummaryMode: "off" });
     expect(result.body.utterances).toEqual(["The full written answer here."]);
+  });
+});
+
+describe("the spoken script: as written by default, span-aligned for karaoke", () => {
+  const MARKDOWN = [
+    "The build number is **749** and the tests pass.",
+    "",
+    "```ts",
+    "const answer = 42;",
+    "```",
+    "",
+    "See [the guide](https://example.com/guide) for more.",
+  ].join("\n");
+
+  it("reads the reply as written and never asks for a summary", async () => {
+    const fixture = setup({ text: MARKDOWN, summary: () => "Seven four nine.  A paraphrase." });
+    const result = await post(fixture, { voice: "vA" });
+    expect(result.status).toBe(200);
+    expect(fixture.summarized).toHaveLength(0);
+    const expected = toUtterances(writtenReply(MARKDOWN));
+    expect(result.body.utterances).toEqual(expected);
+    expect(fixture.speakCalls.map((call) => call.text)).toEqual(expected);
+    // The stored stamp says these clips speak exactly this script.
+    expect(fixture.row.voiceText).toBe(expected.join(" "));
+    expect(fixture.row.voiceTextKind).toBe("written");
+  });
+
+  it("answers exactly as before unless the client asks for spans", async () => {
+    const fixture = setup({ text: MARKDOWN });
+    const plain = await post(fixture, { voice: "vA" }, { device: "mac", progressive: true });
+    expect(plain.body).not.toHaveProperty("script");
+    expect(plain.body).not.toHaveProperty("spans");
+    const onDevice = await post(fixture, { voice: "personal:x" }, { device: "mac", progressive: true });
+    expect(onDevice.body).not.toHaveProperty("spans");
+  });
+
+  it("carries per-utterance spans into the written reply, for hosted and on-device voices", async () => {
+    const source = writtenReply(MARKDOWN);
+    for (const owner of [{ voice: "vA" }, { voice: "personal:x" }]) {
+      const fixture = setup({ text: MARKDOWN });
+      const result = await post(fixture, owner, { device: "mac", progressive: true, spans: true });
+      expect(result.status).toBe(200);
+      expect(result.body.script).toBe("written");
+      const spans = result.body.spans;
+      expect(spans).toMatchObject({ format: 1, source: "written", sourceLength: source.length });
+      expect(spans?.utterances).toHaveLength(result.body.utterances?.length ?? -1);
+      const script = karaokeScriptFromWire(result.body.utterances ?? [], spans);
+      expect(script.sourceLength).toBe(source.length);
+      expect(script.segments.length).toBeGreaterThan(0);
+      // Every copied span is the message text itself, character for character.
+      for (const seg of script.segments) {
+        if (seg.kind === "copy") {
+          expect(script.spokenText.slice(seg.spokenStart, seg.spokenEnd)).toBe(source.slice(seg.srcStart, seg.srcEnd));
+        }
+      }
+      // "749" is spoken as written, not spelled out.
+      expect(script.spokenText).toContain("749");
+    }
+  });
+
+  it("speaks a summary only for an explicit summary mode, and carries no spans for it", async () => {
+    const fixture = setup({ text: MARKDOWN, summary: () => "A short spoken version." });
+    const result = await post(fixture, { voice: "vA", voiceSummaryMode: "on_demand" }, { device: "mac", progressive: true, spans: true });
+    expect(fixture.summarized).toHaveLength(1);
+    expect(result.body.utterances).toEqual(["A short spoken version."]);
+    expect(result.body.script).toBe("summary");
+    expect(result.body).not.toHaveProperty("spans");
+    expect(fixture.row.voiceTextKind).toBe("summary");
+  });
+
+  it("does not take a written script for a summary", async () => {
+    const fixture = setup({ text: MARKDOWN, summary: () => "A short spoken version." });
+    await post(fixture, { voice: "vA" });
+    expect(fixture.row.voiceTextKind).toBe("written");
+    const summary = await post(fixture, { voice: "vA", voiceSummaryMode: "always" });
+    expect(fixture.summarized).toHaveLength(1);
+    expect(summary.body.utterances).toEqual(["A short spoken version."]);
+    // The summary's clips replaced the written ones; none were reused.
+    expect(fixture.speakCalls.at(-1)?.text).toBe("A short spoken version.");
+    expect(summary.body.audio).toHaveLength(1);
+  });
+
+  it("drops a summary's clips when the written script is spoken, and the other way round", async () => {
+    const fixture = setup({ summary: () => "A short spoken version." });
+    await post(fixture, { voice: "vA", voiceSummaryMode: "always" });
+    expect(fixture.speakCalls).toHaveLength(1);
+    const written = await post(fixture, { voice: "vA" }, { spans: true });
+    expect(written.body.script).toBe("written");
+    expect(written.body.utterances).toEqual(["First sentence here.", "Second sentence here.", "Third sentence here."]);
+    expect(fixture.speakCalls).toHaveLength(4);
+    // Played again: served from the stored written clips, nothing billed.
+    await post(fixture, { voice: "vA" });
+    expect(fixture.speakCalls).toHaveLength(4);
+  });
+
+  it("serves a complete set of clips from before the stamp as it was made, without spans or billing", async () => {
+    const fixture = setup({ text: MARKDOWN, voiceText: "Seven four nine is the build. That is all for now." });
+    const legacy = toUtterances("Seven four nine is the build. That is all for now.");
+    fixture.row.audio = legacy.map((_, i) => {
+      fixture.files.set(`old-${i}.mp3`, { bytes: new Uint8Array([i]), mime: "audio/mpeg" });
+      return { path: `/api/attachments/old-${i}.mp3`, mime: "audio/mpeg" };
+    });
+    const result = await post(fixture, { voice: "vA" }, { device: "mac", progressive: true, spans: true });
+    expect(result.status).toBe(200);
+    expect(result.body.utterances).toEqual(legacy);
+    expect(result.body.audio).toEqual(fixture.row.audio);
+    expect(result.body.script).toBe("summary");
+    expect(result.body).not.toHaveProperty("spans");
+    expect(fixture.speakCalls).toHaveLength(0);
+  });
+
+  it("stamps a set from before the stamp that already speaks the written script", async () => {
+    const fixture = setup({ voiceText: "First sentence here. Second sentence here. Third sentence here." });
+    fixture.row.audio = [0, 1, 2].map((i) => {
+      fixture.files.set(`old-${i}.mp3`, { bytes: new Uint8Array([i]), mime: "audio/mpeg" });
+      return { path: `/api/attachments/old-${i}.mp3`, mime: "audio/mpeg" };
+    });
+    const result = await post(fixture, { voice: "vA" }, { spans: true });
+    expect(result.body.script).toBe("written");
+    expect(result.body.spans?.utterances).toHaveLength(3);
+    expect(fixture.speakCalls).toHaveLength(0);
+    expect(fixture.row.voiceTextKind).toBe("written");
+  });
+
+  it("re-synthesizes an unfinished set from before the stamp, dropping every voice's old clips", async () => {
+    const fixture = setup({ voiceText: "A paraphrase one. A paraphrase two." });
+    fixture.files.set("old-0.mp3", { bytes: new Uint8Array([0]), mime: "audio/mpeg" });
+    fixture.files.set("side-0.mp3", { bytes: new Uint8Array([1]), mime: "audio/mpeg" });
+    fixture.row.audio = [{ path: "/api/attachments/old-0.mp3", mime: "audio/mpeg" }];
+    fixture.row.audioByVoice = { vB: [{ path: "/api/attachments/side-0.mp3", mime: "audio/mpeg" }] };
+    const result = await post(fixture, { voice: "vA" }, { spans: true });
+    expect(result.body.script).toBe("written");
+    expect(fixture.speakCalls.map((call) => call.text)).toEqual(["First sentence here.", "Second sentence here.", "Third sentence here."]);
+    expect(result.body.audio?.map((clip) => clip.path)).not.toContain("/api/attachments/old-0.mp3");
+    expect(fixture.row.audioByVoice).toBeUndefined();
+  });
+
+  it("fails the waiters of a job whose script was replaced mid-way instead of answering short", async () => {
+    const fixture = setup({ manual: true, summary: () => "A short spoken version that is long enough." });
+    const summary = post(fixture, { voice: "vA", voiceSummaryMode: "always" });
+    await fixture.settle();
+    const written = post(fixture, { voice: "vA" });
+    await fixture.settle();
+    await fixture.release(1);
+    const failed = await summary;
+    expect(failed.status).toBe(502);
+    expect(failed.body.error).toBe(SCRIPT_CHANGED);
+    await fixture.release(3);
+    const done = await written;
+    expect(done.status).toBe(200);
+    expect(done.body.audio).toHaveLength(3);
+    expect(fixture.row.audio).toHaveLength(3);
+    expect(fixture.row.voiceTextKind).toBe("written");
   });
 });

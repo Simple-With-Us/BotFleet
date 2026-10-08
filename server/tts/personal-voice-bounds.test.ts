@@ -24,9 +24,9 @@ import { toUtterances } from "./speech-text.ts";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(HERE, "message-audio.ts"), "utf8");
 
-/** The POST body: from the utterance split to the synthesis job. */
+/** The POST body: from choosing the spoken script to the synthesis job. */
 function postSource(): string {
-  const start = source.indexOf("const utterances = toUtterances(textToSpeak);");
+  const start = source.indexOf("const kind = voiceScriptKind(owner);");
   expect(start).toBeGreaterThan(-1);
   const end = source.indexOf("this.ensureJob(", start);
   expect(end).toBeGreaterThan(start);

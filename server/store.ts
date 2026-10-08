@@ -137,8 +137,12 @@ export interface Message {
    * keyed by voice id, so a Mac and an iPhone with different hosted voices
    * do not overwrite (and re-bill) each other's clips. */
   audioByVoice?: Record<string, Array<{ path: string; mime: string }>>;
-  /** Distilled speech-friendly text generated for TTS synthesis. */
+  /** The text this reply's voice reads, and its stored clips were made from. */
   voiceText?: string;
+  /** What voiceText is: "written" (the reply as written, span-aligned for
+   * karaoke) or "summary" (an explicit Voice Summary mode).  Absent on rows
+   * from before karaoke (shared/spoken-script.ts). */
+  voiceTextKind?: "written" | "summary";
   /** Original incoming microphone recording and recognizer output never change. */
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   /** Corrections are annotations, not edits to the audio or original transcript. */

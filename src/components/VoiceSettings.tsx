@@ -49,6 +49,11 @@ export const IPHONE_PERSONAL_VOICE_REASON = "Personal Voice from your iPhone.\u0
 export const MAC_PERSONAL_VOICE_ON_IPHONE_REASON =
   "This Personal Voice is from this Mac.\u00A0 Choose a Personal Voice on the iPhone.";
 export const PERSONAL_VOICE_NOT_ON_MAC = "This Personal Voice is not on this Mac.\u00A0 Pick a voice for this Mac.";
+/** The Spoken Text section's explanation (voiceSummaryMode).  Read As Written
+ * is the default: the owner's ruling (board 8cc3c806) is that the speech pass
+ * may not paraphrase, and it is what the karaoke highlight follows. */
+export const SPOKEN_TEXT_HELP =
+  "Read As Written speaks the reply itself, naming code blocks and links instead of reading them out, and highlights each word in the message as it is spoken.\u00A0 A summary is shorter, but a model writes it and it is not highlighted.";
 
 type VoiceOption = { id: string; label: string; description?: string };
 
@@ -880,13 +885,13 @@ export function VoiceSettings({
         </div>
       </div>
 
-      {/* ── Per-Bot Voice Summary Mode ── */}
+      {/* ── Per-Bot Spoken Text (voiceSummaryMode) ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <div className="text-[13px] font-medium text-ink">Voice Summary</div>
+            <div className="text-[13px] font-medium text-ink">Spoken Text</div>
             <p className="mt-1 text-[11.5px] text-ink-secondary">
-              Condenses code, links, and markdown into a conversational verbal update before synthesis with MiniMax.
+              {SPOKEN_TEXT_HELP}
             </p>
           </div>
           <a
@@ -913,19 +918,19 @@ export function VoiceSettings({
           {(
             [
               {
+                id: "off",
+                title: "Read As Written",
+                desc: "Reads the reply and highlights each word",
+              },
+              {
                 id: "on_demand",
-                title: "On-Demand",
-                desc: "Distill only when you play or speak",
+                title: "Summary On Play",
+                desc: "Summarizes when you press Play, no highlight",
               },
               {
                 id: "always",
-                title: "All Messages",
-                desc: "Pre-summarize every response from this bot",
-              },
-              {
-                id: "off",
-                title: "Off",
-                desc: "Speak raw written output directly",
+                title: "Summary Every Reply",
+                desc: "Summarizes each reply ahead of time, no highlight",
               },
             ] as const
           ).map((mode) => {
