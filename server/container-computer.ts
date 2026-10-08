@@ -1642,14 +1642,31 @@ export async function containerComputerAction(
  *
  *  In shared mode every bot's desktop runs as the same cua user in one
  *  container, so one login covers all of them; a per-bot container is its own
- *  cache entry and gets its own login. */
+ *  cache entry and gets its own login.
+ *
+ *  `maxWaitMs` bounds how long a caller waits.  A login that is slower than
+ *  that (GitHub unreachable, a loaded host) keeps running and is recorded when
+ *  it finishes; the caller just stops waiting for it and gets "pending", so a
+ *  nice-to-have credential sync cannot hold up a bot's turn. */
 export async function refreshLocalVmGhCredentials(
   runtime: Runtime,
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
   runner: CommandRunner = sh,
-): Promise<GhSyncOutcome | "disabled"> {
+  options: { maxWaitMs?: number } = {},
+): Promise<GhSyncOutcome | "disabled" | "pending"> {
   if (!shareCliCredentialsConfigured()) return "disabled";
-  return syncLocalVmGhToken({ runtime, containerName: target.containerName, runner });
+  const syncing = syncLocalVmGhToken({ runtime, containerName: target.containerName, runner });
+  if (options.maxWaitMs === undefined) return syncing;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"pending">((resolve) => {
+    timer = setTimeout(() => resolve("pending"), options.maxWaitMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([syncing, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Recreate a stopped Local VM container (the auto-wake), or fail truthfully.

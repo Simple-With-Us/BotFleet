@@ -296,6 +296,27 @@ describe("the existing share-CLI-credentials option gates all of it", () => {
     expect(fake.logins()).toHaveLength(1);
   });
 
+  it("stops waiting for a slow login after maxWaitMs, and the login is still recorded when it finishes", async () => {
+    saveConfig({ localVm: { shareCliCredentials: true } });
+    const fake = ghFake();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow: CommandRunner = async (command, args, timeout, options) => {
+      if (command === "docker") await gate;
+      return fake.run(command, args, timeout, options);
+    };
+    const target = perBotLocalVmTarget("slow-login");
+
+    await expect(refreshLocalVmGhCredentials("docker", target, slow, { maxWaitMs: 20 })).resolves.toBe("pending");
+    release();
+    // The same sync is still in flight, so the next turn joins it instead of starting another.
+    await expect(refreshLocalVmGhCredentials("docker", target, fake.run)).resolves.toBe("synced");
+    expect(fake.logins()).toHaveLength(1);
+    await expect(refreshLocalVmGhCredentials("docker", target, fake.run, { maxWaitMs: 5_000 })).resolves.toBe("unchanged");
+  });
+
   it("keys the cache per container, so each per-bot VM gets its own login", async () => {
     saveConfig({ localVm: { shareCliCredentials: true } });
     const fake = ghFake();
