@@ -297,11 +297,18 @@ public enum KaraokeAlign {
     private static let projectionParams = Params(
         exact: 30, equivalent: 30, fuzzy: 15, substitute: -12, expand: 30, skipCol: -1, insertRow: -10, numbers: false, band: 24
     )
+    /// karaoke-align.ts PROJECTION_EXTRA_BAND_MAX: the projection's band
+    /// widens by the difference in word counts, up to this many.
+    private static let projectionExtraBandMax = 1000
     private static let neg = -1_000_000_000
 
     public static func fuzzyWordMatch(_ a: String, _ b: String) -> Bool {
-        let x = Array(a.utf16)
-        let y = Array(b.utf16)
+        fuzzyUnitsMatch(Array(a.utf16), Array(b.utf16))
+    }
+
+    /// fuzzyWordMatch over keys already split into UTF-16 units, so the
+    /// aligner's inner loop allocates nothing per cell.
+    private static func fuzzyUnitsMatch(_ x: [UInt16], _ y: [UInt16]) -> Bool {
         if x.count < 4 || y.count < 4 { return false }
         if abs(x.count - y.count) > 2 { return false }
         if x[0] != y[0] { return false }
@@ -456,6 +463,9 @@ public enum KaraokeAlign {
         }
         let rowKey = rows.map { intern($0.key) }
         let colKey = cols.map { intern($0.key) }
+        // Split once, not per cell: classify runs for every cell in the band.
+        let rowUnits = rows.map { Array($0.key.utf16) }
+        let colUnits = cols.map { Array($0.key.utf16) }
         var nums: [String: Int] = [:]
         func internNum(_ value: String?) -> Int {
             guard let value else { return -1 }
@@ -483,7 +493,13 @@ public enum KaraokeAlign {
         func classify(_ i: Int, _ j: Int) -> Int {
             if rowKey[i] == colKey[j] { return spokenExact }
             if rowNum[i] >= 0 && rowNum[i] == colNum[j] { return spokenEquivalent }
-            if fuzzyWordMatch(rows[i].key, cols[j].key) { return spokenFuzzy }
+            // The same cheap pre-check as the TypeScript classify, before the
+            // edit distance.
+            let a = rowUnits[i]
+            let b = colUnits[j]
+            if a.count >= 4, b.count >= 4, a[0] == b[0], abs(a.count - b.count) <= 2, fuzzyUnitsMatch(a, b) {
+                return spokenFuzzy
+            }
             return spokenSubstituted
         }
         let kindScore = [0, params.exact, params.equivalent, params.fuzzy, params.substitute]
@@ -587,8 +603,11 @@ public enum KaraokeAlign {
 
     /// For each display word, the markdown source word it renders, or -1.
     public static func projectDisplayToSource(_ displayWords: [KaraokeWord], _ sourceWords: [KaraokeWord]) -> [Int] {
+        // Source-only words between anchors pull the path off the straight
+        // line by up to their count; a fixed band then follows the wrong guide.
+        let extra = min(projectionExtraBandMax, abs(sourceWords.count - displayWords.count))
         let core = alignCore(
-            displayWords, sourceWords, projectionParams, uniqueAnchors(displayWords, sourceWords), projectionParams.band
+            displayWords, sourceWords, projectionParams, uniqueAnchors(displayWords, sourceWords), projectionParams.band + extra
         )
         return (0..<displayWords.count).map { d in
             core.rowKind[d] == spokenExact || core.rowKind[d] == spokenFuzzy ? core.rowToCol[d] : -1
@@ -605,6 +624,36 @@ public enum KaraokeAlign {
         return lo
     }
 
+    /// speakable()'s fence patterns (karaoke-align.ts FENCES); `\z` is
+    /// JavaScript's `$` without the multiline flag.
+    private static let fences: [NSRegularExpression] = [
+        #"```[^\n]*\n[\s\S]*?(?:```|\z)"#,
+        #"~~~[^\n]*\n[\s\S]*?(?:~~~|\z)"#,
+    ].map { pattern in
+        // Constant patterns; a failure is a programming error the tests catch.
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(pattern: pattern)
+    }
+
+    /// Source words inside a fenced code block.  The bubble never shows
+    /// them as reply text, so they stay out of the projection.
+    private static func fencedWords(_ sourceText: String, _ sourceWords: [KaraokeWord]) -> [Bool] {
+        var fenced = [Bool](repeating: false, count: sourceWords.count)
+        let range = NSRange(location: 0, length: (sourceText as NSString).length)
+        for pattern in fences {
+            for m in pattern.matches(in: sourceText, options: [], range: range) {
+                let start = m.range.location
+                let end = start + m.range.length
+                var w = tokenAtOrAfter(sourceWords, start)
+                while w < sourceWords.count && sourceWords[w].start < end {
+                    if sourceWords[w].start >= start { fenced[w] = true }
+                    w += 1
+                }
+            }
+        }
+        return fenced
+    }
+
     /// Expected display word per spoken word from the script's spans; -1
     /// where nothing on screen corresponds.
     public static func guideFromSpans(
@@ -616,10 +665,14 @@ public enum KaraokeAlign {
         var guide = [Int](repeating: -1, count: spokenWords.count)
         let sourceWords = tokenize(sourceText)
         if sourceWords.isEmpty || displayWords.isEmpty || segments.isEmpty { return guide }
-        let displayToSource = projectDisplayToSource(displayWords, sourceWords)
+        // Project onto the words the screen can show (not a fence's code),
+        // then index back.
+        let fenced = fencedWords(sourceText, sourceWords)
+        let shown = sourceWords.indices.filter { !fenced[$0] }
+        let displayToShown = projectDisplayToSource(displayWords, shown.map { sourceWords[$0] })
         var sourceToDisplay = [Int](repeating: -1, count: sourceWords.count)
-        for (d, s) in displayToSource.enumerated() where s >= 0 && sourceToDisplay[s] < 0 {
-            sourceToDisplay[s] = d
+        for (d, k) in displayToShown.enumerated() where k >= 0 && sourceToDisplay[shown[k]] < 0 {
+            sourceToDisplay[shown[k]] = d
         }
         var next = -1
         for s in stride(from: sourceWords.count - 1, through: 0, by: -1) {

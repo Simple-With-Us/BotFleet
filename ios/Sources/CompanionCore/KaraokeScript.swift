@@ -138,6 +138,19 @@ public struct KaraokeScript: Equatable, Sendable {
         return out
     }
 
+    /// The longest spoken script karaoke follows, in UTF-16 units: the
+    /// harness's spoken cap (MAX_SPEAKABLE_CHARS) and the Mac's local bound
+    /// (MAX_LOCAL_SPEECH_CHARS).  The alignment runs on the main actor when a
+    /// read starts, so a reply the phone reads past that bound (its local
+    /// projection after a refusal) is read without a highlight rather than
+    /// stalling the first word.
+    public static let maxFollowedCharacters = 12_000
+
+    /// Whether this script is short enough to follow.
+    public var isFollowable: Bool {
+        !spokenText.isEmpty && spokenText.utf16.count <= Self.maxFollowedCharacters
+    }
+
     /// True when the spans index `sourceText` (the client's own
     /// writtenReply(message.text)).  A different length means a different
     /// text, so the spans would guide the alignment to the wrong words.

@@ -44,10 +44,12 @@ final class KaraokeCenter {
     }
 
     /// Follow `script` over the reply `messageText`.  Nil when the bubble
-    /// has no words to follow.
+    /// has no words to follow, or the script is too long to align before
+    /// the first word (KaraokeScript.isFollowable).
     @discardableResult
     func begin(messageId: String, messageText: String, script: KaraokeScript, mode: MessageKaraoke.Mode) -> MessageKaraoke? {
         clear()
+        guard script.isFollowable else { return nil }
         let karaoke = MessageKaraoke(
             messageId: messageId,
             markdown: KaraokeDisplay.bubbleMarkdown(messageText),

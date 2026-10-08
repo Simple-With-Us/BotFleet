@@ -102,6 +102,19 @@ final class KaraokeScriptTests: XCTestCase {
         XCTAssertTrue(KaraokeScript.fromWire(utterances: utterances, wire: wire).segments.isEmpty)
     }
 
+    func testAScriptPastTheSpokenCapIsReadWithoutAHighlight() {
+        // The alignment runs on the main actor when a read starts; the
+        // phone's own projection of a refused reply has no length cap.
+        let sentence = "This sentence is read aloud by the phone. "
+        let short = KaraokeScript.unguided(utterances: [sentence])
+        XCTAssertTrue(short.isFollowable)
+        let count = KaraokeScript.maxFollowedCharacters / sentence.utf16.count + 1
+        let long = KaraokeScript.unguided(utterances: Array(repeating: sentence, count: count))
+        XCTAssertGreaterThan(long.spokenText.utf16.count, KaraokeScript.maxFollowedCharacters)
+        XCTAssertFalse(long.isFollowable)
+        XCTAssertFalse(KaraokeScript.unguided(utterances: []).isFollowable)
+    }
+
     // MARK: - The /audio answer
 
     func testAWrittenAnswerCarriesItsKaraokeScript() throws {
