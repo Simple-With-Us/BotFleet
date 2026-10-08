@@ -32,8 +32,10 @@ import {
   ghLoginScript,
   localVmGhContainerEnv,
   readHostGhToken,
+  ghSyncFailureReason,
   resetLocalVmGhTokenCache,
   syncLocalVmGhToken,
+  warnGhSyncError,
 } from "./local-vm-gh-credentials.ts";
 
 // A fake that merely LOOKS like a token.  Nothing here ever talks to GitHub.
@@ -141,6 +143,38 @@ describe("the token only ever travels on stdin", () => {
   });
 });
 
+describe("a refresh that throws is reported, not swallowed", () => {
+  it("logs one warning with the container name and a short reason, and never throws", () => {
+    const lines: string[] = [];
+    warnGhSyncError(CONTAINER_NAME, new Error("docker daemon went away\nsecond line"), (level, message) =>
+      lines.push(`${level}: ${message}`),
+    );
+    expect(lines).toEqual([`warn: [local-vm] ${CONTAINER_NAME}: gh login refresh failed: docker daemon went away`]);
+
+    expect(() =>
+      warnGhSyncError(CONTAINER_NAME, new Error("x"), () => {
+        throw new Error("logger exploded");
+      }),
+    ).not.toThrow();
+  });
+
+  it("keeps every part of a token out of the line, including one it was never told about", () => {
+    for (const token of [FAKE_TOKEN, OTHER_TOKEN, "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", "github_pat_11ABCDEFG0abcdefghijkl_mnopqrstuvwxyz"]) {
+      const lines: string[] = [];
+      warnGhSyncError(CONTAINER_NAME, Object.assign(new Error("failed"), { stderr: `bad credentials: ${token} (HTTP 401)\n` }), (_l, message) =>
+        lines.push(message),
+      );
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("HTTP 401");
+      // Not whole, not masked: no 4-character slice of the token survives.
+      for (let start = 0; start + 4 <= token.length; start += 1) {
+        expect(lines[0]).not.toContain(token.slice(start, start + 4));
+      }
+    }
+    expect(ghSyncFailureReason(new Error(`login ${FAKE_TOKEN}`), FAKE_TOKEN)).toBe("login <redacted>");
+  });
+});
+
 describe.skipIf(process.platform === "win32")("the real command runner", () => {
   it("writes input to stdin and removes a variable overlaid with undefined", async () => {
     await expect(defaultCommandRunner("/bin/cat", [], 5_000, { input: "from-stdin" })).resolves.toEqual({
@@ -182,6 +216,34 @@ describe("host login handling", () => {
       ).resolves.toBeNull();
     }
     await expect(readHostGhToken(async () => ({ stdout: `${FAKE_TOKEN}\n` }))).resolves.toBe(FAKE_TOKEN);
+  });
+
+  it("lets a throwing logger neither change the outcome nor suppress the message next time", async () => {
+    const fake = ghFake({ token: null });
+    const attempts: string[] = [];
+    const throwing = (_level: "info" | "warn", message: string) => {
+      attempts.push(message);
+      throw new Error("logger exploded");
+    };
+    await expect(sync(fake.run, { log: throwing })).resolves.toBe("no-host-token");
+
+    // The line was never delivered, so the next attempt says it again.
+    const delivered: string[] = [];
+    await expect(sync(fake.run, { log: (_level, message) => delivered.push(message) })).resolves.toBe("no-host-token");
+    expect(delivered).toEqual(attempts);
+    // And once delivered it is deduplicated as before.
+    await sync(fake.run, { log: (_level, message) => delivered.push(message) });
+    expect(delivered).toHaveLength(1);
+  });
+
+  it("keeps a successful login successful when the logger throws", async () => {
+    const fake = ghFake();
+    const throwing = () => {
+      throw new Error("logger exploded");
+    };
+    await expect(sync(fake.run, { log: throwing })).resolves.toBe("synced");
+    await expect(sync(fake.run, { log: throwing })).resolves.toBe("unchanged");
+    expect(fake.logins()).toHaveLength(1);
   });
 
   it("logs the same 'no host login' line once per container, not once per turn", async () => {

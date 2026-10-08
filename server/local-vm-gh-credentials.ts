@@ -183,13 +183,31 @@ function tokenHash(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-/** One non-secret line from a failed command: gh's first stderr line, with the
- *  token scrubbed in case a tool ever echoed it. */
-function failureReason(error: unknown, token: string): string {
+/** GitHub token shapes (classic, OAuth, app, refresh, fine-grained), scrubbed
+ *  wherever a caller holds no token to compare against. */
+const GITHUB_TOKEN_PATTERN = /\b(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,})/g;
+
+/** One non-secret line from a failed command: the first stderr (or message)
+ *  line, with the known token and anything shaped like a GitHub token scrubbed
+ *  in case a tool ever echoed one.  No part of a token is ever kept, masked or
+ *  otherwise. */
+export function ghSyncFailureReason(error: unknown, token?: string): string {
   const stderr = (error as { stderr?: unknown } | null)?.stderr;
   const text = typeof stderr === "string" && stderr.trim() ? stderr : error instanceof Error ? error.message : "";
   const line = text.split(/\r?\n/).find((entry) => entry.trim()) ?? "command failed";
-  return line.split(token).join("<redacted>").slice(0, 200);
+  const scrubbed = token ? line.split(token).join("<redacted>") : line;
+  return scrubbed.replace(GITHUB_TOKEN_PATTERN, "<redacted>").slice(0, 200);
+}
+
+/** The one warning a caller logs when a refresh throws instead of returning an
+ *  outcome (it should not, but a turn must not lose the evidence if it does).
+ *  Container name and a short scrubbed reason only; never throws. */
+export function warnGhSyncError(containerName: string, error: unknown, log: GhSyncDeps["log"] = defaultLog): void {
+  try {
+    log?.("warn", `[local-vm] ${containerName}: gh login refresh failed: ${ghSyncFailureReason(error)}`);
+  } catch {
+    // Reporting the failure must not become one.
+  }
 }
 
 /** Make the container's gh login match the host's.  Never throws: a missing
@@ -234,8 +252,14 @@ async function runSync(deps: GhSyncDeps, generation: number): Promise<GhSyncOutc
   const log = deps.log ?? defaultLog;
   const logOnce = (level: "info" | "warn", message: string) => {
     if (lastLogged.get(containerName) === message) return;
+    try {
+      log(level, message);
+    } catch {
+      // A throwing logger must neither change the sync outcome nor mark the
+      // line as already said, or the operator would never see it.
+      return;
+    }
     lastLogged.set(containerName, message);
-    log(level, message);
   };
   try {
     const token = await readHostGhToken(runner);
@@ -256,7 +280,7 @@ async function runSync(deps: GhSyncDeps, generation: number): Promise<GhSyncOutc
       if ((generations.get(containerName) ?? 0) === generation) {
         entries.set(containerName, { hash, ok: false, at: now() });
       }
-      logOnce("warn", `[local-vm] ${containerName}: gh login failed: ${failureReason(error, token)}`);
+      logOnce("warn", `[local-vm] ${containerName}: gh login failed: ${ghSyncFailureReason(error, token)}`);
       return "failed";
     }
     // A container replaced mid-sync is not the one this login went into.

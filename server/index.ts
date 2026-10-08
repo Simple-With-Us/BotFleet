@@ -157,6 +157,7 @@ import {
   setupCommands,
   type LocalVmTarget,
 } from "./container-computer.ts";
+import { warnGhSyncError } from "./local-vm-gh-credentials.ts";
 import { boxGatewayUrl, mintBoxGatewayGrant } from "./box-gateway-grant.ts";
 import {
   applyComputerMounts,
@@ -3334,7 +3335,9 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
     // cached by token hash, so a turn only pays for it when the host re-logged
     // in; a failure leaves the VM signed out and never fails the turn, and a
     // slow login stops holding the turn after ten seconds and finishes behind it.
-    await refreshLocalVmGhCredentials(localVm.runtime, target, undefined, { maxWaitMs: 10_000 }).catch(() => undefined);
+    await refreshLocalVmGhCredentials(localVm.runtime, target, undefined, { maxWaitMs: 10_000 }).catch((error) =>
+      warnGhSyncError(target.containerName, error),
+    );
     // The container is up but this bot's desktop may not be: in shared mode each
     // bot owns its own display + socket, and the first turn for a bot is the one
     // that has to start it.  Idempotent, so every later turn is a no-op.  The
