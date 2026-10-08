@@ -40,7 +40,7 @@ Local VMs always run on the same physical host as the BotFleet desktop process. 
 
 ## What's Preinstalled
 
-The desktop image carries the command-line tools a bot reaches for on a Mac, so a bot does not have to ask for an image rebuild before it can search, lint, or script.  Downloaded tools are pinned by version and checksum, and the image build fails if any tool is missing.
+The desktop image carries the command-line tools a bot reaches for on a Mac, so a bot does not have to ask for an image rebuild before it can search, lint, or script.  The image build fails if any tool is missing, so a tool listed here is there.  Newer downloads are pinned by version and checksum.
 
 - **A Mac-like shell.**  The desktop user logs in with zsh, with history and completion set up.  Bash behaves as before, and both see the same tools on their `PATH`.  `open` works like it does on a Mac, and `pbcopy` and `pbpaste` talk to the desktop clipboard.
 - **Homebrew.**  `brew install <formula>` works the way it does on a Mac.  Homebrew is installed under `/home/linuxbrew/.linuxbrew` and sits at the end of `PATH`, so a formula never replaces the pinned Node, the Python environment, or the desktop driver.  Automatic updates and analytics are off, so Homebrew stays on the release the image was built with until you run `brew update`.  Rebuilding the image resets it.

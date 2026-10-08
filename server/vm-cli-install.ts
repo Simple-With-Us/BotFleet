@@ -87,7 +87,6 @@ ${installLines.join("\n")}
   # Installing as root with HOME=/home/cua left a root-owned ~/.npm of several
   # hundred MB in the desktop user's home.  It is only a download cache.
   npm cache clean --force >/dev/null 2>&1 || true
-  rm -rf "$(npm config get cache)"
 }
 `);
   }

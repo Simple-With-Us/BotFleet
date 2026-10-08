@@ -323,7 +323,9 @@ describe("vm CLI manifest install", () => {
     it("drops the npm download cache that installing as root leaves in cua's home", () => {
       const install = renderLinuxInstallScript("local-vm");
       expect(install).toContain("npm cache clean --force");
-      expect(install).toContain('rm -rf "$(npm config get cache)"');
+      // Not an rm of a path read from npm config: a project .npmrc can change it,
+      // and this recipe also runs on cloud installs.
+      expect(install).not.toContain("npm config get cache");
     });
   });
 
