@@ -98,7 +98,7 @@
     "@openfeature/server-sdk": "^1.23.0",
     "@sentry/node": "^10.73.0",
     "@sentry/react": "^10.73.0",
-    "@trycua/cua-driver": "0.32.0",
+    "@trycua/cua-driver": "0.20.0",
     "clsx": "^2.1.1",
     "clutch": "github:Simple-With-Us/Clutch#7fbd88d89625402a8b47631dd207045482236837",
     "harness": "github:Simple-With-Us/Clutch#93bbbfdb26a84970dc9083a887dad93ca3eee0cf",
