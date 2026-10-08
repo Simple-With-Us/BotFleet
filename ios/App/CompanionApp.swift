@@ -137,7 +137,48 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            switch route {
+#if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-tvface-preview") {
+                TVFacePreviewHarness()
+            } else {
+                mainRoutes
+            }
+#else
+            mainRoutes
+#endif
+        }
+        .onChange(of: session.pairingInvite) { _, invite in
+            guard invite != nil else { return }
+            hasSeenWelcome = true
+            pairingRequested = true
+        }
+        .onAppear { reconcileNotificationOnboarding() }
+        .onChange(of: session.notificationAuthorizationResolved) { _, _ in
+            reconcileNotificationOnboarding()
+        }
+        .onChange(of: session.notificationAuthorization) { _, _ in
+            reconcileNotificationOnboarding()
+        }
+        .onChange(of: notificationOnboardingPending) { _, isPending in
+            if isPending { reconcileNotificationOnboarding() }
+        }
+        .alert(
+            "Something went wrong",
+            isPresented: Binding(
+                get: { session.actionError != nil },
+                set: { if !$0 { session.actionError = nil } }
+            ),
+            presenting: session.actionError
+        ) { _ in
+            Button("OK", role: .cancel) { session.actionError = nil }
+        } message: { message in
+            Text(message)
+        }
+    }
+
+    @ViewBuilder
+    private var mainRoutes: some View {
+        switch route {
             case .welcome:
                 CompanionWelcomeView(
                     onConnect: startPairing,
@@ -179,34 +220,6 @@ struct RootView: View {
                     session.signOut()
                     startPairing()
                 }
-            }
-        }
-        .onChange(of: session.pairingInvite) { _, invite in
-            guard invite != nil else { return }
-            hasSeenWelcome = true
-            pairingRequested = true
-        }
-        .onAppear { reconcileNotificationOnboarding() }
-        .onChange(of: session.notificationAuthorizationResolved) { _, _ in
-            reconcileNotificationOnboarding()
-        }
-        .onChange(of: session.notificationAuthorization) { _, _ in
-            reconcileNotificationOnboarding()
-        }
-        .onChange(of: notificationOnboardingPending) { _, isPending in
-            if isPending { reconcileNotificationOnboarding() }
-        }
-        .alert(
-            "Something went wrong",
-            isPresented: Binding(
-                get: { session.actionError != nil },
-                set: { if !$0 { session.actionError = nil } }
-            ),
-            presenting: session.actionError
-        ) { _ in
-            Button("OK", role: .cancel) { session.actionError = nil }
-        } message: { message in
-            Text(message)
         }
     }
 

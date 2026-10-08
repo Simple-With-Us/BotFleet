@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>BotFleet TV-Face — Live fleet demo</title>
+<meta name="apple-itunes-app" content="app-clip-bundle-id=online.fleetlink.Clip, app-clip-display=card"/>
+<style>
+  :root { --bg:#0b0b0f; --card:#14141c; --line:#2a2a36; --text:#e8e8ef; --muted:#9aa0b2; --accent:#4fd1c5; --enter:#7dd3fc; --return:#f9a8d4; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text);
+         min-height:100vh; padding:1.25rem 1rem 3rem; }
+  h1 { margin:0 0 .35rem; font-size:1.45rem; }
+  .sub { color:var(--muted); margin:0 0 1rem; max-width:52rem; line-height:1.45; }
+  .bar { display:flex; flex-wrap:wrap; gap:.75rem 1.25rem; margin:0 0 1.25rem; font-size:.9rem; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(168px,1fr)); gap:1rem; max-width:980px; }
+  .bot { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:1rem .9rem 1.1rem;
+         text-align:center; position:relative; overflow:hidden; }
+  .bot .face-wrap { width:128px; height:128px; margin:0 auto .65rem; position:relative;
+         background: radial-gradient(circle at 50% 40%, #1c1c24 0%, #0e0e14 70%);
+         border-radius:18px; border:1px solid #2a2a36; }
+  .bot canvas.face { width:128px; height:128px; display:block; }
+  .bot .name { font-weight:650; font-size:.95rem; }
+  .bot .role { color:var(--muted); font-size:.8rem; margin-top:.15rem; }
+  .bot .state { margin-top:.55rem; display:inline-block; font-size:.72rem; letter-spacing:.04em; text-transform:uppercase;
+                padding:.25rem .55rem; border-radius:999px; background:#1a1a22; color:var(--accent); border:1px solid #2a2a36; }
+  .bot .state.enter { color:#0b1220; background:var(--enter); border-color:transparent; }
+  .bot .state.return { color:#2a1020; background:var(--return); border-color:transparent; }
+  .bot.transitioning .face-wrap { box-shadow: 0 0 0 2px var(--accent); }
+  .clock { color:var(--muted); font-size:.85rem; margin:0 0 1rem; }
+  .note { max-width:980px; margin-top:1.5rem; color:var(--muted); font-size:.88rem; line-height:1.5; }
+  .tap { margin:0 0 1rem; }
+  .tap button { background:var(--accent); color:#0b1220; border:0; border-radius:10px; padding:.55rem 1rem;
+                font-weight:650; font-size:.9rem; cursor:pointer; }
+</style>
+<meta name="apple-itunes-app" content="app-clip-bundle-id=online.fleetlink.Clip, app-clip-display=card"></head>
+<body>
+  <h1>Live fleet — six bots at once</h1>
+  <p class="sub">Each card is a real BotFleet TV-Face skin.  Enter → hold → return transitions play for about a minute, then loop.  Bookends stay on the resting face.  GIFs are decoded onto a canvas so Safari / iOS animate without needing “Animate Image”.</p>
+  <div class="tap"><button type="button" id="wake">Tap / click to start animations</button></div>
+  <div class="bar">
+    <a href="/TV-Face/botfleet/colors.html">All colors</a>
+    <a href="/TV-Face/botfleet/COLORS.md">COLORS.md</a>
+    <a href="/TV-Face/botfleet/">Default orange pack</a>
+  </div>
+  <p class="clock" id="clock">waiting for start…</p>
+  <div class="grid" id="grid"></div>
+  <p class="note">
+    Assets load from FleetLink transparent packs.  Enter and return are ~1s transitions from/to resting.
+    Hold loops while a bot stays active.  Expressions that only ship stills (no hold GIF) use the still —
+    that is what made Compiler/Designer “cut out” before (celebrate / curious / playful / proud / waking).
+    Green uses red mouth glyphs.
+  </p>
+<script type="module">
+import { parseGIF, decompressFrames } from "https://cdn.jsdelivr.net/npm/gifuct-js@2.1.2/+esm";
+
+const CDN = "https://fleetlink.online/TV-Face/botfleet";
+const CDN_SKINS = "https://fleetlink.online/TV-Face/botfleet-skins";
+
+const HAS_ENTER_RETURN = new Set([
+  "listening","thinking","typing","speaking","computer",
+  "fleet","crash","memory","tools","routine","screen","git","webhook",
+]);
+const HAS_HOLD = new Set([
+  ...HAS_ENTER_RETURN,
+  "alerting","angry","excited","happy","laughing","loading","notifying",
+  "resting","searching","sleeping","surprised","working",
+]);
+
+const bots = [
+  { name: "Director",  color: "blue",   role: "coordinates the fleet",
+    script: [
+      { t:0,  state:"resting", kind:"still" },
+      { t:2,  state:"thinking", kind:"enter" },
+      { t:3,  state:"thinking", kind:"hold" },
+      { t:12, state:"thinking", kind:"return" },
+      { t:13, state:"resting", kind:"still" },
+      { t:15, state:"speaking", kind:"enter" },
+      { t:16, state:"speaking", kind:"hold" },
+      { t:24, state:"speaking", kind:"return" },
+      { t:25, state:"resting", kind:"still" },
+      { t:27, state:"fleet", kind:"enter" },
+      { t:28, state:"fleet", kind:"hold" },
+      { t:38, state:"fleet", kind:"return" },
+      { t:39, state:"resting", kind:"still" },
+      { t:41, state:"happy", kind:"hold" },
+      { t:50, state:"resting", kind:"still" },
+      { t:52, state:"typing", kind:"enter" },
+      { t:53, state:"typing", kind:"hold" },
+      { t:58, state:"typing", kind:"return" },
+      { t:59, state:"resting", kind:"still" },
+    ]},
+  { name: "Compiler", color: "orange", role: "builds & TestFlight",
+    script: [
+      { t:0,  state:"resting", kind:"still" },
+      { t:1,  state:"working", kind:"hold" },
+      { t:10, state:"typing", kind:"enter" },
+      { t:11, state:"typing", kind:"hold" },
+      { t:20, state:"typing", kind:"return" },
+      { t:21, state:"resting", kind:"still" },
+      { t:22, state:"happy", kind:"hold" },
+      { t:28, state:"resting", kind:"still" },
+      { t:30, state:"computer", kind:"enter" },
+      { t:31, state:"computer", kind:"hold" },
+      { t:42, state:"computer", kind:"return" },
+      { t:43, state:"resting", kind:"still" },
+      { t:45, state:"git", kind:"enter" },
+      { t:46, state:"git", kind:"hold" },
+      { t:55, state:"git", kind:"return" },
+      { t:56, state:"resting", kind:"still" },
+    ]},
+  { name: "Monitor",  color: "green",  role: "spend & uptime",
+    script: [
+      { t:0,  state:"searching", kind:"hold" },
+      { t:8,  state:"alerting", kind:"hold" },
+      { t:14, state:"resting", kind:"still" },
+      { t:16, state:"tools", kind:"enter" },
+      { t:17, state:"tools", kind:"hold" },
+      { t:26, state:"tools", kind:"return" },
+      { t:27, state:"notifying", kind:"hold" },
+      { t:34, state:"resting", kind:"still" },
+      { t:36, state:"thinking", kind:"enter" },
+      { t:37, state:"thinking", kind:"hold" },
+      { t:48, state:"thinking", kind:"return" },
+      { t:49, state:"resting", kind:"still" },
+      { t:51, state:"webhook", kind:"enter" },
+      { t:52, state:"webhook", kind:"hold" },
+      { t:58, state:"webhook", kind:"return" },
+      { t:59, state:"resting", kind:"still" },
+    ]},
+  { name: "Fixer",    color: "red",    role: "bugs & Sentry",
+    script: [
+      { t:0,  state:"resting", kind:"still" },
+      { t:2,  state:"crash", kind:"enter" },
+      { t:3,  state:"crash", kind:"hold" },
+      { t:10, state:"crash", kind:"return" },
+      { t:11, state:"angry", kind:"hold" },
+      { t:16, state:"working", kind:"hold" },
+      { t:26, state:"git", kind:"enter" },
+      { t:27, state:"git", kind:"hold" },
+      { t:38, state:"git", kind:"return" },
+      { t:39, state:"resting", kind:"still" },
+      { t:41, state:"happy", kind:"hold" },
+      { t:48, state:"resting", kind:"still" },
+      { t:50, state:"memory", kind:"enter" },
+      { t:51, state:"memory", kind:"hold" },
+      { t:58, state:"memory", kind:"return" },
+      { t:59, state:"resting", kind:"still" },
+    ]},
+  { name: "Designer", color: "black", role: "UI & UX",
+    script: [
+      { t:0,  state:"resting", kind:"still" },
+      { t:2,  state:"screen", kind:"enter" },
+      { t:3,  state:"screen", kind:"hold" },
+      { t:12, state:"screen", kind:"return" },
+      { t:13, state:"resting", kind:"still" },
+      { t:15, state:"happy", kind:"hold" },
+      { t:20, state:"memory", kind:"enter" },
+      { t:21, state:"memory", kind:"hold" },
+      { t:30, state:"memory", kind:"return" },
+      { t:31, state:"resting", kind:"still" },
+      { t:33, state:"tools", kind:"enter" },
+      { t:34, state:"tools", kind:"hold" },
+      { t:44, state:"tools", kind:"return" },
+      { t:45, state:"excited", kind:"hold" },
+      { t:52, state:"resting", kind:"still" },
+      { t:54, state:"speaking", kind:"enter" },
+      { t:55, state:"speaking", kind:"hold" },
+      { t:59, state:"speaking", kind:"return" },
+    ]},
+  { name: "Housekeeper", color: "white", role: "disk & RAM",
+    script: [
+      { t:0,  state:"sleeping", kind:"hold" },
+      { t:8,  state:"waking", kind:"still" },
+      { t:12, state:"resting", kind:"still" },
+      { t:14, state:"routine", kind:"enter" },
+      { t:15, state:"routine", kind:"hold" },
+      { t:26, state:"routine", kind:"return" },
+      { t:27, state:"loading", kind:"hold" },
+      { t:35, state:"webhook", kind:"enter" },
+      { t:36, state:"webhook", kind:"hold" },
+      { t:46, state:"webhook", kind:"return" },
+      { t:47, state:"resting", kind:"still" },
+      { t:49, state:"computer", kind:"enter" },
+      { t:50, state:"computer", kind:"hold" },
+      { t:58, state:"computer", kind:"return" },
+      { t:59, state:"resting", kind:"still" },
+    ]},
+];
+
+function packBase(color) {
+  if (color === "orange") return CDN;
+  return `${CDN_SKINS}/${color}`;
+}
+function packBaseFallback(color) {
+  if (color === "orange") return CDN;
+  return `${CDN}/${color}`;
+}
+function assetUrl(color, state, kind, useFallback = false) {
+  const base = useFallback ? packBaseFallback(color) : packBase(color);
+  if (kind === "still") return `${base}/stills/${state}.png`;
+  return `${base}/gifs/${state}_${kind}.gif`;
+}
+function resolveAsset(color, state, kind) {
+  if ((kind === "enter" || kind === "return") && !HAS_ENTER_RETURN.has(state)) {
+    kind = HAS_HOLD.has(state) ? "hold" : "still";
+  }
+  if (kind === "hold" && !HAS_HOLD.has(state)) kind = "still";
+  return { state, kind, primary: assetUrl(color, state, kind, false), fallback: assetUrl(color, state, kind, true) };
+}
+
+const gifCache = new Map();
+async function loadGif(url) {
+  if (gifCache.has(url)) return gifCache.get(url);
+  const res = await fetch(url, { mode: "cors" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const buf = await res.arrayBuffer();
+  const gif = parseGIF(buf);
+  const frames = decompressFrames(gif, true);
+  const packed = {
+    width: gif.lsd.width,
+    height: gif.lsd.height,
+    frames: frames.map((f) => ({
+      patch: f.patch, dims: f.dims,
+      delay: Math.max(20, f.delay || 40),
+      disposalType: f.disposalType,
+    })),
+  };
+  gifCache.set(url, packed);
+  return packed;
+}
+async function loadStill(url) {
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = url; });
+  return img;
+}
+
+class FacePlayer {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d", { alpha: true });
+    this.raf = 0;
+    this.token = 0;
+  }
+  stop() {
+    this.token++;
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = 0;
+  }
+  async show(url, kind) {
+    const my = ++this.token;
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = 0;
+    try {
+      if (kind === "still" || url.endsWith(".png")) {
+        const img = await loadStill(url);
+        if (my !== this.token) return;
+        this.canvas.width = img.naturalWidth || 480;
+        this.canvas.height = img.naturalHeight || 480;
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        this.ctx.drawImage(img, 0, 0);
+        return;
+      }
+      const gif = await loadGif(url);
+      if (my !== this.token) return;
+      this.canvas.width = gif.width;
+      this.canvas.height = gif.height;
+      const full = this.ctx.createImageData(gif.width, gif.height);
+      let i = 0;
+      let last = performance.now();
+      let acc = 0;
+      const paint = (frame) => {
+        if (frame.disposalType === 2) { this.ctx.clearRect(0, 0, gif.width, gif.height); full.data.fill(0); }
+        const { left, top, width, height } = frame.dims;
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const si = (y * width + x) * 4;
+            const a = frame.patch[si + 3];
+            if (!a) continue;
+            const di = ((top + y) * gif.width + (left + x)) * 4;
+            full.data[di] = frame.patch[si];
+            full.data[di+1] = frame.patch[si+1];
+            full.data[di+2] = frame.patch[si+2];
+            full.data[di+3] = a;
+          }
+        }
+        this.ctx.putImageData(full, 0, 0);
+      };
+      paint(gif.frames[0]);
+      const tick = (now) => {
+        if (my !== this.token) return;
+        const frame = gif.frames[i];
+        acc += now - last; last = now;
+        if (acc >= frame.delay) {
+          acc = 0;
+          i = (i + 1) % gif.frames.length;
+          paint(gif.frames[i]);
+        }
+        this.raf = requestAnimationFrame(tick);
+      };
+      this.raf = requestAnimationFrame(tick);
+    } catch (err) {
+      console.warn("face load failed", url, err);
+      throw err;
+    }
+  }
+}
+
+const grid = document.getElementById("grid");
+const cards = bots.map((b) => {
+  const el = document.createElement("div");
+  el.className = "bot";
+  el.innerHTML = `
+    <div class="face-wrap"><canvas class="face" width="480" height="480"></canvas></div>
+    <div class="name">${b.name}</div>
+    <div class="role">${b.role} · ${b.color}</div>
+    <div class="state">resting</div>`;
+  grid.appendChild(el);
+  return { bot: b, el, player: new FacePlayer(el.querySelector("canvas")), stateEl: el.querySelector(".state"), cur: null };
+});
+
+async function apply(card, step) {
+  const key = step.state + ":" + step.kind;
+  if (card.cur === key) return;
+  card.cur = key;
+  const resolved = resolveAsset(card.bot.color, step.state, step.kind);
+  card.stateEl.textContent =
+    resolved.state + (resolved.kind === "hold" ? " · loop" : resolved.kind === "still" ? "" : " · " + resolved.kind);
+  card.stateEl.className = "state " + (resolved.kind === "enter" || resolved.kind === "return" ? resolved.kind : "");
+  card.el.classList.toggle("transitioning", resolved.kind === "enter" || resolved.kind === "return");
+
+  const tryUrls = [];
+  if (resolved.kind !== "still") {
+    tryUrls.push({ url: resolved.primary, kind: resolved.kind });
+    if (resolved.fallback !== resolved.primary) tryUrls.push({ url: resolved.fallback, kind: resolved.kind });
+  }
+  tryUrls.push({ url: assetUrl(card.bot.color, resolved.state, "still", false), kind: "still" });
+  tryUrls.push({ url: assetUrl(card.bot.color, resolved.state, "still", true), kind: "still" });
+  tryUrls.push({ url: assetUrl(card.bot.color, "resting", "still", false), kind: "still" });
+
+  for (const candidate of tryUrls) {
+    try {
+      if (candidate.kind !== "still") {
+        // Probe by decoding: loadGif throws on 404 and caches the frames,
+        // so the later show() reuses them instead of downloading the GIF a
+        // second time for the existence check.
+        await loadGif(candidate.url);
+      }
+      // A newer step may have claimed the card while this chain was in
+      // flight (tick() fires apply() every frame, unawaited).  Painting now
+      // would tear down the newer loop and freeze on a stale frame.
+      if (card.cur !== key) return;
+      await card.player.show(candidate.url, candidate.kind);
+      return;
+    } catch (_) {}
+  }
+}
+
+const PERIOD = 60;
+const clock = document.getElementById("clock");
+let t0 = 0;
+let started = false;
+
+function tick() {
+  if (!started) { requestAnimationFrame(tick); return; }
+  const elapsed = ((performance.now() - t0) / 1000) % PERIOD;
+  clock.textContent = `t = ${elapsed.toFixed(1)}s / ${PERIOD}s · looping · canvas GIF player`;
+  for (const card of cards) {
+    let step = card.bot.script[0];
+    for (const s of card.bot.script) { if (s.t <= elapsed) step = s; else break; }
+    apply(card, step);
+  }
+  requestAnimationFrame(tick);
+}
+
+function start() {
+  if (started) return;
+  started = true;
+  t0 = performance.now();
+  const wrap = document.querySelector(".tap");
+  if (wrap) wrap.style.display = "none";
+  for (const card of cards) apply(card, card.bot.script[0]);
+}
+
+document.getElementById("wake").addEventListener("click", start);
+window.addEventListener("touchstart", start, { once: true, passive: true });
+// Desktop: auto-start after a short delay so resting stills paint first
+if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) {
+  setTimeout(start, 400);
+}
+// Resting stills immediately
+for (const card of cards) {
+  const r = resolveAsset(card.bot.color, "resting", "still");
+  card.player.show(r.primary, "still").catch(() => card.player.show(r.fallback, "still"));
+}
+tick();
+</script>
+</body>
+</html>
