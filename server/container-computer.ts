@@ -23,6 +23,12 @@ import {
 } from "./container-runtime-guard.ts";
 import { renderDockerfileCliInstallRun, renderDockerfileVerifyArtifacts } from "./vm-cli-install.ts";
 import {
+  forgetLocalVmGhToken,
+  localVmGhContainerEnv,
+  syncLocalVmGhToken,
+  type GhSyncOutcome,
+} from "./local-vm-gh-credentials.ts";
+import {
   allowedCliGuestDestinations,
   cliCredentialCandidates,
   hostCliCredentialMounts,
@@ -38,10 +44,23 @@ import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 const run = promisify(execFile);
 const SCREENSHOT_STATUS_TTL_MS = 10_000;
 
+/** Extras a caller can hand a command.  Both are optional and ignored by
+ *  runners that predate them, so existing fakes keep working unchanged. */
+export interface CommandRunOptions {
+  /** Written to the command's stdin, then stdin is closed.  This is the only
+   *  way a secret reaches a command: argv shows up in `ps` and `docker inspect`
+   *  echoes `-e` values, stdin does neither. */
+  input?: string;
+  /** Overlaid on the harness environment for this call.  An `undefined` value
+   *  removes that variable. */
+  env?: Record<string, string | undefined>;
+}
+
 export type CommandRunner = (
   command: string,
   args: string[],
   timeout?: number,
+  options?: CommandRunOptions,
 ) => Promise<{ stdout: string }>;
 
 export const CUA_DRIVER_VERSION = "0.20.0";
@@ -504,18 +523,30 @@ function redactCommandError(error: unknown): unknown {
   return scrubbed;
 }
 
-async function sh(cmd: string, args: string[], timeout = 8000): Promise<{ stdout: string }> {
+async function sh(
+  cmd: string,
+  args: string[],
+  timeout = 8000,
+  options?: CommandRunOptions,
+): Promise<{ stdout: string }> {
   // The one door every default-runner call walks through (`defaultCommandRunner`
   // is this function).  Kept inline, not wrapped: callers compare
   // `runner === sh` to recognise the real runner.
   const command = resolveRuntimeCommand(cmd);
   try {
-    const { stdout } = await run(command, args, {
+    const pending = run(command, args, {
       timeout,
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
-      env: { ...process.env, PATH: augmentedPath() },
+      env: { ...process.env, PATH: augmentedPath(), ...options?.env },
     });
+    if (options?.input !== undefined) {
+      // A command that exits before it reads stdin closes the pipe on us; that
+      // is the command's failure to report, not an unhandled stream error.
+      pending.child.stdin?.on("error", () => undefined);
+      pending.child.stdin?.end(options.input);
+    }
+    const { stdout } = await pending;
     return { stdout };
   } catch (error) {
     throw redactCommandError(error);
@@ -1404,6 +1435,10 @@ export function containerRunArgs(
         materializeCredentials: options?.materializeCredentials,
       }),
     );
+    // The gh mount is read-only and, on macOS, holds no token (it lives in the
+    // Keychain).  These point gh at a writable directory the token sync logs
+    // into, and git's github.com helper at gh.  All non-secret.
+    for (const entry of localVmGhContainerEnv()) common.push("-e", entry);
   }
   common.push(
     "--mount",
@@ -1584,8 +1619,37 @@ export async function containerComputerAction(
           ? ["rm", runtime === "container" ? "--force" : "-f", target.containerName]
           : [action, target.containerName];
     await runner(runtime, args, 2 * 60_000);
+    if (action === "run" || action === "stop" || action === "remove") {
+      // Whatever login the old container held is gone with it; a remembered
+      // token hash would make the next sync skip the one login a new
+      // container needs.
+      forgetLocalVmGhToken(target.containerName);
+    }
+    if (action === "run" && shareCliCredentials) {
+      // Right after create, so a human opening the viewer finds gh signed in
+      // before any bot turn.  Best-effort: the sync never throws.
+      await syncLocalVmGhToken({ runtime, containerName: target.containerName, runner });
+    }
   }
   return containerComputerStatus(runner, platform, target);
+}
+
+/** Bring the Local VM's gh login in line with the host's, when the existing
+ *  "Share Host CLI Credentials" option is on.  Called for each Local VM turn
+ *  once the container is ready, so a host re-login reaches the VM without a
+ *  recreate.  Never throws, and touches the container only when the host token
+ *  changed (see `syncLocalVmGhToken`).
+ *
+ *  In shared mode every bot's desktop runs as the same cua user in one
+ *  container, so one login covers all of them; a per-bot container is its own
+ *  cache entry and gets its own login. */
+export async function refreshLocalVmGhCredentials(
+  runtime: Runtime,
+  target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+  runner: CommandRunner = sh,
+): Promise<GhSyncOutcome | "disabled"> {
+  if (!shareCliCredentialsConfigured()) return "disabled";
+  return syncLocalVmGhToken({ runtime, containerName: target.containerName, runner });
 }
 
 /** Recreate a stopped Local VM container (the auto-wake), or fail truthfully.
@@ -1793,7 +1857,12 @@ export function setupCommands(
       view: target.viewerPort ? `http://127.0.0.1:${target.viewerPort}/vnc.html` : "",
     };
   }
-  const command = (args: string[]) => [runtime, ...args].join(" ");
+  // Display text a person may paste into a shell, so an argument with a space
+  // or a shell metacharacter (the git credential helper, `!gh auth git-credential`)
+  // is single-quoted rather than left to be split or history-expanded.
+  const shellWord = (word: string) =>
+    /^[A-Za-z0-9_@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
+  const command = (args: string[]) => [runtime, ...args].map(shellWord).join(" ");
   return {
     install,
     runtimeStart,

@@ -148,6 +148,7 @@ import {
   containerComputerScreenshot,
   containerComputerStatus,
   redactSecrets,
+  refreshLocalVmGhCredentials,
   wakeContainerComputer,
   handleBoxGatewayRequest,
   SHARED_LOCAL_VM_TARGET,
@@ -3328,6 +3329,11 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
     if (!localVm.ready || !localVm.runtime) {
       throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
     }
+    // Carry the host's gh login in when "Share Host CLI Credentials" is on: the
+    // macOS Keychain token is not in the mounted ~/.config/gh.  Best-effort and
+    // cached by token hash, so a turn only pays for it when the host re-logged
+    // in; a failure leaves the VM signed out and never fails the turn.
+    await refreshLocalVmGhCredentials(localVm.runtime, target).catch(() => undefined);
     // The container is up but this bot's desktop may not be: in shared mode each
     // bot owns its own display + socket, and the first turn for a bot is the one
     // that has to start it.  Idempotent, so every later turn is a no-op.  The
