@@ -19,6 +19,14 @@ import type { CompanionEndpoint } from "../src/endpoints.ts";
 import { harnessReady } from "../../server/testing/harness-ready.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+/** What the stand-in harness saw of the phone's audio request. */
+interface SeenAudioRequest {
+  method?: string;
+  url?: string;
+  contentType?: string;
+  body: string;
+}
 const ROOT = join(HERE, "..", "..");
 
 /** Ports nothing is listening on.
@@ -412,7 +420,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     // The iPhone names its device and asks for progressive clips in the
     // POST body.  Dropped on the way, the harness would read `{}`, speak the
     // shared voice, and block on every clip again, with nothing failing.
-    let seen: { method?: string; url?: string; contentType?: string; body: string } = { body: "" };
+    let seen: SeenAudioRequest = { body: "" };
     const audioHarness = createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on("data", (chunk: Buffer) => chunks.push(chunk));
