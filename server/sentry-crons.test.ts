@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applySentryConfig,
   isSentryActive,
@@ -8,6 +8,7 @@ import {
   type SentryNode,
 } from "./sentry.ts";
 import {
+  awaitPendingCheckInCloses,
   checkInRoutineFinish,
   checkInRoutineStart,
   routineMonitorConfig,
@@ -242,5 +243,111 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
     });
     expect(checkInRoutineStart(run(), routine())).toBeUndefined();
     expect(() => checkInRoutineFinish(run(), "x", true)).not.toThrow();
+  });
+});
+
+/** A fake SDK whose check-in close can be made to fail its way out of the
+ *  transport, the way a saturated host drops a buffered envelope.  `flush`
+ *  answers from `flushResults` and repeats the last answer forever once that
+ *  list runs out. */
+async function activateFlushableSentry(flushResults: boolean[]) {
+  const checkIns: SentryCheckIn[] = [];
+  const flushCalls: Array<number | undefined> = [];
+  // SAFETY: empty object shell — runtime only calls the members stamped below.
+  const sdk = Object.assign({} as FakeSentrySdk, {
+    init() {},
+    close() {
+      return Promise.resolve(true);
+    },
+    addIntegration() {},
+    consoleLoggingIntegration() {
+      return { name: "ConsoleLogs" };
+    },
+    captureCheckIn(checkIn: SentryCheckIn) {
+      checkIns.push(checkIn);
+      return "check-in-id-1";
+    },
+    async flush(timeout?: number) {
+      flushCalls.push(timeout);
+      return flushResults[Math.min(flushCalls.length - 1, flushResults.length - 1)] ?? true;
+    },
+  });
+  setSentryLoaderForTests(sentryTestLoader(sdk));
+  await applySentryConfig({
+    dsn: "https://abc123@o0.ingest.sentry.io/1",
+    enabled: true,
+    environment: "test",
+    tracesSampleRate: 1,
+    logsEnabled: false,
+    source: "config",
+  });
+  return { checkIns, flushCalls };
+}
+
+/** Let the detached close run to completion: 4 flush attempts, 3 backoffs
+ *  (5s + 30s + 2m), well inside this budget. */
+const RETRY_BUDGET_MS = 200_000;
+
+describe("checkInRoutineFinish close delivery", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("re-sends the same close until a flush confirms it left the process", async () => {
+    vi.useFakeTimers();
+    const { checkIns, flushCalls } = await activateFlushableSentry([false, false, true]);
+    const theRun = run();
+    checkInRoutineFinish(theRun, "check-in-id-1", true);
+    const settled = awaitPendingCheckInCloses();
+    await vi.advanceTimersByTimeAsync(RETRY_BUDGET_MS);
+    await settled;
+
+    // The first close, then one re-send per refused flush — all the same id,
+    // so Sentry treats a duplicate as the same check-in, not a new one.
+    expect(checkIns).toHaveLength(3);
+    expect(checkIns.map((checkIn) => ("checkInId" in checkIn ? checkIn.checkInId : undefined))).toEqual([
+      "check-in-id-1",
+      "check-in-id-1",
+      "check-in-id-1",
+    ]);
+    expect(checkIns.every((checkIn) => checkIn.status === "ok")).toBe(true);
+    expect(checkIns.every((checkIn) => checkIn.monitorSlug === routineMonitorSlug(theRun))).toBe(true);
+    expect(flushCalls).toHaveLength(3);
+    // A 10s budget per attempt: long enough for a slow WAN, short enough
+    // that the run is never gated on it.
+    expect(new Set(flushCalls)).toEqual(new Set([10_000]));
+  });
+
+  it("gives up after three retries and logs one line naming the slug and run", async () => {
+    vi.useFakeTimers();
+    const { checkIns } = await activateFlushableSentry([false]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const theRun = run({ id: "run-471ead38" });
+    try {
+      checkInRoutineFinish(theRun, "check-in-id-1", false);
+      const settled = awaitPendingCheckInCloses();
+      await vi.advanceTimersByTimeAsync(RETRY_BUDGET_MS);
+      await settled;
+
+      expect(checkIns).toHaveLength(4);
+      const lines = warn.mock.calls.map((call) => String(call[0]));
+      expect(lines).toEqual([
+        `[sentry-crons] check-in close failed slug=${routineMonitorSlug(theRun)} run=run-471ead38`,
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("is a no-op — no close, no flush, no retry — when Sentry is inactive", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(isSentryActive()).toBe(false);
+      checkInRoutineFinish(run(), "check-in-id-1", true);
+      await awaitPendingCheckInCloses();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
