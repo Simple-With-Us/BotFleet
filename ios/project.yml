@@ -24,7 +24,7 @@ packages:
     path: .
   Sentry:
     url: https://github.com/getsentry/sentry-cocoa.git
-    from: 8.44.0
+    from: 8.58.4
 targets:
   BotFleet:
     type: application
