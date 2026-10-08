@@ -12052,6 +12052,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (existingBot && body.computers !== undefined) {
         await interruptIfHostRevoked(existingBot, body.computers);
+        // Another request may have changed the bot during that await (the
+        // phone saving its own voice through the profile route).  `voices`
+        // is a per-device merge, so redo it against the bot as it is now,
+        // or the record parsed before the await would put the old value back.
+        if (Object.prototype.hasOwnProperty.call(patch, "voices")) {
+          const fresh = parseBotProfilePatch(body, false, store.bot(m[1]));
+          if (fresh.ok) patch.voices = fresh.patch.voices;
+        }
       }
       const chiefMovedSections =
         Boolean(existingBot?.chiefOfStaff) &&
