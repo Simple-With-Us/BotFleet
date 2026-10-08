@@ -109,6 +109,8 @@ final class MessageVoiceTests: XCTestCase {
         let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(VoiceRequestStub.capturedBody)) as? [String: Any])
         XCTAssertEqual(body["device"] as? String, "iphone")
         XCTAssertEqual(body["progressive"] as? Bool, true)
+        // Karaoke: the script kind and, for a reply read as written, its spans.
+        XCTAssertEqual(body["spans"] as? Bool, true)
     }
 
     func testAClipRequestNamesTheSameDeviceAndOutlastsTheServerWait() async throws {
