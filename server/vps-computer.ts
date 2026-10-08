@@ -26,6 +26,7 @@ import {
   DRIVER_LABEL,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
+  MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   MANAGED_LABEL,
 } from "./container-computer.ts";
 import {
@@ -925,7 +926,7 @@ async function prepareVpsImage(alias: string, runner: VpsCommandRunner) {
   await runner(vpsDockerArgs(alias, ["pull", BASE_IMAGE]), { timeoutMs: 10 * 60_000 });
   await runner(vpsDockerArgs(alias, ["build", "-t", VPS_IMAGE, "-"]), {
     input: managedImageDockerfile(),
-    timeoutMs: 10 * 60_000,
+    timeoutMs: MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   });
 }
 

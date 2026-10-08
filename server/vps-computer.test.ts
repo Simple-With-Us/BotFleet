@@ -13,6 +13,7 @@ import {
   DISPLAY,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
+  MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   MANAGED_LABEL,
   healCuaShimsScript,
   resetCuaShimHealGate,
@@ -434,6 +435,16 @@ describe("VPS computer", () => {
     expect(run).not.toContain("--mount");
     expect(run).not.toContain("-p");
     expect(provision.calls.some(({ args }) => args[2] === "build")).toBe(true);
+  });
+
+  // The CLI layer makes a cold build take 20 minutes or more, and the VPS path
+  // used to cap it at 10, so every VPS rebuild would have timed out.
+  it("gives the image build the same generous timeout as the Local VM", async () => {
+    const provision = fixture({ image: false, container: false });
+    await vpsComputerAction("provision", CONFIG, BOT_ID, provision.runner);
+    const build = provision.calls.find(({ args }) => args[2] === "build");
+    expect(build?.options?.timeoutMs).toBe(MANAGED_IMAGE_BUILD_TIMEOUT_MS);
+    expect(MANAGED_IMAGE_BUILD_TIMEOUT_MS).toBeGreaterThanOrEqual(30 * 60_000);
   });
 
   it("uses the image id produced by a rebuild", async () => {

@@ -62,7 +62,13 @@ export const IMAGE_REPOSITORY = "localhost/botfleet/cua-local-vm";
 // are no running containers to replace.  Note the contrast with CUA_PATH_SHIMS
 // below, which heals in place precisely because bumping there *would* replace
 // live containers.
-export const IMAGE_LAYER_VERSION = "7";
+//
+// v8 (2026-10-07): the VM CLI layer now carries Homebrew, zsh as the login
+// shell, an `open` shim, ripgrep and the gap-list CLIs, and git.  Bumped
+// because a v7 image has none of it and `imageLabelsMatch` would otherwise
+// keep accepting it.  Any container built from v7 or earlier is replaced on the
+// next provision.
+export const IMAGE_LAYER_VERSION = "8";
 export const IMAGE_LAYER_LABEL = "com.botfleet.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export function sanitizeContainerSuffix(name: string): string {
@@ -1429,7 +1435,11 @@ async function ensureVmWorkspace(platform: NodeJS.Platform, target: LocalVmTarge
   if (platform !== "win32") await chmod(target.workspaceDir, 0o700);
 }
 
-const MANAGED_IMAGE_BUILD_TIMEOUT_MS = 45 * 60_000;
+/** How long an image build may run.  The CLI layer downloads and installs
+ * dozens of tools, so a cold build takes well over the 10 minutes the VPS path
+ * used to allow: it measured 21 to 22 minutes on a loaded arm64 Mac.  Shared
+ * with the VPS backend so the two cannot drift apart again. */
+export const MANAGED_IMAGE_BUILD_TIMEOUT_MS = 45 * 60_000;
 
 async function prepareManagedImage(runtime: Runtime, runner: CommandRunner): Promise<void> {
   await runner(runtime, ["pull", BASE_IMAGE], 10 * 60_000);
