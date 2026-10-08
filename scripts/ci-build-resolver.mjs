@@ -20,7 +20,7 @@
 // this shape of call.  Retry a timeout; never retry a 404 that will still be a
 // 404 in ten minutes.
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -29,10 +29,11 @@ import { join, sep } from "node:path";
 const DEFAULT_REPOSITORY = "Simple-With-Us/BotFleet";
 const WORKFLOW_FILE = "mac-commit-build.yml";
 
-// The repository is public, so the Actions API can be read unauthenticated.
-// An hourly anonymous budget exists and is small, but a machine installs a
-// handful of updates a day, not hundreds; a token is still honoured when one
-// is present so a busy or multi-Mac setup is not quietly throttled.
+// Workflow and artifact metadata on a public repo can be read without a token,
+// within GitHub's anonymous API budget.  Downloading the artifact zip always
+// requires authentication, even on a public repo.  GITHUB_TOKEN, GH_TOKEN, or
+// a token from `gh auth login` is used when present; Finder launches expose a
+// minimal PATH, so `authHeaders` also probes common `gh` install locations.
 const API_TIMEOUT_MS = 30_000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const DOWNLOAD_ATTEMPTS = 3;
@@ -115,8 +116,8 @@ function resolutionMessage({ cause, commit, status, repository, detail, conclusi
       );
     case "unauthorized":
       return keyPreview
-        ? `GitHub rejected the configured key (${keyPreview}) while looking up a build for ${sha} (HTTP ${status}).  A key from another account or host is the usual cause.  Unset it to use the public repo anonymously.`
-        : `GitHub rejected an anonymous request for ${sha} (HTTP ${status}), which should not happen on a public repo.  Set GITHUB_TOKEN to authenticate, or retry shortly.`;
+        ? `GitHub rejected the configured key (${keyPreview}) while fetching a hosted build for ${sha} (HTTP ${status}).  Actions artifact downloads require a GitHub token from this account.  Unset the wrong key, run \`gh auth login\` on this Mac, or set GITHUB_TOKEN, then retry.`
+        : `GitHub returned HTTP ${status} while downloading a hosted build for ${sha}.  Actions artifact downloads require a GitHub token.  Run \`gh auth login\` on this Mac or set GITHUB_TOKEN, then retry the update.`;
     case "network-timed-out":
     case "network-failed":
       return (
@@ -192,7 +193,7 @@ async function requestJson(url, { headers = {}, fetchImpl = fetch, timeoutMs = A
   return body;
 }
 
-async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = DOWNLOAD_TIMEOUT_MS, totalTimeoutMs = DOWNLOAD_TOTAL_TIMEOUT_MS, label }) {
+async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = DOWNLOAD_TIMEOUT_MS, totalTimeoutMs = DOWNLOAD_TOTAL_TIMEOUT_MS, label, commit }) {
   let lastError = null;
   const budgetDeadline = Date.now() + totalTimeoutMs;
   for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt += 1) {
@@ -215,7 +216,7 @@ async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = 
         const retryable = response.status === 429 || response.status >= 500;
         lastError = new ResolutionError(
           cause === "unauthorized"
-            ? resolutionMessage({ cause, commit: "(unresolved)", status: response.status, keyPreview: maskedKeyPreview(headers) })
+            ? resolutionMessage({ cause, commit, status: response.status, keyPreview: maskedKeyPreview(headers) })
             : `Downloading ${label} failed with HTTP ${response.status}`,
           cause,
         );
@@ -250,9 +251,44 @@ async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = 
   throw lastError || new ResolutionError(`Downloading ${label} failed`, "unknown");
 }
 
-function authHeaders(env = process.env) {
+const GH_BIN_CANDIDATES = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"];
+const GH_AUTH_TOKEN_TIMEOUT_MS = 5_000;
+
+let ghAuthTokenCache = { resolved: false, token: "" };
+
+/** Clears the cached `gh auth token` result.  Tests only. */
+export function resetGhAuthCacheForTests() {
+  ghAuthTokenCache = { resolved: false, token: "" };
+}
+
+function readGhAuthToken(execFileSyncImpl = execFileSync) {
+  if (ghAuthTokenCache.resolved) return ghAuthTokenCache.token;
+  ghAuthTokenCache.resolved = true;
+  for (const ghPath of GH_BIN_CANDIDATES) {
+    try {
+      const stdout = execFileSyncImpl(ghPath, ["auth", "token"], {
+        encoding: "utf8",
+        timeout: GH_AUTH_TOKEN_TIMEOUT_MS,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const token = String(stdout || "").trim();
+      if (token) {
+        ghAuthTokenCache.token = token;
+        return token;
+      }
+    } catch {
+      // Missing binary, logged-out gh, or timeout — try the next candidate.
+    }
+  }
+  ghAuthTokenCache.token = "";
+  return "";
+}
+
+export function authHeaders(env = process.env, { execFileSyncImpl } = {}) {
   const token = (env.GITHUB_TOKEN || env.GH_TOKEN || "").trim();
-  return token ? { authorization: `Bearer ${token}` } : {};
+  if (token) return { authorization: `Bearer ${token}` };
+  const ghToken = readGhAuthToken(execFileSyncImpl ?? execFileSync);
+  return ghToken ? { authorization: `Bearer ${ghToken}` } : {};
 }
 
 /**
@@ -906,11 +942,12 @@ export async function downloadBuiltBundle({
   fetchImpl = fetch,
   env = process.env,
   log = () => {},
+  execFileSyncImpl,
 } = {}) {
   if (!FULL_COMMIT.test(commit || "")) {
     throw new ResolutionError(`Refusing to resolve a hosted build for a non-commit target: ${commit}`, "bad-target");
   }
-  const headers = authHeaders(env);
+  const headers = authHeaders(env, { execFileSyncImpl });
   const runsUrl = `${apiBase(repository)}/actions/workflows/${WORKFLOW_FILE}/runs?head_sha=${commit}&per_page=20`;
   const runs = (await requestJson(runsUrl, { headers, fetchImpl }))?.workflow_runs;
   const run_ = selectCommitRun(runs, commit);
@@ -958,7 +995,7 @@ export async function downloadBuiltBundle({
     );
   }
   log(`Using hosted build run ${run_.id} for ${commit.slice(0, 12)} (${artifact.name})`);
-  const bytes = await requestBytes(`${artifact.archive_download_url}`, { headers, fetchImpl, label: artifact.name });
+  const bytes = await requestBytes(`${artifact.archive_download_url}`, { headers, fetchImpl, label: artifact.name, commit });
   // The artifact wrapper is a zip holding the manifest and the bundle.
   const scratch = await mkdtemp(join(tmpdir(), "botfleet-ci-manifest-"));
   let manifest;
