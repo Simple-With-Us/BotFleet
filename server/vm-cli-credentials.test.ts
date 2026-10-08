@@ -10,6 +10,7 @@ import {
   DockerConfigSchema,
   guestCredentialOwnershipRepairShell,
   hostCliCredentialMounts,
+  listArchiveRelPaths,
   manifestCredentialCandidates,
   packageCredentialArchive,
   planCredentialSync,
@@ -149,6 +150,58 @@ describe("vm CLI credential sync", () => {
       expect(listing).not.toContain(".config/gcloud/logs");
       expect(listing).not.toContain(".config/gcloud/cache");
       expect(listing).not.toContain(".config/gcloud/data");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+  // The verify step reads the member list back out of the packed archive, so
+  // listing has to feed tar the archive on stdin.  Without it tar waits for a
+  // stream that never arrives and the whole credential sync hangs.
+  it("lists the members the archive packed, reading the archive from stdin", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bf-cred-members-"));
+    try {
+      mkdirSync(join(home, ".ssh"), { recursive: true });
+      writeFileSync(join(home, ".ssh", "config"), "Host *\n");
+      mkdirSync(join(home, ".config", "gcloud", "logs", "2026.10.07"), { recursive: true });
+      writeFileSync(join(home, ".config", "gcloud", "credentials.db"), "credential-bytes");
+      writeFileSync(join(home, ".config", "gcloud", "logs", "2026.10.07", "run.log"), "debug-chatter");
+
+      const plan = planCredentialSync({ homeDir: home });
+      const archive = await packageCredentialArchive(home, plan);
+      const members = await listArchiveRelPaths(archive!);
+
+      // Files, not just the directories that contain them, so a destination
+      // that exists while its credential did not land is still detectable.
+      expect(members).toContain(".ssh/config");
+      expect(members).toContain(".config/gcloud/credentials.db");
+      expect(members.some((entry) => entry.includes("gcloud/logs"))).toBe(false);
+      // Directory members never carry a trailing slash into the probe.
+      expect(members.every((entry) => !entry.endsWith("/"))).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+  // ~/.deno/bin/deno (79MB) and ~/.turso's two binaries (54MB) are installed
+  // tools, not credentials, and the guest installs both CLIs itself.  Shipping
+  // them put a 134MB archive on the wire for every single sync.
+  it("excludes installed tool binaries that live under a credential root", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bf-cred-binaries-"));
+    try {
+      mkdirSync(join(home, ".deno", "bin"), { recursive: true });
+      mkdirSync(join(home, ".turso"), { recursive: true });
+      writeFileSync(join(home, ".deno", "bin", "deno"), "x".repeat(4096));
+      writeFileSync(join(home, ".turso", "sqld"), "x".repeat(4096));
+      writeFileSync(join(home, ".turso", "turso"), "x".repeat(4096));
+      writeFileSync(join(home, ".deno", "env"), "DENO_DIR=/tmp/deno\n");
+
+      const plan = planCredentialSync({ homeDir: home });
+      const archive = await packageCredentialArchive(home, plan);
+      const members = await listArchiveRelPaths(archive!);
+
+      expect(members).toContain(".deno/env");
+      expect(members).not.toContain(".deno/bin/deno");
+      expect(members).not.toContain(".turso/sqld");
+      expect(members).not.toContain(".turso/turso");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

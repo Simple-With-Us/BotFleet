@@ -511,6 +511,12 @@ const CREDENTIAL_EXCLUDE_PATTERNS: string[] = [
   ".config/gcloud/logs",
   ".config/gcloud/cache",
   ".config/gcloud/data",
+  // Installed tool binaries, not credentials.  ~/.deno/bin/deno alone is 79MB
+  // and ~/.turso's two binaries are 54MB, so shipping them put a 134MB archive
+  // on the wire for every sync while the guest installs both CLIs itself.
+  ".deno/bin",
+  ".turso/sqld",
+  ".turso/turso",
 ];
 
 /** Pre-existing generic excludes: interpreter venvs, sockets, editor droppings. */
@@ -524,6 +530,34 @@ const GENERIC_EXCLUDE_PATTERNS: string[] = [
 
 export function credentialSyncExcludePatterns(): string[] {
   return [...GENERIC_EXCLUDE_PATTERNS, ...CREDENTIAL_EXCLUDE_PATTERNS].sort();
+}
+
+/**
+ * Every member the archive actually packed, in archive-relative form.  Read
+ * back out of the archive rather than re-derived from the plan, so the verify
+ * step can never probe a path the excludes dropped and can never miss one it
+ * kept.  Trailing slashes are trimmed so a directory member and the files under
+ * it do not double-count.
+ */
+export async function listArchiveRelPaths(archive: Buffer): Promise<string[]> {
+  const listed = await new Promise<string>((resolve, reject) => {
+    const tar = spawn("tar", ["-tf", "-"], { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+    const chunks: Buffer[] = [];
+    tar.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    tar.on("error", reject);
+    tar.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks).toString("utf8"));
+      else reject(new Error(`tar list failed with code ${code}`));
+    });
+    // tar reads the archive from stdin: without this it waits forever.
+    tar.stdin.on("error", reject);
+    tar.stdin.end(archive);
+  });
+  const members = listed
+    .split("\n")
+    .map((line) => line.trim().replace(/\/+$/, ""))
+    .filter((line) => line && line !== "." && line !== "..");
+  return [...new Set(members)].sort();
 }
 
 export async function packageCredentialArchive(
