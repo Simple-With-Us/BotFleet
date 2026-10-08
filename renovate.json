@@ -26,6 +26,16 @@
       ],
       "matchPackageNames": ["@trycua/cua-driver"],
       "enabled": false
+    },
+    {
+      "description": [
+        "@xmldom/xmldom must stay on the 0.8 line.",
+        "electron-builder's plist parsing (through the plist package) calls DOMParser.parseFromString without a mimeType, which xmldom 0.9 requires, so packaging fails with 'the provided mimeType \"undefined\" is not valid'.",
+        "#919 moved the pnpm override in package.json to 0.9.12 and broke the Mac build.",
+        "Lift this cap only in a PR that proves electron-builder packages on the newer line."
+      ],
+      "matchPackageNames": ["@xmldom/xmldom", "@xmldom/xmldom@*"],
+      "allowedVersions": "<0.9"
     }
   ],
   "vulnerabilityAlerts": { "labels": ["security"] }
