@@ -148,13 +148,8 @@ const rels = [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])].sor
 console.log(JSON.stringify({ root, rels, excludes: credentialSyncExcludePatterns() }));
 NODE
 )" || { echo "Error: manifest-driven credential discovery failed." >&2; exit 1; }
-TAR_ROOT="$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
-
-# tar --exclude flags, sourced from the manifest plan (never print contents).
+TAR_ROOT=""
 TAR_EXCLUDES=()
-while IFS= read -r pattern; do
-  [ -n "$pattern" ] && TAR_EXCLUDES+=("--exclude=$pattern")
-done <<< "$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["excludes"]))')"
 
 cleanup_staging() {
   if [ -n "$TAR_ROOT" ] && [ "$TAR_ROOT" != "$SRC_HOME" ] && [ -d "$TAR_ROOT" ]; then
@@ -165,9 +160,34 @@ trap cleanup_staging EXIT
 trap 'cleanup_staging; exit 130' INT
 trap 'cleanup_staging; exit 143' TERM
 
-while IFS= read -r rel; do
-  [ -n "$rel" ] && FOUND+=("$rel")
-done <<< "$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["rels"]))')"
+# A silent parse failure here would empty ROOT, FOUND or TAR_EXCLUDES and would
+# quietly restore the churn this path exists to exclude.  An `exit` inside a
+# $(...) subshell cannot stop the parent, so the plan is decoded ONCE up front
+# and the script aborts on a non-zero status instead.
+if ! PLAN_DECODED="$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+missing = [k for k in ("root", "rels", "excludes") if k not in d]
+if missing:
+    sys.exit("credential plan is missing key(s): " + ", ".join(missing))
+print(d["root"])
+for pattern in d["excludes"]:
+    print("EXCLUDE\t" + pattern)
+for rel in d["rels"]:
+    print("PATH\t" + rel)
+')"; then
+  echo "Error: could not decode the credential plan; refusing to sync." >&2
+  exit 1
+fi
+
+TAR_ROOT="$(printf '%s\n' "$PLAN_DECODED" | sed -n '1p')"
+
+while IFS=$'\t' read -r kind value; do
+  case "$kind" in
+    EXCLUDE) [ -n "$value" ] && TAR_EXCLUDES+=("--exclude=$value") ;;
+    PATH) [ -n "$value" ] && FOUND+=("$value") ;;
+  esac
+done <<< "$(printf '%s\n' "$PLAN_DECODED" | sed -n '2,$p')"
 
 if [ ${#FOUND[@]} -eq 0 ]; then
   log "No matching CLI credentials found in $SRC_HOME."

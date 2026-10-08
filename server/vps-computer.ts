@@ -1160,9 +1160,9 @@ export async function vpsSyncCliCredentials(
       };
     }
 
-    const plannedGuestPaths = [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])]
-      .map((rel) => guestPathForCredentialRel(rel))
-      .sort();
+    const plannedGuestPaths = [
+      ...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths].map((rel) => guestPathForCredentialRel(rel))),
+    ].sort();
 
     try {
       await run(
@@ -1170,21 +1170,24 @@ export async function vpsSyncCliCredentials(
         60_000,
         tarArchive,
       );
-    } catch {
+    } catch (err) {
       // GNU tar reports per-member errors only after extracting everything it
       // can, so a non-zero exit does not mean the credentials are missing — it
       // means at least one member could not be written.  Verify before failing
       // the whole sync, otherwise one unwritable path on the guest silently
       // denies every other tool its credentials (observed: gcloud's root-owned
       // ~/.config/gcloud, which cost the shared VPS a sync every ~5 minutes).
+      // Keep tar's own message in both outcomes: it is the only thing that
+      // says *why* a member was refused, and the runner already redacts it.
+      const detail = err instanceof Error ? err.message : String(err);
       const missing = await missingGuestCredentialPaths(run, target.containerName, plannedGuestPaths);
       if (missing.length > 0) {
         throw new Error(
-          `credential extract failed and ${missing.length} destination(s) are missing: ${missing.slice(0, 5).join(", ")}`,
+          `credential extract failed and ${missing.length} destination(s) are missing: ${missing.slice(0, 5).join(", ")} (tar: ${detail})`,
         );
       }
       console.warn(
-        `[vps] credential extract reported errors but all ${plannedGuestPaths.length} destination(s) are present`,
+        `[vps] credential extract reported errors but all ${plannedGuestPaths.length} destination(s) are present (tar: ${detail})`,
       );
     }
 
