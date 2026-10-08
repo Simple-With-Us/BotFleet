@@ -302,6 +302,7 @@ final class Session: ObservableObject {
             instanceDriverKinds = ["preview": "claude"]
             status = .live
             TranscriptScrollDemo.startIfRequested(self)
+            KaraokeDemo.startIfRequested(self)
             return
         }
 #endif
@@ -318,6 +319,12 @@ final class Session: ObservableObject {
     /// had delivered a frame.  `state` is otherwise written only here.
     func debugMutateState(_ body: (inout CompanionState) -> Void) {
         body(&state)
+    }
+
+    /// Karaoke fixture only (`-karaoke-demo`): show a reply as being read
+    /// aloud, so its bubble wears Stop Voice.
+    func debugSetSpeaking(_ messageId: String?) {
+        speakingMessageId = messageId
     }
 
     /// `-preview-voice`: every preview bot speaks a MiniMax voice on this
@@ -1872,6 +1879,9 @@ final class Session: ObservableObject {
         voicePlayback?.finish(false)
         voicePlayback = nil
         PersonalVoiceService.shared.stop()
+        // The highlight follows the voice: an early stop clears it at once.
+        // A reply read to the end keeps its short linger.
+        KaraokeCenter.shared.stop()
         speakingMessageId = nil
         // The interruption belonged to the read that just ended.  Left set,
         // its late end would stop the next read.
@@ -1943,11 +1953,13 @@ final class Session: ObservableObject {
             if answer.speaksOnDevice {
                 // The harness resolved a Personal Voice this phone did not
                 // know about (a workspace default, or a newer choice).
-                let segments = answer.utterances.map { SpeechProjection.segments(fromUtterances: $0) }
-                    ?? SpeechProjection.segments(fromReply: message.text ?? "")
-                try await speakPersonal(segments, voiceId: answer.voice ?? voiceId ?? "", botId: botId)
+                let reading = personalReading(answer, message: message)
+                try await speakPersonal(
+                    reading.segments, voiceId: answer.voice ?? voiceId ?? "", botId: botId,
+                    karaoke: reading.script.map { (message, $0) }
+                )
             } else {
-                try await playHostedClips(answer, threadId: threadId, messageId: message.id, client: client)
+                try await playHostedClips(answer, threadId: threadId, message: message, client: client)
             }
         } catch {
             guard !isCancellation(error), !Task.isCancelled else { return }
@@ -1968,7 +1980,7 @@ final class Session: ObservableObject {
         voiceId: String,
         client: CompanionClient?
     ) async throws {
-        var segments: [SpeechSegment]?
+        var answered: MessageVoice?
         var speakWith = voiceId
         if let client {
             // Only the request may fall back to the local projection.  A
@@ -1989,28 +2001,61 @@ final class Session: ObservableObject {
                 guard answer.speaksOnDevice else {
                     // The computer resolved a hosted voice for this iPhone;
                     // this phone's copy of the bot is older.  Play its clips.
-                    try await playHostedClips(answer, threadId: threadId, messageId: message.id, client: client)
+                    try await playHostedClips(answer, threadId: threadId, message: message, client: client)
                     return
                 }
-                segments = answer.utterances.map { SpeechProjection.segments(fromUtterances: $0) }
+                answered = answer
                 if let resolved = answer.voice, BotVoice.isPersonalVoiceId(resolved) { speakWith = resolved }
             }
         }
+        let reading = personalReading(answered, message: message)
         try await speakPersonal(
-            segments ?? SpeechProjection.segments(fromReply: message.text ?? ""),
+            reading.segments,
             voiceId: speakWith,
-            botId: botId
+            botId: botId,
+            karaoke: reading.script.map { (message, $0) }
         )
     }
 
-    private func speakPersonal(_ segments: [SpeechSegment], voiceId: String, botId: String?) async throws {
+    /// What a Personal Voice reads for `message`, and the karaoke script
+    /// that follows it.  The harness's utterances when it answered; a reply
+    /// it reads as written comes with spans (`script: "written"`), and a
+    /// summary has no karaoke.  Without an answer this phone projects the
+    /// reply itself, and the highlight follows that projection without
+    /// spans, anchored on words that occur once on each side.
+    private func personalReading(_ answer: MessageVoice?, message: Message) -> (segments: [SpeechSegment], script: KaraokeScript?) {
+        if let answer, let utterances = answer.utterances {
+            return (SpeechProjection.segments(fromUtterances: utterances), answer.karaokeScript)
+        }
+        let segments = SpeechProjection.segments(fromReply: message.text ?? "")
+        return (segments, KaraokeScript.unguided(utterances: segments.map(\.text)))
+    }
+
+    private func speakPersonal(
+        _ segments: [SpeechSegment],
+        voiceId: String,
+        botId: String?,
+        karaoke follow: (message: Message, script: KaraokeScript)? = nil
+    ) async throws {
         let service = PersonalVoiceService.shared
         if service.authorizationStatus == .notDetermined {
             _ = await service.requestAuthorization()
             try Task.checkCancellation()
         }
         if !service.hasVoice(voiceId) { notePersonalVoiceMissing(botId: botId, voiceId: voiceId) }
-        _ = try await service.speak(segments: segments, voiceId: voiceId)
+        // The bubble follows each word the synthesizer reports.
+        var karaoke: MessageKaraoke?
+        if let follow {
+            karaoke = KaraokeCenter.shared.begin(
+                messageId: follow.message.id, messageText: follow.message.text ?? "", script: follow.script, mode: .live
+            )
+            karaoke?.setChunks(segments.map(\.text))
+        }
+        _ = try await service.speak(segments: segments, voiceId: voiceId) { [weak karaoke] progress in
+            karaoke?.liveWord(chunk: progress.segment, location: progress.location, at: progress.at)
+        }
+        // A stopped read already cleared it; finish only a read that ended.
+        KaraokeCenter.shared.finish(karaoke)
     }
 
     /// Say once per bot and voice why a different voice is reading, and
@@ -2034,14 +2079,22 @@ final class Session: ObservableObject {
     private func playHostedClips(
         _ answer: MessageVoice,
         threadId: String,
-        messageId: String,
+        message: Message,
         client: CompanionClient
     ) async throws {
+        let messageId = message.id
         let total = answer.clipCount
         guard total > 0 else { return }
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.playback, mode: .spokenAudio)
         try audioSession.setActive(true)
+        // Karaoke for a reply read as written, one clip per utterance: each
+        // word's time is proportional to its place in its clip, and a
+        // clip's real length replaces the estimate once it plays.
+        var karaoke: MessageKaraoke?
+        if let script = answer.karaokeScript, script.utterances.count == total {
+            karaoke = KaraokeCenter.shared.begin(messageId: messageId, messageText: message.text ?? "", script: script, mode: .clips)
+        }
         var next = prefetchClip(0, threadId: threadId, messageId: messageId, client: client)
         for index in 0..<total {
             let data: Data
@@ -2058,8 +2111,9 @@ final class Session: ObservableObject {
             if index + 1 < total {
                 next = prefetchClip(index + 1, threadId: threadId, messageId: messageId, client: client)
             }
-            try await playClip(data)
+            try await playClip(data, karaoke: karaoke, index: index)
         }
+        KaraokeCenter.shared.finish(karaoke)
     }
 
     private func prefetchClip(_ index: Int, threadId: String, messageId: String, client: CompanionClient) -> Task<Data, Error> {
@@ -2095,18 +2149,20 @@ final class Session: ObservableObject {
 
     /// Plays one clip to its end.  Waits on the player's delegate rather
     /// than polling isPlaying, which an interruption also turns false.
-    private func playClip(_ data: Data) async throws {
+    private func playClip(_ data: Data, karaoke: MessageKaraoke? = nil, index: Int = 0) async throws {
         let player = try AVAudioPlayer(data: data)
         let playback = ClipPlayback()
         player.delegate = playback
         guard player.prepareToPlay(), player.play() else { throw APIError.transport("Voice clip could not be played.") }
         voicePlayer = player
         voicePlayback = playback
+        karaoke?.attachClip(index, player: player)
         let finished = await withTaskCancellationHandler {
             await playback.wait()
         } onCancel: {
             Task { @MainActor in playback.finish(false) }
         }
+        karaoke?.detachClip(index, finished: finished)
         if voicePlayback === playback {
             voicePlayback = nil
             voicePlayer = nil

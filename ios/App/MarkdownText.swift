@@ -28,6 +28,8 @@ struct MarkdownText: View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { item in
                 view(for: item.element, tail: caret && item.offset == blocks.count - 1)
+                    // Karaoke paints by block (Karaoke.swift).
+                    .environment(\.markdownBlockIndex, item.offset)
             }
         }
         .environment(\.openURL, OpenURLAction { url in
@@ -124,18 +126,11 @@ struct MarkdownText: View {
     ///
     /// Falling back to the raw string on a parse failure is the point: a
     /// half-typed link mid-stream should show as the characters the model has
-    /// sent so far, not vanish until it closes the bracket.
-    private func inline(_ text: String, tail: Bool = false) -> Text {
-        let rendered: Text
-        if let attributed = try? AttributedString(
-            markdown: text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
-            rendered = Text(attributed)
-        } else {
-            rendered = Text(text)
-        }
-        return rendered + caretText(tail)
+    /// sent so far, not vanish until it closes the bracket.  The parse is
+    /// `Markdown.inlineAttributed`, shared with karaoke's display text, and
+    /// `InlineMarkdown` adds the highlight while the reply is read aloud.
+    private func inline(_ text: String, tail: Bool = false) -> InlineMarkdown {
+        InlineMarkdown(text: text, caret: caretText(tail))
     }
 
     /// A figure space then a block, so the caret sits off the last glyph

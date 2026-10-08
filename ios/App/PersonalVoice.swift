@@ -40,6 +40,18 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
         }
     }
 
+    /// A word about to be spoken, for karaoke.  `segment` indexes the
+    /// `segments` passed to `speak`, `location` is the UTF-16 offset of the
+    /// word in that segment's text (a retry's remainder is mapped back), and
+    /// `at` is when the synthesizer said so, in `CACurrentMediaTime()`
+    /// seconds.  The start of each utterance is reported too, because
+    /// whether willSpeakRange fires for every Personal Voice is unverified.
+    struct WordProgress {
+        let segment: Int
+        let location: Int
+        let at: CFTimeInterval
+    }
+
     /// What happened during one `speak`, for the caller's status and telemetry.
     struct SpeakReport {
         /// The requested Personal Voice is not on this iPhone, so another
@@ -69,6 +81,12 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
     private var lastProgressAt = Date()
     private var activeLength = 0
     private var watchdog: Task<Void, Never>?
+
+    // Karaoke: which segment is speaking, and where the utterance's text
+    // starts in it (a retry speaks only the remainder).
+    private var onProgress: (@MainActor (WordProgress) -> Void)?
+    private var activeSegment = -1
+    private var activeSegmentOffset = 0
 
     // An audio interruption (a call, Siri, an alarm) pauses the turn.
     private var interrupted = false
@@ -173,11 +191,16 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
     /// iPhone does not have `voiceId`, it reads with this iPhone's own
     /// Personal Voice, or the system voice, and says so in the report rather
     /// than failing silently or not at all.
-    func speak(segments: [SpeechSegment], voiceId: String) async throws -> SpeakReport {
+    func speak(
+        segments: [SpeechSegment],
+        voiceId: String,
+        onProgress: (@MainActor (WordProgress) -> Void)? = nil
+    ) async throws -> SpeakReport {
         // stop() invalidates any in-flight invocation, including one parked
         // in the retry backoff where no continuation is installed.
         stop()
         let generation = turnGuard.beginInvocation()
+        self.onProgress = onProgress
         var report = SpeakReport()
 
         if authorizationStatus == .notDetermined {
@@ -194,7 +217,8 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
             ?? AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
         else { throw SpeakError.noVoice }
 
-        let pieces = segments.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        // Keep each piece's index in `segments` for progress reports.
+        let pieces = segments.enumerated().filter { !$0.element.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !pieces.isEmpty else { return report }
 
         let audioSession = AVAudioSession.sharedInstance()
@@ -210,11 +234,16 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
             if turnGuard.ownsInvocation(generation) {
                 isSpeaking = false
                 stopWatchdog()
+                self.onProgress = nil
+                activeSegment = -1
             }
         }
 
-        segmentLoop: for (index, segment) in pieces.enumerated() {
+        segmentLoop: for (index, piece) in pieces.enumerated() {
+            let segment = piece.element
             var text = segment.text
+            // Where `text` starts in `segment.text`, in UTF-16 units.
+            var textOffset = 0
             var attempts = 0
             while true {
                 guard isSpeaking, turnGuard.ownsInvocation(generation) else { break segmentLoop }
@@ -231,6 +260,8 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
                 utterance.rate = AVSpeechUtteranceDefaultSpeechRate
                 utterance.postUtteranceDelay = index == pieces.count - 1 ? 0 : (segment.endsParagraph ? 0.25 : 0.05)
 
+                activeSegment = piece.offset
+                activeSegmentOffset = textOffset
                 let outcome = await speakChunkUtterance(utterance, generation: generation)
                 if outcome == .finished { break }
                 // Stopping supersedes this turn.
@@ -258,6 +289,9 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
                     VoiceTelemetry.synthesizerGaveUp(characters: length, attempts: attempts)
                     break
                 }
+                // The remainder is a suffix of `text`, so its start in the
+                // segment moves by what was cut off the front.
+                textOffset += length - (remainder as NSString).length
                 text = remainder
                 if !interrupted { try? await Task.sleep(nanoseconds: 50_000_000) }
             }
@@ -288,6 +322,8 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
     /// Stop ongoing speech playback immediately.
     func stop() {
         turnGuard.supersedeInvocation()
+        onProgress = nil
+        activeSegment = -1
         if synthesizer.isSpeaking || synthesizer.isPaused {
             synthesizer.stopSpeaking(at: .immediate)
         }
@@ -426,9 +462,11 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
     // MARK: - AVSpeechSynthesizerDelegate
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        let at = CACurrentMediaTime()
         Task { @MainActor [weak self] in
             guard let self, self.turnGuard.isActive(utterance: utterance) else { return }
             self.lastProgressAt = Date()
+            self.reportProgress(location: 0, at: at)
         }
     }
 
@@ -437,12 +475,22 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
         willSpeakRangeOfSpeechString characterRange: NSRange,
         utterance: AVSpeechUtterance
     ) {
+        // Taken before the hop to the main actor, so a busy main thread does
+        // not make the word start late.
+        let at = CACurrentMediaTime()
         Task { @MainActor [weak self] in
             guard let self, self.turnGuard.isActive(utterance: utterance) else { return }
             self.nextRangeLocation = characterRange.location
             self.sawWordProgress = true
             self.lastProgressAt = Date()
+            self.reportProgress(location: characterRange.location, at: at)
         }
+    }
+
+    /// A word of the active utterance, as an offset in its segment.
+    private func reportProgress(location: Int, at: CFTimeInterval) {
+        guard let onProgress, activeSegment >= 0, location >= 0 else { return }
+        onProgress(WordProgress(segment: activeSegment, location: activeSegmentOffset + location, at: at))
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didPause utterance: AVSpeechUtterance) {

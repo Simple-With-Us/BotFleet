@@ -1859,6 +1859,10 @@ struct TextBubble: View {
                             .foregroundStyle(Color.primary)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
+                            // While this reply is read aloud, its words
+                            // follow the voice (Karaoke.swift).  Only this
+                            // bubble's blocks observe the per-word paint.
+                            .environment(\.messageKaraoke, KaraokeCenter.shared.karaoke(for: message.id))
                     }
                     ForEach(Array(split.images.enumerated()), id: \.offset) { _, path in
                         AttachedImageView(path: path)
