@@ -84,7 +84,7 @@ export const PERSONAL_VOICE_NEEDS_UPDATE =
   "Update BotFleet on this device to read replies with the workspace's Personal Voice.";
 /** A job whose script was replaced while it ran (the bot's Voice Summary
  * mode changed); its waiters hear this instead of a short clip list. */
-export const SCRIPT_CHANGED = "This reply's spoken text changed while it was being prepared.  Play it again.";
+export const SCRIPT_CHANGED = "This reply's spoken text changed while it was being prepared.\u00A0 Play it again.";
 /** Per-voice clip lists kept on one message besides the owner's own. */
 export const MAX_EXTRA_VOICE_SLOTS = 4;
 
