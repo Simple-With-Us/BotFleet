@@ -20,6 +20,10 @@ between the two.
 
 ## Add Next, Linux-Clean
 
+**Landed in the Local VM CLI PR (image layer v8), with the exception of `ollama`, which stays deferred.**
+Every row below is in `manifest.json` as a `local` target, verified by the build, and listed under
+"What's Preinstalled" in the Local VM docs.  Homebrew landed in the same PR (see the next section).
+
 Ordered by how much a bot actually reaches for them.
 
 | Tool | Why | How |
@@ -40,10 +44,35 @@ Ordered by how much a bot actually reaches for them.
 | `uv` | Python environments without touching system Python. | binary |
 | `ollama` | Local model serving, if a bot ever needs one.  Large; consider on-demand. | binary |
 
+How each one landed: `ripgrep`, `shellcheck`, `tesseract` (with English data), `poppler`
+(`pdftotext`, `pdfimages`), `protoc`, `gdu`, `mosh`, and `git-filter-repo` are apt packages, since
+Debian 12 carries all of them.  `wrangler`, `pm2`, and `sentry-cli` are `npm_global` entries pinned
+to an exact version.  `cloudflared`, `actionlint`, `gitleaks`, `mise`, `uv`, `uvx`, and `yq` are the
+new `pinned_binary` recipe: a per-architecture URL and sha256 in the manifest, checked before
+anything is unpacked.  `git` itself was missing from the base image and is now an explicit entry,
+because `git filter-repo` and Homebrew both need it.
+
 Two of these need a decision rather than a line in a file.  `tesseract` and
 `poppler` are the highest-value adds for a *desktop* VM specifically, because
 the desktop is where documents and screenshots live.  `ollama` is large enough
 that it argues for a base-image change rather than a layer.
+
+## Homebrew And A Mac-Like Shell
+
+**Landed in the same PR.**  `brew install` works in the VM the way it does on the Mac.
+
+- Linuxbrew is installed as `cua` under `/home/linuxbrew/.linuxbrew` from a pinned Homebrew release
+  archive (sha256 checked).  Brew only: no formulae are installed in the image.  Brew's portable Ruby
+  is fetched at build time so the first `brew install` does not depend on the network.
+- It sits at the **end** of `PATH`, after `/usr/local/bin`, so a formula can never shadow the pinned
+  Node 24, the Python venv, or `cua-driver`.  `brew shellenv` is deliberately not used because it
+  prepends.  `HOMEBREW_NO_AUTO_UPDATE` and `HOMEBREW_NO_ANALYTICS` are set image-wide.
+- The archive has no `.git`, but an explicit `brew update` still works because git is installed: it
+  fetches Homebrew's history and moves off the pin.  Auto-update stays off, so the image keeps the
+  pinned release until a bot asks.  Rebuilding the image resets it, and bumping the pin is how a
+  newer Homebrew ships to everyone.
+- `cua` now logs in with zsh, with a minimal `.zshenv` and `.zshrc` (same `PATH` as bash, history,
+  completion).  `open` is a shim onto `xdg-open`, alongside `pbcopy` and `pbpaste`.
 
 ## Take The CLI Part Of A Cask
 
@@ -110,7 +139,7 @@ Worth deciding deliberately rather than by drift.
 
 1. Land the current layer, recreate the VM, confirm the 51 work.  This is in
    flight.
-2. Add the Linux-clean table as one manifest change plus recipe work.  Most are
-   a line each; `wrangler` and `pm2` are npm globals.
+2. **Done (image layer v8).**  Add the Linux-clean table as one manifest change plus recipe work.  Most are
+   a line each; `wrangler` and `pm2` are npm globals.  Homebrew and zsh parity shipped with it.
 3. Decide the agent-CLI question separately; it deserves its own row.
 4. Fill the MCP registry and add SaaS rows there, not here.

@@ -1,0 +1,95 @@
+name: VM Image Build
+
+# Builds the Local VM desktop image from the exact Dockerfile the app renders.
+#
+# Why this exists: no other workflow ever built the image, so unit tests passed
+# while the image itself could not build.  PR #910 shipped a verify script with
+# no shebang and the build died at the last step, after every CLI had installed.
+# A text assertion cannot see that class of bug; running the build can.
+#
+# Deliberately NOT a required check.  The base image is ~1.8 GB and the CLI
+# layer downloads a lot, so it is path-filtered to the files that change the
+# image and left out of branch protection.  A red run here means the image will
+# not build; read it before merging, but it never blocks an unrelated PR.
+
+on:
+  pull_request:
+    paths:
+      - server/container-computer.ts
+      - server/vm-cli-install.ts
+      - server/vm-cli-manifest.ts
+      - scripts/computer-vm-cli/**
+      - .github/workflows/vm-image-build.yml
+  push:
+    branches: [main]
+    paths:
+      - server/container-computer.ts
+      - server/vm-cli-install.ts
+      - server/vm-cli-manifest.ts
+      - scripts/computer-vm-cli/**
+      - .github/workflows/vm-image-build.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vm-image-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both architectures are real: the Mac runs the arm64 image under
+          # OrbStack and a VPS runs amd64.  A recipe that only works on one is
+          # a broken image on the other.
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Enable pnpm
+        run: corepack enable && corepack prepare pnpm@10.33.0 --activate
+      # The renderer imports zod through the manifest loader; no build scripts
+      # (Electron's binary download, native modules) are needed to render text.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Free disk space
+        # The base image alone is ~1.8 GB and the build roughly doubles that
+        # in layers and cache.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker version --format 'docker {{.Server.Version}} on {{.Server.Os}}/{{.Server.Arch}}'
+          df -h /
+      - name: Render the Dockerfile
+        run: node --experimental-strip-types scripts/computer-vm-cli/render-dockerfile.mjs "$RUNNER_TEMP/vm-image-context"
+      - name: Build the image
+        run: docker build --progress=plain -t "botfleet-vm-ci:${{ matrix.arch }}" "$RUNNER_TEMP/vm-image-context"
+      # The build already runs botfleet-vm-cli-verify as its last step.  These
+      # run it again from a fresh container and add what the build cannot see:
+      # how a shell started the way a bot, or the desktop terminal, starts one
+      # resolves PATH.  See scripts/computer-vm-cli/smoke.sh.
+      - name: Verify inside the image
+        run: |
+          set -euo pipefail
+          image="botfleet-vm-ci:${{ matrix.arch }}"
+          docker image ls "$image"
+          docker run --rm --entrypoint /usr/local/bin/botfleet-vm-cli-verify "$image"
+          # The same check as the desktop user.  Running as root hides state a
+          # build step left root-owned in cua's home, which cua then cannot use.
+          docker run --rm --user cua -e HOME=/home/cua --entrypoint /usr/local/bin/botfleet-vm-cli-verify "$image"
+          smoke="$GITHUB_WORKSPACE/scripts/computer-vm-cli/smoke.sh"
+          # `docker exec -u cua` shape: no shell init, only the image ENV.
+          docker run --rm -v "$smoke:/smoke.sh:ro" --entrypoint sh "$image" \
+            -c 'su cua -s /bin/sh -c "sh /smoke.sh"'
+          # Desktop terminal shape: zsh login shell.
+          docker run --rm -v "$smoke:/smoke.sh:ro" --entrypoint sh "$image" \
+            -c 'su - cua -c "zsh -l /smoke.sh"'

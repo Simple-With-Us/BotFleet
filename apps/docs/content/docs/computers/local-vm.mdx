@@ -38,6 +38,22 @@ The equivalent source configuration is:
 
 Local VMs always run on the same physical host as the BotFleet desktop process. `maxInstances: 2` does not pool one VM from a Mac and another from a Windows PC. To use Windows capacity today, run BotFleet on Windows with its supported Podman lane and create both per-bot desktops there. The BYO-VPS backend is limited to an x86_64 Linux Docker host; do not point it at Windows as a substitute remote Local VM. Cross-host Mac and Windows pooling is tracked in [issue #508](https://github.com/milind-soni/BotFleet/issues/508).
 
+## What's Preinstalled
+
+The desktop image carries the command-line tools a bot reaches for on a Mac, so a bot does not have to ask for an image rebuild before it can search, lint, or script.  Downloaded tools are pinned by version and checksum, and the image build fails if any tool is missing.
+
+- **A Mac-like shell.**  The desktop user logs in with zsh, with history and completion set up.  Bash behaves as before, and both see the same tools on their `PATH`.  `open` works like it does on a Mac, and `pbcopy` and `pbpaste` talk to the desktop clipboard.
+- **Homebrew.**  `brew install <formula>` works the way it does on a Mac.  Homebrew is installed under `/home/linuxbrew/.linuxbrew` and sits at the end of `PATH`, so a formula never replaces the pinned Node, the Python environment, or the desktop driver.  Automatic updates and analytics are off, so Homebrew stays on the release the image was built with until you run `brew update`.  Rebuilding the image resets it.
+- **Search and files.**  `rg`, `fd`, `fzf`, `bat`, `tree`, `gdu`, `less`, `file`, `patch`, `yq`, `jq`.
+- **Documents and images.**  `tesseract` for OCR, `pdftotext` and `pdfimages` from poppler, ImageMagick's `convert`, and `ffmpeg`.
+- **Network.**  `curl`, `wget`, `dig`, `nc`, `ping`, `mosh`, `cloudflared`, `ssh`, `scp`, and `rsync`.
+- **Code quality and security.**  `shellcheck`, `actionlint`, `gitleaks`, and `git filter-repo`.
+- **Languages and runtimes.**  Node 24 with `npm` and `pnpm`, Python 3 with `pip` and `venv`, `uv` and `uvx`, `mise` for pinning other runtimes on demand, Rust, Deno, Java, Ruby, and `protoc`.
+- **Platform CLIs.**  `gh`, `wrangler`, `cf`, `vercel`, `sentry-cli`, `pm2`, `aws`, `gcloud`, `kubectl`, `docker`, and `psql`.
+- **Debugging.**  `htop`, `lsof`, `strace`, `ps`, `tmux`, and `vim`.
+
+Host logins are never baked in.  Turn on **Share Host CLI Credentials** in **Host & CLI Integration** to share them read-only.  After an image update, recreate the desktop so it runs the new image; the durable workspace is kept.
+
 ## Persistence
 
 The bot's workspace and browser profile live in a durable mounted directory. Recreating the desktop can repair stale runtime state without deleting the durable workspace.

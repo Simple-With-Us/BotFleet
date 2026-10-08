@@ -62,7 +62,13 @@ export const IMAGE_REPOSITORY = "localhost/botfleet/cua-local-vm";
 // are no running containers to replace.  Note the contrast with CUA_PATH_SHIMS
 // below, which heals in place precisely because bumping there *would* replace
 // live containers.
-export const IMAGE_LAYER_VERSION = "7";
+//
+// v8 (2026-10-07): the VM CLI layer now carries Homebrew, zsh as the login
+// shell, an `open` shim, ripgrep and the gap-list CLIs, and git.  Bumped
+// because a v7 image has none of it and `imageLabelsMatch` would otherwise
+// keep accepting it.  Any container built from v7 or earlier is replaced on the
+// next provision.
+export const IMAGE_LAYER_VERSION = "8";
 export const IMAGE_LAYER_LABEL = "com.botfleet.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export function sanitizeContainerSuffix(name: string): string {

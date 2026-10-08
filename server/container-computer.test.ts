@@ -1485,4 +1485,13 @@ describe("PATH driver symlink repair", () => {
     expect(IMAGE_LAYER_VERSION).not.toBe("6");
   });
 
+  // The Mac-parity layer (Homebrew, zsh login shell, the gap-list CLIs) is
+  // image content too, so it needs its own bump: a v7 image has none of it.
+  it("is at least layer 8, which is the first to carry Homebrew and zsh", () => {
+    const dockerfile = managedImageDockerfile();
+    expect(dockerfile).toContain("ENV HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1");
+    expect(dockerfile).toContain("botfleet_install_zsh_shell");
+    expect(Number(IMAGE_LAYER_VERSION)).toBeGreaterThanOrEqual(8);
+  });
+
 });

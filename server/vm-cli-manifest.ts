@@ -22,6 +22,50 @@ const VmCliCredentialPathSchema = z
   })
   .strict();
 
+// A pinned release artifact, one per CPU architecture.  Everything here is
+// rendered into shell, so the shapes are deliberately narrow: an https URL with
+// no quotes or whitespace, a lowercase sha256, and file names that cannot carry
+// shell syntax.  The renderer verifies the sha256 before it unpacks anything.
+const VmCliDownloadFormatSchema = z.enum(["raw", "tar.gz", "tar.xz"]);
+
+const VmCliDownloadFileSchema = z
+  .object({
+    /** Path inside the archive.  Omitted for a `raw` download, which is the binary itself. */
+    path: z.string().regex(/^[A-Za-z0-9._+/-]+$/).optional(),
+    /** File name installed into /usr/local/bin. */
+    as: z.string().regex(/^[A-Za-z0-9._+-]+$/),
+  })
+  .strict();
+
+const VmCliDownloadAssetSchema = z
+  .object({
+    url: z.string().regex(/^https:\/\/[A-Za-z0-9._~:/?#@%&=+,-]+$/),
+    sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    files: z.array(VmCliDownloadFileSchema).min(1),
+  })
+  .strict();
+
+const VmCliDownloadSchema = z
+  .object({
+    format: VmCliDownloadFormatSchema,
+    assets: z.object({ x86_64: VmCliDownloadAssetSchema, aarch64: VmCliDownloadAssetSchema }).strict(),
+  })
+  .strict()
+  .superRefine((download, ctx) => {
+    for (const [arch, asset] of Object.entries(download.assets)) {
+      if (download.format === "raw") {
+        if (asset.files.length !== 1 || asset.files[0]!.path !== undefined) {
+          ctx.addIssue({
+            code: "custom",
+            message: `raw download for ${arch} must install exactly one file, with no archive path`,
+          });
+        }
+      } else if (asset.files.some((file) => file.path === undefined)) {
+        ctx.addIssue({ code: "custom", message: `${download.format} download for ${arch} needs a path for every file` });
+      }
+    }
+  });
+
 const VmCliToolSchema = z
   .object({
     name: z.string().min(1),
@@ -31,6 +75,8 @@ const VmCliToolSchema = z
     apt: z.array(z.string().min(1)).optional(),
     recipe: z.string().min(1).optional(),
     npmPackage: z.string().min(1).optional(),
+    /** Pinned per-architecture artifacts, consumed by the `pinned_binary` recipe. */
+    download: VmCliDownloadSchema.optional(),
     postInstall: z.string().min(1).optional(),
     credentialPaths: z.array(VmCliCredentialPathSchema).optional(),
   })
@@ -52,6 +98,8 @@ export type VmCliVerify = z.infer<typeof VmCliVerifySchema>;
 export type VmCliCredentialTransform = z.infer<typeof VmCliCredentialTransformSchema>;
 
 export type VmCliCredentialPath = z.infer<typeof VmCliCredentialPathSchema>;
+
+export type VmCliDownload = z.infer<typeof VmCliDownloadSchema>;
 
 export type VmCliTool = z.infer<typeof VmCliToolSchema>;
 
