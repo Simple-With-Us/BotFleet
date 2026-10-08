@@ -1,18 +1,21 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
 import {
   artifactNameFor,
+  assertExtractedBundleContained,
   assertSafeArchiveEntries,
+  BUNDLE_ROOT,
   classifyResolutionFailure,
   downloadBuiltBundle,
   findCommitArtifact,
+  inspectArchive,
   manifestArtifactName,
   maskedKeyPreview,
   materializeBuild,
@@ -440,4 +443,295 @@ test("a rejected key is named by a masked preview, never printed", async () => {
       return true;
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// In-bundle framework symlinks.
+//
+// On 2026-10-08 the safe updater refused the green hosted build of main
+// 8ccf02725, because the guard treated every symlink as a Zip Slip.  A real
+// Electron bundle always carries framework links, so the hosted path could
+// never install a real build.  These tests pin the replacement rule: links
+// strictly inside BotFleet.app/ with relative, non-climbing targets are
+// accepted.  Every way a link could carry a write or a resolution out of the
+// bundle is still refused.
+
+const FW = `${BUNDLE_ROOT}/Contents/Frameworks`;
+const fileEntry = (name) => ({ name, mode: "-rw-r--r--" });
+const dirEntry = (name) => ({ name, mode: "drwxr-xr-x" });
+const linkEntry = (name, target) => ({ name, mode: "lrwxr-xr-x", target });
+
+/** The entry list ditto produces for one framework, sidecars included. */
+function frameworkEntries(framework = "Squirrel", binary = framework) {
+  const root = `${FW}/${framework}.framework`;
+  return [
+    dirEntry(`${BUNDLE_ROOT}/`),
+    dirEntry(`${BUNDLE_ROOT}/Contents/`),
+    dirEntry(`${FW}/`),
+    dirEntry(`${root}/`),
+    dirEntry(`${root}/Versions/`),
+    dirEntry(`${root}/Versions/A/`),
+    dirEntry(`${root}/Versions/A/Resources/`),
+    fileEntry(`${root}/Versions/A/${binary}`),
+    fileEntry(`${root}/Versions/A/Resources/Info.plist`),
+    linkEntry(`${root}/Versions/Current`, "A"),
+    linkEntry(`${root}/Resources`, "Versions/Current/Resources"),
+    linkEntry(`${root}/${binary}`, `Versions/Current/${binary}`),
+    // ditto writes a sidecar for a link too.  It is an ordinary file under
+    // __MACOSX/, not an entry under the link.
+    fileEntry(`__MACOSX/${root}/Versions/._Current`),
+  ];
+}
+
+function assertRefused(entries, why, message) {
+  assert.throws(
+    () => assertSafeArchiveEntries(entries, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }),
+    (error) => {
+      assert.equal(error.cause, "unsafe-archive", message);
+      assert.match(error.message, why, message);
+      return true;
+    },
+    message,
+  );
+}
+
+test("in-bundle framework links are accepted, and only inside the bundle", () => {
+  // The shape of the real 8ccf02725 bundle, including a framework whose name
+  // has a space in it.
+  const real = [...frameworkEntries("Squirrel"), ...frameworkEntries("Electron Framework").slice(3)];
+  assert.doesNotThrow(() => assertSafeArchiveEntries(real, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }));
+
+  // GitHub's wrapper is checked with no symlinkRoot, and there even a
+  // well-formed link is refused, exactly as before.
+  assert.throws(
+    () => assertSafeArchiveEntries(real, { label: "artifact" }),
+    (error) => error.cause === "unsafe-archive" && /symlink entry/.test(error.message),
+  );
+});
+
+test("a link whose target is absolute, climbs, or cannot be read is refused", () => {
+  const base = frameworkEntries();
+  for (const [target, why] of [
+    ["/etc", /absolute target/],
+    ["/Users/someone/.ssh", /absolute target/],
+    ["../../../../../../outside", /climbs with \.\./],
+    // A sibling of the bundle: `<destination>/Sibling.app`.
+    ["../../../Sibling.app/Contents", /climbs with \.\./],
+    // The lexical trap.  `b -> ..` looks contained, and `c -> b/../x` looks
+    // contained, but the kernel applies `..` after following `b`, so `c`
+    // lands outside the bundle.  Refusing every `..` refuses both halves.
+    ["..", /climbs with \.\./],
+    ["b/../x", /climbs with \.\./],
+    ["", /empty target/],
+    ["A\0/x", /contains NUL/],
+    [undefined, /could not be read/],
+  ]) {
+    assertRefused(
+      [...base, linkEntry(`${BUNDLE_ROOT}/Contents/escape`, target)],
+      why,
+      `a link to ${JSON.stringify(target)} must be refused`,
+    );
+  }
+});
+
+test("a link outside BotFleet.app is refused, wherever it sits", () => {
+  const base = frameworkEntries();
+  for (const name of ["Sibling", "__MACOSX/BotFleet.app/Contents/link"]) {
+    assertRefused([...base, linkEntry(name, "A")], /outside BotFleet\.app\//, `${name} must be refused`);
+  }
+  // The bundle itself as a link would make every other entry a write through
+  // it, to wherever it points.
+  assertRefused([linkEntry(BUNDLE_ROOT, "Contents")], /outside BotFleet\.app\//, "the bundle itself as a link");
+  assertRefused([...base, linkEntry("botfleet.APP", "Contents")], /duplicate entry/, "a case-variant bundle link collides with the bundle");
+});
+
+test("nothing may be written through a link, however the name is spelled", () => {
+  const base = frameworkEntries();
+  const current = `${FW}/Squirrel.framework/Versions/Current`;
+  for (const name of [
+    `${current}/payload`,
+    `${current}/nested/dir/`,
+    // APFS is case-insensitive, so this lands inside `Versions/Current`.
+    `${BUNDLE_ROOT.toLowerCase()}/contents/frameworks/squirrel.framework/VERSIONS/current/payload`,
+  ]) {
+    assertRefused([...base, fileEntry(name)], /written through the symlink entry/, `${name} must be refused`);
+  }
+
+  // APFS is normalization-insensitive too.  A link spelled with a composed é
+  // and a payload spelled with a decomposed one are the same directory.
+  assertRefused(
+    [...base, linkEntry(`${BUNDLE_ROOT}/Contents/café`, "Frameworks"), fileEntry(`${BUNDLE_ROOT}/Contents/café/payload`)],
+    /written through the symlink entry/,
+    "a normalization-variant spelling must still be caught",
+  );
+});
+
+test("duplicates, climbing directories, and special files are refused", () => {
+  const base = frameworkEntries();
+  assertRefused(
+    [...base, fileEntry(`${BUNDLE_ROOT}/contents/frameworks/SQUIRREL.framework/Versions/A/Squirrel`)],
+    /duplicate entry/,
+    "a case-folded duplicate would replace the first copy",
+  );
+  // Directory entries used to be skipped outright, so a climbing directory was
+  // never looked at.
+  assertRefused([...base, dirEntry(`${BUNDLE_ROOT}/../../escape/`)], /traverses out of the destination/, "a climbing directory");
+  assertRefused([...base, dirEntry("/abs/dir/")], /absolute path/, "an absolute directory");
+  assertRefused([...base, { name: `${BUNDLE_ROOT}/Contents/fifo`, mode: "prw-r--r--" }], /FIFO/, "a FIFO entry");
+});
+
+const posixOnly = process.platform === "win32" ? "symlinks need privileges on Windows" : false;
+const macOnly = process.platform === "darwin" ? false : "needs ditto, which is macOS only";
+
+/** A real BotFleet.app tree on disk, with frameworks shaped like Electron's. */
+async function stageBundle(root) {
+  const app = join(root, BUNDLE_ROOT);
+  for (const [framework, binary] of [["Squirrel", "Squirrel"], ["Electron Framework", "Electron Framework"]]) {
+    const fw = join(app, "Contents", "Frameworks", `${framework}.framework`);
+    await mkdir(join(fw, "Versions", "A", "Resources"), { recursive: true });
+    await writeFile(join(fw, "Versions", "A", binary), `${framework} binary\n`);
+    await writeFile(join(fw, "Versions", "A", "Resources", "Info.plist"), `${framework} plist\n`);
+    await symlink("A", join(fw, "Versions", "Current"));
+    await symlink("Versions/Current/Resources", join(fw, "Resources"));
+    await symlink(`Versions/Current/${binary}`, join(fw, binary));
+  }
+  await mkdir(join(app, "Contents", "Resources"), { recursive: true });
+  await writeFile(join(app, "Contents", "Resources", "marker.txt"), "staged\n");
+  return app;
+}
+
+/** Pack an app the way the hosted workflow does. */
+async function packBundle(app, zipPath) {
+  await run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", app, zipPath]);
+  return zipPath;
+}
+
+/** Wrap a bundle zip the way GitHub does, with a manifest that matches it. */
+async function wrapBundle(scratch, innerZip) {
+  const innerBytes = await readFile(innerZip);
+  const manifest = {
+    schemaVersion: 1,
+    commit: COMMIT,
+    artifact: "BotFleet-mac-arm64.zip",
+    sha256: createHash("sha256").update(innerBytes).digest("hex"),
+  };
+  const wrapperDir = await mkdtemp(join(scratch, "wrapper-"));
+  await writeFile(join(wrapperDir, "BotFleet-mac-arm64.zip"), innerBytes);
+  await writeFile(join(wrapperDir, "build-manifest.json"), JSON.stringify(manifest));
+  const wrapperZip = join(wrapperDir, "artifact.zip");
+  await run("zip", ["-q", wrapperZip, "BotFleet-mac-arm64.zip", "build-manifest.json"], { cwd: wrapperDir });
+  return { artifactBytes: await readFile(wrapperZip), manifest };
+}
+
+test("a framework-shaped bundle packed by ditto is accepted and unpacks with its links intact", { skip: macOnly }, async (t) => {
+  const scratch = await fixture(t);
+  const app = await stageBundle(join(scratch, "src"));
+  const innerZip = await packBundle(app, join(scratch, "BotFleet-mac-arm64.zip"));
+
+  const entries = await inspectArchive(innerZip, { label: "app bundle", symlinkRoot: BUNDLE_ROOT });
+  // The old listing typed a link with a space in its name as a regular file.
+  // It must come back as a link, with its real target read from the archive.
+  const spaced = entries.find(({ name }) => name === `${FW}/Electron Framework.framework/Electron Framework`);
+  assert.ok(spaced, "the spaced framework binary link is listed");
+  assert.equal(spaced.mode.charAt(0), "l", "a link with a space in its name is typed as a link");
+  assert.equal(spaced.target, "Versions/Current/Electron Framework");
+  assert.equal(entries.filter(({ mode }) => mode.startsWith("l")).length, 6);
+
+  const destination = join(scratch, "staging", "hosted");
+  const built = await materializeBuild({ ...(await wrapBundle(scratch, innerZip)), commit: COMMIT, destination });
+  assert.equal(built.appPath, join(destination, BUNDLE_ROOT));
+  const current = join(built.appPath, "Contents/Frameworks/Squirrel.framework/Versions/Current");
+  assert.ok((await lstat(current)).isSymbolicLink(), "Versions/Current is still a link after unpacking");
+  assert.equal(await readlink(current), "A");
+  assert.equal(
+    await readFile(join(built.appPath, "Contents/Frameworks/Electron Framework.framework/Resources/Info.plist"), "utf8"),
+    "Electron Framework plist\n",
+    "a file reads through the framework links",
+  );
+  // The private extraction directory is gone, and only the app is left.
+  assert.deepEqual(await readdir(destination), [BUNDLE_ROOT]);
+});
+
+test("real archives with escaping links are refused before anything is written", { skip: macOnly }, async (t) => {
+  const scratch = await fixture(t);
+  for (const [label, linkPath, target, why] of [
+    ["an absolute target", "Contents/abs", "/etc", /absolute target/],
+    ["an escape via ../..", "Contents/Frameworks/esc", "../../../outside", /climbs with \.\./],
+    ["a sibling outside the bundle", "Contents/sib", "../../Sibling.app/Contents", /climbs with \.\./],
+  ]) {
+    const root = await mkdtemp(join(scratch, "case-"));
+    const app = await stageBundle(join(root, "src"));
+    await symlink(target, join(app, linkPath));
+    const innerZip = await packBundle(app, join(root, "BotFleet-mac-arm64.zip"));
+    await assert.rejects(
+      inspectArchive(innerZip, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }),
+      (error) => {
+        assert.equal(error.cause, "unsafe-archive", label);
+        assert.match(error.message, why, label);
+        assert.match(error.message, new RegExp(escapeForRegExp(`${BUNDLE_ROOT}/${linkPath}`)), `${label} names the link`);
+        return true;
+      },
+    );
+  }
+});
+
+test("an entry written through a link in a real archive is refused, and nothing lands outside", { skip: macOnly }, async (t) => {
+  const scratch = await fixture(t);
+  const outside = join(scratch, "outside");
+  await mkdir(outside);
+
+  // Stage 1: a bundle whose link points out of it, packed by ditto.
+  const first = await stageBundle(join(scratch, "stage1"));
+  await symlink("../../outside", join(first, "Contents", "evil"));
+  const innerZip = await packBundle(first, join(scratch, "BotFleet-mac-arm64.zip"));
+  // Stage 2: append an innocent-looking file whose path runs through that link.
+  // `zip` cannot hold both on one disk at once, so it comes from a second tree.
+  const second = join(scratch, "stage2");
+  await mkdir(join(second, BUNDLE_ROOT, "Contents", "evil"), { recursive: true });
+  await writeFile(join(second, BUNDLE_ROOT, "Contents", "evil", "pwned"), "pwned\n");
+  await run("zip", ["-q", "-y", innerZip, `${BUNDLE_ROOT}/Contents/evil/pwned`], { cwd: second });
+
+  await assert.rejects(
+    inspectArchive(innerZip, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }),
+    (error) => {
+      assert.equal(error.cause, "unsafe-archive");
+      assert.match(error.message, /BotFleet\.app\/Contents\/evil\/pwned \(written through the symlink entry BotFleet\.app\/Contents\/evil\)/);
+      return true;
+    },
+  );
+
+  // The full materialise path refuses it too, and writes nothing anywhere.
+  const destination = join(scratch, "staging", "hosted");
+  await assert.rejects(
+    materializeBuild({ ...(await wrapBundle(scratch, innerZip)), commit: COMMIT, destination }),
+    (error) => error.cause === "unsafe-archive",
+  );
+  assert.deepEqual(await readdir(outside), [], "nothing was written through the link");
+  assert.deepEqual(await readdir(destination), [], "nothing was unpacked");
+});
+
+test("the unpacked tree is checked again on disk", { skip: posixOnly }, async (t) => {
+  const scratch = await fixture(t);
+  const app = await stageBundle(join(scratch, "good"));
+  await assert.doesNotReject(assertExtractedBundleContained(app));
+
+  // Whatever the archive listing said, a link that really resolves outside the
+  // bundle, or nowhere, is refused before the bundle is moved.
+  for (const [label, linkPath, target, why] of [
+    ["an absolute target", "Contents/abs", scratch, /resolves outside the bundle/],
+    ["a climbing target", "Contents/Frameworks/up", "../../..", /resolves outside the bundle/],
+    ["a dangling target", "Contents/gone", "Nowhere/at/all", /dangling/],
+  ]) {
+    const bad = await stageBundle(await mkdtemp(join(scratch, "bad-")));
+    await mkdir(dirname(join(bad, linkPath)), { recursive: true });
+    await symlink(target, join(bad, linkPath));
+    await assert.rejects(
+      assertExtractedBundleContained(bad),
+      (error) => {
+        assert.equal(error.cause, "unsafe-archive", label);
+        assert.match(error.message, why, label);
+        return true;
+      },
+    );
+  }
 });
