@@ -3,6 +3,7 @@
 // (system-voices.ts, no key).  This file is only the part that reads
 // ~/.botfleet/config.json, picks the engine, and decides whether there
 // is a voice at all.
+import { isPersonalVoiceId } from "../../shared/bot-voice.ts";
 import type { AppConfig } from "../config.ts";
 import * as minimax from "./minimax.ts";
 import * as systemVoices from "./system-voices.ts";
@@ -49,9 +50,10 @@ export function voiceConfigured(cfg: AppConfig): boolean {
   return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
 
+/** The prefix rule lives in shared/bot-voice.ts so the clients and the
+ * iOS mirror cannot drift from what the harness refuses to synthesize. */
 export function isPersonalVoice(voiceId?: string): boolean {
-  if (!voiceId) return false;
-  return voiceId.startsWith("personal:") || voiceId.startsWith("apple-personal:");
+  return isPersonalVoiceId(voiceId);
 }
 
 /** A per-bot voice is a complete choice too; it should not be blocked just
@@ -118,7 +120,9 @@ export function listCustomVoices() {
 /** Synthesize one utterance. Throws NoVoiceConfigured when there is nothing
  * to speak with, which the route turns into a 409 the client can explain. */
 export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: systemVoices.Runner) {
-  if (isPersonalVoice(voiceId)) {
+  // The workspace default can be a Personal Voice too; it must never reach
+  // a hosted engine as if it were one of that engine's ids.
+  if (isPersonalVoice(voiceId || cfg.tts?.voice)) {
     throw new Error("Apple Personal Voices speak on-device on authorized Apple devices (macOS and iOS) and cannot be synthesized on the server.");
   }
   if (voiceProvider(cfg) === "system") {

@@ -206,63 +206,156 @@ let personalVoiceChild = null;
 // reply whose synthesizer never calls back at all.
 const PERSONAL_VOICE_MIN_MS = 15_000;
 const PERSONAL_VOICE_MS_PER_CHAR = 250;
+// Listing can park forever in requestPersonalVoiceAuthorization when the TCC
+// prompt never surfaces to the background-only helper.  Past this, answer with
+// an empty list and stop the helper.
+const PERSONAL_VOICE_LIST_TIMEOUT_MS = 8_000;
+// Range lines are tailed from the helper's stdout file while it speaks.
+const PERSONAL_VOICE_POLL_MS = 40;
 
-export function listPersonalVoices() {
-  if (process.platform !== "darwin") return Promise.resolve([]);
+/**
+ * Tail an NDJSON file the helper appends to.  Reads raw bytes and only
+ * decodes complete lines, so a read that lands mid-line (or mid-character)
+ * never produces a broken record.  Returns a drain function.
+ */
+function ndjsonTail(filePath, onRecord) {
+  let offset = 0;
+  let pending = Buffer.alloc(0);
+  return () => {
+    let content;
+    try {
+      content = readFileSync(filePath);
+    } catch {
+      return;
+    }
+    if (content.length <= offset) return;
+    pending = Buffer.concat([pending, content.subarray(offset)]);
+    offset = content.length;
+    let nl;
+    while ((nl = pending.indexOf(0x0a)) !== -1) {
+      const line = pending.subarray(0, nl).toString("utf8").trim();
+      pending = pending.subarray(nl + 1);
+      if (!line) continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue; // non-JSON noise on stdout
+      }
+      onRecord(parsed);
+    }
+  };
+}
+
+/**
+ * List this Mac's Personal Voices.  Resolves `{ voices, status, timedOut }`
+ * and never rejects: a helper that cannot run, answers garbage, or does not
+ * answer within `timeoutMs` (it can park waiting on authorization) yields an
+ * empty list.  On timeout the helper is stopped through its stop marker,
+ * since killing `open -W` would not kill it.
+ */
+export function listPersonalVoicesResult({ timeoutMs = PERSONAL_VOICE_LIST_TIMEOUT_MS } = {}) {
+  if (process.platform !== "darwin") {
+    return Promise.resolve({ voices: [], status: "unsupported", timedOut: false });
+  }
   try {
     ensureBuilt();
   } catch {
-    return Promise.resolve([]);
+    return Promise.resolve({ voices: [], status: "helper-build-failed", timedOut: false });
   }
   return new Promise((resolve) => {
     const sessionDir = mkdtempSync(path.join(app.getPath("temp"), "botfleet-pv-list-"));
     const outputPath = path.join(sessionDir, "stdout.ndjson");
     const errorPath = path.join(sessionDir, "stderr.log");
+    const stopPath = path.join(sessionDir, "stop");
     writeFileSync(outputPath, "");
     writeFileSync(errorPath, "");
 
-    const proc = spawn(
-      "/usr/bin/open",
-      [
-        "-n",
-        "-g",
-        "-W",
-        "-o",
-        outputPath,
-        "--stderr",
-        errorPath,
-        BUNDLE,
-        "--args",
-        "--list-personal-voices",
-      ],
-      { stdio: "ignore" },
-    );
+    let settled = false;
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      // The helper's stop timer exits on this marker; the close handler still
+      // owns removing the session directory.
+      try {
+        writeFileSync(stopPath, "stop");
+      } catch {}
+      settle({ voices: [], status: "timeout", timedOut: true });
+    }, Math.max(0, timeoutMs));
+    timer.unref?.();
+
+    let proc;
+    try {
+      proc = spawn(
+        "/usr/bin/open",
+        [
+          "-n",
+          "-g",
+          "-W",
+          "-o",
+          outputPath,
+          "--stderr",
+          errorPath,
+          BUNDLE,
+          "--args",
+          "--list-personal-voices",
+          "--stop-file",
+          stopPath,
+        ],
+        { stdio: "ignore" },
+      );
+    } catch {
+      rmSync(sessionDir, { recursive: true, force: true });
+      settle({ voices: [], status: "helper-start-failed", timedOut: false });
+      return;
+    }
 
     proc.on("close", () => {
+      let result = { voices: [], status: "no-answer", timedOut: false };
       try {
         const out = readFileSync(outputPath, "utf8").trim();
         for (const line of out.split("\n")) {
           if (!line.trim()) continue;
           const parsed = JSON.parse(line);
           if (Array.isArray(parsed.voices)) {
-            resolve(parsed.voices);
-            rmSync(sessionDir, { recursive: true, force: true });
-            return;
+            result = {
+              voices: parsed.voices,
+              status: typeof parsed.status === "string" ? parsed.status : "authorized",
+              timedOut: false,
+            };
+            break;
           }
         }
       } catch {}
       rmSync(sessionDir, { recursive: true, force: true });
-      resolve([]);
+      settle(result);
     });
 
     proc.on("error", () => {
       rmSync(sessionDir, { recursive: true, force: true });
-      resolve([]);
+      settle({ voices: [], status: "helper-start-failed", timedOut: false });
     });
   });
 }
 
-export function speakPersonalVoice(text, voiceId) {
+/** The renderer-facing list: a plain array, empty on any failure or timeout. */
+export async function listPersonalVoices(options) {
+  return (await listPersonalVoicesResult(options)).voices;
+}
+
+/**
+ * Speak `text` with a Personal Voice.  `options.onRange({ location, length,
+ * elapsedMs })` is called as each word is about to be spoken: `location` and
+ * `length` are UTF-16 offsets into `text` exactly as passed (so a JavaScript
+ * string index), and `elapsedMs` is the helper's own clock since speech
+ * began, which lets a caller undo the polling delay when lines arrive in a
+ * batch.  Ranges from a stopped or replaced session are never delivered.
+ */
+export function speakPersonalVoice(text, voiceId, options = {}) {
   stopPersonalVoice();
   if (process.platform !== "darwin") {
     return Promise.reject(new Error("Personal Voice requires macOS."));
@@ -272,6 +365,7 @@ export function speakPersonalVoice(text, voiceId) {
   } catch {
     return Promise.reject(new Error("The speech helper couldn't be built."));
   }
+  const onRange = typeof options?.onRange === "function" ? options.onRange : null;
 
   return new Promise((resolve, reject) => {
     const sessionDir = mkdtempSync(path.join(app.getPath("temp"), "botfleet-pv-speak-"));
@@ -313,6 +407,31 @@ export function speakPersonalVoice(text, voiceId) {
     const session = { proc, stopPath, sessionDir, textPath };
     personalVoiceChild = session;
 
+    // Read the helper's lines as they land rather than only at exit, so word
+    // ranges reach the caller while the word is being spoken.
+    let reportedError = null;
+    const drain = ndjsonTail(outputPath, (parsed) => {
+      if (typeof parsed.error === "string" && reportedError === null) reportedError = parsed.error;
+      const range = parsed.range;
+      if (
+        onRange
+        && personalVoiceChild === session
+        && Array.isArray(range)
+        && Number.isSafeInteger(range[0])
+        && Number.isSafeInteger(range[1])
+        && range[0] >= 0
+        && range[1] >= 0
+      ) {
+        const elapsedMs = Number.isFinite(parsed.elapsedMs) ? parsed.elapsedMs : null;
+        try {
+          onRange({ location: range[0], length: range[1], elapsedMs });
+        } catch {
+          /* a listener's failure must not end the speech */
+        }
+      }
+    });
+    if (onRange) watchFile(outputPath, { interval: PERSONAL_VOICE_POLL_MS, persistent: false }, drain);
+
     // The helper parks in RunLoop.main.run() until the synthesizer delegate
     // fires or the stop marker appears, and the Personal Voice TCC prompt may
     // never surface to an LSBackgroundOnly bundle. Without a deadline the
@@ -338,29 +457,18 @@ export function speakPersonalVoice(text, voiceId) {
     timer.unref?.();
 
     proc.on("close", () => {
+      if (onRange) unwatchFile(outputPath, drain);
+      drain();
       if (personalVoiceChild === session) personalVoiceChild = null;
-      try {
-        const out = readFileSync(outputPath, "utf8").trim();
-        for (const line of out.split("\n")) {
-          if (!line.trim()) continue;
-          const parsed = JSON.parse(line);
-          if (parsed.error) {
-            rmSync(sessionDir, { recursive: true, force: true });
-            settle(() => reject(new Error(parsed.error)));
-            return;
-          }
-          if (parsed.finished) {
-            rmSync(sessionDir, { recursive: true, force: true });
-            settle(resolve);
-            return;
-          }
-        }
-      } catch {}
       rmSync(sessionDir, { recursive: true, force: true });
-      settle(resolve);
+      // {"finished":true}, or a stopped helper that exits quietly: both
+      // resolve.  Only a reported error rejects.
+      if (reportedError) settle(() => reject(new Error(reportedError)));
+      else settle(resolve);
     });
 
     proc.on("error", (err) => {
+      if (onRange) unwatchFile(outputPath, drain);
       if (personalVoiceChild === session) personalVoiceChild = null;
       rmSync(sessionDir, { recursive: true, force: true });
       settle(() => reject(err));

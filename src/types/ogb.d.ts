@@ -149,7 +149,17 @@ type SkillRecordingPayload = {
       personalVoice?: {
         isAvailable(): Promise<boolean>;
         list(): Promise<Array<{ id: string; name: string; locale?: string }>>;
-        speak(text: string, voiceId?: string): Promise<void>;
+        /** `onRange` fires as each word is about to be spoken.  `location`
+         * and `length` are UTF-16 offsets into `text` (JavaScript string
+         * indices); `elapsedMs` is the synthesizer's own clock since speech
+         * began, or null. */
+        speak(
+          text: string,
+          voiceId?: string,
+          options?: {
+            onRange?: (range: { location: number; length: number; elapsedMs: number | null }) => void;
+          },
+        ): Promise<void>;
         stop(): Promise<void>;
       };
       skillRecorder?: {

@@ -90,6 +90,66 @@ export interface SummarizeVoiceOptions {
   url?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** The caller asked for a condensed summary, so a result much shorter than
+   * the reply is expected rather than a sign the model dropped content. */
+  condense?: boolean;
+}
+
+/** Where the speech text came from.  "summary" is the model's rewrite;
+ * "short" is the deterministic pass for a short, plain reply; "fallback" is
+ * the deterministic pass standing in for a rewrite that was not usable. */
+export type VoiceSummarySource = "summary" | "short" | "fallback";
+
+/** Why a rewrite was not used.  "unavailable" is transient (network error,
+ * non-200, empty answer) and worth retrying later.  The others reproduce on
+ * a retry, so the deterministic text can be stored in place of the rewrite.
+ * That includes "timeout": the same long reply at the same budget runs out of
+ * time again, and each retry would cost the full deadline before speech. */
+export type VoiceSummaryFallbackReason = "no-key" | "truncated" | "incomplete" | "too-short" | "timeout" | "unavailable";
+
+export interface VoiceSummaryResult {
+  text: string;
+  source: VoiceSummarySource;
+  reason?: VoiceSummaryFallbackReason;
+}
+
+export const SUMMARY_MIN_TOKENS = 500;
+/** Roughly the 12,000-character spoken cap (server/tts/message-audio.ts) at
+ * about three characters a token.  The 15-second request timeout still
+ * applies, so a reply that would need more simply falls back to the full
+ * deterministic text instead of being cut. */
+export const SUMMARY_MAX_TOKENS = 4_000;
+
+/** The completion budget for a reply of `inputChars` characters.  The prompt
+ * asks for a spoken rewrite, not a digest, so output tracks input length and
+ * spelled-out numbers make it longer; a fixed 500 cut long replies short. */
+export function voiceSummaryMaxTokens(inputChars: number): number {
+  return Math.min(SUMMARY_MAX_TOKENS, Math.max(SUMMARY_MIN_TOKENS, Math.ceil(inputChars / 3)));
+}
+
+/** A rewrite shorter than this share of the deterministic speech text, on a
+ * reply at least SUMMARY_RATIO_MIN_CHARS long, is treated as dropped
+ * content.  The deterministic text already removes code, links, and paths,
+ * so an honest rewrite of the same prose stays well above it. */
+export const SUMMARY_MIN_RATIO = 0.35;
+export const SUMMARY_RATIO_MIN_CHARS = 400;
+
+/** Whether voiceSummaryFor should store this result as message.voiceText.
+ * A transient provider failure (network error, non-200, empty answer) is not
+ * stored here, so a play on an on-device voice can still get the rewrite
+ * later.  A hosted voice's clip job does store the text it speaks, whatever
+ * its source: its clips are matched to that text by count alone, so a later
+ * rewrite would pair the old clips with new sentences (server/tts/
+ * message-audio.ts).  A cut-off rewrite is never returned as text (the full
+ * deterministic text stands in), and that stand-in is stored, because asking
+ * again would only be cut off again and billed again. */
+export function voiceSummaryWorthStoring(result: VoiceSummaryResult): boolean {
+  return !(result.source === "fallback" && result.reason === "unavailable");
+}
+
+export function summaryLooksTruncated(summary: string, deterministic: string): boolean {
+  if (deterministic.length < SUMMARY_RATIO_MIN_CHARS) return false;
+  return summary.length < deterministic.length * SUMMARY_MIN_RATIO;
 }
 
 export function normalizeDeepSeekChatUrl(baseUrl?: string): string {
@@ -127,8 +187,19 @@ export async function summarizeForVoice(
   legacySignal?: AbortSignal,
   extraOptions: { url?: string; timeoutMs?: number } = {},
 ): Promise<string> {
+  return (await summarizeForVoiceDetailed(rawText, optionsOrKey, legacySignal, extraOptions)).text;
+}
+
+/** summarizeForVoice, plus where the text came from, so the caller can
+ * decide whether it is worth storing. */
+export async function summarizeForVoiceDetailed(
+  rawText: string,
+  optionsOrKey?: string | SummarizeVoiceOptions,
+  legacySignal?: AbortSignal,
+  extraOptions: { url?: string; timeoutMs?: number } = {},
+): Promise<VoiceSummaryResult> {
   const cleanInput = stripVoiceSummaryTags(rawText);
-  if (!cleanInput.trim()) return "";
+  if (!cleanInput.trim()) return { text: "", source: "short" };
 
   // Short replies without technical artifacts don't need summarization
   const hasTechnicalContent =
@@ -145,7 +216,7 @@ export async function summarizeForVoice(
     // pass: sanitizeForTTS collapses newlines, and the line anchors that
     // strip list markers and add audible paragraph pauses only match on the
     // original text.
-    return sanitizeForTTS(speakable(cleanInput));
+    return { text: sanitizeForTTS(speakable(cleanInput)), source: "short" };
   }
 
   const options: SummarizeVoiceOptions =
@@ -153,13 +224,15 @@ export async function summarizeForVoice(
       ? { key: optionsOrKey, signal: legacySignal }
       : (optionsOrKey ?? {});
 
+  const deterministic = () => sanitizeForTTS(speakable(spokenReply(rawText)));
+  const fallback = (reason: VoiceSummaryFallbackReason): VoiceSummaryResult => ({ text: deterministic(), source: "fallback", reason });
+
   const key = resolveDeepSeekKey(options.key);
-  if (!key) {
-    return sanitizeForTTS(speakable(spokenReply(rawText)));
-  }
+  if (!key) return fallback("no-key");
 
   const endpoint = completionsUrl(options.baseUrl || options.url || extraOptions.url);
   const timeoutMs = options.timeoutMs ?? extraOptions.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxTokens = voiceSummaryMaxTokens(cleanInput.length);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => {
     timeoutController.abort(new Error("Voice summary request timed out"));
@@ -178,6 +251,24 @@ export async function summarizeForVoice(
     }
   }
 
+  /** A usable rewrite, a reason to stop with the deterministic text, or
+   * null to try the next model. */
+  const judge = (data: DeepSeekChatResponse | null): VoiceSummaryResult | null => {
+    const choice = data?.choices?.[0];
+    const content = choice?.message?.content?.trim();
+    if (!content) return null;
+    // finish_reason "length" means max_tokens cut the rewrite off mid-reply.
+    // Anything but "stop" is an incomplete answer; asking a second model the
+    // same question at the same budget would cut it again.
+    const finish = choice?.finish_reason;
+    if (finish === "length") return fallback("truncated");
+    if (finish && finish !== "stop") return fallback("incomplete");
+    const cleaned = cleanSummaryForTTS(content);
+    if (!cleaned) return null;
+    if (!options.condense && summaryLooksTruncated(cleaned, deterministic())) return fallback("too-short");
+    return { text: cleaned, source: "summary" };
+  };
+
   try {
     const response = await fetch(endpoint, {
       method: "POST",
@@ -191,7 +282,7 @@ export async function summarizeForVoice(
           { role: "system", content: DEEPSEEK_FLASH_TTS_PROMPT },
           { role: "user", content: cleanInput },
         ],
-        max_tokens: 500,
+        max_tokens: maxTokens,
         temperature: 0.3,
         thinking: { type: "disabled" },
       }),
@@ -199,15 +290,9 @@ export async function summarizeForVoice(
     });
 
     if (response.ok) {
-      const rawData: unknown = await response.json();
-      const parsed = DeepSeekChatResponseSchema.safeParse(rawData);
-      if (parsed.success) {
-        const summary = parsed.data.choices?.[0]?.message?.content?.trim();
-        if (summary) {
-          const cleaned = cleanSummaryForTTS(summary);
-          if (cleaned) return cleaned;
-        }
-      }
+      const parsed = DeepSeekChatResponseSchema.safeParse(await response.json());
+      const verdict = judge(parsed.success ? parsed.data : null);
+      if (verdict) return verdict;
     }
 
     // Fallback: try deepseek-chat if deepseek-flash returned empty or non-200
@@ -223,25 +308,21 @@ export async function summarizeForVoice(
           { role: "system", content: DEEPSEEK_FLASH_TTS_PROMPT },
           { role: "user", content: cleanInput },
         ],
-        max_tokens: 300,
+        max_tokens: maxTokens,
         temperature: 0.3,
       }),
       signal: timeoutController.signal,
     });
 
     if (fallbackResponse.ok) {
-      const fbRawData: unknown = await fallbackResponse.json();
-      const fbParsed = DeepSeekChatResponseSchema.safeParse(fbRawData);
-      if (fbParsed.success) {
-        const fbSummary = fbParsed.data.choices?.[0]?.message?.content?.trim();
-        if (fbSummary) {
-          const cleaned = cleanSummaryForTTS(fbSummary);
-          if (cleaned) return cleaned;
-        }
-      }
+      const parsed = DeepSeekChatResponseSchema.safeParse(await fallbackResponse.json());
+      const verdict = judge(parsed.success ? parsed.data : null);
+      if (verdict) return verdict;
     }
   } catch {
-    // Graceful fallback to deterministic spoken text
+    // Graceful fallback to deterministic spoken text.  Our own deadline (not
+    // the caller cancelling) is the one failure that will repeat.
+    if (timeoutController.signal.aborted && !effectiveSignal?.aborted) return fallback("timeout");
   } finally {
     clearTimeout(timer);
     if (options.signal) {
@@ -249,5 +330,5 @@ export async function summarizeForVoice(
     }
   }
 
-  return sanitizeForTTS(speakable(spokenReply(rawText)));
+  return fallback("unavailable");
 }
