@@ -10,6 +10,13 @@ import { z } from "zod";
  * clips, speak the caption" — into a reported error.
  */
 
+const SpokenSpansWireSchema = z.object({
+  format: z.literal(1),
+  source: z.literal("written"),
+  sourceLength: z.number().int().nonnegative(),
+  utterances: z.array(z.array(z.number().int().nonnegative())),
+});
+
 /** `POST /api/threads/:id/messages/:id/audio` as `Speaker.speak` consumes it.
  *
  * A progressive answer (`progressive: true` in the request) carries the clips
@@ -26,6 +33,14 @@ export const TtsAudioBodySchema = z.object({
   voice: z.string().optional(),
   onDevice: z.boolean().optional(),
   personalVoice: z.boolean().optional(),
+  /** Asked for with `spans: true`: "written" when the voice reads the reply
+   * as written (karaoke applies), "summary" otherwise. */
+  script: z.enum(["written", "summary"]).optional().catch(undefined),
+  /** shared/spoken-script.ts SpokenSpansWire.  Shape-checked here; the
+   * offsets are checked against the utterances by karaokeScriptFromWire.  A
+   * malformed value is dropped rather than failing the whole answer: the
+   * voice still plays, it just has no guided highlight. */
+  spans: SpokenSpansWireSchema.optional().catch(undefined),
 });
 
 export type TtsAudioBody = z.infer<typeof TtsAudioBodySchema>;

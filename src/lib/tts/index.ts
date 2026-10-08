@@ -1,9 +1,12 @@
 import { spokenReply } from "../../../shared/voice-summary";
 import { isPersonalVoiceId, type SpeechDevice } from "../../../shared/bot-voice";
+import { estimatedClips } from "../../../shared/karaoke-align";
 // The harness's own projection rules (pure, no Node APIs), so a reply this
-// Mac speaks without the harness drops code, links, and markdown the same way.
-import { toUtterances } from "../../../server/tts/speech-text";
+// Mac speaks without the harness drops code, links, and markdown the same way,
+// and carries the same source spans for karaoke.
+import { karaokeScriptFromWire, localKaraokeScript, type KaraokeScript } from "../../../shared/spoken-script";
 import { z } from "zod";
+import { ClipsKaraoke, LiveKaraoke, type KaraokeEndReason, type KaraokeFeed } from "./karaoke-feed";
 import { TtsAudioBodySchema, type TtsAudioBody } from "./schema";
 // The speaker — one voice for the whole window.
 //
@@ -27,6 +30,13 @@ import { TtsAudioBodySchema, type TtsAudioBody } from "./schema";
 //   which this Mac's speech helper speaks;
 // - a hosted voice: the clips ready so far plus `total` (`progressive`), so
 //   the first sentence plays while the rest are still being made.
+//
+// Karaoke: the request asks for `spans`.  When the harness says the script
+// is the reply as written (`script: "written"`), the speaker publishes a
+// karaoke feed for that message (src/lib/tts/karaoke-feed.ts): clip windows
+// and an audio clock for a hosted voice, word ranges from the helper for a
+// Personal Voice.  The message's bubble follows it (src/lib/karaoke-session.ts).
+// A summary has no feed, so nothing is highlighted.
 
 /** The desktop app is the "mac" device in a bot's per-device voices. */
 export const THIS_DEVICE: SpeechDevice = "mac";
@@ -40,10 +50,8 @@ export interface SpeechSnapshot {
   messageId?: string;
   /** the utterance currently audible — call mode shows it as a caption */
   caption?: string;
-  /** full voice summary text for distilled read-along */
+  /** the whole spoken text of the reply being read */
   voiceText?: string;
-  /** zero-based index of the currently spoken word within caption/voiceText */
-  wordIndex?: number;
   /** Why the last speak failed.  It keeps `botId` and `messageId`, so the
    * message's own Play button can show the reason. */
   error?: string;
@@ -195,6 +203,8 @@ export class Speaker {
   private settlePlayback: ((finished: boolean) => void) | null = null;
   private request: AbortController | null = null;
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  private feed: ClipsKaraoke | LiveKaraoke | null = null;
+  private feedWatchers = new Set<(feed: KaraokeFeed | null) => void>();
 
   constructor(options: SpeakerOptions = {}) {
     this.sleep = options.sleep ?? abortableSleep;
@@ -208,6 +218,27 @@ export class Speaker {
 
   get state(): SpeechSnapshot {
     return this.snapshot;
+  }
+
+  /** The karaoke feed for the reply being read, or null.  Not part of the
+   * snapshot on purpose: see src/lib/tts/karaoke-feed.ts. */
+  get karaoke(): KaraokeFeed | null {
+    return this.feed;
+  }
+
+  /** Called now with the current feed, then whenever it changes. */
+  subscribeKaraoke(fn: (feed: KaraokeFeed | null) => void): () => void {
+    this.feedWatchers.add(fn);
+    fn(this.feed);
+    return () => this.feedWatchers.delete(fn);
+  }
+
+  private setFeed(next: ClipsKaraoke | LiveKaraoke | null, reason: KaraokeEndReason = "stopped") {
+    if (next === this.feed) return;
+    const previous = this.feed;
+    this.feed = next;
+    previous?.end(reason);
+    for (const watcher of this.feedWatchers) watcher(next);
   }
 
   private set(next: SpeechSnapshot) {
@@ -233,13 +264,13 @@ export class Speaker {
     // speak() settles and call mode cannot leak a forever-pending task.
     if (this.settlePlayback) this.settlePlayback(false);
     else this.teardownAudio();
+    this.setFeed(null, "stopped");
     if (this.snapshot.status !== "idle" || this.snapshot.error) this.set(IDLE);
   }
 
   private teardownAudio() {
     if (this.audio) {
       this.audio.pause();
-      this.audio.ontimeupdate = null;
       this.audio.src = "";
       this.audio = null;
     }
@@ -272,9 +303,13 @@ export class Speaker {
       } else {
         await this.speakText(text, opts, live, controller.signal);
       }
-      if (live()) this.set(IDLE);
+      if (live()) {
+        this.setFeed(null, "finished");
+        this.set(IDLE);
+      }
     } catch (error) {
       if (live()) {
+        this.setFeed(null, "stopped");
         this.set({
           status: "idle",
           botId: opts.botId,
@@ -304,32 +339,34 @@ export class Speaker {
       // its own rules and the same length bound, rather than leave the owner
       // with silence.  A refusal (413, 4xx) is shown instead.
       if (isPersonalVoiceId(opts.voiceId) && personalVoiceBridge() && harnessUnavailable(error)) {
-        const utterances = toUtterances(spokenReply(text));
+        // The harness's own rules, with their spans.  For an ordinary reply
+        // spokenReply is the reply as written, which the bubble follows.
+        const { utterances, script } = localKaraokeScript(spokenReply(text));
         if (!utterances.length) throw error;
-        const spoken = utterances.join(" ");
-        if (spoken.length > MAX_LOCAL_SPEECH_CHARS) throw new Error(REPLY_TOO_LONG);
-        await this.speakOnDevice(utterances, opts.voiceId ?? "", opts, live, spoken);
+        if (script.spokenText.length > MAX_LOCAL_SPEECH_CHARS) throw new Error(REPLY_TOO_LONG);
+        await this.speakOnDevice(utterances, opts.voiceId ?? "", opts, live, script.spokenText, script);
         return;
       }
       throw error;
     }
     if (!live()) return;
+    const script = writtenScript(body);
     if (body.onDevice) {
       // The harness's own resolution of this Mac's voice wins over the
       // renderer's copy of the bot, which can be a moment stale.
       const voice = body.voice || opts.voiceId || "";
       const parts = body.utterances?.length ? body.utterances : paragraphs(body.voiceText ?? spokenReply(text));
-      await this.speakOnDevice(parts, voice, opts, live, body.voiceText);
+      await this.speakOnDevice(parts, voice, opts, live, body.voiceText, script);
       return;
     }
-    await this.playClips(endpoint, body, opts, live, signal);
+    await this.playClips(endpoint, body, opts, live, signal, script);
   }
 
   private async requestAudio(endpoint: string, signal: AbortSignal): Promise<TtsAudioBody> {
     const response = await fetch(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ device: THIS_DEVICE, progressive: true }),
+      body: JSON.stringify({ device: THIS_DEVICE, progressive: true, spans: true }),
       signal,
     });
     if (!response.ok) {
@@ -349,10 +386,16 @@ export class Speaker {
     opts: SpeakOptions,
     live: Live,
     signal: AbortSignal,
+    script: KaraokeScript | null = null,
   ): Promise<void> {
     const total = first.total ?? first.audio.length;
     const utterances = first.utterances ?? [];
     const voiceText = first.voiceText;
+    // One window per clip on a single audio timeline.  Durations start as
+    // estimates and become real as each clip's metadata arrives.
+    const feed = script && opts.messageId && script.utterances.length === total
+      ? new ClipsKaraoke(opts.messageId, script, estimatedClips(script.utterances))
+      : null;
     // A clip the harness no longer knows (it restarted, or forgot a failed
     // job) is resumed by asking for the reply again, once.
     let resumed = false;
@@ -376,8 +419,21 @@ export class Speaker {
       if ("error" in loaded) throw loaded.error;
       next = index + 1 < total ? load(index + 1) : null;
       const caption = utterances[index] ?? voiceText;
-      this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption, voiceText, wordIndex: 0 });
-      if (!(await this.play(loaded.blob, live, caption))) {
+      this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption, voiceText });
+      const clip = index;
+      const finished = await this.play(loaded.blob, live, feed
+        ? (audio) => {
+            feed.attach(clip, audio);
+            const measure = () => feed.measure(clip, audio.duration);
+            audio.addEventListener("loadedmetadata", measure);
+            audio.addEventListener("durationchange", measure);
+            // Published when the first clip starts, not while it loads, so
+            // the highlight never runs ahead of the voice.
+            if (live()) this.setFeed(feed);
+          }
+        : undefined);
+      feed?.detach(clip, finished);
+      if (!finished) {
         if (!live()) return;
         throw new Error("The voice clip could not be played.");
       }
@@ -408,9 +464,15 @@ export class Speaker {
     opts: SpeakOptions,
     live: Live,
     voiceText?: string,
+    script: KaraokeScript | null = null,
   ): Promise<void> {
     const bridge = personalVoiceBridge();
     if (!bridge) throw new Error(PERSONAL_VOICE_UNSUPPORTED);
+    const feed = script && opts.messageId ? new LiveKaraoke(opts.messageId, script) : null;
+    if (feed && live()) this.setFeed(feed);
+    // Each group is a run of whole utterances joined with single spaces, so
+    // it sits verbatim in the script's spoken text.
+    let cursor = 0;
     for (const group of groupForPersonalVoice(parts)) {
       if (!live()) return;
       this.set({
@@ -419,10 +481,28 @@ export class Speaker {
         messageId: opts.messageId,
         caption: group,
         voiceText: voiceText ?? group,
-        wordIndex: 0,
       });
+      const base = feed ? feed.script.spokenText.indexOf(group, cursor) : -1;
+      if (base >= 0) cursor = base + group.length;
+      // The helper's clock restarts with every call; its first report fixes
+      // where this group's zero is on performance.now().
+      let zero: number | null = null;
+      const options = feed && base >= 0
+        ? {
+            onRange: (range: { location: number; length: number; elapsedMs: number | null }) => {
+              if (!live()) return;
+              const now = performance.now();
+              let atMs = now;
+              if (range.elapsedMs !== null && Number.isFinite(range.elapsedMs)) {
+                zero ??= now - range.elapsedMs;
+                atMs = zero + range.elapsedMs;
+              }
+              feed.range(base + range.location, atMs);
+            },
+          }
+        : undefined;
       try {
-        await bridge.speak(group, voiceId);
+        await (options ? bridge.speak(group, voiceId, options) : bridge.speak(group, voiceId));
       } catch (error) {
         throw new Error(personalVoiceErrorMessage(error instanceof Error ? error.message : String(error)));
       }
@@ -451,8 +531,8 @@ export class Speaker {
       const rendered = await current;
       if (!live()) return;
       if ("error" in rendered) throw rendered.error;
-      this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: utterances[i], wordIndex: 0 });
-      const finished = await this.play(rendered.blob, live, utterances[i]);
+      this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: utterances[i] });
+      const finished = await this.play(rendered.blob, live);
       if (!live()) return;
       if (!finished) throw new Error("The generated voice clip couldn't be played.");
     }
@@ -484,8 +564,9 @@ export class Speaker {
     return res.blob();
   }
 
-  /** Resolves true when the clip finished, false when it was interrupted. */
-  private play(blob: Blob, live: () => boolean, caption?: string): Promise<boolean> {
+  /** Resolves true when the clip finished, false when it was interrupted.
+   * `onAudio` sees the element before it starts, for the karaoke clock. */
+  private play(blob: Blob, live: () => boolean, onAudio?: (audio: HTMLAudioElement) => void): Promise<boolean> {
     return new Promise((resolve) => {
       if (!live()) return resolve(false);
       this.teardownAudio();
@@ -494,14 +575,12 @@ export class Speaker {
       this.audio = audio;
       this.objectUrl = url;
       let settled = false;
-      const words = caption?.trim().split(/\s+/).filter(Boolean) ?? [];
 
       const done = (ok: boolean) => {
         if (settled) return;
         settled = true;
         audio.onended = null;
         audio.onerror = null;
-        audio.ontimeupdate = null;
         if (this.settlePlayback === done) this.settlePlayback = null;
         if (this.audio === audio) this.teardownAudio();
         resolve(ok);
@@ -510,24 +589,18 @@ export class Speaker {
       audio.onended = () => done(true);
       // a clip that cannot decode should not strand the whole message
       audio.onerror = () => done(false);
-
-      if (words.length > 0) {
-        audio.ontimeupdate = () => {
-          if (!live() || settled) return;
-          const duration = audio.duration;
-          if (duration && Number.isFinite(duration) && duration > 0) {
-            const progress = Math.min(1, Math.max(0, audio.currentTime / duration));
-            const idx = Math.min(words.length - 1, Math.floor(progress * words.length));
-            if (idx !== this.snapshot.wordIndex) {
-              this.set({ ...this.snapshot, wordIndex: idx });
-            }
-          }
-        };
-      }
+      onAudio?.(audio);
 
       audio.play().catch(() => done(false));
     });
   }
+}
+
+/** The written-mode script the harness answered with, or null for a
+ * summary (no karaoke) or a harness too old to say. */
+function writtenScript(body: TtsAudioBody): KaraokeScript | null {
+  if (body.script !== "written" || !body.utterances?.length) return null;
+  return karaokeScriptFromWire(body.utterances, body.spans ?? null);
 }
 
 export const speaker = new Speaker();

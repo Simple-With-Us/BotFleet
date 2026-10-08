@@ -30,6 +30,22 @@ describe("TtsAudioBodySchema", () => {
     expect(parsed.success && parsed.data.audio).toHaveLength(1);
   });
 
+  it("keeps the karaoke script and spans, and drops malformed ones without failing the answer", () => {
+    const spans = { format: 1, source: "written", sourceLength: 12, utterances: [[0, 6, 0, 6, 0]] };
+    const parsed = TtsAudioBodySchema.safeParse({ audio: [], utterances: ["Hello."], script: "written", spans });
+    expect(parsed.success && parsed.data).toMatchObject({ script: "written", spans });
+
+    const malformed = TtsAudioBodySchema.safeParse({
+      audio: [],
+      utterances: ["Hello."],
+      script: "poem",
+      spans: { format: 1, source: "written", sourceLength: -1, utterances: [["x"]] },
+    });
+    expect(malformed.success).toBe(true);
+    expect(malformed.success && malformed.data.script).toBeUndefined();
+    expect(malformed.success && malformed.data.spans).toBeUndefined();
+  });
+
   it("keeps the progressive fields: total, complete, and the resolved voice", () => {
     const parsed = TtsAudioBodySchema.safeParse({
       audio: [],

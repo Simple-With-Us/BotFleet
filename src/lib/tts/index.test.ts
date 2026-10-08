@@ -20,11 +20,17 @@ class FakeAudio {
   src: string;
   onended: (() => void) | null = null;
   onerror: (() => void) | null = null;
-  ontimeupdate: (() => void) | null = null;
   currentTime = 0;
   duration = 10;
   pause = vi.fn();
   play = vi.fn(async () => {});
+  listeners = new Map<string, Array<() => void>>();
+  addEventListener(type: string, listener: () => void) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+  fire(type: string) {
+    for (const listener of this.listeners.get(type) ?? []) listener();
+  }
 
   constructor(src: string) {
     this.src = src;
@@ -285,38 +291,6 @@ describe("Speaker lifecycle", () => {
     expect(speaker.state.error).toBe(REPLY_TOO_LONG);
   });
 
-  it("updates wordIndex on ontimeupdate during playback", async () => {
-    stubFetch((call) =>
-      call.url === endpoint
-        ? json({
-            audio: [{ path: "/api/attachments/clip.mp3", mime: "audio/mpeg" }],
-            voiceText: "First second third fourth",
-            utterances: ["First second third fourth"],
-            total: 1,
-            complete: true,
-          })
-        : mp3(),
-    );
-    const speaker = new Speaker();
-    const speaking = speaker.speak("First second third fourth", messageOpts);
-    await vi.waitFor(() => expect(FakeAudio.latest).not.toBeNull());
-
-    expect(speaker.state.wordIndex).toBe(0);
-
-    // 4 words across 10s: word 0 = 0-2.5s, word 1 = 2.5-5s, word 2 = 5-7.5s, word 3 = 7.5-10s
-    FakeAudio.latest!.currentTime = 3.0;
-    FakeAudio.latest!.ontimeupdate?.();
-    expect(speaker.state.wordIndex).toBe(1);
-
-    FakeAudio.latest!.currentTime = 6.0;
-    FakeAudio.latest!.ontimeupdate?.();
-    expect(speaker.state.wordIndex).toBe(2);
-
-    FakeAudio.latest!.onended?.();
-    await speaking;
-    expect(speaker.state.status).toBe("idle");
-  });
-
   it("passes a per-bot voice through preparation and synthesis for text that is not a saved reply", async () => {
     const calls = stubFetch((call) =>
       call.url.endsWith("/prepare") ? json({ ready: true, utterances: ["Distinct voice."] }) : mp3(),
@@ -366,9 +340,12 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
     });
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].body).toEqual({ device: "mac", progressive: true });
+    expect(calls[0].body).toEqual({ device: "mac", progressive: true, spans: true });
     expect(speak).toHaveBeenCalledTimes(1);
     expect(speak).toHaveBeenCalledWith("Morning. The tests went green.", "personal:mac-voice");
+    // No `script: "written"` in the answer (a summary, or an older harness):
+    // no karaoke feed.
+    expect(speaker.karaoke).toBeNull();
     expect(speaker.state).toEqual({ status: "idle" });
   });
 
@@ -413,7 +390,7 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
       voiceId: "personal:mac-voice",
     });
 
-    expect(speak).toHaveBeenCalledWith("Short version.", "personal:mac-voice");
+    expect(speak).toHaveBeenCalledWith("Short version.", "personal:mac-voice", { onRange: expect.any(Function) });
     expect(speaker.state).toEqual({ status: "idle" });
   });
 

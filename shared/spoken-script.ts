@@ -94,13 +94,13 @@ function layout(utterances: readonly string[]): Array<{ spokenStart: number; spo
 }
 
 /** Decode and check one utterance's segments; null when anything is off. */
-function decodeSegments(flat: unknown, utteranceLength: number, offset: number, sourceLength: number): SpeechSpan[] | null {
+function decodeSegments(flat: readonly number[] | undefined, utteranceLength: number, offset: number, sourceLength: number): SpeechSpan[] | null {
   if (!Array.isArray(flat) || flat.length % 5 !== 0) return null;
   const out: SpeechSpan[] = [];
   let lastSpoken = 0;
   let lastSrc = 0;
   for (let i = 0; i < flat.length; i += 5) {
-    const [spokenStart, spokenEnd, srcStart, srcEnd, kind] = flat.slice(i, i + 5) as number[];
+    const [spokenStart, spokenEnd, srcStart, srcEnd, kind] = flat.slice(i, i + 5);
     const ints = [spokenStart, spokenEnd, srcStart, srcEnd].every((n) => Number.isSafeInteger(n) && n >= 0);
     if (!ints || (kind !== 0 && kind !== 1)) return null;
     if (spokenStart < lastSpoken || spokenEnd < spokenStart || spokenEnd > utteranceLength) return null;
@@ -145,7 +145,12 @@ export function karaokeScriptFromWire(utterances: readonly string[], wire?: Spok
  * speaks a Personal Voice reply itself when the harness cannot be asked).
  * Same rules, same spans.
  */
-export function localKaraokeScript(sourceText: string): { utterances: string[]; script: KaraokeScript } {
+export interface LocalKaraokeScript {
+  utterances: string[];
+  script: KaraokeScript;
+}
+
+export function localKaraokeScript(sourceText: string): LocalKaraokeScript {
   const spoken = utterancesWithSpans(sourceText);
   const utterances = spoken.map((u) => u.text);
   return { utterances, script: karaokeScriptFromWire(utterances, encodeSpokenSpans(sourceText, spoken)) };
