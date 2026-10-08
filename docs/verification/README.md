@@ -56,6 +56,12 @@ Keep all evidence with the test run so a reviewer can spot-check any claim.
 
 After a test completes, temporary data directories are removed. Server logs remain at the printed path.  Interrupt long-running fixtures with Ctrl-C; the launcher stops its child before cleanup.
 
+## Container Runtimes Are Off In Fixtures
+
+A throwaway HOME does not isolate docker, podman, Apple `container` or OrbStack.  They talk to one machine-wide daemon, and the Local VM container name follows the OS username, so a fixture that turns the Local VM on can create, replace or remove the owner's real `botfleet-computer-<user>` container.
+
+Every fixture therefore runs with `BOTFLEET_DISABLE_CONTAINER_RUNTIME=1` (`server/container-runtime-guard.ts`).  The default Local VM runner, the BYO-VPS Docker-over-SSH runner and the MCP stdio bridge refuse any runtime command before they spawn it, and runtime detection reports no runtime with a clear problem string.  `spawnDetached`, `server/testing/setup.ts` and the smoke scripts apply it for you.  A suite that must exercise a fake `docker` puts the script in a directory of its own and names that directory in `BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR`; with the switch on, a runtime then runs only from that directory, by absolute path, so a PATH lookup can never reach the real binary.  `server/local-vm-runtime-guard.test.ts` boots a harness with trap runtimes on PATH and fails if one ever runs.
+
 ## What This Proves And What It Does Not
 
 Each recipe proves a specific user workflow in isolation—never against live data, never in the running app on port 8799, never with the user's real bots or threads.

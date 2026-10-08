@@ -15,6 +15,12 @@ import { promisify } from "node:util";
 import { z } from "zod";
 
 import { augmentedPath } from "./env-path.ts";
+import {
+  CONTAINER_RUNTIME_DISABLED_MESSAGE,
+  containerRuntimeDisabled,
+  fixtureRuntimeCommand,
+  resolveRuntimeCommand,
+} from "./container-runtime-guard.ts";
 import { renderDockerfileCliInstallRun, renderDockerfileVerifyArtifacts } from "./vm-cli-install.ts";
 import {
   allowedCliGuestDestinations,
@@ -499,8 +505,12 @@ function redactCommandError(error: unknown): unknown {
 }
 
 async function sh(cmd: string, args: string[], timeout = 8000): Promise<{ stdout: string }> {
+  // The one door every default-runner call walks through (`defaultCommandRunner`
+  // is this function).  Kept inline, not wrapped: callers compare
+  // `runner === sh` to recognise the real runner.
+  const command = resolveRuntimeCommand(cmd);
   try {
-    const { stdout } = await run(cmd, args, {
+    const { stdout } = await run(command, args, {
       timeout,
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
@@ -529,6 +539,9 @@ export interface ContainerRuntimeStatus {
   runtime: Runtime | null;
   available: Runtime[];
   daemonUp: boolean;
+  /** Set only when the kill switch (container-runtime-guard.ts) removed every
+   * runtime: the operator-facing reason no runtime is reported. */
+  disabled?: string;
 }
 
 /** Inspect only the host runtime. Unlike a full Local VM status check, this
@@ -543,7 +556,17 @@ export async function containerRuntimeStatus(
   const candidates: Runtime[] = platform === "win32"
     ? ["podman", "docker"]
     : RUNTIMES.filter((runtime) => runtime !== "container" || platform === "darwin");
-  const present = await Promise.all(candidates.map((runtime) => installed(runtime, runner, platform)));
+  // Kill switch: with it on, the real runner may run only fixture runtimes, so
+  // presence is "is there a fixture file", never a PATH lookup that could find
+  // the machine's real docker.  An injected runner is a test double and is left
+  // alone.
+  const guarded = runner === sh && containerRuntimeDisabled();
+  const present = guarded
+    ? candidates.map((runtime) => fixtureRuntimeCommand(runtime) !== null)
+    : await Promise.all(candidates.map((runtime) => installed(runtime, runner, platform)));
+  if (guarded && !present.includes(true)) {
+    return { runtime: null, available: [], daemonUp: false, disabled: CONTAINER_RUNTIME_DISABLED_MESSAGE };
+  }
   const available = candidates.filter((_, index) => present[index]);
   const healthy = await Promise.all(
     available.map(async (candidate) => {
@@ -791,6 +814,10 @@ export async function containerComputerStatus(
   status.available = runtimeStatus.available;
   status.runtime = runtimeStatus.runtime;
   status.daemonUp = runtimeStatus.daemonUp;
+  if (runtimeStatus.disabled) {
+    status.problem = runtimeStatus.disabled;
+    return status;
+  }
   status.create_supported = target.key === SHARED_LOCAL_VM_TARGET.key || status.runtime !== "container";
   if (!status.runtime || !status.daemonUp) {
     status.problem = statusProblem(status);

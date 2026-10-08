@@ -23,7 +23,14 @@ function runBridge(bin: string, input: string) {
         vpsContainerName("bridge-test"),
       ],
       {
-        env: { ...process.env, OMB_EXTRA_PATH: bin, NODE_NO_WARNINGS: "1" },
+        env: {
+          ...process.env,
+          OMB_EXTRA_PATH: bin,
+          // The suite runs with container runtimes switched off; this fake
+          // `docker` is the one runtime the bridge may run.
+          BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: bin,
+          NODE_NO_WARNINGS: "1",
+        },
         stdio: ["pipe", "pipe", "pipe"],
       },
     );
