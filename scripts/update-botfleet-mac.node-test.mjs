@@ -14,6 +14,7 @@ import {
   exactAppPidsFromPs,
   isZombieState,
   processIsAlive,
+  processStates,
   withoutExitedPids,
   applicationIdentitiesCanTransition,
   classifySmokeFailure,
@@ -1053,7 +1054,7 @@ function processTable(entries) {
 function zombieAwareIsAlive(table) {
   return (pid) => processIsAlive(pid, {
     exists: (target) => table.get(target)?.alive === true,
-    stateOf: async (target) => (table.get(target)?.zombie ? "Z" : "S"),
+    statesOf: async (targets) => new Map(targets.map((target) => [target, table.get(target)?.zombie ? "Z" : "S"])),
   });
 }
 
@@ -1189,24 +1190,56 @@ test("processIsAlive treats a zombie as exited, and any doubt as alive", async (
   for (const state of ["S", "Ss", "R+", "U", "T", "I", "", undefined]) {
     assert.equal(isZombieState(state), false, `state ${JSON.stringify(state)} is not a zombie`);
   }
-  assert.equal(await processIsAlive(61872, { exists, stateOf: async () => "Z" }), false);
-  assert.equal(await processIsAlive(61872, { exists, stateOf: async () => "Z+\n" }), false);
-  assert.equal(await processIsAlive(61872, { exists, stateOf: async () => "Ss" }), true);
+  const statesOf = (state) => async (pids) => new Map(pids.map((pid) => [pid, state]));
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Z") }), false);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Z+") }), false);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Ss") }), true);
   // ESRCH is still the proof of absence, and ps is not even consulted.
   let asked = 0;
-  assert.equal(await processIsAlive(61872, { exists: () => false, stateOf: async () => { asked += 1; return "S"; } }), false);
+  assert.equal(await processIsAlive(61872, { exists: () => false, statesOf: async () => { asked += 1; return new Map(); } }), false);
   assert.equal(asked, 0);
-  // A ps that prints nothing or fails proves nothing: the process is treated
-  // as running, so the swap never proceeds under a live BotFleet because of a
-  // ps hiccup on a loaded Mac.
-  assert.equal(await processIsAlive(61872, { exists, stateOf: async () => "" }), true);
-  assert.equal(await processIsAlive(61872, { exists, stateOf: async () => { throw new Error("spawn ps EAGAIN"); } }), true);
+  // A ps that prints nothing for the pid, or fails, proves nothing: the process
+  // is treated as running, so the swap never proceeds under a live BotFleet
+  // because of a ps hiccup on a loaded Mac.
+  assert.equal(await processIsAlive(61872, { exists, statesOf: async () => new Map() }), true);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("") }), true);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: async () => { throw new Error("spawn ps EAGAIN"); } }), true);
 });
 
 test("withoutExitedPids awaits an asynchronous verdict instead of treating every Promise as alive", async () => {
   assert.deepEqual(await withoutExitedPids([1, 2, 3], { isAlive: async (pid) => pid === 2 }), [2]);
   assert.deepEqual(await withoutExitedPids([1, 2, 3], { isAlive: (pid) => pid !== 2 }), [1, 3]);
   assert.deepEqual(await withoutExitedPids([], { isAlive: async () => true }), []);
+});
+
+test("withoutExitedPids reads every state with one ps spawn per poll, not one per pid", async () => {
+  // A quiesce polls every 250 ms for up to 20 s: one spawn per pid per tick
+  // would burn the budget on a loaded Mac before any process exits.
+  const seen = [];
+  const states = new Map([[10, "Ss"], [11, "Z"], [12, "R+"], [13, "Z+"]]);
+  const options = {
+    exists: (pid) => pid !== 14,
+    statesOf: async (pids) => { seen.push([...pids]); return states; },
+  };
+  assert.deepEqual(await withoutExitedPids([10, 11, 12, 13, 14], options), [10, 12]);
+  assert.deepEqual(seen, [[10, 11, 12, 13]], "one lookup for the four pids kill -0 still sees; the gone pid never reaches ps");
+  // Nothing left after kill -0: no spawn at all.
+  assert.deepEqual(await withoutExitedPids([14], options), []);
+  assert.equal(seen.length, 1);
+  // A pid with no ps row stays alive, and a failed lookup keeps every pid.
+  assert.deepEqual(await withoutExitedPids([10, 11, 12], { ...options, statesOf: async () => new Map([[11, "Z"]]) }), [10, 12]);
+  assert.deepEqual(await withoutExitedPids([10, 11], { ...options, statesOf: async () => { throw new Error("spawn ps EAGAIN"); } }), [10, 11]);
+});
+
+test("processStates parses one real ps row per pid and ignores a pid that is not there", { skip: process.platform === "win32" ? "ps is not available on win32" : false }, async () => {
+  // A reaped child's pid is a real pid that no longer exists.
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await once(child, "exit");
+  const states = await processStates([process.pid, child.pid]);
+  assert.equal(states.has(process.pid), true);
+  assert.equal(isZombieState(states.get(process.pid)), false);
+  assert.equal(states.has(child.pid), false, "a pid with no row is absent, and does not hide the others");
+  assert.equal((await processStates([])).size, 0);
 });
 
 test("quiesce treats a zombie as exited: it is never waited on, inspected or signalled", async () => {
@@ -1265,7 +1298,7 @@ test("quiesce ignores a zombie yet still refuses a live process that ignores SIG
   const previous = { runtimePids: [], appPids: [], processCommands: {}, processCwds: {} };
   await assert.rejects(
     terminateVerified([61872, 501], previous, quiesceConfig, { current: [61872, 501], ...deps, isAlive: zombieAwareIsAlive(table) }),
-    (error) => /\(pid 501\); refusing SIGKILL$/.test(error.message) && !error.message.includes("61872"),
+    (error) => error.message.endsWith("(pid 501); refusing SIGKILL") && !error.message.includes("61872"),
   );
   assert.deepEqual(signals, [[501, "SIGTERM"]], "only the live process is signalled, and never with SIGKILL");
 });

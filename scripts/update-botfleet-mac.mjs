@@ -605,46 +605,65 @@ function processExists(pid) {
  * did not exit after graceful quit and SIGTERM ... refusing SIGKILL".
  */
 export function isZombieState(state) {
-  return typeof state === "string" && state.trim().startsWith("Z");
-}
-
-async function processState(pid) {
-  const result = await run("ps", ["-o", "stat=", "-p", String(pid)], { allowFailure: true });
-  return result.code === 0 ? result.stdout.trim() : "";
+  return String(state ?? "").trim().startsWith("Z");
 }
 
 /**
- * Is `pid` a process that is still running?  A zombie is not: it holds no
- * files, no ports and no database handle, so it can never hold BotFleet state,
- * and no signal can make it exit sooner (only its parent reaping it can).
- *
- * This fails toward alive.  Only a signal-0 ESRCH or a state column that
- * begins with Z says "exited".  A `ps` that fails or prints nothing for a pid
- * `kill -0` still sees proves nothing, and reading that as "exited" would let
- * the swap proceed under a live process.  (A `ps` that hangs blocks this
- * check, as it blocks processCommand; run() has no timeout.)
+ * The `ps` state column for every pid in one spawn, as a Map of pid to state.
+ * `ps` exits nonzero when some listed pid has gone but still prints the rest,
+ * so the rows are read whatever the exit code says.  A pid with no row is
+ * simply absent from the map.
  */
-export async function processIsAlive(pid, { exists = processExists, stateOf = processState } = {}) {
-  if (!exists(pid)) return false;
-  let state;
-  try {
-    state = await stateOf(pid);
-  } catch {
-    return true;
+export async function processStates(pids) {
+  const states = new Map();
+  if (!pids.length) return states;
+  const result = await run("ps", ["-o", "pid=,stat=", "-p", pids.join(",")], { allowFailure: true });
+  for (const line of result.stdout.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(\S+)$/);
+    if (match) states.set(Number(match[1]), match[2]);
   }
-  return !isZombieState(state);
+  return states;
 }
 
 /**
  * The pids in `pids` that are still running.  Every place the updater asks
  * "does anything still hold BotFleet state" goes through this, so a zombie is
- * never captured, waited on, signalled, or reported as a survivor.  `isAlive`
- * may be synchronous or asynchronous; the verdicts are awaited together
- * because a Promise is always truthy and cannot be filtered on directly.
+ * never captured, waited on, signalled, or reported as a survivor.  A zombie
+ * holds no files, no ports and no database handle, so it can never hold
+ * BotFleet state, and no signal can make it exit sooner (only its parent
+ * reaping it can).
+ *
+ * `kill -0` runs first (ESRCH is the proof of absence), then ONE `ps` spawn
+ * reads the state of everything left, so a poll over N pids costs one spawn,
+ * not N.  This fails toward alive: a pid with no `ps` row, or a `ps` that
+ * fails, proves nothing, and reading that as "exited" would let the swap
+ * proceed under a live process.  Only a state beginning with Z says exited.
+ * (A `ps` that hangs blocks this check, as it blocks processCommand; run()
+ * has no timeout.)
+ *
+ * A caller may inject `isAlive`, synchronous or asynchronous.  The verdicts
+ * are awaited together because a Promise is always truthy and cannot be
+ * filtered on directly.
  */
-export async function withoutExitedPids(pids, { isAlive = processIsAlive } = {}) {
-  const verdicts = await Promise.all(pids.map((pid) => isAlive(pid)));
-  return pids.filter((_, index) => verdicts[index]);
+export async function withoutExitedPids(pids, { isAlive, exists = processExists, statesOf = processStates } = {}) {
+  if (isAlive) {
+    const verdicts = await Promise.all(pids.map((pid) => isAlive(pid)));
+    return pids.filter((_, index) => verdicts[index]);
+  }
+  const present = pids.filter((pid) => exists(pid));
+  if (!present.length) return [];
+  let states;
+  try {
+    states = await statesOf(present);
+  } catch {
+    return present;
+  }
+  return present.filter((pid) => !isZombieState(states.get(pid)));
+}
+
+/** Is this one pid still running?  See withoutExitedPids; a zombie is not. */
+export async function processIsAlive(pid, options) {
+  return (await withoutExitedPids([pid], options)).length === 1;
 }
 
 async function parseJsonFile(path, label) {
@@ -1721,7 +1740,7 @@ export function credentialPreparationReceiptPath(prepared) {
   return join(prepared.stageDirectory, "credential-migration.json");
 }
 
-async function waitForExit(pids, timeoutMs, { isAlive = processIsAlive, wait = sleep, now = Date.now } = {}) {
+async function waitForExit(pids, timeoutMs, { isAlive, wait = sleep, now = Date.now } = {}) {
   const deadline = now() + timeoutMs;
   let remaining = await withoutExitedPids(pids, { isAlive });
   while (remaining.length && now() < deadline) {
@@ -1761,7 +1780,7 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
  * the caller records only those.
  */
 export async function captureProcessIdentities(pids, config, {
-  isAlive = processIsAlive,
+  isAlive,
   commandOf = processCommand,
   cwdOf = processCwd,
 } = {}) {
@@ -1811,7 +1830,7 @@ export async function captureProcessIdentities(pids, config, {
  */
 export async function terminateVerified(pids, previous, config, {
   current,
-  isAlive = processIsAlive,
+  isAlive,
   commandOf = processCommand,
   cwdOf = processCwd,
   kill,
@@ -1830,7 +1849,7 @@ export async function terminateVerified(pids, previous, config, {
     if (!sameAsCaptured && !(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
       // Exited while ps and lsof were still describing it: there was no
       // process left to describe, so its identity came back empty.
-      if (!(await isAlive(pid))) continue;
+      if ((await withoutExitedPids([pid], { isAlive })).length === 0) continue;
       // A captured pid that now names something else: the process the
       // capture saw is gone, and this one never held BotFleet state.
       if (resolvedNow && !resolvedNow.has(pid)) continue;
