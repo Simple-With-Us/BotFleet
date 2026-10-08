@@ -393,7 +393,7 @@ const RUNNER_STDERR_CHARS = 8_000;
 /** The tail of a command's stderr, sized to stay readable in a log line, with
  *  an explicit marker when it did not fit — never a silently clipped message
  *  that starts mid-sentence.  `NAME=…` secrets are scrubbed either way. */
-export function runnerFailureDetail(stderr: string, status: string | number | undefined): string {
+export function runnerFailureDetail(stderr: string, status: string | number | null | undefined): string {
   const full = stderr.trim();
   const tail = full.slice(-RUNNER_STDERR_CHARS);
   const trimmed = tail === full ? tail : `… ${full.length - tail.length} earlier characters omitted …\n${tail}`;
