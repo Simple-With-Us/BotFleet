@@ -455,6 +455,35 @@ export function hostCliCredentialMounts(
   return mounts;
 }
 
+/**
+ * Guest-side repair for credential destinations the sync could not write.
+ *
+ * A VPS container runs `--cap-drop ALL` with only SETUID/SETGID, so root can
+ * delete a node it owns but can never `chown` one: ownership can only be fixed
+ * by removing the foreign path and letting the `cua` extract create it again,
+ * which is exactly what the archive is about to write there.  That is why this
+ * runs as uid 0 and why it only ever names paths the extract just failed on.
+ *
+ * Every command is best-effort (`|| true`) so a destination this cannot repair
+ * still falls through to the extract's own error, which carries the reason.
+ */
+export function guestCredentialOwnershipRepairShell(guestPaths: string[], user = "cua"): string {
+  const quoted = guestPaths.map((path) => `'${path.replace(/'/g, `'\\''`)}'`).join(" ");
+  if (guestPaths.length === 0) return "exit 0";
+  return [
+    `cua_uid="$(id -u ${user} 2>/dev/null)"`,
+    `[ -n "$cua_uid" ] || exit 0`,
+    `for p in ${quoted}; do`,
+    `  [ -e "$p" ] || continue`,
+    // A path the archive could not write is one this user does not own; root
+    // created it as root, so it can be removed without CAP_DAC_OVERRIDE.
+    `  owner="$(stat -c %u "$p" 2>/dev/null)"`,
+    `  if [ -n "$owner" ] && [ "$owner" != "$cua_uid" ]; then rm -rf "$p" 2>/dev/null || true; fi`,
+    `done`,
+    `exit 0`,
+  ].join("\n");
+}
+
 export function credentialPermissionHardeningShell(user = "cua"): string {
   return [
     `for d in .ssh .infisical .aws .azure .oci .kube .cargo .config .gnupg .vercel .turso .docker .wrangler .deno; do`,
@@ -467,6 +496,36 @@ export function credentialPermissionHardeningShell(user = "cua"): string {
   ].join("; ");
 }
 
+/**
+ * Host paths under a credential root that must never be archived.  Each entry
+ * is a tar `--exclude` pattern, scoped to the credential root it sits under so
+ * a broad name like `logs` cannot silence an unrelated tool's credential.
+ *
+ * These are tool-maintained, not credential: gcloud writes a dated debug tree
+ * under `logs/`, blobs under `cache/`, and CLI state under `data/`.  The
+ * guest's `~/.config/gcloud` is root-owned, so shipping that churn made the
+ * guest-side `tar -x` exit non-zero and took every other tool's credentials
+ * down with it.
+ */
+const CREDENTIAL_EXCLUDE_PATTERNS: string[] = [
+  ".config/gcloud/logs",
+  ".config/gcloud/cache",
+  ".config/gcloud/data",
+];
+
+/** Pre-existing generic excludes: interpreter venvs, sockets, editor droppings. */
+const GENERIC_EXCLUDE_PATTERNS: string[] = [
+  "*/virtenv*",
+  "*/agent/*",
+  "*.sock",
+  "*cm-*",
+  "*.DS_Store",
+];
+
+export function credentialSyncExcludePatterns(): string[] {
+  return [...GENERIC_EXCLUDE_PATTERNS, ...CREDENTIAL_EXCLUDE_PATTERNS].sort();
+}
+
 export async function packageCredentialArchive(
   homeDir: string,
   plan: CredentialSyncPlan,
@@ -474,6 +533,7 @@ export async function packageCredentialArchive(
   const paths = [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])];
   if (paths.length === 0) return null;
   const tarRoot = plan.stagingDir ?? homeDir;
+  const excludes = credentialSyncExcludePatterns().map((pattern) => `--exclude=${pattern}`);
   return await new Promise<Buffer>((resolve, reject) => {
     const tar = spawn(
       "tar",
@@ -482,11 +542,7 @@ export async function packageCredentialArchive(
         "-C",
         tarRoot,
         "--no-xattrs",
-        "--exclude=*/virtenv*",
-        "--exclude=*/agent/*",
-        "--exclude=*.sock",
-        "--exclude=*cm-*",
-        "--exclude=*.DS_Store",
+        ...excludes,
         "-cf",
         "-",
         ...paths,

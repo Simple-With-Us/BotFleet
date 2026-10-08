@@ -51,8 +51,11 @@ import {
 import { augmentedPath } from "./env-path.ts";
 import {
   credentialPermissionHardeningShell,
+  guestCredentialOwnershipRepairShell,
+  guestPathForCredentialRel,
   packageCredentialArchive,
   prepareCredentialSyncWorkspace,
+  VM_CLI_GUEST_HOME,
   type CredentialSyncResult,
 } from "./vm-cli-credentials.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
@@ -380,6 +383,22 @@ export function closeAllVpsDesktopTunnels(): void {
 }
 
 const STREAM_CAP_CHARS = 16 * 1024 * 1024;
+/** How much stderr a failed docker-over-SSH command keeps for the error.  A
+ *  reader needs every failing path in it, and the message is what reaches the
+ *  harness log: GNU tar names one refused member per line, so a 1000-char tail
+ *  of a gcloud log-tree extraction started mid-word and reported the cause as
+ *  `kdir: Permission denied` instead of `Cannot mkdir: Permission denied`. */
+const RUNNER_STDERR_CHARS = 8_000;
+
+/** The tail of a command's stderr, sized to stay readable in a log line, with
+ *  an explicit marker when it did not fit — never a silently clipped message
+ *  that starts mid-sentence.  `NAME=…` secrets are scrubbed either way. */
+export function runnerFailureDetail(stderr: string, status: string | number | null | undefined): string {
+  const full = stderr.trim();
+  const tail = full.slice(-RUNNER_STDERR_CHARS);
+  const trimmed = tail === full ? tail : `… ${full.length - tail.length} earlier characters omitted …\n${tail}`;
+  return redactSecrets(trimmed) || `Docker-over-SSH exited ${status ?? "without a status"}`;
+}
 
 /** Keeps the LAST 16MB of a stream without rebuilding one giant string per
  * chunk (a 10-minute `docker build` stream made that rebuild quadratic).
@@ -460,8 +479,7 @@ export function defaultRunner(args: string[], options: VpsCommandOptions = {}): 
       }
       settle(() => {
         if (code === 0) return resolve({ stdout: stdout.text(), stderr: stderr.text() });
-        const detail = redactSecrets(stderr.text().trim().slice(-1000));
-        reject(new Error(detail || `Docker-over-SSH exited ${code ?? signal ?? "without a status"}`));
+        reject(new Error(runnerFailureDetail(stderr.text(), code ?? signal)));
       });
     });
     try {
@@ -1159,11 +1177,58 @@ export async function vpsSyncCliCredentials(
       };
     }
 
-    await run(
-      ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", "/home/cua"],
-      60_000,
-      tarArchive,
-    );
+    const plannedGuestPaths = [
+      ...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths].map((rel) => guestPathForCredentialRel(rel))),
+    ].sort();
+    const extractArgs = ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", VM_CLI_GUEST_HOME];
+    const extractArchive = () => run(extractArgs, 60_000, tarArchive);
+
+    let extractError: unknown = null;
+    try {
+      await extractArchive();
+    } catch (err) {
+      extractError = err;
+    }
+
+    if (extractError) {
+      // GNU tar reports per-member errors only after extracting everything it
+      // can, so a non-zero exit does not mean the credentials are missing — it
+      // means at least one member could not be written.  Verify before failing
+      // the whole sync, otherwise one unwritable path on the guest silently
+      // denies every other tool its credentials (observed: gcloud's root-owned
+      // ~/.config/gcloud/logs, which cost the shared VPS a sync every ~5
+      // minutes).
+      let missing = await missingGuestCredentialPaths(run, target.containerName, plannedGuestPaths);
+      // A destination can also be absent because a root-owned leftover sits
+      // exactly where the archive wants to put it.  Clear those and re-run the
+      // extract once before deciding the sync failed.
+      if (
+        missing.length > 0 &&
+        (await repairGuestCredentialOwnership(run, target.containerName, missing))
+      ) {
+        try {
+          await extractArchive();
+          extractError = null;
+        } catch (err) {
+          extractError = err;
+        }
+      }
+
+      if (extractError) {
+        // Keep tar's own message in both outcomes: it is the only thing that
+        // says *why* a member was refused, and the runner already redacts it.
+        const detail = extractError instanceof Error ? extractError.message : String(extractError);
+        missing = await missingGuestCredentialPaths(run, target.containerName, plannedGuestPaths);
+        if (missing.length > 0) {
+          throw new Error(
+            `credential extract failed and ${missing.length} destination(s) are missing: ${missing.slice(0, 5).join(", ")} (tar: ${detail})`,
+          );
+        }
+        console.warn(
+          `[vps] credential extract reported errors but all ${plannedGuestPaths.length} destination(s) are present (tar: ${detail})`,
+        );
+      }
+    }
 
     await run(["exec", "-u", "cua", target.containerName, "sh", "-c", credentialPermissionHardeningShell()], 15_000).catch(
       () => {},
@@ -1177,6 +1242,52 @@ export async function vpsSyncCliCredentials(
     };
   } finally {
     await cleanup();
+  }
+}
+
+/**
+ * Hand the guest's own user ownership of the credential destinations the
+ * extract could not write.  Runs as uid 0 because that is the only identity in
+ * a `--cap-drop ALL` container that can remove a root-owned path, and it can
+ * do nothing useful if the container has no root to ask.
+ */
+async function repairGuestCredentialOwnership(
+  run: (args: string[], timeoutMs?: number, input?: string | Buffer) => Promise<{ stdout: string; stderr: string }>,
+  containerName: string,
+  guestPaths: string[],
+): Promise<boolean> {
+  if (guestPaths.length === 0) return false;
+  try {
+    await run(["exec", "-u", "0", containerName, "sh", "-c", guestCredentialOwnershipRepairShell(guestPaths)], 20_000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Which of the planned guest credential destinations are absent after a
+ * failed extract.  Best-effort: a verification probe that itself fails reports
+ * everything as missing so the caller still surfaces the original failure
+ * instead of claiming a partial sync succeeded.
+ */
+async function missingGuestCredentialPaths(
+  run: (args: string[], timeoutMs?: number, input?: string | Buffer) => Promise<{ stdout: string; stderr: string }>,
+  containerName: string,
+  guestPaths: string[],
+): Promise<string[]> {
+  if (guestPaths.length === 0) return [];
+  const probe = guestPaths
+    .map((path) => `[ -e '${path.replace(/'/g, "'\\''")}' ] || echo '${path.replace(/'/g, "'\\''")}'`)
+    .join("; ");
+  try {
+    const { stdout } = await run(
+      ["exec", "-u", "cua", containerName, "sh", "-c", probe],
+      20_000,
+    );
+    return stdout.split("\n").map((line) => line.trim()).filter((line) => guestPaths.includes(line));
+  } catch {
+    return [...guestPaths];
   }
 }
 
