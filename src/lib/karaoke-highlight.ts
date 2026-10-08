@@ -87,6 +87,7 @@ export function collectDisplayText(container: Element, exclude: string = KARAOKE
   const walker = doc.createTreeWalker(container, SHOW_ELEMENT | SHOW_TEXT, {
     acceptNode(node: Node): number {
       if (node.nodeType === 1 && node !== container) {
+        // SAFETY: nodeType 1 is ELEMENT_NODE.
         const el = node as Element;
         if (exclude && el.matches(exclude)) {
           pendingBreak = true;
@@ -98,6 +99,7 @@ export function collectDisplayText(container: Element, exclude: string = KARAOKE
   });
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
     if (node.nodeType === 1) {
+      // SAFETY: nodeType 1 is ELEMENT_NODE.
       if (BREAK_TAGS.has((node as Element).tagName.toUpperCase())) pendingBreak = true;
       continue;
     }
@@ -107,6 +109,7 @@ export function collectDisplayText(container: Element, exclude: string = KARAOKE
     if (text && (pendingBreak || block !== lastBlock)) text += "\n";
     pendingBreak = false;
     lastBlock = block;
+    // SAFETY: the walker shows only elements and text, and elements were skipped above.
     nodes.push(node as Text);
     nodeStart.push(text.length);
     text += value;
@@ -195,6 +198,8 @@ export interface KaraokeEnv {
 }
 
 function defaultEnv(): KaraokeEnv {
+  // SAFETY: every member is optional and checked before use; this only names
+  // the browser globals the highlighter reads.
   const g = globalThis as {
     CSS?: { highlights?: HighlightRegistryLike };
     Highlight?: new () => HighlightLike;
@@ -207,9 +212,11 @@ function defaultEnv(): KaraokeEnv {
   return {
     highlights: g.CSS?.highlights ?? null,
     createHighlight: HighlightCtor ? () => new HighlightCtor() : null,
+    // SAFETY: the fallback's handle only ever goes back to clearTimeout below.
     requestFrame: g.requestAnimationFrame
       ? (cb) => g.requestAnimationFrame!(cb)
       : (cb) => setTimeout(cb, 16) as unknown as number,
+    // SAFETY: without requestAnimationFrame, every handle came from setTimeout above.
     cancelFrame: g.cancelAnimationFrame
       ? (handle) => g.cancelAnimationFrame!(handle)
       : (handle) => clearTimeout(handle as unknown as ReturnType<typeof setTimeout>),

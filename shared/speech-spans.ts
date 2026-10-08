@@ -140,6 +140,7 @@ function replaceTracked(t: Tracked, re: RegExp, replacer: (m: RegExpMatchWithInd
   const out = new TrackedBuilder();
   let last = 0;
   for (const raw of t.text.matchAll(re)) {
+    // SAFETY: every rule regex carries the `d` flag, so matchAll yields `indices`, and a match always has `index`.
     const m = raw as RegExpMatchWithIndices;
     const start = m.index;
     const end = start + m[0].length;

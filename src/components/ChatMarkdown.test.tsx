@@ -69,6 +69,7 @@ describe("karaoke display text", () => {
     const container = win.document.createElement("div");
     container.innerHTML = renderToStaticMarkup(createElement(ChatMarkdown, { text: markdown }));
     win.document.body.appendChild(container);
+    // SAFETY: happy-dom's Element implements the DOM Element members collectDisplayText reads.
     return collectDisplayText(container as unknown as Element).text;
   };
 

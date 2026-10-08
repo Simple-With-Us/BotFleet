@@ -22,6 +22,7 @@ function mount(html: string): Element {
   container.className = "chat-md";
   container.innerHTML = html;
   win.document.body.appendChild(container);
+  // SAFETY: happy-dom's Element implements the DOM Element members the highlighter reads.
   return container as unknown as Element;
 }
 
@@ -34,6 +35,7 @@ function fakeEnv(overrides: Partial<KaraokeEnv> = {}) {
   const frames: Array<() => void> = [];
   let now = 0;
   const env: Partial<KaraokeEnv> = {
+    // SAFETY: a Map of FakeHighlight has the get/set/delete the registry is used through.
     highlights: registry as unknown as KaraokeEnv["highlights"],
     createHighlight: () => new FakeHighlight(),
     requestFrame: (cb) => frames.push(cb),
@@ -42,6 +44,7 @@ function fakeEnv(overrides: Partial<KaraokeEnv> = {}) {
     prefersReducedMotion: () => false,
     ...overrides,
   };
+  // SAFETY: the highlighter only ever adds Range objects to its highlights.
   const painted = (name: keyof typeof KARAOKE_HIGHLIGHT_NAMES): string[] =>
     [...(registry.get(KARAOKE_HIGHLIGHT_NAMES[name]) ?? [])].map((r) => (r as Range).toString()).sort();
   return {

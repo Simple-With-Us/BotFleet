@@ -392,6 +392,7 @@ describe("the sidecar in front of an unmodified harness", () => {
       res.end(JSON.stringify({ error: "This voice clip is still being prepared.", retryable: true, ready: 1, total: 3 }));
     });
     await new Promise<void>((resolve) => clipHarness.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
     const clipHarnessPort = (clipHarness.address() as { port: number }).port;
     const clipProxy = createServer(createProxyHandler({
       harnessPort: clipHarnessPort,
@@ -400,6 +401,7 @@ describe("the sidecar in front of an unmodified harness", () => {
       serverName: () => "Test computer",
     }));
     await new Promise<void>((resolve) => clipProxy.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
     const clipProxyPort = (clipProxy.address() as { port: number }).port;
     try {
       const response = await fetch(`http://127.0.0.1:${clipProxyPort}/api/threads/th_1/messages/msg_1/audio/1?device=iphone`, {
@@ -436,6 +438,7 @@ describe("the sidecar in front of an unmodified harness", () => {
       });
     });
     await new Promise<void>((resolve) => audioHarness.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
     const audioHarnessPort = (audioHarness.address() as { port: number }).port;
     const audioProxy = createServer(createProxyHandler({
       harnessPort: audioHarnessPort,
@@ -444,6 +447,7 @@ describe("the sidecar in front of an unmodified harness", () => {
       serverName: () => "Test computer",
     }));
     await new Promise<void>((resolve) => audioProxy.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
     const audioProxyPort = (audioProxy.address() as { port: number }).port;
     try {
       const response = await fetch(`http://127.0.0.1:${audioProxyPort}/api/threads/th_1/messages/msg_1/audio`, {

@@ -307,6 +307,7 @@ describe("summarizeForVoiceDetailed: long replies are never cut short", () => {
     const fetchSpy = vi.fn().mockResolvedValue({ ok: false, json: async () => ({}) });
     globalThis.fetch = fetchSpy;
     await summarizeForVoiceDetailed(longReply, "fake-key");
+    // SAFETY: summarizeForVoiceDetailed always posts a JSON string body.
     const budgets = fetchSpy.mock.calls.map(([, init]) => JSON.parse((init as { body: string }).body).max_tokens);
     expect(budgets).toEqual([voiceSummaryMaxTokens(longReply.length), voiceSummaryMaxTokens(longReply.length)]);
     expect(budgets[0]).toBeGreaterThan(500);
@@ -363,6 +364,7 @@ describe("summarizeForVoiceDetailed: long replies are never cut short", () => {
   });
 
   it("stores the stand-in when the rewrite ran out of time, since it would again", async () => {
+    // SAFETY: the stub is only ever called with fetch's (url, init) and returns a Promise, as fetch does.
     globalThis.fetch = vi.fn((_url, init?: RequestInit) => new Promise((_resolve, reject) => {
       init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
     })) as unknown as typeof fetch;
@@ -373,6 +375,7 @@ describe("summarizeForVoiceDetailed: long replies are never cut short", () => {
   });
 
   it("does not call a caller's cancel a timeout", async () => {
+    // SAFETY: the stub is only ever called with fetch's (url, init) and returns a Promise, as fetch does.
     globalThis.fetch = vi.fn((_url, init?: RequestInit) => new Promise((_resolve, reject) => {
       init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
     })) as unknown as typeof fetch;

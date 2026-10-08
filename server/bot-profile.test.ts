@@ -101,16 +101,19 @@ describe("parseBotProfilePatch (both modes)", () => {
   });
 
   it("rejects malformed per-device voices", () => {
+    // SAFETY: deliberately malformed input; parseBotProfilePatch validates at runtime.
     expect(parseBotProfilePatch({ voices: { ipad: "vx" } } as never, true)).toEqual({
       ok: false,
       error: "voices only accepts mac and iphone, not ipad",
     });
+    // SAFETY: deliberately malformed input; parseBotProfilePatch validates at runtime.
     expect(parseBotProfilePatch({ voices: { mac: 7 } } as never, true)).toEqual({ ok: false, error: "voices.mac must be a voice id or null" });
     expect(parseBotProfilePatch({ voices: { iphone: "v".repeat(201) } }, true)).toEqual({
       ok: false,
       error: "voices.iphone must be at most 200 characters",
     });
     for (const voices of ["vx", ["vx"], 3]) {
+      // SAFETY: deliberately malformed input; parseBotProfilePatch validates at runtime.
       expect(parseBotProfilePatch({ voices } as never, true)).toEqual({
         ok: false,
         error: "voices must be an object with mac and iphone voice ids",
