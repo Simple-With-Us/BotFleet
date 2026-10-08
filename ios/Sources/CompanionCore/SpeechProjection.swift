@@ -91,6 +91,63 @@ public enum SpeechProjection {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// The written half of a reply: what the bubble's text is made from,
+    /// and the text the harness's karaoke spans index.  Mirrors
+    /// `writtenReply` in shared/voice-summary.ts character for character
+    /// (JavaScript's `\s` and `trim()`), because a client compares its
+    /// UTF-16 length with the spans' `sourceLength` before trusting them.
+    public static func writtenReply(_ text: String) -> String {
+        guard !text.isEmpty else { return "" }
+        if let split = splitVoiceSummary(text) { return split.written }
+        return stripVoiceSummaryTags(text)
+    }
+
+    /// JavaScript's `\s` (and the set `String.prototype.trim` removes).
+    private static let jsSpace = #"[\t\n\x{0B}\f\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]"#
+    private static let jsTrimSet = CharacterSet(charactersIn: "\t\n\u{0B}\u{0C}\r \u{A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}")
+    private static let protocolTags = #"\[/?(?:voice_summary|written_answer)\]"#
+
+    private static func jsTrim(_ text: String) -> String {
+        text.trimmingCharacters(in: jsTrimSet)
+    }
+
+    /// `splitVoiceSummary` in shared/voice-summary.ts.
+    private static func splitVoiceSummary(_ text: String) -> (voice: String, written: String)? {
+        let s = jsSpace
+        guard let groups = firstMatch(
+            #"\[voice_summary\]"# + s + #"*([\s\S]*?)"# + s + #"*\[/voice_summary\]"# + s + #"*\[written_answer\]"# + s + #"*([\s\S]*?)(?:\[/written_answer\])?"# + s + #"*\z"#,
+            in: text, options: [.caseInsensitive]
+        ) else { return nil }
+        let rawVoice = groups[1] ?? ""
+        let rawWritten = groups[2] ?? ""
+        guard !jsTrim(rawVoice).isEmpty, !jsTrim(rawWritten).isEmpty else { return nil }
+        let voice = jsTrim(replace(protocolTags, in: rawVoice, options: [.caseInsensitive], template: ""))
+        let written = jsTrim(replace(protocolTags, in: rawWritten, options: [.caseInsensitive], template: ""))
+        guard !voice.isEmpty, !written.isEmpty else { return nil }
+        return (voice, written)
+    }
+
+    /// `stripVoiceSummaryTags` in shared/voice-summary.ts: only a reply that
+    /// begins with the protocol is touched.
+    private static func stripVoiceSummaryTags(_ text: String) -> String {
+        guard !text.isEmpty else { return "" }
+        if let split = splitVoiceSummary(text) { return split.written }
+        let s = jsSpace
+        guard firstMatch(#"\A"# + s + #"*\[voice_summary\]"#, in: text, options: [.caseInsensitive]) != nil else { return text }
+        var clean = text
+        if let groups = firstMatch(
+            #"\[written_answer\]([\s\S]*?)(?:\[/written_answer\]"# + s + #"*)?\z"#,
+            in: clean, options: [.caseInsensitive]
+        ) {
+            clean = groups[1] ?? ""
+        } else if let lead = regex(#"\A"# + s + #"*\[voice_summary\][\s\S]*?(?:\[/voice_summary\]"# + s + #"*|\z)"#, [.caseInsensitive]),
+                  let match = lead.firstMatch(in: clean, options: [], range: NSRange(location: 0, length: (clean as NSString).length)) {
+            clean = (clean as NSString).replacingCharacters(in: match.range, with: "")
+        }
+        clean = jsTrim(replace(protocolTags, in: clean, options: [.caseInsensitive], template: ""))
+        return clean.isEmpty ? text : clean
+    }
+
     /// Markdown to a line a voice can read.  Follows `speakable` in
     /// server/tts/speech-text.ts rule for rule: say the prose, name the
     /// artifacts, drop the syntax.

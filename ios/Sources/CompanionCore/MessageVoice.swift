@@ -28,6 +28,14 @@ public struct MessageVoice: Decodable, Equatable, Sendable {
     public var personalVoice: Bool?
     /// The voice the harness resolved for the requested device.
     public var voice: String?
+    /// What the voice reads, when the request asked for `spans`: "written"
+    /// (the reply as written, span-aligned, so karaoke applies) or
+    /// "summary" (a model summary, no karaoke).  Absent from an older
+    /// harness.
+    public var script: String?
+    /// The written script's source spans (KaraokeScript.swift).  A
+    /// malformed value is dropped, never a reason to fail the answer.
+    public var spans: SpokenSpansWire?
 
     public init(
         audio: [VoiceClip] = [],
@@ -37,7 +45,9 @@ public struct MessageVoice: Decodable, Equatable, Sendable {
         complete: Bool? = nil,
         onDevice: Bool? = nil,
         personalVoice: Bool? = nil,
-        voice: String? = nil
+        voice: String? = nil,
+        script: String? = nil,
+        spans: SpokenSpansWire? = nil
     ) {
         self.audio = audio
         self.voiceText = voiceText
@@ -47,10 +57,12 @@ public struct MessageVoice: Decodable, Equatable, Sendable {
         self.onDevice = onDevice
         self.personalVoice = personalVoice
         self.voice = voice
+        self.script = script
+        self.spans = spans
     }
 
     private enum CodingKeys: String, CodingKey {
-        case audio, voiceText, utterances, total, complete, onDevice, personalVoice, voice
+        case audio, voiceText, utterances, total, complete, onDevice, personalVoice, voice, script, spans
     }
 
     public init(from decoder: Decoder) throws {
@@ -63,6 +75,8 @@ public struct MessageVoice: Decodable, Equatable, Sendable {
         onDevice = try container.decodeIfPresent(Bool.self, forKey: .onDevice)
         personalVoice = try container.decodeIfPresent(Bool.self, forKey: .personalVoice)
         voice = try container.decodeIfPresent(String.self, forKey: .voice)
+        script = try? container.decodeIfPresent(String.self, forKey: .script)
+        spans = try? container.decodeIfPresent(SpokenSpansWire.self, forKey: .spans)
     }
 
     /// Speak this reply on the device.  Only `onDevice` says so.

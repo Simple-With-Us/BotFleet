@@ -1015,7 +1015,8 @@ public struct CompanionClient: Sendable {
     /// none, still preparing) instead of after every clip, which a long reply
     /// cannot do inside the companion's 30-second header deadline.  An older
     /// harness ignores both and answers with every clip, which decodes the
-    /// same way.
+    /// same way.  `spans` is always asked for (see `MessageVoice.script`);
+    /// an older harness ignores it too.
     public func messageVoice(
         threadId: String,
         messageId: String,
@@ -1025,7 +1026,9 @@ public struct CompanionClient: Sendable {
         guard Self.validVoiceId(threadId), Self.validVoiceId(messageId) else { throw APIError.badURL }
         var request = try makeRequest(
             "POST", "/api/threads/\(threadId)/messages/\(messageId)/audio",
-            body: ["device": device.rawValue, "progressive": progressive]
+            // `spans` asks for the script kind and, for a reply read as
+            // written, the source spans karaoke lines the voice up with.
+            body: ["device": device.rawValue, "progressive": progressive, "spans": true]
         )
         // A progressive answer arrives within about 20 seconds.  The long
         // ceiling is for an older harness that still makes every clip first.
