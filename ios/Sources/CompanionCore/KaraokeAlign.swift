@@ -39,12 +39,31 @@ public struct KaraokeMapping: Equatable, Sendable {
     public let displayLastSpoken: [Int]
 }
 
+/// Content words on each side and how many the alignment really paired
+/// (karaoke-align.ts KaraokeQuality).
+public struct KaraokeQuality: Equatable, Sendable {
+    public let spokenContent: Int
+    public let spokenMatched: Int
+    public let displayContent: Int
+    public let displayMatched: Int
+
+    public init(spokenContent: Int, spokenMatched: Int, displayContent: Int, displayMatched: Int) {
+        self.spokenContent = spokenContent
+        self.spokenMatched = spokenMatched
+        self.displayContent = displayContent
+        self.displayMatched = displayMatched
+    }
+}
+
 public struct KaraokeAlignment: Equatable, Sendable {
     public let spokenWords: [KaraokeWord]
     public let displayWords: [KaraokeWord]
     public let mapping: KaraokeMapping
     /// True when the script's spans guided the alignment.
     public let guided: Bool
+    public let quality: KaraokeQuality
+    /// KaraokeAlign.followable(quality): false means show no highlight.
+    public let followable: Bool
 }
 
 public struct KaraokeClip: Equatable, Sendable {
@@ -121,22 +140,53 @@ public enum KaraokeAlign {
         "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
     ]
     private static let scales: [String: Int] = ["thousand": 1_000, "million": 1_000_000, "billion": 1_000_000_000]
+    /// karaoke-align.ts ORDINAL_*: the last word of a reading.
+    private static let ordinalUnits: [String: Int] = [
+        "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9,
+    ]
+    private static let ordinalTeens: [String: Int] = [
+        "tenth": 10, "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14, "fifteenth": 15, "sixteenth": 16,
+        "seventeenth": 17, "eighteenth": 18, "nineteenth": 19,
+    ]
+    private static let ordinalTens: [String: Int] = [
+        "twentieth": 20, "thirtieth": 30, "fortieth": 40, "fiftieth": 50, "sixtieth": 60, "seventieth": 70,
+        "eightieth": 80, "ninetieth": 90,
+    ]
+    /// karaoke-align.ts NUMBER_WORDS: every word numberKey knows, except
+    /// "first" and "second", which stand alone too often to equal a digit.
+    private static let numberWords: [String: String] = {
+        var out: [String: String] = [:]
+        for table in [units, teens, tens, ordinalUnits, ordinalTeens, ordinalTens] {
+            for (word, n) in table where word != "first" && word != "second" { out[word] = String(n) }
+        }
+        return out
+    }()
 
     private static func isAsciiDigits(_ key: String) -> Bool {
         !key.isEmpty && key.utf16.allSatisfy { $0 >= 0x30 && $0 <= 0x39 }
     }
 
-    /// Value of one word as a decimal string ("007" -> "7", "seven" -> "7").
+    private static func stripLeadingZeros(_ digits: [UInt16]) -> String {
+        var units = digits
+        while units.count > 1 && units[0] == 0x30 { units.removeFirst() }
+        return String(utf16CodeUnits: units, count: units.count)
+    }
+
+    /// Value of one word as a decimal string ("007" -> "7", "seven" -> "7",
+    /// "24th" -> "24", "fourth" -> "4").
     public static func numberKey(_ key: String) -> String? {
-        if isAsciiDigits(key) {
-            var units = Array(key.utf16)
-            while units.count > 1 && units[0] == 0x30 { units.removeFirst() }
-            return String(utf16CodeUnits: units, count: units.count)
+        guard let c0 = key.utf16.first else { return nil }
+        if c0 >= 0x30 && c0 <= 0x39 {
+            if isAsciiDigits(key) { return stripLeadingZeros(Array(key.utf16)) }
+            // digits, then st, nd, rd or th
+            let all = Array(key.utf16)
+            guard all.count >= 3 else { return nil }
+            let suffix = String(utf16CodeUnits: Array(all.suffix(2)), count: 2)
+            let digits = Array(all.dropLast(2))
+            guard ["st", "nd", "rd", "th"].contains(suffix), digits.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return nil }
+            return stripLeadingZeros(digits)
         }
-        if let v = units[key] { return String(v) }
-        if let v = teens[key] { return String(v) }
-        if let v = tens[key] { return String(v) }
-        return nil
+        return numberWords[key]
     }
 
     private static func digitOf(_ key: String) -> String? {
@@ -146,14 +196,23 @@ public enum KaraokeAlign {
         return nil
     }
 
-    private enum Last { case none, unit, teen, tens, hundred, scale, and }
+    private enum Last { case none, unit, teen, tens, hundred, scale, and, ordinal }
 
     private static func parseCardinal(_ keys: [String]) -> String? {
         var total = 0
         var current = 0
         var last = Last.none
         for key in keys {
-            if let u = units[key], key != "zero" {
+            if last == .ordinal { return nil }
+            if let o = ordinalUnits[key] {
+                guard last == .none || last == .tens || last == .hundred || last == .scale || last == .and else { return nil }
+                current += o
+                last = .ordinal
+            } else if let o = ordinalTeens[key] ?? ordinalTens[key] {
+                guard last == .none || last == .hundred || last == .scale || last == .and else { return nil }
+                current += o
+                last = .ordinal
+            } else if let u = units[key], key != "zero" {
                 guard last == .none || last == .tens || last == .hundred || last == .scale || last == .and else { return nil }
                 current += u
                 last = .unit
@@ -219,17 +278,41 @@ public enum KaraokeAlign {
 
     private static let maxExpansion = 8
 
-    private static func isSingleLetter(_ key: String) -> Bool {
-        guard key.utf16.count == 1, let u = key.utf16.first else { return false }
-        return !(u >= 0x30 && u <= 0x39)
+    /// A word inside a spelled-out code: a digit or teen word as its
+    /// digits, anything else as itself.
+    private static func codedPiece(_ key: String) -> String {
+        if let d = digitOf(key) { return d }
+        if let t = teens[key] { return String(t) }
+        return key
     }
 
-    /// For each spoken word, display keys a run of 2...8 words starting there
-    /// can stand for, with the run lengths (insertion order kept).
-    private static func spokenExpansions(_ words: [KaraokeWord]) -> [[String: [Int]]?] {
+    /// Every prefix of every display key, at scalar boundaries.  A joined
+    /// reading only grows while it is still one of these.
+    private static func keyPrefixes(_ words: [KaraokeWord]) -> Set<String> {
+        var out = Set<String>()
+        for w in words {
+            var acc = String.UnicodeScalarView()
+            for scalar in w.key.unicodeScalars {
+                acc.append(scalar)
+                out.insert(String(acc))
+            }
+        }
+        return out
+    }
+
+    /// For each spoken word, display values a run of 2...8 words starting
+    /// there can stand for, with the run lengths (karaoke-align.ts
+    /// spokenExpansions): keys joined raw and with digit and teen words as
+    /// digits, cardinals with an ordinal end, and paired years.  Only values
+    /// `accept` keeps are recorded.
+    private static func spokenExpansions(
+        _ words: [KaraokeWord],
+        prefixes: Set<String>,
+        accept: (String) -> Bool
+    ) -> [[String: [Int]]?] {
         var out = [[String: [Int]]?](repeating: nil, count: words.count)
         func add(_ i: Int, _ value: String?, _ k: Int) {
-            guard let value else { return }
+            guard let value, accept(value) else { return }
             var map = out[i] ?? [:]
             var list = map[value] ?? []
             if !list.contains(k) { list.append(k) }
@@ -239,31 +322,29 @@ public enum KaraokeAlign {
         for i in 0..<words.count {
             let first = words[i].key
             let numeric = digitOf(first) != nil || teens[first] != nil || tens[first] != nil
-            let letter = isSingleLetter(first)
-            if !numeric && !letter { continue }
-            var digits = digitOf(first) ?? ""
-            var digitsOk = digitOf(first) != nil
-            var letters = letter ? first : ""
-            var lettersOk = letter
+            var raw: String? = prefixes.contains(first) ? first : nil
+            let firstCoded = codedPiece(first)
+            var coded: String? = prefixes.contains(firstCoded) ? firstCoded : nil
             var keys = [first]
             var k = 2
             while k <= maxExpansion && i + k <= words.count {
+                if raw == nil && coded == nil && !numeric { break }
                 let key = words[i + k - 1].key
                 keys.append(key)
-                if digitsOk {
-                    if let d = digitOf(key) {
-                        digits += d
-                        add(i, digits, k)
+                if let joined = raw.map({ $0 + key }) {
+                    if prefixes.contains(joined) {
+                        raw = joined
+                        add(i, joined, k)
                     } else {
-                        digitsOk = false
+                        raw = nil
                     }
                 }
-                if lettersOk {
-                    if isSingleLetter(key) {
-                        letters += key
-                        add(i, letters, k)
+                if let joined = coded.map({ $0 + codedPiece(key) }) {
+                    if prefixes.contains(joined) {
+                        coded = joined
+                        add(i, joined, k)
                     } else {
-                        lettersOk = false
+                        coded = nil
                     }
                 }
                 if numeric {
@@ -476,18 +557,39 @@ public enum KaraokeAlign {
         }
         var rowNum = [Int](repeating: -1, count: R)
         var colNum = [Int](repeating: -1, count: C)
+        var colValues = Set<String>()
+        // By the display key's id, and (for a number reading) by the display
+        // word's number value.
         var expansions = [[Int: [Int]]?](repeating: nil, count: R)
+        var numExpansions = [[Int: [Int]]?](repeating: nil, count: R)
+        func put(_ table: inout [Int: [Int]], _ id: Int, _ ks: [Int]) {
+            var list = table[id] ?? []
+            for k in ks where !list.contains(k) { list.append(k) }
+            table[id] = list
+        }
         if params.numbers {
             for i in 0..<R { rowNum[i] = internNum(numberKey(rows[i].key)) }
-            for j in 0..<C { colNum[j] = internNum(numberKey(cols[j].key)) }
-            let raw = spokenExpansions(rows)
+            for j in 0..<C {
+                let n = numberKey(cols[j].key)
+                colNum[j] = internNum(n)
+                if let n { colValues.insert(n) }
+            }
+            let colWords = Set(cols.map(\.key))
+            let accept: (String) -> Bool = { value in
+                if colWords.contains(value) { return true }
+                return isAsciiDigits(value) && colValues.contains(stripLeadingZeros(Array(value.utf16)))
+            }
+            let raw = spokenExpansions(rows, prefixes: keyPrefixes(cols), accept: accept)
             for i in 0..<R {
                 guard let table = raw[i] else { continue }
                 var byId: [Int: [Int]] = [:]
+                var byNum: [Int: [Int]] = [:]
                 for (value, ks) in table {
-                    if let id = ids[value] { byId[id] = ks }
+                    if let id = ids[value] { put(&byId, id, ks) }
+                    if isAsciiDigits(value), let numId = nums[stripLeadingZeros(Array(value.utf16))] { put(&byNum, numId, ks) }
                 }
                 if !byId.isEmpty { expansions[i] = byId }
+                if !byNum.isEmpty { numExpansions[i] = byNum }
             }
         }
         func classify(_ i: Int, _ j: Int) -> Int {
@@ -512,6 +614,7 @@ public enum KaraokeAlign {
             let upHi = i > 0 ? hi[i - 1] : -1
             let upBase = i > 0 ? offset[i - 1] - upLo : 0
             let table = i < R ? expansions[i] : nil
+            let numTable = i < R ? numExpansions[i] : nil
             for j in rowLo...rowHi {
                 let idx = base + j
                 var best = score[idx]
@@ -552,16 +655,20 @@ public enum KaraokeAlign {
                 }
                 score[idx] = best
                 move[idx] = bestMove
-                if let table, best > neg, j < C, let ks = table[colKey[j]] {
-                    for k in ks {
-                        if i + k > R { continue }
-                        let target = at(i + k, j + 1)
-                        if target < 0 { continue }
-                        let s = best + params.expand
-                        if s > score[target] {
-                            score[target] = s
-                            move[target] = 4
-                            moveK[target] = UInt8(k)
+                if table != nil || numTable != nil, best > neg, j < C {
+                    for pass in 0..<2 {
+                        let ks = pass == 0 ? table?[colKey[j]] : (colNum[j] >= 0 ? numTable?[colNum[j]] : nil)
+                        guard let ks else { continue }
+                        for k in ks {
+                            if i + k > R { continue }
+                            let target = at(i + k, j + 1)
+                            if target < 0 { continue }
+                            let s = best + params.expand
+                            if s > score[target] {
+                                score[target] = s
+                                move[target] = 4
+                                moveK[target] = UInt8(k)
+                            }
                         }
                     }
                 }
@@ -712,27 +819,83 @@ public enum KaraokeAlign {
         )
     }
 
+    // MARK: Is it worth following?
+
+    /// karaoke-align.ts FUNCTION_WORDS and SPOKEN_GLUE_WORDS.
+    private static let functionWords: Set<String> = [
+        "a", "an", "the", "and", "or", "but", "nor", "of", "to", "in", "on", "at", "for", "with", "by", "from", "as", "into",
+        "is", "are", "was", "were", "be", "been", "being", "am", "it", "its", "this", "that", "these", "those", "i", "you",
+        "we", "they", "he", "she", "me", "my", "your", "our", "their", "so", "then", "there", "here", "do", "does", "did",
+        "has", "have", "had", "not", "no", "if", "now", "just", "also", "can", "will", "would", "up", "out", "all",
+    ]
+    private static let spokenGlueWords: Set<String> = [
+        "dot", "slash", "colon", "underscore", "dash", "hyphen", "point", "percent", "dollar", "dollars", "cents", "plus",
+        "minus", "equals", "hash", "first", "next", "finally", "lastly", "second", "third", "oh",
+    ]
+    /// karaoke-align.ts FOLLOW_SPOKEN_MIN and FOLLOW_DISPLAY_MIN (the
+    /// reasoning and the measurements are there).
+    public static let followSpokenMin = (num: 1, den: 3)
+    public static let followDisplayMin = (num: 1, den: 8)
+
+    public static func quality(_ spokenWords: [KaraokeWord], _ displayWords: [KaraokeWord], _ mapping: KaraokeMapping) -> KaraokeQuality {
+        var spokenContent = 0
+        var spokenMatched = 0
+        var hit = [Bool](repeating: false, count: displayWords.count)
+        for s in 0..<spokenWords.count {
+            let kind = mapping.spokenKind[s]
+            let matched = kind == spokenExact || kind == spokenEquivalent || kind == spokenFuzzy || kind == spokenExpanded
+            let d = mapping.spokenToDisplay[s]
+            if matched && d >= 0 { hit[d] = true }
+            let key = spokenWords[s].key
+            if functionWords.contains(key) || spokenGlueWords.contains(key) { continue }
+            spokenContent += 1
+            if matched { spokenMatched += 1 }
+        }
+        var displayContent = 0
+        var displayMatched = 0
+        for d in 0..<displayWords.count where !functionWords.contains(displayWords[d].key) {
+            displayContent += 1
+            if hit[d] { displayMatched += 1 }
+        }
+        return KaraokeQuality(
+            spokenContent: spokenContent, spokenMatched: spokenMatched, displayContent: displayContent, displayMatched: displayMatched
+        )
+    }
+
+    /// Whether the highlight should follow this alignment at all.
+    public static func followable(_ q: KaraokeQuality) -> Bool {
+        if q.spokenMatched == 0 { return false }
+        let spokenOk = q.spokenMatched * followSpokenMin.den >= q.spokenContent * followSpokenMin.num
+        let displayOk = q.displayMatched * followDisplayMin.den >= q.displayContent * followDisplayMin.num
+        return spokenOk && displayOk
+    }
+
     /// The whole alignment in one call.  `segments` + `sourceText` are the
-    /// spoken script's spans and the markdown they index; without them the
-    /// alignment anchors on words that occur once on each side.
+    /// spoken script's spans and the markdown they index; without them (a
+    /// distilled script) the alignment anchors on words that occur once on
+    /// each side.  MiniMax pause tags in `spokenText` are blanked first.
     public static func alignSpokenToDisplay(
         spokenText: String,
         displayText: String,
         segments: [SpeechSpan]? = nil,
         sourceText: String? = nil
     ) -> KaraokeAlignment {
-        let spokenWords = tokenize(spokenText)
+        let spokenWords = tokenize(SpokenPause.mask(spokenText))
         let displayWords = tokenize(displayText)
         var guide: [Int]?
         if let segments, let sourceText, !sourceText.isEmpty {
             guide = guideFromSpans(spokenWords, segments: segments, sourceText: sourceText, displayWords: displayWords)
         }
         let guided = guide?.contains(where: { $0 >= 0 }) ?? false
+        let mapping = alignWords(spokenWords, displayWords, guide: guided ? guide : nil)
+        let quality = quality(spokenWords, displayWords, mapping)
         return KaraokeAlignment(
             spokenWords: spokenWords,
             displayWords: displayWords,
-            mapping: alignWords(spokenWords, displayWords, guide: guided ? guide : nil),
-            guided: guided
+            mapping: mapping,
+            guided: guided,
+            quality: quality,
+            followable: followable(quality)
         )
     }
 

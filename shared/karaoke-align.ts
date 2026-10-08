@@ -1,9 +1,15 @@
 // Karaoke on the main message: which word on screen is being spoken now.
 //
-// The voice reads a spoken script (shared/speech-spans.ts) that is the message
-// with some things skipped ("(a code block)" instead of the code), some things
-// added ("a link"), and, from an LLM distiller, sometimes numbers or acronyms
-// spelled out ("seven four nine" for 749).  The words on screen come from the
+// The voice reads a spoken script that is the message with some things
+// skipped and some things added.  By default that script is the distilled
+// rewrite (server/tts/speech-summary.ts): numbers, codes, acronyms and links
+// spelled out ("seven four nine" for 749, "A P I" for API, "example dot com"),
+// code skipped, lists retold with "First" and "Next", light rewording.  In
+// "off" mode, or when the distiller falls back, it is the deterministic
+// script (shared/speech-spans.ts): "(a code block)" instead of the code, "a
+// link" for a bare URL.  The owner's ask is that the highlight follow the main
+// message either way, tolerating skipped and added words the way a person
+// reading aloud would (owner correction, 2026-10-08).  The words on screen come from the
 // RENDERED message (DOM text on the Mac, the rendered AttributedString on
 // iOS), not from its markdown.  This module pairs the two word lists with a
 // monotonic alignment and turns spoken-word times into display-word times:
@@ -16,8 +22,13 @@
 // Spans make it precise: when the script came from speakableWithSpans(), each
 // spoken word knows the markdown it came from, the markdown is projected onto
 // the rendered words, and the dynamic program only refines inside a narrow band
-// around that guess.  Without spans, unique words shared by both sides anchor
-// the band instead.
+// around that guess.  Without spans (a distilled script), unique words shared
+// by both sides anchor the band instead, and MiniMax pause tags (`<#0.3#>`)
+// are blanked before the spoken text is tokenized.
+//
+// A script that is genuinely a brief summary lines up with almost nothing, and
+// highlighting it would light words at random.  karaokeFollowable() says when
+// an alignment is good enough to show (see FOLLOW_* below).
 //
 // Everything here is pure, deterministic, and integer-scored so the Swift
 // mirror (ios/Sources/CompanionCore/KaraokeAlign.swift) reproduces it exactly;
@@ -25,6 +36,7 @@
 // are UTF-16 code units.  Times are milliseconds.
 
 import { sourceOffsetAt, type SpeechSpan } from "./speech-spans.ts";
+import { maskPauseTags } from "./spoken-script.ts";
 
 export interface WordToken {
   /** UTF-16 offsets into the tokenized text, end exclusive. */
@@ -81,21 +93,44 @@ const TENS = new Map<string, number>([
   ["ninety", 90],
 ]);
 const SCALES = new Map<string, number>([["thousand", 1_000], ["million", 1_000_000], ["billion", 1_000_000_000]]);
+/** Ordinals, as the last word of a reading ("twenty-fourth" for 10/24 or the
+ * 24th).  "first" and "second" stand alone too often ("First, ...", "a
+ * second") to equal a digit by themselves; they still end a longer reading
+ * ("twenty first"). */
+const ORDINAL_UNITS = new Map<string, number>([
+  ["first", 1], ["second", 2], ["third", 3], ["fourth", 4], ["fifth", 5], ["sixth", 6], ["seventh", 7], ["eighth", 8],
+  ["ninth", 9],
+]);
+const ORDINAL_TEENS = new Map<string, number>([
+  ["tenth", 10], ["eleventh", 11], ["twelfth", 12], ["thirteenth", 13], ["fourteenth", 14], ["fifteenth", 15],
+  ["sixteenth", 16], ["seventeenth", 17], ["eighteenth", 18], ["nineteenth", 19],
+]);
+const ORDINAL_TENS = new Map<string, number>([
+  ["twentieth", 20], ["thirtieth", 30], ["fortieth", 40], ["fiftieth", 50], ["sixtieth", 60], ["seventieth", 70],
+  ["eightieth", 80], ["ninetieth", 90],
+]);
 const ASCII_DIGITS = /^[0-9]+$/;
+/** "24th", "1st", "3rd": digits with an ordinal suffix. */
+const ASCII_ORDINAL = /^([0-9]+)(?:st|nd|rd|th)$/;
 const has = (table: Map<string, number>, key: string): boolean => table.has(key);
 const value = (table: Map<string, number>, key: string): number => table.get(key) ?? 0;
 
 /** Value of a single word as a decimal string: "749" -> "749", "007" -> "7",
  * "seven" -> "7", "twenty" -> "20".  Null for anything else. */
+/** One lookup for every word numberKey knows. */
+const NUMBER_WORDS = new Map<string, string>();
+for (const table of [UNITS, TEENS, TENS, ORDINAL_UNITS, ORDINAL_TEENS, ORDINAL_TENS]) {
+  for (const [word, n] of table) if (word !== "first" && word !== "second") NUMBER_WORDS.set(word, String(n));
+}
+
 export function numberKey(key: string): string | null {
-  if (ASCII_DIGITS.test(key)) {
-    const trimmed = key.replace(/^0+(?=[0-9])/, "");
-    return trimmed;
+  const c0 = key.charCodeAt(0);
+  if (c0 >= 48 && c0 <= 57) {
+    if (ASCII_DIGITS.test(key)) return key.replace(/^0+(?=[0-9])/, "");
+    const ordinal = ASCII_ORDINAL.exec(key);
+    return ordinal ? ordinal[1].replace(/^0+(?=[0-9])/, "") : null;
   }
-  if (has(UNITS, key)) return String(value(UNITS, key));
-  if (has(TEENS, key)) return String(value(TEENS, key));
-  if (has(TENS, key)) return String(value(TENS, key));
-  return null;
+  return NUMBER_WORDS.get(key) ?? null;
 }
 
 /** "seven four nine", "zero oh seven": one digit per word.  "oh" is zero. */
@@ -107,13 +142,23 @@ function digitOf(key: string): string | null {
 }
 
 /** Cardinal reading: "seven hundred and forty nine", "twenty three",
- * "two thousand twenty six".  Returns the value or null. */
+ * "two thousand twenty six", and an ordinal at the end ("twenty fourth").
+ * Returns the value or null. */
 function parseCardinal(keys: readonly string[]): string | null {
   let total = 0;
   let current = 0;
-  let last: "none" | "unit" | "teen" | "tens" | "hundred" | "scale" | "and" = "none";
+  let last: "none" | "unit" | "teen" | "tens" | "hundred" | "scale" | "and" | "ordinal" = "none";
   for (const key of keys) {
-    if (has(UNITS, key) && key !== "zero") {
+    if (last === "ordinal") return null;
+    if (has(ORDINAL_UNITS, key)) {
+      if (last !== "none" && last !== "tens" && last !== "hundred" && last !== "scale" && last !== "and") return null;
+      current += value(ORDINAL_UNITS, key);
+      last = "ordinal";
+    } else if (has(ORDINAL_TEENS, key) || has(ORDINAL_TENS, key)) {
+      if (last !== "none" && last !== "hundred" && last !== "scale" && last !== "and") return null;
+      current += has(ORDINAL_TEENS, key) ? value(ORDINAL_TEENS, key) : value(ORDINAL_TENS, key);
+      last = "ordinal";
+    } else if (has(UNITS, key) && key !== "zero") {
       if (last !== "none" && last !== "tens" && last !== "hundred" && last !== "scale" && last !== "and") return null;
       current += value(UNITS, key);
       last = "unit";
@@ -182,13 +227,45 @@ function parseGrouped(keys: readonly string[]): string | null {
 
 const MAX_EXPANSION = 8;
 
-/** For each spoken word, the display keys a run of 2..8 spoken words starting
- * there can stand for, with the run lengths.  Covers digits read one by one,
- * cardinals, paired years, and letters spelled out ("a p i" for "API"). */
-function spokenExpansions(words: readonly WordToken[]): Array<Map<string, number[]> | undefined> {
+/** A word as it reads inside a spelled-out code: a digit or teen word as
+ * its digits, anything else as itself. */
+function codedPiece(key: string): string {
+  return digitOf(key) ?? (has(TEENS, key) ? String(value(TEENS, key)) : key);
+}
+
+/** Every prefix of every display key, at code point boundaries.  A joined
+ * reading only grows while it is still one of these, so joining costs almost
+ * nothing for ordinary prose. */
+function keyPrefixes(words: readonly WordToken[]): Set<string> {
+  const out = new Set<string>();
+  for (const w of words) {
+    let acc = "";
+    for (const ch of w.key) {
+      acc += ch;
+      out.add(acc);
+    }
+  }
+  return out;
+}
+
+/** For each spoken word, the display values a run of 2..8 spoken words
+ * starting there can stand for, with the run lengths:
+ * - joined: the keys run together, raw ("jet blue" for JetBlue, "some one")
+ *   and with digit and teen words as digits ("A P I" for API, "A P Is" for
+ *   APIs, "Q three" for Q3, "B twelve" for B12, "seven four nine" for 749,
+ *   "D L nine eight two" for DL982);
+ * - read as a number: cardinals ("two hundred and fifty", "twenty fourth")
+ *   and paired years ("nineteen eighty four").
+ * `prefixes` are the display keys' prefixes (keyPrefixes); only values
+ * `accept` keeps (a display key, or a display number) are recorded. */
+function spokenExpansions(
+  words: readonly WordToken[],
+  prefixes: ReadonlySet<string>,
+  accept: (value: string) => boolean,
+): Array<Map<string, number[]> | undefined> {
   const out: Array<Map<string, number[]> | undefined> = Array.from({ length: words.length }, () => undefined);
   const add = (i: number, value: string | null, k: number): void => {
-    if (value === null) return;
+    if (value === null || !accept(value)) return;
     let map = out[i];
     if (!map) {
       map = new Map();
@@ -201,35 +278,23 @@ function spokenExpansions(words: readonly WordToken[]): Array<Map<string, number
   for (let i = 0; i < words.length; i += 1) {
     const first = words[i].key;
     const numeric = digitOf(first) !== null || has(TEENS, first) || has(TENS, first);
-    const letter = first.length === 1 && !(first >= "0" && first <= "9");
-    if (!numeric && !letter) continue;
-    let digits = "";
-    let digitsOk = true;
-    let letters = "";
-    let lettersOk = letter;
+    let raw: string | null = prefixes.has(first) ? first : null;
+    const firstCoded = codedPiece(first);
+    let coded: string | null = prefixes.has(firstCoded) ? firstCoded : null;
     const keys: string[] = [first];
-    const firstDigit = digitOf(first);
-    if (firstDigit === null) digitsOk = false;
-    else digits = firstDigit;
-    if (lettersOk) letters = first;
     for (let k = 2; k <= MAX_EXPANSION && i + k <= words.length; k += 1) {
+      if (raw === null && coded === null && !numeric) break;
       const key = words[i + k - 1].key;
       keys.push(key);
-      if (digitsOk) {
-        const d = digitOf(key);
-        if (d === null) digitsOk = false;
-        else {
-          digits += d;
-          add(i, digits, k);
-        }
+      if (raw !== null) {
+        raw += key;
+        if (prefixes.has(raw)) add(i, raw, k);
+        else raw = null;
       }
-      if (lettersOk) {
-        if (key.length === 1 && !(key >= "0" && key <= "9")) {
-          letters += key;
-          add(i, letters, k);
-        } else {
-          lettersOk = false;
-        }
+      if (coded !== null) {
+        coded += codedPiece(key);
+        if (prefixes.has(coded)) add(i, coded, k);
+        else coded = null;
       }
       if (numeric) {
         add(i, parseCardinal(keys), k);
@@ -501,26 +566,46 @@ function alignCore(
   };
   const rowNum = new Int32Array(R).fill(-1);
   const colNum = new Int32Array(C).fill(-1);
+  const colValues = new Set<string>();
   if (params.numbers) {
     for (let i = 0; i < R; i += 1) rowNum[i] = internNum(numberKey(rows[i].key));
-    for (let j = 0; j < C; j += 1) colNum[j] = internNum(numberKey(cols[j].key));
+    for (let j = 0; j < C; j += 1) {
+      const n = numberKey(cols[j].key);
+      colNum[j] = internNum(n);
+      if (n !== null) colValues.add(n);
+    }
   }
-  // Expansions keyed by the display key's id; values no display word has are dropped.
+  // Expansions keyed by the display key's id, and (for a reading that is a
+  // number) by the display word's number value, so "twenty fourth" lands on
+  // "24th" and "zero seven" on "007".  Values no display word has are dropped.
   const expansions: Array<Map<number, number[]> | undefined> = Array.from({ length: R }, () => undefined);
+  const numExpansions: Array<Map<number, number[]> | undefined> = Array.from({ length: R }, () => undefined);
+  const put = (tables: Array<Map<number, number[]> | undefined>, i: number, id: number, ks: readonly number[]): void => {
+    let byId = tables[i];
+    if (!byId) {
+      byId = new Map();
+      tables[i] = byId;
+    }
+    const list = byId.get(id);
+    if (!list) byId.set(id, [...ks]);
+    else for (const k of ks) if (!list.includes(k)) list.push(k);
+  };
   if (params.numbers) {
-    const raw = spokenExpansions(rows);
+    const colWords = new Set<string>();
+    for (const w of cols) colWords.add(w.key);
+    const accept = (value: string): boolean =>
+      colWords.has(value) || (ASCII_DIGITS.test(value) && colValues.has(value.replace(/^0+(?=[0-9])/, "")));
+    const raw = spokenExpansions(rows, keyPrefixes(cols), accept);
     for (let i = 0; i < R; i += 1) {
       const table = raw[i];
       if (!table) continue;
       for (const [value, ks] of table) {
         const id = ids.get(value);
-        if (id === undefined) continue;
-        let byId = expansions[i];
-        if (!byId) {
-          byId = new Map();
-          expansions[i] = byId;
+        if (id !== undefined) put(expansions, i, id, ks);
+        if (ASCII_DIGITS.test(value)) {
+          const numId = nums.get(value.replace(/^0+(?=[0-9])/, ""));
+          if (numId !== undefined) put(numExpansions, i, numId, ks);
         }
-        byId.set(id, ks);
       }
     }
   }
@@ -550,6 +635,7 @@ function alignCore(
     const upHi = i > 0 ? hi[i - 1] : -1;
     const upBase = i > 0 ? offset[i - 1] - upLo : 0;
     const table = i < R ? expansions[i] : undefined;
+    const numTable = i < R ? numExpansions[i] : undefined;
     for (let j = rowLo; j <= rowHi; j += 1) {
       const idx = base + j;
       let best = score[idx];
@@ -590,10 +676,13 @@ function alignCore(
       }
       score[idx] = best;
       move[idx] = bestMove;
-      // Expansions: k spoken words standing for one display word.
-      if (table !== undefined && best > NEG && j < C) {
-        const ks = table.get(colKey[j]);
-        if (ks) {
+      // Expansions: k spoken words standing for one display word, matched
+      // by the display key, then by its number value.
+      // (No closure here: one capturing i, j or best would slow every cell.)
+      if ((table !== undefined || numTable !== undefined) && best > NEG && j < C) {
+        for (let pass = 0; pass < 2; pass += 1) {
+          const ks = pass === 0 ? table?.get(colKey[j]) : colNum[j] >= 0 ? numTable?.get(colNum[j]) : undefined;
+          if (!ks) continue;
           for (const k of ks) {
             if (i + k > R) continue;
             const target = at(i + k, j + 1);
@@ -777,12 +866,102 @@ export function alignWords(
   };
 }
 
+// ── is it worth following? ────────────────────────────────────────────────
+
+/** Words that carry no content of their own: they match by accident, so they
+ * count on neither side when judging an alignment. */
+const FUNCTION_WORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "nor", "of", "to", "in", "on", "at", "for", "with", "by", "from", "as", "into",
+  "is", "are", "was", "were", "be", "been", "being", "am", "it", "its", "this", "that", "these", "those", "i", "you",
+  "we", "they", "he", "she", "me", "my", "your", "our", "their", "so", "then", "there", "here", "do", "does", "did",
+  "has", "have", "had", "not", "no", "if", "now", "just", "also", "can", "will", "would", "up", "out", "all",
+]);
+/** Words the distiller adds that the screen never shows: spelled symbols and
+ * list transitions.  Not content on the spoken side. */
+const SPOKEN_GLUE_WORDS = new Set([
+  "dot", "slash", "colon", "underscore", "dash", "hyphen", "point", "percent", "dollar", "dollars", "cents", "plus",
+  "minus", "equals", "hash", "first", "next", "finally", "lastly", "second", "third", "oh",
+]);
+
+/** Spoken and display content words, and how many of each the alignment
+ * really paired (exact, equivalent, fuzzy or expanded; a substitution or an
+ * attached insert does not count). */
+export interface KaraokeQuality {
+  spokenContent: number;
+  spokenMatched: number;
+  displayContent: number;
+  displayMatched: number;
+}
+
+/**
+ * Follow the voice only when at least a third of the spoken content words
+ * pair with words on screen, and at least an eighth of the content words on
+ * screen are paired.
+ *
+ * Measured on the distilled fixtures in karaoke-align.test.ts (spoken /
+ * screen pairing):
+ * - faithful rewrites, with numbers, codes, acronyms and URLs spelled out,
+ *   lists retold and code skipped: 80 to 100 percent / 67 to 100 percent;
+ * - a rewrite that retells a list of seven paths in one line: 67 / 16;
+ * - a condensed retelling that keeps the reply's order: 87 / 22 (followed:
+ *   the highlight walks the same sentences and sweeps the rest);
+ * - a brief summary that reuses the reply's words ("the flaky cache test was
+ *   a race between workers"): 25 / 3;
+ * - a brief summary in new words: 0 / 0.
+ * Either summary highlighted would light words scattered across paragraphs
+ * the voice never reads.  The spoken bar sits at a third, under half the
+ * worst faithful rewrite; the screen bar at an eighth, under the path list
+ * and four times the reusing summary.
+ */
+export const FOLLOW_SPOKEN_MIN = { num: 1, den: 3 } as const;
+export const FOLLOW_DISPLAY_MIN = { num: 1, den: 8 } as const;
+
+const MATCHED_KINDS = new Set([SPOKEN_EXACT, SPOKEN_EQUIVALENT, SPOKEN_FUZZY, SPOKEN_EXPANDED]);
+
+export function alignmentQuality(
+  spokenWords: readonly WordToken[],
+  displayWords: readonly WordToken[],
+  mapping: KaraokeMapping,
+): KaraokeQuality {
+  let spokenContent = 0;
+  let spokenMatched = 0;
+  const hit = new Uint8Array(displayWords.length);
+  for (let s = 0; s < spokenWords.length; s += 1) {
+    const matched = MATCHED_KINDS.has(mapping.spokenKind[s]);
+    if (matched && mapping.spokenToDisplay[s] >= 0) hit[mapping.spokenToDisplay[s]] = 1;
+    const key = spokenWords[s].key;
+    if (FUNCTION_WORDS.has(key) || SPOKEN_GLUE_WORDS.has(key)) continue;
+    spokenContent += 1;
+    if (matched) spokenMatched += 1;
+  }
+  let displayContent = 0;
+  let displayMatched = 0;
+  for (let d = 0; d < displayWords.length; d += 1) {
+    if (FUNCTION_WORDS.has(displayWords[d].key)) continue;
+    displayContent += 1;
+    if (hit[d]) displayMatched += 1;
+  }
+  return { spokenContent, spokenMatched, displayContent, displayMatched };
+}
+
+/** Whether the highlight should follow this alignment at all (see
+ * FOLLOW_SPOKEN_MIN).  Integer math, so the Swift mirror agrees exactly. */
+export function karaokeFollowable(q: KaraokeQuality): boolean {
+  if (q.spokenMatched === 0) return false;
+  const spokenOk = q.spokenMatched * FOLLOW_SPOKEN_MIN.den >= q.spokenContent * FOLLOW_SPOKEN_MIN.num;
+  const displayOk = q.displayMatched * FOLLOW_DISPLAY_MIN.den >= q.displayContent * FOLLOW_DISPLAY_MIN.num;
+  return spokenOk && displayOk;
+}
+
 export interface KaraokeAlignment {
   spokenWords: WordToken[];
   displayWords: WordToken[];
   mapping: KaraokeMapping;
   /** True when spans guided the alignment. */
   guided: boolean;
+  quality: KaraokeQuality;
+  /** karaokeFollowable(quality): false means show no highlight at all. */
+  followable: boolean;
 }
 
 /**
@@ -790,6 +969,8 @@ export interface KaraokeAlignment {
  *
  * - `spokenText`: exactly the text handed to the voice (SpokenScript.text,
  *   or the utterances joined with single spaces, which is the same string).
+ *   MiniMax pause tags in it are blanked to spaces before tokenizing, so word
+ *   offsets still index the text as given.
  * - `displayText`: the rendered message text (the highlighter's `text`).
  * - `segments` + `sourceText`: the script's spans and the markdown they index
  *   into.  Optional; without them the alignment falls back to unique-word
@@ -803,18 +984,15 @@ export function alignSpokenToDisplay(input: {
   spokenWords?: WordToken[];
   displayWords?: WordToken[];
 }): KaraokeAlignment {
-  const spokenWords = input.spokenWords ?? tokenizeWords(input.spokenText);
+  const spokenWords = input.spokenWords ?? tokenizeWords(maskPauseTags(input.spokenText));
   const displayWords = input.displayWords ?? tokenizeWords(input.displayText);
   const guide = input.segments && input.sourceText
     ? guideFromSpans(spokenWords, input.segments, input.sourceText, displayWords)
     : null;
   const guided = Boolean(guide && guide.some((g) => g >= 0));
-  return {
-    spokenWords,
-    displayWords,
-    mapping: alignWords(spokenWords, displayWords, { guide: guided ? guide : null }),
-    guided,
-  };
+  const mapping = alignWords(spokenWords, displayWords, { guide: guided ? guide : null });
+  const quality = alignmentQuality(spokenWords, displayWords, mapping);
+  return { spokenWords, displayWords, mapping, guided, quality, followable: karaokeFollowable(quality) };
 }
 
 // ── timing ────────────────────────────────────────────────────────────────

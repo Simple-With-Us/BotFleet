@@ -19,6 +19,9 @@ final class KaraokeAlignTests: XCTestCase {
             let displayFirstSpoken: [Int]
             let displayLastSpoken: [Int]
             let timeline: [Double]
+            /// [spokenContent, spokenMatched, displayContent, displayMatched]
+            let quality: [Int]
+            let followable: Bool
         }
 
         /// [start, end, key]
@@ -72,6 +75,12 @@ final class KaraokeAlignTests: XCTestCase {
             XCTAssertEqual(a.mapping.spokenKind, c.spokenKind, "spokenKind: \(c.name)")
             XCTAssertEqual(a.mapping.displayFirstSpoken, c.displayFirstSpoken, "displayFirstSpoken: \(c.name)")
             XCTAssertEqual(a.mapping.displayLastSpoken, c.displayLastSpoken, "displayLastSpoken: \(c.name)")
+            XCTAssertEqual(
+                [a.quality.spokenContent, a.quality.spokenMatched, a.quality.displayContent, a.quality.displayMatched],
+                c.quality,
+                "quality: \(c.name)"
+            )
+            XCTAssertEqual(a.followable, c.followable, "followable: \(c.name)")
 
             let timeline = KaraokeAlign.buildTimeline(spokenTimes: evenTimes(a.spokenWords.count), mapping: a.mapping)
             XCTAssertEqual(timeline.count, c.timeline.count, "timeline length: \(c.name)")
@@ -87,6 +96,49 @@ final class KaraokeAlignTests: XCTestCase {
         XCTAssertEqual(a.mapping.spokenKind[1], KaraokeAlign.spokenExpanded)
         let b = KaraokeAlign.alignSpokenToDisplay(spokenText: "about twenty-three items", displayText: "about 23 items")
         XCTAssertEqual(b.mapping.spokenToDisplay, [0, 1, 1, 2])
+    }
+
+    func testTheFixtureCoversDistilledScriptsAndBriefSummaries() throws {
+        let fixture = try SpeechSpansTests.loadFixture("karaoke-align", as: Fixture.self)
+        let distilled = fixture.cases.filter { $0.name.hasPrefix("distilled:") }
+        XCTAssertGreaterThanOrEqual(distilled.count, 6)
+        XCTAssertTrue(distilled.allSatisfy(\.followable))
+        let summaries = fixture.cases.filter { $0.name.hasPrefix("brief summary") }
+        XCTAssertEqual(summaries.count, 2)
+        XCTAssertTrue(summaries.allSatisfy { !$0.followable })
+    }
+
+    func testADistilledScriptLandsOnTheRenderedWords() {
+        let a = KaraokeAlign.alignSpokenToDisplay(
+            spokenText: "Next, issue seven four nine was fixed. <#0.3#> The A P I timeout is three point five seconds.",
+            displayText: "Fixed issue #749\nThe API timeout is 3.5 seconds"
+        )
+        let landed = a.spokenWords.indices.map { i -> String in
+            let d = a.mapping.spokenToDisplay[i]
+            return d >= 0 ? a.displayWords[d].text : "-"
+        }
+        let pairs = Dictionary(zip(a.spokenWords.map(\.text), landed), uniquingKeysWith: { first, _ in first })
+        XCTAssertEqual(pairs["seven"], "749")
+        XCTAssertEqual(pairs["nine"], "749")
+        XCTAssertEqual(pairs["A"], "API")
+        XCTAssertEqual(pairs["five"], "5")
+        XCTAssertFalse(a.spokenWords.contains { $0.text == "0" }, "pause tags are not words")
+        XCTAssertTrue(a.followable)
+    }
+
+    func testPauseTagsAreBlankedWithoutMovingOffsets() {
+        let spoken = "Done. <#0.3#> Next, the tests. <#1.25#> Done."
+        XCTAssertEqual((SpokenPause.mask(spoken) as NSString).length, (spoken as NSString).length)
+        let a = KaraokeAlign.alignSpokenToDisplay(spokenText: spoken, displayText: "Done.\nThe tests.\nDone.")
+        XCTAssertEqual(a.spokenWords.map { (spoken as NSString).substring(with: NSRange(location: $0.start, length: $0.end - $0.start)) },
+                       ["Done", "Next", "the", "tests", "Done"])
+    }
+
+    func testFollowThresholdsMatchTheTypeScriptRule() {
+        XCTAssertTrue(KaraokeAlign.followable(KaraokeQuality(spokenContent: 3, spokenMatched: 1, displayContent: 8, displayMatched: 1)))
+        XCTAssertFalse(KaraokeAlign.followable(KaraokeQuality(spokenContent: 4, spokenMatched: 1, displayContent: 8, displayMatched: 1)))
+        XCTAssertFalse(KaraokeAlign.followable(KaraokeQuality(spokenContent: 3, spokenMatched: 1, displayContent: 9, displayMatched: 1)))
+        XCTAssertFalse(KaraokeAlign.followable(KaraokeQuality(spokenContent: 0, spokenMatched: 0, displayContent: 0, displayMatched: 0)))
     }
 
     func testClipTimesSpreadByCharacterOffset() {
