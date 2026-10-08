@@ -11,6 +11,7 @@ import {
   artifactNameFor,
   assertExtractedBundleContained,
   assertSafeArchiveEntries,
+  authHeaders,
   BUNDLE_ROOT,
   classifyResolutionFailure,
   downloadBuiltBundle,
@@ -20,6 +21,7 @@ import {
   readSymlinkTargets,
   maskedKeyPreview,
   materializeBuild,
+  resetGhAuthCacheForTests,
   ResolutionError,
   selectCommitRun,
   updateSourcePolicy,
@@ -415,6 +417,87 @@ test("an entry name crafted to defeat a column parser is still checked", () => {
 function escapeForRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+test("authHeaders falls back to gh auth token when env tokens are absent", () => {
+  resetGhAuthCacheForTests();
+  const GH_PREFIX = "ghp";
+  const cliToken = [GH_PREFIX, "cli_fallback_token_0123456789abcd"].join("_");
+  let ghCalls = 0;
+  const execFileSyncImpl = (command, args) => {
+    ghCalls += 1;
+    assert.equal(command, "gh");
+    assert.deepEqual(args, ["auth", "token"]);
+    return `${cliToken}\n`;
+  };
+  assert.deepEqual(authHeaders({}, { execFileSyncImpl }), { authorization: `Bearer ${cliToken}` });
+  assert.equal(ghCalls, 1, "gh is consulted once and then cached");
+  assert.deepEqual(authHeaders({}, { execFileSyncImpl }), { authorization: `Bearer ${cliToken}` });
+  assert.equal(ghCalls, 1, "the cached token is reused");
+});
+
+test("authHeaders skips gh when an env token is present", () => {
+  resetGhAuthCacheForTests();
+  const execFileSyncImpl = () => {
+    throw new Error("gh must not run when GITHUB_TOKEN is set");
+  };
+  assert.deepEqual(
+    authHeaders({ GITHUB_TOKEN: "env-only-token" }, { execFileSyncImpl }),
+    { authorization: "Bearer env-only-token" },
+  );
+  assert.deepEqual(
+    authHeaders({ GH_TOKEN: "gh-env-token" }, { execFileSyncImpl }),
+    { authorization: "Bearer gh-env-token" },
+  );
+});
+
+test("authHeaders swallows gh failures and leaves authorization unset", () => {
+  resetGhAuthCacheForTests();
+  const execFileSyncImpl = (command) => {
+    throw new Error(`${command} unavailable`);
+  };
+  assert.deepEqual(authHeaders({}, { execFileSyncImpl }), {});
+});
+
+test("an artifact download 401 names the commit and explains token setup", async (t) => {
+  resetGhAuthCacheForTests();
+  const execFileSyncImpl = () => {
+    throw new Error("no gh in this fixture");
+  };
+  let calls = 0;
+  const fetchImpl = async (url) => {
+    calls += 1;
+    if (calls === 1) {
+      return { ok: true, status: 200, json: async () => successfulRuns };
+    }
+    if (calls === 2) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ artifacts: [anArtifact({})] }),
+      };
+    }
+    return { ok: false, status: 401, arrayBuffer: async () => new ArrayBuffer(0) };
+  };
+  await assert.rejects(
+    downloadBuiltBundle({
+      commit: COMMIT,
+      destination: await fixture(t),
+      fetchImpl,
+      env: {},
+      execFileSyncImpl,
+    }),
+    (error) => {
+      assert.equal(error.cause, "unauthorized");
+      assert.match(error.message, new RegExp(COMMIT));
+      assert.match(error.message, /gh auth login/);
+      assert.match(error.message, /GITHUB_TOKEN/);
+      assert.doesNotMatch(error.message, /public repo/);
+      assert.doesNotMatch(error.message, /not a full commit/);
+      return true;
+    },
+  );
+  assert.equal(calls, 3, "two lookups plus one download attempt");
+});
 
 test("a rejected key is named by a masked preview, never printed", async () => {
   // A 401 that cannot say WHICH key was rejected is not a diagnosis, and the
