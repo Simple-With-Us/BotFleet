@@ -234,11 +234,16 @@ final class MessageKaraoke {
         guard !disposed else { return false }
         let t = now()
         let next = playhead.frame(at: t)
-        if next != frame {
+        let changed = next != frame
+        if changed {
             frame = next
             repaint()
         }
-        if playhead.idle(at: t) {
+        // Between clips the clip clock holds still (the next one may still
+        // be in synthesis), so the frame cannot change until attachClip,
+        // which starts the ticker again.
+        let waitingForClip = mode == .clips && debugClock == nil && !clipClock.isAttached && !changed
+        if playhead.idle(at: t) || waitingForClip {
             ticker?.invalidate()
             ticker = nil
             return false

@@ -327,6 +327,12 @@ export function createKaraokeHighlighter(
   let live = false;
   let liveIndex = -1;
   let disposed = false;
+  /** The time last painted, and whether the paint is stale anyway (a new
+   * timeline, a cue, a reset).  A clock that has not moved since then, as
+   * between two clips or while one is paused, paints nothing new, so the
+   * frame loop skips the work and the highlight invalidation it costs. */
+  let renderedAt = Number.NaN;
+  let dirty = true;
 
   const register = (): void => {
     if (!supported || !env.highlights || !env.createHighlight) return;
@@ -358,6 +364,7 @@ export function createKaraokeHighlighter(
   };
 
   const resetPaint = (): void => {
+    dirty = true;
     ahead?.clear();
     trail?.clear();
     current?.clear();
@@ -393,6 +400,8 @@ export function createKaraokeHighlighter(
 
   const renderAt = (t: number): void => {
     if (!supported || !ahead || !current || !trail || disposed) return;
+    renderedAt = t;
+    dirty = false;
     const c = indexAt(t);
     // Words before c (and c itself) leave the dimmed set as they are reached.
     if (dimAhead) {
@@ -474,12 +483,16 @@ export function createKaraokeHighlighter(
     return t >= timeline[2 * count - 1] + trailMs;
   };
 
+  /** Live mode with nothing left to animate until the next cue: the last
+   * cued word and its trail are over.  cue() starts the loop again. */
+  const liveIdleAt = (t: number): boolean => live && (liveIndex < 0 || t >= timeline[2 * liveIndex + 1] + trailMs);
+
   const loop = (): void => {
     frame = null;
     if (!clock || disposed) return;
     const t = clock();
-    renderAt(t);
-    if (finishedAt(t)) return;
+    if (dirty || t !== renderedAt) renderAt(t);
+    if (finishedAt(t) || liveIdleAt(t)) return;
     frame = env.requestFrame(loop);
   };
 
@@ -491,6 +504,7 @@ export function createKaraokeHighlighter(
   const setTimeline = (next: ArrayLike<number>): void => {
     timeline = new Float64Array(count * 2);
     for (let i = 0; i < count * 2; i += 1) timeline[i] = i < next.length ? next[i] : Number.POSITIVE_INFINITY;
+    dirty = true;
   };
 
   const stop = (): void => {
@@ -506,6 +520,7 @@ export function createKaraokeHighlighter(
     trailRanges = [];
     painted = -1;
     aheadFrom = count;
+    dirty = true;
     unregister();
   };
 
@@ -575,6 +590,7 @@ export function createKaraokeHighlighter(
         timeline[2 * index + 1] = at + budget + duration;
         liveIndex = index;
       }
+      dirty = true;
       ensureLoop();
     },
     renderAt,

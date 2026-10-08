@@ -232,6 +232,10 @@ public struct KaraokeClipClock: Sendable {
         self.clips = clips
     }
 
+    /// A clip is playing.  While none is (between clips) the clock holds
+    /// still, so nothing on screen changes until the next clip attaches.
+    public var isAttached: Bool { attached }
+
     /// Clip `index` is now the audible one, `durationSeconds` long.  True
     /// when the windows moved (re-time the words).
     @discardableResult

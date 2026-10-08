@@ -187,6 +187,46 @@ describe("timeline painting", () => {
     hl.dispose();
   });
 
+  it("paints nothing new while the clock holds, as between two clips", () => {
+    const fake = fakeEnv();
+    let t = 0;
+    const hl = createKaraokeHighlighter(mount("<p>one two three</p>"), { env: fake.env, dimAhead: false });
+    hl.play(evenTimeline(3), () => t);
+    // Count every write to the highlight registry's sets.
+    const writes = { count: 0 };
+    expect(fake.registry.size).toBe(3);
+    for (const highlight of fake.registry.values()) {
+      const add = highlight.add.bind(highlight);
+      const remove = highlight.delete.bind(highlight);
+      highlight.add = (range) => {
+        writes.count += 1;
+        return add(range);
+      };
+      highlight.delete = (range) => {
+        writes.count += 1;
+        return remove(range);
+      };
+    }
+    // Clip one ended mid-trail; clip two is still being made.
+    t = 300;
+    fake.flush();
+    expect(fake.painted("trail")).toEqual(["one"]);
+    const settled = writes.count;
+    expect(settled).toBeGreaterThan(0);
+    for (let i = 0; i < 5; i += 1) expect(fake.flush()).toBe(1); // still running
+    expect(writes.count).toBe(settled);
+    // New clip windows repaint at once, even with the clock still held.
+    hl.setTimeline(evenTimeline(3).map((ms) => ms + 50));
+    fake.flush();
+    expect(writes.count).toBeGreaterThan(settled);
+    expect(fake.painted("current")).toEqual([]);
+    // The next clip starts: the loop follows the clock again.
+    t = 420;
+    fake.flush();
+    expect(hl.currentIndex).toBe(1);
+    hl.dispose();
+  });
+
   it("clears its highlights on stop and leaves another message's alone", () => {
     const fake = fakeEnv();
     const first = createKaraokeHighlighter(mount("<p>first message</p>"), { env: fake.env });
@@ -244,6 +284,28 @@ describe("live cues", () => {
     hl.cue(2, 250, 10_000);
     hl.renderAt(651);
     expect(hl.currentIndex).toBe(2);
+    hl.dispose();
+  });
+
+  it("stops its frame loop once the last cued word has settled, and a cue starts it again", () => {
+    const fake = fakeEnv();
+    const hl = createKaraokeHighlighter(mount("<p>alpha beta</p>"), { env: fake.env, trailMs: 200 });
+    fake.setNow(0);
+    hl.cue(0, 250);
+    fake.setNow(100);
+    expect(fake.flush()).toBe(1);
+    expect(hl.currentIndex).toBe(0);
+    // The voice pauses after the word: once its trail is over, the loop ends.
+    fake.setNow(460);
+    fake.flush();
+    expect(fake.painted("trail")).toEqual([]);
+    expect(fake.flush()).toBe(0);
+    // The next word wakes it.
+    fake.setNow(900);
+    hl.cue(1, 250);
+    fake.setNow(950);
+    expect(fake.flush()).toBe(1);
+    expect(hl.currentIndex).toBe(1);
     hl.dispose();
   });
 

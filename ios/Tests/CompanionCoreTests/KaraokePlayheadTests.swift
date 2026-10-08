@@ -143,13 +143,19 @@ final class KaraokePlayheadTests: XCTestCase {
     func testTheClockFollowsThePlayerHoldsBetweenClipsAndNeverGoesBack() {
         var clock = KaraokeClipClock(clips: clips())
         XCTAssertEqual(clock.time(currentTime: nil), 0)
+        XCTAssertFalse(clock.isAttached)
         clock.attach(0, durationSeconds: 1)
+        XCTAssertTrue(clock.isAttached)
         XCTAssertEqual(clock.time(currentTime: 0.25), 250)
         XCTAssertEqual(clock.time(currentTime: 0.1), 250, "never backwards")
         XCTAssertEqual(clock.time(currentTime: 3), 1_000, "clamped to a measured clip")
         clock.detach(0, finished: true)
+        // The bubble's display link stops here; attaching the next clip
+        // starts it again.
+        XCTAssertFalse(clock.isAttached)
         XCTAssertEqual(clock.time(currentTime: 0.5), 1_000, "held between clips")
         clock.attach(1, durationSeconds: 2)
+        XCTAssertTrue(clock.isAttached)
         XCTAssertEqual(clock.time(currentTime: 0.5), 1_500)
         XCTAssertEqual(clock.clips[2].startMs, 3_000)
     }
