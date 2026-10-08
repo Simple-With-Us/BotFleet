@@ -306,6 +306,13 @@ const PROJECTION_PARAMS: Params = {
   band: 24,
 };
 
+/** The projection's band also widens by however many more words one side
+ * has than the other, up to this many.  Source-only words between two
+ * anchors pull the path off the straight line by up to their count, and a
+ * fixed band then follows the wrong guide.  Fenced code, the usual cause, is
+ * taken out before projecting (guideFromSpans), so this only has to cover
+ * URLs, image addresses and the like; the cap bounds the work. */
+const PROJECTION_EXTRA_BAND_MAX = 1000;
 const NEG = -1_000_000_000;
 
 function commonPrefix(a: string, b: string): number {
@@ -644,12 +651,13 @@ function alignCore(
  * list numbers) cheaply.
  */
 export function projectDisplayToSource(displayWords: readonly WordToken[], sourceWords: readonly WordToken[]): Int32Array {
+  const extra = Math.min(PROJECTION_EXTRA_BAND_MAX, Math.abs(sourceWords.length - displayWords.length));
   const core = alignCore(
     displayWords,
     sourceWords,
     PROJECTION_PARAMS,
     uniqueAnchors(displayWords, sourceWords),
-    PROJECTION_PARAMS.band,
+    PROJECTION_PARAMS.band + extra,
   );
   const out = new Int32Array(displayWords.length);
   for (let d = 0; d < displayWords.length; d += 1) {
@@ -671,6 +679,26 @@ function tokenAtOrAfter(tokens: readonly WordToken[], offset: number): number {
   return lo;
 }
 
+/** speakable()'s fence patterns (server/tts/speech-text.ts), whole match. */
+const FENCES = [/```[^\n]*\n[\s\S]*?(?:```|$)/g, /~~~[^\n]*\n[\s\S]*?(?:~~~|$)/g];
+
+/** Source words inside a fenced code block.  The screen never shows them as
+ * reply text (the Mac highlighter skips <pre>, iOS drops the block), so they
+ * stay out of the projection; the voice names the block instead. */
+function fencedWords(sourceText: string, sourceWords: readonly WordToken[]): Uint8Array {
+  const fenced = new Uint8Array(sourceWords.length);
+  for (const pattern of FENCES) {
+    for (const m of sourceText.matchAll(pattern)) {
+      const start = m.index ?? 0;
+      const end = start + m[0].length;
+      for (let w = tokenAtOrAfter(sourceWords, start); w < sourceWords.length && sourceWords[w].start < end; w += 1) {
+        if (sourceWords[w].start >= start) fenced[w] = 1;
+      }
+    }
+  }
+  return fenced;
+}
+
 /**
  * Expected display word for each spoken word, from the script's spans: the
  * spoken word's source offset, the source word there, and that source word's
@@ -685,12 +713,17 @@ export function guideFromSpans(
   const guide = new Int32Array(spokenWords.length).fill(-1);
   const sourceWords = tokenizeWords(sourceText);
   if (!sourceWords.length || !displayWords.length || !segments.length) return guide;
-  const displayToSource = projectDisplayToSource(displayWords, sourceWords);
+  // Project onto the words the screen can show, then index back.
+  const fenced = fencedWords(sourceText, sourceWords);
+  const shown: number[] = [];
+  for (let s = 0; s < sourceWords.length; s += 1) if (!fenced[s]) shown.push(s);
+  const displayToShown = projectDisplayToSource(displayWords, shown.map((s) => sourceWords[s]));
   // Source word -> display word; a source word that is not on screen takes
   // the next one that is (the code block's words point past the block).
   const sourceToDisplay = new Int32Array(sourceWords.length).fill(-1);
-  for (let d = 0; d < displayToSource.length; d += 1) {
-    const s = displayToSource[d];
+  for (let d = 0; d < displayToShown.length; d += 1) {
+    const k = displayToShown[d];
+    const s = k >= 0 ? shown[k] : -1;
     if (s >= 0 && sourceToDisplay[s] < 0) sourceToDisplay[s] = d;
   }
   let next = -1;

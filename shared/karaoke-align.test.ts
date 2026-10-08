@@ -162,6 +162,27 @@ describe("alignSpokenToDisplay", () => {
     expect(docs).toEqual(displayDocs);
   });
 
+  it("follows the spans past a long code block in text with no word used once", () => {
+    // Nothing anchors the projection, and the fence's words are on the
+    // source side only.  A fixed band around a straight line followed the
+    // wrong copy of the sentence and misplaced nearly every word.
+    const sentence = "Then run the build again and check the log for the same error.";
+    const para = [sentence, sentence, sentence, sentence, sentence].join(" ");
+    const shell = Array.from({ length: 60 }, (_, i) => `echo step ${i} && make target${i % 3} --flag value`).join("\n");
+    const source = [para, `\`\`\`sh\n${shell}\n\`\`\``, para, para, para, para, para].join("\n\n");
+    const display = [para, para, para, para, para, para].join("\n");
+    const script = speakableWithSpans(source);
+    const a = alignSpokenToDisplay({ spokenText: script.text, displayText: display, segments: script.segments, sourceText: source });
+    expect(a.guided).toBe(true);
+    // Every word the voice reads from the reply lands on its own copy on
+    // screen, in order; only "a shell code block" has none.
+    const spokenFromReply = a.spokenWords
+      .map((w, i) => ({ i, insert: script.segments.find((g) => g.spokenStart <= w.start && w.start < g.spokenEnd)?.kind === "insert" }))
+      .filter((w) => !w.insert)
+      .map((w) => a.mapping.spokenToDisplay[w.i]);
+    expect(spokenFromReply).toEqual(a.displayWords.map((_, j) => j));
+  });
+
   it("is monotonic: display indices never go backwards", () => {
     const script = speakableWithSpans("One two three. Three two one. One one one two.");
     const a = alignSpokenToDisplay({ spokenText: script.text, displayText: "One two three. Three two one. One one one two." });
@@ -320,6 +341,17 @@ const ALIGN_CASES: Array<{ name: string; spoken?: string; display: string; sourc
     name: "guided table and list",
     source: "| Name | State |\n| --- | --- |\n| Scout | idle |\n\n1. First item\n2. Second item with **bold** text\n\nSee https://example.com/status now.",
     display: "Name\nState\nScout\nidle\nFirst item\nSecond item with bold text\nSee https://example.com/status now.",
+  },
+  {
+    name: "guided long code block",
+    // 30 fence lines and four copies of one paragraph: 20 of the 56 words
+    // landed on the wrong copy before the fence was taken out.
+    source: [
+      "Run the build and check the log. Run the build and check the log.",
+      `\`\`\`sh\n${Array.from({ length: 30 }, (_, i) => `make target${i} --flag value`).join("\n")}\n\`\`\``,
+      ...Array.from({ length: 3 }, () => "Run the build and check the log. Run the build and check the log."),
+    ].join("\n\n"),
+    display: Array.from({ length: 4 }, () => "Run the build and check the log. Run the build and check the log.").join("\n"),
   },
   {
     name: "guided emoji and paths",
