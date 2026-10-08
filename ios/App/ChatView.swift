@@ -66,11 +66,12 @@ struct ChatView: View {
     static let bottomId = "companion.bottom"
 
     /// iOS 17 lacks scroll phases and per-role anchors, so it follows with a
-    /// drag gesture and a content probe instead.  `-legacy-follow` forces
-    /// that path on a newer simulator, but only the opening position and the
-    /// repin can be checked that way: from iOS 18 on, a simultaneous drag
-    /// gesture stops the scroll view itself from scrolling, so stopping
-    /// follow and scrolling up need a real iOS 17 runtime or device.
+    /// drag gesture and a content probe instead.  The deployment floor is
+    /// now iOS 27, so only the DEBUG `-legacy-follow` flag reaches that
+    /// path.  It can check the opening position and the repin: from iOS 18
+    /// on, a simultaneous drag gesture stops the scroll view itself from
+    /// scrolling, so stopping follow and scrolling up were never checkable
+    /// without a real iOS 17 runtime or device.
     private var useLegacyFollow: Bool {
 #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("-legacy-follow") { return true }

@@ -101,7 +101,7 @@ Evidence from the iOS 27 simulator on an iPhone 17 Pro:
 
 ### Not Yet Verified
 
-- **iOS 17.**  The deployment target is 17.0, and that path (a drag gesture plus a content probe) has not run on an iOS 17 runtime or device.  Only the iOS 27 runtime is installed on the build Mac.  `-legacy-follow` forces the path on a newer simulator, but from iOS 18 on the simultaneous drag gesture stops the scroll view itself, so only the opening position and the repin can be checked that way.
+- **iOS 17 path.**  The deployment floor is now iOS 27, so release builds never take the drag-and-probe path.  It survives only behind the DEBUG `-legacy-follow` flag and in the unit tests, and it has never run on an iOS 17 runtime or device.  From iOS 18 on, that flag's simultaneous drag gesture stops the scroll view itself, so only the opening position and the repin can be checked with it.  Deleting the path is a follow-up.
 - **VoiceOver.**  A VoiceOver scroll should look like a status-bar tap (only the offset moves), but it has not been driven.
 - **iPad regular width, Reduce Motion, and a room's live speaker row** have not been captured.
 

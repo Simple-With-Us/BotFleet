@@ -65,8 +65,9 @@ else
   cp -R "$product" "$app"
 fi
 
-udid=$(xcrun simctl list devices available | awk -v name="$device_name" '
-  index($0, name " (") { sub(/.*\(/, ""); sub(/\).*/, ""); print; exit }')
+# The UUID is the first parenthesis after the name; the last one is the state.
+udid=$(xcrun simctl list devices available | grep -F "$device_name (" | head -n 1 \
+  | sed 's/^[^(]*(\([0-9A-Fa-f-]*\)).*/\1/')
 if [ -z "$udid" ]; then
   udid=$(heavy xcrun simctl create "$device_name" "$device_type")
 fi
