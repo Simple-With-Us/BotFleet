@@ -24,6 +24,7 @@ import {
   type CommandRunner,
   type LocalVmTarget,
 } from "./container-computer.ts";
+import { CONTAINER_RUNTIME_DISABLED_ENV, ContainerRuntimeDisabledError } from "./container-runtime-guard.ts";
 import {
   GH_SYNC_RETRY_MS,
   LOCAL_VM_GH_CONFIG_DIR,
@@ -140,6 +141,52 @@ describe("the token only ever travels on stdin", () => {
     await expect(sync(fake.run, { log: (level, message) => lines.push(`${level}: ${message}`) })).resolves.toBe("failed");
     expect(lines.join("\n")).toContain("HTTP 401");
     expect(lines.join("\n")).not.toContain(FAKE_TOKEN);
+  });
+});
+
+describe("the container-runtime kill switch", () => {
+  it("skips with one log line, and no backoff, when the runner refuses the exec", async () => {
+    const fake = ghFake();
+    let refusing = true;
+    const guarded: CommandRunner = async (command, args, timeout, options) => {
+      if (refusing && command === "docker") throw new ContainerRuntimeDisabledError();
+      return fake.run(command, args, timeout, options);
+    };
+    const lines: string[] = [];
+    const log = (_level: "info" | "warn", message: string) => lines.push(message);
+
+    await expect(sync(guarded, { log })).resolves.toBe("runtime-disabled");
+    await expect(sync(guarded, { log })).resolves.toBe("runtime-disabled");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("container runtimes are disabled");
+
+    // Lifting the switch logs in at once: the refusal was never recorded as a failed login.
+    refusing = false;
+    await expect(sync(guarded, { log })).resolves.toBe("synced");
+    expect(fake.logins()).toHaveLength(1);
+  });
+
+  it("never reads the host token under the switch when the default runner is in use", async () => {
+    saveConfig({ localVm: { shareCliCredentials: true } });
+    const previous = process.env[CONTAINER_RUNTIME_DISABLED_ENV];
+    process.env[CONTAINER_RUNTIME_DISABLED_ENV] = "1";
+    try {
+      // No runner passed: the real one, which would spawn host gh if it got that far.
+      await expect(refreshLocalVmGhCredentials("docker", perBotLocalVmTarget("kill-switch"))).resolves.toBe(
+        "runtime-disabled",
+      );
+    } finally {
+      if (previous === undefined) delete process.env[CONTAINER_RUNTIME_DISABLED_ENV];
+      else process.env[CONTAINER_RUNTIME_DISABLED_ENV] = previous;
+    }
+  });
+
+  it("does not touch gh after a create refused by the switch", async () => {
+    saveConfig({ localVm: { shareCliCredentials: true } });
+    // The real runner refuses `docker run` under the switch, so create fails before any gh work.
+    await expect(
+      containerComputerAction("run", defaultCommandRunner, process.platform, perBotLocalVmTarget("kill-switch-run")),
+    ).rejects.toMatchObject({ status: 409, message: expect.stringContaining("disabled") });
   });
 });
 

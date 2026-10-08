@@ -1628,10 +1628,11 @@ export async function containerComputerAction(
       // container needs.
       forgetLocalVmGhToken(target.containerName);
     }
-    if (action === "run" && shareCliCredentials) {
+    if (action === "run" && shareCliCredentials && !(runner === sh && containerRuntimeDisabled())) {
       // Right after create, so a human opening the viewer finds gh signed in
       // before any bot turn.  Best-effort: the sync never throws, and the wake
-      // path runs inside a bot's turn, so a slow login finishes behind it.
+      // path runs inside a bot's turn, so a slow login finishes behind it.  Not
+      // under the container-runtime kill switch: the real runner refuses docker.
       await syncLocalVmGhTokenWithin({ runtime, containerName: target.containerName, runner }, CREATE_GH_SYNC_MAX_WAIT_MS);
     }
   }
@@ -1659,6 +1660,10 @@ export async function refreshLocalVmGhCredentials(
   options: { maxWaitMs?: number } = {},
 ): Promise<GhSyncOutcome | "disabled" | "pending"> {
   if (!shareCliCredentialsConfigured()) return "disabled";
+  // The container-runtime kill switch (#948) makes the real runner refuse every
+  // docker exec, so there is nothing to deliver a token to: skip before reading
+  // the host token at all.  An injected runner is a test double and is left alone.
+  if (runner === sh && containerRuntimeDisabled()) return "runtime-disabled";
   const deps = { runtime, containerName: target.containerName, runner };
   return options.maxWaitMs === undefined ? syncLocalVmGhToken(deps) : syncLocalVmGhTokenWithin(deps, options.maxWaitMs);
 }

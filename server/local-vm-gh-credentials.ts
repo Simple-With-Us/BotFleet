@@ -21,6 +21,7 @@
 import { createHash } from "node:crypto";
 
 import type { CommandRunner } from "./container-computer.ts";
+import { ContainerRuntimeDisabledError } from "./container-runtime-guard.ts";
 
 /** Where gh keeps its config inside the container.  Deliberately NOT under any
  *  bind mount (`~/.config/gh` is a read-only mount of the host's directory),
@@ -137,7 +138,10 @@ export type GhSyncOutcome =
   /** The host has no usable gh login. */
   | "no-host-token"
   /** The in-container login failed. */
-  | "failed";
+  | "failed"
+  /** The container-runtime kill switch (container-runtime-guard.ts) is on, so
+   *  no exec was attempted. */
+  | "runtime-disabled";
 
 export interface GhSyncDeps {
   runtime: string;
@@ -277,6 +281,12 @@ async function runSync(deps: GhSyncDeps, generation: number): Promise<GhSyncOutc
       // The token is the exec's stdin and nothing else.
       await runner(deps.runtime, ghLoginExecArgs(containerName), GUEST_LOGIN_TIMEOUT_MS, { input: `${token}\n` });
     } catch (error) {
+      if (error instanceof ContainerRuntimeDisabledError) {
+        // The container-runtime kill switch refused the exec.  Not a failed
+        // login, so no backoff entry: lifting the switch retries at once.
+        logOnce("info", `[local-vm] ${containerName}: container runtimes are disabled in this process; gh login skipped`);
+        return "runtime-disabled";
+      }
       if ((generations.get(containerName) ?? 0) === generation) {
         entries.set(containerName, { hash, ok: false, at: now() });
       }
