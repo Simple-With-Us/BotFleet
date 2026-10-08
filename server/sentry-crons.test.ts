@@ -11,6 +11,7 @@ import {
   awaitPendingCheckInCloses,
   checkInRoutineFinish,
   checkInRoutineStart,
+  resetSentryCronsForTests,
   routineMonitorConfig,
   routineMonitorSlug,
 } from "./sentry-crons.ts";
@@ -70,6 +71,7 @@ function run(over: Partial<RoutineRun> = {}): RoutineRun {
 
 afterEach(() => {
   resetSentryForTests();
+  resetSentryCronsForTests();
 });
 
 describe("routineMonitorSlug", () => {

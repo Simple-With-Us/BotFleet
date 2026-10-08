@@ -186,3 +186,9 @@ export function checkInRoutineFinish(run: RoutineRun, checkInId: string, ok: boo
 export async function awaitPendingCheckInCloses(): Promise<void> {
   await Promise.all(pendingCheckInCloses);
 }
+
+/** Drop in-flight close deliveries so a failed test cannot stall the next
+ *  `awaitPendingCheckInCloses()` under real timers. */
+export function resetSentryCronsForTests(): void {
+  pendingCheckInCloses.clear();
+}
