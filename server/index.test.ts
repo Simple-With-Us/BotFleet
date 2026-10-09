@@ -1183,6 +1183,12 @@ describe("harness HTTP API", () => {
       expect((await quiesce("DELETE")).status).toBe(200);
       await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
       await expect.poll(busy, SLOW).toBe(true);
+
+      // That answer is a live room turn: the one thing the updater still
+      // waits for before it forces (read off the room's speaker).
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      await expect.poll(async () => (await runtime()).drain?.rooms, SLOW).toBe(1);
+      expect((await quiesce("DELETE")).status).toBe(200);
     } finally {
       await quiesce("DELETE");
       await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });

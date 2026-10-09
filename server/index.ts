@@ -9798,7 +9798,14 @@ function drainRuntimeReadiness() {
   return {
     ...runtimeReadiness(inFlightCounts(counts, { queuedRoutineRuns })),
     bots: counts.turns ?? 0,
-    held: { routineRuns: queuedRoutineRuns, sends: counts.queuedSends ?? 0 },
+    // A live room turn: the one kind of work a forced update still will not
+    // interrupt (a room turn cannot be resumed without repeating it), so the
+    // updater waits for it before it forces.  Read off the room speakers (one
+    // per live room thread) rather than rescanning every bot on each poll;
+    // a speaker whose bot is no longer busy is not counted.  Rounds waiting in
+    // the room queue are not counted either: they are held, and carried.
+    rooms: bootComplete ? [...groupSpeakers.values()].filter((speaker) => store.bot(speaker.botId)?.busy === true).length : 0,
+    held: { routineRuns: queuedRoutineRuns, sends: counts.queuedSends ?? 0, rooms: counts.queuedRooms ?? 0 },
   };
 }
 
@@ -9814,12 +9821,8 @@ function drainSnapshot() {
       deadline: status.deadline,
       inFlight: readiness.activeWorkCount,
       bots: readiness.bots,
-      // A live room turn: the one kind of work a forced update still will not
-      // interrupt (a room turn cannot be resumed without repeating it), so the
-      // updater waits for it before it forces.  Rounds waiting in the room
-      // queue are not counted: they are held, and carried across the restart.
-      rooms: store.bots.filter((bot) => bot.busy && store.groupByThread(bot.inflightThreadId ?? bot.threadId)).length,
-      held: { ...readiness.held, rooms: _queuedRoomCount() },
+      rooms: readiness.rooms,
+      held: readiness.held,
     },
   };
 }
