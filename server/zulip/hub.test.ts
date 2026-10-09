@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { FakeZulip } from "../testing/fake-zulip-server.ts";
 import { abortableSleep } from "./client.ts";
+import type { ZulipVaultLocation } from "./credentials.ts";
 import { ZulipHub, type ZulipHubDeps, type ZulipSession } from "./hub.ts";
 import { HANDLED_RING_LIMIT } from "./state.ts";
 import type { ZulipMessage, ZulipSettings } from "./types.ts";
@@ -262,10 +263,10 @@ describe("credentials and identity", () => {
   it("connects with keys from BotFleet's own vault when the Infisical source is chosen", async () => {
     settings.credentialDir = undefined;
     settings.credentialSource = "infisical";
-    const reads: string[] = [];
+    const reads: ZulipVaultLocation[] = [];
     const hub = makeHub({
-      vault: async (path) => {
-        reads.push(path);
+      vault: async (location) => {
+        reads.push(location);
         return new Map([
           ["ZULIP_BF_PLUMBER_EMAIL", "bf-plumber-bot@zulip.test"],
           ["ZULIP_BF_PLUMBER_API_KEY", "plumber-test-key"],
@@ -275,7 +276,34 @@ describe("credentials and identity", () => {
       },
     });
     await connected(hub);
-    expect(reads).toEqual(["/zulip"]);
+    expect(reads.map((r) => [r.projectId, r.environment, r.secretPath])).toEqual([[undefined, undefined, "/zulip"]]);
+    expect(botStatus(hub, "bot-plumber")?.userId).toBe(PLUMBER);
+  });
+
+  it("reads another project's folder when infisicalProjectId and infisicalEnv are set, asking for the bound roles' names only", async () => {
+    settings.credentialDir = undefined;
+    settings.credentialSource = "infisical";
+    settings.infisicalProjectId = "afc-project-id";
+    settings.infisicalEnv = "prod";
+    const reads: ZulipVaultLocation[] = [];
+    const hub = makeHub({
+      vault: async (location) => {
+        reads.push(location);
+        return new Map([
+          ["ZULIP_BF_PLUMBER_EMAIL", "bf-plumber-bot@zulip.test"],
+          ["ZULIP_BF_PLUMBER_API_KEY", "plumber-test-key"],
+          ["ZULIP_BF_PLUMBER_SITE", fake.url],
+        ]);
+      },
+    });
+    await connected(hub);
+    expect(reads).toHaveLength(1);
+    expect(reads[0]).toEqual({
+      secretPath: "/zulip",
+      projectId: "afc-project-id",
+      environment: "prod",
+      names: ["ZULIP_BF_PLUMBER_API_KEY", "ZULIP_BF_PLUMBER_EMAIL", "ZULIP_BF_PLUMBER_SITE"],
+    });
     expect(botStatus(hub, "bot-plumber")?.userId).toBe(PLUMBER);
   });
 
