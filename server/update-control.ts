@@ -379,6 +379,8 @@ export const UPDATE_STEP_LABELS: Record<string, string> = {
   smokeTestBundle: "Verifying the new build actually starts",
   persistPrepared: "Recording the prepared build",
   validatePrepared: "Re-checking the prepared build",
+  sweepLeftovers: "Clearing what an earlier update left behind",
+  ensureRunning: "Making sure BotFleet is running",
   preflight: "Checking for work in flight",
   capturePrevious: "Snapshotting what is installed now",
   materializeCandidate: "Placing the new build alongside",

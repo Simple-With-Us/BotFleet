@@ -2474,8 +2474,15 @@ export function applicationAttachmentError(snapshot, openApplication) {
   return "Updated BotFleet application stayed open but did not expose its bundled UI through the verified harness";
 }
 
-export function rollbackReadinessError(runningProcessCount, snapshot) {
+export function rollbackReadinessError(runningProcessCount, snapshot, { harnessAnswers = true } = {}) {
   if (runningProcessCount === 0 || snapshot?.safe === true) return null;
+  // No harness answers its port: nothing owns active work, only processes on
+  // their way out (2026-10-09: a replacement slow to quit at a load average
+  // in the hundreds).  Deferring then left BotFleet stopped until the owner
+  // relaunched it by hand.  The rollback waits those processes out instead
+  // (bounded, SIGTERM to verified BotFleet processes only, never SIGKILL);
+  // only a live harness that refuses the fence defers it.
+  if (!harnessAnswers) return null;
   return snapshot?.reason || "Current BotFleet work state is unavailable";
 }
 
@@ -2531,6 +2538,112 @@ export class UnrecognizedHolderError extends Error {
     this.pid = pid;
     this.executable = executable || "";
   }
+}
+
+/** How long the updater waits for BotFleet's own processes to finish quitting
+ *  once they have been asked to, before it gives up (never with SIGKILL).
+ *  Fixed and generous rather than load-aware: on 2026-10-09 the app took
+ *  longer than the old one-shot check at load averages of 50 to 500 per core,
+ *  and a longer wait costs nothing on a quiet Mac, where it ends at once. */
+export const DEFAULT_EXIT_WAIT_MS = 180_000;
+const EXIT_WAIT_POLL_MS = 2_000;
+/** How long into that wait a BotFleet process still there gets one SIGTERM. */
+const EXIT_WAIT_NUDGE_MS = 20_000;
+
+/**
+ * Wait, bounded, for whatever `check` reports to clear: BotFleet processes
+ * still quitting, the database still held, a port still answering.  `check`
+ * re-resolves on every pass and returns null once clear, or `{ reason, pids }`.
+ * Progress is reported in a person's words.  `nudge` runs once, after
+ * `nudgeAfterMs`, with what is still there (a verified SIGTERM; never
+ * SIGKILL).  Throws the last reason when the window closes.
+ */
+export async function waitForBotFleetExit(check, {
+  windowMs = DEFAULT_EXIT_WAIT_MS,
+  pollMs = EXIT_WAIT_POLL_MS,
+  now = Date.now,
+  wait = sleep,
+  report = () => {},
+  nudge,
+  nudgeAfterMs = EXIT_WAIT_NUDGE_MS,
+} = {}) {
+  const started = now();
+  const deadline = started + Math.max(0, windowMs);
+  let nudged = false;
+  let lastLine = null;
+  for (;;) {
+    const blocker = await check();
+    if (!blocker) return;
+    if (now() >= deadline) {
+      throw new Error(`${blocker.reason} (waited ${describeWindow(windowMs)} for it to quit; never SIGKILL)`);
+    }
+    if (nudge && !nudged && now() - started >= nudgeAfterMs) {
+      nudged = true;
+      try {
+        await nudge(blocker);
+      } catch (error) {
+        console.error(`Could not ask BotFleet process ${blocker.pids?.join(", ") || "?"} to quit: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      continue;
+    }
+    const count = blocker.pids?.length ?? 0;
+    const line = `Waiting for BotFleet to finish quitting${count ? ` (${plural(count, "process", "processes")})` : ""}`;
+    if (line !== lastLine) {
+      lastLine = line;
+      (report ?? (() => {}))(line);
+    }
+    await wait(Math.min(pollMs, Math.max(0, deadline - now())));
+  }
+}
+
+/**
+ * Make sure a BotFleet harness answers, starting it when none does.
+ *
+ * The invariant every updater exit keeps (2026-10-09): BotFleet is left
+ * running, the new build or the prior one, never stopped.  A no-op when a
+ * harness already answers, so a genuine deferral (a live replacement that
+ * refused) never gets a second one.  An instance still quitting is waited
+ * out first (bounded), because `open` would only bring it forward and a
+ * harness started beside it would race it for the database.  A checkout and
+ * an app that do not match (a rollback that failed partway) are started
+ * anyway, and said: a running BotFleet is better than none, and the next
+ * update replaces both.
+ */
+export async function ensureBotFleetRunning({
+  answers,
+  bundleBusy = async () => [],
+  mismatch = async () => null,
+  start,
+  timeoutMs = 90_000,
+  exitWaitMs = DEFAULT_EXIT_WAIT_MS,
+  pollMs = 1_000,
+  now = Date.now,
+  wait = sleep,
+  report = () => {},
+} = {}) {
+  const say = report ?? (() => {});
+  if (await answers()) return { started: false };
+  let quitting = await bundleBusy();
+  const quitDeadline = now() + Math.max(0, exitWaitMs);
+  while (quitting.length && now() < quitDeadline) {
+    say("Waiting for BotFleet to finish quitting before starting it again");
+    await wait(Math.min(pollMs, Math.max(0, quitDeadline - now())));
+    if (await answers()) return { started: false };
+    quitting = await bundleBusy();
+  }
+  const mixed = await mismatch();
+  if (mixed) {
+    console.error(`Starting BotFleet although ${mixed}: a running BotFleet is better than none, and the next update replaces both.`);
+  }
+  say("Starting BotFleet again");
+  await start({ appStillQuitting: quitting.length > 0 });
+  const deadline = now() + Math.max(0, timeoutMs);
+  for (;;) {
+    if (await answers()) return { started: true, mixed };
+    if (now() >= deadline) break;
+    await wait(Math.min(pollMs, Math.max(0, deadline - now())));
+  }
+  throw new Error(`BotFleet was not running and did not answer within ${describeWindow(timeoutMs)} of being started${mixed ? ` (${mixed})` : ""}`);
 }
 
 /** How long apply waits for a non-BotFleet process to let go of BotFleet state. */
@@ -2921,7 +3034,8 @@ function createConfig(parsed) {
     updatesDirectory: resolve(process.env.BOTFLEET_UPDATE_ROOT || join(home, "Library/Caches/BotFleet/updates")),
     ports: (process.env.BOTFLEET_UPDATE_PORTS || DEFAULT_PORTS.join(",")).split(",").map(Number),
     gracefulExitMs: Number(process.env.BOTFLEET_GRACEFUL_EXIT_MS || 20_000),
-    termExitMs: Number(process.env.BOTFLEET_TERM_EXIT_MS || 20_000),
+    termExitMs: Number(process.env.BOTFLEET_TERM_EXIT_MS || 60_000),
+    exitWaitMs: environmentMs("BOTFLEET_EXIT_WAIT_MS", DEFAULT_EXIT_WAIT_MS),
     startupTimeoutMs: Number(process.env.BOTFLEET_STARTUP_TIMEOUT_MS || 90_000),
     // How long work in flight gets to finish before apply pauses it, and,
     // only with --wait-for-idle, how long apply waits instead of pausing.
@@ -3256,6 +3370,65 @@ function createOperations(config) {
       return lastPreflight;
     },
 
+    // What an earlier run left behind: a candidate bundle or dependency tree,
+    // or a failed replacement's dependency tree, named after an updater that
+    // is gone.  Swept at the start of every apply, not only after a verified
+    // one, so a run of failures cannot pile them up (2026-10-09 left
+    // /Applications/.BotFleet.update-86863-… and its dependency tree).  A
+    // deferred rollback's pending-recovery.json is reported, not acted on:
+    // nothing reads it, so it never blocks this update.
+    sweepLeftovers: async () => {
+      const roots = [dirname(config.appPath), dirname(config.checkout), config.updatesDirectory];
+      await sweepCandidates(dirname(config.appPath), CANDIDATE_BUNDLE_PREFIX, ".app", [], roots);
+      await sweepCandidates(dirname(config.checkout), CANDIDATE_DEPENDENCY_PREFIX, "", [], roots);
+      await sweepCandidates(dirname(config.checkout), FAILED_DEPENDENCY_PREFIX, "", [], roots);
+      for (const name of await listDirectory(config.updatesDirectory)) {
+        const receipt = join(config.updatesDirectory, name, "pending-recovery.json");
+        if (await exists(receipt)) {
+          console.error(`An earlier update deferred its rollback (${receipt}); this update goes ahead and supersedes it.`);
+        }
+      }
+    },
+
+    // The invariant: BotFleet is left running.  Called before the first
+    // preflight (a harness an earlier failure left stopped is started, so a
+    // stale owner record does not refuse every later update) and after every
+    // failure.  A no-op when a harness answers.
+    ensureRunning: async () => ensureBotFleetRunning({
+      answers: async () => (await Promise.all(config.ports.map((port) => probeHealthWithRetry(port))))
+        .some((item) => item.kind === "botfleet"),
+      bundleBusy: () => bundleProcessPids(config.appPath),
+      mismatch: async () => {
+        const [head, appCommit] = await Promise.all([
+          gitOutput(config.checkout, ["rev-parse", "HEAD"]).catch(() => null),
+          installedBuildCommit(config.appPath),
+        ]);
+        return head && appCommit && head !== appCommit
+          ? `the checkout is at ${head.slice(0, 12)} but ${config.appPath} was built from ${appCommit.slice(0, 12)}`
+          : null;
+      },
+      start: async ({ appStillQuitting }) => {
+        const plist = harnessBootstrapPlist(config, {
+          plistExists: await exists(config.plist),
+          legacyPlistExists: await exists(config.legacyPlist),
+        });
+        if (await exists(plist)) {
+          const label = await startedHarnessLabel(config, plist);
+          const loaded = await run("launchctl", ["print", `${config.domain}/${label}`], { allowFailure: true });
+          // Loaded but not running: kickstart it.  Not loaded: bootstrap it.
+          await run("launchctl", loaded.code === 0
+            ? ["kickstart", `${config.domain}/${label}`]
+            : ["bootstrap", config.domain, plist], { allowFailure: true });
+        }
+        if (config.parsed.openApplication !== false && !appStillQuitting) {
+          await run("open", [config.appPath], { allowFailure: true });
+        }
+      },
+      timeoutMs: config.startupTimeoutMs,
+      exitWaitMs: config.exitWaitMs,
+      report: config.reportDetail,
+    }),
+
     fence: async () => fenceRuntimeAdmission(config),
 
     capturePrevious: async (prepared) => {
@@ -3391,22 +3564,35 @@ function createOperations(config) {
       }, { windowMs: config.unknownHolderWaitMs, report: config.reportDetail });
     },
 
-    assertQuiesced: async () => {
-      const holders = await sqliteHolders(config.dataDirectory);
-      if (holders.length) throw new Error(`BotFleet database still has ${holders.length} live holders after graceful shutdown`);
-      // A process can hold no database handle and answer no port while still
-      // running out of the installed bundle.  Renaming that bundle under it is
-      // exactly what leaves the owner looking at a rollback name, so the swap
-      // waits for the bundle to be empty of processes, not only for its state
-      // — and that means the whole bundle: the main binary, the embedded
-      // computer-use driver, and the speech and recorder helper apps.
-      const appPids = await bundleProcessPids(config.appPath);
-      if (appPids.length) {
-        throw new Error(`BotFleet process ${appPids.join(", ")} still runs from inside ${config.appPath} after graceful shutdown`);
-      }
-      const health = await Promise.all(config.ports.map((port) => probeHealthWithRetry(port)));
-      const portError = quiescedPortError(health);
-      if (portError) throw new Error(portError);
+    assertQuiesced: async (previous) => {
+      // Waited for, not checked once: on a loaded Mac the app's own verified
+      // processes can take minutes to quit (2026-10-09, "BotFleet process
+      // 11736 still runs from inside /Applications/BotFleet.app after
+      // graceful shutdown").  A process still there gets one verified SIGTERM;
+      // never SIGKILL.
+      await waitForBotFleetExit(async () => {
+        const holders = await sqliteHolders(config.dataDirectory);
+        if (holders.length) {
+          return { reason: `BotFleet database still has ${holders.length} live holders after graceful shutdown`, pids: holders };
+        }
+        // A process can hold no database handle and answer no port while still
+        // running out of the installed bundle.  Renaming that bundle under it is
+        // exactly what leaves the owner looking at a rollback name, so the swap
+        // waits for the bundle to be empty of processes, not only for its state
+        // — and that means the whole bundle: the main binary, the embedded
+        // computer-use driver, and the speech and recorder helper apps.
+        const appPids = await bundleProcessPids(config.appPath);
+        if (appPids.length) {
+          return { reason: `BotFleet process ${appPids.join(", ")} still runs from inside ${config.appPath} after graceful shutdown`, pids: appPids };
+        }
+        const health = await Promise.all(config.ports.map((port) => probeHealthWithRetry(port)));
+        const portError = quiescedPortError(health);
+        return portError ? { reason: portError, pids: [] } : null;
+      }, {
+        windowMs: config.exitWaitMs,
+        report: config.reportDetail,
+        nudge: ({ pids }) => (pids.length ? terminateVerified(pids, previous ?? {}, config, { current: pids }) : undefined),
+      });
     },
 
     advanceCheckout: async (targetCommit) => {
@@ -3567,8 +3753,11 @@ function createOperations(config) {
       ]);
       const runtimePids = health.filter((item) => item.kind === "botfleet").map((item) => item.pid);
       const runningPids = [...new Set([...holders, ...appPids, ...runtimePids])];
+      // Only a harness that answers can own active work.  Processes with no
+      // harness answering are on their way out, and are waited out below.
+      const harnessAnswers = runtimePids.length > 0;
       let readiness = { safe: true };
-      if (runningPids.length) {
+      if (runningPids.length && harnessAnswers) {
         try {
           // At once: no hold and no grace against the replacement.
           readiness = await fenceRuntimeAdmission(rollbackFenceConfig(config));
@@ -3576,7 +3765,7 @@ function createOperations(config) {
           readiness = { safe: false, reason: error instanceof Error ? error.message : String(error) };
         }
       }
-      const refusal = rollbackReadinessError(runningPids.length, readiness);
+      const refusal = rollbackReadinessError(runningPids.length, readiness, { harnessAnswers });
       if (refusal) {
         const receiptPath = pendingRecoveryReceiptPath(prepared);
         try {
@@ -3632,20 +3821,30 @@ function createOperations(config) {
         await terminateVerified([...holders, ...appPids], { ...previous, runtimePids: [...new Set([...previous.runtimePids, ...holders])] }, config);
       });
       await recordStop(async () => {
-        const [holders, bundlePids, health, owner] = await Promise.all([
-          sqliteHolders(config.dataDirectory),
-          bundleProcessPids(config.appPath),
-          Promise.all(config.ports.map((port) => probeHealthWithRetry(port))),
-          readOwner(config.dataDirectory).catch(() => null),
-        ]);
-        const stranger = health.filter((item) => item.kind === "foreign" || item.kind === "http");
-        if (stranger.length) {
-          console.error(`Something other than BotFleet answers port ${stranger.map((item) => item.port).join(", ")}; rollback is not waiting on it.`);
-        }
-        const owned = ownedRuntimePids({ holders, bundlePids, health, ownerPid: owner?.pid });
-        if (owned.length) {
-          throw new Error(`Rollback cannot mutate files while BotFleet process ${owned.join(", ")} still owns its bundle, database, or health endpoint`);
-        }
+        let strangerSaid = false;
+        // Waited for, bounded, like the install's own shutdown: a replacement
+        // slow to quit is not a reason to leave the Mac half-rolled-back.
+        await waitForBotFleetExit(async () => {
+          const [holders, bundlePids, health, owner] = await Promise.all([
+            sqliteHolders(config.dataDirectory),
+            bundleProcessPids(config.appPath),
+            Promise.all(config.ports.map((port) => probeHealthWithRetry(port))),
+            readOwner(config.dataDirectory).catch(() => null),
+          ]);
+          const stranger = health.filter((item) => item.kind === "foreign" || item.kind === "http");
+          if (stranger.length && !strangerSaid) {
+            strangerSaid = true;
+            console.error(`Something other than BotFleet answers port ${stranger.map((item) => item.port).join(", ")}; rollback is not waiting on it.`);
+          }
+          const owned = ownedRuntimePids({ holders, bundlePids, health, ownerPid: owner?.pid });
+          return owned.length
+            ? { reason: `Rollback cannot mutate files while BotFleet process ${owned.join(", ")} still owns its bundle, database, or health endpoint`, pids: owned }
+            : null;
+        }, {
+          windowMs: config.exitWaitMs,
+          report: config.reportDetail,
+          nudge: ({ pids }) => terminateVerified(pids, { ...previous, runtimePids: [...new Set([...previous.runtimePids, ...pids])] }, config, { current: pids }),
+        });
       });
       if (stopErrors.length) throw new AggregateError(stopErrors, "Could not quiesce the failed replacement for safe rollback");
 
@@ -3847,9 +4046,9 @@ export async function main(argv = process.argv.slice(2)) {
   const perform = async () => {
     if (parsed.command === "prepare") return prepareUpdate(parsed, operations);
     if (parsed.command === "apply") {
-      return applyPreparedUpdate(await loadPrepared(parsed.stage), parsed, operations);
+      return applyPreparedUpdate(await loadPrepared(parsed.stage), { ...parsed, signals: process }, operations);
     }
-    return runUpdate(parsed, parsed, operations);
+    return runUpdate(parsed, { ...parsed, signals: process }, operations);
   };
   if (!progress) {
     await perform();

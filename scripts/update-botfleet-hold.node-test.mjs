@@ -17,6 +17,7 @@ import {
   DEFAULT_ROOM_WAIT_MS,
   describeWindow,
   drainProgressDetail,
+  ensureBotFleetRunning,
   fenceMode,
   fenceRuntimeAdmission,
   keepFenceLease,
@@ -24,6 +25,7 @@ import {
   pauseTimeoutMessage,
   releaseRuntimeAdmission,
   retryTransient,
+  rollbackReadinessError,
   rollbackFenceConfig,
   runtimePreflight,
   settledDatabaseHolders,
@@ -31,6 +33,8 @@ import {
   UnrecognizedHolderError,
   waitForIdleTimeoutMessage,
   waitOutUnrecognizedHolders,
+  waitForBotFleetExit,
+  DEFAULT_EXIT_WAIT_MS,
 } from "./update-botfleet-mac.mjs";
 
 const OWNER = { version: 1, pid: 42, port: 8799, nonce: "a".repeat(64) };
@@ -1000,4 +1004,91 @@ test("progress sentences name what the update is waiting for, in a person's word
   assert.equal(describeWindow(60_000), "1 minute");
   assert.equal(describeWindow(90_000), "1.5 minutes");
   assert.equal(describeWindow(45_000), "45 seconds");
+});
+
+// ── 2026-10-09 overnight: slow exits, deferred rollbacks, BotFleet left stopped ──
+
+test("a BotFleet process slow to quit is waited for, nudged once, and never killed", async () => {
+  // "BotFleet process 11736 still runs from inside /Applications/BotFleet.app
+  // after graceful shutdown", at a load average of 50 to 500 per core.
+  let clock = 0;
+  const reports = [];
+  const nudges = [];
+  await waitForBotFleetExit(async () => (clock < 75_000
+    ? { reason: "BotFleet process 11736 still runs from inside /Applications/BotFleet.app after graceful shutdown", pids: [11736] }
+    : null), {
+    now: () => clock,
+    wait: async (ms) => { clock += ms; },
+    report: (line) => reports.push(line),
+    nudge: async ({ pids }) => { nudges.push([clock, ...pids]); },
+  });
+  assert.ok(clock >= 75_000 && clock < DEFAULT_EXIT_WAIT_MS);
+  assert.equal(nudges.length, 1, "one verified SIGTERM, never a second signal");
+  assert.ok(nudges[0][0] >= 20_000);
+  assert.deepEqual(reports, ["Waiting for BotFleet to finish quitting (1 process)"]);
+
+  // One that never quits ends the wait, bounded, with what was still there.
+  clock = 0;
+  await assert.rejects(waitForBotFleetExit(async () => ({ reason: "BotFleet process 11736 still runs", pids: [11736] }), {
+    now: () => clock,
+    wait: async (ms) => { clock += ms; },
+  }), /^Error: BotFleet process 11736 still runs \(waited 3 minutes for it to quit; never SIGKILL\)$/);
+  assert.equal(clock, DEFAULT_EXIT_WAIT_MS);
+});
+
+test("a rollback is deferred only when a live harness refuses; processes on their way out are waited out", () => {
+  // The overnight deferral had no harness answering at all: nothing owned
+  // active work, and deferring left BotFleet stopped.
+  assert.equal(rollbackReadinessError(4, { safe: false, reason: "Runtime admission fence could not be established" }, { harnessAnswers: false }), null);
+  assert.equal(rollbackReadinessError(4, { safe: false, reason: "A room conversation is live" }, { harnessAnswers: true }), "A room conversation is live");
+  assert.equal(rollbackReadinessError(0, { safe: false, reason: "x" }, { harnessAnswers: true }), null);
+});
+
+test("BotFleet is started again when no harness answers, after an instance still quitting has gone", async () => {
+  let clock = 0;
+  let running = false;
+  let quitting = [11736];
+  const started = [];
+  const result = await ensureBotFleetRunning({
+    answers: async () => running,
+    bundleBusy: async () => quitting,
+    start: async (how) => {
+      started.push(how);
+      running = true;
+    },
+    now: () => clock,
+    wait: async (ms) => {
+      clock += ms;
+      if (clock >= 10_000) quitting = [];
+    },
+  });
+  assert.deepEqual(result, { started: true, mixed: null });
+  assert.deepEqual(started, [{ appStillQuitting: false }], "started once, after the quitting instance had gone");
+  assert.ok(clock >= 10_000);
+
+  // Already running: nothing is started, so a live replacement never gets a second harness.
+  let starts = 0;
+  assert.deepEqual(await ensureBotFleetRunning({ answers: async () => true, start: async () => { starts += 1; } }), { started: false });
+  assert.equal(starts, 0);
+
+  // A checkout and an app that do not match are started anyway, and said.
+  const mixed = await ensureBotFleetRunning({
+    answers: (() => { let n = 0; return async () => (n += 1) > 1; })(),
+    mismatch: async () => "the checkout is at aaaaaaaaaaaa but /Applications/BotFleet.app was built from bbbbbbbbbbbb",
+    start: async () => {},
+    now: () => clock,
+    wait: async (ms) => { clock += ms; },
+  });
+  assert.equal(mixed.started, true);
+  assert.match(mixed.mixed, /checkout is at aaaaaaaaaaaa/);
+
+  // One that never answers is reported, bounded.
+  clock = 0;
+  await assert.rejects(ensureBotFleetRunning({
+    answers: async () => false,
+    start: async () => {},
+    timeoutMs: 90_000,
+    now: () => clock,
+    wait: async (ms) => { clock += ms; },
+  }), /BotFleet was not running and did not answer within 1\.5 minutes of being started/);
 });
