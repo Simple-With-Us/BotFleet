@@ -53,6 +53,20 @@ public struct CompanionState: Sendable {
     /// event.  `nil` until the first of either arrives — not the same as "up
     /// to date", which is a real answer this has to wait for.
     public var macUpdateStatus: MacUpdateStatus?
+    /// Background jobs by conversation (thread id), from `jobs` frames and
+    /// `GET /api/jobs`.  A thread with none has no entry, so the header can ask
+    /// "does this have a pill" with one lookup.
+    public private(set) var jobsByThread: [String: [JobSnapshot]] = [:] {
+        didSet {
+            var index: [String: JobSnapshot] = [:]
+            for jobs in jobsByThread.values {
+                for job in jobs { index[job.id] = job }
+            }
+            jobIndex = index
+        }
+    }
+    /// Every job by id, rebuilt whenever `jobsByThread` changes (see `job(id:)`).
+    private var jobIndex: [String: JobSnapshot] = [:]
     /// Monotonic reducer position used to reject snapshots fetched before a
     /// newer stream frame was folded.
     private let hydrationStateID = UUID()
@@ -293,6 +307,36 @@ public struct CompanionState: Sendable {
         return true
     }
 
+    // MARK: - Background jobs
+
+    /// Replace one conversation's jobs.  An empty set removes the entry, so a
+    /// thread with nothing to show has no pill.
+    public mutating func setJobs(_ jobs: [JobSnapshot], forThread threadId: String) {
+        if jobs.isEmpty {
+            jobsByThread.removeValue(forKey: threadId)
+        } else {
+            jobsByThread[threadId] = jobs
+        }
+    }
+
+    /// One job by id, wherever it lives.  A single lookup in an index kept in
+    /// step with `jobsByThread`, so a screen that watches one job does not
+    /// scan every conversation on each redraw.
+    public func job(id: String) -> JobSnapshot? {
+        jobIndex[id]
+    }
+
+    /// Replace every conversation's jobs with what `GET /api/jobs` answered.
+    /// Separate from `hydrate(_:)`: jobs ride their own request, and a failed
+    /// jobs read must not make a good fleet snapshot look like it failed.
+    public mutating func hydrateJobs(_ jobs: [JobSnapshot]) {
+        var next: [String: [JobSnapshot]] = [:]
+        for job in jobs {
+            next[job.threadId, default: []].append(job)
+        }
+        jobsByThread = next
+    }
+
     /// Prepend an older page fetched for scrollback.
     public mutating func prepend(_ page: ThreadPage, toThread threadId: String) {
         hydrationRevision &+= 1
@@ -337,7 +381,7 @@ public struct CompanionState: Sendable {
         switch frame {
         case .message, .messagePatch, .thread, .bot, .botDeleted, .room, .roomDeleted:
             hydrationRevision &+= 1
-        case .hello, .notify, .screen, .computer, .config, .instances, .runtime, .updateStatus, .unknown:
+        case .hello, .notify, .screen, .computer, .config, .instances, .runtime, .updateStatus, .jobs, .unknown:
             break
         }
         switch frame {
@@ -427,6 +471,7 @@ public struct CompanionState: Sendable {
                 // was the last event that could ever mention this id.
                 clearStream(threadId)
                 clearScreen(botId)
+                jobsByThread.removeValue(forKey: threadId)
                 bots.remove(at: index)
             }
 
@@ -467,6 +512,7 @@ public struct CompanionState: Sendable {
                 // Same reasoning as a deleted bot: the thread is gone, so the
                 // half-written reply streaming into it has nowhere to land.
                 clearStream(threadId)
+                jobsByThread.removeValue(forKey: threadId)
                 rooms.remove(at: index)
             }
 
@@ -484,6 +530,9 @@ public struct CompanionState: Sendable {
 
         case let .updateStatus(status):
             macUpdateStatus = status
+
+        case let .jobs(threadId, jobs):
+            setJobs(jobs, forThread: threadId)
 
         // Nothing to fold: config and provisioning state are not part of
         // this client's job yet.

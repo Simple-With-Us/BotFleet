@@ -15244,9 +15244,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // The same gate as the thread-events route below: the loopback fence
     // every route sits behind, and a job answers only when its thread is one
     // this harness knows.  Output is read here and only here — frames carry
-    // labels and status, never output.  None of these is on the phone
-    // companion's allowlist yet: that is P4, where the owner approved both
-    // Stop and reading output from the phone (ruling d).
+    // labels and status, never output.  On the phone companion's allowlist
+    // (companion/src/routes.ts), because the owner approved both Stop and
+    // reading output from the phone (ruling d): the list, one job's output,
+    // one job's Stop and Stop All.  The bare `GET /api/jobs/:id` and
+    // `/api/jobs/wake-usage` are not, since no screen on the phone uses them.
     // What job wake turns have cost: totals only, never a prompt or output.
     if (method === "GET" && path === "/api/jobs/wake-usage") {
       return json(res, 200, { wakeUsage: jobWakeUsage.snapshot() });

@@ -82,7 +82,7 @@ let lastReviewRoles: string[] = [];
 function reviewedAction(body: ChatRequest): string | null {
   const data = String(body.messages?.find((message) => message.role === "user")?.content ?? "");
   const match = data.match(/"action":"((?:[^"\\]|\\.)*)"/);
-  // SAFETY: the pattern captured the inside of a JSON string literal, so wrapping it in quotes parses to a string.
+  // SAFETY: the capture group is the body of a JSON string literal, so parsing it re-quoted yields a string.
   return match ? (JSON.parse(`"${match[1]}"`) as string) : null;
 }
 /** The tools the stub was last offered as a bot's engine. */
