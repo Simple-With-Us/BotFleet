@@ -101,6 +101,7 @@ export function isSecretConfigKey(key: string): boolean {
   return SECRET_CONFIG_KEY.test(key);
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- type guard over arbitrary host config
 function isRedactableRecord(value: unknown): value is Record<string, unknown> {
   if (value === null || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
@@ -109,6 +110,7 @@ function isRedactableRecord(value: unknown): value is Record<string, unknown> {
 
 /** Copy a config value with secret-looking keys removed at every level.
  *  The copy is the point: the plugin must not hold the live config object. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- config values are arbitrary host data; callers JSON-validate the copy
 export function redactPluginConfig(value: unknown): unknown {
   if (Array.isArray(value)) return value.map((entry) => redactPluginConfig(entry));
   if (!isRedactableRecord(value)) return value;
@@ -117,12 +119,14 @@ export function redactPluginConfig(value: unknown): unknown {
     if (isSecretConfigKey(key)) continue;
     out[key] = redactPluginConfig(value[key]);
   }
+  // oxlint-disable-next-line anti-slop/no-known-value-widening -- accumulator is returned as the same opaque config copy
   return out;
 }
 
 /** Narrow an allowlisted AppConfig section before it crosses into a plugin.
  *  `callStt` exposes only `provider` — keyterms are user vocabulary and
  *  must not leak.  Other allowlisted sections are redacted as usual. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- config values are arbitrary host data; callers JSON-validate the copy
 export function narrowPluginConfigSection(key: string, value: unknown): unknown {
   if (key === "callStt" && isRedactableRecord(value)) {
     return value.provider === undefined ? {} : { provider: value.provider };
