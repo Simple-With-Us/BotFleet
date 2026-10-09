@@ -896,25 +896,27 @@ describe("harness HTTP API", () => {
     // Finding 1: the DELETE the updater sends at its deadline, on Ctrl-C and
     // in the --force give-up used to stand the fence down mid-settle, so the
     // resume snapshot and the held messages landed on an unfenced harness.
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
     const authorization = { Authorization: `Bearer ${owner.nonce}` };
     const quiesce = (method: "POST" | "DELETE", query = "") =>
       fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
     const SLOW = { timeout: 30_000, interval: 250 };
-    const runtime = async () => (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json() as Promise<{
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
       quiescing: boolean;
       fencing: boolean;
       draining: boolean;
-    }>;
+    };
     const resumePath = join(home, ".botfleet", "pending-update-resume.json");
     const carrier = join(home, ".botfleet", "update-held-sends.json");
     const working = (await api("POST", "/api/bots")).body.bot;
     const idle = (await api("POST", "/api/bots")).body.bot;
     const busy = async (id: string) =>
       Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
-    const said = async (threadId: string, text: string) =>
-      ((await api("GET", `/api/threads/${threadId}/messages?limit=50`)).body.messages as Array<{ role: string; text?: string }>)
-        .filter((message) => message.role === "user" && message.text === text).length;
+    const said = async (threadId: string, text: string) => {
+      const messages: Array<{ role: string; text?: string }> = (await api("GET", `/api/threads/${threadId}/messages?limit=50`)).body.messages;
+      return messages.filter((message) => message.role === "user" && message.text === text).length;
+    };
     let heldMutation: ReturnType<typeof request> | null = null;
     try {
       const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
@@ -949,7 +951,8 @@ describe("harness HTTP API", () => {
       // (the interrupted bot resumes), and the held message runs.
       heldMutation.destroy();
       heldMutation = null;
-      const answer = await (await forced).json() as { quiescing: boolean; fencing: boolean };
+      // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+      const answer = (await (await forced).json()) as { quiescing: boolean; fencing: boolean };
       expect(answer).toMatchObject({ quiescing: false, fencing: false });
       expect(await runtime()).toMatchObject({ quiescing: false, fencing: false, draining: false });
       await expect.poll(() => existsSync(resumePath), SLOW).toBe(false);
@@ -976,16 +979,18 @@ describe("harness HTTP API", () => {
     // repeated, up to ten times an update.  Under a hold, paused work now stays
     // paused and saved; later attempts add to the same snapshot; letting go
     // of the hold resumes it once.
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
     const authorization = { Authorization: `Bearer ${owner.nonce}` };
     const quiesce = (method: "POST" | "DELETE", query = "") =>
       fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
     const SLOW = { timeout: 30_000, interval: 250 };
     const resumePath = join(home, ".botfleet", "pending-update-resume.json");
     const carrier = join(home, ".botfleet", "update-held-sends.json");
-    const paused = () => (existsSync(resumePath)
-      ? (JSON.parse(readFileSync(resumePath, "utf8")) as { interruptedBots: Array<{ botId: string }> }).interruptedBots.map((entry) => entry.botId)
-      : []);
+    const paused = () => {
+      if (!existsSync(resumePath)) return [];
+      const snapshot: { interruptedBots: Array<{ botId: string }> } = JSON.parse(readFileSync(resumePath, "utf8"));
+      return snapshot.interruptedBots.map((entry) => entry.botId);
+    };
     const working = (await api("POST", "/api/bots")).body.bot;
     const busy = async (id: string) =>
       Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
@@ -1010,9 +1015,11 @@ describe("harness HTTP API", () => {
       // (a request still reading its body) and rolls back.  The hold is up,
       // so the bot stays paused and saved instead of being re-sent its prompt.
       heldMutation = holdAMutation();
-      const inFlight = async () =>
-        ((await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as { drain: { inFlight: number } | null })
-          .drain?.inFlight ?? 0;
+      const inFlight = async () => {
+        // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+        const answer = (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as { drain: { inFlight: number } | null };
+        return answer.drain?.inFlight ?? 0;
+      };
       await expect.poll(inFlight, SLOW).toBeGreaterThanOrEqual(2);
       const first = await quiesce("POST", "?force=true");
       expect(first.status).toBe(409);
@@ -1052,14 +1059,15 @@ describe("harness HTTP API", () => {
   it("releases a fence whose updater stopped renewing its lease, and never fences on a renewal", async () => {
     // Finding 6: an updater killed between the fence and the shutdown left
     // every bot refused until someone ran `unquiesce`.
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
     const authorization = { Authorization: `Bearer ${owner.nonce}` };
     const quiesce = (method: "POST" | "DELETE", query = "") =>
       fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
-    const runtime = async () => (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json() as Promise<{
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
       quiescing: boolean;
       lease: { expiresAt: number } | null;
-    }>;
+    };
     try {
       // A renewal never raises a fence.
       const stray = await quiesce("POST", "?renew=1&leaseMs=60000");
@@ -1068,7 +1076,8 @@ describe("harness HTTP API", () => {
 
       const fenced = await quiesce("POST", "?leaseMs=3000");
       expect(fenced.status).toBe(200);
-      const first = await fenced.json() as { quiescing: boolean; lease: { expiresAt: number } | null };
+      // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+      const first = (await fenced.json()) as { quiescing: boolean; lease: { expiresAt: number } | null };
       expect(first.quiescing).toBe(true);
       expect(first.lease?.expiresAt).toBeGreaterThan(Date.now());
 
@@ -1092,14 +1101,15 @@ describe("harness HTTP API", () => {
   it("holds a room round for an update like other work, and carries it across the fence", async () => {
     // Finding 7: room messages and rounds were not held, so a room whose bots
     // kept answering each other kept an update waiting for about six minutes.
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
     const authorization = { Authorization: `Bearer ${owner.nonce}` };
     const quiesce = (method: "POST" | "DELETE", query = "") =>
       fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
     const SLOW = { timeout: 30_000, interval: 250 };
-    const runtime = async () => (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json() as Promise<{
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
       drain: { inFlight: number; rooms: number; held: { rooms: number } } | null;
-    }>;
+    };
     const carrier = join(home, ".botfleet", "update-held-sends.json");
     const bot = (await api("POST", "/api/bots")).body.bot;
     const room = (await api("POST", "/api/groups", { name: "Held room", memberIds: [bot.id] })).body.group;
@@ -1123,7 +1133,7 @@ describe("harness HTTP API", () => {
       // The fence carries the round for the restart.
       const fenced = await quiesce("POST");
       expect(fenced.status).toBe(200);
-      const saved = JSON.parse(readFileSync(carrier, "utf8")) as { rooms: Array<{ groupId: string; botId: string }> };
+      const saved: { rooms: Array<{ groupId: string; botId: string }> } = JSON.parse(readFileSync(carrier, "utf8"));
       expect(saved.rooms).toEqual([expect.objectContaining({ groupId: room.id, botId: bot.id })]);
 
       // No restart came: standing down puts the round back and the member answers.

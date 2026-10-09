@@ -1137,7 +1137,8 @@ export function watchStopSignals(signals) {
   const listeners = ["SIGINT", "SIGTERM"].map((signal) => {
     const listener = () => {
       stoppedBy ??= signal;
-      for (const wake of [...wakers]) wake();
+      // Each wake removes itself; deleting the visited entry is safe in a Set.
+      for (const wake of wakers) wake();
     };
     signals?.on?.(signal, listener);
     return [signal, listener];

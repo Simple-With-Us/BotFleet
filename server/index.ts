@@ -4908,15 +4908,16 @@ function restoreHeldWork(work: HeldWork, context: string) {
   for (const round of rooms.stale) {
     if (!store.group(round.groupId)) continue;
     const bot = store.bot(round.botId);
-    store.appendMessage(round.threadId, {
+    const note: Omit<Message, "id" | "at"> = {
       role: "bot",
       kind: "activity",
-      ...(bot ? { from: { botId: bot.id, name: bot.name, color: bot.color } } : {}),
       tool: {
         name: "error: this reply waited for an update that did not finish, so it was not run — ask again if you still need it",
         ok: false,
       },
-    });
+    };
+    if (bot) note.from = { botId: bot.id, name: bot.name, color: bot.color };
+    store.appendMessage(round.threadId, note);
   }
   const restoredRooms = restoreRoomRounds(rooms.run.filter((round) => store.group(round.groupId) && store.bot(round.botId)).map((round) => {
     const restored: Parameters<typeof restoreRoomRounds>[0][number] = {
@@ -9905,7 +9906,7 @@ function readResumeSnapshot(): ResumeSnapshot | null {
   const path = join(DATA_DIR, PENDING_RESUME_FILE);
   if (!existsSync(path)) return null;
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<ResumeSnapshot> | null;
+    const raw: Partial<ResumeSnapshot> | null = JSON.parse(readFileSync(path, "utf8"));
     return {
       timestamp: typeof raw?.timestamp === "number" ? raw.timestamp : Date.now(),
       interruptedRuns: Array.isArray(raw?.interruptedRuns) ? raw.interruptedRuns.filter((run) => typeof run?.id === "string") : [],

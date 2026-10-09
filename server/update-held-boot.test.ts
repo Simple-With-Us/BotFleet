@@ -43,30 +43,57 @@ let base = "";
 let harnessPort = 0;
 let output = "";
 
-const api = async (method: string, path: string, body?: unknown) => {
+/** What these tests read back from the harness: loosely, as the wire has it. */
+interface WireAnswer {
+  bot?: { id: string; threadId: string };
+  messages?: Array<{ role: string; text?: string; tool?: { name?: string } }>;
+  queued?: boolean;
+  quiescing?: boolean;
+  draining?: boolean;
+  safeToRestart?: boolean;
+  drain?: { inFlight: number } | null;
+}
+
+interface CarriedFile {
+  sends: Array<{ botId: string; prompt: string }>;
+}
+
+/** The request bodies these tests send. */
+interface ApiBody {
+  text?: string;
+  modelSelection?: { instanceId: string; model: string };
+}
+
+const api = async (method: string, path: string, body?: ApiBody) => {
   const res = await fetch(`${base}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
-  return { status: res.status, body: (await res.json().catch(() => null)) as any };
+  // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+  const answer = (await res.json().catch(() => ({}))) as WireAnswer;
+  return { status: res.status, body: answer };
 };
 
 const authorization = () => {
-  const owner = JSON.parse(readFileSync(join(dataDir, "harness-owner.json"), "utf8")) as { nonce: string };
+  const owner: { nonce: string } = JSON.parse(readFileSync(join(dataDir, "harness-owner.json"), "utf8"));
   return { Authorization: `Bearer ${owner.nonce}` };
 };
 
 const quiesce = async (method: "POST" | "DELETE", query = "") => {
   const res = await fetch(`${base}/api/runtime/quiesce${query}`, { method, headers: authorization() });
-  return { status: res.status, body: (await res.json()) as Record<string, any> };
+  // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+  const answer = (await res.json()) as WireAnswer;
+  return { status: res.status, body: answer };
 };
+
+const carriedFile = (): CarriedFile => JSON.parse(readFileSync(carrierPath, "utf8"));
 
 async function launch(): Promise<void> {
   child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
     cwd: ROOT,
     env: {
-      ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+      PATH: process.env.PATH ?? "",
       HOME: home,
       USERPROFILE: home,
       OMB_PORT: String(harnessPort),
@@ -109,7 +136,8 @@ describe.skipIf(process.platform === "win32")("messages an update carried across
       let raw = "";
       req.on("data", (chunk) => (raw += String(chunk)));
       req.on("end", () => {
-        const messages = (JSON.parse(raw) as { messages?: Array<{ role: string; content: unknown }> }).messages ?? [];
+        const request: { messages?: Array<{ role: string; content: string | object }> } = JSON.parse(raw);
+        const messages = request.messages ?? [];
         const lastUser = [...messages].reverse().find((message) => message.role === "user");
         asked.push(typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? ""));
         res.writeHead(200, { "content-type": "text/event-stream" });
@@ -117,7 +145,8 @@ describe.skipIf(process.platform === "win32")("messages an update carried across
       });
     });
     await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
-    const providerPort = (provider.address() as { port: number }).port;
+    const address = provider.address();
+    const providerPort = typeof address === "object" && address ? address.port : 0;
     writeFileSync(
       join(dataDir, "config.json"),
       JSON.stringify({
@@ -137,7 +166,8 @@ describe.skipIf(process.platform === "win32")("messages an update carried across
     await launch();
     const created = await api("POST", "/api/bots", { modelSelection: { instanceId: "fixture", model: "fixture-model" } });
     expect(created.status, JSON.stringify(created.body)).toBe(201);
-    const bot = created.body.bot as { id: string; threadId: string };
+    const bot = created.body.bot;
+    if (!bot) throw new Error(`no bot created: ${JSON.stringify(created.body)}`);
 
     expect((await quiesce("POST", "?drain=1&timeoutMs=600000")).body).toMatchObject({ draining: true });
     expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "first held message" })).body)
@@ -156,7 +186,7 @@ describe.skipIf(process.platform === "win32")("messages an update carried across
     const rolledBack = await quiesce("POST", "?force=true");
     expect(rolledBack.status).toBe(409);
     expect(rolledBack.body).toMatchObject({ quiescing: false, draining: true });
-    const afterRollback = JSON.parse(readFileSync(carrierPath, "utf8")) as { sends: Array<{ botId: string; prompt: string }> };
+    const afterRollback = carriedFile();
     expect(afterRollback.sends.map((send) => send.prompt)).toEqual(["first held message"]);
 
     // A second message for the same bot, then the later fence carries it too.
@@ -167,7 +197,7 @@ describe.skipIf(process.platform === "win32")("messages an update carried across
     const fenced = await quiesce("POST");
     expect(fenced.status).toBe(200);
     expect(fenced.body).toMatchObject({ quiescing: true, safeToRestart: true });
-    const carried = JSON.parse(readFileSync(carrierPath, "utf8")) as { sends: Array<{ botId: string; prompt: string }> };
+    const carried = carriedFile();
     expect(carried.sends.map((send) => [send.botId, send.prompt])).toEqual([
       [bot.id, "first held message"],
       [bot.id, "second held message"],
@@ -188,11 +218,7 @@ describe.skipIf(process.platform === "win32")("messages an update carried across
     expect(asked).toHaveLength(2);
     expect(existsSync(carrierPath)).toBe(false);
 
-    const messages = (await api("GET", `/api/threads/${bot.threadId}/messages?limit=50`)).body.messages as Array<{
-      role: string;
-      text?: string;
-      tool?: { name?: string };
-    }>;
+    const messages = (await api("GET", `/api/threads/${bot.threadId}/messages?limit=50`)).body.messages ?? [];
     const said = (text: string) => messages.filter((message) => message.role === "user" && message.text === text).length;
     expect(said("first held message")).toBe(1);
     expect(said("second held message")).toBe(1);
