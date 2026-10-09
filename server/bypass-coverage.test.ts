@@ -39,7 +39,7 @@ describe("bypassCoverage", () => {
 
   it("writes a note only where the switch does not simply work", () => {
     expect(bypassCoverageNote("asks")).toBeNull();
-    expect(bypassCoverageNote("none")).toMatch(/never asks for approval/);
+    expect(bypassCoverageNote("none")).toMatch(/runs its own tools without asking/);
     expect(bypassCoverageNote("native")).toMatch(/skip-permissions mode for turns that do not control This Mac/);
     // A no-break space and a space between sentences, never two ASCII spaces.
     for (const coverage of ["none", "native"] as const) {

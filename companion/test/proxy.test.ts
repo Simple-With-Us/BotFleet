@@ -491,6 +491,18 @@ describe("the sidecar in front of an unmodified harness", () => {
       expect(dropped.body.error).toBe("This Mac can only be turned on or off in BotFleet on your computer");
       expect((await botNow()).bypassPermissions).toBe(true);
 
+      // The phone-set bypass is not a stand-in on the computer's own route
+      // either: Auto Mode without the acknowledgement is refused there too,
+      // and the dialog's request, which carries it, is accepted.
+      const unacknowledged = await loopback({ autoApprove: true });
+      expect(unacknowledged.status).toBe(400);
+      expect((await unacknowledged.json()) as { error: string }).toEqual({
+        error: "Auto mode on this computer requires confirming the warning first (acknowledgeLocalAuto)",
+      });
+      expect((await botNow()).autoApprove).not.toBe(true);
+      // A rename or re-save that does not turn Auto Mode on is left alone.
+      expect((await loopback({ title: "renamed on the computer" })).status).toBe(200);
+
       // The computer answers its own warning.  A bot it put in Auto Mode on
       // This Mac keeps the phone's switches: re-saving is not a new pair.
       const acknowledged = await loopback({ autoApprove: true, acknowledgeLocalAuto: true });

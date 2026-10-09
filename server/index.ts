@@ -12173,8 +12173,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const wantsAuto =
         (body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true) ||
         (body.bypassPermissions !== undefined ? body.bypassPermissions : existingBot?.bypassPermissions === true);
+      // Turning Auto Mode ON is judged as Auto Mode alone.  A paired phone may
+      // put a bot in Bypass Permissions without the Mac's warning (the profile
+      // route, `pairedProfileRefusal`), so a bypass that was never
+      // acknowledged cannot count as "already granted" here, or a request
+      // without `acknowledgeLocalAuto` would slip Auto Mode in behind it.  The
+      // desktop's own dialog always sends the acknowledgement in this case.
+      const turningAutoOn = body.autoApprove === true && existingBot?.autoApprove !== true;
       const ackError = localAutoAcknowledgementError(
-        existingBot,
+        turningAutoOn && existingBot ? { ...existingBot, bypassPermissions: false } : existingBot,
         wantsComputers,
         wantsAuto === true,
         body.acknowledgeLocalAuto === true,

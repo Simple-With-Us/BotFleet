@@ -109,7 +109,7 @@ final class BotExecutionPolicyTests: XCTestCase {
         XCTAssertNil(BypassCoverage.asks.note)
         XCTAssertEqual(
             BypassCoverage.none.note,
-            "This engine never asks for approval, so Bypass Permissions changes nothing for it."
+            "This engine runs its own tools without asking, so Bypass Permissions changes nothing for it."
         )
         let native = try XCTUnwrap(BypassCoverage.native.note)
         XCTAssertTrue(native.contains("skip-permissions mode for turns that do not control This Mac"))

@@ -49,7 +49,7 @@ const GAP = "  ";
 export function bypassCoverageNote(coverage: BypassCoverage): string | null {
   switch (coverage) {
     case "none":
-      return "This engine never asks for approval, so Bypass Permissions changes nothing for it.";
+      return "This engine runs its own tools without asking, so Bypass Permissions changes nothing for it.";
     case "native":
       return `This engine has no approval cards.${GAP}Bypass Permissions turns on its skip-permissions mode for turns that do not control This Mac.`;
     case "asks":

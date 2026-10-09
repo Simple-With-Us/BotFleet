@@ -178,7 +178,7 @@ public enum BypassCoverage: String, Sendable {
         switch self {
         case .asks: nil
         case .native: "This engine has no approval cards.\u{00A0} Bypass Permissions turns on its skip-permissions mode for turns that do not control This Mac."
-        case .none: "This engine never asks for approval, so Bypass Permissions changes nothing for it."
+        case .none: "This engine runs its own tools without asking, so Bypass Permissions changes nothing for it."
         }
     }
 }

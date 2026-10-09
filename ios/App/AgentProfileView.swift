@@ -602,7 +602,7 @@ struct AgentProfileView: View {
         } header: {
             Text("Automation & Approvals")
         } footer: {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(BotExecutionPolicy.autoSummary(isOn: autoApprove))
                 Text(BotExecutionPolicy.autoReviewSummary(bypassIsOn: bypassPermissions, support: autoReviewSupport))
                 Text(BotExecutionPolicy.peerCommsSummary(isOn: approvePeerComms, support: peerCommsSupport))
@@ -621,7 +621,7 @@ struct AgentProfileView: View {
         } header: {
             Text("Bypass Permissions")
         } footer: {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(BotExecutionPolicy.bypassSummary(isOn: bypassPermissions))
                 if let note = BypassCoverage(engine: policyEngine).note {
                     Text(note)
