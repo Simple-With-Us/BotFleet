@@ -152,7 +152,7 @@ export class ResolutionError extends Error {
   }
 }
 
-async function requestJson(url, { headers = {}, fetchImpl = fetch, timeoutMs = API_TIMEOUT_MS } = {}) {
+async function requestJson(url, { headers = {}, fetchImpl = fetch, timeoutMs = API_TIMEOUT_MS, commit = "(unresolved)" } = {}) {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -163,14 +163,14 @@ async function requestJson(url, { headers = {}, fetchImpl = fetch, timeoutMs = A
     const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
     const cause = timedOut ? "network-timed-out" : "network-failed";
     throw new ResolutionError(
-      resolutionMessage({ cause, commit: "(unresolved)", detail: error?.message }),
+      resolutionMessage({ cause, commit, detail: error?.message }),
       cause,
     );
   }
   if (!response.ok) {
     const cause = classifyResolutionFailure({ status: response.status });
     const error = new ResolutionError(
-      resolutionMessage({ cause, commit: "(unresolved)", status: response.status, keyPreview: maskedKeyPreview(headers) }),
+      resolutionMessage({ cause, commit, status: response.status, keyPreview: maskedKeyPreview(headers) }),
       cause,
     );
     error.status = response.status;
@@ -1066,4 +1066,278 @@ export async function downloadBuiltBundle({
     destination,
     manifest,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Choosing WHICH commit to install when the operator did not name one.
+//
+// `ubf` used to install origin/main's tip, and main moves faster than the
+// hosted build finishes: every push cancels the build of the commit it
+// supersedes, so the tip's build is usually queued or cancelled and the update
+// failed with "did not succeed (cancelled)" even though a green build of a
+// commit a few minutes older was sitting right there.  With no `--target`, the
+// wrapper (scripts/update-botfleet.sh) now asks this module for the NEWEST
+// commit on main whose hosted build succeeded and installs that, as long as it
+// is newer than what is installed.  An explicit `--target` never comes here.
+//
+// This runs BEFORE the wrapper archives the updater, because the updater
+// policy must come from the commit that is about to be installed.  So it is
+// reachable only through exports of this file (the wrapper imports it with
+// `node -e`), imports nothing but node: builtins, and fails OPEN: any doubt
+// ends in "install the tip, as before", whose own download then reports the
+// real problem in the usual way.
+// ---------------------------------------------------------------------------
+
+/** How many first-parent commits below main's tip are considered. */
+export const SELECTION_WINDOW = 100;
+/** Green runs whose artifact is checked before giving up on finding one. */
+const SELECTION_ARTIFACT_CHECKS = 5;
+/**
+ * Each lookup gets far less than the 30 seconds an install-time request does.
+ * The selection runs before the updater writes its first progress record, and
+ * the harness gives up on a run with no record after two minutes (LAUNCH_GRACE_MS
+ * in server/update-control.ts), so a slow GitHub must cost seconds here, not
+ * minutes.  Running out of patience is harmless: the selection fails open to
+ * the tip, whose own download then reports what is wrong.
+ */
+const SELECTION_REQUEST_TIMEOUT_MS = 10_000;
+const BUILD_MANIFEST_RELATIVE = "Contents/Resources/server/build-identity.json";
+
+/**
+ * The commit the installed app was built from, or null when it cannot be
+ * read.  Mirrors `installedBuildCommit` in update-botfleet-mac.mjs.
+ *
+ * Hand-checked rather than parsed with zod, for the same reason as
+ * `assertWorkflowRun` above: the updater is bootstrapped from a `git archive`
+ * of a few files into a temp directory with no node_modules, so this module can
+ * import nothing but node: builtins.  The check is still strict on purpose: the
+ * value must BE a string of exactly 40 lowercase hex digits.  `RegExp#test`
+ * coerces its argument, so without the type check a one-element array holding a
+ * valid sha would pass and be returned as if it were one.  Anything else is
+ * "the installed build is unknown", which makes the selection step aside.
+ */
+export async function readInstalledSourceCommit(appPath) {
+  try {
+    const build = JSON.parse(await readFile(join(appPath, BUILD_MANIFEST_RELATIVE), "utf8"));
+    const commit = build?.sourceCommit;
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- build-identity.json boundary parse; zod is unavailable in the updater bootstrap graph (see above).
+    return typeof commit === "string" && FULL_COMMIT.test(commit) ? commit : null;
+  } catch {
+    return null;
+  }
+}
+
+function gitInCheckout(checkout) {
+  return (args) =>
+    execFileSync("git", ["-C", checkout, ...args], {
+      encoding: "utf8",
+      // These are local reads that finish in milliseconds.  They run
+      // synchronously, so the wrapper's watchdog cannot interrupt one: keep the
+      // cap small enough that several in a row still fit inside it.
+      timeout: 10_000,
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: MAX_CHILD_STDOUT_BYTES,
+    }).trim();
+}
+
+/**
+ * The commits an update may choose among: main's first-parent history from the
+ * tip down to, but NOT including, the installed build.
+ *
+ * First-parent because that is exactly the set of commits that were ever
+ * pushed to main and so can have a hosted build at all.  Excluding everything
+ * reachable from the installed commit is what keeps a selection from ever
+ * choosing the installed build or anything older.  Returns `{ skip }` instead
+ * of guessing whenever that floor cannot be established — no installed commit
+ * on record, one this checkout has never seen, or one that is not an ancestor
+ * of main — because without a floor a "newest green" choice could be a
+ * downgrade.  Also skips when the installed build already IS the tip: there is
+ * nothing to choose, and the plain update path (a reinstall under --force, or
+ * a checkout catching up to the app) should run exactly as it always has.
+ */
+export function listUpdateCandidates({ git, installed, windowSize = SELECTION_WINDOW }) {
+  let tip;
+  try {
+    tip = git(["rev-parse", "--verify", "origin/main^{commit}"]);
+  } catch {
+    return { skip: "origin/main cannot be read in the checkout" };
+  }
+  if (!FULL_COMMIT.test(tip)) return { skip: "origin/main did not resolve to a full commit" };
+  if (!installed) return { tip, skip: "the installed build records no source commit" };
+  if (installed === tip) return { tip, skip: "the installed build is already main's tip" };
+  try {
+    git(["cat-file", "-e", `${installed}^{commit}`]);
+    git(["merge-base", "--is-ancestor", installed, tip]);
+  } catch {
+    return { tip, skip: "the installed build is not an ancestor of origin/main in this checkout" };
+  }
+  let chain;
+  let descendants;
+  try {
+    chain = git(["rev-list", "--first-parent", "-n", String(windowSize), tip, `^${installed}`]).split("\n").filter(Boolean);
+    descendants = new Set(git(["rev-list", "--ancestry-path", `${installed}..${tip}`]).split("\n").filter(Boolean));
+  } catch {
+    return { tip, skip: "the commits between the installed build and origin/main cannot be listed" };
+  }
+  // A mainline commit that does not contain the installed build is not an
+  // upgrade from it (the installed build sits on a side branch that main merged
+  // in).  Along the chain the commits that do contain it are a prefix, so
+  // dropping the rest keeps every candidate's distance from the tip intact.
+  const listed = chain.filter((commit) => descendants.has(commit));
+  if (listed.length === 0 || listed[0] !== tip || !listed.every((commit) => FULL_COMMIT.test(commit))) {
+    return { tip, skip: "the commits between the installed build and origin/main did not list cleanly" };
+  }
+  return { tip, candidates: listed, truncated: chain.length >= windowSize };
+}
+
+const short = (commit) => String(commit).slice(0, 12);
+const plural = (count) => `${count} commit${count === 1 ? "" : "s"}`;
+
+/** How main's tip build reads in a sentence ("its build ..."). */
+async function describeTipBuild({ tip, repository, headers, fetchImpl }) {
+  try {
+    const runsUrl = `${apiBase(repository)}/actions/workflows/${WORKFLOW_FILE}/runs?head_sha=${tip}&per_page=20`;
+    const attempted = anyRunForCommit(
+      (await requestJson(runsUrl, { headers, fetchImpl, commit: tip, timeoutMs: SELECTION_REQUEST_TIMEOUT_MS }))?.workflow_runs,
+      tip,
+    );
+    if (!attempted) return "has no hosted build yet";
+    if (STILL_RUNNING.has(attempted.status)) return "is still running";
+    switch (attempted.conclusion) {
+      case "success": return "succeeded, but its artifact is not usable";
+      case "cancelled": return "was cancelled";
+      case "failure": return "failed";
+      case "timed_out": return "timed out";
+      default: return "did not succeed";
+    }
+  } catch {
+    // Only the wording of a message depends on this; never the choice.
+    return "could not be checked";
+  }
+}
+
+/**
+ * Walk `candidates` (newest first) and return the first whose hosted build
+ * succeeded and whose artifact is still available.
+ *
+ * Git order decides, not run order: a re-run of an old commit can finish after
+ * a newer one, and the newest COMMIT is what is wanted.  One listing of main's
+ * successful runs answers for every candidate, so the cost is a single request
+ * plus one artifact lookup for the commit actually chosen.
+ */
+export async function selectNewestGreenCommit({
+  candidates,
+  tip,
+  repository = DEFAULT_REPOSITORY,
+  fetchImpl = fetch,
+  env = process.env,
+  execFileSyncImpl,
+  log = () => {},
+}) {
+  const headers = authHeaders(env, { execFileSyncImpl });
+  const runsUrl = `${apiBase(repository)}/actions/workflows/${WORKFLOW_FILE}/runs?branch=main&status=success&per_page=100`;
+  const runs = (await requestJson(runsUrl, { headers, fetchImpl, commit: tip, timeoutMs: SELECTION_REQUEST_TIMEOUT_MS }))?.workflow_runs;
+  let checked = 0;
+  for (let index = 0; index < candidates.length && checked < SELECTION_ARTIFACT_CHECKS; index += 1) {
+    const commit = candidates[index];
+    const green = selectCommitRun(runs, commit);
+    if (!green) continue;
+    checked += 1;
+    const artifactsUrl = `${apiBase(repository)}/actions/runs/${green.id}/artifacts?per_page=100`;
+    const artifacts = (await requestJson(artifactsUrl, { headers, fetchImpl, commit, timeoutMs: SELECTION_REQUEST_TIMEOUT_MS }))?.artifacts;
+    if (!findCommitArtifact(artifacts, commit)) {
+      log(`${short(commit)} has a successful hosted build but its artifact is missing or expired; looking further back.`);
+      continue;
+    }
+    const tipBuild = index === 0 ? "succeeded" : await describeTipBuild({ tip, repository, headers, fetchImpl });
+    return { commit, behind: index, tipBuild };
+  }
+  // `withoutArtifact` counts green builds passed over because their artifact
+  // is missing or expired, so the caller can say "re-run the build" rather
+  // than "wait for one".  `capped` means the lookups stopped before every
+  // candidate was checked.
+  return {
+    commit: null,
+    behind: null,
+    withoutArtifact: checked,
+    capped: checked >= SELECTION_ARTIFACT_CHECKS,
+    tipBuild: await describeTipBuild({ tip, repository, headers, fetchImpl }),
+  };
+}
+
+/**
+ * Why `selectNewestGreenCommit` found nothing to install, and what to do about
+ * it.  Green builds whose artifact expired need a re-run, not a wait.
+ */
+function noneReason({ withoutArtifact = 0, capped = false }) {
+  if (withoutArtifact > 0) {
+    const one = withoutArtifact === 1;
+    const which = capped
+      ? `The newest ${plural(withoutArtifact)} with a successful hosted build have`
+      : `${plural(withoutArtifact)} in between ${one ? "has a successful hosted build, but its" : "have successful hosted builds, but their"} artifact${one ? " is" : "s are"}`;
+    const state = capped ? "no artifact left to download" : "missing or expired";
+    return `${which} ${state}.  ` +
+      `Re-run the Mac Commit Build workflow on main's tip, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.`;
+  }
+  return "None of the commits in between has a successful hosted build yet.  " +
+    "Wait for a build to finish, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.";
+}
+
+/**
+ * The whole decision, for the wrapper.  Resolves to one of:
+ *
+ *   { status: "selected", commit, message }  install this commit
+ *   { status: "none", message }              nothing newer than the installed
+ *                                            build has a hosted build (`ci`)
+ *   { status: "skip", reason }               not applicable or not provable;
+ *                                            install the tip as before
+ *
+ * `BOTFLEET_UPDATE_SOURCE=local` packages on this Mac, which can build any
+ * commit, so it keeps the tip.  Under `auto`, "nothing newer" also keeps the
+ * tip, because `auto` exists to fall back to a local package of it.
+ */
+export async function selectUpdateTarget({
+  checkout,
+  appPath = "/Applications/BotFleet.app",
+  installedCommit,
+  git,
+  env = process.env,
+  repository = DEFAULT_REPOSITORY,
+  fetchImpl = fetch,
+  execFileSyncImpl,
+  windowSize = SELECTION_WINDOW,
+  log = () => {},
+} = {}) {
+  const policy = updateSourcePolicy(env);
+  if (policy === "local") {
+    return { status: "skip", reason: "BOTFLEET_UPDATE_SOURCE=local packages the commit on this Mac, so there is no hosted build to choose" };
+  }
+  const installed = installedCommit === undefined ? await readInstalledSourceCommit(appPath) : installedCommit;
+  const listed = listUpdateCandidates({ git: git ?? gitInCheckout(checkout), installed, windowSize });
+  if (listed.skip) return { status: "skip", reason: listed.skip };
+  const { tip, candidates, truncated } = listed;
+  const found = await selectNewestGreenCommit({ candidates, tip, repository, fetchImpl, env, execFileSyncImpl, log });
+  if (found.commit) {
+    // `behind` is the chosen commit's position counted down from the tip, so it
+    // is exact however long the installed build's history is.  Truncation only
+    // limits how far BELOW the tip the search looked (the "none" message says
+    // "more than N" because there the count is of the whole unsearched span),
+    // so this count never gets a "more than".  `truncated` is passed on for
+    // callers that want to say the installed build is further back still.
+    const message = found.behind === 0
+      ? `Updating to ${short(found.commit)} (main's tip; its build succeeded)`
+      : `Updating to ${short(found.commit)} (main is ${plural(found.behind)} ahead; its build ${found.tipBuild})`;
+    return { status: "selected", commit: found.commit, tip, behind: found.behind, truncated, message };
+  }
+  if (policy === "auto") {
+    return { status: "skip", reason: "no hosted build is newer than the installed one; the tip will be packaged on this Mac" };
+  }
+  const ahead = `${truncated ? "more than " : ""}${plural(candidates.length)}`;
+  return {
+    status: "none",
+    tip,
+    message:
+      `No newer hosted build to install.  The installed build is ${short(installed)}.  Main is at ${short(tip)}, ` +
+      `${ahead} ahead, and its build ${found.tipBuild}.  ${noneReason(found)}`,
+  };
 }
