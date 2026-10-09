@@ -85,7 +85,7 @@ function answerTurn(res: ServerResponse, body: ChatRequest): void {
   res.end("data: [DONE]\n\n");
 }
 
-const api = async (method: string, path: string, body?: object): Promise<{ status: number; body: any }> => {
+const api = async <Body extends object>(method: string, path: string, body?: Body): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
