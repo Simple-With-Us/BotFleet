@@ -11,6 +11,18 @@ pnpm exec playwright test tests/e2e/bot-off.visual.spec.ts
 cd ios && swift test
 ```
 
+For the iOS screens, build the app unsigned for the simulator and launch it on the fixture roster, in which Pixel is Off:
+
+```sh
+cd ios && xcodegen generate
+xcodebuild -project BotFleet.xcodeproj -scheme BotFleet -destination 'platform=iOS Simulator,name=iPhone 17' CODE_SIGNING_ALLOWED=NO build
+xcrun simctl install booted <path to the built BotFleet.app>
+xcrun simctl launch booted app.botfleet.ios -store-preview -preview-off
+xcrun simctl io booted screenshot ios-bot-off-list.png
+```
+
+Open Pixel from the list for the disabled composer, then its profile for the Power section, taking `xcrun simctl io booted screenshot` of each.  Remove the dev build from the simulator when done.
+
 `server/bot-off.test.ts` boots a real harness with a throwaway HOME and a fake OpenAI-compatible engine.  Every "nothing started" claim is a counted fact: zero completion requests reached the engine.
 
 ## Steps
@@ -30,6 +42,7 @@ cd ios && swift test
 - Step 5: the running turn finishes with its reply, and the queued send is dropped with a "Not sent" line instead of running.
 - Step 6: `off` is still `true`.
 - The disabled composer, the "Off" label and the dimmed avatar are pinned by `tests/e2e/bot-off.visual.spec.ts`.
+- On the phone, the list row shows a grey avatar and an "Off" label, the chat shows "This bot is off.  Turn it on to chat." with a Turn On button in place of the input, and the profile shows a Power section with the switch off.
 
 ## Key Behaviors Verified
 

@@ -7222,6 +7222,11 @@ async function runGroupMemberTurn(
       kind: "activity",
       tool: { name: botOffRoomNotice(bot.name), ok: false },
     });
+    // A connector or secret card is waiting on this turn to continue (its
+    // dispatcher passes `onDispatchError`).  Settle it as failed, with the
+    // reason, rather than leave it stuck on "Resumed" for a turn that will
+    // never start — the same outcome the 1:1 path gets from the thrown refusal.
+    onDispatchError?.(BOT_OFF_REFUSAL);
     return true;
   }
   if (providerReloadInProgress) {

@@ -75,7 +75,20 @@ describe("every raw provider dispatch is gated", () => {
     expect(body.indexOf("providerReloadInProgress")).toBeGreaterThan(gate);
     expect(body.indexOf(".sendTurn(")).toBeGreaterThan(gate);
     // skips the member, not the round: the other responders still speak
-    expect(body.slice(gate, gate + 400)).toContain("return true;");
+    expect(body.slice(gate, gate + 900)).toContain("return true;");
+    // a connector or secret card waiting on this member's turn is settled as
+    // failed with the reason, not left on "Resumed"
+    const gateBody = body.slice(gate, body.indexOf("return true;", gate));
+    expect(gateBody).toContain("onDispatchError?.(BOT_OFF_REFUSAL);");
+  });
+
+  it("hands the card continuations an error callback to settle, in both resume dispatchers", () => {
+    for (const marker of ["markConnectorResumeFailed(entry.threadId, entry.resumeKey, message)", "markSecretResumeFailed(entry.threadId, entry.messageId, message)"]) {
+      const at = source.indexOf(`(message) => ${marker}`);
+      expect(at, marker).toBeGreaterThan(-1);
+      // it is the seventh argument of runGroupMemberTurn, after the card prompt
+      expect(source.slice(Math.max(0, at - 160), at)).toContain("prompt,");
+    }
   });
 });
 
