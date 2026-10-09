@@ -199,14 +199,22 @@ interface Peeled {
   words: string[];
   /** an env assignment in the command already named a virtualenv */
   venv: boolean;
+  /** the wrapper budget ran out with a wrapper still in front, so `words`
+   * does not start at the real program */
+  exhausted: boolean;
 }
+
+/** Wrappers peeled off one stage before the guard stops guessing.  A person
+ * does not stack thirty-two; past it the stage is carded (see `OPAQUE_WRAPPER`). */
+const MAX_PEEL_ROUNDS = 32;
 
 /** Remove clause words, env assignments and wrapper programs from the front
  * of a stage until the real program is first. */
 function peel(tokens: string[]): Peeled {
   let words = tokens;
   let venv = false;
-  for (let round = 0; round < 32; round += 1) {
+  let exhausted = false;
+  for (let round = 0; ; round += 1) {
     let i = 0;
     while (i < words.length) {
       const word = words[i] ?? "";
@@ -219,9 +227,13 @@ function peel(tokens: string[]): Peeled {
     words = words.slice(i);
     const unwrap = WRAPPERS.get(programName(words[0] ?? ""));
     if (!unwrap) break;
+    if (round >= MAX_PEEL_ROUNDS) {
+      exhausted = true;
+      break;
+    }
     words = unwrap(words.slice(1));
   }
-  return { words, venv };
+  return { words, venv, exhausted };
 }
 
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash"]);
@@ -266,6 +278,13 @@ function windowsShellScript(program: string, args: string[]): CommandRisk | stri
 
 /** A command the guard cannot read, so it cannot clear it. */
 const OPAQUE_SHELL: CommandRisk = system("opaque-shell");
+
+/** A stage still fronted by a wrapper after `MAX_PEEL_ROUNDS`.  The program
+ * behind it was never seen, and `riskOfProgram` has no row for a wrapper's own
+ * name, so without this the stage read as ordinary and `env env env … git
+ * clean -fd` (a few hundred characters, no metacharacter) ran unattended.
+ * Mirrors the shell cap above, which cards `nested-shell` past `MAX_SHELL_DEPTH`. */
+const OPAQUE_WRAPPER: CommandRisk = system("opaque-wrapper");
 
 /** `-EncodedCommand`, matched by prefix the way PowerShell itself does. */
 const ENCODED_COMMAND = "encodedcommand";
@@ -523,7 +542,11 @@ function unwrapped(script: string, depth: number): CommandRisk | null {
 function riskIn(command: string, depth: number): CommandRisk | null {
   let found: CommandRisk | null = null;
   for (const stage of stagesOf(command)) {
-    const { words, venv } = peel(stage);
+    const { words, venv, exhausted } = peel(stage);
+    if (exhausted) {
+      found ??= OPAQUE_WRAPPER;
+      continue;
+    }
     if (words.length === 0) continue;
     const risk = riskOfProgram(words, venv, depth);
     if (risk?.kind === "destructive") return risk;

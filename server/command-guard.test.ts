@@ -346,6 +346,20 @@ describe("commandRisk: edges", () => {
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 
+  it("cards a stage still behind a wrapper when the peel budget runs out", () => {
+    const wrapped = (wrapper: string, depth: number) => `${`${wrapper} `.repeat(depth)}git clean -fd`;
+    for (const wrapper of ["env", "command", "nohup", "exec", "builtin", "time"]) {
+      // thirty-two wrappers still unwrap to the real rule
+      expect(commandRisk(wrapped(wrapper, 32))).toEqual({ kind: "destructive", rule: "git-clean" });
+      // one more and the program behind them was never seen: ask, don't clear it
+      expect(commandRisk(wrapped(wrapper, 33))).toEqual({ kind: "system", rule: "opaque-wrapper" });
+    }
+    // a destructive stage elsewhere in the line still wins over the opaque one
+    expect(commandRisk(`${wrapped("env", 33)}; git clean -fd`)).toEqual({ kind: "destructive", rule: "git-clean" });
+    // and an opaque stage is carded wherever it sits in the line
+    expect(commandRisk(`ls; ${wrapped("env", 33)}`)).toEqual({ kind: "system", rule: "opaque-wrapper" });
+  });
+
   it("fails closed on shells nested past the unwrap depth instead of recursing forever", () => {
     let nested = "git clean -fd";
     for (let i = 0; i < 3; i += 1) nested = `sh -c ${JSON.stringify(nested)}`;
