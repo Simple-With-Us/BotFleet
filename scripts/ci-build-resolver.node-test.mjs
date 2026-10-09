@@ -154,6 +154,51 @@ test("a commit with no hosted build says so, and says how to make one", async (t
   );
 });
 
+test("a JSON response without the list is a bad response, not a missing build", async (t) => {
+  // `no-build` is recoverable, so `auto` would quietly package locally and hide an
+  // API change or a proxy fault.  These bodies are valid JSON that is not the
+  // envelope the endpoint promises.
+  for (const body of [{}, null, 42, { workflow_runs: "nope" }, { workflow_runs: null }, { workflows: [] }]) {
+    await assert.rejects(
+      downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl: json(body) }),
+      (error) => {
+        assert.ok(error instanceof ResolutionError, JSON.stringify(body));
+        assert.equal(error.cause, "bad-response", JSON.stringify(body));
+        assert.match(error.message, /without a "workflow_runs" list/);
+        return true;
+      },
+      JSON.stringify(body),
+    );
+  }
+});
+
+test("a run whose artifact list is malformed is a bad response, not a missing build", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) return json({ artifacts: null })();
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "bad-response");
+      assert.match(error.message, /without a "artifacts" list/);
+      return true;
+    },
+  );
+});
+
+test("an empty artifact list is still a missing build", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) return json({ artifacts: [] })();
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => error instanceof ResolutionError && error.cause === "no-build",
+  );
+});
+
 test("a target that is not a full commit is refused before any request", async (t) => {
   let called = false;
   await assert.rejects(
