@@ -2630,7 +2630,7 @@ test("the selection gives up long before the harness decides a run never started
   const grace = Number(/const LAUNCH_GRACE_MS = ([\d_]+)/.exec(control)?.[1]?.replaceAll("_", ""));
   assert.ok(grace > 0, "the harness's launch grace is still where this test looks for it");
 
-  const wrapper = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const wrapper = (await readFile(join(scripts, "update-botfleet.sh"), "utf8")).replace(/\r\n/g, "\n");
   const watchdog = Number(/\}, (\d+)\);\n\s+try \{/.exec(wrapper)?.[1]);
   assert.ok(watchdog > 0 && watchdog <= grace / 2, `the wrapper's watchdog (${watchdog}ms) must be at most half of ${grace}ms`);
 
