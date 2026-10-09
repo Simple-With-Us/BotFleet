@@ -70,6 +70,7 @@ BotFleet is a single-user local harness: the server binds loopback-only (`127.0.
 | `BOTFLEET_UI_TRACES_SAMPLE_RATE` | observability.uiTracesSampleRate | float | 0–1 |
 | `BOTFLEET_SPEND_CEILING_USD` | usage.spendCeilingUsd | float | ≥ 0 |
 | `BOTFLEET_SPEND_CEILING_MIN_PRICED_SHARE` | usage.spendCeilingMinPricedShare | float | 0–1 |
+| `BOTFLEET_AUTO_REVIEW_MAX_PER_TURN` | autoReview.maxReviewsPerTurn | int | 1–500 |
 | `BOTFLEET_INFISICAL_REFRESH_MINUTES` | infisical.refreshMinutes | int | 5–1440 |
 
 Knob values are parsed from their vault strings and clamped to the bounds above; an unparsable value is logged and ignored.  Knob values are not secrets — they are already visible in Settings and `GET /api/config` — so only ids and counts travel the status views.

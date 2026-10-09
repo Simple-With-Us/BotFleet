@@ -119,7 +119,15 @@ async function handle(msg: any) {
       if (conn.destroyed) return dead();
       const ask = isQuestion
         ? { t: "ask", id: askId, kind: "question", tool: "ask_user", input: { question: args.question, choices: args.choices } }
-        : { t: "ask", id: askId, tool: args.tool_name, input: args.input };
+        : {
+          t: "ask",
+          id: askId,
+          tool: args.tool_name,
+          input: args.input,
+          // which tool_use this is about: the harness matches it to the
+          // step it already showed, so auto-review never judges it twice
+          toolUseId: String(args.tool_use_id ?? "") || undefined,
+        };
       try {
         conn.write(JSON.stringify(ask) + "\n");
       } catch {

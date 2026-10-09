@@ -648,10 +648,21 @@ function handle(msg: any, resumed = false) {
         // The idle guard must not trip while the call is open.
         const quietMs = Number(process.env.FAKE_ACP_QUIET_MS) || 400;
         const callId = "quiet-tool-1";
+        // FAKE_ACP_QUIET_TITLE names the call something else (a connected-app
+        // or peer-message tool), which then carries a non-command input.
+        const quietTitle = process.env.FAKE_ACP_QUIET_TITLE || "pnpm build";
         out({
           jsonrpc: "2.0",
           method: "session/update",
-          params: { update: { sessionUpdate: "tool_call", toolCallId: callId, title: "pnpm build", kind: "execute", rawInput: { command: "pnpm build" } } },
+          params: {
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: callId,
+              title: quietTitle,
+              kind: process.env.FAKE_ACP_QUIET_TITLE ? "other" : "execute",
+              rawInput: process.env.FAKE_ACP_QUIET_TITLE ? { bot_id: "peer", message: "hi" } : { command: "pnpm build" },
+            },
+          },
         });
         setTimeout(() => {
           out({
@@ -829,7 +840,19 @@ function handle(msg: any, resumed = false) {
       if (mode === "interleave") playInterleaveTurn();
       else if (mode !== "empty-reply") playTurn();
       if (mode === "permission" || mode === "remote-computer-permission" || mode === "remote-execute-permission") {
-        // ask the client to approve a tool, then complete once answered
+        // ask the client to approve a tool, then complete once answered.
+        // FAKE_ACP_PERMISSION_COMMAND changes the command asked about, and
+        // FAKE_ACP_PERMISSION_CALL_ID first announces the call as a step and
+        // then asks about that same call by id, the way a real agent does.
+        const askedCommand = process.env.FAKE_ACP_PERMISSION_COMMAND || "echo hi";
+        const askedCallId = process.env.FAKE_ACP_PERMISSION_CALL_ID || undefined;
+        if (askedCallId) {
+          out({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: { update: { sessionUpdate: "tool_call", toolCallId: askedCallId, title: askedCommand, kind: "execute", status: "pending", rawInput: { command: askedCommand } } },
+          });
+        }
         pendingPermissionId = 9001;
         onPermissionAnswered = complete;
         out({
@@ -837,9 +860,9 @@ function handle(msg: any, resumed = false) {
           id: pendingPermissionId,
           method: "session/request_permission",
           params: {
-            toolCall: { kind: mode === "remote-computer-permission" ? "mcp" : "execute", rawInput: mode === "remote-computer-permission" || mode === "remote-execute-permission"
+            toolCall: { toolCallId: askedCallId, kind: mode === "remote-computer-permission" ? "mcp" : "execute", rawInput: mode === "remote-computer-permission" || mode === "remote-execute-permission"
               ? { serverName: "computer_shared_vm", toolName: "bash", command: "bash -c echo hi" }
-              : { command: "echo hi" }, title: "echo hi" },
+              : { command: askedCommand }, title: askedCommand },
             options: [
               { optionId: "allow-once", kind: "allow_once" },
               { optionId: "reject", kind: "reject_once" },

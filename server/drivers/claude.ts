@@ -70,6 +70,7 @@ import {
   writePromptSplitReceipt,
   type PromptSplitReceipt,
 } from "./prompt-split.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 /** How the volatile half of the system prompt (memory, mentions) reaches a
@@ -525,6 +526,8 @@ interface Ask {
   tool: string;
   input: Record<string, unknown>;
   at: number;
+  /** The CLI's id for the tool_use being asked about, when it sent one. */
+  toolUseId?: string;
 }
 type AskBehavior = "allow" | "deny" | "answer";
 type AskResolutionSource = "user" | "timeout" | "system";
@@ -625,7 +628,14 @@ function createPermissionBroker(opts: {
       } catch {}
       return;
     }
-    const ask: Ask = { id: askId, kind, tool: msg.tool ?? "tool", input: msg.input ?? {}, at: Date.now() };
+    const ask: Ask = {
+      id: askId,
+      kind,
+      tool: msg.tool ?? "tool",
+      input: msg.input ?? {},
+      at: Date.now(),
+      toolUseId: String(msg.toolUseId ?? "") || undefined,
+    };
     const finish = (behavior: AskBehavior, message: string | undefined, source: AskResolutionSource) => {
       if (!pending.delete(askId)) return;
       clearTimeout(timer);
@@ -1148,9 +1158,21 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const mcpServers: Record<string, unknown> = {};
 
       const allowed: string[] = [];
+      // A turn held for auto-review routes the servers that reach outside
+      // the bot through the permission-prompt tool instead of pre-allowing
+      // them: a connected-app call (an email, a message) and a phone call
+      // then reach the reviewer BEFORE they run, where a pre-allowed call
+      // could only be watched after it had already gone out.  The `agents`
+      // server stays pre-allowed on purpose: it is the harness's own fleet
+      // comms, jobs and Zulip, each guarded by the endpoint it calls (comms
+      // depth, peer approval), and the owner ruled that a full-auto bot's own
+      // `job_start` never becomes a card, which routing it through the broker
+      // would break.  The step watch reviews those calls as they start, a
+      // message to another bot (`ask_bot`) included.
+      const heldForReview = turn.holdForReview === true && permissionMode !== "bypassPermissions";
       if (turn.integrations?.composio) {
         mcpServers.composio = { ...turn.integrations.composio };
-        allowed.push("mcp__composio");
+        if (!heldForReview) allowed.push("mcp__composio");
       }
       // Every granted computer gets its own server, so the agent can choose
       // per task instead of the harness choosing once for it.
@@ -1184,7 +1206,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       }
       if (turn.integrations?.phone) {
         mcpServers.phone = { ...turn.integrations.phone };
-        allowed.push("mcp__phone");
+        if (!heldForReview) allowed.push("mcp__phone");
       }
       if (turn.integrations?.qdrant) {
         mcpServers.qdrant = { ...turn.integrations.qdrant };
@@ -1333,6 +1355,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               ...base(threadId, eventTurnId),
               type: "request.opened",
               requestId: ask.id,
+              // the tool_use this ask is about, the same id its item.started
+              // carried, so the auto-review step watch leaves it to the card
+              itemId: ask.toolUseId,
               requestType: ask.kind,
               tool: ask.tool,
               summary: askSummary(ask),
@@ -2117,8 +2142,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     /** One-shot Claude call with the prompt on stdin, never argv. Approval
      * summaries can contain paths, commands, or secrets, so the generic
      * `claude -p "prompt"` shape is not safe for review. No tools or MCP
-     * servers are mounted in this isolated process. */
-    const generateReview = async (prompt: string, signal?: AbortSignal): Promise<string> => {
+     * servers are mounted in this isolated process.
+     *
+     * A review (`ReviewPrompt`) puts its brief in the system prompt, through
+     * the same `--append-system-prompt` flag every turn already uses, and
+     * only the action under review on stdin, so text inside the action reads
+     * as data rather than as part of the brief.  The brief is fixed text
+     * with nothing from the action in it, so argv is fine for it. */
+    const generateReview = async (stdin: string, system: string | undefined, signal?: AbortSignal): Promise<string> => {
       if (signal?.aborted) throw new Error("Claude review aborted");
       await requireStrictMcp();
       if (signal?.aborted) throw new Error("Claude review aborted");
@@ -2128,6 +2159,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           [
             "-p", "--model", "claude-haiku-4-5", "--output-format", "text",
             "--tools", "", "--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config",
+            ...(system === undefined ? [] : ["--append-system-prompt", system]),
           ],
           {
             stdio: ["pipe", "pipe", "pipe"],
@@ -2174,7 +2206,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (signal?.aborted) onAbort();
         else {
           signal?.addEventListener("abort", onAbort, { once: true });
-          child.stdin.end(prompt);
+          child.stdin.end(stdin);
         }
       });
     };
@@ -2239,8 +2271,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return () => listeners.delete(listener);
         },
       },
-      generateText: (prompt) => generateReview(prompt),
-      reviewPermission: generateReview,
+      generateText: (prompt) => generateReview(prompt, undefined),
+      reviewPermission: (prompt: ReviewPrompt, signal) => generateReview(prompt.data, prompt.system, signal),
       dispose: async () => {
         for (const { stop } of active.values()) stop();
         for (const threadId of [...sessions.keys()]) closeSession(threadId, "dispose");

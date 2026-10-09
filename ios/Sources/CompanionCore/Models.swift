@@ -277,6 +277,11 @@ public struct BotTask: Codable, Hashable, Sendable {
     public var lastActivity: Double?
     public var lastMessage: Message?
     public var usage: TaskUsage?
+    /// `usage` split by the engine instance that ran each turn, with a
+    /// per-model split inside.  Decoded so that a bucket this build cannot read
+    /// costs that figure and never the bot (`UsageBuckets`).  Absent on older
+    /// harnesses.
+    public var usageByInstance: UsageBuckets?
     public var modelSelection: ModelSelection?
     public var activeModelSelection: ModelSelection?
     /// Asleep until: `0` is the until-activity sentinel and sleeps until the
@@ -366,10 +371,19 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var voices: BotVoices? = nil
     public var mascotExpression: String?
     public var tasks: [BotTask]?
+    /// Shared-room turns this bot spoke, banked per engine instance.  Room
+    /// threads are not bot tasks, so they cannot live on the task ledger; a
+    /// bot's usage total includes them (`UsageMath.botUsage`).
+    public var roomUsageByInstance: UsageBuckets?
     public var messages: [Message]?
     public var activeLeafId: String?
     /// Paged responses only: there is more transcript above what you got.
     public var hasMore: Bool?
+    /// The one message pinned above this bot's transcript.  Absent when
+    /// nothing is pinned, and on a harness that predates pins.  The id is not
+    /// checked against the transcript, so a pin whose message is gone simply
+    /// resolves to nothing (`BotOrganize.pinnedMessage`).
+    public var pinnedMessageId: String? = nil
 
     /// Whether this bot is switched Off.  Total over a missing field, so a
     /// payload from an older harness reads as on.
@@ -428,6 +442,9 @@ public struct Room: Codable, Hashable, Identifiable, Sendable {
     public var hasMore: Bool?
     /// Nested conversations in this channel. Absent on DMs and older harnesses.
     public var tasks: [BotTask]?
+    /// The one message pinned above this room's transcript.  Absent when
+    /// nothing is pinned, and on a harness that predates pins.
+    public var pinnedMessageId: String? = nil
 
     /// Older harnesses expose only `busyBotId`; current ones send `working`.
     public var isWorking: Bool { working ?? (busyBotId != nil) }
@@ -632,6 +649,11 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// The probe gave no answer yet (a slow CLI on a busy Mac) and nothing
     /// definitive stood in: the engine is being checked, not missing or signed out.
     public var transient: Bool?
+    /// How the engine bills: `metered` (a charge to an API key) or
+    /// `subscription` (a flat plan, so a cost figure is an equivalent, not a
+    /// charge).  A raw string so a new mode from a newer harness still decodes.
+    /// Absent means the engine did not say.
+    public var billing: String?
 
     public var isAvailable: Bool { state == "available" }
     public var isHidden: Bool { hidden == true }
@@ -682,8 +704,10 @@ public struct InstanceCapabilities: Codable, Hashable, Sendable {
     /// True when this engine can answer a bounded review prompt, which is
     /// what Auto Review needs.  Nil means the computer did not say.
     public var approvalReview: Bool? = nil
-    /// True when this engine can contact other bots.  Nil means the computer
-    /// did not say.
+    /// True when this engine can contact other bots through the harness's
+    /// coordination tools.  A Chief of Staff needs it, so Make Chief Of Staff
+    /// stays off for any other engine, as on the desktop.  Nil means the
+    /// computer did not say, which reads as no.
     public var agentsMcp: Bool? = nil
     /// What a bot's Bypass Permissions switch does on this engine: "asks",
     /// "native" or "none" (`shared/bypass-coverage.ts`).  Read it through
@@ -862,6 +886,9 @@ public struct ConfigStatus: Codable, Sendable {
     /// value is treated as projects.
     public var conversationMode: String?
     public var sidebarSectionOrder: [String]?
+    /// Enable Automatic Update Checks.  Absent on a harness that predates
+    /// the desktop updater, which is not the same as off.
+    public var autoUpdate: ConfigAutoUpdate?
 
     public var isProjectsMode: Bool {
         let raw = conversationMode?.lowercased()
@@ -1577,6 +1604,9 @@ public struct RoomPatch: Encodable, Sendable {
     public var defaultResponder: GroupResponder?
     public var memberIds: [String]?
     public var section: BotProfilePatch.SectionString?
+    /// Pin Message.  `nil` leaves the pin alone, `.set` pins that message,
+    /// and `.clear` sends JSON null, which unpins.
+    public var pinnedMessageId: MessagePin?
 
     public init(
         name: String? = nil,
@@ -1587,7 +1617,8 @@ public struct RoomPatch: Encodable, Sendable {
         extraCwds: [String]? = nil,
         defaultResponder: GroupResponder? = nil,
         memberIds: [String]? = nil,
-        section: BotProfilePatch.SectionString? = nil
+        section: BotProfilePatch.SectionString? = nil,
+        pinnedMessageId: MessagePin? = nil
     ) {
         self.name = name
         self.bulletin = bulletin
@@ -1598,10 +1629,12 @@ public struct RoomPatch: Encodable, Sendable {
         self.defaultResponder = defaultResponder
         self.memberIds = memberIds
         self.section = section
+        self.pinnedMessageId = pinnedMessageId
     }
 
     private enum CodingKeys: String, CodingKey {
         case name, bulletin, avatarUrl, avatarCrop, cwd, extraCwds, defaultResponder, memberIds, section
+        case pinnedMessageId
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1623,6 +1656,12 @@ public struct RoomPatch: Encodable, Sendable {
             switch section {
             case let .set(val): try values.encode(val, forKey: .section)
             case .clear: try values.encodeNil(forKey: .section)
+            }
+        }
+        if let pinnedMessageId {
+            switch pinnedMessageId {
+            case let .set(id): try values.encode(id, forKey: .pinnedMessageId)
+            case .clear: try values.encodeNil(forKey: .pinnedMessageId)
             }
         }
     }

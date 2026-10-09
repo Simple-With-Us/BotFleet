@@ -96,6 +96,12 @@ struct ChatView: View {
         }
     }
 
+    /// Whether this is a shared room, where the jobs list names each member.
+    private var isRoomChat: Bool {
+        if case .room = current { return true }
+        return false
+    }
+
     /// The live chat record, so busy/unread stay current as frames land.
     private var current: Chat {
         switch chat {
@@ -310,7 +316,9 @@ struct ChatView: View {
         .navigationDestination(isPresented: $showingRoutines) {
             TasksRoutinesView()
         }
-        .sheet(isPresented: $showingProfile) {
+        // Deleting the chat from its profile closes the sheet first; the
+        // chat itself closes once the sheet is gone.
+        .sheet(isPresented: $showingProfile, onDismiss: { closeIfGone() }) {
             if case let .bot(bot) = current {
                 AgentProfileView(bot: bot)
             } else if case let .room(room) = current {
@@ -328,6 +336,36 @@ struct ChatView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
+        .modifier(CloseWhenGone(isGone: chatIsGone, waiting: showingProfile, close: { closeIfGone() }))
+    }
+
+    /// Deleted or archived, here or on another device.  Read from the id the
+    /// screen was opened with, because `current` falls back to that snapshot.
+    private var chatIsGone: Bool { chat.isGone(in: session.state) }
+
+    /// Back to the chat list once the chat is gone.  On iPad the chat is the
+    /// detail column's root, with nothing to go back from, so the list lets go
+    /// of it instead (ChatListView `selectedChatIsGone`).
+    private func closeIfGone() {
+        guard chatIsGone, sizeClass != .regular else { return }
+        dismiss()
+    }
+
+    /// The pin, when it resolves to a loaded text message.  A pin whose
+    /// message is gone or not on this page draws nothing, as on the desktop.
+    private var pinnedMessage: Message? {
+        BotOrganize.pinnedMessage(id: current.pinnedMessageId, in: messages)
+    }
+
+    private func pinnedBanner(_ message: Message) -> some View {
+        PinnedMessageBanner(
+            message: message,
+            chatName: current.isBot ? current.name : nil,
+            tint: BotPalette.color(current.color),
+            onJump: { session.focus(message.id) },
+            onUnpin: { Task { await session.pinMessage(nil, in: current) } }
+        )
+        .padding(.horizontal, 16)
     }
 
     /// Split out of `body` so the Swift compiler can type-check the chat
@@ -705,9 +743,17 @@ struct ChatView: View {
             }
             .padding(.horizontal, 16)
 
+            // Background jobs: draws nothing until a bot in this conversation
+            // has one worth showing (running, or ended in the last half hour).
+            JobsPill(threadId: threadId, showsBotNames: isRoomChat)
+
             if case let .bot(bot) = current,
                session.config?.allowsMultipleBotThreads == true {
                 ThreadTabBar(bot: bot)
+            }
+
+            if let pinned = pinnedMessage {
+                pinnedBanner(pinned)
             }
         }
         .padding(.top, 4)
@@ -1414,6 +1460,11 @@ struct MessageRow: View {
         session.state.versions(of: message, inThread: chat.threadId)
     }
 
+    /// This message is the chat's pinned one.
+    private var isPinned: Bool {
+        chat.pinnedMessageId == message.id
+    }
+
     private var senderBot: Bot? {
         if message.role == .user { return nil }
         if let botId = message.from?.botId {
@@ -1625,6 +1676,14 @@ struct MessageRow: View {
             if let text = message.text, !text.isEmpty {
                 Button("Copy", systemImage: "doc.on.doc") {
                     UIPasteboard.general.string = text
+                }
+            }
+            // One pin per chat, shown above the transcript.  Pinning another
+            // message replaces it, as on the desktop.
+            if BotOrganize.canPin(message) {
+                Button(isPinned ? "Unpin Message" : "Pin Message", systemImage: isPinned ? "pin.slash" : "pin") {
+                    let messageId: String? = isPinned ? nil : message.id
+                    Task { await session.pinMessage(messageId, in: chat) }
                 }
             }
             Divider()

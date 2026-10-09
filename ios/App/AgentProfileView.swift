@@ -50,6 +50,10 @@ struct AgentProfileView: View {
     @State private var bypassPermissions: Bool
     @State private var confirmingBypass = false
     @State private var baseline: ProfileFormSnapshot
+    /// Set while the Delete Bot confirmation is up.
+    @State private var deleteTarget: Chat?
+    /// The harness's refusal of a delete, shown in this sheet.
+    @State private var deleteError: String?
     @ObservedObject private var personalVoice = PersonalVoiceService.shared
 
     init(bot: Bot) {
@@ -332,6 +336,7 @@ struct AgentProfileView: View {
                 bypassPermissionsSection
                 computersSection
                 workingDirectorySection
+                skillsSection
 
                 if !Self.voiceSectionFirst { voiceSection }
 
@@ -376,9 +381,14 @@ struct AgentProfileView: View {
                                         .foregroundStyle(.secondary)
                                 }
                             }
+                            NavigationLink("By Model And Session") {
+                                BotUsageDetailView(botId: current.id)
+                            }
                         }
                     }
                 }
+
+                deleteSection
             }
             .navigationTitle("Agent Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -444,6 +454,37 @@ struct AgentProfileView: View {
                 model: modelId,
                 confirm: { bypassPermissions = true }
             ))
+            .modifier(DeleteChatAlert(target: $deleteTarget, roomTerm: "", onConfirm: { _ in
+                Task { await deleteBot() }
+            }))
+            .modifier(InlineErrorAlert(message: $deleteError, title: "Could Not Delete"))
+        }
+    }
+
+    /// Last in the form, away from everything else, behind a confirmation
+    /// that names the bot and what is lost.
+    private var deleteSection: some View {
+        Section {
+            Button("Delete Bot", systemImage: "trash", role: .destructive) {
+                deleteTarget = .bot(current)
+            }
+            .disabled(busy)
+        } footer: {
+            Text("Deleting removes every conversation with this bot for good.\u{00A0} To keep them, archive it instead: long-press it in the chat list.")
+        }
+    }
+
+    /// The chat screen under this sheet closes itself once the bot is gone.
+    private func deleteBot() async {
+        busy = true
+        defer { busy = false }
+        do {
+            try await session.deleteBot(current)
+            dismiss()
+        } catch {
+            if !session.isCancellation(error) {
+                deleteError = error.localizedDescription
+            }
         }
     }
 
@@ -762,6 +803,22 @@ struct AgentProfileView: View {
             Text("Working Directory")
         } footer: {
             Text("Default repository or workspace folder path on the paired Mac.\u{00A0} From this iPhone, choose a folder that a bot or room on your computer already uses.\u{00A0} Any other folder is chosen in BotFleet on your computer.")
+        }
+    }
+
+    /// The bot's imported Agent Skills: read each one, then turn it on or off.
+    /// Those switches act at once and are not part of this form's Save, the
+    /// same as on the Mac.
+    @ViewBuilder
+    private var skillsSection: some View {
+        Section {
+            NavigationLink {
+                BotSkillsView(bot: current)
+            } label: {
+                Label(SkillsDisplay.title, systemImage: "book.closed")
+            }
+        } footer: {
+            Text("Reference material this bot reads when a task matches.\u{00A0} Read a skill, then turn it on or off.")
         }
     }
 

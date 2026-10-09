@@ -18,7 +18,7 @@
 // calls. Adding a feature to the phone means adding its route here, on
 // purpose, in a diff someone can read. That cost is the feature.
 
-import type { JsonObject } from "./json.ts";
+import type { JsonObject, JsonValue } from "./json.ts";
 
 /** A refusal to send back, or null to let the request through. */
 export interface Denial {
@@ -132,6 +132,92 @@ export function companionProfilePatchDenial(body: JsonObject): Denial | null {
     : null;
 }
 
+/** The one bot-level `PATCH /api/bots/:id` a paired phone may send.
+ *
+ * The harness route behind it is the desktop's general bot editor.  It also
+ * reads execution policy (`autoApprove`, `bypassPermissions`, `alwaysAllow`,
+ * `autoReview`), computer grants, working folders, connected apps, the cloud
+ * backend and the persona fields, and none of that is decided here.  So the
+ * request is classified once, and the proxy refuses any body that names a
+ * field outside `COMPANION_BOT_ORGANIZE_FIELDS`, the same way it filters the
+ * profile route.  `ALLOWED` and the proxy's body check share this constant so
+ * the two cannot drift apart. */
+export const COMPANION_BOT_ORGANIZE_ROUTE = {
+  method: "PATCH",
+  path: /^\/api\/bots\/[\w-]+$/,
+} as const;
+
+export function isCompanionBotOrganize(method: string, path: string): boolean {
+  return method === COMPANION_BOT_ORGANIZE_ROUTE.method && COMPANION_BOT_ORGANIZE_ROUTE.path.test(path);
+}
+
+/** How a person organizes the roster from the sidebar menu: Archive and
+ * Restore (`hidden`), Pin (`pinned`), Mark As Unread (`unread`), Make Chief Of
+ * Staff (`chiefOfStaff`), Move To Section (`section`), and Pin Message
+ * (`pinnedMessageId`).  Each one changes where a bot sits or how it is
+ * marked, never what it may do.  An archived bot keeps every transcript and
+ * can be restored. */
+export const COMPANION_BOT_ORGANIZE_FIELDS = [
+  "hidden",
+  "pinned",
+  "unread",
+  "chiefOfStaff",
+  "section",
+  "pinnedMessageId",
+] as const;
+
+const COMPANION_BOT_ORGANIZE_FIELD_SET = new Set<string>(COMPANION_BOT_ORGANIZE_FIELDS);
+const BOT_ORGANIZE_BOOLEAN_FIELDS = new Set<string>(["hidden", "pinned", "unread", "chiefOfStaff"]);
+
+/** Validate the organize boundary before a body reaches the harness.  The
+ * harness copies `hidden`, `pinned` and `unread` into the stored bot without
+ * looking at their type, so the types are checked here as well as the names.
+ * Whole-request rejection, like the profile route: a field the person
+ * expected to save is never silently dropped.  The harness stays the
+ * authority on length limits and on rules that need the stored bot (it
+ * refuses to archive the Chief of Staff). */
+export function companionBotOrganizeDenial(body: JsonObject): Denial | null {
+  const fields = Object.keys(body);
+  if (fields.length === 0) return { status: 400, error: "nothing to save" };
+  const unsupported = fields.find((field) => !COMPANION_BOT_ORGANIZE_FIELD_SET.has(field));
+  if (unsupported) {
+    return { status: 403, error: `${unsupported} can only be changed in BotFleet on your computer` };
+  }
+  for (const field of fields) {
+    const value = body[field];
+    if (BOT_ORGANIZE_BOOLEAN_FIELDS.has(field)) {
+      if (value !== true && value !== false) return { status: 400, error: `${field} must be true or false` };
+    } else if (field === "section") {
+      if (value !== null && !isJsonString(value)) {
+        return { status: 400, error: "section must be a string or null" };
+      }
+    } else if (field === "pinnedMessageId") {
+      if (value !== null && !(isJsonString(value) && /^[\w-]*$/.test(value))) {
+        return { status: 400, error: "pinnedMessageId must be a message id or null" };
+      }
+    }
+  }
+  return null;
+}
+
+/** A string out of `JSON.parse`, which never yields a boxed one, so the
+ * object tag is the same test as `typeof` without the runtime-typeof lint. */
+function isJsonString(value: JsonValue | undefined): value is string {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
+/** The body check a request needs before it is forwarded, or null when the
+ * allowlist alone decides it.  One lookup for the proxy, so a new filtered
+ * route is one line here rather than another branch there. */
+export function companionBodyCheck(
+  method: string,
+  path: string,
+): ((body: JsonObject) => Denial | null) | null {
+  if (isCompanionProfilePatch(method, path)) return companionProfilePatchDenial;
+  if (isCompanionBotOrganize(method, path)) return companionBotOrganizeDenial;
+  return null;
+}
+
 /** Every request the iOS app makes, and nothing else.
  *
  * Ids are `[\w-]+`, matching the harness's own route patterns. The paths
@@ -151,6 +237,11 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // setting gets its own narrow route so /api/config stays write-closed.
   { method: "PATCH", path: /^\/api\/features$/ },
   { method: "PATCH", path: /^\/api\/room-turn-timeout$/ },
+  // Check For Updates Automatically: one boolean, `{ "enabled": bool }`.  It
+  // lives in /api/config beside API keys, so like terminology it gets its own
+  // route and /api/config stays write-closed.  Reading it needs no new route,
+  // because GET /api/config already carries `autoUpdate.enabled`.
+  { method: "PATCH", path: /^\/api\/auto-update$/ },
   { method: "PATCH", path: /^\/api\/profile$/ },
   { method: "GET", path: /^\/api\/events$/ },
   { method: "GET", path: /^\/api\/instances$/ },
@@ -181,6 +272,24 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // Paired-safe profile subset. The proxy validates the JSON field set
   // before forwarding it to the broader harness route.
   { method: "PATCH", path: /^\/api\/bots\/[\w-]+\/profile$/ },
+  // Roster organization: Archive, Restore, Pin, Mark As Unread, Make Chief Of
+  // Staff, Move To Section and Pin Message.  The same bot PATCH the desktop
+  // sidebar uses, behind a field allowlist the proxy enforces on the body
+  // (`companionBotOrganizeDenial`).  Execution policy and computer grants
+  // never pass.
+  COMPANION_BOT_ORGANIZE_ROUTE,
+  // Deleting a bot.  Irreversible, so the native app asks first and names
+  // what is lost.  The harness stops a running turn, removes the bot's
+  // computers and transcripts, and disables its routines and triggers.  The
+  // owner ruled (2026-10-09) that bot management belongs on the phone.
+  { method: "DELETE", path: /^\/api\/bots\/[\w-]+$/ },
+  // Apply Primary and Fallback models to every bot at once (the desktop's
+  // Settings > Models "Set All Bots To Default").  Nothing is stored as a
+  // workspace default and no credential is read: each bot's `modelSelection`
+  // is already phone-editable through the profile route, and this is the same
+  // write fanned out.  Its sibling `apply-defaults` grants computers to every
+  // bot, and stays on the Mac.
+  { method: "POST", path: /^\/api\/bots\/apply-model-defaults$/ },
   { method: "POST", path: /^\/api\/bots\/[\w-]+\/avatar\/generate$/ },
   // Full cloud desktop access. The route is narrow and the proxy applies a
   // second, per-device capability check before it reaches the harness.
@@ -188,7 +297,12 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
 
   // rooms — making one, and talking in one
   { method: "POST", path: /^\/api\/groups$/ },
+  // Rename, bulletin, roster, section and Pin Message (`pinnedMessageId`).
+  // The harness confines any working folder a phone sets here.
   { method: "PATCH", path: /^\/api\/groups\/[\w-]+$/ },
+  // Deleting a room removes its transcripts and tasks; the bots in it stay.
+  // The native app confirms first.
+  { method: "DELETE", path: /^\/api\/groups\/[\w-]+$/ },
   { method: "POST", path: /^\/api\/groups\/[\w-]+\/messages$/ },
   { method: "POST", path: /^\/api\/groups\/[\w-]+\/interrupt$/ },
   { method: "POST", path: /^\/api\/groups\/[\w-]+\/read$/ },
@@ -278,6 +392,45 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "GET", path: /^\/api\/connectors$/ },
   { method: "POST", path: /^\/api\/connectors\/[\w-]+\/authorize$/ },
   { method: "DELETE", path: /^\/api\/connectors\/[\w-]+\/accounts\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/ },
+
+  // Usage and cost, read-only.  The summary itself is computed on the phone
+  // from the bots it already holds; these two add what only the harness knows:
+  // quota windows, rolling per-engine spend and the engines it is holding back
+  // (`quotas`), and the speech provider's character counts (`tts/usage`).
+  // Neither carries a key or a token, and neither has a write side.
+  { method: "GET", path: /^\/api\/quotas$/ },
+  { method: "GET", path: /^\/api\/tts\/usage$/ },
+
+  // Shared memory (the recall corpus) status, as one read-only row in
+  // Settings.  Only the `qdrant` spelling: `/api/recall/status` is the same
+  // handler under a second name and stays closed so there is one door.
+  { method: "GET", path: /^\/api\/qdrant\/status$/ },
+
+  // Background jobs: the list, one job's output, and Stop.  The owner approved
+  // Stop and reading output from the phone (docs/plans/2026-10-01-background-
+  // jobs-and-subagents-decision.md, ruling d).  Nothing here starts a job: a
+  // job only starts from a bot's own tool call.  The bare `GET /api/jobs/:id`
+  // and `/api/jobs/wake-usage` reads are used by no screen, so they stay
+  // closed.  Ids are `[\w-]+`, the harness's own route pattern;  it checks the
+  // `job_<ulid>` shape itself and answers 400 to anything else, so the sidecar
+  // only has to keep a path from being smuggled in.  `stop` with no id is Stop
+  // All for one conversation (`{ threadId }`), which the Mac's jobs menu has
+  // too.
+  { method: "GET", path: /^\/api\/jobs$/ },
+  { method: "GET", path: /^\/api\/jobs\/[\w-]+\/output$/ },
+  { method: "POST", path: /^\/api\/jobs\/[\w-]+\/stop$/ },
+  { method: "POST", path: /^\/api\/jobs\/stop$/ },
+
+  // A bot's imported Agent Skills: read the list, read one SKILL.md, and turn
+  // one on or off, which is exactly what the Mac's Skills panel offers.
+  // Importing is NOT here and must not be: `POST /api/bots/:id/skills` can read
+  // a folder off the Mac's own disk, and the only thing standing between a
+  // caller and that read is "the connection is loopback", which the sidecar
+  // is.  There is no delete on the Mac's panel, so there is none here.  Skill
+  // names are the harness's own `[a-z0-9-]+`.
+  { method: "GET", path: /^\/api\/bots\/[\w-]+\/skills$/ },
+  { method: "GET", path: /^\/api\/bots\/[\w-]+\/skills\/[a-z0-9-]+$/ },
+  { method: "PATCH", path: /^\/api\/bots\/[\w-]+\/skills\/[a-z0-9-]+$/ },
 ];
 
 /** Route families worth naming in the refusal.
@@ -294,6 +447,12 @@ const EXPLAINED: ReadonlyArray<{ path: RegExp; error: string }> = [
     error: "Phone settings are managed on your computer",
   },
   { path: /^\/api\/config$/, error: "API keys can only be changed on your computer" },
+  {
+    // Which computers every bot may use is a grant, not a preference.  Its
+    // sibling `apply-model-defaults` is allowed above.
+    path: /^\/api\/bots\/apply-defaults$/,
+    error: "computer defaults for every bot are set on your computer",
+  },
   { path: /^\/api\/local-computer(\/|$)/, error: "the Local VM is set up on your computer" },
   {
     // Creating one exposes an endpoint to the internet, and rotating a

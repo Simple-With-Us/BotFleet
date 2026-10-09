@@ -145,9 +145,10 @@ export interface ZulipHubDeps {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Test override for the credential source. */
   credentialSource?: (settings: ZulipSettings | undefined) => ZulipCredentialSource | null;
-  /** Reads a folder of BotFleet's own Infisical project, for
-   *  `credentialSource: "infisical"` (the harness passes its
-   *  InfisicalManager, cached).  Without it that source is off. */
+  /** Reads an Infisical folder (BotFleet's own project, or the one
+   *  `infisicalProjectId` names), for `credentialSource: "infisical"` (the
+   *  harness passes its InfisicalManager, cached).  Without it that source
+   *  is off. */
   vault?: ZulipVaultReader;
   timings?: {
     coalesceMs?: number;

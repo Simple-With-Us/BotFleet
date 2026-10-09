@@ -20,12 +20,7 @@ import {
   MAX_COMPANION_ENDPOINTS,
   type CompanionEndpoint,
 } from "./endpoints.ts";
-import {
-  companionProfilePatchDenial,
-  denyReason,
-  isCloudDesktopJoin,
-  isCompanionProfilePatch,
-} from "./routes.ts";
+import { companionBodyCheck, denyReason, isCloudDesktopJoin } from "./routes.ts";
 import { cleanDeviceName, parsePairRequestId } from "./devices.ts";
 import { isJsonObject, type JsonObject, type JsonValue } from "./json.ts";
 import { createSseScrubber, isJson, scrub } from "./wire.ts";
@@ -339,8 +334,13 @@ export function createProxyHandler(options: ProxyOptions) {
       return;
     }
 
+    // Routes that reach a broader harness handler (the bot profile and the
+    // bot organize PATCHes) have their body checked against a field
+    // allowlist first.  What is forwarded is the re-serialized, validated
+    // object, never the bytes the phone sent.
     let forwardedBody: Buffer | undefined;
-    if (isCompanionProfilePatch(method, path)) {
+    const bodyCheck = companionBodyCheck(method, path);
+    if (bodyCheck) {
       let body: JsonObject;
       try {
         body = await readJson(req);
@@ -348,9 +348,9 @@ export function createProxyHandler(options: ProxyOptions) {
         sendJson(res, 400, { error: error instanceof Error ? error.message : "invalid JSON body" });
         return;
       }
-      const profileDenial = companionProfilePatchDenial(body);
-      if (profileDenial) {
-        sendJson(res, profileDenial.status, { error: profileDenial.error });
+      const bodyDenial = bodyCheck(body);
+      if (bodyDenial) {
+        sendJson(res, bodyDenial.status, { error: bodyDenial.error });
         return;
       }
       forwardedBody = Buffer.from(JSON.stringify(body));

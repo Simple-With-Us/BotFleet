@@ -357,6 +357,30 @@ and failure states. Bonjour, Local Network permission, Tailscale routing,
 Keychain behavior across a reboot, and approval delivery still require a real
 iPhone pass.
 
+## Roster management and fleet settings
+
+These are the phone's routes for organizing the roster and a few fleet-level
+settings.  Everything else on the bot and room routes stays closed.
+
+| Phone action | Route through the sidecar | Boundary |
+|---|---|---|
+| Archive, Restore, Pin, Mark As Unread, Make Chief Of Staff, Move To Section, Pin Message (bot) | `PATCH /api/bots/:id` | The proxy accepts only `hidden`, `pinned`, `unread`, `chiefOfStaff`, `section` and `pinnedMessageId`, checks each value's type, and forwards the validated object.  Any other field, such as `autoApprove`, `computers`, `cwd` or `modelSelection`, is a 403 and never reaches the harness. |
+| Delete Bot | `DELETE /api/bots/:id` | The harness stops a running turn, removes the bot's computers, deletes every task transcript, and disables its routines, webhooks and triggers. |
+| Delete Room, Pin Message (room), Move To Section (room) | `DELETE /api/groups/:id`, `PATCH /api/groups/:id` | The room PATCH was already open (the harness confines any working folder); only the DELETE is new. |
+| Models, Set All Bots To Default | `POST /api/bots/apply-model-defaults` | Nothing is stored as a workspace default: the call writes each bot's own `modelSelection`, which the phone could already edit one bot at a time.  `apply-defaults`, which grants computers to every bot, stays on the Mac. |
+| Enable Automatic Update Checks | `PATCH /api/auto-update` | One boolean, `{ "enabled": bool }`.  It is read back from `GET /api/config` (`autoUpdate.enabled`), which was already open, so there is no read route.  `/api/config` itself stays write-closed. |
+
+The phone mirrors two rules the desktop enforces only in its menu, because the
+harness does not: a bot cannot be archived when it is the only active one, and
+Make Chief Of Staff needs an engine with coordination (`capabilities.agentsMcp`).
+The harness does refuse to archive the Chief Of Staff.  Archiving is reversible
+from Archived Bots at the foot of the roster; deleting is not.
+
+The updater re-reads `autoUpdate.enabled` from the config file on every tick
+(`electron/updater.mjs`), so a change made from the phone applies without
+touching the Mac.  A Mac that predates the route answers 404, and the phone says
+to update BotFleet there first.
+
 ## Follow-on releases
 
 Keep the foundational merge separate from capabilities that widen security or
@@ -366,7 +390,15 @@ distribution scope:
    approvals, reconnect, simulator and contract CI.
 2. **Desktop conversation parity:** task create/switch/rename/delete, SQLite
    search with exact-message landing, transcript export/share, reactions, and
-   edit/version controls. Archived or hidden chat management remains desktop-only.
+   edit/version controls.  Roster management followed on 2026-10-09 (owner
+   ruling: bot management and autonomy controls belong on the phone too).  This
+   supersedes the earlier "archived or hidden chat management remains
+   desktop-only" line.  The phone can now Archive and Restore bots, Pin, Mark As
+   Unread, Make Chief Of Staff, Move To Section, Pin Message, Delete a bot or a
+   room (behind a confirmation that names it and says what is lost), apply
+   models to every bot from Settings, Models, and switch Enable Automatic Update
+   Checks.  See "Roster management and fleet settings" below for the exact
+   routes and what stays on the Mac.
 3. **Notifications:** native permission, live/replayed alerts, time-sensitive
    approvals, badges, a brief background grace period, and APNs from the Mac
    sidecar when a paired phone is not streaming.  Tailscale cannot wake a

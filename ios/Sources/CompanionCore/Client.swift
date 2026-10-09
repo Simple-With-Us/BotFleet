@@ -813,6 +813,43 @@ public struct CompanionClient: Sendable {
         )
     }
 
+    /// Enable Automatic Update Checks.  Same phone-safe pattern as the room
+    /// turn timeout: its own route, answering with the full config status,
+    /// so `/api/config` stays write-closed to a paired device.  A Mac older
+    /// than the route answers 404.
+    public func setAutoUpdate(enabled: Bool) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let enabled: Bool
+        }
+        return try await send(
+            try makeRequest(
+                "PATCH",
+                "/api/auto-update",
+                encodedBody: Body(enabled: enabled)
+            ),
+            as: ConfigStatus.self
+        )
+    }
+
+    /// Set All Bots To Default on the Models screen: one call that writes
+    /// the chosen places to every bot.  Nothing is stored as a default.  A
+    /// bot that cannot take the change (busy, or an empty place before a
+    /// chosen fallback) is left alone and named in `skipped`.  Not retried:
+    /// it is not idempotent against a bot that changed in between.
+    public func applyModelDefaults(
+        primary: DefaultModelSlot?,
+        fallbacks: [DefaultModelSlot?]
+    ) async throws -> ApplyModelDefaultsResult {
+        try await send(
+            try makeRequest(
+                "POST",
+                "/api/bots/apply-model-defaults",
+                encodedBody: DefaultModelSlots.applyModelDefaultsBody(primary: primary, fallbacks: fallbacks)
+            ),
+            as: ApplyModelDefaultsResult.self
+        )
+    }
+
     /// Profile name + email only.  Skins and avatars stay on the Mac.
     /// Pass only the field(s) that changed; omitted keys leave the sibling
     /// alone so a concurrent Mac edit of the other field is not overwritten.
@@ -938,6 +975,31 @@ public struct CompanionClient: Sendable {
             try makeRequest("PATCH", "/api/groups/\(id)", encodedBody: patch),
             as: RoomResponse.self
         ).group
+    }
+
+    /// Archive, Restore, Pin, Mark As Unread, Make Chief Of Staff, Move To
+    /// Section and Pin Message, through the desktop's bot PATCH.  The sidecar
+    /// refuses any field `BotOrganizePatch` cannot encode, so nothing else
+    /// about the bot can change through this call.
+    public func organizeBot(id: String, patch: BotOrganizePatch) async throws -> Bot {
+        try await send(
+            try makeRequest("PATCH", "/api/bots/\(id)", encodedBody: patch),
+            as: BotResponse.self
+        ).bot
+    }
+
+    /// Delete a bot for good.  The harness stops a running turn, deletes
+    /// every task transcript, removes its computers, and turns off its
+    /// routines, webhooks and triggers.  It refuses with a sentence (409)
+    /// while a Local VM action is running.
+    public func deleteBot(id: String) async throws {
+        try await send(try makeRequest("DELETE", "/api/bots/\(id)"))
+    }
+
+    /// Delete a room and every transcript in it.  Its bots stay.  The harness
+    /// refuses with a sentence (409) while the room is working.
+    public func deleteRoom(id: String) async throws {
+        try await send(try makeRequest("DELETE", "/api/groups/\(id)"))
     }
 
     /// Persist an avatar and return the app-owned fetch URL.  Chat prompts
@@ -1546,6 +1608,88 @@ public struct CompanionClient: Sendable {
         } catch {
             throw APIError.transport("The computer sent something this app couldn't read.")
         }
+    }
+
+    // MARK: - Background jobs
+
+    /// Every job the harness knows; the screen sorts for display.  A job the
+    /// phone cannot read is left out rather than failing the list.
+    public func jobs() async throws -> [JobSnapshot] {
+        try await send(try makeRequest("GET", "/api/jobs"), as: JobListResponse.self).jobs
+    }
+
+    /// The newest bytes of one job's log (the harness's default 64 KB).
+    /// Output is never on a frame, so it is read here, on demand.
+    public func jobOutput(id: String) async throws -> JobOutputResponse {
+        try await send(try makeRequest("GET", "/api/jobs/\(id)/output"), as: JobOutputResponse.self)
+    }
+
+    /// The owner's Stop: the job gets SIGTERM, then SIGKILL after five
+    /// seconds, and the bot is told on its next turn without being woken.
+    /// Answered at once; the next `jobs` frame shows `stopping`, then
+    /// `killed`.  A job that already ended answers 409, which is the outcome
+    /// asked for, so it is not an error here.  `body: [:]` sends the JSON
+    /// content type every other bodyless write on this client sends.
+    public func stopJob(id: String) async throws {
+        do {
+            try await send(try makeRequest("POST", "/api/jobs/\(id)/stop", body: [:]))
+        } catch let error as APIError where error.isConflict {
+            return
+        }
+    }
+
+    /// Stop every running job of one conversation.
+    public func stopAllJobs(threadId: String) async throws {
+        do {
+            try await send(try makeRequest("POST", "/api/jobs/stop", body: ["threadId": threadId]))
+        } catch let error as APIError where error.isConflict {
+            // Nothing left to stop is the outcome asked for, the same as
+            // `stopJob(id:)`.
+            return
+        }
+    }
+
+    // MARK: - Usage and cost
+
+    /// Quota windows, rolling per-engine spend and the engines being held.
+    public func quotas() async throws -> QuotasSnapshot {
+        try await send(try makeRequest("GET", "/api/quotas"), as: QuotasSnapshot.self)
+    }
+
+    /// The speech provider's character counts.
+    public func speechUsage() async throws -> SpeechUsage {
+        try await send(try makeRequest("GET", "/api/tts/usage"), as: SpeechUsage.self)
+    }
+
+    // MARK: - Shared memory
+
+    /// Whether the recall corpus bots search is reachable.  Read-only.
+    public func sharedMemoryStatus() async throws -> SharedMemoryStatus {
+        try await send(try makeRequest("GET", "/api/qdrant/status"), as: SharedMemoryStatus.self)
+    }
+
+    // MARK: - Skills
+
+    /// A bot's imported skills.
+    public func botSkills(botId: String) async throws -> SkillsResponse {
+        try await send(try makeRequest("GET", "/api/bots/\(botId)/skills"), as: SkillsResponse.self)
+    }
+
+    /// One skill's SKILL.md, which a person reads before enabling it.
+    public func skillText(botId: String, name: String) async throws -> String {
+        try await send(
+            try makeRequest("GET", "/api/bots/\(botId)/skills/\(name)"),
+            as: SkillTextResponse.self
+        ).text
+    }
+
+    /// Turn one skill on or off.  The only write the phone has on skills:
+    /// importing reads a folder off the computer's disk, and stays there.
+    public func setSkillEnabled(botId: String, name: String, enabled: Bool) async throws -> SkillListing {
+        try await send(
+            try makeRequest("PATCH", "/api/bots/\(botId)/skills/\(name)", body: ["enabled": enabled]),
+            as: SkillResponse.self
+        ).skill
     }
 
     // MARK: - Events

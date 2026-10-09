@@ -36,8 +36,26 @@ struct MacUpdateSection: View {
     /// running" would otherwise sit there, stale, long after that run
     /// finished.
     @State private var installErrorStatus: MacUpdateStatus?
+    /// The value the automatic-checks switch shows while its save is in
+    /// flight.  Without it the switch would snap back to the stored value
+    /// until the reply lands; nil means "show what the Mac has".
+    @State private var autoUpdatePending: Bool?
+    @State private var autoUpdateSaving = false
+    /// Why the last save of the automatic-checks switch did not stick.
+    @State private var autoUpdateError: String?
+    /// The paired Mac answered that it has no route for the switch.
+    @State private var autoUpdateNeedsMacUpdate = false
 
     private var status: MacUpdateStatus? { session.state.macUpdateStatus }
+
+    /// The stored preference.  Nil until the config has loaded, and on a Mac
+    /// that predates automatic checks, where it is unknown rather than off.
+    private var storedAutoUpdate: Bool? { session.config?.autoUpdate?.enabled }
+
+    /// The config loaded and has no `autoUpdate`, so this Mac cannot be asked.
+    private var autoUpdateUnsupported: Bool {
+        autoUpdateNeedsMacUpdate || (session.config != nil && storedAutoUpdate == nil)
+    }
 
     var body: some View {
         Section {
@@ -63,6 +81,9 @@ struct MacUpdateSection: View {
                     ProgressView().controlSize(.small)
                 }
             }
+            // The preference lives in the Mac's config, not in the update
+            // status, so it stays here even when that status could not load.
+            autoUpdateRow
         } header: {
             Text("Mac Update")
         } footer: {
@@ -118,6 +139,38 @@ struct MacUpdateSection: View {
                 .foregroundStyle(.secondary)
             Button("Retry") {
                 Task { await loadStatus() }
+            }
+        }
+    }
+
+    /// Enable Automatic Update Checks, as on the desktop's Updates card.  It
+    /// shows the stored value, never a guess: disabled until the config has
+    /// loaded, and on a Mac that cannot be asked.
+    private var autoUpdateRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: Binding(
+                get: { autoUpdatePending ?? storedAutoUpdate ?? false },
+                set: { enabled in
+                    Task { await saveAutoUpdate(enabled) }
+                }
+            )) {
+                Text("Enable Automatic Update Checks")
+            }
+            .disabled(autoUpdateSaving || storedAutoUpdate == nil || autoUpdateNeedsMacUpdate)
+
+            if autoUpdateUnsupported {
+                Text("Update BotFleet on your Mac to change this from your phone.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Auto-checks at most once per 6 hours.\u{00A0} You can still check any time.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let autoUpdateError {
+                    Text("Automatic update preference was not saved.\u{00A0} \(autoUpdateError)")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
         }
     }
@@ -338,6 +391,27 @@ struct MacUpdateSection: View {
         // there is nothing left to keep stale.
         installErrorStatus = message != nil ? status : nil
         installing = false
+    }
+
+    /// One save at a time.  The switch shows the new value while it saves
+    /// and falls back to whatever the Mac has once the reply lands, so a
+    /// refusal reverts it on its own.
+    private func saveAutoUpdate(_ enabled: Bool) async {
+        guard !autoUpdateSaving else { return }
+        autoUpdateSaving = true
+        autoUpdatePending = enabled
+        autoUpdateError = nil
+        let outcome = await session.setAutoUpdateEnabled(enabled)
+        switch outcome {
+        case .saved:
+            break
+        case .needsMacUpdate:
+            autoUpdateNeedsMacUpdate = true
+        case let .failed(message):
+            autoUpdateError = message
+        }
+        autoUpdatePending = nil
+        autoUpdateSaving = false
     }
 
     // MARK: - Formatting
