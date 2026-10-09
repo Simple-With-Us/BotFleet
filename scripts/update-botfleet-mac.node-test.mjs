@@ -2328,3 +2328,293 @@ test("only an expected cancellation justifies packaging on this Mac", async () =
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// With no target named, the wrapper installs the newest commit with a green
+// hosted build instead of main's tip (whose build is usually still running or
+// was cancelled by the next push).  The selection itself is covered in
+// ci-build-resolver.node-test.mjs; these tests cover what the wrapper does with
+// an answer.
+// ---------------------------------------------------------------------------
+
+const wrapperOnly = { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false };
+
+/**
+ * A remote whose main has two commits, each carrying its own stub updater
+ * ("older" and "tip") and a stand-in for ci-build-resolver.mjs whose answer the
+ * test dictates through the environment.  The wrapper runs the TIP's resolver,
+ * so the stand-in is identical in both.  The stub updater records the label of
+ * the commit it was archived from, its arguments, and the hand-off variable.
+ */
+async function newestGreenFixture(t, { resolver } = {}) {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-newest-green-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  const selectLog = join(fixture, "selection.log");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  const fakeResolver = resolver ?? [
+    'import { appendFileSync } from "node:fs";',
+    "export async function selectUpdateTarget(options) {",
+    '  appendFileSync(process.env.UBF_SELECT_LOG, JSON.stringify({ checkout: options.checkout, appPath: options.appPath }) + "\\n");',
+    "  if (process.env.UBF_SELECT_THROW) throw new Error(process.env.UBF_SELECT_THROW);",
+    "  return { status: process.env.UBF_SELECT_STATUS, commit: process.env.UBF_SELECT_COMMIT, message: process.env.UBF_SELECT_MESSAGE };",
+    "}",
+    "",
+  ].join("\n");
+  const writeCommit = async (label) => {
+    for (const path of [
+      "scripts/update-botfleet-mac.mjs",
+      "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+      "scripts/stage-entries.mjs",
+      "scripts/update-progress.mjs",
+      "electron/update-credential-preparation.mjs",
+    ]) {
+      await mkdir(dirname(join(remote, path)), { recursive: true });
+      let text = "// placeholder\n";
+      if (path.endsWith("update-botfleet-mac.mjs")) {
+        text = `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: ${JSON.stringify(label)}, args: process.argv.slice(2), hint: process.env.BOTFLEET_UPDATE_SELECTION_FAILURE ?? null }));\n`;
+      } else if (path.endsWith("ci-build-resolver.mjs")) {
+        text = fakeResolver;
+      }
+      await writeFile(join(remote, path), text);
+    }
+  };
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await writeCommit("older");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "older"]);
+  const older = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  // A commit that never reached main, for the ancestry rule.
+  await git(remote, ["checkout", "-b", "evil"]);
+  await writeCommit("evil");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "evil"]);
+  const evil = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  await git(remote, ["checkout", "main"]);
+  await writeCommit("tip");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "tip"]);
+  const tip = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  await git(fixture, ["clone", "remote", "checkout"]);
+  const wrapper = join(scripts, "update-botfleet.sh");
+  const invoke = async (args, env = {}) => {
+    await rm(marker, { force: true });
+    await rm(selectLog, { force: true });
+    const result = await run("bash", [wrapper, ...args], {
+      env: {
+        BOTFLEET_CHECKOUT: checkout,
+        BOTFLEET_FORCE: "1",
+        BOTFLEET_APP_PATH: join(fixture, "BotFleet.app"),
+        UBF_SELECT_LOG: selectLog,
+        UBF_SELECT_STATUS: "",
+        UBF_SELECT_COMMIT: "",
+        UBF_SELECT_MESSAGE: "",
+        UBF_SELECT_THROW: "",
+        BOTFLEET_UPDATE_TARGET: "",
+        BOTFLEET_UPDATE_SELECTION_FAILURE: "",
+        ...env,
+      },
+      allowFailure: true,
+    });
+    const executed = await readFile(marker, "utf8").then(JSON.parse, () => null);
+    const consulted = await readFile(selectLog, "utf8").then((text) => text.trim().split("\n").map((line) => JSON.parse(line)), () => []);
+    return { ...result, executed, consulted };
+  };
+  return { fixture, checkout, older, evil, tip, invoke };
+}
+
+test("with no target the wrapper installs the chosen commit, using that commit's own updater", wrapperOnly, async (t) => {
+  const { fixture, checkout, older, tip, invoke } = await newestGreenFixture(t);
+  const message = `Updating to ${older.slice(0, 12)} (main is 1 commit ahead; its build was cancelled)`;
+  const chosen = { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: older, UBF_SELECT_MESSAGE: message };
+
+  const plain = await invoke([], chosen);
+  assert.equal(plain.code, 0, plain.stderr);
+  // The updater policy comes from the commit being installed, not from the tip.
+  assert.deepEqual(plain.executed, { label: "older", args: ["--target", older], hint: null });
+  assert.match(plain.stdout, new RegExp(escapeRegExp(message)));
+  assert.notEqual(older, tip);
+  // The selection saw this checkout and this app, not defaults.
+  assert.deepEqual(plain.consulted, [{ checkout, appPath: join(fixture, "BotFleet.app") }]);
+
+  const prepare = await invoke(["prepare"], chosen);
+  assert.deepEqual(prepare.executed, { label: "older", args: ["prepare", "--target", older], hint: null });
+
+  // The harness's detached run: its flags are forwarded untouched, ahead of the pin.
+  const progress = join(fixture, "run.json");
+  const detached = await invoke(["--progress", progress, "--run-id", "run_one"], chosen);
+  assert.deepEqual(detached.executed, {
+    label: "older",
+    args: ["--progress", progress, "--run-id", "run_one", "--target", older],
+    hint: null,
+  });
+});
+
+test("when nothing newer is green the explanation reaches the tip's updater, which fails with it", wrapperOnly, async (t) => {
+  const { tip, invoke } = await newestGreenFixture(t);
+  const message = "No newer hosted build to install.  The installed build is 111111111111.  Main is at 222222222222, 2 commits ahead, and its build is still running.";
+  const result = await invoke([], { UBF_SELECT_STATUS: "none", UBF_SELECT_MESSAGE: message });
+  assert.equal(result.code, 0, result.stderr);
+  // The wrapper does not end the run itself: a run that ends in the wrapper
+  // writes no progress record, and the harness reports it as never started.
+  assert.deepEqual(result.executed, { label: "tip", args: ["--target", tip], hint: message });
+});
+
+test("any doubt in the selection installs main's tip exactly as before", wrapperOnly, async (t) => {
+  const { tip, older, invoke } = await newestGreenFixture(t);
+  const expected = { label: "tip", args: ["--target", tip], hint: null };
+  for (const [label, env] of [
+    ["skip", { UBF_SELECT_STATUS: "skip", UBF_SELECT_MESSAGE: "the installed build is already main's tip" }],
+    ["an unknown status", { UBF_SELECT_STATUS: "banana", UBF_SELECT_COMMIT: older }],
+    ["a selection with no commit", { UBF_SELECT_STATUS: "selected", UBF_SELECT_MESSAGE: "Updating to nothing" }],
+    ["a selection naming something that is not a full commit", { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: "abc1234" }],
+  ]) {
+    const result = await invoke([], env);
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.deepEqual(result.executed, expected, label);
+    assert.doesNotMatch(result.stdout, /Updating to/, label);
+  }
+
+  // A lookup that blows up is a warning, and the update goes on with the tip.
+  const thrown = await invoke([], { UBF_SELECT_THROW: "GitHub is unreachable" });
+  assert.equal(thrown.code, 0, thrown.stderr);
+  assert.deepEqual(thrown.executed, expected);
+  assert.match(thrown.stderr, /WARNING:.*Could not choose among the hosted builds \(GitHub is unreachable\)\..*origin\/main's tip/);
+});
+
+test("a resolver that predates the selection is skipped without a word", wrapperOnly, async (t) => {
+  const { tip, invoke } = await newestGreenFixture(t, { resolver: "// placeholder\n" });
+  const result = await invoke([]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(result.executed, { label: "tip", args: ["--target", tip], hint: null });
+  assert.doesNotMatch(result.stderr, /WARNING/);
+  assert.deepEqual(result.consulted, []);
+});
+
+test("an explicit target, apply, unquiesce and imported sources are never second-guessed", wrapperOnly, async (t) => {
+  const { fixture, older, tip, invoke } = await newestGreenFixture(t);
+  const stage = join(fixture, "stage");
+  await mkdir(stage, { recursive: true });
+  await writeFile(join(stage, "prepared.json"), JSON.stringify({ sourceCommit: tip }));
+  // A selection that would change every one of these if it were consulted.
+  const tempting = { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: older, UBF_SELECT_MESSAGE: "Updating to the wrong commit" };
+  for (const { args, env = {}, expected } of [
+    { args: ["--target", "origin/main"], expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: ["--target=origin/main"], expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: ["--target", tip], expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: ["--target", "origin/main~1"], expected: { label: "older", args: ["--target", older], hint: null } },
+    { args: [], env: { BOTFLEET_UPDATE_TARGET: "origin/main" }, expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: [], env: { BOTFLEET_UPDATE_TARGET: "origin/main~1" }, expected: { label: "older", args: ["--target", older], hint: null } },
+    { args: ["unquiesce"], expected: { label: "tip", args: ["unquiesce"], hint: null } },
+    { args: ["apply", "--stage", stage], expected: { label: "tip", args: ["apply", "--stage", stage], hint: null } },
+    { args: ["--source", fixture], expected: { label: "tip", args: ["--source", fixture, "--target", tip], hint: null } },
+    { args: ["--help"], expected: { label: "tip", args: ["--help", "--target", tip], hint: null } },
+  ]) {
+    const label = `${JSON.stringify(args)} ${JSON.stringify(env)}`;
+    const result = await invoke(args, { ...tempting, ...env });
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.deepEqual(result.consulted, [], `${label} must not consult the selection`);
+    assert.deepEqual(result.executed, expected, label);
+    assert.doesNotMatch(result.stdout, /Updating to the wrong commit/, label);
+  }
+});
+
+test("a chosen commit that is not on origin/main is refused before any of its code runs", wrapperOnly, async (t) => {
+  const { evil, invoke } = await newestGreenFixture(t);
+  const result = await invoke([], { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: evil, UBF_SELECT_MESSAGE: "Updating to evil" });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /not reachable from origin\/main/);
+  assert.equal(result.executed, null, "no archived updater code ran");
+});
+
+test("an explanation left in the caller's environment is not believed", wrapperOnly, async (t) => {
+  const { tip, invoke } = await newestGreenFixture(t);
+  const result = await invoke([], {
+    BOTFLEET_UPDATE_SELECTION_FAILURE: "No newer hosted build to install.  (planted)",
+    UBF_SELECT_STATUS: "skip",
+  });
+  assert.deepEqual(result.executed, { label: "tip", args: ["--target", tip], hint: null });
+});
+
+test("the selection runs after the tip is fetched and before anything is archived for execution", async () => {
+  const source = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const bootstrapDir = source.indexOf('BOOTSTRAP_DIR="$(mktemp -d');
+  const selection = source.indexOf('SELECT_NEWEST_GREEN=0');
+  const tipFetch = source.indexOf('fetch --quiet origin main 2>/dev/null; then\n      SELECT_TIP');
+  const resolverArchive = source.indexOf('show "$SELECT_TIP:scripts/ci-build-resolver.mjs"');
+  const chosen = source.indexOf('BOOTSTRAP_REF="$SELECTION_COMMIT"');
+  const fetch = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin "$BOOTSTRAP_FETCH_REF"');
+  const ancestry = source.indexOf('merge-base --is-ancestor "$BOOTSTRAP_COMMIT" origin/main');
+  const archive = source.indexOf('git -C "$BOTFLEET_CHECKOUT" archive "$BOOTSTRAP_COMMIT"');
+  assert.ok(bootstrapDir >= 0 && selection > bootstrapDir, "the scratch directory exists before the resolver is archived into it");
+  assert.ok(tipFetch > selection && resolverArchive > tipFetch, "the tip is refreshed before its resolver is read");
+  assert.ok(chosen > resolverArchive && chosen < fetch, "the choice replaces the ref before it is fetched, resolved and checked");
+  assert.ok(ancestry > chosen && archive > ancestry, "a chosen commit meets the same origin/main ancestry rule before its updater is archived");
+  // Only a plain update or prepare with no target of any kind is eligible.
+  assert.match(source, /if \[\[ "\$HAS_BOOTSTRAP_TARGET" == "0" && -z "\$\{BOTFLEET_UPDATE_TARGET:-\}" \]\]; then/);
+  assert.match(source, /apply\|unquiesce\) ;;/);
+  // Nothing new is passed to the updater as an argument: the chosen commit may
+  // predate this feature, and an unknown option would stop it.
+  assert.doesNotMatch(source, /PINNED_ARGS\+=\(--(?!target)/);
+});
+
+test("the updater hands the wrapper's explanation back as a failure the progress record keeps", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-no-green-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const progressPath = join(root, "run.json");
+  const explanation = "No newer hosted build to install.  The installed build is 111111111111.  Main is at 222222222222, 2 commits ahead, and its build is still running.";
+  const scratch = {
+    BOTFLEET_UPDATE_ALLOW_NON_DARWIN: "1",
+    BOTFLEET_CHECKOUT: join(root, "checkout"),
+    BOTFLEET_APP_PATH: join(root, "BotFleet.app"),
+    BOTFLEET_DATA_DIR: join(root, "data"),
+    BOTFLEET_UPDATE_LOCK: join(root, "update.lock"),
+    BOTFLEET_UPDATE_ROOT: join(root, "updates"),
+    BOTFLEET_UPDATE_SELECTION_FAILURE: explanation,
+  };
+  const restore = Object.fromEntries(Object.keys(scratch).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, scratch);
+  t.after(() => {
+    for (const [key, value] of Object.entries(restore)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  await assert.rejects(
+    main(["update", "--progress", progressPath, "--run-id", "run_none", "--target", "2".repeat(40)]),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "no-green-build");
+      assert.equal(error.message, explanation);
+      return true;
+    },
+  );
+  const record = JSON.parse(await readFile(progressPath, "utf8"));
+  assert.equal(record.runId, "run_none");
+  assert.equal(record.outcome, "failed");
+  assert.equal(record.message, explanation, "the harness, the desktop app and the phone read this line");
+  assert.equal(record.steps.at(-1).name, "resolveTarget");
+  assert.equal(record.steps.at(-1).ok, false);
+  assert.ok(!record.steps.some((step) => step.name === "prepareSource"), "nothing was staged");
+});
+
+test("resolveTarget raises the wrapper's explanation before it touches git", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  const resolveTarget = source.indexOf("resolveTarget: async (plan) => {");
+  const body = source.slice(resolveTarget, source.indexOf("prepareSource:", resolveTarget));
+  const hint = body.indexOf("BOTFLEET_UPDATE_SELECTION_FAILURE");
+  assert.ok(hint > 0, "resolveTarget reads the hand-off variable");
+  assert.ok(hint < body.indexOf('["fetch", "origin", "main"]'), "the explanation is raised before any fetch");
+  assert.match(body, /new ResolutionError\(nothingNewer, "no-green-build"\)/);
+});
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
