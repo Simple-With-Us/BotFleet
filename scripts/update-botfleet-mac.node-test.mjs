@@ -2550,7 +2550,7 @@ test("an explanation left in the caller's environment is not believed", wrapperO
 });
 
 test("the selection runs after the tip is fetched and before anything is archived for execution", async () => {
-  const source = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const source = (await readFile(join(scripts, "update-botfleet.sh"), "utf8")).replace(/\r\n/g, "\n");
   const bootstrapDir = source.indexOf('BOOTSTRAP_DIR="$(mktemp -d');
   const selection = source.indexOf('SELECT_NEWEST_GREEN=0');
   const tipFetch = source.indexOf('fetch --quiet origin main 2>/dev/null; then\n      SELECT_TIP');
@@ -2571,7 +2571,7 @@ test("the selection runs after the tip is fetched and before anything is archive
   assert.doesNotMatch(source, /PINNED_ARGS\+=\(--(?!target)/);
 });
 
-test("the updater hands the wrapper's explanation back as a failure the progress record keeps", async (t) => {
+test("the updater hands the wrapper's explanation back as a failure the progress record keeps", { skip: process.platform === "win32" ? "the updater reads the POSIX user id (process.getuid) when it builds its configuration" : false }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "botfleet-no-green-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const progressPath = join(root, "run.json");
