@@ -93,8 +93,13 @@ export class ReviewWatch {
   private readonly queues = new Map<string, Pending[]>();
   private readonly draining = new Map<string, Promise<void>>();
   private readonly stoppedTurns = new Set<string>();
+  // A plain field, not a parameter property: the server runs under Node's
+  // strip-only TypeScript, which refuses parameter properties.
+  private readonly deps: ReviewWatchDeps;
 
-  constructor(private readonly deps: ReviewWatchDeps) {}
+  constructor(deps: ReviewWatchDeps) {
+    this.deps = deps;
+  }
 
   /** Called for every `item.started` tool step, with the caller's plan for
    *  it: null when it is not watched (review off, no reviewer, or an engine
