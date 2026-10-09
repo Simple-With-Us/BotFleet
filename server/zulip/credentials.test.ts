@@ -49,6 +49,42 @@ describe("zuliprc files", () => {
     }
   });
 
+  it("refuse a malformed email, key or site by field name, never by value", () => {
+    const refusal = (text: string): ZulipCredentialError => {
+      try {
+        parseZuliprc(text, "/p/BF-X-zuliprc");
+      } catch (e) {
+        if (e instanceof ZulipCredentialError) return e;
+        throw e;
+      }
+      throw new Error("expected a refusal");
+    };
+    const badKey = "has a space";
+    const key = refusal(`[api]\nemail=a@b\nkey=${badKey}\nsite=https://x.test\n`);
+    expect(key.reason).toBe("invalid");
+    expect(key.message).toBe("/p/BF-X-zuliprc: invalid key");
+    expect(key.message).not.toContain(badKey);
+    expect(refusal(`[api]\nemail=not-an-email\nkey=${FAKE_KEY}\nsite=https://x.test\n`).message).toBe(
+      "/p/BF-X-zuliprc: invalid email",
+    );
+    expect(refusal(`[api]\nemail=@b\nkey=${FAKE_KEY}\nsite=https://x.test\n`).message).toBe("/p/BF-X-zuliprc: invalid email");
+    expect(refusal(`[api]\nemail=a@b\nkey=${FAKE_KEY}\nsite=ftp://x.test\n`).message).toBe("/p/BF-X-zuliprc: invalid site");
+    // every wrong field is named once, and the key is in none of the text
+    const all = refusal(`[api]\nemail=nope\nkey=bad key\nsite=ftp://x.test\n`);
+    expect(all.message).toBe("/p/BF-X-zuliprc: invalid email, key, site");
+    expect(all.message).not.toContain("bad key");
+  });
+
+  it("still accept the loose shapes Zulip allows: a bare-host email, a loopback http site, a key of any length", () => {
+    expect(parseZuliprc(`[api]\nemail=a@b\nkey=k\nsite=http://127.0.0.1:9999/\n`, "x")).toEqual({
+      email: "a@b",
+      key: "k",
+      site: "http://127.0.0.1:9999",
+    });
+    const long = "K".repeat(300);
+    expect(parseZuliprc(`[api]\nemail=a@b\nkey=${long}\nsite=x.test\n`, "x").key).toBe(long);
+  });
+
   it.skipIf(!posix)("refuse a file group or other can read", () => {
     const dir = mkdtempSync(join(tmpdir(), "zulip-rc-"));
     const path = rc(dir, "BF-Plumber-zuliprc", `[api]\nemail=a@b\nkey=${FAKE_KEY}\nsite=https://x.test\n`, 0o644);
@@ -127,6 +163,32 @@ describe("the Infisical source", () => {
     expect(calls).toEqual(["/zulip"]);
     // the key never lands in the environment
     expect(Object.values(process.env)).not.toContain(FAKE_KEY);
+  });
+
+  it("refuses a malformed email, key or site from the vault by field name, never by value", async () => {
+    const refusal = async (rows: Record<string, string>): Promise<ZulipCredentialError> => {
+      try {
+        await infisicalCredentialSource(vault(rows).read, { realm: REALM }).load("BF-Plumber");
+      } catch (e) {
+        if (e instanceof ZulipCredentialError) return e;
+        throw e;
+      }
+      throw new Error("expected a refusal");
+    };
+    // a multi-line vault value must not reach the Authorization header
+    const multiline = `${FAKE_KEY}\nX-Injected: 1`;
+    const key = await refusal({ ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test", ZULIP_BF_PLUMBER_API_KEY: multiline });
+    expect(key.reason).toBe("invalid");
+    expect(key.message).toBe("infisical /zulip: invalid key");
+    expect(key.message).not.toContain(FAKE_KEY);
+    const email = await refusal({ ZULIP_BF_PLUMBER_EMAIL: "no-at-sign", ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY });
+    expect(email.message).toBe("infisical /zulip: invalid email");
+    const site = await refusal({
+      ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test",
+      ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY,
+      ZULIP_BF_PLUMBER_SITE: "file:///x",
+    });
+    expect(site.message).toBe("infisical /zulip: invalid site");
   });
 
   it("names what is missing, never a value, and turns a vault failure into a value-free error", async () => {
