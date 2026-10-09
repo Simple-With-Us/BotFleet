@@ -79,6 +79,41 @@ describe("the orphan transcript sweep while the roster is on hold", () => {
     expect(existsSync(log)).toBe(false);
   });
 
+  it("says an unchanged hold once, then again when the reason changes or the hold clears and comes back", () => {
+    const day = 24 * 60 * 60 * 1000;
+    const lines: string[] = [];
+    let held: string | null = "bots.json.corrupt-1 is waiting to be restored or removed";
+    const stop = startOrphanTranscriptSweeps({ eventsDir, nativeDir }, () => [], (line) => lines.push(line), {
+      initialDelayMs: 10,
+      hold: () => held,
+    });
+    const skipped = (reason: string) => `[retention] orphan transcript sweep skipped: ${reason}.`;
+
+    vi.advanceTimersByTime(20); // first run: says why
+    vi.advanceTimersByTime(day); // same reason: quiet
+    vi.advanceTimersByTime(day); // still quiet
+    expect(lines).toEqual([skipped("bots.json.corrupt-1 is waiting to be restored or removed")]);
+
+    held = "groups.json.corrupt-2 is waiting to be restored or removed";
+    vi.advanceTimersByTime(day); // the reason changed: says so
+    vi.advanceTimersByTime(day); // and is quiet again
+    expect(lines).toEqual([
+      skipped("bots.json.corrupt-1 is waiting to be restored or removed"),
+      skipped("groups.json.corrupt-2 is waiting to be restored or removed"),
+    ]);
+    expect(existsSync(log)).toBe(true);
+
+    held = null;
+    vi.advanceTimersByTime(day); // lifted: the sweep runs
+    expect(existsSync(log)).toBe(false);
+    const afterLift = lines.length;
+
+    held = "groups.json.corrupt-2 is waiting to be restored or removed";
+    vi.advanceTimersByTime(day); // the same reason returning after a clear is news again
+    stop();
+    expect(lines.slice(afterLift)).toEqual([skipped("groups.json.corrupt-2 is waiting to be restored or removed")]);
+  });
+
   it("is driven by a set-aside file on disk, not by anything in memory", () => {
     const dataDir = tmp();
     expect(cleanupHoldReason(dataDir)).toBeNull();
