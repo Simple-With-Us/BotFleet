@@ -414,6 +414,12 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(instance.adapter.capabilities.effortLevels).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
   });
 
+  it("tells auto-review it can only watch: pi runs its own tools without a card", async () => {
+    await create();
+    expect(instance.adapter.capabilities.reviewHook).toBe("after");
+    expect(instance.adapter.capabilities.asksWhenHeld).toBeUndefined();
+  });
+
   it("declares the shared-memory mount the dispatcher gates on", async () => {
     // The dispatcher only builds the qdrant integration for a driver that
     // says it can mount it, so the flag and the mount above stand or fall

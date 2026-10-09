@@ -1592,6 +1592,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           // (P2b); `invoke_subagent` rows come with named helpers in P3.
           backgroundJobs: "none",
           helpers: "none",
+          // Print mode has no permission hook (see the header), but every
+          // step streams as a tool_use event, so review can watch it.
+          reviewHook: "after",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

@@ -695,7 +695,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // full-auto bot mount the local computer at all.
         const computerMounts = turnComputerMounts(turn.integrations);
         const controlsHost = hostToolPrefix(computerMounts) !== null;
-        const turnConfig: AcpConfig = controlsHost && config.fullAuto ? { ...config, fullAuto: false } : config;
+        // A turn the harness holds for auto-review is spawned in the same
+        // asking mode, so each `session/request_permission` reaches the
+        // reviewer instead of being answered here.
+        const turnConfig: AcpConfig =
+          (controlsHost || turn.holdForReview === true) && config.fullAuto ? { ...config, fullAuto: false } : config;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         // Carried across a relaunch (see maybeRetry): `attempt` is how many
@@ -1870,6 +1874,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // says so.  Named helper rows come in P3.
             backgroundJobs: mountsMcpServers ? "emulated" : "none",
             helpers: "none",
+            // `session/request_permission` becomes request.opened; a
+            // full-auto instance answers it itself unless the turn is held
+            reviewHook: config.fullAuto ? "after" : "before",
+            asksWhenHeld: true,
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),
