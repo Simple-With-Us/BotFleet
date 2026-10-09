@@ -27,6 +27,8 @@ export interface AgentBot {
   name: string;
   section?: string | null;
   hidden?: boolean;
+  /** Switched Off (shared/bot-power.ts): visible, but takes no new work. */
+  off?: boolean;
   busy?: boolean;
   title?: string | null;
   description?: string | null;
@@ -39,6 +41,10 @@ export interface AgentPeerRow {
   name: string;
   model: string;
   busy: boolean;
+  /** `true` only when the peer is switched Off (absent otherwise, and dropped
+   *  from the JSON): ask_bot and delegate_bot refuse it, so a model should pick
+   *  someone else. */
+  off?: true;
   title?: string;
   description?: string;
 }
@@ -70,6 +76,8 @@ export function selectPeerBots(selfId: string, all: readonly AgentBot[]): AgentP
       name: bot.name,
       model: bot.modelSelection.model,
       busy: !!bot.busy,
+      // only ever `true` (an On bot carries nothing, like title below)
+      off: bot.off === true ? true : undefined,
       // title/description so a Chief-of-Staff-style bot can judge the team:
       // who does what, and who has no job description yet.
       title: bot.title || undefined,
