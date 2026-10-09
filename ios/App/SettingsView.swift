@@ -545,6 +545,7 @@ struct SettingsView: View {
 
     private var roomTerm: String { session.config?.roomTerminologyLabel ?? "Channel" }
     private var roomTermPlural: String { session.config?.roomTerminologyPlural ?? "Channels" }
+    private var roomTermLowered: String { session.config?.roomTerminologyLabelLowered ?? "channel" }
 
     private var normalizedProfileName: String {
         profileName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -606,7 +607,7 @@ struct SettingsView: View {
             return "Workspace arrangement, terminology, and tool toggles unlock after settings load from your computer."
         }
         return session.config?.isProjectsMode == true
-            ? "Any number of threads under each bot and \(roomTerm.lowercased()).\u{00A0} A thread can be tied to one \(roomTerm.lowercased()) on your computer."
+            ? "Any number of threads under each bot and \(roomTermLowered).\u{00A0} A thread can be tied to one \(roomTermLowered) on your computer."
             : "Simple is one conversation per bot.  That word is a group thread invited bots and you can all write in."
     }
 

@@ -162,7 +162,7 @@ struct RoomTaskManagerView: View {
     private var tasks: [BotTask] { current.tasks ?? [] }
     private var blocked: Bool { session.state.roomTaskChangesBlocked(current) }
     private var canAddTask: Bool { session.config?.allowsMultipleBotThreads == true }
-    private var roomWord: String { (session.config?.roomTerminologyLabel ?? "Channel").lowercased() }
+    private var roomWord: String { session.config?.roomTerminologyLabelLowered ?? "channel" }
 
     private var footerText: String {
         var text = "A task is one conversation in this \(roomWord).\u{00A0} Changes wait while a bot is working or needs an answer."
