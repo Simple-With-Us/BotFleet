@@ -154,6 +154,97 @@ test("a commit with no hosted build says so, and says how to make one", async (t
   );
 });
 
+test("a JSON response without the list is a bad response, not a missing build", async (t) => {
+  // `no-build` is recoverable, so `auto` would quietly package locally and hide an
+  // API change or a proxy fault.  These bodies are valid JSON that is not the
+  // envelope the endpoint promises.
+  for (const body of [{}, null, 42, { workflow_runs: "nope" }, { workflow_runs: null }, { workflows: [] }]) {
+    await assert.rejects(
+      downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl: json(body) }),
+      (error) => {
+        assert.ok(error instanceof ResolutionError, JSON.stringify(body));
+        assert.equal(error.cause, "bad-response", JSON.stringify(body));
+        assert.match(error.message, /without a "workflow_runs" list/);
+        return true;
+      },
+      JSON.stringify(body),
+    );
+  }
+});
+
+test("a run whose artifact list is malformed is a bad response, not a missing build", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) return json({ artifacts: null })();
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "bad-response");
+      assert.match(error.message, /without an "artifacts" list/);
+      return true;
+    },
+  );
+});
+
+test("a run entry missing a required field is a bad response at the boundary, not a silent skip", async (t) => {
+  // The old shape only checked the envelope, so a partial entry was passed through
+  // and silently dropped by `selectCommitRun`.  The boundary now rejects it: a
+  // proxy or a 200-with-truncated-body would otherwise look like an empty build
+  // and `auto` would quietly package locally.
+  for (const partial of [
+    { head_sha: COMMIT, status: "completed", conclusion: "success", event: "push" }, // no id
+    { id: 1, status: "completed", conclusion: "success", event: "push" }, // no head_sha
+    { id: 1, head_sha: COMMIT, conclusion: "success", event: "push" }, // no status
+    { id: 1, head_sha: COMMIT, status: "completed", event: "push" }, // no conclusion (must be string|null)
+  ]) {
+    await assert.rejects(
+      downloadBuiltBundle({
+        commit: COMMIT,
+        destination: await fixture(t),
+        fetchImpl: json({ workflow_runs: [partial] }),
+      }),
+      (error) => {
+        assert.ok(error instanceof ResolutionError, JSON.stringify(partial));
+        assert.equal(error.cause, "bad-response", JSON.stringify(partial));
+        assert.match(error.message, /malformed workflow run entry/);
+        return true;
+      },
+      JSON.stringify(partial),
+    );
+  }
+});
+
+test("an artifact entry missing a required field is a bad response at the boundary, not a silent skip", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) {
+      return json({ artifacts: [{ name: artifactNameFor(COMMIT), expired: false, archive_download_url: "https://example.test/a.zip" }] })();
+    }
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "bad-response");
+      assert.match(error.message, /malformed artifact entry/);
+      return true;
+    },
+  );
+});
+
+test("an empty artifact list is still a missing build", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) return json({ artifacts: [] })();
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => error instanceof ResolutionError && error.cause === "no-build",
+  );
+});
+
 test("a target that is not a full commit is refused before any request", async (t) => {
   let called = false;
   await assert.rejects(
