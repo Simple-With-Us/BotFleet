@@ -158,6 +158,7 @@ struct AgentProfileView: View {
                     HStack {
                         Spacer()
                         BotAvatarView(bot: current, size: 112, state: .happy, animated: true)
+                            .providerBadge(for: current, avatarSize: 112)
                         Spacer()
                     }
                     .listRowBackground(Color.clear)
