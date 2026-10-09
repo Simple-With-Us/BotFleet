@@ -82,6 +82,12 @@ final class Session: ObservableObject {
     /// predates PR #383 and does not report the route.  Distinct from
     /// "have not fetched yet" so the row can render the right copy.
     @Published private(set) var pushSenderHealthNotReported = false
+    /// Shared memory (the recall corpus) status, read-only, for the Settings
+    /// row.  `nil` until the first fetch resolves; a failed fetch keeps the
+    /// last answer, and a 404 (a sidecar that predates the route) is
+    /// `sharedMemoryNotReported`.
+    @Published private(set) var sharedMemoryStatus: SharedMemoryStatus?
+    @Published private(set) var sharedMemoryNotReported = false
 
     /// instanceId -> driverKind, cached from the last `instances()` fetch so
     /// the chat header can resolve a bot's current-model provider mark
@@ -601,6 +607,8 @@ final class Session: ObservableObject {
         state = CompanionState()
         pushSenderHealth = nil
         pushSenderHealthNotReported = false
+        sharedMemoryStatus = nil
+        sharedMemoryNotReported = false
         instanceDriverKinds = [:]
         cachedInstances = []
         instanceRoster.reset()
@@ -812,6 +820,10 @@ final class Session: ObservableObject {
                         // Refresh provider marks after reconnect — instances
                         // may have changed while the phone was backgrounded.
                         Task { await self.warmInstanceDriverKinds() }
+                        // Jobs only ride the stream as they change, so a
+                        // connect, or a reconnect that missed frames, asks
+                        // for the whole set once.
+                        Task { await self.loadJobs() }
                         // The last frame this phone saw before the gap may
                         // have said a run was in progress — and the restart
                         // that gap likely IS took the connection down with
@@ -1782,6 +1794,107 @@ final class Session: ObservableObject {
         catch { recordActionError(error) }
     }
 
+    // MARK: - Roster organization
+    //
+    // Archive, Restore, Pin, Mark As Unread, Make Chief Of Staff, Move To
+    // Section, Pin Message, and Delete.  Each applies the harness's answer
+    // as soon as it arrives, the way `updateProfile` does, instead of waiting
+    // for the stream frame that follows.  The rules about what may be asked
+    // live in `BotOrganize`.
+
+    /// The bot PATCH, throwing the harness's refusal so a caller inside a
+    /// sheet can show it there.  No pairing reads as a cancelled tap: the
+    /// same silence every other action here gives it.
+    @MainActor
+    func applyOrganize(_ patch: BotOrganizePatch, to bot: Bot) async throws -> Bot {
+        guard let client, !patch.isEmpty else { throw CancellationError() }
+        let updated = try await client.organizeBot(id: bot.id, patch: patch)
+        // A new Chief of Staff demotes the old one in its section.  The
+        // harness sends that bot as its own frame too; folding it in now
+        // keeps the roster from showing two at once.  A bot deleted while the
+        // request was in flight is not put back (`botsToApply`).
+        for folded in BotOrganize.botsToApply(after: updated, in: state.bots) {
+            state.apply(.bot(folded))
+        }
+        return updated
+    }
+
+    /// `applyOrganize`, reporting a refusal through `actionError`.
+    @MainActor
+    @discardableResult
+    func organizeBot(_ bot: Bot, _ patch: BotOrganizePatch) async -> Bot? {
+        do {
+            return try await applyOrganize(patch, to: bot)
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+    }
+
+    /// Delete a bot for good.  Throws the harness's refusal (a running Local
+    /// VM action is a 409 with a sentence) so the caller decides where to
+    /// show it.  On success the bot leaves `state` now rather than when the
+    /// `bot.deleted` frame lands, so no screen is left showing it.
+    @MainActor
+    func deleteBot(_ bot: Bot) async throws {
+        guard let client else { throw CancellationError() }
+        try await client.deleteBot(id: bot.id)
+        state.apply(.botDeleted(botId: bot.id))
+    }
+
+    /// Delete a room and its transcripts.  Same shape as `deleteBot`.
+    @MainActor
+    func deleteRoom(_ room: Room) async throws {
+        guard let client else { throw CancellationError() }
+        try await client.deleteRoom(id: room.id)
+        state.apply(.roomDeleted(groupId: room.id))
+    }
+
+    /// Move To Section for a room.  A blank or nil name takes it out.
+    @MainActor
+    @discardableResult
+    func moveRoom(_ room: Room, toSection section: String?) async -> Bool {
+        let value: BotProfilePatch.SectionString
+        if let name = BotOrganize.normalizedSection(section) {
+            value = .set(name)
+        } else {
+            value = .clear
+        }
+        return await patchRoom(room, RoomPatch(section: value))
+    }
+
+    /// Pin Message, or unpin with nil, in a bot chat or a room.
+    @MainActor
+    @discardableResult
+    func pinMessage(_ messageId: String?, in chat: Chat) async -> Bool {
+        switch chat {
+        case let .bot(bot):
+            return await organizeBot(bot, .pinMessage(messageId)) != nil
+        case let .room(room):
+            return await patchRoom(room, RoomPatch(pinnedMessageId: MessagePin(messageId)))
+        }
+    }
+
+    @MainActor
+    private func patchRoom(_ room: Room, _ patch: RoomPatch) async -> Bool {
+        guard let client else { return false }
+        do {
+            let updated = try await client.updateRoom(id: room.id, patch: patch)
+            if state.rooms.contains(where: { $0.id == updated.id }) {
+                state.apply(.room(updated))
+            }
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    /// Bring one message of the open chat into view, as a search hit does.
+    func focus(_ messageId: String) {
+        focusedMessageId = messageId
+    }
+
     // MARK: - Room tasks
     //
     // A channel's separate conversations, mirrored from the bot task methods
@@ -2480,6 +2593,56 @@ final class Session: ObservableObject {
         let outcome = await enqueueSettingsUpdate()
         guard let outcome, outcome.timeoutOK == true else { return nil }
         return outcome.status
+    }
+
+    /// Enable Automatic Update Checks, through `PATCH /api/auto-update`.
+    /// One boolean, so it skips the coalescing queue the other settings
+    /// share; it only waits out a flush already in flight, the way
+    /// `configStatus()` does, so it never lands between that flush's write
+    /// and the status it reads back.  The Mac Update card says the outcome
+    /// in place, so nothing here raises the app-wide alert.
+    @MainActor
+    func setAutoUpdateEnabled(_ enabled: Bool) async -> PhoneWriteOutcome<ConfigStatus> {
+        while true {
+            let generationAtAwait = settingsUpdateGeneration
+            _ = await settingsUpdateTail?.value
+            if settingsUpdateGeneration == generationAtAwait { break }
+        }
+        guard let client else { return .failed(nil) }
+        let pairing = pairingGeneration
+        do {
+            let saved = try await client.setAutoUpdate(enabled: enabled)
+            guard pairingGeneration == pairing else { return .failed(nil) }
+            self.config = saved
+            return .saved(saved)
+        } catch let error as APIError where error.isUnauthorized {
+            self.status = .unauthorized
+            return .failed(nil)
+        } catch {
+            if isCancellation(error) { return .failed(nil) }
+            return PhoneWriteOutcome<ConfigStatus>.failure(error)
+        }
+    }
+
+    /// Set All Bots To Default on the Models screen.  Every bot the harness
+    /// changed also arrives on the event stream as a `bot` frame, which is
+    /// what updates the rows; the reply only says who was left alone.
+    @MainActor
+    func applyModelDefaults(
+        primary: DefaultModelSlot?,
+        fallbacks: [DefaultModelSlot?]
+    ) async -> PhoneWriteOutcome<ApplyModelDefaultsResult> {
+        guard let client else { return .failed(nil) }
+        do {
+            let result = try await client.applyModelDefaults(primary: primary, fallbacks: fallbacks)
+            return .saved(result)
+        } catch let error as APIError where error.isUnauthorized {
+            self.status = .unauthorized
+            return .failed(nil)
+        } catch {
+            if isCancellation(error) { return .failed(nil) }
+            return PhoneWriteOutcome<ApplyModelDefaultsResult>.failure(error)
+        }
     }
 
     @MainActor
@@ -3193,6 +3356,112 @@ final class Session: ObservableObject {
         }
     }
 
+    // MARK: - Background jobs
+
+    /// Read every conversation's jobs and replace what the phone holds.
+    ///
+    /// Silent on failure: an older harness or sidecar has no jobs route, and
+    /// then the pill simply never appears.  A pairing that changed while the
+    /// request was out keeps the answer out of the new pairing's state.
+    func loadJobs() async {
+        guard let client else { return }
+        let generation = pairingGeneration
+        do {
+            let jobs = try await client.jobs()
+            guard pairingGeneration == generation else { return }
+            state.hydrateJobs(jobs)
+        } catch {
+            return
+        }
+    }
+
+    /// One job's newest output.  Throws, so the sheet can say what failed in
+    /// place rather than raising an alert over the screen.
+    func readJobOutput(_ jobId: String) async throws -> JobOutputResponse {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.jobOutput(id: jobId)
+    }
+
+    /// The owner's Stop for one job.  The next `jobs` frame shows it
+    /// stopping, then stopped; this only reports whether the request went in.
+    @discardableResult
+    func stopJob(_ jobId: String) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.stopJob(id: jobId)
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    /// Stop every running job of one conversation.
+    @discardableResult
+    func stopAllJobs(threadId: String) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.stopAllJobs(threadId: threadId)
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    // MARK: - Usage and cost
+
+    /// Quota windows, rolling spend and held engines.  `nil` on any failure,
+    /// and never an alert: the screen polls this, and a computer that is
+    /// asleep should not raise an alert every half minute.
+    func loadQuotas() async -> QuotasSnapshot? {
+        guard let client else { return nil }
+        return try? await client.quotas()
+    }
+
+    func loadSpeechUsage() async -> SpeechUsage? {
+        guard let client else { return nil }
+        return try? await client.speechUsage()
+    }
+
+    // MARK: - Shared memory
+
+    /// Refresh the shared-memory status.  Informational, like push health: a
+    /// failure keeps the last answer so a transient blip never blanks the row.
+    func refreshSharedMemoryStatus() async {
+        guard let client else { return }
+        let generation = pairingGeneration
+        do {
+            let fetched = try await client.sharedMemoryStatus()
+            guard pairingGeneration == generation else { return }
+            sharedMemoryStatus = fetched
+            sharedMemoryNotReported = false
+        } catch let error as APIError where error.isNotFound {
+            guard pairingGeneration == generation else { return }
+            sharedMemoryStatus = nil
+            sharedMemoryNotReported = true
+        } catch {
+            return
+        }
+    }
+
+    // MARK: - Skills
+
+    func loadBotSkills(botId: String) async throws -> SkillsResponse {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.botSkills(botId: botId)
+    }
+
+    func loadSkillText(botId: String, name: String) async throws -> String {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.skillText(botId: botId, name: name)
+    }
+
+    func setSkillEnabled(botId: String, name: String, enabled: Bool) async throws -> SkillListing {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.setSkillEnabled(botId: botId, name: name, enabled: enabled)
+    }
+
     // MARK: - Connected apps
 
     func loadConnectorCatalog() async -> ConnectorCatalog? {
@@ -3571,7 +3840,7 @@ extension CompanionState {
     var chatSummaries: [ChatSummary] {
         let bots = self.bots.filter { $0.hidden != true }.map(Chat.bot)
         let rooms = self.rooms.map(Chat.room)
-        return (bots + rooms)
+        let summaries = (bots + rooms)
             .map { chat in
                 let last = newestLoadedMessage(for: chat)
                 return ChatSummary(
@@ -3581,14 +3850,11 @@ extension CompanionState {
                     pinned: Self.pinned(chat)
                 )
             }
-            .sorted { left, right in
-                ChatListOrder.orderedBefore(
-                    pinnedLeft: left.pinned,
-                    activityLeft: left.lastActivity,
-                    pinnedRight: right.pinned,
-                    activityRight: right.lastActivity
-                )
-            }
+        // Pinned first, then newest activity, then the order the harness sent:
+        // the same order the desktop sidebar draws (`ChatListOrder`).
+        return ChatListOrder.stableOrder(summaries) { summary in
+            (pinned: summary.pinned, activity: summary.lastActivity)
+        }
     }
 
     private static func pinned(_ chat: Chat) -> Bool {

@@ -83,6 +83,11 @@ export class ActiveTurnOwners {
     return owners.size === 1 ? owners.values().next().value : undefined;
   }
 
+  /** The provider instances with a live dispatch on this thread. */
+  instancesOn(threadId: string): string[] {
+    return [...(this.byThread.get(threadId)?.keys() ?? [])];
+  }
+
   current(threadId: string): ActiveTurnOwner | undefined {
     const owners = this.byThread.get(threadId);
     if (!owners) return undefined;
@@ -496,6 +501,22 @@ export function inspectThreadOwners(
     }
   }
   return { owners, inspectionFailed };
+}
+
+/** How far an auto-review stop reaches (server/index.ts
+ * `stopTurnForReview`).  `instance` stops only the engine that took the
+ * refused step and closes only its cards: another engine is live on the same
+ * thread, which is a room running two members at once, and stopping the
+ * thread would stop a member the reviewer never refused.  `thread` is the
+ * person's own Stop, which also settles in-process asks and peer approvals:
+ * the step's engine has the thread to itself, or the step did not say which
+ * engine took it, so the only safe stop is all of it. */
+export function reviewStopScope(args: {
+  instanceId: string | undefined;
+  liveInstanceIds: readonly string[];
+}): "instance" | "thread" {
+  if (!args.instanceId) return "thread";
+  return args.liveInstanceIds.some((id) => id !== args.instanceId) ? "instance" : "thread";
 }
 
 export async function interruptThreadOwners(
