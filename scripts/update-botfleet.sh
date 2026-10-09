@@ -177,14 +177,22 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
         OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/harness-owner.json"
         if [[ -f "$OWNER_FILE" ]]; then
           # The bearer credential is never read from harness-owner.json in this
-          # wrapper: it must arrive via BOTFLEET_OWNER_NONCE.  Without it there
-          # is no live harness to authenticate against for the shortcut, which is
-          # not evidence of an outdated checkout.  When it is set, the helper
-          # reads only the port from the owner file and writes just a commit SHA
-          # to stdout; probe failures stay silent so IS_UP_TO_DATE stays 1.
-          if [[ -n "${BOTFLEET_OWNER_NONCE:-}" ]]; then
-            RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" BOTFLEET_OWNER_NONCE="$BOTFLEET_OWNER_NONCE" "$NODE_BIN" "$SCRIPT_DIR/update-botfleet-runtime-commit.mjs" 2>/dev/null) || RUNTIME_COMMIT=""
+          # wrapper: it must arrive via BOTFLEET_OWNER_NONCE.  A live owner
+          # record means the harness was adopted, so a missing or rejected
+          # credential must fail fast instead of pretending the runtime check
+          # passed.  The helper reads only the port from the owner file and
+          # writes just a commit SHA to stdout.
+          : "${BOTFLEET_OWNER_NONCE:?BotFleet updater: BOTFLEET_OWNER_NONCE is required when a harness owner record exists.}"
+          RUNTIME_PROBE_ERR="$(mktemp "${TMPDIR:-/tmp}/botfleet-runtime-probe.XXXXXX")"
+          if ! RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" BOTFLEET_OWNER_NONCE="$BOTFLEET_OWNER_NONCE" "$NODE_BIN" "$SCRIPT_DIR/update-botfleet-runtime-commit.mjs" 2>"$RUNTIME_PROBE_ERR"); then
+            if [[ -s "$RUNTIME_PROBE_ERR" ]]; then
+              cat "$RUNTIME_PROBE_ERR" >&2
+            fi
+            rm -f "$RUNTIME_PROBE_ERR"
+            echo "BotFleet updater: could not verify the running harness commit (credential BOTFLEET_OWNER_NONCE)." >&2
+            exit 1
           fi
+          rm -f "$RUNTIME_PROBE_ERR"
           if [[ "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
             IS_UP_TO_DATE=0
           fi

@@ -696,6 +696,24 @@ function validOwner(owner) {
     typeof owner.nonce === "string" && /^[a-f0-9]{64}$/.test(owner.nonce);
 }
 
+/** Masked env key reference for operator-facing errors; never prints the secret. */
+export function maskedHarnessCredentialEnvRef(credential) {
+  if (typeof credential !== "string" || credential.length === 0) return "BOTFLEET_OWNER_NONCE";
+  if (credential.length <= 12) return "BOTFLEET_OWNER_NONCE (value too short to preview safely)";
+  return `BOTFLEET_OWNER_NONCE (${credential.slice(0, 8)}…${credential.slice(-4)})`;
+}
+
+function requireHarnessBearerCredential() {
+  const credential = process.env.BOTFLEET_OWNER_NONCE;
+  if (typeof credential !== "string" || credential.length === 0) {
+    throw new Error("BOTFLEET_OWNER_NONCE is required to authenticate against the live harness");
+  }
+  if (!/^[a-f0-9]{64}$/.test(credential)) {
+    throw new Error(`${maskedHarnessCredentialEnvRef(credential)} is not a valid harness bearer credential`);
+  }
+  return credential;
+}
+
 /**
  * Classify the owner record instead of collapsing it to a boolean.  "No record"
  * and "a record naming a process that is gone" are different operator problems:
@@ -766,11 +784,20 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
     return { safe: false, reason: `BotFleet harness (pid ${owner.pid}) is not running` };
   }
   if (state !== "live") return null;
+  let bearer;
+  try {
+    bearer = requireHarnessBearerCredential();
+  } catch (error) {
+    return { safe: false, reason: error instanceof Error ? error.message : String(error) };
+  }
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
-    headers: { Authorization: `Bearer ${owner.nonce}` },
+    headers: { Authorization: `Bearer ${bearer}` },
     accept: [200],
   });
   if (response.kind === "http" && response.status === 404) return null;
+  if (response.kind === "http" && (response.status === 401 || response.status === 403)) {
+    return { safe: false, reason: `Harness rejected ${maskedHarnessCredentialEnvRef(bearer)} (HTTP ${response.status})` };
+  }
   if (response.kind !== "ok") return { safe: false, reason: "Authenticated runtime readiness could not be verified" };
   const runtime = response.body;
   const identityError = authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle });
@@ -806,12 +833,21 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
   const releaseAdmission = adapters.releaseRuntimeAdmission ?? releaseRuntimeAdmission;
   const owner = await readRuntimeOwner(config.dataDirectory);
   if (!owner) return { safe: false, reason: "Authenticated runtime owner is unavailable for the admission fence" };
+  let bearer;
+  try {
+    bearer = requireHarnessBearerCredential();
+  } catch (error) {
+    return { safe: false, reason: error instanceof Error ? error.message : String(error) };
+  }
   const forceQuery = (config?.force || process.env.BOTFLEET_FORCE === "1") ? "?force=true" : "";
   const response = await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce${forceQuery}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${owner.nonce}` },
+    headers: { Authorization: `Bearer ${bearer}` },
     accept: [200, 409],
   });
+  if (response.kind === "http" && (response.status === 401 || response.status === 403)) {
+    return { safe: false, reason: `Harness rejected ${maskedHarnessCredentialEnvRef(bearer)} (HTTP ${response.status})` };
+  }
   if (response.kind !== "ok") return { safe: false, reason: "Runtime admission fence could not be established" };
   const runtime = response.body;
   const fenceHeld = response.status === 200 && runtime?.quiescing === true;
@@ -854,9 +890,10 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
 export async function releaseRuntimeAdmission(config) {
   const owner = await readOwner(config.dataDirectory);
   if (!owner) throw new Error("Authenticated runtime owner is unavailable for admission recovery");
+  const bearer = requireHarnessBearerCredential();
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime/quiesce`, {
     method: "DELETE",
-    headers: { Authorization: `Bearer ${owner.nonce}` },
+    headers: { Authorization: `Bearer ${bearer}` },
     accept: [200],
   });
   if (response.kind !== "ok" || response.body?.quiescing !== false) {
