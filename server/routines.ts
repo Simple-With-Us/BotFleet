@@ -18,6 +18,7 @@ import {
 import { foldPrompts, gapEndsAt, withinGap } from "./trigger-gap.ts";
 import { routineFailureCode, routineFailurePhase, type RoutineOutcomeCode, type RoutineFailurePhase } from "../shared/routine-outcomes.ts";
 import { botAutomationsPausedMessage } from "./bot-stop-policy.ts";
+import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
 
@@ -859,14 +860,19 @@ export class RoutineManager {
     }
     const routine = this.routines.find((r) => r.id === id);
     if (!routine) return null;
-    this.clearBotSnooze(routine.botId);
+    // Off outranks "Run now": a person pressing it is asking, but the bot is
+    // off, so the run is recorded as skipped and nothing is dispatched.  The
+    // stop is left in place — only Turn On lifts Off.
+    const off = this.botIsOff(routine.botId);
+    if (!off) this.clearBotSnooze(routine.botId);
     let run!: RoutineRun;
     this.commitMutation(() => {
       run = this.newRun(routine, this.now(), true);
+      if (off) this.skipForOff(run, false);
       if (request) this.rememberRoutineRequest(request, run.id, this.now());
     });
     this.emitRun(run);
-    queueMicrotask(() => void this.tick());
+    if (!off) queueMicrotask(() => void this.tick());
     return { ...run };
   }
 
@@ -921,7 +927,11 @@ export class RoutineManager {
     if (this.options.botState(input.botId) === "missing") {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
-    const snoozed = this.isBotSnoozed(input.botId);
+    // Off is checked before the busy-coalesce below, not after: coalescing
+    // folds the delivery into a receipt that runs when the current turn ends,
+    // which would start new work on a bot that is switched Off.
+    const off = this.botIsOff(input.botId);
+    const snoozed = off || this.isBotSnoozed(input.botId);
     if (!snoozed) {
       const deferred = this.coalesceIntoBusyDefer({
         botId: input.botId,
@@ -945,8 +955,9 @@ export class RoutineManager {
       runOn: input.runOn,
       scheduledFor: input.receivedAt,
       status: snoozed ? "cancelled" : "queued",
-      outcomeCode: snoozed ? "cancelled" : undefined,
+      outcomeCode: off ? "bot_off" : snoozed ? "cancelled" : undefined,
       failurePhase: snoozed ? "lifecycle" : undefined,
+      error: off ? BOT_OFF_SKIPPED : undefined,
       finishedAt: snoozed ? this.now() : undefined,
       manual: false,
       triggerSource: "webhook",
@@ -977,7 +988,11 @@ export class RoutineManager {
     if (this.options.botState(input.botId) === "missing") {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
-    const snoozed = this.isBotSnoozed(input.botId);
+    // Off is checked before the busy-coalesce below, not after: coalescing
+    // folds the delivery into a receipt that runs when the current turn ends,
+    // which would start new work on a bot that is switched Off.
+    const off = this.botIsOff(input.botId);
+    const snoozed = off || this.isBotSnoozed(input.botId);
     if (!snoozed) {
       const deferred = this.coalesceIntoBusyDefer({
         botId: input.botId,
@@ -1001,8 +1016,9 @@ export class RoutineManager {
       runOn: input.runOn,
       scheduledFor: input.receivedAt,
       status: snoozed ? "cancelled" : "queued",
-      outcomeCode: snoozed ? "cancelled" : undefined,
+      outcomeCode: off ? "bot_off" : snoozed ? "cancelled" : undefined,
       failurePhase: snoozed ? "lifecycle" : undefined,
+      error: off ? BOT_OFF_SKIPPED : undefined,
       finishedAt: snoozed ? this.now() : undefined,
       manual: false,
       triggerSource: "resource",
@@ -1150,8 +1166,20 @@ export class RoutineManager {
         if (!routine.enabled || routine.nextRunAt == null || routine.nextRunAt > now) continue;
         const scheduledFor = routine.nextRunAt;
         const late = now - scheduledFor;
+        const off = this.botIsOff(routine.botId);
         const snoozed = this.isBotSnoozed(routine.botId);
-        if (snoozed) {
+        if (off) {
+          // The schedule still advances (below), so turning the bot back on
+          // resumes at the next occurrence instead of replaying the backlog.
+          // The run is recorded as skipped with its reason; it is not
+          // `missed`, which would count as needing attention.
+          const skipped = this.newRun(routine, scheduledFor, false);
+          this.skipForOff(skipped);
+          if (routine.schedule.type === "daily") {
+            const checkInId = this.options.checkInStart?.(skipped, routine);
+            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
+          }
+        } else if (snoozed) {
           const skipped = this.newRun(routine, scheduledFor, false);
           skipped.status = "missed";
           skipped.finishedAt = now;
@@ -1198,6 +1226,14 @@ export class RoutineManager {
       };
       for (const run of [...this.runs].reverse()) {
         if (run.status !== "queued") continue;
+        // An Off bot's queued receipt is settled as skipped, never parked: it
+        // would otherwise wait for a Turn On and then run hours-old work, and
+        // meanwhile count as pending work that blocks an update.
+        if (this.botIsOff(run.botId)) {
+          this.skipForOff(run);
+          this.save();
+          continue;
+        }
         // `holdReason` is a cached verdict from the last time canStart ran, and
         // the gates below can `continue` without ever re-deriving it. A manual
         // snooze can outlast the engine coming back, leaving a receipt that
@@ -1694,6 +1730,42 @@ export class RoutineManager {
     run.holdReason = undefined;
     run.hotDeferredAt = undefined;
     this.publishedHoldBuckets.delete(run.id);
+  }
+
+  /** Settle a receipt for a bot that is switched Off: skipped, never retried.
+   *
+   *  `cancelled`, not `missed` or `failed`: both of those are in
+   *  ROUTINE_ATTENTION_STATUSES, so an Off bot would light the attention badge
+   *  for every Sentry webhook it politely ignored.  The run stays in history
+   *  with the reason, which is the whole requirement — a trigger that fires
+   *  while the bot is Off is recorded and dropped, not held for later.
+   *  Caller saves. */
+  private skipForOff(run: RoutineRun, emit = true): void {
+    this.leaveQueued(run, "cancelled");
+    run.error = BOT_OFF_SKIPPED;
+    run.outcomeCode = "bot_off";
+    run.failurePhase = "lifecycle";
+    run.finishedAt = this.now();
+    if (emit) this.emitRun(run);
+  }
+
+  /** Whether the bot this run targets is switched Off. */
+  private botIsOff(botId: string): boolean {
+    return this.options.botState(botId) === "off";
+  }
+
+  /** Settle every queued receipt a bot has, because it was just switched Off.
+   *  Running and waiting receipts are left alone: a turn that has started
+   *  finishes.  Returns the receipts it settled. */
+  skipQueuedRunsForBot(botId: string): RoutineRun[] {
+    const skipped: RoutineRun[] = [];
+    for (const run of this.runs) {
+      if (run.botId !== botId || run.status !== "queued") continue;
+      this.skipForOff(run);
+      skipped.push({ ...run });
+    }
+    if (skipped.length > 0) this.save();
+    return skipped;
   }
 
   private failRun(run: RoutineRun, message: string, code = routineFailureCode(message)) {

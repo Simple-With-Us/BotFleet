@@ -323,6 +323,11 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var busy: Bool?
     public var pinned: Bool?
     public var hidden: Bool?
+    /// The bot's On/Off switch (`shared/bot-power.ts`).  True means Off:
+    /// nothing new starts for it, but its chat stays readable and a turn
+    /// already running finishes.  Absent (older harnesses included) or false
+    /// means on.  The harness sends an explicit `false` after turning it on.
+    public var off: Bool?
     public var chiefOfStaff: Bool?
     public var approvePeerComms: Bool?
     public var section: String?
@@ -356,6 +361,10 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var activeLeafId: String?
     /// Paged responses only: there is more transcript above what you got.
     public var hasMore: Bool?
+
+    /// Whether this bot is switched Off.  Total over a missing field, so a
+    /// payload from an older harness reads as on.
+    public var isOff: Bool { off == true }
 }
 
 public enum AvatarCrop: String, Codable, CaseIterable, Hashable, Sendable {
@@ -937,6 +946,10 @@ public struct BotProfilePatch: Encodable, Sendable {
     public var approvePeerComms: Bool?
     public var computers: [String]?
     public var cwd: CwdString?
+    /// The On/Off switch.  `nil` leaves it alone, like every other field, so a
+    /// profile save that never touched it cannot flip a bot another device just
+    /// turned off.
+    public var off: Bool?
 
     public enum CwdString: Equatable, Sendable {
         case set(String)
@@ -995,7 +1008,8 @@ public struct BotProfilePatch: Encodable, Sendable {
         autoReview: String? = nil,
         approvePeerComms: Bool? = nil,
         computers: [String]? = nil,
-        cwd: CwdString? = nil
+        cwd: CwdString? = nil,
+        off: Bool? = nil
     ) {
         self.name = name
         self.title = title
@@ -1015,10 +1029,11 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.approvePeerComms = approvePeerComms
         self.computers = computers
         self.cwd = cwd
+        self.off = off
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, computers, cwd
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, computers, cwd, off
     }
 
     private enum DeviceKeys: String, CodingKey { case mac, iphone }
@@ -1066,6 +1081,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         try values.encodeIfPresent(autoReview, forKey: .autoReview)
         try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
         try values.encodeIfPresent(computers, forKey: .computers)
+        try values.encodeIfPresent(off, forKey: .off)
         if let cwd {
             switch cwd {
             case let .set(val): try values.encode(val, forKey: .cwd)
