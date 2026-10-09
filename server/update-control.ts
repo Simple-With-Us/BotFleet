@@ -93,6 +93,24 @@ export interface UpdateAvailable {
   version?: string;
   aheadBy: number;
   commits: UpdateCommit[];
+  /** The INSTALLED commit this `aheadBy` was counted from.
+   *
+   *  `aheadBy` is a distance, so it means nothing without its baseline.  The
+   *  baseline used to be implied by the install's own timestamp, which cannot
+   *  survive an update: the replacement bundle's `build-identity.json` mtime
+   *  dates the BUILD, not the install, and a build staged hours before the
+   *  install left a remembered answer looking newer than the install it
+   *  predated.  The status route then served that answer forever — a Mac that
+   *  had just installed and verified the newest build still advertised "125
+   *  commits behind" when the true distance was 4.
+   *
+   *  Recording the baseline makes staleness a question of identity instead of
+   *  clock comparison: an answer counted from any commit other than the one
+   *  installed now describes a Mac that no longer exists.  Answers written
+   *  before this field existed have no baseline and are refused as
+   *  unplaceable, which is the same treatment an unparseable `checkedAt`
+   *  already gets below. */
+  baselineCommit?: string;
 }
 
 export interface UpdateRunning {
@@ -445,6 +463,12 @@ export function availableIsStale(input: {
 }): boolean {
   if (!input.available) return true;
   if (input.available.sourceCommit === input.installedCommit) return true;
+  // Identity before clock.  An answer counted from a commit other than the one
+  // installed now cannot be refreshed into a correct one, whatever its
+  // timestamp says, so refuse it outright.  An answer carrying no baseline
+  // predates this field and is equally unplaceable; both cases drop to a fresh
+  // check instead of being served.
+  if (input.available.baselineCommit !== input.installedCommit) return true;
   const recorded = input.checkedAt ? Date.parse(input.checkedAt) : Number.NaN;
   // An answer with no readable timestamp cannot be placed relative to the
   // install, and an unplaceable answer is not one to act on.
@@ -977,6 +1001,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       sourceCommit: value.sourceCommit,
       version: typeof value.version === "string" ? value.version : undefined,
       aheadBy: Number.isInteger(value.aheadBy) ? (value.aheadBy as number) : 0,
+      baselineCommit: typeof value.baselineCommit === "string" && /^[a-f0-9]{40}$/.test(value.baselineCommit)
+        ? value.baselineCommit
+        : undefined,
       commits: Array.isArray(value.commits)
         ? (value.commits as unknown[])
             .filter((one): one is UpdateCommit =>
@@ -1285,6 +1312,10 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
           sourceCommit: target,
           version,
           aheadBy: Number.isFinite(aheadBy) ? aheadBy : 0,
+          // `aheadBy` is counted from whatever is installed right now, so say
+          // so in the same breath.  A remembered answer whose baseline no
+          // longer matches is refused on sight.
+          baselineCommit: deps.installed.sourceCommit,
           commits: listed.code === 0
             ? listed.stdout
                 .split("\n")
