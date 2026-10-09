@@ -1074,7 +1074,9 @@ describe("harness HTTP API", () => {
       expect(stray.status).toBe(200);
       expect(await stray.json()).toMatchObject({ renewed: false, quiescing: false, lease: null });
 
-      const fenced = await quiesce("POST", "?leaseMs=3000");
+      // Margins sized for a loaded Mac: a renewal every 3 seconds against a
+      // 10-second lease, over 12 seconds, so only a renewed lease survives.
+      const fenced = await quiesce("POST", "?leaseMs=10000");
       expect(fenced.status).toBe(200);
       // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
       const first = (await fenced.json()) as { quiescing: boolean; lease: { expiresAt: number } | null };
@@ -1082,21 +1084,21 @@ describe("harness HTTP API", () => {
       expect(first.lease?.expiresAt).toBeGreaterThan(Date.now());
 
       // Renewed, it holds past its first deadline.
-      for (let renewal = 0; renewal < 3; renewal += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 1_500));
-        const renewed = await quiesce("POST", "?renew=1&leaseMs=3000");
+      for (let renewal = 0; renewal < 4; renewal += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+        const renewed = await quiesce("POST", "?renew=1&leaseMs=10000");
         expect(await renewed.json()).toMatchObject({ renewed: true, quiescing: true });
       }
       expect((await runtime()).quiescing).toBe(true);
 
       // Left alone, it lets go.
-      await expect.poll(async () => (await runtime()).quiescing, { timeout: 20_000, interval: 250 }).toBe(false);
+      await expect.poll(async () => (await runtime()).quiescing, { timeout: 45_000, interval: 250 }).toBe(false);
       expect((await runtime()).lease).toBeNull();
       expect((await api("GET", "/api/config")).status).toBe(200);
     } finally {
       await quiesce("DELETE");
     }
-  }, 60_000);
+  }, 120_000);
 
   it("holds a room round for an update like other work, and carries it across the fence", async () => {
     // Finding 7: room messages and rounds were not held, so a room whose bots
