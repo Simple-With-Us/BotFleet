@@ -5,7 +5,6 @@ import {
   deterministicSpokenText,
   summarizeForVoice,
   summarizeForVoiceDetailed,
-  summaryLooksTruncated,
   normalizeDeepSeekChatUrl,
   resolveDeepSeekKey,
   voiceSummaryMaxTokens,
@@ -13,7 +12,6 @@ import {
   DEEPSEEK_FLASH_TTS_PROMPT,
   SUMMARY_MAX_TOKENS,
   SUMMARY_MIN_TOKENS,
-  SUMMARY_RATIO_MIN_CHARS,
 } from "./speech-summary.ts";
 
 describe("summarizeForVoice", () => {
@@ -350,17 +348,15 @@ describe("summarizeForVoiceDetailed: long replies are never cut short", () => {
     expect(result.text).toContain("Paragraph 30");
   });
 
-  it("falls back when the rewrite is far shorter than the reply", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(answer("The deploy has thirty steps.", "stop"));
+  it("uses a finished rewrite however much shorter than the reply it is", async () => {
+    // The prompt tells the model to drop hashes, code and links, so a
+    // condensed rewrite is the point, not lost content.
+    const fetchSpy = vi.fn().mockResolvedValue(answer("The deploy has thirty steps.", "stop"));
+    globalThis.fetch = fetchSpy;
     const result = await summarizeForVoiceDetailed(longReply, "fake-key");
-    expect(result).toMatchObject({ source: "fallback", reason: "too-short" });
-    expect(result.text).toContain("Paragraph 30");
-  });
-
-  it("accepts a short rewrite when the caller asked for a condensed summary", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(answer("The deploy has thirty steps.", "stop"));
-    const result = await summarizeForVoiceDetailed(longReply, { key: "fake-key", condense: true });
     expect(result).toMatchObject({ source: "summary", text: "The deploy has thirty steps." });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(voiceSummaryWorthStoring(result)).toBe(true);
   });
 
   it("does not store a transient provider failure", async () => {
@@ -408,12 +404,6 @@ describe("summarizeForVoiceDetailed: long replies are never cut short", () => {
     const short = await summarizeForVoiceDetailed("A short plain reply.", "fake-key");
     expect(short.source).toBe("short");
     expect(voiceSummaryWorthStoring(short)).toBe(true);
-  });
-
-  it("only calls a rewrite too short on replies long enough to judge", () => {
-    expect(summaryLooksTruncated("x".repeat(10), "y".repeat(SUMMARY_RATIO_MIN_CHARS - 1))).toBe(false);
-    expect(summaryLooksTruncated("x".repeat(10), "y".repeat(SUMMARY_RATIO_MIN_CHARS))).toBe(true);
-    expect(summaryLooksTruncated("x".repeat(400), "y".repeat(1_000))).toBe(false);
   });
 
   it("keeps summarizeForVoice returning plain text", async () => {
