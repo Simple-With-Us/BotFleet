@@ -105,6 +105,7 @@ import {
   snapshotAvatarGenerationState,
 } from "./avatar-image.ts";
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
+import { checkBotOrganizeBody, parseAutoUpdateBody } from "./companion-writes.ts";
 import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
 import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
@@ -13330,6 +13331,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           else section = trimmed;
         }
       }
+      // `unread`, `pinned` and `hidden` are stored as sent, so a non-boolean
+      // would land in the bot record and in every client's roster.  The paired
+      // phone's sidecar checks the types too (companion/src/routes.ts), but
+      // this route has other callers, and a guard only one of them honors is
+      // not a guard.  The six organize fields are parsed together.
+      // From a paired phone (the sidecar stamps `x-botfleet-companion`) the
+      // body may carry the six organize fields and nothing else.
+      const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
+      if (!organize.ok) return json(res, organize.status, { error: organize.error });
       for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
@@ -15810,6 +15820,29 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       cfg.rooms = { ...cfg.rooms, turnTimeoutMinutes: patch.rooms.turnTimeoutMinutes };
       saveConfig({ rooms: cfg.rooms });
+      const status = configStatus();
+      broadcast({ kind: "config", ...status });
+      return json(res, 200, status);
+    }
+    // Check For Updates Automatically.  One boolean that lives in /api/config
+    // beside the API keys, so it gets its own route and the paired phone never
+    // holds write access to that one.  Only `enabled` is read: `lastCheckMs`
+    // and `lastAppFingerprint` are written to the same file by the desktop
+    // updater, and the section merge in saveConfig leaves them alone, so a
+    // phone toggle cannot reset the six-hour throttle.  The updater re-reads
+    // `enabled` from disk on every tick (electron/updater.mjs).
+    if (method === "PATCH" && path === "/api/auto-update") {
+      const checked = parseAutoUpdateBody(await readBody(req));
+      if (!checked.ok) return json(res, 400, { error: checked.error });
+      const patch = parseConfigPatch({ autoUpdate: { enabled: checked.enabled } });
+      if (patch.autoUpdate?.enabled === undefined) {
+        return json(res, 400, { error: "nothing to save" });
+      }
+      saveConfig({ autoUpdate: { enabled: patch.autoUpdate.enabled } });
+      // Read the section back rather than patching the in-memory copy: the
+      // updater's check record is written to the file behind this process's
+      // back, and the status below should report what is stored.
+      cfg.autoUpdate = loadConfig().autoUpdate;
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);

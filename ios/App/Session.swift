@@ -1782,6 +1782,107 @@ final class Session: ObservableObject {
         catch { recordActionError(error) }
     }
 
+    // MARK: - Roster organization
+    //
+    // Archive, Restore, Pin, Mark As Unread, Make Chief Of Staff, Move To
+    // Section, Pin Message, and Delete.  Each applies the harness's answer
+    // as soon as it arrives, the way `updateProfile` does, instead of waiting
+    // for the stream frame that follows.  The rules about what may be asked
+    // live in `BotOrganize`.
+
+    /// The bot PATCH, throwing the harness's refusal so a caller inside a
+    /// sheet can show it there.  No pairing reads as a cancelled tap: the
+    /// same silence every other action here gives it.
+    @MainActor
+    func applyOrganize(_ patch: BotOrganizePatch, to bot: Bot) async throws -> Bot {
+        guard let client, !patch.isEmpty else { throw CancellationError() }
+        let updated = try await client.organizeBot(id: bot.id, patch: patch)
+        // A new Chief of Staff demotes the old one in its section.  The
+        // harness sends that bot as its own frame too; folding it in now
+        // keeps the roster from showing two at once.  A bot deleted while the
+        // request was in flight is not put back (`botsToApply`).
+        for folded in BotOrganize.botsToApply(after: updated, in: state.bots) {
+            state.apply(.bot(folded))
+        }
+        return updated
+    }
+
+    /// `applyOrganize`, reporting a refusal through `actionError`.
+    @MainActor
+    @discardableResult
+    func organizeBot(_ bot: Bot, _ patch: BotOrganizePatch) async -> Bot? {
+        do {
+            return try await applyOrganize(patch, to: bot)
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+    }
+
+    /// Delete a bot for good.  Throws the harness's refusal (a running Local
+    /// VM action is a 409 with a sentence) so the caller decides where to
+    /// show it.  On success the bot leaves `state` now rather than when the
+    /// `bot.deleted` frame lands, so no screen is left showing it.
+    @MainActor
+    func deleteBot(_ bot: Bot) async throws {
+        guard let client else { throw CancellationError() }
+        try await client.deleteBot(id: bot.id)
+        state.apply(.botDeleted(botId: bot.id))
+    }
+
+    /// Delete a room and its transcripts.  Same shape as `deleteBot`.
+    @MainActor
+    func deleteRoom(_ room: Room) async throws {
+        guard let client else { throw CancellationError() }
+        try await client.deleteRoom(id: room.id)
+        state.apply(.roomDeleted(groupId: room.id))
+    }
+
+    /// Move To Section for a room.  A blank or nil name takes it out.
+    @MainActor
+    @discardableResult
+    func moveRoom(_ room: Room, toSection section: String?) async -> Bool {
+        let value: BotProfilePatch.SectionString
+        if let name = BotOrganize.normalizedSection(section) {
+            value = .set(name)
+        } else {
+            value = .clear
+        }
+        return await patchRoom(room, RoomPatch(section: value))
+    }
+
+    /// Pin Message, or unpin with nil, in a bot chat or a room.
+    @MainActor
+    @discardableResult
+    func pinMessage(_ messageId: String?, in chat: Chat) async -> Bool {
+        switch chat {
+        case let .bot(bot):
+            return await organizeBot(bot, .pinMessage(messageId)) != nil
+        case let .room(room):
+            return await patchRoom(room, RoomPatch(pinnedMessageId: MessagePin(messageId)))
+        }
+    }
+
+    @MainActor
+    private func patchRoom(_ room: Room, _ patch: RoomPatch) async -> Bool {
+        guard let client else { return false }
+        do {
+            let updated = try await client.updateRoom(id: room.id, patch: patch)
+            if state.rooms.contains(where: { $0.id == updated.id }) {
+                state.apply(.room(updated))
+            }
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    /// Bring one message of the open chat into view, as a search hit does.
+    func focus(_ messageId: String) {
+        focusedMessageId = messageId
+    }
+
     // MARK: - Room tasks
     //
     // A channel's separate conversations, mirrored from the bot task methods
@@ -2480,6 +2581,56 @@ final class Session: ObservableObject {
         let outcome = await enqueueSettingsUpdate()
         guard let outcome, outcome.timeoutOK == true else { return nil }
         return outcome.status
+    }
+
+    /// Enable Automatic Update Checks, through `PATCH /api/auto-update`.
+    /// One boolean, so it skips the coalescing queue the other settings
+    /// share; it only waits out a flush already in flight, the way
+    /// `configStatus()` does, so it never lands between that flush's write
+    /// and the status it reads back.  The Mac Update card says the outcome
+    /// in place, so nothing here raises the app-wide alert.
+    @MainActor
+    func setAutoUpdateEnabled(_ enabled: Bool) async -> PhoneWriteOutcome<ConfigStatus> {
+        while true {
+            let generationAtAwait = settingsUpdateGeneration
+            _ = await settingsUpdateTail?.value
+            if settingsUpdateGeneration == generationAtAwait { break }
+        }
+        guard let client else { return .failed(nil) }
+        let pairing = pairingGeneration
+        do {
+            let saved = try await client.setAutoUpdate(enabled: enabled)
+            guard pairingGeneration == pairing else { return .failed(nil) }
+            self.config = saved
+            return .saved(saved)
+        } catch let error as APIError where error.isUnauthorized {
+            self.status = .unauthorized
+            return .failed(nil)
+        } catch {
+            if isCancellation(error) { return .failed(nil) }
+            return PhoneWriteOutcome<ConfigStatus>.failure(error)
+        }
+    }
+
+    /// Set All Bots To Default on the Models screen.  Every bot the harness
+    /// changed also arrives on the event stream as a `bot` frame, which is
+    /// what updates the rows; the reply only says who was left alone.
+    @MainActor
+    func applyModelDefaults(
+        primary: DefaultModelSlot?,
+        fallbacks: [DefaultModelSlot?]
+    ) async -> PhoneWriteOutcome<ApplyModelDefaultsResult> {
+        guard let client else { return .failed(nil) }
+        do {
+            let result = try await client.applyModelDefaults(primary: primary, fallbacks: fallbacks)
+            return .saved(result)
+        } catch let error as APIError where error.isUnauthorized {
+            self.status = .unauthorized
+            return .failed(nil)
+        } catch {
+            if isCancellation(error) { return .failed(nil) }
+            return PhoneWriteOutcome<ApplyModelDefaultsResult>.failure(error)
+        }
     }
 
     @MainActor
@@ -3571,7 +3722,7 @@ extension CompanionState {
     var chatSummaries: [ChatSummary] {
         let bots = self.bots.filter { $0.hidden != true }.map(Chat.bot)
         let rooms = self.rooms.map(Chat.room)
-        return (bots + rooms)
+        let summaries = (bots + rooms)
             .map { chat in
                 let last = newestLoadedMessage(for: chat)
                 return ChatSummary(
@@ -3581,14 +3732,11 @@ extension CompanionState {
                     pinned: Self.pinned(chat)
                 )
             }
-            .sorted { left, right in
-                ChatListOrder.orderedBefore(
-                    pinnedLeft: left.pinned,
-                    activityLeft: left.lastActivity,
-                    pinnedRight: right.pinned,
-                    activityRight: right.lastActivity
-                )
-            }
+        // Pinned first, then newest activity, then the order the harness sent:
+        // the same order the desktop sidebar draws (`ChatListOrder`).
+        return ChatListOrder.stableOrder(summaries) { summary in
+            (pinned: summary.pinned, activity: summary.lastActivity)
+        }
     }
 
     private static func pinned(_ chat: Chat) -> Bool {
