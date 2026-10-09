@@ -54,6 +54,38 @@ export const CliWrapperConfigSchema = z
 
 export type CliWrapperConfig = z.infer<typeof CliWrapperConfigSchema>;
 
+/** Variables a wrapped CLI inherits from the harness, compared upper-cased
+ * because Windows spells them `SystemRoot` and `Path`.  Locale, terminal,
+ * temp-dir, proxy and certificate settings that programs read to behave, plus
+ * the handful Windows needs to start any process.  `PATH` is deliberately
+ * absent: the driver sets it from `augmentedPath()`.  Nothing here is a
+ * credential. */
+const WRAPPER_INHERITED_ENV = new Set([
+  "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "TERM", "COLORTERM", "NO_COLOR",
+  "TMPDIR", "TMP", "TEMP",
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+  "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "USERNAME",
+  "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+  "HOMEDRIVE", "HOMEPATH", "COMPUTERNAME", "OS", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+]);
+
+/** Prefixes for whole families of non-secret variables (`LC_ALL`, `XDG_CONFIG_HOME`). */
+const WRAPPER_INHERITED_ENV_PREFIXES = ["LC_", "XDG_"];
+
+/** The part of the harness environment a wrapped CLI may see: an allowlist, so
+ * a variable nobody has named yet is withheld rather than leaked. */
+export function wrapperBaseEnvironment(source: NodeJS.ProcessEnv = process.env) {
+  return Object.fromEntries(
+    Object.entries(source).flatMap(([name, value]) => {
+      const upper = name.toUpperCase();
+      const inherited =
+        WRAPPER_INHERITED_ENV.has(upper) || WRAPPER_INHERITED_ENV_PREFIXES.some((prefix) => upper.startsWith(prefix));
+      return value !== undefined && inherited ? [[name, value] as const] : [];
+    }),
+  );
+}
+
 export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
   driverKind: "cli-wrapper",
   metadata: {
@@ -91,14 +123,17 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
       }
     };
 
-    // The wrapped CLI is somebody else's program.  It gets the PATH the app
-    // resolves CLIs with plus the instance's own approved environment, and
-    // none of the harness's credentials — pi.ts and codex.ts build theirs the
-    // same way.  Inheriting all of process.env would hand an arbitrary
-    // binary every provider key and webhook secret the server holds.
+    // The wrapped CLI is an arbitrary executable.  It gets the PATH the app
+    // resolves CLIs with, a short list of non-secret variables every program
+    // needs (`wrapperBaseEnvironment`), and the instance's own approved
+    // environment.  It does NOT get the rest of process.env: a scrub list can
+    // only name the credentials someone already thought of, and a GitHub,
+    // Sentry or webhook token added later would ride into an unknown binary
+    // until somebody noticed.  The scrubs below stay as a second line for
+    // anything the instance environment itself carries.
     const childEnv = (): Record<string, string | undefined> => {
       const env: Record<string, string | undefined> = {
-        ...process.env,
+        ...wrapperBaseEnvironment(),
         ...input.environment,
         PATH: augmentedPath(),
       };
