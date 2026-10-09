@@ -52,7 +52,9 @@ export const PERSONAL_VOICE_NOT_ON_MAC = "This Personal Voice is not on this Mac
 /** The Voice Summary section's explanation (voiceSummaryMode).  Distilling is
  * the default (On-Demand for a text-only bot, All Messages for one with
  * voice replies on), as it was before #952 (owner correction, 2026-10-08).
- * The karaoke highlight follows the message in every mode. */
+ * The karaoke highlight follows the message in every mode; only a distilled
+ * script that is really a brief summary, lining up with almost nothing on
+ * screen, goes unhighlighted (shared/karaoke-align.ts karaokeFollowable). */
 export const SPOKEN_TEXT_HELP =
   "Rewrites each reply for listening before it is spoken: numbers, codes, and links spelled out, code skipped.\u00A0 The message highlights each word as it is read, in every mode.";
 

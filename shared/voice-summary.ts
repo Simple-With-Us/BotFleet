@@ -20,8 +20,10 @@ export type VoiceSummaryMode = "off" | "on_demand" | "always";
  * to use it", and "I never said I wanted it read word for word").  It
  * reverses #952, which had made "off" the default citing board 8cc3c806.
  * "off" reads the reply as written, through the deterministic speakable
- * pass.  Karaoke
- * follows the main message text in every mode (shared/karaoke-align.ts).
+ * pass.  Karaoke follows the main message text in every mode, sweeping
+ * quickly past what the voice skips; the one thing it does not follow is a
+ * distilled script that is really a brief summary and lines up with almost
+ * nothing on screen (shared/karaoke-align.ts karaokeFollowable).
  */
 export function resolveVoiceSummaryMode(bot?: {
   voiceSummaryMode?: VoiceSummaryMode;
