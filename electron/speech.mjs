@@ -372,13 +372,16 @@ function hasControlCharacter(value) {
  * refused here, as the helper also refuses to match an ordinary voice.
  * Hand-written guards: the packaged app has no node_modules for a schema.
  */
-export function validatePersonalVoiceRequest(text, voiceId) {
+export function validatePersonalVoiceRequest(text, voiceIdOrNone) {
   if (typeof text !== "string" || !text.trim()) {
     return { ok: false, error: "Personal Voice needs some text to speak." };
   }
   if (text.length > MAX_PERSONAL_VOICE_TEXT_CHARS) {
     return { ok: false, error: "That text is too long to read aloud." };
   }
+  // The bridge declares the id optional (`speak(text, voiceId?, options?)`), and a call
+  // without one has always meant "no voice named", so a missing id is the empty id.
+  const voiceId = voiceIdOrNone ?? "";
   if (
     typeof voiceId !== "string"
     || voiceId.length > MAX_PERSONAL_VOICE_ID_CHARS
