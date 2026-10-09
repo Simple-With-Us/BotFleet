@@ -30,9 +30,14 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 state.temp = mkdtempSync(path.join(tmpdir(), "botfleet-pv-test-"));
-const { listPersonalVoices, listPersonalVoicesResult, speakPersonalVoice, stopPersonalVoice } = await import(
-  "./speech.mjs"
-);
+const {
+  MAX_PERSONAL_VOICE_TEXT_CHARS,
+  listPersonalVoices,
+  listPersonalVoicesResult,
+  speakPersonalVoice,
+  stopPersonalVoice,
+  validatePersonalVoiceRequest,
+} = await import("./speech.mjs");
 
 afterAll(() => {
   if (state.realPlatform) Object.defineProperty(process, "platform", state.realPlatform);
@@ -41,6 +46,45 @@ afterAll(() => {
 const argAfter = (args, flag) => args[args.indexOf(flag) + 1];
 const lastSpawn = () => state.spawned[state.spawned.length - 1];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("speakPersonalVoice request validation", () => {
+  // The renderer chooses the text and the voice id.  A bad payload used to be coerced with
+  // String(), spawn the helper, and wait out the speaking deadline.
+  const bad = [
+    ["text that is a number", 42, "personal:x"],
+    ["no text", undefined, "personal:x"],
+    ["blank text", "  \n ", "personal:x"],
+    ["text past the cap", "x".repeat(12_001), "personal:x"],
+    ["an ordinary voice name", "hi", "Samantha"],
+    ["a voice id that is not a string", "hi", 7],
+    ["no voice id", "hi", undefined],
+    ["a control character in the voice id", "hi", "personal:a\nb"],
+    ["an overlong voice id", "hi", `personal:${"x".repeat(300)}`],
+  ];
+
+  it.each(bad)("rejects %s without spawning, writing files or stopping current speech", async (_name, text, voiceId) => {
+    const live = speakPersonalVoice("a live reply", "personal:x", { onRange: () => {} });
+    const running = lastSpawn();
+    const stopMarker = argAfter(running.args, "--stop-file");
+    const spawnedBefore = state.spawned.length;
+
+    await expect(speakPersonalVoice(text, voiceId)).rejects.toThrow();
+
+    expect(state.spawned.length).toBe(spawnedBefore);
+    // a rejected request must not have told the running helper to stop
+    expect(existsSync(stopMarker)).toBe(false);
+    running.proc.emit("close", 0);
+    await expect(live).resolves.toBeUndefined();
+  });
+
+  it("accepts a Personal Voice id, an apple-personal id, and no named voice", () => {
+    expect(validatePersonalVoiceRequest("Hello", "personal:abc")).toEqual({ ok: true, text: "Hello", voiceId: "personal:abc" });
+    expect(validatePersonalVoiceRequest("Hello", "apple-personal:abc").ok).toBe(true);
+    // Nothing named: the helper picks the first Personal Voice.
+    expect(validatePersonalVoiceRequest("Hello", "").ok).toBe(true);
+    expect(validatePersonalVoiceRequest("x".repeat(MAX_PERSONAL_VOICE_TEXT_CHARS), "personal:abc").ok).toBe(true);
+  });
+});
 
 describe("speakPersonalVoice word ranges", () => {
   it("delivers each range as its line lands, joining a line split across writes", async () => {

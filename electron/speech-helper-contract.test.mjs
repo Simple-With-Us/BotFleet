@@ -22,11 +22,27 @@ describe("Personal Voice helper contract", () => {
     // argv is world-readable through `ps` on macOS, and this text is a voice
     // summary of the user's own private messages.
     expect(speechSource).toMatch(/const textPath = path\.join\(sessionDir, "text\.txt"\);/);
-    expect(speechSource).toMatch(/writeFileSync\(textPath, String\(text \?\? ""\), \{ mode: 0o600 \}\);/);
+    expect(speechSource).toMatch(/writeFileSync\(textPath, request\.text, \{ mode: 0o600 \}\);/);
     expect(speechSource).toContain('"--text-file"');
     // The old shape put the reply itself in argv.
     expect(speechSource).not.toMatch(/^\s*"--text",$/m);
+    expect(speechSource).not.toMatch(/^\s*request\.text,\s*$/m);
     expect(speechSource).not.toMatch(/^\s*String\(text \?\? ""\),\s*$/m);
+  });
+
+  it("matches only Personal Voices, never an ordinary voice of the same name", () => {
+    // `personal:Samantha` used to select the system voice Samantha, because the match ran over
+    // every installed voice by identifier or name.  The lookup narrows to the Personal Voice
+    // trait first, for the named voice and for the no-voice-named guess alike.
+    const start = helperSource.indexOf("let doSpeak = {");
+    const end = helperSource.indexOf("let status = AVSpeechSynthesizer.personalVoiceAuthorizationStatus", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const lookup = helperSource.slice(start, end);
+    expect(lookup).toMatch(/let personalVoices = AVSpeechSynthesisVoice\.speechVoices\(\)\s*\.filter \{ \$0\.voiceTraits\.contains\(\.isPersonalVoice\) \}/);
+    expect(lookup).toMatch(/let matched = personalVoices\.first\(where:/);
+    expect(lookup).toMatch(/\?\? \(rawId\.isEmpty \? personalVoices\.first : nil\)/);
+    expect(lookup).not.toContain("allVoices");
   });
 
   it("reads the text from the file the main process writes", () => {
