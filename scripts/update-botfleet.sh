@@ -397,10 +397,14 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
             console.log([status, commit, message].map((line) => String(line).replace(/\s*[\r\n]+\s*/g, "  ")).join("\n"));
           };
           // A hung lookup must not hold the update: give up and fall through.
+          // This all happens before the updater writes its first progress
+          // record, and the harness settles a run with none after two minutes
+          // (LAUNCH_GRACE_MS in server/update-control.ts) as never started, so
+          // the whole lookup gets well under that.
           const watchdog = setTimeout(() => {
             emit("warn", "", "Looking up the hosted builds timed out.");
             process.exit(0);
-          }, 120000);
+          }, 45000);
           try {
             const resolver = await import(pathToFileURL(process.env.BOTFLEET_SELECT_RESOLVER).href);
             if (typeof resolver.selectUpdateTarget !== "function") {

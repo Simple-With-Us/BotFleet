@@ -1050,6 +1050,15 @@ export async function downloadBuiltBundle({
 export const SELECTION_WINDOW = 100;
 /** Green runs whose artifact is checked before giving up on finding one. */
 const SELECTION_ARTIFACT_CHECKS = 5;
+/**
+ * Each lookup gets far less than the 30 seconds an install-time request does.
+ * The selection runs before the updater writes its first progress record, and
+ * the harness gives up on a run with no record after two minutes (LAUNCH_GRACE_MS
+ * in server/update-control.ts), so a slow GitHub must cost seconds here, not
+ * minutes.  Running out of patience is harmless: the selection fails open to
+ * the tip, whose own download then reports what is wrong.
+ */
+const SELECTION_REQUEST_TIMEOUT_MS = 10_000;
 const BUILD_MANIFEST_RELATIVE = "Contents/Resources/server/build-identity.json";
 
 /**
@@ -1069,7 +1078,10 @@ function gitInCheckout(checkout) {
   return (args) =>
     execFileSync("git", ["-C", checkout, ...args], {
       encoding: "utf8",
-      timeout: 30_000,
+      // These are local reads that finish in milliseconds.  They run
+      // synchronously, so the wrapper's watchdog cannot interrupt one: keep the
+      // cap small enough that several in a row still fit inside it.
+      timeout: 10_000,
       stdio: ["ignore", "pipe", "ignore"],
       maxBuffer: MAX_CHILD_STDOUT_BYTES,
     }).trim();
@@ -1132,7 +1144,10 @@ const plural = (count) => `${count} commit${count === 1 ? "" : "s"}`;
 async function describeTipBuild({ tip, repository, headers, fetchImpl }) {
   try {
     const runsUrl = `${apiBase(repository)}/actions/workflows/${WORKFLOW_FILE}/runs?head_sha=${tip}&per_page=20`;
-    const attempted = anyRunForCommit((await requestJson(runsUrl, { headers, fetchImpl, commit: tip }))?.workflow_runs, tip);
+    const attempted = anyRunForCommit(
+      (await requestJson(runsUrl, { headers, fetchImpl, commit: tip, timeoutMs: SELECTION_REQUEST_TIMEOUT_MS }))?.workflow_runs,
+      tip,
+    );
     if (!attempted) return "has no hosted build yet";
     if (STILL_RUNNING.has(attempted.status)) return "is still running";
     switch (attempted.conclusion) {
@@ -1168,7 +1183,7 @@ export async function selectNewestGreenCommit({
 }) {
   const headers = authHeaders(env, { execFileSyncImpl });
   const runsUrl = `${apiBase(repository)}/actions/workflows/${WORKFLOW_FILE}/runs?branch=main&status=success&per_page=100`;
-  const runs = (await requestJson(runsUrl, { headers, fetchImpl, commit: tip }))?.workflow_runs;
+  const runs = (await requestJson(runsUrl, { headers, fetchImpl, commit: tip, timeoutMs: SELECTION_REQUEST_TIMEOUT_MS }))?.workflow_runs;
   let checked = 0;
   for (let index = 0; index < candidates.length && checked < SELECTION_ARTIFACT_CHECKS; index += 1) {
     const commit = candidates[index];
@@ -1176,7 +1191,7 @@ export async function selectNewestGreenCommit({
     if (!green) continue;
     checked += 1;
     const artifactsUrl = `${apiBase(repository)}/actions/runs/${green.id}/artifacts?per_page=100`;
-    const artifacts = (await requestJson(artifactsUrl, { headers, fetchImpl, commit }))?.artifacts;
+    const artifacts = (await requestJson(artifactsUrl, { headers, fetchImpl, commit, timeoutMs: SELECTION_REQUEST_TIMEOUT_MS }))?.artifacts;
     if (!findCommitArtifact(artifacts, commit)) {
       log(`${short(commit)} has a successful hosted build but its artifact is missing or expired; looking further back.`);
       continue;
