@@ -32,6 +32,7 @@ import { PendingApprovalActions, PendingApprovalPanel, pendingApprovals } from "
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { ReplyQuote } from "./ReplyQuote";
 import { instanceSupportsLocalComputer } from "@/lib/local-computer";
+import { queuedChipLabel, useUpdateDrain } from "@/lib/update-control";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { resolveRoomLabels } from "../../shared/terminology";
 import { readCachedInventory } from "@/lib/connected-apps-cache";
@@ -330,6 +331,9 @@ function ComposerInner({
   const pendingChip = group
     ? queued?.text
     : (bot ? state.pendingQueued?.[bot.threadId]?.at(-1)?.text : undefined);
+  // While an update holds new work, a queued send waits for the restart and
+  // not for the bot, which may be idle.  The chip says so.
+  const updateHolding = useUpdateDrain() !== null;
   // a chip on its own is a message: the send control has to appear for it
   const fileInput = useRef<HTMLInputElement>(null);
   const [autoWarn, setAutoWarn] = useState(false);
@@ -637,8 +641,11 @@ function ComposerInner({
         {pendingChip && (
           <div className="mb-2 flex items-center gap-2 rounded-lg border border-hairline/40 bg-panel px-3 py-2 text-[12.5px] text-ink-secondary">
             <Clock size={13} className="shrink-0" />
-            <span className="min-w-0 flex-1 truncate" title={`Queued — sends when ${busyName} finishes: “${pendingChip}”`}>
-              Queued — sends when {busyName} finishes: “{pendingChip}”
+            <span
+              className="min-w-0 flex-1 truncate"
+              title={queuedChipLabel({ text: pendingChip, busyName, draining: updateHolding })}
+            >
+              {queuedChipLabel({ text: pendingChip, busyName, draining: updateHolding })}
             </span>
             <button
               type="button"
