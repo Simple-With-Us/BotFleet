@@ -105,6 +105,7 @@ import {
   snapshotAvatarGenerationState,
 } from "./avatar-image.ts";
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
+import { checkBotOrganizeBody, parseAutoUpdateBody } from "./companion-writes.ts";
 import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
 import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
@@ -13330,15 +13331,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           else section = trimmed;
         }
       }
-      // These three are stored as sent, so a non-boolean would land in the
-      // bot record and in every client's roster.  The paired phone's sidecar
-      // checks the type too (companion/src/routes.ts), but this route has
-      // other callers, and a guard only one of them honors is not a guard.
-      for (const key of ["unread", "pinned", "hidden"] as const) {
-        if (body[key] !== undefined && body[key] !== true && body[key] !== false) {
-          return json(res, 400, { error: `${key} must be true or false` });
-        }
-      }
+      // `unread`, `pinned` and `hidden` are stored as sent, so a non-boolean
+      // would land in the bot record and in every client's roster.  The paired
+      // phone's sidecar checks the types too (companion/src/routes.ts), but
+      // this route has other callers, and a guard only one of them honors is
+      // not a guard.  The six organize fields are parsed together.
+      const organize = checkBotOrganizeBody(body);
+      if (!organize.ok) return json(res, 400, { error: organize.error });
       for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
@@ -15831,11 +15830,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // phone toggle cannot reset the six-hour throttle.  The updater re-reads
     // `enabled` from disk on every tick (electron/updater.mjs).
     if (method === "PATCH" && path === "/api/auto-update") {
-      const body = await readBody(req);
-      if (!body || Array.isArray(body) || (body.enabled !== true && body.enabled !== false)) {
-        return json(res, 400, { error: "enabled must be true or false" });
-      }
-      const patch = parseConfigPatch({ autoUpdate: { enabled: body.enabled } });
+      const checked = parseAutoUpdateBody(await readBody(req));
+      if (!checked.ok) return json(res, 400, { error: checked.error });
+      const patch = parseConfigPatch({ autoUpdate: { enabled: checked.enabled } });
       if (patch.autoUpdate?.enabled === undefined) {
         return json(res, 400, { error: "nothing to save" });
       }

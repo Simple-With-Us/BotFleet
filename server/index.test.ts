@@ -7724,6 +7724,13 @@ describe("PATCH /api/bots/:id roster organization fields", () => {
         expect(res.status, JSON.stringify(body)).toBe(400);
         expect(res.body.error).toMatch(/must be true or false/);
       }
+      // the section and the pinned message are typed by the same parse
+      const badSection = await api("PATCH", `/api/bots/${bot.id}`, { section: 4 });
+      expect(badSection.status).toBe(400);
+      expect(badSection.body.error).toMatch(/section must be a string/);
+      const badPin = await api("PATCH", `/api/bots/${bot.id}`, { pinnedMessageId: ["m"] });
+      expect(badPin.status).toBe(400);
+      expect(badPin.body.error).toMatch(/pinnedMessageId must be a message id/);
       const stored = (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id);
       expect(stored.pinned).not.toBe("yes");
       expect(stored.hidden).not.toBe(1);

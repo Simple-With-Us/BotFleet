@@ -9,6 +9,7 @@
 // reached the harness" is a fact the test reads rather than infers.
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 
 import type { JsonObject } from "../src/json.ts";
 import { createProxyHandler } from "../src/proxy.ts";
@@ -73,6 +74,8 @@ beforeEach(() => {
   seen = [];
 });
 
+const refusalBody = z.object({ error: z.string() });
+
 const phone = async (
   method: string,
   path: string,
@@ -89,13 +92,15 @@ const phone = async (
     body: opts.raw ?? (body === undefined ? undefined : JSON.stringify(body)),
   });
   const text = await res.text();
-  let parsed: any = text;
+  let parsed: unknown = text;
   try {
     parsed = JSON.parse(text);
   } catch {
     /* not JSON */
   }
-  return { status: res.status, body: parsed };
+  // Narrowed rather than asserted: the sentence a refusal carries, if any.
+  const refusal = refusalBody.safeParse(parsed);
+  return { status: res.status, body: parsed, error: refusal.success ? refusal.data.error : undefined };
 };
 
 describe("the bot PATCH, narrowed to roster organization", () => {
@@ -162,7 +167,7 @@ describe("the bot PATCH, narrowed to roster organization", () => {
       for (const body of [{ [field]: true }, { pinned: true, [field]: "x" }, { [field]: { nested: ["x"] } }]) {
         const res = await phone("PATCH", "/api/bots/b1", body);
         expect(res.status, `${field}: ${JSON.stringify(body)}`).toBe(403);
-        expect(res.body.error).toBe(`${field} can only be changed in BotFleet on your computer`);
+        expect(res.error).toBe(`${field} can only be changed in BotFleet on your computer`);
       }
     }
     expect(seen).toEqual([]);
@@ -243,7 +248,7 @@ describe("the verbs this batch opened", () => {
     seen = [];
     const computers = await phone("POST", "/api/bots/apply-defaults", { botDefaults: { computers: ["local"] } });
     expect(computers.status).toBe(403);
-    expect(computers.body.error).toBe("computer defaults for every bot are set on your computer");
+    expect(computers.error).toBe("computer defaults for every bot are set on your computer");
     expect(seen).toEqual([]);
   });
 
