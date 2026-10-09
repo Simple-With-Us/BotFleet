@@ -29,7 +29,9 @@ import { ApiKeyRow, EngineKeyRow, VpsConnection } from "./ApiKeys";
 import { LinqSettings } from "./LinqSettings";
 import { useUpdaterState } from "@/lib/updater";
 import {
+  activeDrain,
   availableLabel,
+  drainLabel,
   idleLabel,
   installPausesWork,
   PAUSES_WORK_COPY,
@@ -39,6 +41,7 @@ import {
   lastRunLabel,
   runningLabel,
   updateSource,
+  useNow,
   useUpdateControl,
 } from "@/lib/update-control";
 import { EnginesSettings } from "./EnginesSettings";
@@ -462,6 +465,9 @@ function UpdatesRow() {
   // only path that works there — and on a Mac that has both, it is the one
   // that can actually install without waiting for a published build.
   const local = useUpdateControl();
+  // A countdown while an update holds new work, so it ticks; a hook, so it
+  // comes before the early return below.
+  const holdNow = useNow(local.status?.drain ? 1_000 : null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const hasBridge = Boolean(window.ogb?.updater);
@@ -492,9 +498,11 @@ function UpdatesRow() {
   const blockedReason = source === "harness" ? installBlockedReason(status) : null;
   const isBlocked = blockedReason !== null;
   const subtitleReason = blockedReason ?? (source === "harness" && installPausesWork(status) ? PAUSES_WORK_COPY : null);
+  // How many messages are saved for after the restart, and when it begins.
+  const holdLine = source === "harness" ? drainLabel(activeDrain(status, holdNow), holdNow) : null;
   const subtitle =
     source === "harness" && status
-      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}`
+      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}${holdLine ? `${"\u00A0 "}${holdLine}` : ""}`
       : `${feedLabel}${"\u00A0 "}Auto-checks at most once per 6 hours;${"\u00A0 "}you can manually check any time if an update is available.`;
   const lastRun = source === "harness" ? lastRunLabel(status?.lastRun ?? null) : null;
   // The updater's own message for that run — a hover only, never inline.

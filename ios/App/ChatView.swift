@@ -205,6 +205,9 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             transcriptColumn
+            // While the Mac holds new work for an update, a message sent now
+            // is saved and runs after the restart; this says so.
+            UpdateHoldNotice()
             // An Off bot refuses every new turn, so the input is replaced by
             // the way out of that state.  The transcript above stays as it was.
             if current.isOff, case let .bot(bot) = current {
