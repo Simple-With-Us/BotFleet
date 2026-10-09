@@ -23,6 +23,7 @@ import {
   pauseTimeoutMessage,
   releaseRuntimeAdmission,
   retryTransient,
+  rollbackFenceConfig,
   runtimePreflight,
   terminateVerified,
   UnrecognizedHolderError,
@@ -389,6 +390,29 @@ test("--force skips the hold and the grace entirely", async () => {
   const result = await fenceRuntimeAdmission(config({ force: true }), harness.adapters);
   assert.equal(result.safe, true);
   assert.deepEqual(harness.state.requests, ["POST /api/runtime/quiesce?force=true"]);
+});
+
+test("a rollback takes the fence on the replacement at once: no hold, no grace, no hours of waiting", async () => {
+  // Finding 4: rollback ran the whole hold, grace and pause cycle against the
+  // replacement, and under --wait-for-idle could wait up to six hours.
+  const busy = scriptedHarness({ inFlight: () => 3 });
+  const paused = await fenceRuntimeAdmission(rollbackFenceConfig(config()), busy.adapters);
+  assert.equal(paused.safe, true);
+  assert.deepEqual(busy.state.requests, ["POST /api/runtime/quiesce?force=true"]);
+  assert.equal(busy.clock(), 0);
+
+  // --wait-for-idle never interrupts, so the rollback asks once and defers.
+  const patient = scriptedHarness({ inFlight: () => 3 });
+  const deferred = await fenceRuntimeAdmission(rollbackFenceConfig(config({ waitForIdleMs: 6 * 60 * 60_000 })), patient.adapters);
+  assert.equal(deferred.safe, false);
+  assert.equal(patient.state.forced, 0);
+  assert.deepEqual(patient.state.requests, ["POST /api/runtime/quiesce"]);
+  assert.equal(patient.clock(), 0);
+
+  const idle = scriptedHarness({ inFlight: () => 0 });
+  assert.equal((await fenceRuntimeAdmission(rollbackFenceConfig(config({ waitForIdleMs: 60_000 })), idle.adapters)).safe, true);
+  assert.equal(fenceMode(rollbackFenceConfig({})), "force");
+  assert.equal(fenceMode(rollbackFenceConfig({ waitForIdleMs: 60_000 })), "now");
 });
 
 test("a signal while holding lifts the hold before the run ends", async () => {

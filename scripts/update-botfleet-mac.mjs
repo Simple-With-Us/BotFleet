@@ -968,10 +968,27 @@ function forcedRun(config) {
   return Boolean(config?.force || process.env.BOTFLEET_FORCE === "1");
 }
 
-/** How the fence step treats work in flight.  See `usage()`. */
+/** How the fence step treats work in flight.  See `usage()`.  `now` is one
+ *  plain ask with no hold and no grace (a rollback under --wait-for-idle). */
 export function fenceMode(config) {
+  if (config?.fenceNow === "force") return "force";
+  if (config?.fenceNow === "idle") return "now";
   if (forcedRun(config)) return "force";
   return waitForIdleFor(config) > 0 ? "wait-for-idle" : "grace";
+}
+
+/**
+ * The fence a rollback takes on the replacement: at once, never the hold,
+ * grace and pause cycle an update runs.  A replacement that failed its checks
+ * should not keep its work waiting 60 seconds before it is paused, and under
+ * --wait-for-idle it could otherwise wait hours.  So the forced quiesce runs
+ * straight away (the replacement's work is saved and the restored build
+ * resumes it) — except under --wait-for-idle, the opt-in that never
+ * interrupts: there it asks once, and a busy replacement defers the rollback
+ * with a recovery receipt rather than being interrupted.
+ */
+export function rollbackFenceConfig(config) {
+  return { ...config, fenceNow: waitForIdleFor(config) > 0 ? "idle" : "force" };
 }
 
 export async function runtimePreflight(config, expectedBuild, adapters = {}) {
@@ -1342,8 +1359,15 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
   const mode = fenceMode(config);
   let response;
   let forced = mode === "force";
-  if (mode === "force") {
-    response = await forceFence(owner, { request, now, wait, pollMs: config?.drainPollMs });
+  if (mode === "force" || mode === "now") {
+    response = mode === "force"
+      ? await forceFence(owner, { request, now, wait, pollMs: config?.drainPollMs })
+      : await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${owner.nonce}` },
+        accept: [200, 409],
+        timeoutMs: QUIESCE_TIMEOUT_MS,
+      });
     if (response.kind !== "ok") {
       // No answer, and the harness may be fenced: never leave it that way.
       const reason = "Runtime admission fence could not be established";
@@ -3333,7 +3357,8 @@ function createOperations(config) {
       let readiness = { safe: true };
       if (runningPids.length) {
         try {
-          readiness = await fenceRuntimeAdmission(config);
+          // At once: no hold and no grace against the replacement.
+          readiness = await fenceRuntimeAdmission(rollbackFenceConfig(config));
         } catch (error) {
           readiness = { safe: false, reason: error instanceof Error ? error.message : String(error) };
         }
