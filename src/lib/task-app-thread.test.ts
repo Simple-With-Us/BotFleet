@@ -50,11 +50,10 @@ describe("resolveAppContext", () => {
     viewedThreadId: null,
   };
 
-  it("keeps the App when a bot is opened in it, and yields the matrix", () => {
+  it("keeps the App when a bot is opened in it", () => {
     // openBotInApp: select with the pin set to the app thread.
     expect(resolveAppContext({ ...base, selectionChanged: true, viewedThreadId: appThread })).toEqual({
       selectedAppId: "app-a",
-      yieldMatrix: true,
     });
   });
 
@@ -63,7 +62,6 @@ describe("resolveAppContext", () => {
     // Reading the null pin as "left the App" cleared the highlight and the keyboard routing.
     expect(resolveAppContext({ ...base, bots: [switched], viewedThreadId: null })).toEqual({
       selectedAppId: "app-a",
-      yieldMatrix: false,
     });
   });
 
@@ -72,7 +70,7 @@ describe("resolveAppContext", () => {
     expect(resolveAppContext({ ...base, viewedThreadId: "some-other-thread" }).selectedAppId).toBeNull();
   });
 
-  it("drops the App when another bot is picked from the list, and yields the matrix", () => {
+  it("drops the App when another bot is picked from the list", () => {
     expect(
       resolveAppContext({
         ...base,
@@ -80,20 +78,14 @@ describe("resolveAppContext", () => {
         selectedId: "bot-2",
         selectionChanged: true,
       }),
-    ).toEqual({ selectedAppId: null, yieldMatrix: true });
-  });
-
-  it("does not close the matrix overview on a frame that leaves the selection alone", () => {
-    // An SSE frame replaces `bots` and re-runs the effect; the overview the user opened must stay.
-    expect(resolveAppContext({ ...base, selectedAppId: null, bots: [{ ...bot }] }).yieldMatrix).toBe(false);
-    expect(resolveAppContext({ ...base, bots: [switched] }).yieldMatrix).toBe(false);
+    ).toEqual({ selectedAppId: null });
   });
 
   it("leaves a selected App group and an unknown selection alone", () => {
     const groups = [{ id: "app-a", dm: false }];
     expect(resolveAppContext({ ...base, groups, selectedId: "app-a" }).selectedAppId).toBe("app-a");
     expect(resolveAppContext({ ...base, selectedId: "missing" }).selectedAppId).toBe("app-a");
-    expect(resolveAppContext({ ...base, selectedId: null }).yieldMatrix).toBe(false);
+    expect(resolveAppContext({ ...base, selectedId: null }).selectedAppId).toBe("app-a");
   });
 });
 

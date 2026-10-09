@@ -38,8 +38,6 @@ export interface AppContextInput {
 
 export interface AppContextDecision {
   selectedAppId: string | null;
-  /** Close the fleet matrix overview in favour of the selected chat. */
-  yieldMatrix: boolean;
 }
 
 /** The thread a bot shows: the pinned one, else its active thread.  The pin is
@@ -49,19 +47,18 @@ export function shownThreadId(bot: { threadId?: string }, viewedThreadId: string
   return viewedThreadId ?? bot.threadId;
 }
 
-/** Decide, from the current selection, whether the highlighted App stays and
- *  whether the matrix overview closes.
+/** Decide, from the current selection, whether the highlighted App stays.
  *
  *  Two mistakes lived in the effect this replaces.  It read a null pin as "the
  *  user left the App", but the task-switch ack that `openBotInApp` triggers
  *  nulls the pin on purpose, so the App highlight and the app-scoped keyboard
  *  routing were cleared as soon as the switch landed.  And it closed the matrix
  *  overview on every run, including runs caused by an SSE frame replacing the
- *  `bots` array, so the overview snapped back to the chat.  The overview now
- *  yields only when the selection itself changed. */
+ *  `bots` array, so the overview snapped back to the chat.  Matrix dismissal on
+ *  a pick now lives in `useDismissOnSelection` against `state.selectionNonce`,
+ *  which only moves on actual picks. */
 export function resolveAppContext(input: AppContextInput): AppContextDecision {
-  const yieldMatrix = input.selectionChanged && Boolean(input.selectedId);
-  const unchanged: AppContextDecision = { selectedAppId: input.selectedAppId, yieldMatrix };
+  const unchanged: AppContextDecision = { selectedAppId: input.selectedAppId };
   if (!input.selectedAppId) return unchanged;
   const group = input.groups.find((candidate) => candidate.id === input.selectedId);
   // An App is a group: selecting one keeps itself highlighted.
@@ -73,5 +70,5 @@ export function resolveAppContext(input: AppContextInput): AppContextDecision {
   // selection after an ack or a frame has no pin, and means the bot's active thread.
   const shown = input.selectionChanged ? input.viewedThreadId : shownThreadId(bot, input.viewedThreadId);
   const inApp = Boolean(shown) && shown === appThread;
-  return { selectedAppId: inApp ? input.selectedAppId : null, yieldMatrix };
+  return { selectedAppId: inApp ? input.selectedAppId : null };
 }
