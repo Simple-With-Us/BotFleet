@@ -24,6 +24,7 @@ import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
+import type { ReviewHook } from "../../shared/auto-review";
 import type { ContextInjectionRef } from "../../shared/context-injection";
 import { taskWorkspaceContextsMatch, type TaskAppRef, type TaskWorkspaceContext } from "../../shared/task-workspace-context";
 import { eligibleTaskApps } from "@/lib/task-app-context";
@@ -579,6 +580,9 @@ export interface ConfigStatus {
     projects: Array<{ slug: string; match: string[] }>;
     enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
   };
+  /** Auto-review's fallback reviewer: the engine that reviews a bot's
+   * approvals when the bot's own engine cannot.  An instance id, or null. */
+  autoReview?: { fallbackReviewer: string | null };
   /** Opt-in flags. Absent means off. */
   features?: { skillRecorder: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
   /** Sentry diagnostics.  `configured` mirrors `hasDsn` — a key is on file,
@@ -655,7 +659,7 @@ export function getConversationMode(config?: ConfigStatus | null): ConversationM
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq"
+  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq" | "autoReview"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -690,6 +694,9 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     // Without this every SSE `config` frame wipes Linq status and resets
     // LinqSettings back to its empty defaults.
     imessageLinq: frame.imessageLinq,
+    // Without this every SSE `config` frame forgets the fallback reviewer,
+    // and the Bot Profile tells the owner auto-review is unavailable again.
+    autoReview: frame.autoReview,
   };
 }
 
@@ -791,6 +798,11 @@ export interface InstanceInfo {
     /** This engine can answer a bounded review prompt without changing the
      * bot's active conversation. */
     approvalReview?: boolean;
+    /** Where auto-review can see this engine's tool calls (shared/auto-review.ts).
+     * Absent means the engine has not reported it yet, never "none". */
+    reviewHook?: ReviewHook;
+    /** A full-auto instance can run a held turn in its asking mode. */
+    asksWhenHeld?: boolean;
     /** The harness runs this engine's tool loop, so Maximum Tool Rounds applies. */
     toolLoop?: boolean;
   };

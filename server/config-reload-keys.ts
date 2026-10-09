@@ -35,6 +35,8 @@ export const CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD: ReadonlySet<string> = new Set(
   "terminologyCustom",
   "conversationMode",
   "botDefaults",
+  // The fallback reviewer is looked up per review from the live config.
+  "autoReview",
 ]);
 
 /** The keys in a config patch that require rebuilding the provider fleet. */

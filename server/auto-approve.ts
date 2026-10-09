@@ -362,6 +362,11 @@ export function offerableApprovalKey(
   return key;
 }
 
+/** The rule a permission-bypass grant carries.  Auto-review keys on it:
+ *  On screens a bypass approval before it is delivered, and Watch audits it
+ *  afterwards (server/auto-review.ts `reviewsBypass`). */
+export const PERMISSION_BYPASS_RULE = "permission-bypass";
+
 export interface AutoApprover {
   autoApprove?: boolean;
   bypassPermissions?: boolean;
@@ -424,7 +429,7 @@ export function autoVerdict(
   // acknowledgeLocalAuto before this combination is created.
   if (bot.bypassPermissions && context?.scope !== "local-computer") {
     const key = approvalKey(tool, summary, context?.scope);
-    return { approve: `auto-approved ${key} (permission bypass)`, source: "auto-mode", rule: "permission-bypass" };
+    return { approve: `auto-approved ${key} (permission bypass)`, source: "auto-mode", rule: PERMISSION_BYPASS_RULE };
   }
   // Owner ruling, 2026-10-01 and applied literally 2026-10-02: a bot in full
   // auto never gets an approval card for the harness's own `job_start`.  It

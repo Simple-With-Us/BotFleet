@@ -1091,9 +1091,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // but a turn that can click on the user's real desktop runs brokered:
       // the CLI gets acceptEdits plus the permission-prompt tool, so every
       // ask reaches the harness and the bot's Auto policy decides. Nothing
-      // else could make host control safe on a bypass instance.
+      // else could make host control safe on a bypass instance.  A turn the
+      // harness holds for auto-review (`holdForReview`) is brokered the same
+      // way, so the reviewer sees each ask before it runs.
       const permissionMode: ClaudeConfig["permissionMode"] =
-        controlsHost && config.permissionMode === "bypassPermissions" ? "auto" : config.permissionMode;
+        (controlsHost || turn.holdForReview === true) && config.permissionMode === "bypassPermissions"
+          ? "auto"
+          : config.permissionMode;
       const retryAbort = new AbortController();
       const retry = retryState.get(threadId) ?? { attempt: 0, cancelled: false };
       retry.cancelled = false;
@@ -2200,6 +2204,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // under the Task/Agent row that started it.  One level deep; the
           // three-at-once cap is the CLI's and advisory (CLAUDE_CONTAINMENT_ENV).
           helpers: "typed",
+          // Every ask reaches the permission-prompt tool, except on a bypass
+          // instance, which asks nothing unless a turn is held for review.
+          reviewHook: config.permissionMode === "bypassPermissions" ? "after" : "before",
+          asksWhenHeld: true,
         },
         sendTurn,
         steer,

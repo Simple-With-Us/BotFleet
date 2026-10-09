@@ -878,6 +878,32 @@ describe("CodexDriver turns (fake app-server)", () => {
     });
   });
 
+  it("brokers a full-auto turn held for auto-review, so the reviewer sees the ask before it runs", async () => {
+    // Auto-review On for a bot on a full-auto Codex instance: the harness
+    // sets `holdForReview` on an attended turn, and the turn is brokered
+    // exactly like a host-control turn, inside workspace-write on-request.
+    await create({ mode: "approval", fullAuto: true });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+    const dump = join(scratch, "held-dump.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-held", text: "clean up", holdForReview: true });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    // an ordinary ask, which auto-review may answer: no host scope on it
+    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    await instance.adapter.respondToRequest("t-held", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(startParams(JSON.parse(readFileSync(dump, "utf8")) as FakeDump)).toMatchObject({
+      sandbox: "workspace-write",
+      approvalPolicy: "on-request",
+    });
+  });
+
+  it("asks before every approval when not full-auto, which is where review holds it", async () => {
+    await create({ mode: "approval" });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "before", asksWhenHeld: true });
+  });
+
   it("does not broker an isolated computer, which carries no host scope", async () => {
     // The Local VM and a VPS also arrive as `localComputer`, and a full-auto
     // bot is meant to keep running unattended inside them.  Only a mount

@@ -146,6 +146,9 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
       provider: "cli-wrapper",
       capabilities: {
         sessionModelSwitch: "unsupported",
+        // A wrapped command prints text and nothing else: no asks, no tool
+        // steps, so there is no action auto-review could see.
+        reviewHook: "none",
       },
       async sendTurn(turnInput: SendTurnInput): Promise<TurnStartResult> {
         const turnId = newId();

@@ -1187,6 +1187,49 @@ describe("ACP turns (fake CLI)", () => {
     expect(seen.argv.slice(0, 2)).toEqual(["--permission-mode", "bypassPermissions"]);
   });
 
+  it("declares where auto-review sees its actions: before an ask, or only afterwards when full-auto", async () => {
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-review-hook",
+      displayName: "ACP",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "before", asksWhenHeld: true });
+    await instance.dispose();
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-review-hook-auto",
+      displayName: "ACP Full Auto",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+  });
+
+  it("runs a full-auto turn held for auto-review in its asking mode, so the ask reaches the reviewer", async () => {
+    process.env.FAKE_ACP_MODE = "permission";
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-full-auto-held",
+      displayName: "ACP Full Auto",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+    const dump = join(scratch, "full-auto-held.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-full-auto-held", text: "list the files", holdForReview: true });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    // an ordinary ask, not host control: the reviewer may answer it
+    expect(opened).toMatchObject({ requestType: "permission", tool: "shell", summary: "echo hi" });
+    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv.slice(0, 2)).toEqual(["--permission-mode", "default"]);
+    await instance.adapter.respondToRequest("t-full-auto-held", (opened as any).requestId, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
   it("grok fails closed when the CLI advertises no cached_token (needs login)", async () => {
     process.env.FAKE_ACP_MODE = "no-auth";
     mkdirSync(join(scratch, ".grok"), { recursive: true });

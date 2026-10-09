@@ -285,6 +285,16 @@ describe("ProviderRegistry", () => {
     expect((await registry.describe())[0].capabilities.approvalReview).toBe(true);
   });
 
+  it("ships where auto-review sees an instance's actions, and reads an undeclared hook as none", async () => {
+    const fake = makeFakeDriver();
+    const registry = new ProviderRegistry([fake.driver]);
+    await registry.load({ a: { driver: "fake" } });
+
+    expect((await registry.describe())[0].capabilities).toMatchObject({ reviewHook: "none", asksWhenHeld: false });
+    Object.assign(registry.get("a")!.adapter.capabilities, { reviewHook: "after", asksWhenHeld: true });
+    expect((await registry.describe())[0].capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+  });
+
   // GET /api/instances used to re-probe every CLI (--version, auth status,
   // model discovery) on every call, costing real seconds on a machine with
   // many engines installed — the engine rail's passive refreshes now pass
