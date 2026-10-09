@@ -599,6 +599,24 @@ test("countInternalTesters counts only members of internal all-builds groups", a
   assert.equal(failing.ok, false, "an unreadable count is not reported as zero");
 });
 
+test("countInternalTesters follows pagination and reports an unreadable later page as unreadable, not as a smaller count", async () => {
+  const { countInternalTesters } = await import("./ios-fleet/asc-api.mjs");
+  const group = { id: "int1", type: "betaGroups", attributes: { name: "Internal Testers", isInternalGroup: true, hasAccessToAllBuilds: true } };
+  const page = (emails, next) => ({
+    status: 200, ok: true, text: "",
+    parsed: { data: emails.map((e) => ({ type: "betaTesters", id: e, attributes: { email: e } })), ...(next ? { links: { next } } : {}) }
+  });
+  const make = (failSecond) => async (method, path) => {
+    if (path.startsWith("/v1/apps/1/betaGroups")) return { status: 200, ok: true, parsed: { data: [group] }, text: "" };
+    if (path.startsWith("/v1/betaGroups/int1/betaTesters")) return page(["a@example.com", "b@example.com"], "https://api.appstoreconnect.apple.com/v1/betaGroups/int1/betaTesters?cursor=2");
+    if (path.includes("cursor=2")) return failSecond ? { status: 500, ok: false, parsed: {}, text: "" } : page(["b@example.com", "c@example.com"]);
+    return { status: 500, ok: false, parsed: {}, text: "" };
+  };
+  assert.deepEqual(await countInternalTesters({ api: make(false), appId: "1" }), { ok: true, groups: 1, testers: 3 }, "unique testers across both pages");
+  const broken = await countInternalTesters({ api: make(true), appId: "1" });
+  assert.equal(broken.ok, false);
+});
+
 test("the ship no longer claims internal testers can install when none exist", () => {
   const sh = read("scripts/ios-fleet/ship-testflight.sh");
   const mjs = read("scripts/ios-fleet/asc-api.mjs");
