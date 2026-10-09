@@ -157,6 +157,41 @@ describe("on Windows", () => {
   });
 });
 
+posix("launch environment", () => {
+  it("gives a job's shell the launch variables of the bot and thread that started it, over the minimal environment", () => {
+    const { spawnFn, children } = fakeSpawn();
+    const seen: Array<[string, string]> = [];
+    const h = harness({
+      spawn: spawnFn,
+      launchEnv: (botId, threadId) => {
+        seen.push([botId, threadId]);
+        return { AGENT_LAUNCHER: "botfleet", AGENT_LAUNCH_SEAT: "BF-MONITOR", AGENT_SESSION: threadId };
+      },
+    });
+    process.env.AGENT_SEAT = "CLAUDE";
+    try {
+      expect(start(h, "echo hi", "thread-m", "bot-m").ok).toBe(true);
+    } finally {
+      delete process.env.AGENT_SEAT;
+    }
+    expect(seen).toEqual([["bot-m", "thread-m"]]);
+    const env = children[0]!.spec.env;
+    expect(env.AGENT_LAUNCHER).toBe("botfleet");
+    expect(env.AGENT_LAUNCH_SEAT).toBe("BF-MONITOR");
+    expect(env.AGENT_SESSION).toBe("thread-m");
+    expect(env.BOTFLEET_JOB_ID).toMatch(/\S/);
+    // the harness's own seat is not in the allowlisted base
+    expect(env.AGENT_SEAT).toBeUndefined();
+  });
+
+  it("starts a job with the minimal environment alone when no launcher is wired", () => {
+    const { spawnFn, children } = fakeSpawn();
+    const h = harness({ spawn: spawnFn });
+    expect(start(h, "echo hi").ok).toBe(true);
+    expect(children[0]!.spec.env.AGENT_LAUNCHER).toBeUndefined();
+  });
+});
+
 posix("caps", () => {
   it("refuses past 3 per thread, 4 per bot and 8 per host", () => {
     const { spawnFn } = fakeSpawn();

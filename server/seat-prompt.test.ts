@@ -1,6 +1,7 @@
 /// <reference types="vitest/config" />
 import { describe, expect, it } from "vitest";
 
+import { BOTFLEET_ROLES } from "./launch-identity.ts";
 import {
   composeFleetSeatPrompt,
   countMarker,
@@ -27,19 +28,70 @@ describe("fleet seat prompt composition", () => {
     }
   });
 
+  it("covers exactly the ten BotFleet roles, none of them a platform seat or a Grok Bot tag", () => {
+    expect([...FLEET_SEAT_IDS].sort()).toEqual([
+      "builder",
+      "compiler",
+      "deployer",
+      "designer",
+      "fixer",
+      "housekeeper",
+      "monitor",
+      "oracle",
+      "plumber",
+      "publisher",
+    ]);
+    for (const seatId of FLEET_SEAT_IDS) {
+      const composed = composeFleetSeatPrompt(seatId);
+      expect(composed, seatId).not.toMatch(/\[GB-/);
+      expect(composed, seatId).not.toMatch(/\[(CLAUDE|CODEX|CURSOR|GROK|AG|MINIMAX|MM|MONET|PRODUCER)\]/);
+    }
+  });
+
+  it("opens with the assigned seat, which overrides an engine's default seat", () => {
+    for (const role of BOTFLEET_ROLES) {
+      const composed = composeFleetSeatPrompt(role.id);
+      // The seat sentence comes before the shared coordination text.
+      expect(composed.indexOf(`Your fleet seat is ${role.seat}.`), role.id).toBeGreaterThanOrEqual(0);
+      expect(composed.indexOf(role.seat), role.id).toBeLessThan(composed.indexOf(FLEET_SHARED_RULE_MARKERS[0]));
+      expect(composed).toContain(`BotFleet role bot ${role.name}`);
+      expect(composed).toContain("assigned that seat when it launched you");
+      expect(composed).toMatch(/overrides any default seat named in your engine's own rules files, skills, or memory/);
+      expect(composed).toContain(`AGENT_LAUNCH_SEAT variable in your environment is missing or is not ${role.seat}`);
+      expect(composed).not.toMatch(/\{(seat|name)\}/);
+      // Every other role's seat is absent, so a bot is never told two seats.
+      for (const other of BOTFLEET_ROLES) {
+        if (other.id !== role.id) expect(composed, `${role.id} names ${other.seat}`).not.toContain(other.seat);
+      }
+    }
+  });
+
   it("reports byte counts for PR math", () => {
     const shared = fleetSharedPreambleBytes();
     expect(shared).toBeGreaterThan(900);
     expect(shared).toBeLessThan(2500);
-    const composed = fleetComposedPromptBytes("cursor");
+    const composed = fleetComposedPromptBytes("plumber");
     expect(composed).toBeGreaterThan(shared);
     expect(legacyDuplicatedSharedBytesPerTurn(2)).toBe(shared);
   });
 
-  it("resolves seat ids from BF- names and @fleet-seat hints", () => {
-    expect(resolveFleetSeatId({ name: "BF-Claude" })).toBe("claude");
+  it("resolves seat ids from @fleet-seat hints, BF- names, and bare role names", () => {
+    expect(resolveFleetSeatId({ name: "BF-Plumber" })).toBe("plumber");
     expect(resolveFleetSeatId({ name: "BF Oracle", description: "@fleet-seat: oracle" })).toBe("oracle");
+    expect(resolveFleetSeatId({ name: "Anything", description: "Keeps CI green.  @fleet-seat: bf-fixer" })).toBe("fixer");
+    // The real bots are named for the role alone.
+    expect(resolveFleetSeatId({ name: "Plumber" })).toBe("plumber");
+    expect(resolveFleetSeatId({ name: " housekeeper " })).toBe("housekeeper");
     expect(resolveFleetSeatId({ name: "Kiwi" })).toBeNull();
+    expect(resolveFleetSeatId({ name: "Plumber 2" })).toBeNull();
+  });
+
+  it("no longer maps a BF- bot to a platform seat or a Grok Bot tag", () => {
+    for (const name of ["BF-Claude", "BF-Codex", "BF-Grok", "BF-Cursor", "BF-Director", "BF-Monet"]) {
+      expect(resolveFleetSeatId({ name }), name).toBeNull();
+    }
+    expect(resolveFleetSeatId({ name: "Claude" })).toBeNull();
+    expect(resolveFleetSeatId({ name: "Kiwi", description: "@fleet-seat: claude" })).toBeNull();
   });
 
   it("returns a prompt part only when the harness flag is on", () => {
@@ -47,12 +99,15 @@ describe("fleet seat prompt composition", () => {
     try {
       delete process.env.BOTFLEET_FLEET_SEAT_PROMPTS;
       expect(fleetSeatPromptsEnabled()).toBe(false);
-      expect(fleetSeatPromptPart({ name: "BF-Grok" })).toBeNull();
+      expect(fleetSeatPromptPart({ name: "BF-Plumber" })).toBeNull();
       process.env.BOTFLEET_FLEET_SEAT_PROMPTS = "1";
       expect(fleetSeatPromptsEnabled()).toBe(true);
-      const part = fleetSeatPromptPart({ name: "BF-Grok" });
-      expect(part?.seatId).toBe("grok");
+      const part = fleetSeatPromptPart({ name: "Plumber" });
+      expect(part?.seatId).toBe("plumber");
+      expect(part?.text).toContain("Your fleet seat is BF-PLUMBER.");
       expect(part?.text).toContain("fleet Zulip coordination channel");
+      // A bot that names no role gets no seat sentence, and no prompt at all.
+      expect(fleetSeatPromptPart({ name: "Kiwi" })).toBeNull();
       for (const marker of FLEET_SHARED_RULE_MARKERS) {
         expect(countMarker(part!.text, marker)).toBe(1);
       }
@@ -70,7 +125,7 @@ describe("fleet seat prompt composition", () => {
       process.env.BOTFLEET_FLEET_SEAT_PROMPTS = "1";
       process.env.OMB_BOTS_DIR = "/nonexistent/bots-root";
       resetFleetSeatPromptCacheForTests();
-      expect(fleetSeatPromptPart({ name: "BF-Grok" })).toBeNull();
+      expect(fleetSeatPromptPart({ name: "BF-Plumber" })).toBeNull();
     } finally {
       if (prevFlag === undefined) delete process.env.BOTFLEET_FLEET_SEAT_PROMPTS;
       else process.env.BOTFLEET_FLEET_SEAT_PROMPTS = prevFlag;
@@ -82,32 +137,5 @@ describe("fleet seat prompt composition", () => {
 });
 
 function seatTag(seatId: FleetSeatId): string {
-  switch (seatId) {
-    case "claude":
-      return "[CLAUDE]";
-    case "cursor":
-      return "[CURSOR]";
-    case "grok":
-      return "[GROK]";
-    case "codex":
-      return "[CODEX]";
-    case "ag":
-      return "[AG]";
-    case "minimax":
-      return "[MINIMAX]";
-    case "monet":
-      return "[MONET]";
-    case "producer":
-      return "[PRODUCER]";
-    case "oracle":
-      return "[GB-ORACLE]";
-    case "deployer":
-      return "[GB-DEPLOYER]";
-    case "fixer":
-      return "[GB-FIXER]";
-    default: {
-      const _exhaustive: never = seatId;
-      return _exhaustive;
-    }
-  }
+  return `[${BOTFLEET_ROLES.find((role) => role.id === seatId)!.seat}]`;
 }

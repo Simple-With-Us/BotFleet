@@ -103,6 +103,16 @@ describe("what the app may do", () => {
     ["GET", "/api/connectors"],
     ["POST", "/api/connectors/slack/authorize"],
     ["DELETE", "/api/connectors/slack/accounts/ca_123"],
+    ["GET", "/api/quotas"],
+    ["GET", "/api/tts/usage"],
+    ["GET", "/api/qdrant/status"],
+    ["GET", "/api/jobs"],
+    ["GET", "/api/jobs/job_01JABCDEFGHJKMNPQRSTVWXYZ0/output"],
+    ["POST", "/api/jobs/job_01JABCDEFGHJKMNPQRSTVWXYZ0/stop"],
+    ["POST", "/api/jobs/stop"],
+    ["GET", "/api/bots/bot_123/skills"],
+    ["GET", "/api/bots/bot_123/skills/pdf-tools"],
+    ["PATCH", "/api/bots/bot_123/skills/pdf-tools"],
   ];
 
   for (const [method, path] of calls) {
@@ -133,6 +143,84 @@ describe("what the app may do", () => {
     expect(ask("POST", "/api/update/unquiesce")?.status).toBe(404);
     expect(ask("POST", "/api/update/status")?.status).toBe(404);
     expect(ask("GET", "/api/update/status", false)?.status).toBe(401);
+  });
+});
+
+describe("usage, memory status, jobs and skills", () => {
+  const JOB = "job_01JABCDEFGHJKMNPQRSTVWXYZ0";
+
+  it("reads usage and memory status, and nothing writes to them", () => {
+    for (const path of ["/api/quotas", "/api/tts/usage", "/api/qdrant/status"]) {
+      expect(allowed("GET", path), path).toBe(true);
+      for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+        expect(allowed(method, path), `${method} ${path}`).toBe(false);
+      }
+      expect(ask("GET", path, false)?.status, path).toBe(401);
+    }
+    // the alias for the same handler is not a second door
+    expect(allowed("GET", "/api/recall/status")).toBe(false);
+    // nor is the speech provider's other usage-adjacent surface
+    expect(allowed("GET", "/api/quotas/extra")).toBe(false);
+    expect(allowed("GET", "/api/tts/usage/reset")).toBe(false);
+    expect(allowed("GET", "/api/qdrant/collections")).toBe(false);
+  });
+
+  it("lets the phone list jobs, read one's output and Stop it, with only those verbs", () => {
+    expect(allowed("GET", "/api/jobs")).toBe(true);
+    expect(allowed("GET", `/api/jobs/${JOB}/output`)).toBe(true);
+    expect(allowed("POST", `/api/jobs/${JOB}/stop`)).toBe(true);
+    expect(allowed("POST", "/api/jobs/stop")).toBe(true);
+    // each is exact-method: reading a stop route or posting to an output route is nothing
+    expect(allowed("POST", `/api/jobs/${JOB}/output`)).toBe(false);
+    expect(allowed("GET", `/api/jobs/${JOB}/stop`)).toBe(false);
+    expect(allowed("GET", "/api/jobs/stop")).toBe(false);
+    expect(allowed("DELETE", "/api/jobs")).toBe(false);
+    expect(allowed("POST", "/api/jobs")).toBe(false);
+    expect(allowed("PUT", `/api/jobs/${JOB}/stop`)).toBe(false);
+    expect(ask("GET", "/api/jobs", false)?.status).toBe(401);
+    expect(ask("POST", `/api/jobs/${JOB}/stop`, false)?.status).toBe(401);
+  });
+
+  it("keeps the reads no screen uses closed, and lets no path be smuggled in as a job id", () => {
+    // one job's metadata and the wake-turn cost totals are on the harness but not on the phone
+    expect(allowed("GET", `/api/jobs/${JOB}`)).toBe(false);
+    expect(allowed("GET", "/api/jobs/wake-usage")).toBe(false);
+    // ids are the harness's own `[\w-]+` route pattern;  the `job_<ulid>` shape
+    // is the harness's to judge (it answers 400), so a plain wrong id is forwarded
+    expect(allowed("GET", "/api/jobs/not-a-job/output")).toBe(true);
+    expect(allowed("POST", "/api/jobs/job_short/stop")).toBe(true);
+    for (const id of ["job_../../config", "job_01JABCDEFGHJKMNPQRSTVWXYZ0%2f..", "job.1", "job 1", "..", "a/b"]) {
+      expect(allowed("GET", `/api/jobs/${id}/output`), id).toBe(false);
+      expect(allowed("POST", `/api/jobs/${id}/stop`), id).toBe(false);
+    }
+    expect(allowed("GET", `/api/jobs/${JOB}/output/extra`)).toBe(false);
+    expect(allowed("POST", `/api/jobs/${JOB}/stop/extra`)).toBe(false);
+    // the harness's internal job endpoints are bot-tool plumbing and do not exist off the Mac
+    expect(ask("POST", "/api/internal/jobs/start")?.status).toBe(404);
+    expect(ask("POST", "/api/internal/jobs/kill")?.status).toBe(404);
+  });
+
+  it("lets the phone read skills and switch one on or off, and never import or remove one", () => {
+    expect(allowed("GET", "/api/bots/bot_123/skills")).toBe(true);
+    expect(allowed("GET", "/api/bots/bot_123/skills/pdf-tools")).toBe(true);
+    expect(allowed("PATCH", "/api/bots/bot_123/skills/pdf-tools")).toBe(true);
+    // Import can read a folder off the Mac's disk and is gated only on the
+    // connection being loopback, which the sidecar's is.  Closed, with both
+    // body shapes it takes (`{ folder }` and `{ source }`).
+    expect(allowed("POST", "/api/bots/bot_123/skills")).toBe(false);
+    expect(ask("POST", "/api/bots/bot_123/skills")?.status).toBe(404);
+    // the desktop panel has no remove button, so there is no remove route
+    expect(allowed("DELETE", "/api/bots/bot_123/skills/pdf-tools")).toBe(false);
+    expect(allowed("PUT", "/api/bots/bot_123/skills/pdf-tools")).toBe(false);
+    expect(allowed("PATCH", "/api/bots/bot_123/skills")).toBe(false);
+    expect(allowed("POST", "/api/bots/bot_123/skills/pdf-tools")).toBe(false);
+    // the harness's skill-name charset is lowercase letters, digits and hyphen
+    for (const name of ["PDF-Tools", "pdf_tools", "pdf.tools", "..", "pdf-tools/extra", "pdf%2ftools", "pdf tools"]) {
+      expect(allowed("GET", `/api/bots/bot_123/skills/${name}`), name).toBe(false);
+      expect(allowed("PATCH", `/api/bots/bot_123/skills/${name}`), name).toBe(false);
+    }
+    expect(ask("GET", "/api/bots/bot_123/skills", false)?.status).toBe(401);
+    expect(ask("PATCH", "/api/bots/bot_123/skills/pdf-tools", false)?.status).toBe(401);
   });
 });
 

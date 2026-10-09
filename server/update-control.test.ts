@@ -627,6 +627,21 @@ describe("the launcher", () => {
     expect(args[10]).toContain("--run-id 'run_one'");
   });
 
+  it("sources harness bearer credentials from a launch env file, not the -c string", () => {
+    const { args } = launchPlanCommand({
+      runId: "run_nonce",
+      progressPath: "/tmp/state/runs/run_nonce.progress.json",
+      logPath: "/tmp/state/runs/run_nonce.log",
+      scriptPath: "/Users/jay/apps/update-botfleet.sh",
+      label: "com.jay.botfleet-update",
+      nodeDirectory: "/opt/homebrew/bin",
+      launchEnvFilePath: "/tmp/state/runs/run_nonce.launch.env",
+    });
+    const script = args[10];
+    expect(script).toContain(". '/tmp/state/runs/run_nonce.launch.env'");
+    expect(script).not.toContain("BOTFLEET_OWNER_NONCE=");
+  });
+
   it("records the run before launching it, and launches nothing it cannot record", async () => {
     const paths = rig();
     const order: string[] = [];

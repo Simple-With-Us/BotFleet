@@ -9,7 +9,12 @@ import { test, expect, type Page, type Locator } from '@playwright/test';
 // (0.02 explicit, 0.2 by Playwright's default).  Only animation and caret
 // handling stay on the call.  No mask: these cards have no animated mascot
 // or live frame.
-const stableShot = { animations: 'disabled' as const, caret: 'hide' as const };
+const stableShot = {
+  animations: 'disabled' as const,
+  caret: 'hide' as const,
+  maxDiffPixelRatio: 0.02,
+  threshold: 0.2,
+} as const;
 
 // The Runs On row labels "This Mac" when the user agent contains "Mac".
 // Pin a Linux Chrome UA so that label cannot drift between hosts. Desktop
@@ -43,6 +48,28 @@ test.use({
   userAgent: LINUX_CHROME_UA,
 });
 
+function vpsComputerStatusForFixture(page: Page) {
+  const warning = new URL(page.url()).searchParams.get('warning');
+  if (warning === 'vps-incompatible') {
+    return {
+      configured: true,
+      imageMatches: false,
+      managed: true,
+      container: 'running',
+      ready: false,
+      problem: 'The VPS Linux desktop image is from an older BotFleet release.',
+    };
+  }
+  return {
+    configured: false,
+    imageMatches: true,
+    managed: false,
+    container: 'missing',
+    ready: false,
+    problem: null,
+  };
+}
+
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/bots/visual-bot/computer**', (route) => {
     const url = new URL(route.request().url());
@@ -57,14 +84,7 @@ test.beforeEach(async ({ page }) => {
       return route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify({
-          configured: false,
-          imageMatches: true,
-          managed: false,
-          container: 'missing',
-          ready: false,
-          problem: null,
-        }),
+        body: JSON.stringify(vpsComputerStatusForFixture(page)),
       });
     }
     return route.fallback();
@@ -83,6 +103,24 @@ test('visual: ComputerPanel VPS unconfigured warning', async ({ page }) => {
   await expect(board.getByText('This Computer', { exact: true })).toBeVisible();
 
   await expect(card).toHaveScreenshot('computer-panel-vps-unconfigured.png', stableShot);
+});
+
+test('visual: ComputerPanel VPS incompatible replacement error', async ({ page }) => {
+  await page.goto('/?fixture=computer-panel&warning=vps-incompatible');
+  await pinFonts(page);
+
+  const board = page.getByTestId('computer-panel-board');
+  await expect(board).toBeVisible();
+  await expect(board.getByText('The VPS Linux desktop image is from an older BotFleet release.')).toBeVisible();
+  await expect(board.getByRole('button', { name: 'Replace VPS computer' })).toBeVisible();
+
+  const errorCard = board.locator('.border-danger\\/30').filter({
+    hasText: 'The VPS Linux desktop image is from an older BotFleet release.',
+  });
+  await expect(errorCard).toHaveScreenshot('computer-panel-vps-incompatible-error.png', {
+    ...stableShot,
+    mask: [errorCard.getByRole('button', { name: 'Replace VPS computer' })],
+  });
 });
 
 test('visual: ComputerPanel VPS auto-start and off-computer warnings', async ({ page }) => {

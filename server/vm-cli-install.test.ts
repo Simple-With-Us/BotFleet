@@ -151,6 +151,38 @@ describe("vm CLI manifest install", () => {
     expect(script).toContain("ssh '-V'");
   });
 
+  // Regression, 2026-10-08: `botfleet-vm-cli-verify` run as cua inside the live
+  // Local VM exited 1 with
+  //   missing VM CLIs: ping
+  // The image build verifies as root with Docker's default capability set, so it
+  // passed.  The running container is created with `--cap-drop ALL` and only
+  // SETUID and SETGID added back, and ping carries the file capability
+  // cap_net_raw.  Linux refuses to exec a file whose capabilities exceed the
+  // bounding set, so `ping -V` (or any argument) dies with "operation not
+  // permitted" before ping runs.  Reproduced on the v8 image in a throwaway
+  // container with those flags, as cua: `ping -V` exits 255, `strace -V` exits 0,
+  // and the baked verifier reported only ping.  The fix is not a capability
+  // (NET_RAW would widen a hardened sandbox): the package is present, so verify
+  // that, the way scp and sftp are.
+  it("verifies ping by presence, because the Local VM drops NET_RAW and ping then cannot start", () => {
+    const script = renderVerifyScript("local-vm");
+    const tool = loadVmCliManifest().tools.find((t) => t.name === "ping");
+    expect(tool?.verify?.command, "ping must not be executed by the verifier").toBe("command");
+    expect(tool?.verify?.args).toEqual(["-v", "ping"]);
+    expect(script).toContain("command '-v' 'ping'");
+    expect(script).not.toContain("ping '-V'");
+    // The package is still installed; only the probe changed.
+    expect(tool?.apt).toEqual(["iputils-ping"]);
+  });
+
+  it("keeps strace on a real invocation: -V prints the version and needs no ptrace", () => {
+    // Checked in the same throwaway container as ping above: under CapDrop ALL,
+    // `strace -V` exits 0 (it never traces anything), so it keeps the stronger
+    // check and only ping is relaxed.
+    const strace = loadVmCliManifest().tools.find((t) => t.name === "strace");
+    expect(strace?.verify).toEqual({ command: "strace", args: ["-V"] });
+  });
+
   it("keeps scp and sftp on openssh-client, which ships both binaries", () => {
     // There is no binary package named `scp` in bookworm: `apt-cache show scp`
     // finds nothing, so naming one aborts the whole install RUN under

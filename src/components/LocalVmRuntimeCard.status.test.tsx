@@ -182,6 +182,55 @@ describe("LocalVmRuntimeCard header for the other setup states", () => {
     expect(card.text).toContain("Open and start docker");
   });
 
+  // 2026-10-08: with the load average in the hundreds the harness's runtime
+  // health probe timed out while OrbStack was running, and this header told the
+  // owner to start it.  The harness now reports `daemonSlow` for that case.
+  // The problem string is the stale "Start docker first" on purpose: the pill
+  // and the body have to follow daemonSlow, not that string.
+  it("says the runtime is slow, never to start it, while its health check is only timing out", async () => {
+    const card = await readCard({
+      ...DAEMON_UP_NO_IMAGE,
+      daemonUp: false,
+      daemonSlow: true,
+      problem: "Start docker first",
+    });
+    expect(card.pill).toBe("Docker is slow to respond right now; try again in a moment");
+    expect(card.pill).not.toMatch(/start docker first/i);
+    expect(card.text).toContain("Waiting for docker to respond");
+    expect(card.text).toContain("The container runtime (docker) is installed but did not answer in time");
+    expect(card.text).toContain("because this Mac is busy");
+    // The two sentences are joined by a real U+00A0 plus a space, which HTML
+    // keeps; two ASCII spaces would collapse to one.
+    expect(card.text).toContain("is busy.\u00a0 BotFleet keeps checking.");
+    expect(card.text).toContain("Waiting for the container runtime to respond.");
+    expect(card.text).not.toMatch(/start docker first/i);
+    expect(card.text).not.toMatch(/Open and start/i);
+    expect(card.text).not.toMatch(/start the container runtime above first/i);
+    expect(card.buttons).not.toContain("Prepare Linux Desktop");
+  });
+
+  it("capitalizes the slow-runtime sentence when the harness sends no problem", async () => {
+    const card = await readCard({
+      ...DAEMON_UP_NO_IMAGE,
+      daemonUp: false,
+      daemonSlow: true,
+      problem: null,
+    });
+    expect(card.pill).toBe("Docker is slow to respond right now; try again in a moment");
+    expect(card.pill).not.toMatch(/^docker\b/);
+  });
+
+  it("still says to start the runtime when the daemon refused rather than timed out", async () => {
+    const card = await readCard({
+      ...DAEMON_UP_NO_IMAGE,
+      daemonUp: false,
+      daemonSlow: false,
+      problem: "Start docker first",
+    });
+    expect(card.pill).toBe("Start docker first");
+    expect(card.text).toContain("Open and start docker");
+  });
+
   it("points at creating the VM once the image exists", async () => {
     const card = await readCard({
       ...DAEMON_UP_NO_IMAGE,

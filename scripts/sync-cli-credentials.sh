@@ -30,7 +30,7 @@ Copies host developer CLI credentials into a Local VM or Cloud VPS container.
 
 Options:
   -t, --target <local|vps|all>   Target environment:
-                                  local: Local VM container (default: botfleet-computer)
+                                  local: Local VM container (default: botfleet-computer-<user>, legacy botfleet-computer)
                                   vps:   Cloud VPS container (default: botfleet-vps-shared)
                                   all:   Sync to both local and VPS containers
                                  (default: auto-detect from active config/containers)

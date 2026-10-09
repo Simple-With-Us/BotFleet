@@ -12,6 +12,7 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
+import { readHarnessOwner } from "./harness-ownership.mjs";
 import { createUpdaterCoordinator } from "./updater-coordinator.mjs";
 import {
   AUTO_CHECK_FAILURE_BACKOFF_MS,
@@ -160,14 +161,33 @@ export function registerUpdaterIpc() {
     const logFile = join(logDir, "updater-local.log");
     try { mkdirSync(logDir, { recursive: true, mode: 0o700 }); } catch { /* already exists */ }
 
+    const dataDir = process.env.OMB_DATA_DIR || process.env.BOTFLEET_DATA_DIR || join(homedir(), ".botfleet");
+    let harnessOwner;
+    try {
+      harnessOwner = readHarnessOwner(dataDir);
+    } catch {
+      setState({ status: "error", message: "Could not read harness ownership for the local update." });
+      return;
+    }
+    const childEnv = {
+      ...process.env,
+      PATH: childPath,
+      BOTFLEET_CHECKOUT: join(homedir(), "apps", "botfleet-server"),
+    };
+    if (harnessOwner) {
+      if (!harnessOwner.nonce) {
+        setState({
+          status: "error",
+          message: "Harness bearer credential is missing.\u00A0 Restart the harness before updating locally.",
+        });
+        return;
+      }
+      childEnv.BOTFLEET_OWNER_NONCE = harnessOwner.nonce;
+    }
     const child = spawn("/bin/bash", [script], {
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],
-      env: {
-        ...process.env,
-        PATH: childPath,
-        BOTFLEET_CHECKOUT: join(homedir(), "apps", "botfleet-server"),
-      },
+      env: childEnv,
     });
 
     // Capture stderr to the log so a 127 / missing-node error is visible.

@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureDirs } from "../../config.ts";
 import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../../testing/launch-identity.ts";
 import { MODEL_REJECTED_STOP_REASON } from "../../model-fallback.ts";
 import { classifyError } from "../retry.ts";
 import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
@@ -882,6 +883,30 @@ describe("ACP turns (fake CLI)", () => {
     expect(seen.env.CURSOR_AUTH_TOKEN).toBeUndefined();
     expect(seen.env.BOX_TOKEN).toBeUndefined();
     expect(seen.env.OMB_TTS_KEY).toBeUndefined();
+  });
+
+  it("launches each bot's turn with its own seat and none of the harness's identity", async () => {
+    const restore = inheritHarnessIdentity();
+    try {
+      await create();
+      const dump = join(scratch, "launch-dump.json");
+      process.env.FAKE_ACP_DUMP = dump;
+      const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+        const started = await instance.adapter.sendTurn({ threadId, text: "go", launchIdentity });
+        await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+        return readEngineDump(dump).env;
+      };
+      const plumber = await seenFor("t-acp-plumber", { seat: "BF-PLUMBER", session: "t-acp-plumber" });
+      const fixer = await seenFor("t-acp-fixer", { seat: "BF-FIXER", session: "t-acp-fixer" });
+      const none = await seenFor("t-acp-none", { seat: null, session: "t-acp-none" });
+      const bare = await seenFor("t-acp-bare", undefined);
+      expectLaunchedAs(plumber, { seat: "BF-PLUMBER", session: "t-acp-plumber" });
+      expectLaunchedAs(fixer, { seat: "BF-FIXER", session: "t-acp-fixer" });
+      expectLaunchedAs(none, { seat: null, session: "t-acp-none" });
+      expectLaunchedAs(bare, { seat: null });
+    } finally {
+      restore();
+    }
   });
 
   // ACP session/new accepts stdio MCP entries, so connected apps use the

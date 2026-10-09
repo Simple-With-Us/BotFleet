@@ -30,6 +30,8 @@ import {
   DEFAULT_CONTAINER_LIMITS,
   LEGACY_UNLABELED_CONTAINER_LIMITS,
   LIMITS_LABEL,
+  RUNTIME_PROBE_ATTEMPTS,
+  RUNTIME_PROBE_TIMEOUT_MS,
   adaptContainerLimits,
   localVmHostCapacityError,
   declaredHardening,
@@ -94,6 +96,49 @@ function runner(responses: Record<string, string | Error>) {
     return { stdout: response };
   };
   return { calls, run };
+}
+
+const DOCKER_PROBE = "docker info --format {{.ServerVersion}}";
+
+/** What `execFile` rejects with when its `timeout` kills the child: `killed`
+ * and `signal` set, no exit code, and a "Command failed:" message that never
+ * says "timed out". */
+function probeTimeout(command = DOCKER_PROBE): Error {
+  return Object.assign(new Error(`Command failed: ${command}`), { killed: true, signal: "SIGTERM", code: null });
+}
+
+/** The error a stopped daemon gives at once, which is an answer rather than a
+ * timeout. */
+function daemonRefused(): Error {
+  return Object.assign(
+    new Error("Command failed: docker info\nCannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"),
+    { code: 1 },
+  );
+}
+
+/** A runner whose answers to one command arrive in order (the last repeats),
+ * recording every call with the timeout it was given. */
+function sequencedRunner(sequences: Record<string, Array<string | Error>>) {
+  const calls: Array<{ key: string; timeout: number | undefined }> = [];
+  const used = new Map<string, number>();
+  const run: CommandRunner = async (command, args, timeout) => {
+    const key = [command, ...args].join(" ");
+    calls.push({ key, timeout });
+    const outcomes = sequences[key];
+    if (!outcomes) throw new Error(`unexpected command: ${key}`);
+    const index = Math.min(used.get(key) ?? 0, outcomes.length - 1);
+    used.set(key, (used.get(key) ?? 0) + 1);
+    const outcome = outcomes[index]!;
+    if (outcome instanceof Error) throw outcome;
+    return { stdout: outcome };
+  };
+  return {
+    calls,
+    run,
+    keys: () => calls.map((call) => call.key),
+    count: (key: string) => calls.filter((call) => call.key === key).length,
+    timeouts: (key: string) => calls.filter((call) => call.key === key).map((call) => call.timeout),
+  };
 }
 
 const driverExec =
@@ -954,19 +999,145 @@ describe("containerComputerAction", () => {
   });
 });
 
+// Regression, 2026-10-08.  On a Mac whose load average sat between 115 and 450,
+// `docker info` took 1.2 s from a shell yet the harness's 10 s probe timed out
+// now and then.  A GET of /api/local-computer showed `daemonUp: true`; seconds
+// later a POST to /run failed with "Start docker first" while OrbStack was up
+// the whole time.  A timeout says nothing about the daemon, so it is asked
+// again once, and two timeouts are "slow", never "stopped".
+describe("container runtime health probe on a loaded host", () => {
+  const healthy = "29\n";
+  const slowMessage = "Docker is slow to respond right now; try again in a moment";
+  const whichDockerOnly = { "/usr/bin/which docker": ["docker\n"], "/usr/bin/which podman": [new Error("missing")] };
+
+  it("costs one call when the daemon answers at once", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [healthy] });
+
+    const status = await containerRuntimeStatus(fake.run, "linux");
+
+    expect(status).toEqual({ runtime: "docker", available: ["docker"], daemonUp: true });
+    expect(fake.count(DOCKER_PROBE)).toBe(1);
+  });
+
+  it("asks again after a timeout and reports the daemon up when the second look answers", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [probeTimeout(), healthy] });
+
+    const status = await containerRuntimeStatus(fake.run, "linux");
+
+    expect(status).toEqual({ runtime: "docker", available: ["docker"], daemonUp: true });
+    expect(status.daemonSlow).toBeUndefined();
+    expect(fake.count(DOCKER_PROBE)).toBe(2);
+  });
+
+  it("gives the probe about 24 seconds in total, spread over its attempts", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [probeTimeout()] });
+
+    await containerRuntimeStatus(fake.run, "linux");
+
+    const budgets = fake.timeouts(DOCKER_PROBE);
+    expect(budgets).toEqual(Array(RUNTIME_PROBE_ATTEMPTS).fill(RUNTIME_PROBE_TIMEOUT_MS));
+    const total = RUNTIME_PROBE_ATTEMPTS * RUNTIME_PROBE_TIMEOUT_MS;
+    expect(total).toBeGreaterThanOrEqual(20_000);
+    expect(total).toBeLessThanOrEqual(25_000);
+  });
+
+  it("reports a slow daemon, not a stopped one, after two timeouts", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [probeTimeout()] });
+
+    const runtime = await containerRuntimeStatus(fake.run, "linux");
+    expect(runtime).toEqual({ runtime: "docker", available: ["docker"], daemonUp: false, daemonSlow: true });
+    expect(fake.count(DOCKER_PROBE)).toBe(RUNTIME_PROBE_ATTEMPTS);
+
+    const status = await containerComputerStatus(fake.run, "linux");
+    expect(status.daemonUp).toBe(false);
+    expect(status.daemonSlow).toBe(true);
+    expect(status.ready).toBe(false);
+    expect(status.problem).toBe(slowMessage);
+    expect(status.problem).not.toMatch(/Start docker/i);
+    // Nothing past the failed probe is asked of a daemon that is not answering.
+    expect(fake.keys().filter((key) => key.includes("inspect"))).toEqual([]);
+  });
+
+  it("still says Start docker first when the daemon refuses at once, and does not ask twice", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [daemonRefused()] });
+
+    const status = await containerComputerStatus(fake.run, "linux");
+
+    expect(status.daemonUp).toBe(false);
+    expect(status.daemonSlow).toBe(false);
+    expect(status.problem).toBe("Start docker first");
+    expect(fake.count(DOCKER_PROBE)).toBe(1);
+  });
+
+  it("does not treat a timeout then a refusal as slow: the refusal is the answer", async () => {
+    const fake = sequencedRunner({ ...whichDockerOnly, [DOCKER_PROBE]: [probeTimeout(), daemonRefused()] });
+
+    const status = await containerComputerStatus(fake.run, "linux");
+
+    expect(status.daemonSlow).toBe(false);
+    expect(status.problem).toBe("Start docker first");
+    expect(fake.count(DOCKER_PROBE)).toBe(2);
+  });
+
+  it("names the runtime that timed out when the other one refused outright", async () => {
+    const fake = sequencedRunner({
+      "/usr/bin/which docker": ["docker\n"],
+      "/usr/bin/which podman": ["podman\n"],
+      [DOCKER_PROBE]: [daemonRefused()],
+      "podman info --format json": [probeTimeout("podman info")],
+    });
+
+    const status = await containerComputerStatus(fake.run, "linux");
+
+    expect(status.runtime).toBe("podman");
+    expect(status.available).toEqual(["docker", "podman"]);
+    expect(status.daemonSlow).toBe(true);
+    expect(status.problem).toBe("Podman is slow to respond right now; try again in a moment");
+  });
+
+  it("prefers a runtime that answers over one that is only slow", async () => {
+    const fake = sequencedRunner({
+      "/usr/bin/which docker": ["docker\n"],
+      "/usr/bin/which podman": ["podman\n"],
+      [DOCKER_PROBE]: [probeTimeout()],
+      "podman info --format json": ['{"host":{"arch":"amd64"}}\n'],
+    });
+
+    const status = await containerRuntimeStatus(fake.run, "linux");
+
+    expect(status).toEqual({ runtime: "podman", available: ["docker", "podman"], daemonUp: true });
+  });
+});
+
 describe("wakeContainerComputer", () => {
   // A stateful fake daemon: the container starts STOPPED, `rm` moves it to
   // missing, `run` moves it to running (unless scripted to fail). Every
   // status probe answers from the current phase.
-  function wakeFake(opts: { removeResult?: Error; runResult?: Error; initialPhase?: "stopped" | "running" } = {}) {
+  function wakeFake(
+    opts: {
+      removeResult?: Error;
+      runResult?: Error;
+      initialPhase?: "stopped" | "missing" | "running";
+      /** Answers to the daemon health probe, in order; the last repeats.  Absent
+       * means a healthy daemon.  Lets a test script a loaded host's flap. */
+      daemonProbe?: Array<string | Error>;
+    } = {},
+  ) {
     let phase: "stopped" | "missing" | "running" = opts.initialPhase ?? "stopped";
+    let probes = 0;
     const calls: string[] = [];
     const run: CommandRunner = async (command, args) => {
       const key = [command, ...args].join(" ");
       calls.push(key);
       if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
       if (key === "/usr/bin/which podman") throw new Error("missing");
-      if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === "docker info --format {{.ServerVersion}}") {
+        const answers = opts.daemonProbe ?? ["29\n"];
+        const answer = answers[Math.min(probes, answers.length - 1)]!;
+        probes += 1;
+        if (answer instanceof Error) throw answer;
+        return { stdout: answer };
+      }
       if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "8 17179869184\n" };
       if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "Linux\n" };
       if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
@@ -1077,6 +1248,73 @@ describe("wakeContainerComputer", () => {
       /could not be started: rm refused/,
     );
     expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(false);
+  });
+
+  // The same flap, hit through the lifecycle actions: a button press or a bot
+  // turn's auto-wake lands on a probe that times out once and then answers.
+  describe("when the daemon probe flaps on a loaded host", () => {
+    const slowPattern = /Docker is slow to respond right now; try again in a moment/;
+
+    function withImageBuild(fake: ReturnType<typeof wakeFake>): CommandRunner {
+      return async (command, args, timeout, options) => {
+        const key = [command, ...args].join(" ");
+        if (key.startsWith("docker pull ") || key.startsWith("docker build ")) {
+          fake.calls.push(key);
+          return { stdout: "" };
+        }
+        return fake.run(command, args, timeout, options);
+      };
+    }
+
+    it("creates the VM when the probe times out once and then answers", async () => {
+      const fake = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout(), "29\n"] });
+
+      const status = await containerComputerAction("run", fake.run, "linux");
+
+      expect(status.container).toBe("running");
+      expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(true);
+    });
+
+    it("prepares the image when the probe times out once and then answers", async () => {
+      const fake = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout(), "29\n"] });
+
+      await containerComputerAction("pull", withImageBuild(fake), "linux");
+
+      expect(fake.calls.some((call) => call.startsWith("docker build "))).toBe(true);
+    });
+
+    it("gets past the daemon gate on start after one timeout (start itself is refused for another reason)", async () => {
+      const fake = wakeFake({ initialPhase: "stopped", daemonProbe: [probeTimeout(), "29\n"] });
+
+      await expect(containerComputerAction("start", fake.run, "linux")).rejects.toThrow(/cannot safely resume/);
+    });
+
+    it.each(["run", "start", "pull"] as const)(
+      "refuses %s with the slow-daemon message, never Start docker first, after two timeouts",
+      async (action) => {
+        const fake = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout()] });
+
+        const attempt = containerComputerAction(action, withImageBuild(fake), "linux");
+
+        await expect(attempt).rejects.toBeInstanceOf(Error);
+        await expect(attempt).rejects.toMatchObject({ status: 409, message: expect.stringMatching(slowPattern) });
+        await expect(attempt).rejects.not.toMatchObject({ message: expect.stringMatching(/Start docker/i) });
+        expect(fake.calls.some((call) => call.startsWith("docker run ") || call.startsWith("docker build "))).toBe(false);
+      },
+    );
+
+    it("tells a bot turn the daemon is slow, not stopped, instead of waking a VM", async () => {
+      const probe = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout()] });
+      const slow = await containerComputerStatus(probe.run, "linux");
+      expect(slow.daemonSlow).toBe(true);
+
+      const fake = wakeFake({ initialPhase: "missing", daemonProbe: [probeTimeout()] });
+      const result = await wakeContainerComputer(slow, fake.run, "linux");
+
+      expect(result).toBe(slow);
+      expect(result.problem).toMatch(slowPattern);
+      expect(fake.calls).toHaveLength(0);
+    });
   });
 });
 
@@ -1555,6 +1793,16 @@ describe("PATH driver symlink repair", () => {
     expect(dockerfile).toContain("ENV HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1");
     expect(dockerfile).toContain("botfleet_install_zsh_shell");
     expect(Number(IMAGE_LAYER_VERSION)).toBeGreaterThanOrEqual(8);
+  });
+
+  // The baked verifier checks ping by presence.  The layer version is NOT bumped
+  // for this verify-only change (a bump blocks Local VM bots and invalidates
+  // Self-Hosted VPS containers), so the fix reaches the next image that is built
+  // for a real reason.
+  it("bakes the presence-only ping check into newly built images", () => {
+    const dockerfile = managedImageDockerfile();
+    expect(dockerfile).toContain("command '-v' 'ping'");
+    expect(dockerfile).not.toContain("ping '-V'");
   });
 
 });
