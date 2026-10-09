@@ -892,6 +892,84 @@ describe("harness HTTP API", () => {
     }
   }, 240_000);
 
+  it("defers a release that arrives while a forced quiesce is still settling, then honours it", async () => {
+    // Finding 1: the DELETE the updater sends at its deadline, on Ctrl-C and
+    // in the --force give-up used to stand the fence down mid-settle, so the
+    // resume snapshot and the held messages landed on an unfenced harness.
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    const runtime = async () => (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json() as Promise<{
+      quiescing: boolean;
+      fencing: boolean;
+      draining: boolean;
+    }>;
+    const resumePath = join(home, ".botfleet", "pending-update-resume.json");
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const working = (await api("POST", "/api/bots")).body.bot;
+    const idle = (await api("POST", "/api/bots")).body.bot;
+    const busy = async (id: string) =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
+    const said = async (threadId: string, text: string) =>
+      ((await api("GET", `/api/threads/${threadId}/messages?limit=50`)).body.messages as Array<{ role: string; text?: string }>)
+        .filter((message) => message.role === "user" && message.text === text).length;
+    let heldMutation: ReturnType<typeof request> | null = null;
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      for (const bot of [working, idle]) {
+        await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      }
+      expect((await api("POST", `/api/bots/${working.id}/messages`, { text: "keep working through the release" })).status).toBe(202);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      expect((await api("POST", `/api/bots/${idle.id}/messages`, { text: "held through a deferred release" })).body)
+        .toMatchObject({ queued: true });
+
+      // A request still reading its body keeps the forced quiesce settling
+      // (it waits up to 15 seconds for work in flight to clear).
+      heldMutation = request({
+        hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
+        headers: { "content-type": "application/json", "content-length": "2" },
+      });
+      heldMutation.on("error", () => {});
+      heldMutation.write("{");
+      const forced = quiesce("POST", "?force=true");
+      await expect.poll(async () => (await runtime()).fencing, SLOW).toBe(true);
+
+      // The release lands mid-settle: kept, not acted on yet.
+      const early = await quiesce("DELETE");
+      expect(early.status).toBe(200);
+      expect(await early.json()).toMatchObject({ releasePending: true, fencing: true, quiescing: true });
+      expect((await runtime()).quiescing).toBe(true);
+
+      // The settle completes, and the release is honoured the moment it does:
+      // the forced request answers unfenced, the snapshot it wrote is consumed
+      // (the interrupted bot resumes), and the held message runs.
+      heldMutation.destroy();
+      heldMutation = null;
+      const answer = await (await forced).json() as { quiescing: boolean; fencing: boolean };
+      expect(answer).toMatchObject({ quiescing: false, fencing: false });
+      expect(await runtime()).toMatchObject({ quiescing: false, fencing: false, draining: false });
+      await expect.poll(() => existsSync(resumePath), SLOW).toBe(false);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+      await expect.poll(() => busy(idle.id), SLOW).toBe(true);
+      expect(await said(idle.threadId, "held through a deferred release")).toBe(1);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+    } finally {
+      heldMutation?.destroy();
+      await quiesce("DELETE");
+      for (const bot of [working, idle]) {
+        await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      }
+      for (const bot of [working, idle]) await expect.poll(() => busy(bot.id), SLOW).toBe(false);
+      for (const bot of [working, idle]) await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+      rmSync(resumePath, { force: true });
+    }
+  }, 240_000);
+
   it("serves packaged UI assets and preserves API 404s", async () => {
     const root = await fetch(`${BASE}/`);
     expect(root.status).toBe(200);

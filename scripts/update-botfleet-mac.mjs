@@ -1060,11 +1060,33 @@ export function drainProgressDetail(runtime, phase = "wait") {
   return "Waiting for work in flight to finish";
 }
 
-/** A fence this run may use: up, and settled.  A forced quiesce still
- *  interrupting and saving work (`fencing`) can still roll back. */
+/**
+ * Whether a runtime answer shows a fence this run may use: up, and settled.
+ *
+ * A forced quiesce still interrupting and saving work can still roll back, so
+ * a fence is only usable once the harness says it settled (`fencing: false`).
+ * The harness installed before this updater never reports `fencing`, and it
+ * raises `quiescing` BEFORE it starts interrupting, so for it the only proof
+ * of a settled fence is the work count itself: nothing in flight.  One rule
+ * for every path that can meet a fence — a forced answer, a second forced
+ * ask, and a fence discovered after an answer was lost.
+ */
+export function fenceUsable(body) {
+  if (body?.quiescing !== true) return false;
+  if (body.fencing === false) return true;
+  if (body.fencing === true) return false;
+  return body.safeToRestart === true && body.activeWorkCount === 0;
+}
+
+/** Whether a runtime answer shows a forced quiesce still interrupting and
+ *  saving work: the opposite of a settled fence, for a fence that is up. */
+export function fenceStillSettling(body) {
+  return body?.quiescing === true && !fenceUsable(body);
+}
+
+/** A fenced quiesce answer this run may use. */
 function runtimeQuiesced(response) {
-  return response?.kind === "ok" && response.status === 200 && response.body?.quiescing === true &&
-    response.body?.fencing !== true;
+  return response?.kind === "ok" && response.status === 200 && fenceUsable(response.body);
 }
 
 const STOPPED_HOLDING = "BotFleet stopped holding new work before the update could start; nothing was interrupted.  Try again.";
@@ -1246,14 +1268,15 @@ async function holdAndFence(config, owner, deps) {
         // An ask whose answer timed out on this side landed on that one.  A
         // forced fence still interrupting and saving work is not usable yet
         // (it can still roll back), so wait for it to settle; a settled one
-        // is this run's fence.  It counts as forced for the idle check: the
-        // harness only raises it idle, or having saved what it interrupted.
-        if (polled.body?.fencing === true) {
+        // is this run's fence (`fenceUsable`).  Only a harness that says it
+        // settled skips the idle check: it raises the fence idle, or having
+        // saved what it interrupted.
+        if (!fenceUsable(polled.body)) {
           last = polled.body;
           continue;
         }
         holding = false;
-        return { ok: true, response: { kind: "ok", status: 200, body: polled.body }, forced: true };
+        return { ok: true, response: { kind: "ok", status: 200, body: polled.body }, forced: polled.body.fencing === false };
       }
       if (polled.body?.draining !== true) {
         // The lease ran out, something released it, or the harness restarted.
@@ -1294,7 +1317,13 @@ async function forceFence(owner, { request, now, wait, pollMs }) {
     const polled = await request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
     if (polled.kind !== "ok" || polled.body?.pid !== owner.pid) continue;
     if (polled.body?.fencing === true) continue;
-    return { kind: "ok", status: polled.body?.quiescing === true ? 200 : 409, body: polled.body };
+    // No fence: the forced quiesce rolled itself back (or never started).
+    if (polled.body?.quiescing !== true) return { kind: "ok", status: 409, body: polled.body };
+    // A fence is only collected once it is settled: the harness says so, or
+    // (one that predates `fencing`) nothing is left in flight.  The installed
+    // harness raises its fence before it interrupts anything, so a fence seen
+    // with work still counted may yet roll back.
+    if (fenceUsable(polled.body)) return { kind: "ok", status: 200, body: polled.body };
   }
   return { kind: "unavailable", reason: "forced quiesce did not settle" };
 }
@@ -1304,9 +1333,10 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
   const request = adapters.requestJson ?? requestJson;
   const inspectTopology = adapters.healthTopology ?? healthTopology;
   const inspectHolders = adapters.sqliteHolders ?? sqliteHolders;
-  const releaseAdmission = adapters.releaseRuntimeAdmission ?? releaseRuntimeAdmission;
   const now = adapters.now ?? Date.now;
   const wait = adapters.sleep ?? sleep;
+  const releaseAdmission = adapters.releaseRuntimeAdmission ??
+    ((cfg) => releaseRuntimeAdmission(cfg, { readOwner: readRuntimeOwner, requestJson: request, now, sleep: wait }));
   const owner = await readRuntimeOwner(config.dataDirectory);
   if (!owner) return { safe: false, reason: "Authenticated runtime owner is unavailable for the admission fence" };
   const mode = fenceMode(config);
@@ -1385,21 +1415,77 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
   return { safe: true, mode: "authenticated", pid: owner.pid, port: owner.port, runtime, holders, health: topology.health };
 }
 
-export async function releaseRuntimeAdmission(config) {
-  const owner = await readOwner(config.dataDirectory);
+/** How long a release waits for a forced quiesce the harness says is settling. */
+const RELEASE_SETTLE_MS = FORCED_QUIESCE_TIMEOUT_MS;
+/** How long it waits on a harness that predates `fencing` and still counts
+ *  work under its fence: it may be interrupting, or rolling back. */
+const LEGACY_RELEASE_SETTLE_MS = 30_000;
+const RELEASE_POLL_MS = 1_000;
+
+/**
+ * Stand the fence down, or lift the hold, and confirm it.
+ *
+ * Never while a forced quiesce is still settling: a release that lands
+ * mid-settle used to stand the fence down under it, so its resume snapshot
+ * and held messages landed on an unfenced harness — bots latched stopped,
+ * cancelled routine runs left cancelled, held sends waiting for a restart
+ * that was not coming.  So this waits for the settle first (bounded), and a
+ * harness that still defers the release (`releasePending`) is watched until
+ * it has honoured it.  Every caller gets the wait: a hold given up on, a
+ * fence refused after its checks, the `--force` give-up, and `unquiesce`.
+ */
+export async function releaseRuntimeAdmission(config, adapters = {}) {
+  const readRuntimeOwner = adapters.readOwner ?? readOwner;
+  const request = adapters.requestJson ?? requestJson;
+  const now = adapters.now ?? Date.now;
+  const wait = adapters.sleep ?? sleep;
+  const owner = await readRuntimeOwner(config.dataDirectory);
   if (!owner) throw new Error("Authenticated runtime owner is unavailable for admission recovery");
+  const base = `http://127.0.0.1:${owner.port}`;
+  const headers = { Authorization: `Bearer ${owner.nonce}` };
+  const read = () => request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
+  /** Poll while `still` holds, up to a window chosen from the first answer.
+   *  Resolves the last answer read, or null when none came. */
+  const watch = async (still, windowFor) => {
+    let deadline = null;
+    let last = null;
+    for (;;) {
+      const answer = await read();
+      if (answer.kind !== "ok") {
+        // A harness too slow to say: the release itself retries, so go on.
+        if (deadline === null) return last;
+      } else {
+        last = answer.body;
+        if (!still(answer.body)) return answer.body;
+        deadline ??= now() + windowFor(answer.body);
+      }
+      if (now() >= deadline) return last;
+      await wait(Math.min(RELEASE_POLL_MS, Math.max(0, deadline - now())));
+    }
+  };
+  const settleWindow = (body) => (body?.fencing === true ? RELEASE_SETTLE_MS : LEGACY_RELEASE_SETTLE_MS);
+  await watch(fenceStillSettling, settleWindow);
   // Releasing is the one request that must not be lost to a slow harness:
   // a fence or a hold left behind keeps every bot on this Mac waiting.
   const response = await retryTransient(async () => {
-    const answer = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime/quiesce`, {
+    const answer = await request(`${base}/api/runtime/quiesce`, {
       method: "DELETE",
-      headers: { Authorization: `Bearer ${owner.nonce}` },
+      headers,
       accept: [200],
       timeoutMs: QUIESCE_TIMEOUT_MS,
     });
     return { ...answer, transient: answer.kind === "unavailable" };
-  }, { windowMs: 30_000 });
-  if (response.kind !== "ok" || response.body?.quiescing !== false || response.body?.draining === true) {
+  }, { windowMs: 30_000, now, wait });
+  let body = response.kind === "ok" ? response.body : null;
+  if (body && (body.releasePending === true || body.fencing === true)) {
+    // Still settling after all: the harness keeps the release and honours it
+    // the moment the forced quiesce settles.  Watch it land.
+    body = await watch(
+      (current) => current?.quiescing !== false || current?.draining === true || current?.fencing === true,
+      () => RELEASE_SETTLE_MS,
+    );
+  }
+  if (body?.quiescing !== false || body?.draining === true) {
     throw new Error("Runtime admission fence could not be released");
   }
 }

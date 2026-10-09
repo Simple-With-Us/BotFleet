@@ -616,9 +616,13 @@ export class RoutineManager {
     return true;
   }
 
+  /** Put a run an update cancelled back in the queue.  Only a `cancelled`
+   *  run: one that is running or waiting has already been restarted by
+   *  something else (a release that resumed it first), and queueing it again
+   *  would run the same automation twice. */
   requeueRun(runId: string): boolean {
     const run = this.runs.find((candidate) => candidate.id === runId);
-    if (run && ["cancelled", "running", "waiting"].includes(run.status)) {
+    if (run && run.status === "cancelled") {
       run.status = "queued";
       run.outcomeCode = undefined;
       run.failurePhase = undefined;

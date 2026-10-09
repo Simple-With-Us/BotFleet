@@ -746,6 +746,12 @@ let runtimeQuiescing = false;
 // held messages are not on disk yet.  An updater whose forced request timed
 // out reads this to know whether the fence it sees is one it may use.
 let runtimeFencing = false;
+// A release (`DELETE /api/runtime/quiesce`) that arrived while a forced
+// quiesce was still settling.  Standing the fence down mid-settle would let
+// the resume snapshot and the held messages land on an unfenced harness, so
+// the release waits for the settle and is honoured the moment it completes
+// (`beginRuntimeQuiesce`).
+let releaseWhenSettled = false;
 let activeUpdateAdmissions = 0;
 // An update waiting for work in flight to finish (server/update-drain.ts).
 // Unlike `runtimeQuiescing` it closes no route: it only holds NEW turns.
@@ -9939,11 +9945,30 @@ async function beginRuntimeQuiesce(force = false) {
   }
   if (!force) return takeRuntimeFence(false);
   runtimeFencing = true;
+  let answer: RuntimeQuiesceAnswer | undefined;
   try {
-    return await takeRuntimeFence(true);
+    answer = await takeRuntimeFence(true);
   } finally {
     runtimeFencing = false;
+    // A release that arrived mid-settle is honoured now that the fence has
+    // settled one way or the other: it stands down a fence the forced path
+    // raised, resumes from the snapshot it wrote, and lets the held work go.
+    // The forced request then answers unfenced, so it is never used.
+    if (releaseWhenSettled) {
+      releaseWhenSettled = false;
+      console.log("[update-quiesce] a release arrived while the fence was settling; released it once settled");
+      answer = endRuntimeQuiesce();
+    }
   }
+  return answer;
+}
+
+/** What a quiesce or release request answers, before the route adds identity. */
+interface RuntimeQuiesceAnswer {
+  safeToRestart: boolean;
+  activeWorkCount: number | null;
+  quiescing: boolean;
+  releasePending?: boolean;
 }
 
 async function takeRuntimeFence(force: boolean) {
@@ -10093,7 +10118,16 @@ async function takeRuntimeFence(force: boolean) {
   return { ...idleReadiness, quiescing: true };
 }
 
-function endRuntimeQuiesce() {
+function endRuntimeQuiesce(): RuntimeQuiesceAnswer {
+  if (runtimeFencing) {
+    // A forced quiesce is still interrupting and saving work.  Releasing now
+    // would land its snapshot and its held messages on an unfenced harness:
+    // bots latched as stopped, cancelled runs left cancelled, and held sends
+    // waiting for a restart that is not coming.  Defer to the settle.
+    releaseWhenSettled = true;
+    const { activeWorkCount } = currentRuntimeReadiness();
+    return { safeToRestart: false, activeWorkCount, quiescing: runtimeQuiescing, releasePending: true };
+  }
   // A drain the updater is giving up on, or a fence it will not use: either
   // way everything held for the update runs now (`releaseHeldWork` below).
   const wasDraining = updateDrain.stop();

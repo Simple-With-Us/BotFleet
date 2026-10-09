@@ -21,6 +21,7 @@ import {
   fenceRuntimeAdmission,
   parseArguments,
   pauseTimeoutMessage,
+  releaseRuntimeAdmission,
   retryTransient,
   runtimePreflight,
   terminateVerified,
@@ -44,20 +45,61 @@ const IDENTITY = {
  */
 function scriptedHarness({
   drains = true,
+  // The harness installed before this updater never reports `fencing`, and
+  // raises `quiescing` before it starts interrupting anything.
+  reportsFencing = true,
   inFlight = () => 0,
   rooms = () => 0,
   bots,
   forceRefusals = 0,
   // A forced answer that times out on the updater's side while the harness
-  // carries on, still `fencing` until the clock reaches this.
+  // carries on, still settling until the clock reaches this.
   loseForcedAnswerUntil,
+  // That lost forced quiesce rolls itself back when it settles, instead of
+  // holding the fence.
+  rollsBack = false,
   // The first hold request's answer is lost this many times.
   loseFirstAnswers = 0,
 } = {}) {
   let clock = 0;
   let firstAnswersLost = 0;
   let fencingUntil = null;
-  const state = { draining: false, quiescing: false, released: 0, forced: 0, plain: 0, polls: 0, requests: [] };
+  const state = {
+    draining: false,
+    quiescing: false,
+    // The fence settled: what was running was interrupted and saved.
+    fenced: false,
+    releasePending: false,
+    released: 0,
+    releasedAt: [],
+    forced: 0,
+    plain: 0,
+    polls: 0,
+    requests: [],
+    renewals: 0,
+    lease: null,
+  };
+  const fencing = () => fencingUntil !== null && clock < fencingUntil;
+  const release = () => {
+    state.released += 1;
+    state.releasedAt.push(clock);
+    state.draining = false;
+    state.quiescing = false;
+    state.fenced = false;
+    state.lease = null;
+  };
+  // Time passing settles a forced quiesce, and honours a release it deferred.
+  const settle = () => {
+    if (fencingUntil === null || clock < fencingUntil) return;
+    fencingUntil = null;
+    if (rollsBack) state.quiescing = false;
+    else state.fenced = true;
+    if (state.releasePending) {
+      state.releasePending = false;
+      release();
+    }
+  };
+  const work = () => (state.fenced ? 0 : inFlight(clock));
   const drain = () => ({
     inFlight: inFlight(clock),
     bots: bots ? bots(clock) : inFlight(clock),
@@ -67,17 +109,18 @@ function scriptedHarness({
   const body = (extra = {}) => {
     const answer = {
       ...IDENTITY,
-      safeToRestart: inFlight(clock) === 0,
-      activeWorkCount: inFlight(clock),
+      safeToRestart: work() === 0,
+      activeWorkCount: work(),
       quiescing: state.quiescing,
-      fencing: fencingUntil !== null && clock < fencingUntil,
     };
+    if (reportsFencing) answer.fencing = fencing();
     // An older harness has never heard of a hold, so says nothing about one.
     if (drains) Object.assign(answer, { draining: state.draining, drain: state.draining ? drain() : null });
     return { ...answer, ...extra };
   };
   let refusalsLeft = forceRefusals;
   const requestJson = async (url, options = {}) => {
+    settle();
     const method = options.method ?? "GET";
     const { pathname, searchParams } = new URL(url);
     state.requests.push(`${method} ${pathname}${searchParams.size ? `?${searchParams}` : ""}`);
@@ -86,13 +129,22 @@ function scriptedHarness({
       return { kind: "ok", status: 200, body: body() };
     }
     if (method === "DELETE") {
-      state.released += 1;
-      state.draining = false;
-      state.quiescing = false;
+      if (fencing() && reportsFencing) {
+        // server/index.ts endRuntimeQuiesce: deferred to the settle.
+        state.releasePending = true;
+        return { kind: "ok", status: 200, body: body({ releasePending: true, safeToRestart: false }) };
+      }
+      release();
       return { kind: "ok", status: 200, body: body() };
     }
     const force = searchParams.get("force") === "true";
-    if (force && loseForcedAnswerUntil !== undefined && fencingUntil === null) {
+    if (force && fencing()) {
+      // A second forced ask while the first settles: the current harness says
+      // "not yet"; the installed one answers its readiness under the fence.
+      state.forced += 1;
+      return { kind: "ok", status: reportsFencing || work() !== 0 ? 409 : 200, body: body() };
+    }
+    if (force && loseForcedAnswerUntil !== undefined && fencingUntil === null && !state.fenced) {
       state.forced += 1;
       state.quiescing = true;
       state.draining = false;
@@ -106,8 +158,9 @@ function scriptedHarness({
         return { kind: "ok", status: 409, body: body() };
       }
       state.quiescing = true;
+      state.fenced = true;
       state.draining = false;
-      return { kind: "ok", status: 200, body: body({ safeToRestart: true, activeWorkCount: 0 }) };
+      return { kind: "ok", status: 200, body: body() };
     }
     if (searchParams.get("drain") === "1" && drains) {
       state.draining = true;
@@ -121,8 +174,9 @@ function scriptedHarness({
     state.plain += 1;
     if (inFlight(clock) === 0) {
       state.quiescing = true;
+      state.fenced = true;
       state.draining = false;
-      return { kind: "ok", status: 200, body: body({ safeToRestart: true, activeWorkCount: 0 }) };
+      return { kind: "ok", status: 200, body: body() };
     }
     return { kind: "ok", status: 409, body: body() };
   };
@@ -131,9 +185,6 @@ function scriptedHarness({
     requestJson,
     healthTopology: async () => ({ safe: true, pid: 42, pids: [42], port: 8799, health: [] }),
     sqliteHolders: async () => [42],
-    releaseRuntimeAdmission: async () => {
-      await requestJson(`http://127.0.0.1:8799/api/runtime/quiesce`, { method: "DELETE" });
-    },
     now: () => clock,
     sleep: async (ms) => {
       clock += Math.max(ms, 1);
@@ -242,16 +293,83 @@ test("a forced answer lost to a slow harness is collected once the fence settles
   assert.ok(harness.clock() >= DEFAULT_GRACE_MS + 20_000);
 });
 
-test("--force watches a lost answer, and releases a fence that never settles", async () => {
+test("--force watches a lost answer, and releases a fence that settles too late only once it has settled", async () => {
   const settles = scriptedHarness({ inFlight: () => 2, loseForcedAnswerUntil: 15_000 });
   assert.equal((await fenceRuntimeAdmission(config({ force: true }), settles.adapters)).safe, true);
   assert.equal(settles.state.released, 0);
 
-  const never = scriptedHarness({ inFlight: () => 2, loseForcedAnswerUntil: Number.MAX_SAFE_INTEGER });
-  const result = await fenceRuntimeAdmission(config({ force: true }), never.adapters);
+  // Still settling when the watch gives up: the release waits for the settle
+  // rather than standing the fence down under it.
+  const late = scriptedHarness({ inFlight: () => 2, loseForcedAnswerUntil: 150_000 });
+  const result = await fenceRuntimeAdmission(config({ force: true }), late.adapters);
   assert.equal(result.safe, false);
-  assert.equal(never.state.released, 1, "never left fenced");
-  assert.equal(never.state.quiescing, false);
+  assert.equal(late.state.released, 1, "never left fenced");
+  assert.equal(late.state.quiescing, false);
+  assert.ok(late.state.releasedAt[0] >= 150_000, `released at ${late.state.releasedAt[0]}, mid-settle`);
+  assert.equal(late.state.requests.filter((line) => line.startsWith("DELETE")).length, 1);
+
+  // One that never settles: the release is left with the harness, which
+  // honours it when the settle comes, and the operator is told how to finish.
+  const never = scriptedHarness({ inFlight: () => 2, loseForcedAnswerUntil: Number.MAX_SAFE_INTEGER });
+  const stuck = await fenceRuntimeAdmission(config({ force: true }), never.adapters);
+  assert.equal(stuck.safe, false);
+  assert.match(stuck.reason, /unquiesce/);
+  assert.equal(never.state.releasePending, true, "the harness holds the release for its settle");
+});
+
+test("a release never stands down a fence that is still settling", async () => {
+  // Finding 1: a DELETE at the final deadline, on SIGINT, or in the --force
+  // give-up used to land mid-settle.  The release now waits for `fencing` to
+  // clear first, and only then asks.
+  const harness = scriptedHarness({ inFlight: () => 2, loseForcedAnswerUntil: 40_000 });
+  // Start the forced quiesce whose answer is lost, so the harness is settling.
+  await harness.adapters.requestJson("http://127.0.0.1:8799/api/runtime/quiesce?force=true", { method: "POST" });
+  await releaseRuntimeAdmission(config(), harness.adapters);
+  assert.equal(harness.state.released, 1);
+  assert.ok(harness.state.releasedAt[0] >= 40_000, "not before the settle");
+  assert.equal(harness.state.releasePending, false);
+  const deleteAt = harness.state.requests.indexOf("DELETE /api/runtime/quiesce");
+  assert.ok(deleteAt > 0 && harness.state.requests.slice(1, deleteAt).every((line) => line === "GET /api/runtime"),
+    "the updater only read the runtime until it settled");
+});
+
+test("the installed harness, whose forced answer was lost, is not used while it is still interrupting", async () => {
+  // Finding 2: the harness on the owner's Mac (15a5097e5) raises `quiescing`
+  // before it interrupts anything and never reports `fencing`.  Treating the
+  // missing field as settled let an install start under a harness still
+  // interrupting bots, or about to roll back.
+  const settles = scriptedHarness({ drains: false, reportsFencing: false, inFlight: () => 2, loseForcedAnswerUntil: 20_000 });
+  const fenced = await fenceRuntimeAdmission(config({ force: true }), settles.adapters);
+  assert.equal(fenced.safe, true);
+  assert.ok(settles.clock() >= 20_000, `used at ${settles.clock()}, while it still counted work`);
+  assert.ok(settles.state.polls >= 3, "it was watched, not taken at the first sight of `quiescing`");
+  assert.equal(settles.state.released, 0);
+
+  // It rolls itself back instead: a refusal, never a fence.
+  const rolledBack = scriptedHarness({
+    drains: false, reportsFencing: false, inFlight: () => 2, loseForcedAnswerUntil: 20_000, rollsBack: true,
+  });
+  const refused = await fenceRuntimeAdmission(config({ force: true }), rolledBack.adapters);
+  assert.equal(refused.safe, false);
+  assert.equal(rolledBack.state.quiescing, false);
+
+  // Never settles inside the watch: released (after giving it the legacy
+  // settle window), never installed over.
+  const busy = scriptedHarness({ drains: false, reportsFencing: false, inFlight: () => 2, loseForcedAnswerUntil: Number.MAX_SAFE_INTEGER });
+  const gaveUp = await fenceRuntimeAdmission(config({ force: true }), busy.adapters);
+  assert.equal(gaveUp.safe, false);
+  assert.equal(busy.state.released, 1);
+
+  // The grace mode against the same harness: a second forced ask while it
+  // still interrupts answers `quiescing: true` with work counted, and is not
+  // taken for a fence either.
+  const graced = scriptedHarness({
+    drains: false, reportsFencing: false, inFlight: () => 2, loseForcedAnswerUntil: DEFAULT_GRACE_MS + 40_000,
+  });
+  const afterGrace = await fenceRuntimeAdmission(config(), graced.adapters);
+  assert.equal(afterGrace.safe, true);
+  assert.ok(graced.clock() >= DEFAULT_GRACE_MS + 40_000);
+  assert.ok(graced.state.forced >= 2, "asked again while it settled");
 });
 
 test("a lost answer to the first hold request is asked again, and released if it never comes", async () => {
