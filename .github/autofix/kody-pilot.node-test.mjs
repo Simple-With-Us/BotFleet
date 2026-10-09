@@ -197,6 +197,8 @@ test('credential, payment, permission and quota refusals stop upstream retries w
 });
 test('provider keys are required from the environment at runtime', () => {
   assert.throws(()=>requireDeepSeekApiKey({}),/DEEPSEEK_API_KEY is missing/);
+  assert.throws(()=>requireDeepSeekApiKey({DEEPSEEK_API_KEY:''}),/DEEPSEEK_API_KEY is missing/);
+  assert.throws(()=>requireDeepSeekApiKey({DEEPSEEK_API_KEY:123}),/DEEPSEEK_API_KEY is missing/);
   assert.equal(requireDeepSeekApiKey({DEEPSEEK_API_KEY:'sk-test-key-12345678'}), 'sk-test-key-12345678');
 });
 test('model scratch home is removed after CLI startup failure and no provider call occurs', async () => {
