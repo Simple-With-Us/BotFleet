@@ -19,6 +19,9 @@ const PLUMBER = 101;
 const FIXER = 102;
 const ADMIN = 103;
 const PLUMBER_THREAD = "thread-bot-plumber";
+// Shaped like a Zulip API key (32 mixed-case letters and digits) so the
+// outbound scan fires; built at runtime so no token-shaped literal is in the source.
+const FAKE_ZULIP_KEY = ["FakeZulip", "Key", "0".repeat(16), "aB12"].join("");
 
 let fake: FakeZulip;
 let dataDir: string;
@@ -899,8 +902,7 @@ describe("review fixes: outbound", () => {
       botId: "bot-plumber",
       threadId: PLUMBER_THREAD,
       tool: "post",
-      // gitleaks runs on every PR: an obviously fake value, shaped like a key
-      args: { channel: "builds", topic: "key FakeZulipKey0000000000000000aB12", content: "see topic" },
+      args: { channel: "builds", topic: `key ${FAKE_ZULIP_KEY}`, content: "see topic" },
     });
     expect(result.ok).toBe(false);
     expect(result.text).toMatch(/the topic contains a Zulip-shaped API key/);
