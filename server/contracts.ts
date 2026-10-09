@@ -9,6 +9,7 @@ import type { ComputerMount } from "./computer-grants.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
+import type { ReviewHook } from "../shared/auto-review.ts";
 
 export type DriverKind = string;
 export type InstanceId = string;
@@ -414,6 +415,14 @@ export interface SendTurnInput {
    *  driver that converts autoApprove into a permission bypass must treat an
    *  unattended turn as a hard stop (see auto-approve.ts). */
   unattended?: boolean;
+  /** True when the bot's auto-review is On, a reviewer is available, and a
+   *  person is present for this turn (server/auto-review.ts
+   *  `shouldHoldForReview`).  A driver that declares `asksWhenHeld` runs a
+   *  full-auto instance in its asking mode for this one turn, so each ask
+   *  reaches the reviewer before it runs.  Never set on an unattended turn:
+   *  an ask the reviewer turns down would wait on a card nobody is there to
+   *  answer. */
+  holdForReview?: boolean;
 }
 
 /** The decoded `arguments` object of one tool call.
@@ -587,6 +596,17 @@ export interface ProviderAdapter {
      * every helper event names the call that started it, so its steps nest
      * under that row.  Absent reads as `"none"`. */
     helpers?: HelperSupport;
+    /** Where auto-review can see this instance's tool calls
+     * (shared/auto-review.ts).  Decided from the instance's own config, so a
+     * full-auto instance that never asks says `"after"`.  Absent reads as
+     * `"none"`: an engine that does not say where its actions surface is never
+     * promised a review. */
+    reviewHook?: ReviewHook;
+    /** True when the driver honours `SendTurnInput.holdForReview`: a full-auto
+     * instance then runs that one turn in its asking mode, the same downgrade
+     * a host-control turn already gets, so every ask reaches the reviewer
+     * before it runs.  Meaningful only beside `reviewHook: "after"`. */
+    asksWhenHeld?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
@@ -754,7 +774,12 @@ export interface ProviderInstance {
   generateText?(prompt: string): Promise<string>;
   /** Isolated, tool-free permission review on this same provider. Kept
    * separate from generateText so the UI never infers a security capability
-   * from a generic helper that may expose prompts in argv or lack approvals. */
+   * from a generic helper that may expose prompts in argv or lack approvals.
+   * Implemented by Claude (a tool-free one-shot CLI with the prompt on
+   * stdin) and by the HTTP lanes (a chat-completions call with no `tools`,
+   * the prompt in the request body).  An engine without one is reviewed by
+   * the owner's fallback reviewer, never by an arbitrary sibling
+   * (server/auto-review.ts `reviewersFor`). */
   reviewPermission?(prompt: string, signal?: AbortSignal): Promise<string>;
   dispose(): Promise<void>;
 }

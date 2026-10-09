@@ -51,9 +51,19 @@ import {
 } from "../shared/credential-request.ts";
 
 import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, isJobTool, isOwnJobStartRequest, offerableApprovalKey } from "./auto-approve.ts";
-import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
+import {
+  resolveAutoReviewMode,
+  reviewersFor,
+  reviewsBypass,
+  reviewWithReviewers,
+  shouldHoldForReview,
+  shouldReview,
+  type Reviewer,
+} from "./auto-review.ts";
+import { ReviewWatch } from "./review-watch.ts";
+import { effectiveReviewHook } from "../shared/auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
-import { appendDecision, readDecisions } from "./decision-log.ts";
+import { appendDecision, readDecisions, type DecisionSource } from "./decision-log.ts";
 import { checkWriteTargets } from "./path-containment.ts";
 import { cwdConfinementError, protectedCwdDirs, realOrResolved, validateBotCwd, type CwdConfinement } from "./bot-cwd.ts";
 import { captureTaskWorkspaceContext, TaskWorkspaceContextError, taskWorkspaceExecutionError } from "./task-workspace-context.ts";
@@ -221,6 +231,7 @@ import {
   INSTANCE_API_KEY_ENV,
   isAbsoluteHttpUrl,
   localQuotaRoutingEnabled,
+  autoReviewFallbackReviewer,
   usageIngestUrl,
   usageProjectRules,
   vpsCpus,
@@ -3224,8 +3235,48 @@ void registry
   })
   .catch(() => {});
 
+/** Who reviews an ask raised on `instance`: that engine itself when it can
+ * run an isolated review, then the owner's fallback reviewer from settings
+ * (server/auto-review.ts `reviewersFor`).  Read from the live config on every
+ * call, so choosing a reviewer takes effect without a restart. */
+function reviewersForInstance(instance: ProviderInstance | null | undefined): Reviewer[] {
+  const fallbackId = autoReviewFallbackReviewer(cfg);
+  return reviewersFor(instance, fallbackId ? registry.get(fallbackId) : null);
+}
+
+/** Whether this dispatch runs a full-auto instance in its asking mode so the
+ * reviewer sees each ask first (`SendTurnInput.holdForReview`), and remember
+ * the answer so the step watch leaves that turn's steps to the card.  Only an
+ * instance that would otherwise act unasked and can ask is held. */
+function holdTurnForReview(
+  bot: { id: string; autoReview?: string },
+  threadId: string,
+  instance: ProviderInstance,
+): boolean {
+  const capabilities = instance.adapter.capabilities;
+  const hold =
+    capabilities.reviewHook === "after" &&
+    capabilities.asksWhenHeld === true &&
+    shouldHoldForReview({
+      mode: resolveAutoReviewMode(bot.autoReview),
+      unattended: isUnattended(bot.id),
+      hasReviewer: reviewersForInstance(instance).length > 0,
+    });
+  const key = heldKey(threadId, instance.instanceId);
+  if (hold) heldForReview.add(key);
+  else heldForReview.delete(key);
+  return hold;
+}
+
+/** The bot as the reviewer is told about it: name, title and description. */
+function reviewPersona(bot: { name: string; title?: string; description?: string }): string {
+  return [bot.name, bot.title, bot.description].filter(Boolean).join(" — ");
+}
+
 async function reviewPermissionCard(args: {
-  instance: ProviderInstance;
+  /** The engine that raised the ask, which the answer goes back through. */
+  instance: ProviderInstance | null;
+  reviewers: Reviewer[];
   asker: {
     id: string;
     name: string;
@@ -3241,14 +3292,14 @@ async function reviewPermissionCard(args: {
   summary: string;
 }): Promise<boolean> {
   const mode = resolveAutoReviewMode(args.asker.autoReview);
-  if (mode === "off" || !args.instance.reviewPermission) return false;
-  const persona = [args.asker.name, args.asker.title, args.asker.description].filter(Boolean).join(" — ");
-  const reviewed = await requestReview(args.instance.reviewPermission.bind(args.instance), {
+  if (mode === "off" || args.reviewers.length === 0) return false;
+  const reviewed = await reviewWithReviewers(args.reviewers, {
     tool: args.tool,
     summary: args.summary,
-    persona,
+    persona: reviewPersona(args.asker),
   });
   if (!reviewed) return false;
+  const { verdict, reviewer } = reviewed;
 
   if (mode === "shadow") {
     appendDecision(DATA_DIR, {
@@ -3258,18 +3309,38 @@ async function reviewPermissionCard(args: {
       botName: args.asker.name,
       tool: args.tool,
       summary: args.summary,
-      decision: reviewed.allow ? "review-would-approve" : "review-would-deny",
+      decision: verdict.allow ? "review-would-approve" : "review-would-deny",
       source: "auto-review-shadow",
-      rule: reviewed.reason,
+      rule: verdict.reason,
+      reviewer: reviewer.instanceId,
     });
     return false;
   }
-  if (!reviewed.allow) return false;
 
   // The human can answer while review is running. Their click wins before
   // the provider receives anything and before the audit log claims approval.
   const card = store.messagesFor(args.threadId).find((message) => message.id === args.messageId)?.card;
   if (!card || card.answered) return false;
+  if (!verdict.allow) {
+    // A refusal never answers the card for the person: it stays open, and
+    // now says who refused it and why.
+    store.patchMessage(args.threadId, args.messageId, {
+      card: { ...card, held: `The reviewer (${reviewer.name}) did not approve this: ${verdict.reason}` },
+    });
+    appendDecision(DATA_DIR, {
+      threadId: args.threadId,
+      requestId: args.requestId,
+      botId: args.asker.id,
+      botName: args.asker.name,
+      tool: args.tool,
+      summary: args.summary,
+      decision: "card-shown",
+      source: "auto-review",
+      rule: verdict.reason,
+      reviewer: reviewer.instanceId,
+    });
+    return false;
+  }
   let outcome: RequestOutcome = "unavailable";
   try {
     // Not a person's click, so the card must not show as one — the reviewer
@@ -3288,7 +3359,7 @@ async function reviewPermissionCard(args: {
   store.appendMessage(args.threadId, {
     role: "bot",
     kind: "activity",
-    tool: { name: `review approved ${args.tool}: ${reviewed.reason}`, ok: true },
+    tool: { name: `review approved ${args.tool} (${reviewer.name}): ${verdict.reason}`, ok: true },
   });
   appendDecision(DATA_DIR, {
     threadId: args.threadId,
@@ -3299,10 +3370,57 @@ async function reviewPermissionCard(args: {
     summary: args.summary,
     decision: "auto-approved",
     source: "auto-review",
-    rule: reviewed.reason,
+    rule: verdict.reason,
+    reviewer: reviewer.instanceId,
   });
   return true;
 }
+
+// Which thread/instance pairs are running a turn held in its asking mode for
+// review (`SendTurnInput.holdForReview`), so the step watch below leaves
+// their steps to the card.  Set at dispatch, cleared when the turn settles.
+const heldForReview = new Set<string>();
+const heldKey = (threadId: string, instanceId: string | undefined) => `${threadId}:${instanceId ?? ""}`;
+// The turn in flight on each thread, by turn id, so a refusal that arrives
+// after its turn ended is shown as a flag and never stops the next turn.
+const runningTurnByThread = new Map<string, string>();
+
+/** Stop a turn the reviewer refused a step of.  Latched exactly like the
+ * person's Stop, so the turn ends instead of failing over to the bot's next
+ * engine, and its open cards are closed. */
+function stopTurnForReview(botId: string, threadId: string): void {
+  const turnKey = `${botId}:${threadId}`;
+  stoppedTurns.add(turnKey);
+  fallbackAttemptByTurn.delete(turnKey);
+  pendingCredentialFallback.delete(turnKey);
+  pendingMemberFallback.delete(threadId);
+  void interruptThreadEverywhere(threadId)
+    .then(() => closeOpenApprovals(threadId))
+    .catch((error) => console.error(`auto-review: could not stop thread ${threadId}`, error));
+}
+
+// Auto-review for steps an engine runs without asking first
+// (server/review-watch.ts).  The plan is decided in the item.started fold.
+const reviewWatch = new ReviewWatch({
+  turnRunning: (threadId, turnId) =>
+    turnId ? runningTurnByThread.get(threadId) === turnId : runningTurnByThread.has(threadId),
+  stopTurn: (threadId, botId) => stopTurnForReview(botId, threadId),
+  note: (threadId, text, ok) => {
+    store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name: text, ok } });
+  },
+  log: (row) => appendDecision(DATA_DIR, row),
+});
+
+bus.subscribe((event: RuntimeEvent) => {
+  if (event.type === "turn.started" && event.turnId) {
+    runningTurnByThread.set(event.threadId, event.turnId);
+  } else if (event.type === "turn.completed") {
+    if (!event.turnId || runningTurnByThread.get(event.threadId) === event.turnId) {
+      runningTurnByThread.delete(event.threadId);
+    }
+    heldForReview.delete(heldKey(event.threadId, event.providerInstanceId));
+  }
+});
 
 bus.subscribe((event: RuntimeEvent) => {
   if (event.type === "request.opened") watchdog.setWaitingOnHuman(event.threadId, true);
@@ -3950,6 +4068,42 @@ bus.subscribe((event: RuntimeEvent) => {
         // appends a richer "Messaged @X" chip linking to the channel
         if (event.title?.endsWith("__ask_bot")) break;
         const name = event.title ?? "tool";
+        // Auto-review on an engine that ran this step without asking: the
+        // step watch reviews it after the fact (server/review-watch.ts).
+        // Steps from an engine whose asks reach the card are left to it.
+        reviewWatch.observe(
+          {
+            threadId: event.threadId,
+            turnId: event.turnId,
+            tool: name,
+            target: event.target,
+            toolKind: event.toolKind,
+          },
+          (() => {
+            const owner = group ? activeTurnOwners.forEvent(event.threadId, event.providerInstanceId) : undefined;
+            const actor =
+              bot ?? (owner ? store.bot(owner.botId) : undefined) ?? (speaker ? store.bot(speaker.botId) : undefined);
+            if (!actor) return null;
+            const mode = resolveAutoReviewMode(actor.autoReview);
+            if (mode === "off") return null;
+            const instance = registry.get(event.providerInstanceId ?? actor.modelSelection.instanceId);
+            const capabilities = instance?.adapter.capabilities;
+            const hook = effectiveReviewHook(
+              capabilities?.reviewHook ?? "none",
+              capabilities?.asksWhenHeld === true,
+              heldForReview.has(heldKey(event.threadId, event.providerInstanceId)),
+            );
+            if (hook !== "after") return null;
+            return {
+              botId: actor.id,
+              botName: actor.name,
+              persona: reviewPersona(actor),
+              mode,
+              reviewers: reviewersForInstance(instance),
+              unattended: isUnattended(actor.id),
+            };
+          })(),
+        );
         // narration is folded in here, once, so call mode can read the
         // chip aloud without re-deriving it — and so the phrase a user
         // hears and the chip they see can never drift apart
@@ -4018,78 +4172,157 @@ bus.subscribe((event: RuntimeEvent) => {
           : registry.get(asker.modelSelection.instanceId);
         const requestId = event.requestId;
         const { tool, summary } = event;
+        // Hand the ask back to the human as an ordinary card, saying why.
+        const showHeldCard = (held: string, row: { source: DecisionSource; rule?: string; reviewer?: string }, buzz: boolean) => {
+          const card = pushMessage({
+            role: "bot",
+            kind: "options",
+            card: {
+              title: "Approval needed",
+              subtitle: summary,
+              options: ["Allow", "Deny"],
+              requestId,
+              tool,
+              // a job start is never remembered (ruling c), whatever its scope
+              allowKey: event.approvalScope === "local-computer" || isJobTool(tool)
+                ? undefined
+                : approvalKey(tool, summary, event.approvalScope),
+              held,
+              approvalScope: event.approvalScope,
+            },
+          });
+          askMessageByRequest.set(`${event.threadId}:${requestId}`, card.id);
+          appendDecision(DATA_DIR, {
+            threadId: event.threadId,
+            requestId,
+            botId: asker.id,
+            botName: asker.name,
+            tool,
+            summary,
+            decision: "card-shown",
+            source: row.source,
+            rule: row.rule,
+            reviewer: row.reviewer,
+            unattended: unattended || undefined,
+          });
+          if (buzz) {
+            if (asker.busy) store.setActivity(asker.id, "waiting-on-you");
+            notify(
+              buildNotification("approval", asker, event.threadId, summary, {
+                requestId,
+                tool,
+                snoozed: threadAlertsSnoozed(asker.id, event.threadId),
+              }),
+            );
+          }
+        };
         // The chip is written only AFTER the provider takes the answer.
         // Claiming approval first and correcting later means a moment
         // where the transcript says "approved" over a request nothing
         // answered — and if the provider is gone entirely, forever.
-        void (async () => {
-          try {
-            // The broker answers its own requests whether or not the
-            // instance lookup found anything; an engine's request still
-            // needs its engine.  `deliverDecision` is the one place that
-            // distinction lives.
-            const outcome = await deliverDecision(
-              event.threadId,
-              requestId,
-              { behavior: "allow", source: "auto" },
-              instance,
-            );
-            if (outcome === "unavailable") {
-              throw new Error(instance ? "the ask is no longer open" : "provider unavailable");
-            }
-            pushMessage({
-              role: "bot",
-              kind: "activity",
-              tool: { name: `${settled}: ${summary.slice(0, 120)}`, ok: true },
-            });
-            // logged under the same discipline as the chip: only once the
-            // provider has actually taken the answer, so the audit log
-            // never claims an approval nothing received
-            appendDecision(DATA_DIR, {
-              threadId: event.threadId,
-              requestId,
-              botId: asker.id,
-              botName: asker.name,
-              tool,
-              summary,
-              decision: "auto-approved",
-              source: verdict.source,
-              rule: verdict.rule,
-            });
-          } catch {
-            // couldn't answer it for them — hand it back to the human
-            // rather than leaving the bot waiting on nobody
-            const card = pushMessage({
-              role: "bot",
-              kind: "options",
-              card: {
-                title: "Approval needed",
-                subtitle: summary,
-                options: ["Allow", "Deny"],
+        const answerForThem = (chip: string, row: { source: DecisionSource; rule?: string; reviewer?: string }) => {
+          void (async () => {
+            try {
+              // The broker answers its own requests whether or not the
+              // instance lookup found anything; an engine's request still
+              // needs its engine.  `deliverDecision` is the one place that
+              // distinction lives.
+              const outcome = await deliverDecision(
+                event.threadId,
                 requestId,
+                { behavior: "allow", source: "auto" },
+                instance,
+              );
+              if (outcome === "unavailable") {
+                throw new Error(instance ? "the ask is no longer open" : "provider unavailable");
+              }
+              pushMessage({
+                role: "bot",
+                kind: "activity",
+                tool: { name: `${chip}: ${summary.slice(0, 120)}`, ok: true },
+              });
+              // logged under the same discipline as the chip: only once the
+              // provider has actually taken the answer, so the audit log
+              // never claims an approval nothing received
+              appendDecision(DATA_DIR, {
+                threadId: event.threadId,
+                requestId,
+                botId: asker.id,
+                botName: asker.name,
                 tool,
-                // a job start is never remembered (ruling c), whatever its scope
-                allowKey: event.approvalScope === "local-computer" || isJobTool(tool)
-                  ? undefined
-                  : approvalKey(tool, summary, event.approvalScope),
-                held: "Auto mode couldn't answer this one.",
-                approvalScope: event.approvalScope,
+                summary,
+                decision: "auto-approved",
+                source: row.source,
+                rule: row.rule,
+                reviewer: row.reviewer,
+              });
+            } catch {
+              // couldn't answer it for them — hand it back to the human
+              // rather than leaving the bot waiting on nobody
+              showHeldCard("Auto mode couldn't answer this one.", { source: "auto-fallback", rule: verdict.rule }, false);
+            }
+          })();
+        };
+        // Bypass Permissions skips the cards, not the reviewer
+        // (server/auto-review.ts `reviewsBypass`).  On holds the approval
+        // until the reviewer allows it; Watch lets it through and records
+        // what the reviewer would have said.
+        const reviewMode = resolveAutoReviewMode(asker.autoReview);
+        const bypassReviewed = permission && reviewsBypass({
+          source: verdict.source,
+          rule: verdict.rule,
+          mode: reviewMode,
+          approvalScope: event.approvalScope,
+        });
+        const reviewers = bypassReviewed ? reviewersForInstance(instance) : [];
+        const reviewRequest = { tool, summary, persona: reviewPersona(asker) };
+        if (bypassReviewed && reviewMode === "enforce") {
+          void (async () => {
+            const reviewed = reviewers.length > 0 ? await reviewWithReviewers(reviewers, reviewRequest) : null;
+            if (reviewed?.verdict.allow) {
+              answerForThem(`${settled}, review approved (${reviewed.reviewer.name})`, {
+                source: "auto-review",
+                rule: reviewed.verdict.reason,
+                reviewer: reviewed.reviewer.instanceId,
+              });
+              return;
+            }
+            showHeldCard(
+              reviewed
+                ? `Bypass is on, but the reviewer (${reviewed.reviewer.name}) did not approve this: ${reviewed.verdict.reason}`
+                : "Bypass is on, but no reviewer could check this one, so it waits for you.",
+              {
+                source: "auto-review",
+                rule: reviewed?.verdict.reason ?? "no reviewer answered",
+                reviewer: reviewed?.reviewer.instanceId,
               },
-            });
-            askMessageByRequest.set(`${event.threadId}:${requestId}`, card.id);
-            appendDecision(DATA_DIR, {
-              threadId: event.threadId,
-              requestId,
-              botId: asker.id,
-              botName: asker.name,
-              tool,
-              summary,
-              decision: "card-shown",
-              source: "auto-fallback",
-              rule: verdict.rule,
-            });
-          }
-        })();
+              true,
+            );
+          })().catch((error) => console.error("auto-review: bypass screening failed", error));
+          break;
+        }
+        answerForThem(settled, { source: verdict.source, rule: verdict.rule });
+        if (bypassReviewed && reviewers.length > 0) {
+          // Watch under Bypass: an after-the-fact audit of an approval that
+          // has already gone out.  It never changes the answer.
+          void reviewWithReviewers(reviewers, reviewRequest)
+            .then((reviewed) => {
+              if (!reviewed) return;
+              appendDecision(DATA_DIR, {
+                threadId: event.threadId,
+                requestId,
+                botId: asker.id,
+                botName: asker.name,
+                tool,
+                summary,
+                decision: reviewed.verdict.allow ? "review-would-approve" : "review-would-deny",
+                source: "auto-review-shadow",
+                rule: reviewed.verdict.reason,
+                reviewer: reviewed.reviewer.instanceId,
+              });
+            })
+            .catch(() => {});
+        }
         break;
       }
       const message = pushMessage({
@@ -4142,13 +4375,16 @@ bus.subscribe((event: RuntimeEvent) => {
           approvalScope: event.approvalScope,
         })
       ) {
-        // Review stays on the provider boundary that opened the request.
-        // Falling back to an arbitrary sibling could disclose action details
-        // to a provider the user did not choose for this bot.
+        // Review stays on the provider boundary that opened the request,
+        // with one door the owner opened on purpose: the fallback reviewer
+        // chosen in settings.  An arbitrary sibling is never asked — it
+        // could disclose action details to a provider nobody chose.
         const instance = registry.get(event.providerInstanceId ?? asker.modelSelection.instanceId);
-        if (instance?.reviewPermission) {
+        const reviewers = reviewersForInstance(instance);
+        if (reviewers.length > 0) {
           reviewTask = reviewPermissionCard({
             instance,
+            reviewers,
             asker,
             threadId: event.threadId,
             requestId: event.requestId,
@@ -6226,6 +6462,7 @@ async function startTurn(
         autoApprove: bot.autoApprove === true,
         bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
+        holdForReview: holdTurnForReview(bot, threadId, instance) || undefined,
       };
       // What the harness put in front of the model that the person did not
       // type: the bot's memory, the skills and playbooks this message
@@ -8372,6 +8609,7 @@ async function runGroupMemberTurn(
         autoApprove: bot.autoApprove === true,
         bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
+        holdForReview: holdTurnForReview(bot, threadId, instance) || undefined,
         ...memberTurnSelection(selection),
       });
     })
@@ -9217,6 +9455,11 @@ function configStatus() {
       localQuotaRouting: localQuotaRoutingEnabled(cfg),
       projects: usageProjectRules(cfg),
       enginePlans: cfg.usage?.enginePlans ?? {},
+    },
+    // The fleet's fallback reviewer for auto-review: an instance id the Bot
+    // Profile resolves against the engine list, or null when none is chosen.
+    autoReview: {
+      fallbackReviewer: autoReviewFallbackReviewer(cfg),
     },
     // This frame is broadcast to every window and, with Remote Access on,
     // travels the tunnel — so it carries the ingest host and never the DSN.

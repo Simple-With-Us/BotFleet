@@ -401,6 +401,14 @@ const appConfigSchema = z.object({
     accessClientId: z.string().optional(),
     accessClientSecret: z.string().optional(),
   }).optional(),
+  // The fleet's fallback reviewer: the provider instance that reviews a
+  // bot's approvals when the bot's own engine cannot run an isolated review
+  // (server/auto-review.ts `reviewersFor`).  An empty string clears it.  No
+  // other engine is ever asked, so leaving it empty keeps every review on
+  // the engine that raised the request.
+  autoReview: z.object({
+    fallbackReviewer: z.string().max(200).optional(),
+  }).optional(),
   // Usage telemetry has no built-in endpoint: whoever runs BotFleet points
   // it at their own usage monitor. Unconfigured means the stream is off.
   usage: z.object({
@@ -639,6 +647,11 @@ export interface AppConfig {
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
   };
+  /** Who reviews a bot's approvals when its own engine cannot. */
+  autoReview?: {
+    /** Instance id of the owner's fallback reviewer; empty or absent is none. */
+    fallbackReviewer?: string;
+  };
   usage?: {
     ingestUrl?: string;
     ingestToken?: string;
@@ -876,6 +889,12 @@ export function usageIngestUrl(cfg: AppConfig): string | null {
 /** Project classification rules, in the order they should be consulted.
  * Rules with no usable slug or no match terms are dropped. */
 /** Local subscription caps divert auto-fallback unless turned off. */
+/** The owner's fallback reviewer instance id, or null when none is chosen. */
+export function autoReviewFallbackReviewer(cfg: AppConfig): string | null {
+  const id = cfg.autoReview?.fallbackReviewer?.trim();
+  return id ? id : null;
+}
+
 export function localQuotaRoutingEnabled(cfg: AppConfig): boolean {
   return cfg.usage?.localQuotaRouting !== false;
 }
@@ -1678,7 +1697,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip"] as const) {
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip", "autoReview"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
