@@ -488,6 +488,7 @@ import { stripAnsi } from "./desktop-probe.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
 import { fleetSeatPromptPart } from "./seat-prompt.ts";
+import { launchEnvironment, launchIdentityFor } from "./launch-identity.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
@@ -2187,6 +2188,12 @@ const jobRegistry = new JobRegistry({
   dir: join(DATA_DIR, "jobs"),
   dataDir: DATA_DIR,
   settings: jobSettings,
+  // A job is a shell the model started: it carries its bot's launch identity
+  // the way the engine's own children do (server/launch-identity.ts).
+  launchEnv: (botId, threadId) => {
+    const bot = store.bot(botId);
+    return launchEnvironment(bot ? launchIdentityFor(bot, threadId) : undefined);
+  },
   spendBlocked: () => spendBlockedForUnattendedWork("bot"),
   stopReason: jobStopReason,
   broadcast: (frame) => broadcast({ ...frame }),
@@ -6502,6 +6509,7 @@ async function startTurn(
           ? createTurnToolHost({
               botId: bot.id,
               threadId,
+              launchIdentity: launchIdentityFor(bot, threadId),
               commsDepth,
               // HTTP toolLoop engines only (MiniMax / Grok HTTP / openai-compat).
               // Unset/invalid → undefined → DEFAULT_TURN_LOOP_BUDGET.maxRounds, which is
@@ -6594,6 +6602,7 @@ async function startTurn(
         bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
+        launchIdentity: launchIdentityFor(bot, threadId),
       };
       // What the harness put in front of the model that the person did not
       // type: the bot's memory, the skills and playbooks this message
@@ -8632,6 +8641,7 @@ async function runGroupMemberTurn(
       ? createTurnToolHost({
           botId: bot.id,
           threadId,
+          launchIdentity: launchIdentityFor(bot, threadId),
           commsDepth: hop,
           // Same HTTP toolLoop ceiling as the 1:1 lane.
           maxRounds: resolveMaxToolRounds(bot.maxToolRounds),
@@ -8741,6 +8751,7 @@ async function runGroupMemberTurn(
         bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
+        launchIdentity: launchIdentityFor(bot, threadId),
         ...memberTurnSelection(selection),
       });
     })
