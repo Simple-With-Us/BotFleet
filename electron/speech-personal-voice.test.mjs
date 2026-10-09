@@ -57,7 +57,6 @@ describe("speakPersonalVoice request validation", () => {
     ["text past the cap", "x".repeat(12_001), "personal:x"],
     ["an ordinary voice name", "hi", "Samantha"],
     ["a voice id that is not a string", "hi", 7],
-    ["no voice id", "hi", undefined],
     ["a control character in the voice id", "hi", "personal:a\nb"],
     ["an overlong voice id", "hi", `personal:${"x".repeat(300)}`],
   ];
@@ -80,8 +79,11 @@ describe("speakPersonalVoice request validation", () => {
   it("accepts a Personal Voice id, an apple-personal id, and no named voice", () => {
     expect(validatePersonalVoiceRequest("Hello", "personal:abc")).toEqual({ ok: true, text: "Hello", voiceId: "personal:abc" });
     expect(validatePersonalVoiceRequest("Hello", "apple-personal:abc").ok).toBe(true);
-    // Nothing named: the helper picks the first Personal Voice.
-    expect(validatePersonalVoiceRequest("Hello", "").ok).toBe(true);
+    // Nothing named: the helper picks the first Personal Voice.  The bridge declares the id
+    // optional, so a missing one is the same as an empty one, as it was before validation.
+    expect(validatePersonalVoiceRequest("Hello", "")).toEqual({ ok: true, text: "Hello", voiceId: "" });
+    expect(validatePersonalVoiceRequest("Hello", undefined)).toEqual({ ok: true, text: "Hello", voiceId: "" });
+    expect(validatePersonalVoiceRequest("Hello", null)).toEqual({ ok: true, text: "Hello", voiceId: "" });
     expect(validatePersonalVoiceRequest("x".repeat(MAX_PERSONAL_VOICE_TEXT_CHARS), "personal:abc").ok).toBe(true);
   });
 });
