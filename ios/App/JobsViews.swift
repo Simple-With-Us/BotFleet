@@ -165,6 +165,9 @@ struct JobsSheet: View {
         }
         .presentationDetents([.medium, .large])
         .task { await session.loadJobs() }
+        // Pull to refresh re-reads the whole set, so a phone that missed a
+        // frame is right again without closing the sheet.
+        .refreshable { await session.loadJobs() }
         .onChange(of: allJobs) { _, jobs in
             // A stop the frames have answered needs no local "Stopping".
             stopping = stopping.filter { id in

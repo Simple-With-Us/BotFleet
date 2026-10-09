@@ -1640,7 +1640,13 @@ public struct CompanionClient: Sendable {
 
     /// Stop every running job of one conversation.
     public func stopAllJobs(threadId: String) async throws {
-        try await send(try makeRequest("POST", "/api/jobs/stop", body: ["threadId": threadId]))
+        do {
+            try await send(try makeRequest("POST", "/api/jobs/stop", body: ["threadId": threadId]))
+        } catch let error as APIError where error.isConflict {
+            // Nothing left to stop is the outcome asked for, the same as
+            // `stopJob(id:)`.
+            return
+        }
     }
 
     // MARK: - Usage and cost

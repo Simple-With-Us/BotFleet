@@ -243,6 +243,27 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(rows[1].model, "MiniMax-M3")
     }
 
+    func testTheRunningCostShowsWheneverAnyEarlierSessionHadOneNotOnlyThisSessions() throws {
+        let bot = try XCTUnwrap(fleet(botJSON("b", name: "B", extra: #"""
+        ,"tasks":[
+          {"threadId":"free-first","title":"","createdAt":1,"lastActivity":50,"usage":{"input":10,"output":0,"turns":1}},
+          {"threadId":"paid","title":"","createdAt":1,"lastActivity":100,"usage":{"input":10,"output":0,"costUsd":0.4,"turns":1}},
+          {"threadId":"free-last","title":"","createdAt":1,"lastActivity":300,"usage":{"input":10,"output":0,"turns":1}}]
+        """#)).first)
+        let rows = Dictionary(uniqueKeysWithValues: UsageMath.sessionRows(bot).map { ($0.id, $0) })
+        // before anything reported a cost there is no running cost to show
+        XCTAssertFalse(try XCTUnwrap(rows["free-first"]).showsCumulativeCost)
+        XCTAssertTrue(try XCTUnwrap(rows["paid"]).showsCumulativeCost)
+        // a later session with no cost of its own still sits on the running total
+        let last = try XCTUnwrap(rows["free-last"])
+        XCTAssertNil(last.usage.costUsd)
+        XCTAssertTrue(last.showsCumulativeCost)
+        close(last.cumulativeCost, 0.4)
+
+        let none = try XCTUnwrap(fleet(botJSON("n", name: "N", extra: #","tasks":[{"threadId":"a","title":"","createdAt":1,"usage":{"input":1,"output":0,"turns":1}}]"#)).first)
+        XCTAssertFalse(try XCTUnwrap(UsageMath.sessionRows(none).first).showsCumulativeCost)
+    }
+
     func testASessionIsLabelledByTheModelThatRanItAndSaysWhenHistoryIsIncomplete() throws {
         let bot = try XCTUnwrap(fleet(botJSON("b", name: "B", extra: #"""
         ,"tasks":[

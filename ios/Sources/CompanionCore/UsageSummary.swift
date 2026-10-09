@@ -401,6 +401,11 @@ public struct UsageSessionRow: Hashable, Identifiable, Sendable {
     /// way a ledger does.
     public var cumulativeTokens: Double
     public var cumulativeCost: Double
+
+    /// Whether the running cost belongs on the line.  It is the ledger total
+    /// up to and including this session, so it is worth showing whenever any
+    /// session so far reported a cost, even when this one reported none.
+    public var showsCumulativeCost: Bool { cumulativeCost > 0 }
 }
 
 extension UsageMath {

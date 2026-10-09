@@ -352,6 +352,26 @@ final class JobsTests: XCTestCase {
         try await client().stopJob(id: jobId)
     }
 
+    func testStopAllWithNothingLeftToStopIsTheOutcomeAskedFor() async throws {
+        JobsRequestStub.statusCode = 409
+        JobsRequestStub.responseBody = Data(#"{"error":"nothing is running"}"#.utf8)
+        try await client().stopAllJobs(threadId: "t1")
+        XCTAssertEqual(JobsRequestStub.capturedRequest?.url?.path, "/api/jobs/stop")
+    }
+
+    func testAnyOtherStopAllFailureStillThrows() async {
+        JobsRequestStub.statusCode = 404
+        JobsRequestStub.responseBody = Data(#"{"error":"no such thread"}"#.utf8)
+        do {
+            try await client().stopAllJobs(threadId: "gone")
+            XCTFail("a 404 is a real failure")
+        } catch let error as APIError {
+            XCTAssertTrue(error.isNotFound)
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+    }
+
     func testAnyOtherStopFailureStillThrows() async {
         JobsRequestStub.statusCode = 404
         JobsRequestStub.responseBody = Data(#"{"error":"no such job"}"#.utf8)

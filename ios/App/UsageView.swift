@@ -472,7 +472,7 @@ struct BotUsageDetailView: View {
         var parts: [String] = []
         if row.at > 0 { parts.append(OwnerClock.stamp(ms: row.at)) }
         parts.append(modelLabel(row.model))
-        let costPart = UsageMath.hasFiniteCost(row.usage.costUsd)
+        let costPart = row.showsCumulativeCost
             ? " \u{00B7} \(UsageMath.formatUsd(row.cumulativeCost)) cumulative"
             : ""
         return parts.joined(separator: " \u{00B7} ") + "\n\(UsageMath.formatTokens(row.cumulativeTokens)) tokens cumulative\(costPart)"
