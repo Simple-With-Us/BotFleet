@@ -182,7 +182,53 @@ test("a run whose artifact list is malformed is a bad response, not a missing bu
     (error) => {
       assert.ok(error instanceof ResolutionError);
       assert.equal(error.cause, "bad-response");
-      assert.match(error.message, /without a "artifacts" list/);
+      assert.match(error.message, /without an "artifacts" list/);
+      return true;
+    },
+  );
+});
+
+test("a run entry missing a required field is a bad response at the boundary, not a silent skip", async (t) => {
+  // The old shape only checked the envelope, so a partial entry was passed through
+  // and silently dropped by `selectCommitRun`.  The boundary now rejects it: a
+  // proxy or a 200-with-truncated-body would otherwise look like an empty build
+  // and `auto` would quietly package locally.
+  for (const partial of [
+    { head_sha: COMMIT, status: "completed", conclusion: "success", event: "push" }, // no id
+    { id: 1, status: "completed", conclusion: "success", event: "push" }, // no head_sha
+    { id: 1, head_sha: COMMIT, conclusion: "success", event: "push" }, // no status
+    { id: 1, head_sha: COMMIT, status: "completed", event: "push" }, // no conclusion (must be string|null)
+  ]) {
+    await assert.rejects(
+      downloadBuiltBundle({
+        commit: COMMIT,
+        destination: await fixture(t),
+        fetchImpl: json({ workflow_runs: [partial] }),
+      }),
+      (error) => {
+        assert.ok(error instanceof ResolutionError, JSON.stringify(partial));
+        assert.equal(error.cause, "bad-response", JSON.stringify(partial));
+        assert.match(error.message, /malformed workflow run entry/);
+        return true;
+      },
+      JSON.stringify(partial),
+    );
+  }
+});
+
+test("an artifact entry missing a required field is a bad response at the boundary, not a silent skip", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) {
+      return json({ artifacts: [{ name: artifactNameFor(COMMIT), expired: false, archive_download_url: "https://example.test/a.zip" }] })();
+    }
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "bad-response");
+      assert.match(error.message, /malformed artifact entry/);
       return true;
     },
   );
