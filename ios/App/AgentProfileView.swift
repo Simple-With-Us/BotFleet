@@ -611,7 +611,14 @@ struct AgentProfileView: View {
             // Read-only: This Mac is the person's real desktop, so the
             // computer, not the phone, turns it on or off.  The state shown is
             // the computer's, live.
-            LabeledContent("This Mac", value: BotComputers.holdsThisMac(current.computers) ? "On" : "Off")
+            // An Auto bot has no list: on a Mac the computer may still hand it
+            // this desktop, so "Off" would overstate what is known.
+            LabeledContent(
+                "This Mac",
+                value: current.computers == nil
+                    ? "Automatic"
+                    : (BotComputers.holdsThisMac(current.computers) ? "On" : "Off")
+            )
         } header: {
             Text("Computers")
         } footer: {

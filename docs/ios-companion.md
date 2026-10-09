@@ -27,12 +27,14 @@ The first version includes:
   Box computer view. The loopback-only VPS SSH viewer remains desktop-only.
 - Markdown rendering and Keychain storage for the phone's pairing trust.
 
-Alerts work while the app is open or for the short period it remains connected
-after moving to the background.  After notification authorization, the app
-registers for remote notifications and POSTs the device token as hex to
-`POST /api/companion/push-token` (sidecar-local, like endpoints).  The Mac
-sidecar stores the token on the paired device and can APNs-wake a killed app;
-iOS never sends a push itself.  Live Activities stay local (`pushType: nil`).
+Alerts reach the phone while the app is open or in the background, and once
+the computer has push set up they reach it when the app is closed too.
+Settings says whether that is working (Closed-app notifications).  After
+notification authorization, the app registers for remote notifications and
+POSTs the device token as hex to `POST /api/companion/push-token`
+(sidecar-local, like endpoints).  The Mac sidecar stores the token on the
+paired device and APNs-wakes an app that is not running; iOS never sends a
+push itself.  Live Activities stay local (`pushType: nil`).
 The optional hosted transport connects to the user's own computer; it is not a
 cloud transcript store.
 
