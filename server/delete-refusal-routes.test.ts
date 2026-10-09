@@ -25,7 +25,7 @@ const ROOT = join(SERVER_DIR, "..");
 
 let home: string;
 let data: string;
-let child: ChildProcess | undefined;
+let child: ChildProcess;
 let stdout = "";
 let stderr = "";
 let portBase = 0;
