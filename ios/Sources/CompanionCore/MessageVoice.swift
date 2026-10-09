@@ -29,9 +29,9 @@ public struct MessageVoice: Decodable, Equatable, Sendable {
     /// The voice the harness resolved for the requested device.
     public var voice: String?
     /// What the voice reads, when the request asked for `spans`: "written"
-    /// (the reply as written, span-aligned, so karaoke applies) or
-    /// "summary" (a model summary, no karaoke).  Absent from an older
-    /// harness.
+    /// (the deterministic script, span-aligned) or "summary" (the distilled
+    /// rewrite, the default, no spans).  Karaoke follows the message for
+    /// both.  Absent from an older harness.
     public var script: String?
     /// The written script's source spans (KaraokeScript.swift).  A
     /// malformed value is dropped, never a reason to fail the answer.

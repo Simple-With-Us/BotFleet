@@ -139,9 +139,9 @@ export interface Message {
   audioByVoice?: Record<string, Array<{ path: string; mime: string }>>;
   /** The text this reply's voice reads, and its stored clips were made from. */
   voiceText?: string;
-  /** What voiceText is: "written" (the reply as written, span-aligned for
-   * karaoke) or "summary" (an explicit Voice Summary mode).  Absent on rows
-   * from before karaoke (shared/spoken-script.ts). */
+  /** What voiceText is: "written" (the reply as written, the "off" mode) or
+   * "summary" (the distiller path, the default).  Absent on rows from before
+   * karaoke, whose voiceText is reused as a summary (shared/spoken-script.ts). */
   voiceTextKind?: "written" | "summary";
   /** Original incoming microphone recording and recognizer output never change. */
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };

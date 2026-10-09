@@ -158,25 +158,30 @@ describe("VoiceSettings", () => {
     expect(html).toContain("Personal Voice from your iPhone.\u00A0 Choose it on the iPhone.");
   });
 
-  it("renders the spoken text options with Read As Written as the default", () => {
+  it("renders the voice summary options with distilling as the default (owner correction, 2026-10-08)", () => {
     const html = render(sampleBot("voice-1"));
 
-    expect(html).toContain("Spoken Text");
+    expect(html).toContain("Voice Summary");
     expect(html).toContain("Benchmark Findings");
-    expect(html).toContain("Read As Written");
-    expect(html).toContain("Summary On Play");
-    expect(html).toContain("Summary Every Reply");
-    expect(html).toContain("highlights each word in the message as it is spoken.  A summary is shorter");
-    expect(html).not.toContain("Voice Summary");
-    // No saved mode: the first option is the selected one.
-    const selected = html.indexOf("border-accent bg-accent/5");
-    expect(selected).toBeGreaterThan(-1);
-    expect(html.slice(selected, html.indexOf("</button>", selected))).toContain("Read As Written");
-    // The choice is announced, not only colored: one pressed mode button.
+    expect(html).toContain("On-Demand");
+    expect(html).toContain("All Messages");
+    expect(html).toContain("Read the reply as written");
+    expect(html).toContain("code skipped.\u00A0 The message highlights each word as it is read, in every mode.");
+    expect(html).not.toContain("no highlight");
+    expect(html).not.toContain("Read As Written");
+    const pressedTitle = (markup: string) => {
+      const pressed = markup.indexOf('aria-pressed="true"');
+      return markup.slice(pressed, markup.indexOf("</button>", pressed));
+    };
+    // A text-only bot with no saved mode distills when played.
     expect(html.match(/aria-pressed="true"/g)).toHaveLength(1);
     expect(html.match(/aria-pressed="false"/g)).toHaveLength(2);
-    const pressed = html.indexOf('aria-pressed="true"');
-    expect(html.slice(pressed, html.indexOf("</button>", pressed))).toContain("Read As Written");
+    expect(pressedTitle(html)).toContain("On-Demand");
+    // A bot with voice replies on distills every reply ahead of time.
+    expect(pressedTitle(render({ ...sampleBot("voice-1"), speakReplies: true }))).toContain("All Messages");
+    expect(pressedTitle(render({ ...sampleBot("voice-1"), speechDevices: ["iphone"] }))).toContain("All Messages");
+    // A saved mode wins.
+    expect(pressedTitle(render({ ...sampleBot("voice-1"), speakReplies: true, voiceSummaryMode: "off" }))).toContain(">Off<");
   });
 });
 

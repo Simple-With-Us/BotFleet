@@ -7,26 +7,47 @@ export type VoiceSummaryMode = "off" | "on_demand" | "always";
 /**
  * Resolves the effective voice summary mode for a bot.
  *
- * Unset means "off": the voice reads the reply as written, through the
- * deterministic speakable pass (code blocks named, links by their label,
- * markdown dropped), so the spoken words line up with the message on screen
- * and the karaoke highlight can follow them.  The owner's ruling (board
- * 8cc3c806) is that the speech pass may not paraphrase or summarize, so a
- * model-written summary is only ever spoken when the owner picked one for the
- * bot: an explicit "on_demand" (summarize when played) or "always" (summarize
- * every reply ahead of time).
+ * An explicit voiceSummaryMode ("off" | "on_demand" | "always") always wins.
+ * Unset, a bot with voice replies on (speakReplies or speechDevices) is
+ * "always": every reply is distilled for speech ahead of time.  A text-only
+ * bot is "on_demand": a reply is distilled when it is played.
+ *
+ * Distilled means the DeepSeek pass (server/tts/speech-summary.ts): the reply
+ * rewritten for the ear, with numbers, codes, acronyms and links spelled out
+ * and code skipped.  That is what the owner wants spoken (owner correction,
+ * 2026-10-08: "Why would I want to spend a bunch of time and energy and money
+ * having an llm distill speech to optimize for spoken word if I didn't want
+ * to use it", and "I never said I wanted it read word for word").  It
+ * reverses #952, which had made "off" the default citing board 8cc3c806.
+ * "off" reads the reply as written, through the deterministic speakable
+ * pass.  Karaoke follows the main message text in every mode, sweeping
+ * quickly past what the voice skips; the one thing it does not follow is a
+ * distilled script that is really a brief summary and lines up with almost
+ * nothing on screen (shared/karaoke-align.ts karaokeFollowable).
  */
 export function resolveVoiceSummaryMode(bot?: {
   voiceSummaryMode?: VoiceSummaryMode;
+  speakReplies?: boolean;
+  speechDevices?: string[];
 } | null): VoiceSummaryMode {
-  return bot?.voiceSummaryMode ?? "off";
+  if (bot?.voiceSummaryMode) return bot.voiceSummaryMode;
+  if (bot?.speakReplies || (bot?.speechDevices && bot.speechDevices.length > 0)) {
+    return "always";
+  }
+  return "on_demand";
 }
 
-/** What a bot's voice reads: the reply as written (span-aligned, so karaoke
- * applies) or a model-written summary (no karaoke). */
+/** What a bot's voice reads: the reply as written ("off": the deterministic
+ * speakable pass, span-aligned) or the distilled spoken rewrite (the default).
+ * The karaoke highlight follows the message either way; only the written
+ * script carries spans to guide it. */
 export type VoiceScriptKind = "written" | "summary";
 
-export function voiceScriptKind(bot?: { voiceSummaryMode?: VoiceSummaryMode } | null): VoiceScriptKind {
+export function voiceScriptKind(bot?: {
+  voiceSummaryMode?: VoiceSummaryMode;
+  speakReplies?: boolean;
+  speechDevices?: string[];
+} | null): VoiceScriptKind {
   return resolveVoiceSummaryMode(bot) === "off" ? "written" : "summary";
 }
 
