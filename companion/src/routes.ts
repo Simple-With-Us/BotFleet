@@ -175,6 +175,13 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "PATCH", path: /^\/api\/routines\/[\w-]+$/ },
   { method: "DELETE", path: /^\/api\/routines\/[\w-]+$/ },
   { method: "POST", path: /^\/api\/routines\/[\w-]+\/run$/ },
+  // Run receipts: stop one that is queued, running or waiting, and mark a
+  // failure as seen.  Both act on a run that already exists and neither
+  // creates, edits or deletes a routine, so a lost phone gains no new reach.
+  // The bare `POST /api/routine-runs/seen` is the "mark every failure seen"
+  // sweep; it clears the badge and keeps every run, status and error.
+  { method: "POST", path: /^\/api\/routine-runs\/[\w-]+\/(?:cancel|seen)$/ },
+  { method: "POST", path: /^\/api\/routine-runs\/seen$/ },
 
   // Checking for a newer BotFleet and installing it.  The phone is the one
   // place an update is convenient to start — the Mac is usually mid-work when

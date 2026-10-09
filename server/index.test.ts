@@ -4605,6 +4605,48 @@ describe("harness HTTP API", () => {
     expect(invalid.status).toBe(400);
   });
 
+  it("sends the backend a bot really uses without disturbing the raw value", async () => {
+    // The workspace default fills in for a bot that was never pinned, and the
+    // join route resolves it that way.  A phone deciding whether to offer the
+    // live cloud desktop must see that answer, while the desktop keeps the
+    // stored value to tell an inherited backend from a pinned one.
+    const originalDefault = (await api("GET", "/api/config")).body.botDefaults.cloudBackend ?? "box";
+    const unpinned = (await api("POST", "/api/bots", { name: "Unpinned Backend" })).body.bot;
+    const pinned = (await api("POST", "/api/bots", { name: "Pinned Backend" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${pinned.id}`, { cloudBackend: "box" })).status).toBe(200);
+      const find = async (id: string) =>
+        (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === id);
+
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      let unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("box");
+
+      // The workspace now sends unpinned bots to the VPS: the stored value is
+      // still unset, the effective one follows the default, and a bot pinned
+      // to Box stays on Box.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "vps" } })).status).toBe(200);
+      unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("vps");
+      const pinnedWire = await find(pinned.id);
+      expect(pinnedWire.cloudBackend).toBe("box");
+      expect(pinnedWire.effectiveCloudBackend).toBe("box");
+
+      // A pin to the VPS wins over a Box default.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      const repinned = await api("PATCH", `/api/bots/${unpinned.id}`, { cloudBackend: "vps" });
+      expect(repinned.status).toBe(200);
+      expect(repinned.body.bot.cloudBackend).toBe("vps");
+      expect(repinned.body.bot.effectiveCloudBackend).toBe("vps");
+    } finally {
+      await api("DELETE", `/api/bots/${unpinned.id}`);
+      await api("DELETE", `/api/bots/${pinned.id}`);
+      await api("PUT", "/api/config", { botDefaults: { cloudBackend: originalDefault } });
+    }
+  });
+
   it("validates a Composio project key, creates a Session, and keeps externally stored secrets off disk", async () => {
     const oldKey = await api("PUT", "/api/config", { composio: { apiKey: "old_key" } });
     expect(oldKey.status).toBe(400);

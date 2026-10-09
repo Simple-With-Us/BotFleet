@@ -180,6 +180,16 @@ public struct CompanionState: Sendable {
         rooms.first { $0.threadId == threadId }
     }
 
+    /// Whether the harness would refuse to create, switch, rename or delete one
+    /// of this room's tasks right now (`channelTaskBlocked` in
+    /// server/index.ts): a turn is running, or a request is waiting on an
+    /// answer.  Only the open thread's transcript is loaded here, so a request
+    /// waiting in another task still answers 409 — and the harness's own
+    /// sentence reaches the person.
+    public func roomTaskChangesBlocked(_ room: Room) -> Bool {
+        room.isWorking || transcript(forThread: room.threadId).contains { $0.card?.isPending == true }
+    }
+
     /// Every unanswered approval or question, newest first. This is the
     /// screen the whole companion exists for.
     public var pendingApprovals: [(threadId: String, message: Message)] {
@@ -423,7 +433,21 @@ public struct CompanionState: Sendable {
         case let .room(room):
             if let index = rooms.firstIndex(where: { $0.id == room.id }) {
                 var merged = room
-                merged.messages = rooms[index].messages
+                let previous = rooms[index]
+                if previous.threadId != room.threadId, let replacement = room.messages {
+                    // A channel task was created, switched to, or deleted down
+                    // to another one.  The room names a different thread now,
+                    // and the answer to that call carries its transcript, which
+                    // is authoritative — same as a bot's task switch above.
+                    // An ordinary frame keeps the transcript it already has.
+                    messages[room.threadId] = replacement
+                    hasMore[room.threadId] = room.hasMore ?? false
+                    merged.messages = replacement
+                    clearStream(previous.threadId)
+                    clearStream(room.threadId)
+                } else {
+                    merged.messages = previous.messages
+                }
                 rooms[index] = merged
             } else {
                 rooms.append(room)
