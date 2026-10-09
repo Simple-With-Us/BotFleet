@@ -132,6 +132,45 @@ struct SettingsView: View {
                         }
                     }
 
+                    NavigationLink {
+                        FleetModelsView()
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Models")
+                                Text("Every bot's primary and fallbacks")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            SettingsIcon(symbol: "cpu", color: .green)
+                        }
+                    }
+
+                    NavigationLink {
+                        UsageView()
+                    } label: {
+                        Label {
+                            Text("Usage & Cost")
+                        } icon: {
+                            SettingsIcon(symbol: "chart.bar.xaxis", color: .green)
+                        }
+                    }
+
+                    NavigationLink {
+                        SharedMemoryView()
+                    } label: {
+                        HStack {
+                            Label {
+                                Text("Shared Memory")
+                            } icon: {
+                                SettingsIcon(symbol: "memorychip", color: .pink)
+                            }
+                            Spacer()
+                            SharedMemoryStateText()
+                        }
+                    }
+
                     Picker(selection: Binding(
                         get: { session.config?.isProjectsMode == true ? "projects" : "simple" },
                         set: { mode in

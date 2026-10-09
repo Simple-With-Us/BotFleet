@@ -1358,9 +1358,10 @@
       ],
       "version": "apt",
       "verify": {
-        "command": "ping",
+        "command": "command",
         "args": [
-          "-V"
+          "-v",
+          "ping"
         ]
       },
       "apt": [

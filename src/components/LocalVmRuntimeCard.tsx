@@ -22,7 +22,12 @@ import { redactCommandSecrets } from "@/lib/redact-command-secrets";
 import { localVmSetupLine } from "@/lib/local-vm-setup-line";
 import { PersistentActionErrorCard } from "./PersistentActionErrorCard";
 
-const STATUS_TIMEOUT_MS = 15_000;
+// Must outlast the harness's worst case for one status read: a 4 s presence
+// check, then the runtime health probe, which retries once on a timeout (two
+// 12 s attempts).  A shorter wait aborts the request in exactly the case the
+// "slow to respond" message exists for, and each abandoned request keeps
+// running on the harness.
+const STATUS_TIMEOUT_MS = 40_000;
 
 type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
 
@@ -31,6 +36,8 @@ interface Status {
   runtime: string | null;
   available: string[];
   daemonUp: boolean;
+  /** Installed, but its health check timed out twice: unknown, not stopped. */
+  daemonSlow?: boolean;
   image: boolean;
   imageMatches: boolean;
   managed: boolean;
@@ -384,10 +391,20 @@ export function LocalVmRuntimeCard() {
 
           <Step
             n={2}
-            title={status?.runtime && !status.daemonUp ? `Open and start ${status.runtime}` : "Start the container runtime"}
+            title={
+              status?.runtime && status.daemonSlow && !status.daemonUp
+                ? `Waiting for ${status.runtime} to respond`
+                : status?.runtime && !status.daemonUp
+                  ? `Open and start ${status.runtime}`
+                  : "Start the container runtime"
+            }
             done={Boolean(status?.daemonUp)}
           >
-            {!status?.runtime ? null : c?.runtimeStart ? (
+            {!status?.runtime ? null : status.daemonSlow && !status.daemonUp ? (
+              <div className="text-[13px] text-ink-secondary">
+                The container runtime ({status.runtime}) is installed but did not answer in time, usually because this {host} is busy.{"\u00a0 "}BotFleet keeps checking.
+              </div>
+            ) : c?.runtimeStart ? (
               <CommandLine command={c.runtimeStart} />
             ) : (
               <div className="text-[13px] text-ink-secondary">Open the installed runtime and start its engine, then re-check.</div>
@@ -451,7 +468,9 @@ export function LocalVmRuntimeCard() {
               <div className="text-[13px] text-ink-secondary">
                 {status.daemonUp
                   ? "Prepare the Linux desktop above first.\u00a0 Then create the VM here."
-                  : "Start the container runtime above first."}
+                  : status.daemonSlow
+                    ? "Waiting for the container runtime to respond."
+                    : "Start the container runtime above first."}
               </div>
             ) : null}
             {localVmOff && !perBot && (
