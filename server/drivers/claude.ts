@@ -637,6 +637,9 @@ function createPermissionBroker(opts: {
     // An unreadable name falls back to the generic "tool", the same name a
     // frame with no tool at all has always carried.
     const toolName = z.string().min(1).safeParse(msg.tool);
+    if (!toolName.success) {
+      console.warn("permission broker: non-string tool name on ask frame", toolName.error.issues);
+    }
     const tool = toolName.success ? toolName.data : "tool";
     const ask: Ask = {
       id: askId,
