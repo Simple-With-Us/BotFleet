@@ -28,6 +28,17 @@ struct SettingsView: View {
     @FocusState private var focusedProfileField: ProfileField?
 
     private enum ProfileField: Hashable { case name, email }
+
+    /// DEBUG `-store-preview -preview-voice -open-settings`: the Voice
+    /// section comes first, so the screenshot harness can see it without
+    /// scrolling (the same rule AgentProfileView uses).
+    private static var voiceSectionFirst: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-preview-voice")
+#else
+        false
+#endif
+    }
     private let onConnect: (() -> Void)?
 
     init(onConnect: (() -> Void)? = nil) {
@@ -36,6 +47,9 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            if Self.voiceSectionFirst, session.connection != nil {
+                WorkspaceVoiceSection()
+            }
             Section("Computer") {
                 if let connection = session.connection {
                     NavigationLink {
@@ -198,7 +212,9 @@ struct SettingsView: View {
                     Text(workspaceFooter)
                 }
 
-                WorkspaceVoiceSection()
+                if !Self.voiceSectionFirst {
+                    WorkspaceVoiceSection()
+                }
 
                 Section {
                     HStack {

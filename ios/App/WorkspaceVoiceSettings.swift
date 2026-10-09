@@ -21,27 +21,28 @@ struct WorkspaceVoiceSection: View {
     private var defaultVoice: String { session.config?.workspaceDefaultVoice ?? "" }
     private var hostedVoices: [Voice] { voices.filter { !BotVoice.isPersonalVoiceId($0.id) } }
     private var listed: Bool { hostedVoices.contains(where: { $0.id == defaultVoice }) }
+    private var defaultName: String {
+        defaultVoice.isEmpty ? BotVoice.noDefaultVoice : BotVoice.displayName(defaultVoice, voices: voices)
+    }
+    /// The phone's write routes shipped with the list, so a computer that
+    /// sends no list cannot take the change: show the voice, read-only.
+    private var canChange: Bool { session.config?.pronunciations != nil }
 
     var body: some View {
         Section {
-            Picker(selection: Binding(get: { defaultVoice }, set: { save($0) })) {
-                if defaultVoice.isEmpty {
-                    Text(BotVoice.noDefaultVoice).tag("")
-                } else if !listed {
-                    Text(BotVoice.displayName(defaultVoice, voices: voices)).tag(defaultVoice)
-                }
-                ForEach(hostedVoices) { voice in
-                    Text(BotVoice.displayName(voice.id, voices: hostedVoices)).tag(voice.id)
-                }
-            } label: {
-                Label {
-                    Text("Default Voice")
-                } icon: {
-                    SettingsIcon(symbol: "speaker.wave.2", color: .pink)
+            if canChange {
+                picker
+            } else {
+                LabeledContent {
+                    Text(defaultName)
+                } label: {
+                    Label {
+                        Text("Default Voice")
+                    } icon: {
+                        SettingsIcon(symbol: "speaker.wave.2", color: .pink)
+                    }
                 }
             }
-            .disabled(saving || session.config?.tts == nil)
-            .accessibilityValue(defaultVoice.isEmpty ? BotVoice.noDefaultVoice : BotVoice.displayName(defaultVoice, voices: voices))
 
             NavigationLink {
                 PronunciationsView()
@@ -59,7 +60,7 @@ struct WorkspaceVoiceSection: View {
                     SettingsIcon(symbol: "character.bubble", color: .teal)
                 }
             }
-            .disabled(session.config?.pronunciations == nil)
+            .disabled(!canChange)
 
             if !error.isEmpty {
                 Text(error)
@@ -76,6 +77,27 @@ struct WorkspaceVoiceSection: View {
         }
     }
 
+    private var picker: some View {
+        Picker(selection: Binding(get: { defaultVoice }, set: { save($0) })) {
+            if defaultVoice.isEmpty {
+                Text(BotVoice.noDefaultVoice).tag("")
+            } else if !listed {
+                Text(BotVoice.displayName(defaultVoice, voices: voices)).tag(defaultVoice)
+            }
+            ForEach(hostedVoices) { voice in
+                Text(BotVoice.displayName(voice.id, voices: hostedVoices)).tag(voice.id)
+            }
+        } label: {
+            Label {
+                Text("Default Voice")
+            } icon: {
+                SettingsIcon(symbol: "speaker.wave.2", color: .pink)
+            }
+        }
+        .disabled(saving || session.config?.tts == nil)
+        .accessibilityValue(defaultName)
+    }
+
     private var footer: String {
         var parts: [String] = []
         if defaultVoice.isEmpty {
@@ -84,8 +106,8 @@ struct WorkspaceVoiceSection: View {
             parts.append("Every bot without a voice of its own speaks with this one, on the Mac and on iPhone.")
         }
         parts.append(BotVoice.personalVoiceNotDefault)
-        if session.config?.tts != nil, session.config?.pronunciations == nil {
-            parts.append("Update BotFleet on your computer to change pronunciations here.")
+        if session.config?.tts != nil, !canChange {
+            parts.append("Change it on the Mac, or update BotFleet on your computer to change it and the pronunciations here.")
         } else {
             parts.append("Pronunciations say terms the voice keeps getting wrong.")
         }
