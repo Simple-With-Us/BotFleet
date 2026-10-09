@@ -57,6 +57,8 @@ A room turn already running is the one thing that is never interrupted, because 
 
 If the updater stops partway (Ctrl-C, a signal, a lost harness), it releases what it holds on its way out, and resumes anything it paused.  If it is killed outright, the harness lets go by itself: the hold a couple of minutes past the updater's window, and the fence three minutes after the updater stops renewing it, so new work is never left waiting.
 
+The updater never leaves BotFleet stopped.  If it finds BotFleet not running when it starts, it starts it first.  Every way an update can end (installed, refused, rolled back, or a rollback it had to defer) finishes with BotFleet running, the new build or the previous one.  Once it has stopped BotFleet, Ctrl-C waits for the install or the rollback to finish.  BotFleet gets up to 3 minutes to quit before the updater gives up, and the updater never force-kills it.
+
 From a terminal, `--wait-for-idle [MINUTES]` is the opt-in that never interrupts anything: it holds new work and waits up to 20 minutes (or `MINUTES`) for the running work to finish, and if it does not, everything held runs and the update stops without changing anything.  `--force` skips the grace and pauses at once.
 
 ## When it refuses

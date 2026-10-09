@@ -39,8 +39,14 @@ could not be verified").
   the fence predicate; the settle-aware release; the signal watcher and lease
   renewal; rollback's immediate fence; the foreign-holder wait at preflight and
   after the fence; preflight retry.
-- `scripts/update-botfleet.sh`, `scripts/update-progress.mjs`: the new flags
-  and the progress `detail`.
+- `scripts/mac-update-transaction.mjs`: `ensureRunning` before the first check
+  and after every failure, held signals past the interruption boundary, and the
+  leftover sweep at the start of every apply.
+- `scripts/update-botfleet-mac.mjs` (2026-10-09 overnight): `ensureBotFleetRunning`,
+  `waitForBotFleetExit` for slow exits, the rollback deferral rule, and the
+  `sweepLeftovers` op.
+- `scripts/update-botfleet.sh`, `scripts/update-progress.mjs`: the new flags,
+  the progress `detail`, and the two new step names.
 - `src/lib/update-control.ts`, `src/components/UpdateBanner.tsx`,
   `src/components/SettingsModal.tsx`, `src/components/Sidebar.tsx`,
   `companion/src/routes.ts`: no `force: true`, busy copy, and `detail` shown.
@@ -121,6 +127,34 @@ process's executable.  An unrecognised process is never signalled, and quiesce
 identifies every survivor before it signals any, so a refusal never leaves
 BotFleet half-stopped.
 
+### Never Left Stopped (2026-10-09 Overnight)
+
+Between about 12:13am and 3:20am the forced updater, at target `db3403f11`, left
+the owner's Mac with no BotFleet: the app's own processes were slow to quit at a
+load average of 50 to 500 per core ("BotFleet process 11736 still runs from
+inside /Applications/BotFleet.app after graceful shutdown"), the rollback
+deferred although no harness answered ("Replacement may own active work"),
+nothing started BotFleet again, and every later run refused on "BotFleet harness
+(pid 43837) is not running" until the owner relaunched the app at 3:22am.
+
+- Every exit leaves BotFleet running, the new build or the prior one.  A stopped
+  BotFleet is started before the first check, and every failure path (refused,
+  rolled back, a rollback that failed or was deferred) makes sure one runs.  It
+  is a no-op when a harness answers, it waits for an instance still quitting
+  before starting, and it starts a mismatched checkout and app anyway, saying so.
+- Past the interruption boundary, Ctrl-C and SIGTERM wait for the install or its
+  rollback to finish.
+- Slow exits are waited for: up to 3 minutes, re-checked every 2 seconds, with
+  progress, one verified SIGTERM after 20 seconds, never SIGKILL.  SIGTERM's own
+  window is 60 seconds.  Fixed and generous rather than load-aware: the wait ends
+  at once on a quiet Mac.
+- A rollback is deferred only when a live harness answers and refuses.  With no
+  harness answering, the rollback waits the processes out and restores.
+- Candidate bundles and dependency trees an earlier run left (named after an
+  updater that is gone) are swept at the start of every apply.  A deferred
+  rollback's `pending-recovery.json` is reported; nothing reads it, so it never
+  blocks an update.
+
 ## The First Update Carrying This
 
 The updater that runs is the one at `origin/main`; the harness answering it is the
@@ -161,8 +195,9 @@ and on CI.  Exact commands, with `DOCKER_HOST=unix:///nonexistent.sock`:
 | `pnpm typecheck` | pass |
 | `pnpm lint` | pass (4802 warnings, baseline 4890) |
 | `git diff --check origin/main...HEAD` | pass |
-| `node --test scripts/update-botfleet-hold.node-test.mjs` | pass (36 of 36) |
-| `pnpm test:mac-updater` | 245 pass, 2 fail: "the stable wrapper detects a linked worktree checkout" and "the up-to-date shortcut only swallows a plain update to origin/main", which fail the same way with the base updater (A/B), because this checkout is a linked worktree |
+| `node --test scripts/update-botfleet-hold.node-test.mjs` | pass (39 of 39) |
+| `node --test scripts/mac-update-transaction.node-test.mjs` | pass (27 of 27), including the overnight replay |
+| `pnpm test:mac-updater` | 253 pass, 2 fail: "the stable wrapper detects a linked worktree checkout" and "the up-to-date shortcut only swallows a plain update to origin/main", which fail the same way with the base updater (A/B), because this checkout is a linked worktree |
 | `npx vitest run server/index.test.ts -t "<the update tests>"` | pass: the hold, the forced fence, a release while settling, a rolled-back attempt that keeps work paused, the fence lease, a held room round, and malformed quiesce input |
 | `npx vitest run server/update-held-boot.test.ts` | pass (two boots); fails against the base harness with one of two carried sends run (A/B) |
 | `npx vitest run server/steer-queue.test.ts server/update-drain.test.ts server/room-queue.test.ts server/routines.test.ts server/update-control.test.ts server/bot-off-wiring.test.ts server/bot-power.test.ts` | pass |
@@ -186,6 +221,10 @@ and on CI.  Exact commands, with `DOCKER_HOST=unix:///nonexistent.sock`:
   live room turn; malformed quiesce input.
 - `server/update-held-boot.test.ts`: two boots, the carrier read at boot, and two
   carried messages for one bot run once each, in order.
+- `scripts/mac-update-transaction.node-test.mjs`: the overnight sequence (slow
+  exit, deferred rollback, restart, the next run proceeds), every failure path
+  ending with BotFleet running, a failed restart reported, signals held past the
+  boundary, and a failing leftover sweep.
 
 ## Review Fixes
 
@@ -195,4 +234,6 @@ work count is zero (2); carried sends go through the steer queue after jobs sett
 (3, 8, 9); rollback fences at once (4); foreign database holders are waited out at
 preflight and after the fence (5); signals cover the whole fence step and the
 fence has a lease (6, 11); room rounds are held and carried, while a live room turn
-is still waited for (7); work is paused at most once per update (10).
+is still waited for (7); work is paused at most once per update (10).  The
+2026-10-09 overnight failures: a slow harness is asked again (preflight retry); a
+slow exit is waited out; BotFleet is never left stopped; leftovers are swept.
