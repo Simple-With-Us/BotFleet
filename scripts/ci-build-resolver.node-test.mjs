@@ -1162,6 +1162,42 @@ test("nothing newer than the installed build is green: a clear refusal, never th
   assert.ok(!decision.message.includes("\n"), "the explanation is one line, because the wrapper hands it over in a variable");
 });
 
+test("a truncated window changes what is said about the span searched, never the distance to the chosen commit", async (t) => {
+  // Six commits, a window of three: the installed build (c0) is further back
+  // than the search looked.
+  const { commits, gitSync } = await mainHistory(t, 6);
+  const [c0, , , c3, c4, c5] = commits;
+  const common = { git: gitSync, installedCommit: c0, env: SELECT_ENV, windowSize: 3 };
+
+  // The chosen commit is two below the tip, and that count is exact: it is the
+  // chosen commit's position counted down from the tip, so it is not "more
+  // than" anything even though the window was cut.
+  const selected = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [c3], tipRun: { head_sha: c5, status: "in_progress", conclusion: null } }),
+  });
+  assert.deepEqual([selected.status, selected.commit, selected.behind, selected.truncated], ["selected", c3, 2, true]);
+  assert.equal(selected.message, `Updating to ${c3.slice(0, 12)} (main is 2 commits ahead; its build is still running)`);
+
+  // Nothing green in the window: the span between the installed build and the
+  // tip is what is unsearched, so THAT count is a lower bound.
+  const none = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [], tipRun: { head_sha: c5, status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(none.status, "none");
+  assert.match(none.message, new RegExp(`Main is at ${c5.slice(0, 12)}, more than 3 commits ahead`));
+
+  // A window that was not cut says nothing of the kind.
+  const whole = await selectUpdateTarget({
+    ...common,
+    windowSize: 100,
+    fetchImpl: actionsFetch({ green: [c4], tipRun: { head_sha: c5, status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(whole.truncated, false);
+  assert.equal(whole.message, `Updating to ${c4.slice(0, 12)} (main is 1 commit ahead; its build is still running)`);
+});
+
 test("the policy decides what 'nothing newer' means: local keeps the tip, auto falls back to it", async (t) => {
   const { commits, gitSync } = await mainHistory(t);
   const nothingGreen = actionsFetch({ green: [], tipRun: { head_sha: commits[4], status: "in_progress", conclusion: null } });
@@ -1209,6 +1245,27 @@ test("the installed build is read from the app's build identity", async (t) => {
   assert.equal(await readInstalledSourceCommit(app), C[1]);
   await writeFile(identity, JSON.stringify({ sourceCommit: "not-a-commit" }));
   assert.equal(await readInstalledSourceCommit(app), null);
+  // Strict: a string of exactly 40 lowercase hex digits, nothing that merely
+  // coerces to one.  `RegExp#test` stringifies its argument, so an array
+  // holding a valid sha used to pass.
+  for (const [label, sourceCommit] of [
+    ["an array holding a valid sha", [C[1]]],
+    ["a number", 1234567890],
+    ["null", null],
+    ["an object", { sha: C[1] }],
+    ["39 digits", "a".repeat(39)],
+    ["41 digits", "a".repeat(41)],
+    ["uppercase hex", "A".repeat(40)],
+    ["a sha with a trailing newline", `${C[1]}\n`],
+    ["a sha with surrounding space", ` ${C[1]}`],
+  ]) {
+    await writeFile(identity, JSON.stringify({ sourceCommit }));
+    assert.equal(await readInstalledSourceCommit(app), null, label);
+  }
+  await writeFile(identity, JSON.stringify(null));
+  assert.equal(await readInstalledSourceCommit(app), null, "a manifest that is not an object");
+  await writeFile(identity, JSON.stringify({ sourceCommit: C[1] }));
+  assert.equal(await readInstalledSourceCommit(app), C[1]);
   await writeFile(identity, "{ torn");
   assert.equal(await readInstalledSourceCommit(app), null);
   assert.equal(await readInstalledSourceCommit(join(app, "missing")), null);

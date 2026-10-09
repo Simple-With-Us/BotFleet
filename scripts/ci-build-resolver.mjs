@@ -1064,11 +1064,22 @@ const BUILD_MANIFEST_RELATIVE = "Contents/Resources/server/build-identity.json";
 /**
  * The commit the installed app was built from, or null when it cannot be
  * read.  Mirrors `installedBuildCommit` in update-botfleet-mac.mjs.
+ *
+ * Hand-checked rather than parsed with zod, for the same reason as
+ * `assertWorkflowRun` above: the updater is bootstrapped from a `git archive`
+ * of a few files into a temp directory with no node_modules, so this module can
+ * import nothing but node: builtins.  The check is still strict on purpose: the
+ * value must BE a string of exactly 40 lowercase hex digits.  `RegExp#test`
+ * coerces its argument, so without the type check a one-element array holding a
+ * valid sha would pass and be returned as if it were one.  Anything else is
+ * "the installed build is unknown", which makes the selection step aside.
  */
 export async function readInstalledSourceCommit(appPath) {
   try {
     const build = JSON.parse(await readFile(join(appPath, BUILD_MANIFEST_RELATIVE), "utf8"));
-    return FULL_COMMIT.test(build?.sourceCommit || "") ? build.sourceCommit : null;
+    const commit = build?.sourceCommit;
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- build-identity.json boundary parse; zod is unavailable in the updater bootstrap graph (see above).
+    return typeof commit === "string" && FULL_COMMIT.test(commit) ? commit : null;
   } catch {
     return null;
   }
@@ -1237,11 +1248,16 @@ export async function selectUpdateTarget({
   const { tip, candidates, truncated } = listed;
   const found = await selectNewestGreenCommit({ candidates, tip, repository, fetchImpl, env, execFileSyncImpl, log });
   if (found.commit) {
-    const ahead = `${truncated ? "more than " : ""}${plural(found.behind)}`;
+    // `behind` is the chosen commit's position counted down from the tip, so it
+    // is exact however long the installed build's history is.  Truncation only
+    // limits how far BELOW the tip the search looked (the "none" message says
+    // "more than N" because there the count is of the whole unsearched span),
+    // so this count never gets a "more than".  `truncated` is passed on for
+    // callers that want to say the installed build is further back still.
     const message = found.behind === 0
       ? `Updating to ${short(found.commit)} (main's tip; its build succeeded)`
-      : `Updating to ${short(found.commit)} (main is ${ahead} ahead; its build ${found.tipBuild})`;
-    return { status: "selected", commit: found.commit, tip, behind: found.behind, message };
+      : `Updating to ${short(found.commit)} (main is ${plural(found.behind)} ahead; its build ${found.tipBuild})`;
+    return { status: "selected", commit: found.commit, tip, behind: found.behind, truncated, message };
   }
   if (policy === "auto") {
     return { status: "skip", reason: "no hosted build is newer than the installed one; the tip will be packaged on this Mac" };
