@@ -97,6 +97,30 @@ describe("plugin registry", () => {
     expect(listing.capabilities.length).toBe(0);
   });
 
+  it("does not touch another install's staging dir for the same plugin", async () => {
+    const manifest = JSON.stringify({
+      name: "demo",
+      version: "1.0.0",
+      description: "Demo plugin.",
+      botfleet: ">=1",
+      entry: "plugin.mjs",
+    });
+    // Stand-in for a concurrent install of "demo" in this process: its staging
+    // dir uses the old pid-only suffix and holds a half-written file.
+    const other = join(baseDir, `demo.staging-${process.pid}`);
+    mkdirSync(other, { recursive: true });
+    writeFileSync(join(other, "half-written.txt"), "in progress");
+    await writePluginTree("demo", {
+      source: "/tmp/demo",
+      manifestText: manifest,
+      files: [{ path: "plugin.mjs", content: "export const hello = 'world';\n" }],
+    }, baseDir);
+    expect(existsSync(join(other, "half-written.txt"))).toBe(true);
+    expect(existsSync(join(baseDir, "demo", "botfleet-plugin.json"))).toBe(true);
+    // Only this call's own staging and aside dirs are cleaned up.
+    expect(readdirSync(baseDir).filter((n) => /^demo\.(staging|replacing)-/.test(n))).toEqual([`demo.staging-${process.pid}`]);
+  });
+
   it("fails listingFor with a useful message when the manifest is unreadable", () => {
     mkdirSync(join(baseDir, "broken"), { recursive: true, mode: 0o700 });
     const entry = buildEntry({
