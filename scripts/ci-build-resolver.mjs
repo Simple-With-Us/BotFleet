@@ -1196,11 +1196,13 @@ export async function selectNewestGreenCommit({
   const runsUrl = `${apiBase(repository)}/actions/workflows/${WORKFLOW_FILE}/runs?branch=main&status=success&per_page=100`;
   const runs = (await requestJson(runsUrl, { headers, fetchImpl, commit: tip, timeoutMs: SELECTION_REQUEST_TIMEOUT_MS }))?.workflow_runs;
   let checked = 0;
+  let foundAnyGreen = false;
   for (let index = 0; index < candidates.length && checked < SELECTION_ARTIFACT_CHECKS; index += 1) {
     const commit = candidates[index];
     const green = selectCommitRun(runs, commit);
     if (!green) continue;
     checked += 1;
+    foundAnyGreen = true;
     const artifactsUrl = `${apiBase(repository)}/actions/runs/${green.id}/artifacts?per_page=100`;
     const artifacts = (await requestJson(artifactsUrl, { headers, fetchImpl, commit, timeoutMs: SELECTION_REQUEST_TIMEOUT_MS }))?.artifacts;
     if (!findCommitArtifact(artifacts, commit)) {
@@ -1210,7 +1212,12 @@ export async function selectNewestGreenCommit({
     const tipBuild = index === 0 ? "succeeded" : await describeTipBuild({ tip, repository, headers, fetchImpl });
     return { commit, behind: index, tipBuild };
   }
-  return { commit: null, behind: null, tipBuild: await describeTipBuild({ tip, repository, headers, fetchImpl }) };
+  // `no-artifact` is the cap was reached (or every green run that was found had
+  // its artifact expire): a build exists, just not a usable one.  `no-green-run`
+  // is no candidate has a successful hosted build yet, so waiting is what fixes
+  // it.  `selectUpdateTarget` branches the message on this.
+  const cause = foundAnyGreen ? "no-artifact" : "no-green-run";
+  return { commit: null, behind: null, cause, tipBuild: await describeTipBuild({ tip, repository, headers, fetchImpl }) };
 }
 
 /**
@@ -1263,12 +1270,21 @@ export async function selectUpdateTarget({
     return { status: "skip", reason: "no hosted build is newer than the installed one; the tip will be packaged on this Mac" };
   }
   const ahead = `${truncated ? "more than " : ""}${plural(candidates.length)}`;
+  // Two distinct failures hide behind `commit: null`.  `no-artifact` means a
+  // green build exists but its artifact has expired (the SELECTION_ARTIFACT_CHECKS
+  // cap was reached before a usable one was found, or every candidate's run had
+  // already expired): re-running the workflow on main's tip recovers it.
+  // `no-green-run` means no candidate has a successful hosted build yet, so
+  // waiting is what fixes it.  The remediation differs, so the wording differs.
+  const checkedAllExpired = found.cause === "no-artifact";
+  const reason = checkedAllExpired
+    ? `All recent successful builds had their artifacts expire.  Re-run the workflow on origin/main's tip, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.`
+    : `None of the commits in between has a successful hosted build yet.  Wait for a build to finish, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.`;
   return {
     status: "none",
     tip,
     message:
       `No newer hosted build to install.  The installed build is ${short(installed)}.  Main is at ${short(tip)}, ` +
-      `${ahead} ahead, and its build ${found.tipBuild}.  None of the commits in between has a successful hosted build yet.  ` +
-      `Wait for a build to finish, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.`,
+      `${ahead} ahead, and its build ${found.tipBuild}.  ` + reason,
   };
 }
