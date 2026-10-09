@@ -53,7 +53,7 @@ const api = async (method: string, path: string, body?: ApiBody): Promise<{ stat
 const serverReady = async (): Promise<boolean> => {
   try {
     const res = await fetch(`${base()}/api/health`);
-    const health = z.object({ ready: z.boolean().optional() }).safeParse(await res.json());
+    const health = z.object({ ready: z.boolean().optional() }).strict().safeParse(await res.json());
     return res.ok && (!health.success || health.data.ready !== false);
   } catch {
     return false;
