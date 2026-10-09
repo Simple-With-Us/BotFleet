@@ -353,7 +353,7 @@ test("asc_latest_seq surfaces asc-api stderr and does not require the env file",
 // tests drive the real helpers in asc-api.mjs against an in-memory fake of the
 // handful of App Store Connect endpoints they use.
 // ---------------------------------------------------------------------------
-function fakeAsc({ groups = [], users = [], testers = [], failCreateGroup = false, usersReadable = true } = {}) {
+function fakeAsc({ groups = [], users = [], testers = [], failCreateGroup = false, usersReadable = true, userPages = null, failUsersPage = -1 } = {}) {
   const state = {
     groups: groups.map((g) => ({ ...g, members: new Set(g.members || []) })),
     testers: testers.map((t) => ({ ...t })),
@@ -375,7 +375,14 @@ function fakeAsc({ groups = [], users = [], testers = [], failCreateGroup = fals
       state.groups.push(g);
       return ok({ id: g.id, type: "betaGroups", attributes: { name: g.name } }, 201);
     }
-    if (method === "GET" && path.startsWith("/v1/users")) {
+    if (method === "GET" && (path.startsWith("/v1/users") || path.startsWith("https://api.appstoreconnect.apple.com/v1/users"))) {
+      if (userPages) {
+        const idx = Number((path.match(/cursor=(\d+)/) || [0, 0])[1]);
+        if (idx === failUsersPage) return bad(500, "UNEXPECTED", "page failed");
+        const body = { data: userPages[idx].map((u) => ({ type: "users", id: u, attributes: { username: u } })) };
+        if (idx + 1 < userPages.length) body.links = { next: `https://api.appstoreconnect.apple.com/v1/users?cursor=${idx + 1}` };
+        return { status: 200, ok: true, parsed: body, text: "" };
+      }
       return usersReadable ? ok(users.map((u) => ({ type: "users", id: u, attributes: { username: u } }))) : bad(403, "FORBIDDEN", "no");
     }
     let m = path.match(/^\/v1\/betaGroups\/([^/]+)\/betaTesters/);
@@ -483,6 +490,24 @@ test("ensureInternalTesterGroup warns loudly when nobody can be an internal test
   const noUsers = fakeAsc({ usersReadable: false });
   const out3 = await ensureInternalTesterGroup({ api: noUsers.api, appId: "1", emails: ["bob@example.org"], log: () => {}, warn: () => {} });
   assert.equal(out3.added, 1);
+});
+
+test("ensureInternalTesterGroup reads every page of App Store Connect users, and a failed later page means unreadable, not everyone external", async () => {
+  const { ensureInternalTesterGroup } = await import("./ios-fleet/asc-api.mjs");
+  // The standing email is only on the SECOND page of users.
+  const paged = fakeAsc({ userPages: [["zed@example.com"], ["alice@example.com"]] });
+  const out = await ensureInternalTesterGroup({ api: paged.api, appId: "1", emails: ["alice@example.com"], log: () => {}, warn: () => {} });
+  assert.equal(out.added, 1, "a user beyond the first page must still be recognised");
+  assert.equal(out.external, 0);
+
+  // Page 2 fails after page 1 succeeded: the list is incomplete, so try the email
+  // rather than deciding alice is not an ASC user.
+  const flaky = fakeAsc({ userPages: [["zed@example.com"], ["alice@example.com"]], failUsersPage: 1 });
+  const logs = [];
+  const out2 = await ensureInternalTesterGroup({ api: flaky.api, appId: "1", emails: ["alice@example.com"], log: (m) => logs.push(m), warn: () => {} });
+  assert.equal(out2.added, 1);
+  assert.equal(out2.external, 0, "a partial user list must not push every standing email to external-only");
+  assert.match(logs.join("\n"), /could not read App Store Connect users/);
 });
 
 test("addTesterToGroup does not attach another app's tester record to this app's group", async () => {

@@ -479,7 +479,13 @@ export async function ensureInternalTesterGroup({ api, appId, emails, log, warn 
   let usersReadable = false;
   for (let page = 0; page < 50 && usersUrl; page++) {
     const usersRes = await api("GET", usersUrl);
-    if (!usersRes.ok) { ascUsers.clear(); break; }
+    if (!usersRes.ok) {
+      // A failure on ANY page makes the list incomplete.  Treat it as unreadable
+      // (try every standing email) rather than as "everyone else is not a user".
+      ascUsers.clear();
+      usersReadable = false;
+      break;
+    }
     usersReadable = true;
     for (const u of ascRows(usersRes)) {
       ascUsers.add(String(u.attributes?.username || "").toLowerCase());
