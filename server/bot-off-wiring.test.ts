@@ -146,7 +146,9 @@ describe("peers", () => {
 
 describe("update readiness", () => {
   it("leaves an Off bot's queued work out of what holds an update, but still counts its running turn", () => {
-    const body = functionBody("function currentRuntimeReadiness(");
+    // The counts readiness sums live in `runtimeWorkCounts`, which both the
+    // update fence (`currentRuntimeReadiness`) and the update hold read.
+    const body = functionBody("function runtimeWorkCounts(");
     expect(body).toContain("queuedMessageCount(botIsOffId)");
     expect(body).toContain("_queuedRoomCount(botIsOffId)");
     expect(body).toContain("botIsOffId(item.toBotId)");

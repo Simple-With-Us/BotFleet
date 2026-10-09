@@ -9,7 +9,8 @@ import {
   bannerIsActionable,
   fetchUpdateStatus,
   idleLabel,
-  installBlockedBusy,
+  installPausesWork,
+  PAUSES_WORK_COPY,
   installBlockedReason,
   installBlockedReasonDetail,
   installedLabel,
@@ -211,6 +212,15 @@ describe("what it says", () => {
       progress: 0.25,
       logTail: [],
     })).toBe("Installing dependencies (25%)…");
+    // What the step is waiting on reads better than the step's own name.
+    expect(runningLabel({
+      runId: "r",
+      startedAt: "",
+      step: "Holding new work",
+      detail: "Waiting for 3 bots to finish",
+      progress: 0.4,
+      logTail: [],
+    })).toBe("Waiting for 3 bots to finish (40%)…");
   });
 
   it("distinguishes the four outcomes", () => {
@@ -308,34 +318,35 @@ describe("what it says", () => {
     }))).toBeNull();
   });
 
-  it("only treats the selected blocker as busy, never a structural one that shares the list", () => {
-    const busy = "BotFleet is working right now.\u00a0 The updater will not interrupt a turn in flight.";
+  it("says an install pauses busy bots only when Install is actually available", () => {
     const updaterOutdated = "The updater in /Users/jay/Code/BotFleet predates this build."
-      + "  Run it once from a terminal to pick up the new one.";
+      + "  Run it once from a terminal to pick up the new one.";
     const offer = { sourceCommit: NEXT, aheadBy: 2, commits: [] };
-    // The harness lists "busy" last; a structural blocker ahead of it selects
-    // the real guidance, and Install must stay down on that reason.
-    expect(installBlockedBusy(status({
+    // Busy is not a blocker: Install stays available and says it will pause.
+    expect(installPausesWork(status({
       available: offer,
-      capabilities: {
-        canCheck: true, canRun: false,
-        reasons: [updaterOutdated, busy],
-        codes: ["updater-outdated", "busy"],
-      },
-    }))).toBe(false);
-    // A purely busy Mac is the one forceable case.
-    expect(installBlockedBusy(status({
-      available: offer,
-      capabilities: { canCheck: true, canRun: false, reasons: [busy], codes: ["busy"] },
+      capabilities: { canCheck: true, canRun: true, reasons: [], codes: [], busy: true },
     }))).toBe(true);
-    // Nothing selected, nothing busy.
-    expect(installBlockedBusy(null)).toBe(false);
-    expect(installBlockedBusy(status({ available: offer }))).toBe(false);
-    // An older harness with no codes array keeps the old behaviour.
-    expect(installBlockedBusy(status({
+    expect(installBlockedReason(status({
       available: offer,
-      capabilities: { canCheck: true, canRun: false, reasons: [busy] },
+      capabilities: { canCheck: true, canRun: true, reasons: [], codes: [], busy: true },
+    }))).toBeNull();
+    // A structural blocker wins, and the busy copy never replaces its guidance.
+    expect(installPausesWork(status({
+      available: offer,
+      capabilities: { canCheck: true, canRun: false, reasons: [updaterOutdated], codes: ["updater-outdated"], busy: true },
     }))).toBe(false);
+    // Nothing to install, a run in flight, an idle Mac, or an older harness
+    // that never says `busy`: nothing to pause.
+    expect(installPausesWork(null)).toBe(false);
+    expect(installPausesWork(status({ capabilities: { canCheck: true, canRun: true, reasons: [], busy: true } }))).toBe(false);
+    expect(installPausesWork(status({
+      available: offer,
+      running: { runId: "r", startedAt: "", step: "Building", logTail: [] },
+      capabilities: { canCheck: true, canRun: true, reasons: [], busy: true },
+    }))).toBe(false);
+    expect(installPausesWork(status({ available: offer }))).toBe(false);
+    expect(PAUSES_WORK_COPY).not.toMatch(/agent/i);
   });
 
   it("maps a structural refusal to product copy, and keeps the harness's own sentence for hover", () => {
