@@ -429,9 +429,15 @@ export async function countInternalTesters({ api, appId }) {
   );
   let testers = 0;
   for (const g of groups) {
-    const members = await api("GET", `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email`);
-    if (!members.ok) return { ok: false, error: ascErrorText(members), groups: groups.length, testers };
-    testers += ascRows(members).length;
+    const seen = new Set();
+    let url = `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email`;
+    for (let page = 0; page < 50 && url; page++) {
+      const members = await api("GET", url);
+      if (!members.ok) return { ok: false, error: ascErrorText(members), groups: groups.length, testers: seen.size };
+      for (const t of ascRows(members)) seen.add(String(t.attributes?.email || "").toLowerCase());
+      url = members.parsed?.links?.next || "";
+    }
+    testers += seen.size;
   }
   return { ok: true, groups: groups.length, testers };
 }
