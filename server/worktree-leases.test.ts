@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
@@ -191,10 +191,71 @@ describe("WorktreeLeaseManager", () => {
     expect(existsSync(worktreePath)).toBe(true);
   });
 
-  it("refuses unconfirmed branch deletion during release", async () => {
+  it("refuses unconfirmed branch deletion during release, before the worktree is touched", async () => {
     const lease = await manager.acquire(repoDir, "bot-del", "thread-del", 60);
+    writeFileSync(join(lease.worktreePath, "unsaved.txt"), "still here");
+
     await expect(manager.release(lease, { removeBranch: true })).rejects.toThrow(
       "Branch deletion requires explicit owner confirmation",
     );
+
+    // The refusal used to land AFTER the removal, so the caller was told no
+    // about the branch while the working tree was already gone.
+    expect(existsSync(join(lease.worktreePath, "unsaved.txt"))).toBe(true);
+    expect(runGit(repoDir, "branch", "--list", lease.branch).trim()).not.toBe("");
+
+    await manager.release(lease);
+  });
+
+  it("deletes the branch when the caller confirms, so botfleet/* branches do not pile up", async () => {
+    const lease = await manager.acquire(repoDir, "bot-del", "thread-del", 61);
+    expect(runGit(repoDir, "branch", "--list", lease.branch).trim()).not.toBe("");
+
+    await manager.release(lease, { removeBranch: true, confirmBranchDeletion: true });
+
+    expect(existsSync(lease.worktreePath)).toBe(false);
+    expect(runGit(repoDir, "branch", "--list", lease.branch).trim()).toBe("");
+    expect(exactTurnLeases.hasTarget(lease.targetKey)).toBe(false);
+  });
+
+  it("refuses to delete a branch while keeping its worktree checked out", async () => {
+    const lease = await manager.acquire(repoDir, "bot-del", "thread-keep", 62);
+
+    await expect(
+      manager.release(lease, { keepWorktree: true, removeBranch: true, confirmBranchDeletion: true }),
+    ).rejects.toThrow(/while keeping its worktree/);
+    expect(existsSync(lease.worktreePath)).toBe(true);
+
+    await manager.release(lease);
+  });
+
+  it("gives bot and thread pairs that join to the same text separate worktrees", async () => {
+    // Both pairs spelled `<base>/<repoHash>/bot-1-thread-1`.  Their lease keys
+    // differ, so the lease engine admitted both, and the second acquire then
+    // removed and re-created the first turn's live working tree.
+    const first = await manager.acquire(repoDir, "bot-1", "thread-1", 70);
+    writeFileSync(join(first.worktreePath, "first.txt"), "first turn's work");
+
+    const second = await manager.acquire(repoDir, "bot-1-thread", "1", 71);
+
+    expect(second.worktreePath).not.toBe(first.worktreePath);
+    expect(readFileSync(join(first.worktreePath, "first.txt"), "utf8")).toBe("first turn's work");
+    expect(existsSync(second.worktreePath)).toBe(true);
+
+    await manager.release(first);
+    await manager.release(second);
+  });
+
+  it("names a worktree from the raw ids, not their sanitized spelling", async () => {
+    // `a/b` and `a_b` sanitize to the same segment.
+    const slash = await manager.acquire(repoDir, "bot", "a/b", 80);
+    const underscore = await manager.acquire(repoDir, "bot-2", "a_b", 81);
+    const sameBotOtherThread = await manager.acquire(repoDir, "bot-3", "a/b", 82);
+    const sameBotSanitized = await manager.acquire(repoDir, "bot-3b", "a_b", 83);
+
+    const paths = new Set([slash, underscore, sameBotOtherThread, sameBotSanitized].map((l) => l.worktreePath));
+    expect(paths.size).toBe(4);
+
+    for (const lease of [slash, underscore, sameBotOtherThread, sameBotSanitized]) await manager.release(lease);
   });
 });
