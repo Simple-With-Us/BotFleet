@@ -55,6 +55,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
+import { applyLaunchIdentity } from "../launch-identity.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -569,11 +570,14 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           return spawnCli(config.cli, childArgs, {
             stdio: ["pipe", "pipe", "pipe"],
             cwd: turn.cwd,
-            env: piEnvironment({
-              ...process.env,
-              ...input.environment,
-              ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
-            }),
+            env: applyLaunchIdentity(
+              piEnvironment({
+                ...process.env,
+                ...input.environment,
+                ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
+              }),
+              turn.launchIdentity,
+            ),
           });
         } catch (err) {
           if (mcpTempDir) {

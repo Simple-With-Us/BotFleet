@@ -488,6 +488,7 @@ import { stripAnsi } from "./desktop-probe.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
 import { fleetSeatPromptPart } from "./seat-prompt.ts";
+import { launchEnvironment, launchIdentityFor } from "./launch-identity.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
@@ -758,6 +759,7 @@ const updateControl = createUpdateControl({
   // while a turn is running.  Both `POST` routes pass their own reading
   // instead, excluding the admission the request itself holds.
   readiness: () => currentRuntimeReadiness(),
+  harnessOwnerNonce: () => harnessOwner.nonce,
   emit: (status) => broadcast({ kind: "update.status", status }),
 });
 // Bound the per-thread transcript logs before anything starts appending to
@@ -2186,6 +2188,12 @@ const jobRegistry = new JobRegistry({
   dir: join(DATA_DIR, "jobs"),
   dataDir: DATA_DIR,
   settings: jobSettings,
+  // A job is a shell the model started: it carries its bot's launch identity
+  // the way the engine's own children do (server/launch-identity.ts).
+  launchEnv: (botId, threadId) => {
+    const bot = store.bot(botId);
+    return launchEnvironment(bot ? launchIdentityFor(bot, threadId) : undefined);
+  },
   spendBlocked: () => spendBlockedForUnattendedWork("bot"),
   stopReason: jobStopReason,
   broadcast: (frame) => broadcast({ ...frame }),
@@ -6497,6 +6505,7 @@ async function startTurn(
           ? createTurnToolHost({
               botId: bot.id,
               threadId,
+              launchIdentity: launchIdentityFor(bot, threadId),
               commsDepth,
               // HTTP toolLoop engines only (MiniMax / Grok HTTP / openai-compat).
               // Unset/invalid → undefined → DEFAULT_TURN_LOOP_BUDGET.maxRounds, which is
@@ -6589,6 +6598,7 @@ async function startTurn(
         bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
+        launchIdentity: launchIdentityFor(bot, threadId),
       };
       // What the harness put in front of the model that the person did not
       // type: the bot's memory, the skills and playbooks this message
@@ -8627,6 +8637,7 @@ async function runGroupMemberTurn(
       ? createTurnToolHost({
           botId: bot.id,
           threadId,
+          launchIdentity: launchIdentityFor(bot, threadId),
           commsDepth: hop,
           // Same HTTP toolLoop ceiling as the 1:1 lane.
           maxRounds: resolveMaxToolRounds(bot.maxToolRounds),
@@ -8736,6 +8747,7 @@ async function runGroupMemberTurn(
         bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
+        launchIdentity: launchIdentityFor(bot, threadId),
         ...memberTurnSelection(selection),
       });
     })
@@ -15244,9 +15256,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // The same gate as the thread-events route below: the loopback fence
     // every route sits behind, and a job answers only when its thread is one
     // this harness knows.  Output is read here and only here — frames carry
-    // labels and status, never output.  None of these is on the phone
-    // companion's allowlist yet: that is P4, where the owner approved both
-    // Stop and reading output from the phone (ruling d).
+    // labels and status, never output.  On the phone companion's allowlist
+    // (companion/src/routes.ts), because the owner approved both Stop and
+    // reading output from the phone (ruling d): the list, one job's output,
+    // one job's Stop and Stop All.  The bare `GET /api/jobs/:id` and
+    // `/api/jobs/wake-usage` are not, since no screen on the phone uses them.
     // What job wake turns have cost: totals only, never a prompt or output.
     if (method === "GET" && path === "/api/jobs/wake-usage") {
       return json(res, 200, { wakeUsage: jobWakeUsage.snapshot() });
