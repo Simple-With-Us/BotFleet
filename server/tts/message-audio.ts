@@ -640,23 +640,20 @@ export class MessageAudio {
         script.script = label;
         if (label === "written" && onDeviceSpans) script.spans = onDeviceSpans;
       }
-      return {
-        kind: "json",
-        status: 200,
-        body: {
-          audio: [],
-          // What a caption shows: the words as written, never the respelling.
-          voiceText: asWritten.join(" "),
-          utterances: onDevice,
-          ...(respelledAny ? { captions: asWritten } : {}),
-          total: onDevice.length,
-          complete: true,
-          onDevice: true,
-          personalVoice: true,
-          voice,
-          ...script,
-        },
+      const body: AudioResponseBody = {
+        audio: [],
+        // What a caption shows: the words as written, never the respelling.
+        voiceText: asWritten.join(" "),
+        utterances: onDevice,
+        total: onDevice.length,
+        complete: true,
+        onDevice: true,
+        personalVoice: true,
+        voice,
+        ...script,
       };
+      if (respelledAny) body.captions = asWritten;
+      return { kind: "json", status: 200, body };
     }
 
     if (this.deps.credentialPending()) {
