@@ -761,6 +761,9 @@ describe("CodexDriver turns (fake app-server)", () => {
     await instance.adapter.sendTurn({ threadId: "t-approve", text: "clean up" });
     const opened = await recorder.until((e) => e.type === "request.opened");
     expect(opened).toMatchObject({ requestType: "permission", tool: "shell", summary: "rm -rf scratch" });
+    // the step the ask is about (legacy `callId`, v2 `itemId`), so the
+    // auto-review step watch leaves this step to the card
+    expect(opened).toHaveProperty("itemId", "call-approve");
 
     await instance.adapter.respondToRequest("t-approve", opened.requestId!, { behavior: "allow" });
     const resolved = await recorder.until((e) => e.type === "request.resolved");

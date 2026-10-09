@@ -8,10 +8,18 @@
 // header is derived from the structured facts for the setup states, in setup
 // order, and the harness's wording is used only where it describes something
 // the facts cannot (a VM that exists but is unsafe, a desktop still starting).
+// A slow daemon is one of the derived states: the sentence is
+// `daemonSlowProblem` (the product name, capitalized), and `problem` is not
+// consulted.  A stale "Start docker first" must not override it.
+
+import { daemonSlowProblem } from "../../shared/container-runtime-name";
 
 export interface LocalVmSetupFacts {
   runtime: string | null;
   daemonUp: boolean;
+  /** The runtime is installed but its health check timed out twice, so nothing
+   * says it is stopped.  Absent from a harness that predates the field. */
+  daemonSlow?: boolean;
   image: boolean;
   container: "running" | "stopped" | "missing";
   problem: string | null;
@@ -22,7 +30,15 @@ export function localVmSetupLine(status: LocalVmSetupFacts | null, perBot: boole
   // No runtime at all: the harness may be saying why none is allowed (a
   // disabled-runtime notice), which no fact here can improve on.
   if (!status.runtime) return status.problem ?? "Install a container runtime first";
-  if (!status.daemonUp) return `Start ${status.runtime} first`;
+  if (!status.daemonUp) {
+    // A loaded Mac can make `docker info` outlast its budget while the engine
+    // is running fine.  That is not "stopped", and telling someone to start a
+    // runtime that is running sends them to restart it for nothing.
+    if (status.daemonSlow) {
+      return daemonSlowProblem(status.runtime);
+    }
+    return `Start ${status.runtime} first`;
+  }
   // The daemon answers.  With no image and no VM, the real next step is to
   // prepare the desktop and then create the VM; per-bot VMs are created from
   // each bot's own Computer panel, so only the first step belongs here.

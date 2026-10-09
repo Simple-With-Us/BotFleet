@@ -50,9 +50,22 @@ State is kept per bot in `~/.botfleet/zulip/<botId>.json` (mode 600): a message-
 
 Do these in order.  Nothing below runs until `zulip.enabled` is `true`.
 
-1. **Keys.**  Each BF bot already exists on the realm (owner-created).  Two sources are built, and neither is on until the owner picks one (Open Decisions, D0).
+1. **Keys.**  Each BF bot already exists on the realm (owner-created).  Two sources are built.  The fleet uses the Infisical source, reading the keys where the fleet keeps them (Open Decisions, D0); neither source is on until it is set.
 
-   **The Infisical source.**  Put `ZULIP_<ROLE>_EMAIL` and `ZULIP_<ROLE>_API_KEY` (`ZULIP_BF_PLUMBER_EMAIL`, `ZULIP_BF_PLUMBER_API_KEY`; an optional `ZULIP_<ROLE>_SITE`, else the realm) in the `/zulip` folder of BotFleet's own Infisical project, in the environment its machine identity reads, and set `"credentialSource": "infisical"` (and `"infisicalPath"` for another folder).  The hub reads that folder through the harness's InfisicalManager (`readPath`), at most once per 15 minutes for all bots, and keeps the values in memory only:  never in the Infisical snapshot, `cfg`, `process.env`, a log or the status view.  Infisical must be configured and turned on in Settings.
+   **The Infisical source (the fleet's choice).**  The keys are `ZULIP_<ROLE>_EMAIL` and `ZULIP_<ROLE>_API_KEY` (`ZULIP_BF_PLUMBER_EMAIL`, `ZULIP_BF_PLUMBER_API_KEY`; an optional `ZULIP_<ROLE>_SITE`, else the realm).  The fleet keeps them in Infisical project "AI Fleet Coordinator" (`9bf7417a-fbbb-42ca-870c-2b45207233f5`), environment `prod`, folder `/zulip`, and BotFleet reads them there, so there is one copy and a rotation there reaches BotFleet with nothing to copy.  Set:
+
+   ```json
+   {
+     "zulip": {
+       "credentialSource": "infisical",
+       "infisicalProjectId": "9bf7417a-fbbb-42ca-870c-2b45207233f5",
+       "infisicalEnv": "prod",
+       "infisicalPath": "/zulip"
+     }
+   }
+   ```
+
+   With `infisicalProjectId` and `infisicalEnv` unset (or empty), the folder is in BotFleet's own project and environment instead.  The hub reads the folder through the harness's InfisicalManager (`readPath`) with the harness's own machine identity, which must be able to read that project, environment and folder.  It reads at most once per 15 minutes for all bots, keeps the bound roles' names only (Infisical returns the whole `/zulip` folder, every seat's key included, so those are in memory while the read is in flight and are dropped as soon as it returns).  The values stay in memory only:  never in the Infisical snapshot, `cfg`, `process.env`, a log or the status view.  A rotated key is used from a bot's next connection once that 15-minute read has expired:  revoking the old key makes the session fail, and the 5-minute reconcile retries it, so a rotation lands in about 20 minutes at most.  Infisical must be configured and turned on in Settings.
 
    **The file source.**  Put each bot's zuliprc in one folder, named `<Role>-zuliprc` (`BF-Plumber-zuliprc`), mode 600, and set `credentialDir`:
 
@@ -77,7 +90,10 @@ Do these in order.  Nothing below runs until `zulip.enabled` is `true`.
        "enabled": true,
        "dryRun": true,
        "ownerUserId": 123456,
-       "credentialDir": "~/.secrets/Zulip",
+       "credentialSource": "infisical",
+       "infisicalProjectId": "9bf7417a-fbbb-42ca-870c-2b45207233f5",
+       "infisicalEnv": "prod",
+       "infisicalPath": "/zulip",
        "bots": {
          "<plumber bot id>": { "role": "BF-Plumber" },
          "<fixer bot id>": { "role": "BF-Fixer" }
@@ -95,7 +111,7 @@ Do these in order.  Nothing below runs until `zulip.enabled` is `true`.
 
 `peerDmAllow` is retired: a peer's DM no longer needs an allowlist.  It never shipped on `main`, so no stored config carries it, and the settings parser drops the key if one does.
 
-Other settings: `credentialSource` (`"file"` or `"infisical"`), `infisicalPath` (default `/zulip`), `autoReply` (`"final"` or `"off"`), `staleMinutes`, `budgets` (`dmsPerHour`, `peerWakesPerHour`, `peerWakesPerTopicPerHour`, `ownerWakesPerHour`, `peerChainLimit`), `realm`, `ownerClients`.
+Other settings: `credentialSource` (`"file"` or `"infisical"`), `infisicalPath` (default `/zulip`), `infisicalProjectId` and `infisicalEnv` (default:  the harness's own project and environment), `autoReply` (`"final"` or `"off"`), `staleMinutes`, `budgets` (`dmsPerHour`, `peerWakesPerHour`, `peerWakesPerTopicPerHour`, `ownerWakesPerHour`, `peerChainLimit`), `realm`, `ownerClients`.
 
 Environment overrides, for tests and soak rigs: `OMB_ZULIP_REALM`, `OMB_ZULIP_CREDENTIAL_DIR`, and `OMB_ZULIP_DISABLE=1` (a kill switch, read at boot and on every reconcile: with it set, no session runs).
 
@@ -124,11 +140,10 @@ All three are offered only to a bot whose Zulip session is connected, never in a
 
 ## Open Decisions and Follow-Ups
 
-- **D0, credentials (owner).**  Where the BF bots' keys come from is the owner's call, and nothing is on until it is made.
-  - The keys live today in Infisical project "AI Fleet Coordinator", environment `prod`, folder `/zulip`, as `ZULIP_BF_<ROLE>_EMAIL` and `ZULIP_BF_<ROLE>_API_KEY`, with runtime copies in `~/.secrets/Zulip/BF-<Role>-zuliprc` on Jay's Mac.  BotFleet's own vault is its "BotFleet" project.
-  - **Option A, Infisical (built, fits the rules as written).**  Copy (or import by reference) those names into the BotFleet project's `/zulip` folder, in the environment BotFleet's machine identity reads, and set `"credentialSource": "infisical"`.  Rotation then has to reach both projects, unless the BotFleet folder imports from the AFC one.  The source reads the folder directly rather than through `server/secret-map.ts`'s table, because the names are per role and the values must stay out of `cfg`; the owner may want that recorded against the Infisical directive in `AGENTS.md`.
-  - **Option B, the file source (built, off).**  Set `credentialDir` to `~/.secrets/Zulip`.  `AGENTS.md` ("Secret Handoff") and `docs/secrets.md` say the product server does not read fleet handoff files, so this needs the owner's ruling and an amendment to those two documents in the same change.  This PR does not change them.
-  - **Precedence** when both are set: as built, `credentialSource: "infisical"` wins over `credentialDir`.
+- **D0, credentials (resolved by the owner 2026-10-09:  one source of truth, linked, not copied).**  BotFleet reads the BF keys where the fleet keeps them, Infisical project "AI Fleet Coordinator" (`9bf7417a-fbbb-42ca-870c-2b45207233f5`), environment `prod`, folder `/zulip`, through `infisicalProjectId` and `infisicalEnv` (Setup, step 1).  A change there reaches BotFleet with no copy to update.
+  - **Why not an Infisical link.**  Infisical's cross-project references (`${@project-slug.env.KEY}`) and cross-project imports would do this inside Infisical, but they are a paid Enterprise feature that the fleet's plan does not have (`crossProjectSecretSharing` is off), and a same-project import or reference cannot reach another project.  A Secret Sync into BotFleet's project would be a second copy of the whole folder, every seat's key included.
+  - **Access.**  BotFleet's machine identity is the organization's one machine identity ("automation"), which can already read AI Fleet Coordinator, so no grant was added.  A narrower read-only identity limited to `prod`, `/zulip` and `ZULIP_BF_*` needs custom roles or additional privileges, which the plan does not have either (`rbac` is off).  Until then the source narrows what it keeps instead:  Infisical's API returns the whole folder (there is no name filter), so another seat's key is in memory while the read is in flight, and only the bound roles' names are kept once it returns.
+  - **What stays.**  The runtime copies in `~/.secrets/Zulip/BF-<Role>-zuliprc` are for the fleet CLI on Jay's Mac, not for BotFleet.  The file source stays built and off, and `AGENTS.md` ("Secret Handoff") and `docs/secrets.md` still keep the product server away from fleet handoff files.  The Infisical source reads the folder directly rather than through `server/secret-map.ts`'s table, because the names are per role and the values must stay out of `cfg`.
 - **Tag casing (owner).**  The harness writes `[BF-PLUMBER]` per the seat-tag rule; the fleet guide's example shows `[BF-Deployer]`.
 - **Model downgrade (owner).**  Zulip turns are unattended, so `unattendedModelDowngrade` moves them to the cheaper model, as it does for webhooks.  Background jobs have an owner ruling that exempts them; Zulip has none yet.
 - **Owner messages and stopped bots.**  Jay's Zulip messages run unattended and do not wake a bot he stopped in BotFleet.  Lifting either needs an owner ruling.

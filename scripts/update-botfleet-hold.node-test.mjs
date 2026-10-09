@@ -38,6 +38,7 @@ import {
 } from "./update-botfleet-mac.mjs";
 
 const OWNER = { version: 1, pid: 42, port: 8799, nonce: "a".repeat(64) };
+process.env.BOTFLEET_OWNER_NONCE = OWNER.nonce;
 const IDENTITY = {
   app: "botfleet",
   pid: 42,
