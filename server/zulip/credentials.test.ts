@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { looksSensitive } from "../auto-approve.ts";
 import {
   ZulipCredentialError,
+  type ZulipVaultLocation,
   cachedVaultReader,
   credentialSourceFor,
   fileCredentialSource,
@@ -16,6 +17,7 @@ import {
   resolveRealm,
   verifyCredentialRealm,
   zulipVaultNames,
+  zulipVaultNamesFor,
 } from "./credentials.ts";
 
 const FAKE_KEY = "fake-test-key-not-real";
@@ -47,6 +49,42 @@ describe("zuliprc files", () => {
     } catch (e) {
       expect(String(e)).not.toContain(FAKE_KEY);
     }
+  });
+
+  it("refuse a malformed email, key or site by field name, never by value", () => {
+    const refusal = (text: string): ZulipCredentialError => {
+      try {
+        parseZuliprc(text, "/p/BF-X-zuliprc");
+      } catch (e) {
+        if (e instanceof ZulipCredentialError) return e;
+        throw e;
+      }
+      throw new Error("expected a refusal");
+    };
+    const badKey = "has a space";
+    const key = refusal(`[api]\nemail=a@b\nkey=${badKey}\nsite=https://x.test\n`);
+    expect(key.reason).toBe("invalid");
+    expect(key.message).toBe("/p/BF-X-zuliprc: invalid key");
+    expect(key.message).not.toContain(badKey);
+    expect(refusal(`[api]\nemail=not-an-email\nkey=${FAKE_KEY}\nsite=https://x.test\n`).message).toBe(
+      "/p/BF-X-zuliprc: invalid email",
+    );
+    expect(refusal(`[api]\nemail=@b\nkey=${FAKE_KEY}\nsite=https://x.test\n`).message).toBe("/p/BF-X-zuliprc: invalid email");
+    expect(refusal(`[api]\nemail=a@b\nkey=${FAKE_KEY}\nsite=ftp://x.test\n`).message).toBe("/p/BF-X-zuliprc: invalid site");
+    // every wrong field is named once, and the key is in none of the text
+    const all = refusal(`[api]\nemail=nope\nkey=bad key\nsite=ftp://x.test\n`);
+    expect(all.message).toBe("/p/BF-X-zuliprc: invalid email, key, site");
+    expect(all.message).not.toContain("bad key");
+  });
+
+  it("still accept the loose shapes Zulip allows: a bare-host email, a loopback http site, a key of any length", () => {
+    expect(parseZuliprc(`[api]\nemail=a@b\nkey=k\nsite=http://127.0.0.1:9999/\n`, "x")).toEqual({
+      email: "a@b",
+      key: "k",
+      site: "http://127.0.0.1:9999",
+    });
+    const long = "K".repeat(300);
+    expect(parseZuliprc(`[api]\nemail=a@b\nkey=${long}\nsite=x.test\n`, "x").key).toBe(long);
   });
 
   it.skipIf(!posix)("refuse a file group or other can read", () => {
@@ -91,11 +129,13 @@ describe("the Infisical source", () => {
   const REALM = "https://z.test";
   const vault = (rows: Record<string, string>) => {
     const calls: string[] = [];
-    const read = async (path: string) => {
-      calls.push(path);
+    const locations: ZulipVaultLocation[] = [];
+    const read = async (location: ZulipVaultLocation) => {
+      calls.push(location.secretPath);
+      locations.push(location);
       return new Map(Object.entries(rows));
     };
-    return { read, calls };
+    return { read, calls, locations };
   };
 
   it("is off unless chosen, needs the harness's reader, and never wins over the env's test folder", () => {
@@ -129,6 +169,32 @@ describe("the Infisical source", () => {
     expect(Object.values(process.env)).not.toContain(FAKE_KEY);
   });
 
+  it("refuses a malformed email, key or site from the vault by field name, never by value", async () => {
+    const refusal = async (rows: Record<string, string>): Promise<ZulipCredentialError> => {
+      try {
+        await infisicalCredentialSource(vault(rows).read, { realm: REALM }).load("BF-Plumber");
+      } catch (e) {
+        if (e instanceof ZulipCredentialError) return e;
+        throw e;
+      }
+      throw new Error("expected a refusal");
+    };
+    // a multi-line vault value must not reach the Authorization header
+    const multiline = `${FAKE_KEY}\nX-Injected: 1`;
+    const key = await refusal({ ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test", ZULIP_BF_PLUMBER_API_KEY: multiline });
+    expect(key.reason).toBe("invalid");
+    expect(key.message).toBe("infisical /zulip: invalid key");
+    expect(key.message).not.toContain(FAKE_KEY);
+    const email = await refusal({ ZULIP_BF_PLUMBER_EMAIL: "no-at-sign", ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY });
+    expect(email.message).toBe("infisical /zulip: invalid email");
+    const site = await refusal({
+      ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test",
+      ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY,
+      ZULIP_BF_PLUMBER_SITE: "file:///x",
+    });
+    expect(site.message).toBe("infisical /zulip: invalid site");
+  });
+
   it("names what is missing, never a value, and turns a vault failure into a value-free error", async () => {
     const { read } = vault({ ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test" });
     const missing = await Promise.resolve()
@@ -159,14 +225,86 @@ describe("the Infisical source", () => {
       },
       { ttlMs: 1_000, now: () => now },
     );
-    await expect(cached("/zulip")).rejects.toThrow("down");
+    const at = { secretPath: "/zulip" };
+    await expect(cached(at)).rejects.toThrow("down");
     fail = false;
-    await cached("/zulip");
-    await cached("/zulip");
+    await cached(at);
+    await cached({ secretPath: "/zulip" });
     expect(reads).toBe(2);
     now = 1_500;
-    await cached("/zulip");
+    await cached(at);
     expect(reads).toBe(3);
+  });
+
+  it("reads another project's folder when infisicalProjectId and infisicalEnv are set", async () => {
+    const { read, locations } = vault({ ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test", ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY });
+    const source = credentialSourceFor(
+      {
+        credentialSource: "infisical",
+        infisicalProjectId: "9bf7417a-fbbb-42ca-870c-2b45207233f5",
+        infisicalEnv: "prod",
+        bots: { a: { role: "BF-Plumber" }, b: { role: "BF-Fixer" } },
+      },
+      {},
+      { vault: read, realm: REALM },
+    );
+    expect(source?.describe("BF-Plumber")).toBe("infisical 9bf7417a-fbbb-42ca-870c-2b45207233f5 prod /zulip ZULIP_BF_PLUMBER_*");
+    const creds = await source!.load("BF-Plumber");
+    expect(creds.source).toBe("infisical 9bf7417a-fbbb-42ca-870c-2b45207233f5 prod /zulip");
+    expect(creds.key).toBe(FAKE_KEY);
+    // one read for every bound role, naming the project, the environment and the bound roles' names only
+    expect(locations).toEqual([
+      {
+        secretPath: "/zulip",
+        projectId: "9bf7417a-fbbb-42ca-870c-2b45207233f5",
+        environment: "prod",
+        names: zulipVaultNamesFor(["BF-Fixer", "BF-Plumber"]),
+      },
+    ]);
+    expect(zulipVaultNamesFor(["BF-Plumber", "BF-Plumber", "../bad"])).toEqual([
+      "ZULIP_BF_PLUMBER_API_KEY",
+      "ZULIP_BF_PLUMBER_EMAIL",
+      "ZULIP_BF_PLUMBER_SITE",
+    ]);
+    // empty means the harness's own project and environment
+    const own = credentialSourceFor({ credentialSource: "infisical", infisicalProjectId: "", infisicalEnv: " " }, {}, { vault: read });
+    expect(own?.describe("BF-Plumber")).toBe("infisical /zulip ZULIP_BF_PLUMBER_*");
+    // one set and the other empty: the empty one is the harness's own, and the label says so
+    const projectOnly = credentialSourceFor({ credentialSource: "infisical", infisicalProjectId: "p1", infisicalEnv: " " }, {}, { vault: read });
+    expect(projectOnly?.describe("BF-Plumber")).toBe("infisical p1 own-env /zulip ZULIP_BF_PLUMBER_*");
+    const envOnly = credentialSourceFor({ credentialSource: "infisical", infisicalEnv: "prod" }, {}, { vault: read });
+    expect(envOnly?.describe("BF-Plumber")).toBe("infisical own-project prod /zulip ZULIP_BF_PLUMBER_*");
+    // a missing name says which project and folder it looked in, never a value
+    const { read: emptyRead } = vault({});
+    await expect(
+      infisicalCredentialSource(emptyRead, { projectId: "p1", environment: "prod", realm: REALM }).load("BF-Plumber"),
+    ).rejects.toThrow("Infisical p1 prod /zulip has no ZULIP_BF_PLUMBER_EMAIL or ZULIP_BF_PLUMBER_API_KEY");
+  });
+
+  it("keeps only the asked-for names from a shared folder, and caches each location on its own", async () => {
+    const reads: ZulipVaultLocation[] = [];
+    const cached = cachedVaultReader(async (location) => {
+      reads.push(location);
+      // a shared folder: another seat's key sits next to the BF bot's
+      return new Map([
+        ["ZULIP_BF_PLUMBER_API_KEY", FAKE_KEY],
+        ["ZULIP_CLAUDE_API_KEY", "another-seat-key-not-real"],
+      ]);
+    });
+    const names = ["ZULIP_BF_PLUMBER_API_KEY", "ZULIP_BF_PLUMBER_EMAIL"];
+    const kept = await cached({ secretPath: "/zulip", projectId: "p1", environment: "prod", names });
+    expect([...kept.keys()]).toEqual(["ZULIP_BF_PLUMBER_API_KEY"]);
+    expect([...kept.values()]).not.toContain("another-seat-key-not-real");
+    // same location, names in another order: served from the cache
+    await cached({ secretPath: "/zulip", projectId: "p1", environment: "prod", names: [...names].reverse() });
+    expect(reads).toHaveLength(1);
+    // another project, another environment, or another set of names is another read
+    await cached({ secretPath: "/zulip", projectId: "p2", environment: "prod", names });
+    await cached({ secretPath: "/zulip", projectId: "p1", environment: "dev", names });
+    await cached({ secretPath: "/zulip", projectId: "p1", environment: "prod", names: ["ZULIP_BF_FIXER_API_KEY"] });
+    expect(reads).toHaveLength(4);
+    // with no names, the whole folder comes back
+    expect((await cached({ secretPath: "/zulip" })).size).toBe(2);
   });
 });
 

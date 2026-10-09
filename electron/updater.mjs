@@ -352,6 +352,13 @@ export function startUpdater(mainWindow) {
     // gate a permanently broken feed retries every hour forever.
     if (Date.now() < autoCheckBackoffUntilMs) return false;
     const record = readAutoUpdateConfig(configPath());
+    // The harness owns the toggle and writes it to this same file, whoever
+    // flipped it: this window's checkbox goes through the update:set-enabled
+    // handler as well, but a paired phone changes it through the harness
+    // alone, and with the window closed nothing would tell this process.
+    // Reading it back every tick keeps the cached copy from outliving the
+    // stored one.  An unreadable file reads as off, as it does at launch.
+    autoUpdateEnabled = record.enabled === true;
     return shouldRunAutomaticCheck({
       enabled: autoUpdateEnabled,
       lastCheckMs: record.lastCheckMs,

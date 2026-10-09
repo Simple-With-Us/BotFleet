@@ -22,6 +22,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
 import { splitChatPrompt } from "./prompt-split.ts";
 import { toolFields } from "../tool-fields.ts";
@@ -1043,13 +1044,18 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         return text.trim() ? text : reasoning;
       },
       // Auto-review on this same account: the utility model, no `tools`, the
-      // prompt in the request body, cancelled by the reviewer's deadline.
+      // brief as the system message and the action as the user message,
+      // cancelled by the reviewer's deadline.
       // Only the answer text counts as a verdict, never the reasoning.
-      reviewPermission: async (prompt: string, signal?: AbortSignal) => {
-        const { text } = await complete([{ role: "user", content: prompt }], UTILITY_MODEL, {
-          stream: false,
-          signal,
-        });
+      reviewPermission: async (prompt: ReviewPrompt, signal?: AbortSignal) => {
+        const { text } = await complete(
+          [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.data },
+          ],
+          UTILITY_MODEL,
+          { stream: false, signal },
+        );
         return text;
       },
       dispose: async () => {

@@ -1096,6 +1096,23 @@ describe("ACP turns (fake CLI)", () => {
     expect(done).toMatchObject({ ok: true });
   });
 
+  it("names the tool call an ask is about, the id its item.started carried", async () => {
+    process.env.FAKE_ACP_PERMISSION_CALL_ID = "tc-ask";
+    try {
+      await create(GrokAgentDriver, "permission");
+      await instance.adapter.sendTurn({ threadId: "t-perm-id", text: "go" });
+      const opened = await recorder.until((e) => e.type === "request.opened");
+      const started = recorder.events.find((e) => e.type === "item.started" && e.itemId === "tc-ask");
+      expect(started).toBeDefined();
+      // the auto-review step watch matches the two by this id
+      expect(opened).toHaveProperty("itemId", "tc-ask");
+      await instance.adapter.respondToRequest("t-perm-id", (opened as any).requestId, { behavior: "deny" });
+      await recorder.until((e) => e.type === "turn.completed");
+    } finally {
+      delete process.env.FAKE_ACP_PERMISSION_CALL_ID;
+    }
+  });
+
   it("leaves an explicitly remote MCP ask unscoped in a mixed-computer turn", async () => {
     await create(GrokAgentDriver, "remote-computer-permission");
     await instance.adapter.sendTurn({

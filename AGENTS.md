@@ -97,7 +97,7 @@ Two spaces between sentences in every paragraph a human reads: product UI, App S
 
 ## Secret Handoff (owner -> agent)
 
-When the owner gives you a secret, read it from `chmod 600` files under `/Users/jay/.secrets/` and NEVER print or echo it.  Never grep `KEY=value` lines (names only: `grep -oE '^[A-Z][A-Z0-9_]*' file`).  Never read `~/.botfleet/config.json` values, plist environment blocks, or `.env*` contents into a transcript.  The product server must not read fleet handoff files; runtime secrets come from the app's own config or Infisical.
+When the owner gives you a secret, read it from `chmod 600` files under `/Users/jay/.secrets/` and NEVER print or echo it.  Never grep `KEY=value` lines (names only: `grep -oE '^[A-Z][A-Z0-9_]*' file`).  Never read `~/.botfleet/config.json` values, plist environment blocks, or `.env*` contents into a transcript.  The product server must not read fleet handoff files; runtime secrets come from the app's own config or Infisical.  A fleet secret that already lives in another Infisical project is read there with the harness's own machine identity, never copied into BotFleet's project:  the BF bots' Zulip keys are read from AI Fleet Coordinator `prod` `/zulip` (`zulip.infisicalProjectId`, `docs/zulip.md`).
 
 ## Infisical Sole Source Of Truth (owner directive, 2026-10-03)
 
