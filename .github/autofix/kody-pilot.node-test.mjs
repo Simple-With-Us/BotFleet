@@ -177,7 +177,7 @@ test('malformed branch refs fail validation before string-method use', () => {
     assert.throws(()=>validatePull(p,input),/Malformed source branch ref/);}
 });
 test('credential, payment, permission and quota refusals stop upstream retries without key disclosure', async () => {
-  const sampleKey = 'sk-live-abcdefgh1234567890wxyz';
+  const sampleKey = 'fake-key';
   for(const status of [401,402,403,429]) {
     let calls=0;const events=[];
     const proxy=await startProxy(sampleKey,async()=>{calls++;return new Response('sensitive upstream body',{status});},event=>events.push(event));
