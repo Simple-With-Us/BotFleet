@@ -32,6 +32,9 @@ export interface UpdateRunning {
   runId: string;
   startedAt: string;
   step: string;
+  /** What the step is waiting on ("Waiting for 3 bots to finish"), when the
+   * updater says.  Absent from an older harness, and most of the time. */
+  detail?: string;
   progress?: number;
   logTail: string[];
 }
@@ -65,6 +68,9 @@ export interface UpdateStatus {
      * harness that has never heard of it, so every read of this falls back
      * to the harness's own sentence at that index. */
     codes?: string[];
+    /** Bots are working.  Not a blocker: the update gives them a short grace,
+     * then pauses and resumes them.  Absent from an older harness. */
+    busy?: boolean;
   };
 }
 
@@ -207,7 +213,7 @@ export function runningLabel(running: UpdateRunning): string {
   const percent = typeof running.progress === "number"
     ? ` (${Math.round(Math.min(1, Math.max(0, running.progress)) * 100)}%)`
     : "";
-  return `${running.step}${percent}…`;
+  return `${running.detail ?? running.step}${percent}…`;
 }
 
 /** A short local date and time for a finished run, or null when there is
@@ -332,16 +338,17 @@ export function installBlockedReason(status: UpdateStatus | null): string | null
  * looks like.
  */
 /**
- * Whether the selected blocker's reason is the transient busy one — the only
- * refusal `force` can talk past.  Reads the same first code
- * `installBlockedReason` renders, so a structural blocker that merely shares
- * the list with "busy" (an outdated updater on a working Mac, say) is never
- * misclassified as forceable and the real guidance is never swapped for
- * pause-and-resume copy.
+ * Whether installing now would pause busy bots.  Busy is not a blocker any
+ * more: the update holds new work, gives the bots a short grace to finish,
+ * then pauses what is left and resumes it after the restart.  True only when
+ * Install is actually available, so a structural blocker always wins.
  */
-export function installBlockedBusy(status: UpdateStatus | null): boolean {
-  return installBlockedReason(status) !== null && status?.capabilities.codes?.[0] === "busy";
+export function installPausesWork(status: UpdateStatus | null): boolean {
+  return Boolean(status?.available && !status.running && status.capabilities.canRun && status.capabilities.busy);
 }
+
+/** What a surface says when installing would pause busy bots. */
+export const PAUSES_WORK_COPY = "Busy bots get a minute to finish, then pause and resume after the update";
 
 export function installBlockedReasonDetail(status: UpdateStatus | null): string | null {
   if (!status?.available || status.running || status.capabilities.canRun) return null;
@@ -550,7 +557,9 @@ export function useUpdateControl(pollMs = 5_000): UpdateControlView {
     setBusy("install");
     setError(null);
     try {
-      const result = await requestUpdateRun(options ?? { force: true });
+      // No `force`: the harness's own default already never waits on busy
+      // bots for long, and it gives them a grace before pausing them.
+      const result = await requestUpdateRun(options ?? {});
       // The refusal's own status is the one that explains it — take it even
       // when the answer is no.
       if (result.status) setStatus(result.status);

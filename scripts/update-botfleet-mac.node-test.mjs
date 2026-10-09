@@ -1429,7 +1429,7 @@ test("quiesce confirms a harness bootout with launchctl print and boots out a jo
 test("quiesce re-resolves current holders, bundle processes and port owners before signalling", async () => {
   const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
   const quiesce = source.indexOf("quiesce: async (previous) => {");
-  const assertQuiesced = source.indexOf("assertQuiesced: async () => {", quiesce);
+  const assertQuiesced = source.indexOf("assertQuiesced: async (previous) => {", quiesce);
   assert.ok(quiesce >= 0 && assertQuiesced > quiesce);
   const body = source.slice(quiesce, assertQuiesced);
   assert.match(body, /await bootOutHarnessForQuiesce\(config, previous\)/);
