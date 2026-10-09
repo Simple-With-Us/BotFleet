@@ -84,13 +84,15 @@ const TRANSPORT_FAILURE =
  * timeout kills the child and reports `killed`/`signal` with a "Command
  * failed:" message that never says "timed out", so that case reads the error
  * fields rather than the text. */
-export function isTransientProbeFailure(error: unknown): boolean {
-  if (typeof error === "string") return TRANSPORT_FAILURE.test(error);
-  if (!(error instanceof Error)) return false;
-  const detail = error as Error & { killed?: unknown; code?: unknown };
-  if (detail.killed === true || detail.code === "ETIMEDOUT") return true;
+export function isTransientProbeFailure(error: ExecFailure): boolean {
+  if (error.killed === true || error.code === "ETIMEDOUT") return true;
   return TRANSPORT_FAILURE.test(error.message);
 }
+
+/** An Error as a runner rejects with it: `execFile` adds `killed` and `code`
+ * to the Error it throws, and the VPS runner adds nothing.  Both are optional,
+ * so any Error is one. */
+export type ExecFailure = Error & { killed?: boolean; code?: string | number | null };
 
 export interface DesktopProbeVerdict {
   /** A real fault to show after "failed to start", or null. */
@@ -101,10 +103,9 @@ export interface DesktopProbeVerdict {
 
 /** Decide what a failed desktop probe means.  `supervisorLog` is the tail of
  * the Driver's stderr log, or null when it could not be read. */
-export function judgeDesktopProbeFailure(error: unknown, supervisorLog: string | null): DesktopProbeVerdict {
+export function judgeDesktopProbeFailure(error: ExecFailure, supervisorLog: string | null): DesktopProbeVerdict {
   const fromLog = supervisorLog ? realDriverProblems(supervisorLog) : "";
   if (fromLog) return { desktopError: fromLog, unreachable: false };
   if (isTransientProbeFailure(error)) return { desktopError: null, unreachable: true };
-  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  return { desktopError: realDriverProblems(message) || null, unreachable: false };
+  return { desktopError: realDriverProblems(error.message) || null, unreachable: false };
 }

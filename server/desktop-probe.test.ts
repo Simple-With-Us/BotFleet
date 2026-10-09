@@ -109,8 +109,7 @@ describe("isTransientProbeFailure", () => {
     expect(isTransientProbeFailure(new Error("CUA health report is failed"))).toBe(false);
     // From `cua-driver status --socket` this means the daemon is down.
     expect(isTransientProbeFailure(new Error("connect: Connection refused"))).toBe(false);
-    expect(isTransientProbeFailure("something else")).toBe(false);
-    expect(isTransientProbeFailure(undefined)).toBe(false);
+    expect(isTransientProbeFailure(new Error("something else"))).toBe(false);
   });
 });
 

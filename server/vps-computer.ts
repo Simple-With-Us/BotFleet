@@ -819,7 +819,7 @@ async function computeVpsComputerStatus(
           // The log may not exist during the first seconds of container boot,
           // or the link that failed the probe may fail this read too.
         }
-        const verdict = judgeDesktopProbeFailure(error, supervisorLog);
+        const verdict = judgeDesktopProbeFailure(error instanceof Error ? error : new Error(String(error)), supervisorLog);
         status.desktop_error = verdict.desktopError;
         status.desktopUnreachable = verdict.unreachable;
       }

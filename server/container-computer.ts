@@ -1053,7 +1053,7 @@ export async function containerComputerStatus(
       } catch {
         // The log may not exist during the first seconds of container boot.
       }
-      const verdict = judgeDesktopProbeFailure(error, supervisorLog);
+      const verdict = judgeDesktopProbeFailure(error instanceof Error ? error : new Error(String(error)), supervisorLog);
       status.desktop_error = verdict.desktopError;
       status.desktopUnreachable = verdict.unreachable;
     }
