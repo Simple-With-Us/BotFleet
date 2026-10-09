@@ -24,6 +24,8 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
+import { z } from "zod";
+
 export interface ZulipCredentials {
   email: string;
   /** The API key.  Never logged, never put in env. */
@@ -77,6 +79,49 @@ function stripQuotes(value: string): string {
   return v;
 }
 
+/** A site given without a scheme means https; a trailing slash is noise. */
+function normalizeSite(site: string): string {
+  const trimmed = site.trim().replace(/\/+$/, "");
+  return trimmed.includes("://") ? trimmed : `https://${trimmed}`;
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === "https:" || protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/** The shape of one bot's credential fields, whichever source produced them
+ *  (a zuliprc file or a vault folder: both are outside the type system, so
+ *  both pass through here before the values are used).  Deliberately loose
+ *  where Zulip is: the email needs an `@` with text on both sides (no TLD
+ *  rule, a self-hosted realm may use a bare host), the key is printable ASCII
+ *  with no whitespace (a CR or LF inside a vault value would otherwise break
+ *  the Authorization header), and its length is not fixed.  Whether the site
+ *  is https, and whether it is the configured realm, stay with `resolveRealm`
+ *  and `verifyCredentialRealm`. */
+const zulipCredentialFieldsSchema = z.object({
+  email: z.string().max(320).regex(/^[^\s@]+@[^\s@]+$/),
+  key: z.string().regex(/^[\x21-\x7e]+$/),
+  site: z.string().max(2048).refine(isHttpUrl),
+});
+
+/** Validate the three fields.  A failure names the fields that are wrong and
+ *  the source, never a value and never zod's own message: an issue text could
+ *  quote the input, and the key is one of the inputs. */
+function checkCredentialFields(
+  fields: { email: string; key: string; site: string },
+  source: string,
+): { email: string; key: string; site: string } {
+  const parsed = zulipCredentialFieldsSchema.safeParse(fields);
+  if (parsed.success) return parsed.data;
+  const names = [...new Set(parsed.error.issues.map((issue) => String(issue.path[0] ?? "credentials")))];
+  throw new ZulipCredentialError(`${source}: invalid ${names.join(", ")}`, "invalid");
+}
+
 /** Parse a zuliprc's `[api]` section.  Comments (`#`, `;`) and other sections
  *  are ignored.  Throws a message that names the path only. */
 export function parseZuliprc(text: string, path: string): Omit<ZulipCredentials, "source"> {
@@ -100,9 +145,7 @@ export function parseZuliprc(text: string, path: string): Omit<ZulipCredentials,
   if (missing.length) {
     throw new ZulipCredentialError(`${path}: the [api] section is missing ${missing.join(", ")}`, "invalid");
   }
-  let site = values.site!.replace(/\/+$/, "");
-  if (!site.includes("://")) site = `https://${site}`;
-  return { email: values.email!, key: values.key!, site };
+  return checkCredentialFields({ email: values.email!, key: values.key!, site: normalizeSite(values.site!) }, path);
 }
 
 /** Read one zuliprc file.  Refuses anything that is not a regular file and
@@ -186,8 +229,9 @@ export function infisicalCredentialSource(
       const key = values.get(names.key)?.trim();
       const missing = [!email && names.email, !key && names.key].filter(Boolean);
       if (missing.length) throw new ZulipCredentialError(`Infisical ${path} has no ${missing.join(" or ")}`, "missing");
-      const site = (values.get(names.site)?.trim() || opts.realm).replace(/\/+$/, "");
-      return { email: email!, key: key!, site: site.includes("://") ? site : `https://${site}`, source: `infisical ${path}` };
+      const source = `infisical ${path}`;
+      const site = normalizeSite(values.get(names.site)?.trim() || opts.realm);
+      return { ...checkCredentialFields({ email: email!, key: key!, site }, source), source };
     },
   };
 }

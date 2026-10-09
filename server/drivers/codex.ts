@@ -291,7 +291,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const computerMounts = turnComputerMounts(turn.integrations);
       const hostPrefix = hostToolPrefix(computerMounts);
       const controlsHost = hostPrefix !== null;
-      const brokered = controlsHost && config.fullAuto;
+      // A turn the harness holds for auto-review (`holdForReview`) is
+      // brokered for the same reason: the reviewer can only hold an ask the
+      // app-server actually sends.  It runs inside workspace-write on-request
+      // and resumes only a thread started brokered, exactly like a host turn.
+      const brokered = (controlsHost || turn.holdForReview === true) && config.fullAuto;
       const turnFullAuto = config.fullAuto && !brokered;
       // a retry relaunches the whole app-server; the backoff is scaled down in
       // tests so a fake's transient failures don't stall real seconds
@@ -792,8 +796,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // otherwise starts a fresh one.  The cost is one lost codex-side
         // continuation per instance restart, for full-auto bots that also
         // hold this computer; the alternative is an unbrokered host turn.
+        //
+        // The same rule runs the other way for an UNATTENDED full-auto turn.
+        // A thread started brokered (a host turn, or a turn held for
+        // auto-review) keeps asking when resumed, and an unattended turn's
+        // ask waits on a card nobody is there to answer.  Such a turn starts
+        // fresh instead, so a webhook on a full-auto bot runs the way its
+        // instance is configured.
+        const unattendedFullAuto = turnFullAuto && turn.unattended === true;
         const cursor =
           (brokered && !(resumeCursor && brokeredThreads.has(resumeCursor))) ||
+          (unattendedFullAuto && resumeCursor !== null && brokeredThreads.has(resumeCursor)) ||
           (resumeCursor !== null && modelRejectedThreads.has(resumeCursor))
             ? null
             : resumeCursor;
@@ -1038,6 +1051,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // the decision doc records for Codex.
         backgroundJobs: "emulated",
         helpers: "none",
+        // on-request approvals arrive as request.opened; a full-auto
+        // instance (approvalPolicy "never") asks nothing unless held
+        reviewHook: config.fullAuto ? "after" : "before",
+        asksWhenHeld: true,
       },
       sendTurn,
       interruptTurn: async (threadId) => active.get(threadId)?.stop(),

@@ -41,6 +41,12 @@ Effort logs: live board `/Users/jay/apps/BOTFLEET-EFFORT-LOG.md` (update first),
 
 Search the `fleet-agents` corpus before re-deriving a lesson (`recall "query"` on the Mac, or the `fleet-recall` MCP; cloud seats use `https://agents.jays.services/mcp`), and contribute a one-paragraph lesson after you learn one.  A hit is a lead, not a verdict.  Canonical: `AGENT-SYNC.md` § Fleet recall.
 
+## Kody Review Rules (Fleet Policy)
+
+Fleet-wide Kody review rules live in **`Simple-With-Us/Kodus-Config`**, not in this repo.  Edit or add rules under `.kody-rules/review/` there (and under `BotFleet/.kody-rules/review/` for BotFleet-only rules).  Read that repo's `README.md` and `AGENTS.md` before changing rules — especially the no-allowlist secret-scan policy.
+
+This repository keeps only **`kodus-config.yml`** at the root: per-repo review toggles for BotFleet pull requests (for example suggestion filters and request-changes behavior).  Do not recreate a `.kody-rules/` tree here; it was a stale duplicate of the centralized config.
+
 ## Prior Messages Stay In Scope (owner preference — ALL agents, ALL platforms)
 
 **Never assume a new user message means prior questions or tasks are dropped.**  Treat the full conversation as still active unless the owner explicitly contradicts, cancels, or redirects.
