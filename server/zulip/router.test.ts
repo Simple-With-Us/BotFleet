@@ -112,8 +112,10 @@ describe("followed topics", () => {
   it("wakes on any new message in a followed topic, mention or not", () => {
     expect(fverdict(watch({}))).toEqual({ wake: "peer", via: "followed" });
     expect(fverdict(watch({ sender_id: 9, client: "website" }))).toEqual({ wake: "owner", via: "followed" });
-    // the topic is matched the way Zulip matches it: case and the resolved mark folded
-    expect(fverdict(watch({ subject: "✔ bf WATCH" }))).toEqual({ wake: "peer", via: "followed" });
+    // the topic is matched the way Zulip matches it: case folded
+    expect(fverdict(watch({ subject: "bf WATCH" }))).toEqual({ wake: "peer", via: "followed" });
+    // a resolved topic is another name to Zulip; its follow arrives as its own event
+    expect(fverdict(watch({ subject: "✔ BF watch" }))).toEqual({ wake: null, reason: "not_a_mention" });
     // a mention there is still a mention
     expect(fverdict(watch({ content: "@**BF-Plumber** look", flags: ["mentioned"] }))).toEqual({ wake: "peer", via: "mention" });
   });

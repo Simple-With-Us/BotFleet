@@ -69,9 +69,12 @@ export function sameOrigin(a: ZulipOrigin, b: ZulipOrigin): boolean {
 }
 
 /** The key for one followed topic: the channel's id and the topic, case
- *  and resolved mark folded the way Zulip folds topic names. */
+ *  folded the way Zulip folds topic names.  The resolved mark is NOT
+ *  folded: "✔ x" is another topic name to Zulip, and a follow that moves
+ *  with a resolve arrives as its own user_topic events (an add for the new
+ *  name and a removal of the old), which must not cancel each other. */
 export function followKey(streamId: number, topic: string): string {
-  return `${streamId}\u0000${stripResolved(topic.trim()).toLowerCase()}`;
+  return `${streamId}\u0000${topic.trim().toLowerCase()}`;
 }
 
 /** Why a topic cannot be posted to, or null.  `role` and `fullName` are the
