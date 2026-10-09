@@ -49,5 +49,9 @@
     { "name": "no default voice", "defaultVoice": "", "voices": null, "expected": "No default voice" },
     { "name": "a whitespace-only default is no default", "defaultVoice": "   ", "voices": null, "expected": "No default voice" },
     { "name": "a missing default is no default", "defaultVoice": null, "voices": null, "expected": "No default voice" }
-  ]
+  ],
+  "strings": {
+    "noDefaultVoice": "No default voice",
+    "personalVoiceNotDefault": "Personal Voices stay on the device that made them, so they cannot be the default."
+  }
 }

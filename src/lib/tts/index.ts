@@ -1,5 +1,6 @@
 import { spokenReply, writtenReply, type VoiceScriptKind } from "../../../shared/voice-summary";
 import { isPersonalVoiceId, type SpeechDevice } from "../../../shared/bot-voice";
+import { pronouncer, type Pronunciation } from "../../../shared/pronunciations";
 import { estimatedClips } from "../../../shared/karaoke-align";
 // The harness's own projection rules (pure, no Node APIs), so a reply this
 // Mac speaks without the harness drops code, links, and markdown the same way,
@@ -131,19 +132,29 @@ function harnessUnavailable(error: unknown): boolean {
 /** Pack sentences (or paragraphs) into helper-call-sized groups, in order.
  * A single part longer than `max` is its own group; the helper chunks it. */
 export function groupForPersonalVoice(parts: string[], max = PERSONAL_VOICE_GROUP_CHARS): string[] {
-  const groups: string[] = [];
-  let current = "";
-  for (const raw of parts) {
+  return groupIndexesForPersonalVoice(parts, max).map((group) => group.map((i) => parts[i].trim()).join(" "));
+}
+
+/** groupForPersonalVoice as the indexes of the parts in each group, so a
+ * parallel list (the captions) can be grouped the same way.  Blank parts
+ * are in no group. */
+export function groupIndexesForPersonalVoice(parts: string[], max = PERSONAL_VOICE_GROUP_CHARS): number[][] {
+  const groups: number[][] = [];
+  let current: number[] = [];
+  let length = 0;
+  parts.forEach((raw, i) => {
     const part = raw.trim();
-    if (!part) continue;
-    if (current && current.length + 1 + part.length > max) {
+    if (!part) return;
+    if (current.length && length + 1 + part.length > max) {
       groups.push(current);
-      current = part;
+      current = [i];
+      length = part.length;
     } else {
-      current = current ? `${current} ${part}` : part;
+      length = current.length ? length + 1 + part.length : part.length;
+      current.push(i);
     }
-  }
-  if (current) groups.push(current);
+  });
+  if (current.length) groups.push(current);
   return groups;
 }
 
@@ -212,9 +223,19 @@ export class Speaker {
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   private feed: ClipsKaraoke | LiveKaraoke | null = null;
   private feedWatchers = new Set<(feed: KaraokeFeed | null) => void>();
+  /** The workspace pronunciation list (config tts.pronunciations), for the
+   * text this Mac hands its own Personal Voice without the harness. */
+  private respell: (text: string) => string = (text) => text;
+  private pronunciationList: readonly Pronunciation[] = [];
 
   constructor(options: SpeakerOptions = {}) {
     this.sleep = options.sleep ?? abortableSleep;
+  }
+
+  /** The store keeps this current with the config. */
+  setPronunciations(list: readonly Pronunciation[] | null | undefined): void {
+    this.respell = list?.length ? pronouncer(list) : (text) => text;
+    this.pronunciationList = list ?? [];
   }
 
   subscribe(fn: (s: SpeechSnapshot) => void): () => void {
@@ -305,8 +326,10 @@ export class Speaker {
         await this.speakMessage(text, opts, live, controller.signal);
       } else if (isPersonalVoiceId(opts.voiceId)) {
         // A sample or a call prompt: no saved reply to project, so the
-        // text is spoken as given.
-        await this.speakOnDevice(paragraphs(text), opts.voiceId ?? "", opts, live);
+        // text is spoken as given, with the pronunciation list the harness
+        // would apply to a hosted voice.  The caption keeps the words.
+        const parts = paragraphs(text);
+        await this.speakOnDevice(parts.map(this.respell), opts.voiceId ?? "", opts, live, undefined, null, parts);
       } else {
         await this.speakText(text, opts, live, controller.signal);
       }
@@ -351,11 +374,16 @@ export class Speaker {
         // so a distilled bot reads the reply's own voice half (or the
         // reply), and "off" reads the written reply.  Karaoke follows
         // either; the spans guide it when they index the bubble's text.
+        // The pronunciation list goes in as the harness would put it, with
+        // the spans kept on the original terms; captions keep the words.
         const written = (opts.scriptKind ?? "written") === "written";
-        const { utterances, script } = localKaraokeScript(written ? writtenReply(text) : spokenReply(text));
+        const { utterances, captions, script } = localKaraokeScript(
+          written ? writtenReply(text) : spokenReply(text),
+          this.pronunciationList,
+        );
         if (!utterances.length) throw error;
         if (script.spokenText.length > MAX_LOCAL_SPEECH_CHARS) throw new Error(REPLY_TOO_LONG);
-        await this.speakOnDevice(utterances, opts.voiceId ?? "", opts, live, script.spokenText, script);
+        await this.speakOnDevice(utterances, opts.voiceId ?? "", opts, live, captions.join(" "), script, captions);
         return;
       }
       throw error;
@@ -367,7 +395,10 @@ export class Speaker {
       // renderer's copy of the bot, which can be a moment stale.
       const voice = body.voice || opts.voiceId || "";
       const parts = body.utterances?.length ? body.utterances : paragraphs(body.voiceText ?? spokenReply(text));
-      await this.speakOnDevice(parts, voice, opts, live, body.voiceText, script);
+      // The harness respelled what the device says; a caption shows the
+      // words as written when it sent them, one for each utterance.
+      const captions = body.captions?.length === parts.length ? body.captions : undefined;
+      await this.speakOnDevice(parts, voice, opts, live, body.voiceText, script, captions);
       return;
     }
     await this.playClips(endpoint, body, opts, live, signal, script);
@@ -477,6 +508,9 @@ export class Speaker {
     live: Live,
     voiceText?: string,
     script: KaraokeScript | null = null,
+    /** `parts` as written, one for each, for the caption; absent when the
+     * parts are the words as written already. */
+    captions?: string[],
   ): Promise<void> {
     const bridge = personalVoiceBridge();
     if (!bridge) throw new Error(PERSONAL_VOICE_UNSUPPORTED);
@@ -485,14 +519,16 @@ export class Speaker {
     // Each group is a run of whole utterances joined with single spaces, so
     // it sits verbatim in the script's spoken text.
     let cursor = 0;
-    for (const group of groupForPersonalVoice(parts)) {
+    for (const indexes of groupIndexesForPersonalVoice(parts)) {
       if (!live()) return;
+      const group = indexes.map((i) => parts[i].trim()).join(" ");
+      const caption = captions ? indexes.map((i) => (captions[i] ?? "").trim()).filter(Boolean).join(" ") : group;
       this.set({
         status: "speaking",
         botId: opts.botId,
         messageId: opts.messageId,
-        caption: group,
-        voiceText: voiceText ?? group,
+        caption,
+        voiceText: voiceText ?? caption,
       });
       const base = feed ? feed.script.spokenText.indexOf(group, cursor) : -1;
       if (base >= 0) cursor = base + group.length;

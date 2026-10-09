@@ -36,9 +36,21 @@ final class BotVoiceTests: XCTestCase {
             var expected: String
         }
 
+        struct Strings: Decodable {
+            var noDefaultVoice: String
+            var personalVoiceNotDefault: String
+        }
+
         var voiceForDevice: [VoiceCase]
         var isPersonalVoiceId: [PersonalCase]
         var defaultVoiceOptionLabel: [LabelCase]
+        var strings: Strings
+    }
+
+    func testTheSharedCopyMatchesTheFixture() throws {
+        let strings = try fixture().strings
+        XCTAssertEqual(BotVoice.noDefaultVoice, strings.noDefaultVoice)
+        XCTAssertEqual(BotVoice.personalVoiceNotDefault, strings.personalVoiceNotDefault)
     }
 
     private func fixture() throws -> Fixture {

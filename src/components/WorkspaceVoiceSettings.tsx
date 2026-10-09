@@ -151,6 +151,9 @@ const sameList = (a: readonly Pronunciation[], b: readonly Pronunciation[]): boo
 const filled = (rows: readonly Row[]): Array<{ term: string; say: string }> =>
   rows.filter((row) => row.term.trim() || row.say.trim()).map((row) => ({ term: row.term, say: row.say }));
 
+/** One field filled and the other blank: a row still being written. */
+const halfDone = (row: Row): boolean => Boolean(row.term.trim()) !== Boolean(row.say.trim());
+
 export function PronunciationSettings({
   tts,
   onConfig,
@@ -169,10 +172,26 @@ export function PronunciationSettings({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /** Rows focus has left since they were added or edited; only these are
+   * told they are missing a field. */
+  const [left, setLeft] = useState<ReadonlySet<number>>(() => new Set());
+  const termInputs = useRef(new Map<number, HTMLInputElement>());
+  const addButton = useRef<HTMLButtonElement>(null);
+  /** Where focus goes once the rows have rendered: a row's Term field, or
+   * the Add Term button (null). */
+  const focusNext = useRef<number | null | undefined>(undefined);
+
   const check = useMemo(() => checkPronunciations(filled(rows)), [rows]);
   const dirty = !check.ok || !sameList(check.list, saved ?? []);
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
+
+  useEffect(() => {
+    const target = focusNext.current;
+    if (target === undefined) return;
+    focusNext.current = undefined;
+    (target === null ? addButton.current : termInputs.current.get(target))?.focus();
+  }, [rows]);
 
   // Adopt a list saved elsewhere (the iPhone, another window) unless this
   // draft has edits of its own, which a save would then replace.
@@ -195,8 +214,20 @@ export function PronunciationSettings({
 
   const update = (key: number, field: "term" | "say", value: string) =>
     setRows((current) => current.map((row) => (row.key === key ? { ...row, [field]: value } : row)));
-  const remove = (key: number) => setRows((current) => current.filter((row) => row.key !== key));
-  const add = () => setRows((current) => [...current, { key: nextKey.current++, term: "", say: "" }]);
+  // Removing the focused row's button would drop focus to the page, so it
+  // moves to the next row's Term field, the one before, or Add Term.
+  const remove = (key: number) => {
+    const at = rows.findIndex((row) => row.key === key);
+    focusNext.current = (rows[at + 1] ?? rows[at - 1])?.key ?? null;
+    setRows((current) => current.filter((row) => row.key !== key));
+  };
+  // A new row is typed into straight away.
+  const add = () => {
+    const key = nextKey.current++;
+    focusNext.current = key;
+    setRows((current) => [...current, { key, term: "", say: "" }]);
+  };
+  const leaveRow = (key: number) => setLeft((current) => (current.has(key) ? current : new Set(current).add(key)));
 
   const save = () => {
     if (!check.ok) return;
@@ -214,9 +245,15 @@ export function PronunciationSettings({
   const voiceId = tts.voice ?? "";
   const canTry = Boolean(voiceId) && (isPersonalVoiceId(voiceId) || tts.configured);
   const full = rows.length >= PRONUNCIATIONS_MAX;
-  // A row still being typed is not an error yet: only say so once the
-  // person has something to save.
-  const problem = dirty && !check.ok ? check.error : null;
+  // What is wrong with the list itself (a duplicate, a say containing a
+  // term, a length) is said at once.  A row with one field filled is still
+  // being written: it only says what it is missing once focus has left it,
+  // and politely, so typing a term never sets off an alert.
+  const listCheck = checkPronunciations(filled(rows.filter((row) => !halfDone(row))));
+  const problem = listCheck.ok ? null : listCheck.error;
+  const unfinished = rows.find((row) => halfDone(row) && left.has(row.key));
+  const unfinishedCheck = unfinished ? checkPronunciations([{ term: unfinished.term, say: unfinished.say }]) : null;
+  const hint = unfinishedCheck && !unfinishedCheck.ok ? unfinishedCheck.error : null;
 
   return (
     <div className="mt-4 border-t border-hairline/40 pt-4" data-testid="pronunciations">
@@ -230,8 +267,19 @@ export function PronunciationSettings({
           {rows.map((row, index) => {
             const label = row.term.trim() || `term ${index + 1}`;
             return (
-              <div key={row.key} className="contents">
+              <div
+                key={row.key}
+                className="contents"
+                onBlur={(e) => {
+                  // Focus moving between the row's own fields is not leaving it.
+                  if (!(e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget))) leaveRow(row.key);
+                }}
+              >
                 <input
+                  ref={(node) => {
+                    if (node) termInputs.current.set(row.key, node);
+                    else termInputs.current.delete(row.key);
+                  }}
                   type="text"
                   value={row.term}
                   onChange={(e) => update(row.key, "term", e.target.value)}
@@ -283,9 +331,11 @@ export function PronunciationSettings({
         <p className="mt-3 text-[12px] text-ink-secondary">The list is empty, so every term is read as written.</p>
       )}
       {problem && <div role="alert" className="mt-2 text-[12px] text-danger">{problem}</div>}
+      <div role="status" aria-live="polite" className={cn("text-[12px] text-danger", hint && "mt-2")}>{hint}</div>
       {error && <div role="alert" className="mt-2 text-[12px] text-danger">{error}</div>}
       <div className="mt-3 flex items-center gap-2">
         <button
+          ref={addButton}
           type="button"
           onClick={add}
           disabled={full}

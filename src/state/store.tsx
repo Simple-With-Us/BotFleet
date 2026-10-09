@@ -2388,6 +2388,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, rawDispatch] = useReducer(reducer, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
+  // The speaker applies the workspace pronunciation list to what this Mac's
+  // Personal Voice says without the harness (src/lib/tts/index.ts).
+  const pronunciations = state.config?.tts?.pronunciations;
+  useEffect(() => {
+    speaker.setPronunciations(pronunciations);
+  }, [pronunciations]);
   // per-frame stream-delta batching (see the "runtime" SSE case); stream
   // state is intentionally OUTSIDE the reducer so token frames re-render
   // only StreamContext consumers

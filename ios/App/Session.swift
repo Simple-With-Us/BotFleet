@@ -1964,10 +1964,16 @@ final class Session: ObservableObject {
         avatarCache.removeAllObjects()
     }
 
-    func voiceOptions() async -> [Voice] {
+    /// The computer's voice list.  `quietly` leaves a failure unreported:
+    /// Settings asks every time it opens, often while the computer is asleep
+    /// or being fixed, and names the default voice from the config anyway.
+    func voiceOptions(quietly: Bool = false) async -> [Voice] {
         guard let client else { return previewVoiceOptions ?? [] }
         do { return try await client.voices() }
-        catch { recordActionError(error); return [] }
+        catch {
+            if !quietly { recordActionError(error) }
+            return []
+        }
     }
 
     // MARK: - Workspace voice settings
@@ -2175,6 +2181,10 @@ final class Session: ObservableObject {
         if let answer, let utterances = answer.utterances {
             return (SpeechProjection.segments(fromUtterances: utterances), answer.karaokeScript)
         }
+        // Known gap: the pronunciation list is not applied to this offline
+        // projection.  The matcher lives in shared/pronunciations.ts and has
+        // no Swift port yet, so a term here is read as written until the
+        // computer answers again.
         let segments = SpeechProjection.segments(fromReply: message.text ?? "")
         return (segments, KaraokeScript.unguided(utterances: segments.map(\.text)))
     }

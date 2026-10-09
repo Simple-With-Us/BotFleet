@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   groupForPersonalVoice,
+  groupIndexesForPersonalVoice,
   MAX_LOCAL_SPEECH_CHARS,
   personalVoiceErrorMessage,
   PERSONAL_VOICE_GROUP_CHARS,
@@ -12,6 +13,16 @@ import {
 import type { KaraokeFeed } from "./karaoke-feed";
 import type { TtsAudioBody } from "./schema";
 import { writtenReply } from "../../../shared/voice-summary";
+import { DEFAULT_PRONUNCIATIONS } from "../../../shared/pronunciations";
+
+/** Every caption a speaker shows, in order. */
+function captionsOf(speaker: Speaker): string[] {
+  const seen: string[] = [];
+  speaker.subscribe((snapshot) => {
+    if (snapshot.caption && seen.at(-1) !== snapshot.caption) seen.push(snapshot.caption);
+  });
+  return seen;
+}
 
 class FakeAudio {
   static instances: FakeAudio[] = [];
@@ -524,6 +535,62 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
     expect(stop).toHaveBeenCalled();
   });
 
+  it("says the harness's respelled utterances and captions the words as written", async () => {
+    const { speak } = stubPersonalVoice();
+    stubFetch(() =>
+      json({
+        audio: [],
+        voiceText: "Parse the JSON. Then run the SQL.",
+        utterances: ["Parse the Jason.", "Then run the sequel."],
+        captions: ["Parse the JSON.", "Then run the SQL."],
+        total: 2,
+        complete: true,
+        onDevice: true,
+        personalVoice: true,
+        voice: "personal:mac-voice",
+      }),
+    );
+    const speaker = new Speaker();
+    const captions = captionsOf(speaker);
+    await speaker.speak("Parse the `JSON`.  Then run the SQL.", messageOpts);
+
+    expect(speak).toHaveBeenCalledWith("Parse the Jason. Then run the sequel.", "personal:mac-voice", { onRange: expect.any(Function) });
+    expect(captions).toEqual(["Parse the JSON. Then run the SQL."]);
+  });
+
+  it("applies the pronunciation list to a reply it projects itself, captioning the words as written", async () => {
+    const { speak } = stubPersonalVoice();
+    stubFetch(() => json({ error: "harness unavailable" }, 503));
+    const speaker = new Speaker();
+    speaker.setPronunciations(DEFAULT_PRONUNCIATIONS);
+    const captions = captionsOf(speaker);
+    const feeds: Array<KaraokeFeed | null> = [];
+    speaker.subscribeKaraoke((feed) => feeds.push(feed));
+    const reply = "Run the **SQL** migration, then check `cron`.";
+    await speaker.speak(reply, { ...messageOpts, voiceId: "personal:mac-voice" });
+
+    expect(speak).toHaveBeenCalledWith("Run the sequel migration, then check kron.", "personal:mac-voice", { onRange: expect.any(Function) });
+    expect(captions).toEqual(["Run the SQL migration, then check cron."]);
+    // Karaoke still follows the reply: the spans index the bubble's text.
+    const feed = feeds.find((f): f is KaraokeFeed => f !== null);
+    expect(feed?.script.sourceLength).toBe(writtenReply(reply).length);
+  });
+
+  it("applies the pronunciation list to a sample or call prompt it speaks on-device", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+    const { speak } = stubPersonalVoice();
+    const speaker = new Speaker();
+    speaker.setPronunciations(DEFAULT_PRONUNCIATIONS);
+    const captions = captionsOf(speaker);
+    await speaker.speak("The OAuth flow is ready.", { voiceId: "personal:com.apple.speech.voice.Jay", botId: "bot_1" });
+
+    expect(speak).toHaveBeenCalledWith("The oh auth flow is ready.", "personal:com.apple.speech.voice.Jay");
+    expect(captions).toEqual(["The OAuth flow is ready."]);
+    speaker.setPronunciations([]);
+    await speaker.speak("The OAuth flow is ready.", { voiceId: "personal:com.apple.speech.voice.Jay", botId: "bot_1" });
+    expect(speak).toHaveBeenLastCalledWith("The OAuth flow is ready.", "personal:com.apple.speech.voice.Jay");
+  });
+
   it("handles unsupported platform for personal voice when ogb bridge is absent", async () => {
     vi.stubGlobal("window", {});
     const speaker = new Speaker();
@@ -541,6 +608,9 @@ describe("groupForPersonalVoice", () => {
     expect(groupForPersonalVoice(["One.", "Two.", "Three."], 9)).toEqual(["One. Two.", "Three."]);
     expect(groupForPersonalVoice(["A much longer sentence.", "B."], 10)).toEqual(["A much longer sentence.", "B."]);
     expect(groupForPersonalVoice(["  ", "", "Only."])).toEqual(["Only."]);
+    // The same groups as indexes, so captions group with what is said.
+    expect(groupIndexesForPersonalVoice(["One.", "Two.", "Three."], 9)).toEqual([[0, 1], [2]]);
+    expect(groupIndexesForPersonalVoice(["  ", "", "Only."])).toEqual([[2]]);
   });
 });
 

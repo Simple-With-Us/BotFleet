@@ -35,7 +35,8 @@
 // All offsets are JavaScript string indices.  The Swift client converts them
 // with SpeechSpans.stringRange(utf16:_:in:).
 
-import { utterancesWithSpans, type SpeechSpan, type SpokenUtterance } from "./speech-spans.ts";
+import type { Pronunciation } from "./pronunciations.ts";
+import { pronounceUtterance, utterancesWithSpans, type SpeechSpan, type SpokenUtterance } from "./speech-spans.ts";
 
 export const SPOKEN_SPANS_FORMAT = 1;
 
@@ -172,15 +173,23 @@ export function karaokeScriptFromWire(utterances: readonly string[], wire?: Spok
 /**
  * The written-mode script made here instead of by the harness (this Mac
  * speaks a Personal Voice reply itself when the harness cannot be asked).
- * Same rules, same spans.
+ * Same rules, same spans, and the same pronunciation list the harness would
+ * apply: `utterances` are what the voice says, respelled with their spans
+ * kept on the original terms, and `captions` the same utterances as written.
  */
 export interface LocalKaraokeScript {
   utterances: string[];
+  captions: string[];
   script: KaraokeScript;
 }
 
-export function localKaraokeScript(sourceText: string): LocalKaraokeScript {
-  const spoken = utterancesWithSpans(sourceText);
+export function localKaraokeScript(sourceText: string, pronunciations: readonly Pronunciation[] = []): LocalKaraokeScript {
+  const written = utterancesWithSpans(sourceText);
+  const spoken = pronunciations.length ? written.map((u) => pronounceUtterance(u, pronunciations)) : written;
   const utterances = spoken.map((u) => u.text);
-  return { utterances, script: karaokeScriptFromWire(utterances, encodeSpokenSpans(sourceText, spoken)) };
+  return {
+    utterances,
+    captions: written.map((u) => u.text),
+    script: karaokeScriptFromWire(utterances, encodeSpokenSpans(sourceText, spoken)),
+  };
 }

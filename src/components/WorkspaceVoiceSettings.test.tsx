@@ -205,6 +205,40 @@ describe("workspace voice settings", () => {
     expect(button("Save Pronunciations").disabled).toBe(true);
   });
 
+  it("says what a new row is missing only once focus leaves it, and politely", async () => {
+    await mount(list_(baseTts()));
+    await act(async () => button("Add Term").click());
+    const added = rows()[2];
+    // Add Term puts the cursor in the new row's Term field.
+    expect(document.activeElement).toBe(added.term);
+    await act(async () => setInputValue(added.term, "S"));
+    await act(async () => setInputValue(added.term, "SQ"));
+    // Typing the first field is not an error: no alert, no hint yet.
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("");
+    expect(button("Save Pronunciations").disabled).toBe(true);
+    // Moving to the row's other field is not leaving the row.
+    await act(async () => added.say.focus());
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("");
+    // Leaving the row says what it is missing, as a polite status.
+    await act(async () => button("Save Pronunciations").focus());
+    await act(async () => button("Add Term").focus());
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Add how to say SQ.");
+    expect(container.querySelector('[role="status"]')?.getAttribute("aria-live")).toBe("polite");
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("keeps focus in the list when a row is removed", async () => {
+    await mount(list_(baseTts()));
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Remove SQL"]')!.click());
+    // The next row's Term field.
+    expect(document.activeElement).toBe(rows()[0].term);
+    expect(rows()[0].term.value).toBe("cron");
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Remove cron"]')!.click());
+    // With no rows left, Add Term.
+    expect(document.activeElement).toBe(button("Add Term"));
+  });
+
   it("tries a respelling with the workspace default voice", async () => {
     await mount(list_(baseTts()));
     await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Try SQL"]')!.click());

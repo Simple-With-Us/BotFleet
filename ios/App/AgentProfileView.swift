@@ -142,18 +142,30 @@ struct AgentProfileView: View {
         }
     }
 
+    /// Whether this iPhone can set the workspace default voice.  The phone's
+    /// write route shipped with the pronunciation list, so a computer that
+    /// sends no list cannot take the change (WorkspaceVoiceSection.canChange).
+    private var canChangeDefaultVoice: Bool { config?.pronunciations != nil }
+
+    /// Where the workspace default voice is picked from this iPhone's view.
+    private var defaultVoicePlace: String { canChangeDefaultVoice ? "in Settings" : "on your Mac" }
+
+    private var noDefaultVoiceLead: String {
+        "No default voice is picked, so a bot without a voice of its own stays silent until one is picked \(defaultVoicePlace)."
+    }
+
     private var missingDefaultVoiceGuidance: String {
         switch voiceProvider {
         case .minimax:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared MiniMax key on your computer."
+            return "\(noDefaultVoiceLead)\u{00A0} Choose a voice for each device above; synthesis still uses the shared MiniMax key on your computer."
         case .elevenlabs:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared ElevenLabs key on your computer."
+            return "\(noDefaultVoiceLead)\u{00A0} Choose a voice for each device above; synthesis still uses the shared ElevenLabs key on your computer."
         case .system:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the built-in Mac voices on your computer."
+            return "\(noDefaultVoiceLead)\u{00A0} Choose a voice for each device above; synthesis still uses the built-in Mac voices on your computer."
         case .personal:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose an Apple Personal Voice for this iPhone above to speak on this device."
+            return "\(noDefaultVoiceLead)\u{00A0} Choose an Apple Personal Voice for this iPhone above to speak on this device."
         case .unknown:
-            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the selected voice engine on your computer."
+            return "\(noDefaultVoiceLead)\u{00A0} Choose a voice for each device above; synthesis still uses the selected voice engine on your computer."
         }
     }
 
@@ -840,7 +852,7 @@ struct AgentProfileView: View {
             } else if !hasWorkspaceDefaultVoice {
                 Text(missingDefaultVoiceGuidance)
             } else {
-                Text("Each device speaks with its own voice.\u{00A0} A Personal Voice stays on the device that made it and speaks there, with no audio sent over the network.\u{00A0} MiniMax voices work on both.\u{00A0} \(defaultVoiceName) is the workspace default voice; change it in Settings.")
+                Text("Each device speaks with its own voice.\u{00A0} A Personal Voice stays on the device that made it and speaks there, with no audio sent over the network.\u{00A0} MiniMax voices work on both.\u{00A0} \(defaultVoiceName) is the workspace default voice; change it \(defaultVoicePlace).")
             }
         }
     }
@@ -1115,7 +1127,7 @@ struct AgentProfileView: View {
     /// Previews the voice this iPhone speaks with.
     private func previewVoice() async {
         guard iphoneVoiceCanSpeak else {
-            session.actionError = "Pick a voice for this iPhone, or set a workspace default voice on your computer first."
+            session.actionError = "Pick a voice for this iPhone, or pick a default voice \(defaultVoicePlace)."
             return
         }
         busy = true
