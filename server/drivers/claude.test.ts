@@ -795,8 +795,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(held.mcpConfig.mcpServers.phone).toBeDefined();
     expect(heldAllowed).not.toContain("mcp__composio");
     expect(heldAllowed).not.toContain("mcp__phone");
-    // peer messages stay pre-allowed (the CLI's own look-alike would shadow
-    // them), and the step watch reviews them as they start
+    // the harness's own fleet comms stay pre-allowed (each tool is guarded by
+    // the endpoint it calls, and a full-auto bot's job_start must never become
+    // a card); the step watch reviews those calls as they start
     expect(heldAllowed).toContain("mcp__agents");
 
     // an unheld bypass turn keeps every pre-allow: nothing asks there

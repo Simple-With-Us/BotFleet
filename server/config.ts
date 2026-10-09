@@ -907,8 +907,8 @@ export function autoReviewFallbackReviewer(cfg: AppConfig): string | null {
 
 /** Reviewer calls one turn may spend, clamped to the knob's bounds. */
 export function autoReviewMaxPerTurn(cfg: AppConfig): number {
-  const value = cfg.autoReview?.maxReviewsPerTurn;
-  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_MAX_REVIEWS_PER_TURN;
+  const value = cfg.autoReview?.maxReviewsPerTurn ?? Number.NaN;
+  if (!Number.isFinite(value)) return DEFAULT_MAX_REVIEWS_PER_TURN;
   return Math.min(MAX_MAX_REVIEWS_PER_TURN, Math.max(MIN_MAX_REVIEWS_PER_TURN, Math.floor(value)));
 }
 

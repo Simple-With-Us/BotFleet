@@ -126,7 +126,7 @@ async function handle(msg: any) {
           input: args.input,
           // which tool_use this is about: the harness matches it to the
           // step it already showed, so auto-review never judges it twice
-          toolUseId: typeof args.tool_use_id === "string" ? args.tool_use_id : undefined,
+          toolUseId: String(args.tool_use_id ?? "") || undefined,
         };
       try {
         conn.write(JSON.stringify(ask) + "\n");

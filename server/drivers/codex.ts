@@ -536,7 +536,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           ...base(threadId, turnId),
           type: "request.opened",
           requestId,
-          ...(askedItem.success ? { itemId: askedItem.data } : {}),
+          itemId: askedItem.success ? askedItem.data : undefined,
           requestType: isQuestion ? "question" : "permission",
           tool,
           summary,
