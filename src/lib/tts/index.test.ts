@@ -336,6 +336,8 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
       }),
     );
     const speaker = new Speaker();
+    const feeds: Array<KaraokeFeed | null> = [];
+    speaker.subscribeKaraoke((feed) => feeds.push(feed));
     await speaker.speak("**Morning.**  The tests went green: `pnpm test`.", {
       ...messageOpts,
       voiceId: "personal:stale-copy",
@@ -344,9 +346,13 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].body).toEqual({ device: "mac", progressive: true, spans: true });
     expect(speak).toHaveBeenCalledTimes(1);
-    expect(speak).toHaveBeenCalledWith("Morning. The tests went green.", "personal:mac-voice");
-    // No `script: "written"` in the answer (a summary, or an older harness):
-    // no karaoke feed.
+    expect(speak).toHaveBeenCalledWith("Morning. The tests went green.", "personal:mac-voice", { onRange: expect.any(Function) });
+    // No `script: "written"` in the answer (a distilled script, or an older
+    // harness): karaoke still follows, aligned without spans.
+    const feed = feeds.find((f): f is KaraokeFeed => f !== null);
+    expect(feed?.mode).toBe("live");
+    expect(feed?.script.spokenText).toBe("Morning. The tests went green.");
+    expect(feed?.script.segments).toEqual([]);
     expect(speaker.karaoke).toBeNull();
     expect(speaker.state).toEqual({ status: "idle" });
   });
@@ -415,7 +421,7 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
     expect(feed?.script.segments.length).toBeGreaterThan(0);
   });
 
-  it("reads the voice half without karaoke for a bot whose voice reads a summary", async () => {
+  it("reads the voice half for a distilled bot when the harness cannot be asked, and karaoke follows it", async () => {
     const { speak } = stubPersonalVoice();
     stubFetch(() => json({ error: "harness unavailable" }, 503));
     const speaker = new Speaker();
@@ -427,8 +433,10 @@ describe("Speaker with an Apple Personal Voice on this Mac", () => {
       scriptKind: "summary",
     });
 
-    expect(speak).toHaveBeenCalledWith("Short version.", "personal:mac-voice");
-    expect(feeds.filter((f) => f !== null)).toEqual([]);
+    expect(speak).toHaveBeenCalledWith("Short version.", "personal:mac-voice", { onRange: expect.any(Function) });
+    const feed = feeds.find((f): f is KaraokeFeed => f !== null);
+    expect(feed?.mode).toBe("live");
+    expect(feed?.script.spokenText).toBe("Short version.");
     expect(speaker.state).toEqual({ status: "idle" });
   });
 

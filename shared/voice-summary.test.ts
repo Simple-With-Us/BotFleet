@@ -42,25 +42,34 @@ describe("voice summary", () => {
   });
 
   describe("resolveVoiceSummaryMode", () => {
-    it("reads the reply as written when no mode is saved, for voice bots and text-only bots alike", () => {
-      expect(resolveVoiceSummaryMode({})).toBe("off");
-      expect(resolveVoiceSummaryMode(null)).toBe("off");
-      expect(resolveVoiceSummaryMode(undefined)).toBe("off");
-      const voiceBot: { voiceSummaryMode?: "off" | "on_demand" | "always"; speakReplies: boolean; speechDevices: string[] } = {
-        speakReplies: true,
-        speechDevices: ["mac"],
-      };
-      expect(resolveVoiceSummaryMode(voiceBot)).toBe("off");
-      expect(voiceScriptKind(voiceBot)).toBe("written");
+    // Owner correction, 2026-10-08: the distilled spoken rewrite is the
+    // default again, as it was before #952.
+    it("defaults to always for bots with speakReplies enabled", () => {
+      expect(resolveVoiceSummaryMode({ speakReplies: true })).toBe("always");
     });
 
-    it("keeps an explicit mode", () => {
-      expect(resolveVoiceSummaryMode({ voiceSummaryMode: "off" })).toBe("off");
-      expect(resolveVoiceSummaryMode({ voiceSummaryMode: "on_demand" })).toBe("on_demand");
-      expect(resolveVoiceSummaryMode({ voiceSummaryMode: "always" })).toBe("always");
+    it("defaults to always for bots with speechDevices configured", () => {
+      expect(resolveVoiceSummaryMode({ speechDevices: ["mac"] })).toBe("always");
+      expect(resolveVoiceSummaryMode({ speechDevices: ["iphone"] })).toBe("always");
     });
 
-    it("speaks a summary only when the owner picked one", () => {
+    it("defaults to on_demand for text-only bots", () => {
+      expect(resolveVoiceSummaryMode({})).toBe("on_demand");
+      expect(resolveVoiceSummaryMode(null)).toBe("on_demand");
+      expect(resolveVoiceSummaryMode(undefined)).toBe("on_demand");
+      expect(resolveVoiceSummaryMode({ speakReplies: false, speechDevices: [] })).toBe("on_demand");
+    });
+
+    it("preserves explicit voiceSummaryMode settings regardless of speakReplies", () => {
+      expect(resolveVoiceSummaryMode({ voiceSummaryMode: "off", speakReplies: true })).toBe("off");
+      expect(resolveVoiceSummaryMode({ voiceSummaryMode: "on_demand", speakReplies: true })).toBe("on_demand");
+      expect(resolveVoiceSummaryMode({ voiceSummaryMode: "always", speakReplies: false })).toBe("always");
+    });
+
+    it("reads the reply as written only in an explicit off mode", () => {
+      expect(voiceScriptKind({})).toBe("summary");
+      expect(voiceScriptKind(null)).toBe("summary");
+      expect(voiceScriptKind({ speakReplies: true, speechDevices: ["mac"] })).toBe("summary");
       expect(voiceScriptKind({ voiceSummaryMode: "off" })).toBe("written");
       expect(voiceScriptKind({ voiceSummaryMode: "on_demand" })).toBe("summary");
       expect(voiceScriptKind({ voiceSummaryMode: "always" })).toBe("summary");

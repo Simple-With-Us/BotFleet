@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { utterancesWithSpans } from "../../shared/speech-spans.ts";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
 import { sanitizeForTTS } from "./minimax.ts";
 import { speakable } from "./speech-text.ts";
@@ -84,15 +85,26 @@ OUTPUT: "Here are your options for the flight. <#0.3#> First, American Airlines 
 </example_transformation>
 </system_prompt>`;
 
+/**
+ * The deterministic spoken text for `text`: speakable()'s rules, split into
+ * utterances and joined with single spaces.  This is exactly the written-mode
+ * script (shared/speech-spans.ts utterancesWithSpans), so when the distiller
+ * is skipped (a short plain reply) or falls back (no key, timeout, a cut-off
+ * rewrite), server/tts/message-audio.ts can recognize the
+ * text it stored and hand clients the source spans that guide the karaoke
+ * highlight.  MiniMax still gets its acoustic pass: synthesize() runs
+ * sanitizeForTTS on every utterance.
+ */
+export function deterministicSpokenText(text: string): string {
+  return utterancesWithSpans(text).map((u) => u.text).join(" ");
+}
+
 export interface SummarizeVoiceOptions {
   key?: string;
   baseUrl?: string;
   url?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
-  /** The caller asked for a condensed summary, so a result much shorter than
-   * the reply is expected rather than a sign the model dropped content. */
-  condense?: boolean;
 }
 
 /** Where the speech text came from.  "summary" is the model's rewrite;
@@ -105,7 +117,7 @@ export type VoiceSummarySource = "summary" | "short" | "fallback";
  * a retry, so the deterministic text can be stored in place of the rewrite.
  * That includes "timeout": the same long reply at the same budget runs out of
  * time again, and each retry would cost the full deadline before speech. */
-export type VoiceSummaryFallbackReason = "no-key" | "truncated" | "incomplete" | "too-short" | "timeout" | "unavailable";
+export type VoiceSummaryFallbackReason = "no-key" | "truncated" | "incomplete" | "timeout" | "unavailable";
 
 export interface VoiceSummaryResult {
   text: string;
@@ -127,29 +139,16 @@ export function voiceSummaryMaxTokens(inputChars: number): number {
   return Math.min(SUMMARY_MAX_TOKENS, Math.max(SUMMARY_MIN_TOKENS, Math.ceil(inputChars / 3)));
 }
 
-/** A rewrite shorter than this share of the deterministic speech text, on a
- * reply at least SUMMARY_RATIO_MIN_CHARS long, is treated as dropped
- * content.  The deterministic text already removes code, links, and paths,
- * so an honest rewrite of the same prose stays well above it. */
-export const SUMMARY_MIN_RATIO = 0.35;
-export const SUMMARY_RATIO_MIN_CHARS = 400;
-
-/** Whether voiceSummaryFor should store this result as message.voiceText.
- * A transient provider failure (network error, non-200, empty answer) is not
- * stored here, so a play on an on-device voice can still get the rewrite
- * later.  A hosted voice's clip job does store the text it speaks, whatever
- * its source: its clips are matched to that text by count alone, so a later
- * rewrite would pair the old clips with new sentences (server/tts/
+/** Whether this result is worth keeping as message.voiceText.  A transient
+ * provider failure (network error, non-200, empty answer) is not: the next
+ * play asks the distiller again, on any device, and a hosted voice's clips of
+ * the stand-in are stamped as the reply as written so they are reused if the
+ * distiller is still down and replaced if it answers (server/tts/
  * message-audio.ts).  A cut-off rewrite is never returned as text (the full
- * deterministic text stands in), and that stand-in is stored, because asking
+ * deterministic text stands in), and that stand-in is kept, because asking
  * again would only be cut off again and billed again. */
 export function voiceSummaryWorthStoring(result: VoiceSummaryResult): boolean {
   return !(result.source === "fallback" && result.reason === "unavailable");
-}
-
-export function summaryLooksTruncated(summary: string, deterministic: string): boolean {
-  if (deterministic.length < SUMMARY_RATIO_MIN_CHARS) return false;
-  return summary.length < deterministic.length * SUMMARY_MIN_RATIO;
 }
 
 export function normalizeDeepSeekChatUrl(baseUrl?: string): string {
@@ -212,11 +211,10 @@ export async function summarizeForVoiceDetailed(
     /[*#_\[\]]/.test(cleanInput);
 
   if (cleanInput.length <= 120 && !hasTechnicalContent) {
-    // Normalize the markdown and paragraph structure *before* the acoustic
-    // pass: sanitizeForTTS collapses newlines, and the line anchors that
-    // strip list markers and add audible paragraph pauses only match on the
-    // original text.
-    return { text: sanitizeForTTS(speakable(cleanInput)), source: "short" };
+    // The deterministic script, span-aligned to the reply (see
+    // deterministicSpokenText); its markdown and paragraph rules run on the
+    // original text, before synthesize()'s acoustic pass collapses newlines.
+    return { text: deterministicSpokenText(cleanInput), source: "short" };
   }
 
   const options: SummarizeVoiceOptions =
@@ -224,7 +222,7 @@ export async function summarizeForVoiceDetailed(
       ? { key: optionsOrKey, signal: legacySignal }
       : (optionsOrKey ?? {});
 
-  const deterministic = () => sanitizeForTTS(speakable(spokenReply(rawText)));
+  const deterministic = () => deterministicSpokenText(spokenReply(rawText));
   const fallback = (reason: VoiceSummaryFallbackReason): VoiceSummaryResult => ({ text: deterministic(), source: "fallback", reason });
 
   const key = resolveDeepSeekKey(options.key);
@@ -263,9 +261,11 @@ export async function summarizeForVoiceDetailed(
     const finish = choice?.finish_reason;
     if (finish === "length") return fallback("truncated");
     if (finish && finish !== "stop") return fallback("incomplete");
+    // A finished rewrite is used however much shorter than the reply it is:
+    // the prompt asks the model to leave out hashes, code and links, so a
+    // condensed rewrite is what it is for, not a sign of lost content.
     const cleaned = cleanSummaryForTTS(content);
     if (!cleaned) return null;
-    if (!options.condense && summaryLooksTruncated(cleaned, deterministic())) return fallback("too-short");
     return { text: cleaned, source: "summary" };
   };
 

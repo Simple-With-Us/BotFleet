@@ -133,18 +133,31 @@ final class KaraokeScriptTests: XCTestCase {
         XCTAssertTrue(script.guides(SpeechProjection.writtenReply(Self.source)))
     }
 
-    func testASummaryOrAnOlderHarnessHasNoKaraoke() throws {
-        let summary = try JSONDecoder().decode(
-            MessageVoice.self,
-            from: Data(#"{"audio":[],"utterances":["A short summary."],"total":1,"script":"summary"}"#.utf8)
-        )
-        XCTAssertNil(summary.karaokeScript)
+    func testADistilledScriptOrAnOlderHarnessGetsAnUnguidedKaraokeScript() throws {
+        // The distilled rewrite is the default script: karaoke follows the
+        // message without spans (any spans sent with it are not trusted).
+        let wire = SpokenSpansWire.encode(sourceText: "A short reply.", utterances: SpeechSpans.utterancesWithSpans("A short reply."))
+        let body: [String: Any] = [
+            "audio": [],
+            "utterances": ["A short reply, spelled for the ear."],
+            "total": 1,
+            "script": "summary",
+            "spans": ["format": 1, "source": "written", "sourceLength": wire.sourceLength, "utterances": wire.utterances],
+        ]
+        let summary = try JSONDecoder().decode(MessageVoice.self, from: JSONSerialization.data(withJSONObject: body))
+        let distilled = try XCTUnwrap(summary.karaokeScript)
+        XCTAssertEqual(distilled.spokenText, "A short reply, spelled for the ear.")
+        XCTAssertTrue(distilled.segments.isEmpty)
+        XCTAssertNil(distilled.sourceLength)
         let older = try JSONDecoder().decode(
             MessageVoice.self,
             from: Data(#"{"audio":[],"utterances":["Read as written."],"total":1}"#.utf8)
         )
         XCTAssertNil(older.script)
-        XCTAssertNil(older.karaokeScript)
+        XCTAssertEqual(older.karaokeScript?.spokenText, "Read as written.")
+        XCTAssertEqual(older.karaokeScript?.segments.isEmpty, true)
+        let empty = try JSONDecoder().decode(MessageVoice.self, from: Data(#"{"audio":[],"total":0}"#.utf8))
+        XCTAssertNil(empty.karaokeScript)
     }
 
     func testMalformedSpansAreDroppedWithoutFailingTheAnswer() throws {
