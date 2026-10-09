@@ -746,7 +746,7 @@ function fixtureCases() {
       pronunciations: c.pronunciations,
     });
     const times = evenTimes(a.spokenWords.length);
-    return {
+    const row = {
       name: c.name,
       source: c.source ?? null,
       spokenText,
@@ -761,9 +761,9 @@ function fixtureCases() {
       timeline: Array.from(buildKaraokeTimeline(times, a.mapping)),
       quality: [a.quality.spokenContent, a.quality.spokenMatched, a.quality.displayContent, a.quality.displayMatched],
       followable: a.followable,
-      // Only the cases that use a list carry one, so older lines never churn.
-      ...(c.pronunciations ? { pronunciations: c.pronunciations.map((p) => ({ term: p.term, say: p.say })) } : {}),
     };
+    // Only the cases that use a list carry one, so older lines never churn.
+    return c.pronunciations ? { ...row, pronunciations: c.pronunciations.map((p) => ({ term: p.term, say: p.say })) } : row;
   });
 }
 

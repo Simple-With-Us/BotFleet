@@ -31,6 +31,8 @@
 //   matched again.  A "say" that contains a term is refused when the list is
 //   saved, so applying the list twice is the same as applying it once.
 
+import { z } from "zod";
+
 /** A type alias, not an interface, so a list is plain JSON to the config
  * code (server/schema.ts JsonValue). */
 export type Pronunciation = {
@@ -99,6 +101,16 @@ const isWordChar = (ch: string): boolean => ch !== "" && WORD_CHAR.test(ch);
  * name or dotted name once the matched term is set aside. */
 const PROTECTED_CHUNK = /:\/\/|[/\\@]|[\p{L}\p{N}_]\.[\p{L}\p{N}_]/u;
 const PAUSE_TAG = /<#[0-9]+(?:\.[0-9]+)?#>/g;
+
+/** One row's shape on the wire, before the rules run.  Callers parse with
+ * these at their own boundary (the config schema, the phone's route, the
+ * stored file) and hand checkPronunciations typed rows. */
+export const PronunciationDraftSchema = z.object({ term: z.string(), say: z.string() }).strict();
+export const PronunciationDraftListSchema = z.array(PronunciationDraftSchema);
+export type PronunciationDraft = z.infer<typeof PronunciationDraftSchema>;
+
+/** A value read from the config file: JSON, nothing narrower known yet. */
+export type StoredJson = string | number | boolean | null | StoredJson[] | { [key: string]: StoredJson };
 
 export interface PronunciationMatch {
   /** UTF-16 offsets of the matched term, end exclusive. */
@@ -243,23 +255,15 @@ export type PronunciationCheck =
  * term on the list.  Returns the canonical list or the first problem, in
  * words a person can act on.
  */
-export function checkPronunciations(value: unknown): PronunciationCheck {
-  if (!Array.isArray(value)) return { ok: false, error: "Pronunciations must be a list." };
-  if (value.length > PRONUNCIATIONS_MAX) {
+export function checkPronunciations(drafts: readonly PronunciationDraft[]): PronunciationCheck {
+  if (drafts.length > PRONUNCIATIONS_MAX) {
     return { ok: false, error: `Keep the list to ${PRONUNCIATIONS_MAX} terms or fewer.` };
   }
   const list: Pronunciation[] = [];
   const seen = new Set<string>();
-  for (const raw of value) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      return { ok: false, error: "Each pronunciation needs a term and how to say it." };
-    }
-    const record = raw as Record<string, unknown>;
-    if (typeof record.term !== "string" || typeof record.say !== "string") {
-      return { ok: false, error: "Each pronunciation needs a term and how to say it." };
-    }
-    const term = record.term.trim();
-    const say = record.say.trim().replace(/\s+/g, " ");
+  for (const draft of drafts) {
+    const term = draft.term.trim();
+    const say = draft.say.trim().replace(/\s+/g, " ");
     if (!term) return { ok: false, error: say ? `Add the term that is said as "${say}".` : "A pronunciation is missing its term." };
     if (!say) return { ok: false, error: `Add how to say ${term}.` };
     if (/\s/.test(term)) return { ok: false, error: `${term} has a space.\u00a0 Use one word or symbol for each term.` };
@@ -299,13 +303,15 @@ export function checkPronunciations(value: unknown): PronunciationCheck {
  * pass checkPronunciations on their own are dropped, so a hand-edited config
  * keeps every other setting (server/config.ts parseStoredConfig).
  */
-export function sanitizeStoredPronunciations(value: unknown): Pronunciation[] | undefined {
-  if (!Array.isArray(value)) return undefined;
+export function sanitizeStoredPronunciations(stored: StoredJson | undefined): Pronunciation[] | undefined {
+  if (!Array.isArray(stored)) return undefined;
   const kept: Pronunciation[] = [];
   const seen = new Set<string>();
-  for (const raw of value) {
+  for (const raw of stored) {
     if (kept.length >= PRONUNCIATIONS_MAX) break;
-    const one = checkPronunciations([raw]);
+    const draft = PronunciationDraftSchema.safeParse(raw);
+    if (!draft.success) continue;
+    const one = checkPronunciations([draft.data]);
     if (!one.ok) continue;
     const entry = one.list[0];
     const key = entry.term.toLowerCase();

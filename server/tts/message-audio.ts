@@ -592,9 +592,13 @@ export class MessageAudio {
           .filter((u) => /[\p{L}\p{N}]/u.test(u))
           .map(respell);
       }
-      const script: Partial<AudioResponseBody> = spans
-        ? { script: label, ...(label === "written" && onDeviceSpans ? { spans: onDeviceSpans } : {}) }
-        : {};
+      // `script` and `spans` only for a client that asked, as extra() does,
+      // with the spans of what the device is actually handed.
+      const script: Partial<AudioResponseBody> = {};
+      if (spans) {
+        script.script = label;
+        if (label === "written" && onDeviceSpans) script.spans = onDeviceSpans;
+      }
       return {
         kind: "json",
         status: 200,

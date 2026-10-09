@@ -512,9 +512,9 @@ export function sourceOffsetAt(segments: readonly SpeechSpan[], spokenOffset: nu
  * its text in order with no gaps). */
 function trackedFromUtterance(u: SpokenUtterance): Tracked {
   const n = u.text.length;
-  const srcStart = new Array<number>(n).fill(-1);
-  const srcEnd = new Array<number>(n).fill(-1);
-  const kind = new Array<number>(n).fill(KIND_INSERT);
+  const srcStart = Array.from({ length: n }, () => -1);
+  const srcEnd = Array.from({ length: n }, () => -1);
+  const kind = Array.from({ length: n }, () => KIND_INSERT);
   for (const seg of u.segments) {
     for (let i = Math.max(0, seg.spokenStart); i < Math.min(n, seg.spokenEnd); i += 1) {
       if (seg.kind === "copy") {

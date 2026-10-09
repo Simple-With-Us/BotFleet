@@ -23,15 +23,20 @@ import {
   type RoomTerminology,
 } from "../shared/terminology.ts";
 import { DEFAULT_VPS_MODE, migrateAllowedComputersToProviders } from "../shared/local-auto-consent.ts";
-import { checkPronunciations, sanitizeStoredPronunciations, type Pronunciation } from "../shared/pronunciations.ts";
+import {
+  checkPronunciations,
+  PronunciationDraftListSchema,
+  sanitizeStoredPronunciations,
+  type Pronunciation,
+} from "../shared/pronunciations.ts";
 
 const optionalText = z.string().optional();
 const externalCredentialStorage = z.literal("external").optional();
 /** The workspace pronunciation list (shared/pronunciations.ts), checked and
  * canonicalized by the one validator every client also runs.  Absent means
  * the seeded defaults; a saved list, even an empty one, is used as is. */
-const pronunciationListSchema = z.array(z.unknown()).transform((value, ctx): Pronunciation[] => {
-  const checked = checkPronunciations(value);
+const pronunciationListSchema = PronunciationDraftListSchema.transform((drafts, ctx): Pronunciation[] => {
+  const checked = checkPronunciations(drafts);
   if (checked.ok) return checked.list;
   ctx.addIssue({ code: "custom", message: checked.error });
   return z.NEVER;

@@ -559,7 +559,12 @@ export function VoiceSettings({
       </div>
 
       {/* ── Default Voice (workspace) ── */}
-      <DefaultVoicePicker voices={voices} loading={loadingVoices} />
+      <DefaultVoicePicker
+        tts={tts}
+        voices={voices}
+        loading={loadingVoices}
+        onConfig={(config) => dispatch({ type: "configStatus", config })}
+      />
 
       {/* ── MiniMax Key Input ── */}
       <div className="mt-4">
@@ -871,7 +876,7 @@ export function VoiceSettings({
       )}
 
       {/* ── Pronunciations (workspace) ── */}
-      <PronunciationSettings />
+      <PronunciationSettings tts={tts} onConfig={(config) => dispatch({ type: "configStatus", config })} />
 
       {/* ── Speech to Text ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">

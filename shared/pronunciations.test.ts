@@ -12,6 +12,7 @@ import {
   PRONUNCIATION_TERM_MAX,
   PRONUNCIATIONS_MAX,
   pronouncer,
+  PronunciationDraftListSchema,
   sanitizeStoredPronunciations,
   type Pronunciation,
 } from "./pronunciations.ts";
@@ -139,9 +140,11 @@ describe("checkPronunciations", () => {
     expect(checkPronunciations([{ term: "", say: "x" }]).ok).toBe(false);
     expect(checkPronunciations([{ term: "SQL", say: "  " }])).toEqual({ ok: false, error: "Add how to say SQL." });
     expect(checkPronunciations([{ term: "Hacker News", say: "hacker news" }]).ok).toBe(false);
-    expect(checkPronunciations([{ term: "SQL" }]).ok).toBe(false);
-    expect(checkPronunciations("SQL").ok).toBe(false);
-    expect(checkPronunciations([null]).ok).toBe(false);
+    // A bad shape never reaches the rules: each boundary parses first.
+    expect(PronunciationDraftListSchema.safeParse([{ term: "SQL" }]).success).toBe(false);
+    expect(PronunciationDraftListSchema.safeParse("SQL").success).toBe(false);
+    expect(PronunciationDraftListSchema.safeParse([null]).success).toBe(false);
+    expect(PronunciationDraftListSchema.safeParse([{ term: "SQL", say: "sequel", extra: 1 }]).success).toBe(false);
   });
 
   it("bounds lengths and count", () => {

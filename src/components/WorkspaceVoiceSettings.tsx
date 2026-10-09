@@ -13,7 +13,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Loader2, Plus, Trash2, Volume2 } from "lucide-react";
 
-import { api, useStore, type ConfigStatus } from "@/state/store";
+import { api, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
 import { cn } from "@/lib/cn";
 import {
@@ -26,6 +26,23 @@ import { checkPronunciations, PRONUNCIATION_SAY_MAX, PRONUNCIATION_TERM_MAX, PRO
 
 export type WorkspaceVoiceOption = { id: string; label: string; description?: string };
 
+type WorkspaceTts = NonNullable<ConfigStatus["tts"]>;
+
+/** What these sections save and speak with.  The defaults are the real
+ * config write (PUT /api/config, its validation) and the existing Try path;
+ * tests hand in their own. */
+export interface WorkspaceVoiceDeps {
+  saveConfig(patch: { tts: { voice: string } } | { tts: { pronunciations: Pronunciation[] } }): Promise<ConfigStatus>;
+  speak(text: string, voiceId: string): void;
+}
+
+export const defaultWorkspaceVoiceDeps: WorkspaceVoiceDeps = {
+  saveConfig: (patch) => api("/api/config", { method: "PUT", body: JSON.stringify(patch) }),
+  speak: (text, voiceId) => {
+    void speaker.speak(text, { voiceId });
+  },
+};
+
 export const DEFAULT_VOICE_SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
 
 export const DEFAULT_VOICE_HELP = "Every bot without a voice of its own speaks with this one, on this Mac and on iPhone.";
@@ -37,12 +54,22 @@ export const PRONUNCIATIONS_HELP =
 const inputClass =
   "w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none";
 
-export function DefaultVoicePicker({ voices, loading }: { voices: WorkspaceVoiceOption[]; loading: boolean }) {
-  const { state, dispatch } = useStore();
-  const tts = state.config?.tts;
+export function DefaultVoicePicker({
+  tts,
+  voices,
+  loading,
+  onConfig,
+  deps = defaultWorkspaceVoiceDeps,
+}: {
+  tts: WorkspaceTts;
+  voices: WorkspaceVoiceOption[];
+  loading: boolean;
+  /** A saved config snapshot, for the store. */
+  onConfig: (config: ConfigStatus) => void;
+  deps?: WorkspaceVoiceDeps;
+}) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  if (!tts) return null;
 
   const current = tts.voice ?? "";
   // Hosted and built-in voices only: a Personal Voice speaks on one device.
@@ -54,8 +81,8 @@ export function DefaultVoicePicker({ voices, loading }: { voices: WorkspaceVoice
     if (!next || next === current) return;
     setSaving(true);
     setError(null);
-    api("/api/config", { method: "PUT", body: JSON.stringify({ tts: { voice: next } }) })
-      .then((status: ConfigStatus) => dispatch({ type: "configStatus", config: status }))
+    deps.saveConfig({ tts: { voice: next } })
+      .then(onConfig)
       .catch((e: Error) => setError(e.message))
       .finally(() => setSaving(false));
   };
@@ -96,7 +123,7 @@ export function DefaultVoicePicker({ voices, loading }: { voices: WorkspaceVoice
         </select>
         <button
           type="button"
-          onClick={() => void speaker.speak(DEFAULT_VOICE_SAMPLE, { voiceId: current })}
+          onClick={() => deps.speak(DEFAULT_VOICE_SAMPLE, current)}
           disabled={!canTry}
           title={canTry ? "Hear the default voice" : "Pick a default voice first"}
           aria-label={canTry ? "Hear the default voice" : "Pick a default voice first"}
@@ -124,10 +151,17 @@ const sameList = (a: readonly Pronunciation[], b: readonly Pronunciation[]): boo
 const filled = (rows: readonly Row[]): Array<{ term: string; say: string }> =>
   rows.filter((row) => row.term.trim() || row.say.trim()).map((row) => ({ term: row.term, say: row.say }));
 
-export function PronunciationSettings() {
-  const { state, dispatch } = useStore();
-  const tts = state.config?.tts;
-  const saved = tts?.pronunciations;
+export function PronunciationSettings({
+  tts,
+  onConfig,
+  deps = defaultWorkspaceVoiceDeps,
+}: {
+  tts: WorkspaceTts;
+  /** A saved config snapshot, for the store. */
+  onConfig: (config: ConfigStatus) => void;
+  deps?: WorkspaceVoiceDeps;
+}) {
+  const saved = tts.pronunciations;
   const nextKey = useRef(0);
   const toRows = (list: readonly Pronunciation[]): Row[] =>
     list.map((entry) => ({ key: nextKey.current++, term: entry.term, say: entry.say }));
@@ -148,7 +182,6 @@ export function PronunciationSettings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- savedKey is the list's value
   }, [savedKey]);
 
-  if (!tts) return null;
   if (!saved) {
     return (
       <div className="mt-4 border-t border-hairline/40 pt-4">
@@ -169,9 +202,9 @@ export function PronunciationSettings() {
     if (!check.ok) return;
     setSaving(true);
     setError(null);
-    api("/api/config", { method: "PUT", body: JSON.stringify({ tts: { pronunciations: check.list } }) })
-      .then((status: ConfigStatus) => {
-        dispatch({ type: "configStatus", config: status });
+    deps.saveConfig({ tts: { pronunciations: check.list } })
+      .then((status) => {
+        onConfig(status);
         setRows(toRows(status.tts?.pronunciations ?? check.list));
       })
       .catch((e: Error) => setError(e.message))
@@ -223,7 +256,7 @@ export function PronunciationSettings() {
                 <div className="flex items-center gap-1">
                   <button
                     type="button"
-                    onClick={() => void speaker.speak(row.say.trim(), { voiceId })}
+                    onClick={() => deps.speak(row.say.trim(), voiceId)}
                     disabled={!canTry || !row.say.trim()}
                     title={canTry ? `Hear how ${label} is said` : "Pick a default voice first"}
                     aria-label={`Try ${label}`}

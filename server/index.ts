@@ -384,7 +384,7 @@ import {
   resolveVoiceSummaryMode,
 } from "../shared/voice-summary.ts";
 import { isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
-import { checkPronunciations } from "../shared/pronunciations.ts";
+import { checkPronunciations, PronunciationDraftListSchema } from "../shared/pronunciations.ts";
 import { deterministicSpokenText, summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
 import { isWrittenScript, MessageAudio, type SummarizedSpeech } from "./tts/message-audio.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
@@ -14489,7 +14489,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const body = await readBody(req);
       // The shared validator first, for its plain-language message; the
       // config schema then runs the same check on the way to disk.
-      const checked = checkPronunciations(body?.pronunciations);
+      const drafts = PronunciationDraftListSchema.safeParse(body?.pronunciations);
+      if (!drafts.success) return json(res, 400, { error: "Each pronunciation needs a term and how to say it." });
+      const checked = checkPronunciations(drafts.data);
       if (!checked.ok) return json(res, 400, { error: checked.error });
       let patch;
       try {
