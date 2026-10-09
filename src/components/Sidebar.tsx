@@ -62,6 +62,7 @@ import {
 } from "@/lib/thread-drag";
 
 import { BotAvatar, InitialsAvatar } from "./Avatar";
+import { BotOffBadge } from "./BotOffBadge";
 import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
 import { botActivityLocation, botStatusText, botWaitReason } from "@/lib/sidebar-activity";
@@ -1850,7 +1851,7 @@ export function BotListItem({
   );
   const body = (
     <>
-      <div className="shrink-0 pointer-events-none relative">
+      <div className="shrink-0 pointer-events-none relative data-[off=true]:opacity-50 data-[off=true]:grayscale" data-off={bot.off === true ? "true" : undefined}>
         <BotAvatar
           bot={bot}
           state={stateForBot({ ...bot, messages: visible })}
@@ -1863,6 +1864,7 @@ export function BotListItem({
           // decorative; busy/unread/motion are the real signals).
           animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
         />
+        {iconOnly && bot.off === true && <BotOffBadge compact className="absolute -bottom-1 -right-1" />}
         {iconOnly && (
           hasError ? (
             <span
@@ -1909,6 +1911,7 @@ export function BotListItem({
                 </span>
               );
             })()}
+            {bot.off === true && <BotOffBadge className="ml-1" />}
           </span>
           {selected && activityAt > 0 && !renaming && (
             <span className="shrink-0 text-xs text-ink-secondary transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">

@@ -139,9 +139,9 @@ export interface Message {
   audioByVoice?: Record<string, Array<{ path: string; mime: string }>>;
   /** The text this reply's voice reads, and its stored clips were made from. */
   voiceText?: string;
-  /** What voiceText is: "written" (the reply as written, span-aligned for
-   * karaoke) or "summary" (an explicit Voice Summary mode).  Absent on rows
-   * from before karaoke (shared/spoken-script.ts). */
+  /** What voiceText is: "written" (the reply as written, the "off" mode) or
+   * "summary" (the distiller path, the default).  Absent on rows from before
+   * karaoke, whose voiceText is reused as a summary (shared/spoken-script.ts). */
   voiceTextKind?: "written" | "summary";
   /** Original incoming microphone recording and recognizer output never change. */
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
@@ -657,6 +657,14 @@ export interface BotRecord {
   rewound?: boolean;
   pinned?: boolean;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  Absent or false = on.
+   *  While true, no NEW turn starts for this bot from any source — chat from
+   *  every channel, routines, webhooks, resource triggers, room fan-out,
+   *  peer delegation, resumes — but the chat stays visible and a turn that was
+   *  already running finishes.  Unlike `hidden` (an archive) it keeps the bot
+   *  in the roster, and unlike a routine-manager "stop" no message clears it:
+   *  only an explicit Turn On does.  Persisted with the roster. */
+  off?: boolean;
   /** Optional labeled divider used to organize this bot in the sidebar. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread; a pin
@@ -751,9 +759,9 @@ export const sectionKey = (section?: string | null): string => section?.trim() |
  * "New Bot"), names match case-insensitively, longest name wins (so
  * "@New Bot 2" never half-matches "New Bot"), hidden bots skipped, results
  * deduped. Callers pre-filter the sender out of `peers`. */
-export function mentionedBots<T extends { name: string; hidden?: boolean }>(text: string, peers: T[]): T[] {
+export function mentionedBots<T extends { name: string; hidden?: boolean; off?: boolean }>(text: string, peers: T[]): T[] {
   const candidates = peers
-    .filter((p) => !p.hidden && p.name.trim())
+    .filter((p) => !p.hidden && !p.off && p.name.trim())
     .sort((a, b) => b.name.length - a.name.length);
   const lower = text.toLowerCase();
   const found: T[] = [];
@@ -821,12 +829,13 @@ export function normalizeGroupDefaultResponder(
 
 /** Resolve the bots invoked by a human room message. Explicit targets win;
  * otherwise the room policy chooses one member, everyone, or nobody. */
-export function roomResponders<T extends { id: string; name: string; hidden?: boolean }>(
+export function roomResponders<T extends { id: string; name: string; hidden?: boolean; off?: boolean }>(
   text: string,
   members: T[],
   defaultResponder: GroupDefaultResponder,
 ): T[] {
-  const available = members.filter((member) => !member.hidden);
+  // An Off member cannot speak, so it is skipped exactly like an archived one.
+  const available = members.filter((member) => !member.hidden && !member.off);
   if (/(?:^|\s)@everyone\b/i.test(text)) return available;
   const mentioned = mentionedBots(text, available);
   if (mentioned.length) return mentioned;

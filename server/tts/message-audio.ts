@@ -26,32 +26,46 @@
 // - A request without `progressive` is a shipped TestFlight build (every
 //   current client sends it).  It keeps its contract: one answer with every
 //   clip, the historical MAX_UTTERANCES cap, and the shared voice when it
-//   sends no `device`.  What it reads changed with the default script below,
-//   and a written reply can be much longer than the model summary it used to
-//   get, so two limits answer it with something it can show instead of
-//   failing: a reply over its cap gets LEGACY_REPLY_TOO_LONG (still 413), and
-//   a reply not ready within BLOCKING_RESPONSE_BUDGET_MS gets STILL_PREPARING
-//   (425, retryable) instead of the companion's 504.  The job keeps going, so
-//   the next tap is served from the finished clips.
-// - What the voice reads (shared/voice-summary.ts voiceScriptKind): by default
-//   the reply as written, through the deterministic speakable pass, with the
-//   source span of every spoken character (shared/speech-spans.ts).  A model
-//   summary is spoken only when the bot's Voice Summary mode was picked
-//   explicitly (board 8cc3c806: the speech pass may not paraphrase).
+//   sends no `device`.  Two limits answer it with something it can show
+//   instead of failing: a reply over its cap gets LEGACY_REPLY_TOO_LONG
+//   (still 413), and a reply not ready within BLOCKING_RESPONSE_BUDGET_MS
+//   gets STILL_PREPARING (425, retryable) instead of the companion's 504.
+//   The job keeps going, so the next tap is served from the finished clips.
+// - What the voice reads (shared/voice-summary.ts voiceScriptKind): by
+//   default the distilled rewrite (`summarize`, voiceSummaryFor in
+//   server/index.ts, the DeepSeek pass in speech-summary.ts), for hosted
+//   clips and for Personal Voice alike.  That is the owner's choice (owner
+//   correction, 2026-10-08), restoring what #952 had replaced with the reply
+//   as written.  Only an explicit "off" reads the reply as written, through
+//   the deterministic speakable pass with the source span of every spoken
+//   character (shared/speech-spans.ts).  The distiller's own fallback (no
+//   key, a timeout, a cut-off rewrite) and a short plain reply it skips are
+//   that same deterministic script, so they get spans too.
 // - `message.voiceText` plus `voiceTextKind` say which script the stored
 //   clips were made from.  Clips are only ever served with the utterances
 //   they were made from: a different script resets the message's clip lists
-//   before synthesis, and a complete set from before this field existed is
-//   served as it was made (no spans, no karaoke) instead of being billed
-//   again.
-// - `spans: true` in the request adds `script` and, for a written script,
-//   `spans` (shared/spoken-script.ts) to the answer.  Without it the answer is
-//   byte-for-byte what it was, so shipped clients are unaffected.
+//   before synthesis.  A row from before voiceTextKind holds what was spoken
+//   then (usually the distilled rewrite); the distiller path reuses it and
+//   its clips as they are, so nothing is rewritten or billed again.
+// - When the distiller is down for a moment (`retry`), its stand-in is the
+//   reply as written and is stamped "written", so the next play asks the
+//   distiller again instead of keeping the stand-in for good.  A script whose
+//   utterances are the same either way (the deterministic script, however it
+//   was reached) owns clips stamped with either kind, so the same text is
+//   never synthesized twice just because the stamp changed.
+// - `spans: true` in the request adds `script` to the answer, and `spans`
+//   when the utterances are the deterministic script ("written").  A
+//   distilled script answers "summary" with no spans; clients align it to the
+//   message without them.  Without the flag the answer is byte-for-byte what
+//   it was, so shipped clients are unaffected.
+// - An on-device (Personal Voice) answer has the distiller's MiniMax pause
+//   tags (`<#0.3#>`) taken out, since an Apple voice would read them; hosted
+//   clips keep them, because MiniMax turns them into the pauses they ask for.
 import { z } from "zod";
 
 import { isPersonalVoiceId, isSpeechDevice, SPEECH_DEVICES, voiceForDevice, type BotVoices, type SpeechDevice } from "../../shared/bot-voice.ts";
 import { utterancesWithSpans } from "../../shared/speech-spans.ts";
-import { encodeSpokenSpans, type SpokenScriptKind, type SpokenSpansWire } from "../../shared/spoken-script.ts";
+import { encodeSpokenSpans, stripPauseTags, type SpokenScriptKind, type SpokenSpansWire } from "../../shared/spoken-script.ts";
 import { voiceScriptKind, writtenReply, type VoiceSummaryMode } from "../../shared/voice-summary.ts";
 import { toUtterances } from "./speech-text.ts";
 
@@ -130,12 +144,20 @@ export interface AudioMessage {
   audioByVoice?: Record<string, VoiceClip[]>;
 }
 
+/** What `summarize` hands back.  `retry` marks a stand-in for a rewrite that
+ * failed for a passing reason (speech-summary.ts voiceSummaryWorthStoring):
+ * it is spoken now, but not kept as the reply's distilled script. */
+export interface SummarizedSpeech {
+  text: string;
+  retry?: boolean;
+}
+
 export interface MessageAudioDeps {
   /** A fresh read of the stored message. */
   message(threadId: string, messageId: string): AudioMessage | undefined;
   patchMessage(threadId: string, messageId: string, patch: Partial<AudioMessage>): void;
   /** The speech text for a reply that has none stored yet (voiceSummaryFor). */
-  summarize(threadId: string, messageId: string, text: string): Promise<string>;
+  summarize(threadId: string, messageId: string, text: string): Promise<SummarizedSpeech>;
   speak(text: string, voice: string | undefined): Promise<{ bytes: Uint8Array; mime: string }>;
   saveClip(bytes: Uint8Array, mime: string): VoiceClip;
   clipExists(clip: VoiceClip): boolean;
@@ -164,8 +186,9 @@ export type AudioResponseBody = {
   ready?: number;
   maxUtterances?: number;
   maxCharacters?: number;
-  /** Only with `spans: true`: what the voice reads.  "written" is span-aligned
-   * to the message (karaoke applies); "summary" is not. */
+  /** Only with `spans: true`: what the voice reads.  "written" is the
+   * deterministic script, span-aligned to the message; "summary" is the
+   * distilled rewrite.  Karaoke follows the message for both. */
   script?: SpokenScriptKind;
   /** Only with `spans: true` and a written script. */
   spans?: SpokenSpansWire;
@@ -203,6 +226,17 @@ export function parseAudioRequest(body: AudioRequestBody | null | undefined): { 
 export function parseClipDevice(value: string | null | undefined): { ok: true; device?: SpeechDevice } | { ok: false; error: string } {
   if (value === null || value === undefined || value === "") return { ok: true };
   return isSpeechDevice(value) ? { ok: true, device: value } : { ok: false, error: "device must be mac or iphone" };
+}
+
+function sameUtterances(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((u, i) => u === b[i]);
+}
+
+/** Whether `voiceText`, split the way a distilled script is, gives exactly
+ * the utterances of `replyText` as written.  Then clips stamped with either
+ * kind for this text are the same audio. */
+export function isWrittenScript(replyText: string, voiceText: string): boolean {
+  return sameUtterances(utterancesWithSpans(writtenReply(replyText)).map((u) => u.text), toUtterances(voiceText));
 }
 
 interface ClipJob {
@@ -313,9 +347,14 @@ export class MessageAudio {
     return { kind: "json", status: this.deps.isNoVoiceConfigured(error) ? 409 : 502, body: { error: error.message } };
   }
 
-  /** Whether the message's stored clips were made from this script. */
-  private ownsClips(message: AudioMessage, voiceText: string, kind: SpokenScriptKind): boolean {
-    if (message.voiceTextKind) return message.voiceTextKind === kind && message.voiceText === voiceText;
+  /** Whether the message's stored clips were made from this script.
+   * `eitherKind`: the script's utterances are the same whichever kind made
+   * them (the deterministic script reached through the distiller), so a
+   * stamp of the other kind with the same text owns them too. */
+  private ownsClips(message: AudioMessage, voiceText: string, kind: SpokenScriptKind, eitherKind = false): boolean {
+    if (message.voiceTextKind) {
+      return message.voiceText === voiceText && (message.voiceTextKind === kind || eitherKind);
+    }
     // A row from before voiceTextKind: its clips belong to whatever voiceText
     // it holds, as they always have, and only a summary may keep them.
     return kind === "summary" && (!message.voiceText || message.voiceText === voiceText);
@@ -337,6 +376,7 @@ export class MessageAudio {
     utterances: string[],
     voiceText: string,
     voiceTextKind: SpokenScriptKind,
+    eitherKind = false,
   ): ClipJob {
     const key = `${threadId}:${messageId}:${voice}`;
     const running = this.jobs.get(key);
@@ -358,7 +398,8 @@ export class MessageAudio {
     const ours = () => {
       if (!current()) return false;
       const latest = this.deps.message(threadId, messageId);
-      return !latest?.voiceTextKind || (latest.voiceTextKind === voiceTextKind && latest.voiceText === voiceText);
+      return !latest?.voiceTextKind
+        || (latest.voiceText === voiceText && (latest.voiceTextKind === voiceTextKind || eitherKind));
     };
     const stamp = { voiceText, voiceTextKind };
     // Registered before the body runs: the body checks current() each clip.
@@ -366,7 +407,7 @@ export class MessageAudio {
     job.done = (async () => {
       let message = this.deps.message(threadId, messageId);
       if (!message) throw new Error("The reply is no longer available.");
-      if (!this.ownsClips(message, voiceText, voiceTextKind)) {
+      if (!this.ownsClips(message, voiceText, voiceTextKind, eitherKind)) {
         // The stored clips (every voice's) speak another script.  Drop them
         // so no list ever pairs old audio with these utterances.
         this.deps.patchMessage(threadId, messageId, { audio: undefined, audioVoice: undefined, audioByVoice: undefined, ...stamp });
@@ -435,27 +476,53 @@ export class MessageAudio {
     // Shipped clients send no device: they keep the shared voice.
     const voice = this.effective(device ? voiceForDevice(owner, device) : owner.voice);
 
-    // What the voice reads.  Written: the reply itself, span-aligned, the same
-    // string every time.  Summary: a model rewrite, kept once made.
+    // What the voice reads.  `kind` is the script the stored clips are
+    // stamped with; `label` is what the answer calls it.
+    // - Summary (the default): the distilled rewrite, kept once made.  A row
+    //   from before voiceTextKind is reused the same way.  When the text is
+    //   the deterministic script (a skipped short reply, or the distiller's
+    //   fallback) it is labelled "written" and carries the spans.
+    // - Written ("off"): the reply itself, span-aligned, the same string
+    //   every time.
     const kind = voiceScriptKind(owner);
+    let label: SpokenScriptKind = kind;
     let utterances: string[];
     let textToSpeak: string;
     let spansWire: SpokenSpansWire | undefined;
+    // The kind the clips are stamped with, and whether a stamp of the other
+    // kind with the same text owns them too (see ownsClips).
+    let stampKind: SpokenScriptKind = kind;
+    let eitherKind = false;
+    const source = writtenReply(message.text);
     if (kind === "written") {
-      const source = writtenReply(message.text);
       const spoken = utterancesWithSpans(source);
       utterances = spoken.map((u) => u.text);
       textToSpeak = utterances.join(" ");
       if (spans) spansWire = encodeSpokenSpans(source, spoken);
+      eitherKind = sameUtterances(toUtterances(textToSpeak), utterances);
     } else {
-      // A written-mode script is not a summary; summarize instead of reusing it.
-      textToSpeak = message.voiceText && message.voiceTextKind !== "written"
-        ? message.voiceText
+      // A written-mode script is the reply as written, not a distilled one;
+      // distill instead of reusing it.
+      const summarized: SummarizedSpeech = message.voiceText && message.voiceTextKind !== "written"
+        ? { text: message.voiceText }
         : await this.deps.summarize(threadId, messageId, message.text);
+      textToSpeak = summarized.text;
       utterances = toUtterances(textToSpeak);
+      const deterministic = utterancesWithSpans(source);
+      if (sameUtterances(deterministic.map((u) => u.text), utterances)) {
+        label = "written";
+        eitherKind = true;
+        if (spans) spansWire = encodeSpokenSpans(source, deterministic);
+        // A stand-in for a rewrite that failed for a passing reason is the
+        // reply as written, and stamped so: the next play distills again.
+        // (A stand-in that is not exactly the written script, which only a
+        // redacted secret or the bot's own [voice_summary] makes, is kept as
+        // a summary; stamping it "written" would misdescribe its clips.)
+        if (summarized.retry) stampKind = "written";
+      }
     }
     /** `script` and `spans`, only for a client that asked. */
-    const extra = (script: SpokenScriptKind = kind): Partial<AudioResponseBody> =>
+    const extra = (script: SpokenScriptKind = label): Partial<AudioResponseBody> =>
       spans ? { script, ...(script === "written" && spansWire ? { spans: spansWire } : {}) } : {};
 
     const spoken = utterances.join(" ");
@@ -490,10 +557,25 @@ export class MessageAudio {
       if (!device && !isPersonalVoiceId(owner.voice)) {
         return { kind: "json", status: 409, body: { error: PERSONAL_VOICE_NEEDS_UPDATE } };
       }
+      // An Apple voice would read the distiller's MiniMax pause tags aloud.
+      // The deterministic script has none, and its spans index it as it is.
+      const onDevice = label === "written"
+        ? utterances
+        : utterances.map(stripPauseTags).filter((u) => /[\p{L}\p{N}]/u.test(u));
       return {
         kind: "json",
         status: 200,
-        body: { audio: [], voiceText: spoken, utterances, total: utterances.length, complete: true, onDevice: true, personalVoice: true, voice, ...extra() },
+        body: {
+          audio: [],
+          voiceText: onDevice.join(" "),
+          utterances: onDevice,
+          total: onDevice.length,
+          complete: true,
+          onDevice: true,
+          personalVoice: true,
+          voice,
+          ...extra(),
+        },
       };
     }
 
@@ -504,7 +586,13 @@ export class MessageAudio {
     const cached = this.slotClips(message, voice, ownerVoice);
     const complete = (list: VoiceClip[] | undefined, count: number): list is VoiceClip[] =>
       list?.length === count && list.every((clip) => this.deps.clipExists(clip));
-    if (this.ownsClips(message, textToSpeak, kind) && complete(cached, utterances.length)) {
+    if (this.ownsClips(message, textToSpeak, stampKind, eitherKind) && complete(cached, utterances.length)) {
+      // Clips of this very script stamped "written" (a play in the "off" mode,
+      // or while #952 made that the default, or while the distiller was down)
+      // become the distilled script once the distiller has settled on it.
+      if (stampKind === "summary" && message.voiceTextKind === "written") {
+        this.deps.patchMessage(threadId, messageId, { voiceTextKind: "summary" });
+      }
       return {
         kind: "json",
         status: 200,
@@ -542,7 +630,7 @@ export class MessageAudio {
       }
     }
 
-    const job = this.ensureJob(threadId, messageId, voice, ownerVoice, utterances, textToSpeak, kind);
+    const job = this.ensureJob(threadId, messageId, voice, ownerVoice, utterances, textToSpeak, stampKind, eitherKind);
     if (!progressive) {
       await this.waitFor(job, () => false, startedAt + BLOCKING_RESPONSE_BUDGET_MS - this.now());
       if (job.error) return this.failure(job.error);

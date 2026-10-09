@@ -5,7 +5,8 @@
 import { describe, expect, it } from "vitest";
 
 import { estimatedClips } from "../../shared/karaoke-align";
-import { localKaraokeScript } from "../../shared/spoken-script";
+import { karaokeScriptFromWire, localKaraokeScript } from "../../shared/spoken-script";
+import { toUtterances } from "../../server/tts/speech-text";
 import { attachKaraoke, KARAOKE_LINGER_MS } from "./karaoke-session";
 import { KARAOKE_HIGHLIGHT_NAMES, type KaraokeEnv } from "./karaoke-highlight";
 import { ClipsKaraoke, LiveKaraoke } from "./tts/karaoke-feed";
@@ -165,6 +166,45 @@ describe("attachKaraoke with a hosted voice", () => {
   });
 });
 
+describe("attachKaraoke with a script that has spans", () => {
+  // A reply that is mostly bare links: the deterministic script reads each
+  // one as "a link", so few spoken words match a word on screen.  The spans
+  // still say which link each "a link" stands for.
+  const LINKS_SOURCE = [
+    "Sources:",
+    "",
+    ...Array.from({ length: 8 }, (_, i) => `- https://example.com/docs/page-${i}/section`),
+    "",
+    "Done.",
+  ].join("\n");
+  const LINKS_RENDERED =
+    "<p>Sources:</p><ul>" +
+    Array.from({ length: 8 }, (_, i) => `<li><a href='https://example.com/docs/page-${i}/section'>https://example.com/docs/page-${i}/section</a></li>`).join("") +
+    "</ul><p>Done.</p>";
+
+  it("follows a link list read as \"a link\" each time", () => {
+    const fx = fakeEnv();
+    const { script } = localKaraokeScript(LINKS_SOURCE);
+    const feed = new LiveKaraoke("msg_1", script);
+    const session = attachKaraoke(mount(LINKS_RENDERED), feed, LINKS_SOURCE, { env: fx.env, schedule: fx.schedule });
+    expect(session.alignment?.guided).toBe(true);
+    expect(session.alignment?.followable).toBe(true);
+    fx.setNow(1_000);
+    feed.range(script.spokenText.lastIndexOf("Done"), 990);
+    // The 56 link words before "Done" were never reported; the cue sweeps
+    // them quickly and lands on "Done" instead of staying dark.
+    let landed = false;
+    for (let t = 1_050; t <= 5_000 && !landed; t += 50) {
+      fx.setNow(t);
+      fx.flush();
+      const current = fx.painted("current");
+      landed = current.length === 1 && "Done".startsWith(current[0]);
+    }
+    expect(landed).toBe(true);
+    session.dispose();
+  });
+});
+
 describe("attachKaraoke with a Personal Voice", () => {
   it("cues each reported word, including the newest one reported before it attached", () => {
     const fx = fakeEnv();
@@ -188,5 +228,52 @@ describe("attachKaraoke with a Personal Voice", () => {
     expect(fx.painted("trail").some((text) => "749".startsWith(text) || text === "749")).toBe(true);
     session.dispose();
     expect(fx.registry.size).toBe(0);
+  });
+});
+
+describe("attachKaraoke with a distilled script", () => {
+  // What the default voice reads for SOURCE: the DeepSeek rewrite, with the
+  // number spelled out, the code block skipped, a pause tag, and the link
+  // read by its label.  No spans.
+  const DISTILLED = "Build seven four nine passed on main. <#0.3#> See the guide for the rest.";
+
+  it("follows the rendered words without spans, landing the spelled number on 749", () => {
+    const fx = fakeEnv();
+    const script = karaokeScriptFromWire(toUtterances(DISTILLED));
+    const feed = new LiveKaraoke("msg_1", script);
+    const session = attachKaraoke(mount(RENDERED), feed, SOURCE, { env: fx.env, schedule: fx.schedule });
+    expect(session.alignment?.guided).toBe(false);
+    expect(session.alignment?.followable).toBe(true);
+
+    fx.setNow(1_000);
+    feed.range(script.spokenText.indexOf("four"), 990);
+    fx.setNow(1_100);
+    fx.flush();
+    expect(fx.painted("current")).toHaveLength(1);
+    expect("749".startsWith(fx.painted("current")[0])).toBe(true);
+    // "passed on main See the" were never reported (the clock jumped), so
+    // the cue sweeps them in 40 ms apiece before "guide" rolls in.
+    fx.setNow(1_400);
+    feed.range(script.spokenText.indexOf("guide"), 1_390);
+    fx.setNow(1_700);
+    fx.flush();
+    expect(fx.painted("current")).toHaveLength(1);
+    expect("guide".startsWith(fx.painted("current")[0])).toBe(true);
+    session.dispose();
+  });
+
+  it("shows no highlight for a brief summary that does not line up with the message", () => {
+    const fx = fakeEnv();
+    const script = karaokeScriptFromWire(["Good news, everything shipped and nothing else needs your attention."]);
+    const feed = new LiveKaraoke("msg_1", script);
+    const session = attachKaraoke(mount(RENDERED), feed, SOURCE, { env: fx.env, schedule: fx.schedule });
+    expect(session.alignment?.followable).toBe(false);
+    fx.setNow(1_000);
+    feed.range(script.spokenText.indexOf("shipped"), 990);
+    fx.setNow(1_100);
+    fx.flush();
+    expect(fx.painted("current")).toEqual([]);
+    expect(fx.registry.size).toBe(0);
+    session.dispose();
   });
 });

@@ -295,6 +295,9 @@ final class Session: ObservableObject {
             if ProcessInfo.processInfo.arguments.contains("-preview-voice") {
                 seedVoicePreview(&fleet)
             }
+            if ProcessInfo.processInfo.arguments.contains("-preview-off") {
+                seedOffPreview(&fleet)
+            }
             state.hydrate(fleet)
             // StorePreview bots all select instanceId "preview"; seed the
             // driver map so the chat-header provider mark appears in the
@@ -325,6 +328,16 @@ final class Session: ObservableObject {
     /// aloud, so its bubble wears Stop Voice.
     func debugSetSpeaking(_ messageId: String?) {
         speakingMessageId = messageId
+    }
+
+    /// `-preview-off`: Pixel is switched Off, so the chat list's dimmed row and
+    /// Off label, the disabled composer and the profile's Power section can be
+    /// screenshotted without a paired computer.  Pass `-open-first` as well to
+    /// land on Scout, then open Pixel from the list.
+    private func seedOffPreview(_ fleet: inout Fleet) {
+        for index in fleet.bots.indices where fleet.bots[index].id == "preview-pixel" {
+            fleet.bots[index].off = true
+        }
     }
 
     /// `-preview-voice`: every preview bot speaks a MiniMax voice on this
@@ -2018,11 +2031,12 @@ final class Session: ObservableObject {
     }
 
     /// What a Personal Voice reads for `message`, and the karaoke script
-    /// that follows it.  The harness's utterances when it answered; a reply
-    /// it reads as written comes with spans (`script: "written"`), and a
-    /// summary has no karaoke.  Without an answer this phone projects the
-    /// reply itself, and the highlight follows that projection without
-    /// spans, anchored on words that occur once on each side.
+    /// that follows it.  The harness's utterances when it answered: the
+    /// distilled rewrite by default (aligned to the message without spans),
+    /// or the written script with its spans (`script: "written"`).  Without
+    /// an answer this phone projects the reply itself, and the highlight
+    /// follows that projection without spans, anchored on words that occur
+    /// once on each side.
     private func personalReading(_ answer: MessageVoice?, message: Message) -> (segments: [SpeechSegment], script: KaraokeScript?) {
         if let answer, let utterances = answer.utterances {
             return (SpeechProjection.segments(fromUtterances: utterances), answer.karaokeScript)
@@ -2088,9 +2102,10 @@ final class Session: ObservableObject {
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.playback, mode: .spokenAudio)
         try audioSession.setActive(true)
-        // Karaoke for a reply read as written, one clip per utterance: each
-        // word's time is proportional to its place in its clip, and a
-        // clip's real length replaces the estimate once it plays.
+        // Karaoke over the message, one clip per utterance, for the
+        // distilled script and the written one alike: each word's time is
+        // proportional to its place in its clip, and a clip's real length
+        // replaces the estimate once it plays.
         var karaoke: MessageKaraoke?
         if let script = answer.karaokeScript, script.utterances.count == total {
             karaoke = KaraokeCenter.shared.begin(messageId: messageId, messageText: message.text ?? "", script: script, mode: .clips)
@@ -3345,6 +3360,15 @@ enum Chat: Identifiable, Hashable {
         switch self {
         case let .bot(bot): return bot.busy ?? false
         case let .room(room): return room.isWorking
+        }
+    }
+
+    /// A bot switched Off.  Rooms are never Off themselves: an Off member is
+    /// skipped inside the room with a notice, and the room composer stays.
+    var isOff: Bool {
+        switch self {
+        case let .bot(bot): return bot.isOff
+        case .room: return false
         }
     }
 

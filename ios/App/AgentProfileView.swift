@@ -41,6 +41,7 @@ struct AgentProfileView: View {
     @State private var autoApprove: Bool
     @State private var autoReview: String
     @State private var approvePeerComms: Bool
+    @State private var isOff: Bool
     @State private var computers: Set<String>
     @State private var cwd: String
     @State private var baseline: ProfileFormSnapshot
@@ -64,6 +65,7 @@ struct AgentProfileView: View {
         _autoApprove = State(initialValue: bot.autoApprove ?? false)
         _autoReview = State(initialValue: bot.autoReview ?? "off")
         _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
+        _isOff = State(initialValue: bot.isOff)
         _computers = State(initialValue: Set(bot.computers ?? []))
         _cwd = State(initialValue: bot.cwd ?? "")
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
@@ -158,6 +160,7 @@ struct AgentProfileView: View {
                     HStack {
                         Spacer()
                         BotAvatarView(bot: current, size: 112, state: .happy, animated: true)
+                            .providerBadge(for: current, avatarSize: 112)
                         Spacer()
                     }
                     .listRowBackground(Color.clear)
@@ -199,6 +202,17 @@ struct AgentProfileView: View {
                     Text(imageGenerationReady
                          ? "Generation uses the shared image provider configured on your computer. No provider key is sent to or stored on this phone."
                          : "To generate images, configure the shared image provider in BotFleet on your computer. Provider keys cannot be added from a phone.")
+                }
+
+                Section {
+                    Toggle("On", isOn: Binding(get: { !isOff }, set: { isOff = !$0 }))
+                } header: {
+                    Text("Power")
+                } footer: {
+                    // Two spaces between sentences, held with a non-breaking space.
+                    Text(isOff
+                         ? "Nothing new starts for this bot.\u{00A0} Chat, routines, webhooks and rooms are skipped, and a turn already running finishes.\u{00A0} Its chat stays visible."
+                         : "This bot answers chat, runs its routines and webhooks, and speaks in rooms.\u{00A0} Turn it off to stop all new work.")
                 }
 
                 Section("Identity") {
@@ -520,7 +534,8 @@ struct AgentProfileView: View {
             autoReview: autoReview == baseline.autoReview ? nil : autoReview,
             approvePeerComms: approvePeerComms == baseline.approvePeerComms ? nil : approvePeerComms,
             computers: computers == baseline.computers ? nil : computersArray,
-            cwd: cwdPatch
+            cwd: cwdPatch,
+            off: isOff == baseline.isOff ? nil : isOff
         )
     }
 
@@ -1017,6 +1032,7 @@ struct AgentProfileView: View {
         autoApprove = bot.autoApprove ?? false
         autoReview = bot.autoReview ?? "off"
         approvePeerComms = bot.approvePeerComms ?? false
+        isOff = bot.isOff
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
         baseline = ProfileFormSnapshot(bot: bot)
@@ -1038,6 +1054,7 @@ private struct ProfileFormSnapshot {
     var autoApprove: Bool
     var autoReview: String
     var approvePeerComms: Bool
+    var isOff: Bool
     var computers: Set<String>
     var cwd: String
 
@@ -1055,6 +1072,7 @@ private struct ProfileFormSnapshot {
         autoApprove = bot.autoApprove ?? false
         autoReview = bot.autoReview ?? "off"
         approvePeerComms = bot.approvePeerComms ?? false
+        isOff = bot.isOff
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
     }

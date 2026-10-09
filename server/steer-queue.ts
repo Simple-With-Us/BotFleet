@@ -17,6 +17,7 @@
 // stop-then-steer (queue a correction, hit Stop, the correction runs) is
 // the feature.
 
+import { botOffQueuedNotSent } from "../shared/bot-power.ts";
 import { newId } from "./contracts.ts";
 import type { BotRecord, Message } from "./store.ts";
 
@@ -119,6 +120,14 @@ export function drainSteeredMessages(
       continue;
     }
     if (bot.busy || started.has(entry.botId)) continue; // still working — the next settle tries again
+    // A bot switched Off while these waited gets nothing new: the turn they
+    // were queued behind has finished, and the next one will not start.  They
+    // are the person's own words, so say they were not sent rather than drop
+    // them silently — and never append them to the transcript as if sent.
+    if (bot.off === true) {
+      dropForOffBot(store, threadId, entry);
+      continue;
+    }
     // committed to draining: the entry leaves the map before anything runs,
     // so a settle racing another settle can never fire the same queue twice
     queues.delete(threadId);
@@ -188,6 +197,34 @@ export function drainSteeredMessages(
   }
 }
 
+/** Settle a queue whose bot is Off: the entry leaves the map and one
+ *  transcript line says how many messages were not sent. */
+function dropForOffBot(store: SteerStore, threadId: string, entry: QueueEntry): void {
+  queues.delete(threadId);
+  if (entry.items.length === 0) return;
+  store.appendMessage(threadId, {
+    role: "bot",
+    kind: "activity",
+    tool: { name: botOffQueuedNotSent(entry.items.length), ok: false },
+  });
+}
+
+/** The bot was just switched Off while idle: nothing is running for its
+ *  queue to wait behind, so settle every queue it owns now instead of at a
+ *  settle that may never come.  A busy bot's queue is left for
+ *  `drainSteeredMessages`, which settles it when the running turn ends.
+ *  Returns how many messages were dropped. */
+export function dropQueuedForOffBot(store: SteerStore, botId: string): number {
+  let dropped = 0;
+  // deleting only the entry being visited is safe under Map iteration
+  for (const [threadId, entry] of queues) {
+    if (entry.botId !== botId) continue;
+    dropped += entry.items.length;
+    dropForOffBot(store, threadId, entry);
+  }
+  return dropped;
+}
+
 /** Drop one waiting send so it never drains. Returns false when that
  * queue id was not in the in-memory queue (already drained, or a restart
  * lost the auto-run intent). */
@@ -242,9 +279,13 @@ export function restoreSteeredEntries(entries: readonly SteerQueueSnapshot[]): v
   }
 }
 
-/** Count pending sends without exposing message text to diagnostics. */
-export function queuedMessageCount(): number {
-  return [...queues.values()].reduce((total, entry) => total + entry.items.length, 0);
+/** Count pending sends without exposing message text to diagnostics.
+ *  `ignoreBot` leaves out the queues of bots that will never drain them (an Off
+ *  bot's waiting sends are dropped, not run), so they cannot hold an update. */
+export function queuedMessageCount(ignoreBot?: (botId: string) => boolean): number {
+  return [...queues.values()]
+    .filter((entry) => !ignoreBot?.(entry.botId))
+    .reduce((total, entry) => total + entry.items.length, 0);
 }
 
 /** Test helper: how many messages remain queued for a thread. */
