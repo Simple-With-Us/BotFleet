@@ -26,7 +26,7 @@ on product code.  Do not fix anything you find; the defects the evidence names a
 have board rows and CLAUDE lanes: 6689e3f3 (overview auto-dismiss), fbd2be5e (kanban
 card flood), 710979ea (fleet pill double count), 20725f10 (arrangement copy).
 
-1. Read, from a fresh worktree off origin/main (never the read-only integration tree):
+1. Read, from a fresh worktree off origin/main (never ~/Code/BotFleet):
    docs/audits/2026-10-09-fleet-matrix-ux-panel/00-brief.md
    docs/audits/2026-10-09-fleet-matrix-ux-panel/01-evidence.md  (file:line evidence; screenshots beside it)
    docs/audits/2026-10-09-fleet-matrix-ux-panel/02-candidate-arrangements.md
