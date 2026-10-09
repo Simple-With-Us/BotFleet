@@ -256,9 +256,10 @@ describe("VoiceSettings rendered voice commit", () => {
     await flush();
   }
 
-  /** The Mac picker: the first select on the card. */
+  /** The Mac picker.  (The first select on the card is the workspace
+   * Default Voice.) */
   function select() {
-    const found = container.querySelector("select");
+    const found = container.querySelector<HTMLSelectElement>('select[aria-label="Assistant\'s voice on this Mac"]');
     if (!found) throw new Error("missing voice select");
     return found;
   }

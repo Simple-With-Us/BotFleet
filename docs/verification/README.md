@@ -26,6 +26,8 @@ Verification uses these isolated fixtures:
 - [Mac updater transaction](mac-updater.md) — signed update delivery and application
 - [Staged candidate smoke test](staged-candidate-smoke.md) — the pre-activation probe that runs a candidate before anything live is touched
 - [Connector grants](connector-grants.md) — per-bot third-party tool authorization
+- [Saved data faults](saved-data.md) — unreadable bots, rooms, routines and settings files are set aside, never deleted
+- [Bot On/Off switch](bot-off.md) — an Off bot starts nothing new and finishes a running turn
 
 ### Test Fixtures
 
@@ -40,6 +42,7 @@ Many recipes are codified as unit tests or integration tests:
 - **Mac updater:** `scripts/mac-update-transaction.node-test.mjs` simulates signed update delivery.
 - **Staged candidate smoke:** `smokeStagedServer` boots a real signed bundle; see [staged-candidate-smoke.md](staged-candidate-smoke.md) for the recipe that runs it against the installed app.
 - **Connector grants:** `server/mcp-server.test.ts` and integration fixtures verify tool authorization per bot.
+- **Saved data faults:** `server/store-quarantine.test.ts`, `server/routines-quarantine.test.ts`, `server/config-salvage.test.ts` and `server/data-faults-boot.test.ts` cover each store and the real server; `tests/e2e/data-fault-banner.spec.ts` covers the bar.
 
 ## Evidence
 

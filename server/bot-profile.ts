@@ -31,6 +31,7 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "bypassPermissions",
   "autoReview",
   "composio",
+  "off",
   "connectorTools",
   "cloudBackend",
   "autoStartVps",
@@ -143,6 +144,10 @@ const profilePatchSchema = z.object({
   bypassPermissions: z.boolean({ error: "bypassPermissions must be true or false" }).optional(),
   autoReview: z.enum(["off", "shadow", "enforce"], { error: "autoReview must be off, shadow, or enforce" }).optional(),
   composio: z.boolean({ error: "composio must be true or false" }).optional(),
+  // The bot's On/Off switch (shared/bot-power.ts).  Writable from a paired
+  // phone as well as the desktop: turning a bot Off only ever STOPS work, and
+  // the phone has to be able to turn it back On.  Same validation both ways.
+  off: z.boolean({ error: "off must be true or false" }).optional(),
   connectorTools: z.union([connectorToolsSchema, z.null()]).optional(),
   cloudBackend: z.enum(["box", "vps"], { error: "cloudBackend must be box or vps" }).optional(),
   autoStartVps: z.boolean({ error: "autoStartVps must be true or false" }).optional(),
@@ -178,6 +183,7 @@ export type BotProfilePatch = Partial<
     | "bypassPermissions"
     | "autoReview"
     | "composio"
+    | "off"
     | "connectorTools"
     | "cloudBackend"
     | "autoStartVps"
@@ -197,6 +203,13 @@ export type BotProfilePatchResult =
  * The shared validation boundary for profile fields. The desktop's broad bot
  * PATCH passes strict=false; paired clients use strict=true so a future bot
  * field cannot silently become remotely writable.
+ *
+ * The execution-policy fields (`autoApprove`, `autoReview`,
+ * `approvePeerComms`, `bypassPermissions`) pass in both modes since the
+ * owner's 2026-10-09 ruling that a paired phone may set them.  Validating the
+ * VALUE is all this file does; whether a particular bot may have Auto or
+ * Bypass switched on from a phone (never when it can use This Mac) is decided
+ * where the stored bot is, in the profile route of server/index.ts.
  *
  * avatarUrl deliberately uses `undefined` as the normalized clear value.
  * Store persistence already omits undefined fields, while wireBot sends null
@@ -225,10 +238,6 @@ export function parseBotProfilePatch(
       return { ok: false, error: "avatarCrop must be mascot, circle, rounded, or square" };
     }
     return { ok: false, error: issue?.message ?? "invalid profile patch" };
-  }
-
-  if (strict && Object.prototype.hasOwnProperty.call(parsed.data, "bypassPermissions")) {
-    return { ok: false, error: "unsupported profile field: bypassPermissions" };
   }
 
   const { avatarUrl, cwd, connectorTools, voices, maxToolRounds: _maxToolRounds, ...fields } = parsed.data;

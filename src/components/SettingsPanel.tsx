@@ -14,11 +14,13 @@ import { shortPath } from "@/lib/short-path";
 import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@/lib/cloud-backend";
 import { computerDestinationDisabledReason, instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
+import { BotPowerToggle } from "./BotPowerToggle";
 import { BotSkillsPanel } from "./BotSkillsPanel";
 import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
 import { BypassPermissionsWarning } from "./BypassPermissionsWarning";
 import { evaluateModelRiskForBypass } from "../../shared/model-safety";
+import { bypassCoverageNote } from "../../shared/bypass-coverage";
 import { VoiceSettings } from "./VoiceSettings";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
 import { botCapabilityGates, toolRoundsGate } from "@/lib/bot-settings-gates";
@@ -383,6 +385,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "composio"
         | "modelSelection"
         | "maxToolRounds"
+        | "off"
       >
     > & { acknowledgeLocalAuto?: boolean; connectorTools?: Bot["connectorTools"] },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
@@ -397,6 +400,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const engine = gates.engine;
   const { canAutoReview, canCoordinate, canUseConnectedApps, canUseVps } = gates;
   const roundsGate = toolRoundsGate(state.instances, bot);
+  // Null when the engine asks and the broker answers, which is the common case.
+  const bypassNote = bypassCoverageNote(engine?.capabilities?.bypassCoverage ?? "asks");
   const connectedAppsConfigured = state.config?.composio?.configured === true;
   const connectedAppsEnabled = bot.composio !== false;
   const sectionName = bot.section?.trim() || "General";
@@ -465,6 +470,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               onChange={(e) => patch({ description: e.target.value })}
             />
           </Field>
+
+          <BotPowerToggle off={bot.off === true} onChange={(off) => patch({ off })} />
 
           <div className={cn(
             "rounded-xl border p-4",
@@ -838,8 +845,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 </div>
                 <div className="mt-0.5 text-[13px] text-ink-secondary">
                   {bot.bypassPermissions
-                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards."
-                    : "Automatically approve all tool, command, and routine requests without stopping for manual approval cards."}
+                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards.  Requests that control This Mac still ask."
+                    : "Automatically approve all tool, command, and routine requests without stopping for manual approval cards.  Requests that control This Mac still ask."}
                 </div>
               </div>
               <button
@@ -866,6 +873,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 />
               </button>
             </div>
+            {bypassNote && (
+              <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{bypassNote}</div>
+            )}
             {modelRisk.isDangerous && (
               <div className="mt-3 flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-2.5 text-[12px] text-warning">
                 <AlertTriangle size={15} className="mt-0.5 shrink-0" />

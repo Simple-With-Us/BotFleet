@@ -20,17 +20,21 @@ The first version includes:
 - Secure per-device trust, device listing, and revocation.
 - Bot and room lists, paged transcripts, sending, interruption, and unread
   state.
-- Approvals and questions, including narrow “always allow” grants.
+- Approvals and questions.  “Always allow” stays a computer-only grant: the
+  phone answers each approval once, and a provider's “Always allow” choice
+  reaches it as “Allow once.”
 - Resumable SSE, streamed reply text, reconnect hydration, and an opt-in live
   Box computer view. The loopback-only VPS SSH viewer remains desktop-only.
 - Markdown rendering and Keychain storage for the phone's pairing trust.
 
-Alerts work while the app is open or for the short period it remains connected
-after moving to the background.  After notification authorization, the app
-registers for remote notifications and POSTs the device token as hex to
-`POST /api/companion/push-token` (sidecar-local, like endpoints).  The Mac
-sidecar stores the token on the paired device and can APNs-wake a killed app;
-iOS never sends a push itself.  Live Activities stay local (`pushType: nil`).
+Alerts reach the phone while the app is open or in the background, and once
+the computer has push set up they reach it when the app is closed too.
+Settings says whether that is working (Closed-app notifications).  After
+notification authorization, the app registers for remote notifications and
+POSTs the device token as hex to `POST /api/companion/push-token`
+(sidecar-local, like endpoints).  The Mac sidecar stores the token on the
+paired device and APNs-wakes an app that is not running; iOS never sends a
+push itself.  Live Activities stay local (`pushType: nil`).
 The optional hosted transport connects to the user's own computer; it is not a
 cloud transcript store.
 
@@ -218,7 +222,7 @@ The device-facing socket rejects browser `Origin` headers before reading a
 token. Its route policy in `companion/src/routes.ts` is default-deny: a new
 harness route remains unreachable until it is deliberately added.
 
-Allowed in the first release:
+Allowed:
 
 - Read the fleet, rooms, instances, configuration status, and transcripts.
 - Fetch settled screen images and opt into live screen frames.
@@ -226,20 +230,64 @@ Allowed in the first release:
   owner has enabled that capability for this specific paired phone.
 - Send messages, interrupt bots, answer approvals/questions, and mark chats
   read.
-- Create a basic bot.
+- Create a bot, make a room, and edit a room (`PATCH /api/groups/:id`).
+- Edit a bot's profile through the narrow
+  `PATCH /api/bots/:id/profile`, described below.
+- Play back and annotate the phone's own voice recordings.
+- Create, edit, run, and delete routines; list a connected app, authorize one,
+  and detach one account.
+- Check for a newer BotFleet and install it.
 
-The write surface uses purpose-built `read` and `always-allow` endpoints. The
-general bot and room `PATCH` endpoints are not reachable through the sidecar.
-An always-allow request succeeds only when its server-issued key is still on a
-pending approval for that bot, so possession of a device token is not enough
-to invent a broad execution grant.
+The write surface uses purpose-built endpoints.  The general bot `PATCH` is not
+reachable through the sidecar, and neither is the always-allow route: a
+standing grant would widen what runs unattended, so the phone answers each
+approval once.
+
+A profile edit is held to an allowlist (`COMPANION_PROFILE_PATCH_FIELDS` in
+`companion/src/routes.ts`), and the sidecar refuses the **whole** request on
+the first field outside it, so one refused field also loses a name or voice
+edit made in the same save.  The native sheet therefore never offers an edit
+the computer would refuse.
+
+- Open to the phone: name, title, description, notifications, avatar, voice
+  and per-device voices, speech devices, model selection, the maximum tool
+  rounds, the bot's computers, and its working folder.
+- Computers: the phone switches the sandboxed destinations (a cloud computer,
+  the Local VM).  Whether a bot holds **This Mac**, the person's real desktop,
+  is turned on or off in BotFleet on the computer.  The harness checks that
+  against the stored bot (`PAIRED_LOCAL_COMPUTER_ERROR` in `server/index.ts`),
+  and the sheet shows the row read-only with a **Change On Mac** note.
+- Working folder: from a paired phone it may only reuse or narrow a folder this
+  computer already shares with a bot or room, the same confinement a room
+  folder gets.  Anything else is a 403 that says so.
+- Execution policy, open to the phone since the owner's ruling of 2026-10-09
+  ("Bots should have bypass permissions options too or YOLO or whatever"):
+  Auto Mode (`autoApprove`), Auto Review (`autoReview`: off, watch, on), Ask
+  Before Contacting Other Bots (`approvePeerComms`) and Bypass Permissions
+  (`bypassPermissions`).  #323 had kept all of them on the computer.
+  - Bypass Permissions asks first, with a short form of the desktop's warning,
+    and a bot that has it on carries a **Bypass** mark beside its name in the
+    chat header.  It answers every request the engine raises, destructive and
+    credential-file ones included, and ones from webhook turns, except a
+    request that controls This Mac, which still asks
+    (`server/auto-approve.ts`).  The sheet says so on the engines where it
+    changes nothing or works differently (`shared/bypass-coverage.ts`, shipped
+    as `capabilities.bypassCoverage`).
+  - Auto Mode is the one switch the phone cannot turn ON for a bot that can
+    use This Mac: it is what lets a click on the real desktop go unasked, and
+    its warning dialog is the computer's.  The harness refuses with a 403
+    (`PAIRED_AUTO_ON_THIS_MAC_ERROR`), and turning it off always works.
+  - Auto Review's On and Watch, and the peer-contact switch, follow the
+    engine's `approvalReview` and `agentsMcp` capabilities, as on the desktop.
 
 Intentionally refused:
 
 - API keys and provider configuration.
 - Pairing, device revocation, or companion lifecycle control.
-- Local VM lifecycle, webhooks, connectors, routines, team import/export, and
-  internal peer-agent routes.
+- Local VM lifecycle, webhooks, resource triggers, removing a whole connected
+  app (listing, authorizing, and detaching one account are allowed), routine
+  operations beyond the ones above, team import/export, and internal
+  peer-agent routes.
 - Cloud computer provisioning, sleep, shell execution, and screenshot APIs.
   The phone receives only the fresh `join` viewer URL, never the provider key.
 - New harness routes that have not been reviewed for phone access.

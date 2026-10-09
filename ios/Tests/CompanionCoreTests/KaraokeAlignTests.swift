@@ -22,6 +22,8 @@ final class KaraokeAlignTests: XCTestCase {
             /// [spokenContent, spokenMatched, displayContent, displayMatched]
             let quality: [Int]
             let followable: Bool
+            /// Only the cases that exercise the pronunciation list carry one.
+            let pronunciations: [Pronunciation]?
         }
 
         /// [start, end, key]
@@ -66,7 +68,8 @@ final class KaraokeAlignTests: XCTestCase {
                 spokenText: c.spokenText,
                 displayText: c.displayText,
                 segments: segments,
-                sourceText: c.source
+                sourceText: c.source,
+                pronunciations: c.pronunciations ?? []
             )
             XCTAssertEqual(a.spokenWords.map(Fixture.Word.init), c.spokenWords, "spoken words: \(c.name)")
             XCTAssertEqual(a.displayWords.map(Fixture.Word.init), c.displayWords, "display words: \(c.name)")
@@ -88,6 +91,28 @@ final class KaraokeAlignTests: XCTestCase {
                 XCTAssertEqual(got, want, accuracy: 1e-6, "timeline[\(index)]: \(c.name)")
             }
         }
+    }
+
+    func testTheFixtureCoversThePronunciationList() throws {
+        let fixture = try SpeechSpansTests.loadFixture("karaoke-align", as: Fixture.self)
+        XCTAssertGreaterThanOrEqual(fixture.cases.filter { $0.pronunciations != nil }.count, 3)
+    }
+
+    func testARespelledTermLandsOnTheTermOnScreen() {
+        let list = [Pronunciation(term: "OAuth", say: "oh auth"), Pronunciation(term: "SQL", say: "sequel")]
+        let a = KaraokeAlign.alignSpokenToDisplay(
+            spokenText: "Sign in with oh auth on the sequel box.",
+            displayText: "Sign in with OAuth on the SQL box.",
+            pronunciations: list
+        )
+        XCTAssertEqual(a.mapping.spokenToDisplay, [0, 1, 2, 3, 3, 4, 5, 6, 7])
+        XCTAssertEqual(a.mapping.spokenKind[3], KaraokeAlign.spokenExpanded)
+        XCTAssertEqual(a.mapping.spokenKind[7], KaraokeAlign.spokenExpanded)
+        let without = KaraokeAlign.alignSpokenToDisplay(
+            spokenText: "Sign in with oh auth on the sequel box.",
+            displayText: "Sign in with OAuth on the SQL box."
+        )
+        XCTAssertNotEqual(without.mapping.spokenKind[7], KaraokeAlign.spokenExpanded)
     }
 
     func testNumbersReadAloudLandOnTheirDigits() {

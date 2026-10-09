@@ -4,12 +4,16 @@
 // one). messages-<threadId>.json holds the folded transcript.
 import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 
 import { isDelegationMessage } from "../shared/delegation-message.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
+import { rosterIsOnHold } from "./data-faults.ts";
 import * as mdb from "./message-db.ts";
+import type { JsonValue } from "./schema.ts";
+import { interpretRecordList, loadGuarded, logRefusedSave } from "./store-guard.ts";
 import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId, type TurnBillingMode } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
@@ -122,7 +126,7 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
@@ -657,6 +661,14 @@ export interface BotRecord {
   rewound?: boolean;
   pinned?: boolean;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  Absent or false = on.
+   *  While true, no NEW turn starts for this bot from any source — chat from
+   *  every channel, routines, webhooks, resource triggers, room fan-out,
+   *  peer delegation, resumes — but the chat stays visible and a turn that was
+   *  already running finishes.  Unlike `hidden` (an archive) it keeps the bot
+   *  in the roster, and unlike a routine-manager "stop" no message clears it:
+   *  only an explicit Turn On does.  Persisted with the roster. */
+  off?: boolean;
   /** Optional labeled divider used to organize this bot in the sidebar. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread; a pin
@@ -725,6 +737,15 @@ const BOTS_FILE = join(DATA_DIR, "bots.json");
 /** Which one-time model-lineage migrations this data dir has had. */
 const MODEL_LINEAGE_MARKER = "model-lineage.json";
 const GROUPS_FILE = join(DATA_DIR, "groups.json");
+/** The least a bots.json entry must be before the Store's own migrations can run on it.  Anything
+ * else in the entry is left to those migrations, as it always was: a stricter test here would set
+ * aside a roster an older build wrote. */
+const botEntrySchema = z.looseObject({ id: z.string().min(1) });
+/** The same for rooms.  Every non-channel room reads `memberIds` before anything else. */
+const groupEntrySchema = z.looseObject({ id: z.string().min(1), memberIds: z.array(z.string()) });
+const isBotEntry = (candidate: JsonValue): candidate is JsonValue & BotRecord => botEntrySchema.safeParse(candidate).success;
+const isGroupEntry = (candidate: JsonValue): candidate is JsonValue & GroupRecord =>
+  groupEntrySchema.safeParse(candidate).success;
 /** How long a burst of saveBots() calls coalesces into one atomic write. */
 const BOTS_SAVE_DEBOUNCE_MS = 250;
 const messagesFile = (threadId: string) => join(DATA_DIR, `messages-${threadId}.json`);
@@ -751,9 +772,9 @@ export const sectionKey = (section?: string | null): string => section?.trim() |
  * "New Bot"), names match case-insensitively, longest name wins (so
  * "@New Bot 2" never half-matches "New Bot"), hidden bots skipped, results
  * deduped. Callers pre-filter the sender out of `peers`. */
-export function mentionedBots<T extends { name: string; hidden?: boolean }>(text: string, peers: T[]): T[] {
+export function mentionedBots<T extends { name: string; hidden?: boolean; off?: boolean }>(text: string, peers: T[]): T[] {
   const candidates = peers
-    .filter((p) => !p.hidden && p.name.trim())
+    .filter((p) => !p.hidden && !p.off && p.name.trim())
     .sort((a, b) => b.name.length - a.name.length);
   const lower = text.toLowerCase();
   const found: T[] = [];
@@ -821,12 +842,13 @@ export function normalizeGroupDefaultResponder(
 
 /** Resolve the bots invoked by a human room message. Explicit targets win;
  * otherwise the room policy chooses one member, everyone, or nobody. */
-export function roomResponders<T extends { id: string; name: string; hidden?: boolean }>(
+export function roomResponders<T extends { id: string; name: string; hidden?: boolean; off?: boolean }>(
   text: string,
   members: T[],
   defaultResponder: GroupDefaultResponder,
 ): T[] {
-  const available = members.filter((member) => !member.hidden);
+  // An Off member cannot speak, so it is skipped exactly like an archived one.
+  const available = members.filter((member) => !member.hidden && !member.off);
   if (/(?:^|\s)@everyone\b/i.test(text)) return available;
   const mentioned = mentionedBots(text, available);
   if (mentioned.length) return mentioned;
@@ -909,11 +931,18 @@ export class Store {
   private threads: ThreadCache;
   private defaultSelection: () => ModelSelection;
   private listeners = new Set<(change: StoreChange) => void>();
-  /** true when no bots.json existed at load — the one time the roster is seeded */
+  /** true when no bots.json existed at load — the one time the roster is seeded.  Never true while
+   * a set-aside bots.json is waiting beside it: that is a roster to restore, not a fresh install. */
   private firstRun = false;
-  /** true when bots.json existed but did not parse — do not treat an empty
-   * in-memory roster as "every room member was deleted". */
+  /** true when the roster may be incomplete — bots.json could not be read, was set aside, lost
+   * entries, or has a set-aside copy waiting from an earlier run.  An empty or short in-memory
+   * roster is then not evidence that "every room member was deleted", and must not drive any
+   * migration or prune that treats it as the truth.  Read from disk on every boot. */
   private botsLoadFailed = false;
+  /** true when saving would destroy the only copy of something: the file could not be read, or
+   * could not be moved aside.  The only case in which a store stops saving; logged and shown. */
+  private botsWritesRefused = false;
+  private groupsWritesRefused = false;
   /** Coalesces bursts of saveBots() calls — a single startTurn used to fire
    * at least three full-roster fsynced rewrites — into one atomic write.
    * Fires a fixed delay after the first dirty call in a burst rather than
@@ -933,20 +962,24 @@ export class Store {
     this.defaultSelection = defaultSelection;
     this.threads = new ThreadCache(opts.threadCacheLimit ?? DEFAULT_THREAD_CACHE_LIMIT);
     mkdirSync(DATA_DIR, { recursive: true });
-    try {
-      this.bots = JSON.parse(readFileSync(BOTS_FILE, "utf8"));
-    } catch (error) {
-      this.bots = [];
-      // Only a missing bots.json is a first run. A file that exists but will
-      // not parse must not be silently replaced with a fresh default roster.
-      this.firstRun = (error as NodeJS.ErrnoException)?.code === "ENOENT";
-      this.botsLoadFailed = !this.firstRun;
-    }
-    try {
-      this.groups = JSON.parse(readFileSync(GROUPS_FILE, "utf8"));
-    } catch {
-      this.groups = [];
-    }
+    // Only a missing bots.json is a first run.  A file that exists but cannot be used is moved aside
+    // (never deleted) and reported; see store-guard.ts.  Wrong-typed JSON used to throw out of this
+    // constructor, so the server would not even start.
+    const botsLoad = loadGuarded<BotRecord[]>(BOTS_FILE, (parsed) =>
+      interpretRecordList(parsed, isBotEntry, { one: "bot", many: "bots" }),
+    );
+    this.bots = botsLoad.value ?? [];
+    this.botsWritesRefused = botsLoad.writesRefused;
+    // Asked after the load, so a file it just set aside counts, and so does one set aside by an
+    // earlier run: bots.json is then simply missing, which on its own would read as a fresh install.
+    const rosterOnHold = rosterIsOnHold(DATA_DIR);
+    this.firstRun = botsLoad.status === "missing" && !rosterOnHold;
+    this.botsLoadFailed = rosterOnHold || botsLoad.status === "unreadable" || botsLoad.writesRefused;
+    const groupsLoad = loadGuarded<GroupRecord[]>(GROUPS_FILE, (parsed) =>
+      interpretRecordList(parsed, isGroupEntry, { one: "room", many: "rooms" }),
+    );
+    this.groups = groupsLoad.value ?? [];
+    this.groupsWritesRefused = groupsLoad.writesRefused;
     // busy never survives a restart — no turn does either. Rooms saved
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
@@ -1177,6 +1210,12 @@ export class Store {
       this.saveBotsTimer = null;
     }
     if (!this.botsDirty) return;
+    if (this.botsWritesRefused) {
+      // `botsDirty` stays set on purpose: it is cleared only after a write lands, so a refused
+      // write leaves the pending change marked and a later flush still tries to persist it.
+      logRefusedSave(BOTS_FILE);
+      return;
+    }
     // busy/activity never survive a restart (reset on load above) and
     // change on every turn transition, so they are excluded here rather
     // than debounced — nothing to coalesce for state nobody reads back.
@@ -1185,6 +1224,10 @@ export class Store {
   }
 
   private saveGroups() {
+    if (this.groupsWritesRefused) {
+      logRefusedSave(GROUPS_FILE);
+      return;
+    }
     writeFileAtomic(GROUPS_FILE, JSON.stringify(this.groups.map(({ busyBotId, ...g }) => g), null, 2));
   }
 
@@ -1299,6 +1342,14 @@ export class Store {
   deleteGroup(id: string): boolean {
     const group = this.group(id);
     if (!group) return false;
+    // Deleting a room also deletes its threads' message rows, and that is not undoable.  A save
+    // that was refused leaves this removal only in memory, so the room would come back on the next
+    // boot pointing at transcripts that are already gone.  Nothing is deleted until the roster is
+    // known to be writable.
+    if (this.groupsWritesRefused) {
+      logRefusedSave(GROUPS_FILE);
+      return false;
+    }
     this.groups = this.groups.filter((g) => g.id !== id);
     this.saveGroups();
     for (const threadId of new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)])) {
@@ -1925,6 +1976,16 @@ export class Store {
   deleteBot(id: string): boolean {
     const bot = this.bot(id);
     if (!bot) return false;
+    // A bot's threads, transcripts and workspace all go with it, and none of that comes back.  The
+    // roster edit is debounced, so a delete cannot be made durable first without reordering the
+    // write path; what it can do is stop while the roster is known to be unwritable, so a refused
+    // save never ends in a workspace that is gone for good and a bot that returns on the next boot
+    // still pointing at it.
+    if (this.botsWritesRefused || this.groupsWritesRefused) {
+      if (this.botsWritesRefused) logRefusedSave(BOTS_FILE);
+      if (this.groupsWritesRefused) logRefusedSave(GROUPS_FILE);
+      return false;
+    }
     this.bots = this.bots.filter((b) => b.id !== id);
     // Rooms keep their own roster.  Strip the deleted id so memberIds and
     // defaultResponder never point at a ghost.  A remaining member becomes

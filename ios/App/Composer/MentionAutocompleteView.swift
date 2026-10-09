@@ -117,6 +117,7 @@ public struct MentionAutocompleteView: View {
                                 HStack(spacing: 8) {
                                     if let bot = item.bot {
                                         BotAvatarView(bot: bot, size: 24, state: .idle, animated: false)
+                                            .providerBadge(for: bot, avatarSize: 24)
                                     } else {
                                         Image(systemName: "number")
                                             .font(.system(size: 13, weight: .bold))

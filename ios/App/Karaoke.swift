@@ -49,7 +49,16 @@ final class KaraokeCenter {
     /// the message (a brief summary: KaraokeAlignment.followable, the same
     /// rule as the Mac's).
     @discardableResult
-    func begin(messageId: String, messageText: String, script: KaraokeScript, mode: MessageKaraoke.Mode) -> MessageKaraoke? {
+    /// `pronunciations` is the workspace list in force (config
+    /// `tts.pronunciations`), so a respelled term ("sequel") lights up the
+    /// term on screen ("SQL").
+    func begin(
+        messageId: String,
+        messageText: String,
+        script: KaraokeScript,
+        mode: MessageKaraoke.Mode,
+        pronunciations: [Pronunciation] = []
+    ) -> MessageKaraoke? {
         clear()
         guard script.isFollowable else { return nil }
         let karaoke = MessageKaraoke(
@@ -58,7 +67,8 @@ final class KaraokeCenter {
             sourceText: SpeechProjection.writtenReply(messageText),
             script: script,
             mode: mode,
-            reducedMotion: UIAccessibility.isReduceMotionEnabled
+            reducedMotion: UIAccessibility.isReduceMotionEnabled,
+            pronunciations: pronunciations
         )
         // Lighting scattered words would be worse than lighting none.
         guard karaoke.alignment.followable else {
@@ -131,7 +141,15 @@ final class MessageKaraoke {
     /// DEBUG fixture only: a pinned clock for screenshots.
     var debugClock: (() -> Double)?
 
-    init(messageId: String, markdown: String, sourceText: String, script: KaraokeScript, mode: Mode, reducedMotion: Bool) {
+    init(
+        messageId: String,
+        markdown: String,
+        sourceText: String,
+        script: KaraokeScript,
+        mode: Mode,
+        reducedMotion: Bool,
+        pronunciations: [Pronunciation] = []
+    ) {
         self.messageId = messageId
         self.mode = mode
         self.script = script
@@ -147,7 +165,8 @@ final class MessageKaraoke {
             spokenText: script.spokenText,
             displayText: display.text,
             segments: guided ? script.segments : nil,
-            sourceText: guided ? sourceText : nil
+            sourceText: guided ? sourceText : nil,
+            pronunciations: pronunciations
         )
         playhead = KaraokePlayhead(words: display.words, reducedMotion: reducedMotion)
         clipClock = KaraokeClipClock(clips: script.estimatedClips())

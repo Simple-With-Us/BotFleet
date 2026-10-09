@@ -295,6 +295,9 @@ final class Session: ObservableObject {
             if ProcessInfo.processInfo.arguments.contains("-preview-voice") {
                 seedVoicePreview(&fleet)
             }
+            if ProcessInfo.processInfo.arguments.contains("-preview-off") {
+                seedOffPreview(&fleet)
+            }
             state.hydrate(fleet)
             // StorePreview bots all select instanceId "preview"; seed the
             // driver map so the chat-header provider mark appears in the
@@ -327,6 +330,16 @@ final class Session: ObservableObject {
         speakingMessageId = messageId
     }
 
+    /// `-preview-off`: Pixel is switched Off, so the chat list's dimmed row and
+    /// Off label, the disabled composer and the profile's Power section can be
+    /// screenshotted without a paired computer.  Pass `-open-first` as well to
+    /// land on Scout, then open Pixel from the list.
+    private func seedOffPreview(_ fleet: inout Fleet) {
+        for index in fleet.bots.indices where fleet.bots[index].id == "preview-pixel" {
+            fleet.bots[index].off = true
+        }
+    }
+
     /// `-preview-voice`: every preview bot speaks a MiniMax voice on this
     /// iPhone and a Mac Personal Voice on the Mac, with the voice engine
     /// configured, so the profile's two voice pickers can be screenshotted.
@@ -336,11 +349,20 @@ final class Session: ObservableObject {
             fleet.bots[index].voices = BotVoices(mac: "personal:com.apple.speech.personalvoice.preview-mac")
             fleet.bots[index].speechDevices = ["mac", "iphone"]
         }
+        // The owner's own setup: his MiniMax clone as the workspace default
+        // (listed with no friendly label, so it reads as the id made
+        // readable) and the seeded pronunciation list.
         config = try? JSONDecoder().decode(
             ConfigStatus.self,
-            from: Data(#"{"tts":{"configured":true,"voice":"English_Graceful_Lady","provider":"minimax"}}"#.utf8)
+            from: Data(#"""
+            {"tts":{"configured":true,"voice":"jay-wedgeworth-001","provider":"minimax","pronunciations":[
+              {"term":"JSON","say":"Jason"},{"term":"SaaS","say":"sass"},{"term":"SQL","say":"sequel"},
+              {"term":"REGEX","say":"redge ex"},{"term":"GUI","say":"gooey"},{"term":"CAPTCHA","say":"cap cha"},
+              {"term":"sudo","say":"soo doo"},{"term":"cron","say":"kron"},{"term":"OAuth","say":"oh auth"}]}}
+            """#.utf8)
         )
         previewVoiceOptions = [
+            Voice(id: "jay-wedgeworth-001", label: "jay-wedgeworth-001", description: "Custom"),
             Voice(id: "English_Graceful_Lady", label: "Graceful Lady"),
             Voice(id: "English_Persuasive_Man", label: "Persuasive Man"),
             Voice(id: "English_Wise_Woman", label: "Wise Woman"),
@@ -1148,6 +1170,15 @@ final class Session: ObservableObject {
         )
     }
 
+    /// Allow every permission request waiting in this conversation (the
+    /// desktop's "Approve All").  The cards settle through the stream as the
+    /// harness answers each one, so nothing is folded in here.
+    @discardableResult
+    func approveAll(chat: Chat) async -> Bool {
+        let threadId = chat.threadId
+        return await perform { _ = try await $0.approveAll(threadId: threadId) }
+    }
+
     /// The same answer, from something that only has the ids — the Live
     /// Activity's buttons.  Returns whether it reached the harness; the
     /// intent ignores that, a notification action does not.
@@ -1442,13 +1473,53 @@ final class Session: ObservableObject {
         }
     }
 
+    /// Duplicate a bot: make a new one, then copy onto it the profile fields a
+    /// paired phone is allowed to set (`BotDuplicate.profilePatch`).  The new
+    /// bot is folded in as soon as it exists, so if filling in its profile
+    /// fails the person still sees the bot that was made, with the reason.
+    @discardableResult
+    func duplicateBot(_ source: Bot) async -> Bot? {
+        guard let client else { return nil }
+        let patch = BotDuplicate.profilePatch(from: source)
+        let created: Bot
+        do {
+            created = try await client.createBot()
+            state.apply(.bot(created))
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+        do {
+            let patched = try await client.updateProfile(botId: created.id, patch: patch)
+            state.apply(.bot(patched))
+            return patched
+        } catch {
+            if !isCancellation(error) {
+                actionError = "The new bot was made, but its profile could not be copied.\u{00A0} \(error.localizedDescription)"
+            }
+            return created
+        }
+    }
+
     /// Make a room from the phone. Same shape as `createBot`: fold it in
     /// rather than wait for a broadcast, and hand it back so it can be opened.
     @discardableResult
-    func createRoom(name: String?, memberIds: [String]) async -> Room? {
+    func createRoom(
+        name: String?,
+        memberIds: [String],
+        cwd: String? = nil,
+        bulletin: String? = nil,
+        defaultResponder: GroupResponder? = nil
+    ) async -> Room? {
         guard let client else { return nil }
         do {
-            let room = try await client.createRoom(name: name, memberIds: memberIds)
+            let room = try await client.createRoom(
+                name: name,
+                memberIds: memberIds,
+                cwd: cwd,
+                bulletin: bulletin,
+                defaultResponder: defaultResponder
+            )
             state.apply(.room(room))
             return room
         } catch {
@@ -1711,6 +1782,38 @@ final class Session: ObservableObject {
         catch { recordActionError(error) }
     }
 
+    // MARK: - Room tasks
+    //
+    // A channel's separate conversations, mirrored from the bot task methods
+    // above.  Create, switch and delete answer with the room as it now stands,
+    // transcript included, so the answer is folded in directly.
+
+    func createRoomTask(for room: Room, title: String?) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.createRoomTask(roomId: room.id, title: title))) }
+        catch { recordActionError(error) }
+    }
+
+    func switchRoomTask(_ task: BotTask, for room: Room) async {
+        guard let client, task.threadId != room.threadId else { return }
+        do { state.apply(.room(try await client.switchRoomTask(roomId: room.id, threadId: task.threadId))) }
+        catch { recordActionError(error) }
+    }
+
+    func renameRoomTask(_ task: BotTask, for room: Room, title: String) async {
+        guard let client else { return }
+        do {
+            try await client.renameRoomTask(roomId: room.id, threadId: task.threadId, title: title)
+            await refresh()
+        } catch { recordActionError(error) }
+    }
+
+    func deleteRoomTask(_ task: BotTask, for room: Room) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.deleteRoomTask(roomId: room.id, threadId: task.threadId))) }
+        catch { recordActionError(error) }
+    }
+
     // MARK: - Agent profile
 
     @MainActor
@@ -1865,6 +1968,50 @@ final class Session: ObservableObject {
         guard let client else { return previewVoiceOptions ?? [] }
         do { return try await client.voices() }
         catch { recordActionError(error); return [] }
+    }
+
+    // MARK: - Workspace voice settings
+
+    /// Save the workspace default voice.  Returns the refusal in words, or
+    /// nil when it saved.
+    @MainActor
+    func updateDefaultVoice(_ voiceId: String) async -> String? {
+        guard let client else {
+            // The store preview has no computer; apply it here so the screen
+            // can be exercised.
+            guard previewVoiceOptions != nil else { return "Connect a computer first." }
+            config?.tts?.voice = voiceId
+            return nil
+        }
+        let pairing = pairingGeneration
+        do {
+            let status = try await client.updateDefaultVoice(voiceId)
+            guard pairingGeneration == pairing else { return nil }
+            config = status
+            return nil
+        } catch {
+            return isCancellation(error) ? nil : error.localizedDescription
+        }
+    }
+
+    /// Replace the workspace pronunciation list.  Returns the refusal in
+    /// words, or nil when it saved.
+    @MainActor
+    func updatePronunciations(_ list: [Pronunciation]) async -> String? {
+        guard let client else {
+            guard previewVoiceOptions != nil else { return "Connect a computer first." }
+            config?.tts?.pronunciations = list
+            return nil
+        }
+        let pairing = pairingGeneration
+        do {
+            let status = try await client.updatePronunciations(list)
+            guard pairingGeneration == pairing else { return nil }
+            config = status
+            return nil
+        } catch {
+            return isCancellation(error) ? nil : error.localizedDescription
+        }
     }
 
     func stopVoice() {
@@ -2048,7 +2195,11 @@ final class Session: ObservableObject {
         var karaoke: MessageKaraoke?
         if let follow {
             karaoke = KaraokeCenter.shared.begin(
-                messageId: follow.message.id, messageText: follow.message.text ?? "", script: follow.script, mode: .live
+                messageId: follow.message.id,
+                messageText: follow.message.text ?? "",
+                script: follow.script,
+                mode: .live,
+                pronunciations: config?.pronunciations ?? []
             )
             karaoke?.setChunks(segments.map(\.text))
         }
@@ -2095,7 +2246,13 @@ final class Session: ObservableObject {
         // replaces the estimate once it plays.
         var karaoke: MessageKaraoke?
         if let script = answer.karaokeScript, script.utterances.count == total {
-            karaoke = KaraokeCenter.shared.begin(messageId: messageId, messageText: message.text ?? "", script: script, mode: .clips)
+            karaoke = KaraokeCenter.shared.begin(
+                messageId: messageId,
+                messageText: message.text ?? "",
+                script: script,
+                mode: .clips,
+                pronunciations: config?.pronunciations ?? []
+            )
         }
         var next = prefetchClip(0, threadId: threadId, messageId: messageId, client: client)
         for index in 0..<total {
@@ -2928,6 +3085,27 @@ final class Session: ObservableObject {
         catch { recordActionError(error); return false }
     }
 
+    /// Stop a routine run that is queued, running or waiting.
+    func cancelRoutineRun(_ run: RoutineRun) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.cancelRoutineRun(id: run.id); return true }
+        catch { recordActionError(error); return false }
+    }
+
+    /// Acknowledge one failed or missed run.  It keeps its status and error.
+    func markRoutineRunSeen(_ run: RoutineRun) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.markRoutineRunSeen(id: run.id); return true }
+        catch { recordActionError(error); return false }
+    }
+
+    /// Acknowledge every unseen failure at once.
+    func markAllRoutineRunsSeen() async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.markAllRoutineRunsSeen(); return true }
+        catch { recordActionError(error); return false }
+    }
+
     // MARK: - Notification navigation
 
     func openNotification(_ target: NotificationTarget) async {
@@ -3347,6 +3525,15 @@ enum Chat: Identifiable, Hashable {
         switch self {
         case let .bot(bot): return bot.busy ?? false
         case let .room(room): return room.isWorking
+        }
+    }
+
+    /// A bot switched Off.  Rooms are never Off themselves: an Off member is
+    /// skipped inside the room with a notice, and the room composer stays.
+    var isOff: Bool {
+        switch self {
+        case let .bot(bot): return bot.isOff
+        case .room: return false
         }
     }
 
