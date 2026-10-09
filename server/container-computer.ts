@@ -14,8 +14,14 @@ import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 
+import {
+  CONTAINER_RUNTIME_IDS,
+  daemonSlowProblem,
+  runtimeProductName,
+  type ContainerRuntimeId,
+} from "../shared/container-runtime-name.ts";
 import { augmentedPath } from "./env-path.ts";
-import { judgeDesktopProbeFailure, problemText } from "./desktop-probe.ts";
+import { isTransientProbeFailure, judgeDesktopProbeFailure, problemText } from "./desktop-probe.ts";
 import {
   CONTAINER_RUNTIME_DISABLED_MESSAGE,
   containerRuntimeDisabled,
@@ -97,6 +103,14 @@ export const IMAGE_REPOSITORY = "localhost/botfleet/cua-local-vm";
 // because a v7 image has none of it and `imageLabelsMatch` would otherwise
 // keep accepting it.  Any container built from v7 or earlier is replaced on the
 // next provision.
+//
+// Deliberately NOT bumped for a verify-only change (2026-10-08): the baked
+// `botfleet-vm-cli-verify` now checks `ping` by presence instead of running
+// `ping -V`, which fails as the desktop user in a live VM (no NET_RAW).  A bump
+// would block every Local VM bot until Prepare and a recreate, and invalidate
+// Self-Hosted VPS containers (they share this label), to fix a script that only
+// matters when someone runs it by hand.  The new check ships with the next image
+// whose contents change for a real reason.
 export const IMAGE_LAYER_VERSION = "8";
 export const IMAGE_LAYER_LABEL = "com.botfleet.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
@@ -137,8 +151,8 @@ export const DISPLAY = ":1";
 export const CUA_SOCKET = "/run/user/1000/botfleet-cua.sock";
 export const CUA_EXECUTABLE = "/usr/local/libexec/botfleet/cua-driver";
 
-const RUNTIMES = ["docker", "podman", "container"] as const;
-export type Runtime = (typeof RUNTIMES)[number];
+const RUNTIMES = CONTAINER_RUNTIME_IDS;
+export type Runtime = ContainerRuntimeId;
 export type LifecycleAction = "pull" | "run" | "start" | "stop" | "remove";
 
 const INTERNAL_VIEWER_PORT = 6901;
@@ -222,21 +236,6 @@ export function adaptContainerLimits(
   const memoryGib =
     hostGib === null ? ceiling.memoryGib : Math.min(ceiling.memoryGib, hostGib < MIN_CONTAINER_MEMORY_GIB ? Math.max(1, hostGib) : hostGib);
   return { cpus: Math.max(1, cpus), memoryGib };
-}
-
-function runtimeProductName(runtime: Runtime): string {
-  switch (runtime) {
-    case "docker":
-      return "Docker";
-    case "podman":
-      return "Podman";
-    case "container":
-      return "Apple Container";
-    default: {
-      const never: never = runtime;
-      return never;
-    }
-  }
 }
 
 /** Parsed capacity from `docker info` / `podman info` format templates — trust boundary. */
@@ -574,9 +573,53 @@ export interface ContainerRuntimeStatus {
   runtime: Runtime | null;
   available: Runtime[];
   daemonUp: boolean;
+  /** Set (to true) only when the runtime is installed but its health probe ran
+   * out of time on every attempt, so nobody knows whether the daemon is up.
+   * Absent otherwise, so a healthy or plainly-stopped runtime keeps its old
+   * shape.  Distinct from `daemonUp: false` on its own, which means the daemon
+   * answered "not running". */
+  daemonSlow?: true;
   /** Set only when the kill switch (container-runtime-guard.ts) removed every
    * runtime: the operator-facing reason no runtime is reported. */
   disabled?: string;
+}
+
+/** Budget for one health probe of the daemon (`docker info` and friends).
+ *
+ *  Ten seconds was too tight on a Mac whose load average sat in the hundreds:
+ *  OrbStack was up the whole time and `docker info` took 1.2 s from a shell,
+ *  yet the probe timed out and the Local VM card told the owner to start a
+ *  runtime that was running.  Two attempts of this length keep the worst case
+ *  around 24 s.  A healthy daemon answers the first attempt, so the common case
+ *  costs exactly one call, as before. */
+export const RUNTIME_PROBE_TIMEOUT_MS = 12_000;
+export const RUNTIME_PROBE_ATTEMPTS = 2;
+
+type DaemonProbe = "up" | "down" | "slow";
+
+function daemonProbeArgs(candidate: Runtime): string[] {
+  return candidate === "container"
+    ? ["system", "status"]
+    : candidate === "podman"
+      ? ["info", "--format", "json"]
+      : ["info", "--format", "{{.ServerVersion}}"];
+}
+
+/** Is the runtime's daemon answering?  Only a probe that RAN OUT OF TIME is
+ *  asked again, and then once: a fast "Cannot connect to the Docker daemon" is
+ *  an answer (the daemon is down, and asking again changes nothing), while a
+ *  timeout says nothing about the daemon and often succeeds on a second look.
+ *  Two timeouts are reported as "slow", never as "down". */
+async function probeDaemon(candidate: Runtime, runner: CommandRunner): Promise<DaemonProbe> {
+  for (let attempt = 1; attempt <= RUNTIME_PROBE_ATTEMPTS; attempt += 1) {
+    try {
+      await runner(candidate, daemonProbeArgs(candidate), RUNTIME_PROBE_TIMEOUT_MS);
+      return "up";
+    } catch (error) {
+      if (!(error instanceof Error) || !isTransientProbeFailure(error)) return "down";
+    }
+  }
+  return "slow";
 }
 
 /** Inspect only the host runtime. Unlike a full Local VM status check, this
@@ -603,31 +646,20 @@ export async function containerRuntimeStatus(
     return { runtime: null, available: [], daemonUp: false, disabled: CONTAINER_RUNTIME_DISABLED_MESSAGE };
   }
   const available = candidates.filter((_, index) => present[index]);
-  const healthy = await Promise.all(
-    available.map(async (candidate) => {
-      try {
-        const infoArgs = candidate === "container"
-          ? ["system", "status"]
-          : candidate === "podman"
-            ? ["info", "--format", "json"]
-            : ["info", "--format", "{{.ServerVersion}}"];
-        await runner(
-          candidate,
-          infoArgs,
-          10_000,
-        );
-        return true;
-      } catch {
-        return false;
-      }
-    }),
-  );
-  const healthyIndex = healthy.indexOf(true);
-  return {
-    runtime: healthyIndex >= 0 ? available[healthyIndex] : (available[0] ?? null),
+  const verdicts = await Promise.all(available.map((candidate) => probeDaemon(candidate, runner)));
+  const healthyIndex = verdicts.indexOf("up");
+  // With nothing healthy, a runtime that timed out is the one to name: it may
+  // be perfectly fine, whereas the first-listed one that refused is stopped.
+  const slowIndex = healthyIndex >= 0 ? -1 : verdicts.indexOf("slow");
+  const pickedIndex = healthyIndex >= 0 ? healthyIndex : slowIndex >= 0 ? slowIndex : 0;
+  const status: ContainerRuntimeStatus = {
+    runtime: available[pickedIndex] ?? null,
     available,
     daemonUp: healthyIndex >= 0,
   };
+  // Set only when true, so a healthy or plainly-stopped runtime keeps its shape.
+  if (slowIndex >= 0) status.daemonSlow = true;
+  return status;
 }
 
 export interface ContainerComputerStatus {
@@ -635,6 +667,11 @@ export interface ContainerComputerStatus {
   runtime: Runtime | null;
   available: Runtime[];
   daemonUp: boolean;
+  /** The runtime is installed but its health probe timed out twice, so whether
+   * the daemon is up is unknown right now.  Never "start the runtime": the
+   * daemon is probably fine and merely slow (a loaded host), and the next poll
+   * re-checks.  Only ever true alongside `daemonUp: false`. */
+  daemonSlow: boolean;
   image: boolean;
   imageMatches: boolean;
   managed: boolean;
@@ -669,6 +706,7 @@ function emptyStatus(platform: NodeJS.Platform, target: LocalVmTarget): Containe
     runtime: null,
     available: [],
     daemonUp: false,
+    daemonSlow: false,
     image: false,
     imageMatches: false,
     managed: false,
@@ -697,7 +735,7 @@ function emptyStatus(platform: NodeJS.Platform, target: LocalVmTarget): Containe
 
 function statusProblem(status: ContainerComputerStatus): string | null {
   if (!status.runtime) return "Install a supported container runtime first";
-  if (!status.daemonUp) return `Start ${status.runtime} first`;
+  if (!status.daemonUp) return status.daemonSlow ? daemonSlowProblem(status.runtime) : `Start ${status.runtime} first`;
   if (!status.image) return `Prepare the CUA desktop image with Driver ${CUA_DRIVER_VERSION}`;
   if (status.container === "missing" && !status.create_supported) {
     return "Per-bot Local VMs require Docker or Podman because Apple container requires a fixed host port";
@@ -855,6 +893,7 @@ export async function containerComputerStatus(
   status.available = runtimeStatus.available;
   status.runtime = runtimeStatus.runtime;
   status.daemonUp = runtimeStatus.daemonUp;
+  status.daemonSlow = runtimeStatus.daemonSlow === true;
   if (runtimeStatus.disabled) {
     status.problem = runtimeStatus.disabled;
     return status;
