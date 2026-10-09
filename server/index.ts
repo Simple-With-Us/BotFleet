@@ -320,6 +320,7 @@ import {
   queueSteeredMessage,
   queuedMessageCount,
   restoreJobNotices,
+  drainEveryReadyBatch,
   restoreSteeredEntries,
   takeSteeredEntries,
   type SteerQueueSnapshot,
@@ -4856,25 +4857,22 @@ function drainQueuedSends() {
 function commitHeldSends(): HeldSend[] {
   const held: HeldSend[] = [];
   const heldAt = Date.now();
-  // One pass per Linq-chat or committed-batch boundary, and per extra thread
-  // of the same bot, in the longest queue; bounded anyway.
-  for (let pass = 0; pass < 100 && queuedMessageCount() > 0; pass += 1) {
-    const before = queuedMessageCount();
-    drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId, carried) => {
-      const send: HeldSend = {
-        botId,
-        threadId,
-        prompt,
-        userMessageId: userMessage.id,
-        excludeIds,
-        relayed: carried ? carried.relayed : takeRelayMark(threadId, excludeIds),
-        heldAt: carried?.heldAt ?? heldAt,
-      };
-      if (linqChatId) send.linqChatId = linqChatId;
-      held.push(send);
-    });
-    if (queuedMessageCount() === before) break;
-  }
+  // Every idle bot's queue, to the last batch: no pass cap, so no message is
+  // left behind because a counter ran out.  A busy bot's queue stays where
+  // it is, and `persistHeldWork` carries it uncommitted.
+  drainEveryReadyBatch(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId, carried) => {
+    const send: HeldSend = {
+      botId,
+      threadId,
+      prompt,
+      userMessageId: userMessage.id,
+      excludeIds,
+      relayed: carried ? carried.relayed : takeRelayMark(threadId, excludeIds),
+      heldAt: carried?.heldAt ?? heldAt,
+    };
+    if (linqChatId) send.linqChatId = linqChatId;
+    held.push(send);
+  });
   return held;
 }
 
@@ -10219,16 +10217,21 @@ function releaseHeldWork() {
  *  on disk nor running would be lost. */
 function persistHeldWork(context: string, interrupted: ReadonlySet<string> = new Set()): HeldWork {
   const heldAt = Date.now();
-  const queued: HeldQueueEntry[] = takeSteeredEntries((botId) => interrupted.has(botId)).map((entry) => ({
-    botId: entry.botId,
-    threadId: entry.threadId,
-    heldAt,
-    items: entry.items.map((item) => ({
-      ...item,
-      relayed: item.committed ? item.committed.relayed : relayQueuedMessageIds.delete(item.messageId),
-    })),
-  }));
+  const carryUncommitted = (pick: (botId: string) => boolean): HeldQueueEntry[] =>
+    takeSteeredEntries(pick).map((entry) => ({
+      botId: entry.botId,
+      threadId: entry.threadId,
+      heldAt,
+      items: entry.items.map((item) => ({
+        ...item,
+        relayed: item.committed ? item.committed.relayed : relayQueuedMessageIds.delete(item.messageId),
+      })),
+    }));
+  const queued = carryUncommitted((botId) => interrupted.has(botId));
   const sends = commitHeldSends();
+  // Anything still queued (a bot that is somehow still busy) is carried as it
+  // is, uncommitted, rather than left in memory to die with the restart.
+  queued.push(...carryUncommitted(() => true));
   // Room rounds: a request to speak, nothing in the transcript yet.
   const rooms: HeldRoomRound[] = takeRoomRounds().map((round) => {
     const held: HeldRoomRound = { groupId: round.groupId, threadId: round.threadId, botId: round.botId, hop: round.hop, heldAt };

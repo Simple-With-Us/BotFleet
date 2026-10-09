@@ -19,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import {
   cancelSteeredMessage,
+  drainEveryReadyBatch,
   drainSteeredMessages,
   queueSteeredMessage,
   restoreSteeredEntries,
@@ -327,6 +328,26 @@ describe("steer-queue module", () => {
     drainSteeredMessages(store, run);
     expect(run).toHaveBeenCalledTimes(2);
     expect(run.mock.calls[1][2]).toBe("on the second thread");
+  });
+
+  it("commits every waiting batch for an update with no pass cap, and leaves a busy bot's for the caller", () => {
+    // Kody 4227445923: the update's commit loop stopped after 100 passes, and
+    // every batch past that was never carried: lost with the restart.  150
+    // Linq chats are 150 batches, one per pass.
+    const idle = fakeBot("bot-many", "thread-many", true);
+    const busy = fakeBot("bot-busy-commit", "thread-busy-commit", true);
+    const store = fakeStore([idle, busy]);
+    for (let chat = 0; chat < 150; chat += 1) queueSteeredMessage(idle, `chat ${chat}`, { linqChatId: `chat-${chat}` });
+    queueSteeredMessage(busy, "waits behind a running turn");
+    idle.busy = false;
+    const run = vi.fn();
+    drainEveryReadyBatch(store, run);
+    expect(run).toHaveBeenCalledTimes(150);
+    expect(run.mock.calls.map((call) => call[2])).toEqual(Array.from({ length: 150 }, (_, chat) => `chat ${chat}`));
+    expect(_queuedCount("thread-many")).toBe(0);
+    // A busy bot's queue is left where it is, for the update to carry.
+    expect(_queuedCount("thread-busy-commit")).toBe(1);
+    expect(takeSteeredEntries((botId) => botId === "bot-busy-commit")).toHaveLength(1);
   });
 
   it("drops the queue of a deleted bot without running it", () => {

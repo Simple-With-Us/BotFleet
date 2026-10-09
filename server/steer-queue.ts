@@ -225,6 +225,23 @@ export function dropQueuedForOffBot(store: SteerStore, botId: string): number {
   return dropped;
 }
 
+/** Drain every batch that can drain now, pass after pass, until the queue is
+ *  empty or a pass moves nothing: a bot still busy keeps its queue.  For a
+ *  `run` that starts no turn (an update committing held sends for its
+ *  restart), every idle bot's queue empties completely — one batch per bot per
+ *  pass, however many Linq chats or committed batches it holds.  No pass cap:
+ *  each pass that continues has taken at least one batch, so the loop ends,
+ *  and nothing is ever left behind because a counter ran out.  Whatever is
+ *  left (a busy bot's) is still in the queue for the caller to carry. */
+export function drainEveryReadyBatch(store: SteerStore, run: Parameters<typeof drainSteeredMessages>[1]): void {
+  for (let before = queuedMessageCount(); before > 0;) {
+    drainSteeredMessages(store, run);
+    const after = queuedMessageCount();
+    if (after >= before) return;
+    before = after;
+  }
+}
+
 /** Drop one waiting send so it never drains. Returns false when that
  * queue id was not in the in-memory queue (already drained, or a restart
  * lost the auto-run intent). */
