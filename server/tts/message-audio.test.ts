@@ -31,6 +31,7 @@ import { deterministicSpokenText } from "./speech-summary.ts";
 import { toUtterances } from "./speech-text.ts";
 import { karaokeScriptFromWire } from "../../shared/spoken-script.ts";
 import { writtenReply } from "../../shared/voice-summary.ts";
+import { DEFAULT_PRONUNCIATIONS, type Pronunciation } from "../../shared/pronunciations.ts";
 
 class NoVoice extends Error {}
 
@@ -51,6 +52,7 @@ function setup(options: {
   credentialPending?: boolean;
   failOn?: number;
   summary?: (text: string) => string | SummarizedSpeech;
+  pronunciations?: readonly Pronunciation[];
 } = {}) {
   const row: AudioMessage = {
     id: MESSAGE,
@@ -63,6 +65,7 @@ function setup(options: {
   const summarized: string[] = [];
   let saved = 0;
   let credentialPending = options.credentialPending ?? false;
+  let pronunciations: readonly Pronunciation[] = options.pronunciations ?? [];
 
   const audio = new MessageAudio({
     message: (threadId, messageId) => (threadId === THREAD && messageId === MESSAGE ? { ...row } : undefined),
@@ -93,6 +96,7 @@ function setup(options: {
     clipExists: (clip) => files.has(clip.path.replace("/api/attachments/", "")),
     readClip: (clip) => files.get(clip.path.replace("/api/attachments/", "")) ?? null,
     defaultVoice: () => options.defaultVoice ?? "",
+    pronunciations: () => pronunciations,
     credentialPending: () => credentialPending,
     isNoVoiceConfigured: (error) => error instanceof NoVoice,
   });
@@ -123,6 +127,9 @@ function setup(options: {
     settle,
     setCredentialPending: (value: boolean) => {
       credentialPending = value;
+    },
+    setPronunciations: (value: readonly Pronunciation[]) => {
+      pronunciations = value;
     },
   };
 }
@@ -1075,5 +1082,62 @@ describe("the spoken script: as written in off mode, span-aligned for karaoke", 
     const replay = await post(fixture, summaryOwner, { progressive: true, device: "iphone" });
     expect(replay.body.complete).toBe(true);
     expect(fixture.speakCalls).toHaveLength(calls);
+  });
+});
+
+describe("the pronunciation list (shared/pronunciations.ts)", () => {
+  const REPLY = "Run the **SQL** migration, then check `cron`.\n\nUse OAuth for the GUI.";
+
+  it("hands an on-device voice the written script respelled, with spans still on the original terms", async () => {
+    const fixture = setup({ text: REPLY, pronunciations: DEFAULT_PRONUNCIATIONS });
+    const result = await post(fixture, { voice: "personal:x", voiceSummaryMode: "off" }, { device: "iphone", progressive: true, spans: true });
+    expect(result.body.onDevice).toBe(true);
+    expect(result.body.utterances).toEqual(["Run the sequel migration, then check kron.", "Use oh auth for the gooey."]);
+    expect(result.body.voiceText).toBe("Run the sequel migration, then check kron. Use oh auth for the gooey.");
+    expect(result.body.script).toBe("written");
+    const source = writtenReply(REPLY);
+    const script = karaokeScriptFromWire(result.body.utterances ?? [], result.body.spans);
+    expect(script.sourceLength).toBe(source.length);
+    const spoken = script.spokenText;
+    const at = (word: string) => script.segments.find((seg) => spoken.slice(seg.spokenStart, seg.spokenEnd) === word);
+    expect(source.slice(at("sequel")!.srcStart, at("sequel")!.srcEnd)).toBe("SQL");
+    expect(source.slice(at("oh auth")!.srcStart, at("oh auth")!.srcEnd)).toBe("OAuth");
+    expect(source.slice(at("gooey")!.srcStart, at("gooey")!.srcEnd)).toBe("GUI");
+    // Nothing about the stored row changed.
+    expect(fixture.row.voiceText).toBeUndefined();
+  });
+
+  it("respells a distilled on-device script after taking the pause tags out", async () => {
+    const fixture = setup({
+      text: REPLY,
+      summary: () => "Run the SQL migration. <#0.3#> Then check cron and OAuth.",
+      pronunciations: DEFAULT_PRONUNCIATIONS,
+    });
+    const result = await post(fixture, { voice: "personal:x", voiceSummaryMode: "always" }, { device: "mac", progressive: true, spans: true });
+    expect(result.body.utterances?.join(" ")).toBe("Run the sequel migration. Then check kron and oh auth.");
+    expect(result.body.script).toBe("summary");
+    // The stored script is the distiller's, as it was written.
+    expect(fixture.row.voiceText).toBeUndefined();
+  });
+
+  it("never puts the list in a hosted script or its cache, so a list edit re-bills nothing", async () => {
+    const fixture = setup({ text: REPLY, pronunciations: DEFAULT_PRONUNCIATIONS });
+    const owner: AudioOwner = { voice: "vA", voiceSummaryMode: "off" };
+    const first = await post(fixture, owner, { device: "mac", progressive: true, spans: true });
+    await fixture.settle();
+    const plain = toUtterances(writtenReply(REPLY));
+    // The engine-side pass (server/tts/index.ts speak) respells; the job
+    // hands it the script as stored.
+    expect(first.body.utterances).toEqual(plain);
+    expect(fixture.speakCalls.map((call) => call.text)).toEqual(plain);
+    expect(fixture.row.voiceText).toBe(plain.join(" "));
+    const clips = [...(fixture.row.audio ?? [])];
+    expect(clips).toHaveLength(plain.length);
+
+    fixture.setPronunciations([{ term: "SQL", say: "S Q L" }]);
+    const again = await post(fixture, owner, { device: "mac", progressive: true, spans: true });
+    expect(again.body.audio).toEqual(clips);
+    expect(fixture.speakCalls).toHaveLength(plain.length);
+    expect(fixture.row.audio).toEqual(clips);
   });
 });

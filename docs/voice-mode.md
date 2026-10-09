@@ -52,6 +52,47 @@ and the client fetches the next while the current one plays. One request per
 utterance rather than the streaming-input WebSocket: same perceived latency, far
 fewer moving parts, and no socket to leak when a turn is interrupted.
 
+## The default voice and the pronunciation list
+
+Two voice settings belong to the whole workspace, not to a bot (owner ruling,
+2026-10-08).  Both live in the workspace config next to the voice key, the way
+the always-spell-correctly vocabulary lives as `callStt.keyterms`.  Neither is
+a credential or a tunable knob, so neither is in `server/secret-map.ts` or
+`server/knob-map.ts`.
+
+- **Default Voice** is `tts.voice`: what every bot without a voice of its own
+  speaks with, on every device.  `GET /api/config` returns it (it is a
+  setting, not a secret), and every picker names it, "Jay Wedgeworth 001
+  (default)", never a bare "(default)" (`defaultVoiceOptionLabel` in
+  `shared/bot-voice.ts`, mirrored in Swift).  An empty one reads "No default
+  voice": a bot without its own voice then cannot speak (`NoVoiceConfigured`).
+  A Personal Voice is device-local and is never offered as the default.
+- **Pronunciations** is `tts.pronunciations`: `{ term, say }` pairs, seeded
+  with JSON "Jason", SaaS "sass", SQL "sequel", REGEX "redge ex", GUI "gooey",
+  CAPTCHA "cap cha", sudo "soo doo", cron "kron" and OAuth "oh auth".  Absent
+  means those defaults; a saved list, even an empty one, is used as is.  The
+  one validator and matcher are in `shared/pronunciations.ts`.
+
+The Mac saves both through `PUT /api/config`.  The phone saves them through two
+narrow routes, `PATCH /api/tts/default-voice` and `PATCH /api/tts/pronunciations`,
+which validate the same way and write only their own field, so `/api/config`
+stays write-closed to a paired phone (`companion/src/routes.ts`).
+
+Where the list applies, and why a change never re-bills a clip:
+
+- The distiller is told to say each term as given (`voiceSummarySystemPrompt`).
+  A distilled script stored before a change is reused as it was, with its
+  clips.  **The list applies to scripts generated after a change.**
+- The deterministic pass runs only where text leaves for a voice: in
+  `tts.speak` (MiniMax and the built-in Mac voices; message clips, Try and call
+  mode) and on the utterances an on-device Personal Voice answer hands the
+  device, whose spans are rebuilt so a respelled term still maps to the term.
+  `voiceText`, the stamps and the utterances every cache check compares never
+  carry it.  **Clips already made keep the sound they were made with; new
+  synthesis uses the current list.**
+- Karaoke treats each pair as the same word (`shared/karaoke-align.ts`, mirrored
+  in `KaraokeAlign.swift`), so "oh auth" lights up "OAuth" on screen.
+
 ## Call mode
 
 **Half-duplex, on purpose.** The dictation helper is `SFSpeechRecognizer` on raw

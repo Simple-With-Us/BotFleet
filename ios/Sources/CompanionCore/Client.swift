@@ -881,6 +881,33 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("GET", "/api/tts/voices"), as: VoiceListResponse.self).voices
     }
 
+    /// The workspace default voice: what every bot without a voice of its
+    /// own speaks with.  Its own narrow route, so /api/config (which carries
+    /// the voice key) stays closed to writes from a phone.  The harness
+    /// refuses a Personal Voice, which belongs to one device.
+    public func updateDefaultVoice(_ voiceId: String) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let voice: String
+        }
+        return try await send(
+            try makeRequest("PATCH", "/api/tts/default-voice", encodedBody: Body(voice: voiceId)),
+            as: ConfigStatus.self
+        )
+    }
+
+    /// Replace the workspace pronunciation list.  The harness validates it
+    /// with the same rules as the Mac (`shared/pronunciations.ts`) and
+    /// answers a refusal in words the person can act on.
+    public func updatePronunciations(_ list: [Pronunciation]) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let pronunciations: [Pronunciation]
+        }
+        return try await send(
+            try makeRequest("PATCH", "/api/tts/pronunciations", encodedBody: Body(pronunciations: list)),
+            as: ConfigStatus.self
+        )
+    }
+
     public func routines() async throws -> (routines: [Routine], runs: [RoutineRun]) {
         let response = try await send(try makeRequest("GET", "/api/routines"), as: RoutinesResponse.self)
         return (response.routines, response.runs)

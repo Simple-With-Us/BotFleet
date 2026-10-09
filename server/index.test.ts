@@ -7157,6 +7157,60 @@ describe("PATCH /api/terminology", () => {
   });
 });
 
+describe("workspace voice settings", () => {
+  it("hands every client the default voice by id and the pronunciation list in force", async () => {
+    const saved = await api("PUT", "/api/config", { tts: { voice: "jay-wedgeworth-001" } });
+    expect(saved.status).toBe(200);
+    expect(saved.body.tts.voice).toBe("jay-wedgeworth-001");
+    const status = await api("GET", "/api/config");
+    expect(status.body.tts.voice).toBe("jay-wedgeworth-001");
+    // Never saved yet: the seeded list, so a client never has to know it.
+    expect(status.body.tts.pronunciations).toEqual(expect.arrayContaining([
+      { term: "SQL", say: "sequel" },
+      { term: "OAuth", say: "oh auth" },
+    ]));
+  });
+
+  it("saves the list through PUT /api/config with the shared validation", async () => {
+    const ok = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "SQL", say: "S Q L" }] } });
+    expect(ok.status).toBe(200);
+    expect(ok.body.tts.pronunciations).toEqual([{ term: "SQL", say: "S Q L" }]);
+    const dup = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "a", say: "x" }, { term: "A", say: "y" }] } });
+    expect(dup.status).toBe(400);
+  });
+
+  it("lets the phone's narrow route change the default voice, and nothing else", async () => {
+    const res = await api("PATCH", "/api/tts/default-voice", { voice: "English_Graceful_Lady", profile: { name: "Side Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.voice).toBe("English_Graceful_Lady");
+    expect((await api("GET", "/api/config")).body.profile?.name).not.toBe("Side Door");
+    // A Personal Voice belongs to one device; blank and junk are refused.
+    const personal = await api("PATCH", "/api/tts/default-voice", { voice: "personal:Jay" });
+    expect(personal.status).toBe(400);
+    expect(personal.body.error).toContain("Personal Voices stay on the device");
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "  " })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "a\u0000b" })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: 7 })).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.voice).toBe("English_Graceful_Lady");
+    // The MiniMax id is kept exactly; MiniMax ids are case-sensitive.
+    const exact = await api("PATCH", "/api/tts/default-voice", { voice: "jay-wedgeworth-001" });
+    expect(exact.body.tts.voice).toBe("jay-wedgeworth-001");
+  });
+
+  it("lets the phone's narrow route replace the pronunciation list, with a plain-language refusal", async () => {
+    const list = [{ term: "JSON", say: "Jason" }, { term: "kubectl", say: "cube control" }];
+    const res = await api("PATCH", "/api/tts/pronunciations", { pronunciations: list, tts: { voice: "Side_Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.pronunciations).toEqual(list);
+    expect(res.body.tts.voice).not.toBe("Side_Door");
+    const bad = await api("PATCH", "/api/tts/pronunciations", { pronunciations: [{ term: "JSON", say: "my JSON" }] });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toContain("which is also on the list");
+    expect((await api("PATCH", "/api/tts/pronunciations", {})).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.pronunciations).toEqual(list);
+  });
+});
+
 describe("local Auto consent for inherited and discovered computers", () => {
   it("guards config defaults and per-bot Auto while preserving explicit Off", async () => {
     expect((await api("PUT", "/api/config", {
