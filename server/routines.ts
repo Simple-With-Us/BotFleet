@@ -2,12 +2,15 @@ import { boundStalePromptSnapshots, retainRoutineRuns } from "../shared/routine-
 import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
+import type { JsonValue } from "./schema.ts";
+import { loadGuarded, logRefusedSave, type Interpreted } from "./store-guard.ts";
 import type { RoutineRequestOperation } from "../shared/routine-request.ts";
 import {
   allowsMultipleBotThreads,
@@ -224,6 +227,27 @@ interface RoutineFile {
   /** Manual bot snoozes, keyed by bot id.  `null` is an indefinite snooze
    * (Infinity is not valid JSON); a number is the epoch-ms expiry. */
   botSnoozes?: Record<string, number | null>;
+}
+
+/** The least routines.json must be before the manager can read it: an object whose routines and runs,
+ * when present, are lists of objects that have an id.  Receipts and snoozes keep their own lenient
+ * handling below, as they always had; a stricter test here would set aside a file an older build wrote. */
+const routineFileSchema = z.looseObject({ routines: z.array(z.unknown()).optional(), runs: z.array(z.unknown()).optional() });
+const routineEntrySchema = z.looseObject({ id: z.string().min(1) });
+const isRoutineFile = (candidate: JsonValue): candidate is JsonValue & Partial<RoutineFile> =>
+  routineFileSchema.safeParse(candidate).success;
+
+function interpretRoutineFile(parsed: JsonValue): Interpreted<Partial<RoutineFile>> {
+  if (!isRoutineFile(parsed)) return { ok: false, reason: "it does not hold a routines file" };
+  const routines = (parsed.routines ?? []).filter((entry) => routineEntrySchema.safeParse(entry).success);
+  const runs = (parsed.runs ?? []).filter((entry) => routineEntrySchema.safeParse(entry).success);
+  const found = (parsed.routines?.length ?? 0) + (parsed.runs?.length ?? 0);
+  const usable = routines.length + runs.length;
+  if (found > 0 && usable === 0) return { ok: false, reason: `none of its ${found} entries is a usable routine or run` };
+  // Everything else in the file is carried through untouched: when entries are left out, this value
+  // is what store-guard writes back over routines.json, and it must lose only those entries.
+  const whole: Partial<RoutineFile> = parsed;
+  return { ok: true, value: { ...whole, routines, runs }, omitted: found - usable };
 }
 
 export type RoutineRequestOwner = Pick<RoutineRequestReceipt, "requestId" | "messageId" | "botId" | "threadId">;
@@ -465,6 +489,9 @@ export class RoutineManager {
    * so sustained activity still flushes on a bounded cadence. */
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
+  /** True when routines.json could not be read or moved aside, so saving would destroy the only
+   * copy of it.  Logged and shown; the one case in which this manager stops saving. */
+  private writesRefused = false;
   /** When each trigger last STARTED, keyed by `automationThreadKey`.
    *
    * In memory only: a gap is a rate limit on waking a bot, and after a
@@ -486,49 +513,47 @@ export class RoutineManager {
     this.file = options.file ?? join(DATA_DIR, "routines.json");
     this.now = options.now ?? Date.now;
     let runOnMigrated = false;
-    try {
-      const disk = JSON.parse(readFileSync(this.file, "utf8")) as Partial<RoutineFile>;
-      const rawRoutines = Array.isArray(disk.routines) ? disk.routines : [];
-      const rawRuns = Array.isArray(disk.runs) ? disk.runs : [];
-      this.routines = rawRoutines.map((routine) => {
-        const runOn = normalizeRunOn(routine.runOn);
-        if ((routine as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
-        return { ...routine, runOn };
-      });
-      this.runs = rawRuns.map((run) => {
-        const runOn = normalizeRunOn(run.runOn);
-        if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
-        return { ...run, runOn };
-      });
-      this.routineRequestReceipts = Array.isArray(disk.routineRequestReceipts)
-        ? disk.routineRequestReceipts.filter((receipt): receipt is RoutineRequestReceipt =>
-            typeof receipt?.requestId === "string" &&
-            typeof receipt?.messageId === "string" &&
-            typeof receipt?.botId === "string" &&
-            typeof receipt?.threadId === "string" &&
-            isRoutineRequestAction(receipt?.action) &&
-            receipt?.fingerprintVersion === 1 &&
-            typeof receipt?.fingerprint === "string" && /^[a-f0-9]{64}$/.test(receipt.fingerprint) &&
-            typeof receipt?.resultId === "string" &&
-            Number.isFinite(receipt?.appliedAt)
-          )
-        : [];
-      // Manual snoozes survive restarts: a crash or relaunch must not clear
-      // a user's explicit stop and let the next schedule or webhook restart
-      // the bot.  Expired finite snoozes are dropped, not revived.
-      if (disk.botSnoozes) {
-        for (const [botId, until] of Object.entries(disk.botSnoozes)) {
-          if (until === null) {
-            this.botSnoozeUntil.set(botId, Infinity);
-          } else if (typeof until === "number" && Number.isFinite(until) && until > this.now()) {
-            this.botSnoozeUntil.set(botId, until);
-          }
+    // A routines.json that cannot be used is moved aside, never deleted, and reported (store-guard.ts).
+    // It used to read as "no routines", and the next save replaced it.
+    const loaded = loadGuarded(this.file, interpretRoutineFile);
+    this.writesRefused = loaded.writesRefused;
+    const disk = loaded.value ?? {};
+    const rawRoutines = Array.isArray(disk.routines) ? disk.routines : [];
+    const rawRuns = Array.isArray(disk.runs) ? disk.runs : [];
+    this.routines = rawRoutines.map((routine) => {
+      const runOn = normalizeRunOn(routine.runOn);
+      if ((routine as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
+      return { ...routine, runOn };
+    });
+    this.runs = rawRuns.map((run) => {
+      const runOn = normalizeRunOn(run.runOn);
+      if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
+      return { ...run, runOn };
+    });
+    this.routineRequestReceipts = Array.isArray(disk.routineRequestReceipts)
+      ? disk.routineRequestReceipts.filter((receipt): receipt is RoutineRequestReceipt =>
+          typeof receipt?.requestId === "string" &&
+          typeof receipt?.messageId === "string" &&
+          typeof receipt?.botId === "string" &&
+          typeof receipt?.threadId === "string" &&
+          isRoutineRequestAction(receipt?.action) &&
+          receipt?.fingerprintVersion === 1 &&
+          typeof receipt?.fingerprint === "string" && /^[a-f0-9]{64}$/.test(receipt.fingerprint) &&
+          typeof receipt?.resultId === "string" &&
+          Number.isFinite(receipt?.appliedAt)
+        )
+      : [];
+    // Manual snoozes survive restarts: a crash or relaunch must not clear
+    // a user's explicit stop and let the next schedule or webhook restart
+    // the bot.  Expired finite snoozes are dropped, not revived.
+    if (disk.botSnoozes) {
+      for (const [botId, until] of Object.entries(disk.botSnoozes)) {
+        if (until === null) {
+          this.botSnoozeUntil.set(botId, Infinity);
+        } else if (typeof until === "number" && Number.isFinite(until) && until > this.now()) {
+          this.botSnoozeUntil.set(botId, until);
         }
       }
-    } catch {
-      this.routines = [];
-      this.runs = [];
-      this.routineRequestReceipts = [];
     }
     if (runOnMigrated) this.save();
     // A local process cannot still own these turns after a full restart.
@@ -617,9 +642,13 @@ export class RoutineManager {
     return true;
   }
 
+  /** Put a run an update cancelled back in the queue.  Only a `cancelled`
+   *  run: one that is running or waiting has already been restarted by
+   *  something else (a release that resumed it first), and queueing it again
+   *  would run the same automation twice. */
   requeueRun(runId: string): boolean {
     const run = this.runs.find((candidate) => candidate.id === runId);
-    if (run && ["cancelled", "running", "waiting"].includes(run.status)) {
+    if (run && run.status === "cancelled") {
       run.status = "queued";
       run.outcomeCode = undefined;
       run.failurePhase = undefined;
@@ -1960,6 +1989,14 @@ export class RoutineManager {
       this.saveTimer = null;
     }
     if (!this.dirty) return;
+    if (this.writesRefused) {
+      // `dirty` stays set on purpose.  It is cleared only after a write lands, so a refused write
+      // leaves the pending state marked exactly as a failed write would — a later flush, once the
+      // owner has fixed the file, still tries to persist it.  Clearing it here would report a save
+      // that never happened as done, and the refusal is logged once per file either way.
+      logRefusedSave(this.file);
+      return;
+    }
     mkdirSync(dirname(this.file), { recursive: true });
     const now = this.now();
     const botSnoozes: Record<string, number | null> = {};
