@@ -8,6 +8,11 @@
 // only its own; the iPhone's Personal Voice is shown greyed with the reason,
 // and a MiniMax voice can be chosen for either device from here.
 //
+// Two settings on this card belong to the whole workspace, not the bot: the
+// Default Voice at the top (cfg.tts.voice, what "(default)" in the pickers
+// below means, always shown by name) and the Pronunciations list at the
+// foot (src/components/WorkspaceVoiceSettings.tsx).
+//
 // The MiniMax list comes from the harness, which holds the key — the
 // renderer never talks to MiniMax itself.  The Personal Voice list comes
 // from this Mac's speech helper.  The two load independently, so a helper
@@ -28,7 +33,8 @@ import {
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
-import { isPersonalVoiceId, voiceForDevice } from "../../shared/bot-voice";
+import { defaultVoiceOptionLabel, isPersonalVoiceId, voiceForDevice } from "../../shared/bot-voice";
+import { DefaultVoicePicker, PronunciationSettings } from "./WorkspaceVoiceSettings";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
 
@@ -477,12 +483,9 @@ export function VoiceSettings({
   const notOnThisMac = (id: string) =>
     isPersonalVoice(id) && personalName(id) !== "" && personalKnown && !macPersonalIds.has(id);
 
-  const defaultVoiceRecord = tts.voice ? voices.find((v) => v.id === tts.voice) : null;
-  const defaultVoiceDisplay = defaultVoiceRecord
-    ? `${defaultVoiceRecord.label} (default)`
-    : tts.voice
-      ? `${tts.voice} (default)`
-      : "Workspace default";
+  // The workspace default by name, "Jay Wedgeworth 001 (default)", or
+  // "No default voice"; never a bare "(default)".
+  const defaultVoiceDisplay = defaultVoiceOptionLabel(tts.voice, voices);
 
   // ── Voice on This Mac ──
   // Against a harness that predates per-device voices, the Mac picker shows
@@ -552,8 +555,11 @@ export function VoiceSettings({
     <div className="rounded-xl bg-card p-4">
       <div className="text-[15px] font-medium text-ink">Voice</div>
       <div className="mt-0.5 text-[13px] text-ink-secondary">
-        Give this bot a voice for calls and spoken replies.{"\u00A0 "}Each device can use its own voice: an Apple Personal Voice stays on the device that made it, and a MiniMax voice plays anywhere.{"\u00A0 "}The voices belong to this bot; the MiniMax key is shared by the workspace.
+        Give this bot a voice for calls and spoken replies.{"\u00A0 "}Each device can use its own voice: an Apple Personal Voice stays on the device that made it, and a MiniMax voice plays anywhere.{"\u00A0 "}The voices belong to this bot; the MiniMax key, the default voice and the pronunciations are shared by the workspace.
       </div>
+
+      {/* ── Default Voice (workspace) ── */}
+      <DefaultVoicePicker voices={voices} loading={loadingVoices} />
 
       {/* ── MiniMax Key Input ── */}
       <div className="mt-4">
@@ -863,6 +869,9 @@ export function VoiceSettings({
           </div>
         </div>
       )}
+
+      {/* ── Pronunciations (workspace) ── */}
+      <PronunciationSettings />
 
       {/* ── Speech to Text ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">
