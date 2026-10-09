@@ -395,8 +395,9 @@ export async function addTesterToGroup({ api, appId, groupId, email, createFirst
   const recoverFromCrossApp = async () => {
     const appTesters = await api("GET", `/v1/betaTesters?filter[apps]=${appId}&limit=200&fields[betaTesters]=email`);
     const appScoped = ascRows(appTesters).find(sameEmail);
-    if (appScoped) return addExisting(appScoped);
-    return null;
+    if (!appScoped) return null;
+    existing = appScoped;
+    return addExisting(appScoped);
   };
   let res;
   if (existing) {

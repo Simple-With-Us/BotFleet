@@ -40,7 +40,12 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   assert.match(syncStep, /appleid_rc/);
   // Reuse a tester stored with different letter case (create answers 409), and
   // never skip the review submission silently when buildBetaDetail can't be read.
-  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /res\.status === 409[\s\S]*filter\[apps\]=/);
+  // The recovery helper does the app-scoped lookup, and both 409 paths (create
+  // refused, or another app's record refused) go through it.
+  assert.match(
+    read("scripts/ios-fleet/asc-api.mjs"),
+    /const recoverFromCrossApp[\s\S]*filter\[apps\]=[\s\S]*res\.status === 409[\s\S]*recoverFromCrossApp\(\)[\s\S]*res\.status === 409[\s\S]*recoverFromCrossApp\(\)/
+  );
   assert.match(read("scripts/ios-fleet/asc-api.mjs"), /buildBetaDetail`\);\s*if \(!detail\.ok\)/);
   // Every group/tester/build mutation is gated on a successful tester listing.
   assert.match(read("scripts/ios-fleet/asc-api.mjs"), /if \(!inGroupRes\.ok\)/);
@@ -485,6 +490,36 @@ test("addTesterToGroup falls back to the app-scoped lookup when the create is re
   assert.equal(out.ok, true);
   assert.equal(out.existing, true);
   assert.ok(calls[0] === "POST /v1/betaTesters" && calls[1] === "GET /v1/betaTesters (apps)", calls.join(" > "));
+});
+
+test("addTesterToGroup recovers from a 409 on another app's record with this app's own record", async () => {
+  const { addTesterToGroup } = await import("./ios-fleet/asc-api.mjs");
+  const calls = [];
+  const api = async (method, path, body) => {
+    calls.push(`${method} ${path.split("?")[0]}`);
+    // The app-scoped lookup finds nothing, so the plain lookup returns a record
+    // that belongs to another app.
+    if (method === "GET" && path.includes("filter[email]=") && path.includes("filter[apps]=1")) {
+      return { status: 200, ok: true, parsed: { data: [] }, text: "" };
+    }
+    if (method === "GET" && path.includes("filter[email]=")) {
+      return { status: 200, ok: true, parsed: { data: [{ id: "foreign", attributes: { email: "alice@example.com" } }] }, text: "" };
+    }
+    if (method === "GET" && path.startsWith("/v1/betaTesters?filter[apps]=1&limit=200")) {
+      return { status: 200, ok: true, parsed: { data: [{ id: "own", attributes: { email: "alice@example.com" } }] }, text: "" };
+    }
+    if (method === "POST" && path === "/v1/betaGroups/g1/relationships/betaTesters") {
+      const id = JSON.parse(body).data[0].id;
+      return id === "own"
+        ? { status: 204, ok: true, parsed: {}, text: "" }
+        : { status: 409, ok: false, parsed: { errors: [{ code: "STATE_ERROR", detail: "Tester(s) cannot be assigned" }] }, text: "" };
+    }
+    return { status: 500, ok: false, parsed: {}, text: "" };
+  };
+  const out = await addTesterToGroup({ api, appId: "1", groupId: "g1", email: "alice@example.com" });
+  assert.equal(out.ok, true, "the 409 on the foreign record must not be the final answer");
+  assert.equal(out.existing, true, "the recovered record is reported as an existing tester");
+  assert.equal(calls.filter((c) => c === "POST /v1/betaGroups/g1/relationships/betaTesters").length, 2);
 });
 
 test("countInternalTesters counts only members of internal all-builds groups", async () => {
