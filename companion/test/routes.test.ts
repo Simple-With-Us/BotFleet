@@ -8,7 +8,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  COMPANION_BOT_ORGANIZE_FIELDS,
   COMPANION_PROFILE_PATCH_FIELDS,
+  companionBodyCheck,
+  companionBotOrganizeDenial,
   companionProfilePatchDenial,
   denyReason,
 } from "../src/routes.ts";
@@ -58,8 +61,14 @@ describe("what the app may do", () => {
     ["PATCH", "/api/bots/bot_123/tasks/th_1"],
     ["DELETE", "/api/bots/bot_123/tasks/th_1"],
     ["PATCH", "/api/bots/bot_123/profile"],
+    ["PATCH", "/api/bots/bot_123"],
+    ["DELETE", "/api/bots/bot_123"],
+    ["POST", "/api/bots/apply-model-defaults"],
     ["POST", "/api/bots/bot_123/avatar/generate"],
     ["POST", "/api/bots/bot_123/computer/join"],
+    ["PATCH", "/api/groups/room-1"],
+    ["DELETE", "/api/groups/room-1"],
+    ["PATCH", "/api/auto-update"],
     ["POST", "/api/groups/room-1/messages"],
     ["POST", "/api/groups/room-1/interrupt"],
     ["POST", "/api/groups/room-1/read"],
@@ -230,8 +239,14 @@ describe("what it may not", () => {
       status: 403,
       error: "composio can only be changed in BotFleet on your computer",
     });
-    // The general bot PATCH is not on the phone's route list.
-    expect(allowed("PATCH", "/api/bots/b_1")).toBe(false);
+    // The general bot PATCH is on the route list only for roster
+    // organization, behind a field allowlist (see the organize tests below).
+    // Turning a bot Off is still a profile field and nothing else.
+    expect(allowed("PATCH", "/api/bots/b_1")).toBe(true);
+    expect(companionBotOrganizeDenial({ off: true })).toEqual({
+      status: 403,
+      error: "off can only be changed in BotFleet on your computer",
+    });
     expect(allowed("PATCH", "/api/bots/b_1/profile")).toBe(true);
   });
 
@@ -389,10 +404,16 @@ describe("what it may not", () => {
   // and deleting a bot are the same path.
   it("allows a path only for the methods it was allowed for", () => {
     expect(allowed("GET", "/api/bots")).toBe(true);
-    expect(allowed("DELETE", "/api/bots/bot_123")).toBe(false);
+    // a bot id is one path segment: the bare resource takes exactly the
+    // verbs listed, and nothing nested under it by accident
+    expect(allowed("DELETE", "/api/bots/bot_123")).toBe(true);
+    expect(allowed("PUT", "/api/bots/bot_123")).toBe(false);
+    expect(allowed("GET", "/api/bots/bot_123")).toBe(false);
+    expect(allowed("DELETE", "/api/bots/bot_123/profile")).toBe(false);
+    expect(allowed("DELETE", "/api/bots/bot_123/messages")).toBe(false);
     expect(allowed("POST", "/api/threads/th_1/messages")).toBe(false);
     expect(allowed("GET", "/api/groups/room-1")).toBe(false);
-    expect(allowed("PATCH", "/api/bots/bot_123")).toBe(false);
+    expect(allowed("PUT", "/api/groups/room-1")).toBe(false);
     expect(allowed("PATCH", "/api/bots/bot_123/profile/execution-policy")).toBe(false);
     expect(allowed("PUT", "/api/config")).toBe(false);
     expect(allowed("GET", "/api/attachments/../config.json")).toBe(false);
@@ -407,7 +428,9 @@ describe("what it may not", () => {
     expect(allowed("DELETE", "/api/connectors/slack/accounts/ca_123")).toBe(true);
     expect(allowed("DELETE", "/api/connectors/slack/accounts/../../config")).toBe(false);
     expect(allowed("POST", "/api/connectors/slack/authorize/extra")).toBe(false);
-    expect(allowed("DELETE", "/api/groups/room-1")).toBe(false);
+    expect(allowed("DELETE", "/api/groups/room-1")).toBe(true);
+    expect(allowed("DELETE", "/api/groups/room-1/messages")).toBe(false);
+    expect(allowed("DELETE", "/api/groups/room-1/extra")).toBe(false);
   });
 
   // Patterns are anchored, so a path that merely starts right is still a
@@ -482,6 +505,134 @@ describe("settings display preferences", () => {
     expect(ask("PATCH", "/api/features", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/room-turn-timeout", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/profile", false)?.status).toBe(401);
+  });
+});
+
+describe("roster organization", () => {
+  it("opens the bot PATCH for the six organize fields and no others", () => {
+    expect([...COMPANION_BOT_ORGANIZE_FIELDS].sort()).toEqual(
+      ["chiefOfStaff", "hidden", "pinned", "pinnedMessageId", "section", "unread"].sort(),
+    );
+    expect(companionBotOrganizeDenial({ hidden: true })).toBeNull();
+    expect(companionBotOrganizeDenial({ hidden: false })).toBeNull();
+    expect(companionBotOrganizeDenial({ pinned: true })).toBeNull();
+    expect(companionBotOrganizeDenial({ unread: true })).toBeNull();
+    expect(companionBotOrganizeDenial({ chiefOfStaff: false })).toBeNull();
+    expect(companionBotOrganizeDenial({ section: "Work" })).toBeNull();
+    expect(companionBotOrganizeDenial({ section: null })).toBeNull();
+    expect(companionBotOrganizeDenial({ pinnedMessageId: "msg_1-a" })).toBeNull();
+    expect(companionBotOrganizeDenial({ pinnedMessageId: null })).toBeNull();
+    expect(companionBotOrganizeDenial({ pinnedMessageId: "" })).toBeNull();
+    // several at once is fine: the desktop archives and demotes in one save
+    expect(companionBotOrganizeDenial({ hidden: true, chiefOfStaff: false })).toBeNull();
+  });
+
+  it("refuses every field the bot PATCH reads that is not an organize field", () => {
+    // The keys the harness handler reads, plus a name nobody has invented
+    // yet.  Each one alone, and each one riding along with a legitimate
+    // organize field: the whole request fails either way.
+    for (const field of [
+      "autoApprove",
+      "bypassPermissions",
+      "alwaysAllow",
+      "autoReview",
+      "approvePeerComms",
+      "acknowledgeLocalAuto",
+      "computers",
+      "computer",
+      "composio",
+      "cloudBackend",
+      "autoStartVps",
+      "gitWorktreeLeases",
+      "cwd",
+      "color",
+      "mascotExpression",
+      "name",
+      "title",
+      "modelSelection",
+      "requireAvailableModel",
+      "off",
+      "playbooks",
+      "futurePrivilege",
+    ]) {
+      const expected = {
+        status: 403,
+        error: `${field} can only be changed in BotFleet on your computer`,
+      };
+      expect(companionBotOrganizeDenial({ [field]: true }), field).toEqual(expected);
+      expect(companionBotOrganizeDenial({ pinned: true, [field]: true }), `${field} beside pinned`).toEqual(expected);
+    }
+  });
+
+  it("checks value types the harness would store as sent", () => {
+    for (const field of ["hidden", "pinned", "unread", "chiefOfStaff"]) {
+      for (const bad of ["true", 1, 0, null, {}, [], "false"]) {
+        expect(companionBotOrganizeDenial({ [field]: bad }), `${field}=${JSON.stringify(bad)}`).toEqual({
+          status: 400,
+          error: `${field} must be true or false`,
+        });
+      }
+    }
+    for (const bad of [1, true, {}, []]) {
+      expect(companionBotOrganizeDenial({ section: bad })?.status).toBe(400);
+    }
+    for (const bad of [1, true, {}, [], "../etc/passwd", "a b", "x/y"]) {
+      expect(companionBotOrganizeDenial({ pinnedMessageId: bad })?.status, JSON.stringify(bad)).toBe(400);
+    }
+    expect(companionBotOrganizeDenial({})).toEqual({ status: 400, error: "nothing to save" });
+  });
+
+  it("picks the right body check for each filtered route, and none for the rest", () => {
+    expect(companionBodyCheck("PATCH", "/api/bots/b_1/profile")).not.toBeNull();
+    expect(companionBodyCheck("PATCH", "/api/bots/b_1")).toBe(companionBotOrganizeDenial);
+    expect(companionBodyCheck("DELETE", "/api/bots/b_1")).toBeNull();
+    expect(companionBodyCheck("PATCH", "/api/bots/b_1/tasks/t_1")).toBeNull();
+    expect(companionBodyCheck("PATCH", "/api/groups/room-1")).toBeNull();
+  });
+
+  it("deletes a bot or a room only with the DELETE verb, on the bare resource", () => {
+    expect(allowed("DELETE", "/api/bots/bot_123")).toBe(true);
+    expect(allowed("DELETE", "/api/groups/room-1")).toBe(true);
+    expect(ask("DELETE", "/api/bots/bot_123", false)?.status).toBe(401);
+    expect(ask("DELETE", "/api/groups/room-1", false)?.status).toBe(401);
+    // an encoded traversal fails to match and is denied
+    expect(allowed("DELETE", "/api/bots/..%2Fgroups%2Froom-1")).toBe(false);
+    expect(allowed("DELETE", "/api/bots/")).toBe(false);
+    expect(allowed("DELETE", "/api/bots")).toBe(false);
+    expect(allowed("DELETE", "/api/groups")).toBe(false);
+  });
+
+  it("covers Pin Message on a room through the room PATCH it already had", () => {
+    expect(allowed("PATCH", "/api/groups/room-1")).toBe(true);
+    expect(ask("PATCH", "/api/groups/room-1", false)?.status).toBe(401);
+  });
+});
+
+describe("model defaults and automatic updates", () => {
+  it("lets the phone apply model defaults, and keeps the computer defaults on the Mac", () => {
+    expect(allowed("POST", "/api/bots/apply-model-defaults")).toBe(true);
+    expect(allowed("GET", "/api/bots/apply-model-defaults")).toBe(false);
+    expect(allowed("POST", "/api/bots/apply-model-defaults/extra")).toBe(false);
+    expect(ask("POST", "/api/bots/apply-model-defaults", false)?.status).toBe(401);
+    // Computer grants for every bot are not a phone decision, and the
+    // refusal says so rather than reading as a bug in the companion.
+    expect(ask("POST", "/api/bots/apply-defaults")).toEqual({
+      status: 403,
+      error: "computer defaults for every bot are set on your computer",
+    });
+  });
+
+  it("opens one narrow route for the automatic update preference, not the config", () => {
+    expect(allowed("PATCH", "/api/auto-update")).toBe(true);
+    expect(allowed("PUT", "/api/auto-update")).toBe(false);
+    expect(allowed("POST", "/api/auto-update")).toBe(false);
+    expect(allowed("GET", "/api/auto-update")).toBe(false);
+    expect(allowed("PATCH", "/api/auto-update/extra")).toBe(false);
+    expect(ask("PATCH", "/api/auto-update", false)?.status).toBe(401);
+    // the preference is still readable where it always was, as a boolean
+    expect(allowed("GET", "/api/config")).toBe(true);
+    expect(allowed("PATCH", "/api/config")).toBe(false);
+    expect(allowed("PUT", "/api/config")).toBe(false);
   });
 });
 
