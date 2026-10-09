@@ -17617,10 +17617,15 @@ console.log(`botfleet server ready on http://127.0.0.1:${PORT}`);
 zulipHub = new ZulipHub({
   dataDir: DATA_DIR,
   settings: () => cfg.zulip,
-  // `credentialSource: "infisical"` only: one read of BotFleet's own vault
-  // folder per 15 minutes, shared by every bot.  The keys stay in the hub's
-  // memory, never in `cfg`, `process.env` or a log (docs/zulip.md, D0).
-  vault: cachedVaultReader((secretPath) => infisical.readPath(secretPath)),
+  // `credentialSource: "infisical"` only: one read of the vault folder
+  // (BotFleet's own, or `infisicalProjectId` / `infisicalEnv`) per 15
+  // minutes, shared by every bot.  The Infisical call returns the whole
+  // folder, so only the bound roles' names are kept once it returns; the
+  // rest are in memory for the length of the fetch.  The keys stay in the
+  // hub's memory, never in `cfg`, `process.env` or a log (docs/zulip.md, D0).
+  vault: cachedVaultReader((location) =>
+    infisical.readPath(location.secretPath, { projectId: location.projectId, environment: location.environment }),
+  ),
   botExists: (botId) => Boolean(store.bot(botId)),
   // A bot holding a crash marker is not free either: its interrupted turn
   // belongs to boot recovery (or to the person, for one left over the cap),
