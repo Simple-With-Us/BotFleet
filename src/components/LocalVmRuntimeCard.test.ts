@@ -14,7 +14,7 @@ describe("LocalVmRuntimeCard runtime UX", () => {
     const refreshBlock = source.match(/const refresh = useCallback[\s\S]*?\], \[\]\);/)?.[0] ?? "";
     expect(refreshBlock).not.toContain("setActionError");
     expect(source).not.toContain("productErrorHeadline");
-    expect(source).toContain("STATUS_TIMEOUT_MS = 15_000");
+    expect(source).toContain("STATUS_TIMEOUT_MS = 40_000");
     expect(source).not.toContain('void act("start")');
   });
 });
