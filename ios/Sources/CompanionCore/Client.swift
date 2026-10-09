@@ -1417,6 +1417,82 @@ public struct CompanionClient: Sendable {
         }
     }
 
+    // MARK: - Background jobs
+
+    /// Every job the harness knows; the screen sorts for display.  A job the
+    /// phone cannot read is left out rather than failing the list.
+    public func jobs() async throws -> [JobSnapshot] {
+        try await send(try makeRequest("GET", "/api/jobs"), as: JobListResponse.self).jobs
+    }
+
+    /// The newest bytes of one job's log (the harness's default 64 KB).
+    /// Output is never on a frame, so it is read here, on demand.
+    public func jobOutput(id: String) async throws -> JobOutputResponse {
+        try await send(try makeRequest("GET", "/api/jobs/\(id)/output"), as: JobOutputResponse.self)
+    }
+
+    /// The owner's Stop: the job gets SIGTERM, then SIGKILL after five
+    /// seconds, and the bot is told on its next turn without being woken.
+    /// Answered at once; the next `jobs` frame shows `stopping`, then
+    /// `killed`.  A job that already ended answers 409, which is the outcome
+    /// asked for, so it is not an error here.  `body: [:]` sends the JSON
+    /// content type every other bodyless write on this client sends.
+    public func stopJob(id: String) async throws {
+        do {
+            try await send(try makeRequest("POST", "/api/jobs/\(id)/stop", body: [:]))
+        } catch let error as APIError where error.isConflict {
+            return
+        }
+    }
+
+    /// Stop every running job of one conversation.
+    public func stopAllJobs(threadId: String) async throws {
+        try await send(try makeRequest("POST", "/api/jobs/stop", body: ["threadId": threadId]))
+    }
+
+    // MARK: - Usage and cost
+
+    /// Quota windows, rolling per-engine spend and the engines being held.
+    public func quotas() async throws -> QuotasSnapshot {
+        try await send(try makeRequest("GET", "/api/quotas"), as: QuotasSnapshot.self)
+    }
+
+    /// The speech provider's character counts.
+    public func speechUsage() async throws -> SpeechUsage {
+        try await send(try makeRequest("GET", "/api/tts/usage"), as: SpeechUsage.self)
+    }
+
+    // MARK: - Shared memory
+
+    /// Whether the recall corpus bots search is reachable.  Read-only.
+    public func sharedMemoryStatus() async throws -> SharedMemoryStatus {
+        try await send(try makeRequest("GET", "/api/qdrant/status"), as: SharedMemoryStatus.self)
+    }
+
+    // MARK: - Skills
+
+    /// A bot's imported skills.
+    public func botSkills(botId: String) async throws -> SkillsResponse {
+        try await send(try makeRequest("GET", "/api/bots/\(botId)/skills"), as: SkillsResponse.self)
+    }
+
+    /// One skill's SKILL.md, which a person reads before enabling it.
+    public func skillText(botId: String, name: String) async throws -> String {
+        try await send(
+            try makeRequest("GET", "/api/bots/\(botId)/skills/\(name)"),
+            as: SkillTextResponse.self
+        ).text
+    }
+
+    /// Turn one skill on or off.  The only write the phone has on skills:
+    /// importing reads a folder off the computer's disk, and stays there.
+    public func setSkillEnabled(botId: String, name: String, enabled: Bool) async throws -> SkillListing {
+        try await send(
+            try makeRequest("PATCH", "/api/bots/\(botId)/skills/\(name)", body: ["enabled": enabled]),
+            as: SkillResponse.self
+        ).skill
+    }
+
     // MARK: - Events
 
     /// A session for a connection that is meant to stay open for hours.

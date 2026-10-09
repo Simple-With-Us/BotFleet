@@ -277,6 +277,11 @@ public struct BotTask: Codable, Hashable, Sendable {
     public var lastActivity: Double?
     public var lastMessage: Message?
     public var usage: TaskUsage?
+    /// `usage` split by the engine instance that ran each turn, with a
+    /// per-model split inside.  Decoded so that a bucket this build cannot read
+    /// costs that figure and never the bot (`UsageBuckets`).  Absent on older
+    /// harnesses.
+    public var usageByInstance: UsageBuckets?
     public var modelSelection: ModelSelection?
     public var activeModelSelection: ModelSelection?
     /// Asleep until: `0` is the until-activity sentinel and sleeps until the
@@ -357,6 +362,10 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var voices: BotVoices? = nil
     public var mascotExpression: String?
     public var tasks: [BotTask]?
+    /// Shared-room turns this bot spoke, banked per engine instance.  Room
+    /// threads are not bot tasks, so they cannot live on the task ledger; a
+    /// bot's usage total includes them (`UsageMath.botUsage`).
+    public var roomUsageByInstance: UsageBuckets?
     public var messages: [Message]?
     public var activeLeafId: String?
     /// Paged responses only: there is more transcript above what you got.
