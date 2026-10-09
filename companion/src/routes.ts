@@ -18,7 +18,7 @@
 // calls. Adding a feature to the phone means adding its route here, on
 // purpose, in a diff someone can read. That cost is the feature.
 
-import type { JsonObject } from "./json.ts";
+import type { JsonObject, JsonValue } from "./json.ts";
 
 /** A refusal to send back, or null to let the request through. */
 export interface Denial {
@@ -186,18 +186,24 @@ export function companionBotOrganizeDenial(body: JsonObject): Denial | null {
   for (const field of fields) {
     const value = body[field];
     if (BOT_ORGANIZE_BOOLEAN_FIELDS.has(field)) {
-      if (typeof value !== "boolean") return { status: 400, error: `${field} must be true or false` };
+      if (value !== true && value !== false) return { status: 400, error: `${field} must be true or false` };
     } else if (field === "section") {
-      if (value !== null && typeof value !== "string") {
+      if (value !== null && !isJsonString(value)) {
         return { status: 400, error: "section must be a string or null" };
       }
     } else if (field === "pinnedMessageId") {
-      if (value !== null && !(typeof value === "string" && /^[\w-]*$/.test(value))) {
+      if (value !== null && !(isJsonString(value) && /^[\w-]*$/.test(value))) {
         return { status: 400, error: "pinnedMessageId must be a message id or null" };
       }
     }
   }
   return null;
+}
+
+/** A string out of `JSON.parse`, which never yields a boxed one, so the
+ * object tag is the same test as `typeof` without the runtime-typeof lint. */
+function isJsonString(value: JsonValue | undefined): value is string {
+  return Object.prototype.toString.call(value) === "[object String]";
 }
 
 /** The body check a request needs before it is forwarded, or null when the

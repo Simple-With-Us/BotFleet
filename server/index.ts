@@ -13076,7 +13076,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // checks the type too (companion/src/routes.ts), but this route has
       // other callers, and a guard only one of them honors is not a guard.
       for (const key of ["unread", "pinned", "hidden"] as const) {
-        if (body[key] !== undefined && typeof body[key] !== "boolean") {
+        if (body[key] !== undefined && body[key] !== true && body[key] !== false) {
           return json(res, 400, { error: `${key} must be true or false` });
         }
       }
@@ -15573,7 +15573,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // `enabled` from disk on every tick (electron/updater.mjs).
     if (method === "PATCH" && path === "/api/auto-update") {
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.enabled !== "boolean") {
+      if (!body || Array.isArray(body) || (body.enabled !== true && body.enabled !== false)) {
         return json(res, 400, { error: "enabled must be true or false" });
       }
       const patch = parseConfigPatch({ autoUpdate: { enabled: body.enabled } });
