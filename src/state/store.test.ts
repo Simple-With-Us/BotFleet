@@ -1253,3 +1253,107 @@ describe("task switch transcript", () => {
     expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
   });
 });
+
+// The Fleet Matrix overview closes when the person picks a chat, and only then.
+// `selectedId` cannot say that: a click on the open chat leaves it unchanged,
+// and the store rewrites it by itself when a hydrate loses the selection or a
+// delete falls back.  `selectionNonce` is the signal, so this pins which
+// actions move it.
+describe("selectionNonce", () => {
+  const botNamed = (id: string) =>
+    ({
+      id,
+      threadId: `${id}-thread`,
+      name: id,
+      title: "",
+      description: "",
+      notifications: true,
+      color: "blue",
+      unread: false,
+      modelSelection: { instanceId: "x", model: "y" },
+      messages: [],
+    }) satisfies Bot;
+  const roomNamed = (id: string) =>
+    ({
+      id,
+      threadId: `${id}-thread`,
+      name: id,
+      memberIds: ["a"],
+      defaultResponder: { kind: "everyone" },
+      bulletin: "",
+      unread: false,
+      createdAt: 1,
+      messages: [],
+    }) satisfies Group;
+  const open = {
+    ...initialState,
+    bots: [botNamed("a"), botNamed("b")],
+    groups: [roomNamed("room")],
+    selectedId: "a",
+  };
+
+  it("counts picking another bot or a room", () => {
+    const toBot = reducer(open, { type: "select", id: "b" });
+    expect(toBot.selectionNonce).toBe(open.selectionNonce + 1);
+    const toRoom = reducer(toBot, { type: "select", id: "room" });
+    expect(toRoom.selectionNonce).toBe(open.selectionNonce + 2);
+  });
+
+  it("counts a click on the chat that is already open, which selectedId cannot show", () => {
+    const sameBot = reducer(open, { type: "select", id: "a" });
+    expect(sameBot.selectedId).toBe(open.selectedId);
+    expect(sameBot.selectionNonce).toBe(open.selectionNonce + 1);
+
+    const inRoom = { ...open, selectedId: "room" };
+    const sameRoom = reducer(inRoom, { type: "select", id: "room" });
+    expect(sameRoom.selectedId).toBe("room");
+    expect(sameRoom.selectionNonce).toBe(inRoom.selectionNonce + 1);
+  });
+
+  it("counts a new bot taking the selection, not a second fold of the bot already on screen", () => {
+    const added = reducer(open, { type: "botAdded", bot: botNamed("c") });
+    expect(added.selectedId).toBe("c");
+    expect(added.selectionNonce).toBe(open.selectionNonce + 1);
+    const refolded = reducer(added, { type: "botAdded", bot: botNamed("c") });
+    expect(refolded.selectedId).toBe("c");
+    expect(refolded.selectionNonce).toBe(added.selectionNonce);
+  });
+
+  it("does not move for a bot or room update streamed in the background", () => {
+    const busy = reducer(open, { type: "botPatched", bot: { ...botNamed("a"), busy: true } });
+    const arrived = reducer(busy, { type: "botPatched", bot: botNamed("elsewhere") });
+    const room = reducer(arrived, { type: "groupPatched", group: { id: "room", unread: true } });
+    const thread = reducer(room, { type: "taskSwitched", bot: { id: "a", threadId: "a-other" } });
+    expect(thread.selectionNonce).toBe(open.selectionNonce);
+  });
+
+  it("does not move when hydrate picks the first bot at launch or after the selection vanished", () => {
+    const launch = reducer(initialState, {
+      type: "hydrate",
+      bots: [botNamed("a"), botNamed("b")],
+      groups: [roomNamed("room")],
+      computerControl: {},
+    });
+    expect(launch.selectedId).toBe("a");
+    expect(launch.selectionNonce).toBe(initialState.selectionNonce);
+
+    const lost = reducer({ ...open, selectedId: "gone" }, {
+      type: "hydrate",
+      bots: [botNamed("b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(lost.selectedId).toBe("b");
+    expect(lost.selectionNonce).toBe(open.selectionNonce);
+  });
+
+  it("does not move when a delete makes the store fall back to another chat", () => {
+    const roomGone = reducer({ ...open, selectedId: "room" }, { type: "groupDeleted", groupId: "room" });
+    expect(roomGone.selectedId).toBe("a");
+    expect(roomGone.selectionNonce).toBe(open.selectionNonce);
+
+    const botGone = reducer(open, { type: "deleteBot", botId: "a" });
+    expect(botGone.selectedId).toBe("b");
+    expect(botGone.selectionNonce).toBe(open.selectionNonce);
+  });
+});

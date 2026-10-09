@@ -123,7 +123,7 @@ Before #800 (merged Fri, Oct 9), `loadConfig` treated any schema failure as a fi
 
 Captured by the owner on Thu, Oct 8 at about 11:47pm from the installed build (the update banner reads "1.0.31, 6 commits ahead", so the build is within six commits of `4106a5d64`).
 
-- `screenshots/settings-workspace-arrangement.webp`: Settings › Terminology (Apps selected) and Workspace Arrangement (Simple; Apps selected, "Named bots stay hidden"), then Channel Turns.
+- `screenshots/settings-workspace-arrangement.webp`: Settings › Terminology (Apps selected) and Workspace Arrangement with the second option, titled "Apps" by the terminology word, selected and reading "Named bots stay hidden", then Channel Turns.  So the owner runs the `projects` arrangement, which is also why the Director shows nested threads in the matrix capture.
 - `screenshots/kanban-command-center.webp`: the App Deck (All Apps 10 errors, 10 working, 18 unread; CodeCaps, Clutch, Hog Hunter, BotFleet), the header card in Kanban mode, "1609 Cards · 449 Needs Action · 1 In Progress", four columns, repeated "Run Failed — GitHub UI Pass → Designer — Start docker first" cards.
 - `screenshots/fleet-matrix-grid.webp`: the full window; sidebar (Director with BF-DIRECTOR and Overnight Board nested, Apps section, Team Map, Teach a Skill, update banner); the header card in Matrix mode with pills; rows CodeCaps, Clutch, Hog Hunter, BotFleet, AFC+OPS, Usage Monitor, DealDex, Congress.Trade; columns Room Chat, Oracle, Publisher, Plumber, Housekeeper, Monitor, Builder.
 
