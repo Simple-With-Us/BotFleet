@@ -92,7 +92,7 @@ describe.each(ENGINES)("$name reviews its own approvals", ({ create }) => {
     stubFetch("");
     const instance = await create();
     expect(instance.adapter.capabilities.reviewHook).toBe("before");
-    expect(typeof instance.reviewPermission).toBe("function");
+    expect(instance.reviewPermission).toEqual(expect.any(Function));
     await instance.dispose();
   });
 

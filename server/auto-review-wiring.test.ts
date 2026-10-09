@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { z } from "zod";
 
 import type { DecisionRow } from "./decision-log.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
@@ -171,8 +172,8 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
       });
     });
     await new Promise<void>((resolve) => reviewer.listen(0, "127.0.0.1", resolve));
-    const address = reviewer.address();
-    const reviewerUrl = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/v1`;
+    const address = z.object({ port: z.number().int().min(1).max(65_535) }).parse(reviewer.address());
+    const reviewerUrl = `http://127.0.0.1:${address.port}/v1`;
 
     chmodSync(FAKE_CLI, 0o755);
     chmodSync(FAKE_PI_CLI, 0o755);
