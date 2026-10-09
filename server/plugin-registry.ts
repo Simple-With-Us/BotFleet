@@ -8,7 +8,7 @@
 // The host owns this directory.  Nothing in a plugin path can reach
 // into it.
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
@@ -174,7 +174,7 @@ export function removePluginEntry(name: string, baseDir: string = PLUGINS_DIR): 
   return registry;
 }
 
-/** Write a fetched plugin to disk.  Stages into `<dir>.staging-<pid>` and
+/** Write a fetched plugin to disk.  Stages into `<dir>.staging-<pid>-<uuid>` and
  *  renames into place only after every file and the manifest are on disk,
  *  so a failed write never destroys a working install.  Manifest is still
  *  written last inside the staging tree.  Filesystem errors propagate to
@@ -187,9 +187,10 @@ export async function writePluginTree(
   baseDir: string = PLUGINS_DIR,
 ): Promise<void> {
   const dir = pluginDirFor(name, baseDir);
-  const staging = `${dir}.staging-${process.pid}`;
-  // Drop a leftover staging tree from a prior crash before rewriting.
-  await removeDirSafe(staging);
+  // A per-call id keeps two concurrent installs of the same plugin from
+  // sharing a staging or aside directory.
+  const attemptId = `${process.pid}-${randomUUID()}`;
+  const staging = `${dir}.staging-${attemptId}`;
   mkdirSync(staging, { recursive: true, mode: 0o700 });
 
   try {
@@ -210,7 +211,7 @@ export async function writePluginTree(
     // "incomplete install" and we surface that to the user.
     writeFileSync(join(staging, "botfleet-plugin.json"), fetched.manifestText, { mode: 0o600 });
 
-    const aside = `${dir}.replacing-${process.pid}`;
+    const aside = `${dir}.replacing-${attemptId}`;
     if (existsSync(dir)) {
       renameSync(dir, aside);
     }
