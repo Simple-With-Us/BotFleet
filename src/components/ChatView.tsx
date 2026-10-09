@@ -56,6 +56,7 @@ import { MentionText } from "./MentionText";
 import { OptionCard, shouldHideOnboardingCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { Composer } from "./Composer";
+import { UpdateDrainNotice } from "./UpdateDrainNotice";
 import { ErrorRow, TurnErrorAnnouncement, latestTurnErrorMessage, turnErrorBranchKey } from "./ErrorRow";
 import { ChatFindBar } from "./ChatFindBar";
 import { ReplyQuote } from "./ReplyQuote";
@@ -1815,6 +1816,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
         </button>
       )}
       <div className="w-full">
+      <UpdateDrainNotice />
       <Composer
         key={bot.id}
         bot={bot}

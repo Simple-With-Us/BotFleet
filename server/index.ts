@@ -70,10 +70,12 @@ import { workspaceCredentialPending } from "../electron/workspace-credentials.mj
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
 import {
   appendHeldWork,
+  drainViewOf,
   inFlightCounts,
   partitionByAge,
   takeHeldWork,
   UpdateDrain,
+  type UpdateDrainView,
   type HeldQueueEntry,
   type HeldRoomRound,
   type HeldSend,
@@ -740,6 +742,10 @@ const updateControl = createUpdateControl({
   // while a turn is running.  Both `POST` routes pass their own reading
   // instead, excluding the admission the request itself holds.
   readiness: () => currentRuntimeReadiness(),
+  // The hold an update has on new work, for the screens that tell a person
+  // their message is saved.  Lazy: `updateDrain` is declared further down, and
+  // nothing before `bootComplete` may reach it.
+  drain: () => (bootComplete ? updateDrainView() : null),
   emit: (status) => broadcast({ kind: "update.status", status }),
 });
 // Bound the per-thread transcript logs before anything starts appending to
@@ -797,6 +803,7 @@ let activeUpdateAdmissions = 0;
 // Unlike `runtimeQuiescing` it closes no route: it only holds NEW turns.
 const updateDrain = new UpdateDrain({
   onRelease: () => releaseAfterDrain(),
+  onChange: () => announceDrainChange(),
   log: (line) => console.warn(line),
 });
 const cfg = loadConfig();
@@ -10073,6 +10080,42 @@ function drainRuntimeReadiness() {
     rooms: bootComplete ? [...groupSpeakers.values()].filter((speaker) => store.bot(speaker.botId)?.busy === true).length : 0,
     held: { routineRuns: queuedRoutineRuns, sends: counts.queuedSends ?? 0, rooms: counts.queuedRooms ?? 0 },
   };
+}
+
+/** The hold as the update status reports it to the app and the phone
+ *  (`UpdateStatus.drain`): counts and times, none of it a credential or a
+ *  word of anyone's message.  Null when nothing is held. */
+function updateDrainView(): UpdateDrainView | null {
+  const status = updateDrain.status();
+  if (!status) return null;
+  return drainViewOf(status, drainRuntimeReadiness());
+}
+
+/** How often the held counts are re-read while a hold lasts.  The status
+ *  poll only runs for a run the harness started; an updater started from a
+ *  terminal holds work with no run to poll for. */
+const DRAIN_VIEW_REFRESH_MS = 2_000;
+let drainViewTicker: ReturnType<typeof setInterval> | null = null;
+
+/** The hold started, was renewed or ended: tell every screen now, and keep
+ *  its counts live for as long as it lasts. */
+function announceDrainChange(): void {
+  if (updateDrain.active) {
+    if (!drainViewTicker) {
+      drainViewTicker = setInterval(() => updateControl.notify(), DRAIN_VIEW_REFRESH_MS);
+      drainViewTicker.unref?.();
+    }
+  } else if (drainViewTicker) {
+    clearInterval(drainViewTicker);
+    drainViewTicker = null;
+  }
+  // A status that cannot be built must never fail the quiesce request that
+  // changed the hold.
+  try {
+    updateControl.notify();
+  } catch (error) {
+    console.warn(`[update-drain] could not broadcast the hold: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /** The drain half of `GET /api/runtime` and the quiesce routes. */

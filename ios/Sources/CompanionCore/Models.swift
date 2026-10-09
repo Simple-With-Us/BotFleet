@@ -1682,15 +1682,144 @@ public struct MacUpdateRun: Codable, Hashable, Sendable {
     public var runId: String
     public var startedAt: String
     public var step: String
+    /// What the step is waiting on ("Waiting for 3 bots to finish"), when the
+    /// updater says.  Absent from a harness that predates it, and most of the
+    /// time on one that does not.
+    public var detail: String?
     public var progress: Double?
     public var logTail: [String]
 
-    public init(runId: String, startedAt: String, step: String, progress: Double? = nil, logTail: [String] = []) {
+    public init(
+        runId: String,
+        startedAt: String,
+        step: String,
+        detail: String? = nil,
+        progress: Double? = nil,
+        logTail: [String] = []
+    ) {
         self.runId = runId
         self.startedAt = startedAt
         self.step = step
+        self.detail = detail
         self.progress = progress
         self.logTail = logTail
+    }
+
+    /// The wait's own words when there is one, else the step.  The same choice
+    /// the desktop makes (`runningLabel` in src/lib/update-control.ts).
+    public var headline: String {
+        if let detail, !detail.isEmpty { return detail }
+        return step
+    }
+
+    /// Whether `progress` means anything beside this step.  It is the run's own
+    /// step count and does not move while a step waits on something outside it
+    /// (bots finishing, a process letting go of BotFleet's files), so a bar or
+    /// a percent beside a wait detail would sit still for a minute and read as
+    /// stuck.  The desktop drops it by the same rule (`runningShowsPercent`).
+    public var showsPercent: Bool {
+        guard progress != nil else { return false }
+        return detail?.isEmpty ?? true
+    }
+}
+
+/// The hold an update has on new work while bots finish: `drain` on the
+/// `GET /api/update/status` answer and the `update.status` event.  While it
+/// lasts, a message sent to the paired Mac is accepted and kept; it runs after
+/// the restart.  Counts and times only, in epoch milliseconds on the Mac's clock.
+public struct MacUpdateDrain: Codable, Hashable, Sendable {
+    public struct Held: Codable, Hashable, Sendable {
+        public var sends: Int
+        public var rooms: Int
+        public var routineRuns: Int
+
+        public init(sends: Int = 0, rooms: Int = 0, routineRuns: Int = 0) {
+            self.sends = sends
+            self.rooms = rooms
+            self.routineRuns = routineRuns
+        }
+    }
+
+    public var startedAt: Double
+    /// The latest the restart begins: the end of the updater's own window.
+    public var windowEndsAt: Double
+    /// When the Mac gives the hold up by itself.  Past it, a phone still
+    /// showing the hold is showing a Mac that went away mid-update.
+    public var deadline: Double
+    /// Bots mid-turn: what the update is waiting for.
+    public var bots: Int
+    /// Live room turns, which an update will not interrupt.
+    public var rooms: Int
+    public var held: Held
+
+    public init(
+        startedAt: Double,
+        windowEndsAt: Double,
+        deadline: Double,
+        bots: Int = 0,
+        rooms: Int = 0,
+        held: Held = Held()
+    ) {
+        self.startedAt = startedAt
+        self.windowEndsAt = windowEndsAt
+        self.deadline = deadline
+        self.bots = bots
+        self.rooms = rooms
+        self.held = held
+    }
+
+    /// The wide gap between sentences: a no-break space, then a space.
+    static let gap = "\u{00A0} "
+
+    private static func milliseconds(_ date: Date) -> Double {
+        date.timeIntervalSince1970 * 1000
+    }
+
+    /// Still worth showing at `now`.  A hold past its lease belongs to a Mac
+    /// that went away mid-update.
+    public func isActive(at now: Date) -> Bool {
+        Self.milliseconds(now) < deadline
+    }
+
+    /// Messages saved for after the restart: a send waiting in a bot's queue,
+    /// or a room round waiting for its bots to speak.
+    public var heldMessageCount: Int {
+        held.sends + held.rooms
+    }
+
+    /// How long to expect to wait, as a person would say it: "about 40
+    /// seconds", "about 4 minutes", or nil when it is nearly over.  Rounded up
+    /// on purpose; a wait that ends early costs nobody anything.
+    public static func waitPhrase(milliseconds: Double) -> String? {
+        guard milliseconds.isFinite, milliseconds > 5_000 else { return nil }
+        if milliseconds < 90_000 {
+            return "about \(Int((milliseconds / 10_000).rounded(.up)) * 10) seconds"
+        }
+        return "about \(Int((milliseconds / 60_000).rounded(.up))) minutes"
+    }
+
+    private func restartTiming(at now: Date) -> String {
+        if let phrase = Self.waitPhrase(milliseconds: windowEndsAt - Self.milliseconds(now)) {
+            return "The restart begins within \(phrase)."
+        }
+        return "The restart begins shortly."
+    }
+
+    /// What a chat says while the Mac holds new work.  The counts are the whole
+    /// Mac's, not this thread's, so it says what happens to the message being
+    /// typed and claims nothing about one already sent.
+    public func noticeText(at now: Date) -> String {
+        "BotFleet is updating.\(Self.gap)Messages you send now are saved and will run after the restart.\(Self.gap)\(restartTiming(at: now))"
+    }
+
+    /// What the update card says beside the step: how many messages are saved,
+    /// and when the restart begins.
+    public func summaryText(at now: Date) -> String {
+        let count = heldMessageCount
+        let saved = count > 0
+            ? "\(count) \(count == 1 ? "message is" : "messages are") saved and will run after the restart."
+            : "New messages are saved and will run after the restart."
+        return "\(saved)\(Self.gap)\(restartTiming(at: now))"
     }
 }
 
@@ -1777,6 +1906,10 @@ public struct MacUpdateStatus: Codable, Hashable, Sendable {
     public var running: MacUpdateRun?
     public var lastRun: MacUpdateLastRun?
     public var capabilities: MacUpdateCapabilities
+    /// Present only while an update holds new work for bots to finish, whether
+    /// or not the Mac started the run itself (an updater launched from a
+    /// terminal holds work too).  Absent from a harness that predates it.
+    public var drain: MacUpdateDrain?
 
     public init(
         installed: MacInstalledBuild,
@@ -1785,7 +1918,8 @@ public struct MacUpdateStatus: Codable, Hashable, Sendable {
         checkError: String? = nil,
         running: MacUpdateRun? = nil,
         lastRun: MacUpdateLastRun? = nil,
-        capabilities: MacUpdateCapabilities
+        capabilities: MacUpdateCapabilities,
+        drain: MacUpdateDrain? = nil
     ) {
         self.installed = installed
         self.available = available
@@ -1794,6 +1928,7 @@ public struct MacUpdateStatus: Codable, Hashable, Sendable {
         self.running = running
         self.lastRun = lastRun
         self.capabilities = capabilities
+        self.drain = drain
     }
 }
 

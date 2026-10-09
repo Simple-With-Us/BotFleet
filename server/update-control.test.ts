@@ -27,6 +27,7 @@ import {
   type RuntimeReadiness,
   type UpdateCapabilities,
   type UpdateControl,
+  type UpdateDrainView,
   type UpdateStatus,
 } from "./update-control.ts";
 // Test-only import of the updater's own step list.  It keeps the two files
@@ -96,6 +97,7 @@ function build(
     processAlive?: (pid: number) => boolean;
     updaterReportsProgress?: boolean;
     readiness?: RuntimeReadiness;
+    drain?: () => UpdateDrainView | null;
     launchDelay?: () => Promise<void>;
     installedAt?: string;
     writeState?: (path: string, value: unknown) => void;
@@ -136,6 +138,7 @@ function build(
       return options.exec ? options.exec(command, args) : ok();
     },
     readiness: () => options.readiness ?? { safeToRestart: true, activeWorkCount: 0 },
+    drain: options.drain,
     ...(options.writeState ? { writeState: options.writeState } : {}),
     processAlive: options.processAlive ?? (() => true),
     updaterReportsProgress: () => options.updaterReportsProgress ?? true,
@@ -181,6 +184,75 @@ function writeCurrentRun(paths: ReturnType<typeof rig>, runId: string, launcher 
     targetCommit: NEW_COMMIT,
   }));
 }
+
+describe("the hold an update has on new work", () => {
+  const hold = (patch: Partial<UpdateDrainView> = {}): UpdateDrainView => ({
+    startedAt: 1_000,
+    windowEndsAt: 61_000,
+    deadline: 181_000,
+    bots: 3,
+    rooms: 0,
+    held: { sends: 2, rooms: 1, routineRuns: 0 },
+    ...patch,
+  });
+
+  it("reports the hold on the status, whether or not the harness knows a run", () => {
+    const paths = rig();
+    let current: UpdateDrainView | null = null;
+    const { control } = build(paths, { drain: () => current });
+    expect(control.status()).not.toHaveProperty("drain");
+    // An updater started from a terminal holds work with no run behind it.
+    current = hold();
+    expect(control.status()).toMatchObject({ running: null, drain: hold() });
+    current = null;
+    expect(control.status()).not.toHaveProperty("drain");
+  });
+
+  it("carries the hold on a run's status too, beside the step and its detail", () => {
+    const paths = rig();
+    writeCurrentRun(paths, "run_hold");
+    writeProgress(paths, "run_hold", { step: "fence", detail: "Waiting for 3 bots to finish", progress: 0.4 });
+    const { control } = build(paths, { drain: () => hold() });
+    const status = control.status();
+    expect(status.running).toMatchObject({ step: "Holding new work", detail: "Waiting for 3 bots to finish" });
+    expect(status.running).not.toHaveProperty("progress");
+    expect(status.drain).toEqual(hold());
+  });
+
+  it("never lets a hold that cannot be read take the status down", () => {
+    const paths = rig();
+    const { control } = build(paths, { drain: () => { throw new Error("the drain is not built yet"); } });
+    expect(control.status()).toMatchObject({ installed: { version: "1.0.30" }, capabilities: { canCheck: true } });
+    expect(control.status()).not.toHaveProperty("drain");
+  });
+
+  it("broadcasts when the hold begins, changes and ends, and only then", () => {
+    const paths = rig();
+    let current: UpdateDrainView | null = null;
+    const { control, emitted } = build(paths, { drain: () => current });
+    control.notify();
+    const baseline = emitted.length;
+    // Nothing changed since: no frame, however often it is asked.
+    control.notify();
+    control.notify();
+    expect(emitted).toHaveLength(baseline);
+    current = hold();
+    control.notify();
+    expect(emitted).toHaveLength(baseline + 1);
+    expect(emitted.at(-1)?.drain).toEqual(hold());
+    control.notify();
+    expect(emitted).toHaveLength(baseline + 1);
+    // A held message arriving is a change the screens must hear about.
+    current = hold({ held: { sends: 3, rooms: 1, routineRuns: 0 } });
+    control.notify();
+    expect(emitted).toHaveLength(baseline + 2);
+    expect(emitted.at(-1)?.drain?.held.sends).toBe(3);
+    current = null;
+    control.notify();
+    expect(emitted).toHaveLength(baseline + 3);
+    expect(emitted.at(-1)).not.toHaveProperty("drain");
+  });
+});
 
 describe("status", () => {
   it("describes a Mac that has never checked", () => {
@@ -1013,6 +1085,23 @@ describe("reading what another process wrote", () => {
     expectTypeOf<ProgressRecord>().toHaveProperty("pid").toEqualTypeOf<number>();
     expectTypeOf<ProgressRecord>().toHaveProperty("updatedAt").toEqualTypeOf<string>();
     expectTypeOf<ProgressRecord>().toHaveProperty("outcome").toEqualTypeOf<"verified" | "rolled-back" | "failed" | "refused" | null>();
+  });
+
+  it("withholds the step percent while a step is waiting on something", () => {
+    // `progress` counts the run's own steps and does not move while a step
+    // waits on bots, so "(40%)" beside "Waiting for 3 bots to finish" was a
+    // number the wait never reached.
+    const waiting = parseProgressRecord({
+      schemaVersion: 1, runId: "x", startedAt: "t", step: "fence", detail: "Waiting for 3 bots to finish", progress: 0.4,
+    });
+    expect(runningFrom(waiting!, [])).toMatchObject({ detail: "Waiting for 3 bots to finish" });
+    expect(runningFrom(waiting!, [])).not.toHaveProperty("progress");
+    // Between waits the percent is true again.
+    const building = parseProgressRecord({
+      schemaVersion: 1, runId: "x", startedAt: "t", step: "buildBundle", detail: null, progress: 0.4,
+    });
+    expect(runningFrom(building!, [])).toMatchObject({ progress: 0.4 });
+    expect(runningFrom(building!, [])).not.toHaveProperty("detail");
   });
 
   it("passes a step's detail through to the running status, bounded", () => {

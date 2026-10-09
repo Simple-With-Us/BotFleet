@@ -253,6 +253,10 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // updater holds new work, gives running bots a short grace, then pauses
   // and resumes what is left (server/update-drain.ts); `{ "force": true }`
   // skips the grace.  `status` is a read; `check` and `run` are the two actions.
+  // While new work is held, `status` also carries `drain` (what is waiting and
+  // when the restart begins), pushed as `update.status`: that is how the phone
+  // tells a person their message is saved.  `GET /api/runtime`, which reports
+  // the same hold, needs the harness owner's token and stays closed.
   { method: "GET", path: /^\/api\/update\/status$/ },
   { method: "POST", path: /^\/api\/update\/check$/ },
   { method: "POST", path: /^\/api\/update\/run$/ },

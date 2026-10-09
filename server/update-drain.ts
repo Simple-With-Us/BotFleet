@@ -99,6 +99,64 @@ export interface UpdateDrainStatus {
   timeoutMs: number;
 }
 
+/** What a person's screens may know about a hold in progress: the part of
+ *  `GET /api/runtime`'s `drain` that matters to them, as `UpdateStatus.drain`.
+ *
+ *  `/api/runtime` itself stays out of reach of both the app and a paired
+ *  phone (loopback plus the harness owner's token, and not on the companion
+ *  allowlist), so the view rides on the update status, which both already
+ *  read and are pushed.  Counts and times only: no thread ids, no text. */
+export interface UpdateDrainView {
+  /** When the hold began (epoch milliseconds). */
+  startedAt: number;
+  /** The latest the updater's own window runs to (epoch milliseconds).  After
+   *  this the updater has fenced the harness or let the hold go, so a message
+   *  held now waits no longer than this.  It is NOT `deadline`: that adds the
+   *  lease slack for an updater that never comes back, which is minutes more
+   *  than anyone actually waits. */
+  windowEndsAt: number;
+  /** When the harness releases the hold by itself (epoch milliseconds). */
+  deadline: number;
+  /** Bots mid-turn: what the updater tells a person it is waiting for. */
+  bots: number;
+  /** Live room turns, which an update will not interrupt. */
+  rooms: number;
+  /** What is waiting rather than running. */
+  held: { sends: number; rooms: number; routineRuns: number };
+}
+
+/** The readiness numbers a view is built from (`drainRuntimeReadiness`). */
+export interface UpdateDrainCounts {
+  bots?: number;
+  rooms?: number;
+  held?: { sends?: number; rooms?: number; routineRuns?: number };
+}
+
+const wholeCount = (value: number | undefined): number =>
+  value !== undefined && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+
+/** The view of a hold, or null when nothing is held.  Pure, so the numbers a
+ *  screen shows can be tested without a harness. */
+export function drainViewOf(
+  status: UpdateDrainStatus | null,
+  counts: UpdateDrainCounts,
+  leaseGraceMs: number = UPDATE_DRAIN_LEASE_GRACE_MS,
+): UpdateDrainView | null {
+  if (!status) return null;
+  return {
+    startedAt: status.startedAt,
+    windowEndsAt: Math.max(status.startedAt, status.deadline - Math.max(0, leaseGraceMs)),
+    deadline: status.deadline,
+    bots: wholeCount(counts.bots),
+    rooms: wholeCount(counts.rooms),
+    held: {
+      sends: wholeCount(counts.held?.sends),
+      rooms: wholeCount(counts.held?.rooms),
+      routineRuns: wholeCount(counts.held?.routineRuns),
+    },
+  };
+}
+
 export type UpdateDrainRelease = "updater" | "lease-expired";
 
 export interface UpdateDrainTimer {
@@ -108,6 +166,11 @@ export interface UpdateDrainTimer {
 export interface UpdateDrainOptions {
   /** Let held work run: the steer queue, the routine scheduler, job wakes. */
   onRelease(reason: UpdateDrainRelease): void;
+  /** The hold started, was renewed, or ended, however it ended.  Screens read
+   *  the hold from the update status, and nothing else tells them it changed:
+   *  an updater started from a terminal is not a run the harness watches.
+   *  Never allowed to break the hold itself. */
+  onChange?(): void;
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => UpdateDrainTimer;
   graceMs?: number;
@@ -163,7 +226,16 @@ export class UpdateDrain {
         this.options.log?.("[update-drain] the updater never came back; released held work");
       }
     }, timeout + grace);
+    this.changed();
     return { ...this.current };
+  }
+
+  private changed(): void {
+    try {
+      this.options.onChange?.();
+    } catch (error) {
+      this.options.log?.(`[update-drain] a change listener failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /** Stop holding and let held work run now.  False when nothing was held. */
@@ -185,6 +257,7 @@ export class UpdateDrain {
     this.current = null;
     this.timer?.cancel();
     this.timer = null;
+    this.changed();
     return true;
   }
 }

@@ -44,6 +44,13 @@ struct MacUpdateSection: View {
             if let status {
                 installedRow(status)
                 availabilityRow(status)
+                // The Mac is holding new work while bots finish: say what
+                // happens to a message sent now, and when the restart begins.
+                // Separate from the run row because a hold is also real when
+                // the update was started from the Mac's own terminal.
+                if let drain = status.drain, drain.isActive(at: Date()) {
+                    holdRow(drain, updating: status.running == nil)
+                }
                 if let lastRun = status.lastRun, status.running == nil {
                     lastRunRow(lastRun)
                 }
@@ -205,11 +212,16 @@ struct MacUpdateSection: View {
                 Spacer()
                 ProgressView().controlSize(.small)
             }
-            Text(running.step)
+            // The wait's own words when the step is waiting on something
+            // ("Waiting for 3 bots to finish"), else the step.
+            Text(running.headline)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .padding(.leading, 40)
-            if let progress = running.progress {
+            // No bar while a step waits: `progress` is the run's own step
+            // count and does not move then, so a bar would sit still and read
+            // as stuck.  The spinner above already says it is working.
+            if running.showsPercent, let progress = running.progress {
                 ProgressView(value: min(max(progress, 0), 1))
                     .padding(.leading, 40)
             }
@@ -218,6 +230,28 @@ struct MacUpdateSection: View {
                     .font(.caption.monospaced())
                     .foregroundStyle(.tertiary)
                     .lineLimit(2)
+                    .padding(.leading, 40)
+            }
+        }
+    }
+
+    /// What a message sent now will do, and when the restart begins.  The
+    /// countdown ticks once a second; nothing else on the card moves.
+    private func holdRow(_ drain: MacUpdateDrain, updating: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if updating {
+                HStack(spacing: 12) {
+                    MacUpdateIcon(symbol: "arrow.triangle.2.circlepath", color: .orange)
+                    Text("Updating…")
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    ProgressView().controlSize(.small)
+                }
+            }
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(drain.summaryText(at: context.date))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                     .padding(.leading, 40)
             }
         }
@@ -416,5 +450,51 @@ private struct MacUpdateIcon: View {
             .frame(width: 28, height: 28)
             .background(color, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
             .accessibilityHidden(true)
+    }
+}
+
+/// The line a chat or a room shows while the paired Mac holds new work for an
+/// update.
+///
+/// A message sent in that window is accepted and kept, and runs after the
+/// restart.  Nothing else on screen changes, so a bot looks stuck and a room
+/// goes quiet.  This says why, and when the restart begins.  Silent when no
+/// update is holding anything, and against a Mac that predates the field.
+///
+/// The hold arrives on the same `update.status` event the Mac Update card
+/// reads (`GET /api/update/status` is the one update route a paired phone may
+/// ask; `GET /api/runtime`, which reports the same hold, stays Mac-only).  A
+/// phone that never opened Settings has no status yet, so the first appearance
+/// asks for it once.
+struct UpdateHoldNotice: View {
+    @EnvironmentObject private var session: Session
+
+    var body: some View {
+        Group {
+            if let drain = session.state.macUpdateStatus?.drain {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    if drain.isActive(at: context.date) {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                            Text(drain.noticeText(at: context.date))
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .accessibilityElement(children: .combine)
+                    }
+                }
+            }
+        }
+        .task {
+            if session.state.macUpdateStatus == nil {
+                await session.loadMacUpdateStatus()
+            }
+        }
     }
 }

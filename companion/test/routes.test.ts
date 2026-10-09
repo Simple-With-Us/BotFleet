@@ -125,6 +125,19 @@ describe("what the app may do", () => {
     expect(ask("POST", "/api/update/status")?.status).toBe(404);
     expect(ask("GET", "/api/update/status", false)?.status).toBe(401);
   });
+
+  it("shows the phone the hold an update has on new work through the update status, not the runtime route", () => {
+    // `GET /api/runtime` reports the hold (draining, what is held, when it
+    // ends), but it is loopback plus the harness owner's token and stays
+    // closed to a paired phone.  The same numbers ride on `update.status`,
+    // which the phone already reads and is pushed, so no new route was
+    // needed and a lost phone reaches nothing more.
+    expect(allowed("GET", "/api/update/status")).toBe(true);
+    expect(ask("GET", "/api/runtime")).toEqual({ status: 404, error: "no route: GET /api/runtime" });
+    expect(ask("POST", "/api/runtime/quiesce")?.status).toBe(404);
+    expect(ask("DELETE", "/api/runtime/quiesce")?.status).toBe(404);
+    expect(ask("GET", "/api/update/drain")?.status).toBe(404);
+  });
 });
 
 describe("what it may not", () => {

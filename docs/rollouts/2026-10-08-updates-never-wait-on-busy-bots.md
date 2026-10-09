@@ -238,3 +238,35 @@ fence has a lease (6, 11); room rounds are held and carried, while a live room t
 is still waited for (7); work is paused at most once per update (10).  The
 2026-10-09 overnight failures: a slow harness is asked again (preflight retry); a
 slow exit is waited out; BotFleet is never left stopped; leftovers are swept.
+
+### Follow-up: Telling People Their Messages Are Held
+
+PR #960 held a message sent during an update without telling anyone: the bot
+looked stuck and a room went quiet.  `GET /api/runtime` already reports the hold,
+but it needs the harness owner's token on a loopback address, so neither the app
+nor a paired phone could read it, and it is not on the companion allowlist.
+
+- The hold now rides `UpdateStatus.drain` on `GET /api/update/status`, the
+  `update.status` push, and the check and run answers: `startedAt`,
+  `windowEndsAt` (the end of the updater's own window, the ceiling on the wait),
+  `deadline` (the harness's lease), `bots`, `rooms` and
+  `held.{sends,rooms,routineRuns}`.  Counts and times only.  It is present whether
+  or not the harness started the run, so an updater launched from a terminal shows
+  too: `UpdateDrain` calls `onChange`, and the harness broadcasts on begin, renew
+  and every way the hold ends, and every two seconds while it lasts.
+- No new companion route: the phone already reads that status.  `GET /api/runtime`
+  stays closed to it (pinned in `companion/test/routes.test.ts`).
+- Desktop: a line above the composer in every chat and room
+  (`src/components/UpdateDrainNotice.tsx`), a line on the floating card, the
+  Settings Updates card and the sidebar button's hover, and the queued chip says
+  "Saved, runs after the update restarts" instead of "sends when the bot finishes",
+  because the bot may be idle.  iOS: the same line above the composer
+  (`UpdateHoldNotice`) and under the update card.
+- The counts are the whole harness's, not one thread's, so the line says what
+  happens to the message being typed and claims nothing about one already sent.
+- The step percent is gone while a step waits on something: `progress` is the run's
+  own step count and stays put during the grace, so "Waiting for 3 bots to finish
+  (40%)" was a number the wait never reached.  The harness withholds `progress`
+  while a `detail` is set, and the desktop label, the floating card's bar and the
+  phone's bar each drop it by the same rule (a build that predates the rule gets
+  the same result from the harness).
