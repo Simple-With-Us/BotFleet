@@ -55,7 +55,14 @@ function deps(over: Partial<TurnToolHostDeps> = {}): TurnToolHostDeps {
 
 const hostFor = (
   over: Partial<TurnToolHostDeps> = {},
-  ctx: { commsDepth?: number; chiefOfStaff?: boolean; localComputer?: boolean; workspace?: boolean; cwd?: string } = {},
+  ctx: {
+    commsDepth?: number;
+    chiefOfStaff?: boolean;
+    localComputer?: boolean;
+    workspace?: boolean;
+    cwd?: string;
+    launchIdentity?: { seat: string | null; session: string };
+  } = {},
 ) =>
   createTurnToolHost({
     botId: "bot-self",
@@ -65,6 +72,7 @@ const hostFor = (
     localComputer: ctx.localComputer,
     workspace: ctx.workspace,
     cwd: ctx.cwd,
+    launchIdentity: ctx.launchIdentity,
     deps: deps(over),
   });
 
@@ -438,6 +446,24 @@ describe("host computer tools on HTTP lane", () => {
     expect(asking.asks[0]).toMatchObject({ tool: "bash", summary: "bash: echo 'hello host'", approvalScope: "local-computer" });
     expect(outcome.kind).toBe("result");
     expect(outcome.content).toContain("hello host");
+  });
+
+  // cmd.exe (the Windows shell) does not expand $NAME
+  it.skipIf(process.platform === "win32")("runs bash marked as launched, as the bot that owns the turn, or with no seat", async () => {
+    const echo = { id: "1", name: "bash", arguments: { command: 'echo "$AGENT_LAUNCHER/$AGENT_LAUNCH_SEAT/$AGENT_SESSION"' } };
+    const seated = await hostFor({}, { localComputer: true, launchIdentity: { seat: "BF-FIXER", session: "thread-1" } }).execute(
+      echo,
+      runtime,
+    );
+    expect(seated.content).toBe("botfleet/BF-FIXER/thread-1");
+    const roleless = await hostFor({}, { localComputer: true, launchIdentity: { seat: null, session: "thread-1" } }).execute(
+      echo,
+      runtime,
+    );
+    expect(roleless.content).toBe("botfleet//thread-1");
+    // A host built with no identity still marks the shell as launched, with no seat.
+    const bare = await hostFor({}, { localComputer: true }).execute(echo, runtime);
+    expect(bare.content).toBe("botfleet//");
   });
 
   it("asks for approval before running bash, fails on deny", async () => {

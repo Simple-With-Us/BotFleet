@@ -1,0 +1,1 @@
+Seat tag `[BF-PUBLISHER]`.
