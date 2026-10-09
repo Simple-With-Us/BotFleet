@@ -214,6 +214,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "conversation-mode-row") {
+  // Visual-spec harness (tests/e2e/conversation-mode-row.visual.spec.ts):
+  // Settings → Workspace Arrangement.  Pins the Projects-subtitle
+  // interpolation (the lowercase room word) and the merge panel.
+  void import("./components/ConversationModeRowVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "bypass-warning") {
   // Visual-spec harness (tests/e2e/bypass-warning.visual.spec.ts): the Permission
   // Bypass confirmation dialog, standard, high-risk model and busy.
