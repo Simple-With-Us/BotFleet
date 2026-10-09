@@ -16,6 +16,7 @@ import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
 import { noEngineCanRun } from "@/lib/engine-status";
 import { resolveAppContext, shownThreadId, threadIdForApp } from "@/lib/task-app-thread";
+import { useDismissOnSelection } from "@/lib/use-dismiss-on-selection";
 
 // UI2: every one of these is already conditionally rendered — near-modal
 // panels/pages that most sessions never open in a given launch — so they
@@ -120,10 +121,17 @@ function Shell() {
     }
   }, [group?.id, group?.dm]);
 
-  // When selection changes via sidebar or store, yield matrix overview to the
-  // selected chat, and drop the App highlight unless the selection is still in
-  // that App.  The decision is a pure function so it can be tested: this effect
-  // re-runs on every SSE frame, and only a changed selection may close the matrix.
+  // The overview covers the chat pane, so a pick from anywhere (sidebar, ⌘1–9,
+  // command palette, notification) has to close it.  Only a pick: the store
+  // streams bot and room updates all session and hydrate selects the first bot
+  // at launch, and none of that may dismiss the overview.  The deck, the matrix
+  // and the "All" tab close or open it in their own handlers below.
+  const dismissMatrixOverview = useCallback(() => setMatrixOverviewActive(false), []);
+  useDismissOnSelection(state.selectionNonce, dismissMatrixOverview);
+
+  // Drop the App highlight unless the selection is still in that App.  The
+  // decision is a pure function so it can be tested: this effect re-runs on
+  // every SSE frame, and only a changed selection may clear the highlight.
   const lastSelectedId = useRef(state.selectedId);
   useEffect(() => {
     const selectionChanged = lastSelectedId.current !== state.selectedId;
@@ -136,7 +144,6 @@ function Shell() {
       bots: state.bots,
       viewedThreadId: state.viewedThreadId,
     });
-    if (decision.yieldMatrix) setMatrixOverviewActive(false);
     if (decision.selectedAppId !== selectedAppId) setSelectedAppId(decision.selectedAppId);
   }, [state.selectedId, state.viewedThreadId, state.bots, state.groups, selectedAppId]);
 
