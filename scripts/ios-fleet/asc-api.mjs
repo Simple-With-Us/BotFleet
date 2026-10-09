@@ -392,15 +392,26 @@ export async function addTesterToGroup({ api, appId, groupId, email, createFirst
   }
   const addExisting = (tester) => api("POST", `/v1/betaGroups/${groupId}/relationships/betaTesters`,
     JSON.stringify({ data: [{ type: "betaTesters", id: tester.id }] }));
+  const recoverFromCrossApp = async () => {
+    const appTesters = await api("GET", `/v1/betaTesters?filter[apps]=${appId}&limit=200&fields[betaTesters]=email`);
+    const appScoped = ascRows(appTesters).find(sameEmail);
+    if (appScoped) return addExisting(appScoped);
+    return null;
+  };
   let res;
   if (existing) {
     res = await addExisting(existing);
+    if (res.status === 409) {
+      // The record we found is for another app; Apple refused to assign it.
+      // Try the app-scoped lookup before giving up.
+      const recovered = await recoverFromCrossApp();
+      if (recovered) res = recovered;
+    }
   } else {
     res = await create();
     if (res.status === 409) {
-      const appTesters = await api("GET", `/v1/betaTesters?filter[apps]=${appId}&limit=200&fields[betaTesters]=email`);
-      existing = ascRows(appTesters).find(sameEmail);
-      if (existing) res = await addExisting(existing);
+      const recovered = await recoverFromCrossApp();
+      if (recovered) res = recovered;
     }
   }
   return { ok: Boolean(res.ok || res.status === 204), existing: Boolean(existing), res };
