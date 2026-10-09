@@ -40,7 +40,12 @@ type Range = readonly [number, number];
 
 /** Fenced blocks (opening line through closing line, or to the end when
  *  unclosed) and the prose runs between them, as line-aligned ranges. */
-function splitFences(text: string): { fenced: Range[]; prose: Range[] } {
+interface FenceSplit {
+  fenced: Range[];
+  prose: Range[];
+}
+
+function splitFences(text: string): FenceSplit {
   const fenced: Range[] = [];
   const prose: Range[] = [];
   let pos = 0;
