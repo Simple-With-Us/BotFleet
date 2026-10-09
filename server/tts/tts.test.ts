@@ -270,7 +270,10 @@ describe("MiniMax clone", () => {
     const calls = seen.slice(-2);
     expect(calls.map((call) => call.url)).toEqual(["/v1/files/upload", "/v1/voice_clone"]);
     expect(JSON.parse(calls[1].body).voice_id).toBe("Jay-Wedgeworth-001");
-    expect((await listVoices(cfg({ key: "sk-mm" }))).some((voice) => voice.id === result.id)).toBe(true);
+    // Listed by name, not by the raw id it was saved under, so every picker
+    // on the Mac and iPhone (shipped builds too) shows one name for it.
+    const listed = (await listVoices(cfg({ key: "sk-mm" }))).find((voice) => voice.id === result.id);
+    expect(listed).toMatchObject({ id: "Jay-Wedgeworth-001", label: "Jay Wedgeworth 001", description: "Custom" });
   });
   it("refuses malformed audio data before contacting the provider", async () => {
     seen.length = 0;

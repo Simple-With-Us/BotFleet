@@ -87,6 +87,13 @@ export function voiceDisplayName(
   return label && label !== voiceId ? label : readableVoiceId(voiceId);
 }
 
+/** `voices` with every label a person can read: a label that is only the id
+ * again ("jay-wedgeworth-001", how a clone is saved) becomes the id made
+ * readable, so one voice has one name in every picker. */
+export function withDisplayNames<T extends { id: string; label?: string | null }>(voices: readonly T[]): Array<T & { label: string }> {
+  return voices.map((voice) => ({ ...voice, label: voiceDisplayName(voice.id, [voice]) }));
+}
+
 /** The first option of every per-device picker: the workspace default by
  * name, "Jay Wedgeworth 001 (default)", never a bare "(default)". */
 export function defaultVoiceOptionLabel(

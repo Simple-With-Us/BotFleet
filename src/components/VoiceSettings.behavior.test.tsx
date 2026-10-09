@@ -196,6 +196,12 @@ describe("VoiceSettings rendered voice commit", () => {
   // store folds them (applyBotPatch), so a device the patch does not name
   // keeps its value.
   let startingBot: Bot = sampleBot("");
+  /** What the harness lists from /api/tts/voices on the next mount. */
+  const DEFAULT_HARNESS_VOICES = [
+    { id: "personal:jay", label: "Jay Personal", description: "Custom" },
+    { id: "custom-1", label: "Mine", description: "Custom" },
+  ];
+  let harnessVoices: Array<{ id: string; label: string; description?: string }> = DEFAULT_HARNESS_VOICES;
 
   function Harness() {
     const [bot, setBot] = useState<Bot>(startingBot);
@@ -223,19 +229,13 @@ describe("VoiceSettings rendered voice commit", () => {
     apiMock.mockReset();
     patches.splice(0, patches.length);
     startingBot = sampleBot("");
+    harnessVoices = DEFAULT_HARNESS_VOICES;
     Reflect.deleteProperty(window, "ogb");
   });
 
   async function mount() {
     apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (path === "/api/tts/voices") {
-        return {
-          voices: [
-            { id: "personal:jay", label: "Jay Personal", description: "Custom" },
-            { id: "custom-1", label: "Mine", description: "Custom" },
-          ],
-        };
-      }
+      if (path === "/api/tts/voices") return { voices: harnessVoices };
       if (path === "/api/tts/custom-voice" && init?.method === "POST") {
         const body = parseCustomVoiceRequestBody(init);
         const voiceId = body.voiceId ?? "";
@@ -678,6 +678,30 @@ describe("VoiceSettings rendered voice commit", () => {
   }
 
   const optionValues = (node: HTMLSelectElement) => [...node.options].map((option) => option.value);
+
+  const optionTexts = (node: HTMLSelectElement) => [...node.options].map((option) => option.textContent ?? "");
+
+  it("names the owner's clone the same way in every picker, never by its raw id", async () => {
+    // A clone is saved with its id as its label (server/tts/minimax.ts), and
+    // an older harness lists it that way.  The workspace default is that
+    // clone; a second bot override names an id the list does not have.
+    harnessVoices = [
+      { id: "standard-default", label: "standard-default", description: "Custom" },
+      { id: "custom-1", label: "Mine", description: "Custom" },
+    ];
+    startingBot = sampleBot("", { mac: "ghost_voice-2" });
+    await mount();
+
+    for (const picker of [select(), iphoneSelect()]) {
+      const texts = optionTexts(picker);
+      expect(texts.some((text) => text.includes("standard-default"))).toBe(false);
+      expect(texts).toContain("Standard Default — Custom");
+    }
+    expect(optionTexts(iphoneSelect())[0]).toBe("Standard Default (default)");
+    expect(optionTexts(select())).toContain("Ghost Voice 2 (Current)");
+    const workspace = container.querySelector<HTMLSelectElement>('select[aria-label="Default voice for every bot"]');
+    expect(workspace && optionTexts(workspace)).toContain("Standard Default — Custom");
+  });
 
   it("shows the MiniMax voices while the Personal Voice list is still waiting", async () => {
     installPersonalVoices(() => new Promise(() => {}));
