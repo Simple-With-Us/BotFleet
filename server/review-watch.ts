@@ -499,11 +499,16 @@ export class ReviewWatch {
    *  that it stopped recording, and records nothing more for the turn. */
   private capped(step: WatchedStep, plan: WatchPlan, limit: number): void {
     const rule = noVerdictRule({ kind: "capped", limit });
-    if (plan.mode === "enforce") {
+    if (plan.mode === "enforce" && !this.endedSteps.has(step)) {
       this.stop(step, plan, {
         rule,
         chip: `review stopped the turn at ${step.tool}: it reached its limit of ${limit} reviews for this turn`,
       });
+      return;
+    }
+    if (plan.mode === "enforce") {
+      // Late step: stop() -> turnOver() produces its own note
+      this.stop(step, plan, { rule, chip: "" });
       return;
     }
     if (this.endedSteps.has(step)) {
