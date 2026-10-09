@@ -35,6 +35,7 @@ function instance(
   capabilities: Partial<NonNullable<InstanceInfo["capabilities"]>> = {},
   extra: { driverKind?: string; displayName?: string; state?: "available" | "unavailable" } = {},
 ): InstanceInfo {
+  // SAFETY: a fixture that carries only the fields the gates read; the real InstanceInfo has many more.
   return {
     instanceId,
     driverKind: extra.driverKind ?? "openai-compat",
