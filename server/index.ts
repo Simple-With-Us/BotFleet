@@ -69,12 +69,14 @@ import { planCredentialRestore } from "../electron/credential-restore.mjs";
 import { workspaceCredentialPending } from "../electron/workspace-credentials.mjs";
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
 import {
-  appendHeldSends,
+  appendHeldWork,
   inFlightCounts,
-  partitionHeldSends,
-  takeHeldSends,
+  partitionByAge,
+  takeHeldWork,
   UpdateDrain,
+  type HeldQueueEntry,
   type HeldSend,
+  type HeldWork,
 } from "./update-drain.ts";
 import { botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import { createUpdateControl, packagedInstalledAt } from "./update-control.ts";
@@ -307,6 +309,8 @@ import {
   queueSteeredMessage,
   queuedMessageCount,
   restoreJobNotices,
+  restoreSteeredEntries,
+  takeSteeredEntries,
   type JobNoticeItem,
 } from "./steer-queue.ts";
 import { jobsPrompt, noticeWithoutJobTools } from "./jobs/prompt.ts";
@@ -732,6 +736,11 @@ if (bootTranscriptSweep) console.log(bootTranscriptSweep);
 // never the reason the process stays alive.
 const stopTranscriptSweeps = startTranscriptRetentionSweeps(transcriptDirs);
 let runtimeQuiescing = false;
+// A forced quiesce is still interrupting and saving work.  The fence is up
+// (`runtimeQuiescing`) but not yet settled: it can still roll back, and the
+// held messages are not on disk yet.  An updater whose forced request timed
+// out reads this to know whether the fence it sees is one it may use.
+let runtimeFencing = false;
 let activeUpdateAdmissions = 0;
 // An update waiting for work in flight to finish (server/update-drain.ts).
 // Unlike `runtimeQuiescing` it closes no route: it only holds NEW turns.
@@ -4743,7 +4752,7 @@ function runQueuedSend(send: Omit<HeldSend, "heldAt">, userMessage: Message) {
 function drainQueuedSends() {
   // An update is holding new work, or fenced for its restart: a queued send is
   // new work, so it stays queued.  It is either released (`releaseHeldWork`)
-  // or committed to its transcript for the restart (`persistHeldSends`) —
+  // or carried across the restart (`persistHeldWork`) —
   // never started into a fence that would refuse it.
   if (updateDrain.active || runtimeQuiescing) return;
   drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId) =>
@@ -4784,7 +4793,7 @@ function commitHeldSends(): HeldSend[] {
 /** Run sends a drain committed to their transcripts.  Too-old ones are not
  *  run (see HELD_SENDS_MAX_AGE_MS); the thread says so instead of going quiet. */
 function runHeldSends(sends: readonly HeldSend[], context: string) {
-  const { run, stale } = partitionHeldSends(sends, Date.now());
+  const { run, stale } = partitionByAge(sends, Date.now());
   for (const send of stale) {
     if (!store.bot(send.botId)) continue;
     store.appendMessage(send.threadId, {
@@ -4807,6 +4816,41 @@ function runHeldSends(sends: readonly HeldSend[], context: string) {
     void runQueuedSend(send, userMessage);
   }
   if (sends.length > 0) console.log(`[${context}] ran ${run.length} held message(s), ${stale.length} too old to run`);
+}
+
+/** Put sends carried uncommitted (`HeldQueueEntry`) back in the steer queue,
+ *  ahead of anything queued since, with their relay marks.  They run when
+ *  their bot is next idle, which is after its own resumed turn.  Too-old ones
+ *  are written into their thread unrun, so the words are never lost. */
+function restoreHeldQueue(entries: readonly HeldQueueEntry[], context: string) {
+  const { run, stale } = partitionByAge(entries, Date.now());
+  for (const entry of stale) {
+    if (!store.bot(entry.botId)) continue;
+    for (const item of entry.items) {
+      store.appendMessage(entry.threadId, { role: "user", kind: "text", text: item.text, replyToId: item.replyToId });
+    }
+    store.appendMessage(entry.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: {
+        name: "error: these messages waited for an update that did not finish, so they were not run — send them again if you still need them",
+        ok: false,
+      },
+    });
+  }
+  const live = run.filter((entry) => store.bot(entry.botId));
+  for (const entry of live) {
+    for (const item of entry.items) if (item.relayed) relayQueuedMessageIds.add(item.messageId);
+  }
+  restoreSteeredEntries(live.map((entry) => ({
+    threadId: entry.threadId,
+    botId: entry.botId,
+    items: entry.items.map(({ relayed: _relayed, automationSource, ...item }) => ({
+      ...item,
+      ...(automationSource ? { automationSource: automationSource as Message["automationSource"] } : {}),
+    })),
+  })));
+  if (entries.length > 0) console.log(`[${context}] requeued ${live.length} held thread(s), ${stale.length} too old to run`);
 }
 
 // ── turn dispatch (upstream ProviderCommandReactor, miniature) ──────────
@@ -9565,9 +9609,13 @@ function drainSnapshot() {
       deadline: status.deadline,
       inFlight: readiness.activeWorkCount,
       bots: readiness.bots,
-      // Live room turns: the one kind a forced update still will not
-      // interrupt, so the updater waits for these before it forces.
-      rooms: store.bots.filter((bot) => bot.busy && store.groupByThread(bot.inflightThreadId ?? bot.threadId)).length,
+      // Room work: the one kind a forced update still will not interrupt.  A
+      // live room turn refuses the forced quiesce outright, and a room round
+      // queued behind a busy member is still counted after the interrupt, so
+      // the forced quiesce rolls back.  The updater waits for both to clear
+      // before it forces, rather than interrupting everyone for nothing.
+      rooms: store.bots.filter((bot) => bot.busy && store.groupByThread(bot.inflightThreadId ?? bot.threadId)).length +
+        _queuedRoomCount(),
       held: readiness.held,
     },
   };
@@ -9723,11 +9771,11 @@ function rollbackForcedQuiesce(
   routines?.start();
   resourceTriggers.start();
   infisical.start();
-  void resumeInterruptedChatTurns(interruptedBots, "quiesce-rollback");
-  // Messages the forced path committed for a restart that is not coming run
-  // now, unless an update drain is still holding new work: then they wait
-  // with everything else it holds, and run when it lets go.
-  releaseHeldWork();
+  // Messages the forced path carried for a restart that is not coming run
+  // after the interrupted turns are back in flight, so each waits behind its
+  // own bot's turn — unless an update drain is still holding new work: then
+  // they wait with everything else it holds, and run when it lets go.
+  void resumeInterruptedChatTurns(interruptedBots, "quiesce-rollback").finally(releaseHeldWork);
 }
 
 /** How long a forced quiesce waits for interrupted work to actually settle.
@@ -9782,26 +9830,44 @@ function beginRuntimeDrain(timeoutMs: unknown) {
 function releaseHeldWork() {
   queueMicrotask(() => {
     if (runtimeQuiescing || updateDrain.active) return;
-    runHeldSends(takeHeldSends(DATA_DIR, (line) => console.warn(line)), "update-released");
+    const carried = takeHeldWork(DATA_DIR, (line) => console.warn(line));
+    runHeldSends(carried.sends, "update-released");
+    restoreHeldQueue(carried.queued, "update-released");
     drainQueuedSends();
     void routines?.tick();
     for (const bot of store.bots) if (!bot.busy) jobWakes.botSettled(bot.id);
   });
 }
 
-/** Commit the steer queue for the restart: into the transcripts, and into the
- *  carrier the next boot reads (server/update-drain.ts).  Returns the sends
- *  it could NOT save, for the caller to run once it has stood the fence down
- *  — a send that is neither on disk nor running would be lost. */
-function persistHeldSends(context: string): HeldSend[] {
-  const held = commitHeldSends();
+/** Carry the steer queue across the restart, in the carrier the next boot
+ *  reads (server/update-drain.ts).  A bot in `interrupted` keeps its sends
+ *  uncommitted, because its own turn resumes first and boot recovery reads
+ *  the thread to find it; every other bot's sends are committed to their
+ *  transcripts and run at boot.  Returns whatever it could NOT save, for the
+ *  caller to put back once it has stood the fence down — work that is neither
+ *  on disk nor running would be lost. */
+function persistHeldWork(context: string, interrupted: ReadonlySet<string> = new Set()): HeldWork {
+  const heldAt = Date.now();
+  const queued: HeldQueueEntry[] = takeSteeredEntries((botId) => interrupted.has(botId)).map((entry) => ({
+    botId: entry.botId,
+    threadId: entry.threadId,
+    heldAt,
+    items: entry.items.map((item) => ({ ...item, relayed: relayQueuedMessageIds.delete(item.messageId) })),
+  }));
+  const sends = commitHeldSends();
   try {
-    appendHeldSends(DATA_DIR, held);
-    return [];
+    appendHeldWork(DATA_DIR, { sends, queued });
+    return { sends: [], queued: [] };
   } catch (error) {
-    console.warn(`[${context}] could not save held messages; refusing the update and running them:`, error);
-    return held;
+    console.warn(`[${context}] could not save held messages; refusing the update and putting them back:`, error);
+    return { sends, queued };
   }
+}
+
+/** Work `persistHeldWork` could not save, back where it came from. */
+function returnUnsavedWork(unsaved: HeldWork, context: string) {
+  runHeldSends(unsaved.sends, context);
+  restoreHeldQueue(unsaved.queued, context);
 }
 
 /** Turn a drain into the real fence, once nothing is left in flight.
@@ -9815,11 +9881,11 @@ function persistHeldSends(context: string): HeldSend[] {
 function convertDrainToFence() {
   const { safeToRestart, activeWorkCount } = drainRuntimeReadiness();
   if (!safeToRestart) return { safeToRestart, activeWorkCount, quiescing: false };
-  const unsaved = persistHeldSends("update-drain");
-  if (unsaved.length > 0) {
+  const unsaved = persistHeldWork("update-drain");
+  if (unsaved.sends.length > 0 || unsaved.queued.length > 0) {
     // Refuse rather than fence: let everything else the drain held go too.
+    returnUnsavedWork(unsaved, "update-drain");
     updateDrain.release("updater");
-    runHeldSends(unsaved, "update-drain");
     return { ...currentRuntimeReadiness(), quiescing: false };
   }
   updateDrain.stop();
@@ -9832,6 +9898,24 @@ function convertDrainToFence() {
 }
 
 async function beginRuntimeQuiesce(force = false) {
+  if (runtimeFencing) {
+    // A forced quiesce is still interrupting and saving work.  Whatever this
+    // request asks, the answer is "not yet": never a second fence, never a
+    // drain conversion racing the first, and never a fence the caller may
+    // use before it has settled (`fencing` in the runtime answer says when).
+    const { activeWorkCount } = currentRuntimeReadiness();
+    return { safeToRestart: false, activeWorkCount, quiescing: runtimeQuiescing };
+  }
+  if (!force) return takeRuntimeFence(false);
+  runtimeFencing = true;
+  try {
+    return await takeRuntimeFence(true);
+  } finally {
+    runtimeFencing = false;
+  }
+}
+
+async function takeRuntimeFence(force: boolean) {
   // An unforced request during a drain is the updater asking for the fence
   // because nothing is left in flight.  A forced one runs the path below with
   // the drain still holding, so nothing new starts while bots are being
@@ -9947,10 +10031,11 @@ async function beginRuntimeQuiesce(force = false) {
     // Sends that waited behind the interrupted bots, or behind a drain, are
     // the person's own words: commit them for the restart rather than lose
     // them with the steer queue.
-    const unsaved = persistHeldSends("update-quiesce");
-    if (unsaved.length > 0) {
+    const interrupted = new Set([...interruptedBots.map((entry) => entry.botId), ...interruptedRuns.map((run) => run.botId)]);
+    const unsaved = persistHeldWork("update-quiesce", interrupted);
+    if (unsaved.sends.length > 0 || unsaved.queued.length > 0) {
       rollbackForcedQuiesce(interruptedRuns, interruptedBots);
-      runHeldSends(unsaved, "update-quiesce");
+      returnUnsavedWork(unsaved, "update-quiesce");
       return { ...currentRuntimeReadiness(), quiescing: false };
     }
 
@@ -9982,6 +10067,7 @@ function endRuntimeQuiesce() {
   // way everything held for the update runs now (`releaseHeldWork` below).
   const wasDraining = updateDrain.stop();
   const wasQuiescing = runtimeQuiescing;
+  let resumed: Promise<unknown> = Promise.resolve();
   if (runtimeQuiescing) {
     // Clear admission before restarting schedulers so their immediate ticks
     // can dispatch normally.  This is an authenticated recovery action for
@@ -10006,7 +10092,7 @@ function endRuntimeQuiesce() {
               stoppedTurns.delete(`${entry.botId}:${entry.threadId}`);
             }
           }
-          void resumeInterruptedChatTurns(resumeState.interruptedBots, "unquiesce-resume");
+          resumed = resumeInterruptedChatTurns(resumeState.interruptedBots, "unquiesce-resume");
         }
         unlinkSync(pendingResumePath);
       } catch (err) {
@@ -10014,7 +10100,8 @@ function endRuntimeQuiesce() {
       }
     }
   }
-  if (wasDraining || wasQuiescing) releaseHeldWork();
+  // After any interrupted turn is back in flight, so held sends queue behind it.
+  if (wasDraining || wasQuiescing) void resumed.finally(releaseHeldWork);
   return { ...currentRuntimeReadiness(), quiescing: false };
 }
 
@@ -13580,6 +13667,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, refused ? 409 : 200, {
         ...runtimeBuildIdentity, pid: process.pid, ...readiness,
         quiescing: runtimeQuiescing,
+        fencing: runtimeFencing,
         ...drainSnapshot(),
         dataOwner: { pid: harnessOwner.pid, port: harnessOwner.port },
       });
@@ -15958,7 +16046,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 // Messages an update drain held and committed before the restart.  Run before
 // the scheduler starts, so a routine receipt queued behind the same bot cannot
 // take it first and leave the person's own words refused as "already working".
-runHeldSends(takeHeldSends(DATA_DIR, (line) => console.warn(line)), "update-held");
+const carriedAcrossUpdate = takeHeldWork(DATA_DIR, (line) => console.warn(line));
+runHeldSends(carriedAcrossUpdate.sends, "update-held");
 routines?.start();
 resourceTriggers.start();
 if (!process.env.OMB_DISABLE_ANTIGRAVITY_QUOTA) {
@@ -16074,7 +16163,15 @@ console.log(`botfleet server ready on http://127.0.0.1:${PORT}`);
 // provider fleet, the shutdown record read at the top of this file, and the
 // post-update snapshot folded into it a few lines above.
 setTimeout(() => {
-  void runBootRecovery();
+  // Sends that waited behind an interrupted bot go back in its queue only
+  // once recovery has decided about that bot's own turn: resumed, it is busy
+  // and they wait for it to settle; not resumed, they run now.
+  void runBootRecovery()
+    .catch((error: unknown) => console.error("[boot-recovery] failed:", error))
+    .finally(() => {
+      restoreHeldQueue(carriedAcrossUpdate.queued, "update-held");
+      drainQueuedSends();
+    });
 }, BOOT_RECOVERY_DELAY_MS);
 
 // Test-only safety net (see server/test-parent-watchdog.ts): a harness

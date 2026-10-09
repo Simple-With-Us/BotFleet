@@ -851,8 +851,17 @@ describe("harness HTTP API", () => {
       expect(await forced.json()).toMatchObject({ quiescing: true, draining: false, safeToRestart: true });
       const resume = JSON.parse(readFileSync(resumePath, "utf8")) as { interruptedBots: Array<{ botId: string }> };
       expect(resume.interruptedBots.map((entry) => entry.botId)).toContain(working.id);
-      const saved = JSON.parse(readFileSync(carrier, "utf8")) as { sends: Array<{ botId: string }> };
+      const saved = JSON.parse(readFileSync(carrier, "utf8")) as {
+        sends: Array<{ botId: string }>;
+        queued: Array<{ botId: string; items: Array<{ text: string }> }>;
+      };
+      // The idle bot's message is committed to its thread and runs first
+      // thing.  (A send queued behind the interrupted bot would be carried
+      // uncommitted instead — server/steer-queue.test.ts and
+      // server/update-drain.test.ts cover that half, because the fixture CLI
+      // steers every mid-turn message into the live turn.)
       expect(saved.sends.map((entry) => entry.botId)).toEqual([idle.id]);
+      expect(saved.queued).toEqual([]);
 
       // No restart came: standing down resumes the interrupted bot and runs
       // the held message, and leaves nothing behind on disk.

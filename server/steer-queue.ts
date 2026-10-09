@@ -161,6 +161,46 @@ export function cancelSteeredMessage(threadId: string, messageId: string): boole
   return true;
 }
 
+/** One thread's waiting sends, as an update carries them across a restart. */
+export interface SteerQueueSnapshot {
+  threadId: string;
+  botId: string;
+  items: Array<{
+    messageId: string;
+    text: string;
+    prompt: string;
+    replyToId?: string;
+    linqChatId?: string;
+    automationSource?: Message["automationSource"];
+  }>;
+}
+
+/** Take the chosen bots' waiting sends out of the queue, untouched: still off
+ *  the transcript, so a restart can carry them and put them back in the same
+ *  place in line (`restoreSteeredEntries`).  An update uses this for a bot it
+ *  interrupted, whose own turn must resume before these run. */
+export function takeSteeredEntries(pick: (botId: string) => boolean): SteerQueueSnapshot[] {
+  const taken: SteerQueueSnapshot[] = [];
+  for (const [threadId, entry] of queues) {
+    if (!pick(entry.botId)) continue;
+    queues.delete(threadId);
+    taken.push({ threadId, botId: entry.botId, items: entry.items.map((item) => ({ ...item })) });
+  }
+  return taken;
+}
+
+/** Put carried sends back, ahead of anything queued on the thread since. */
+export function restoreSteeredEntries(entries: readonly SteerQueueSnapshot[]): void {
+  for (const entry of entries) {
+    if (entry.items.length === 0) continue;
+    const existing = queues.get(entry.threadId);
+    queues.set(entry.threadId, {
+      botId: entry.botId,
+      items: [...entry.items.map((item) => ({ ...item })), ...(existing?.items ?? [])],
+    });
+  }
+}
+
 /** Count pending sends without exposing message text to diagnostics. */
 export function queuedMessageCount(): number {
   return [...queues.values()].reduce((total, entry) => total + entry.items.length, 0);

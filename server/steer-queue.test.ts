@@ -17,7 +17,15 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { spawnDetached, waitForExit } from "./testing/cleanup.ts";
-import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, _queuedCount, type SteerStore } from "./steer-queue.ts";
+import {
+  cancelSteeredMessage,
+  drainSteeredMessages,
+  queueSteeredMessage,
+  restoreSteeredEntries,
+  takeSteeredEntries,
+  _queuedCount,
+  type SteerStore,
+} from "./steer-queue.ts";
 import type { BotRecord, Message } from "./store.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 
@@ -65,6 +73,40 @@ function fakeStore(bots: BotRecord[]): SteerStore & { messages: Message[] } {
 }
 
 describe("steer-queue module", () => {
+  it("lets an update carry a bot's waiting sends off the transcript and put them back in line", () => {
+    const interrupted = fakeBot("bot-carry", "thread-carry", true);
+    const other = fakeBot("bot-stay", "thread-stay", true);
+    const store = fakeStore([interrupted, other]);
+    const first = queueSteeredMessage(interrupted, "carried one", { linqChatId: "chat-c" });
+    queueSteeredMessage(other, "stays queued");
+    const taken = takeSteeredEntries((botId) => botId === "bot-carry");
+    expect(taken).toEqual([{
+      threadId: "thread-carry",
+      botId: "bot-carry",
+      items: [expect.objectContaining({ messageId: first.id, text: "carried one", linqChatId: "chat-c" })],
+    }]);
+    // Out of the queue and still off the transcript.
+    expect(_queuedCount("thread-carry")).toBe(0);
+    expect(_queuedCount("thread-stay")).toBe(1);
+    expect(store.messages).toHaveLength(0);
+
+    // Something queued on the thread since waits behind what is restored.
+    queueSteeredMessage(interrupted, "queued after the restart");
+    restoreSteeredEntries(taken);
+    expect(_queuedCount("thread-carry")).toBe(2);
+    interrupted.busy = false;
+    other.busy = false;
+    const run = vi.fn();
+    // A Linq line drains on its own, so the carried thread takes two passes.
+    drainSteeredMessages(store, run);
+    drainSteeredMessages(store, run);
+    const said = (threadId: string) =>
+      store.messages.filter((m) => m.role === "user" && m.id.endsWith(threadId)).map((m) => m.text);
+    expect(said("thread-carry")).toEqual(["carried one", "queued after the restart"]);
+    expect(said("thread-stay")).toEqual(["stays queued"]);
+    expect(store.messages.find((m) => m.text === "carried one")).toMatchObject({ queueId: first.id });
+  });
+
   it("does not append a queued user message until drain", () => {
     const bot = fakeBot("bot-a", "thread-a", true);
     const store = fakeStore([bot]);

@@ -5,8 +5,12 @@
 // fake clock, so a 60-second grace or a 20-minute wait runs in milliseconds and
 // nothing here touches a real harness, port or launchd job.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   DEFAULT_GRACE_MS,
   DEFAULT_ROOM_WAIT_MS,
@@ -34,8 +38,21 @@ const IDENTITY = {
  * A harness that answers the way server/index.ts does.  `inFlight` and
  * `rooms` are read on every answer, so a test changes them as time passes.
  */
-function scriptedHarness({ drains = true, inFlight = () => 0, rooms = () => 0, bots, forceRefusals = 0 } = {}) {
+function scriptedHarness({
+  drains = true,
+  inFlight = () => 0,
+  rooms = () => 0,
+  bots,
+  forceRefusals = 0,
+  // A forced answer that times out on the updater's side while the harness
+  // carries on, still `fencing` until the clock reaches this.
+  loseForcedAnswerUntil,
+  // The first hold request's answer is lost this many times.
+  loseFirstAnswers = 0,
+} = {}) {
   let clock = 0;
+  let firstAnswersLost = 0;
+  let fencingUntil = null;
   const state = { draining: false, quiescing: false, released: 0, forced: 0, plain: 0, polls: 0, requests: [] };
   const drain = () => ({
     inFlight: inFlight(clock),
@@ -48,6 +65,7 @@ function scriptedHarness({ drains = true, inFlight = () => 0, rooms = () => 0, b
     safeToRestart: inFlight(clock) === 0,
     activeWorkCount: inFlight(clock),
     quiescing: state.quiescing,
+    fencing: fencingUntil !== null && clock < fencingUntil,
     ...(drains ? { draining: state.draining, drain: state.draining ? drain() : null } : {}),
     ...extra,
   });
@@ -67,6 +85,13 @@ function scriptedHarness({ drains = true, inFlight = () => 0, rooms = () => 0, b
       return { kind: "ok", status: 200, body: body() };
     }
     const force = searchParams.get("force") === "true";
+    if (force && loseForcedAnswerUntil !== undefined && fencingUntil === null) {
+      state.forced += 1;
+      state.quiescing = true;
+      state.draining = false;
+      fencingUntil = loseForcedAnswerUntil;
+      return { kind: "unavailable", reason: "TimeoutError" };
+    }
     if (force) {
       state.forced += 1;
       if (rooms(clock) > 0 || refusalsLeft > 0) {
@@ -79,6 +104,10 @@ function scriptedHarness({ drains = true, inFlight = () => 0, rooms = () => 0, b
     }
     if (searchParams.get("drain") === "1" && drains) {
       state.draining = true;
+      if (firstAnswersLost < loseFirstAnswers) {
+        firstAnswersLost += 1;
+        return { kind: "unavailable", reason: "TimeoutError" };
+      }
       return { kind: "ok", status: 200, body: body() };
     }
     // A plain quiesce: converts a drain, or fences an idle harness.
@@ -194,6 +223,40 @@ test("--wait-for-idle proceeds as soon as the work finishes", async () => {
   assert.equal(result.safe, true);
   assert.equal(harness.state.forced, 0);
   assert.equal(harness.state.released, 0);
+});
+
+test("a forced answer lost to a slow harness is collected once the fence settles", async () => {
+  const harness = scriptedHarness({ inFlight: () => 2, loseForcedAnswerUntil: DEFAULT_GRACE_MS + 20_000 });
+  const result = await fenceRuntimeAdmission(config(), harness.adapters);
+  assert.equal(result.safe, true);
+  assert.equal(harness.state.forced, 1, "not asked twice");
+  assert.equal(harness.state.released, 0);
+  // Not used while the harness was still interrupting and saving work.
+  assert.ok(harness.clock() >= DEFAULT_GRACE_MS + 20_000);
+});
+
+test("--force watches a lost answer, and releases a fence that never settles", async () => {
+  const settles = scriptedHarness({ inFlight: () => 2, loseForcedAnswerUntil: 15_000 });
+  assert.equal((await fenceRuntimeAdmission(config({ force: true }), settles.adapters)).safe, true);
+  assert.equal(settles.state.released, 0);
+
+  const never = scriptedHarness({ inFlight: () => 2, loseForcedAnswerUntil: Number.MAX_SAFE_INTEGER });
+  const result = await fenceRuntimeAdmission(config({ force: true }), never.adapters);
+  assert.equal(result.safe, false);
+  assert.equal(never.state.released, 1, "never left fenced");
+  assert.equal(never.state.quiescing, false);
+});
+
+test("a lost answer to the first hold request is asked again, and released if it never comes", async () => {
+  const flaky = scriptedHarness({ inFlight: () => 0, loseFirstAnswers: 2 });
+  assert.equal((await fenceRuntimeAdmission(config(), flaky.adapters)).safe, true);
+
+  const silent = scriptedHarness({ inFlight: () => 0, loseFirstAnswers: Number.MAX_SAFE_INTEGER });
+  const result = await fenceRuntimeAdmission(config(), silent.adapters);
+  assert.equal(result.safe, false);
+  assert.match(result.reason, /could not be established/);
+  assert.equal(silent.state.released, 1, "a hold that may have started is let go");
+  assert.equal(silent.state.draining, false);
 });
 
 test("--force skips the hold and the grace entirely", async () => {
@@ -371,6 +434,29 @@ test("the mode flags parse, and contradictory ones are refused", () => {
   assert.equal(fenceMode({}), "grace");
   assert.equal(fenceMode({ waitForIdleMs: 60_000 }), "wait-for-idle");
   assert.equal(fenceMode({ force: true }), "force");
+});
+
+test("the wrapper's up-to-date shortcut survives the busy-work flags and nothing else new", async () => {
+  // Just the argument loop, lifted out of the wrapper: the full wrapper test
+  // needs a real checkout at origin/main, which a linked worktree is not.
+  const wrapper = await readFile(join(dirname(fileURLToPath(import.meta.url)), "update-botfleet.sh"), "utf8");
+  const start = wrapper.indexOf("SHORTCUT_ARG_INDEX=0");
+  const endMarker = '[[ "$EXPECT_SHORTCUT_TARGET" == "0" ]] || UP_TO_DATE_SHORTCUT=0';
+  const end = wrapper.indexOf(endMarker) + endMarker.length;
+  assert.ok(start > 0 && end > start, "the shortcut loop is where this test expects it");
+  const loop = `UP_TO_DATE_SHORTCUT=1\n${wrapper.slice(start, end)}\necho "$UP_TO_DATE_SHORTCUT"`;
+  const shortcut = (args) => {
+    const result = spawnSync("/bin/bash", ["-c", loop, "wrapper", ...args], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim() === "1";
+  };
+  for (const args of [[], ["update"], ["--grace", "90"], ["--grace=5"], ["--wait-for-idle"], ["--wait-for-idle", "30"],
+    ["--wait-for-idle=10", "--no-open"], ["update", "--wait-for-idle", "--grace", "0"], ["--force"]]) {
+    assert.equal(shortcut(args), true, `${JSON.stringify(args)} keeps the shortcut`);
+  }
+  for (const args of [["apply"], ["--grace", "90", "stray"], ["--wait-for-idle", "soon"], ["--progress", "/tmp/p"], ["--target", "abc"]]) {
+    assert.equal(shortcut(args), false, `${JSON.stringify(args)} reaches the updater`);
+  }
 });
 
 test("progress sentences name what the update is waiting for, in a person's words", () => {

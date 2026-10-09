@@ -126,7 +126,9 @@ fi
 #     writes and settles a run that never writes one as "never started", so
 #     that run must not end here without a record.
 # Anything not on this allowlist (including --help, --source, --stage) goes to
-# the updater unchanged.
+# the updater unchanged.  --grace SECONDS and --wait-for-idle [MINUTES] are on
+# it: how busy bots are treated says nothing about whether there is anything
+# new to install.
 UP_TO_DATE_SHORTCUT=1
 case "${BOTFLEET_UPDATE_TARGET:-origin/main}" in
   origin/main) ;;

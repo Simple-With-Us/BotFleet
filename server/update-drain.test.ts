@@ -3,17 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  appendHeldSends,
+  appendHeldWork,
   clampDrainTimeout,
   HELD_SENDS_FILE,
   HELD_SENDS_MAX_AGE_MS,
   inFlightCounts,
-  partitionHeldSends,
-  takeHeldSends,
+  partitionByAge,
+  takeHeldWork,
   UPDATE_DRAIN_DEFAULT_TIMEOUT_MS,
   UPDATE_DRAIN_LEASE_GRACE_MS,
   UPDATE_DRAIN_MAX_TIMEOUT_MS,
   UpdateDrain,
+  type HeldQueueEntry,
   type HeldSend,
 } from "./update-drain.ts";
 
@@ -137,51 +138,74 @@ describe("what a drain waits for", () => {
   });
 });
 
-describe("the held-sends carrier", () => {
-  it("round-trips sends, keeps an earlier update's, and is private", () => {
+function queued(patch: Partial<HeldQueueEntry> = {}): HeldQueueEntry {
+  return {
+    botId: "bot_busy",
+    threadId: "thread_busy",
+    heldAt: 1_000,
+    items: [{ messageId: "q_1", text: "after you finish", prompt: "after you finish", relayed: true, linqChatId: "chat_2" }],
+    ...patch,
+  };
+}
+
+describe("the held-work carrier", () => {
+  it("round-trips sends and queued entries, keeps an earlier update's, and is private", () => {
     const dir = dataDir();
-    appendHeldSends(dir, [send()]);
-    appendHeldSends(dir, [send({ botId: "bot_two", relayed: true, linqChatId: "chat_1" })]);
+    appendHeldWork(dir, { sends: [send()] });
+    appendHeldWork(dir, { sends: [send({ botId: "bot_two", relayed: true, linqChatId: "chat_1" })], queued: [queued()] });
     const path = join(dir, HELD_SENDS_FILE);
     expect(statSync(path).mode & 0o777).toBe(0o600);
-    const taken = takeHeldSends(dir);
-    expect(taken.map((item) => [item.botId, item.relayed, item.linqChatId])).toEqual([
+    const taken = takeHeldWork(dir);
+    expect(taken.sends.map((item) => [item.botId, item.relayed, item.linqChatId])).toEqual([
       ["bot_one", false, undefined],
       ["bot_two", true, "chat_1"],
     ]);
+    // Carried exactly as queued: relay mark and Linq chat intact.
+    expect(taken.queued).toEqual([queued()]);
     // Taken means gone: the next boot does not run them again.
     expect(existsSync(path)).toBe(false);
-    expect(takeHeldSends(dir)).toEqual([]);
+    expect(takeHeldWork(dir)).toEqual({ sends: [], queued: [] });
   });
 
   it("writes nothing when nothing is held", () => {
     const dir = dataDir();
-    appendHeldSends(dir, []);
+    appendHeldWork(dir, { sends: [], queued: [] });
     expect(existsSync(join(dir, HELD_SENDS_FILE))).toBe(false);
   });
 
   it("drops a malformed entry and an unreadable file instead of failing boot", () => {
     const dir = dataDir();
     const path = join(dir, HELD_SENDS_FILE);
-    writeFileSync(path, JSON.stringify({ version: 1, sends: [send(), { botId: 5 }] }));
-    expect(takeHeldSends(dir)).toHaveLength(1);
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      sends: [send(), { botId: 5 }],
+      queued: [queued(), queued({ items: [] }), { botId: "x" }],
+    }));
+    const taken = takeHeldWork(dir);
+    expect(taken.sends).toHaveLength(1);
+    expect(taken.queued).toHaveLength(1);
+    // A file from before queued entries existed reads as sends only.
+    writeFileSync(path, JSON.stringify({ version: 1, sends: [send()] }));
+    expect(takeHeldWork(dir)).toMatchObject({ sends: [send()], queued: [] });
     writeFileSync(path, "{ not json");
     const lines: string[] = [];
-    expect(takeHeldSends(dir, (line) => lines.push(line))).toEqual([]);
+    expect(takeHeldWork(dir, (line: string) => lines.push(line))).toEqual({ sends: [], queued: [] });
     expect(lines[0]).toContain(HELD_SENDS_FILE);
     expect(existsSync(path)).toBe(false);
   });
 
-  it("an unreadable leftover does not stop new sends being saved", () => {
+  it("an unreadable leftover does not stop new work being saved", () => {
     const dir = dataDir();
     writeFileSync(join(dir, HELD_SENDS_FILE), "garbage");
-    appendHeldSends(dir, [send()]);
-    expect(JSON.parse(readFileSync(join(dir, HELD_SENDS_FILE), "utf8")).sends).toHaveLength(1);
+    appendHeldWork(dir, { queued: [queued()] });
+    expect(JSON.parse(readFileSync(join(dir, HELD_SENDS_FILE), "utf8")).queued).toHaveLength(1);
   });
 
-  it("does not run a send that waited far longer than an update takes", () => {
+  it("does not run work that waited far longer than an update takes", () => {
     const fresh = send({ heldAt: 1_000 });
     const old = send({ botId: "bot_old", heldAt: 1_000 - HELD_SENDS_MAX_AGE_MS - 1 });
-    expect(partitionHeldSends([fresh, old], 2_000)).toEqual({ run: [fresh], stale: [old] });
+    expect(partitionByAge([fresh, old], 2_000)).toEqual({ run: [fresh], stale: [old] });
+    const staleQueue = queued({ heldAt: 1_000 - HELD_SENDS_MAX_AGE_MS - 1 });
+    expect(partitionByAge([staleQueue], 2_000)).toEqual({ run: [], stale: [staleQueue] });
   });
 });

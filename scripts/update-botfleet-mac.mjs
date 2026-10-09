@@ -753,8 +753,8 @@ async function probeHealthWithRetry(port, { attempts = 3, backoffMs = 250 } = {}
   return { ...result, port };
 }
 
-async function probeHealth(port) {
-  const result = await requestJson(`http://127.0.0.1:${port}/api/health`, { accept: [200] });
+async function probeHealth(port, { timeoutMs } = {}) {
+  const result = await requestJson(`http://127.0.0.1:${port}/api/health`, { accept: [200], ...(timeoutMs ? { timeoutMs } : {}) });
   if (result.kind !== "ok") return result;
   if (result.body?.app !== "botfleet" || !Number.isInteger(result.body?.pid) || result.body.pid <= 0) {
     return { kind: "foreign" };
@@ -796,8 +796,13 @@ export function healthTopologyResult(results, { allowMultiple = false } = {}) {
 }
 
 async function healthTopology(ports, options = {}) {
-  return healthTopologyResult(await Promise.all(ports.map(probeHealth)), options);
+  const probe = (port) => probeHealth(port, { timeoutMs: options.timeoutMs });
+  return healthTopologyResult(await Promise.all(ports.map(probe)), options);
 }
+
+/** A loaded Mac (load average in the hundreds) answers, just slowly: the
+ *  preflight reads wait this long for each answer instead of three seconds. */
+const PATIENT_REQUEST_MS = 10_000;
 
 const OWNER_KEYS = ["version", "pid", "port", "nonce"];
 
@@ -895,6 +900,7 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
     headers: { Authorization: `Bearer ${owner.nonce}` },
     accept: [200],
+    timeoutMs: PATIENT_REQUEST_MS,
   });
   if (response.kind === "http" && response.status === 404) return null;
   // `transient` marks the answers a slow harness gives: no answer at all, or
@@ -905,7 +911,7 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   const runtime = response.body;
   const identityError = authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle });
   if (identityError) return { safe: false, reason: identityError };
-  const topology = await healthTopology(config.ports);
+  const topology = await healthTopology(config.ports, { timeoutMs: PATIENT_REQUEST_MS });
   if (!topology.safe || topology.pid !== owner.pid) {
     return {
       safe: false,
@@ -1094,8 +1100,22 @@ async function holdAndFence(config, owner, deps) {
   const finalDeadline = mode === "grace" ? waitDeadline + roomWaitMs : waitDeadline;
   // The harness holds a little past the updater's whole window, so its lease
   // never runs out under a run that is still deciding.
-  const first = await quiesce(`?drain=1&timeoutMs=${Math.max(1_000, finalDeadline - now())}`);
-  if (first.kind !== "ok") return { ok: false, reason: "Runtime admission fence could not be established" };
+  const first = await retryTransient(async () => {
+    const answer = await quiesce(`?drain=1&timeoutMs=${Math.max(1_000, finalDeadline - now())}`);
+    return { ...answer, transient: answer.kind === "unavailable" };
+  }, { windowMs: DRAIN_SILENCE_LIMIT_MS, now, wait: sleepFor });
+  if (first.kind !== "ok") {
+    // The harness may have started holding and only the answer was lost:
+    // let go of whatever it holds rather than leave automations waiting on a
+    // lease nobody will collect.
+    const reason = "Runtime admission fence could not be established";
+    try {
+      await releaseAdmission(config);
+      return { ok: false, reason };
+    } catch {
+      return { ok: false, reason: `${reason}.  If BotFleet is holding new work, run update-botfleet.sh unquiesce.` };
+    }
+  }
   if (runtimeQuiesced(first)) return { ok: true, response: first, forced: false };
   const draining = first.body?.draining === true;
   let holding = draining;
@@ -1163,7 +1183,8 @@ async function holdAndFence(config, owner, deps) {
         // A live room turn refuses the forced quiesce without touching
         // anything, so asking while one runs only costs a request; an older
         // harness cannot say, so it is simply asked.
-        if (rooms === 0 && now() >= nextForceAt) {
+        // Never a second forced ask while the first is still fencing.
+        if (rooms === 0 && now() >= nextForceAt && last?.fencing !== true) {
           const forced = await forceQuiesce();
           if (runtimeQuiesced(forced)) {
             holding = false;
@@ -1214,12 +1235,18 @@ async function holdAndFence(config, owner, deps) {
         holding = false;
         return { ok: false, reason: STOPPED_HOLDING };
       }
-      if (polled.body?.quiescing === true && phase === "pause") {
-        // A forced ask that timed out on this side finished on that one:
-        // asking again collects the fence it already holds.
-        nextForceAt = 0;
-        last = polled.body;
-        continue;
+      if (polled.body?.quiescing === true) {
+        // An ask whose answer timed out on this side landed on that one.  A
+        // forced fence still interrupting and saving work is not usable yet
+        // (it can still roll back), so wait for it to settle; a settled one
+        // is this run's fence.  It counts as forced for the idle check: the
+        // harness only raises it idle, or having saved what it interrupted.
+        if (polled.body?.fencing === true) {
+          last = polled.body;
+          continue;
+        }
+        holding = false;
+        return { ok: true, response: { kind: "ok", status: 200, body: polled.body }, forced: true };
       }
       if (polled.body?.draining !== true) {
         // The lease ran out, something released it, or the harness restarted.
@@ -1232,6 +1259,37 @@ async function holdAndFence(config, owner, deps) {
   } finally {
     for (const [signal, listener] of listeners) signals?.off?.(signal, listener);
   }
+}
+
+/**
+ * `--force`: one forced quiesce, watched to its end.  A forced quiesce can take
+ * a while (it interrupts every busy bot and waits for them to settle), and on a
+ * loaded Mac its answer can miss the timeout while the harness carries on.
+ * Asking again would only be told "already fencing", so the runtime is read
+ * until the fence settles one way or the other.  Resolves the settled answer,
+ * or `{ kind: "unavailable" }` when it never could tell.
+ */
+async function forceFence(owner, { request, now, wait, pollMs }) {
+  const base = `http://127.0.0.1:${owner.port}`;
+  const headers = { Authorization: `Bearer ${owner.nonce}` };
+  const answer = await request(`${base}/api/runtime/quiesce?force=true`, {
+    method: "POST",
+    headers,
+    accept: [200, 409],
+    timeoutMs: FORCED_QUIESCE_TIMEOUT_MS,
+  });
+  if (runtimeQuiesced(answer)) return answer;
+  if (answer.kind === "ok" && answer.body?.quiescing !== true) return answer;
+  const deadline = now() + FORCED_QUIESCE_TIMEOUT_MS;
+  const interval = Number.isFinite(pollMs) && pollMs > 0 ? pollMs : DEFAULT_DRAIN_POLL_MS;
+  while (now() < deadline) {
+    await wait(Math.min(interval, Math.max(0, deadline - now())));
+    const polled = await request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
+    if (polled.kind !== "ok" || polled.body?.pid !== owner.pid) continue;
+    if (polled.body?.fencing === true) continue;
+    return { kind: "ok", status: polled.body?.quiescing === true ? 200 : 409, body: polled.body };
+  }
+  return { kind: "unavailable", reason: "forced quiesce did not settle" };
 }
 
 export async function fenceRuntimeAdmission(config, adapters = {}) {
@@ -1248,12 +1306,17 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
   let response;
   let forced = mode === "force";
   if (mode === "force") {
-    response = await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce?force=true`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${owner.nonce}` },
-      accept: [200, 409],
-      timeoutMs: FORCED_QUIESCE_TIMEOUT_MS,
-    });
+    response = await forceFence(owner, { request, now, wait, pollMs: config?.drainPollMs });
+    if (response.kind !== "ok") {
+      // No answer, and the harness may be fenced: never leave it that way.
+      const reason = "Runtime admission fence could not be established";
+      try {
+        await releaseAdmission(config);
+        return { safe: false, reason };
+      } catch {
+        return { safe: false, reason: `${reason}.  If BotFleet is fenced, run update-botfleet.sh unquiesce.` };
+      }
+    }
   } else {
     const atLeastZero = (value, fallback) => (Number.isFinite(value) && value >= 0 ? value : fallback);
     const held = await holdAndFence(config, owner, {

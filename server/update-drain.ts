@@ -194,44 +194,95 @@ export interface HeldSend {
   heldAt: number;
 }
 
+/** Sends that waited behind a bot the update interrupted, carried exactly as
+ *  the steer queue held them: NOT committed to the transcript.  That bot's own
+ *  turn resumes after the restart, and boot recovery finds what to resume by
+ *  reading the thread, so a committed line would be resumed in its place.
+ *  These go back in the queue once recovery has run, and wait their turn. */
+export interface HeldQueueEntry {
+  botId: string;
+  threadId: string;
+  heldAt: number;
+  items: Array<{
+    messageId: string;
+    text: string;
+    prompt: string;
+    replyToId?: string;
+    linqChatId?: string;
+    automationSource?: string;
+    relayed: boolean;
+  }>;
+}
+
+export interface HeldWork {
+  sends: HeldSend[];
+  queued: HeldQueueEntry[];
+}
+
 interface HeldSendsFile {
   version: 1;
   sends: HeldSend[];
+  queued?: HeldQueueEntry[];
 }
+
+const optionalString = (value: unknown) => value === undefined || typeof value === "string";
+const nonEmpty = (value: unknown) => typeof value === "string" && value.length > 0;
 
 function isHeldSend(value: unknown): value is HeldSend {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const raw = value as Record<string, unknown>;
-  return typeof raw.botId === "string" && raw.botId.length > 0 &&
-    typeof raw.threadId === "string" && raw.threadId.length > 0 &&
+  return nonEmpty(raw.botId) && nonEmpty(raw.threadId) &&
     typeof raw.prompt === "string" &&
-    typeof raw.userMessageId === "string" && raw.userMessageId.length > 0 &&
+    nonEmpty(raw.userMessageId) &&
     Array.isArray(raw.excludeIds) && raw.excludeIds.every((id) => typeof id === "string") &&
-    (raw.linqChatId === undefined || typeof raw.linqChatId === "string") &&
+    optionalString(raw.linqChatId) &&
     typeof raw.relayed === "boolean" &&
     typeof raw.heldAt === "number" && Number.isFinite(raw.heldAt);
 }
 
-function readHeldSendsFile(path: string): HeldSend[] {
-  if (!existsSync(path)) return [];
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<HeldSendsFile>;
-  if (parsed?.version !== 1 || !Array.isArray(parsed.sends)) throw new Error("held sends file has an unknown shape");
-  return parsed.sends.filter(isHeldSend);
+function isHeldQueueEntry(value: unknown): value is HeldQueueEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const raw = value as Record<string, unknown>;
+  return nonEmpty(raw.botId) && nonEmpty(raw.threadId) &&
+    typeof raw.heldAt === "number" && Number.isFinite(raw.heldAt) &&
+    Array.isArray(raw.items) && raw.items.length > 0 && raw.items.every((item: unknown) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+      const one = item as Record<string, unknown>;
+      return nonEmpty(one.messageId) && typeof one.text === "string" && typeof one.prompt === "string" &&
+        optionalString(one.replyToId) && optionalString(one.linqChatId) && optionalString(one.automationSource) &&
+        typeof one.relayed === "boolean";
+    });
 }
 
-/** Add sends to the carrier, keeping any an earlier update left behind.
- *  Throws when it cannot write: the caller must then run the sends instead,
+function readHeldWorkFile(path: string): HeldWork {
+  if (!existsSync(path)) return { sends: [], queued: [] };
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<HeldSendsFile>;
+  if (parsed?.version !== 1 || !Array.isArray(parsed.sends)) throw new Error("held sends file has an unknown shape");
+  return {
+    sends: parsed.sends.filter(isHeldSend),
+    queued: Array.isArray(parsed.queued) ? parsed.queued.filter(isHeldQueueEntry) : [],
+  };
+}
+
+/** Add held work to the carrier, keeping any an earlier update left behind.
+ *  Throws when it cannot write: the caller must then run the work instead,
  *  because a send that is neither on disk nor running would be lost. */
-export function appendHeldSends(dataDir: string, sends: readonly HeldSend[]): void {
-  if (sends.length === 0) return;
+export function appendHeldWork(dataDir: string, work: Partial<HeldWork>): void {
+  const sends = work.sends ?? [];
+  const queued = work.queued ?? [];
+  if (sends.length === 0 && queued.length === 0) return;
   const path = join(dataDir, HELD_SENDS_FILE);
-  let existing: HeldSend[] = [];
+  let existing: HeldWork = { sends: [], queued: [] };
   try {
-    existing = readHeldSendsFile(path);
+    existing = readHeldWorkFile(path);
   } catch {
-    // An unreadable leftover is not a reason to lose the sends in hand.
+    // An unreadable leftover is not a reason to lose the work in hand.
   }
-  const file: HeldSendsFile = { version: 1, sends: [...existing, ...sends] };
+  const file: HeldSendsFile = {
+    version: 1,
+    sends: [...existing.sends, ...sends],
+    queued: [...existing.queued, ...queued],
+  };
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, path);
@@ -239,31 +290,31 @@ export function appendHeldSends(dataDir: string, sends: readonly HeldSend[]): vo
 
 /** Read and remove the carrier.  An unreadable file is removed too (and
  *  reported), so it cannot fail every boot after it. */
-export function takeHeldSends(dataDir: string, log?: (line: string) => void): HeldSend[] {
+export function takeHeldWork(dataDir: string, log?: (line: string) => void): HeldWork {
   const path = join(dataDir, HELD_SENDS_FILE);
-  if (!existsSync(path)) return [];
-  let sends: HeldSend[] = [];
+  if (!existsSync(path)) return { sends: [], queued: [] };
+  let work: HeldWork = { sends: [], queued: [] };
   try {
-    sends = readHeldSendsFile(path);
+    work = readHeldWorkFile(path);
   } catch (error) {
     log?.(`[update-drain] could not read ${HELD_SENDS_FILE}: ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
     unlinkSync(path);
   } catch {
-    // Already gone, or unremovable; the sends in hand still run.
+    // Already gone, or unremovable; the work in hand still runs.
   }
-  return sends;
+  return work;
 }
 
-/** Split taken sends into the ones to run and the ones too old to run. */
-export function partitionHeldSends(
-  sends: readonly HeldSend[],
+/** Split taken work into what to run and what waited too long to run. */
+export function partitionByAge<T extends { heldAt: number }>(
+  items: readonly T[],
   now: number,
   maxAgeMs = HELD_SENDS_MAX_AGE_MS,
-): { run: HeldSend[]; stale: HeldSend[] } {
-  const run: HeldSend[] = [];
-  const stale: HeldSend[] = [];
-  for (const send of sends) (now - send.heldAt > maxAgeMs ? stale : run).push(send);
+): { run: T[]; stale: T[] } {
+  const run: T[] = [];
+  const stale: T[] = [];
+  for (const item of items) (now - item.heldAt > maxAgeMs ? stale : run).push(item);
   return { run, stale };
 }
