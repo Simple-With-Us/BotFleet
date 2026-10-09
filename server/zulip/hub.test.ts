@@ -1,7 +1,7 @@
 // The Zulip source end to end against a fake Zulip server: real HTTP, real
 // event queues, real files on disk, and a fake `startTurn` standing in for
 // the harness.  Each test boots its own fake realm and its own data folder.
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -946,5 +946,45 @@ describe("review fixes: a response of the wrong shape", () => {
     // and the bot still hears what arrives on the new queue
     fake.postStream(JAY, "agent-sync", "BF shape", "@**BF-Plumber** still there?", "website");
     await waitFor(() => turns.length === 1, "the wake after the retry");
+  });
+});
+
+describe("review fixes: the first connection's cursor", () => {
+  it("starts from now when register names no newest message, and a reconnect before anything arrives does not backfill the mailbox", async () => {
+    fake.omitMaxMessageId = true;
+    fake.postStream(JAY, "agent-sync", "BF old", "@**BF-Plumber** from long ago", "website");
+    const hub = makeHub();
+    await connected(hub);
+    await settle(150);
+    expect(turns).toHaveLength(0);
+    // no position was invented: the cursor is unset, in memory and on disk
+    expect(sessionOf(hub).state.cursor).toBeNull();
+    expect(JSON.parse(readFileSync(join(dataDir, "zulip", "bot-plumber.json"), "utf8")).cursor).toBeNull();
+    // Zulip drops the queue before any message arrives: a cursor of 0 here
+    // would make this reconnect backfill everything above 0 as new
+    fake.expireQueues(PLUMBER);
+    await waitFor(() => fake.requests.filter((request) => request.path === "register").length === 2, "the second register");
+    await connected(hub);
+    await settle(150);
+    expect(fake.requests.some((request) => request.path === "messages" && request.method === "GET")).toBe(false);
+    expect(turns).toHaveLength(0);
+    expect(sessionOf(hub).state.cursor).toBeNull();
+    // the first live message wakes, and sets the cursor
+    const fresh = fake.postStream(JAY, "agent-sync", "BF new", "@**BF-Plumber** now", "website");
+    await waitFor(() => turns.length === 1, "the live wake");
+    expect(turns[0]?.text).not.toContain("from long ago");
+    expect(sessionOf(hub).state.cursor).toBe(fresh);
+  });
+
+  it("accepts nothing older than the first live message once it has one", async () => {
+    fake.omitMaxMessageId = true;
+    const hub = makeHub();
+    await connected(hub);
+    const session = sessionOf(hub);
+    expect(session.floor).toBeNull();
+    expect(session.firstSighting(5000)).toBe(true);
+    expect(session.floor).toBe(4999);
+    expect(session.firstSighting(4000)).toBe(false);
+    expect(session.firstSighting(5001)).toBe(true);
   });
 });

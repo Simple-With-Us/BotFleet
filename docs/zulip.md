@@ -37,6 +37,7 @@ A BF bot can follow a topic, and a new message in a topic it follows wakes it th
 State is kept per bot in `~/.botfleet/zulip/<botId>.json` (mode 600): a message-id cursor, a ring of handled message ids, the units still waiting, and the budget ledgers, all written in one atomic write.
 
 - The first connection starts from the newest message; history is not a wake.
+- If register does not name the newest message, no position is invented: the cursor stays unset (a reconnect before anything arrives starts from now again), and the first live message fixes the floor, so nothing older than it is accepted.
 - On `BAD_EVENT_QUEUE_ID` (Zulip dropped an idle queue), the session re-registers at once and backfills `is:dm` and `is:mentioned` above the cursor, plus each followed topic (one channel-and-topic narrow per topic, at most 25 topics and 200 messages each).
 - De-duplication gates on the cursor as it stood when the queue was registered, plus the ids this connection has already seen, never on the live cursor: Zulip can deliver a lower id after a higher one, and that message still wakes.
 - A long poll that times out, or a connection something cut, polls the same queue again; Zulip answers `BAD_EVENT_QUEUE_ID` if it is gone.  The poll timeout is the queue's own `event_queue_longpoll_timeout_seconds` plus 10 seconds.  Any other failure re-registers, and the old queue is deleted first, so reconnects never leave orphaned queues on the realm.

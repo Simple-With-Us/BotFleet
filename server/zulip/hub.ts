@@ -268,6 +268,9 @@ class ZulipSession {
    *  live cursor is NOT the gate: Zulip can deliver a lower id after a higher
    *  one (ids are assigned at insert, events go out after commit). */
   floor: number | null = null;
+  /** First connection with no known newest message: the floor is set by the
+   *  first live message, to the id just below it. */
+  private floorFromFirstLive = false;
   private readonly seen = new Set<number>();
   /** Consecutive failures since the last poll that returned. */
   failures = 0;
@@ -316,6 +319,10 @@ class ZulipSession {
 
   /** True the first time this connection meets `id` above its floor. */
   firstSighting(id: number): boolean {
+    if (this.floorFromFirstLive) {
+      this.floor = id - 1;
+      this.floorFromFirstLive = false;
+    }
     if (this.floor !== null && id <= this.floor) return false;
     if (this.seen.has(id)) return false;
     this.remember(id);
@@ -475,10 +482,21 @@ class ZulipSession {
     for (const user of registered.realm_users) this.users.set(user.user_id, user);
     this.followed.clear();
     for (const entry of registered.user_topics) this.applyUserTopic(entry);
+    this.floorFromFirstLive = false;
     if (this.state.cursor === null) {
       // First connection: start from now.  History is not a wake.
-      this.state.cursor = typeof registered.max_message_id === "number" ? registered.max_message_id : 0;
-      this.floor = this.state.cursor;
+      if (registered.max_message_id !== undefined) {
+        this.state.cursor = registered.max_message_id;
+        this.floor = this.state.cursor;
+      } else {
+        // Zulip did not say which message is the newest.  Do not invent a
+        // position: a cursor of 0 would make the next reconnect backfill the
+        // whole mailbox as new.  The cursor stays unset (a reconnect before
+        // anything arrives starts from now again), and the first live message
+        // fixes the floor: nothing older than it is accepted.
+        this.floor = null;
+        this.floorFromFirstLive = true;
+      }
       this.markDirty();
       this.save();
     } else {

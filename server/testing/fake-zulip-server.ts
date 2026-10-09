@@ -95,6 +95,9 @@ export class FakeZulip {
   private failures: Array<{ method: string; path: string; status: number }> = [];
   private answers: Array<{ method: string; path: string; body: Record<string, unknown> }> = [];
   heartbeatMs = 150;
+  /** Leave `max_message_id` out of register's answer: a realm that does not
+   *  say which message is the newest. */
+  omitMaxMessageId = false;
   url = "";
   /** Seconds since the epoch for the next message; tests move it. */
   clock = Math.floor(Date.now() / 1000);
@@ -372,7 +375,7 @@ export class FakeZulip {
         result: "success",
         queue_id: id,
         last_event_id: -1,
-        max_message_id: this.maxMessageId,
+        ...(this.omitMaxMessageId ? {} : { max_message_id: this.maxMessageId }),
         realm_users: [...this.users.values()]
           .filter((entry) => entry.is_active !== false)
           .map(({ key: _key, is_active: _active, ...rest }) => rest),
