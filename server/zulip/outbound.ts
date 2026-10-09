@@ -10,7 +10,11 @@
 //     in it: one topic per unit of work) or one the owner listed in
 //     `zulip.postChannels`.  Other channels are refused rather than carded:
 //     a Zulip turn is unattended, so a card would only stall it.
-//   - A DM goes only to the person whose 1:1 DM started this turn.
+//   - A DM goes to the person whose 1:1 DM started this turn, or to any
+//     active realm member who is the owner or a bot: never the bot itself,
+//     never an incoming-webhook bot, never a deactivated or unknown user,
+//     and never a person who is not the owner.  The hub also caps DMs that
+//     are not replies per bot per hour (`budgets.dmsPerHour`).
 //   - Text that looks like a secret is refused, in the content and in a new
 //     topic, and the refusal names the kind of match, never the matched text.
 
@@ -18,7 +22,7 @@ import { z } from "zod";
 
 import { redactSecretsInText } from "../../shared/redact.ts";
 import { ZULIP_MAX_CONTENT_CHARS, sameOrigin, splitContent, topicRefusal } from "./format.ts";
-import type { ZulipOrigin } from "./types.ts";
+import type { ZulipOrigin, ZulipUser } from "./types.ts";
 
 /** At most this many chunks per call; longer belongs in a file or a link. */
 export const ZULIP_MAX_CHUNKS = 4;
@@ -66,6 +70,35 @@ export interface OutboundPolicy {
   postChannels: readonly string[];
   /** The bot's own names: its role and its Zulip display name. */
   names: readonly string[];
+  /** Who a DM may reach beyond the origin's sender: the realm's active
+   *  members as the bot's session cached them at register.  Without it,
+   *  a DM goes only to the origin's sender. */
+  directory?: DmDirectory;
+}
+
+export interface DmDirectory {
+  /** The bot's own Zulip user id. */
+  me: number;
+  /** Jay's Zulip user id, when configured. */
+  ownerUserId?: number;
+  /** Active realm members by id (register's `realm_users`). */
+  users: ReadonlyMap<number, ZulipUser>;
+}
+
+/** Zulip's bot_type for an incoming-webhook integration (Sentry, Linear, …). */
+const INCOMING_WEBHOOK_BOT = 2;
+
+/** Why a DM may not go to `userId`, or null.  Fails closed: a user the
+ *  directory does not list (unknown, or deactivated, which register leaves
+ *  out of `realm_users`) is refused. */
+export function dmRefusal(userId: number, directory: DmDirectory): string | null {
+  if (userId === directory.me) return "a bot cannot DM itself";
+  const user = directory.users.get(userId);
+  if (!user || user.is_active === false) return `user ${userId} is not an active member of this realm`;
+  if (user.bot_type === INCOMING_WEBHOOK_BOT) return `user ${userId} is an incoming-webhook integration, which cannot be messaged`;
+  if (directory.ownerUserId !== undefined && userId === directory.ownerUserId) return null;
+  if (user.is_bot === true) return null;
+  return `user ${userId} is a person who is not the owner; a DM may go only to the owner or to a bot`;
 }
 
 export type TargetResult = { target: ZulipTarget; toOrigin: boolean } | { error: string };
@@ -100,13 +133,16 @@ export function resolveTarget(
     if (channel || topic) return { error: "Pass either dm_user_id or a channel and topic, not both." };
     const userId = Number(dmRaw);
     if (!Number.isInteger(userId) || userId <= 0) return { error: "dm_user_id must be a Zulip user id (a whole number)." };
-    if (origin?.kind !== "dm" || origin.userId !== userId) {
+    if (origin?.kind === "dm" && origin.userId === userId) return { target: originTarget(origin), toOrigin: true };
+    if (!policy.directory) {
       return {
         error:
           "A DM may go only to the person whose direct message started this turn.  Post in a channel topic instead (zulip_post with channel and topic).",
       };
     }
-    return { target: originTarget(origin), toOrigin: true };
+    const refused = dmRefusal(userId, policy.directory);
+    if (refused) return { error: `Not posted: ${refused}.` };
+    return { target: { kind: "dm", userIds: [userId] }, toOrigin: false };
   }
   if (!channel) return { error: "zulip_post needs a channel and a topic (or use zulip_reply to answer where you were woken)." };
   // The origin's own topic may be the resolved form, which can run past 58.

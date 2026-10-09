@@ -40,6 +40,9 @@ export interface ZulipUser {
   role?: number;
   is_admin?: boolean;
   is_owner?: boolean;
+  /** Absent in register's `realm_users` (every one listed is active); set on
+   *  `realm_user` events. */
+  is_active?: boolean;
 }
 
 /** Who this bot is on Zulip, from GET /users/me. */
@@ -51,7 +54,10 @@ export interface ZulipIdentity {
 
 /** Where a turn's Zulip conversation lives: a channel topic, or a 1:1 DM. */
 export type ZulipOrigin =
-  | { kind: "stream"; channel: string; topic: string }
+  /** `streamId` is the channel's numeric id when the message carried one:
+   *  it builds message links and keys followed topics, never the
+   *  conversation (originKey is channel name + topic). */
+  | { kind: "stream"; channel: string; topic: string; streamId?: number }
   | { kind: "dm"; userId: number };
 
 /** One message the bot was woken for, as it is persisted and handed to the
@@ -106,9 +112,10 @@ export interface ZulipSettings {
   autoReply?: "final" | "off";
   /** Peer messages older than this do not wake (backfill after an outage). */
   staleMinutes?: number;
-  /** Bot user ids whose DMs may wake a BF bot (pair work). */
-  peerDmAllow?: number[];
   budgets?: {
+    /** DMs a bot may send per hour that are not replies to the DM that
+     *  woke it.  Default 20. */
+    dmsPerHour?: number;
     peerWakesPerHour?: number;
     peerWakesPerTopicPerHour?: number;
     ownerWakesPerHour?: number;

@@ -25,6 +25,8 @@ export interface FakeZulipUser {
   is_bot: boolean;
   bot_type?: number | null;
   role: number;
+  /** False once deactivated: left out of register's realm_users. */
+  is_active?: boolean;
   /** API key; absent for a user that cannot authenticate. */
   key?: string;
 }
@@ -126,6 +128,24 @@ export class FakeZulip {
         this.queues.delete(id);
         for (const wake of queue.waiters) wake();
       }
+    }
+  }
+
+  /** Deactivate a user: register stops listing it, and every queue gets a
+   *  realm_user update saying so, as on Zulip. */
+  deactivate(userId: number): void {
+    const user = this.users.get(userId);
+    if (!user) throw new Error(`no user ${userId}`);
+    user.is_active = false;
+    this.pushToAll({ type: "realm_user", op: "update", person: { user_id: userId, is_active: false } });
+  }
+
+  /** Push one event to every live queue (or one user's). */
+  private pushToAll(event: Record<string, unknown>, userId?: number): void {
+    for (const queue of this.queues.values()) {
+      if (userId !== undefined && queue.userId !== userId) continue;
+      queue.events.push({ id: queue.nextEventId++, ...event });
+      for (const wake of queue.waiters) wake();
     }
   }
 
@@ -280,7 +300,9 @@ export class FakeZulip {
         queue_id: id,
         last_event_id: -1,
         max_message_id: this.maxMessageId,
-        realm_users: [...this.users.values()].map(({ key: _key, ...rest }) => rest),
+        realm_users: [...this.users.values()]
+          .filter((entry) => entry.is_active !== false)
+          .map(({ key: _key, is_active: _active, ...rest }) => rest),
       });
     }
     if (req.method === "GET" && path === "events") {

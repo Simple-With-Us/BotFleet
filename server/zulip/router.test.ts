@@ -47,7 +47,7 @@ function dm(sender: number, others: number[], over: Partial<ZulipMessage> = {}):
   });
 }
 
-const verdict = (message: ZulipMessage, allowPeerDm = false) => wakeVerdict(classify(message, ctx), allowPeerDm);
+const verdict = (message: ZulipMessage) => wakeVerdict(classify(message, ctx));
 
 describe("who wakes a BF bot", () => {
   it("drops the bot's own posts", () => {
@@ -61,7 +61,7 @@ describe("who wakes a BF bot", () => {
     const c = classify(stream({ sender_id: 9, client: "ZulipPython" }), ctx);
     expect(c.owner).toBe(false);
     expect(c.ownerViaApi).toBe(true);
-    expect(wakeVerdict(c, false)).toEqual({ wake: null, reason: "owner_via_api" });
+    expect(wakeVerdict(c)).toEqual({ wake: null, reason: "owner_via_api" });
   });
 
   it("wakes a peer bot's direct mention, but not a stale one", () => {
@@ -84,16 +84,19 @@ describe("who wakes a BF bot", () => {
     expect(verdict(stream({ sender_id: 60 }))).toEqual({ wake: null, reason: "webhook_sender" });
   });
 
-  it("wakes on Jay's 1:1 DM, never on a group DM, and on a bot's DM only when allowed", () => {
+  it("wakes on Jay's 1:1 DM, never on a group DM, and on a peer bot's 1:1 DM as a peer", () => {
     expect(verdict(dm(9, [101], { client: "website" }))).toEqual({ wake: "owner" });
     expect(classify(dm(9, [101], { client: "website" }), ctx).origin).toEqual({ kind: "dm", userId: 9 });
     expect(verdict(dm(9, [101, 50], { client: "website" }))).toEqual({ wake: null, reason: "group_dm" });
-    expect(verdict(dm(50, [101]))).toEqual({ wake: null, reason: "dm_from_bot" });
-    expect(verdict(dm(50, [101]), true)).toEqual({ wake: "peer" });
+    // Peer requests are screened, not refused: no allowlist gates the wake.
+    expect(verdict(dm(50, [101]))).toEqual({ wake: "peer" });
+    expect(verdict(dm(50, [101], { timestamp: NOW / 1000 - 3600 }))).toEqual({ wake: null, reason: "stale" });
+    // An incoming-webhook bot never wakes, by DM or otherwise.
+    expect(verdict(dm(60, [101]))).toEqual({ wake: null, reason: "webhook_sender" });
   });
 
   it("counts an unknown sender as a bot", () => {
     expect(classify(stream({ sender_id: 777 }), ctx).senderIsBot).toBe(true);
-    expect(verdict(dm(777, [101]))).toEqual({ wake: null, reason: "dm_from_bot" });
+    expect(verdict(dm(777, [101]))).toEqual({ wake: "peer" });
   });
 });

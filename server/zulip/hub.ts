@@ -45,12 +45,16 @@ const BACKOFF_MS = [5_000, 30_000, 60_000, 120_000];
 const PAGE = 100;
 const MAX_PAGES = 20;
 const DEFAULTS = {
+  dmsPerHour: 20,
   staleMinutes: 30,
   peerWakesPerHour: 6,
   peerWakesPerTopicPerHour: 2,
   ownerWakesPerHour: 30,
   peerChainLimit: 4,
 };
+/** A peer DM conversation's loop-guard chain resets after this long with no
+ *  peer wake in it (Jay cannot speak in a peer's DM to reset it). */
+const DM_CHAIN_QUIET_MS = 3600_000;
 /** A unit nobody could start for this long is dropped (a stopped bot). */
 const UNIT_MAX_AGE_MS = 6 * 3600_000;
 /** A binding whose turn never reported completion is let go after this, but
@@ -137,6 +141,11 @@ export interface ZulipBotStatus {
   fullName?: string;
   pending: number;
   since: number;
+  /** Realm members the session cached at register, and how many are bots:
+   *  counts only.  A DM out is checked against this list, so zero bots
+   *  means every DM to a peer would be refused. */
+  members?: number;
+  memberBots?: number;
 }
 
 export interface ZulipSendRequest {
@@ -496,9 +505,27 @@ class ZulipSession {
         if (typeof event.id === "number" && event.id > this.lastEventId) this.lastEventId = event.id;
         if (event.type === "message" && event.message) {
           this.hub.handleMessage(this, { ...event.message, flags: event.flags ?? event.message.flags ?? [] });
+        } else if (event.type === "realm_user") {
+          this.applyRealmUser(event.op, event.person);
         }
       }
       this.saveSoon();
+    }
+  }
+
+  /** Keep the member cache current between registers: an added member is
+   *  listed, a removed or deactivated one is dropped (so a DM to it is
+   *  refused), and an update changes only the fields it names. */
+  private applyRealmUser(op: string | undefined, person: Partial<ZulipUser> | undefined): void {
+    const userId = person?.user_id;
+    if (typeof userId !== "number") return;
+    if (op === "remove" || (op === "update" && person?.is_active === false)) {
+      this.users.delete(userId);
+    } else if (op === "add" && person?.is_active !== false) {
+      this.users.set(userId, { ...person, user_id: userId });
+    } else if (op === "update") {
+      const known = this.users.get(userId);
+      if (known) this.users.set(userId, { ...known, ...person, user_id: userId });
     }
   }
 
@@ -666,7 +693,13 @@ export class ZulipHub {
       enabled: this.enabled(),
       realm: "realm" in realm ? realm.realm : undefined,
       dryRun: settings?.dryRun === true,
-      bots: [...this.sessions.values()].map((session) => ({ ...session.status, pending: session.state.pending.length })),
+      bots: [...this.sessions.values()].map((session) => ({
+        ...session.status,
+        pending: session.state.pending.length,
+        ...(session.users.size
+          ? { members: session.users.size, memberBots: [...session.users.values()].filter((user) => user.is_bot === true).length }
+          : {}),
+      })),
     };
   }
 
@@ -703,12 +736,17 @@ export class ZulipHub {
     return out;
   }
 
+  /** Jay's Zulip user id, when the settings name a valid one. */
+  ownerUserId(): number | undefined {
+    const owner = Number(this.settings()?.ownerUserId);
+    return Number.isInteger(owner) && owner > 0 ? owner : undefined;
+  }
+
   private routerContext(session: ZulipSession): RouterContext {
     const settings = this.settings();
-    const owner = Number(settings?.ownerUserId);
     return {
       me: session.me!,
-      ownerUserId: Number.isInteger(owner) && owner > 0 ? owner : undefined,
+      ownerUserId: this.ownerUserId(),
       ownerClients: new Set(settings?.ownerClients?.length ? settings.ownerClients : DEFAULT_OWNER_CLIENTS),
       users: session.users,
       nowMs: this.now(),
@@ -740,7 +778,7 @@ export class ZulipHub {
     // Jay speaking in a conversation resets its peer chain, mention or not.
     if (c.owner && c.origin) state.chains[originKey(c.origin)] = 0;
     const settings = this.settings();
-    const verdict = wakeVerdict(c, c.dm && (settings?.peerDmAllow ?? []).includes(message.sender_id));
+    const verdict = wakeVerdict(c);
     if (verdict.wake === null) {
       if (verdict.reason !== "own" && verdict.reason !== "not_a_mention") {
         this.log(`[zulip] ${session.role}: message ${id} not woken (${verdict.reason})`);
@@ -795,6 +833,14 @@ export class ZulipHub {
     const hour = state.wakes.filter((w) => now - w.at < 3600_000);
     if (kind === "owner") {
       return hour.filter((w) => w.kind === "owner").length >= this.budget("ownerWakesPerHour") ? "owner_budget" : null;
+    }
+    // A topic's chain resets when Jay speaks there.  Jay never speaks in a
+    // peer's DM with the bot, so a DM chain resets after a quiet spell
+    // instead; without that, a peer that reached the limit once could never
+    // DM this bot again.
+    if (key.startsWith("dm:") && (state.chains[key] ?? 0) > 0) {
+      const last = Math.max(0, ...state.wakes.filter((w) => w.kind === "peer" && w.key === key).map((w) => w.at));
+      if (now - last >= DM_CHAIN_QUIET_MS) state.chains[key] = 0;
     }
     if ((state.chains[key] ?? 0) >= this.budget("peerChainLimit")) return "loop_guard";
     if (hour.filter((w) => w.kind === "peer").length >= this.budget("peerWakesPerHour")) return "peer_budget";
@@ -953,6 +999,8 @@ export class ZulipHub {
         me: session.me!,
         nonce,
         autoReply: (this.settings()?.autoReply ?? "final") === "final",
+        ownerUserId: this.ownerUserId(),
+        realm: session.realm,
       },
     );
     /** Retire exactly the batch.  What arrived meanwhile stays pending as
@@ -1025,8 +1073,24 @@ export class ZulipHub {
     const target = resolveTarget(request.tool, args, origin, {
       postChannels: this.settings()?.postChannels ?? [],
       names,
+      directory: { me: session.me!.userId, ownerUserId: this.ownerUserId(), users: session.users },
     });
     if ("error" in target) return { ok: false, text: target.error };
+    // A DM out (not a reply to the DM that woke the turn) is rate limited
+    // per bot: a peer's prompt cannot turn a bot into a DM cannon.
+    const dmOut = target.target.kind === "dm" && !target.toOrigin;
+    if (target.target.kind === "dm" && dmOut) {
+      const now = this.now();
+      const limit = this.budget("dmsPerHour");
+      const lastHour = session.state.dms.filter((at) => now - at < 3600_000).length;
+      if (lastHour >= limit) {
+        this.log(`[zulip] ${session.role}: DM to user ${target.target.userIds.join(", ")} refused (dm_budget)`);
+        return {
+          ok: false,
+          text: `Not posted: this bot has sent ${lastHour} DMs in the last hour, its limit (zulip.budgets.dmsPerHour).  Post in a channel topic instead, or wait.`,
+        };
+      }
+    }
     const known = this.knownSecrets();
     // A new topic is text the model wrote, posted where everyone in the
     // channel reads it: it passes the same secret scan as the content.
@@ -1041,6 +1105,15 @@ export class ZulipHub {
     try {
       const ids = await session.post(target.target, content.chunks);
       if (target.toOrigin && binding) binding.replied = true;
+      if (target.target.kind === "dm") {
+        // The recipient's id, never the text.
+        this.log(`[zulip] ${session.role}: DM posted to user ${target.target.userIds.join(", ")}${dmOut ? "" : " (reply)"}`);
+        if (dmOut) {
+          session.state.dms.push(this.now());
+          session.markDirty();
+          session.save();
+        }
+      }
       const where =
         target.target.kind === "dm"
           ? `a direct message to user ${target.target.userIds.join(", ")}`

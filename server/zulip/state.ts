@@ -13,6 +13,8 @@
 //                in one atomic write, so a crash can never advance the cursor
 //                past a wake it had not yet queued.
 //   - `wakes` and `chains`  the budget and loop-guard ledgers.
+//   - `dms`      when each outbound DM that was not a reply went out: the
+//                per-bot DM rate limit's ledger.
 
 import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -43,10 +45,12 @@ export interface ZulipBotState {
   wakes: ZulipWakeRecord[];
   /** originKey -> peer wakes since the last owner message there. */
   chains: Record<string, number>;
+  /** ms since the epoch of each DM sent that was not a reply to the origin. */
+  dms: number[];
 }
 
 export function emptyState(role: string): ZulipBotState {
-  return { version: 1, role, cursor: null, handled: [], pending: [], wakes: [], chains: {} };
+  return { version: 1, role, cursor: null, handled: [], pending: [], wakes: [], chains: {}, dms: [] };
 }
 
 function fileName(botId: string): string {
@@ -56,7 +60,7 @@ function fileName(botId: string): string {
 // The file on disk, parsed at the boundary.  Each ledger is parsed on its own
 // (`.catch`), so one damaged field costs that ledger and not the cursor.
 const originSchema = z.union([
-  z.object({ kind: z.literal("stream"), channel: z.string(), topic: z.string() }),
+  z.object({ kind: z.literal("stream"), channel: z.string(), topic: z.string(), streamId: z.number().optional().catch(undefined) }),
   z.object({ kind: z.literal("dm"), userId: z.number() }),
 ]);
 const itemSchema = z.object({
@@ -88,6 +92,8 @@ const stateFileSchema = z.object({
     .array(z.object({ at: z.number(), kind: z.enum(["owner", "peer"]), key: z.string() }))
     .catch([]),
   chains: z.record(z.string(), z.number()).catch({}),
+  // Added after the first state files were written: absent reads as empty.
+  dms: z.array(z.number()).optional().catch(undefined),
 });
 
 export class ZulipStateStore {
@@ -114,8 +120,8 @@ export class ZulipStateStore {
       return emptyState(role);
     }
     if (!parsed.success || parsed.data.role !== role) return emptyState(role);
-    const { userId, ...rest } = parsed.data;
-    const state: ZulipBotState = { ...rest };
+    const { userId, dms, ...rest } = parsed.data;
+    const state: ZulipBotState = { ...rest, dms: dms ?? [] };
     if (userId !== undefined) state.userId = userId;
     return state;
   }
@@ -124,6 +130,7 @@ export class ZulipStateStore {
     // Bound every ledger before it reaches disk.
     if (state.handled.length > HANDLED_RING_LIMIT) state.handled = state.handled.slice(-HANDLED_RING_LIMIT);
     state.wakes = state.wakes.filter((w) => now - w.at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
+    state.dms = (state.dms ?? []).filter((at) => now - at < WAKE_LEDGER_MS).slice(-WAKE_LEDGER_LIMIT);
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     try {
       chmodSync(this.dir, 0o700);

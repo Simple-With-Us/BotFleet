@@ -99,6 +99,9 @@ export interface ZulipEvent {
   type: string;
   message?: ZulipMessage;
   flags?: string[];
+  /** `realm_user` events: "add", "remove" or "update", and who. */
+  op?: string;
+  person?: Partial<ZulipUser>;
 }
 
 export class ZulipClient {
@@ -229,14 +232,15 @@ export class ZulipClient {
   }
 
   /** One unnarrowed queue: the bot's DMs and every channel it is subscribed
-   *  to.  `realm_user` state is fetched (not subscribed to) so the router
-   *  can tell bots from people. */
+   *  to.  `realm_user` state is fetched so the router can tell bots from
+   *  people and a DM can be checked against the realm's active members, and
+   *  subscribed to so a deactivation reaches the cache without a restart. */
   register(signal?: AbortSignal): Promise<ZulipRegisterResult> {
     return this.request(
       "POST",
       "register",
       {
-        event_types: ["message"],
+        event_types: ["message", "realm_user"],
         fetch_event_types: ["message", "realm_user"],
         apply_markdown: false,
         client_gravatar: true,

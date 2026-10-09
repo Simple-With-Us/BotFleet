@@ -254,9 +254,9 @@ const zulipConfigSchema = z.object({
   postChannels: z.array(z.string().trim().min(1)).max(50).optional(),
   autoReply: z.enum(["final", "off"]).optional(),
   staleMinutes: z.number().int().min(1).max(10_080).optional(),
-  peerDmAllow: z.array(z.number().int().positive()).max(100).optional(),
   budgets: z
     .object({
+      dmsPerHour: z.number().int().min(0).max(1000).optional(),
       peerWakesPerHour: z.number().int().min(0).max(1000).optional(),
       peerWakesPerTopicPerHour: z.number().int().min(0).max(1000).optional(),
       ownerWakesPerHour: z.number().int().min(0).max(1000).optional(),

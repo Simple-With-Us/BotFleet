@@ -67,6 +67,7 @@ export function classify(message: ZulipMessage, ctx: RouterContext): Classificat
     if (!groupDm && !own) origin = { kind: "dm", userId: sender };
   } else if (typeof message.display_recipient === "string") {
     origin = { kind: "stream", channel: message.display_recipient, topic: messageTopic(message) };
+    if (typeof message.stream_id === "number") origin.streamId = message.stream_id;
   }
   const fromOwnerAccount = Boolean(ctx.ownerUserId) && sender === ctx.ownerUserId;
   const owner = fromOwnerAccount && !own && ctx.ownerClients.has(String(message.client ?? ""));
@@ -88,18 +89,19 @@ export function classify(message: ZulipMessage, ctx: RouterContext): Classificat
 
 /** Whether this message wakes the bot, and as whom.  Only a direct
  *  @-mention or a 1:1 DM ever wakes; wildcard and group mentions, group DMs,
- *  incoming-webhook bots and the bot's own posts never do. */
-export function wakeVerdict(c: Classification, peerDmAllowed: boolean): WakeVerdict {
+ *  incoming-webhook bots and the bot's own posts never do.
+ *
+ *  A peer bot's mention or DM wakes the bot like anyone else's (the fleet's
+ *  rule: peer requests are screened, not refused).  What stops a peer is
+ *  the hub's loop guard and peer budgets, and the screen the woken turn is
+ *  told to apply; the wake itself is never a grant of anything. */
+export function wakeVerdict(c: Classification): WakeVerdict {
   if (c.own) return { wake: null, reason: "own" };
   if (!c.origin) return { wake: null, reason: c.groupDm ? "group_dm" : "no_origin" };
   if (c.ownerViaApi) return { wake: null, reason: "owner_via_api" };
   if (c.webhookSender) return { wake: null, reason: "webhook_sender" };
   if (c.owner && (c.direct || c.dm)) return { wake: "owner" };
-  if (c.dm) {
-    if (c.senderIsBot && !peerDmAllowed) return { wake: null, reason: "dm_from_bot" };
-    return c.stale ? { wake: null, reason: "stale" } : { wake: "peer" };
-  }
-  if (c.direct) return c.stale ? { wake: null, reason: "stale" } : { wake: "peer" };
+  if (c.dm || c.direct) return c.stale ? { wake: null, reason: "stale" } : { wake: "peer" };
   if (c.wildcard) return { wake: null, reason: "wildcard" };
   return { wake: null, reason: "not_a_mention" };
 }

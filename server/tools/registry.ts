@@ -1153,9 +1153,10 @@ const LINQ_VOICE_MESSAGE: HarnessTool = {
 // a post safe is enforced by the harness, not asked of a person — the reply
 // target is the conversation that woke the turn and the model cannot move
 // it, an off-origin post must name a channel the owner allowed, a DM may go
-// only to the person whose DM started the turn, and text that looks like a
-// secret is refused (server/zulip/outbound.ts).  A card would only stall an
-// unattended Zulip turn.
+// only to the owner, a bot, or the person whose DM started the turn (and DMs
+// out are rate limited per bot), and text that looks like a secret is
+// refused (server/zulip/outbound.ts).  A card would only stall an unattended
+// Zulip turn.
 
 const zulipEnabled = (ctx: ToolGateContext) => Boolean(ctx.zulip);
 
@@ -1183,7 +1184,7 @@ const ZULIP_REPLY: HarnessTool = {
 const ZULIP_POST: HarnessTool = {
   name: "zulip_post",
   description:
-    "Post to Zulip as your own bot. A channel post needs a channel AND a topic: one topic per unit of work, at most 58 characters, never your own name. Only the channel that woke you (any topic there) or a channel the owner allowed is accepted. dm_user_id answers a direct message, and only to the person whose DM started this turn. Never include secrets, keys or tokens: the post is refused.",
+    "Post to Zulip as your own bot. A channel post needs a channel AND a topic: one topic per unit of work, at most 58 characters, never your own name. Only the channel that woke you (any topic there) or a channel the owner allowed is accepted. dm_user_id sends a direct message instead: to the owner, to another bot, or to the person whose DM started this turn; never to an integration, a deactivated user, or a person who is not the owner, and only a few an hour. Never include secrets, keys or tokens: the post is refused.",
   schema: {
     type: "object",
     properties: {
@@ -1191,7 +1192,7 @@ const ZULIP_POST: HarnessTool = {
       topic: { type: "string", description: "The topic (thread) to post in. Required with channel." },
       dm_user_id: {
         type: "integer",
-        description: "Zulip user id to answer by direct message. Only the sender of the DM that started this turn.",
+        description: "Zulip user id to direct-message: the owner, another bot, or the sender of the DM that started this turn.",
       },
       content: {
         type: "string",
