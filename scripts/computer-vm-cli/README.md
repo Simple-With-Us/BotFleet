@@ -28,6 +28,8 @@ Use **App Settings → Local VM → Prepare**, or let a bot create flow build th
 
 Credentials are never baked into the image.  Enable **Share Host CLI Credentials** in Host & CLI Integration to mount or sync host login files read-only.
 
+The GitHub CLI is the one exception to "read-only login files": on macOS `gh` keeps its token in the Keychain, so the mounted `~/.config/gh` has none.  With the option on, a Local VM sets `GH_CONFIG_DIR` to a writable directory inside the container (`/home/cua/.local/state/botfleet-gh`) and logs `gh` in there with the host's `gh auth token`, passed on stdin only.  The login is written when the VM is created and refreshed on a later turn if the host re-logs in; a container created before this existed picks it up the next time it is recreated.  The Shared VPS path does not carry this token yet.
+
 ## Adding a tool
 
 Append one entry to the end of `manifest.json` (do not reorder existing ones).  `targets` is `both` for cloud and Local VM, or `local` for the Local VM image only.  Pick the shape that fits:
