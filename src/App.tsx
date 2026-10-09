@@ -15,8 +15,7 @@ import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
 import { noEngineCanRun } from "@/lib/engine-status";
-import { threadIdForApp } from "@/lib/task-app-thread";
-import { useDismissOnSelection } from "@/lib/use-dismiss-on-selection";
+import { resolveAppContext, shownThreadId, threadIdForApp } from "@/lib/task-app-thread";
 
 // UI2: every one of these is already conditionally rendered — near-modal
 // panels/pages that most sessions never open in a given launch — so they
@@ -104,12 +103,14 @@ function Shell() {
   const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
   const hasApps = state.groups.some((g) => !g.dm);
 
+  // The task-switch ack clears the pin, so a null pin means "the bot's active
+  // thread", not "left the App" (see resolveAppContext).
   const appKeyboardRouting = Boolean(
     selectedAppId &&
       ((group && !group.dm && group.id === selectedAppId) ||
         (bot &&
-          state.viewedThreadId &&
-          state.viewedThreadId === threadIdForApp(bot, selectedAppId))),
+          shownThreadId(bot, state.viewedThreadId) &&
+          shownThreadId(bot, state.viewedThreadId) === threadIdForApp(bot, selectedAppId))),
   );
 
   // If a group was chosen in the sidebar or store, keep selectedAppId aligned
@@ -119,30 +120,24 @@ function Shell() {
     }
   }, [group?.id, group?.dm]);
 
-  // The overview covers the chat pane, so a pick from anywhere (sidebar, ⌘1–9,
-  // command palette, notification) has to close it.  Only a pick: the store
-  // streams bot and room updates all session and hydrate selects the first bot
-  // at launch, and none of that may dismiss the overview.  The deck, the matrix
-  // and the "All" tab close or open it in their own handlers below.
-  const dismissMatrixOverview = useCallback(() => setMatrixOverviewActive(false), []);
-  useDismissOnSelection(state.selectionNonce, dismissMatrixOverview);
-
-  // A bot opened outside an app context must not leave selectedAppId on the
-  // previous app, or ⌘1–9 would keep routing through openBotInApp (#854).  This
-  // one reads bots, groups and the viewed thread, which is why it stays apart
-  // from the overview dismissal above: those inputs change all the time.
+  // When selection changes via sidebar or store, yield matrix overview to the
+  // selected chat, and drop the App highlight unless the selection is still in
+  // that App.  The decision is a pure function so it can be tested: this effect
+  // re-runs on every SSE frame, and only a changed selection may close the matrix.
+  const lastSelectedId = useRef(state.selectedId);
   useEffect(() => {
-    const selectedGroup = state.groups.find((g) => g.id === state.selectedId);
-    if (selectedGroup && !selectedGroup.dm) return;
-    const selectedBot = state.bots.find((b) => b.id === state.selectedId);
-    if (!selectedBot) return;
-    const inApp =
-      selectedAppId &&
-      state.viewedThreadId &&
-      state.viewedThreadId === threadIdForApp(selectedBot, selectedAppId);
-    if (!inApp) {
-      setSelectedAppId(null);
-    }
+    const selectionChanged = lastSelectedId.current !== state.selectedId;
+    lastSelectedId.current = state.selectedId;
+    const decision = resolveAppContext({
+      selectedAppId,
+      selectedId: state.selectedId,
+      selectionChanged,
+      groups: state.groups,
+      bots: state.bots,
+      viewedThreadId: state.viewedThreadId,
+    });
+    if (decision.yieldMatrix) setMatrixOverviewActive(false);
+    if (decision.selectedAppId !== selectedAppId) setSelectedAppId(decision.selectedAppId);
   }, [state.selectedId, state.viewedThreadId, state.bots, state.groups, selectedAppId]);
 
   // Nothing on this machine can run a bot. A missing cloud login does not

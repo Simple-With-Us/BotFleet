@@ -15,54 +15,9 @@ import { ArrowUpCircle, Loader2, Power, PowerOff, RefreshCw, Trash2, TriangleAle
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
 
-export interface PluginSource {
-  kind: "folder" | "git";
-  path?: string;
-  url?: string;
-  ref?: string | null;
-}
-
-export interface PluginContributionCard {
-  id: string;
-  title: string;
-  description?: string;
-  layout: "stat-grid" | "key-value" | "list";
-  fields?: string[];
-}
-
-export interface PluginContributionCommand {
-  name: string;
-  description: string;
-  args?: string[];
-}
-
-export interface PluginListing {
-  name: string;
-  version: string;
-  description: string;
-  author?: string;
-  license?: string;
-  botfleet: string;
-  entry: string;
-  enabled: boolean;
-  installedAt: string;
-  updatedAt: string;
-  source: PluginSource;
-  warnings: string[];
-  capabilities: string[];
-  contributes?: {
-    cards?: PluginContributionCard[];
-    commands?: PluginContributionCommand[];
-  };
-}
-
 interface PluginInstallIssue {
   field: string;
   message: string;
-}
-
-interface PluginsResponse {
-  plugins: PluginListing[];
 }
 
 interface ApiError {
@@ -115,17 +70,22 @@ async function readApiError(response: Response): Promise<ApiError | null> {
   return { error: errorText, issues };
 }
 
-const PluginSourceSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("folder"), path: z.string().min(1) }).passthrough(),
+// The schemas below are the one definition of what the plugins route returns.
+// The types the view uses are derived from them (`z.infer`), so a field added or
+// renamed on one side cannot drift from the other, and no cast is needed where a
+// response is read.  Unknown fields are stripped rather than rejected: the server
+// may add one, and a strict schema would blank the whole list when it does.
+export const PluginSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("folder"), path: z.string().min(1) }),
   z.object({
     kind: z.literal("git"),
     url: z.string().min(1),
     ref: z.string().nullable().optional(),
     path: z.string().optional(),
-  }).passthrough(),
+  }),
 ]);
 
-const PluginListingSchema = z.object({
+export const PluginListingSchema = z.object({
   name: z.string().min(1),
   version: z.string().min(1),
   description: z.string(),
@@ -146,18 +106,22 @@ const PluginListingSchema = z.object({
       description: z.string().optional(),
       layout: z.enum(["stat-grid", "key-value", "list"]),
       fields: z.array(z.string()).optional(),
-    }).passthrough()).optional(),
+    })).optional(),
     commands: z.array(z.object({
       name: z.string(),
       description: z.string(),
       args: z.array(z.string()).optional(),
-    }).passthrough()).optional(),
-  }).passthrough().optional(),
-}).passthrough();
+    })).optional(),
+  }).optional(),
+});
 
-const PluginsResponseSchema = z.object({
+export const PluginsResponseSchema = z.object({
   plugins: z.array(PluginListingSchema),
 });
+
+export type PluginSource = z.infer<typeof PluginSourceSchema>;
+export type PluginListing = z.infer<typeof PluginListingSchema>;
+export type PluginsResponse = z.infer<typeof PluginsResponseSchema>;
 
 async function readPluginsResponse(response: Response): Promise<PluginsResponse | null> {
   let body: unknown;
@@ -167,8 +131,7 @@ async function readPluginsResponse(response: Response): Promise<PluginsResponse 
     return null;
   }
   const parsed = PluginsResponseSchema.safeParse(body);
-  // SAFETY: PluginsResponseSchema established the listing fields at runtime; PluginListing is the consumer shape.
-  return parsed.success ? (parsed.data as PluginsResponse) : null;
+  return parsed.success ? parsed.data : null;
 }
 
 function errorMessage(error: ErrorLike): string {
