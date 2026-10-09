@@ -17,7 +17,6 @@
 // length, and a failed handler as a stable reason code.
 import { z } from "zod";
 
-import type { JsonValue } from "../shared/plugin-manifest.ts";
 import { PluginExportsSchema } from "./plugin-types.ts";
 
 /** Upper bound on one handler result, measured as JSON text.  A plugin
