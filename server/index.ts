@@ -376,8 +376,8 @@ import {
   spokenReply,
   resolveVoiceSummaryMode,
 } from "../shared/voice-summary.ts";
-import { summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
-import { MessageAudio } from "./tts/message-audio.ts";
+import { deterministicSpokenText, summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
+import { isWrittenScript, MessageAudio, type SummarizedSpeech } from "./tts/message-audio.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { fitListToBudget, serializedPreview } from "./serialized-preview.ts";
 import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh, ROOM_REPLY_PREFIX } from "./turn-context.ts";
@@ -9805,23 +9805,26 @@ function endRuntimeQuiesce() {
 
 // One paid summary request per message: the background prewarm and the audio
 // route share this promise instead of each asking the provider.
-const voiceSummaryJobs = new Map<string, Promise<string>>();
+const voiceSummaryJobs = new Map<string, Promise<SummarizedSpeech>>();
 
 function voiceSummaryFor(
   threadId: string,
   messageId: string,
   text: string,
   config?: typeof cfg,
-): Promise<string> {
+): Promise<SummarizedSpeech> {
   const currentCfg = config ?? cfg;
   const key = `${threadId}:${messageId}`;
   let job = voiceSummaryJobs.get(key);
   if (!job) {
     job = (async () => {
       const row = store.messagesFor(threadId).find((candidate) => candidate.id === messageId);
-      // A written-mode script (voiceTextKind "written") is the reply as
-      // written, not a summary, so it is never handed back as one.
-      if (row?.voiceText && row.voiceTextKind !== "written") return row.voiceText;
+      // A distilled script stored before or after karaoke (no voiceTextKind,
+      // or "summary") is reused as it is: no second paid rewrite, and its
+      // clips stay valid.  A written-mode script (voiceTextKind "written",
+      // the "off" mode, or any reply played while #952 made that the
+      // default) is the reply as written, so it is distilled now.
+      if (row?.voiceText && row.voiceTextKind !== "written") return { text: row.voiceText };
       try {
         const scrubbedInput = redactSecretsInText(text);
         const summary = await summarizeForVoiceDetailed(scrubbedInput, {
@@ -9829,21 +9832,35 @@ function voiceSummaryFor(
           baseUrl: currentCfg.deepseek?.url,
         });
         const safeSummary = summary.text ? redactSecretsInText(summary.text) : "";
-        if (voiceSummaryWorthStoring(summary) && safeSummary && safeSummary !== text) {
-          // Stored clips were made from another script (the written one, or
-          // a row's raw text), so they go with it: voiceText always names the
-          // script of the clips beside it (server/tts/message-audio.ts).
-          store.patchMessage(threadId, messageId, {
-            voiceText: safeSummary,
-            voiceTextKind: "summary",
-            audio: undefined,
-            audioVoice: undefined,
-            audioByVoice: undefined,
-          });
+        const worthStoring = voiceSummaryWorthStoring(summary);
+        if (worthStoring && safeSummary && safeSummary !== text) {
+          if (safeSummary === row?.voiceText && isWrittenScript(text, safeSummary)) {
+            // The very script the stored written-mode clips speak (a short
+            // plain reply, or a stand-in, played while #952 was the default
+            // or while the distiller was down): keep the clips, and say the
+            // text is now settled as the distilled script.
+            store.patchMessage(threadId, messageId, { voiceTextKind: "summary" });
+          } else {
+            // Stored clips were made from another script (the written one,
+            // or a row's raw text), so they go with it: voiceText always
+            // names the script of the clips beside it (server/tts/
+            // message-audio.ts).
+            store.patchMessage(threadId, messageId, {
+              voiceText: safeSummary,
+              voiceTextKind: "summary",
+              audio: undefined,
+              audioVoice: undefined,
+              audioByVoice: undefined,
+            });
+          }
         }
-        return safeSummary || spokenReply(text);
+        // A passing provider failure is spoken now but not kept, so the next
+        // play asks the distiller again.
+        return { text: safeSummary || deterministicSpokenText(spokenReply(text)), retry: !worthStoring };
       } catch {
-        return spokenReply(text);
+        // The deterministic script, as the summarizer's own fallback is, so
+        // the karaoke highlight still gets its spans.
+        return { text: deterministicSpokenText(spokenReply(text)), retry: true };
       }
     })();
     voiceSummaryJobs.set(key, job);
