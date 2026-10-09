@@ -190,6 +190,29 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "usage-notices") {
+  // Visual-spec harness (tests/e2e/usage-notices.visual.spec.ts): the held-bots
+  // and shorter-fallback-chain notices from Settings → Usage → Engine Quotas.
+  // Dynamically imported so the real app boot path never pays for it.
+  void import("./components/UsageNoticesVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "bypass-warning") {
+  // Visual-spec harness (tests/e2e/bypass-warning.visual.spec.ts): the Permission
+  // Bypass confirmation dialog, standard, high-risk model and busy.
+  void import("./components/BypassPermissionsWarningVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else {
   createRoot(rootElement).render(
     <StrictMode>
