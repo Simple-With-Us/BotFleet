@@ -172,11 +172,15 @@ describe("usage, memory status, jobs and skills", () => {
     expect(ask("POST", `/api/jobs/${JOB}/stop`, false)?.status).toBe(401);
   });
 
-  it("keeps the reads no screen uses closed, and refuses an id that is not a job id", () => {
+  it("keeps the reads no screen uses closed, and lets no path be smuggled in as a job id", () => {
     // one job's metadata and the wake-turn cost totals are on the harness but not on the phone
     expect(allowed("GET", `/api/jobs/${JOB}`)).toBe(false);
     expect(allowed("GET", "/api/jobs/wake-usage")).toBe(false);
-    for (const id of ["not-a-job", "job_short", "job_../../config", "JOB_01JABCDEFGHJKMNPQRSTVWXYZ0", "job_01JABCDEFGHJKMNPQRSTVWXYZ0%2f.."]) {
+    // ids are the harness's own `[\w-]+` route pattern;  the `job_<ulid>` shape
+    // is the harness's to judge (it answers 400), so a plain wrong id is forwarded
+    expect(allowed("GET", "/api/jobs/not-a-job/output")).toBe(true);
+    expect(allowed("POST", "/api/jobs/job_short/stop")).toBe(true);
+    for (const id of ["job_../../config", "job_01JABCDEFGHJKMNPQRSTVWXYZ0%2f..", "job.1", "job 1", "..", "a/b"]) {
       expect(allowed("GET", `/api/jobs/${id}/output`), id).toBe(false);
       expect(allowed("POST", `/api/jobs/${id}/stop`), id).toBe(false);
     }

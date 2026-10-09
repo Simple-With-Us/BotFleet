@@ -299,12 +299,14 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // jobs-and-subagents-decision.md, ruling d).  Nothing here starts a job: a
   // job only starts from a bot's own tool call.  The bare `GET /api/jobs/:id`
   // and `/api/jobs/wake-usage` reads are used by no screen, so they stay
-  // closed.  Ids are the harness's own `job_<ulid>` shape.  `stop` with no id
-  // is Stop All for one conversation (`{ threadId }`), which the Mac's jobs
-  // menu has too.
+  // closed.  Ids are `[\w-]+`, the harness's own route pattern;  it checks the
+  // `job_<ulid>` shape itself and answers 400 to anything else, so the sidecar
+  // only has to keep a path from being smuggled in.  `stop` with no id is Stop
+  // All for one conversation (`{ threadId }`), which the Mac's jobs menu has
+  // too.
   { method: "GET", path: /^\/api\/jobs$/ },
-  { method: "GET", path: /^\/api\/jobs\/job_[0-9A-Za-z]{10,40}\/output$/ },
-  { method: "POST", path: /^\/api\/jobs\/job_[0-9A-Za-z]{10,40}\/stop$/ },
+  { method: "GET", path: /^\/api\/jobs\/[\w-]+\/output$/ },
+  { method: "POST", path: /^\/api\/jobs\/[\w-]+\/stop$/ },
   { method: "POST", path: /^\/api\/jobs\/stop$/ },
 
   // A bot's imported Agent Skills: read the list, read one SKILL.md, and turn
