@@ -198,6 +198,8 @@ struct SettingsView: View {
                     Text(workspaceFooter)
                 }
 
+                WorkspaceVoiceSection()
+
                 Section {
                     HStack {
                         Label {
@@ -682,7 +684,8 @@ private struct ComputerSettingsRow: View {
     }
 }
 
-private struct SettingsIcon: View {
+/// Shared with WorkspaceVoiceSettings.swift, so the Voice rows match.
+struct SettingsIcon: View {
     let symbol: String
     let color: Color
 
