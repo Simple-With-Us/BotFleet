@@ -74,6 +74,18 @@ test('visual: Linux Local Control needs attention', async ({ page }) => {
   await expect(section).toHaveScreenshot('linux-local-control-needs-attention.png', stableShot);
 });
 
+test('visual: Linux Local Control bundled driver header', async ({ page }) => {
+  await page.goto('/?fixture=linux-local-control&state=ready');
+  await pinFonts(page);
+
+  const section = localControlSection(page);
+  await expect(section).toBeVisible();
+  const panel = section.locator('.font-mono').filter({ hasText: 'Bundled Computer Driver' });
+  await expect(panel).toContainText('0.19.3');
+
+  await expect(panel).toHaveScreenshot('linux-local-control-driver-header.png', stableShot);
+});
+
 test('visual: Linux Local Control ready', async ({ page }) => {
   await page.goto('/?fixture=linux-local-control&state=ready');
   await pinFonts(page);

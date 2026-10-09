@@ -129,9 +129,27 @@ test.beforeEach(async ({ page }) => {
     // aborted in `test.afterEach`.
     if (route.request().method() !== 'GET') return route.fallback();
     const pageState = new URL(page.url()).searchParams.get('state') ?? 'normal';
-    if (pageState === 'normal' || pageState === 'loading') {
+    if (pageState === 'loading') {
       pendingVpsRoutes.push(route);
       return;
+    }
+    if (pageState === 'normal' || pageState === 'shared') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          backend: 'vps',
+          configured: true,
+          sshAlias: 'vps',
+          daemonUp: true,
+          image: true,
+          imageMatches: true,
+          managed: true,
+          container: 'running',
+          ready: true,
+          problem: null,
+        }),
+      });
     }
     return route.fulfill({
       status: 200,
@@ -217,6 +235,21 @@ test('visual: SharedVpsRuntimeCard — Fetching VPS status… loading state', as
   await expect(board.getByText('Fetching VPS status…')).toBeVisible();
   await expect(board.getByText('Shared VPS VM')).toBeVisible();
   await expect(board).toHaveScreenshot('runtime-cards-shared-vps-loading.png', {
+    ...stableShot,
+    mask: [board.locator('.animate-spin')],
+  });
+});
+
+test('visual: SharedVpsRuntimeCard — shared ready state', async ({ page }) => {
+  await page.goto('/?fixture=runtime-cards&card=shared-vps&state=normal', {
+    waitUntil: 'domcontentloaded',
+  });
+  await pinFonts(page);
+  const board = page.getByTestId('runtime-cards-shared-vps');
+  await expect(board).toBeVisible();
+  await expect(board.getByText('Shared VPS VM')).toBeVisible();
+  await expect(board.getByText('Running', { exact: true })).toBeVisible();
+  await expect(board).toHaveScreenshot('runtime-cards-shared-vps-ready.png', {
     ...stableShot,
     mask: [board.locator('.animate-spin')],
   });

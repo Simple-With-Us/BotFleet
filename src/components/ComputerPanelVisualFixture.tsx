@@ -7,6 +7,8 @@
 //
 // warning=unconfigured: computers is cloud + VPS, status.configured is false,
 // so the "Configure the VPS SSH alias" card renders.
+// warning=vps-incompatible: cloud computer selected, managed VPS container
+// image is stale, so the replacement error and button render.
 // Any other value: computers is unset and cloudBackend is vps, so the
 // "Start VPS automatically" sentence and the Off-computer schedule warning
 // both render. An empty computers array hides that auto-start row.
@@ -31,7 +33,7 @@ const claude: InstanceInfo = {
   capabilities: { computerMcp: true },
 };
 
-function visualBot(unconfigured: boolean): Bot {
+function visualBot(mode: "default" | "unconfigured" | "vps-incompatible"): Bot {
   return {
     id: BOT_ID,
     threadId: "visual-thread",
@@ -45,18 +47,21 @@ function visualBot(unconfigured: boolean): Bot {
     // Unset computers is the Auto/Off state that shows the auto-start sentence.
     // ["cloud"] is what lets the panel ask for VPS status and reach
     // vps-unconfigured. [] would skip that fetch and also hide the sentence.
-    ...(unconfigured ? { computers: ["cloud" as const] } : {}),
+    ...(mode === "unconfigured" || mode === "vps-incompatible" ? { computers: ["cloud" as const] } : {}),
     cloudBackend: "vps",
-    autoStartVps: false,
+    autoStartVps: mode === "vps-incompatible",
     messages: [],
   };
 }
 
 export default function ComputerPanelVisualFixture() {
   const value = useMemo(() => {
-    const unconfigured =
-      new URLSearchParams(window.location.search).get("warning") === "unconfigured";
-    const bot = visualBot(unconfigured);
+    const warning = new URLSearchParams(window.location.search).get("warning");
+    const mode =
+      warning === "unconfigured" ? "unconfigured"
+        : warning === "vps-incompatible" ? "vps-incompatible"
+          : "default";
+    const bot = visualBot(mode);
     return {
       state: {
         ...initialState,
