@@ -12,7 +12,8 @@ import {
   Sparkles,
 } from "lucide-react";
 import { getRoomTerminology, useStore } from "@/state/store";
-import type { RoutineRun } from "@/lib/routines";
+import { ATTENTION_STATUSES, needsAttention, triggerAttentionKey } from "@/lib/routine-attention";
+import type { RoutineRun, RoutineRunStatus } from "@/lib/routines";
 import { botAvatarUrlSchema } from "../../shared/bot-avatar";
 
 interface KanbanCommandCenterProps {
@@ -25,7 +26,10 @@ interface KanbanCommandCenterProps {
 
 export type KanbanColumnId = "attention" | "in_progress" | "ready" | "completed";
 
-export const COMPLETED_VISIBLE_CAP = 15;
+/** How many cards a column shows before "Show More".  Every column is paged,
+ *  not just Completed:  the harness keeps up to two thousand routine runs, and
+ *  a board that renders every card it can build stops being a board. */
+export const COLUMN_VISIBLE_CAP = 15;
 
 export interface KanbanCardItem {
   id: string;
@@ -44,6 +48,9 @@ export interface KanbanCardItem {
   timestamp: number;
   unblockValue: number; // Higher number = higher priority to show at top
   rawRun?: RoutineRun;
+  /** Set on a card that stands in for a routine's repeated failures, misses or
+   *  approvals:  how many older runs of that routine it replaced. */
+  olderRuns?: number;
 }
 
 export function safeAvatarUrl(url?: string | null): string | null {
@@ -56,6 +63,80 @@ export function safeAvatarUrl(url?: string | null): string | null {
   return parsed.success ? parsed.data : null;
 }
 
+const COLLAPSIBLE_RUN_STATUSES: ReadonlySet<RoutineRunStatus> = new Set<RoutineRunStatus>([
+  "failed",
+  "missed",
+  "waiting",
+]);
+
+/** What a run is a repeat of.  A failure and a miss fold together, the way the
+ *  Routines page's attention summary groups them.  An approval that is still
+ *  waiting keeps its own card:  it needs a different answer from a failure, and
+ *  folding it under a newer failure would bury it.  The source reuses the
+ *  attention module's trigger key, so a webhook or resource trigger can never
+ *  merge with a scheduled routine, and a manual run folds into the routine it
+ *  belongs to. */
+function repeatKey(run: RoutineRun): string {
+  const kind = run.status === "waiting" ? "approval" : "failure";
+  return `${kind}:${triggerAttentionKey(run) ?? `routine:${run.routineId}`}`;
+}
+
+/** One card per routine for runs that need a person.  A routine that breaks on
+ *  a schedule writes a new failed run every time it fires, so without this one
+ *  broken routine fills the Attention Queue with identical cards.  The newest
+ *  run, by the same clock its card displays, stands in for the group and
+ *  carries a count of the older runs it replaced.  Cards that are not
+ *  failed, missed or waiting runs pass through untouched, in their original
+ *  order. */
+export function collapseAttentionCards(cards: KanbanCardItem[]): KanbanCardItem[] {
+  const groups = new Map<string, { newest: KanbanCardItem; size: number }>();
+  for (const card of cards) {
+    const run = card.rawRun;
+    if (!run || !COLLAPSIBLE_RUN_STATUSES.has(run.status)) continue;
+    const key = repeatKey(run);
+    const group = groups.get(key);
+    if (!group) {
+      groups.set(key, { newest: card, size: 1 });
+      continue;
+    }
+    group.size += 1;
+    // `>=`: on a tie the card later in the list stands in.
+    if (card.timestamp >= group.newest.timestamp) group.newest = card;
+  }
+
+  const collapsed: KanbanCardItem[] = [];
+  for (const card of cards) {
+    const run = card.rawRun;
+    if (!run || !COLLAPSIBLE_RUN_STATUSES.has(run.status)) {
+      collapsed.push(card);
+      continue;
+    }
+    const group = groups.get(repeatKey(run))!;
+    if (group.newest !== card) continue;
+    collapsed.push(group.size > 1 ? { ...card, olderRuns: group.size - 1 } : card);
+  }
+  return collapsed;
+}
+
+/** The control under a capped column.  It reveals one more page, and says how
+ *  many cards are still out of view so a capped column is never mistaken for a
+ *  short one. */
+function ShowMoreFooter({ hidden, onShowMore }: { hidden: number; onShowMore: () => void }) {
+  if (hidden <= 0) return null;
+  return (
+    <div className="flex flex-col items-center gap-1 pt-1">
+      <button
+        type="button"
+        onClick={onShowMore}
+        className="rounded-md border border-hairline/60 bg-panel px-2.5 py-1 text-[11px] font-medium text-ink-secondary transition-colors hover:border-primary hover:text-primary"
+      >
+        {`Show ${Math.min(COLUMN_VISIBLE_CAP, hidden)} More`}
+      </button>
+      <span className="text-[10px] text-ink-tertiary">{`${hidden} hidden`}</span>
+    </div>
+  );
+}
+
 export function KanbanCommandCenter({
   onSelectApp,
   onSelectBot,
@@ -66,6 +147,15 @@ export function KanbanCommandCenter({
   const { state } = useStore();
   const terminology = getRoomTerminology(state.config);
   const [searchQuery, setSearchQuery] = useState("");
+  // How many cards each column currently shows.  "Show More" adds one page.
+  const [visibleCounts, setVisibleCounts] = useState<Record<KanbanColumnId, number>>({
+    attention: COLUMN_VISIBLE_CAP,
+    in_progress: COLUMN_VISIBLE_CAP,
+    ready: COLUMN_VISIBLE_CAP,
+    completed: COLUMN_VISIBLE_CAP,
+  });
+  const showMore = (column: KanbanColumnId) =>
+    setVisibleCounts((current) => ({ ...current, [column]: current[column] + COLUMN_VISIBLE_CAP }));
 
   const appMap = useMemo(() => {
     const map = new Map<string, { id: string; name: string; avatarUrl?: string | null; memberIds: string[] }>();
@@ -228,6 +318,14 @@ export function KanbanCommandCenter({
         continue;
       }
 
+      // A failure or miss the owner already acknowledged on the Routines page is
+      // dealt with:  it keeps its history there, but it must not keep asking for
+      // action here.  `needsAttention` is the one definition of "still
+      // unanswered" that the badge, the Attention panel and the server's
+      // Acknowledge All share, so the board cannot drift from them.  A waiting
+      // approval is not an acknowledgeable status, so it always stays.
+      if (ATTENTION_STATUSES.includes(run.status) && !needsAttention(run)) continue;
+
       if (run.status === "failed") {
         items.push({
           id: `run-${run.id}`,
@@ -349,7 +447,7 @@ export function KanbanCommandCenter({
       }
     }
 
-    return items;
+    return collapseAttentionCards(items);
   }, [state.bots, state.routineRuns, appMap, botMap, filterAppId]);
 
   const filteredCards = useMemo(() => {
@@ -395,6 +493,13 @@ export function KanbanCommandCenter({
 
     return colMap;
   }, [filteredCards]);
+
+  const visible = {
+    attention: columns.attention.slice(0, visibleCounts.attention),
+    in_progress: columns.in_progress.slice(0, visibleCounts.in_progress),
+    ready: columns.ready.slice(0, visibleCounts.ready),
+    completed: columns.completed.slice(0, visibleCounts.completed),
+  };
 
   const formatWaitTime = (ms?: number) => {
     if (!ms || ms <= 0) return null;
@@ -466,7 +571,7 @@ export function KanbanCommandCenter({
       {/* 4-Column Board */}
       <div className="grid flex-1 grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 overflow-x-auto pb-4">
         {/* Column 1: Attention Queue */}
-        <div className="flex flex-col rounded-xl border border-hairline/60 bg-raised/30 p-3 min-w-[260px]">
+        <div data-testid="kanban-column-attention" className="flex flex-col rounded-xl border border-hairline/60 bg-raised/30 p-3 min-w-[260px]">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-1.5">
               <span className="flex h-5 w-5 items-center justify-center rounded-full bg-danger/15 text-danger">
@@ -486,7 +591,7 @@ export function KanbanCommandCenter({
                 <span className="text-[12px]">All clear.  No blocked bots or pending approvals.</span>
               </div>
             ) : (
-              columns.attention.map((card) => {
+              visible.attention.map((card) => {
                 const waitLabel = formatWaitTime(card.waitingMs);
                 return (
                   <div
@@ -515,6 +620,15 @@ export function KanbanCommandCenter({
                         {card.subtitle}
                       </p>
                     )}
+
+                    {card.olderRuns ? (
+                      <p
+                        className="text-[10px] font-medium text-ink-secondary"
+                        title={`${card.olderRuns} older ${card.olderRuns === 1 ? "run" : "runs"} of this routine are folded into this card.`}
+                      >
+                        {`+${card.olderRuns} older`}
+                      </p>
+                    ) : null}
 
                     <div className="mt-1 flex items-center justify-between border-t border-hairline/30 pt-2 text-[11px]">
                       <div className="flex items-center gap-1.5 text-ink-secondary">
@@ -548,11 +662,15 @@ export function KanbanCommandCenter({
                 );
               })
             )}
+            <ShowMoreFooter
+              hidden={columns.attention.length - visible.attention.length}
+              onShowMore={() => showMore("attention")}
+            />
           </div>
         </div>
 
         {/* Column 2: In Progress */}
-        <div className="flex flex-col rounded-xl border border-hairline/60 bg-raised/30 p-3 min-w-[260px]">
+        <div data-testid="kanban-column-in_progress" className="flex flex-col rounded-xl border border-hairline/60 bg-raised/30 p-3 min-w-[260px]">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-1.5">
               <span className="flex h-5 w-5 items-center justify-center rounded-full bg-info/15 text-info">
@@ -571,7 +689,7 @@ export function KanbanCommandCenter({
                 <span className="text-[12px]">No bots actively running turns right now.</span>
               </div>
             ) : (
-              columns.in_progress.map((card) => (
+              visible.in_progress.map((card) => (
                 <div
                   key={card.id}
                   onClick={() => handleCardClick(card)}
@@ -609,11 +727,15 @@ export function KanbanCommandCenter({
                 </div>
               ))
             )}
+            <ShowMoreFooter
+              hidden={columns.in_progress.length - visible.in_progress.length}
+              onShowMore={() => showMore("in_progress")}
+            />
           </div>
         </div>
 
         {/* Column 3: Ready / Available */}
-        <div className="flex flex-col rounded-xl border border-hairline/60 bg-raised/30 p-3 min-w-[260px]">
+        <div data-testid="kanban-column-ready" className="flex flex-col rounded-xl border border-hairline/60 bg-raised/30 p-3 min-w-[260px]">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-1.5">
               <span className="flex h-5 w-5 items-center justify-center rounded-full bg-raised text-ink-secondary">
@@ -632,7 +754,7 @@ export function KanbanCommandCenter({
                 <span className="text-[12px]">All bots busy or assigned to other tasks.</span>
               </div>
             ) : (
-              columns.ready.map((card) => (
+              visible.ready.map((card) => (
                 <div
                   key={card.id}
                   onClick={() => handleCardClick(card)}
@@ -666,11 +788,15 @@ export function KanbanCommandCenter({
                 </div>
               ))
             )}
+            <ShowMoreFooter
+              hidden={columns.ready.length - visible.ready.length}
+              onShowMore={() => showMore("ready")}
+            />
           </div>
         </div>
 
         {/* Column 4: Completed Output */}
-        <div className="flex flex-col rounded-xl border border-hairline/60 bg-raised/30 p-3 min-w-[260px]">
+        <div data-testid="kanban-column-completed" className="flex flex-col rounded-xl border border-hairline/60 bg-raised/30 p-3 min-w-[260px]">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-1.5">
               <span className="flex h-5 w-5 items-center justify-center rounded-full bg-success/15 text-success">
@@ -679,8 +805,7 @@ export function KanbanCommandCenter({
               <h3 className="text-[13px] font-semibold text-ink">Completed</h3>
             </div>
             <span className="rounded-full bg-raised px-2 py-0.5 text-[11px] font-semibold text-ink-secondary">
-              {Math.min(columns.completed.length, COMPLETED_VISIBLE_CAP)}
-              {columns.completed.length > COMPLETED_VISIBLE_CAP ? "+" : ""}
+              {columns.completed.length}
             </span>
           </div>
 
@@ -690,7 +815,7 @@ export function KanbanCommandCenter({
                 <span className="text-[12px]">Finished routine runs will appear here with output receipts.</span>
               </div>
             ) : (
-              columns.completed.slice(0, COMPLETED_VISIBLE_CAP).map((card) => (
+              visible.completed.map((card) => (
                 <div
                   key={card.id}
                   onClick={() => handleCardClick(card)}
@@ -718,11 +843,10 @@ export function KanbanCommandCenter({
                 </div>
               ))
             )}
-            {columns.completed.length > COMPLETED_VISIBLE_CAP && (
-              <div className="pt-1 text-center text-[10px] text-ink-tertiary">
-                +{columns.completed.length - COMPLETED_VISIBLE_CAP} more completed runs
-              </div>
-            )}
+            <ShowMoreFooter
+              hidden={columns.completed.length - visible.completed.length}
+              onShowMore={() => showMore("completed")}
+            />
           </div>
         </div>
       </div>
