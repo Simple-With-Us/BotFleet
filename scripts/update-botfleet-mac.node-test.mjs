@@ -2864,6 +2864,10 @@ test("only a launchd job that has exited counts as a crash; one that is still bo
   const signalled = `${LAUNCHD_RUNNING.replace("(never exited)", "9")}\n\tlast terminating signal = Segmentation fault: 11`;
   assert.match(describeLaunchdExit(parseLaunchdJob(signalled)), /killed by a signal \(Segmentation fault: 11\)/);
 
+  const zeroSignal = `${LAUNCHD_RUNNING}\n\tlast terminating signal = 0\n`;
+  assert.equal(describeLaunchdExit(parseLaunchdJob(zeroSignal)), null,
+    "signal 0 is launchd's no-signal sentinel, not a crash; the trailing newline must be trimmed");
+
   const restarted = LAUNCHD_RUNNING.replace("runs = 1", "runs = 3");
   assert.equal(describeLaunchdExit(parseLaunchdJob(restarted)), "launchd has had to start it 3 times");
 

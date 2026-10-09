@@ -2814,7 +2814,10 @@ export function parseLaunchdJob(text) {
 
 /** Why a launchd job counts as crashed, or null while it is merely running. */
 export function describeLaunchdExit(job) {
-  if (job?.signal) return `its process was killed by a signal (${job.signal})`;
+  // "0" is launchd's no-signal sentinel, and a non-empty string is truthy, so
+  // `job?.signal` alone misreads a healthy job as one killed by signal 0.
+  const signal = job?.signal;
+  if (signal && signal !== "0" && signal !== 0) return `its process was killed by a signal (${signal})`;
   if (job?.lastExit && !/never exited/i.test(job.lastExit)) {
     return /^\d+$/.test(job.lastExit) ? `its process exited with code ${job.lastExit}` : `its process exited (${job.lastExit})`;
   }
