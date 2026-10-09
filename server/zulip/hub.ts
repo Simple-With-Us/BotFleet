@@ -52,7 +52,7 @@ import {
   type ZulipTarget,
 } from "./outbound.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type RouterContext } from "./router.ts";
-import { ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
+import { HANDLED_RING_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
 import type { ZulipIdentity, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
 
 /** Zulip roles a BF bot may hold: moderator (300) and member (400).  An
@@ -272,6 +272,13 @@ class ZulipSession {
    *  first live message, to the id just below it. */
   private floorFromFirstLive = false;
   private readonly seen = new Set<number>();
+  /** Indexes over `state.handled` and the items in `state.pending`, so the
+   *  per-message "already decided?" check is a lookup and not a scan of a
+   *  2000-id ring.  Memory only: rebuilt from the state whenever it is
+   *  loaded or replaced (`seedSeen`), and kept current by `markHandled` and
+   *  `indexPending`, the only places the hub changes either list. */
+  private readonly handledIds = new Set<number>();
+  private readonly pendingIds = new Set<number>();
   /** Consecutive failures since the last poll that returned. */
   failures = 0;
   /** This queue's long-poll limit plus a margin, from register. */
@@ -306,6 +313,35 @@ class ZulipSession {
     this.seen.clear();
     for (const id of this.state.handled) this.remember(id);
     for (const unit of this.state.pending) for (const item of unit.items) this.remember(item.id);
+    this.handledIds.clear();
+    for (const id of this.state.handled) this.handledIds.add(id);
+    this.indexPending();
+  }
+
+  /** Already dispatched, dropped by policy, or waiting in a unit. */
+  holds(id: number): boolean {
+    return this.handledIds.has(id) || this.pendingIds.has(id);
+  }
+
+  /** Record ids as handled.  The ring is bounded here, as the saved file is,
+   *  so the array and its index never disagree. */
+  markHandled(ids: Iterable<number>): void {
+    const { handled } = this.state;
+    for (const id of ids) {
+      if (this.handledIds.has(id)) continue;
+      handled.push(id);
+      this.handledIds.add(id);
+    }
+    if (handled.length > HANDLED_RING_LIMIT) {
+      for (const id of handled.splice(0, handled.length - HANDLED_RING_LIMIT)) this.handledIds.delete(id);
+    }
+  }
+
+  /** Re-read which message ids are waiting in a unit.  Called after every
+   *  change to `state.pending` or to a unit's items. */
+  indexPending(): void {
+    this.pendingIds.clear();
+    for (const unit of this.state.pending) for (const item of unit.items) this.pendingIds.add(item.id);
   }
 
   private remember(id: number): void {
@@ -871,8 +907,7 @@ export class ZulipHub {
     // live cursor": Zulip can deliver a lower id after a higher one, and that
     // message would be lost for good (the next backfill starts at the cursor).
     if (!session.firstSighting(id)) return;
-    if (state.handled.includes(id)) return;
-    if (state.pending.some((unit) => unit.items.some((item) => item.id === id))) return;
+    if (session.holds(id)) return;
     state.cursor = Math.max(state.cursor ?? 0, id);
     session.markDirty();
     const c = classify(message, this.routerContext(session));
@@ -894,7 +929,7 @@ export class ZulipHub {
       // A new wake: budgets and the loop guard decide whether it may exist.
       const refusal = this.wakeRefusal(state, verdict.wake, key, now);
       if (refusal) {
-        state.handled.push(id);
+        session.markHandled([id]);
         this.log(`[zulip] ${session.role}: message ${id} not woken (${refusal})`);
         session.save(true);
         return;
@@ -912,7 +947,7 @@ export class ZulipHub {
       via: verdict.via,
     };
     if (settings?.dryRun) {
-      state.handled.push(id);
+      session.markHandled([id]);
       this.log(
         `[zulip] ${session.role}: dry run — message ${id} would wake (${verdict.wake})` +
           (verdict.via === "followed" ? " from a followed topic" : ""),
@@ -929,6 +964,7 @@ export class ZulipHub {
       state.wakes.push({ at: now, kind: verdict.wake, key });
       if (verdict.wake === "peer") state.chains[key] = (state.chains[key] ?? 0) + 1;
     }
+    session.indexPending();
     this.log(`[zulip] ${session.role}: message ${id} queued (${verdict.wake})`);
     session.save(true);
     this.scheduleDrain();
@@ -1078,8 +1114,9 @@ export class ZulipHub {
     // stale by the time it is started again.
     const expired = state.pending.filter((unit) => now - unit.createdAt > UNIT_MAX_AGE_MS);
     if (expired.length) {
-      for (const unit of expired) for (const item of unit.items) state.handled.push(item.id);
+      for (const unit of expired) session.markHandled(unit.items.map((item) => item.id));
       state.pending = state.pending.filter((unit) => !expired.includes(unit));
+      session.indexPending();
       this.log(`[zulip] ${session.role}: dropped ${expired.length} unit(s) older than ${UNIT_MAX_AGE_MS / 3600_000}h`);
       session.save(true);
     }
@@ -1116,9 +1153,10 @@ export class ZulipHub {
      *  the conversation's next unit. */
     const retireBatch = () => {
       const ids = new Set(batch.map((item) => item.id));
-      for (const id of ids) state.handled.push(id);
+      session.markHandled(ids);
       unit.items = unit.items.filter((item) => !ids.has(item.id));
       if (!unit.items.length) state.pending = state.pending.filter((candidate) => candidate !== unit);
+      session.indexPending();
       return unit.items.length;
     };
     try {

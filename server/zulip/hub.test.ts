@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FakeZulip } from "../testing/fake-zulip-server.ts";
 import { abortableSleep } from "./client.ts";
 import { ZulipHub, type ZulipHubDeps, type ZulipSession } from "./hub.ts";
+import { HANDLED_RING_LIMIT } from "./state.ts";
 import type { ZulipMessage, ZulipSettings } from "./types.ts";
 
 const JAY = 9;
@@ -986,5 +987,57 @@ describe("review fixes: the first connection's cursor", () => {
     expect(session.floor).toBe(4999);
     expect(session.firstSighting(4000)).toBe(false);
     expect(session.firstSighting(5001)).toBe(true);
+  });
+});
+
+describe("review fixes: the decided-message indexes", () => {
+  it("never write the indexes to the state file", async () => {
+    const hub = makeHub();
+    await connected(hub);
+    fake.postStream(JAY, "agent-sync", "BF index", "@**BF-Plumber** one", "website");
+    const saved = () => {
+      try {
+        return JSON.parse(readFileSync(join(dataDir, "zulip", "bot-plumber.json"), "utf8"));
+      } catch {
+        return undefined;
+      }
+    };
+    await waitFor(() => saved()?.handled?.length === 1, "the saved handled id");
+    expect(Object.keys(saved()).sort()).toEqual(
+      ["chains", "cursor", "dms", "handled", "pending", "role", "userId", "version", "wakes"].sort(),
+    );
+  });
+
+  it("still refuse a waiting id and a handled id after a restart", async () => {
+    let held = true;
+    const first = makeHub({ dispatchHeld: () => held });
+    await connected(first);
+    const waiting = fake.postStream(JAY, "agent-sync", "BF restart", "@**BF-Plumber** before the restart", "website");
+    await waitFor(() => botStatus(first, "bot-plumber")?.pending === 1, "the queued unit");
+    await first.stop();
+    const second = makeHub({ dispatchHeld: () => held });
+    await connected(second);
+    expect(botStatus(second, "bot-plumber")?.pending).toBe(1);
+    expect(sessionOf(second).holds(waiting)).toBe(true);
+    expect(sessionOf(second).holds(waiting + 1)).toBe(false);
+    held = false;
+    await waitFor(() => turns.length === 1, "the released dispatch");
+    await waitFor(() => botStatus(second, "bot-plumber")?.pending === 0, "the unit retired");
+    // handled now, not waiting: still refused
+    expect(sessionOf(second).state.handled).toContain(waiting);
+    expect(sessionOf(second).holds(waiting)).toBe(true);
+  });
+
+  it("bound the handled ring and its index together, and never record an id twice", async () => {
+    const hub = makeHub();
+    await connected(hub);
+    const session = sessionOf(hub);
+    session.markHandled(Array.from({ length: HANDLED_RING_LIMIT + 5 }, (_, n) => n + 1));
+    expect(session.state.handled).toHaveLength(HANDLED_RING_LIMIT);
+    expect(session.holds(5)).toBe(false);
+    expect(session.holds(6)).toBe(true);
+    expect(session.holds(HANDLED_RING_LIMIT + 5)).toBe(true);
+    session.markHandled([HANDLED_RING_LIMIT + 5]);
+    expect(session.state.handled).toHaveLength(HANDLED_RING_LIMIT);
   });
 });
