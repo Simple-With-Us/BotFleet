@@ -44,19 +44,22 @@ describe("parseBotProfilePatch (strict — the paired boundary)", () => {
   });
 
   it("still validates each switch's value, so a stray string or number writes nothing", () => {
-    expect(parseBotProfilePatch({ bypassPermissions: "true" } as never, true)).toEqual({
+    // Parsed from JSON the way a request body arrives, so the wrong types are
+    // the wire's and need no cast.
+    const wire = (json: string) => parseBotProfilePatch(JSON.parse(json), true);
+    expect(wire('{"bypassPermissions":"true"}')).toEqual({
       ok: false,
       error: "bypassPermissions must be true or false",
     });
-    expect(parseBotProfilePatch({ autoApprove: 1 } as never, true)).toEqual({
+    expect(wire('{"autoApprove":1}')).toEqual({
       ok: false,
       error: "autoApprove must be true or false",
     });
-    expect(parseBotProfilePatch({ approvePeerComms: null } as never, true)).toEqual({
+    expect(wire('{"approvePeerComms":null}')).toEqual({
       ok: false,
       error: "approvePeerComms must be true or false",
     });
-    expect(parseBotProfilePatch({ autoReview: "always" } as never, true)).toEqual({
+    expect(wire('{"autoReview":"always"}')).toEqual({
       ok: false,
       error: "autoReview must be off, shadow, or enforce",
     });

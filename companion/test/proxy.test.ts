@@ -116,7 +116,8 @@ const device = async (
  * (no DOM lib), so the shape is stated once here. */
 const createHarnessBot = async (): Promise<string> => {
   const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
-  return ((await created.json()) as { bot: { id: string } }).bot.id;
+  const made: { bot: { id: string } } = JSON.parse(await created.text());
+  return made.bot.id;
 };
 
 /** raw request with a chosen Host header — fetch will not let us set one */
@@ -496,7 +497,7 @@ describe("the sidecar in front of an unmodified harness", () => {
       // and the dialog's request, which carries it, is accepted.
       const unacknowledged = await loopback({ autoApprove: true });
       expect(unacknowledged.status).toBe(400);
-      expect((await unacknowledged.json()) as { error: string }).toEqual({
+      expect(JSON.parse(await unacknowledged.text())).toEqual({
         error: "Auto mode on this computer requires confirming the warning first (acknowledgeLocalAuto)",
       });
       expect((await botNow()).autoApprove).not.toBe(true);
@@ -581,7 +582,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     mkdirSync(shared, { recursive: true });
     mkdirSync(other, { recursive: true });
     const botId = await createHarnessBot();
-    const roomCount = async () => (await device("GET", "/api/bots")).body.groups.length as number;
+    const roomCount = async () => Number((await device("GET", "/api/bots")).body.groups.length);
     let roomId: string | undefined;
     try {
       const grant = await fetch(`${HARNESS}/api/bots/${botId}`, {

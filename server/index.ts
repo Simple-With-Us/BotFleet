@@ -1933,6 +1933,14 @@ const PAIRED_LOCAL_COMPUTER_ERROR =
 const PAIRED_AUTO_ON_THIS_MAC_ERROR =
   "Auto Mode can only be turned on in BotFleet on your computer for a bot that can use This Mac";
 
+/** A bot as the Auto Mode consent check should see it: its Bypass Permissions
+ * left out, because bypass never answers a request that controls This Mac and
+ * so is not what that warning is about (see `pairedProfileRefusal`). */
+function withoutBypass<T extends { bypassPermissions?: boolean }>(bot: T): Omit<T, "bypassPermissions"> {
+  const { bypassPermissions: _bypass, ...rest } = bot;
+  return rest;
+}
+
 /** The paired-device rules for a profile write that touches `computers` or
  * `autoApprove`: a refusal with the status to send, or null when it may go
  * ahead.  Called by the profile route, which is the one a phone reaches
@@ -1970,7 +1978,7 @@ function pairedProfileRefusal(
     if (patch.computers.includes("local") !== heldLocal) return { status: 403, error: PAIRED_LOCAL_COMPUTER_ERROR };
   }
   const ackError = localAutoAcknowledgementError(
-    existing ? { ...existing, bypassPermissions: false } : existing,
+    existing ? withoutBypass(existing) : existing,
     patch.computers ?? storedComputerGrants(existing),
     patch.autoApprove !== undefined ? patch.autoApprove : existing?.autoApprove === true,
     false,
@@ -11173,7 +11181,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // a phone choose left a half-made room behind.  Sent here, a refusal
       // leaves nothing.  Left unmarked as "set up": the desktop's setup
       // prompt still offers itself, exactly as it does for a phone room.
-      const first: { bulletin?: string; defaultResponder?: GroupDefaultResponder; cwd?: string } = {};
+      interface FirstSettings {
+        bulletin?: string;
+        defaultResponder?: GroupDefaultResponder;
+        cwd?: string;
+      }
+      const first: FirstSettings = {};
       if (body.bulletin !== undefined) {
         if (typeof body.bulletin !== "string") return json(res, 400, { error: "bulletin must be a string" });
         if (body.bulletin.length > 12_000) {
@@ -12423,7 +12436,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // desktop's own dialog always sends the acknowledgement in this case.
       const turningAutoOn = body.autoApprove === true && existingBot?.autoApprove !== true;
       const ackError = localAutoAcknowledgementError(
-        turningAutoOn && existingBot ? { ...existingBot, bypassPermissions: false } : existingBot,
+        turningAutoOn && existingBot ? withoutBypass(existingBot) : existingBot,
         wantsComputers,
         wantsAuto === true,
         body.acknowledgeLocalAuto === true,

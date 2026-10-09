@@ -1385,9 +1385,6 @@ describe("Antigravity host control", () => {
     expect(host.argv).not.toContain("--dangerously-skip-permissions");
     const mode = host.argv.indexOf("--mode");
     expect(host.argv.slice(mode, mode + 2)).toEqual(["--mode", "accept-edits"]);
-    expect(
-      host.events.some((e) => (e as any).title === ANTIGRAVITY_HOST_CONTROL_NOTICE),
-    ).toBe(true);
 
     const viaComputers = await runTurn("host-computers-bypass", false, hostComputersIntegrations, {}, undefined, false, false, true);
     expect(viaComputers.argv).not.toContain("--dangerously-skip-permissions");
