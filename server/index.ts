@@ -1857,47 +1857,55 @@ async function interruptIfHostRevoked(
 const PAIRED_LOCAL_COMPUTER_ERROR =
   "This Mac can only be turned on or off in BotFleet on your computer";
 
-/** What a paired phone is told when its save would turn Auto-Approve or
- * Bypass Permissions ON for a bot that can use This Mac.  Auto on the person's
- * real desktop has a warning dialog that only the computer shows
- * (`localAutoAcknowledgementError`), so the phone cannot create that pair.
- * Switching either OFF, or ON for a bot that cannot use This Mac, is the
- * phone's to do (owner ruling, 2026-10-09). */
+/** What a paired phone is told when its save would turn Auto Mode ON for a bot
+ * that can use This Mac.  Auto Mode on the person's real desktop is the one
+ * switch that lets a click or keystroke on it go unasked, and its warning
+ * dialog is only shown by the computer (`localAutoAcknowledgementError`), so
+ * the phone cannot create that pair.  Turning Auto Mode OFF, or ON for a bot
+ * that cannot use This Mac, is the phone's to do (owner ruling, 2026-10-09). */
 const PAIRED_AUTO_ON_THIS_MAC_ERROR =
-  "Auto-Approve and Bypass Permissions can only be turned on in BotFleet on your computer for a bot that can use This Mac";
+  "Auto Mode can only be turned on in BotFleet on your computer for a bot that can use This Mac";
 
-/** The paired-device rules for a profile write that touches `computers`,
- * `autoApprove` or `bypassPermissions`: a refusal with the status to send, or
- * null when it may go ahead.  Called by the profile route, which is the one a
- * phone reaches through the sidecar (the desktop uses the broad bot PATCH).
- * The sidecar cannot make this call: telling "kept This Mac" from "added This
- * Mac", or "already Auto on this Mac" from "newly Auto", needs the stored bot,
- * so the check lives where the bot does, and a loopback caller of the same
- * route gets the same guard.
+/** The paired-device rules for a profile write that touches `computers` or
+ * `autoApprove`: a refusal with the status to send, or null when it may go
+ * ahead.  Called by the profile route, which is the one a phone reaches
+ * through the sidecar (the desktop uses the broad bot PATCH).  The sidecar
+ * cannot make this call: telling "kept This Mac" from "added This Mac", or
+ * "already Auto on this Mac" from "newly Auto", needs the stored bot, so the
+ * check lives where the bot does, and a loopback caller of the same route gets
+ * the same guard.
  *
  * Membership of `local` must come out the way it went in.  Everything else the
  * desktop PATCH does for a `computers` write is either unreachable once that
  * holds (the mid-turn interrupt only fires when `local` is removed) or runs
  * here too (the Auto Mode acknowledgement, whose doc says every route that
- * grants `computers` calls it).  The same acknowledgement is what stops a
- * switch to Auto-Approve or Bypass Permissions: the profile schema carries no
- * `acknowledgeLocalAuto`, so a bot that can use This Mac and is not already in
- * Auto cannot be put there from here, only from the desktop's own dialog. */
+ * grants `computers` calls it).  The same acknowledgement stops a switch to
+ * Auto Mode: the profile schema carries no `acknowledgeLocalAuto`, so a bot
+ * that can use This Mac and is not already in Auto Mode cannot be put there
+ * from here, only from the desktop's own dialog.
+ *
+ * Bypass Permissions is NOT part of that consent here, on purpose.  The
+ * desktop route counts it (AG, #870), but it cannot do what the dialog warns
+ * about: `autoVerdict` never answers a `local-computer` request in bypass, and
+ * no driver turns the bot's bypass into an engine switch on a turn that
+ * controls This Mac.  Counting it would make the phone's bypass switch fail on
+ * every Auto bot on a Mac (an Auto bot has no computer list, so it may reach
+ * the desktop), which would defeat the owner's 2026-10-09 ruling that bots get
+ * Bypass Permissions from the phone.  It is read as off when judging whether a
+ * bot is "already" in Auto Mode, so a phone-set bypass can never stand in for
+ * the Auto Mode acknowledgement. */
 function pairedProfileRefusal(
   existing: ComputerGrantSubject | null | undefined,
-  patch: { computers?: Array<"cloud" | "vm" | "local">; autoApprove?: boolean; bypassPermissions?: boolean },
+  patch: { computers?: Array<"cloud" | "vm" | "local">; autoApprove?: boolean },
 ): { status: number; error: string } | null {
   if (patch.computers !== undefined) {
     const heldLocal = currentComputerGrants(existing).includes("local");
     if (patch.computers.includes("local") !== heldLocal) return { status: 403, error: PAIRED_LOCAL_COMPUTER_ERROR };
   }
-  const nextAuto =
-    (patch.autoApprove !== undefined ? patch.autoApprove : existing?.autoApprove === true) ||
-    (patch.bypassPermissions !== undefined ? patch.bypassPermissions : existing?.bypassPermissions === true);
   const ackError = localAutoAcknowledgementError(
-    existing,
+    existing ? { ...existing, bypassPermissions: false } : existing,
     patch.computers ?? storedComputerGrants(existing),
-    nextAuto,
+    patch.autoApprove !== undefined ? patch.autoApprove : existing?.autoApprove === true,
     false,
     {
       currentDefault: cfg.botDefaults?.computers,
@@ -1907,9 +1915,9 @@ function pairedProfileRefusal(
     },
   );
   if (!ackError) return null;
-  // A request to turn auto on is declined for the computer to answer.
+  // A request to turn Auto Mode on is declined for the computer to answer.
   // Anything else gets the same 400 the desktop route would give.
-  return patch.autoApprove === true || patch.bypassPermissions === true
+  return patch.autoApprove === true
     ? { status: 403, error: PAIRED_AUTO_ON_THIS_MAC_ERROR }
     : { status: 400, error: ackError };
 }
@@ -5768,6 +5776,7 @@ async function startTurn(
         integrations,
         cwd,
         autoApprove: bot.autoApprove === true,
+        bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
       };
       // What the harness put in front of the model that the person did not
@@ -7856,6 +7865,7 @@ async function runGroupMemberTurn(
         tools: roomTurnTools,
         toolHost: roomToolHost,
         autoApprove: bot.autoApprove === true,
+        bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
         ...memberTurnSelection(selection),
       });
@@ -11880,8 +11890,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         localAutoConsentConfigBusy &&
         (parsed.patch.name !== undefined ||
           parsed.patch.computers !== undefined ||
-          parsed.patch.autoApprove !== undefined ||
-          parsed.patch.bypassPermissions !== undefined)
+          parsed.patch.autoApprove !== undefined)
       ) {
         return json(res, 409, { error: localAutoConsentConfigBusyError });
       }
@@ -11889,11 +11898,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // De-duplicated the way the broad PATCH stores it.
         parsed.patch.computers = [...new Set(parsed.patch.computers)];
       }
-      if (
-        parsed.patch.computers !== undefined ||
-        parsed.patch.autoApprove !== undefined ||
-        parsed.patch.bypassPermissions !== undefined
-      ) {
+      if (parsed.patch.computers !== undefined || parsed.patch.autoApprove !== undefined) {
         const refused = pairedProfileRefusal(existingBot, parsed.patch);
         if (refused) return json(res, refused.status, { error: refused.error });
       }

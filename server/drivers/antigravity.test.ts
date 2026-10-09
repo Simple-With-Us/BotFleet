@@ -1293,6 +1293,7 @@ describe("Antigravity host control", () => {
     beforeDispose?: () => Promise<void>,
     autoApprove?: boolean,
     unattended?: boolean,
+    bypassPermissions?: boolean,
   ) => {
     const dump = join(home, `${name}.json`);
     const instance = await AntigravityDriver.create({
@@ -1304,7 +1305,14 @@ describe("Antigravity host control", () => {
     });
     const recorder = recordEvents(instance.adapter);
     try {
-      await instance.adapter.sendTurn({ threadId: `t-host-${name}`, text: "hi", integrations, autoApprove, unattended });
+      await instance.adapter.sendTurn({
+        threadId: `t-host-${name}`,
+        text: "hi",
+        integrations,
+        autoApprove,
+        unattended,
+        bypassPermissions,
+      });
       await recorder.until((e) => e.type === "turn.completed");
       if (beforeDispose) await beforeDispose();
       return {
@@ -1350,6 +1358,46 @@ describe("Antigravity host control", () => {
     expect(sandbox.argv).not.toContain("--dangerously-skip-permissions");
     const mode = sandbox.argv.indexOf("--mode");
     expect(sandbox.argv.slice(mode, mode + 2)).toEqual(["--mode", "accept-edits"]);
+  });
+
+  it("carries a bot's Bypass Permissions to a turn that does not control this computer", async () => {
+    // Print mode has no approval cards, so the bot's own switch is the only
+    // way it can reach the engine's skip-permissions mode.  Without it a bot
+    // the person put in bypass had its shell commands refused by agy and
+    // nothing to approve them.
+    const sandbox = await runTurn("sandbox-bypass", false, sandboxIntegrations, {}, undefined, false, false, true);
+    expect(sandbox.argv).toContain("--dangerously-skip-permissions");
+    expect(sandbox.argv).not.toContain("--mode");
+
+    const plain = await runTurn("plain-bypass", false, undefined, {}, undefined, false, false, true);
+    expect(plain.argv).toContain("--dangerously-skip-permissions");
+
+    // Off stays off: only the bot's switch (or the engine's) turns it on.
+    const off = await runTurn("sandbox-no-bypass", false, sandboxIntegrations, {}, undefined, false, false, false);
+    expect(off.argv).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("never lets Bypass Permissions reach a turn that controls this computer", async () => {
+    // The broker draws the same line: a bot in bypass is still asked about
+    // anything that controls This Mac.  Here there is no broker, so the
+    // bypass is dropped and the host-control notice says why.
+    const host = await runTurn("host-bypass", false, hostIntegrations, {}, undefined, false, false, true);
+    expect(host.argv).not.toContain("--dangerously-skip-permissions");
+    const mode = host.argv.indexOf("--mode");
+    expect(host.argv.slice(mode, mode + 2)).toEqual(["--mode", "accept-edits"]);
+    expect(
+      host.events.some((e) => (e as any).title === ANTIGRAVITY_HOST_CONTROL_NOTICE),
+    ).toBe(true);
+
+    const viaComputers = await runTurn("host-computers-bypass", false, hostComputersIntegrations, {}, undefined, false, false, true);
+    expect(viaComputers.argv).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("applies Bypass Permissions to an unattended turn, as the broker's bypass does", async () => {
+    // Unlike autoApprove (withheld below), bypass is the person's standing
+    // choice to have nothing ask, webhook turns included.
+    const sandbox = await runTurn("sandbox-bypass-unattended", false, sandboxIntegrations, {}, undefined, false, true, true);
+    expect(sandbox.argv).toContain("--dangerously-skip-permissions");
   });
 
   it("withholds the bypass for an unattended host-control turn even with autoApprove", async () => {

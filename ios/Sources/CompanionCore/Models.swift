@@ -671,6 +671,10 @@ public struct InstanceCapabilities: Codable, Hashable, Sendable {
     /// True when this engine can contact other bots.  Nil means the computer
     /// did not say.
     public var agentsMcp: Bool? = nil
+    /// What a bot's Bypass Permissions switch does on this engine: "asks",
+    /// "native" or "none" (`shared/bypass-coverage.ts`).  Read it through
+    /// `BypassCoverage(wire:)`; nil is a computer that predates it.
+    public var bypassCoverage: String? = nil
 }
 
 public struct Instance: Codable, Hashable, Identifiable, Sendable {

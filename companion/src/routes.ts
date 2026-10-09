@@ -72,15 +72,17 @@ export function isCloudDesktopJoin(method: string, path: string): boolean {
  * options too or YOLO or whatever."  #323 (audit BF-IOS-001) had kept all of
  * them on the computer, and the native sheet showed them read-only.  What did
  * NOT move is host control of the person's real desktop:
- *   - The harness profile route refuses to turn Auto-Approve or Bypass
- *     Permissions ON for a bot that can use This Mac, with the same
- *     acknowledgement rule the desktop applies (`localAutoAcknowledgementError`
- *     in server/index.ts).  The warning dialog is the Mac's, so a phone cannot
- *     create that pair.  Like `computers`, that check needs the stored bot and
- *     lives there rather than here.
+ *   - The harness profile route refuses to turn Auto-Approve ON for a bot that
+ *     can use This Mac, with the same acknowledgement rule the desktop applies
+ *     (`localAutoAcknowledgementError` in server/index.ts).  Auto-Approve is the
+ *     one switch that lets a click on the real desktop go unasked, and its
+ *     warning dialog is the Mac's, so a phone cannot create that pair.  Like
+ *     `computers`, that check needs the stored bot and lives there rather than
+ *     here.  Turning it off is always the phone's.
  *   - Bypass Permissions never answers a request that controls This Mac
- *     (server/auto-approve.ts excludes `scope === "local-computer"`), so
- *     host control still asks even on a bot the phone put in bypass.
+ *     (server/auto-approve.ts excludes `scope === "local-computer"`), so host
+ *     control still asks even on a bot the phone put in bypass, and the phone
+ *     may switch it on for any bot.
  *   - The This Mac grant itself is still the Mac's alone (see `computers`). */
 export const COMPANION_PROFILE_PATCH_FIELDS = [
   "name",
@@ -101,8 +103,8 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "maxToolRounds",
   "cwd",
   // Execution policy, open to the phone by the 2026-10-09 owner ruling above.
-  // The harness validates each value, and refuses the "on" switch for a bot
-  // that can use This Mac.
+  // The harness validates each value, and refuses to turn autoApprove ON for
+  // a bot that can use This Mac.
   "autoApprove",
   "autoReview",
   "approvePeerComms",

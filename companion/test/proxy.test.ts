@@ -111,6 +111,14 @@ const device = async (
   return { status: res.status, body, headers: res.headers };
 };
 
+/** A bot made straight on the harness, the way the computer's own route makes
+ * one, and its id.  `Response.json()` is `unknown` under the server tsconfig
+ * (no DOM lib), so the shape is stated once here. */
+const createHarnessBot = async (): Promise<string> => {
+  const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
+  return ((await created.json()) as { bot: { id: string } }).bot.id;
+};
+
 /** raw request with a chosen Host header — fetch will not let us set one */
 const withHost = (port: number, host: string, path = "/api/health", headers: Record<string, string> = {}) =>
   new Promise<number>((resolve, reject) => {
@@ -353,8 +361,7 @@ describe("the sidecar in front of an unmodified harness", () => {
   });
 
   it("lets the phone switch cloud and Local VM, and leaves This Mac to the computer", async () => {
-    const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
-    const botId = (await created.json()).bot.id as string;
+    const botId = await createHarnessBot();
     const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
     const botNow = async () =>
       (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
@@ -407,12 +414,13 @@ describe("the sidecar in front of an unmodified harness", () => {
     }
   });
 
-  it("lets the phone set Auto-Approve, Auto Review, peer-contact approval and Bypass Permissions, but not on a bot that can use This Mac", async () => {
+  it("lets the phone set Auto Mode, Auto Review, peer-contact approval and Bypass Permissions, but not put a bot that can use This Mac in Auto Mode", async () => {
     // Owner ruling 2026-10-09: bots get bypass permissions from the phone too.
-    // Host control stays the computer's, so a bot that can use This Mac cannot
-    // be put in Auto or Bypass from here: the warning dialog is the Mac's.
-    const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
-    const botId = (await created.json()).bot.id as string;
+    // Host control stays the computer's: Auto Mode is the one switch that lets
+    // a click on the real desktop go unasked, and the warning dialog for that
+    // pair is the Mac's.  Bypass never answers a host-control request
+    // (server/auto-approve.ts), so it is the phone's on every bot.
+    const botId = await createHarnessBot();
     const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
     const botNow = async () =>
       (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
@@ -423,7 +431,7 @@ describe("the sidecar in front of an unmodified harness", () => {
         body: JSON.stringify(body),
       });
     const autoOnThisMac =
-      "Auto-Approve and Bypass Permissions can only be turned on in BotFleet on your computer for a bot that can use This Mac";
+      "Auto Mode can only be turned on in BotFleet on your computer for a bot that can use This Mac";
     try {
       // A new bot is on Auto, which on a Mac may reach the desktop.  Name its
       // sandboxed computers so the answer does not depend on the machine
@@ -457,38 +465,43 @@ describe("the sidecar in front of an unmodified harness", () => {
       expect(off.status).toBe(200);
       expect(await botNow()).toMatchObject({ autoApprove: false, bypassPermissions: false, autoReview: "off" });
 
-      // The computer hands the bot This Mac.  From then on the phone cannot
-      // turn either switch on, and nothing in the same save is written.
+      // The computer hands the bot This Mac.  The phone still cannot put it in
+      // Auto Mode, and nothing in the same save is written.
       expect((await loopback({ computers: ["vm", "local"] })).status).toBe(200);
-      for (const field of ["autoApprove", "bypassPermissions"]) {
-        const refused = await profile({ title: "must not apply", [field]: true });
-        expect(refused.status, field).toBe(403);
-        expect(refused.body.error, field).toBe(autoOnThisMac);
-      }
+      const refused = await profile({ title: "must not apply", autoApprove: true, bypassPermissions: true });
+      expect(refused.status).toBe(403);
+      expect(refused.body.error).toBe(autoOnThisMac);
       const afterRefusal = await botNow();
       expect(afterRefusal.title).not.toBe("must not apply");
       expect(afterRefusal.autoApprove).not.toBe(true);
       expect(afterRefusal.bypassPermissions).not.toBe(true);
-      // The review mode and peer-contact approval do not make the bot run
-      // unattended on the desktop, so they stay the phone's.
-      expect((await profile({ autoReview: "shadow", approvePeerComms: true })).status).toBe(200);
+      // Bypass, review mode and peer-contact approval do not let a click on
+      // the desktop go unasked, so they stay the phone's on this bot too.
+      const others = await profile({ bypassPermissions: true, autoReview: "shadow", approvePeerComms: true });
+      expect(others.status).toBe(200);
+      expect(others.body.bot).toMatchObject({ bypassPermissions: true, autoReview: "shadow", approvePeerComms: true });
+      // Bypass is not a stand-in for the Mac's warning: a bot in bypass is not
+      // "already in Auto Mode", so Auto Mode is still refused.
+      const stillRefused = await profile({ autoApprove: true });
+      expect(stillRefused.status).toBe(403);
+      expect(stillRefused.body.error).toBe(autoOnThisMac);
       // Taking This Mac away is still refused, as before.
       const dropped = await profile({ computers: ["vm"], bypassPermissions: false });
       expect(dropped.status).toBe(403);
       expect(dropped.body.error).toBe("This Mac can only be turned on or off in BotFleet on your computer");
+      expect((await botNow()).bypassPermissions).toBe(true);
 
-      // The computer answers its own warning.  A bot it put in Auto on This
-      // Mac keeps the phone's switches: re-saving them, and turning Bypass on
-      // beside the Auto the Mac already confirmed, are not a new pair.
+      // The computer answers its own warning.  A bot it put in Auto Mode on
+      // This Mac keeps the phone's switches: re-saving is not a new pair.
       const acknowledged = await loopback({ autoApprove: true, acknowledgeLocalAuto: true });
       expect(acknowledged.status).toBe(200);
       expect((await profile({ autoApprove: true })).status).toBe(200);
-      expect((await profile({ bypassPermissions: true })).status).toBe(200);
-      // Off, then on again, is a new pair: the Mac's dialog again.
       expect((await profile({ autoApprove: false, bypassPermissions: false })).status).toBe(200);
-      const again = await profile({ bypassPermissions: true });
+      // Off, then on again, is a new pair: the Mac's dialog again.
+      const again = await profile({ autoApprove: true });
       expect(again.status).toBe(403);
       expect(again.body.error).toBe(autoOnThisMac);
+      expect((await profile({ bypassPermissions: true })).status).toBe(200);
     } finally {
       await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
     }
@@ -499,7 +512,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     const other = join(home, "projects", "other");
     mkdirSync(join(shared, "sub"), { recursive: true });
     mkdirSync(other, { recursive: true });
-    const made = async () => (await (await fetch(`${HARNESS}/api/bots`, { method: "POST" })).json()).bot.id as string;
+    const made = createHarnessBot;
     const lead = await made();
     const botId = await made();
     const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
@@ -555,7 +568,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     const other = join(home, "projects", "room-other");
     mkdirSync(shared, { recursive: true });
     mkdirSync(other, { recursive: true });
-    const botId = (await (await fetch(`${HARNESS}/api/bots`, { method: "POST" })).json()).bot.id as string;
+    const botId = await createHarnessBot();
     const roomCount = async () => (await device("GET", "/api/bots")).body.groups.length as number;
     let roomId: string | undefined;
     try {
@@ -618,8 +631,7 @@ describe("the sidecar in front of an unmodified harness", () => {
   });
 
   it("lets the phone set the tool-round budget", async () => {
-    const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
-    const botId = (await created.json()).bot.id as string;
+    const botId = await createHarnessBot();
     try {
       const set = await device("PATCH", `/api/bots/${botId}/profile`, { body: { maxToolRounds: 40 } });
       expect(set.status).toBe(200);

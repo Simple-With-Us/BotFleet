@@ -39,29 +39,32 @@ public enum AutoReviewMode: String, CaseIterable, Hashable, Sendable {
 /// the computer; `companion/src/routes.ts` has the history).  What did not
 /// move is host control of the person's real desktop:
 ///
-/// - The computer refuses to turn Auto Mode or Bypass Permissions ON for a bot
-///   that can use This Mac, because the warning dialog for that pair is the
-///   Mac's (`PAIRED_AUTO_ON_THIS_MAC_ERROR` in server/index.ts).  Turning
-///   either off is always the phone's.
+/// - The computer refuses to turn Auto Mode ON for a bot that can use This Mac,
+///   because Auto Mode is the one switch that lets a click on the real desktop
+///   go unasked, and the warning dialog for that pair is the Mac's
+///   (`PAIRED_AUTO_ON_THIS_MAC_ERROR` in server/index.ts).  Turning it off is
+///   always the phone's.
 /// - Bypass Permissions never answers a request that controls This Mac
-///   (`server/auto-approve.ts`), so host control still asks on a bot in bypass.
+///   (`server/auto-approve.ts`), so host control still asks on a bot in bypass,
+///   and the phone may switch it on for any bot.
 ///
 /// Every sentence gap below is a no-break space plus a space, the way the
 /// rest of the app writes them.
 public enum BotExecutionPolicy {
-    /// Whether the phone can ask for Auto Mode or Bypass Permissions to be
-    /// turned ON for a bot with these computers.  False when the bot holds
-    /// This Mac, because the computer would refuse.  An Auto bot (no list) is
-    /// left to the computer, which knows whether it can reach the desktop: the
-    /// phone asks, and shows the computer's own sentence if it declines.
+    /// Whether the phone can ask for Auto Mode to be turned ON for a bot with
+    /// these computers.  False when the bot holds This Mac, because the
+    /// computer would refuse.  An Auto bot (no list) is left to the computer,
+    /// which knows whether it can reach the desktop: the phone asks, and shows
+    /// the computer's own sentence if it declines.  Bypass Permissions has no
+    /// such condition.
     public static func mayTurnOnAuto(computers: [String]?) -> Bool {
         !BotComputers.holdsThisMac(computers)
     }
 
-    /// Said under the switches, always, because an Auto bot's answer is the
-    /// computer's.
+    /// Said under the Auto Mode switch, always, because an Auto bot's answer
+    /// is the computer's.
     public static let thisMacNote =
-        "A bot that can use This Mac can only be put in Auto Mode or Bypass Permissions in BotFleet on your computer.\u{00A0} Turning them off works from here."
+        "A bot that can use This Mac can only be put in Auto Mode in BotFleet on your computer.\u{00A0} Turning it off works from here."
 
     // MARK: - Bypass Permissions
 
@@ -85,7 +88,9 @@ public enum BotExecutionPolicy {
         return text
     }
 
-    /// The line under the Bypass Permissions switch.
+    /// The line under the Bypass Permissions switch.  What it does on a
+    /// particular engine, when that is not the plain answer, is
+    /// `BypassCoverage.note`.
     public static func bypassSummary(isOn: Bool) -> String {
         isOn
             ? "Active.\u{00A0} Every tool call and command is approved automatically, except actions that control This Mac."
@@ -144,6 +149,37 @@ public enum BotExecutionPolicy {
     private static func support(_ flag: Bool?, engineKnown: Bool) -> EngineSupport {
         guard engineKnown, let flag else { return .unknown }
         return flag ? .supported : .unsupported
+    }
+}
+
+/// What a bot's Bypass Permissions switch does on an engine, as the computer
+/// reports it (`shared/bypass-coverage.ts`): the engine's approval requests are
+/// answered, its own skip-approvals mode is turned on, or the engine never asks.
+/// The notes are that file's, word for word; `companion/test/ios-client-parity.test.ts`
+/// fails if they drift.
+public enum BypassCoverage: String, Sendable {
+    case asks
+    case native
+    case none
+
+    /// An absent or unrecognized answer reads as `asks`, which says nothing: a
+    /// computer too old to report it, or a newer one, never makes the phone
+    /// claim the switch is dead.
+    public init(wire: String?) {
+        self = wire.flatMap(Self.init(rawValue:)) ?? .asks
+    }
+
+    public init(engine: Instance?) {
+        self.init(wire: engine?.capabilities?.bypassCoverage)
+    }
+
+    /// Shown under the Bypass Permissions switch, or nil when it works as described.
+    public var note: String? {
+        switch self {
+        case .asks: nil
+        case .native: "This engine has no approval cards.\u{00A0} Bypass Permissions turns on its skip-permissions mode for turns that do not control This Mac."
+        case .none: "This engine never asks for approval, so Bypass Permissions changes nothing for it."
+        }
     }
 }
 

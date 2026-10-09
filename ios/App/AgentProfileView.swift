@@ -315,6 +315,7 @@ struct AgentProfileView: View {
                 }
 
                 automationAndApprovalsSection
+                bypassPermissionsSection
                 computersSection
                 workingDirectorySection
 
@@ -415,6 +416,12 @@ struct AgentProfileView: View {
                 guard let item else { return }
                 Task { await upload(item) }
             }
+            .modifier(BypassConfirmation(
+                isPresented: $confirmingBypass,
+                botName: current.name,
+                model: modelId,
+                confirm: { bypassPermissions = true }
+            ))
         }
     }
 
@@ -574,28 +581,83 @@ struct AgentProfileView: View {
         }
     }
 
-    /// Read-only on purpose.  These decide what a bot runs without asking and
-    /// who it may contact without asking, and the companion keeps them on the
-    /// computer (`companion/src/routes.ts`), so a switch here would only ever
-    /// come back refused.  The values are the computer's, live.
+    /// The execution policy, which the phone owns since the owner's ruling of
+    /// 2026-10-09 (`BotExecutionPolicy` has the history).  The one thing it
+    /// does not offer is turning Auto Mode ON for a bot that holds This Mac:
+    /// the computer would refuse, because that pair's warning is the Mac's.
+    /// Turning Auto Mode off always works, and so does Bypass Permissions.
     @ViewBuilder
     private var automationAndApprovalsSection: some View {
         Section {
-            LabeledContent("Automatic approvals", value: (current.autoApprove ?? false) ? "On" : "Off")
-            LabeledContent("Auto review", value: Self.autoReviewLabel(current.autoReview))
-            LabeledContent("Ask before contacting other bots", value: (current.approvePeerComms ?? false) ? "On" : "Off")
+            Toggle("Auto Mode", isOn: $autoApprove)
+                .disabled(!autoApprove && !BotExecutionPolicy.mayTurnOnAuto(computers: current.computers))
+            Picker("Auto Review", selection: $autoReview) {
+                ForEach(autoReviewChoices, id: \.self) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .disabled(autoReviewChoices.count < 2)
+            Toggle("Ask Before Contacting Other Bots", isOn: $approvePeerComms)
+                .disabled(!approvePeerComms && !peerCommsSupport.allowsTurningOn)
         } header: {
             Text("Automation & Approvals")
         } footer: {
-            Text("Change On Mac:\u{00A0} these decide what a bot may do without asking, so they are changed in BotFleet on your computer.\u{00A0} Automatic approvals run safe read-only and non-destructive tool operations without confirmation.\u{00A0} Auto review inspects changes for syntax and safety.")
+            VStack(alignment: .leading, spacing: 6) {
+                Text(BotExecutionPolicy.autoSummary(isOn: autoApprove))
+                Text(BotExecutionPolicy.autoReviewSummary(bypassIsOn: bypassPermissions, support: autoReviewSupport))
+                Text(BotExecutionPolicy.peerCommsSummary(isOn: approvePeerComms, support: peerCommsSupport))
+                Text(BotExecutionPolicy.thisMacNote)
+            }
         }
     }
 
-    private static func autoReviewLabel(_ value: String?) -> String {
-        switch value {
-        case "shadow": return "Shadow (advisory)"
-        case "enforce": return "Enforce (blocks unsafe)"
-        default: return "Off"
+    /// Bypass Permissions has its own section because it is the one switch here
+    /// that drops every approval card, destructive actions included.  Turning
+    /// it on goes through `confirmingBypass`; turning it off does not ask.
+    @ViewBuilder
+    private var bypassPermissionsSection: some View {
+        Section {
+            Toggle("Bypass Permissions", isOn: bypassBinding)
+        } header: {
+            Text("Bypass Permissions")
+        } footer: {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(BotExecutionPolicy.bypassSummary(isOn: bypassPermissions))
+                if let note = BypassCoverage(engine: policyEngine).note {
+                    Text(note)
+                }
+            }
+        }
+    }
+
+    /// Switching on asks first; the toggle stays where it was until the person
+    /// confirms, because `get` reads the unconfirmed state.
+    private var bypassBinding: Binding<Bool> {
+        Binding(
+            get: { bypassPermissions },
+            set: { wantsOn in
+                if wantsOn {
+                    confirmingBypass = true
+                } else {
+                    bypassPermissions = false
+                }
+            }
+        )
+    }
+
+    /// The engine the form is set to, which is what the next turn runs on.
+    private var policyEngine: Instance? {
+        instances.first(where: { $0.id == instanceId })
+    }
+
+    private var autoReviewSupport: EngineSupport { BotExecutionPolicy.autoReviewSupport(policyEngine) }
+    private var peerCommsSupport: EngineSupport { BotExecutionPolicy.peerCommsSupport(policyEngine) }
+
+    /// Off, what is set now, and the others only on an engine that can review,
+    /// the way the desktop disables them.
+    private var autoReviewChoices: [AutoReviewMode] {
+        AutoReviewMode.allCases.filter { mode in
+            mode == .off || mode == autoReview || autoReviewSupport.allowsTurningOn
         }
     }
 
@@ -894,17 +956,27 @@ struct AgentProfileView: View {
         )
     }
 
-    /// A refused save puts the two fields the computer can say no to back to
-    /// what it holds, so the sheet stops showing a switch or folder as saved
-    /// after the banner says it was not.  The computer's own sentence is the
-    /// banner (`Session.updateProfile` records it).  A name, a voice or a
-    /// model stays as typed for the retry.
+    /// A refused save puts the fields the computer can say no to back to what
+    /// it holds, so the sheet stops showing a switch or folder as saved after
+    /// the banner says it was not.  The computer's own sentence is the banner
+    /// (`Session.updateProfile` records it).  A name, a voice or a model stays
+    /// as typed for the retry.  Auto Mode is on the list because the computer
+    /// declines it for a bot that can use This Mac; the other three are only
+    /// here because a refused save refuses them all.
     private func revertRefusableFields() {
         let held = current
         computers = Set(held.computers ?? [])
         baseline.computers = computers
         cwd = held.cwd ?? ""
         baseline.cwd = cwd
+        autoApprove = held.autoApprove ?? false
+        baseline.autoApprove = autoApprove
+        autoReview = AutoReviewMode(stored: held.autoReview)
+        baseline.autoReview = autoReview
+        approvePeerComms = held.approvePeerComms ?? false
+        baseline.approvePeerComms = approvePeerComms
+        bypassPermissions = held.bypassPermissions ?? false
+        baseline.bypassPermissions = bypassPermissions
     }
 
     /// The same save for a computer that predates per-device voices and so
@@ -1061,7 +1133,35 @@ struct AgentProfileView: View {
         maxToolRoundsText = Self.roundsText(bot.maxToolRounds)
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
+        autoApprove = bot.autoApprove ?? false
+        autoReview = AutoReviewMode(stored: bot.autoReview)
+        approvePeerComms = bot.approvePeerComms ?? false
+        bypassPermissions = bot.bypassPermissions ?? false
         baseline = ProfileFormSnapshot(bot: bot)
+    }
+}
+
+/// The question before Bypass Permissions goes on.  A separate modifier so the
+/// sheet's already long body does not carry the alert's closures too.
+private struct BypassConfirmation: ViewModifier {
+    @Binding var isPresented: Bool
+    let botName: String
+    let model: String
+    let confirm: () -> Void
+
+    private var confirmTitle: String {
+        BypassModelRisk.isHighRisk(model: model)
+            ? BotExecutionPolicy.bypassRiskyConfirmButton
+            : BotExecutionPolicy.bypassConfirmButton
+    }
+
+    func body(content: Content) -> some View {
+        content.alert(BotExecutionPolicy.bypassTitle, isPresented: $isPresented) {
+            Button("Cancel", role: .cancel) {}
+            Button(confirmTitle, role: .destructive, action: confirm)
+        } message: {
+            Text(BotExecutionPolicy.bypassWarning(botName: botName, model: model))
+        }
     }
 }
 
@@ -1079,6 +1179,10 @@ private struct ProfileFormSnapshot {
     var maxToolRoundsText: String
     var computers: Set<String>
     var cwd: String
+    var autoApprove: Bool
+    var autoReview: AutoReviewMode
+    var approvePeerComms: Bool
+    var bypassPermissions: Bool
 
     init(bot: Bot) {
         name = bot.name
@@ -1093,6 +1197,10 @@ private struct ProfileFormSnapshot {
         maxToolRoundsText = bot.maxToolRounds.map(String.init) ?? ""
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
+        autoApprove = bot.autoApprove ?? false
+        autoReview = AutoReviewMode(stored: bot.autoReview)
+        approvePeerComms = bot.approvePeerComms ?? false
+        bypassPermissions = bot.bypassPermissions ?? false
     }
 }
 

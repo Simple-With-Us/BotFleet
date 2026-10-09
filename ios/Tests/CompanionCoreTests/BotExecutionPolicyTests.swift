@@ -90,6 +90,32 @@ final class BotExecutionPolicyTests: XCTestCase {
         XCTAssertFalse(EngineSupport.unknown.allowsTurningOn)
     }
 
+    func testTheSwitchSaysSoWhereTheEngineNeverAsksOrHasAModeOfItsOwn() throws {
+        func engine(_ capabilities: String) throws -> Instance {
+            try JSONDecoder().decode(
+                Instance.self,
+                from: Data(#"{"instanceId":"e","driverKind":"piAgent","snapshot":{"state":"available"},"models":{"default":"m","options":[]},"capabilities":\#(capabilities)}"#.utf8)
+            )
+        }
+        XCTAssertEqual(BypassCoverage(engine: try engine(#"{"bypassCoverage":"none"}"#)), .none)
+        XCTAssertEqual(BypassCoverage(engine: try engine(#"{"bypassCoverage":"native"}"#)), .native)
+        XCTAssertEqual(BypassCoverage(engine: try engine(#"{"bypassCoverage":"asks"}"#)), .asks)
+        // A computer that predates the answer, a newer one with a word this
+        // build has not heard, and an engine not loaded yet all read as the
+        // plain case: the phone never claims the switch is dead on a guess.
+        XCTAssertEqual(BypassCoverage(engine: try engine(#"{"toolLoop":true}"#)), .asks)
+        XCTAssertEqual(BypassCoverage(engine: try engine(#"{"bypassCoverage":"someday"}"#)), .asks)
+        XCTAssertEqual(BypassCoverage(engine: nil), .asks)
+        XCTAssertNil(BypassCoverage.asks.note)
+        XCTAssertEqual(
+            BypassCoverage.none.note,
+            "This engine never asks for approval, so Bypass Permissions changes nothing for it."
+        )
+        let native = try XCTUnwrap(BypassCoverage.native.note)
+        XCTAssertTrue(native.contains("skip-permissions mode for turns that do not control This Mac"))
+        XCTAssertFalse(native.contains(".  "), "an ASCII double space")
+    }
+
     // MARK: - This Mac
 
     func testThePhoneDoesNotOfferToTurnAutoOnForABotThatHoldsThisMac() {

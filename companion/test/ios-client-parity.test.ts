@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
+import { bypassCoverageNote } from "../../shared/bypass-coverage.ts";
 import { COMPANION_PROFILE_PATCH_FIELDS, denyReason } from "../src/routes.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -69,5 +70,34 @@ describe("the native client against the allowlist", () => {
       (key) => !declaredButUnused.has(key) && !(COMPANION_PROFILE_PATCH_FIELDS as readonly string[]).includes(key),
     );
     expect(refused).toEqual([]);
+  });
+});
+
+describe("the native app's copies of what the desktop decides", () => {
+  // Two lists the phone cannot import, because they are written in the other
+  // language.  Each is copied once, and these fail when the copy drifts.
+  it("warns about the same models before a bypass as the desktop does", () => {
+    const desktop = readFileSync(join(HERE, "..", "..", "shared", "model-safety.ts"), "utf8");
+    const desktopBlock = desktop.match(/const HIGH_RISK_PATTERNS[^=]*= \[([\s\S]*?)\n\];/)?.[1] ?? "";
+    const desktopPatterns = [...desktopBlock.matchAll(/^\s*\/(.+)\/i,\s*$/gm)].map((match) => match[1]);
+
+    const swift = read("BotExecutionPolicy.swift");
+    const swiftBlock = swift.match(/static let highRiskPatterns: \[String\] = \[([\s\S]*?)\n    \]/)?.[1] ?? "";
+    const swiftPatterns = [...swiftBlock.matchAll(/#"(.+)"#/g)].map((match) => match[1]);
+
+    expect(desktopPatterns.length).toBeGreaterThan(8);
+    expect(swiftPatterns).toEqual(desktopPatterns);
+  });
+
+  it("says the same thing as the desktop where Bypass Permissions does not simply work", () => {
+    const swift = read("BotExecutionPolicy.swift");
+    for (const coverage of ["native", "none"] as const) {
+      const note = bypassCoverageNote(coverage)!;
+      // The Swift source spells a no-break space as an escape.
+      const asSwift = note.replaceAll("\u00A0", "\\u{00A0}");
+      expect(swift, coverage).toContain(`"${asSwift}"`);
+    }
+    // The wire names the phone decodes are the ones the computer sends.
+    expect(swift).toMatch(/case asks\s+case native\s+case none/);
   });
 });
