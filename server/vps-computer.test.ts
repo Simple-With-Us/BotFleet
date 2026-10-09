@@ -612,6 +612,105 @@ describe("VPS computer", () => {
     expect(fake.calls.some(({ args }) => args[2] === "exec" && args.includes("tail"))).toBe(true);
   });
 
+  describe("a failed desktop probe never blames the Driver's normal startup output", () => {
+    const ESC = "\u001b";
+    // The owner's card on 2026-10-08: the update notice, a coloured WARN, and
+    // the readiness line, shown as "The VPS CUA desktop failed to start".
+    const healthyLog = [
+      "cua-driver v0.34.0 is available (you have v0.20.0)",
+      "   Update with: cua-driver update",
+      "   Release notes: https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.34.0",
+      `${ESC}[2m2026-10-07T13:54:42.869037Z${ESC}[0m ${ESC}[33m WARN${ESC}[0m ${ESC}[2mplatform_linux::overlay${ESC}[0m${ESC}[2m:${ESC}[0m X11 overlay: root reads cannot see this window's own pixels`,
+      "Cua Driver daemon listening on /opt/ogb/run/cua.sock",
+    ].join("\n");
+
+    /** A runner whose Driver probe throws `probeError` and whose supervisor log
+     * reads as `log` (or fails to read, when `log` is an Error). */
+    function failingProbe(probeError: Error, log: string | Error) {
+      const fake = fixture();
+      const runner: VpsCommandRunner = async (args, options) => {
+        if (args[2] === "exec" && args.at(-1) === "--version") throw probeError;
+        if (args[2] === "exec" && args.includes("tail")) {
+          if (log instanceof Error) throw log;
+          return { stdout: log, stderr: "" };
+        }
+        return fake.runner(args, options);
+      };
+      return { runner, calls: fake.calls };
+    }
+
+    it("shows no banner, no WARN and no escape codes when the log is only startup noise", async () => {
+      const { runner } = failingProbe(new Error("CUA health report is failed"), healthyLog);
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.desktopReady).toBe(false);
+      expect(status.container).toBe("running");
+      expect(status.problem).toBe("The VPS CUA desktop failed to start: CUA health report is failed");
+      for (const noise of ["Release notes", "WARN", "overlay", "listening", "[2m", "[0m", ESC]) {
+        expect(status.problem).not.toContain(noise);
+      }
+    });
+
+    it("falls back to the generic not-ready copy when nothing real can be said", async () => {
+      const { runner } = failingProbe(new Error(healthyLog), healthyLog);
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.desktop_error).toBeNull();
+      expect(status.desktopUnreachable).toBe(false);
+      expect(status.problem).toBe("The VPS container started, but CUA Driver is not ready yet");
+    });
+
+    it("reports one timed-out probe as a transient check failure beside a running container", async () => {
+      const timedOut = new Error("Docker-over-SSH command timed out");
+      const { runner } = failingProbe(timedOut, timedOut);
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.container).toBe("running");
+      expect(status.desktopReady).toBe(false);
+      expect(status.desktop_error).toBeNull();
+      expect(status.desktopUnreachable).toBe(true);
+      expect(status.ready).toBe(false);
+      expect(status.problem).toBe("Couldn't reach the VPS desktop just now; retrying");
+      expect(status.problem).not.toMatch(/failed to start|agent/i);
+    });
+
+    it("still reports a real supervisor fault when the probe also timed out", async () => {
+      const timedOut = new Error("Docker-over-SSH command timed out");
+      const { runner } = failingProbe(
+        timedOut,
+        `${healthyLog.split("\n")[0]}\n${ESC}[31m2026-10-07T13:56:00Z ERROR${ESC}[0m cua_driver: worker panicked`,
+      );
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.desktopUnreachable).toBe(false);
+      expect(status.problem).toBe(
+        "The VPS CUA desktop failed to start: 2026-10-07T13:56:00Z ERROR cua_driver: worker panicked",
+      );
+    });
+
+    it("names the Driver version that answered when it is not the pinned one", async () => {
+      const fake = fixture();
+      const runner: VpsCommandRunner = async (args, options) => {
+        if (args[2] === "exec" && args.at(-1) === "--version") return { stdout: "cua-driver 0.34.0\n", stderr: "" };
+        if (args[2] === "exec" && args.includes("tail")) return { stdout: healthyLog, stderr: "" };
+        return fake.runner(args, options);
+      };
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.problem).toBe(
+        `The VPS CUA desktop failed to start: unexpected CUA Driver version "cua-driver 0.34.0" (expected ${CUA_DRIVER_VERSION})`,
+      );
+    });
+
+    it("strips escape codes from a transport failure", async () => {
+      const fake = fixture();
+      const runner: VpsCommandRunner = async (args, options) => {
+        if (args[2] === "image") throw new Error(`${ESC}[31mssh: connect to host vps port 22: Operation timed out${ESC}[0m`);
+        return fake.runner(args, options);
+      };
+      const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+      expect(status.daemonUp).toBe(false);
+      expect(status.problem).toBe(
+        "Docker over SSH failed while checking the VPS: ssh: connect to host vps port 22: Operation timed out",
+      );
+    });
+  });
+
   it("waits for readiness with a cheap driver probe and backoff, not full re-inspections", async () => {
     vi.useFakeTimers();
     try {

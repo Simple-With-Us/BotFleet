@@ -30,6 +30,7 @@ import {
   MANAGED_LABEL,
 } from "./container-computer.ts";
 import { resolveRuntimeCommand } from "./container-runtime-guard.ts";
+import { judgeDesktopProbeFailure, problemText } from "./desktop-probe.ts";
 import {
   ensureSharedVpsSessionExecArgs,
   isSharedVpsMode,
@@ -254,6 +255,10 @@ export interface VpsComputerStatus {
   security: "hardened" | "unsafe" | "unknown";
   desktopReady: boolean;
   desktop_error: string | null;
+  /** One desktop check timed out or lost its transport, so the desktop's state
+   * is unknown right now.  Never a "failed to start": the container is known
+   * to be running, and the next poll re-checks. */
+  desktopUnreachable: boolean;
   ready: boolean;
   problem: string | null;
   image_ref: string;
@@ -510,6 +515,7 @@ function emptyStatus(target: VpsTarget, alias: string | null): VpsComputerStatus
     security: "unknown",
     desktopReady: false,
     desktop_error: null,
+    desktopUnreachable: false,
     ready: false,
     problem: alias ? "Docker over SSH is not reachable" : "Configure a VPS SSH alias in App Settings → Connections",
     image_ref: VPS_IMAGE,
@@ -531,7 +537,7 @@ function isMissingObjectMessage(message: string): boolean {
 }
 
 function transportFailure(message: string): string {
-  return `Docker over SSH failed while checking the VPS: ${message.trim().slice(0, 200) || "unknown transport error"}`;
+  return `Docker over SSH failed while checking the VPS: ${problemText(message, 200) || "unknown transport error"}`;
 }
 
 function privateDockerIpv4(value: string | undefined): boolean {
@@ -589,6 +595,7 @@ function statusProblem(status: VpsComputerStatus): string | null {
   if (status.mounts === "unsafe") return "The VPS container has host mounts; refusing to use it";
   if (status.security === "unsafe") return "The VPS container is missing BotFleet safety limits";
   if (status.container === "stopped") return "The BotFleet VPS container is stopped";
+  if (status.desktopUnreachable) return "Couldn't reach the VPS desktop just now; retrying";
   if (status.desktop_error) return `The VPS CUA desktop failed to start: ${status.desktop_error}`;
   if (!status.desktopReady) return "The VPS container started, but CUA Driver is not ready yet";
   return null;
@@ -761,7 +768,13 @@ async function computeVpsComputerStatus(
     if (canProbe && containerRef) {
       try {
         const version = await run(cuaExecArgs(["--version"], { container: containerRef }));
-        if (version.stdout.trim() !== `cua-driver ${CUA_DRIVER_VERSION}`) throw new Error("unexpected CUA Driver version");
+        if (version.stdout.trim() !== `cua-driver ${CUA_DRIVER_VERSION}`) {
+          // Say which version answered: the Driver's own update notice names
+          // the newest release, which is easy to mistake for the one running.
+          throw new Error(
+            `unexpected CUA Driver version "${problemText(version.stdout, 60) || "none"}" (expected ${CUA_DRIVER_VERSION})`,
+          );
+        }
         await run(cuaExecArgs(["status", "--socket", CUA_SOCKET], { container: containerRef }));
         const health = await run(
           cuaExecArgs(["call", "health_report", "{}", "--socket", CUA_SOCKET], { container: containerRef }),
@@ -791,20 +804,24 @@ async function computeVpsComputerStatus(
         status.desktopReady = true;
       } catch (error) {
         status.desktopReady = false;
-        status.desktop_error = error instanceof Error ? error.message.slice(0, 320) : null;
-        // Mirror the Local VM's probe: when the desktop fails, the
-        // supervisor's error log says WHY — a bounded tail turns an endless
-        // "not ready yet" into something the user can act on.
+        // Mirror the Local VM's probe: the supervisor's error log says WHY the
+        // desktop failed.  A bounded tail of it is only a reason when it holds
+        // a real fault: a healthy Driver writes its update notice and WARN
+        // lines to the same file, so the log is judged, never pasted.
+        let supervisorLog: string | null = null;
         try {
           const errorLog = await run(
-            ["exec", containerRef, "tail", "-n", "4", "/var/log/supervisor/cua-driver.error.log"],
+            ["exec", containerRef, "tail", "-n", "12", "/var/log/supervisor/cua-driver.error.log"],
             10_000,
           );
-          status.desktop_error =
-            errorLog.stdout.replace(/\s+/g, " ").trim().slice(0, 320) || status.desktop_error;
+          supervisorLog = errorLog.stdout;
         } catch {
-          // The log may not exist during the first seconds of container boot.
+          // The log may not exist during the first seconds of container boot,
+          // or the link that failed the probe may fail this read too.
         }
+        const verdict = judgeDesktopProbeFailure(error instanceof Error ? error : new Error(String(error)), supervisorLog);
+        status.desktop_error = verdict.desktopError;
+        status.desktopUnreachable = verdict.unreachable;
       }
     }
   } catch (error) {
@@ -819,6 +836,9 @@ async function computeVpsComputerStatus(
   }
 
   status.problem = statusProblem(status);
+  // Every path to this string (a transport message, a probe message, a log
+  // line) may carry terminal colour codes; strip them once, here.
+  if (status.problem) status.problem = problemText(status.problem, 600);
   status.ready = status.problem === null;
   return status;
 }
