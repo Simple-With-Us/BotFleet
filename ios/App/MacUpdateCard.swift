@@ -66,6 +66,8 @@ struct MacUpdateSection: View {
                 // happens to a message sent now, and when the restart begins.
                 // Separate from the run row because a hold is also real when
                 // the update was started from the Mac's own terminal.
+                // Judged again against the timeline's clock inside `holdRow`;
+                // this check only keeps an already-expired hold from adding a row.
                 if let drain = status.drain, drain.isActive(at: Date()) {
                     holdRow(drain, updating: status.running == nil)
                 }
@@ -289,23 +291,28 @@ struct MacUpdateSection: View {
     }
 
     /// What a message sent now will do, and when the restart begins.  The
-    /// countdown ticks once a second; nothing else on the card moves.
+    /// whole row, not just its countdown, is judged against the clock the
+    /// timeline ticks, so a hold whose lease runs out while the card is open
+    /// stops saying "Updating…" at the deadline rather than waiting for the
+    /// next status to arrive.
     private func holdRow(_ drain: MacUpdateDrain, updating: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if updating {
-                HStack(spacing: 12) {
-                    MacUpdateIcon(symbol: "arrow.triangle.2.circlepath", color: .orange)
-                    Text("Updating…")
-                        .foregroundStyle(.primary)
-                    Spacer()
-                    ProgressView().controlSize(.small)
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            if drain.isActive(at: context.date) {
+                VStack(alignment: .leading, spacing: 8) {
+                    if updating {
+                        HStack(spacing: 12) {
+                            MacUpdateIcon(symbol: "arrow.triangle.2.circlepath", color: .orange)
+                            Text("Updating…")
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                    Text(drain.summaryText(at: context.date))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 40)
                 }
-            }
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text(drain.summaryText(at: context.date))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 40)
             }
         }
     }
