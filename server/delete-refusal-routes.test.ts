@@ -30,8 +30,19 @@ let stdout = "";
 let stderr = "";
 let portBase = 0;
 
+/** Request bodies used in this file. */
+interface ApiBody {
+  name?: string;
+  memberIds?: string[];
+  prompt?: string;
+  botId?: string;
+  runOn?: string;
+  enabled?: boolean;
+  schedule?: { type: string; time: string; weekdays: number[] };
+}
+
 const base = () => `http://127.0.0.1:${portBase}`;
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+const api = async (method: string, path: string, body?: ApiBody): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${base()}${path}`, {
     method,
     headers: body === undefined ? undefined : { "content-type": "application/json" },
