@@ -2615,6 +2615,27 @@ test("resolveTarget raises the wrapper's explanation before it touches git", asy
   assert.match(body, /new ResolutionError\(nothingNewer, "no-green-build"\)/);
 });
 
+test("the selection gives up long before the harness decides a run never started", async () => {
+  // The selection runs before the updater writes its first progress record.  The
+  // harness settles a run with no record after LAUNCH_GRACE_MS and removes its
+  // launchd job, so a slow GitHub must not be able to outlast that.
+  const control = await readFile(join(scripts, "..", "server/update-control.ts"), "utf8");
+  const grace = Number(/const LAUNCH_GRACE_MS = ([\d_]+)/.exec(control)?.[1]?.replaceAll("_", ""));
+  assert.ok(grace > 0, "the harness's launch grace is still where this test looks for it");
+
+  const wrapper = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const watchdog = Number(/\}, (\d+)\);\n\s+try \{/.exec(wrapper)?.[1]);
+  assert.ok(watchdog > 0 && watchdog <= grace / 2, `the wrapper's watchdog (${watchdog}ms) must be at most half of ${grace}ms`);
+
+  const resolver = await readFile(join(scripts, "ci-build-resolver.mjs"), "utf8");
+  const selection = resolver.slice(resolver.indexOf("Choosing WHICH commit to install"));
+  const requests = selection.match(/requestJson\(/g)?.length ?? 0;
+  const bounded = selection.match(/timeoutMs: SELECTION_REQUEST_TIMEOUT_MS/g)?.length ?? 0;
+  assert.ok(requests >= 3, "the selection still makes its Actions requests");
+  assert.equal(bounded, requests, "every Actions request the selection makes carries the short timeout");
+  assert.match(selection, /const SELECTION_REQUEST_TIMEOUT_MS = 10_000;/);
+});
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
