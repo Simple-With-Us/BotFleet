@@ -15,7 +15,6 @@ import {
   alignSpokenToDisplay,
   alignmentQuality,
   buildKaraokeTimeline,
-  FOLLOW_DISPLAY_MIN,
   FOLLOW_SPOKEN_MIN,
   karaokeFollowable,
   estimatedClips,
@@ -343,6 +342,31 @@ function landedOn(a: KaraokeAlignment, text: string, nth = 0): string {
   throw new Error(`no spoken word ${text} #${nth}`);
 }
 
+/** Real paths from this change, for the list-retold cases. */
+const PATHS = [
+  "server/tts/message-audio.ts", "server/tts/speech-summary.ts", "shared/karaoke-align.ts", "shared/spoken-script.ts",
+  "src/lib/tts/index.ts", "src/lib/karaoke-session.ts", "ios/Sources/CompanionCore/KaraokeAlign.swift",
+  "server/tts/speech-text.ts", "shared/speech-spans.ts", "shared/voice-summary.ts", "src/lib/tts/karaoke-feed.ts",
+  "ios/App/Karaoke.swift", "ios/App/Session.swift", "ios/Sources/CompanionCore/KaraokeScript.swift",
+  "ios/Sources/CompanionCore/MessageVoice.swift", "src/components/VoiceSettings.tsx", "src/lib/tts/schema.ts",
+  "server/store.ts", "server/index.ts", "src/lib/karaoke-highlight.ts", "shared/bot-voice.ts",
+  "server/tts/minimax.ts", "src/components/ChatMarkdown.tsx", "ios/App/ChatView.swift", "docs/tts-karaoke.md",
+];
+
+/** A status table as the Mac renders it: one cell per line. */
+const STATUS_TABLE = [
+  "Here is where every bot stands:",
+  "Bot", "State", "Last run", "Branch",
+  "Scout", "idle", "3:15 PM", "main",
+  "Builder", "running", "3:40 PM", "claude/voice-distill-karaoke",
+  "Archivist", "idle", "2:05 PM", "main",
+  "Reviewer", "failed", "3:42 PM", "codex/review-sweep",
+  "Courier", "idle", "1:10 PM", "main",
+  "Janitor", "idle", "12:30 PM", "main",
+  "Scribe", "idle", "11:55 AM", "docs/tts-notes",
+  "Watcher", "idle", "3:00 PM", "main",
+].join("\n");
+
 const BRIEF_REPLY = [
   "I tracked down the flaky test in the cache suite.",
   "The failure only showed up when two workers warmed the cache at the same time.  The second worker read a half-written entry and the assertion on the entry size failed.",
@@ -426,6 +450,50 @@ export const DISTILLED_CASES: Array<{
     lands: [["changed", 0, "changed"], ["files", 0, "files"], ["tests", 0, "tests"], ["pass", 0, "pass"]],
   },
   {
+    // Under a tenth of the words on screen pair; the rest are swept.
+    name: "distilled: a list of twelve paths retold in one line",
+    display: `I changed these files:\n${PATHS.slice(0, 12).join("\n")}\nAll the tests pass.`,
+    spoken: "I changed twelve files, mostly in the speech and karaoke code. All the tests pass.",
+    followable: true,
+    lands: [["changed", 0, "changed"], ["files", 0, "files"], ["tests", 0, "tests"], ["pass", 0, "pass"]],
+  },
+  {
+    name: "distilled: a list of twenty-five paths retold in one line",
+    display: `I changed these files:\n${PATHS.join("\n")}\nAll the tests pass.`,
+    spoken: "I changed twenty five files, mostly in the speech and karaoke code. All the tests pass.",
+    followable: true,
+    lands: [["changed", 0, "changed"], ["files", 0, "files"], ["tests", 0, "tests"], ["pass", 0, "pass"]],
+  },
+  {
+    name: "distilled: a status table retold in one sentence",
+    display: STATUS_TABLE,
+    spoken: "Every bot is idle except Builder, which is running, and Reviewer, which failed.",
+    followable: true,
+    lands: [["Builder", 0, "Builder"], ["running", 0, "running"], ["Reviewer", 0, "Reviewer"], ["failed", 0, "failed"]],
+  },
+  {
+    // This repo's own yyyymmddHHMM build numbers: twelve words, one code.
+    name: "distilled: a twelve-digit build number read digit by digit",
+    display: "The build number is 202610081532.",
+    spoken: "The build number is two zero two six one zero zero eight one five three two.",
+    followable: true,
+    lands: [["number", 0, "number"], ["two", 0, "202610081532"], ["eight", 0, "202610081532"], ["two", 2, "202610081532"]],
+  },
+  {
+    name: "distilled: a ten-digit order number read digit by digit",
+    display: "Your order number is 4711923856.",
+    spoken: "Your order number is four seven one one nine two three eight five six.",
+    followable: true,
+    lands: [["order", 0, "order"], ["four", 0, "4711923856"], ["six", 0, "4711923856"]],
+  },
+  {
+    name: "distilled: a nine-character id read character by character",
+    display: "The run id is abcdef123.",
+    spoken: "The run id is a b c d e f one two three.",
+    followable: true,
+    lands: [["id", 0, "id"], ["b", 0, "abcdef123"], ["three", 0, "abcdef123"]],
+  },
+  {
     name: "condensed, in order",
     display: BRIEF_REPLY,
     spoken: "I tracked down the flaky cache test. Two workers warmed the cache at once. I added a lock and a regression test, and it passes now.",
@@ -480,7 +548,7 @@ describe("distilled scripts", () => {
     });
   }
 
-  it("keeps faithful rewrites well clear of the follow threshold, and summaries well under it", () => {
+  it("keeps faithful rewrites well clear of the follow threshold, and summaries under it", () => {
     const ratio = (n: number, d: number) => (d === 0 ? 1 : n / d);
     for (const c of DISTILLED_CASES) {
       const a = alignSpokenToDisplay({ spokenText: c.spoken, displayText: c.display });
@@ -492,7 +560,10 @@ describe("distilled scripts", () => {
         expect(spoken, c.name).toBeGreaterThan(1.5 * (FOLLOW_SPOKEN_MIN.num / FOLLOW_SPOKEN_MIN.den));
       }
       if (!c.followable) {
-        expect(display, c.name).toBeLessThan(FOLLOW_DISPLAY_MIN.num / FOLLOW_DISPLAY_MIN.den / 2);
+        // A summary misses on what it says, not on how much of the screen
+        // it covers.
+        expect(spoken, c.name).toBeLessThan(FOLLOW_SPOKEN_MIN.num / FOLLOW_SPOKEN_MIN.den);
+        expect(display, c.name).toBeLessThan(1 / 16);
       }
     }
   });
@@ -503,10 +574,36 @@ describe("distilled scripts", () => {
     expect(a.followable).toBe(false);
     expect(karaokeFollowable({ spokenContent: 3, spokenMatched: 1, displayContent: 8, displayMatched: 1 })).toBe(true);
     expect(karaokeFollowable({ spokenContent: 4, spokenMatched: 1, displayContent: 8, displayMatched: 1 })).toBe(false);
-    expect(karaokeFollowable({ spokenContent: 3, spokenMatched: 1, displayContent: 9, displayMatched: 1 })).toBe(false);
+    // How much of the screen is covered is not a bar: a long list retold in
+    // a sentence covers almost none of it and is still followed.
+    expect(karaokeFollowable({ spokenContent: 3, spokenMatched: 1, displayContent: 9, displayMatched: 1 })).toBe(true);
+    expect(karaokeFollowable({ spokenContent: 9, spokenMatched: 6, displayContent: 129, displayMatched: 6 })).toBe(true);
     const b = alignSpokenToDisplay({ spokenText: "The deploy finished.", displayText: "The deploy finished." });
     expect(alignmentQuality(b.spokenWords, b.displayWords, b.mapping)).toEqual(b.quality);
     expect(b.quality).toEqual({ spokenContent: 2, spokenMatched: 2, displayContent: 2, displayMatched: 2 });
+  });
+
+  it("always follows a script with spans, even one that reads a list of links as \"a link\"", () => {
+    const source = ["Sources:", "", ...Array.from({ length: 8 }, (_, i) => `- https://example.com/docs/page-${i}/section`), "", "Done."].join("\n");
+    const display = ["Sources:", ...Array.from({ length: 8 }, (_, i) => `https://example.com/docs/page-${i}/section`), "Done."].join("\n");
+    const script = speakableWithSpans(source);
+    const a = alignSpokenToDisplay({ spokenText: script.text, displayText: display, segments: script.segments, sourceText: source });
+    expect(a.guided).toBe(true);
+    // Unguided, this little pairs would not be followed.
+    expect(karaokeFollowable(a.quality)).toBe(false);
+    expect(a.followable).toBe(true);
+    expect(landedOn(a, "Done")).toBe("Done");
+  });
+
+  it("joins a code read out one character at a time up to forty characters", () => {
+    const spell = (code: string) => code.split("").map((c) => (/[0-9]/.test(c) ? ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"][Number(c)] : c)).join(" ");
+    const hash40 = "ef9876543210abcdef1234567890abcdef123456";
+    const at = alignSpokenToDisplay({ spokenText: `Merged as ${spell(hash40)}.`, displayText: `Merged as ${hash40}.` });
+    expect(at.followable).toBe(true);
+    expect(at.mapping.spokenKind.filter((k) => k === SPOKEN_EXPANDED)).toHaveLength(40);
+    // One more character is past the cap: nothing joins, and nothing breaks.
+    const past = alignSpokenToDisplay({ spokenText: `Merged as ${spell(`${hash40}7`)}.`, displayText: `Merged as ${hash40}7.` });
+    expect(past.mapping.spokenKind.filter((k) => k === SPOKEN_EXPANDED)).toHaveLength(0);
   });
 
   it("blanks pause tags without moving any spoken word's offsets", () => {
@@ -560,6 +657,21 @@ const ALIGN_CASES: Array<{ name: string; spoken?: string; display: string; sourc
     display: "Shipped 🚀 the fix in server/tts/minimax.ts — 3 files, 749 lines.",
   },
   { name: "joined words and codes", spoken: "Fly jet blue on the twenty first, gate B twelve, code zero zero seven", display: "Fly JetBlue on the 21st, gate B12, code 007" },
+  {
+    name: "joined run at the cap",
+    spoken: "Merged as e f nine eight seven six five four three two one zero a b c d e f one two three four five six seven eight nine zero a b c d e f one two three four five six.",
+    display: "Merged as ef9876543210abcdef1234567890abcdef123456.",
+  },
+  {
+    name: "joined run past the cap",
+    spoken: "Merged as e f nine eight seven six five four three two one zero a b c d e f one two three four five six seven eight nine zero a b c d e f one two three four five six seven.",
+    display: "Merged as ef9876543210abcdef1234567890abcdef1234567.",
+  },
+  {
+    name: "guided link list",
+    source: ["Sources:", "", ...Array.from({ length: 8 }, (_, i) => `- https://example.com/docs/page-${i}/section`), "", "Done."].join("\n"),
+    display: ["Sources:", ...Array.from({ length: 8 }, (_, i) => `https://example.com/docs/page-${i}/section`), "Done."].join("\n"),
+  },
   ...DISTILLED_CASES.map((c) => ({ name: c.name, spoken: c.spoken, display: c.display })),
 ];
 

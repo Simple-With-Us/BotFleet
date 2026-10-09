@@ -106,6 +106,17 @@ final class KaraokeAlignTests: XCTestCase {
         let summaries = fixture.cases.filter { $0.name.hasPrefix("brief summary") }
         XCTAssertEqual(summaries.count, 2)
         XCTAssertTrue(summaries.allSatisfy { !$0.followable })
+        // A script with spans is followed however little of it pairs.
+        let links = try XCTUnwrap(fixture.cases.first { $0.name == "guided link list" })
+        XCTAssertTrue(links.guided)
+        XCTAssertTrue(links.followable)
+        XCTAssertFalse(KaraokeAlign.followable(KaraokeQuality(
+            spokenContent: links.quality[0], spokenMatched: links.quality[1],
+            displayContent: links.quality[2], displayMatched: links.quality[3]
+        )))
+        // A code read out one character at a time joins up to 40 characters.
+        let atCap = try XCTUnwrap(fixture.cases.first { $0.name == "joined run at the cap" })
+        XCTAssertEqual(atCap.spokenKind.filter { $0 == KaraokeAlign.spokenExpanded }.count, 40)
     }
 
     func testADistilledScriptLandsOnTheRenderedWords() {
@@ -137,7 +148,9 @@ final class KaraokeAlignTests: XCTestCase {
     func testFollowThresholdsMatchTheTypeScriptRule() {
         XCTAssertTrue(KaraokeAlign.followable(KaraokeQuality(spokenContent: 3, spokenMatched: 1, displayContent: 8, displayMatched: 1)))
         XCTAssertFalse(KaraokeAlign.followable(KaraokeQuality(spokenContent: 4, spokenMatched: 1, displayContent: 8, displayMatched: 1)))
-        XCTAssertFalse(KaraokeAlign.followable(KaraokeQuality(spokenContent: 3, spokenMatched: 1, displayContent: 9, displayMatched: 1)))
+        // How much of the screen is covered is not a bar.
+        XCTAssertTrue(KaraokeAlign.followable(KaraokeQuality(spokenContent: 3, spokenMatched: 1, displayContent: 9, displayMatched: 1)))
+        XCTAssertTrue(KaraokeAlign.followable(KaraokeQuality(spokenContent: 9, spokenMatched: 6, displayContent: 129, displayMatched: 6)))
         XCTAssertFalse(KaraokeAlign.followable(KaraokeQuality(spokenContent: 0, spokenMatched: 0, displayContent: 0, displayMatched: 0)))
     }
 

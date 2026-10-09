@@ -166,6 +166,45 @@ describe("attachKaraoke with a hosted voice", () => {
   });
 });
 
+describe("attachKaraoke with a script that has spans", () => {
+  // A reply that is mostly bare links: the deterministic script reads each
+  // one as "a link", so few spoken words match a word on screen.  The spans
+  // still say which link each "a link" stands for.
+  const LINKS_SOURCE = [
+    "Sources:",
+    "",
+    ...Array.from({ length: 8 }, (_, i) => `- https://example.com/docs/page-${i}/section`),
+    "",
+    "Done.",
+  ].join("\n");
+  const LINKS_RENDERED =
+    "<p>Sources:</p><ul>" +
+    Array.from({ length: 8 }, (_, i) => `<li><a href='https://example.com/docs/page-${i}/section'>https://example.com/docs/page-${i}/section</a></li>`).join("") +
+    "</ul><p>Done.</p>";
+
+  it("follows a link list read as \"a link\" each time", () => {
+    const fx = fakeEnv();
+    const { script } = localKaraokeScript(LINKS_SOURCE);
+    const feed = new LiveKaraoke("msg_1", script);
+    const session = attachKaraoke(mount(LINKS_RENDERED), feed, LINKS_SOURCE, { env: fx.env, schedule: fx.schedule });
+    expect(session.alignment?.guided).toBe(true);
+    expect(session.alignment?.followable).toBe(true);
+    fx.setNow(1_000);
+    feed.range(script.spokenText.lastIndexOf("Done"), 990);
+    // The 56 link words before "Done" were never reported; the cue sweeps
+    // them quickly and lands on "Done" instead of staying dark.
+    let landed = false;
+    for (let t = 1_050; t <= 5_000 && !landed; t += 50) {
+      fx.setNow(t);
+      fx.flush();
+      const current = fx.painted("current");
+      landed = current.length === 1 && "Done".startsWith(current[0]);
+    }
+    expect(landed).toBe(true);
+    session.dispose();
+  });
+});
+
 describe("attachKaraoke with a Personal Voice", () => {
   it("cues each reported word, including the newest one reported before it attached", () => {
     const fx = fakeEnv();
@@ -210,14 +249,16 @@ describe("attachKaraoke with a distilled script", () => {
     feed.range(script.spokenText.indexOf("four"), 990);
     fx.setNow(1_100);
     fx.flush();
-    expect("749".startsWith(fx.painted("current")[0] ?? "")).toBe(true);
+    expect(fx.painted("current")).toHaveLength(1);
+    expect("749".startsWith(fx.painted("current")[0])).toBe(true);
     // "passed on main See the" were never reported (the clock jumped), so
     // the cue sweeps them in 40 ms apiece before "guide" rolls in.
     fx.setNow(1_400);
     feed.range(script.spokenText.indexOf("guide"), 1_390);
     fx.setNow(1_700);
     fx.flush();
-    expect("guide".startsWith(fx.painted("current")[0] ?? "")).toBe(true);
+    expect(fx.painted("current")).toHaveLength(1);
+    expect("guide".startsWith(fx.painted("current")[0])).toBe(true);
     session.dispose();
   });
 

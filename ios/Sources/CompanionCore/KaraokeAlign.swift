@@ -62,7 +62,8 @@ public struct KaraokeAlignment: Equatable, Sendable {
     /// True when the script's spans guided the alignment.
     public let guided: Bool
     public let quality: KaraokeQuality
-    /// KaraokeAlign.followable(quality): false means show no highlight.
+    /// guided || KaraokeAlign.followable(quality): false means show no
+    /// highlight.
     public let followable: Bool
 }
 
@@ -276,7 +277,11 @@ public enum KaraokeAlign {
         return groups >= 2 ? out : nil
     }
 
+    /// Longest run read as a number (karaoke-align.ts MAX_EXPANSION).
     private static let maxExpansion = 8
+    /// Longest run joined into one code (karaoke-align.ts MAX_JOINED).  It
+    /// keeps the run length within the aligner's UInt8 move record.
+    private static let maxJoined = 40
 
     /// A word inside a spelled-out code: a digit or teen word as its
     /// digits, anything else as itself.
@@ -300,11 +305,12 @@ public enum KaraokeAlign {
         return out
     }
 
-    /// For each spoken word, display values a run of 2...8 words starting
-    /// there can stand for, with the run lengths (karaoke-align.ts
+    /// For each spoken word, display values a run of words starting there
+    /// can stand for, with the run lengths (karaoke-align.ts
     /// spokenExpansions): keys joined raw and with digit and teen words as
-    /// digits, cardinals with an ordinal end, and paired years.  Only values
-    /// `accept` keeps are recorded.
+    /// digits (2...maxJoined words), and cardinals with an ordinal end and
+    /// paired years (2...maxExpansion words).  Only values `accept` keeps are
+    /// recorded.
     private static func spokenExpansions(
         _ words: [KaraokeWord],
         prefixes: Set<String>,
@@ -327,10 +333,11 @@ public enum KaraokeAlign {
             var coded: String? = prefixes.contains(firstCoded) ? firstCoded : nil
             var keys = [first]
             var k = 2
-            while k <= maxExpansion && i + k <= words.count {
-                if raw == nil && coded == nil && !numeric { break }
+            while k <= maxJoined && i + k <= words.count {
+                let asNumber = numeric && k <= maxExpansion
+                if raw == nil && coded == nil && !asNumber { break }
                 let key = words[i + k - 1].key
-                keys.append(key)
+                if asNumber { keys.append(key) }
                 if let joined = raw.map({ $0 + key }) {
                     if prefixes.contains(joined) {
                         raw = joined
@@ -347,7 +354,7 @@ public enum KaraokeAlign {
                         coded = nil
                     }
                 }
-                if numeric {
+                if asNumber {
                     add(i, parseCardinal(keys), k)
                     add(i, parseGrouped(keys), k)
                 }
@@ -832,10 +839,10 @@ public enum KaraokeAlign {
         "dot", "slash", "colon", "underscore", "dash", "hyphen", "point", "percent", "dollar", "dollars", "cents", "plus",
         "minus", "equals", "hash", "first", "next", "finally", "lastly", "second", "third", "oh",
     ]
-    /// karaoke-align.ts FOLLOW_SPOKEN_MIN and FOLLOW_DISPLAY_MIN (the
-    /// reasoning and the measurements are there).
+    /// karaoke-align.ts FOLLOW_SPOKEN_MIN (the reasoning and the
+    /// measurements are there).  How much of the screen is covered is not a
+    /// bar: a long list retold in a sentence is swept, not left dark.
     public static let followSpokenMin = (num: 1, den: 3)
-    public static let followDisplayMin = (num: 1, den: 8)
 
     public static func quality(_ spokenWords: [KaraokeWord], _ displayWords: [KaraokeWord], _ mapping: KaraokeMapping) -> KaraokeQuality {
         var spokenContent = 0
@@ -862,12 +869,11 @@ public enum KaraokeAlign {
         )
     }
 
-    /// Whether the highlight should follow this alignment at all.
+    /// Whether the highlight should follow an unguided alignment at all.
+    /// The display counts are reported for diagnostics only.
     public static func followable(_ q: KaraokeQuality) -> Bool {
         if q.spokenMatched == 0 { return false }
-        let spokenOk = q.spokenMatched * followSpokenMin.den >= q.spokenContent * followSpokenMin.num
-        let displayOk = q.displayMatched * followDisplayMin.den >= q.displayContent * followDisplayMin.num
-        return spokenOk && displayOk
+        return q.spokenMatched * followSpokenMin.den >= q.spokenContent * followSpokenMin.num
     }
 
     /// The whole alignment in one call.  `segments` + `sourceText` are the
@@ -895,7 +901,9 @@ public enum KaraokeAlign {
             mapping: mapping,
             guided: guided,
             quality: quality,
-            followable: followable(quality)
+            // Spans tie every spoken word to its source, so a guided script
+            // is always followed.
+            followable: guided || followable(quality)
         )
     }
 

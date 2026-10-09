@@ -28,7 +28,8 @@
 //
 // A script that is genuinely a brief summary lines up with almost nothing, and
 // highlighting it would light words at random.  karaokeFollowable() says when
-// an alignment is good enough to show (see FOLLOW_* below).
+// an unguided alignment is good enough to show (see FOLLOW_SPOKEN_MIN below);
+// a script with spans is always shown.
 //
 // Everything here is pure, deterministic, and integer-scored so the Swift
 // mirror (ios/Sources/CompanionCore/KaraokeAlign.swift) reproduces it exactly;
@@ -225,7 +226,14 @@ function parseGrouped(keys: readonly string[]): string | null {
   return groups >= 2 ? out : null;
 }
 
+/** Longest run read as a number (a cardinal or a paired year). */
 const MAX_EXPANSION = 8;
+/** Longest run joined into one code.  A joined reading only grows while it
+ * is still a prefix of some display key, so this bound is rarely reached: it
+ * lets a twelve-digit build number or a hash read character by character
+ * join, and keeps the run length within the aligner's one-byte move record
+ * (and its band of 40). */
+const MAX_JOINED = 40;
 
 /** A word as it reads inside a spelled-out code: a digit or teen word as
  * its digits, anything else as itself. */
@@ -248,14 +256,15 @@ function keyPrefixes(words: readonly WordToken[]): Set<string> {
   return out;
 }
 
-/** For each spoken word, the display values a run of 2..8 spoken words
- * starting there can stand for, with the run lengths:
- * - joined: the keys run together, raw ("jet blue" for JetBlue, "some one")
- *   and with digit and teen words as digits ("A P I" for API, "A P Is" for
- *   APIs, "Q three" for Q3, "B twelve" for B12, "seven four nine" for 749,
- *   "D L nine eight two" for DL982);
- * - read as a number: cardinals ("two hundred and fifty", "twenty fourth")
- *   and paired years ("nineteen eighty four").
+/** For each spoken word, the display values a run of spoken words starting
+ * there can stand for, with the run lengths:
+ * - joined (2..MAX_JOINED words): the keys run together, raw ("jet blue" for
+ *   JetBlue, "some one") and with digit and teen words as digits ("A P I"
+ *   for API, "A P Is" for APIs, "Q three" for Q3, "B twelve" for B12, "seven
+ *   four nine" for 749, "D L nine eight two" for DL982, "two zero two six
+ *   one zero zero eight one five three two" for 202610081532);
+ * - read as a number (2..MAX_EXPANSION words): cardinals ("two hundred and
+ *   fifty", "twenty fourth") and paired years ("nineteen eighty four").
  * `prefixes` are the display keys' prefixes (keyPrefixes); only values
  * `accept` keeps (a display key, or a display number) are recorded. */
 function spokenExpansions(
@@ -282,10 +291,11 @@ function spokenExpansions(
     const firstCoded = codedPiece(first);
     let coded: string | null = prefixes.has(firstCoded) ? firstCoded : null;
     const keys: string[] = [first];
-    for (let k = 2; k <= MAX_EXPANSION && i + k <= words.length; k += 1) {
-      if (raw === null && coded === null && !numeric) break;
+    for (let k = 2; k <= MAX_JOINED && i + k <= words.length; k += 1) {
+      const asNumber = numeric && k <= MAX_EXPANSION;
+      if (raw === null && coded === null && !asNumber) break;
       const key = words[i + k - 1].key;
-      keys.push(key);
+      if (asNumber) keys.push(key);
       if (raw !== null) {
         raw += key;
         if (prefixes.has(raw)) add(i, raw, k);
@@ -296,7 +306,7 @@ function spokenExpansions(
         if (prefixes.has(coded)) add(i, coded, k);
         else coded = null;
       }
-      if (numeric) {
+      if (asNumber) {
         add(i, parseCardinal(keys), k);
         add(i, parseGrouped(keys), k);
       }
@@ -894,27 +904,31 @@ export interface KaraokeQuality {
 }
 
 /**
- * Follow the voice only when at least a third of the spoken content words
- * pair with words on screen, and at least an eighth of the content words on
- * screen are paired.
+ * Follow an unguided (distilled) script only when at least a third of its
+ * spoken content words pair with words on screen.  A script with spans is
+ * always followed (alignSpokenToDisplay): the spans prove the correspondence.
  *
- * Measured on the distilled fixtures in karaoke-align.test.ts (spoken /
- * screen pairing):
+ * Measured on the distilled fixtures in karaoke-align.test.ts (spoken
+ * content words paired):
  * - faithful rewrites, with numbers, codes, acronyms and URLs spelled out,
- *   lists retold and code skipped: 80 to 100 percent / 67 to 100 percent;
- * - a rewrite that retells a list of seven paths in one line: 67 / 16;
- * - a condensed retelling that keeps the reply's order: 87 / 22 (followed:
- *   the highlight walks the same sentences and sweeps the rest);
+ *   lists retold and code skipped: 80 to 100 percent;
+ * - a rewrite that retells a list of 7, 12 or 25 paths in one line: 60 to
+ *   67 (with 16 down to 5 percent of the words on screen paired);
+ * - a status table retold in one sentence: 70 (11 percent on screen);
+ * - a code of up to 40 characters read out one by one: 100;
+ * - a condensed retelling that keeps the reply's order: 87;
  * - a brief summary that reuses the reply's words ("the flaky cache test was
- *   a race between workers"): 25 / 3;
- * - a brief summary in new words: 0 / 0.
+ *   a race between workers"): 25;
+ * - a brief summary in new words: 0.
  * Either summary highlighted would light words scattered across paragraphs
- * the voice never reads.  The spoken bar sits at a third, under half the
- * worst faithful rewrite; the screen bar at an eighth, under the path list
- * and four times the reusing summary.
+ * the voice never reads.  The bar sits at a third, under half the worst
+ * faithful rewrite.  There is deliberately no bar on how much of the screen
+ * is covered: a script that skips most of the message (a long list or table
+ * retold in a sentence) is what the owner asked karaoke to handle, by
+ * sweeping the skipped words quickly (buildKaraokeTimeline), not by going
+ * dark.
  */
 export const FOLLOW_SPOKEN_MIN = { num: 1, den: 3 } as const;
-export const FOLLOW_DISPLAY_MIN = { num: 1, den: 8 } as const;
 
 const MATCHED_KINDS = new Set([SPOKEN_EXACT, SPOKEN_EQUIVALENT, SPOKEN_FUZZY, SPOKEN_EXPANDED]);
 
@@ -944,13 +958,12 @@ export function alignmentQuality(
   return { spokenContent, spokenMatched, displayContent, displayMatched };
 }
 
-/** Whether the highlight should follow this alignment at all (see
- * FOLLOW_SPOKEN_MIN).  Integer math, so the Swift mirror agrees exactly. */
+/** Whether the highlight should follow an unguided alignment at all (see
+ * FOLLOW_SPOKEN_MIN).  Integer math, so the Swift mirror agrees exactly.
+ * The display counts are reported for diagnostics only. */
 export function karaokeFollowable(q: KaraokeQuality): boolean {
   if (q.spokenMatched === 0) return false;
-  const spokenOk = q.spokenMatched * FOLLOW_SPOKEN_MIN.den >= q.spokenContent * FOLLOW_SPOKEN_MIN.num;
-  const displayOk = q.displayMatched * FOLLOW_DISPLAY_MIN.den >= q.displayContent * FOLLOW_DISPLAY_MIN.num;
-  return spokenOk && displayOk;
+  return q.spokenMatched * FOLLOW_SPOKEN_MIN.den >= q.spokenContent * FOLLOW_SPOKEN_MIN.num;
 }
 
 export interface KaraokeAlignment {
@@ -960,7 +973,8 @@ export interface KaraokeAlignment {
   /** True when spans guided the alignment. */
   guided: boolean;
   quality: KaraokeQuality;
-  /** karaokeFollowable(quality): false means show no highlight at all. */
+  /** guided || karaokeFollowable(quality): false means show no highlight
+   * at all. */
   followable: boolean;
 }
 
@@ -992,7 +1006,9 @@ export function alignSpokenToDisplay(input: {
   const guided = Boolean(guide && guide.some((g) => g >= 0));
   const mapping = alignWords(spokenWords, displayWords, { guide: guided ? guide : null });
   const quality = alignmentQuality(spokenWords, displayWords, mapping);
-  return { spokenWords, displayWords, mapping, guided, quality, followable: karaokeFollowable(quality) };
+  // Spans tie every spoken word to its source, so a guided script is always
+  // followed, however much of the message it reads as "a link" or skips.
+  return { spokenWords, displayWords, mapping, guided, quality, followable: guided || karaokeFollowable(quality) };
 }
 
 // ── timing ────────────────────────────────────────────────────────────────
