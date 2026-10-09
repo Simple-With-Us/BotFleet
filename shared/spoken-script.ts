@@ -2,12 +2,20 @@
 // client for karaoke.
 //
 // The harness projects a reply into utterances (server/tts/message-audio.ts).
-// In the default "written" mode that projection is utterancesWithSpans() over
-// writtenReply(message.text): deterministic, never paraphrased (board
-// 8cc3c806), and every spoken character carries the span of the message text
-// it came from.  A client that asks for them (`spans: true` on POST /audio)
-// gets those spans next to the utterances, and uses them to line the voice up
-// with the rendered message (shared/karaoke-align.ts).
+// By default that is the distilled rewrite (server/tts/speech-summary.ts, the
+// owner's choice: numbers, codes, acronyms and links spelled out, code
+// skipped), answered as `script: "summary"` with no spans.  The highlight
+// still follows the main message: clients align the distilled words to the
+// rendered words without spans (shared/karaoke-align.ts), which tolerates
+// skipped, added and spelled-out words.
+//
+// When the script is the deterministic one (the "off" mode, a short plain
+// reply the distiller skips, or the distiller's fallback), it is
+// utterancesWithSpans() over writtenReply(message.text), every spoken
+// character carries the span of the message text it came from, and the answer
+// says `script: "written"`.  A client that asks for them (`spans: true` on
+// POST /audio) gets those spans next to the utterances, and the aligner uses
+// them as a band around the right words.
 //
 // Wire format (`spans` on the /audio response), version SPOKEN_SPANS_FORMAT:
 //   {
@@ -26,9 +34,6 @@
 //   "(a code block)").
 // All offsets are JavaScript string indices.  The Swift client converts them
 // with SpeechSpans.stringRange(utf16:_:in:).
-//
-// A summary (an explicit Voice Summary mode) carries no spans: karaoke does not
-// apply, and the response says `script: "summary"`.
 
 import { utterancesWithSpans, type SpeechSpan, type SpokenUtterance } from "./speech-spans.ts";
 
@@ -37,11 +42,35 @@ export const SPOKEN_SPANS_FORMAT = 1;
 /** What a voice reads.  Also stored on the message as `voiceTextKind`, next
  * to the `voiceText` its clips were made from:
  * - "written": voiceText is the exact written-mode script (the utterances
- *   joined with single spaces), span-aligned to the message.
- * - "summary": voiceText is a model summary (an explicit Voice Summary mode).
- * A row without voiceTextKind is from before karaoke; its voiceText may be a
- * model paraphrase or markdown, and it is never used for karaoke. */
+ *   joined with single spaces), span-aligned to the message ("off" mode).
+ * - "summary": voiceText came from the distiller path (the default modes):
+ *   the distilled rewrite, or the deterministic script it fell back to.
+ * A row without voiceTextKind is from before karaoke.  Its voiceText is
+ * whatever was spoken then, usually the distilled rewrite, and is reused as
+ * a summary-kind script; karaoke aligns it like any distilled script.
+ *
+ * On the wire `script` is "written" whenever the utterances are the
+ * deterministic script (spans attached), whichever mode produced them. */
 export type SpokenScriptKind = "written" | "summary";
+
+/** A MiniMax pause tag, `<#0.3#>`: the distiller writes them between thoughts
+ * (DEEPSEEK_FLASH_TTS_PROMPT).  MiniMax takes them as silence; an on-device
+ * voice would read them out, and the aligner would see the words "0" and "3". */
+export const PAUSE_TAG = /<#[0-9]+(?:\.[0-9]+)?#>/g;
+
+/** `text` without pause tags, for a voice that does not understand them. */
+export function stripPauseTags(text: string): string {
+  if (!text.includes("<#")) return text;
+  return text.replace(PAUSE_TAG, " ").replace(/[ \t]{2,}/g, " ").trim();
+}
+
+/** `text` with every pause tag blanked to spaces of the same UTF-16 length,
+ * so offsets into the text the voice received (clip windows, Personal Voice
+ * ranges) still index the masked copy. */
+export function maskPauseTags(text: string): string {
+  if (!text.includes("<#")) return text;
+  return text.replace(PAUSE_TAG, (tag) => " ".repeat(tag.length));
+}
 
 export interface SpokenSpansWire {
   format: typeof SPOKEN_SPANS_FORMAT;

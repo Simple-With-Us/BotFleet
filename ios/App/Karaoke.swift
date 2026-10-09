@@ -44,8 +44,10 @@ final class KaraokeCenter {
     }
 
     /// Follow `script` over the reply `messageText`.  Nil when the bubble
-    /// has no words to follow, or the script is too long to align before
-    /// the first word (KaraokeScript.isFollowable).
+    /// has no words to follow, the script is too long to align before the
+    /// first word (KaraokeScript.isFollowable), or it does not line up with
+    /// the message (a brief summary: KaraokeAlignment.followable, the same
+    /// rule as the Mac's).
     @discardableResult
     func begin(messageId: String, messageText: String, script: KaraokeScript, mode: MessageKaraoke.Mode) -> MessageKaraoke? {
         clear()
@@ -58,6 +60,11 @@ final class KaraokeCenter {
             mode: mode,
             reducedMotion: UIAccessibility.isReduceMotionEnabled
         )
+        // Lighting scattered words would be worse than lighting none.
+        guard karaoke.alignment.followable else {
+            karaoke.dispose()
+            return nil
+        }
         active = karaoke
         return karaoke
     }
@@ -133,7 +140,8 @@ final class MessageKaraoke {
         // The spans index the written reply.  When this phone's copy of it
         // is not the text the harness projected (another length), they
         // would guide the alignment to the wrong words, so it anchors on
-        // words that occur once on each side instead.
+        // words that occur once on each side instead, as it does for a
+        // distilled script, which has no spans.
         let guided = script.guides(sourceText)
         alignment = KaraokeAlign.alignSpokenToDisplay(
             spokenText: script.spokenText,
