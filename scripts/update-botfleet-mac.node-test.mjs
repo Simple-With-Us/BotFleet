@@ -2320,7 +2320,7 @@ test("only an expected cancellation justifies packaging on this Mac", async () =
 
   assert.equal(isRecoverableResolutionFailure(new ResolutionError("x", "no-build")), true,
     "the commit predates the workflow");
-  for (const cause of ["network-failed", "network-timed-out", "rate-limited", "checksum-mismatch", "bad-manifest", "unauthorized", "pointer-lost"]) {
+  for (const cause of ["network-failed", "network-timed-out", "rate-limited", "checksum-mismatch", "bad-manifest", "bad-response", "unauthorized", "pointer-lost"]) {
     assert.equal(
       isRecoverableResolutionFailure(new ResolutionError("x", cause)),
       false,
