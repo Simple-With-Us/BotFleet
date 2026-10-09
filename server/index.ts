@@ -159,6 +159,7 @@ import {
   containerComputerScreenshot,
   containerComputerStatus,
   redactSecrets,
+  refreshLocalVmGhCredentials,
   wakeContainerComputer,
   handleBoxGatewayRequest,
   SHARED_LOCAL_VM_TARGET,
@@ -167,6 +168,7 @@ import {
   setupCommands,
   type LocalVmTarget,
 } from "./container-computer.ts";
+import { warnGhSyncError } from "./local-vm-gh-credentials.ts";
 import { boxGatewayUrl, mintBoxGatewayGrant } from "./box-gateway-grant.ts";
 import {
   applyComputerMounts,
@@ -438,6 +440,7 @@ import {
 } from "./local-vm-shared-session.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
+import { stripAnsi } from "./desktop-probe.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
 import { fleetSeatPromptPart } from "./seat-prompt.ts";
@@ -3359,6 +3362,14 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
     if (!localVm.ready || !localVm.runtime) {
       throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
     }
+    // Carry the host's gh login in when "Share Host CLI Credentials" is on: the
+    // macOS Keychain token is not in the mounted ~/.config/gh.  Best-effort and
+    // cached by token hash, so a turn only pays for it when the host re-logged
+    // in; a failure leaves the VM signed out and never fails the turn, and a
+    // slow login stops holding the turn after ten seconds and finishes behind it.
+    await refreshLocalVmGhCredentials(localVm.runtime, target, undefined, { maxWaitMs: 10_000 }).catch((error) =>
+      warnGhSyncError(target.containerName, error),
+    );
     // The container is up but this bot's desktop may not be: in shared mode each
     // bot owns its own display + socket, and the first turn for a bot is the one
     // that has to start it.  Idempotent, so every later turn is a no-op.  The
@@ -8517,7 +8528,9 @@ function localComputerActionError(error: unknown): LocalComputerActionFailure {
         ? Number(statusField)
         : 500;
   const raw = error instanceof Error ? error.message : String(error);
-  return { status, error: redactSecrets(raw) };
+  // A failed `docker exec` carries the Driver's coloured stderr; the panel
+  // would print the escape codes as `[2m` and `[0m`.
+  return { status, error: redactSecrets(stripAnsi(raw)) };
 }
 
 
