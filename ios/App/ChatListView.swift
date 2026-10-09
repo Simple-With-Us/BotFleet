@@ -34,6 +34,9 @@ struct ChatListView: View {
     @FocusState private var searchFocused: Bool
     /// Drives the live-session "Open BotFleet on Mac" header control.
     @State private var isOpeningMacApp = false
+    /// DEBUG `-store-preview -open-settings`: land on Settings, for the
+    /// screenshot harness.
+    @State private var showingDebugSettings = false
 
     /// Room for the floating bar, so the last row can scroll clear of it.
     private static let barClearance: CGFloat = 96
@@ -75,6 +78,7 @@ struct ChatListView: View {
                 NavigationStack(path: $path) {
                     roster
                         .navigationDestination(for: Chat.self) { ChatView(chat: $0) }
+                        .navigationDestination(isPresented: $showingDebugSettings) { SettingsView() }
                 }
             }
         }
@@ -99,6 +103,9 @@ struct ChatListView: View {
             if ProcessInfo.processInfo.arguments.contains("-open-first"),
                let first = chats.first {
                 open(first.chat)
+            }
+            if ProcessInfo.processInfo.arguments.contains("-open-settings") {
+                showingDebugSettings = true
             }
         }
 #endif

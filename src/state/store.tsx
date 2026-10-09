@@ -45,6 +45,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
+import type { Pronunciation } from "../../shared/pronunciations";
 import { voiceScriptKind } from "../../shared/voice-summary";
 import { applyBotPatch, createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { voiceForDevice, type BotVoices } from "../../shared/bot-voice";
@@ -103,7 +104,7 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   /** A "Job Finished" row: a background job of the bot's ended. */
   job?: import("../../shared/jobs").JobRowData;
@@ -354,6 +355,11 @@ export interface Bot {
   computers?: Array<"cloud" | "vm" | "local" | "off">;
   /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
   cloudBackend?: CloudBackend;
+  /** The backend this bot really uses once the workspace default fills in for
+   * an unpinned one.  Read-only on the wire: the phone uses it to decide
+   * whether a live desktop exists; the settings UI keeps reading the raw
+   * `cloudBackend` so "inherited" and "pinned" stay distinguishable. */
+  effectiveCloudBackend?: CloudBackend;
   /** Allow Auto to prepare/start the managed VPS container. Off by default. */
   autoStartVps?: boolean;
   /** where new tasks run their shell tools; absent = the private bot workspace */
@@ -531,7 +537,17 @@ export interface ConfigStatus {
   /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "system"; optimizedSummary?: boolean };
+  /** `voice` is the workspace default voice (every bot without its own
+   * speaks with it).  `pronunciations` is the list in force, the seeded
+   * defaults included; absent only from a harness older than the list. */
+  tts?: {
+    configured: boolean;
+    ready: boolean;
+    voice: string;
+    provider?: "minimax" | "system";
+    optimizedSummary?: boolean;
+    pronunciations?: Pronunciation[];
+  };
   /** Call-mode STT preference + global vocabulary, mirrored from AppConfig.
    * `provider` is undefined when the picker has no explicit preference and
    * chooses the platform default. `keyterms` is the global voice vocabulary

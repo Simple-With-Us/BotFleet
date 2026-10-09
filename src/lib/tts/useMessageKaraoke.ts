@@ -1,4 +1,6 @@
-import { useEffect, type RefObject } from "react";
+import { useEffect, useRef, type RefObject } from "react";
+
+import type { Pronunciation } from "../../../shared/pronunciations";
 
 import { attachKaraoke, type KaraokeSession } from "../karaoke-session";
 import type { KaraokeFeed } from "./karaoke-feed";
@@ -13,7 +15,17 @@ import { speaker } from "./index";
  * `sourceText` is writtenReply(message.text).  When it changes the message
  * has re-rendered, its text nodes are new, and the highlighter is rebuilt.
  */
-export function useMessageKaraoke(ref: RefObject<HTMLElement | null>, messageId: string, sourceText: string, enabled = true): void {
+export function useMessageKaraoke(
+  ref: RefObject<HTMLElement | null>,
+  messageId: string,
+  sourceText: string,
+  enabled = true,
+  pronunciations?: readonly Pronunciation[] | null,
+): void {
+  // Read when a reply starts, not a dependency: a config frame mid-reply
+  // must not tear down the highlight that is following the voice.
+  const pronunciationsRef = useRef(pronunciations);
+  pronunciationsRef.current = pronunciations;
   useEffect(() => {
     if (!enabled) return;
     let session: KaraokeSession | null = null;
@@ -33,7 +45,7 @@ export function useMessageKaraoke(ref: RefObject<HTMLElement | null>, messageId:
       const container = ref.current;
       if (!feed || feed.messageId !== messageId || !container) return;
       following = feed;
-      session = attachKaraoke(container, feed, sourceText);
+      session = attachKaraoke(container, feed, sourceText, { pronunciations: pronunciationsRef.current });
     });
     return () => {
       unsubscribe();

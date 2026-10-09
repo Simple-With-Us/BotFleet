@@ -307,7 +307,9 @@ function Bubble({
   const spokenRef = useRef<HTMLDivElement>(null);
   const speakable = message.role === "bot" && message.kind === "text";
   const writtenSource = useMemo(() => (speakable ? writtenReply(message.text ?? "") : ""), [speakable, message.text]);
-  useMessageKaraoke(spokenRef, message.id, writtenSource, speakable);
+  // The workspace pronunciation list, so a respelled term ("sequel") lights
+  // up the term on screen ("SQL").
+  useMessageKaraoke(spokenRef, message.id, writtenSource, speakable, state.config?.tts?.pronunciations);
   const playRecording = () => {
     if (recordingAudio.current) {
       recordingAudio.current.pause();

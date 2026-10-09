@@ -30,7 +30,8 @@ import {
   wordKey,
   type KaraokeAlignment,
 } from "./karaoke-align.ts";
-import { speakableWithSpans, utterancesWithSpans } from "./speech-spans.ts";
+import { DEFAULT_PRONUNCIATIONS, type Pronunciation } from "./pronunciations.ts";
+import { pronounceUtterance, speakableWithSpans, utterancesWithSpans } from "./speech-spans.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, "..", "ios", "Tests", "CompanionCoreTests", "Fixtures", "karaoke-align.json");
@@ -613,9 +614,49 @@ describe("distilled scripts", () => {
   });
 });
 
+describe("pronunciations", () => {
+  it("lands a respelled term on the term on screen", () => {
+    const a = alignSpokenToDisplay({
+      spokenText: "Sign in with oh auth and run soo doo on the sequel box.",
+      displayText: "Sign in with OAuth and run sudo on the SQL box.",
+      pronunciations: DEFAULT_PRONUNCIATIONS,
+    });
+    expect(landed(a)).toEqual(["Sign", "in", "with", "OAuth", "OAuth", "and", "run", "sudo", "sudo", "on", "the", "SQL", "box"]);
+    expect(a.mapping.spokenKind[3]).toBe(SPOKEN_EXPANDED);
+    expect(a.mapping.spokenKind[11]).toBe(SPOKEN_EXPANDED);
+    expect(a.quality.spokenMatched).toBe(a.quality.spokenContent);
+  });
+
+  it("does not pair a respelling without the list", () => {
+    const a = alignSpokenToDisplay({
+      spokenText: "Sign in with oh auth and run soo doo on the sequel box.",
+      displayText: "Sign in with OAuth and run sudo on the SQL box.",
+    });
+    expect(a.mapping.spokenKind[11]).not.toBe(SPOKEN_EXPANDED);
+    expect(a.quality.spokenMatched).toBeLessThan(a.quality.spokenContent);
+  });
+
+  it("keeps a guided script with a respelled term on the right words", () => {
+    const source = "Run the **SQL** migration with `sudo`, then check cron.";
+    const display = "Run the SQL migration with sudo, then check cron.";
+    const [u] = utterancesWithSpans(source);
+    const p = pronounceUtterance(u, DEFAULT_PRONUNCIATIONS);
+    expect(p.text).toBe("Run the sequel migration with soo doo, then check kron.");
+    const a = alignSpokenToDisplay({
+      spokenText: p.text,
+      displayText: display,
+      segments: p.segments,
+      sourceText: source,
+      pronunciations: DEFAULT_PRONUNCIATIONS,
+    });
+    expect(a.guided).toBe(true);
+    expect(landed(a)).toEqual(["Run", "the", "SQL", "migration", "with", "sudo", "sudo", "then", "check", "cron"]);
+  });
+});
+
 // ── shared fixture for the Swift mirror ───────────────────────────────────
 
-const ALIGN_CASES: Array<{ name: string; spoken?: string; display: string; source?: string }> = [
+const ALIGN_CASES: Array<{ name: string; spoken?: string; display: string; source?: string; pronunciations?: readonly Pronunciation[] }> = [
   { name: "identical", spoken: "The tests pass now.", display: "The tests pass now." },
   { name: "skipped path", spoken: "I changed core.ts today", display: "I changed server/drivers/acp/core.ts today" },
   { name: "inserted code block", spoken: "Fixed it. (a TypeScript code block) That's it.", display: "Fixed it:\nThat's it." },
@@ -673,6 +714,24 @@ const ALIGN_CASES: Array<{ name: string; spoken?: string; display: string; sourc
     display: ["Sources:", ...Array.from({ length: 8 }, (_, i) => `https://example.com/docs/page-${i}/section`), "Done."].join("\n"),
   },
   ...DISTILLED_CASES.map((c) => ({ name: c.name, spoken: c.spoken, display: c.display })),
+  {
+    name: "pronunciations one word",
+    spoken: "The sequel query returns Jason now, in the gooey.",
+    display: "The SQL query returns JSON now, in the GUI.",
+    pronunciations: DEFAULT_PRONUNCIATIONS,
+  },
+  {
+    name: "pronunciations several words",
+    spoken: "Sign in with oh auth, run soo doo, then the kron job and the redge ex check.",
+    display: "Sign in with OAuth, run sudo, then the cron job and the REGEX check.",
+    pronunciations: DEFAULT_PRONUNCIATIONS,
+  },
+  {
+    name: "pronunciations symbol term",
+    spoken: "Write C sharp at fifty percent.",
+    display: "Write C# at 50%.",
+    pronunciations: [{ term: "C#", say: "C sharp" }, { term: "%", say: "percent" }],
+  },
 ];
 
 function fixtureCases() {
@@ -684,9 +743,10 @@ function fixtureCases() {
       displayText: c.display,
       segments: script?.segments,
       sourceText: c.source,
+      pronunciations: c.pronunciations,
     });
     const times = evenTimes(a.spokenWords.length);
-    return {
+    const row = {
       name: c.name,
       source: c.source ?? null,
       spokenText,
@@ -702,6 +762,8 @@ function fixtureCases() {
       quality: [a.quality.spokenContent, a.quality.spokenMatched, a.quality.displayContent, a.quality.displayMatched],
       followable: a.followable,
     };
+    // Only the cases that use a list carry one, so older lines never churn.
+    return c.pronunciations ? { ...row, pronunciations: c.pronunciations.map((p) => ({ term: p.term, say: p.say })) } : row;
   });
 }
 

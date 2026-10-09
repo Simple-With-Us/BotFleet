@@ -37,6 +37,7 @@ struct AgentProfileView: View {
     @State private var instancesLoaded = false
     @State private var config: ConfigStatus?
     @State private var busy = false
+    @State private var confirmingDuplicate = false
     @State private var player: AVAudioPlayer?
     @State private var autoApprove: Bool
     @State private var autoReview: String
@@ -139,15 +140,15 @@ struct AgentProfileView: View {
     private var missingDefaultVoiceGuidance: String {
         switch voiceProvider {
         case .minimax:
-            return "No workspace default voice is selected.\u{00A0} Choose a voice for each device above; synthesis still uses the shared MiniMax key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared MiniMax key on your computer."
         case .elevenlabs:
-            return "No workspace default voice is selected.\u{00A0} Choose a voice for each device above; synthesis still uses the shared ElevenLabs key on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the shared ElevenLabs key on your computer."
         case .system:
-            return "No workspace default voice is selected.\u{00A0} Choose a voice for each device above; synthesis still uses the built-in Mac voices on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the built-in Mac voices on your computer."
         case .personal:
-            return "No workspace default voice is selected.\u{00A0} Choose an Apple Personal Voice for this iPhone above to speak on this device."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose an Apple Personal Voice for this iPhone above to speak on this device."
         case .unknown:
-            return "No workspace default voice is selected.\u{00A0} Choose a voice for each device above; synthesis still uses the selected voice engine on your computer."
+            return "No default voice is picked, so a bot without a voice of its own stays silent until one is picked in Settings.\u{00A0} Choose a voice for each device above; synthesis still uses the selected voice engine on your computer."
         }
     }
 
@@ -338,6 +339,8 @@ struct AgentProfileView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                duplicateSection
+
                 if let tasks = current.tasks, !tasks.isEmpty {
                     let totalTurns = tasks.compactMap { $0.usage?.turns }.reduce(0, +)
                     let totalInput = tasks.compactMap { $0.usage?.input }.reduce(0, +)
@@ -390,6 +393,12 @@ struct AgentProfileView: View {
                 }
             }
             .overlay { if busy { ProgressView().controlSize(.large) } }
+            .confirmationDialog("Duplicate Bot?", isPresented: $confirmingDuplicate, titleVisibility: .visible) {
+                Button("Duplicate Bot") { Task { await duplicate() } }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(BotDuplicate.summary)
+            }
             .task {
                 if !session.cachedInstances.isEmpty {
                     instances = profileEngines(from: session.cachedInstances)
@@ -424,6 +433,32 @@ struct AgentProfileView: View {
                 Task { await upload(item) }
             }
         }
+    }
+
+    /// Copies the bot as it is saved, not the form: edits not yet saved are
+    /// not part of what gets duplicated.
+    private var duplicateSection: some View {
+        Section {
+            Button("Duplicate Bot", systemImage: "plus.square.on.square") {
+                confirmingDuplicate = true
+            }
+            .disabled(busy)
+        } footer: {
+            Text(BotDuplicate.notCopiedNote)
+        }
+    }
+
+    /// Make the copy, then close this sheet and open it.  If the profile could
+    /// not be copied the session has already said why; the new bot still opens.
+    private func duplicate() async {
+        // Held before the sheet closes: this keeps running after `dismiss()`.
+        let session = self.session
+        busy = true
+        let copy = await session.duplicateBot(current)
+        busy = false
+        guard let copy else { return }
+        dismiss()
+        await session.openChat(botId: copy.id, threadId: copy.threadId)
     }
 
     /// Re-fetch the engine list after a slow or failed load.
@@ -713,17 +748,24 @@ struct AgentProfileView: View {
             } else if !hasWorkspaceDefaultVoice {
                 Text(missingDefaultVoiceGuidance)
             } else {
-                Text("Each device speaks with its own voice.\u{00A0} A Personal Voice stays on the device that made it and speaks there, with no audio sent over the network.\u{00A0} MiniMax voices work on both, and Workspace default uses the voice selected on your computer.")
+                Text("Each device speaks with its own voice.\u{00A0} A Personal Voice stays on the device that made it and speaks there, with no audio sent over the network.\u{00A0} MiniMax voices work on both.\u{00A0} \(defaultVoiceName) is the workspace default voice; change it in Settings.")
             }
         }
     }
 
+    /// The workspace default voice by name ("Jay Wedgeworth 001").
+    private var defaultVoiceName: String {
+        BotVoice.displayName(config?.workspaceDefaultVoice ?? "", voices: voices)
+    }
+
+    /// Every picker's first option names the workspace default voice,
+    /// "Jay Wedgeworth 001 (default)", never a bare "(default)".
     @ViewBuilder
     private var defaultVoiceOption: some View {
         if hasWorkspaceDefaultVoice {
-            Text("Workspace default").tag("")
+            Text(BotVoice.defaultOptionLabel(config?.workspaceDefaultVoice, voices: voices)).tag("")
         } else {
-            Text("Choose a voice").tag("").disabled(true)
+            Text(BotVoice.noDefaultVoice).tag("").disabled(true)
         }
     }
 
