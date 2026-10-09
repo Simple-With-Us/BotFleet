@@ -737,7 +737,7 @@ describe("harness HTTP API", () => {
 
   it("refuses a malformed quiesce request with 400 and changes nothing", async () => {
     // Kody 4226532374: force, drain and the windows were read loosely.
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
     const authorization = { Authorization: `Bearer ${owner.nonce}` };
     const post = (query: string, body?: string) => fetch(`${BASE}/api/runtime/quiesce${query}`, {
       method: "POST",
@@ -777,11 +777,12 @@ describe("harness HTTP API", () => {
   });
 
   it("holds new work for an update without closing routes, and never drops a held message", async () => {
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
     const authorization = { Authorization: `Bearer ${owner.nonce}` };
     const quiesce = (method: "POST" | "DELETE", query = "") =>
       fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
     const SLOW = { timeout: 30_000, interval: 250 };
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
     const runtime = async () => (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json() as Promise<{
       draining: boolean;
       quiescing: boolean;
@@ -791,6 +792,7 @@ describe("harness HTTP API", () => {
     const bot = (await api("POST", "/api/bots")).body.bot;
     const busy = async () =>
       Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy);
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
     const said = async (text: string) => ((await api("GET", `/api/threads/${bot.threadId}/messages?limit=50`)).body.messages as Array<{
       role: string;
       text?: string;
@@ -845,7 +847,7 @@ describe("harness HTTP API", () => {
       const fenced = await quiesce("POST");
       expect(fenced.status).toBe(200);
       expect(await fenced.json()).toMatchObject({ quiescing: true, draining: false, safeToRestart: true, activeWorkCount: 0 });
-      const saved = JSON.parse(readFileSync(carrier, "utf8")) as { sends: Array<{ botId: string; prompt: string }> };
+      const saved: { sends: Array<{ botId: string; prompt: string }> } = JSON.parse(readFileSync(carrier, "utf8"));
       expect(saved.sends).toEqual([expect.objectContaining({ botId: bot.id, prompt: "carried across the restart" })]);
 
       // The restart did not come: standing the fence down runs it now.
@@ -863,7 +865,7 @@ describe("harness HTTP API", () => {
   }, 180_000);
 
   it("pauses a busy bot after the grace and carries held messages across a forced fence", async () => {
-    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
     const authorization = { Authorization: `Bearer ${owner.nonce}` };
     const quiesce = (method: "POST" | "DELETE", query = "") =>
       fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
@@ -900,8 +902,9 @@ describe("harness HTTP API", () => {
       }
       expect(forced.status).toBe(200);
       expect(await forced.json()).toMatchObject({ quiescing: true, draining: false, safeToRestart: true });
-      const resume = JSON.parse(readFileSync(resumePath, "utf8")) as { interruptedBots: Array<{ botId: string }> };
+      const resume: { interruptedBots: Array<{ botId: string }> } = JSON.parse(readFileSync(resumePath, "utf8"));
       expect(resume.interruptedBots.map((entry) => entry.botId)).toContain(working.id);
+      // SAFETY: the carrier this harness just wrote, read back by its test; the assertions below check it.
       const saved = JSON.parse(readFileSync(carrier, "utf8")) as {
         sends: Array<{ botId: string }>;
         queued: Array<{ botId: string; items: Array<{ text: string }> }>;
@@ -7577,6 +7580,60 @@ describe("PATCH /api/terminology", () => {
     expect(res.status).toBe(200);
     const status = await api("GET", "/api/config");
     expect(status.body.profile?.name).not.toBe("Someone Else");
+  });
+});
+
+describe("workspace voice settings", () => {
+  it("hands every client the default voice by id and the pronunciation list in force", async () => {
+    const saved = await api("PUT", "/api/config", { tts: { voice: "jay-wedgeworth-001" } });
+    expect(saved.status).toBe(200);
+    expect(saved.body.tts.voice).toBe("jay-wedgeworth-001");
+    const status = await api("GET", "/api/config");
+    expect(status.body.tts.voice).toBe("jay-wedgeworth-001");
+    // Never saved yet: the seeded list, so a client never has to know it.
+    expect(status.body.tts.pronunciations).toEqual(expect.arrayContaining([
+      { term: "SQL", say: "sequel" },
+      { term: "OAuth", say: "oh auth" },
+    ]));
+  });
+
+  it("saves the list through PUT /api/config with the shared validation", async () => {
+    const ok = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "SQL", say: "S Q L" }] } });
+    expect(ok.status).toBe(200);
+    expect(ok.body.tts.pronunciations).toEqual([{ term: "SQL", say: "S Q L" }]);
+    const dup = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "a", say: "x" }, { term: "A", say: "y" }] } });
+    expect(dup.status).toBe(400);
+  });
+
+  it("lets the phone's narrow route change the default voice, and nothing else", async () => {
+    const res = await api("PATCH", "/api/tts/default-voice", { voice: "English_Graceful_Lady", profile: { name: "Side Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.voice).toBe("English_Graceful_Lady");
+    expect((await api("GET", "/api/config")).body.profile?.name).not.toBe("Side Door");
+    // A Personal Voice belongs to one device; blank and junk are refused.
+    const personal = await api("PATCH", "/api/tts/default-voice", { voice: "personal:Jay" });
+    expect(personal.status).toBe(400);
+    expect(personal.body.error).toContain("Personal Voices stay on the device");
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "  " })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "a\u0000b" })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: 7 })).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.voice).toBe("English_Graceful_Lady");
+    // The MiniMax id is kept exactly; MiniMax ids are case-sensitive.
+    const exact = await api("PATCH", "/api/tts/default-voice", { voice: "jay-wedgeworth-001" });
+    expect(exact.body.tts.voice).toBe("jay-wedgeworth-001");
+  });
+
+  it("lets the phone's narrow route replace the pronunciation list, with a plain-language refusal", async () => {
+    const list = [{ term: "JSON", say: "Jason" }, { term: "kubectl", say: "cube control" }];
+    const res = await api("PATCH", "/api/tts/pronunciations", { pronunciations: list, tts: { voice: "Side_Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.pronunciations).toEqual(list);
+    expect(res.body.tts.voice).not.toBe("Side_Door");
+    const bad = await api("PATCH", "/api/tts/pronunciations", { pronunciations: [{ term: "JSON", say: "my JSON" }] });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toContain("which is also on the list");
+    expect((await api("PATCH", "/api/tts/pronunciations", {})).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.pronunciations).toEqual(list);
   });
 });
 

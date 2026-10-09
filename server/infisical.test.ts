@@ -376,6 +376,33 @@ describe("probe", () => {
   });
 });
 
+describe("readPath", () => {
+  it("returns one folder's values to the caller and nowhere else", async () => {
+    withSettings({});
+    const fetchMock = loginThenList([{ secretKey: "ZULIP_BF_PLUMBER_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const values = await infisical.readPath("/zulip");
+
+    expect(values.get("ZULIP_BF_PLUMBER_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+    // the folder asked for, not the configured snapshot path
+    expect(String(fetchMock.mock.calls.at(-1)?.[0])).toContain("secretPath=%2Fzulip");
+    // never the snapshot, never the environment, never the status view
+    expect(infisicalSnapshot()).toBeNull();
+    expect(Object.values(process.env)).not.toContain(SENTINEL_VAULT_VALUE);
+    expect(JSON.stringify(infisical.getStatus())).not.toContain(SENTINEL_VAULT_VALUE);
+  });
+
+  it("refuses with no request when Infisical is turned off", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    withSettings({ enabled: false });
+
+    await expect(infisical.readPath("/zulip")).rejects.toThrow(/not configured and turned on/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("writeSecret", () => {
   it("refuses with 409 when write-through is off, without a request", async () => {
     const fetchMock = vi.fn();

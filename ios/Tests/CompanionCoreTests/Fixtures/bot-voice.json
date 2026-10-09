@@ -37,5 +37,17 @@
     { "name": "voices null clears both", "existing": { "mac": "personal:m", "iphone": "vx" }, "patch": null, "expected": null },
     { "name": "an empty patch changes nothing", "existing": { "mac": "personal:m" }, "patch": {}, "expected": { "mac": "personal:m" } },
     { "name": "stored values are trimmed", "existing": null, "patch": { "mac": "  vy  " }, "expected": { "mac": "vy" } }
+  ],
+  "defaultVoiceOptionLabel": [
+    { "name": "a cloned id with no friendly label is made readable", "defaultVoice": "jay-wedgeworth-001", "voices": [{ "id": "jay-wedgeworth-001", "label": "jay-wedgeworth-001" }], "expected": "Jay Wedgeworth 001 (default)" },
+    { "name": "an id the list does not have is made readable", "defaultVoice": "jay-wedgeworth-001", "voices": [], "expected": "Jay Wedgeworth 001 (default)" },
+    { "name": "the listed label wins", "defaultVoice": "English_Graceful_Lady", "voices": [{ "id": "English_Graceful_Lady", "label": "Graceful Lady" }], "expected": "Graceful Lady (default)" },
+    { "name": "underscores read as spaces", "defaultVoice": "English_radiant_girl", "voices": null, "expected": "English Radiant Girl (default)" },
+    { "name": "the lookup is case-sensitive, like MiniMax ids", "defaultVoice": "Jay-Wedgeworth-001", "voices": [{ "id": "jay-wedgeworth-001", "label": "Jay" }], "expected": "Jay Wedgeworth 001 (default)" },
+    { "name": "a blank label falls back to the id", "defaultVoice": "voice_x", "voices": [{ "id": "voice_x", "label": "  " }], "expected": "Voice X (default)" },
+    { "name": "a Personal Voice drops its prefix", "defaultVoice": "personal:Jay", "voices": null, "expected": "Jay (default)" },
+    { "name": "no default voice", "defaultVoice": "", "voices": null, "expected": "No default voice" },
+    { "name": "a whitespace-only default is no default", "defaultVoice": "   ", "voices": null, "expected": "No default voice" },
+    { "name": "a missing default is no default", "defaultVoice": null, "voices": null, "expected": "No default voice" }
   ]
 }
