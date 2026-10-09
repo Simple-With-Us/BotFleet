@@ -923,7 +923,11 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
       reason: topology.reason || "Health endpoints do not share the authenticated runtime owner",
     };
   }
-  const holders = await sqliteHolders(config.dataDirectory);
+  // A bot's own `sqlite3` or `node` holding the database for a moment is
+  // waited out, never signalled, and named if it stays (finding 5).
+  const settled = await settledDatabaseHolders(config, owner.pid, { report: config.reportDetail });
+  if (!settled.holders) return { safe: false, reason: settled.reason };
+  const holders = settled.holders;
   if (holders.length !== 1 || holders[0] !== owner.pid) {
     return { safe: false, reason: `Database ownership is ambiguous (${holders.length} live holders)` };
   }
@@ -1418,14 +1422,22 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
     return refuseAfterFence(identityError || "Runtime refused the admission fence because work is active");
   }
   let topology;
-  let holders;
+  let settled;
   try {
-    [topology, holders] = await Promise.all([
+    [topology, settled] = await Promise.all([
       retryTransient(async () => {
         const result = await inspectTopology(config.ports);
         return { ...result, transient: !result.safe && TOPOLOGY_UNAVAILABLE.test(result.reason || "") };
       }, { windowMs: 30_000, now, wait }),
-      inspectHolders(config.dataDirectory),
+      // A bot's own tool holding the database for a moment is waited out,
+      // never signalled, and named if it stays (finding 5).
+      settledDatabaseHolders(config, owner.pid, {
+        inspect: inspectHolders,
+        identify: adapters.processIdentity ?? {},
+        now,
+        wait,
+        report: adapters.report ?? config?.reportDetail,
+      }),
     ]);
   } catch {
     return refuseAfterFence("Runtime ownership could not be verified after the admission fence");
@@ -1433,6 +1445,8 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
   if (!topology.safe || topology.pid !== owner.pid) {
     return refuseAfterFence(topology.reason || "Health endpoints do not share the fenced runtime owner");
   }
+  if (!settled.holders) return refuseAfterFence(settled.reason);
+  const holders = settled.holders;
   if (holders.length !== 1 || holders[0] !== owner.pid) {
     return refuseAfterFence(`Database ownership is ambiguous after admission fence (${holders.length} live holders)`);
   }
@@ -2087,7 +2101,7 @@ export function isRecoverableResolutionFailure(error) {
   return false;
 }
 
-export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
+export async function isExpectedBotFleetProcess(command, cwd, config, pid, { txtPathsOf = processTxtPaths } = {}) {
   const appExecutable = join(config.appPath, "Contents/MacOS/BotFleet");
   if (command === appExecutable || command.startsWith(`${appExecutable} `) || command.startsWith(`${config.appPath}/Contents/`)) {
     return true;
@@ -2099,7 +2113,7 @@ export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
     return true;
   }
   if (pid) {
-    const txtPaths = await processTxtPaths(pid);
+    const txtPaths = await txtPathsOf(pid);
     const helperPrefix = join(config.appPath, "Contents/Frameworks/BotFleet Helper");
     if (txtPaths.includes(appExecutable) || txtPaths.some((p) => p.startsWith(helperPrefix))) {
       return true;
@@ -2381,6 +2395,8 @@ export async function waitOutUnrecognizedHolders(attempt, {
   now = Date.now,
   wait = sleep,
   report = () => {},
+  // A signal ends the wait at once; the caller says why it stopped.
+  stopped = () => false,
 } = {}) {
   const deadline = now() + Math.max(0, windowMs);
   let lastReport = null;
@@ -2389,6 +2405,7 @@ export async function waitOutUnrecognizedHolders(attempt, {
       return await attempt();
     } catch (error) {
       if (!(error instanceof UnrecognizedHolderError)) throw error;
+      if (stopped()) throw error;
       if (now() >= deadline) {
         throw new UnrecognizedHolderError(
           error.pid,
@@ -2408,6 +2425,45 @@ export async function waitOutUnrecognizedHolders(attempt, {
 }
 
 /**
+ * The processes holding the BotFleet database, once any that is not BotFleet
+ * has let go.
+ *
+ * The preflight and the check after the fence used to count every holder and
+ * refuse "Database ownership is ambiguous" at once — which is exactly where a
+ * bot's own `sqlite3` or `node` reading the database for a second trips an
+ * update.  An extra holder that is not a BotFleet process is now waited out
+ * the same bounded way capture and quiesce wait (`waitOutUnrecognizedHolders`),
+ * never signalled, and named when it stays.  A second holder that IS a
+ * BotFleet process is still a definitive ambiguity for the caller to refuse.
+ * Resolves `{ holders }`, or `{ holders: null, reason }` when a foreign holder
+ * outlasted the window.
+ */
+export async function settledDatabaseHolders(config, ownerPid, {
+  inspect = sqliteHolders,
+  identify = {},
+  windowMs = Number.isFinite(config?.unknownHolderWaitMs) ? config.unknownHolderWaitMs : DEFAULT_UNKNOWN_HOLDER_WAIT_MS,
+  now = Date.now,
+  wait = sleep,
+  report = () => {},
+  stopped = () => false,
+} = {}) {
+  try {
+    const holders = await waitOutUnrecognizedHolders(async () => {
+      const current = await inspect(config.dataDirectory);
+      const others = current.filter((pid) => pid !== ownerPid);
+      if (!others.length) return current;
+      // Throws for a live holder that is not BotFleet; drops one that exited.
+      const { pids } = await captureProcessIdentities(others, config, identify);
+      return current.filter((pid) => pid === ownerPid || pids.includes(pid));
+    }, { windowMs, now, wait, report: report ?? (() => {}), stopped });
+    return { holders };
+  } catch (error) {
+    if (error instanceof UnrecognizedHolderError) return { holders: null, reason: error.message };
+    throw error;
+  }
+}
+
+/**
  * Record the identity of every running process that holds BotFleet state, so
  * quiesce can tell the process it captured from a recycled pid.  Exited pids
  * (a zombie above all) are dropped first: they hold nothing, and a zombie's
@@ -2421,6 +2477,7 @@ export async function captureProcessIdentities(pids, config, {
   commandOf = processCommand,
   cwdOf = processCwd,
   executableOf = processExecutable,
+  txtPathsOf = processTxtPaths,
 } = {}) {
   const live = await withoutExitedPids([...new Set(pids)], { isAlive });
   const processCommands = {};
@@ -2428,7 +2485,7 @@ export async function captureProcessIdentities(pids, config, {
   for (const pid of live) {
     const command = await commandOf(pid);
     const cwd = await cwdOf(pid);
-    if (!(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
+    if (!(await isExpectedBotFleetProcess(command, cwd, config, pid, { txtPathsOf }))) {
       // Gone while it was being described: it holds nothing any more.
       if ((await withoutExitedPids([pid], { isAlive })).length === 0) continue;
       throw new UnrecognizedHolderError(
@@ -2478,6 +2535,7 @@ export async function terminateVerified(pids, previous, config, {
   commandOf = processCommand,
   cwdOf = processCwd,
   executableOf = processExecutable,
+  txtPathsOf = processTxtPaths,
   kill,
   wait = sleep,
   now = Date.now,
@@ -2493,7 +2551,7 @@ export async function terminateVerified(pids, previous, config, {
     const cwd = await cwdOf(pid);
     const sameAsCaptured = Boolean(previous.processCommands?.[pid]) && previous.processCommands[pid] === command &&
       previous.processCwds?.[pid] === cwd;
-    if (!sameAsCaptured && !(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
+    if (!sameAsCaptured && !(await isExpectedBotFleetProcess(command, cwd, config, pid, { txtPathsOf }))) {
       // Exited while ps and lsof were still describing it: there was no
       // process left to describe, so its identity came back empty.
       if ((await withoutExitedPids([pid], { isAlive })).length === 0) continue;

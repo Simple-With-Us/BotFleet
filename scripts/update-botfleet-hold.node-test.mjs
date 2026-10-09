@@ -25,6 +25,7 @@ import {
   retryTransient,
   rollbackFenceConfig,
   runtimePreflight,
+  settledDatabaseHolders,
   terminateVerified,
   UnrecognizedHolderError,
   waitForIdleTimeoutMessage,
@@ -473,13 +474,86 @@ test("an older harness without holds still updates: an idle moment, or the grace
 });
 
 test("a fence that fails its ownership check after the hold is still released", async () => {
+  // A second holder that is BotFleet itself is a real ambiguity: refused at
+  // once, not waited on.
   const harness = scriptedHarness({ inFlight: () => 0 });
   harness.adapters.sqliteHolders = async () => [42, 43];
-  const result = await fenceRuntimeAdmission(config(), harness.adapters);
+  harness.adapters.processIdentity = holderTable({ 43: { command: APP_EXECUTABLE, cwd: "/" } }).deps;
+  const result = await fenceRuntimeAdmission(config(holderConfig), harness.adapters);
   assert.equal(result.safe, false);
   assert.match(result.reason, /Database ownership is ambiguous/);
   assert.equal(harness.state.released, 1);
   assert.equal(harness.state.quiescing, false);
+  assert.equal(harness.clock(), 0, "not waited on");
+});
+
+test("a foreign process holding the database after the fence is waited out, never signalled", async () => {
+  // Finding 5: the 90-second wait covered capture and quiesce, but not the two
+  // places such a process actually trips an update.
+  const harness = scriptedHarness({ inFlight: () => 0 });
+  const { table, signals, deps } = holderTable({
+    77001: { command: "sqlite3 /Users/test/.botfleet/messages.db", cwd: "/", executable: "/usr/bin/sqlite3" },
+  });
+  harness.adapters.sqliteHolders = async () => [42, ...[...table].filter(([, row]) => row.alive).map(([pid]) => pid)];
+  harness.adapters.processIdentity = deps;
+  const sleep = harness.adapters.sleep;
+  harness.adapters.sleep = async (ms) => {
+    await sleep(ms);
+    if (harness.clock() >= 8_000) table.get(77001).alive = false;
+  };
+  const result = await fenceRuntimeAdmission(config(holderConfig), harness.adapters);
+  assert.equal(result.safe, true);
+  assert.deepEqual(result.holders, [42]);
+  assert.ok(harness.clock() >= 8_000);
+  assert.deepEqual(signals, []);
+  assert.ok(harness.state.reports.includes("Waiting for sqlite3 to let go of BotFleet's files"));
+
+  // One that stays is named, never signalled, and the fence is released.
+  const stuck = scriptedHarness({ inFlight: () => 0 });
+  const stays = holderTable({ 77002: { command: "node /tmp/probe.js", cwd: "/tmp", executable: "/opt/homebrew/bin/node" } });
+  stuck.adapters.sqliteHolders = async () => [42, 77002];
+  stuck.adapters.processIdentity = stays.deps;
+  const refused = await fenceRuntimeAdmission(config(holderConfig), stuck.adapters);
+  assert.equal(refused.safe, false);
+  assert.match(refused.reason, /^Process 77002 still holds BotFleet state after 1\.5 minutes and is not a BotFleet process/);
+  assert.match(refused.reason, /\/opt\/homebrew\/bin\/node/);
+  assert.equal(stuck.state.released, 1);
+  assert.deepEqual(stays.signals, []);
+});
+
+test("preflight waits out a foreign database holder the same way, and names one that stays", async () => {
+  const { table, signals, deps } = holderTable({
+    77003: { command: "curl http://127.0.0.1:8799/api/health", cwd: "/", executable: "/usr/bin/curl" },
+  });
+  let clock = 0;
+  const holders = async () => [42, ...[...table].filter(([, row]) => row.alive).map(([pid]) => pid)];
+  const waited = await settledDatabaseHolders({ ...holderConfig, dataDirectory: "/private/data" }, 42, {
+    inspect: holders,
+    identify: deps,
+    now: () => clock,
+    wait: async (ms) => {
+      clock += ms;
+      if (clock >= 4_000) table.get(77003).alive = false;
+    },
+  });
+  assert.deepEqual(waited, { holders: [42] });
+  assert.deepEqual(signals, []);
+
+  clock = 0;
+  table.get(77003).alive = true;
+  const named = await settledDatabaseHolders({ ...holderConfig, dataDirectory: "/private/data", unknownHolderWaitMs: 30_000 }, 42, {
+    inspect: holders,
+    identify: deps,
+    now: () => clock,
+    wait: async (ms) => {
+      clock += ms;
+    },
+  });
+  assert.equal(named.holders, null);
+  assert.match(named.reason, /Process 77003 still holds BotFleet state after 30 seconds/);
+  assert.match(named.reason, /\(\/usr\/bin\/curl\)$/);
+  assert.equal(clock, 30_000);
+  assert.deepEqual(signals, []);
 });
 
 test("a slow health port after the fence is asked again rather than failing the update", async () => {
@@ -633,6 +707,8 @@ function holderTable(rows) {
       commandOf: async (pid) => (table.get(pid)?.alive ? table.get(pid).command : ""),
       cwdOf: async (pid) => (table.get(pid)?.alive ? table.get(pid).cwd : ""),
       executableOf: async (pid) => (table.get(pid)?.alive ? table.get(pid).executable ?? "" : ""),
+      // What the process has mapped: nothing BotFleet, unless the row says so.
+      txtPathsOf: async (pid) => (table.get(pid)?.alive ? table.get(pid).txt ?? [] : []),
       kill: (pid, signal) => {
         signals.push([pid, signal]);
         const row = table.get(pid);
