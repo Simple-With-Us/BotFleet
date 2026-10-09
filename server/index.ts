@@ -12812,7 +12812,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (!allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode))) {
         return json(res, 409, {
-          error: "this workspace uses one conversation per channel — switch Workspace Arrangement in Settings to allow extra threads",
+          error: `this workspace uses one conversation per ${resolveRoomLabels(cfg.terminology, cfg.terminologyCustom).singular.toLowerCase()} — switch Workspace Arrangement in Settings to allow extra threads`,
         });
       }
       const task = store.createGroupTask(group.id, typeof body.title === "string" ? body.title : undefined);

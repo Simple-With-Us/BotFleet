@@ -13,7 +13,7 @@
 // (default "channel" — the workspace default).
 import { useMemo, type Dispatch } from "react";
 import { z } from "zod";
-import { StoreContext, initialState, type Action } from "@/state/store";
+import { StoreContext, initialState, type Action, type AppState } from "@/state/store";
 import type { RoomLabels } from "../../shared/terminology";
 import { ConversationModeRow } from "./SettingsModal";
 
@@ -21,27 +21,32 @@ const noopDispatch: Dispatch<Action> = () => {};
 
 const roomSchema = z.enum(["channel", "room"]).default("channel");
 
-const ROOM_LABELS: Record<"channel" | "room", RoomLabels> = {
+const ROOM_LABELS = {
   channel: { singular: "Channel", plural: "Channels" },
   room: { singular: "Room", plural: "Rooms" },
-};
+} satisfies Record<"channel" | "room", RoomLabels>;
 
 export default function ConversationModeRowVisualFixture() {
   const raw = new URLSearchParams(window.location.search).get("room") ?? undefined;
   const room = roomSchema.parse(raw);
-  const value = useMemo(() => ({
-    state: {
+  // Typed as AppState so conversationMode keeps the literal "projects"
+  // instead of widening to string.
+  const value = useMemo(() => {
+    const state: AppState = {
       ...initialState,
       config: {
         ...initialState.config!,
         conversationMode: "projects",
         roomLabels: ROOM_LABELS[room],
       },
-    },
-    dispatch: noopDispatch,
-    flushBotPatches: async () => {},
-    refreshInstances: async () => {},
-  }), [room]);
+    };
+    return {
+      state,
+      dispatch: noopDispatch,
+      flushBotPatches: async () => {},
+      refreshInstances: async () => {},
+    };
+  }, [room]);
   return (
     <StoreContext.Provider value={value}>
       <div
