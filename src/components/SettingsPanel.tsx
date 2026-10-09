@@ -14,6 +14,7 @@ import { shortPath } from "@/lib/short-path";
 import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@/lib/cloud-backend";
 import { computerDestinationDisabledReason, instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
+import { BotPowerToggle } from "./BotPowerToggle";
 import { BotSkillsPanel } from "./BotSkillsPanel";
 import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
@@ -383,6 +384,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "composio"
         | "modelSelection"
         | "maxToolRounds"
+        | "off"
       >
     > & { acknowledgeLocalAuto?: boolean; connectorTools?: Bot["connectorTools"] },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
@@ -465,6 +467,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               onChange={(e) => patch({ description: e.target.value })}
             />
           </Field>
+
+          <BotPowerToggle off={bot.off === true} onChange={(off) => patch({ off })} />
 
           <div className={cn(
             "rounded-xl border p-4",

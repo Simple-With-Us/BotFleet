@@ -811,7 +811,11 @@ struct ChatRow: View {
             .frame(maxHeight: .infinity)
 
             HStack(alignment: .top, spacing: 14) {
+                // An Off bot keeps its place in the list, dimmed and grey, so
+                // it reads as switched off rather than merely quiet.
                 ChatAvatarView(chat: chat, size: 52, state: state, animated: state.showsActivity)
+                    .opacity(chat.isOff ? 0.5 : 1)
+                    .saturation(chat.isOff ? 0 : 1)
                     .padding(.top, 12)
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -821,6 +825,16 @@ struct ChatRow: View {
                             .foregroundStyle(Color.primary)
                             .lineLimit(1)
                             .layoutPriority(1)
+
+                        if chat.isOff {
+                            Text("Off")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Color.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.secondary.opacity(0.18)))
+                                .accessibilityLabel("Off")
+                        }
 
                         // the bot's job, the way the desktop shows it
                         if !chat.subtitle.isEmpty {

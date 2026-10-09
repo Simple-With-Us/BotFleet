@@ -108,8 +108,11 @@ export function drainRoomRounds(
 }
 
 /** Test seam: how many rounds are waiting. */
-export function _queuedRoomCount(): number {
-  return queues.size;
+export function _queuedRoomCount(ignoreBot?: (botId: string) => boolean): number {
+  if (!ignoreBot) return queues.size;
+  let count = 0;
+  for (const round of queues.values()) if (!ignoreBot(round.botId)) count += 1;
+  return count;
 }
 
 /** Whether the exact bot/thread round is still retained.  Runtime readiness
