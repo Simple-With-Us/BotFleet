@@ -355,7 +355,11 @@ export async function enablePlugin(
   const entry = registry.plugins[name];
   if (entry) {
     const writeError = trySetPluginEntry({ ...entry, enabled: true }, baseDir);
-    if (writeError) return writeError;
+    if (writeError) {
+      // The entry stayed disabled, so do not leave its sandbox running.
+      await dropLoaded(name);
+      return writeError;
+    }
   }
   return listingOrError(name, baseDir);
 }
