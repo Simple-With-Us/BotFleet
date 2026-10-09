@@ -1251,6 +1251,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             ...base(threadId, turnId),
             type: "request.opened",
             requestId,
+            // the tool call this ask is about, the same id its item.started
+            // carried, so the auto-review step watch leaves it to the card
+            ...(typeof toolCall.toolCallId === "string" && toolCall.toolCallId ? { itemId: toolCall.toolCallId } : {}),
             requestType: "permission",
             tool,
             summary,
