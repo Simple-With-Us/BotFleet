@@ -50,20 +50,24 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, isJobTool, isOwnJobStartRequest, offerableApprovalKey } from "./auto-approve.ts";
+import { autoVerdict, coarseAlwaysAllowRefused, isOwnJobStartRequest, offerableApprovalKey } from "./auto-approve.ts";
 import {
+  grantLabel,
+  heldGrantText,
+  noVerdictRule,
   resolveAutoReviewMode,
+  ReviewBudget,
   reviewersFor,
-  reviewsBypass,
-  reviewWithReviewers,
+  reviewsGrant,
+  runReview,
   shouldHoldForReview,
   shouldReview,
   type Reviewer,
 } from "./auto-review.ts";
-import { ReviewWatch } from "./review-watch.ts";
-import { effectiveReviewHook } from "../shared/auto-review.ts";
+import { HELD_ASK_GRACE_MS, ReviewWatch, RunningTurns, type StopTarget } from "./review-watch.ts";
+import { fallbackReviewerSetting, pickAutoReviewer, reviewerHealth } from "../shared/auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
-import { appendDecision, readDecisions, type DecisionSource } from "./decision-log.ts";
+import { appendDecision, readDecisions, type DecisionRow, type DecisionSource } from "./decision-log.ts";
 import { checkWriteTargets } from "./path-containment.ts";
 import { cwdConfinementError, protectedCwdDirs, realOrResolved, validateBotCwd, type CwdConfinement } from "./bot-cwd.ts";
 import { captureTaskWorkspaceContext, TaskWorkspaceContextError, taskWorkspaceExecutionError } from "./task-workspace-context.ts";
@@ -233,6 +237,7 @@ import {
   isAbsoluteHttpUrl,
   localQuotaRoutingEnabled,
   autoReviewFallbackReviewer,
+  autoReviewMaxPerTurn,
   usageIngestUrl,
   usageProjectRules,
   vpsCpus,
@@ -301,6 +306,7 @@ import {
   eligibleAutoFallbackChain,
   inspectThreadOwners,
   interruptThreadOwners,
+  reviewStopScope,
   scheduleStalledReleaseRecheck,
   stalledReleaseDecision,
   TurnOwnerClaims,
@@ -3251,42 +3257,92 @@ void registry
   })
   .catch(() => {});
 
+/** The fleet's fallback reviewer right now: the engine the owner picked,
+ * nobody when they turned it off, or, left on Automatic, the best healthy
+ * engine that can review (shared/auto-review.ts `pickAutoReviewer`).  Read
+ * from the live config and the registry's last probes on every call, so a
+ * choice or an engine going down takes effect without a restart. */
+function fallbackReviewerInstance(): ProviderInstance | null {
+  const setting = fallbackReviewerSetting(autoReviewFallbackReviewer(cfg));
+  if (setting.kind === "none") return null;
+  if (setting.kind === "chosen") return registry.get(setting.instanceId);
+  const automatic = automaticFallbackReviewerId();
+  return automatic ? registry.get(automatic) : null;
+}
+
+/** Which engine Automatic picks, by instance id, or null when none can
+ * review.  The Bot Profile runs the same rule over the same probes. */
+function automaticFallbackReviewerId(): string | null {
+  return pickAutoReviewer(
+    registry.instances().map((instance) => ({
+      instanceId: instance.instanceId,
+      driverKind: instance.driverKind,
+      canReview: instance.enabled !== false && instance.reviewPermission !== undefined,
+      health: reviewerHealth(registry.lastKnown(instance.instanceId)?.snapshot),
+    })),
+  );
+}
+
 /** Who reviews an ask raised on `instance`: that engine itself when it can
- * run an isolated review, then the owner's fallback reviewer from settings
- * (server/auto-review.ts `reviewersFor`).  Read from the live config on every
- * call, so choosing a reviewer takes effect without a restart. */
+ * run an isolated review, and the fleet's fallback reviewer, in the order
+ * server/auto-review.ts `reviewersFor` sets. */
 function reviewersForInstance(instance: ProviderInstance | null | undefined): Reviewer[] {
-  const fallbackId = autoReviewFallbackReviewer(cfg);
-  return reviewersFor(instance, fallbackId ? registry.get(fallbackId) : null);
+  return reviewersFor(instance, fallbackReviewerInstance());
 }
 
 /** Whether this dispatch runs a full-auto instance in its asking mode so the
- * reviewer sees each ask first (`SendTurnInput.holdForReview`), and remember
- * the answer so the step watch leaves that turn's steps to the card.  Only an
- * instance that would otherwise act unasked and can ask is held. */
-function holdTurnForReview(
-  bot: { id: string; autoReview?: string },
-  threadId: string,
-  instance: ProviderInstance,
-): boolean {
+ * reviewer sees each ask first (`SendTurnInput.holdForReview`).  Only an
+ * instance that would otherwise act unasked and can ask is held.  The step
+ * watch still runs on a held turn, for the steps the engine takes without
+ * asking even then. */
+function holdTurnForReview(bot: { id: string; autoReview?: string }, instance: ProviderInstance): boolean {
   const capabilities = instance.adapter.capabilities;
-  const hold =
+  return (
     capabilities.reviewHook === "after" &&
     capabilities.asksWhenHeld === true &&
     shouldHoldForReview({
       mode: resolveAutoReviewMode(bot.autoReview),
       unattended: isUnattended(bot.id),
       hasReviewer: reviewersForInstance(instance).length > 0,
-    });
-  const key = heldKey(threadId, instance.instanceId);
-  if (hold) heldForReview.add(key);
-  else heldForReview.delete(key);
-  return hold;
+    })
+  );
 }
 
 /** The bot as the reviewer is told about it: name, title and description. */
 function reviewPersona(bot: { name: string; title?: string; description?: string }): string {
   return [bot.name, bot.title, bot.description].filter(Boolean).join(" — ");
+}
+
+// Every turn running on each thread, so a refusal that arrives after its turn
+// ended is shown as a flag and never stops the next turn, and so a room with
+// two members running at once still stops the right one.
+const runningTurns = new RunningTurns();
+// Reviewer calls spent per turn, shared by the card, the Auto and Bypass
+// grant screen and the step watch (`autoReview.maxReviewsPerTurn`).
+const reviewBudget = new ReviewBudget(() => autoReviewMaxPerTurn(cfg));
+
+/** The budget key for a review on `threadId`.  An in-process ask (an HTTP
+ * lane's tool) carries no turn id, so it is charged to the thread's one
+ * running turn. */
+function reviewBudgetKey(threadId: string, turnId: string | undefined): string {
+  return ReviewBudget.key(threadId, turnId ?? runningTurns.only(threadId));
+}
+
+/** Say once per turn that review stopped recording because the turn spent
+ * its review limit.  Used under Watch, where nothing is stopped for it. */
+function noteReviewCap(row: Omit<DecisionRow, "at" | "decision" | "source" | "rule">, budgetKey: string, limit: number): void {
+  if (!reviewBudget.firstNotice(budgetKey)) return;
+  store.appendMessage(row.threadId, {
+    role: "bot",
+    kind: "activity",
+    tool: { name: `review paused for the rest of this turn: it reached its limit of ${limit} reviews`, ok: true },
+  });
+  appendDecision(DATA_DIR, {
+    ...row,
+    decision: "review-skipped",
+    source: "auto-review-shadow",
+    rule: noVerdictRule({ kind: "capped", limit }),
+  });
 }
 
 async function reviewPermissionCard(args: {
@@ -3306,25 +3362,47 @@ async function reviewPermissionCard(args: {
   messageId: string;
   tool: string;
   summary: string;
+  budgetKey: string;
 }): Promise<boolean> {
   const mode = resolveAutoReviewMode(args.asker.autoReview);
   if (mode === "off" || args.reviewers.length === 0) return false;
-  const reviewed = await reviewWithReviewers(args.reviewers, {
+  const result = await runReview(
+    args.reviewers,
+    { tool: args.tool, summary: args.summary, persona: reviewPersona(args.asker) },
+    { budget: reviewBudget.forTurn(args.budgetKey) },
+  );
+  const row = {
+    threadId: args.threadId,
+    requestId: args.requestId,
+    botId: args.asker.id,
+    botName: args.asker.name,
     tool: args.tool,
     summary: args.summary,
-    persona: reviewPersona(args.asker),
-  });
-  if (!reviewed) return false;
-  const { verdict, reviewer } = reviewed;
+  };
+  if (result.kind === "capped") {
+    if (mode === "shadow") {
+      noteReviewCap(row, args.budgetKey, result.limit);
+      return false;
+    }
+    // On, past the limit: the card stays with the person, and says why it
+    // was not reviewed.
+    const card = store.messagesFor(args.threadId).find((message) => message.id === args.messageId)?.card;
+    if (!card || card.answered) return false;
+    store.patchMessage(args.threadId, args.messageId, {
+      card: {
+        ...card,
+        held: `Auto-review reached its limit of ${result.limit} reviews for this turn, so this waits for you.`,
+      },
+    });
+    appendDecision(DATA_DIR, { ...row, decision: "card-shown", source: "auto-review", rule: noVerdictRule(result) });
+    return false;
+  }
+  if (result.kind === "no-answer") return false;
+  const { verdict, reviewer } = result;
 
   if (mode === "shadow") {
     appendDecision(DATA_DIR, {
-      threadId: args.threadId,
-      requestId: args.requestId,
-      botId: args.asker.id,
-      botName: args.asker.name,
-      tool: args.tool,
-      summary: args.summary,
+      ...row,
       decision: verdict.allow ? "review-would-approve" : "review-would-deny",
       source: "auto-review-shadow",
       rule: verdict.reason,
@@ -3344,12 +3422,7 @@ async function reviewPermissionCard(args: {
       card: { ...card, held: `The reviewer (${reviewer.name}) did not approve this: ${verdict.reason}` },
     });
     appendDecision(DATA_DIR, {
-      threadId: args.threadId,
-      requestId: args.requestId,
-      botId: args.asker.id,
-      botName: args.asker.name,
-      tool: args.tool,
-      summary: args.summary,
+      ...row,
       decision: "card-shown",
       source: "auto-review",
       rule: verdict.reason,
@@ -3378,12 +3451,7 @@ async function reviewPermissionCard(args: {
     tool: { name: `review approved ${args.tool} (${reviewer.name}): ${verdict.reason}`, ok: true },
   });
   appendDecision(DATA_DIR, {
-    threadId: args.threadId,
-    requestId: args.requestId,
-    botId: args.asker.id,
-    botName: args.asker.name,
-    tool: args.tool,
-    summary: args.summary,
+    ...row,
     decision: "auto-approved",
     source: "auto-review",
     rule: verdict.reason,
@@ -3392,24 +3460,48 @@ async function reviewPermissionCard(args: {
   return true;
 }
 
-// Which thread/instance pairs are running a turn held in its asking mode for
-// review (`SendTurnInput.holdForReview`), so the step watch below leaves
-// their steps to the card.  Set at dispatch, cleared when the turn settles.
-const heldForReview = new Set<string>();
-const heldKey = (threadId: string, instanceId: string | undefined) => `${threadId}:${instanceId ?? ""}`;
-// The turn in flight on each thread, by turn id, so a refusal that arrives
-// after its turn ended is shown as a flag and never stops the next turn.
-const runningTurnByThread = new Map<string, string>();
+/** Close the open cards one engine raised on a thread, leaving every other
+ * engine's alone: the room-scoped half of `closeOpenApprovals`.  An HTTP
+ * lane's in-process ask needs nothing here, since interrupting its turn
+ * aborts the ask's own signal and the broker settles it. */
+function closeOpenApprovalsForInstance(threadId: string, instanceId: string): void {
+  for (const message of store.messagesFor(threadId)) {
+    const card = message.card;
+    if (!card?.requestId || card.answered || card.dismissed) continue;
+    if (card.routineRequest) continue;
+    const key = `${threadId}:${card.requestId}`;
+    if (askInstanceByRequest.get(key) !== instanceId) continue;
+    store.patchMessage(threadId, message.id, { card: { ...card, answered: "unavailable", dismissed: true } });
+    askMessageByRequest.delete(key);
+    askInstanceByRequest.delete(key);
+  }
+}
 
-/** Stop a turn the reviewer refused a step of.  Latched exactly like the
- * person's Stop, so the turn ends instead of failing over to the bot's next
- * engine, and its open cards are closed. */
-function stopTurnForReview(botId: string, threadId: string): void {
+/** Stop the turn auto-review refused (or could not check) a step of.
+ * Latched exactly like the person's Stop, so the turn ends instead of
+ * failing over to the bot's next engine, and its open cards are closed.
+ *
+ * Only that bot's turn: on a thread where another engine is running too (a
+ * room with two members at once) the stop goes to the step's own engine and
+ * closes only its cards (server/turn-safety.ts `reviewStopScope`).  On a
+ * thread it has to itself, the whole-thread stop also settles in-process
+ * asks and peer approvals. */
+function stopTurnForReview(target: StopTarget): void {
+  const { botId, threadId, instanceId, turnId } = target;
   const turnKey = `${botId}:${threadId}`;
   stoppedTurns.add(turnKey);
   fallbackAttemptByTurn.delete(turnKey);
   pendingCredentialFallback.delete(turnKey);
-  pendingMemberFallback.delete(threadId);
+  if (pendingMemberFallback.get(threadId)?.botId === botId) pendingMemberFallback.delete(threadId);
+  const scope = reviewStopScope({ instanceId, liveInstanceIds: activeTurnOwners.instancesOn(threadId) });
+  const instance = scope === "instance" && instanceId ? registry.get(instanceId) : null;
+  if (instance && instanceId) {
+    void instance.adapter
+      .interruptTurn(threadId, turnId)
+      .then(() => closeOpenApprovalsForInstance(threadId, instanceId))
+      .catch((error) => console.error(`auto-review: could not stop ${instanceId} on thread ${threadId}`, error));
+    return;
+  }
   void interruptThreadEverywhere(threadId)
     .then(() => closeOpenApprovals(threadId))
     .catch((error) => console.error(`auto-review: could not stop thread ${threadId}`, error));
@@ -3418,23 +3510,28 @@ function stopTurnForReview(botId: string, threadId: string): void {
 // Auto-review for steps an engine runs without asking first
 // (server/review-watch.ts).  The plan is decided in the item.started fold.
 const reviewWatch = new ReviewWatch({
-  turnRunning: (threadId, turnId) =>
-    turnId ? runningTurnByThread.get(threadId) === turnId : runningTurnByThread.has(threadId),
-  stopTurn: (threadId, botId) => stopTurnForReview(botId, threadId),
+  turnRunning: (threadId, turnId) => runningTurns.running(threadId, turnId),
+  stopTurn: (target) => stopTurnForReview(target),
   note: (threadId, text, ok) => {
     store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name: text, ok } });
   },
   log: (row) => appendDecision(DATA_DIR, row),
+  budget: reviewBudget,
 });
 
 bus.subscribe((event: RuntimeEvent) => {
   if (event.type === "turn.started" && event.turnId) {
-    runningTurnByThread.set(event.threadId, event.turnId);
+    runningTurns.started(event.threadId, event.turnId);
   } else if (event.type === "turn.completed") {
-    if (!event.turnId || runningTurnByThread.get(event.threadId) === event.turnId) {
-      runningTurnByThread.delete(event.threadId);
+    runningTurns.completed(event.threadId, event.turnId);
+    reviewWatch.turnEnded(event.threadId, event.turnId);
+    reviewBudget.release(ReviewBudget.key(event.threadId, event.turnId));
+    // An in-process ask carries no turn id and, with two turns running on one
+    // thread (a room), is charged to the thread as a whole.  That shared
+    // budget is released once the thread has no turn left running.
+    if (!runningTurns.running(event.threadId, undefined)) {
+      reviewBudget.release(ReviewBudget.key(event.threadId, undefined));
     }
-    heldForReview.delete(heldKey(event.threadId, event.providerInstanceId));
   }
 });
 
@@ -4080,46 +4177,53 @@ bus.subscribe((event: RuntimeEvent) => {
         // the other bot replies (minutes, or a person's approval), and left
         // unclocked it would all be billed to the model.
         if (bot && event.itemId) turnStats.toolStarted(event.threadId, event.itemId);
-        // ask_bot's raw tool chip is redundant — the internal endpoint
-        // appends a richer "Messaged @X" chip linking to the channel
-        if (event.title?.endsWith("__ask_bot")) break;
         const name = event.title ?? "tool";
-        // Auto-review on an engine that ran this step without asking: the
-        // step watch reviews it after the fact (server/review-watch.ts).
-        // Steps from an engine whose asks reach the card are left to it.
+        // Auto-review on an engine that can run steps without asking: the
+        // step watch reviews each one as it starts (server/review-watch.ts).
+        // That includes a full-auto turn held in its asking mode for review,
+        // since even held, Claude edits and calls pre-allowed MCP servers and
+        // Codex runs sandboxed commands unasked.  A step whose ask did reach
+        // the card is recognised by its item id and left to the card.  An
+        // engine whose every action asks first ("before") is not watched.
+        // The check comes before the ask_bot exit below, so a message to
+        // another bot is watched like any other step the engine took without
+        // asking.  A step with no turn id is charged to, and stopped with,
+        // the thread's one running turn, as an in-process review is.
+        const instanceId = event.providerInstanceId;
         reviewWatch.observe(
           {
             threadId: event.threadId,
-            turnId: event.turnId,
+            turnId: event.turnId ?? runningTurns.only(event.threadId),
+            itemId: event.itemId,
+            instanceId,
             tool: name,
             target: event.target,
             toolKind: event.toolKind,
           },
           (() => {
-            const owner = group ? activeTurnOwners.forEvent(event.threadId, event.providerInstanceId) : undefined;
+            const owner = group ? activeTurnOwners.forEvent(event.threadId, instanceId) : undefined;
             const actor =
               bot ?? (owner ? store.bot(owner.botId) : undefined) ?? (speaker ? store.bot(speaker.botId) : undefined);
             if (!actor) return null;
             const mode = resolveAutoReviewMode(actor.autoReview);
             if (mode === "off") return null;
-            const instance = registry.get(event.providerInstanceId ?? actor.modelSelection.instanceId);
-            const capabilities = instance?.adapter.capabilities;
-            const hook = effectiveReviewHook(
-              capabilities?.reviewHook ?? "none",
-              capabilities?.asksWhenHeld === true,
-              heldForReview.has(heldKey(event.threadId, event.providerInstanceId)),
-            );
-            if (hook !== "after") return null;
+            const instance = registry.get(instanceId ?? actor.modelSelection.instanceId);
+            if (instance?.adapter.capabilities.reviewHook !== "after") return null;
             return {
               botId: actor.id,
               botName: actor.name,
               persona: reviewPersona(actor),
               mode,
               reviewers: reviewersForInstance(instance),
+              // a held turn's steps give their ask a moment to reach the card
+              askGraceMs: holdTurnForReview(actor, instance) ? HELD_ASK_GRACE_MS : undefined,
               unattended: isUnattended(actor.id),
             };
           })(),
         );
+        // ask_bot's raw tool chip is redundant — the internal endpoint
+        // appends a richer "Messaged @X" chip linking to the channel
+        if (event.title?.endsWith("__ask_bot")) break;
         // narration is folded in here, once, so call mode can read the
         // chip aloud without re-deriving it — and so the phrase a user
         // hears and the chip they see can never drift apart
@@ -4139,6 +4243,9 @@ bus.subscribe((event: RuntimeEvent) => {
       if (event.requestId && event.providerInstanceId) {
         askInstanceByRequest.set(`${event.threadId}:${event.requestId}`, event.providerInstanceId);
       }
+      // This step reached a card, which reviews it before it runs and which
+      // a person may answer: the step watch leaves it alone from here on.
+      if (event.itemId) reviewWatch.markAsked(event.threadId, event.turnId, event.itemId);
       const permission = event.requestType === "permission";
       // Auto mode / always-allow: answer routine tool permissions for the
       // bot so it keeps working. A QUESTION always reaches the human — the
@@ -4199,10 +4306,11 @@ bus.subscribe((event: RuntimeEvent) => {
               options: ["Allow", "Deny"],
               requestId,
               tool,
-              // a job start is never remembered (ruling c), whatever its scope
-              allowKey: event.approvalScope === "local-computer" || isJobTool(tool)
-                ? undefined
-                : approvalKey(tool, summary, event.approvalScope),
+              // The same grant the ordinary card would offer, decided the
+              // same way: a job start (ruling c), host control, a bare shell
+              // runner, a destructive or sensitive action, and a write
+              // outside the bot's folders are never offered as "always".
+              allowKey: offerableApprovalKey(tool, summary, event.approvalScope, { fileWrite }),
               held,
               approvalScope: event.approvalScope,
             },
@@ -4279,62 +4387,63 @@ bus.subscribe((event: RuntimeEvent) => {
             }
           })();
         };
-        // Bypass Permissions skips the cards, not the reviewer
-        // (server/auto-review.ts `reviewsBypass`).  On holds the approval
+        // Auto and Bypass skip the cards, not the reviewer
+        // (server/auto-review.ts `reviewsGrant`).  On holds the approval
         // until the reviewer allows it; Watch lets it through and records
         // what the reviewer would have said.
         const reviewMode = resolveAutoReviewMode(asker.autoReview);
-        const bypassReviewed = permission && reviewsBypass({
+        const grantReviewed = permission && reviewsGrant({
           source: verdict.source,
-          rule: verdict.rule,
           mode: reviewMode,
           approvalScope: event.approvalScope,
+          ownJobStart,
         });
-        const reviewers = bypassReviewed ? reviewersForInstance(instance) : [];
+        const reviewers = grantReviewed ? reviewersForInstance(instance) : [];
         const reviewRequest = { tool, summary, persona: reviewPersona(asker) };
-        if (bypassReviewed && reviewMode === "enforce") {
+        const budgetKey = reviewBudgetKey(event.threadId, event.turnId);
+        if (grantReviewed && reviewMode === "enforce") {
           void (async () => {
-            const reviewed = reviewers.length > 0 ? await reviewWithReviewers(reviewers, reviewRequest) : null;
-            if (reviewed?.verdict.allow) {
-              answerForThem(`${settled}, review approved (${reviewed.reviewer.name})`, {
+            const result = await runReview(reviewers, reviewRequest, { budget: reviewBudget.forTurn(budgetKey) });
+            if (result.kind === "verdict" && result.verdict.allow) {
+              answerForThem(`${settled}, review approved (${result.reviewer.name})`, {
                 source: "auto-review",
-                rule: reviewed.verdict.reason,
-                reviewer: reviewed.reviewer.instanceId,
+                rule: result.verdict.reason,
+                reviewer: result.reviewer.instanceId,
               });
               return;
             }
+            // A refusal, no answer, or a spent review limit: never run it
+            // unchecked, hand it to the person as an ordinary card.
             showHeldCard(
-              reviewed
-                ? `Bypass is on, but the reviewer (${reviewed.reviewer.name}) did not approve this: ${reviewed.verdict.reason}`
-                : "Bypass is on, but no reviewer could check this one, so it waits for you.",
+              heldGrantText(grantLabel(verdict.rule), result),
               {
                 source: "auto-review",
-                rule: reviewed?.verdict.reason ?? "no reviewer answered",
-                reviewer: reviewed?.reviewer.instanceId,
+                rule: result.kind === "verdict" ? result.verdict.reason : noVerdictRule(result),
+                reviewer: result.kind === "verdict" ? result.reviewer.instanceId : undefined,
               },
               true,
             );
-          })().catch((error) => console.error("auto-review: bypass screening failed", error));
+          })().catch((error) => console.error("auto-review: grant screening failed", error));
           break;
         }
         answerForThem(settled, { source: verdict.source, rule: verdict.rule });
-        if (bypassReviewed && reviewers.length > 0) {
-          // Watch under Bypass: an after-the-fact audit of an approval that
-          // has already gone out.  It never changes the answer.
-          void reviewWithReviewers(reviewers, reviewRequest)
-            .then((reviewed) => {
-              if (!reviewed) return;
+        if (grantReviewed && reviewers.length > 0) {
+          // Watch under Auto or Bypass: an after-the-fact audit of an
+          // approval that has already gone out.  It never changes the answer.
+          const row = { threadId: event.threadId, requestId, botId: asker.id, botName: asker.name, tool, summary };
+          void runReview(reviewers, reviewRequest, { budget: reviewBudget.forTurn(budgetKey) })
+            .then((result) => {
+              if (result.kind === "capped") {
+                noteReviewCap(row, budgetKey, result.limit);
+                return;
+              }
+              if (result.kind !== "verdict") return;
               appendDecision(DATA_DIR, {
-                threadId: event.threadId,
-                requestId,
-                botId: asker.id,
-                botName: asker.name,
-                tool,
-                summary,
-                decision: reviewed.verdict.allow ? "review-would-approve" : "review-would-deny",
+                ...row,
+                decision: result.verdict.allow ? "review-would-approve" : "review-would-deny",
                 source: "auto-review-shadow",
-                rule: reviewed.verdict.reason,
-                reviewer: reviewed.reviewer.instanceId,
+                rule: result.verdict.reason,
+                reviewer: result.reviewer.instanceId,
               });
             })
             .catch(() => {});
@@ -4407,6 +4516,7 @@ bus.subscribe((event: RuntimeEvent) => {
             messageId: message.id,
             tool: event.tool,
             summary: event.summary,
+            budgetKey: reviewBudgetKey(event.threadId, event.turnId),
           });
         }
       }
@@ -6478,7 +6588,7 @@ async function startTurn(
         autoApprove: bot.autoApprove === true,
         bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
-        holdForReview: holdTurnForReview(bot, threadId, instance) || undefined,
+        holdForReview: holdTurnForReview(bot, instance) || undefined,
       };
       // What the harness put in front of the model that the person did not
       // type: the bot's memory, the skills and playbooks this message
@@ -8625,7 +8735,7 @@ async function runGroupMemberTurn(
         autoApprove: bot.autoApprove === true,
         bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
-        holdForReview: holdTurnForReview(bot, threadId, instance) || undefined,
+        holdForReview: holdTurnForReview(bot, instance) || undefined,
         ...memberTurnSelection(selection),
       });
     })
@@ -9472,10 +9582,15 @@ function configStatus() {
       projects: usageProjectRules(cfg),
       enginePlans: cfg.usage?.enginePlans ?? {},
     },
-    // The fleet's fallback reviewer for auto-review: an instance id the Bot
-    // Profile resolves against the engine list, or null when none is chosen.
+    // Auto-review's fleet settings.  `fallbackReviewer` is the stored choice:
+    // null for Automatic, "none" for off, or the instance id the owner
+    // picked.  `automaticReviewer` is who Automatic picks right now, which
+    // the Bot Profile also works out live from the engine list by the same
+    // rule.  `maxReviewsPerTurn` is the per-turn reviewer-call cap.
     autoReview: {
       fallbackReviewer: autoReviewFallbackReviewer(cfg),
+      automaticReviewer: automaticFallbackReviewerId(),
+      maxReviewsPerTurn: autoReviewMaxPerTurn(cfg),
     },
     // This frame is broadcast to every window and, with Remote Access on,
     // travels the tunnel — so it carries the ingest host and never the DSN.
