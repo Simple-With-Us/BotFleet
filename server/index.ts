@@ -307,6 +307,7 @@ import { jobsPrompt, noticeWithoutJobTools } from "./jobs/prompt.ts";
 import { JobRegistry, resolveJobsSettings } from "./jobs/registry.ts";
 import { JobWakeCoordinator } from "./jobs/wake.ts";
 import { ZulipHub } from "./zulip/hub.ts";
+import { zulipToolsMounted } from "./zulip/mount.ts";
 import type { ZulipOrigin } from "./zulip/types.ts";
 import { JobWakeUsage } from "./jobs/wake-usage.ts";
 import {
@@ -5365,18 +5366,19 @@ async function startTurn(
       );
       // Zulip tools (docs/zulip.md): offered only to a bot whose own Zulip
       // identity is connected right now (never in a dry run), and only to a
-      // turn that may speak for it: a Zulip turn, where every target rule
-      // and the secret scan stand in for a card, or a turn the owner is
-      // attending.  Webhook, iMessage, Linq, routine and job turns carry
-      // outside text and nobody watching, so they get no uncarded way to
-      // post as the bot.  One read, fed to both lanes and to the comms grant.
-      const zulipTurnMayPost =
-        opts?.automationSource === "zulip" ||
-        // a card continuation of a Zulip turn: the same turn, resumed
-        zulipHub?.answersThread(bot.id, threadId) === true ||
-        (opts?.automationSource === undefined && !isUnattended(bot.id));
-      const zulipMounted =
-        commsDepth < MAX_COMMS_DEPTH && zulipTurnMayPost && zulipHub?.outboundReady(bot.id) === true;
+      // turn that may speak for it: a Zulip turn (or a continuation of one),
+      // or a turn the owner is attending.  Never a peer's ask_bot turn, and
+      // never a webhook, iMessage, Linq, routine or job turn
+      // (server/zulip/mount.ts).  One read, fed to both lanes and to the
+      // comms grant.
+      const zulipMounted = zulipToolsMounted({
+        automationSource: opts?.automationSource,
+        commsDepth,
+        maxCommsDepth: MAX_COMMS_DEPTH,
+        continuesZulipTurn: zulipHub?.answersThread(bot.id, threadId) === true,
+        unattended: isUnattended(bot.id),
+        outboundReady: zulipHub?.outboundReady(bot.id) === true,
+      });
       if (
         commsDepth < MAX_COMMS_DEPTH &&
         instance.adapter.capabilities.agentsMcp === true
