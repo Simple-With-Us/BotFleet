@@ -972,6 +972,41 @@ describe("reading what another process wrote", () => {
       .toMatchObject({ progress: 1 });
   });
 
+  it("reads a well-formed record exactly, and lets one bad field cost only itself", () => {
+    // Kody 4226168326: the record crosses a trust boundary (another process
+    // writes it), so it is checked with a zod schema.  A valid record reads
+    // the same as before; a malformed optional field falls back alone.
+    const full = {
+      schemaVersion: 1,
+      runId: "run-1",
+      command: "apply",
+      pid: 4242,
+      startedAt: "2026-10-09T07:00:00.000Z",
+      updatedAt: "2026-10-09T07:01:00.000Z",
+      step: "fence",
+      detail: "Waiting for 2 bots to finish",
+      progress: 0.4,
+      targetCommit: "a".repeat(40),
+      receiptPath: "/tmp/receipt.json",
+      finishedAt: null,
+      outcome: null,
+      message: null,
+      rolledBack: false,
+    };
+    const { rolledBack: _ignored, ...expected } = full;
+    expect(parseProgressRecord(full)).toEqual(expected);
+    expect(parseProgressRecord({ ...full, outcome: "rolled-back", finishedAt: "2026-10-09T07:02:00.000Z", message: "Rolled back." }))
+      .toMatchObject({ outcome: "rolled-back", finishedAt: "2026-10-09T07:02:00.000Z", message: "Rolled back." });
+    // Each malformed optional field falls back to what an absent one reads as.
+    expect(parseProgressRecord({ ...full, pid: 1.5, command: 7, updatedAt: 3, step: false, progress: "0.4", targetCommit: 1 }))
+      .toMatchObject({ pid: 0, command: "update", updatedAt: full.startedAt, step: null, progress: null, targetCommit: null });
+    expect(parseProgressRecord({ ...full, progress: -2 })).toMatchObject({ progress: 0 });
+    // The identity fields are required.
+    expect(parseProgressRecord({ ...full, startedAt: 7 })).toBeNull();
+    expect(parseProgressRecord({ ...full, runId: 7 })).toBeNull();
+    expect(parseProgressRecord([full])).toBeNull();
+  });
+
   it("passes a step's detail through to the running status, bounded", () => {
     const record = parseProgressRecord({
       schemaVersion: 1, runId: "x", startedAt: "t", step: "fence", detail: "  Waiting for 3 bots to finish  ",

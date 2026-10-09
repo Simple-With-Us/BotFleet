@@ -37,6 +37,7 @@ import { dirname, join, resolve, sep } from "node:path";
 // rather than a cosmetic bug — see scripts/stage-entries.mjs.
 import { stageIsPrunable } from "../scripts/stage-entries.mjs";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 
 export const UPDATE_PROGRESS_SCHEMA_VERSION = 1;
 export const UPDATE_LAUNCH_LABEL = "com.jay.botfleet-update";
@@ -311,31 +312,57 @@ function writeJsonFile(path: string, value: unknown): void {
   renameSync(temporary, path);
 }
 
+/** A field the updater writes but a record can live without: its value when
+ *  it has the right shape, null otherwise.  One bad field costs only itself,
+ *  never the whole record — the status route reads this file while another
+ *  process writes it. */
+const optionalString = z.string().nullable().catch(null);
+
+/** A progress file written by `scripts/update-progress.mjs`, checked at the
+ *  trust boundary.  The identity fields are required and a record without
+ *  them is "no record"; everything else falls back field by field.  Fields
+ *  this build does not read (`rolledBack`, newer ones) are dropped. */
+const ProgressRecordSchema = z.object({
+  schemaVersion: z.literal(UPDATE_PROGRESS_SCHEMA_VERSION),
+  runId: z.string().min(1),
+  startedAt: z.string(),
+  command: z.string().catch("update"),
+  pid: z.number().int().catch(0),
+  updatedAt: optionalString,
+  step: optionalString,
+  // One short line: trimmed, clipped, and absent when empty.
+  detail: z.string().nullable().catch(null)
+    .transform((detail) => detail?.trim().slice(0, DETAIL_MAX) || null),
+  // A fraction of the run: clamped to [0, 1], absent when not a finite number.
+  progress: z.number().nullable().catch(null)
+    .transform((progress) => (progress === null || !Number.isFinite(progress) ? null : Math.min(1, Math.max(0, progress)))),
+  targetCommit: optionalString,
+  receiptPath: optionalString,
+  finishedAt: optionalString,
+  outcome: z.string().nullable().catch(null).transform((outcome) => (isOutcome(outcome) ? outcome : null)),
+  message: optionalString,
+});
+
 /** Validate a progress file written by `scripts/update-progress.mjs`. */
 export function parseProgressRecord(value: unknown): ProgressRecord | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
-  if (raw.schemaVersion !== UPDATE_PROGRESS_SCHEMA_VERSION) return null;
-  if (typeof raw.runId !== "string" || !raw.runId) return null;
-  if (typeof raw.startedAt !== "string") return null;
-  const progress = typeof raw.progress === "number" && Number.isFinite(raw.progress)
-    ? Math.min(1, Math.max(0, raw.progress))
-    : null;
+  const parsed = ProgressRecordSchema.safeParse(value);
+  if (!parsed.success) return null;
+  const raw = parsed.data;
   return {
     schemaVersion: UPDATE_PROGRESS_SCHEMA_VERSION,
     runId: raw.runId,
-    command: typeof raw.command === "string" ? raw.command : "update",
-    pid: Number.isInteger(raw.pid) ? (raw.pid as number) : 0,
+    command: raw.command,
+    pid: raw.pid,
     startedAt: raw.startedAt,
-    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : raw.startedAt,
-    step: typeof raw.step === "string" ? raw.step : null,
-    detail: typeof raw.detail === "string" && raw.detail.trim() ? raw.detail.trim().slice(0, DETAIL_MAX) : null,
-    progress,
-    targetCommit: typeof raw.targetCommit === "string" ? raw.targetCommit : null,
-    receiptPath: typeof raw.receiptPath === "string" ? raw.receiptPath : null,
-    finishedAt: typeof raw.finishedAt === "string" ? raw.finishedAt : null,
-    outcome: isOutcome(raw.outcome) ? raw.outcome : null,
-    message: typeof raw.message === "string" ? raw.message : null,
+    updatedAt: raw.updatedAt ?? raw.startedAt,
+    step: raw.step,
+    detail: raw.detail,
+    progress: raw.progress,
+    targetCommit: raw.targetCommit,
+    receiptPath: raw.receiptPath,
+    finishedAt: raw.finishedAt,
+    outcome: raw.outcome,
+    message: raw.message,
   };
 }
 
