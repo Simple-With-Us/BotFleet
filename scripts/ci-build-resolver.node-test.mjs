@@ -1015,6 +1015,54 @@ test("only runs the install path itself would accept count as green", async () =
   assert.equal(found.commit, C[3], "a pull_request run is not a build of main; a workflow_dispatch run is");
 });
 
+test("a malformed Actions response is no usable build, never a guess", async () => {
+  // Hand-checked (no zod: the updater is bootstrapped without node_modules), so
+  // the checks have to hold on their own: an array, then every item's shape.
+  const respond = ({ runs, artifacts }) => async (url) => {
+    const text = String(url);
+    const body = text.includes("/artifacts")
+      ? artifacts
+      : text.includes("head_sha=") ? { workflow_runs: [] } : runs;
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const goodRuns = { workflow_runs: [aRun({ id: 100, head_sha: C[4] })] };
+  const goodArtifact = anArtifact({ name: artifactNameFor(C[4]) });
+  // Control: the well-formed pair selects the commit.
+  assert.equal((await select([C[4]], { fetchImpl: respond({ runs: goodRuns, artifacts: { artifacts: [goodArtifact] } }) })).commit, C[4]);
+
+  for (const [label, artifacts] of [
+    ["a body that is not an object", "oops"],
+    ["a null body", null],
+    ["no artifacts key", {}],
+    ["artifacts that is not an array", { artifacts: { 0: goodArtifact } }],
+    ["artifacts that is null", { artifacts: null }],
+    ["an item that is not an object", { artifacts: ["x", 7, null] }],
+    ["an item without expired", { artifacts: [{ ...goodArtifact, expired: undefined }] }],
+    ["an item with a string expired", { artifacts: [{ ...goodArtifact, expired: "false" }] }],
+    ["an item with a string id", { artifacts: [{ ...goodArtifact, id: "1" }] }],
+    ["an item without a download url", { artifacts: [{ ...goodArtifact, archive_download_url: undefined }] }],
+    ["an item with a numeric name", { artifacts: [{ ...goodArtifact, name: 5 }] }],
+    ["an expired item", { artifacts: [{ ...goodArtifact, expired: true }] }],
+    ["an artifact for another commit", { artifacts: [{ ...goodArtifact, name: artifactNameFor(C[3]) }] }],
+  ]) {
+    const found = await select([C[4]], { fetchImpl: respond({ runs: goodRuns, artifacts }) });
+    assert.equal(found.commit, null, label);
+  }
+
+  for (const [label, runs] of [
+    ["a body that is not an object", "oops"],
+    ["workflow_runs that is not an array", { workflow_runs: { 0: aRun({ head_sha: C[4] }) } }],
+    ["a run without an id", { workflow_runs: [aRun({ id: undefined, head_sha: C[4] })] }],
+    ["a run with a numeric head_sha", { workflow_runs: [aRun({ head_sha: 4 })] }],
+    ["a run with a missing status", { workflow_runs: [aRun({ head_sha: C[4], status: undefined })] }],
+    ["a run that did not conclude success", { workflow_runs: [aRun({ head_sha: C[4], conclusion: "failure" })] }],
+    ["a run with no conclusion", { workflow_runs: [aRun({ id: 100, head_sha: C[4], conclusion: null })] }],
+  ]) {
+    const found = await select([C[4]], { fetchImpl: respond({ runs, artifacts: { artifacts: [goodArtifact] } }) });
+    assert.equal(found.commit, null, label);
+  }
+});
+
 test("nothing green among the candidates is an answer, not an error", async () => {
   const found = await select([C[4], C[3]], {
     fetchImpl: actionsFetch({ green: [], tipRun: { head_sha: C[4], status: "in_progress", conclusion: null } }),
