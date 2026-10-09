@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: autofix-${{ github.event.issue.number || github.event.pull_request.number }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   autofix:
@@ -25,7 +25,7 @@ jobs:
       ANTHROPIC_BASE_URL: https://api.minimax.io/anthropic
       ANTHROPIC_AUTH_TOKEN: ${{ secrets.MINIMAX_API_KEY }}
     steps:
-      - uses: urcades/pr-autofix@main
+      - uses: urcades/pr-autofix@21c823f445c39c49272e05d68d2e310bc587f660
         with:
           anthropic_api_key: ${{ secrets.MINIMAX_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
