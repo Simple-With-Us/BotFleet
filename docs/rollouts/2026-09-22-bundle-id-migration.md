@@ -92,6 +92,18 @@ The same LaunchAgent rename is replicated outside the repo so the live harness m
 - **iOS pairing.** `CompanionConnectionStore.exportLegacyPairingToSharedStorage()` copies `UserDefaults.standard` into `group.app.botfleet` at launch without overwriting a suite that already has data.  A future rename to `app.botfleet.ios` reads the suite first, then standard.  Keychain writes use `CC8UTF7ATG.group.app.botfleet` with a private-group fallback on read.
 - **URL scheme.** Pairing QR codes use `botfleet-ios://pair`.  The iOS app also still registers legacy `botfleet://` so older links and Live Activities can land here.
 
+## A New App Record Starts With No TestFlight Groups (added 2026-10-09)
+
+A new bundle ID is a new App Store Connect app record, and it carries none of the old record's TestFlight groups or testers.  The iOS ship moved to `app.botfleet.ios` (appleId 6820175685) on Oct 7 and uploaded 14 VALID builds that reached nobody: the legacy record had an internal group ("BotFleet Testers", access to all builds) holding the owner, the new one had none, and the external "Public Beta" testers stay NOT_INVITED until a build clears Beta App Review (GH #1018).  Every run was green because `internalBuildState` only says Apple finished processing.
+
+What keeps this from recurring:
+
+- `asc-api.mjs ensure-standing-testers` (the "Sync standing TestFlight testers" step) creates or reuses an internal group with access to all builds and adds every standing email that is an App Store Connect user.  Internal testers need no Beta App Review and get each build as soon as it processes.  Emails that are not App Store Connect users stay in the external group only.
+- `asc-api.mjs ensure-tf-ready` counts the testers of internal all-builds groups after a build is processed.  When the count is zero it exits 5, and `ship-testflight.sh` logs a warning plus a `::warning` annotation instead of "internal testers can install this build".
+- Tester records are per app: an address has a separate record for every app it was added to, and assigning another app's record answers 409 "Tester(s) cannot be assigned".  The tester add creates the record for the internal group (Apple returns the app's own record when it exists) rather than reusing the first record found by email.
+
+Owner steps when a new app record appears: accept the TestFlight invitation email for the new record (it is a different app from the old install, so it is a fresh install, not an update), and rename or retire the old record so TestFlight shows one "BotFleet".
+
 ## Out Of Scope
 
 - Apple Developer Portal App ID registration (owner).

@@ -307,3 +307,215 @@ test("asc_latest_seq surfaces asc-api stderr and does not require the env file",
   // reports on stdout once turned a correct sequence into an arithmetic error.
   assert.match(ship, /rm -f "\$errf" >\/dev\/null 2>&1 \|\| true/);
 });
+
+// ---------------------------------------------------------------------------
+// Internal TestFlight group (GH #1018): a new bundle ID is a new App Store
+// Connect record with no groups, so 14 green ships reached no tester.  These
+// tests drive the real helpers in asc-api.mjs against an in-memory fake of the
+// handful of App Store Connect endpoints they use.
+// ---------------------------------------------------------------------------
+function fakeAsc({ groups = [], users = [], testers = [], failCreateGroup = false, usersReadable = true } = {}) {
+  const state = {
+    groups: groups.map((g) => ({ ...g, members: new Set(g.members || []) })),
+    testers: testers.map((t) => ({ ...t })),
+    calls: []
+  };
+  let nextId = 100;
+  const ok = (data, status = 200) => ({ status, ok: true, parsed: { data }, text: "" });
+  const bad = (status, code, detail) => ({ status, ok: false, parsed: { errors: [{ code, detail }] }, text: "" });
+  const api = async (method, path, body) => {
+    state.calls.push(`${method} ${path.split("?")[0]}`);
+    const json = body ? JSON.parse(body) : null;
+    if (method === "GET" && /^\/v1\/apps\/\d+\/betaGroups/.test(path)) {
+      return ok(state.groups.map((g) => ({ id: g.id, type: "betaGroups", attributes: { name: g.name, isInternalGroup: g.isInternalGroup, hasAccessToAllBuilds: g.hasAccessToAllBuilds } })));
+    }
+    if (method === "POST" && path === "/v1/betaGroups") {
+      if (failCreateGroup) return bad(409, "ENTITY_ERROR", "cannot create");
+      const a = json.data.attributes;
+      const g = { id: `g${nextId++}`, name: a.name, isInternalGroup: a.isInternalGroup === true, hasAccessToAllBuilds: a.hasAccessToAllBuilds === true, members: new Set(), created: a };
+      state.groups.push(g);
+      return ok({ id: g.id, type: "betaGroups", attributes: { name: g.name } }, 201);
+    }
+    if (method === "GET" && path.startsWith("/v1/users")) {
+      return usersReadable ? ok(users.map((u) => ({ type: "users", id: u, attributes: { username: u } }))) : bad(403, "FORBIDDEN", "no");
+    }
+    let m = path.match(/^\/v1\/betaGroups\/([^/]+)\/betaTesters/);
+    if (method === "GET" && m) {
+      const g = state.groups.find((x) => x.id === m[1]);
+      return ok([...g.members].map((e) => ({ type: "betaTesters", id: `t-${e}`, attributes: { email: e } })));
+    }
+    // Tester records are per app on Apple's side: an address has one record for
+    // each app it was ever added to, and filter[email] alone returns them all.
+    m = path.match(/^\/v1\/betaTesters\?filter\[email\]=([^&]+)(?:&filter\[apps\]=(\d+))?/);
+    if (method === "GET" && m) {
+      const e = decodeURIComponent(m[1]);
+      const rows = state.testers.filter((t) => t.email === e && (!m[2] || t.appId === m[2]));
+      return ok(rows.map((t) => ({ type: "betaTesters", id: t.id, attributes: { email: t.email } })));
+    }
+    m = path.match(/^\/v1\/betaGroups\/([^/]+)\/relationships\/betaTesters$/);
+    if (method === "POST" && m) {
+      const g = state.groups.find((x) => x.id === m[1]);
+      const t = state.testers.find((x) => x.id === json.data[0].id);
+      if ((t.appId || "1") !== "1") return bad(409, "STATE_ERROR", "Tester(s) cannot be assigned");
+      g.members.add(t.email);
+      return { status: 204, ok: true, parsed: {}, text: "" };
+    }
+    if (method === "POST" && path === "/v1/betaTesters") {
+      const email = json.data.attributes.email;
+      let rec = state.testers.find((t) => t.email === email && (t.appId || "1") === "1");
+      if (!rec) {
+        rec = { id: `t-${email}`, email, appId: "1" };
+        state.testers.push(rec);
+      }
+      state.groups.find((x) => x.id === json.data.relationships.betaGroups.data[0].id).members.add(email);
+      return ok({ type: "betaTesters", id: rec.id }, 201);
+    }
+    return bad(500, "UNEXPECTED", `${method} ${path}`);
+  };
+  return { api, state };
+}
+
+test("ensureInternalTesterGroup creates an all-builds internal group and adds only App Store Connect users, then is idempotent", async () => {
+  const { ensureInternalTesterGroup, INTERNAL_GROUP_NAME } = await import("./ios-fleet/asc-api.mjs");
+  const emails = ["alice@example.com", "bob@example.org", "carol@example.net"];
+  const { api, state } = fakeAsc({
+    groups: [{ id: "ext1", name: "Public Beta", isInternalGroup: false, hasAccessToAllBuilds: null, members: ["alice@example.com"] }],
+    users: ["alice@example.com", "carol@example.net"],
+    testers: [{ id: "t-alice@example.com", email: "alice@example.com" }]
+  });
+  const logs = [];
+  const warns = [];
+  const first = await ensureInternalTesterGroup({ api, appId: "1", emails, log: (m) => logs.push(m), warn: (m) => warns.push(m) });
+  assert.equal(first.created, true);
+  assert.equal(first.added, 2);
+  assert.equal(first.external, 1, "bob is not an ASC user and stays external-only");
+  assert.equal(first.warnings, 0);
+  assert.deepEqual(warns, []);
+  const group = state.groups.find((g) => g.id === first.groupId);
+  assert.equal(group.name, INTERNAL_GROUP_NAME);
+  assert.equal(group.isInternalGroup, true);
+  assert.equal(group.hasAccessToAllBuilds, true, "the group must see every build, with no per-build assignment");
+  assert.deepEqual([...group.members].sort(), ["alice@example.com", "carol@example.net"]);
+  assert.equal(state.groups.find((g) => g.id === "ext1").members.size, 1, "the external group is untouched");
+  assert.ok(!logs.join("\n").match(/alice|bob|carol/), `emails must be masked in logs: ${logs.join(" | ")}`);
+
+  const callsAfterFirst = state.calls.length;
+  const second = await ensureInternalTesterGroup({ api, appId: "1", emails, log: (m) => logs.push(m), warn: (m) => warns.push(m) });
+  assert.equal(second.created, false);
+  assert.equal(second.added, 0);
+  assert.equal(second.alreadyIn, 2);
+  assert.equal(state.groups.length, 2, "no duplicate group");
+  assert.ok(
+    state.calls.slice(callsAfterFirst).every((c) => c.startsWith("GET ")),
+    "an idempotent re-run only reads"
+  );
+});
+
+test("ensureInternalTesterGroup reuses an existing all-builds internal group whatever its name", async () => {
+  const { ensureInternalTesterGroup } = await import("./ios-fleet/asc-api.mjs");
+  const { api, state } = fakeAsc({
+    groups: [{ id: "int1", name: "BotFleet Testers", isInternalGroup: true, hasAccessToAllBuilds: true, members: [] }],
+    users: ["alice@example.com"],
+    testers: [{ id: "t-alice@example.com", email: "alice@example.com" }]
+  });
+  const out = await ensureInternalTesterGroup({ api, appId: "1", emails: ["alice@example.com"], log: () => {}, warn: () => {} });
+  assert.equal(out.created, false);
+  assert.equal(out.groupId, "int1");
+  assert.equal(out.added, 1);
+  assert.ok(!state.calls.includes("POST /v1/betaGroups"), "must not create a second internal group");
+});
+
+test("ensureInternalTesterGroup warns loudly when nobody can be an internal tester, and never throws on API failure", async () => {
+  const { ensureInternalTesterGroup } = await import("./ios-fleet/asc-api.mjs");
+  const none = fakeAsc({ users: ["someone-else@example.com"] });
+  const warns = [];
+  const out = await ensureInternalTesterGroup({ api: none.api, appId: "1", emails: ["bob@example.org"], log: () => {}, warn: (m) => warns.push(m) });
+  assert.equal(out.testers, 0);
+  assert.ok(out.warnings >= 1);
+  assert.match(warns.join("\n"), /nobody can install builds without Beta App Review/);
+
+  const broken = fakeAsc({ failCreateGroup: true });
+  const warns2 = [];
+  const out2 = await ensureInternalTesterGroup({ api: broken.api, appId: "1", emails: ["bob@example.org"], log: () => {}, warn: (m) => warns2.push(m) });
+  assert.equal(out2.groupId, null);
+  assert.match(warns2.join("\n"), /could not create internal group.*create it by hand/);
+
+  // An unreadable user list falls back to trying every email and letting Apple answer.
+  const noUsers = fakeAsc({ usersReadable: false });
+  const out3 = await ensureInternalTesterGroup({ api: noUsers.api, appId: "1", emails: ["bob@example.org"], log: () => {}, warn: () => {} });
+  assert.equal(out3.added, 1);
+});
+
+test("addTesterToGroup does not attach another app's tester record to this app's group", async () => {
+  const { ensureInternalTesterGroup } = await import("./ios-fleet/asc-api.mjs");
+  // The first record filter[email] returns belongs to ANOTHER app; assigning it
+  // here answers 409 STATE_ERROR.  This is the live failure from 2026-10-09.
+  const { api, state } = fakeAsc({
+    groups: [{ id: "int1", name: "Internal Testers", isInternalGroup: true, hasAccessToAllBuilds: true, members: [] }],
+    users: ["alice@example.com"],
+    testers: [
+      { id: "t-other-app", email: "alice@example.com", appId: "9" },
+      { id: "t-this-app", email: "alice@example.com", appId: "1" }
+    ]
+  });
+  const warns = [];
+  const out = await ensureInternalTesterGroup({ api, appId: "1", emails: ["alice@example.com"], log: () => {}, warn: (m) => warns.push(m) });
+  assert.deepEqual(warns, []);
+  assert.equal(out.added, 1);
+  assert.deepEqual([...state.groups[0].members], ["alice@example.com"]);
+  assert.equal(state.testers.length, 2, "reused this app's record, created nothing");
+});
+
+test("addTesterToGroup falls back to the app-scoped lookup when the create is refused", async () => {
+  const { addTesterToGroup } = await import("./ios-fleet/asc-api.mjs");
+  const calls = [];
+  const api = async (method, path, body) => {
+    calls.push(`${method} ${path.split("?")[0]}${path.includes("filter[apps]") ? " (apps)" : ""}`);
+    if (method === "POST" && path === "/v1/betaTesters") return { status: 409, ok: false, parsed: { errors: [{ code: "ENTITY_ERROR" }] }, text: "" };
+    if (method === "GET" && path.includes("filter[apps]=1&limit=5")) {
+      return { status: 200, ok: true, parsed: { data: [{ id: "rec", attributes: { email: "Alice@Example.com" } }] }, text: "" };
+    }
+    if (method === "POST" && path === "/v1/betaGroups/g1/relationships/betaTesters") {
+      assert.equal(JSON.parse(body).data[0].id, "rec");
+      return { status: 204, ok: true, parsed: {}, text: "" };
+    }
+    return { status: 500, ok: false, parsed: {}, text: "" };
+  };
+  const out = await addTesterToGroup({ api, appId: "1", groupId: "g1", email: "alice@example.com", createFirst: true });
+  assert.equal(out.ok, true);
+  assert.equal(out.existing, true);
+  assert.ok(calls[0] === "POST /v1/betaTesters" && calls[1] === "GET /v1/betaTesters (apps)", calls.join(" > "));
+});
+
+test("countInternalTesters counts only members of internal all-builds groups", async () => {
+  const { countInternalTesters } = await import("./ios-fleet/asc-api.mjs");
+  const empty = fakeAsc({
+    groups: [{ id: "ext1", name: "Public Beta", isInternalGroup: false, hasAccessToAllBuilds: null, members: ["a@example.com", "b@example.com", "c@example.com"] }]
+  });
+  assert.deepEqual(await countInternalTesters({ api: empty.api, appId: "1" }), { ok: true, groups: 0, testers: 0 });
+  const mixed = fakeAsc({
+    groups: [
+      { id: "ext1", name: "Public Beta", isInternalGroup: false, hasAccessToAllBuilds: null, members: ["a@example.com"] },
+      { id: "int1", name: "Some Builds", isInternalGroup: true, hasAccessToAllBuilds: false, members: ["b@example.com"] },
+      { id: "int2", name: "Internal Testers", isInternalGroup: true, hasAccessToAllBuilds: true, members: ["c@example.com", "d@example.com"] }
+    ]
+  });
+  assert.deepEqual(await countInternalTesters({ api: mixed.api, appId: "1" }), { ok: true, groups: 1, testers: 2 });
+  const failing = await countInternalTesters({ api: async () => ({ status: 500, ok: false, parsed: {}, text: "" }), appId: "1" });
+  assert.equal(failing.ok, false, "an unreadable count is not reported as zero");
+});
+
+test("the ship no longer claims internal testers can install when none exist", () => {
+  const sh = read("scripts/ios-fleet/ship-testflight.sh");
+  const mjs = read("scripts/ios-fleet/asc-api.mjs");
+  // asc-api exits 5 only when the count was READ and is zero.
+  assert.match(mjs, /process\.exit\(nobody \? 5 : 0\)/);
+  assert.match(mjs, /const nobody = internalTesters\.ok && internalTesters\.testers === 0;/);
+  // The wrapper turns rc=5 into a warning plus a CI annotation, not a success line.
+  const rc5 = sh.slice(sh.indexOf("if [[ $rc -eq 5 ]]"), sh.indexOf("if [[ $rc -eq 3 ]]"));
+  assert.match(rc5, /has no internal TestFlight tester/);
+  assert.match(rc5, /::warning title=TestFlight has no internal tester::/);
+  assert.doesNotMatch(rc5, /internal testers can install this build/);
+  // The sync step creates the group, so the workflow must keep calling it.
+  assert.match(mjs, /await ensureInternalTesterGroup\(/);
+});

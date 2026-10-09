@@ -1100,6 +1100,19 @@ ensure_tf_ready() {
     log "TestFlight internal testers can install this build"
     return 0
   fi
+  if [[ $rc -eq 5 ]]; then
+    # Apple finished processing the build, but the app has no internal tester
+    # with access to all builds, so nobody can install it.  This is not a failed
+    # upload (the build is in App Store Connect), so do not fail the job; make
+    # it impossible to miss instead.  A new bundle ID starts with no groups, and
+    # 14 green ships once reached nobody this way (GH #1018).
+    log "warning: build ${BUILD_NUM} is processed but ${BUNDLE_ID} has no internal TestFlight tester; nobody can install it yet"
+    log "warning: the Sync standing TestFlight testers step creates the internal group; otherwise add an App Store Connect user under TestFlight > Internal Testing"
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+      echo "::warning title=TestFlight has no internal tester::${BUNDLE_ID} build ${BUILD_NUM} is processed but no internal tester can install it.  Check the Sync standing TestFlight testers step."
+    fi
+    return 0
+  fi
   if [[ $rc -eq 3 ]]; then
     log "warning: upload succeeded but ASC has not reached IN_BETA_TESTING yet; watch TestFlight"
     return 0
