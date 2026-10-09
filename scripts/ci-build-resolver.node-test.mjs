@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,13 +17,18 @@ import {
   downloadBuiltBundle,
   findCommitArtifact,
   inspectArchive,
+  listUpdateCandidates,
   manifestArtifactName,
+  readInstalledSourceCommit,
   readSymlinkTargets,
   maskedKeyPreview,
   materializeBuild,
   resetGhAuthCacheForTests,
   ResolutionError,
   selectCommitRun,
+  selectNewestGreenCommit,
+  selectUpdateTarget,
+  SELECTION_WINDOW,
   updateSourcePolicy,
   verifyManifest,
 } from "./ci-build-resolver.mjs";
@@ -896,4 +901,315 @@ test("the unpacked tree is checked again on disk", { skip: posixOnly }, async (t
       },
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Choosing the newest commit with a green hosted build when no target is named
+// ---------------------------------------------------------------------------
+
+// Oldest to newest.  C0 is "installed" in most cases below; C4 is main's tip.
+const C = ["1", "2", "3", "4", "5"].map((digit) => digit.repeat(40));
+const SELECT_ENV = { GITHUB_TOKEN: "fixture-token" };
+
+/**
+ * A fetch that answers the three Actions endpoints the selection reads, and
+ * records every URL it was asked for.  `green` is the commits that have a
+ * successful run (newest-first as GitHub lists them); `tipRun` is what the
+ * per-commit lookup of main's tip returns.
+ */
+function actionsFetch({ green = [], tipRun = null, expired = [], urls = [], fail = null } = {}) {
+  const body = (value) => ({ ok: true, status: 200, json: async () => value });
+  return async (url) => {
+    const text = String(url);
+    urls.push(text);
+    if (fail) return fail(text);
+    if (text.includes("status=success")) {
+      return body({ workflow_runs: green.map((commit, index) => aRun({ id: 100 + index, head_sha: commit })) });
+    }
+    if (text.includes("head_sha=")) {
+      return body({ workflow_runs: tipRun ? [aRun({ id: 7, ...tipRun })] : [] });
+    }
+    const match = /runs\/(\d+)\/artifacts/.exec(text);
+    if (match) {
+      const commit = green[Number(match[1]) - 100];
+      return body({ artifacts: [anArtifact({ name: artifactNameFor(commit), expired: expired.includes(commit) })] });
+    }
+    throw new Error(`unexpected request ${text}`);
+  };
+}
+
+const select = (candidates, options = {}) =>
+  selectNewestGreenCommit({ candidates, tip: candidates[0], env: SELECT_ENV, ...options });
+
+test("main's tip is chosen when its build is green", async () => {
+  const urls = [];
+  const found = await select([C[4], C[3], C[2]], { fetchImpl: actionsFetch({ green: [C[4], C[3]], urls }) });
+  assert.equal(found.commit, C[4]);
+  assert.equal(found.behind, 0);
+  assert.equal(found.tipBuild, "succeeded");
+  // The listing is one request for all of main's successful runs, then the
+  // artifact of the commit chosen.  The tip's own state is not looked up
+  // because nothing needs describing.
+  assert.equal(urls.length, 2, urls.join("\n"));
+  assert.match(urls[0], /\/actions\/workflows\/mac-commit-build\.yml\/runs\?branch=main&status=success&per_page=100$/);
+  assert.match(urls[1], /\/actions\/runs\/100\/artifacts/);
+});
+
+test("a cancelled tip falls back to the newest earlier commit that is green", async () => {
+  // Exactly the 2026-10-09 failure: the tip's build was cancelled by the next
+  // push, and the commit before it had a green build.
+  const found = await select([C[4], C[3], C[2]], {
+    fetchImpl: actionsFetch({ green: [C[3], C[2]], tipRun: { head_sha: C[4], status: "completed", conclusion: "cancelled" } }),
+  });
+  assert.equal(found.commit, C[3]);
+  assert.equal(found.behind, 1);
+  assert.equal(found.tipBuild, "was cancelled");
+});
+
+test("the newest GREEN COMMIT wins, whatever order the runs finished in", async () => {
+  // A re-run of an old commit can finish after a newer one, so GitHub lists the
+  // older commit's run first.  Git order decides.
+  const found = await select([C[4], C[3], C[2]], {
+    fetchImpl: actionsFetch({ green: [C[2], C[3]], tipRun: { head_sha: C[4], status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(found.commit, C[3]);
+  assert.equal(found.behind, 1);
+  assert.equal(found.tipBuild, "is still running");
+});
+
+test("a tip that is still queued, failed or has no build at all is described as such", async () => {
+  for (const [tipRun, expected] of [
+    [{ head_sha: C[4], status: "queued", conclusion: null }, "is still running"],
+    [{ head_sha: C[4], status: "completed", conclusion: "failure" }, "failed"],
+    [{ head_sha: C[4], status: "completed", conclusion: "timed_out" }, "timed out"],
+    [null, "has no hosted build yet"],
+  ]) {
+    const found = await select([C[4], C[3]], { fetchImpl: actionsFetch({ green: [C[3]], tipRun }) });
+    assert.equal(found.commit, C[3]);
+    assert.equal(found.tipBuild, expected);
+  }
+});
+
+test("a green run whose artifact has expired is skipped for the next candidate", async () => {
+  const logs = [];
+  const found = await select([C[4], C[3], C[2]], {
+    fetchImpl: actionsFetch({ green: [C[4], C[3], C[2]], expired: [C[4]], tipRun: { head_sha: C[4], status: "completed", conclusion: "success" } }),
+    log: (line) => logs.push(line),
+  });
+  assert.equal(found.commit, C[3]);
+  assert.equal(found.behind, 1);
+  assert.match(logs.join("\n"), /artifact is missing or expired/);
+});
+
+test("only runs the install path itself would accept count as green", async () => {
+  const fetchImpl = async (url) => ({
+    ok: true,
+    status: 200,
+    json: async () => String(url).includes("status=success")
+      ? { workflow_runs: [aRun({ id: 1, head_sha: C[4], event: "pull_request" }), aRun({ id: 2, head_sha: C[3], event: "workflow_dispatch" })] }
+      : String(url).includes("head_sha=")
+        ? { workflow_runs: [] }
+        : { artifacts: [anArtifact({ name: artifactNameFor(C[3]) })] },
+  });
+  const found = await select([C[4], C[3]], { fetchImpl });
+  assert.equal(found.commit, C[3], "a pull_request run is not a build of main; a workflow_dispatch run is");
+});
+
+test("nothing green among the candidates is an answer, not an error", async () => {
+  const found = await select([C[4], C[3]], {
+    fetchImpl: actionsFetch({ green: [], tipRun: { head_sha: C[4], status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(found.commit, null);
+  assert.equal(found.tipBuild, "is still running");
+});
+
+test("only a handful of artifact lookups are made before giving up", async () => {
+  const urls = [];
+  const many = Array.from({ length: 12 }, (_, index) => String(index + 1).padStart(2, "0").repeat(20));
+  const found = await select(many, { fetchImpl: actionsFetch({ green: many, expired: many, urls }) });
+  assert.equal(found.commit, null);
+  assert.equal(urls.filter((url) => url.includes("/artifacts")).length, 5);
+});
+
+test("a GitHub failure surfaces as a classified error the wrapper can fail open on", async () => {
+  await assert.rejects(
+    select([C[4]], { fetchImpl: actionsFetch({ fail: () => ({ ok: false, status: 403, json: async () => ({}) }) }) }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "rate-limited");
+      // The message names the commit it was looking for, not a placeholder.
+      assert.match(error.message, new RegExp(C[4]));
+      return true;
+    },
+  );
+});
+
+// ---- Which commits are candidates: real git, because the floor is the point.
+
+async function mainHistory(t, count = 5) {
+  const dir = await fixture(t);
+  const git = async (...args) => (await run("git", ["-C", dir, ...args])).stdout.trim();
+  await run("git", ["init", "-q", "-b", "main", dir]);
+  const commits = [];
+  for (let index = 0; index < count; index += 1) {
+    await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", `c${index}`);
+    commits.push(await git("rev-parse", "HEAD"));
+  }
+  await git("update-ref", "refs/remotes/origin/main", commits.at(-1));
+  return { dir, commits, git, gitSync: (args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim() };
+}
+
+test("candidates run from main's tip down to, but not including, the installed build", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [c0, c1, c2, c3, c4] = commits;
+  const listed = listUpdateCandidates({ git: gitSync, installed: c1 });
+  assert.deepEqual(listed.candidates, [c4, c3, c2], "the installed build and everything older is excluded");
+  assert.equal(listed.tip, c4);
+  assert.notEqual(listed.truncated, true);
+  assert.deepEqual(listUpdateCandidates({ git: gitSync, installed: c3 }).candidates, [c4]);
+  assert.ok(!listUpdateCandidates({ git: gitSync, installed: c0 }).candidates.includes(c0));
+});
+
+test("when the floor cannot be proven the selection steps aside rather than guess", async (t) => {
+  const { commits, git, gitSync } = await mainHistory(t);
+  const tip = commits.at(-1);
+  assert.match(listUpdateCandidates({ git: gitSync, installed: null }).skip, /no source commit/);
+  assert.match(listUpdateCandidates({ git: gitSync, installed: tip }).skip, /already main's tip/);
+  assert.match(listUpdateCandidates({ git: gitSync, installed: "9".repeat(40) }).skip, /not an ancestor/);
+  // A build from a commit that never reached main is not on main's history.
+  await git("checkout", "-q", "-b", "side", commits[1]);
+  await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "side");
+  const sideCommit = await git("rev-parse", "HEAD");
+  assert.match(listUpdateCandidates({ git: gitSync, installed: sideCommit }).skip, /not an ancestor/);
+  await git("update-ref", "-d", "refs/remotes/origin/main");
+  assert.match(listUpdateCandidates({ git: gitSync, installed: commits[0] }).skip, /origin\/main cannot be read/);
+});
+
+test("the candidate window is bounded and says when it was cut", async (t) => {
+  const { commits, gitSync } = await mainHistory(t, 6);
+  const listed = listUpdateCandidates({ git: gitSync, installed: commits[0], windowSize: 3 });
+  assert.equal(listed.candidates.length, 3);
+  assert.equal(listed.truncated, true);
+  assert.equal(SELECTION_WINDOW, 100);
+});
+
+test("first-parent history is what is walked, so a merged side branch is never a candidate", async (t) => {
+  const { commits, git, gitSync } = await mainHistory(t, 3);
+  await git("checkout", "-q", "-b", "feature", commits[0]);
+  await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "feature work");
+  const feature = await git("rev-parse", "HEAD");
+  await git("checkout", "-q", "main");
+  await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "merge", "-q", "--no-ff", "-m", "merge feature", "feature");
+  const merge = await git("rev-parse", "HEAD");
+  await git("update-ref", "refs/remotes/origin/main", merge);
+  const listed = listUpdateCandidates({ git: gitSync, installed: commits[0] });
+  assert.deepEqual(listed.candidates, [merge, commits[2], commits[1]]);
+  assert.ok(!listed.candidates.includes(feature), "a commit only reachable through a merge was never pushed to main, so it has no build");
+  // An installed build on the merged side branch: the mainline commits that do
+  // not contain it are not an upgrade from it, so only the merge itself is.
+  assert.deepEqual(listUpdateCandidates({ git: gitSync, installed: feature }).candidates, [merge]);
+});
+
+// ---- The whole decision.
+
+test("selectUpdateTarget picks the tip when it is green and the earlier commit when it is not", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [c0, , c2, c3, c4] = commits;
+  const common = { git: gitSync, installedCommit: c0, env: SELECT_ENV };
+
+  const tipGreen = await selectUpdateTarget({ ...common, fetchImpl: actionsFetch({ green: [c4, c3] }) });
+  assert.deepEqual([tipGreen.status, tipGreen.commit], ["selected", c4]);
+  assert.match(tipGreen.message, new RegExp(`^Updating to ${c4.slice(0, 12)} \\(main's tip; its build succeeded\\)$`));
+
+  const tipCancelled = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [c3, c2], tipRun: { head_sha: c4, status: "completed", conclusion: "cancelled" } }),
+  });
+  assert.deepEqual([tipCancelled.status, tipCancelled.commit], ["selected", c3]);
+  assert.equal(
+    tipCancelled.message,
+    `Updating to ${c3.slice(0, 12)} (main is 1 commit ahead; its build was cancelled)`,
+  );
+
+  const tipRunning = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [c2], tipRun: { head_sha: c4, status: "in_progress", conclusion: null } }),
+  });
+  assert.deepEqual([tipRunning.status, tipRunning.commit], ["selected", c2]);
+  assert.equal(
+    tipRunning.message,
+    `Updating to ${c2.slice(0, 12)} (main is 2 commits ahead; its build is still running)`,
+  );
+});
+
+test("nothing newer than the installed build is green: a clear refusal, never the installed build", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [, c1, , , c4] = commits;
+  // The installed commit (c1) and an older one are green; everything above is
+  // not.  Choosing either would be a reinstall or a downgrade.
+  const decision = await selectUpdateTarget({
+    git: gitSync,
+    installedCommit: c1,
+    env: SELECT_ENV,
+    fetchImpl: actionsFetch({ green: [c1, commits[0]], tipRun: { head_sha: c4, status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(decision.status, "none");
+  assert.match(decision.message, /^No newer hosted build to install\./);
+  assert.match(decision.message, new RegExp(`installed build is ${c1.slice(0, 12)}`));
+  assert.match(decision.message, new RegExp(`Main is at ${c4.slice(0, 12)}, 3 commits ahead`));
+  assert.match(decision.message, /its build is still running/);
+  assert.match(decision.message, /BOTFLEET_UPDATE_SOURCE=local/);
+  assert.ok(!decision.message.includes("\n"), "the explanation is one line, because the wrapper hands it over in a variable");
+});
+
+test("the policy decides what 'nothing newer' means: local keeps the tip, auto falls back to it", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const nothingGreen = actionsFetch({ green: [], tipRun: { head_sha: commits[4], status: "in_progress", conclusion: null } });
+  const base = { git: gitSync, installedCommit: commits[0], fetchImpl: nothingGreen };
+
+  const local = await selectUpdateTarget({ ...base, env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "local" } });
+  assert.equal(local.status, "skip");
+  assert.match(local.reason, /packages the commit on this Mac/);
+
+  const auto = await selectUpdateTarget({ ...base, env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "auto" } });
+  assert.equal(auto.status, "skip", "auto packages the tip locally when no hosted build is newer");
+
+  // auto still prefers a hosted build over packaging when one exists.
+  const autoGreen = await selectUpdateTarget({
+    ...base,
+    env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "auto" },
+    fetchImpl: actionsFetch({ green: [commits[3]], tipRun: { head_sha: commits[4], status: "in_progress", conclusion: null } }),
+  });
+  assert.deepEqual([autoGreen.status, autoGreen.commit], ["selected", commits[3]]);
+
+  // local never even asks GitHub.
+  const urls = [];
+  await selectUpdateTarget({ ...base, env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "local" }, fetchImpl: actionsFetch({ urls }) });
+  assert.deepEqual(urls, []);
+});
+
+test("an installed build that is already the tip leaves the plain update path alone", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const urls = [];
+  const decision = await selectUpdateTarget({
+    git: gitSync,
+    installedCommit: commits[4],
+    env: SELECT_ENV,
+    fetchImpl: actionsFetch({ urls }),
+  });
+  assert.equal(decision.status, "skip");
+  assert.deepEqual(urls, [], "nothing is looked up when there is nothing to choose");
+});
+
+test("the installed build is read from the app's build identity", async (t) => {
+  const app = await fixture(t);
+  const identity = join(app, "Contents/Resources/server/build-identity.json");
+  await mkdir(dirname(identity), { recursive: true });
+  await writeFile(identity, JSON.stringify({ sourceCommit: C[1] }));
+  assert.equal(await readInstalledSourceCommit(app), C[1]);
+  await writeFile(identity, JSON.stringify({ sourceCommit: "not-a-commit" }));
+  assert.equal(await readInstalledSourceCommit(app), null);
+  await writeFile(identity, "{ torn");
+  assert.equal(await readInstalledSourceCommit(app), null);
+  assert.equal(await readInstalledSourceCommit(join(app, "missing")), null);
 });

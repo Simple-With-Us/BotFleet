@@ -165,6 +165,13 @@ function usage() {
                               [--grace SECONDS | --wait-for-idle [MINUTES] | --force]
   update-botfleet-mac.mjs unquiesce
 
+With no --target, update and prepare (run through scripts/update-botfleet.sh) install the newest
+commit on origin/main whose hosted Mac build succeeded and that is newer than the installed build,
+rather than main's tip, whose build is usually still running or was cancelled by the next push.
+They print which commit was chosen and how far behind the tip it is, and stop with an explanation
+when nothing newer has a successful build.  --target installs exactly the commit named, and
+BOTFLEET_UPDATE_SOURCE=local keeps main's tip.
+
 Any of update/prepare/apply also accepts --progress PATH [--run-id ID], which records each
 step and the final outcome to a JSON file a detached caller can read while the run is going.
 
@@ -3187,6 +3194,14 @@ function createOperations(config) {
     acquireLock: (mode) => acquireDirectoryLock(config.lockDirectory, mode),
 
     resolveTarget: async (plan) => {
+      // The wrapper (scripts/update-botfleet.sh) looked for the newest commit
+      // on main with a successful hosted build and found none newer than the
+      // installed one.  It hands that explanation here instead of ending the
+      // run itself, so it is recorded in the progress file like any other
+      // failure rather than being reported as an updater that never started.
+      // An explicit --target never carries it.
+      const nothingNewer = (process.env.BOTFLEET_UPDATE_SELECTION_FAILURE ?? "").trim();
+      if (nothingNewer) throw new ResolutionError(nothingNewer, "no-green-build");
       const repository = plan.source || config.checkout;
       await git(repository, ["fetch", "origin", "main"]);
       const commit = await gitOutput(repository, ["rev-parse", "--verify", `${plan.target}^{commit}`]);
