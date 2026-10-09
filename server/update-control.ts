@@ -750,15 +750,23 @@ async function defaultLaunch(plan: LaunchPlan): Promise<LaunchResult> {
   await execCommand("/bin/launchctl", ["remove", plan.label]);
   const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
   const launchPlan: LaunchPlan = { ...plan };
-  if (harnessOwnerNonce && !plan.launchEnvFilePath) {
-    const envPath = join(dirname(plan.progressPath), `${plan.runId}.launch.env`);
-    mkdirSync(dirname(envPath), { recursive: true, mode: 0o700 });
-    writeFileSync(envPath, `BOTFLEET_OWNER_NONCE=${harnessOwnerNonce}\n`, { mode: 0o600 });
-    launchPlan.launchEnvFilePath = envPath;
+  let launchEnvFilePath = plan.launchEnvFilePath;
+  if (harnessOwnerNonce && !launchEnvFilePath) {
+    launchEnvFilePath = join(dirname(plan.progressPath), `${plan.runId}.launch.env`);
+    mkdirSync(dirname(launchEnvFilePath), { recursive: true, mode: 0o700 });
+    writeFileSync(launchEnvFilePath, `BOTFLEET_OWNER_NONCE=${harnessOwnerNonce}\n`, { mode: 0o600 });
+    launchPlan.launchEnvFilePath = launchEnvFilePath;
   }
   const { command, args } = launchPlanCommand(launchPlan);
   const submitted = await execCommand(command, args);
   if (submitted.code === 0) return { launcher: "launchd" };
+  if (launchEnvFilePath) {
+    try {
+      rmSync(launchEnvFilePath, { force: true });
+    } catch {
+      /* a leftover env file is swept with the run artifacts */
+    }
+  }
   // launchd refused (an old label still settling, a sandboxed domain).  A
   // detached, session-leading child is still better than not updating: it
   // outlives the desktop app, and the harness restart it performs is a
