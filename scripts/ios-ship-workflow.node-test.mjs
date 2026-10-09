@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -294,6 +294,30 @@ test("asc-api.mjs says what it tried instead of failing on a missing file", () =
     });
     assert.equal(bad.status, 1);
     assert.match(bad.stderr, /APPLE_API_KEY_P8_BASE64 is set but did not decode to a PEM private key/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("asc-api.mjs stays dependency-free: it runs from a bare directory with no node_modules", () => {
+  // The hosted ios-ship workflow runs this client with plain `node` BEFORE any
+  // `pnpm install`, so a package import (zod, an autofix's favorite) throws
+  // ERR_MODULE_NOT_FOUND and breaks every TestFlight ship.  Running it from a
+  // copy in a temp directory is the only check that cannot resolve a package
+  // from this repo's node_modules.
+  const src = read("scripts/ios-fleet/asc-api.mjs");
+  const specs = [...src.matchAll(/^\s*import\s[^;]*?from\s+["']([^"']+)["']/gm)].map((m) => m[1]);
+  assert.deepEqual(specs.filter((spec) => !spec.startsWith("node:") && !spec.startsWith(".")), [], "asc-api.mjs may only import node: builtins");
+  const tmp = mkdtempSync(join(tmpdir(), "asc-bare-"));
+  try {
+    const copy = join(tmp, "asc-api.mjs");
+    writeFileSync(copy, src);
+    const run = spawnSync(process.execPath, [copy, "latest-build-seq", "app.botfleet.ios", "1.0"], {
+      encoding: "utf8",
+      env: { PATH: process.env.PATH || "", HOME: tmp },
+    });
+    assert.doesNotMatch(run.stderr, /ERR_MODULE_NOT_FOUND|Cannot find (package|module)/);
+    assert.match(run.stderr, /no App Store Connect/, "must reach main() and stop on the missing key, not on an import");
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
