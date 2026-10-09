@@ -812,6 +812,7 @@ struct ChatRow: View {
 
             HStack(alignment: .top, spacing: 14) {
                 ChatAvatarView(chat: chat, size: 52, state: state, animated: state.showsActivity)
+                    .providerBadge(for: chat, avatarSize: 52)
                     .padding(.top, 12)
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -890,7 +891,10 @@ struct UpdatesPill: View {
         Button(action: action) {
             HStack(spacing: 8) {
                 if !updates.isEmpty {
-                    MascotStack(colors: Array(updates.prefix(3).map(\.chat.color)))
+                    MascotStack(
+                        colors: Array(updates.prefix(3).map(\.chat.color)),
+                        chats: Array(updates.prefix(3).map(\.chat))
+                    )
                 }
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 4) {
@@ -945,15 +949,22 @@ struct UpdatesPill: View {
 /// Up to three mascots overlapping, the way a group of faces reads at a glance.
 struct MascotStack: View {
     let colors: [String]
+    /// The chats behind `colors`, when they are known: each bot's face then
+    /// wears its model badge like every other avatar.
+    var chats: [Chat] = []
     var size: CGFloat = 28
     var overlap: CGFloat = 12
 
     var body: some View {
         HStack(spacing: -overlap) {
-            ForEach(Array(colors.enumerated()), id: \.offset) { _, color in
+            ForEach(Array(colors.enumerated()), id: \.offset) { index, color in
                 BotMascot(color: color, size: size, state: .idle, animated: false)
+                    .providerBadge(for: chats.indices.contains(index) ? chats[index] : nil, avatarSize: size)
                     .padding(2)
                     .background(Circle().fill(Color(uiColor: .systemBackground)))
+                    // Each face sits above the next, so its badge is not
+                    // covered by the face that overlaps it.
+                    .zIndex(Double(colors.count - index))
             }
         }
     }
