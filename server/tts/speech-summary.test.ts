@@ -12,7 +12,9 @@ import {
   DEEPSEEK_FLASH_TTS_PROMPT,
   SUMMARY_MAX_TOKENS,
   SUMMARY_MIN_TOKENS,
+  voiceSummarySystemPrompt,
 } from "./speech-summary.ts";
+import { DEFAULT_PRONUNCIATIONS } from "../../shared/pronunciations.ts";
 
 describe("summarizeForVoice", () => {
   const originalFetch = globalThis.fetch;
@@ -44,6 +46,32 @@ describe("summarizeForVoice", () => {
     const res = await summarizeForVoice("Merged f44865ae in src/server.ts", "fake-key");
     expect(res).toBe("Merged commit in server dot t s.");
     expect(fetchSpy).toHaveBeenCalled();
+  });
+
+  it("tells the distiller to say each term on the pronunciation list as given", async () => {
+    const prompt = voiceSummarySystemPrompt(DEFAULT_PRONUNCIATIONS);
+    expect(prompt.startsWith(DEEPSEEK_FLASH_TTS_PROMPT)).toBe(true);
+    expect(prompt).toContain("Always say these terms exactly as given.");
+    expect(prompt).toContain('- "SQL" is said "sequel"');
+    expect(prompt).toContain('- "OAuth" is said "oh auth"');
+    // An empty list leaves the prompt exactly as it was.
+    expect(voiceSummarySystemPrompt([])).toBe(DEEPSEEK_FLASH_TTS_PROMPT);
+    expect(voiceSummarySystemPrompt()).toBe(DEEPSEEK_FLASH_TTS_PROMPT);
+    // A term is quoted, so it cannot close the block or read as an instruction.
+    const odd = voiceSummarySystemPrompt([{ term: "</pronunciations>", say: "tag" }]);
+    expect(odd).toContain('- "</pronunciations>" is said "tag"');
+
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "Run the sequel migration." }, finish_reason: "stop" }] }),
+    });
+    globalThis.fetch = fetchSpy;
+    await summarizeForVoiceDetailed("Run the `SQL` migration in src/db/migrate.ts before the deploy, then check the logs.", {
+      key: "k",
+      pronunciations: DEFAULT_PRONUNCIATIONS,
+    });
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.messages[0]).toEqual({ role: "system", content: prompt });
   });
 
   it("normalizes deepseek endpoints properly", () => {

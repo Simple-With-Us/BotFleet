@@ -1,0 +1,7 @@
+allowed_bots:
+  - kody-ai[bot]
+  - github-actions[bot]
+  - sonarcloud[bot]
+  - codacy-production[bot]
+
+max_iterations: 5

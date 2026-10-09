@@ -76,6 +76,11 @@ const SENSITIVE = [
   // The desktop's OS-encrypted credential document (safeStorage), which is
   // where every packaged-app key actually lands.
   /\bcredentials\.bin\b/i,
+  // The fleet's secrets folder and every Zulip key file in it.  Each BF role
+  // bot's `<Role>-zuliprc` is a live bot key (docs/zulip.md): a bot that can
+  // read another role's file can post as that role, so a read is carded too.
+  /(^|[\s/"'=:~])\.secrets([/\\]|$|["'\s])/i,
+  /zuliprc\b/i,
   ...(process.env.OMB_DATA_DIR
     ? [new RegExp(`(^|[\\s/"'])${process.env.OMB_DATA_DIR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([/\\\\]|$|["'\\s])`, "i")]
     : []),

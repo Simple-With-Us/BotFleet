@@ -490,7 +490,8 @@ public enum KaraokeAlign {
         _ cols: [KaraokeWord],
         _ params: Params,
         _ anchors: [(Int, Int)],
-        _ band: Int
+        _ band: Int,
+        _ pronunciations: [Pronunciation] = []
     ) -> CoreResult {
         let R = rows.count
         let C = cols.count
@@ -597,6 +598,29 @@ public enum KaraokeAlign {
                 }
                 if !byId.isEmpty { expansions[i] = byId }
                 if !byNum.isEmpty { numExpansions[i] = byNum }
+            }
+        }
+        // The pronunciation list (karaoke-align.ts): a run of spoken words
+        // that is exactly how a term is said expands to the term's (first)
+        // display word.  In list order and after the number readings, so
+        // ties break as they do in TypeScript.
+        for entry in pronunciations {
+            guard let termWord = tokenize(entry.term).first, let id = ids[termWord.key] else { continue }
+            let sayKeys = tokenize(entry.say).map(\.key)
+            let k = sayKeys.count
+            if k == 0 || k > maxJoined || k > R { continue }
+            for i in 0...(R - k) {
+                var same = true
+                var q = 0
+                while q < k && same {
+                    same = rows[i + q].key == sayKeys[q]
+                    q += 1
+                }
+                if same {
+                    var table = expansions[i] ?? [:]
+                    put(&table, id, [k])
+                    expansions[i] = table
+                }
             }
         }
         func classify(_ i: Int, _ j: Int) -> Int {
@@ -801,11 +825,23 @@ public enum KaraokeAlign {
     }
 
     /// Pair spoken words with display words.
-    public static func alignWords(_ spokenWords: [KaraokeWord], _ displayWords: [KaraokeWord], guide: [Int]? = nil) -> KaraokeMapping {
+    public static func alignWords(
+        _ spokenWords: [KaraokeWord],
+        _ displayWords: [KaraokeWord],
+        guide: [Int]? = nil,
+        pronunciations: [Pronunciation] = []
+    ) -> KaraokeMapping {
         let S = spokenWords.count
         let D = displayWords.count
         let anchors = guide.map { guideAnchors($0, S, D) } ?? uniqueAnchors(spokenWords, displayWords)
-        let core = alignCore(spokenWords, displayWords, spokenParams, anchors, guide != nil ? guidedBand : spokenParams.band)
+        let core = alignCore(
+            spokenWords,
+            displayWords,
+            spokenParams,
+            anchors,
+            guide != nil ? guidedBand : spokenParams.band,
+            pronunciations
+        )
         var spokenToDisplay = [Int](repeating: -1, count: S)
         var previous = -1
         for s in 0..<S {
@@ -880,11 +916,14 @@ public enum KaraokeAlign {
     /// spoken script's spans and the markdown they index; without them (a
     /// distilled script) the alignment anchors on words that occur once on
     /// each side.  MiniMax pause tags in `spokenText` are blanked first.
+    /// `pronunciations` is the workspace list in force, so a respelled term
+    /// ("sequel") pairs with the term on screen ("SQL").
     public static func alignSpokenToDisplay(
         spokenText: String,
         displayText: String,
         segments: [SpeechSpan]? = nil,
-        sourceText: String? = nil
+        sourceText: String? = nil,
+        pronunciations: [Pronunciation] = []
     ) -> KaraokeAlignment {
         let spokenWords = tokenize(SpokenPause.mask(spokenText))
         let displayWords = tokenize(displayText)
@@ -893,7 +932,7 @@ public enum KaraokeAlign {
             guide = guideFromSpans(spokenWords, segments: segments, sourceText: sourceText, displayWords: displayWords)
         }
         let guided = guide?.contains(where: { $0 >= 0 }) ?? false
-        let mapping = alignWords(spokenWords, displayWords, guide: guided ? guide : nil)
+        let mapping = alignWords(spokenWords, displayWords, guide: guided ? guide : nil, pronunciations: pronunciations)
         let quality = quality(spokenWords, displayWords, mapping)
         return KaraokeAlignment(
             spokenWords: spokenWords,

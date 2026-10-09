@@ -77,6 +77,8 @@ describe("what the app may do", () => {
     ["GET", "/api/attachments/avatar-123.webp"],
     ["GET", "/api/tts/voices"],
     ["POST", "/api/tts/speak"],
+    ["PATCH", "/api/tts/default-voice"],
+    ["PATCH", "/api/tts/pronunciations"],
     ["POST", "/api/threads/th_1/messages/msg_2/audio"],
     ["GET", "/api/threads/th_1/messages/msg_2/audio/0"],
     ["GET", "/api/routines"],
@@ -429,5 +431,25 @@ describe("settings display preferences", () => {
     expect(ask("PATCH", "/api/features", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/room-turn-timeout", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/profile", false)?.status).toBe(401);
+  });
+});
+
+describe("workspace voice settings", () => {
+  it("lets the phone change the default voice and the pronunciation list, and nothing else under tts", () => {
+    expect(allowed("PATCH", "/api/tts/default-voice")).toBe(true);
+    expect(allowed("PATCH", "/api/tts/pronunciations")).toBe(true);
+    expect(allowed("PUT", "/api/tts/default-voice")).toBe(false);
+    expect(allowed("POST", "/api/tts/pronunciations")).toBe(false);
+    expect(allowed("GET", "/api/tts/pronunciations")).toBe(false);
+    expect(allowed("PATCH", "/api/tts/default-voice/extra")).toBe(false);
+    expect(allowed("PATCH", "/api/tts/key")).toBe(false);
+    expect(allowed("POST", "/api/tts/voice-clone")).toBe(false);
+    expect(allowed("PATCH", "/api/config")).toBe(false);
+    expect(allowed("PUT", "/api/config")).toBe(false);
+  });
+
+  it("still refuses an unpaired device", () => {
+    expect(ask("PATCH", "/api/tts/default-voice", false)?.status).toBe(401);
+    expect(ask("PATCH", "/api/tts/pronunciations", false)?.status).toBe(401);
   });
 });

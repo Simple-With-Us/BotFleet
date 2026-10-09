@@ -61,10 +61,19 @@
 // - An on-device (Personal Voice) answer has the distiller's MiniMax pause
 //   tags (`<#0.3#>`) taken out, since an Apple voice would read them; hosted
 //   clips keep them, because MiniMax turns them into the pauses they ask for.
+// - The workspace pronunciation list (shared/pronunciations.ts) is applied
+//   only where text leaves for a voice: each hosted utterance on its way to
+//   the engine (server/tts/index.ts speak) and the utterances an on-device
+//   answer hands the device, whose spans are rebuilt so a respelled term
+//   still maps to the term on screen.  voiceText, the stamps and the
+//   utterances every cache check compares never carry it, so a list edit
+//   never resets or re-bills a clip: clips already made keep their sound,
+//   and new synthesis uses the list.
 import { z } from "zod";
 
 import { isPersonalVoiceId, isSpeechDevice, SPEECH_DEVICES, voiceForDevice, type BotVoices, type SpeechDevice } from "../../shared/bot-voice.ts";
-import { utterancesWithSpans } from "../../shared/speech-spans.ts";
+import { pronouncer, type Pronunciation } from "../../shared/pronunciations.ts";
+import { pronounceUtterance, utterancesWithSpans, type SpokenUtterance } from "../../shared/speech-spans.ts";
 import { encodeSpokenSpans, stripPauseTags, type SpokenScriptKind, type SpokenSpansWire } from "../../shared/spoken-script.ts";
 import { voiceScriptKind, writtenReply, type VoiceSummaryMode } from "../../shared/voice-summary.ts";
 import { toUtterances } from "./speech-text.ts";
@@ -164,6 +173,9 @@ export interface MessageAudioDeps {
   readClip(clip: VoiceClip): { bytes: Uint8Array; mime: string } | null;
   /** cfg.tts.voice: what an empty bot voice means. */
   defaultVoice(): string;
+  /** The workspace pronunciation list in force, for on-device answers.
+   * Hosted clips get it from `speak`.  Absent means none. */
+  pronunciations?(): readonly Pronunciation[];
   /** A hosted-voice key is saved but has not reached the harness yet. */
   credentialPending(): boolean;
   /** tts.NoVoiceConfigured, which the route reports as 409, not 502. */
@@ -493,9 +505,13 @@ export class MessageAudio {
     // kind with the same text owns them too (see ownsClips).
     let stampKind: SpokenScriptKind = kind;
     let eitherKind = false;
+    /** The span-carrying utterances when the script is the deterministic
+     * one, for an on-device answer to respell with its spans intact. */
+    let written: SpokenUtterance[] | undefined;
     const source = writtenReply(message.text);
     if (kind === "written") {
       const spoken = utterancesWithSpans(source);
+      written = spoken;
       utterances = spoken.map((u) => u.text);
       textToSpeak = utterances.join(" ");
       if (spans) spansWire = encodeSpokenSpans(source, spoken);
@@ -512,6 +528,7 @@ export class MessageAudio {
       if (sameUtterances(deterministic.map((u) => u.text), utterances)) {
         label = "written";
         eitherKind = true;
+        written = deterministic;
         if (spans) spansWire = encodeSpokenSpans(source, deterministic);
         // A stand-in for a rewrite that failed for a passing reason is the
         // reply as written, and stamped so: the next play distills again.
@@ -559,9 +576,29 @@ export class MessageAudio {
       }
       // An Apple voice would read the distiller's MiniMax pause tags aloud.
       // The deterministic script has none, and its spans index it as it is.
-      const onDevice = label === "written"
-        ? utterances
-        : utterances.map(stripPauseTags).filter((u) => /[\p{L}\p{N}]/u.test(u));
+      // The device speaks exactly these strings, so the pronunciation list
+      // goes in here, with the written script's spans rebuilt around it.
+      const list = this.deps.pronunciations?.() ?? [];
+      let onDevice: string[];
+      let onDeviceSpans = spansWire;
+      if (label === "written" && written) {
+        const respelled = list.length ? written.map((u) => pronounceUtterance(u, list)) : written;
+        onDevice = respelled.map((u) => u.text);
+        if (spans && respelled !== written) onDeviceSpans = encodeSpokenSpans(source, respelled);
+      } else {
+        const respell = pronouncer(list);
+        onDevice = utterances
+          .map(stripPauseTags)
+          .filter((u) => /[\p{L}\p{N}]/u.test(u))
+          .map(respell);
+      }
+      // `script` and `spans` only for a client that asked, as extra() does,
+      // with the spans of what the device is actually handed.
+      const script: Partial<AudioResponseBody> = {};
+      if (spans) {
+        script.script = label;
+        if (label === "written" && onDeviceSpans) script.spans = onDeviceSpans;
+      }
       return {
         kind: "json",
         status: 200,
@@ -574,7 +611,7 @@ export class MessageAudio {
           onDevice: true,
           personalVoice: true,
           voice,
-          ...extra(),
+          ...script,
         },
       };
     }

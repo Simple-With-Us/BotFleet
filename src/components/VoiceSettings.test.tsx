@@ -149,7 +149,7 @@ describe("VoiceSettings", () => {
     // Its Try is off: the Mac cannot speak the iPhone's Personal Voice.
     expect(html).toContain("title=\"Personal Voice from your iPhone.\u00A0 Choose it on the iPhone.\"");
     // The Mac picker is unaffected: it still offers the shared voice.
-    expect(html).toContain("standard-default (default)");
+    expect(html).toContain("Standard Default (default)");
   });
 
   it("names an iPhone falling back to a shared Personal Voice as the iPhone's", () => {
