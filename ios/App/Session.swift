@@ -3722,7 +3722,7 @@ extension CompanionState {
     var chatSummaries: [ChatSummary] {
         let bots = self.bots.filter { $0.hidden != true }.map(Chat.bot)
         let rooms = self.rooms.map(Chat.room)
-        return (bots + rooms)
+        let summaries = (bots + rooms)
             .map { chat in
                 let last = newestLoadedMessage(for: chat)
                 return ChatSummary(
@@ -3732,14 +3732,11 @@ extension CompanionState {
                     pinned: Self.pinned(chat)
                 )
             }
-            .sorted { left, right in
-                ChatListOrder.orderedBefore(
-                    pinnedLeft: left.pinned,
-                    activityLeft: left.lastActivity,
-                    pinnedRight: right.pinned,
-                    activityRight: right.lastActivity
-                )
-            }
+        // Pinned first, then newest activity, then the order the harness sent:
+        // the same order the desktop sidebar draws (`ChatListOrder`).
+        return ChatListOrder.stableOrder(summaries) { summary in
+            (pinned: summary.pinned, activity: summary.lastActivity)
+        }
     }
 
     private static func pinned(_ chat: Chat) -> Bool {
