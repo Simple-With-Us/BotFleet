@@ -86,6 +86,9 @@ describe("what the app may do", () => {
     ["PATCH", "/api/routines/routine_1"],
     ["DELETE", "/api/routines/routine_1"],
     ["POST", "/api/routines/routine_1/run"],
+    ["POST", "/api/routine-runs/run_1/cancel"],
+    ["POST", "/api/routine-runs/run_1/seen"],
+    ["POST", "/api/routine-runs/seen"],
     ["GET", "/api/connectors/catalog"],
     ["GET", "/api/connectors/connected"],
     ["GET", "/api/connectors"],
@@ -134,8 +137,8 @@ describe("what it may not", () => {
     // option failed at the tap.  Owner's call: parity (see routes.ts).
     expect(ask("POST", "/api/connectors/slack/authorize")).toBeNull();
     expect(ask("DELETE", "/api/connectors/slack/accounts/ca_123")).toBeNull();
-    // Profile subset and approval answers stay on the phone.  Privilege
-    // fields on profile are still refused by the harness, not widened here.
+    // Profile subset and approval answers stay on the phone.  Connected apps
+    // and host paths on profile are still refused by the allowlist.
     expect(ask("PATCH", "/api/bots/bot_123/profile")).toBeNull();
     expect(ask("POST", "/api/threads/th_1/respond")).toBeNull();
     expect(ask("POST", "/api/threads/th_1/approve-all")).toBeNull();
@@ -146,19 +149,13 @@ describe("what it may not", () => {
       expect(companionProfilePatchDenial({ [field]: "value" }), field).toBeNull();
     }
     for (const field of [
-      "autoApprove",
-      "autoReview",
-      "bypassPermissions",
       "composio",
       "connectorTools",
-      "computers",
       "cloudBackend",
       "autoStartVps",
-      "cwd",
       "extraCwds",
       "userNotes",
       "chiefOfStaff",
-      "approvePeerComms",
       "futurePrivilege",
     ]) {
       expect(companionProfilePatchDenial({ name: "Scout", [field]: true }), field).toEqual({
@@ -168,6 +165,60 @@ describe("what it may not", () => {
     }
   });
 
+  it("lets the phone switch computers, the tool-round budget and a bot's folder", () => {
+    // The Computers, round-budget and folder controls of the native bot sheet
+    // shipped (#709, #649) without anyone extending this list, so every save
+    // of any of them came back "can only be changed in BotFleet on your
+    // computer".  What the harness does with each is tested end to end in
+    // companion/test/proxy.test.ts: it checks This Mac against the stored bot
+    // and confines the folder, neither of which the sidecar can see.
+    for (const field of ["computers", "maxToolRounds", "cwd"]) {
+      expect(COMPANION_PROFILE_PATCH_FIELDS, field).toContain(field);
+    }
+    expect(companionProfilePatchDenial({ computers: ["cloud", "vm"] })).toBeNull();
+    expect(companionProfilePatchDenial({ maxToolRounds: null, name: "Scout" })).toBeNull();
+    expect(companionProfilePatchDenial({ cwd: "/Users/jay/Code/BotFleet", name: "Scout" })).toBeNull();
+    expect(companionProfilePatchDenial({ cwd: null })).toBeNull();
+  });
+
+  it("lets the phone set the execution policy, by the 2026-10-09 owner ruling", () => {
+    // #323 (audit BF-IOS-001) kept these on the computer and the native sheet
+    // showed them read-only.  The owner then ruled that bots get bypass
+    // permissions and the rest from the phone too.  What a bot may do on This
+    // Mac is not moved by this list: the harness refuses to turn Auto Mode on
+    // for a bot that can use it, and bypass never answers a host-control
+    // request.  Both are tested against a real harness in
+    // companion/test/proxy.test.ts.
+    for (const field of ["autoApprove", "autoReview", "approvePeerComms", "bypassPermissions"]) {
+      expect(COMPANION_PROFILE_PATCH_FIELDS, field).toContain(field);
+      expect(companionProfilePatchDenial({ [field]: true }), field).toBeNull();
+      expect(companionProfilePatchDenial({ name: "Scout", computers: ["vm"], [field]: true }), field).toBeNull();
+    }
+    expect(companionProfilePatchDenial({ autoReview: "enforce", bypassPermissions: false })).toBeNull();
+    // The neighbours stay refused, and one refused field still refuses the
+    // whole request, including the edits that would have been fine alone.
+    expect(companionProfilePatchDenial({ bypassPermissions: true, composio: true })).toEqual({
+      status: 403,
+      error: "composio can only be changed in BotFleet on your computer",
+    });
+  });
+
+  it("lets the phone play back and annotate its own recordings, and nothing nearby", () => {
+    // The native chat view calls both; they answered "no route".
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording")).toBeNull();
+    expect(ask("PATCH", "/api/threads/th_1/messages/msg_1/recording-review")).toBeNull();
+    // Exactly those two verbs on exactly those two paths, and a device that
+    // has not paired gets neither.
+    expect(ask("PUT", "/api/threads/th_1/messages/msg_1/recording")?.status).toBe(404);
+    expect(ask("DELETE", "/api/threads/th_1/messages/msg_1/recording")?.status).toBe(404);
+    expect(ask("POST", "/api/threads/th_1/messages/msg_1/recording-review")?.status).toBe(404);
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording-review")?.status).toBe(404);
+    expect(allowed("GET", "/api/threads/th_1/messages/msg_1/recording/extra")).toBe(false);
+    expect(allowed("GET", "/api/threads/th_1/messages/msg_1/recording/../../config")).toBe(false);
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording", false)?.status).toBe(401);
+    expect(ask("PATCH", "/api/threads/th_1/messages/msg_1/recording-review", false)?.status).toBe(401);
+  });
+
   it("lets the phone turn a bot Off and back On, and only through the profile route", () => {
     // The phone's disabled composer has one button, Turn On, so a refusal here
     // would strand an Off bot on the phone.
@@ -175,9 +226,9 @@ describe("what it may not", () => {
     expect(companionProfilePatchDenial({ off: true })).toBeNull();
     expect(companionProfilePatchDenial({ off: false })).toBeNull();
     // Switching it is not a way to smuggle a host-control field along.
-    expect(companionProfilePatchDenial({ off: false, autoApprove: true })).toEqual({
+    expect(companionProfilePatchDenial({ off: false, composio: true })).toEqual({
       status: 403,
-      error: "autoApprove can only be changed in BotFleet on your computer",
+      error: "composio can only be changed in BotFleet on your computer",
     });
     // The general bot PATCH is not on the phone's route list.
     expect(allowed("PATCH", "/api/bots/b_1")).toBe(false);
@@ -188,6 +239,26 @@ describe("what it may not", () => {
     expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("voices");
     expect(companionProfilePatchDenial({ voices: { iphone: "English_Graceful_Lady" } })).toBeNull();
     expect(companionProfilePatchDenial({ voices: null, speechDevices: ["mac", "iphone"] })).toBeNull();
+  });
+
+  it("accepts the profile body the phone's Duplicate Bot sends", () => {
+    // `POST /api/bots` then `PATCH /api/bots/:id/profile` with the fields the
+    // phone owns.  The iOS client (BotDuplicate.profilePatch) keeps to exactly
+    // these keys; the sidecar refuses a body with any other, so if this list
+    // ever narrows, Duplicate Bot would start failing at the second request.
+    expect(allowed("POST", "/api/bots")).toBe(true);
+    expect(allowed("PATCH", "/api/bots/bot_new/profile")).toBe(true);
+    const body = {
+      name: "Scout copy",
+      title: "Researcher",
+      description: "Reads things",
+      notifications: false,
+      avatarUrl: "/api/attachments/face.png",
+      avatarCrop: "circle",
+      voice: "English_Graceful_Lady",
+      modelSelection: { instanceId: "claude", model: "sonnet", fallbacks: [] },
+    };
+    expect(companionProfilePatchDenial(body)).toBeNull();
   });
 
   it("permits a device-qualified clip GET", () => {
@@ -269,6 +340,32 @@ describe("what it may not", () => {
     expect(ask("POST", "/api/routines/routine_1/run")).toBeNull();
   });
 
+  it("lets the phone cancel a routine run and mark runs seen, and nothing else about them", () => {
+    expect(ask("POST", "/api/routine-runs/run_1/cancel")).toBeNull();
+    expect(ask("POST", "/api/routine-runs/run_1/seen")).toBeNull();
+    // The sweep that marks every failure seen.
+    expect(ask("POST", "/api/routine-runs/seen")).toBeNull();
+    // Method is part of the allowance.
+    for (const method of ["GET", "PUT", "PATCH", "DELETE"]) {
+      expect(ask(method, "/api/routine-runs/run_1/cancel")?.status, method).toBe(404);
+      expect(ask(method, "/api/routine-runs/run_1/seen")?.status, method).toBe(404);
+      expect(ask(method, "/api/routine-runs/seen")?.status, method).toBe(404);
+    }
+    // Only those two action words, and the runs listing is not a route.
+    expect(ask("POST", "/api/routine-runs/run_1/retry")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/run_1")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs")?.status).toBe(404);
+    expect(ask("GET", "/api/routine-runs")?.status).toBe(404);
+    // Anchored at both ends: no traversal, no trailing segment, no encoded dot.
+    expect(ask("POST", "/api/routine-runs/../config/cancel")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/run_1/cancel/extra")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/run%2E1/cancel")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/seen/extra")?.status).toBe(404);
+    // And it is still a paired-device route rather than an open one.
+    expect(ask("POST", "/api/routine-runs/run_1/cancel", false)?.status).toBe(401);
+    expect(ask("POST", "/api/routine-runs/seen", false)?.status).toBe(401);
+  });
+
   it("denies the peer-agent endpoints exist at all", () => {
     expect(ask("GET", "/api/internal/peers")?.status).toBe(404);
     expect(ask("POST", "/api/internal/ask-bot")?.status).toBe(404);
@@ -299,7 +396,9 @@ describe("what it may not", () => {
     expect(allowed("PATCH", "/api/bots/bot_123/profile/execution-policy")).toBe(false);
     expect(allowed("PUT", "/api/config")).toBe(false);
     expect(allowed("GET", "/api/attachments/../config.json")).toBe(false);
-    expect(allowed("POST", "/api/routine-runs/run_1/cancel")).toBe(false);
+    // Cancelling and marking a run seen are allowed (see the routine-runs
+    // test below); every other way to reach a run still is not.
+    expect(allowed("GET", "/api/routine-runs/run_1/cancel")).toBe(false);
     expect(allowed("DELETE", "/api/connectors/slack")).toBe(false);
     expect(allowed("GET", "/api/connectors/connected/all")).toBe(false);
     // listing, authorizing and detaching ONE account are allowed; an account

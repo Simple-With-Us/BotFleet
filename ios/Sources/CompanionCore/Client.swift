@@ -1127,6 +1127,23 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("DELETE", "/api/routines/\(id)"))
     }
 
+    /// Stop a run that is queued, running or waiting.  The harness answers 404
+    /// once the run has already settled.
+    public func cancelRoutineRun(id: String) async throws -> RoutineRun {
+        try await send(try makeRequest("POST", "/api/routine-runs/\(id)/cancel"), as: RoutineRunResponse.self).run
+    }
+
+    /// Acknowledge one run.  It keeps its status and error; it just stops
+    /// counting toward the unseen-failure badge.
+    public func markRoutineRunSeen(id: String) async throws -> RoutineRun {
+        try await send(try makeRequest("POST", "/api/routine-runs/\(id)/seen"), as: RoutineRunResponse.self).run
+    }
+
+    /// Acknowledge every unseen failure at once.  Returns the runs it marked.
+    public func markAllRoutineRunsSeen() async throws -> [RoutineRun] {
+        try await send(try makeRequest("POST", "/api/routine-runs/seen"), as: MarkedRoutineRunsResponse.self).runs
+    }
+
     private static func routineBody(_ input: RoutineInput) -> [String: Any] {
         var schedule: [String: Any] = ["type": input.schedule.type.rawValue]
         if let at = input.schedule.at { schedule["at"] = at }
@@ -1143,10 +1160,52 @@ public struct CompanionClient: Sendable {
 
     /// Make a room. The harness names it after the first member when `name`
     /// is empty, exactly as the desktop's dialog does.
-    public func createRoom(name: String?, memberIds: [String]) async throws -> Room {
+    ///
+    /// The first settings travel in this one request.  They used to follow in a
+    /// PATCH, so a folder the computer would not let a phone choose (403) left
+    /// a half-made room behind.  Sent here, the computer checks them before it
+    /// creates anything.
+    public func createRoom(
+        name: String?,
+        memberIds: [String],
+        cwd: String? = nil,
+        bulletin: String? = nil,
+        defaultResponder: GroupResponder? = nil
+    ) async throws -> Room {
+        let body = Self.roomCreateBody(
+            name: name,
+            memberIds: memberIds,
+            cwd: cwd,
+            bulletin: bulletin,
+            defaultResponder: defaultResponder
+        )
+        return try await send(try makeRequest("POST", "/api/groups", body: body), as: CreatedRoom.self).group
+    }
+
+    /// The wire body for `createRoom`.  Blank values are left out, so a room
+    /// made with nothing to say about a folder or bulletin sends what it
+    /// always did.
+    static func roomCreateBody(
+        name: String?,
+        memberIds: [String],
+        cwd: String?,
+        bulletin: String?,
+        defaultResponder: GroupResponder?
+    ) -> [String: Any] {
         var body: [String: Any] = ["memberIds": memberIds]
         if let name, !name.trimmingCharacters(in: .whitespaces).isEmpty { body["name"] = name }
-        return try await send(try makeRequest("POST", "/api/groups", body: body), as: CreatedRoom.self).group
+        if let cwd, !cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["cwd"] = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let bulletin, !bulletin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["bulletin"] = bulletin.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let defaultResponder {
+            var responder: [String: Any] = ["kind": defaultResponder.kind]
+            if let botId = defaultResponder.botId { responder["botId"] = botId }
+            body["defaultResponder"] = responder
+        }
+        return body
     }
 
     @discardableResult
@@ -1226,6 +1285,19 @@ public struct CompanionClient: Sendable {
         var body: [String: Any] = ["requestId": requestId, "behavior": behavior]
         if let message { body["message"] = message }
         try await send(try makeRequest("POST", "/api/threads/\(threadId)/respond", body: body))
+    }
+
+    /// Allow every permission request waiting in a thread (the desktop's
+    /// "Approve All").  Returns how many the harness approved, which can be
+    /// fewer than the card count the phone showed when one was answered
+    /// somewhere else in the meantime.
+    @discardableResult
+    public func approveAll(threadId: String) async throws -> Int {
+        let response = try await send(
+            try makeRequest("POST", "/api/threads/\(threadId)/approve-all"),
+            as: ApproveAllResponse.self
+        )
+        return response.approvedCount ?? 0
     }
 
     /// Starts one more account authorization for a toolkit. Revocation is
@@ -1335,6 +1407,38 @@ public struct CompanionClient: Sendable {
 
     public func deleteTask(botId: String, threadId: String) async throws -> Bot {
         try await send(try makeRequest("DELETE", "/api/bots/\(botId)/tasks/\(threadId)"), as: BotResponse.self).bot
+    }
+
+    // MARK: - Room tasks
+    //
+    // A channel's separate conversations.  The route answers each of create,
+    // switch and delete with the room as it now stands, transcript included.
+
+    public func createRoomTask(roomId: String, title: String? = nil) async throws -> Room {
+        var body: [String: Any] = [:]
+        if let title, !title.isEmpty { body["title"] = title }
+        return try await send(
+            try makeRequest("POST", "/api/groups/\(roomId)/tasks", body: body),
+            as: CreatedRoom.self
+        ).group
+    }
+
+    public func switchRoomTask(roomId: String, threadId: String) async throws -> Room {
+        try await send(
+            try makeRequest("POST", "/api/groups/\(roomId)/tasks/\(threadId)"),
+            as: CreatedRoom.self
+        ).group
+    }
+
+    public func renameRoomTask(roomId: String, threadId: String, title: String) async throws {
+        try await send(try makeRequest("PATCH", "/api/groups/\(roomId)/tasks/\(threadId)", body: ["title": title]))
+    }
+
+    public func deleteRoomTask(roomId: String, threadId: String) async throws -> Room {
+        try await send(
+            try makeRequest("DELETE", "/api/groups/\(roomId)/tasks/\(threadId)"),
+            as: CreatedRoom.self
+        ).group
     }
 
     public func interrupt(botId: String, threadId: String) async throws {

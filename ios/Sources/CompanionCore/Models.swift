@@ -333,6 +333,10 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var section: String?
     public var autoApprove: Bool?
     public var autoReview: String?
+    /// Auto-answers every request the engine raises, guards included, except
+    /// ones that control This Mac (`server/auto-approve.ts`).  Nil on a
+    /// harness that predates it, which reads as off.
+    public var bypassPermissions: Bool?
     public var alwaysAllow: [String]?
     public var composio: Bool?
     /// Which computers this bot may run on: "local", "cloud", and/or "vm".
@@ -343,6 +347,11 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     /// the user's own server, which has no interactive desktop to offer a
     /// phone.
     public var cloudBackend: String?
+    /// The backend this bot really uses once the workspace default has filled
+    /// in for an unpinned one.  `cloudBackend` stays the raw stored value; this
+    /// is the answer the join route gives.  Absent on a harness that predates
+    /// it, where `cloudDesktopAvailability` falls back to `cloudBackend`.
+    public var effectiveCloudBackend: String?
     public var autoStartVps: Bool?
     public var cwd: String?
     public var extraCwds: [String]?
@@ -670,6 +679,16 @@ public struct InstanceCapabilities: Codable, Hashable, Sendable {
     public var effortLevels: [String]?
     /// True when this engine runs the harness HTTP tool loop.
     public var toolLoop: Bool? = nil
+    /// True when this engine can answer a bounded review prompt, which is
+    /// what Auto Review needs.  Nil means the computer did not say.
+    public var approvalReview: Bool? = nil
+    /// True when this engine can contact other bots.  Nil means the computer
+    /// did not say.
+    public var agentsMcp: Bool? = nil
+    /// What a bot's Bypass Permissions switch does on this engine: "asks",
+    /// "native" or "none" (`shared/bypass-coverage.ts`).  Read it through
+    /// `BypassCoverage(wire:)`; nil is a computer that predates it.
+    public var bypassCoverage: String? = nil
 }
 
 public struct Instance: Codable, Hashable, Identifiable, Sendable {
@@ -967,10 +986,20 @@ public struct BotProfilePatch: Encodable, Sendable {
         case clear
     }
 
+    /// The execution policy, which the owner put on the phone on 2026-10-09
+    /// (`companion/src/routes.ts`; #323 had kept it on the computer).  Each is
+    /// sent only when the person changed it.  The computer still refuses to
+    /// turn `autoApprove` or `bypassPermissions` ON for a bot that can use This
+    /// Mac (a 403 with its own sentence), so the sheet does not offer that.
     public var autoApprove: Bool?
-    public var autoReview: String?
+    public var autoReview: AutoReviewMode?
     public var approvePeerComms: Bool?
+    public var bypassPermissions: Bool?
+    /// `BotComputers.updated` builds this: the sandboxed destinations only,
+    /// with This Mac carried through as the computer has it.
     public var computers: [String]?
+    /// A folder on the computer.  The harness confines it from a phone to
+    /// folders a bot or room there already uses, and answers 403 otherwise.
     public var cwd: CwdString?
     /// The On/Off switch.  `nil` leaves it alone, like every other field, so a
     /// profile save that never touched it cannot flip a bot another device just
@@ -1031,8 +1060,9 @@ public struct BotProfilePatch: Encodable, Sendable {
         section: SectionString? = nil,
         maxToolRounds: MaxToolRounds? = nil,
         autoApprove: Bool? = nil,
-        autoReview: String? = nil,
+        autoReview: AutoReviewMode? = nil,
         approvePeerComms: Bool? = nil,
+        bypassPermissions: Bool? = nil,
         computers: [String]? = nil,
         cwd: CwdString? = nil,
         off: Bool? = nil
@@ -1053,13 +1083,14 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.autoApprove = autoApprove
         self.autoReview = autoReview
         self.approvePeerComms = approvePeerComms
+        self.bypassPermissions = bypassPermissions
         self.computers = computers
         self.cwd = cwd
         self.off = off
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, computers, cwd, off
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, bypassPermissions, computers, cwd, off
     }
 
     private enum DeviceKeys: String, CodingKey { case mac, iphone }
@@ -1104,8 +1135,9 @@ public struct BotProfilePatch: Encodable, Sendable {
             }
         }
         try values.encodeIfPresent(autoApprove, forKey: .autoApprove)
-        try values.encodeIfPresent(autoReview, forKey: .autoReview)
+        try values.encodeIfPresent(autoReview?.rawValue, forKey: .autoReview)
         try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
+        try values.encodeIfPresent(bypassPermissions, forKey: .bypassPermissions)
         try values.encodeIfPresent(computers, forKey: .computers)
         try values.encodeIfPresent(off, forKey: .off)
         if let cwd {
@@ -1246,6 +1278,20 @@ public struct RoutineRun: Codable, Hashable, Identifiable, Sendable {
     public var error: String?
     public var createdAt: Double
     public var seenAt: Double?
+
+    /// Runs the harness will still stop.  Mirrors `cancelRun` in
+    /// server/routines.ts and the desktop's "Cancel Run" button, so a run
+    /// that has already settled never shows a button that answers 404.
+    public var canCancel: Bool {
+        status == "queued" || status == "running" || status == "waiting"
+    }
+
+    /// Failures that raise the badge until someone acknowledges them
+    /// (`ROUTINE_ATTENTION_STATUSES` in shared/routine-outcomes.ts), and have
+    /// not been yet.
+    public var needsAcknowledgement: Bool {
+        (status == "failed" || status == "missed") && seenAt == nil
+    }
 }
 
 public struct RoutineInput: Encodable, Sendable {
@@ -1515,6 +1561,7 @@ struct RoutinesResponse: Codable, Sendable {
 
 struct RoutineResponse: Codable, Sendable { var routine: Routine }
 struct RoutineRunResponse: Codable, Sendable { var run: RoutineRun }
+struct MarkedRoutineRunsResponse: Codable, Sendable { var acknowledged: Int?; var runs: [RoutineRun] }
 
 struct ConnectorAuthorizationResponse: Codable, Sendable {
     var url: String
