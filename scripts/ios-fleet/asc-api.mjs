@@ -27,45 +27,6 @@ import { createHash, createSign } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { z } from "zod";
-
-// ASC response schemas.  The App Store Connect API is the trust boundary for
-// every value these helpers read; parsing through Zod turns an unexpected
-// shape into a caught error instead of a downstream crash (Kody rule 25).
-const BetaTesterSchema = z.object({
-  type: z.string().optional(),
-  id: z.string(),
-  attributes: z.object({ email: z.string().optional() }).passthrough()
-}).passthrough();
-const BetaTesterListSchema = z.object({ data: z.array(BetaTesterSchema) }).passthrough();
-
-const BetaGroupAttributesSchema = z.object({
-  name: z.string().optional(),
-  isInternalGroup: z.boolean().optional(),
-  hasAccessToAllBuilds: z.union([z.boolean(), z.null()]).optional()
-}).passthrough();
-const BetaGroupSchema = z.object({
-  type: z.string().optional(),
-  id: z.string(),
-  attributes: BetaGroupAttributesSchema
-}).passthrough();
-const BetaGroupListSchema = z.object({ data: z.array(BetaGroupSchema) }).passthrough();
-const BetaGroupResponseSchema = z.object({ data: BetaGroupSchema }).passthrough();
-
-const UserSchema = z.object({
-  type: z.string().optional(),
-  id: z.string(),
-  attributes: z.object({ username: z.string().optional() }).passthrough()
-}).passthrough();
-const UserListSchema = z.object({ data: z.array(UserSchema) }).passthrough();
-
-// Parse an ASC response body against `schema` and return the validated object,
-// or null when the response is not ok, has no body, or the shape is wrong.
-function parseBody(res, schema) {
-  if (!res || !res.ok || !res.parsed) return null;
-  const out = schema.safeParse(res.parsed);
-  return out.success ? out.data : null;
-}
 
 function loadEnvFile(path) {
   const text = readFileSync(path, "utf8");
@@ -425,15 +386,15 @@ export async function addTesterToGroup({ api, appId, groupId, email, createFirst
     if (made.ok) return { ok: true, existing: false, res: made };
   }
   const sameEmail = (t) => String(t.attributes?.email || "").toLowerCase() === wanted;
-  let existing = (parseBody(await api("GET", `/v1/betaTesters?filter[email]=${encodeURIComponent(email)}&filter[apps]=${appId}&limit=5`), BetaTesterListSchema)?.data || []).find(sameEmail);
+  let existing = ascRows(await api("GET", `/v1/betaTesters?filter[email]=${encodeURIComponent(email)}&filter[apps]=${appId}&limit=5`)).find(sameEmail);
   if (!existing) {
-    existing = (parseBody(await api("GET", `/v1/betaTesters?filter[email]=${encodeURIComponent(email)}&limit=5`), BetaTesterListSchema)?.data || []).find(sameEmail);
+    existing = ascRows(await api("GET", `/v1/betaTesters?filter[email]=${encodeURIComponent(email)}&limit=5`)).find(sameEmail);
   }
   const addExisting = (tester) => api("POST", `/v1/betaGroups/${groupId}/relationships/betaTesters`,
     JSON.stringify({ data: [{ type: "betaTesters", id: tester.id }] }));
   const recoverFromCrossApp = async () => {
     const appTesters = await api("GET", `/v1/betaTesters?filter[apps]=${appId}&limit=200&fields[betaTesters]=email`);
-    const appScoped = (parseBody(appTesters, BetaTesterListSchema)?.data || []).find(sameEmail);
+    const appScoped = ascRows(appTesters).find(sameEmail);
     if (!appScoped) return null;
     existing = appScoped;
     return addExisting(appScoped);
@@ -463,14 +424,14 @@ export async function addTesterToGroup({ api, appId, groupId, email, createFirst
 export async function countInternalTesters({ api, appId }) {
   const groupsRes = await api("GET", `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,hasAccessToAllBuilds`);
   if (!groupsRes.ok) return { ok: false, error: ascErrorText(groupsRes), groups: 0, testers: 0 };
-  const groups = (parseBody(groupsRes, BetaGroupListSchema)?.data || []).filter(
+  const groups = ascRows(groupsRes).filter(
     (g) => g.attributes?.isInternalGroup === true && g.attributes?.hasAccessToAllBuilds === true
   );
   let testers = 0;
   for (const g of groups) {
     const members = await api("GET", `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email`);
     if (!members.ok) return { ok: false, error: ascErrorText(members), groups: groups.length, testers };
-    testers += (parseBody(members, BetaTesterListSchema)?.data || []).length;
+    testers += ascRows(members).length;
   }
   return { ok: true, groups: groups.length, testers };
 }
@@ -487,7 +448,7 @@ export async function ensureInternalTesterGroup({ api, appId, emails, log, warn 
 
   const groupsRes = await api("GET", `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,hasAccessToAllBuilds`);
   if (!groupsRes.ok) return fail(`internal group list failed (${ascErrorText(groupsRes)})`);
-  let group = (parseBody(groupsRes, BetaGroupListSchema)?.data || []).find(
+  let group = ascRows(groupsRes).find(
     (g) => g.attributes?.isInternalGroup === true && g.attributes?.hasAccessToAllBuilds === true
   );
   if (group) {
@@ -503,10 +464,7 @@ export async function ensureInternalTesterGroup({ api, appId, emails, log, warn 
     if (!created.ok) {
       return fail(`could not create internal group "${INTERNAL_GROUP_NAME}" (${ascErrorText(created)}); create it by hand in App Store Connect > TestFlight > Internal Testing`);
     }
-    group = parseBody(created, BetaGroupResponseSchema)?.data;
-    if (!group) {
-      return fail(`internal group create returned an unexpected body (${ascErrorText(created)}); create it by hand in App Store Connect > TestFlight > Internal Testing`);
-    }
+    group = created.parsed.data;
     out.created = true;
     log(`created internal group "${INTERNAL_GROUP_NAME}" id=${group.id} (all builds)`);
   }
@@ -517,13 +475,13 @@ export async function ensureInternalTesterGroup({ api, appId, emails, log, warn 
   // all and let Apple answer.
   const usersRes = await api("GET", "/v1/users?limit=200&fields[users]=username");
   const ascUsers = usersRes.ok
-    ? new Set((parseBody(usersRes, UserListSchema)?.data || []).map((u) => String(u.attributes?.username || "").toLowerCase()))
+    ? new Set(ascRows(usersRes).map((u) => String(u.attributes?.username || "").toLowerCase()))
     : null;
   if (!ascUsers) log(`could not read App Store Connect users (${ascErrorText(usersRes)}); trying every standing email`);
 
   const inGroupRes = await api("GET", `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email`);
   if (!inGroupRes.ok) return fail(`could not list testers in internal group (${ascErrorText(inGroupRes)}); not re-adding anyone`);
-  const inGroup = new Set((parseBody(inGroupRes, BetaTesterListSchema)?.data || []).map((t) => String(t.attributes?.email || "").toLowerCase()));
+  const inGroup = new Set(ascRows(inGroupRes).map((t) => String(t.attributes?.email || "").toLowerCase()));
 
   for (const email of emails) {
     const key = email.toLowerCase();
