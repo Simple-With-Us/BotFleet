@@ -7115,6 +7115,148 @@ describe("PATCH /api/terminology", () => {
   });
 });
 
+describe("PATCH /api/auto-update", () => {
+  const configPath = () => join(home, ".botfleet", "config.json");
+  const readDisk = () => JSON.parse(readFileSync(configPath(), "utf8"));
+
+  it("stores the flag, reports it, and hands clients the same status as every config route", async () => {
+    try {
+      const on = await api("PATCH", "/api/auto-update", { enabled: true });
+      expect(on.status).toBe(200);
+      expect(on.body.autoUpdate).toMatchObject({ enabled: true });
+      expect(readDisk().autoUpdate.enabled).toBe(true);
+      // the phone reads it back from the route it already had
+      expect((await api("GET", "/api/config")).body.autoUpdate.enabled).toBe(true);
+
+      const off = await api("PATCH", "/api/auto-update", { enabled: false });
+      expect(off.status).toBe(200);
+      expect(off.body.autoUpdate).toMatchObject({ enabled: false });
+      expect(readDisk().autoUpdate.enabled).toBe(false);
+    } finally {
+      await api("PATCH", "/api/auto-update", { enabled: false });
+    }
+  });
+
+  it("leaves the updater's own check record alone, so a toggle cannot reset the throttle", async () => {
+    try {
+      expect((await api("PATCH", "/api/auto-update", { enabled: true })).status).toBe(200);
+      // The desktop updater writes these to the same file from another process.
+      const disk = readDisk();
+      disk.autoUpdate = { ...disk.autoUpdate, lastCheckMs: 1_700_000_000_000, lastAppFingerprint: "fp-123" };
+      writeFileSync(configPath(), JSON.stringify(disk, null, 2));
+
+      const off = await api("PATCH", "/api/auto-update", { enabled: false });
+      expect(off.status).toBe(200);
+      expect(readDisk().autoUpdate).toEqual({
+        enabled: false,
+        lastCheckMs: 1_700_000_000_000,
+        lastAppFingerprint: "fp-123",
+      });
+      // and the status reports what is stored, not a stale in-memory copy
+      expect(off.body.autoUpdate).toMatchObject({ enabled: false, lastCheckMs: 1_700_000_000_000 });
+    } finally {
+      const disk = readDisk();
+      delete disk.autoUpdate;
+      writeFileSync(configPath(), JSON.stringify(disk, null, 2));
+      await api("PATCH", "/api/auto-update", { enabled: false });
+    }
+  });
+
+  it("accepts only a boolean `enabled`", async () => {
+    for (const body of [{}, { enabled: "true" }, { enabled: 1 }, { enabled: null }, { autoUpdate: { enabled: true } }]) {
+      expect((await api("PATCH", "/api/auto-update", body)).status, JSON.stringify(body)).toBe(400);
+    }
+  });
+
+  it("is not a side door into the rest of the config file", async () => {
+    const before = await api("GET", "/api/config");
+    const res = await api("PATCH", "/api/auto-update", {
+      enabled: false,
+      profile: { name: "Someone Else" },
+      ingress: { publicUrl: "https://evil.example.com" },
+    });
+    expect(res.status).toBe(200);
+    const after = await api("GET", "/api/config");
+    expect(after.body.profile?.name).toBe(before.body.profile?.name);
+    expect(readDisk().ingress?.publicUrl).not.toBe("https://evil.example.com");
+  });
+});
+
+describe("PATCH /api/bots/:id roster organization fields", () => {
+  const SECTION = "organize-test";
+
+  it("refuses a pinned, hidden or unread value that is not a boolean", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Organize Types" })).body.bot;
+    try {
+      for (const body of [{ pinned: "yes" }, { hidden: 1 }, { unread: null }, { pinned: {} }, { hidden: [] }]) {
+        const res = await api("PATCH", `/api/bots/${bot.id}`, body);
+        expect(res.status, JSON.stringify(body)).toBe(400);
+        expect(res.body.error).toMatch(/must be true or false/);
+      }
+      const stored = (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id);
+      expect(stored.pinned).not.toBe("yes");
+      expect(stored.hidden).not.toBe(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("archives, restores, pins and marks a bot unread, and moves it between sections", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Organize Roundtrip" })).body.bot;
+    try {
+      const archived = await api("PATCH", `/api/bots/${bot.id}`, { hidden: true });
+      expect(archived.status).toBe(200);
+      expect(archived.body.bot).toMatchObject({ id: bot.id, hidden: true });
+      const restored = await api("PATCH", `/api/bots/${bot.id}`, { hidden: false });
+      expect(restored.body.bot).toMatchObject({ hidden: false });
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { pinned: true })).body.bot).toMatchObject({ pinned: true });
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { pinned: false })).body.bot).toMatchObject({ pinned: false });
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { unread: true })).body.bot).toMatchObject({ unread: true });
+
+      const moved = await api("PATCH", `/api/bots/${bot.id}`, { section: `  ${SECTION}  ` });
+      expect(moved.body.bot.section).toBe(SECTION);
+      const tooLong = await api("PATCH", `/api/bots/${bot.id}`, { section: "x".repeat(61) });
+      expect(tooLong.status).toBe(400);
+      const cleared = await api("PATCH", `/api/bots/${bot.id}`, { section: null });
+      expect(cleared.body.bot.section).toBeUndefined();
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("hands the Chief of Staff role over inside a section, and will not archive the chief", async () => {
+    const first = (await api("POST", "/api/bots", { name: "Chief One" })).body.bot;
+    const second = (await api("POST", "/api/bots", { name: "Chief Two" })).body.bot;
+    try {
+      await api("PATCH", `/api/bots/${first.id}`, { section: SECTION });
+      await api("PATCH", `/api/bots/${second.id}`, { section: SECTION });
+      const fleet = async () => (await api("GET", "/api/bots")).body.bots as Array<{ id: string; chiefOfStaff?: boolean }>;
+
+      expect((await api("PATCH", `/api/bots/${first.id}`, { chiefOfStaff: true })).body.bot).toMatchObject({
+        chiefOfStaff: true,
+      });
+      // electing the second demotes the first, in the stored roster
+      expect((await api("PATCH", `/api/bots/${second.id}`, { chiefOfStaff: true })).status).toBe(200);
+      const after = await fleet();
+      expect(after.find((entry) => entry.id === second.id)?.chiefOfStaff).toBe(true);
+      expect(after.find((entry) => entry.id === first.id)?.chiefOfStaff).toBeFalsy();
+
+      // the harness refuses to archive the chief; the demote-then-archive
+      // pair the desktop sends is how a chief is archived
+      const refused = await api("PATCH", `/api/bots/${second.id}`, { hidden: true });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/choose another Chief of Staff/i);
+      const demoted = await api("PATCH", `/api/bots/${second.id}`, { hidden: true, chiefOfStaff: false });
+      expect(demoted.status).toBe(200);
+      expect(demoted.body.bot).toMatchObject({ hidden: true });
+    } finally {
+      await api("DELETE", `/api/bots/${first.id}`);
+      await api("DELETE", `/api/bots/${second.id}`);
+    }
+  });
+});
+
 describe("local Auto consent for inherited and discovered computers", () => {
   it("guards config defaults and per-bot Auto while preserving explicit Off", async () => {
     expect((await api("PUT", "/api/config", {

@@ -45,6 +45,10 @@ struct AgentProfileView: View {
     @State private var computers: Set<String>
     @State private var cwd: String
     @State private var baseline: ProfileFormSnapshot
+    /// Set while the Delete Bot confirmation is up.
+    @State private var deleteTarget: Chat?
+    /// The harness's refusal of a delete, shown in this sheet.
+    @State private var deleteError: String?
     @ObservedObject private var personalVoice = PersonalVoiceService.shared
 
     init(bot: Bot) {
@@ -370,6 +374,8 @@ struct AgentProfileView: View {
                         }
                     }
                 }
+
+                deleteSection
             }
             .navigationTitle("Agent Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -422,6 +428,37 @@ struct AgentProfileView: View {
             .onChange(of: photo) { _, item in
                 guard let item else { return }
                 Task { await upload(item) }
+            }
+            .modifier(DeleteChatAlert(target: $deleteTarget, roomTerm: "", onConfirm: { _ in
+                Task { await deleteBot() }
+            }))
+            .modifier(InlineErrorAlert(message: $deleteError, title: "Could Not Delete"))
+        }
+    }
+
+    /// Last in the form, away from everything else, behind a confirmation
+    /// that names the bot and what is lost.
+    private var deleteSection: some View {
+        Section {
+            Button("Delete Bot", systemImage: "trash", role: .destructive) {
+                deleteTarget = .bot(current)
+            }
+            .disabled(busy)
+        } footer: {
+            Text("Deleting removes every conversation with this bot for good.\u{00A0} To keep them, archive it instead: long-press it in the chat list.")
+        }
+    }
+
+    /// The chat screen under this sheet closes itself once the bot is gone.
+    private func deleteBot() async {
+        busy = true
+        defer { busy = false }
+        do {
+            try await session.deleteBot(current)
+            dismiss()
+        } catch {
+            if !session.isCancellation(error) {
+                deleteError = error.localizedDescription
             }
         }
     }

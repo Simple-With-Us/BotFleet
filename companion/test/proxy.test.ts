@@ -326,7 +326,12 @@ describe("the sidecar in front of an unmodified harness", () => {
     // verbs instead, so a stolen device token cannot smuggle those fields.
     const { body } = await device("GET", "/api/bots");
     const botId = body.bots[0].id;
-    expect((await device("PATCH", `/api/bots/${botId}`, { body: { autoApprove: true } })).status).toBe(404);
+    // The bot PATCH is open only for roster organization (see
+    // companion/test/bot-organize.test.ts), so an execution-policy field on
+    // it is refused by the sidecar itself, before the harness sees it.
+    const policy = await device("PATCH", `/api/bots/${botId}`, { body: { autoApprove: true } });
+    expect(policy.status).toBe(403);
+    expect(policy.body.error).toBe("autoApprove can only be changed in BotFleet on your computer");
     expect((await device("PATCH", `/api/groups/not-a-room`, { body: { unread: false } })).status).toBe(404);
   });
 

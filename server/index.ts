@@ -12046,6 +12046,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           else section = trimmed;
         }
       }
+      // These three are stored as sent, so a non-boolean would land in the
+      // bot record and in every client's roster.  The paired phone's sidecar
+      // checks the type too (companion/src/routes.ts), but this route has
+      // other callers, and a guard only one of them honors is not a guard.
+      for (const key of ["unread", "pinned", "hidden"] as const) {
+        if (body[key] !== undefined && typeof body[key] !== "boolean") {
+          return json(res, 400, { error: `${key} must be true or false` });
+        }
+      }
       for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
@@ -14443,6 +14452,31 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       cfg.rooms = { ...cfg.rooms, turnTimeoutMinutes: patch.rooms.turnTimeoutMinutes };
       saveConfig({ rooms: cfg.rooms });
+      const status = configStatus();
+      broadcast({ kind: "config", ...status });
+      return json(res, 200, status);
+    }
+    // Check For Updates Automatically.  One boolean that lives in /api/config
+    // beside the API keys, so it gets its own route and the paired phone never
+    // holds write access to that one.  Only `enabled` is read: `lastCheckMs`
+    // and `lastAppFingerprint` are written to the same file by the desktop
+    // updater, and the section merge in saveConfig leaves them alone, so a
+    // phone toggle cannot reset the six-hour throttle.  The updater re-reads
+    // `enabled` from disk on every tick (electron/updater.mjs).
+    if (method === "PATCH" && path === "/api/auto-update") {
+      const body = await readBody(req);
+      if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.enabled !== "boolean") {
+        return json(res, 400, { error: "enabled must be true or false" });
+      }
+      const patch = parseConfigPatch({ autoUpdate: { enabled: body.enabled } });
+      if (patch.autoUpdate?.enabled === undefined) {
+        return json(res, 400, { error: "nothing to save" });
+      }
+      saveConfig({ autoUpdate: { enabled: patch.autoUpdate.enabled } });
+      // Read the section back rather than patching the in-memory copy: the
+      // updater's check record is written to the file behind this process's
+      // back, and the status below should report what is stored.
+      cfg.autoUpdate = loadConfig().autoUpdate;
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);
