@@ -969,6 +969,8 @@ describe("a turn that ends with steps still queued", () => {
       rule: "review limit of 2 reached for this turn",
     });
     expect(h.notes.at(-1)?.text).toBe("review could not check run_command before the turn ended: review limit of 2 reached for this turn");
+    // a late step is never "stopped": the stop chip is for a turn still running
+    expect(h.notes.some((note) => note.text.includes("review stopped the turn"))).toBe(false);
     // the released budget was not charged again
     expect(budget.remaining(key)).toBe(2);
   });

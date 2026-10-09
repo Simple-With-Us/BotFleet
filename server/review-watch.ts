@@ -211,7 +211,9 @@ interface Pending {
   lateBudget?: ReviewSpend;
 }
 
-/** `left` reviewer calls, spent one at a time. */
+/** `left` reviewer calls, spent one at a time.  `limit` stays the turn's
+ *  configured limit, not `left`: a capped late review reports it as "review
+ *  limit of N reached for this turn", and N is that limit. */
 function snapshotSpend(left: number, limit: number): ReviewSpend {
   let remaining = left;
   return { limit, spend: () => (remaining > 0 ? (remaining--, true) : false) };
