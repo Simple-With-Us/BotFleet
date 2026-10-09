@@ -23,6 +23,7 @@ import {
   type CustomRoomLabels,
   type RoomTerminology,
 } from "../shared/terminology.ts";
+import { DEFAULT_MAX_REVIEWS_PER_TURN, MAX_MAX_REVIEWS_PER_TURN, MIN_MAX_REVIEWS_PER_TURN } from "../shared/auto-review.ts";
 import { DEFAULT_VPS_MODE, migrateAllowedComputersToProviders } from "../shared/local-auto-consent.ts";
 import { fsFailureCode, jsonFailureReason, stripBom } from "./store-guard.ts";
 import {
@@ -402,12 +403,16 @@ const appConfigSchema = z.object({
     accessClientSecret: z.string().optional(),
   }).optional(),
   // The fleet's fallback reviewer: the provider instance that reviews a
-  // bot's approvals when the bot's own engine cannot run an isolated review
-  // (server/auto-review.ts `reviewersFor`).  An empty string clears it.  No
-  // other engine is ever asked, so leaving it empty keeps every review on
-  // the engine that raised the request.
+  // bot's approvals when the bot's own engine cannot run an isolated review,
+  // or when its own review fails (server/auto-review.ts `reviewersFor`).
+  // Absent or empty is Automatic (the best healthy engine that can review,
+  // shared/auto-review.ts `pickAutoReviewer`), "none" turns it off, and
+  // anything else is the instance id the owner picked.
+  // `maxReviewsPerTurn` caps reviewer calls per turn (a knob, see
+  // server/knob-map.ts); past it On fails closed and Watch stops recording.
   autoReview: z.object({
     fallbackReviewer: z.string().max(200).optional(),
+    maxReviewsPerTurn: z.number().int().min(MIN_MAX_REVIEWS_PER_TURN).max(MAX_MAX_REVIEWS_PER_TURN).optional(),
   }).optional(),
   // Usage telemetry has no built-in endpoint: whoever runs BotFleet points
   // it at their own usage monitor. Unconfigured means the stream is off.
@@ -647,10 +652,13 @@ export interface AppConfig {
      *  anyway.  Absent means 20. */
     webhookHotDeferMinutes?: number;
   };
-  /** Who reviews a bot's approvals when its own engine cannot. */
+  /** Who reviews a bot's approvals when its own engine cannot, and how many
+   *  reviews one turn may spend. */
   autoReview?: {
-    /** Instance id of the owner's fallback reviewer; empty or absent is none. */
+    /** Empty or absent is Automatic, "none" is off, else an instance id. */
     fallbackReviewer?: string;
+    /** Reviewer calls per turn.  Absent means DEFAULT_MAX_REVIEWS_PER_TURN. */
+    maxReviewsPerTurn?: number;
   };
   usage?: {
     ingestUrl?: string;
@@ -889,10 +897,19 @@ export function usageIngestUrl(cfg: AppConfig): string | null {
 /** Project classification rules, in the order they should be consulted.
  * Rules with no usable slug or no match terms are dropped. */
 /** Local subscription caps divert auto-fallback unless turned off. */
-/** The owner's fallback reviewer instance id, or null when none is chosen. */
+/** The stored fallback-reviewer setting: null for Automatic, "none" for off,
+ *  or the instance id the owner picked (shared/auto-review.ts
+ *  `fallbackReviewerSetting` reads it). */
 export function autoReviewFallbackReviewer(cfg: AppConfig): string | null {
   const id = cfg.autoReview?.fallbackReviewer?.trim();
   return id ? id : null;
+}
+
+/** Reviewer calls one turn may spend, clamped to the knob's bounds. */
+export function autoReviewMaxPerTurn(cfg: AppConfig): number {
+  const value = cfg.autoReview?.maxReviewsPerTurn ?? Number.NaN;
+  if (!Number.isFinite(value)) return DEFAULT_MAX_REVIEWS_PER_TURN;
+  return Math.min(MAX_MAX_REVIEWS_PER_TURN, Math.max(MIN_MAX_REVIEWS_PER_TURN, Math.floor(value)));
 }
 
 export function localQuotaRoutingEnabled(cfg: AppConfig): boolean {
