@@ -14,7 +14,7 @@ export function useTranscriptionAvailability(): boolean {
     };
     const initialRevision = revision;
     window.addEventListener(TRANSCRIPTION_STATUS_EVENT, update);
-    void window.ogb?.transcription?.status?.().then((status) => {
+    void window.ogb?.transcription?.status?.()?.then((status) => {
       if (active && revision === initialRevision) setConfigured(Boolean(status?.configured));
     }).catch(() => {});
     return () => {
