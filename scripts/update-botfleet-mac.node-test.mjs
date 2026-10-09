@@ -59,6 +59,15 @@ import {
 
 const scripts = dirname(fileURLToPath(import.meta.url));
 
+/** Wrapper tests must not read ~/.botfleet or /Applications/BotFleet.app. */
+function wrapperFixtureEnv(checkout, fixture) {
+  return {
+    BOTFLEET_CHECKOUT: checkout,
+    BOTFLEET_DATA_DIR: join(fixture, "data"),
+    BOTFLEET_APP_PATH: join(fixture, "no-app.app"),
+  };
+}
+
 // A real 40-char commit, so the resolver is driven with a target it will accept.
 const COMMIT = "c".repeat(40);
 
@@ -714,14 +723,14 @@ test("the stable wrapper detects a linked worktree checkout, where .git is a fil
 
   // Up-to-date check: the worktree is already at origin/main, so an unforced
   // run must short-circuit instead of running any updater.
-  const current = await run("bash", [wrapper], { env: { BOTFLEET_CHECKOUT: checkout }, allowFailure: true });
+  const current = await run("bash", [wrapper], { env: wrapperFixtureEnv(checkout, fixture), allowFailure: true });
   assert.equal(current.code, 0, current.stderr);
   assert.match(current.stdout, /Already at .*Nothing to update/);
   assert.equal(await readFile(marker, "utf8").catch(() => null), null, "an up-to-date worktree runs no updater");
 
   // Bootstrap: a forced run must archive and run the target's updater from
   // the worktree, not fall back to the installed implementation.
-  const forced = await run("bash", [wrapper], { env: { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1" }, allowFailure: true });
+  const forced = await run("bash", [wrapper], { env: { ...wrapperFixtureEnv(checkout, fixture), BOTFLEET_FORCE: "1" }, allowFailure: true });
   assert.equal(forced.code, 0, forced.stderr);
   assert.doesNotMatch(forced.stderr, /using the installed implementation/);
   const mainCommit = (await git(checkout, ["rev-parse", "origin/main"])).stdout.trim();
@@ -774,7 +783,7 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
   // No BOTFLEET_FORCE anywhere below: every run sees HEAD == origin/main.
   const invoke = async (args, extraEnv = {}) => {
     await rm(marker, { force: true });
-    const result = await run("bash", [wrapper, ...args], { env: { BOTFLEET_CHECKOUT: checkout, ...extraEnv }, allowFailure: true });
+    const result = await run("bash", [wrapper, ...args], { env: { ...wrapperFixtureEnv(checkout, fixture), ...extraEnv }, allowFailure: true });
     const executed = await readFile(marker, "utf8").then(JSON.parse, () => null);
     return { ...result, executed };
   };

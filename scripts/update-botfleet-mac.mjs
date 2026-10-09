@@ -827,6 +827,23 @@ function validOwner(owner) {
     typeof owner.nonce === "string" && /^[a-f0-9]{64}$/.test(owner.nonce);
 }
 
+/** Runtime calls authenticate with BOTFLEET_OWNER_NONCE only — never read the
+ *  bearer credential back out of harness-owner.json in this process. */
+export function requireHarnessBearerCredential() {
+  const credential = process.env.BOTFLEET_OWNER_NONCE;
+  if (typeof credential !== "string" || credential.length === 0) {
+    throw new Error("BOTFLEET_OWNER_NONCE is required when a harness owner record exists");
+  }
+  if (!/^[a-f0-9]{64}$/.test(credential)) {
+    throw new Error("BOTFLEET_OWNER_NONCE is not a valid harness bearer credential");
+  }
+  return credential;
+}
+
+function harnessAuthorizationHeader() {
+  return { Authorization: `Bearer ${requireHarnessBearerCredential()}` };
+}
+
 /**
  * Classify the owner record instead of collapsing it to a boolean.  "No record"
  * and "a record naming a process that is gone" are different operator problems:
@@ -902,7 +919,7 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   }
   if (state !== "live") return null;
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
-    headers: { Authorization: `Bearer ${owner.nonce}` },
+    headers: harnessAuthorizationHeader(),
     accept: [200],
     timeoutMs: PATIENT_REQUEST_MS,
   });
@@ -1184,7 +1201,7 @@ export function keepFenceLease(owner, {
   clearTimer = clearTimeout,
 } = {}) {
   const url = `http://127.0.0.1:${owner.port}/api/runtime/quiesce?renew=1&leaseMs=${leaseMs}`;
-  const headers = { Authorization: `Bearer ${owner.nonce}` };
+  const headers = harnessAuthorizationHeader();
   let stopped = false;
   let timer = null;
   let inFlight = Promise.resolve();
@@ -1249,7 +1266,7 @@ export function keepFenceLease(owner, {
 async function holdAndFence(config, owner, deps) {
   const { request, now, pause: sleepFor, report, releaseAdmission, stop, mode, windowMs, roomWaitMs, pollMs } = deps;
   const base = `http://127.0.0.1:${owner.port}`;
-  const headers = { Authorization: `Bearer ${owner.nonce}` };
+  const headers = harnessAuthorizationHeader();
   const quiesce = (query = "", timeoutMs = QUIESCE_TIMEOUT_MS) => request(`${base}/api/runtime/quiesce${query}`, {
     method: "POST",
     headers,
@@ -1442,7 +1459,7 @@ async function holdAndFence(config, owner, deps) {
  */
 async function forceFence(owner, { request, now, wait, pollMs, stop }) {
   const base = `http://127.0.0.1:${owner.port}`;
-  const headers = { Authorization: `Bearer ${owner.nonce}` };
+  const headers = harnessAuthorizationHeader();
   const answer = await request(`${base}/api/runtime/quiesce?force=true&${LEASE_QUERY}`, {
     method: "POST",
     headers,
@@ -1509,7 +1526,7 @@ async function fenceWithin(config, owner, { request, inspectTopology, inspectHol
       ? await forceFence(owner, { request, now, wait: pause, pollMs: config?.drainPollMs, stop })
       : await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce?${LEASE_QUERY}`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${owner.nonce}` },
+        headers: harnessAuthorizationHeader(),
         accept: [200, 409],
         timeoutMs: QUIESCE_TIMEOUT_MS,
       });
@@ -1635,7 +1652,7 @@ export async function releaseRuntimeAdmission(config, adapters = {}) {
   const owner = await readRuntimeOwner(config.dataDirectory);
   if (!owner) throw new Error("Authenticated runtime owner is unavailable for admission recovery");
   const base = `http://127.0.0.1:${owner.port}`;
-  const headers = { Authorization: `Bearer ${owner.nonce}` };
+  const headers = harnessAuthorizationHeader();
   const read = () => request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
   /** Poll while `still` holds, up to a window chosen from the first answer.
    *  Resolves the last answer read, or null when none came. */
