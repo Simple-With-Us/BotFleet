@@ -78,6 +78,15 @@ function safeErrorText(err: unknown): string {
   return redactSecretsInText(raw).replace(/\s+/g, " ").trim().slice(0, 300);
 }
 
+/** Paths this adapter serves.  Anything else is logged as `(other)`: a request
+ *  target can carry a token in its query string or in a path segment, and a
+ *  log line must name the route, never echo the caller's text. */
+const LOGGABLE_PATHS = new Set(["/", "/health", "/api/health", "/mcp", "/mcp/sse", "/sse", "/mcp/messages", "/messages"]);
+
+function describeRoute(req: IncomingMessage, pathname: string): string {
+  return `${req.method} ${LOGGABLE_PATHS.has(pathname) ? pathname : "(other)"}`;
+}
+
 function setCorsHeaders(res: ServerResponse): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
@@ -103,9 +112,9 @@ function sendJson(res: ServerResponse, status: number, data: unknown, isHead = f
  *  the Authorization header: it carries the token.  The comparison is
  *  constant-time (length-guarded, like authorizedComms in server/index.ts) so a
  *  network caller cannot learn the token a byte at a time. */
-function isAuthorized(req: IncomingMessage): boolean {
+function isAuthorized(req: IncomingMessage, route: string): boolean {
   if (!AUTH_TOKEN) {
-    logError(`Missing or invalid token for ${req.method} ${req.url}`);
+    logError(`Missing or invalid token for ${route}`);
     return false;
   }
 
@@ -119,7 +128,7 @@ function isAuthorized(req: IncomingMessage): boolean {
   const got = Buffer.from(providedToken ?? "", "utf8");
 
   if (!authHeader.toLowerCase().startsWith("bearer ") || got.length !== expected.length || !timingSafeEqual(got, expected)) {
-    logError(`Missing or invalid token for ${req.method} ${req.url}`);
+    logError(`Missing or invalid token for ${route}`);
     return false;
   }
   return true;
@@ -219,7 +228,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
 
   // Authentication check for MCP endpoints if configured
-  if (!isAuthorized(req)) {
+  if (!isAuthorized(req, describeRoute(req, pathname))) {
     sendJson(res, 401, {
       jsonrpc: "2.0",
       id: null,

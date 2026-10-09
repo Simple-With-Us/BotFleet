@@ -268,6 +268,9 @@ const zulipConfigSchema = z.object({
   credentialDir: optionalText,
   credentialSource: z.enum(["file", "infisical"]).optional(),
   infisicalPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+  // Empty means unset (the harness's own project and environment).
+  infisicalProjectId: z.string().trim().regex(/^[A-Za-z0-9-]*$/).max(64).optional(),
+  infisicalEnv: z.string().trim().regex(/^[A-Za-z0-9_-]*$/).max(64).optional(),
   bots: z
     .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
     .optional(),

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // Regression cover for the adapter installing its default harness URL.  The
@@ -15,13 +17,10 @@ describe("MCP HTTP/SSE adapter harness URL default", () => {
     delete process.env.BOTFLEET_URL;
     delete process.env.OPENMAUSBOT_URL;
     delete process.env.OMB_PORT;
-    if (!process.env.BOTFLEET_MCP_TEST_TOKEN) {
-      process.env.BOTFLEET_MCP_TEST_TOKEN = "test-canary-ordering-token";
-    }
-    const canary = process.env.BOTFLEET_MCP_TEST_TOKEN;
-    if (!canary) {
-      throw new Error("BOTFLEET_MCP_TEST_TOKEN is required to run the MCP adapter env-ordering test");
-    }
+    // Generated per run rather than committed or read from the environment: the
+    // adapter only needs a token to start, and a credential-shaped literal does
+    // not belong in versioned source even when it is synthetic.
+    const canary = randomUUID();
     process.env.BOTFLEET_TOKEN = canary;
     process.env.BOTFLEET_MCP_TOKEN = canary;
     process.env.BOTFLEET_MCP_HOST = "127.0.0.1";

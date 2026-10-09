@@ -416,14 +416,20 @@ class InfisicalManager {
     }
   }
 
-  /** One folder of the configured project, read for a caller that keeps the
-   * values to itself: the Zulip source's per-role bot keys
-   * (`server/zulip/credentials.ts`, docs/zulip.md).  It never touches the
-   * snapshot, never writes `process.env`, and never puts a value in a log
-   * line, an error or the status view: the names and values go back to the
-   * caller and nowhere else.  Refuses, with no request, when Infisical is
-   * not configured or is turned off. */
-  async readPath(secretPath: string): Promise<ReadonlyMap<string, string>> {
+  /** One folder, read for a caller that keeps the values to itself: the
+   * Zulip source's per-role bot keys (`server/zulip/credentials.ts`,
+   * docs/zulip.md).  The folder is in the configured project and
+   * environment unless `scope` names another project or environment, which
+   * the same machine identity must be able to read (the fleet keeps the BF
+   * bots' keys in AI Fleet Coordinator's project, not BotFleet's).  It never
+   * touches the snapshot, never writes `process.env`, and never puts a value
+   * in a log line, an error or the status view: the names and values go back
+   * to the caller and nowhere else.  Refuses, with no request, when
+   * Infisical is not configured or is turned off. */
+  async readPath(
+    secretPath: string,
+    scope: { projectId?: string; environment?: string } = {},
+  ): Promise<ReadonlyMap<string, string>> {
     const settings = this.settings();
     if (!isConfigured(settings) || settings.enabled !== true) {
       throw new InfisicalError("Infisical is not configured and turned on for this workspace.", 409);
@@ -437,8 +443,8 @@ class InfisicalManager {
     const { values } = await listSecrets({
       siteUrl: settings.siteUrl,
       token,
-      projectId: settings.projectId,
-      environment: settings.environment,
+      projectId: scope.projectId?.trim() || settings.projectId,
+      environment: scope.environment?.trim() || settings.environment,
       secretPath,
       viewValues: true,
       timeoutMs: callTimeoutMs(),
