@@ -38,6 +38,9 @@ import { dirname, join, resolve, sep } from "node:path";
 import { stageIsPrunable } from "../scripts/stage-entries.mjs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import type { UpdateDrainView } from "./update-drain.ts";
+
+export type { UpdateDrainView } from "./update-drain.ts";
 
 export const UPDATE_PROGRESS_SCHEMA_VERSION = 1;
 export const UPDATE_LAUNCH_LABEL = "com.jay.botfleet-update";
@@ -189,6 +192,12 @@ export interface UpdateStatus {
   running: UpdateRunning | null;
   lastRun: UpdateLastRun | null;
   capabilities: UpdateCapabilities;
+  /** An update is holding new work while bots finish: what is running, what
+   * is waiting, and how long the wait can last.  Present only while that is
+   * true, and independent of `running` — an updater started from a terminal
+   * holds work without the harness knowing it as a run.  The same numbers
+   * `GET /api/runtime` reports, which neither the app nor a phone can read. */
+  drain?: UpdateDrainView;
 }
 
 export interface CommandResult {
@@ -243,6 +252,10 @@ export interface UpdateControlDeps {
    * busy because of the question.  This one answers `GET /api/update/status`,
    * which holds no admission. */
   readiness: () => RuntimeReadiness;
+  /** The hold an update has on new work, or null when there is none.  Called
+   * on every status build, so it must be cheap; one that throws is treated
+   * as "no hold" rather than taking the status route down. */
+  drain: () => UpdateDrainView | null;
   /** Live harness-owner nonce for updater child env (BOTFLEET_OWNER_NONCE). */
   harnessOwnerNonce?: () => string | null;
   /** How a state file reaches disk.  A seam rather than a detail: the
@@ -421,7 +434,13 @@ export function runningFrom(record: ProgressRecord, logTail: string[]): UpdateRu
     logTail,
   };
   if (record.detail) running.detail = record.detail;
-  if (record.progress !== null) running.progress = record.progress;
+  // `progress` is the run's own step count and does not move while a step
+  // waits on something outside it — bots finishing, a process letting go of
+  // BotFleet's files.  "Waiting for 3 bots to finish (40%)" read as 40% of
+  // the wait, and stayed there for a minute.  Every surface drops the percent
+  // beside a detail; withholding it here as well means an app or phone build
+  // that predates that rule stops showing a frozen bar too.
+  if (record.progress !== null && !record.detail) running.progress = record.progress;
   return running;
 }
 
@@ -851,6 +870,7 @@ function defaultDeps(overrides: Partial<UpdateControlDeps>): UpdateControlDeps {
     launch: overrides.launch ?? defaultLaunch,
     exec: overrides.exec ?? execCommand,
     readiness: overrides.readiness ?? (() => ({ safeToRestart: true, activeWorkCount: 0 })),
+    drain: overrides.drain ?? (() => null),
     writeState: overrides.writeState ?? writeJsonFile,
     processAlive: overrides.processAlive ?? ((pid) => {
       try {
@@ -887,6 +907,10 @@ export interface UpdateControl {
     { ok: true; runId: string; status: UpdateStatus } | { ok: false; error: string; status: UpdateStatus }
   >;
   reconcile(): void;
+  /** Broadcast the status if it differs from the last one sent, for a caller
+   * that changed something the status reports without a run to poll for it
+   * (the hold an update has on new work). */
+  notify(): void;
   dispose(): void;
 }
 
@@ -1224,6 +1248,17 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
     }
   };
 
+  /** The hold, or nothing.  A callback that throws (it reads harness state
+   * that may not exist yet while the harness is still booting) is "no hold":
+   * a status that cannot be built is worse than one missing a courtesy. */
+  const readDrain = (): UpdateDrainView | null => {
+    try {
+      return deps.drain();
+    } catch {
+      return null;
+    }
+  };
+
   const buildStatus = (readiness?: RuntimeReadiness): UpdateStatus => {
     let running: UpdateRunning | null = null;
     if (current) {
@@ -1237,7 +1272,7 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
             logTail: readLogTail(current.logPath),
           };
     }
-    return {
+    const status: UpdateStatus = {
       installed: deps.installed,
       // Belt and braces: an answer recorded before this build was installed
       // never reaches a client, whichever commit it names.
@@ -1248,6 +1283,10 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       lastRun,
       capabilities: capabilities(Boolean(running), readiness),
     };
+    // Absent, not null, when nothing is held: an older client never sees a key it does not know.
+    const drain = readDrain();
+    if (drain) status.drain = drain;
+    return status;
   };
 
   /** Broadcast the status when it has changed.  The caller's readiness is
@@ -1526,6 +1565,7 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       reconcile();
       emitIfChanged();
     },
+    notify: () => emitIfChanged(),
     dispose: () => {
       if (timer) clearInterval(timer);
       timer = null;

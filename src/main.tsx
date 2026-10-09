@@ -118,6 +118,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "update-drain") {
+  // Visual-spec harness (tests/e2e/update-drain.visual.spec.ts): the line a
+  // chat shows while an update holds new work.  Dynamically imported so the
+  // real app boot path never pays for it.
+  void import("./components/UpdateDrainVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "routine-hold") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
   // for in the real app boot path. The App render below is unchanged for any
@@ -183,6 +195,29 @@ if (fixtureParam === "tv-face") {
   // for in the real app boot path.  Drives the FleetMatrixView's view-mode
   // switch (matrix grid vs kanban board) for visual coverage of both modes.
   void import("./components/FleetMatrixViewVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "usage-notices") {
+  // Visual-spec harness (tests/e2e/usage-notices.visual.spec.ts): the held-bots
+  // and shorter-fallback-chain notices from Settings → Usage → Engine Quotas.
+  // Dynamically imported so the real app boot path never pays for it.
+  void import("./components/UsageNoticesVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "bypass-warning") {
+  // Visual-spec harness (tests/e2e/bypass-warning.visual.spec.ts): the Permission
+  // Bypass confirmation dialog, standard, high-risk model and busy.
+  void import("./components/BypassPermissionsWarningVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>
