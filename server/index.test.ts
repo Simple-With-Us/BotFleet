@@ -970,6 +970,85 @@ describe("harness HTTP API", () => {
     }
   }, 240_000);
 
+  it("keeps work a rolled-back forced attempt paused under the hold, and never interrupts it twice", async () => {
+    // Finding 10: every forced attempt that rolled back resumed what it had
+    // interrupted, so the next attempt interrupted it again and its tool calls
+    // repeated, up to ten times an update.  Under a hold, paused work now stays
+    // paused and saved; later attempts add to the same snapshot; letting go
+    // of the hold resumes it once.
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    const resumePath = join(home, ".botfleet", "pending-update-resume.json");
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const paused = () => (existsSync(resumePath)
+      ? (JSON.parse(readFileSync(resumePath, "utf8")) as { interruptedBots: Array<{ botId: string }> }).interruptedBots.map((entry) => entry.botId)
+      : []);
+    const working = (await api("POST", "/api/bots")).body.bot;
+    const busy = async (id: string) =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
+    const holdAMutation = () => {
+      const held = request({
+        hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
+        headers: { "content-type": "application/json", "content-length": "2" },
+      });
+      held.on("error", () => {});
+      held.write("{");
+      return held;
+    };
+    let heldMutation: ReturnType<typeof request> | null = null;
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      await api("PATCH", `/api/bots/${working.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      expect((await api("POST", `/api/bots/${working.id}/messages`, { text: "paused once, resumed once" })).status).toBe(202);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      expect((await quiesce("POST", "?drain=1&timeoutMs=120000")).status).toBe(200);
+
+      // First forced attempt: interrupts the bot, saves it, then cannot finish
+      // (a request still reading its body) and rolls back.  The hold is up,
+      // so the bot stays paused and saved instead of being re-sent its prompt.
+      heldMutation = holdAMutation();
+      const inFlight = async () =>
+        ((await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as { drain: { inFlight: number } | null })
+          .drain?.inFlight ?? 0;
+      await expect.poll(inFlight, SLOW).toBeGreaterThanOrEqual(2);
+      const first = await quiesce("POST", "?force=true");
+      expect(first.status).toBe(409);
+      expect(await first.json()).toMatchObject({ quiescing: false, draining: true });
+      expect(paused()).toEqual([working.id]);
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      expect(await busy(working.id)).toBe(false);
+
+      // Second forced attempt: nothing to interrupt; the snapshot is the same.
+      const second = await quiesce("POST", "?force=true");
+      expect(second.status).toBe(409);
+      expect(paused()).toEqual([working.id]);
+      expect(await busy(working.id)).toBe(false);
+
+      // The hold converts to the fence once nothing is in flight, keeping the
+      // snapshot for the restart.
+      heldMutation.destroy();
+      heldMutation = null;
+      await expect.poll(async () => (await quiesce("POST")).status, SLOW).toBe(200);
+      expect(paused()).toEqual([working.id]);
+
+      // No restart came: standing down resumes the paused turn, once.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      expect(existsSync(resumePath)).toBe(false);
+    } finally {
+      heldMutation?.destroy();
+      await quiesce("DELETE");
+      await api("POST", `/api/bots/${working.id}/interrupt`, { threadId: working.threadId });
+      await expect.poll(() => busy(working.id), SLOW).toBe(false);
+      await api("DELETE", `/api/bots/${working.id}`);
+      rmSync(carrier, { force: true });
+      rmSync(resumePath, { force: true });
+    }
+  }, 240_000);
+
   it("serves packaged UI assets and preserves API 404s", async () => {
     const root = await fetch(`${BASE}/`);
     expect(root.status).toBe(200);

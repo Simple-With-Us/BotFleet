@@ -756,7 +756,7 @@ let activeUpdateAdmissions = 0;
 // An update waiting for work in flight to finish (server/update-drain.ts).
 // Unlike `runtimeQuiescing` it closes no route: it only holds NEW turns.
 const updateDrain = new UpdateDrain({
-  onRelease: () => releaseHeldWork(),
+  onRelease: () => releaseAfterDrain(),
   log: (line) => console.warn(line),
 });
 const cfg = loadConfig();
@@ -9825,28 +9825,114 @@ async function resumeInterruptedChatTurns(
   }
 }
 
-// Undo a forced quiesce that cannot proceed.  A refused update must hand the
-// harness back in working order — requeue the cancelled routine runs, drop the
-// stop latches, re-dispatch interrupted chat turns, discard the resume snapshot
-// (no reboot is coming, and a stale snapshot would corrupt a future update's resume),
-// and restart the schedulers — instead of leaving the runtime fenced and rejecting new
-// turns until a manual unquiesce or restart.
-function rollbackForcedQuiesce(
-  interruptedRuns: RoutineRun[],
-  interruptedBots: InterruptedBotResumeEntry[],
-) {
-  for (const run of interruptedRuns) {
+/** What a forced quiesce paused, saved for the restart that resumes it. */
+interface ResumeSnapshot {
+  timestamp: number;
+  interruptedRuns: RoutineRun[];
+  interruptedBots: InterruptedBotResumeEntry[];
+}
+
+const PENDING_RESUME_FILE = "pending-update-resume.json";
+
+/** The resume snapshot on disk, or null when there is none (or it is unreadable). */
+function readResumeSnapshot(): ResumeSnapshot | null {
+  const path = join(DATA_DIR, PENDING_RESUME_FILE);
+  if (!existsSync(path)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<ResumeSnapshot> | null;
+    return {
+      timestamp: typeof raw?.timestamp === "number" ? raw.timestamp : Date.now(),
+      interruptedRuns: Array.isArray(raw?.interruptedRuns) ? raw.interruptedRuns.filter((run) => typeof run?.id === "string") : [],
+      interruptedBots: Array.isArray(raw?.interruptedBots)
+        ? raw.interruptedBots.filter((entry) => typeof entry?.botId === "string" && typeof entry?.threadId === "string")
+        : [],
+    };
+  } catch (error) {
+    console.warn(`[update-resume] could not read ${PENDING_RESUME_FILE}:`, error);
+    return null;
+  }
+}
+
+/** One snapshot out of an earlier attempt's and this one's: each run once, and
+ *  each bot's thread once, keeping the turn interrupted last. */
+function mergeResumeSnapshots(
+  earlier: ResumeSnapshot | null,
+  runs: readonly RoutineRun[],
+  bots: readonly InterruptedBotResumeEntry[],
+): ResumeSnapshot {
+  const byRun = new Map<string, RoutineRun>();
+  for (const run of [...(earlier?.interruptedRuns ?? []), ...runs]) byRun.set(run.id, run);
+  const byTurn = new Map<string, InterruptedBotResumeEntry>();
+  for (const entry of [...(earlier?.interruptedBots ?? []), ...bots]) byTurn.set(`${entry.botId}:${entry.threadId}`, entry);
+  return { timestamp: Date.now(), interruptedRuns: [...byRun.values()], interruptedBots: [...byTurn.values()] };
+}
+
+/** The bots whose own paused work resumes first after the restart. */
+function pausedBotIds(snapshot: ResumeSnapshot | null): Set<string> {
+  return new Set([
+    ...(snapshot?.interruptedBots ?? []).map((entry) => entry.botId),
+    ...(snapshot?.interruptedRuns ?? []).map((run) => run.botId),
+  ]);
+}
+
+/** Resume everything an update paused and saved, on this harness: requeue the
+ *  cancelled runs, drop the stop latches, re-dispatch the interrupted turns,
+ *  and discard the snapshot (no restart will read it).  Resolves once the
+ *  turns are back in flight; null when nothing was paused. */
+function resumePausedWork(
+  context: string,
+  extra: { runs?: readonly RoutineRun[]; bots?: readonly InterruptedBotResumeEntry[] } = {},
+): Promise<void> | null {
+  const path = join(DATA_DIR, PENDING_RESUME_FILE);
+  const saved = readResumeSnapshot();
+  const paused = mergeResumeSnapshots(saved, extra.runs ?? [], extra.bots ?? []);
+  try {
+    unlinkSync(path);
+  } catch {}
+  if (paused.interruptedRuns.length === 0 && paused.interruptedBots.length === 0) return null;
+  for (const run of paused.interruptedRuns) {
     try {
       routines?.requeueRun(run.id);
     } catch {}
   }
-  for (const { botId, threadId } of interruptedBots) {
-    stoppedTurns.delete(`${botId}:${threadId}`);
+  for (const { botId, threadId } of paused.interruptedBots) stoppedTurns.delete(`${botId}:${threadId}`);
+  return resumeInterruptedChatTurns(paused.interruptedBots, context);
+}
+
+// Undo a forced quiesce that cannot proceed.  A refused update must hand the
+// harness back in working order instead of leaving the runtime fenced and
+// rejecting new turns until a manual unquiesce or restart.
+//
+// What happens to the work it paused depends on whether the update is still
+// holding.  With no hold (`--force`, one attempt), or when the snapshot could
+// not be saved, it is resumed now: requeue the cancelled routine runs, drop
+// the stop latches, re-dispatch the interrupted chat turns, discard the
+// snapshot.  Under a hold (`park`), the update will ask again, and resuming
+// would only have the next attempt interrupt the same turns and repeat their
+// tool calls: so it stays paused and saved, the next attempt adds to the same
+// snapshot, and whatever finally lets go of the hold resumes it
+// (`endRuntimeQuiesce`, the hold's own lease) — or the restart does.
+function rollbackForcedQuiesce(
+  interruptedRuns: RoutineRun[],
+  interruptedBots: InterruptedBotResumeEntry[],
+  { park = false }: { park?: boolean } = {},
+) {
+  if (park) {
+    runtimeQuiescing = false;
+    routines?.start();
+    resourceTriggers.start();
+    infisical.start();
+    const kept = readResumeSnapshot();
+    console.log(
+      `[quiesce-rollback] the update is still holding; ${kept?.interruptedBots.length ?? 0} paused turn(s) and ` +
+        `${kept?.interruptedRuns.length ?? 0} run(s) stay paused for its next attempt`,
+    );
+    releaseHeldWork();
+    return;
   }
-  try {
-    unlinkSync(join(DATA_DIR, "pending-update-resume.json"));
-  } catch {}
+  // Unfenced first: a resumed turn started under the fence would be refused.
   runtimeQuiescing = false;
+  const resumed = resumePausedWork("quiesce-rollback", { runs: interruptedRuns, bots: interruptedBots });
   routines?.start();
   resourceTriggers.start();
   infisical.start();
@@ -9854,7 +9940,7 @@ function rollbackForcedQuiesce(
   // after the interrupted turns are back in flight, so each waits behind its
   // own bot's turn — unless an update drain is still holding new work: then
   // they wait with everything else it holds, and run when it lets go.
-  void resumeInterruptedChatTurns(interruptedBots, "quiesce-rollback").finally(releaseHeldWork);
+  void (resumed ?? Promise.resolve()).finally(releaseHeldWork);
 }
 
 /** How long a forced quiesce waits for interrupted work to actually settle.
@@ -9904,6 +9990,25 @@ function beginRuntimeDrain(timeoutMs: DrainWindowInput) {
   }
   if (!runtimeQuiescing) updateDrain.begin(timeoutMs);
   return { ...currentRuntimeReadiness(), quiescing: runtimeQuiescing };
+}
+
+/** The hold let go on its own terms: the updater gave up on it, or its lease
+ *  ran out under an updater that never came back.  Work an attempt paused and
+ *  parked under it resumes, then everything held runs.  Mid-fence the forced
+ *  attempt decides instead: rolled back with nothing holding, it resumes what
+ *  it paused itself; fenced, the restart does. */
+function releaseAfterDrain() {
+  if (runtimeQuiescing || runtimeFencing) {
+    releaseHeldWork();
+    return;
+  }
+  let resumed: Promise<void> | null = null;
+  try {
+    resumed = resumePausedWork("update-released");
+  } catch (err) {
+    console.warn("[update-drain] failed to resume paused work:", err);
+  }
+  void (resumed ?? Promise.resolve()).finally(releaseHeldWork);
 }
 
 /** Let everything held for an update run now: messages committed for a
@@ -9966,7 +10071,9 @@ function returnUnsavedWork(unsaved: HeldWork, context: string) {
 function convertDrainToFence() {
   const { safeToRestart, activeWorkCount } = drainRuntimeReadiness();
   if (!safeToRestart) return { safeToRestart, activeWorkCount, quiescing: false };
-  const unsaved = persistHeldWork("update-drain");
+  // A bot an earlier forced attempt paused (and parked) resumes its own turn
+  // first after the restart, so its sends are carried uncommitted.
+  const unsaved = persistHeldWork("update-drain", pausedBotIds(readResumeSnapshot()));
   if (unsaved.sends.length > 0 || unsaved.queued.length > 0) {
     // Refuse rather than fence: let everything else the drain held go too.
     returnUnsavedWork(unsaved, "update-drain");
@@ -10104,41 +10211,43 @@ async function takeRuntimeFence(force: boolean) {
       }
     }
 
+    // Work an earlier attempt of this update paused is still paused and
+    // saved (`rollbackForcedQuiesce` parks it under a hold): this attempt
+    // adds to the same snapshot rather than interrupting it again.
+    const paused = mergeResumeSnapshots(readResumeSnapshot(), interruptedRuns, interruptedBots);
     if (interruptedRuns.length > 0 || interruptedBots.length > 0) {
-      const resumeSnapshot = {
-        timestamp: Date.now(),
-        interruptedRuns,
-        interruptedBots,
-      };
       let snapshotSaved = false;
       try {
-        writeFileSync(join(DATA_DIR, "pending-update-resume.json"), JSON.stringify(resumeSnapshot, null, 2), {
+        writeFileSync(join(DATA_DIR, PENDING_RESUME_FILE), JSON.stringify(paused, null, 2), {
           mode: 0o600,
         });
         snapshotSaved = true;
       } catch (err) {
-        console.warn("Failed to write pending-update-resume.json:", err);
+        console.warn(`Failed to write ${PENDING_RESUME_FILE}:`, err);
       }
       if (!snapshotSaved) {
         // The snapshot is the only recovery path for interrupted work, so an
         // update that cannot persist it must not proceed.  Roll the forced
         // quiesce back and hand the fence back refused so the updater stands
-        // down.
+        // down — and resume now, since nothing saved what was paused.
         rollbackForcedQuiesce(interruptedRuns, interruptedBots);
         const abortedReadiness = currentRuntimeReadiness();
         return { ...abortedReadiness, quiescing: false };
       }
     }
+    // Under a hold the updater asks again after a refusal: keep what was
+    // paused paused (see rollbackForcedQuiesce).  Interrupt at most once.
+    const park = () => updateDrain.active;
 
     await drainAfterInterrupt();
 
     // Sends that waited behind the interrupted bots, or behind a drain, are
     // the person's own words: commit them for the restart rather than lose
-    // them with the steer queue.
-    const interrupted = new Set([...interruptedBots.map((entry) => entry.botId), ...interruptedRuns.map((run) => run.botId)]);
-    const unsaved = persistHeldWork("update-quiesce", interrupted);
+    // them with the steer queue.  A bot paused by an earlier attempt counts as
+    // interrupted too: its own turn resumes first.
+    const unsaved = persistHeldWork("update-quiesce", pausedBotIds(paused));
     if (unsaved.sends.length > 0 || unsaved.queued.length > 0) {
-      rollbackForcedQuiesce(interruptedRuns, interruptedBots);
+      rollbackForcedQuiesce(interruptedRuns, interruptedBots, { park: park() });
       returnUnsavedWork(unsaved, "update-quiesce");
       return { ...currentRuntimeReadiness(), quiescing: false };
     }
@@ -10153,7 +10262,7 @@ async function takeRuntimeFence(force: boolean) {
     // update coming to relieve it.
     const finalReadiness = currentRuntimeReadiness();
     if (!finalReadiness.safeToRestart) {
-      rollbackForcedQuiesce(interruptedRuns, interruptedBots);
+      rollbackForcedQuiesce(interruptedRuns, interruptedBots, { park: park() });
       const rolledBack = currentRuntimeReadiness();
       return { ...rolledBack, quiescing: false };
     }
@@ -10180,7 +10289,6 @@ function endRuntimeQuiesce(): RuntimeQuiesceAnswer {
   // way everything held for the update runs now (`releaseHeldWork` below).
   const wasDraining = updateDrain.stop();
   const wasQuiescing = runtimeQuiescing;
-  let resumed: Promise<unknown> = Promise.resolve();
   if (runtimeQuiescing) {
     // Clear admission before restarting schedulers so their immediate ticks
     // can dispatch normally.  This is an authenticated recovery action for
@@ -10189,32 +10297,18 @@ function endRuntimeQuiesce(): RuntimeQuiesceAnswer {
     infisical.start();
     routines?.start();
     resourceTriggers.start();
-    const pendingResumePath = join(DATA_DIR, "pending-update-resume.json");
-    if (existsSync(pendingResumePath)) {
-      try {
-        const raw = readFileSync(pendingResumePath, "utf-8");
-        const resumeState = JSON.parse(raw);
-        if (Array.isArray(resumeState.interruptedRuns)) {
-          for (const run of resumeState.interruptedRuns) {
-            if (run?.id) routines?.requeueRun(run.id);
-          }
-        }
-        if (Array.isArray(resumeState.interruptedBots)) {
-          for (const entry of resumeState.interruptedBots) {
-            if (entry?.botId && entry?.threadId) {
-              stoppedTurns.delete(`${entry.botId}:${entry.threadId}`);
-            }
-          }
-          resumed = resumeInterruptedChatTurns(resumeState.interruptedBots, "unquiesce-resume");
-        }
-        unlinkSync(pendingResumePath);
-      } catch (err) {
-        console.warn("[unquiesce] failed to restore resume snapshot:", err);
-      }
-    }
+  }
+  // What the update paused: saved by the fence for its restart, or kept
+  // paused under the hold across an attempt that rolled back.  No restart is
+  // coming, so it resumes here.
+  let resumed: Promise<void> | null = null;
+  try {
+    resumed = resumePausedWork("unquiesce-resume");
+  } catch (err) {
+    console.warn("[unquiesce] failed to restore resume snapshot:", err);
   }
   // After any interrupted turn is back in flight, so held sends queue behind it.
-  if (wasDraining || wasQuiescing) void resumed.finally(releaseHeldWork);
+  if (wasDraining || wasQuiescing || resumed) void (resumed ?? Promise.resolve()).finally(releaseHeldWork);
   return { ...currentRuntimeReadiness(), quiescing: false };
 }
 
