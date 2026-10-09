@@ -4,6 +4,12 @@ Thanks for wanting to help — community PRs have already shipped in this repo, 
 This file tells you how to get a working dev setup, what the codebase expects from a change, and what
 makes a PR easy to merge. Read it once before opening anything; it's short on purpose.
 
+## Kody (automated PR review)
+
+BotFleet uses [Kody](https://kodus.io) for automated pull-request review.  **Fleet-wide review rules** are maintained in the central rules source.  Do not recreate `.kody-rules/` in this repository.
+
+This repo's root **`kodus-config.yml`** only overrides review behavior for BotFleet (for example severity filters and request-changes settings).  Leave it in place unless you are intentionally changing how Kody behaves on BotFleet PRs.
+
 ## Ground rules
 
 - **Small, focused PRs.** One concern per PR. A PR that ports a platform *and* adds a feature *and*

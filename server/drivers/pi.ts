@@ -1056,6 +1056,11 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // xhigh/max only land on models that expose them; pi rejects an
           // unsupported level and the turn keeps the engine default.
           effortLevels: EFFORT_LEVELS,
+          // pi core runs its own bash/edit/write without asking, in every
+          // mode (fullAuto changes nothing here); only host-control MCP calls
+          // reach a card, and auto-review never answers those.  Its steps do
+          // arrive as tool_execution_start, so review can watch them.
+          reviewHook: "after",
           // Jobs matrix: BotFleet's own job tools arrive through the same
           // pi-mcp-extension that already carries ask_bot, and the chain is
           // proven end to end in server/drivers/pi-jobs.test.ts — the real
