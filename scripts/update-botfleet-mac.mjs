@@ -1060,8 +1060,11 @@ export function drainProgressDetail(runtime, phase = "wait") {
   return "Waiting for work in flight to finish";
 }
 
+/** A fence this run may use: up, and settled.  A forced quiesce still
+ *  interrupting and saving work (`fencing`) can still roll back. */
 function runtimeQuiesced(response) {
-  return response?.kind === "ok" && response.status === 200 && response.body?.quiescing === true;
+  return response?.kind === "ok" && response.status === 200 && response.body?.quiescing === true &&
+    response.body?.fencing !== true;
 }
 
 const STOPPED_HOLDING = "BotFleet stopped holding new work before the update could start; nothing was interrupted.  Try again.";

@@ -9844,6 +9844,11 @@ async function drainAfterInterrupt(): Promise<void> {
 /** Start holding new work for an update, or renew the hold (server/update-drain.ts).
  *  Already fenced is reported as fenced: there is nothing left to drain. */
 function beginRuntimeDrain(timeoutMs: DrainWindowInput) {
+  // A forced quiesce still settling: "not yet", like every other quiesce ask.
+  if (runtimeFencing) {
+    const { activeWorkCount } = currentRuntimeReadiness();
+    return { safeToRestart: false, activeWorkCount, quiescing: runtimeQuiescing };
+  }
   if (!runtimeQuiescing) updateDrain.begin(timeoutMs);
   return { ...currentRuntimeReadiness(), quiescing: runtimeQuiescing };
 }
