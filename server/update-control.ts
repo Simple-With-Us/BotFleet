@@ -51,6 +51,8 @@ const GAP = "\u00a0 ";
 const LOG_TAIL_LINES = 24;
 const LOG_TAIL_BYTES = 64 * 1024;
 const LOG_LINE_MAX = 400;
+/** A progress detail is one short line; anything longer is clipped. */
+const DETAIL_MAX = 200;
 /** Commit subjects shown in "what is new".  Beyond this the count carries it. */
 const MAX_LISTED_COMMITS = 20;
 /** A run with no progress file this long after launch never started. */
@@ -97,6 +99,9 @@ export interface UpdateRunning {
   runId: string;
   startedAt: string;
   step: string;
+  /** What the step is waiting on, when the updater says ("Waiting for 3 bots
+   * to finish" while it drains).  Absent the rest of the time. */
+  detail?: string;
   progress?: number;
   logTail: string[];
 }
@@ -122,8 +127,7 @@ export type UpdateCapabilityCode =
   | "checkout-missing"
   | "updater-missing"
   | "updater-outdated"
-  | "already-running"
-  | "busy";
+  | "already-running";
 
 export interface UpdateCapabilities {
   canCheck: boolean;
@@ -131,6 +135,11 @@ export interface UpdateCapabilities {
   reasons: string[];
   /** One code per `reasons` entry, same order and length. */
   codes: UpdateCapabilityCode[];
+  /** Bots are working right now.  Not a reason the update cannot run: the
+   * updater holds new work, gives this work a short grace, then pauses what
+   * is left and resumes it after the restart (server/update-drain.ts), so
+   * surfaces only say that will happen. */
+  busy: boolean;
 }
 
 /** What `currentRuntimeReadiness()` in the harness reports: whether any turn,
@@ -140,10 +149,6 @@ export interface RuntimeReadiness {
   activeWorkCount: number | null;
 }
 
-/** The one refusal `force` is meant to override, so the capability reason and
- * the refusal are the same string and can be compared. */
-export const BUSY_REFUSAL =
-  "BotFleet is working right now.\u00a0 The updater will not interrupt a turn in flight.";
 
 export interface UpdateInstalled {
   version: string;
@@ -240,6 +245,7 @@ export interface ProgressRecord {
   startedAt: string;
   updatedAt: string;
   step: string | null;
+  detail: string | null;
   progress: number | null;
   targetCommit: string | null;
   receiptPath: string | null;
@@ -305,6 +311,7 @@ export function parseProgressRecord(value: unknown): ProgressRecord | null {
     startedAt: raw.startedAt,
     updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : raw.startedAt,
     step: typeof raw.step === "string" ? raw.step : null,
+    detail: typeof raw.detail === "string" && raw.detail.trim() ? raw.detail.trim().slice(0, DETAIL_MAX) : null,
     progress,
     targetCommit: typeof raw.targetCommit === "string" ? raw.targetCommit : null,
     receiptPath: typeof raw.receiptPath === "string" ? raw.receiptPath : null,
@@ -388,6 +395,7 @@ export function runningFrom(record: ProgressRecord, logTail: string[]): UpdateRu
     step: stepLabel(record.step),
     logTail,
   };
+  if (record.detail) running.detail = record.detail;
   if (record.progress !== null) running.progress = record.progress;
   return running;
 }
@@ -462,12 +470,11 @@ export function runRefusal(input: {
   force: boolean;
 }): string | null {
   if (input.running) return "An update is already running.";
-  // Readiness comes before the structural reasons because it is the one
-  // `force` is meant to override.  Forcing does not make it safe: the
-  // updater's own preflight refuses a busy machine too, and the run then
-  // ends `refused` rather than interrupting a turn.
-  if (!input.readiness.safeToRestart && !input.force) return BUSY_REFUSAL;
-  const structural = input.capabilities.reasons.find((reason) => reason !== BUSY_REFUSAL);
+  // A busy Mac is never a refusal.  A run holds new work, gives the work in
+  // flight a short grace to finish, then pauses what is left and resumes it
+  // after the restart (server/update-drain.ts); a forced run skips the grace.
+  // `readiness` only describes the Mac now.
+  const structural = input.capabilities.reasons[0];
   if (!input.capabilities.canRun && structural) return structural;
   if (input.dirty) {
     return "The always-on checkout has uncommitted changes, so the updater would refuse.";
@@ -898,9 +905,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
 
   /** What this Mac is equipped to do, before anything about what it is doing
    * right now.  Separated from `capabilities` because the dirty-checkout
-   * precheck has to run on a busy machine too: `force` talks past readiness,
-   * and a forced run on a dirty checkout must be refused here rather than
-   * launched for the updater to refuse a minute later. */
+   * precheck has to run on a busy machine too: a run on a dirty checkout must
+   * be refused here rather than launched for the updater to refuse a minute
+   * later. */
   const structural = () => {
     const darwin = deps.platform === "darwin";
     const checkoutPresent = darwin && existsSync(join(deps.checkout, ".git"));
@@ -918,9 +925,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
 
   /** What this Mac may do right now.  `readiness` overrides the harness-wide
    * reading for a caller that holds an admission of its own — without it a
-   * `POST` route answers with `canRun: false` and "BotFleet is working right
-   * now." on a completely idle Mac, and the client that stores that status
-   * stops offering Install Update until something else refreshes it. */
+   * `POST` route reports `busy` on a completely idle Mac, because the request
+   * asking is itself the work it counts. */
   const capabilities = (running: boolean, readiness?: RuntimeReadiness): UpdateCapabilities => {
     const able = structural();
     const reasons: string[] = [];
@@ -947,13 +953,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       reasons.push("An update is already running.");
       codes.push("already-running");
     }
-    // Listed last, and the only reason `force` can talk past — see runRefusal.
-    const idle = (readiness ?? deps.readiness()).safeToRestart;
-    if (!idle) {
-      reasons.push(BUSY_REFUSAL);
-      codes.push("busy");
-    }
-    return { canCheck: able.canCheck, canRun: able.canRun && !running && idle, reasons, codes };
+    // Not a reason: an update on a busy Mac waits for its bots (see runRefusal).
+    const busy = !(readiness ?? deps.readiness()).safeToRestart;
+    return { canCheck: able.canCheck, canRun: able.canRun && !running, reasons, codes, busy };
   };
 
   const loadAvailable = () => {
@@ -1337,10 +1339,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       running: before.running,
       available: before.available,
       readiness: readiness ?? deps.readiness(),
-      // Asked whenever this Mac is equipped to run one at all, not only when
-      // it is free to: `force` talks past readiness, and a forced run on a
-      // dirty checkout has to be refused here rather than launched for the
-      // updater to refuse a minute later.
+      // Asked whenever this Mac is equipped to run one at all, busy or not:
+      // a run on a dirty checkout has to be refused here rather than
+      // launched for the updater to refuse a minute later.
       dirty: structural().canRun ? await dirtyCheckout() : false,
       force,
     });

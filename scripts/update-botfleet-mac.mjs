@@ -94,14 +94,27 @@ export function parseArguments(argv) {
     else if (arg === "--progress") parsed.progress = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--run-id") parsed.runId = requiredValue(arg, args.shift());
     else if (arg === "--no-open") parsed.openApplication = false;
+    else if (arg === "--grace") parsed.graceMs = graceSeconds(requiredValue(arg, args.shift()));
+    else if (arg.startsWith("--grace=")) parsed.graceMs = graceSeconds(requiredValue("--grace", arg.slice("--grace=".length)));
+    else if (arg === "--wait-for-idle") {
+      // The minutes are optional: a bare flag waits the default window.
+      parsed.waitForIdleMs = /^\d+(\.\d+)?$/.test(args[0] ?? "") ? idleMinutes(args.shift()) : DEFAULT_WAIT_FOR_IDLE_MS;
+    }
+    else if (arg.startsWith("--wait-for-idle=")) {
+      parsed.waitForIdleMs = idleMinutes(requiredValue("--wait-for-idle", arg.slice("--wait-for-idle=".length)));
+    }
     else if (arg === "--force" || arg === "-f") parsed.force = true;
     else if (arg === "--help" || arg === "-h") parsed.help = true;
     else throw new Error(`Unknown option: ${arg}`);
   }
   if (command === "apply" && !parsed.stage) throw new Error("apply requires --stage <directory>");
   if (command === "unquiesce" && (parsed.target !== "origin/main" || parsed.source || parsed.stage || parsed.bundle ||
-      parsed.dependencies || parsed.openApplication === false || parsed.progress || parsed.runId)) {
+      parsed.dependencies || parsed.openApplication === false || parsed.progress || parsed.runId ||
+      parsed.graceMs !== undefined || parsed.waitForIdleMs !== undefined)) {
     throw new Error("unquiesce accepts no options");
+  }
+  if (parsed.force && parsed.waitForIdleMs !== undefined) {
+    throw new Error("--force and --wait-for-idle ask for opposite things; pass one");
   }
   if (command === "apply" && (parsed.bundle || parsed.dependencies || parsed.source)) {
     throw new Error("apply accepts only a prepared --stage");
@@ -124,12 +137,32 @@ function requiredValue(flag, value) {
   return value;
 }
 
+/** `--grace` is in seconds: how long work in flight gets before it is paused. */
+function graceSeconds(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0 || seconds > 600) {
+    throw new Error("--grace must be a number of seconds from 0 to 600");
+  }
+  return Math.round(seconds * 1_000);
+}
+
+/** `--wait-for-idle` is in minutes, because a person types it. */
+function idleMinutes(value) {
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 360) {
+    throw new Error("--wait-for-idle must be a number of minutes above 0 and at most 360");
+  }
+  return Math.round(minutes * 60_000);
+}
+
 function usage() {
   return `Usage:
   update-botfleet-mac.mjs update  [--target REF] [--source PATH] [--stage PATH] [--no-open]
+                              [--grace SECONDS | --wait-for-idle [MINUTES] | --force]
   update-botfleet-mac.mjs prepare [--target REF] [--source PATH] [--stage PATH]
                               [--bundle PATH --dependencies PATH]
   update-botfleet-mac.mjs apply   --stage PATH [--no-open]
+                              [--grace SECONDS | --wait-for-idle [MINUTES] | --force]
   update-botfleet-mac.mjs unquiesce
 
 Any of update/prepare/apply also accepts --progress PATH [--run-id ID], which records each
@@ -137,15 +170,26 @@ step and the final outcome to a JSON file a detached caller can read while the r
 
 prepare builds and validates without touching the live checkout, installed app, or processes.
 An existing exact-source build can be imported with --bundle and --dependencies.
-apply performs a fresh active-work check, installs one prepared stage, verifies exact runtime identity,
-and rolls the prior bundle and checkout back if any install or startup step fails.
+apply installs one prepared stage, verifies exact runtime identity, and rolls the prior bundle and
+checkout back if any install or startup step fails.
 unquiesce is the authenticated recovery action if the updater exits after fencing admission but before shutdown.
 
---force (-f, or BOTFLEET_FORCE=1) does more than reinstall when the checkout is already current.
-It drops the requirement that the harness be idle and asks it to quiesce with force=true, which
-interrupts busy bots and running or queued routines.  Their work is saved to
-pending-update-resume.json and resumed after the update.  A live room turn still refuses the
-forced update.  Use it only when interrupting that work is acceptable.`;
+Busy bots never block an update.  Before it stops anything, apply asks BotFleet to hold new work
+(new turns, routine and webhook runs, job wakes) and gives the work already running a short grace
+to finish on its own: 60 seconds, or --grace SECONDS (BOTFLEET_UPDATE_GRACE_MS).  Whatever is
+still running then is interrupted, saved to pending-update-resume.json and resumed after the
+update.  Held work is queued, never dropped: it runs after the restart.  The one thing that is
+never interrupted is a live room turn, because a room turn cannot be resumed without repeating
+it; apply waits up to 5 more minutes for rooms to go quiet (BOTFLEET_UPDATE_ROOM_WAIT_MS), and
+then lets everything go and stops without updating.
+
+--wait-for-idle [MINUTES] never interrupts anything.  It waits for the work already running to
+finish, 20 minutes unless MINUTES says otherwise, and if bots are still busy when the time runs
+out, everything held runs now and the update stops without changing anything.
+
+--force (-f, or BOTFLEET_FORCE=1) skips the grace and interrupts at once, and also reinstalls when
+the checkout is already current.  Interrupted work is saved to pending-update-resume.json and
+resumed after the update.  A live room turn still refuses it.`;
 }
 
 async function exists(path) {
@@ -827,6 +871,10 @@ export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requi
   return null;
 }
 
+/** The topology reason a port that timed out produces: on a loaded Mac that
+ *  is a slow harness, not a wrong one, and worth asking again. */
+const TOPOLOGY_UNAVAILABLE = /unavailable or ambiguous/;
+
 async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   const { state, owner } = await ownerRecordState(config.dataDirectory);
   // A record naming a dead pid is a stopped or crashed harness, not an
@@ -849,13 +897,21 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
     accept: [200],
   });
   if (response.kind === "http" && response.status === 404) return null;
-  if (response.kind !== "ok") return { safe: false, reason: "Authenticated runtime readiness could not be verified" };
+  // `transient` marks the answers a slow harness gives: no answer at all, or
+  // a health port that timed out.  runtimePreflight asks again for those.
+  if (response.kind !== "ok") {
+    return { safe: false, transient: true, reason: "Authenticated runtime readiness could not be verified" };
+  }
   const runtime = response.body;
   const identityError = authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle });
   if (identityError) return { safe: false, reason: identityError };
   const topology = await healthTopology(config.ports);
   if (!topology.safe || topology.pid !== owner.pid) {
-    return { safe: false, reason: topology.reason || "Health endpoints do not share the authenticated runtime owner" };
+    return {
+      safe: false,
+      transient: TOPOLOGY_UNAVAILABLE.test(topology.reason || ""),
+      reason: topology.reason || "Health endpoints do not share the authenticated runtime owner",
+    };
   }
   const holders = await sqliteHolders(config.dataDirectory);
   if (holders.length !== 1 || holders[0] !== owner.pid) {
@@ -864,9 +920,62 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   return { safe: true, mode: "authenticated", pid: owner.pid, port: owner.port, runtime, holders, health: topology.health };
 }
 
-export async function runtimePreflight(config, expectedBuild) {
-  const requireIdle = !config?.force && process.env.BOTFLEET_FORCE !== "1";
-  const strict = await strictRuntimePreflight(config, expectedBuild, { requireIdle });
+/** How long a preflight keeps asking a harness that does not answer. */
+export const DEFAULT_PREFLIGHT_RETRY_MS = 60_000;
+
+/**
+ * Ask again while the answer is only "too slow to tell", with backoff, inside
+ * a bounded window.  A loaded Mac (load average in the hundreds) can miss a
+ * three-second request now and then, and one missed request used to abort the
+ * whole apply.  A definitive answer — wrong identity, two database holders,
+ * no harness — returns at once, and so does the last attempt in the window.
+ */
+export async function retryTransient(attempt, {
+  windowMs = DEFAULT_PREFLIGHT_RETRY_MS,
+  now = Date.now,
+  wait = sleep,
+  firstDelayMs = 1_000,
+  maxDelayMs = 10_000,
+} = {}) {
+  const deadline = now() + Math.max(0, windowMs);
+  let delay = firstDelayMs;
+  for (;;) {
+    const result = await attempt();
+    const remaining = deadline - now();
+    if (!result?.transient || remaining <= 0) return result;
+    await wait(Math.min(delay, remaining));
+    delay = Math.min(maxDelayMs, delay * 2);
+  }
+}
+
+/** The non-interrupting mode: zero, or how long `--wait-for-idle` waits. */
+function waitForIdleFor(config) {
+  const value = config?.waitForIdleMs;
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function forcedRun(config) {
+  return Boolean(config?.force || process.env.BOTFLEET_FORCE === "1");
+}
+
+/** How the fence step treats work in flight.  See `usage()`. */
+export function fenceMode(config) {
+  if (forcedRun(config)) return "force";
+  return waitForIdleFor(config) > 0 ? "wait-for-idle" : "grace";
+}
+
+export async function runtimePreflight(config, expectedBuild, adapters = {}) {
+  // Work in flight is never a reason to stop here: the fence step decides
+  // what happens to it.  What this checks is that the harness is the one this
+  // Mac owns, and a harness too slow to say so is asked again.
+  const strict = await retryTransient(
+    () => (adapters.strictPreflight ?? strictRuntimePreflight)(config, expectedBuild, { requireIdle: false }),
+    {
+      windowMs: Number.isFinite(config?.preflightRetryMs) ? config.preflightRetryMs : DEFAULT_PREFLIGHT_RETRY_MS,
+      now: adapters.now,
+      wait: adapters.sleep,
+    },
+  );
   if (strict) return strict;
   return { safe: false, reason: "Runtime does not expose complete authenticated readiness; manual first adoption is required" };
 }
@@ -876,20 +985,293 @@ async function runtimeIdentityPreflight(config, expectedBuild) {
   return strict || { safe: false, reason: "Expected build does not expose authenticated runtime identity" };
 }
 
+/** How long running work gets to finish on its own before it is paused. */
+export const DEFAULT_GRACE_MS = 60_000;
+/** How long `--wait-for-idle` waits when no minutes are given. */
+export const DEFAULT_WAIT_FOR_IDLE_MS = 20 * 60_000;
+/** After the grace, how long the updater keeps trying to pause work that the
+ *  harness will not interrupt — a live room turn — before it gives up. */
+export const DEFAULT_ROOM_WAIT_MS = 5 * 60_000;
+const DEFAULT_DRAIN_POLL_MS = 5_000;
+/** Between two forced attempts the harness refused for something other than
+ *  a room turn: each one interrupts and resumes, so they are spaced out. */
+const FORCE_RETRY_MS = 30_000;
+/** A forced quiesce interrupts every busy bot and waits up to 15 s for them
+ *  to settle, so its answer can take a while on a loaded Mac. */
+const FORCED_QUIESCE_TIMEOUT_MS = 90_000;
+const QUIESCE_TIMEOUT_MS = 20_000;
+/** How long the hold keeps polling a harness that has stopped answering. */
+const DRAIN_SILENCE_LIMIT_MS = 60_000;
+
+function plural(count, one, many = `${one}s`) {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+/** "20 minutes", "1 minute", "45 seconds": a window as a person says it. */
+export function describeWindow(ms) {
+  if (ms >= 60_000 && ms % 60_000 === 0) return plural(ms / 60_000, "minute");
+  if (ms >= 60_000) return plural(Math.round(ms / 6_000) / 10, "minute");
+  return plural(Math.max(1, Math.round(ms / 1_000)), "second");
+}
+
+/** The refusal `--wait-for-idle` ends with when bots stay busy. */
+export function waitForIdleTimeoutMessage(ms) {
+  return `Bots were still busy after ${describeWindow(ms)}; nothing was interrupted.  `
+    + "Try again later, or run without --wait-for-idle to pause and resume them.";
+}
+
+/** The refusal the default mode ends with when work would not pause.  The
+ *  one known cause is a room conversation, which is never interrupted. */
+export function pauseTimeoutMessage(ms, runtime) {
+  const rooms = Number.isInteger(runtime?.drain?.rooms) ? runtime.drain.rooms : 0;
+  if (rooms > 0) {
+    return `A room conversation was still running after ${describeWindow(ms)}, and a room turn cannot be paused `
+      + "without repeating it, so the update did not start.  Nothing was interrupted.  Try again when the room is quiet.";
+  }
+  return `BotFleet could not pause its work within ${describeWindow(ms)}, so the update did not start.  `
+    + "Anything it paused was resumed.  Try again in a few minutes.";
+}
+
+/** What the update is waiting for, for the progress record and the terminal.
+ *  `runtime` is a `/api/runtime` or quiesce answer: a drain-capable harness
+ *  reports `drain`, an older one only `activeWorkCount`. */
+export function drainProgressDetail(runtime, phase = "wait") {
+  const drain = runtime?.drain;
+  const bots = Number.isInteger(drain?.bots) ? drain.bots : 0;
+  const rooms = Number.isInteger(drain?.rooms) ? drain.rooms : 0;
+  const inFlight = Number.isInteger(drain?.inFlight) ? drain.inFlight
+    : Number.isInteger(runtime?.activeWorkCount) ? runtime.activeWorkCount : null;
+  if (phase === "pause") {
+    if (rooms > 0) return `Waiting for ${plural(rooms, "room conversation")} to finish`;
+    return bots > 0 ? `Pausing ${plural(bots, "bot")} to resume after the update` : "Pausing work to resume after the update";
+  }
+  if (bots > 0) return `Waiting for ${plural(bots, "bot")} to finish`;
+  if (inFlight !== null && inFlight > 0) return `Waiting for ${plural(inFlight, "operation")} to finish`;
+  return "Waiting for work in flight to finish";
+}
+
+function runtimeQuiesced(response) {
+  return response?.kind === "ok" && response.status === 200 && response.body?.quiescing === true;
+}
+
+const STOPPED_HOLDING = "BotFleet stopped holding new work before the update could start; nothing was interrupted.  Try again.";
+
+/**
+ * Hold new work, give the work in flight its window, then take the fence.
+ *
+ * Resolves `{ ok: true, response, forced }` with the fenced quiesce answer,
+ * or `{ ok: false, reason }` having released whatever it held.  Every way
+ * out that is not a fence lifts the hold: the window closing, a signal, a
+ * harness that stops answering.  The harness's own lease is the backstop for
+ * an updater killed outright (server/update-drain.ts).
+ *
+ * `grace` (the default): work in flight gets `windowMs` to finish on its own;
+ * whatever is still running is then paused with the forced quiesce, saved to
+ * pending-update-resume.json and resumed after the restart.  The forced path
+ * still will not interrupt a live room turn, so for up to `roomWaitMs` more
+ * the updater waits for rooms to go quiet and asks again.
+ *
+ * `wait-for-idle`: the opt-in that never interrupts.  When `windowMs` runs
+ * out with bots still busy, it lets everything go and refuses.
+ *
+ * A harness that predates drains answers the first request as a plain
+ * quiesce, fenced when idle and refused when busy, with no `draining` field.
+ * That is the first update to carry this code, so it is not an error: the
+ * wait retries the plain fence, and the grace mode then forces as before.
+ */
+async function holdAndFence(config, owner, deps) {
+  const { request, now, pause: sleepFor, report, releaseAdmission, signals, mode, windowMs, roomWaitMs, pollMs } = deps;
+  const base = `http://127.0.0.1:${owner.port}`;
+  const headers = { Authorization: `Bearer ${owner.nonce}` };
+  const quiesce = (query = "", timeoutMs = QUIESCE_TIMEOUT_MS) => request(`${base}/api/runtime/quiesce${query}`, {
+    method: "POST",
+    headers,
+    accept: [200, 409],
+    timeoutMs,
+  });
+  const forceQuiesce = () => quiesce("?force=true", FORCED_QUIESCE_TIMEOUT_MS);
+  const waitDeadline = now() + windowMs;
+  const finalDeadline = mode === "grace" ? waitDeadline + roomWaitMs : waitDeadline;
+  // The harness holds a little past the updater's whole window, so its lease
+  // never runs out under a run that is still deciding.
+  const first = await quiesce(`?drain=1&timeoutMs=${Math.max(1_000, finalDeadline - now())}`);
+  if (first.kind !== "ok") return { ok: false, reason: "Runtime admission fence could not be established" };
+  if (runtimeQuiesced(first)) return { ok: true, response: first, forced: false };
+  const draining = first.body?.draining === true;
+  let holding = draining;
+  const release = async (reason) => {
+    if (!holding) return { ok: false, reason };
+    try {
+      await releaseAdmission(config);
+      holding = false;
+      return { ok: false, reason };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `${reason}  Releasing the held work also failed; run update-botfleet.sh unquiesce: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  };
+
+  let stoppedBy = null;
+  let wake = () => {};
+  const listeners = ["SIGINT", "SIGTERM"].map((signal) => {
+    const listener = () => {
+      stoppedBy = signal;
+      wake();
+    };
+    signals?.on?.(signal, listener);
+    return [signal, listener];
+  });
+  const pause = (ms) => new Promise((resolvePause) => {
+    wake = resolvePause;
+    if (stoppedBy) return resolvePause();
+    sleepFor(ms).then(resolvePause, resolvePause);
+  });
+
+  try {
+    let last = first.body;
+    let phase = "wait";
+    let silentSince = null;
+    let nextForceAt = 0;
+    let lastDetail = null;
+    for (;;) {
+      if (stoppedBy) {
+        return release(`Stopped by ${stoppedBy} while waiting for bots to finish; nothing was interrupted.`);
+      }
+      if (phase === "wait" && draining && last?.draining === true && last.drain?.inFlight === 0) {
+        // Nothing in flight: ask for the fence.  Work can land between the
+        // poll and this request; the harness then keeps holding and answers
+        // 409, and this simply goes round again.
+        const fenced = await quiesce();
+        if (runtimeQuiesced(fenced)) {
+          holding = false;
+          return { ok: true, response: fenced, forced: false };
+        }
+        if (fenced.kind === "ok") last = fenced.body;
+        if (fenced.kind === "ok" && fenced.body?.draining !== true) {
+          holding = false;
+          return { ok: false, reason: STOPPED_HOLDING };
+        }
+      }
+      if (phase === "wait" && now() >= waitDeadline) {
+        if (mode !== "grace") return release(waitForIdleTimeoutMessage(windowMs));
+        phase = "pause";
+      }
+      if (phase === "pause") {
+        const rooms = Number.isInteger(last?.drain?.rooms) ? last.drain.rooms : 0;
+        // A live room turn refuses the forced quiesce without touching
+        // anything, so asking while one runs only costs a request; an older
+        // harness cannot say, so it is simply asked.
+        if (rooms === 0 && now() >= nextForceAt) {
+          const forced = await forceQuiesce();
+          if (runtimeQuiesced(forced)) {
+            holding = false;
+            return { ok: true, response: forced, forced: true };
+          }
+          if (forced.kind === "ok") {
+            last = forced.body;
+            // A refusal with no room turn interrupted and resumed work; do
+            // not churn through that again straight away.
+            if (!(Number.isInteger(last?.drain?.rooms) && last.drain.rooms > 0)) nextForceAt = now() + FORCE_RETRY_MS;
+          } else {
+            // No answer in time.  The harness may still be fencing; the next
+            // ask either collects the fence or is refused, so just go round.
+            nextForceAt = now() + pollMs;
+          }
+        }
+        if (now() >= finalDeadline) return release(pauseTimeoutMessage(windowMs + roomWaitMs, last));
+      }
+      const detail = drainProgressDetail(last, phase);
+      if (detail !== lastDetail) {
+        lastDetail = detail;
+        report(detail);
+      }
+      const deadline = phase === "wait" ? waitDeadline : finalDeadline;
+      await pause(Math.max(0, Math.min(pollMs, deadline - now())));
+      if (stoppedBy) continue;
+      if (!draining) {
+        // An older harness: nothing is held, so there is nothing to poll.
+        // While waiting, retry the plain fence for an idle moment; the pause
+        // phase above asks for the forced one itself.
+        if (phase === "wait") {
+          const retried = await quiesce();
+          if (runtimeQuiesced(retried)) return { ok: true, response: retried, forced: false };
+          if (retried.kind === "ok") last = retried.body;
+        }
+        continue;
+      }
+      const polled = await request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
+      if (polled.kind !== "ok") {
+        silentSince ??= now();
+        if (now() - silentSince >= DRAIN_SILENCE_LIMIT_MS) {
+          return release("BotFleet stopped answering while the update waited for bots to finish; nothing was interrupted.");
+        }
+        continue;
+      }
+      silentSince = null;
+      if (polled.body?.pid !== owner.pid) {
+        holding = false;
+        return { ok: false, reason: STOPPED_HOLDING };
+      }
+      if (polled.body?.quiescing === true && phase === "pause") {
+        // A forced ask that timed out on this side finished on that one:
+        // asking again collects the fence it already holds.
+        nextForceAt = 0;
+        last = polled.body;
+        continue;
+      }
+      if (polled.body?.draining !== true) {
+        // The lease ran out, something released it, or the harness restarted.
+        // Whatever it held is running again, so there is nothing to release.
+        holding = false;
+        return { ok: false, reason: STOPPED_HOLDING };
+      }
+      last = polled.body;
+    }
+  } finally {
+    for (const [signal, listener] of listeners) signals?.off?.(signal, listener);
+  }
+}
+
 export async function fenceRuntimeAdmission(config, adapters = {}) {
   const readRuntimeOwner = adapters.readOwner ?? readOwner;
   const request = adapters.requestJson ?? requestJson;
   const inspectTopology = adapters.healthTopology ?? healthTopology;
   const inspectHolders = adapters.sqliteHolders ?? sqliteHolders;
   const releaseAdmission = adapters.releaseRuntimeAdmission ?? releaseRuntimeAdmission;
+  const now = adapters.now ?? Date.now;
+  const wait = adapters.sleep ?? sleep;
   const owner = await readRuntimeOwner(config.dataDirectory);
   if (!owner) return { safe: false, reason: "Authenticated runtime owner is unavailable for the admission fence" };
-  const forceQuery = (config?.force || process.env.BOTFLEET_FORCE === "1") ? "?force=true" : "";
-  const response = await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce${forceQuery}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${owner.nonce}` },
-    accept: [200, 409],
-  });
+  const mode = fenceMode(config);
+  let response;
+  let forced = mode === "force";
+  if (mode === "force") {
+    response = await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce?force=true`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${owner.nonce}` },
+      accept: [200, 409],
+      timeoutMs: FORCED_QUIESCE_TIMEOUT_MS,
+    });
+  } else {
+    const atLeastZero = (value, fallback) => (Number.isFinite(value) && value >= 0 ? value : fallback);
+    const held = await holdAndFence(config, owner, {
+      request,
+      releaseAdmission,
+      mode,
+      windowMs: mode === "grace" ? atLeastZero(config?.graceMs, DEFAULT_GRACE_MS) : waitForIdleFor(config),
+      roomWaitMs: atLeastZero(config?.roomWaitMs, DEFAULT_ROOM_WAIT_MS),
+      pollMs: Number.isFinite(config?.drainPollMs) && config.drainPollMs > 0 ? config.drainPollMs : DEFAULT_DRAIN_POLL_MS,
+      now,
+      pause: wait,
+      report: adapters.report ?? config?.reportDetail ?? (() => {}),
+      signals: adapters.signals === undefined ? process : adapters.signals,
+    });
+    if (!held.ok) return { safe: false, reason: held.reason };
+    response = held.response;
+    forced = held.forced;
+  }
   if (response.kind !== "ok") return { safe: false, reason: "Runtime admission fence could not be established" };
   const runtime = response.body;
   const fenceHeld = response.status === 200 && runtime?.quiescing === true;
@@ -905,8 +1287,9 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
       };
     }
   };
-  const requireIdle = !config?.force && process.env.BOTFLEET_FORCE !== "1";
-  const identityError = authenticatedRuntimeError(runtime, owner, undefined, { requireIdle });
+  // A fence taken without forcing must be idle on the harness's own terms;
+  // a forced one has interrupted and saved whatever was running.
+  const identityError = authenticatedRuntimeError(runtime, owner, undefined, { requireIdle: !forced });
   if (identityError || !fenceHeld) {
     return refuseAfterFence(identityError || "Runtime refused the admission fence because work is active");
   }
@@ -914,7 +1297,10 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
   let holders;
   try {
     [topology, holders] = await Promise.all([
-      inspectTopology(config.ports),
+      retryTransient(async () => {
+        const result = await inspectTopology(config.ports);
+        return { ...result, transient: !result.safe && TOPOLOGY_UNAVAILABLE.test(result.reason || "") };
+      }, { windowMs: 30_000, now, wait }),
       inspectHolders(config.dataDirectory),
     ]);
   } catch {
@@ -932,12 +1318,18 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
 export async function releaseRuntimeAdmission(config) {
   const owner = await readOwner(config.dataDirectory);
   if (!owner) throw new Error("Authenticated runtime owner is unavailable for admission recovery");
-  const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime/quiesce`, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${owner.nonce}` },
-    accept: [200],
-  });
-  if (response.kind !== "ok" || response.body?.quiescing !== false) {
+  // Releasing is the one request that must not be lost to a slow harness:
+  // a fence or a hold left behind keeps every bot on this Mac waiting.
+  const response = await retryTransient(async () => {
+    const answer = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime/quiesce`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${owner.nonce}` },
+      accept: [200],
+      timeoutMs: QUIESCE_TIMEOUT_MS,
+    });
+    return { ...answer, transient: answer.kind === "unavailable" };
+  }, { windowMs: 30_000 });
+  if (response.kind !== "ok" || response.body?.quiescing !== false || response.body?.draining === true) {
     throw new Error("Runtime admission fence could not be released");
   }
 }
@@ -2055,9 +2447,27 @@ function createConfig(parsed) {
     gracefulExitMs: Number(process.env.BOTFLEET_GRACEFUL_EXIT_MS || 20_000),
     termExitMs: Number(process.env.BOTFLEET_TERM_EXIT_MS || 20_000),
     startupTimeoutMs: Number(process.env.BOTFLEET_STARTUP_TIMEOUT_MS || 90_000),
+    // How long work in flight gets to finish before apply pauses it, and,
+    // only with --wait-for-idle, how long apply waits instead of pausing.
+    // A flag wins over the environment; an unreadable value is the default.
+    graceMs: parsed.graceMs ?? environmentMs("BOTFLEET_UPDATE_GRACE_MS", DEFAULT_GRACE_MS),
+    waitForIdleMs: parsed.waitForIdleMs,
+    roomWaitMs: environmentMs("BOTFLEET_UPDATE_ROOM_WAIT_MS", DEFAULT_ROOM_WAIT_MS),
+    preflightRetryMs: environmentMs("BOTFLEET_PREFLIGHT_RETRY_MS", DEFAULT_PREFLIGHT_RETRY_MS),
+    drainPollMs: environmentMs("BOTFLEET_DRAIN_POLL_MS", 5_000),
     force: Boolean(parsed.force || process.env.BOTFLEET_FORCE === "1"),
+    // Set by main() once the progress record exists: what the drain is
+    // waiting for, for the terminal and for the Mac and the phone.
+    reportDetail: undefined,
     parsed,
   };
+}
+
+function environmentMs(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 function createOperations(config) {
@@ -2941,6 +3351,10 @@ export async function main(argv = process.argv.slice(2)) {
         target: parsed.target,
       })
     : null;
+  config.reportDetail = (detail) => {
+    console.log(`${detail}...`);
+    progress?.note({ detail });
+  };
   const operations = progress ? instrumentOperations(bare, progress) : bare;
   const perform = async () => {
     if (parsed.command === "prepare") return prepareUpdate(parsed, operations);

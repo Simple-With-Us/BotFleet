@@ -110,6 +110,10 @@ export function createUpdateProgress({
     startedAt,
     updatedAt: startedAt,
     step: null,
+    // What the current step is waiting on, in a person's words ("Waiting for
+    // 3 bots to finish").  Only the fence's drain sets it; every step change
+    // clears it, so a stale wait never outlives the step that reported it.
+    detail: null,
     stepIndex: 0,
     stepCount: UPDATE_STEPS.length,
     progress: 0,
@@ -158,6 +162,7 @@ export function createUpdateProgress({
 
   const begin = (name) => {
     record.step = name;
+    record.detail = null;
     if (name === "quiesce") record.crossedBoundary = true;
     const position = UPDATE_STEPS.indexOf(name);
     if (position >= 0) {
@@ -179,6 +184,7 @@ export function createUpdateProgress({
         break;
       }
     }
+    record.detail = null;
     if (ok && name === "rollback") record.rolledBack = true;
     flush();
   };
@@ -196,6 +202,7 @@ export function createUpdateProgress({
       record.outcome = outcome;
       record.message = message ?? null;
       record.step = null;
+      record.detail = null;
       if (outcome === "verified") record.progress = 1;
       flush();
     },
