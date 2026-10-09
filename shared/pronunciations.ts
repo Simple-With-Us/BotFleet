@@ -7,26 +7,36 @@
 //
 // Where it applies (server/tts):
 // - The distiller is told to say each term as given, so a distilled script
-//   made after a change already reads "sequel" for SQL.  A script stored
-//   before the change is reused as it was, with its clips.
+//   reads "sequel" for SQL.  The distiller spells other acronyms out letter
+//   by letter ("G I F"), which no later pass can match, so each stored
+//   script records the list it was made with (pronunciationsFingerprint).
+//   A script made with another list is distilled again when it is next
+//   played, unless a clip was already made from it: a reply that has been
+//   voiced keeps its sound, and is never billed again for a list edit
+//   (server/tts/distill.ts).
 // - applyPronunciations() runs on every utterance on its way to a voice
 //   engine (server/tts/index.ts speak) and on the utterances an on-device
-//   Personal Voice is handed (server/tts/message-audio.ts).  It never touches
-//   the stored script, so a list edit never invalidates or re-bills a clip:
-//   clips already made keep the sound they were made with, and new
-//   synthesis uses the list.
+//   Personal Voice is handed (server/tts/message-audio.ts), which catches
+//   terms the script kept as written (the reply as written, the
+//   deterministic fallback).  It never touches the stored script.
 // - Karaoke treats each pair as the same word (shared/karaoke-align.ts), so
 //   a spoken "oh auth" lights up "OAuth" on screen.
 //
 // Matching, the same everywhere:
-// - A term is one token (no spaces).  A term made only of letters, digits,
-//   marks and underscores matches without case ("json", "Json", "JSON"); a
-//   term with any other character ("C#", "%") matches exactly.
+// - A term is one token (no spaces).  A term with no capital letters
+//   matches in any case ("cron", "Cron", "CRON").  A term with a capital
+//   matches only as written or in all capitals ("SaaS", "SAAS"), so an
+//   acronym that is also a word ("IT", "US", "AM", "A") never rewrites the
+//   word ("it", "us", "am", "a").
 // - Whole terms only: a letter or digit at the term's edge may not touch
-//   another one, so "JSON" never matches inside "JSONL" or "parseJSON".
+//   another one, so "JSON" never matches inside "JSONL" or "parseJSON".  The
+//   one exception is a version number after a term ending in a letter:
+//   "OAuth2" is "oh auth 2", "JSON5" is "Jason 5".
 // - Never inside a URL, a path, an email address, a file name or a dotted
-//   name ("config.json", "src/sql/x.ts", "example.com"), and never inside a
-//   MiniMax pause tag (`<#0.3#>`).
+//   name ("config.json", "src/sql/x.ts", "~/cron", "example.com"), and never
+//   inside a MiniMax pause tag (`<#0.3#>`).  A single slash between two
+//   words with a capital among them is prose, not a path: "JSON/YAML" and
+//   "SQL/NoSQL" are respelled, and "src/cron" is not.
 // - One left-to-right scan, longest term first, so a replacement is never
 //   matched again.  A "say" that contains a term is refused when the list is
 //   saved, so applying the list twice is the same as applying it once.
@@ -65,16 +75,40 @@ export function effectivePronunciations(saved: readonly Pronunciation[] | null |
   return Array.isArray(saved) ? saved : DEFAULT_PRONUNCIATIONS;
 }
 
+/**
+ * A short, stable name for `list`, stored with each distilled script
+ * (`voiceTextPronunciations`) so a script made with another list is known.
+ * Order does not matter: matching is longest term first, and duplicate
+ * terms are refused, so two orderings of one list say the same thing.  The
+ * empty list is "", which is also what a script from before the list has.
+ */
+export function pronunciationsFingerprint(list: readonly Pronunciation[]): string {
+  if (!list.length) return "";
+  const canonical = JSON.stringify(
+    list.map((entry) => [entry.term, entry.say]).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+  );
+  // FNV-1a, 32 bits: a change detector, not a secret.
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < canonical.length; i += 1) {
+    hash ^= canonical.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `p1-${list.length}-${hash.toString(16).padStart(8, "0")}`;
+}
+
 const WORD_CHAR = /[\p{L}\p{M}\p{N}_]/u;
-const WORD_TERM = /^[\p{L}\p{M}\p{N}_]+$/u;
+const LETTER = /\p{L}/u;
+const DIGIT = /\p{Nd}/u;
 const CONTROL = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
 /** Characters a "say" may not contain: markup a voice engine reads as tags
  * (MiniMax pause tags, sound and IPA parentheses). */
 const SAY_FORBIDDEN = /[<>()[\]{}]/;
 
-/** Whether `term` matches without case (letters, digits, marks, `_` only). */
-export function isWordTerm(term: string): boolean {
-  return WORD_TERM.test(term);
+/** Whether `term` matches in any case: it has no capital letters ("cron",
+ * "sudo").  A term with a capital matches only as written or in all
+ * capitals, so "IT" never rewrites "it". */
+export function matchesAnyCase(term: string): boolean {
+  return term === term.toLowerCase();
 }
 
 /** The code point ending just before UTF-16 index `i`, or "" at the start. */
@@ -97,9 +131,30 @@ function charAt(text: string, i: number): string {
 
 const isWordChar = (ch: string): boolean => ch !== "" && WORD_CHAR.test(ch);
 
-/** A whitespace-delimited chunk that is a URL, path, email address, file
- * name or dotted name once the matched term is set aside. */
-const PROTECTED_CHUNK = /:\/\/|[/\\@]|[\p{L}\p{N}_]\.[\p{L}\p{N}_]/u;
+/** A URL, a Windows path, an email address, a file name or a dotted name. */
+const URL_OR_DOTTED = /:\/\/|[\\@]|[\p{L}\p{N}_]\.[\p{L}\p{N}_]/u;
+/** Punctuation around a chunk that says nothing about whether it is a path:
+ * quotes, brackets, emphasis, and a sentence's closing mark. */
+const CHUNK_EDGE = /^[^\p{L}\p{N}_/.~]+|[^\p{L}\p{N}_/]+$/gu;
+
+/**
+ * Whether a whitespace-delimited chunk is a URL, path, email address, file
+ * name or dotted name.  `probe` is the chunk with the matched term set aside
+ * as "w"; `chunk` is the chunk as written.  A single slash between two words
+ * with a capital among them ("JSON/YAML", "SQL/NoSQL", "GUI/CLI") is prose.
+ * A chunk that starts like a path ("/", "./", "../", "~/"), ends with a
+ * slash, has two or more slashes, or is all lowercase ("src/cron") is a
+ * path.
+ */
+function protectedChunk(probe: string, chunk: string): boolean {
+  if (URL_OR_DOTTED.test(probe)) return true;
+  const core = probe.replace(CHUNK_EDGE, "");
+  const slashes = core.split("/").length - 1;
+  if (slashes === 0) return false;
+  if (slashes > 1) return true;
+  if (/^(?:\.{0,2}\/|~\/)/.test(core) || core.endsWith("/")) return true;
+  return chunk === chunk.toLowerCase();
+}
 const PAUSE_TAG = /<#[0-9]+(?:\.[0-9]+)?#>/g;
 
 /** One row's shape on the wire, before the rules run.  Callers parse with
@@ -125,9 +180,14 @@ interface Prepared {
   entry: Pronunciation;
   term: string;
   lower: string;
-  word: boolean;
+  /** The term in all capitals, matched besides the term as written. */
+  upper: string;
+  /** No capital letters: matched in any case. */
+  anyCase: boolean;
   startsWord: boolean;
   endsWord: boolean;
+  /** Ends in a letter, so a version number may follow ("OAuth2"). */
+  endsLetter: boolean;
 }
 
 function prepare(list: readonly Pronunciation[]): Map<string, Prepared[]> {
@@ -135,13 +195,16 @@ function prepare(list: readonly Pronunciation[]): Map<string, Prepared[]> {
   for (const entry of list) {
     const term = entry?.term ?? "";
     if (!term || !entry.say) continue;
+    const last = charBefore(term, term.length);
     prepared.push({
       entry,
       term,
       lower: term.toLowerCase(),
-      word: isWordTerm(term),
+      upper: term.toUpperCase(),
+      anyCase: matchesAnyCase(term),
       startsWord: isWordChar(charAt(term, 0)),
-      endsWord: isWordChar(charBefore(term, term.length)),
+      endsWord: isWordChar(last),
+      endsLetter: LETTER.test(last),
     });
   }
   // Longest first; a stable sort keeps list order between equal lengths.
@@ -194,20 +257,22 @@ function scan(text: string, byFirst: Map<string, Prepared[]>): PronunciationMatc
         const end = i + p.term.length;
         if (end > text.length) continue;
         const slice = text.slice(i, end);
-        if (p.word ? slice.toLowerCase() !== p.lower : slice !== p.term) continue;
+        if (p.anyCase ? slice.toLowerCase() !== p.lower : slice !== p.term && slice !== p.upper) continue;
         if (tag < tags.length && tags[tag][0] < end) continue;
         const before = charBefore(text, i);
         const after = charAt(text, end);
         if (p.startsWord && isWordChar(before)) continue;
-        if (p.endsWord && isWordChar(after)) continue;
+        const version = p.endsLetter && DIGIT.test(after) && versionFollows(text, end);
+        if (p.endsWord && isWordChar(after) && !version) continue;
         const [c, d] = chunkAround(plain, i, end);
         const probe = `${plain.slice(c, i)}w${plain.slice(end, d)}`;
-        if (PROTECTED_CHUNK.test(probe)) continue;
-        // A symbol term touching a word ("50%", "C#5") gets its own spaces,
-        // so the respelling never runs into the word beside it.
+        if (protectedChunk(probe, plain.slice(c, d))) continue;
+        // A symbol term touching a word ("50%", "C#5"), or a term with a
+        // version number after it ("OAuth2"), gets its own spaces, so the
+        // respelling never runs into the word beside it.
         const say = p.entry.say;
         const lead = !p.startsWord && isWordChar(before) && isWordChar(charAt(say, 0)) ? " " : "";
-        const trail = !p.endsWord && isWordChar(after) && isWordChar(charBefore(say, say.length)) ? " " : "";
+        const trail = (version || !p.endsWord) && isWordChar(after) && isWordChar(charBefore(say, say.length)) ? " " : "";
         matched = { start: i, end, replacement: `${lead}${say}${trail}`, entry: p.entry };
         break;
       }
@@ -220,6 +285,14 @@ function scan(text: string, byFirst: Map<string, Prepared[]>): PronunciationMatc
     }
   }
   return out;
+}
+
+/** Whether the digits at `at` are a version number that ends the word:
+ * "OAuth2" and "SQL2016" yes, "OAuth2Client" and "JSON5x" no. */
+function versionFollows(text: string, at: number): boolean {
+  let j = at;
+  while (j < text.length && DIGIT.test(charAt(text, j))) j += charAt(text, j).length;
+  return !isWordChar(charAt(text, j));
 }
 
 /** `text` with every term in `list` replaced by how to say it. */

@@ -31,7 +31,7 @@ import { deterministicSpokenText } from "./speech-summary.ts";
 import { toUtterances } from "./speech-text.ts";
 import { karaokeScriptFromWire } from "../../shared/spoken-script.ts";
 import { writtenReply } from "../../shared/voice-summary.ts";
-import { DEFAULT_PRONUNCIATIONS, type Pronunciation } from "../../shared/pronunciations.ts";
+import { DEFAULT_PRONUNCIATIONS, pronunciationsFingerprint, type Pronunciation } from "../../shared/pronunciations.ts";
 
 class NoVoice extends Error {}
 
@@ -1118,6 +1118,46 @@ describe("the pronunciation list (shared/pronunciations.ts)", () => {
     expect(result.body.script).toBe("summary");
     // The stored script is the distiller's, as it was written.
     expect(fixture.row.voiceText).toBeUndefined();
+  });
+
+  it("distills a stored script again when it was made with another list and nothing was voiced from it", async () => {
+    // The distiller spells acronyms out ("G I F"), so no later pass can
+    // reach a term added after the script was stored.
+    const fixture = setup({ text: REPLY, summary: () => "Run the sequel migration, then check kron.", pronunciations: DEFAULT_PRONUNCIATIONS });
+    Object.assign(fixture.row, { voiceText: "Run the S Q L migration, then check cron.", voiceTextKind: "summary" });
+    const result = await post(fixture, { voice: "vA", voiceSummaryMode: "always" }, { device: "mac", progressive: true });
+    expect(fixture.summarized).toHaveLength(1);
+    expect(result.body.voiceText).toBe("Run the sequel migration, then check kron.");
+  });
+
+  it("reuses a stored script made with the list in force, or from before the list when the list is empty", async () => {
+    const current = setup({ text: REPLY, pronunciations: DEFAULT_PRONUNCIATIONS });
+    Object.assign(current.row, {
+      voiceText: "Run the sequel migration.",
+      voiceTextKind: "summary",
+      voiceTextPronunciations: pronunciationsFingerprint(DEFAULT_PRONUNCIATIONS),
+    });
+    const a = await post(current, { voice: "vA", voiceSummaryMode: "always" }, { device: "mac", progressive: true });
+    expect(current.summarized).toEqual([]);
+    expect(a.body.voiceText).toBe("Run the sequel migration.");
+
+    const legacy = setup({ text: REPLY, pronunciations: [] });
+    Object.assign(legacy.row, { voiceText: "Run the S Q L migration.", voiceTextKind: "summary" });
+    await post(legacy, { voice: "vA", voiceSummaryMode: "always" }, { device: "mac", progressive: true });
+    expect(legacy.summarized).toEqual([]);
+  });
+
+  it("keeps a stored script made with another list once any voice has a clip of it", async () => {
+    for (const clips of [
+      { audio: [{ path: "/api/attachments/old-1.mp3", mime: "audio/mpeg" }] },
+      { audioByVoice: { vB: [{ path: "/api/attachments/old-2.mp3", mime: "audio/mpeg" }] } },
+    ]) {
+      const fixture = setup({ text: REPLY, pronunciations: DEFAULT_PRONUNCIATIONS });
+      Object.assign(fixture.row, { voiceText: "Run the S Q L migration.", voiceTextKind: "summary", ...clips });
+      const result = await post(fixture, { voice: "vA", voiceSummaryMode: "always" }, { device: "mac", progressive: true });
+      expect(fixture.summarized).toEqual([]);
+      expect(result.body.voiceText).toBe("Run the S Q L migration.");
+    }
   });
 
   it("never puts the list in a hosted script or its cache, so a list edit re-bills nothing", async () => {

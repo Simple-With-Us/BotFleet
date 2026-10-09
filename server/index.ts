@@ -411,13 +411,13 @@ import * as tts from "./tts/index.ts";
 import { speechUsageTotals } from "./tts/usage.ts";
 import {
   VOICE_SUMMARY_PROMPT,
-  spokenReply,
   resolveVoiceSummaryMode,
 } from "../shared/voice-summary.ts";
 import { isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
 import { checkPronunciations, PronunciationDraftListSchema } from "../shared/pronunciations.ts";
-import { deterministicSpokenText, summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
-import { isWrittenScript, MessageAudio, type SummarizedSpeech } from "./tts/message-audio.ts";
+import { summarizeForVoiceDetailed } from "./tts/speech-summary.ts";
+import { distillReply } from "./tts/distill.ts";
+import { MessageAudio, type SummarizedSpeech } from "./tts/message-audio.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { fitListToBudget, serializedPreview } from "./serialized-preview.ts";
 import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh, ROOM_REPLY_PREFIX } from "./turn-context.ts";
@@ -10826,51 +10826,21 @@ function voiceSummaryFor(
   let job = voiceSummaryJobs.get(key);
   if (!job) {
     job = (async () => {
+      // Reuse, distill again, or distill for the first time: the rules and
+      // why are in server/tts/distill.ts.
       const row = store.messagesFor(threadId).find((candidate) => candidate.id === messageId);
-      // A distilled script stored before or after karaoke (no voiceTextKind,
-      // or "summary") is reused as it is: no second paid rewrite, and its
-      // clips stay valid.  A written-mode script (voiceTextKind "written",
-      // the "off" mode, or any reply played while #952 made that the
-      // default) is the reply as written, so it is distilled now.
-      if (row?.voiceText && row.voiceTextKind !== "written") return { text: row.voiceText };
-      try {
-        const scrubbedInput = redactSecretsInText(text);
-        const summary = await summarizeForVoiceDetailed(scrubbedInput, {
+      return distillReply({
+        row,
+        text,
+        pronunciations: tts.pronunciations(currentCfg),
+        summarize: (input, pronunciations) => summarizeForVoiceDetailed(input, {
           key: currentCfg.deepseek?.key,
           baseUrl: currentCfg.deepseek?.url,
-          pronunciations: tts.pronunciations(currentCfg),
-        });
-        const safeSummary = summary.text ? redactSecretsInText(summary.text) : "";
-        const worthStoring = voiceSummaryWorthStoring(summary);
-        if (worthStoring && safeSummary && safeSummary !== text) {
-          if (safeSummary === row?.voiceText && isWrittenScript(text, safeSummary)) {
-            // The very script the stored written-mode clips speak (a short
-            // plain reply, or a stand-in, played while #952 was the default
-            // or while the distiller was down): keep the clips, and say the
-            // text is now settled as the distilled script.
-            store.patchMessage(threadId, messageId, { voiceTextKind: "summary" });
-          } else {
-            // Stored clips were made from another script (the written one,
-            // or a row's raw text), so they go with it: voiceText always
-            // names the script of the clips beside it (server/tts/
-            // message-audio.ts).
-            store.patchMessage(threadId, messageId, {
-              voiceText: safeSummary,
-              voiceTextKind: "summary",
-              audio: undefined,
-              audioVoice: undefined,
-              audioByVoice: undefined,
-            });
-          }
-        }
-        // A passing provider failure is spoken now but not kept, so the next
-        // play asks the distiller again.
-        return { text: safeSummary || deterministicSpokenText(spokenReply(text)), retry: !worthStoring };
-      } catch {
-        // The deterministic script, as the summarizer's own fallback is, so
-        // the karaoke highlight still gets its spans.
-        return { text: deterministicSpokenText(spokenReply(text)), retry: true };
-      }
+          pronunciations,
+        }),
+        redact: redactSecretsInText,
+        patch: (patch) => store.patchMessage(threadId, messageId, patch),
+      });
     })();
     voiceSummaryJobs.set(key, job);
     void job.finally(() => voiceSummaryJobs.delete(key)).catch(() => {});

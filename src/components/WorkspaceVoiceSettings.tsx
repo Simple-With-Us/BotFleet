@@ -49,7 +49,7 @@ export const DEFAULT_VOICE_HELP = "Every bot without a voice of its own speaks w
 export const NO_DEFAULT_VOICE_HELP =
   "No default voice is picked.  A bot without a voice of its own stays silent until you pick one here.";
 export const PRONUNCIATIONS_HELP =
-  "How the voice says terms it keeps getting wrong, for every bot.  A change applies to replies voiced after you save; clips already made keep their sound.";
+  "How the voice says terms it keeps getting wrong, for every bot.  A term in lowercase matches any case; one with capitals matches only as written or in all capitals.  A change applies to every reply not voiced yet, and a reply already voiced keeps its sound.";
 
 const inputClass =
   "w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none";

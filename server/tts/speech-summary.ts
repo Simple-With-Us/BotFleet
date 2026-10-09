@@ -88,11 +88,12 @@ OUTPUT: "Here are your options for the flight. <#0.3#> First, American Airlines 
 
 /**
  * The system prompt with the workspace pronunciation list appended, so a
- * distilled script made after the list changes already says each term the
- * way the owner asked ("sequel" for SQL).  Scripts stored before the change
- * are reused as they are, with their clips (server/index.ts voiceSummaryFor),
- * so the list reaches them only through the engine-side pass in
- * server/tts/index.ts speak.  Kept deliberately small; the prompt itself is
+ * distilled script says each term the way the owner asked ("sequel" for
+ * SQL).  The acronym rule above spells every other acronym out ("G I F"),
+ * which no later pass can match, so a stored script records the list it was
+ * made with and is distilled again under a new list until a clip is made
+ * from it (server/tts/distill.ts).  The matching rule here is the one in
+ * shared/pronunciations.ts.  Kept deliberately small; the prompt itself is
  * rewritten separately.
  */
 export function voiceSummarySystemPrompt(pronunciations: readonly Pronunciation[] = []): string {
@@ -102,7 +103,7 @@ export function voiceSummarySystemPrompt(pronunciations: readonly Pronunciation[
   const pairs = pronunciations.map((p) => `- ${JSON.stringify(p.term)} is said ${JSON.stringify(p.say)}`).join("\n");
   return `${DEEPSEEK_FLASH_TTS_PROMPT}
 <pronunciations>
-Always say these terms exactly as given.  Write the respelling in place of the term, wherever the term appears as a whole word in the spoken text.  This overrides the acronym rule above: do not spell these terms out letter by letter.
+Always say these terms exactly as given.  Write the respelling in place of the term, wherever the term appears as a whole word in the spoken text.  A term written with capital letters counts only when it is written with those capitals or in all capitals, so "IT" never changes the word "it".  A term in lowercase counts in any case.  This overrides the acronym rule above: do not spell these terms out letter by letter.
 ${pairs}
 </pronunciations>`;
 }

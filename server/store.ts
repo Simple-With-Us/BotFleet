@@ -147,6 +147,11 @@ export interface Message {
    * "summary" (the distiller path, the default).  Absent on rows from before
    * karaoke, whose voiceText is reused as a summary (shared/spoken-script.ts). */
   voiceTextKind?: "written" | "summary";
+  /** The pronunciation list a distilled voiceText was made with
+   * (shared/pronunciations.ts pronunciationsFingerprint); absent on rows from
+   * before the list.  A script made with another list is distilled again
+   * until a clip is made from it (server/tts/distill.ts). */
+  voiceTextPronunciations?: string;
   /** Original incoming microphone recording and recognizer output never change. */
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   /** Corrections are annotations, not edits to the audio or original transcript. */
