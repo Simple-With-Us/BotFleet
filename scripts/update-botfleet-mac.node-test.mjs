@@ -60,6 +60,7 @@ import {
   terminateVerified,
   validateBuiltBundle,
   waitForLaunchdBootout,
+  waitForStableApplication,
   waitForStartup,
 } from "./update-botfleet-mac.mjs";
 
@@ -2668,6 +2669,82 @@ test("the start-up wait is long by default and still overridable", async () => {
   assert.match(source.slice(verify, source.indexOf("startApplication:", verify)), /waitForStartup\(/);
   const restored = source.indexOf("Restored BotFleet runtime did not regain safe single ownership");
   assert.match(source.slice(restored - 900, restored), /waitForStartup\(/);
+});
+
+const OWN_APP_PID = [4242];
+
+test("an app that never produces a process times out with the timeout message, not a pid-stability one", async () => {
+  const clock = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => [],
+      attachmentError: async () => { throw new Error("nothing to attach to"); },
+      timeoutMs: 5 * 60_000,
+      now: clock.now,
+      wait: clock.wait,
+    }),
+    (error) => error.message === "Timeout waiting for application to stabilize",
+  );
+  assert.ok(clock.at() >= 5 * 60_000, "a slow launch is waited out for the whole window");
+});
+
+test("an app that starts late, settles to one process and attaches passes", async () => {
+  const clock = fakeClock();
+  const reports = [];
+  await waitForStableApplication({
+    samplePids: async () => (clock.at() >= 3 * 60_000 ? OWN_APP_PID : []),
+    attachmentError: async () => null,
+    timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+    report: (line) => reports.push(line),
+    now: clock.now,
+    wait: clock.wait,
+  });
+  assert.ok(clock.at() >= 3 * 60_000 && clock.at() < 4 * 60_000);
+  assert.deepEqual(reports, [
+    "Waiting for the app to start, 1 min so far",
+    "Waiting for the app to start, 2 min so far",
+    "Waiting for the app to start, 3 min so far",
+  ]);
+});
+
+test("an app that was running and vanished fails at once, and an unstable one reports its pids", async () => {
+  const gone = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => (gone.at() < 3_000 ? OWN_APP_PID : []),
+      attachmentError: async () => "not attached yet",
+      timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+      now: gone.now,
+      wait: gone.wait,
+    }),
+    (error) => error.message === "The updated application exited after it had started",
+  );
+  assert.ok(gone.at() < 10_000, `failed after ${gone.at()}ms`);
+
+  const unstable = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => [1, 2],
+      attachmentError: async () => null,
+      timeoutMs: 10_000,
+      now: unstable.now,
+      wait: unstable.wait,
+    }),
+    (error) => /did not remain running as one exact installed-bundle process/.test(error.message),
+  );
+
+  // Running and stable but never attaching ends with the attachment reason.
+  const detached = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => OWN_APP_PID,
+      attachmentError: async () => "Updated application did not attach to the authenticated single data owner",
+      timeoutMs: 10_000,
+      now: detached.now,
+      wait: detached.wait,
+    }),
+    (error) => error.message === "Updated application did not attach to the authenticated single data owner",
+  );
 });
 
 test("a slow but successful boot passes, and says how long it has been waiting", async () => {
