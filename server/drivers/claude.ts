@@ -1167,8 +1167,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // comms, jobs and Zulip, each guarded by the endpoint it calls (comms
       // depth, peer approval), and the owner ruled that a full-auto bot's own
       // `job_start` never becomes a card, which routing it through the broker
-      // would break.  The step watch reviews those calls as they start, a
-      // message to another bot (`ask_bot`) included.
+      // would break.  The step watch reviews the ones that change something
+      // as they start (server/review-watch.ts `isWatchedHarnessTool`): a
+      // message to another bot, a new bot, a credential request, a routine, a
+      // Zulip post or reply, a job start or kill.  A `job_start` is watched,
+      // not carded: a refusal stops the turn, it never becomes a card.  The
+      // server's read tools (`list_bots`, `job_output`) are not reviewed.
       const heldForReview = turn.holdForReview === true && permissionMode !== "bypassPermissions";
       if (turn.integrations?.composio) {
         mcpServers.composio = { ...turn.integrations.composio };

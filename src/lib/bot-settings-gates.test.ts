@@ -267,6 +267,11 @@ describe("autoReviewGate: auto-review on every engine", () => {
     // it no longer claims every action is reviewed before it runs
     expect(gate.summary).toContain("Steps it still takes without asking");
     expect(gate.summary).toContain("The stop is not instant");
+    // the held summary makes the same promise as the can-only-watch one: a
+    // stop undoes nothing that already started
+    expect(gate.summary).toContain("nothing already started is undone");
+    // and says an always-allow is reviewed there too
+    expect(gate.summary).toContain("including anything you set to always allow");
     expect(gate.hints.enforce).toBe("Answer only reviews that return a strict approval.");
   });
 
