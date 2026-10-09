@@ -23,9 +23,19 @@ import {
   type RoomTerminology,
 } from "../shared/terminology.ts";
 import { DEFAULT_VPS_MODE, migrateAllowedComputersToProviders } from "../shared/local-auto-consent.ts";
+import { checkPronunciations, sanitizeStoredPronunciations, type Pronunciation } from "../shared/pronunciations.ts";
 
 const optionalText = z.string().optional();
 const externalCredentialStorage = z.literal("external").optional();
+/** The workspace pronunciation list (shared/pronunciations.ts), checked and
+ * canonicalized by the one validator every client also runs.  Absent means
+ * the seeded defaults; a saved list, even an empty one, is used as is. */
+const pronunciationListSchema = z.array(z.unknown()).transform((value, ctx): Pronunciation[] => {
+  const checked = checkPronunciations(value);
+  if (checked.ok) return checked.list;
+  ctx.addIssue({ code: "custom", message: checked.error });
+  return z.NEVER;
+});
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
@@ -276,10 +286,11 @@ const appConfigSchema = z.object({
    * engine does not need the key to function. "for my user" — workspace
    * scope, not per-bot. */
   deepseek: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
-  /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "minimax" (default; needs a key) or "system" (the Mac's
-   * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
+  /** Voice credentials, the workspace default voice id (what every bot
+   * without a voice of its own speaks with), and the pronunciation list.
+   * `provider` picks the engine: "minimax" (default; needs a key) or
+   * "system" (the Mac's built-in voices, no key). */
+  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), pronunciations: pronunciationListSchema.optional(), credentialStorage: externalCredentialStorage }).optional(),
   callStt: z.object({ provider: z.enum(["apple", "assemblyai"]).nullable().optional(), keyterms: z.array(z.string().trim().min(1)).max(100).optional() }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
@@ -475,7 +486,10 @@ export interface AppConfig {
   vps?: { sshAlias?: string; memoryGib?: number; cpus?: number };
   opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
   deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
-  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
+  /** `voice` is the workspace default voice; `pronunciations` is the
+   *  workspace list of terms and how to say them (shared/pronunciations.ts),
+   *  absent until first saved, which means the seeded defaults. */
+  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; pronunciations?: Pronunciation[]; credentialStorage?: "external" };
   /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
    *  falls back to platform defaults when `provider` is absent (Apple on
    *  macOS without a cloud key, AssemblyAI on every other platform, and
@@ -661,6 +675,20 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
       value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
       value.tts.provider === "elevenlabs") {
     value = { ...value, tts: { ...value.tts, provider: "minimax" } };
+  }
+  // A hand-edited pronunciation list must not cost every other setting: the
+  // strict schema below would reject the whole file over one bad entry, and
+  // loadConfig reads a rejection as a first run.  Keep the entries that pass
+  // on their own; a value that is not a list at all reads as never saved.
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
+      Object.hasOwn(value.tts, "pronunciations")) {
+    const { pronunciations: stored, ...ttsRest } = value.tts;
+    const kept = sanitizeStoredPronunciations(stored);
+    value = {
+      ...value,
+      tts: kept === undefined ? ttsRest : { ...ttsRest, pronunciations: kept.map(({ term, say }) => ({ term, say })) },
+    };
   }
   const parsed = appConfigSchema.safeParse(value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
