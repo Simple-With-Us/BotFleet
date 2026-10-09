@@ -2102,6 +2102,21 @@ function pairedProfileRefusal(
     : { status: 400, error: ackError };
 }
 
+/** The first settings a new channel may carry beside its roster, parsed at the
+ * trust boundary.  Shapes and lengths only: that the responder names a member,
+ * and that the folder exists and may be chosen from a phone, need the roster and
+ * the disk, so `checkedGroupResponder` and `validateBotCwd` still answer those. */
+const firstRoomSettingsSchema = z.object({
+  bulletin: z
+    .string({ error: "bulletin must be a string" })
+    .max(12_000, { error: "bulletin must be at most 12000 characters" })
+    .optional(),
+  defaultResponder: z
+    .object({ kind: z.enum(["everyone", "mentions", "member"]), botId: z.string().optional() })
+    .optional(),
+  cwd: z.union([z.string(), z.null()], { error: "cwd must be a string" }).optional(),
+});
+
 function checkedGroupResponder(value: unknown, memberIds: string[]): GroupDefaultResponder | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const responder = value as { kind?: unknown; botId?: unknown };
@@ -11914,20 +11929,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         cwd?: string;
       }
       const first: FirstSettings = {};
-      if (body.bulletin !== undefined) {
-        if (typeof body.bulletin !== "string") return json(res, 400, { error: "bulletin must be a string" });
-        if (body.bulletin.length > 12_000) {
-          return json(res, 400, { error: "bulletin must be at most 12000 characters" });
-        }
-        first.bulletin = body.bulletin;
+      const parsedFirst = firstRoomSettingsSchema.safeParse(body);
+      if (!parsedFirst.success) {
+        const issue = parsedFirst.error.issues[0];
+        return json(res, 400, {
+          error: issue?.path[0] === "defaultResponder" ? "invalid default responder" : (issue?.message ?? "invalid channel settings"),
+        });
       }
-      if (body.defaultResponder !== undefined) {
-        const responder = checkedGroupResponder(body.defaultResponder, memberIds);
+      if (parsedFirst.data.bulletin !== undefined) first.bulletin = parsedFirst.data.bulletin;
+      if (parsedFirst.data.defaultResponder !== undefined) {
+        const responder = checkedGroupResponder(parsedFirst.data.defaultResponder, memberIds);
         if (!responder) return json(res, 400, { error: "invalid default responder" });
         first.defaultResponder = responder;
       }
-      if (body.cwd !== undefined && body.cwd !== null && body.cwd !== "") {
-        const checked = validateBotCwd(body.cwd);
+      if (parsedFirst.data.cwd !== undefined && parsedFirst.data.cwd !== null && parsedFirst.data.cwd !== "") {
+        const checked = validateBotCwd(parsedFirst.data.cwd);
         if (!checked.ok) return json(res, 400, { error: checked.error });
         // Same confinement as a phone-set room folder (the room PATCH below).
         if (checked.cwd && req.headers["x-botfleet-companion"] === "1") {
