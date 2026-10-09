@@ -356,7 +356,7 @@ const mcpConfigFileSchema = z.looseObject({
 /** The computer MCP server for this turn, or null when the turn has none.
  * Cloud boxes go through BotFleet's REST-to-MCP adapter (the same spec
  * claude.ts and codex.ts build); Local VM and VPS connections arrive as a
- * ready-made Cua Driver stdio command and pass through unchanged. */
+ * ready-made CUA Driver stdio command and pass through unchanged. */
 export function antigravityMcpServers(
   integrations: SendTurnInput["integrations"],
 ): Record<string, { command: string; args: string[]; env: Record<string, string> }> {
@@ -767,9 +767,18 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // bot-level autoApprove flag flip fullAuto for sandbox/cloud/VM turns
       // would silently promote an engine-level security gate the owner never
       // switched on.  Non-host turns keep exactly what config.fullAuto says.
+      //
+      // Bypass Permissions is the other per-bot switch, and the one the
+      // person turned on precisely to have nothing ask.  Print mode has no
+      // broker to carry it, so it is this driver's to apply, to the turns
+      // where it is safe to: never one that controls This Mac, the same line
+      // the broker draws (`autoVerdict` never answers a `local-computer`
+      // request in bypass), and, like the broker's bypass, even an unattended
+      // turn.  A host turn keeps exactly the rule above.
+      const isBypassed = turn.bypassPermissions === true && !controlsHost;
       const turnConfig: AntigravityConfig = {
         ...config,
-        fullAuto: controlsHost ? isAutoApproved : config.fullAuto,
+        fullAuto: controlsHost ? isAutoApproved : config.fullAuto || isBypassed,
       };
 
       // Default cwd to a per-thread workspace under DATA_DIR — deliberately

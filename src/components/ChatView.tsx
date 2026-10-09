@@ -39,6 +39,7 @@ import {
   type Message,
 } from "@/state/store";
 import { BotAvatar, BotMascot } from "./Avatar";
+import { BotOffBadge } from "./BotOffBadge";
 import { usePageVisible } from "@/lib/page-visible";
 import { ProviderMark } from "./ProviderIcons";
 import { TurnPresence } from "./TurnPresence";
@@ -49,8 +50,8 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { modelChip } from "@/lib/model-chip";
 import { ChatMarkdown } from "./ChatMarkdown";
-import { splitVoiceSummary, stripVoiceSummaryTags } from "../../shared/voice-summary";
-import { useSpeech } from "@/lib/tts/useSpeech";
+import { splitVoiceSummary, stripVoiceSummaryTags, writtenReply } from "../../shared/voice-summary";
+import { useMessageKaraoke } from "@/lib/tts/useMessageKaraoke";
 import { MentionText } from "./MentionText";
 import { OptionCard, shouldHideOnboardingCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
@@ -259,73 +260,6 @@ function BubbleEditor({
   );
 }
 
-function SpokenSummaryCard({
-  messageId,
-  voiceText,
-  legacyVoice,
-}: {
-  messageId: string;
-  voiceText?: string;
-  legacyVoice?: string;
-}) {
-  const speech = useSpeech();
-  const isMine = speech.messageId === messageId && speech.status === "speaking";
-  const isPreparing = speech.messageId === messageId && speech.status === "preparing";
-  const spokenText = (isMine && speech.caption) || voiceText || legacyVoice || "";
-
-  if (!spokenText && !isMine && !isPreparing) return null;
-
-  const words = spokenText.trim().split(/\s+/).filter(Boolean);
-  const activeWordIdx = isMine ? speech.wordIndex ?? -1 : -1;
-
-  return (
-    <details
-      open={isMine || isPreparing ? true : undefined}
-      className="mt-2 border-t border-hairline/40 pt-2"
-      onClick={(event) => event.stopPropagation()}
-    >
-      <summary className="cursor-pointer text-[12px] font-medium text-ink-secondary hover:text-ink flex items-center gap-1.5 select-none">
-        <span>Spoken Summary</span>
-        {isMine && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-accent font-normal animate-pulse">
-            • Reading aloud
-          </span>
-        )}
-        {isPreparing && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-ink-secondary/70 font-normal">
-            • Preparing audio…
-          </span>
-        )}
-      </summary>
-      <div className="mt-2 text-[13px] leading-relaxed text-ink-secondary">
-        {isMine && words.length > 0 ? (
-          <p className="select-text">
-            {words.map((word, idx) => {
-              const isCurrent = idx === activeWordIdx;
-              const isPast = activeWordIdx >= 0 && idx < activeWordIdx;
-              return (
-                <span
-                  key={idx}
-                  className={cn(
-                    "transition-colors duration-75",
-                    isCurrent && "font-bold text-accent px-0.5 rounded bg-accent/15",
-                    isPast && "text-ink font-medium",
-                    !isCurrent && !isPast && "text-ink-secondary/70",
-                  )}
-                >
-                  {word}{" "}
-                </span>
-              );
-            })}
-          </p>
-        ) : (
-          <ChatMarkdown text={spokenText} />
-        )}
-      </div>
-    </details>
-  );
-}
-
 function Bubble({
   bot,
   message,
@@ -367,6 +301,15 @@ function Bubble({
   const [recordingPlaying, setRecordingPlaying] = useState(false);
   const recordingAudio = useRef<HTMLAudioElement | null>(null);
   useEffect(() => () => { recordingAudio.current?.pause(); recordingAudio.current = null; }, []);
+  // Karaoke on the reply itself: while this reply is read aloud, its words
+  // follow the voice (src/lib/karaoke-session.ts).  The spans index the
+  // written text, so that is the source handed over.
+  const spokenRef = useRef<HTMLDivElement>(null);
+  const speakable = message.role === "bot" && message.kind === "text";
+  const writtenSource = useMemo(() => (speakable ? writtenReply(message.text ?? "") : ""), [speakable, message.text]);
+  // The workspace pronunciation list, so a respelled term ("sequel") lights
+  // up the term on screen ("SQL").
+  useMessageKaraoke(spokenRef, message.id, writtenSource, speakable, state.config?.tts?.pronunciations);
   const playRecording = () => {
     if (recordingAudio.current) {
       recordingAudio.current.pause();
@@ -691,14 +634,9 @@ function Bubble({
               {toImessageBody !== null && (
                 <div className="mb-1 text-[11px] font-medium text-accent">To iMessage</div>
               )}
-              <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />
-              {message.role === "bot" && (
-                <SpokenSummaryCard
-                  messageId={message.id}
-                  voiceText={message.voiceText}
-                  legacyVoice={voiceSections?.voice}
-                />
-              )}
+              <div ref={spokenRef}>
+                <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />
+              </div>
             </MessageBoundary>
           )}
         </div>
@@ -1604,6 +1542,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
               <span className="@max-2xl/chathead:hidden">Chief of Staff</span>
             </span>
           )}
+          {bot.off === true && <BotOffBadge />}
           {bot.busy && <Loader2 size={14} className="shrink-0 animate-spin text-ink-secondary" />}
         </div>
         <div style={noDragStyle} className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 md:gap-2">

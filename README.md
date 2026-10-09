@@ -11,7 +11,7 @@
 <br>
 <br>
 
-<a href="https://botfleet.app"><b>botfleet.app</b></a> &nbsp;·&nbsp; <a href="https://testflight.apple.com/join/ER6sPNMh">iPhone companion on TestFlight (public beta)</a> &nbsp;·&nbsp; <a href="https://simplewithus.com/">From Simple With Us</a> &nbsp;·&nbsp; <a href="https://github.com/jaywedgeworth22/BotFleet">source</a> &nbsp;·&nbsp; <a href="https://github.com/milind-soni/OpenMausBot"><b>upstream OpenMausBot</b></a>
+<a href="https://botfleet.app"><b>botfleet.app</b></a> &nbsp;·&nbsp; <a href="https://testflight.apple.com/join/ER6sPNMh">iPhone companion on TestFlight (public beta)</a> &nbsp;·&nbsp; <a href="https://simplewithus.com/">From Simple With Us</a> &nbsp;·&nbsp; <a href="https://github.com/Simple-With-Us/BotFleet">source</a> &nbsp;·&nbsp; <a href="https://github.com/milind-soni/OpenMausBot"><b>upstream OpenMausBot</b></a>
 
 </div>
 
@@ -110,13 +110,13 @@ See the [OpenMausBot repository](https://github.com/milind-soni/OpenMausBot) for
 
 ## Quick start
 
-**Released builds ([latest](https://github.com/jaywedgeworth22/BotFleet/releases/latest)):** the harness server is embedded, so no separate server setup is required.  This page always points at the latest packaged assets rather than a frozen tag, so it tracks whatever is actually published.
+**Released builds ([latest](https://github.com/Simple-With-Us/BotFleet/releases/latest)):** the harness server is embedded, so no separate server setup is required.  Desktop numbering matches iOS (`1.0.x`).  This page always points at the latest packaged assets rather than a frozen tag, so it tracks whatever is actually published.
 
 | | Download | Install |
 |---|---|---|
-| **macOS** (Apple silicon) | [BotFleet.dmg](https://github.com/jaywedgeworth22/BotFleet/releases/latest/download/BotFleet.dmg) | Drag it to Applications, open it.  Signed with the BotFleet Developer ID. |
-| **macOS** (Intel) | [BotFleet-intel.dmg](https://github.com/jaywedgeworth22/BotFleet/releases/latest/download/BotFleet-intel.dmg) | Same app, built for Intel Macs. |
-| **Windows** (x64) | Not published yet | The Windows installer is built by the release workflow but no Windows build has shipped.  Watch the [releases page](https://github.com/jaywedgeworth22/BotFleet/releases) or build from source below. |
+| **macOS** (Apple silicon) | [BotFleet.dmg](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet.dmg) | Drag it to Applications, open it.  Signed with the BotFleet Developer ID. |
+| **macOS** (Intel) | [BotFleet-intel.dmg](https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet-intel.dmg) | Same app, built for Intel Macs. |
+| **Windows** (x64) | Not published yet | The Windows installer is built by the release workflow but no Windows build has shipped.  Watch the [releases page](https://github.com/Simple-With-Us/BotFleet/releases) or build from source below. |
 | **Ubuntu 24.04** (x64) | Not published yet | Ubuntu packages are built by the release workflow but no Ubuntu build has shipped.  See the [Ubuntu Desktop guide](docs/linux-desktop.md) to build one from source. |
 
 In-app **Check for updates** reads `latest-mac.yml` from the GitHub release.
@@ -135,7 +135,7 @@ See the [Ubuntu Desktop guide](docs/linux-desktop.md) for installation, capabili
 **From source:**
 
 ```sh
-git clone https://github.com/jaywedgeworth22/BotFleet && cd BotFleet
+git clone https://github.com/Simple-With-Us/BotFleet && cd BotFleet
 pnpm install
 
 pnpm dev:server    # harness server → 127.0.0.1:8799
@@ -165,7 +165,7 @@ pnpm package:linux    # Ubuntu x64: .deb + AppImage + verified CUA runtime
 | Bot control of this computer | Supported | Beta, explicit opt-in | Disabled: Wayland safety gate |
 | Native on-device dictation | Supported | Planned | Planned |
 
-The Linux preview is user-initiated and never enables local bot control or Auto routing.  On Xorg, the reviewed Cua Driver 0.19.3 runtime starts only after explicit opt-in and without its full-screen cursor overlay.  On Wayland the app never starts it and clears legacy opt-ins while that real-seat safety gate remains unresolved.  Chat, preview, Cloud, and Local VM remain available on both sessions.  See the [Ubuntu Desktop guide](docs/linux-desktop.md) and tracking issues [#29](https://github.com/jaywedgeworth22/BotFleet/issues/29) and [#113](https://github.com/jaywedgeworth22/BotFleet/issues/113).
+The Linux preview is user-initiated and never enables local bot control or Auto routing.  On Xorg, the reviewed Cua Driver 0.19.3 runtime starts only after explicit opt-in and without its full-screen cursor overlay.  On Wayland the app never starts it and clears legacy opt-ins while that real-seat safety gate remains unresolved.  Chat, preview, Cloud, and Local VM remain available on both sessions.  See the [Ubuntu Desktop guide](docs/linux-desktop.md) and tracking issues [#29](https://github.com/Simple-With-Us/BotFleet/issues/29) and [#113](https://github.com/Simple-With-Us/BotFleet/issues/113).
 
 The Linux packager downloads only the tag-pinned upstream archive during the build, verifies its size, SHA-256, complete member allowlist, and inner executable hashes, then packages only the CLI and cursor-theme sidecar.  The installed app never downloads or self-updates native automation code.  Cua's MIT notice, Inter's SIL OFL, a generated third-party license report, and a CycloneDX inventory ship with the runtime.  See [`third_party/cua-driver/`](third_party/cua-driver/) for the reviewed provenance record.
 

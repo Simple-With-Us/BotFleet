@@ -3,11 +3,12 @@
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
 import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 
-import { updateConfigFile } from "../electron/config-file-lock.mjs";
+import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
+import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
 import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
@@ -23,9 +24,25 @@ import {
   type RoomTerminology,
 } from "../shared/terminology.ts";
 import { DEFAULT_VPS_MODE, migrateAllowedComputersToProviders } from "../shared/local-auto-consent.ts";
+import { fsFailureCode, jsonFailureReason, stripBom } from "./store-guard.ts";
+import {
+  checkPronunciations,
+  PronunciationDraftListSchema,
+  sanitizeStoredPronunciations,
+  type Pronunciation,
+} from "../shared/pronunciations.ts";
 
 const optionalText = z.string().optional();
 const externalCredentialStorage = z.literal("external").optional();
+/** The workspace pronunciation list (shared/pronunciations.ts), checked and
+ * canonicalized by the one validator every client also runs.  Absent means
+ * the seeded defaults; a saved list, even an empty one, is used as is. */
+const pronunciationListSchema = PronunciationDraftListSchema.transform((drafts, ctx): Pronunciation[] => {
+  const checked = checkPronunciations(drafts);
+  if (checked.ok) return checked.list;
+  ctx.addIssue({ code: "custom", message: checked.error });
+  return z.NEVER;
+});
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
@@ -223,6 +240,7 @@ const localVmConfigSchema = z.object({
     .max(MAX_LOCAL_VM_MAX_INSTANCES)
     .optional(),
   shareCliCredentials: z.boolean().optional(),
+  shareGpgPrivateKeys: z.boolean().optional(),
   allowHostTerminal: z.boolean().optional(),
   /** Optional ceilings for the Local VM container.  Absent means "request about
    * 2 CPUs and 3 GiB, then adapt to what the container runtime actually has,
@@ -240,6 +258,32 @@ const featureConfigSchema = z.object({
   /** Per-turn Git worktree isolation for bots working in a shared repository. */
   gitWorktreeLeases: z.boolean().optional(),
 });
+const zulipConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  dryRun: z.boolean().optional(),
+  realm: optionalText,
+  ownerUserId: z.number().int().positive().optional(),
+  ownerClients: z.array(z.string().trim().min(1)).max(20).optional(),
+  credentialDir: optionalText,
+  credentialSource: z.enum(["file", "infisical"]).optional(),
+  infisicalPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+  bots: z
+    .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
+    .optional(),
+  postChannels: z.array(z.string().trim().min(1)).max(50).optional(),
+  autoReply: z.enum(["final", "off"]).optional(),
+  staleMinutes: z.number().int().min(1).max(10_080).optional(),
+  budgets: z
+    .object({
+      dmsPerHour: z.number().int().min(0).max(1000).optional(),
+      peerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerWakesPerTopicPerHour: z.number().int().min(0).max(1000).optional(),
+      ownerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerChainLimit: z.number().int().min(0).max(1000).optional(),
+    })
+    .optional(),
+});
+
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -275,10 +319,11 @@ const appConfigSchema = z.object({
    * engine does not need the key to function. "for my user" — workspace
    * scope, not per-bot. */
   deepseek: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
-  /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "minimax" (default; needs a key) or "system" (the Mac's
-   * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
+  /** Voice credentials, the workspace default voice id (what every bot
+   * without a voice of its own speaks with), and the pronunciation list.
+   * `provider` picks the engine: "minimax" (default; needs a key) or
+   * "system" (the Mac's built-in voices, no key). */
+  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), pronunciations: pronunciationListSchema.optional(), credentialStorage: externalCredentialStorage }).optional(),
   callStt: z.object({ provider: z.enum(["apple", "assemblyai"]).nullable().optional(), keyterms: z.array(z.string().trim().min(1)).max(100).optional() }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
@@ -326,6 +371,12 @@ const appConfigSchema = z.object({
      *  without the operator's explicit consent. */
     allowVoiceByDefault: z.boolean().optional(),
   }).optional(),
+  /** The Zulip source (docs/zulip.md): which BotFleet bots hold a Zulip
+   *  identity, where their keys come from, and the wake and post rules.  No
+   *  key lives here — `credentialDir` names the folder of `<Role>-zuliprc`
+   *  files, and `credentialSource: "infisical"` reads the vault instead.  A malformed section reads as absent rather than failing the
+   *  whole stored config, so a typo turns Zulip off and nothing else. */
+  zulip: zulipConfigSchema.optional().catch(undefined),
   ingress: z.object({
     publicUrl: z
       .string()
@@ -403,6 +454,11 @@ const appConfigSchema = z.object({
       maxSwapPercent: z.number().min(1).max(100).optional(),
       minFreeDiskMb: z.number().min(0).optional(),
     }).optional(),
+    // How long a webhook may sit queued while the host is hot before the
+    // scheduler dispatches it anyway.  Absent means 20 minutes
+    // (DEFAULT_WEBHOOK_HOT_DEFER_MINUTES).  The vault knob of the same
+    // field overrides the file.
+    webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
   }).optional(),
   // Error and performance reporting.  The kill switch is explicit: a DSN
   // with no `enabled` flag reports.  Only a stored `false` stops it, so an
@@ -455,7 +511,11 @@ const appConfigSchema = z.object({
 // check, busy-bot check, atomic reassignment), so accepting it here would let
 // `PATCH /api/config {"deleteInstance":"claude"}` bypass all of them and
 // strand bots on a protected engine that no longer exists.
-const appConfigPatchSchema = appConfigSchema.omit({ instances: true, deleteInstance: true });
+// A save is strict about the Zulip section (a bad value is a 400 the panel
+// can show), while a stored file stays lenient (a bad value turns Zulip off).
+const appConfigPatchSchema = appConfigSchema
+  .omit({ instances: true, deleteInstance: true })
+  .extend({ zulip: zulipConfigSchema.optional() });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
 export interface AppConfig {
@@ -469,7 +529,10 @@ export interface AppConfig {
   vps?: { sshAlias?: string; memoryGib?: number; cpus?: number };
   opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
   deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
-  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
+  /** `voice` is the workspace default voice; `pronunciations` is the
+   *  workspace list of terms and how to say them (shared/pronunciations.ts),
+   *  absent until first saved, which means the seeded defaults. */
+  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; pronunciations?: Pronunciation[]; credentialStorage?: "external" };
   /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
    *  falls back to platform defaults when `provider` is absent (Apple on
    *  macOS without a cloud key, AssemblyAI on every other platform, and
@@ -534,12 +597,15 @@ export interface AppConfig {
     allowVoiceByDefault?: boolean;
   };
   ingress?: { publicUrl?: string; enabled?: boolean };
+  /** The Zulip source (docs/zulip.md, server/zulip/types.ts). */
+  zulip?: import("./zulip/types.ts").ZulipSettings;
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
   localVm?: {
     mode?: "shared" | "per-bot";
     maxInstances?: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
     cpus?: number;
     memoryGib?: number;
@@ -569,6 +635,9 @@ export interface AppConfig {
     maxMinutes?: number;
     cpuCores?: number;
     admission?: { maxSwapPercent?: number; minFreeDiskMb?: number };
+    /** Minutes a hot host may park a webhook before the wake dispatches
+     *  anyway.  Absent means 20. */
+    webhookHotDeferMinutes?: number;
   };
   usage?: {
     ingestUrl?: string;
@@ -651,6 +720,20 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
       value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
       value.tts.provider === "elevenlabs") {
     value = { ...value, tts: { ...value.tts, provider: "minimax" } };
+  }
+  // A hand-edited pronunciation list must not cost every other setting: the
+  // strict schema below would reject the whole file over one bad entry, and
+  // loadConfig reads a rejection as a first run.  Keep the entries that pass
+  // on their own; a value that is not a list at all reads as never saved.
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
+      Object.hasOwn(value.tts, "pronunciations")) {
+    const { pronunciations: stored, ...ttsRest } = value.tts;
+    const kept = sanitizeStoredPronunciations(stored);
+    value = {
+      ...value,
+      tts: kept === undefined ? ttsRest : { ...ttsRest, pronunciations: kept.map(({ term, say }) => ({ term, say })) },
+    };
   }
   const parsed = appConfigSchema.safeParse(value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
@@ -1114,13 +1197,168 @@ export function migrateComputerProvidersConfig(cfg: AppConfig): boolean {
   return true;
 }
 
-export function loadConfig(): AppConfig {
-  let cfg: AppConfig = {};
-  try {
-    cfg = parseStoredConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")));
-  } catch {
-    /* first run — env fallbacks below */
+/** What reading config.json turned up besides the settings themselves. */
+interface StoredConfigProblem {
+  /** "config-ignored": nothing in the file was usable.  "config-partial": some sections were left out. */
+  kind: "config-ignored" | "config-partial";
+  /** For the log and the notice.  Built from paths and error codes only, never from values. */
+  reason: string;
+  sections: string[];
+}
+
+interface StoredConfigRead {
+  config: AppConfig;
+  problem: StoredConfigProblem | null;
+}
+
+/** The sections of config.json this build understands.  Salvage keeps only these, so a key it has
+ * never heard of (a newer build's, or a hostile one such as `__proto__`) never reaches the config. */
+const STORED_CONFIG_SECTIONS: ReadonlySet<string> = new Set<string>(appConfigSchema.keyof().options);
+
+/** The last problem reported, so a file that stays broken is reported once rather than on every
+ * loadConfig() call, which routes make per request.  A clean read resets it, so a file that is
+ * repaired and then breaks again is reported again. */
+let lastStoredConfigWarning: string | null = null;
+
+function ignoredConfig(reason: string): StoredConfigRead {
+  return { config: {}, problem: { kind: "config-ignored", reason, sections: [] } };
+}
+
+/** Keep every section of an invalid config.json that validates on its own, and report the rest.
+ * Inside `instances` the unit is one engine entry, because dropping the whole map reroutes every
+ * engine to its default for the sake of one bad field.  Each piece is validated with the same
+ * parseStoredConfig the whole file goes through, so the legacy-value rewrites apply here too. */
+function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
+  const usable: JsonObject = {};
+  const issues: string[] = [];
+  const left: string[] = [];
+  for (const [section, value] of Object.entries(stored)) {
+    if (!STORED_CONFIG_SECTIONS.has(section)) continue;
+    try {
+      parseStoredConfig({ [section]: value });
+      usable[section] = value;
+      continue;
+    } catch (error) {
+      const entries = section === "instances" ? jsonObjectSchema.safeParse(value) : null;
+      if (!entries?.success) {
+        issues.push(error instanceof Error ? error.message : `${section} is invalid`);
+        left.push(section);
+        continue;
+      }
+      const kept: Array<[string, JsonValue]> = [];
+      for (const [id, entry] of Object.entries(entries.data)) {
+        try {
+          parseStoredConfig({ [section]: { [id]: entry } });
+          kept.push([id, entry]);
+        } catch (entryError) {
+          issues.push(entryError instanceof Error ? entryError.message : `${section}.${id} is invalid`);
+          left.push(`${section}.${id}`);
+        }
+      }
+      if (kept.length > 0) usable[section] = Object.fromEntries(kept);
+    }
   }
+  // Nothing survived: every setting was left out, so this is a total loss —
+  // the same "using defaults" notice as an unreadable file, not a partial one
+  // that claims the rest of the file is in use.
+  if (Object.keys(usable).length === 0) return ignoredConfig(issues.join("; "));
+  return {
+    config: parseStoredConfig(usable),
+    problem: { kind: "config-partial", reason: issues.join("; "), sections: left },
+  };
+}
+
+/** The set-aside files in `dir`.
+ *
+ * `findSetAsideFiles` is a synchronous read of the whole data directory, and that directory grows
+ * one message file per thread, so asking on every `loadConfig()` would put an O(files in the data
+ * directory) read on a request path — `loadConfig()` is called per turn from the Linq webhook, the
+ * tool lane and the index, and a fresh install has no config.json at all, which is the very branch
+ * that asks.  A directory mtime/ctime/size stamp was tried here as a cheap change signal, but it is
+ * not reliable: a `writeFileSync` of a set-aside into the data directory left mtime, ctime and size
+ * unchanged on the windows-latest runner and on this Linux box, so a cached stamp returned a stale
+ * empty listing and `loadConfig()` after the first-run read reported a first run over a quarantined
+ * file for the life of the process (the "still sees a set-aside file that appears after an earlier
+ * first-run read" test).  The stamp is therefore not trusted to skip `findSetAsideFiles`; the
+ * directory is read every time.  The hot-path cost — one `readdirSync` plus a handful of `statSync`
+ * calls per `loadConfig()` — is accepted; the contract that a new set-aside is always seen is not
+ * worth trading for it. */
+function setAsideFilesIn(dir: string): SetAsideFile[] {
+  return findSetAsideFiles(dir);
+}
+
+/** Read config.json.  Silent only when the file does not exist AND nothing of it is lying around, which
+ * is a first run; every other way of not getting a full config out of it is a problem the caller
+ * reports. */
+function readStoredConfig(path: string): StoredConfigRead {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const code = fsFailureCode(error instanceof Error ? error : new Error(String(error)));
+    if (code !== "ENOENT") return ignoredConfig(`it could not be read (${code})`);
+    // A missing config.json is a first run only when nothing of it is left
+    // over.  The config lock renames the old file aside and then renames the
+    // staged one over it, and a process that dies between those two adjacent
+    // syscalls leaves the file absent with its contents sitting in the
+    // set-aside.  Reading that as a first run would put BotFleet on defaults
+    // with no fault, no log and no banner — the exact silent loss this branch
+    // exists to prevent.  registerLeftOverSetAsideFiles would also raise it,
+    // but only once it runs, and only as history; this branch runs on the read
+    // itself and says which file is waiting, so the two cannot both be quiet.
+    const leftOver = setAsideFilesIn(dirname(path)).find((entry) => entry.file === basename(path));
+    return leftOver
+      ? ignoredConfig(`it is missing, but an earlier copy of it was set aside as ${leftOver.name}, so these are not first-run settings`)
+      : { config: {}, problem: null };
+  }
+  const body = stripBom(text);
+  if (body.trim() === "") return ignoredConfig("it is empty");
+  let parsed: JsonValue;
+  try {
+    parsed = parseJson(body);
+  } catch (error) {
+    return ignoredConfig(jsonFailureReason(error instanceof Error ? error : new Error(String(error)), body.length));
+  }
+  try {
+    return { config: parseStoredConfig(parsed), problem: null };
+  } catch {
+    const asObject = jsonObjectSchema.safeParse(parsed);
+    return asObject.success ? salvageStoredConfig(asObject.data) : ignoredConfig("it must hold a JSON object");
+  }
+}
+
+function reportStoredConfig(path: string, problem: StoredConfigProblem | null): void {
+  if (!problem) {
+    lastStoredConfigWarning = null;
+    clearDataFault("config.json", ["config-ignored", "config-partial"]);
+    return;
+  }
+  const message =
+    problem.kind === "config-ignored"
+      ? `config: ignoring ${path} and using defaults because ${problem.reason}.  The file itself was not changed.`
+      : `config: ${path} has settings BotFleet could not use, and they were left out: ${problem.reason}.  Every other setting in the file is in use.  The file itself was not changed.`;
+  if (message !== lastStoredConfigWarning) {
+    lastStoredConfigWarning = message;
+    console.warn(message);
+  }
+  recordDataFault({
+    file: "config.json",
+    kind: problem.kind,
+    reason: problem.reason,
+    setAsideAs: null,
+    omitted: 0,
+    sections: problem.sections,
+    writesRefused: false,
+    holdsCleanup: false,
+    at: Date.now(),
+  });
+}
+
+export function loadConfig(): AppConfig {
+  const configPath = join(DATA_DIR, "config.json");
+  const stored = readStoredConfig(configPath);
+  reportStoredConfig(configPath, stored.problem);
+  const cfg: AppConfig = stored.config;
   // these secrets OS-encrypted and hands them to this process as env at
   // spawn, leaving config.json without the plaintext field — so the file
   // value is the dev-mode (no desktop shell) fallback, not the primary.
@@ -1395,7 +1633,28 @@ export function saveConfig(
       merged[section] = next;
     }
     return merged;
-  }, { mode: 0o600 });
+  }, { mode: 0o600, onSetAside: reportConfigSetAside });
+}
+
+/** updateConfigFile renamed an unusable config.json aside just before replacing it.  Say so in the
+ * log and in the app: the new file holds this save and nothing else, so the owner needs to know
+ * where the rest of their settings went. */
+function reportConfigSetAside(info: ConfigFileSetAside): void {
+  const to = info.setAsidePath;
+  console.error(
+    `config: ${info.path} could not be used because ${info.reason}.  ${to ? `Moved it to ${to}` : "It had already been moved aside"} and saved this change into a new file.  Nothing was deleted.  Settings that were only in the old file are not in effect until you copy them across.`,
+  );
+  recordDataFault({
+    file: "config.json",
+    kind: "set-aside",
+    reason: info.reason,
+    setAsideAs: to ? basename(to) : null,
+    omitted: 0,
+    sections: [],
+    writesRefused: false,
+    holdsCleanup: false,
+    at: Date.now(),
+  });
 }
 
 /** Merge a validated patch into the parsed on-disk object.  Runs under the
@@ -1419,7 +1678,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);

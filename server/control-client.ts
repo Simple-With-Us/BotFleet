@@ -3,7 +3,7 @@
 // processes consult it through this client before acting, because the
 // action paths themselves never traverse the harness — a box click goes
 // straight to the box's REST API, and a Local VM / VPS click rides a
-// transparent stdio bridge into Cua Driver.
+// transparent stdio bridge into CUA Driver.
 //
 // Failure posture: CLOSED when configured.  A harness hiccup must not let
 // the bot keep driving; read() returns held:true on fetch failure or a
@@ -116,7 +116,7 @@ export const CONTROL_REFUSAL =
   "Call computer_request_help (no reason needed) to wait for them to finish, " +
   "then take a fresh screenshot before your next action.";
 
-/** The bridge-gated computers (Local VM, VPS) speak Cua Driver's own tool
+/** The bridge-gated computers (Local VM, VPS) speak CUA Driver's own tool
  * surface, which has no wait tool to point at — so the guidance is to
  * pause, not to call anything. */
 export const CONTROL_REFUSAL_PLAIN =

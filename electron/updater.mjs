@@ -256,7 +256,7 @@ export function startUpdater(mainWindow) {
       const fallbackConfig = join(fallbackDir, "app-update.yml");
       if (!existsSync(fallbackConfig)) {
         const content = [
-          "owner: jaywedgeworth22",
+          "owner: Simple-With-Us",
           "repo: BotFleet",
           "provider: github",
           "updaterCacheDirName: botfleet-updater",

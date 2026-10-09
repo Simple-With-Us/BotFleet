@@ -19,7 +19,7 @@ const LOCAL_IMPORT = /from\s+"(\.[^"]+)"/g;
 
 async function archivedPaths() {
   const wrapper = await readFile(join(root, "scripts/update-botfleet.sh"), "utf8");
-  const archive = wrapper.match(/git -C "\$BOTFLEET_CHECKOUT" archive[^|]*?--\s*((?:[\\\s]+[\w.\/-]+)+?)\s*\|/);
+  const archive = wrapper.match(/git -C "\$BOTFLEET_CHECKOUT" archive[^|]*?--\s*((?:[\\\s]+[\w./-]+)+?)\s*\|/);
   assert.ok(archive, "could not find the `git archive` call in scripts/update-botfleet.sh");
   // The paths sit on shell line-continuation lines, so the captured group also
   // contains the backslashes that join them.

@@ -53,7 +53,16 @@ const write = (name, value) => {
 const start = (label, args, env) => {
   const child = spawn(process.execPath, args, {
     cwd: ROOT,
-    env: { ...(process.env.PATH ? { PATH: process.env.PATH } : {}), ...env },
+    env: {
+      ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+      ...env,
+      // The harness runs against a throwaway HOME but shares the machine's
+      // container runtime; keep it from ever touching the owner's real Local VM
+      // (server/container-runtime-guard.ts).
+      BOTFLEET_DISABLE_CONTAINER_RUNTIME: "1",
+      DOCKER_HOST: "unix:///nonexistent.sock",
+      CONTAINER_HOST: "unix:///nonexistent.sock",
+    },
     stdio: ["ignore", "ignore", "pipe"],
   });
   child.stderr.on("data", (c) => (child.err = (child.err ?? "") + c));

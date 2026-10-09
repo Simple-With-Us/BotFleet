@@ -28,6 +28,8 @@ describe("HostCliIntegrationCard", () => {
   it("uses the non-breaking sentence gap in everything a person reads", () => {
     const offenders = codeLines.filter((line) => /[.?!] {2}\S/.test(line));
     expect(offenders).toEqual([]);
-    expect(card).toContain("accounts.\\u00a0 ");
+    expect(card).toContain("and more).\\u00a0 ");
+    expect(card).toContain("ten minutes.\\u00a0 ");
+    expect(card).toContain("pick this up.");
   });
 });

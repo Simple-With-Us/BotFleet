@@ -7,7 +7,7 @@
 // scripts/botfleet-server-start.sh and docs/audits/2026-09-24-efficiency-audit.md OP10.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -140,4 +140,121 @@ test("a missing checkout is an ordinary preflight failure, not an unhandled cras
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
+});
+
+// --- Immutable releases ------------------------------------------------------
+//
+// The dependency self-heal used to run `pnpm install --frozen-lockfile` INSIDE
+// $ROOT and record its "heal attempted" stamp there too.  Both break once $ROOT
+// is a promoted release: the directory is read-only by construction and is
+// supposed to stay byte-identical to the commit it names.  The failure is quiet
+// either way — a permissions error that says nothing useful, or a successful
+// reinstall that leaves a release matching nothing the updater verified.
+
+const RELEASE_COMMIT = "abc123def4567890abcdef1234567890abcdef12";
+
+function makeReleaseFixture() {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-server-start-release-"));
+  const serverRoot = join(dir, "releases", RELEASE_COMMIT);
+  mkdirSync(join(serverRoot, "server"), { recursive: true });
+  writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
+  // No node_modules, which is what triggers the heal in the first place.
+  writeFileSync(
+    join(serverRoot, ".botfleet-release.json"),
+    `${JSON.stringify({ schemaVersion: 1, commit: RELEASE_COMMIT, promotedAt: "2026-10-04T00:00:00.000Z" }, null, 2)}\n`,
+  );
+  const logFile = join(dir, "server.log");
+  // A pnpm that records that it was called, so "did not reinstall" is
+  // observable rather than inferred from a log line.
+  const pnpmCalled = join(dir, "pnpm-was-called");
+  const pnpmStub = join(dir, "pnpm-stub");
+  writeFileSync(pnpmStub, `#!/bin/sh\ntouch "${pnpmCalled}"\nexit 0\n`);
+  chmodSync(pnpmStub, 0o755);
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  return { dir, serverRoot, logFile, pnpmCalled, pnpmStub, ledger: join(dir, "ledger"), port };
+}
+
+function runRelease(fixture) {
+  return spawnSync("bash", [SCRIPT, "--heal-only"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${fixture.dir}:${process.env.PATH}`,
+      HOME: fixture.dir,
+      BOTFLEET_SERVER_ROOT: fixture.serverRoot,
+      BOTFLEET_PORT: String(fixture.port),
+      BOTFLEET_NODE: "/bin/echo",
+      BOTFLEET_PNPM: fixture.pnpmStub,
+      BOTFLEET_SERVER_LOG: fixture.logFile,
+      BOTFLEET_FAIL_LEDGER: fixture.ledger,
+      BOTFLEET_FAIL_STORM_THRESHOLD: "20",
+      BOTFLEET_FAIL_WINDOW_SECONDS: "3600",
+    },
+  });
+}
+
+test("a release with missing dependencies is not repaired in place", () => {
+  const fixture = makeReleaseFixture();
+  try {
+    const result = runRelease(fixture);
+    assert.equal(existsSync(fixture.pnpmCalled), false, "pnpm must not run against an immutable release");
+    // log_err writes to stderr; the log file is only what launchd captures from
+    // the harness process itself, which never starts here.
+    const said = `${result.stdout || ""}${result.stderr || ""}`;
+    assert.match(said, /immutable release/);
+    // A refusal with no alternative leaves the operator with nothing to do, so
+    // the message has to name the commit and what to run instead.
+    assert.match(said, new RegExp(RELEASE_COMMIT.slice(0, 12)), "the refusal must name the broken release");
+    assert.match(said, /update-botfleet\.sh/, "the refusal must say what to run instead");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a mutable checkout is still repaired in place", () => {
+  // The other direction matters just as much: the release store must not have
+  // cost the fast repair for a half-deleted node_modules in an ordinary
+  // checkout, which is a recurring failure on this machine.
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-heal-still-works-"));
+  try {
+    const serverRoot = join(dir, "root");
+    mkdirSync(join(serverRoot, "server"), { recursive: true });
+    writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
+    const pnpmCalled = join(dir, "pnpm-was-called");
+    const pnpmStub = join(dir, "pnpm-stub");
+    writeFileSync(pnpmStub, `#!/bin/sh\ntouch "${pnpmCalled}"\nexit 0\n`);
+    chmodSync(pnpmStub, 0o755);
+    const fixture = {
+      dir,
+      serverRoot,
+      pnpmCalled,
+      pnpmStub,
+      logFile: join(dir, "server.log"),
+      ledger: join(dir, "ledger"),
+      port: 20000 + Math.floor(Math.random() * 20000),
+    };
+    runRelease(fixture);
+    assert.equal(existsSync(fixture.pnpmCalled), true, "a mutable checkout must still self-heal in place");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the heal stamp's default is not inside the root", () => {
+  // The stamp is mutable state.  Writing it into a read-only release fails on
+  // exactly the code path whose job is to report a problem.
+  const source = readFileSync(SCRIPT, "utf8");
+  const stamp = source.match(/STAMP="\$\{BOTFLEET_HEAL_STAMP:(.+?)\}"/);
+  assert.ok(stamp, "the stamp must keep an overridable default");
+  assert.doesNotMatch(stamp[1], /\$ROOT/, "the default stamp must not live inside $ROOT");
+});
+
+test("the root is resolved physically so a pointer is not mistaken for a path", () => {
+  // `current` is a symlink into releases/<commit>.  If the launcher keeps the
+  // symlink, the server's working directory is the POINTER rather than the
+  // release — and the updater's dependency fingerprint and bundle identity
+  // checks both refuse a symlinked root, so the two halves would disagree about
+  // which directory they are reasoning about.
+  const source = readFileSync(SCRIPT, "utf8");
+  assert.match(source, /cd -P "\$ROOT"/, "the root must be resolved with a physical cd");
 });

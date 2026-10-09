@@ -5,10 +5,10 @@ import { fileURLToPath } from "node:url";
 /** Unique substrings in `bots/_shared.md` — tests assert each appears exactly
  *  once in a composed seat prompt.  Keep them stable; they are the contract. */
 export const FLEET_SHARED_RULE_MARKERS = [
-  "fleet Slack coordination channel",
+  "fleet Zulip coordination channel",
   "Recall CLI fallback",
   "[to iMessage]",
-  "Never post unprompted status spam or routine commentary to Slack",
+  "Never post unprompted status spam or routine commentary to Zulip",
   "Extra-ship: NO",
 ] as const;
 

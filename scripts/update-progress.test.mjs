@@ -69,7 +69,7 @@ function fakeOperations(overrides = {}) {
   // rather than an out-of-date fake.  Check it here instead, naming the step.
   for (const step of [...PREPARE_STEPS, ...APPLY_STEPS]) {
     if (step === "acquireLock") continue;
-    if (typeof base[step] !== "function") {
+    if (!Object.hasOwn(base, step) || base[step]?.call === undefined) {
       throw new Error(`fakeOperations is missing ${step}; add it so this fixture keeps matching the transaction`);
     }
   }

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
+import { credentialMountStagingRoot } from "./vm-cli-credentials.ts";
 import {
   BASE_IMAGE,
   BASE_IMAGE_DIGEST,
@@ -66,6 +67,20 @@ import {
   type CommandRunner,
   type LocalVmTarget,
 } from "./container-computer.ts";
+
+function bindMountSpecs(args: string[]): string[] {
+  return args.filter((entry) => entry.startsWith("type=bind,"));
+}
+
+function expectBindMount(args: string[], guestTarget: string, sourcePath: string): void {
+  const mount = bindMountSpecs(args).find((entry) => entry.includes(`target=${guestTarget},readonly`));
+  expect(mount).toBeDefined();
+  const normalize = (value: string) =>
+    process.platform === "win32"
+      ? value.replaceAll("\\", "/").toLowerCase()
+      : value.replaceAll("\\", "/");
+  expect(normalize(mount!).includes(normalize(sourcePath))).toBe(true);
+}
 
 function runner(responses: Record<string, string | Error>) {
   const calls: string[] = [];
@@ -503,7 +518,7 @@ describe("containerComputerStatus", () => {
 
   it("reports the bounded desktop startup error instead of waiting forever", async () => {
     const errorProbe =
-      `docker exec ${CONTAINER} tail -n 4 /var/log/supervisor/cua-driver.error.log`;
+      `docker exec ${CONTAINER} tail -n 12 /var/log/supervisor/cua-driver.error.log`;
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -521,8 +536,71 @@ describe("containerComputerStatus", () => {
     expect(status.problem).toContain("desktop failed to start");
   });
 
+  describe("a failed desktop probe never blames the Driver's normal startup output", () => {
+    const ESC = "\u001b";
+    const errorProbe = `docker exec ${CONTAINER} tail -n 12 /var/log/supervisor/cua-driver.error.log`;
+    const healthyLog = [
+      "cua-driver v0.34.0 is available (you have v0.20.0)",
+      "   Update with: cua-driver update",
+      "   Release notes: https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.34.0",
+      `${ESC}[2m2026-10-07T13:54:42.869037Z${ESC}[0m ${ESC}[33m WARN${ESC}[0m ${ESC}[2mplatform_linux::overlay${ESC}[0m${ESC}[2m:${ESC}[0m X11 overlay: root reads cannot see this window's own pixels`,
+      "Cua Driver daemon listening on /opt/ogb/run/cua.sock",
+    ].join("\n");
+
+    function statusWith(probes: Record<string, string | Error>) {
+      const fake = runner({
+        "/usr/bin/which docker": "docker\n",
+        "/usr/bin/which podman": new Error("missing"),
+        "docker info --format {{.ServerVersion}}": "29\n",
+        [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+        [`docker inspect ${CONTAINER}`]: readyInspect(),
+        ...probes,
+      });
+      return containerComputerStatus(fake.run, "linux");
+    }
+
+    it("shows no banner, no WARN and no escape codes when the log is only startup noise", async () => {
+      const status = await statusWith({
+        [versionProbe]: `cua-driver ${CUA_DRIVER_VERSION}\n`,
+        [statusProbe]: "running\n",
+        [healthProbe]: JSON.stringify({ schema_version: "1", overall: "failed", checks: [] }),
+        [errorProbe]: healthyLog,
+      });
+      expect(status.desktopReady).toBe(false);
+      expect(status.problem).toBe("The Local VM desktop failed to start: CUA health report is failed");
+      for (const noise of ["Release notes", "WARN", "overlay", "listening", "[2m", "[0m", ESC]) {
+        expect(status.problem).not.toContain(noise);
+      }
+    });
+
+    it("reports a probe killed by its timeout as a transient check failure", async () => {
+      const killed = Object.assign(new Error(`Command failed: ${versionProbe}`), {
+        killed: true,
+        signal: "SIGTERM",
+        code: null,
+      });
+      const status = await statusWith({ [versionProbe]: killed, [errorProbe]: killed });
+      expect(status.container).toBe("running");
+      expect(status.desktopReady).toBe(false);
+      expect(status.desktop_error).toBeNull();
+      expect(status.desktopUnreachable).toBe(true);
+      expect(status.ready).toBe(false);
+      expect(status.problem).toBe("Couldn't reach the Local VM desktop just now; retrying");
+    });
+
+    it("still reports a real supervisor fault, with its colour stripped", async () => {
+      const status = await statusWith({
+        [versionProbe]: new Error("driver unavailable"),
+        [errorProbe]: `${healthyLog.split("\n")[0]}\n${ESC}[31m2026-10-07T13:56:00Z ERROR${ESC}[0m cua_driver: worker panicked`,
+      });
+      expect(status.problem).toBe(
+        "The Local VM desktop failed to start: 2026-10-07T13:56:00Z ERROR cua_driver: worker panicked",
+      );
+    });
+  });
+
   it("does not report ready when the driver's health contract fails", async () => {
-    const errorProbe = `docker exec ${CONTAINER} tail -n 4 /var/log/supervisor/cua-driver.error.log`;
+    const errorProbe = `docker exec ${CONTAINER} tail -n 12 /var/log/supervisor/cua-driver.error.log`;
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -597,7 +675,7 @@ describe("containerComputerStatus", () => {
   });
 });
 
-describe("Cua integration", () => {
+describe("CUA integration", () => {
   it("points the box proxy at the harness gateway instead of the account's Box API", () => {
     // Repinned: the proxy used to receive the account-wide API key and talk
     // to ascii.dev itself.  It now receives a per-mount grant and the
@@ -700,26 +778,32 @@ describe("Cua integration", () => {
     writeFileSync(join(fakeHome, ".infisical", "infisical-config.json"), "fake infisical");
     writeFileSync(join(fakeHome, ".config", "infisical", "shared.env"), "fake shared env");
     writeFileSync(join(fakeHome, ".ssh", "config"), "fake ssh");
-    writeFileSync(join(fakeHome, ".docker", "config.json"), "fake docker");
+    writeFileSync(join(fakeHome, ".docker", "config.json"), '{"credsStore":"osxkeychain"}\n');
+
+    const stagingRoot = credentialMountStagingRoot(fakeHome);
+    const stagedDockerConfig = join(stagingRoot, ".docker", "config.json");
 
     const mounts = hostCliCredentialMounts("darwin", fakeHome);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "gh")},target=/home/cua/.config/gh,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "infisical")},target=/home/cua/.config/infisical,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".docker", "config.json")},target=/home/cua/.docker/config.json,readonly`);
+    expectBindMount(mounts, "/home/cua/.gitconfig", join(fakeHome, ".gitconfig"));
+    expectBindMount(mounts, "/home/cua/.config/gh", join(fakeHome, ".config", "gh"));
+    expectBindMount(mounts, "/home/cua/.infisical", join(fakeHome, ".infisical"));
+    expectBindMount(mounts, "/home/cua/.config/infisical", join(fakeHome, ".config", "infisical"));
+    expectBindMount(mounts, "/home/cua/.ssh", join(fakeHome, ".ssh"));
+    expectBindMount(mounts, "/home/cua/.docker/config.json", stagedDockerConfig);
+    expect(readFileSync(stagedDockerConfig, "utf8")).not.toContain("osxkeychain");
 
     const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin", {
       shareCliCredentials: true,
       homeDir: fakeHome,
     });
-    expect(args).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
-    expect(args).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
-    expect(args).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
+    expectBindMount(args, "/home/cua/.gitconfig", join(fakeHome, ".gitconfig"));
+    expectBindMount(args, "/home/cua/.infisical", join(fakeHome, ".infisical"));
+    expectBindMount(args, "/home/cua/.ssh", join(fakeHome, ".ssh"));
+    expectBindMount(args, "/home/cua/.docker/config.json", stagedDockerConfig);
   });
 
   it("accepts containers running with read-only CLI credential mounts as safe and durable", async () => {
+    const credentialHome = mkdtempSync(join(tmpdir(), "bf-cli-inspect-home-"));
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -728,9 +812,9 @@ describe("Cua integration", () => {
       [`docker inspect ${CONTAINER}`]: readyInspect({
         Mounts: [
           { Type: "bind", Source: VM_WORKSPACE_DIR, Destination: VM_WORKSPACE_GUEST, RW: true },
-          { Type: "bind", Source: "/Users/test/.infisical", Destination: "/home/cua/.infisical", RW: false },
-          { Type: "bind", Source: "/Users/test/.ssh", Destination: "/home/cua/.ssh", RW: false },
-          { Type: "bind", Source: "/Users/test/.gitconfig", Destination: "/home/cua/.gitconfig", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".infisical"), Destination: "/home/cua/.infisical", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".ssh"), Destination: "/home/cua/.ssh", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".gitconfig"), Destination: "/home/cua/.gitconfig", RW: false },
         ],
       }),
       [versionProbe]: `cua-driver ${CUA_DRIVER_VERSION}\n`,
@@ -745,7 +829,7 @@ describe("Cua integration", () => {
     expect(status.ready).toBe(true);
   });
 
-  it("mounts the official Cua MCP server for Local VM turns", () => {
+  it("mounts the official CUA MCP server for Local VM turns", () => {
     const connection = containerComputerMcp("podman");
     expect(connection.command).toBe(process.execPath);
     expect(connection.args.at(-3)).toBe("podman");
@@ -754,8 +838,9 @@ describe("Cua integration", () => {
     expect(connection.env).toEqual({ ELECTRON_RUN_AS_NODE: "1" });
   });
 
-  it("builds an exact, checksum-verified Cua Driver 0.20.0 image", () => {
+  it("builds an exact, checksum-verified CUA Driver 0.20.0 image", () => {
     const dockerfile = managedImageDockerfile();
+    expect(dockerfile.startsWith("# syntax=docker/dockerfile:1\n")).toBe(true);
     expect(BASE_IMAGE).toMatch(/@sha256:[a-f0-9]{64}$/);
     expect(dockerfile).toContain(`FROM ${BASE_IMAGE}`);
     expect(dockerfile).toContain("cua_driver-0.20.0-py3-none-manylinux_2_31_x86_64.whl");
@@ -773,6 +858,8 @@ describe("Cua integration", () => {
     expect(dockerfile).toContain("migrate_profile chromium");
     expect(dockerfile).toContain("SingletonLock");
     expect(dockerfile).toContain(`${IMAGE_LAYER_LABEL}="${IMAGE_LAYER_VERSION}"`);
+    expect(dockerfile).toContain("BOTFLEET_VM_CLI_INSTALL");
+    expect(dockerfile).toContain("botfleet-vm-cli-verify");
     expect(dockerfile).toContain("did not become ready within 45 seconds");
     expect(dockerfile).not.toContain("while ! DISPLAY=:1 xset q");
   });
@@ -792,7 +879,7 @@ describe("Cua integration", () => {
     expect(fetch).toBeGreaterThan(gate);
   });
 
-  it("captures the preview through Cua Driver rather than xdotool or VNC", async () => {
+  it("captures the preview through CUA Driver rather than xdotool or VNC", async () => {
     const screenshotCall =
       `${driverExec} call get_desktop_state {} --socket ${CUA_SOCKET} ` +
       "--screenshot-out-file /tmp/botfleet-preview.png";
@@ -1450,4 +1537,24 @@ describe("PATH driver symlink repair", () => {
       expect(script).toContain(`readlink ${shim}`);
     }
   });
+  // Kody review on #911.  `imageLabelsMatch` treats the layer label as the
+  // compatibility check, so an image-content change that does not bump
+  // IMAGE_LAYER_VERSION is invisible: already-provisioned containers keep the
+  // broken layer and never rebuild.  This tripwire fails if the bump that
+  // carries `ENV RUSTUP_HOME` is reverted while the ENV stays.
+  it("bumps the image layer whenever the CLI layer bakes image-level ENV", () => {
+    const dockerfile = managedImageDockerfile();
+    expect(dockerfile).toContain("ENV RUSTUP_HOME=/usr/local/rustup");
+    expect(IMAGE_LAYER_VERSION).not.toBe("6");
+  });
+
+  // The Mac-parity layer (Homebrew, zsh login shell, the gap-list CLIs) is
+  // image content too, so it needs its own bump: a v7 image has none of it.
+  it("is at least layer 8, which is the first to carry Homebrew and zsh", () => {
+    const dockerfile = managedImageDockerfile();
+    expect(dockerfile).toContain("ENV HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1");
+    expect(dockerfile).toContain("botfleet_install_zsh_shell");
+    expect(Number(IMAGE_LAYER_VERSION)).toBeGreaterThanOrEqual(8);
+  });
+
 });

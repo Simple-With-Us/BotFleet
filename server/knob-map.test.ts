@@ -78,6 +78,12 @@ describe("parseKnobValue", () => {
     expect(parseKnobValue(spec("observability.tracesSampleRate"), "0.5")).toBe(0.5);
   });
 
+  it("clamps the webhook hot-host deferral limit to its minute bounds", () => {
+    expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "20")).toBe(20);
+    expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "0")).toBe(1);
+    expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "9999")).toBe(720);
+  });
+
   it("round-trips through the canonical string", () => {
     for (const entry of KNOB_FIELDS) {
       if (entry.kind === "bool") continue;

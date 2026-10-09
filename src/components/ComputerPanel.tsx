@@ -52,6 +52,7 @@ import {
 } from "@/lib/local-computer";
 import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@/lib/cloud-backend";
 import { vpsComputerNeedsReplacement, type VpsComputerStatus } from "@/lib/vps-computer";
+import { CliCredentialSyncPanel } from "./CliCredentialSyncPanel";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
@@ -1231,6 +1232,15 @@ export function ComputerPanel({
           </button>
         )}
         {/* Cloud-only actions */}
+        {phase === "ready" && cloudBackend === "vps" && vpsStatus?.container === "running" && (
+          <div className="mt-3">
+            <CliCredentialSyncPanel
+              syncUrl={`/api/bots/${bot.id}/computer/sync-credentials`}
+              description="Copy host CLI login files from the VM CLI manifest into this bot's cloud VPS container (shared or per-bot, per workspace mode)."
+              autoSyncEnabled={Boolean(state.config?.localVm?.shareCliCredentials)}
+            />
+          </div>
+        )}
         {phase === "ready" && (
           <div className="mt-3 flex gap-2">
             {!control.held && !control.helpReason && (

@@ -20,19 +20,20 @@
 // this shape of call.  Retry a timeout; never retry a 404 that will still be a
 // 404 in ten minutes.
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
-const DEFAULT_REPOSITORY = "jaywedgeworth22/BotFleet";
+const DEFAULT_REPOSITORY = "Simple-With-Us/BotFleet";
 const WORKFLOW_FILE = "mac-commit-build.yml";
 
-// The repository is public, so the Actions API can be read unauthenticated.
-// An hourly anonymous budget exists and is small, but a machine installs a
-// handful of updates a day, not hundreds; a token is still honoured when one
-// is present so a busy or multi-Mac setup is not quietly throttled.
+// Workflow and artifact metadata on a public repo can be read without a token,
+// within GitHub's anonymous API budget.  Downloading the artifact zip always
+// requires authentication, even on a public repo.  GITHUB_TOKEN, GH_TOKEN, or
+// a token from `gh auth login` is used when present; Finder launches expose a
+// minimal PATH, so `authHeaders` also probes common `gh` install locations.
 const API_TIMEOUT_MS = 30_000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const DOWNLOAD_ATTEMPTS = 3;
@@ -115,8 +116,8 @@ function resolutionMessage({ cause, commit, status, repository, detail, conclusi
       );
     case "unauthorized":
       return keyPreview
-        ? `GitHub rejected the configured key (${keyPreview}) while looking up a build for ${sha} (HTTP ${status}).  A key from another account or host is the usual cause.  Unset it to use the public repo anonymously.`
-        : `GitHub rejected an anonymous request for ${sha} (HTTP ${status}), which should not happen on a public repo.  Set GITHUB_TOKEN to authenticate, or retry shortly.`;
+        ? `GitHub rejected the configured key (${keyPreview}) while fetching a hosted build for ${sha} (HTTP ${status}).  Actions artifact downloads require a GitHub token from this account.  Unset the wrong key, run \`gh auth login\` on this Mac, or set GITHUB_TOKEN, then retry.`
+        : `GitHub returned HTTP ${status} while downloading a hosted build for ${sha}.  Actions artifact downloads require a GitHub token.  Run \`gh auth login\` on this Mac or set GITHUB_TOKEN, then retry the update.`;
     case "network-timed-out":
     case "network-failed":
       return (
@@ -192,7 +193,7 @@ async function requestJson(url, { headers = {}, fetchImpl = fetch, timeoutMs = A
   return body;
 }
 
-async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = DOWNLOAD_TIMEOUT_MS, totalTimeoutMs = DOWNLOAD_TOTAL_TIMEOUT_MS, label }) {
+async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = DOWNLOAD_TIMEOUT_MS, totalTimeoutMs = DOWNLOAD_TOTAL_TIMEOUT_MS, label, commit }) {
   let lastError = null;
   const budgetDeadline = Date.now() + totalTimeoutMs;
   for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt += 1) {
@@ -215,7 +216,7 @@ async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = 
         const retryable = response.status === 429 || response.status >= 500;
         lastError = new ResolutionError(
           cause === "unauthorized"
-            ? resolutionMessage({ cause, commit: "(unresolved)", status: response.status, keyPreview: maskedKeyPreview(headers) })
+            ? resolutionMessage({ cause, commit, status: response.status, keyPreview: maskedKeyPreview(headers) })
             : `Downloading ${label} failed with HTTP ${response.status}`,
           cause,
         );
@@ -250,9 +251,44 @@ async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = 
   throw lastError || new ResolutionError(`Downloading ${label} failed`, "unknown");
 }
 
-function authHeaders(env = process.env) {
+const GH_BIN_CANDIDATES = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"];
+const GH_AUTH_TOKEN_TIMEOUT_MS = 5_000;
+
+let ghAuthTokenCache = { resolved: false, token: "" };
+
+/** Clears the cached `gh auth token` result.  Tests only. */
+export function resetGhAuthCacheForTests() {
+  ghAuthTokenCache = { resolved: false, token: "" };
+}
+
+function readGhAuthToken(execFileSyncImpl = execFileSync) {
+  if (ghAuthTokenCache.resolved) return ghAuthTokenCache.token;
+  ghAuthTokenCache.resolved = true;
+  for (const ghPath of GH_BIN_CANDIDATES) {
+    try {
+      const stdout = execFileSyncImpl(ghPath, ["auth", "token"], {
+        encoding: "utf8",
+        timeout: GH_AUTH_TOKEN_TIMEOUT_MS,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const token = String(stdout || "").trim();
+      if (token) {
+        ghAuthTokenCache.token = token;
+        return token;
+      }
+    } catch {
+      // Missing binary, logged-out gh, or timeout — try the next candidate.
+    }
+  }
+  ghAuthTokenCache.token = "";
+  return "";
+}
+
+export function authHeaders(env = process.env, { execFileSyncImpl } = {}) {
   const token = (env.GITHUB_TOKEN || env.GH_TOKEN || "").trim();
-  return token ? { authorization: `Bearer ${token}` } : {};
+  if (token) return { authorization: `Bearer ${token}` };
+  const ghToken = readGhAuthToken(execFileSyncImpl ?? execFileSync);
+  return ghToken ? { authorization: `Bearer ${ghToken}` } : {};
 }
 
 /**
@@ -281,6 +317,7 @@ export function maskedKeyPreview(headers = {}) {
  * an untrusted response without checking its shape — is met explicitly; adding
  * zod would break updater bootstrap on every Mac.
  */
+/* oxlint-disable anti-slop/no-runtime-typeof -- hand-written GitHub Actions boundary parse; zod is unavailable in the updater bootstrap graph (see comment above). */
 function assertWorkflowRun(value) {
   const conclusion = value?.conclusion;
   if (typeof value?.id !== "number" ||
@@ -302,6 +339,7 @@ function assertArtifact(value) {
   }
   return value;
 }
+/* oxlint-enable anti-slop/no-runtime-typeof */
 
 /** The newest attempt at this commit, for diagnosis when none succeeded. */
 function anyRunForCommit(runs, commit) {
@@ -348,6 +386,7 @@ export function verifyManifest(manifest, { commit, bytes }) {
       "checksum-mismatch",
     );
   }
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- manifest field boundary parse (same bootstrap constraint as assertWorkflowRun).
   if (typeof manifest.artifact !== "string" || !manifest.artifact.endsWith(".zip")) {
     throw new ResolutionError(`Hosted build manifest names no zip artifact: ${manifest.artifact}`, "bad-manifest");
   }
@@ -390,10 +429,73 @@ function run(command, args, options) {
  */
 export function manifestArtifactName(manifest) {
   const name = manifest?.artifact;
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- manifest field boundary parse (same bootstrap constraint as assertWorkflowRun).
   if (typeof name !== "string" || !/^[\w.-]+\.zip$/.test(name)) {
     throw new ResolutionError(`Hosted build manifest names no zip artifact: ${name}`, "bad-manifest");
   }
   return name;
+}
+
+/**
+ * The one directory in the bundle archive that may contain symlinks.  The
+ * workflow packs the app with `--keepParent`, so every real entry lives under
+ * it.  The only other top-level directory is ditto's `__MACOSX/` sidecar tree,
+ * which holds ordinary files and never a link.
+ */
+export const BUNDLE_ROOT = "BotFleet.app";
+
+/**
+ * Paths as APFS compares them.  The default macOS volume is case-insensitive
+ * and normalization-insensitive, so `A/LINK/payload` is written through an
+ * entry called `a/link`.  A duplicate check or a "nothing under a link" check
+ * that compared raw strings would be beaten by changing the case of one letter.
+ */
+function foldPath(path) {
+  return path.normalize("NFD").toLowerCase().normalize("NFD");
+}
+
+/**
+ * Why a symlink entry is refused, or null when it is a legitimate in-bundle link.
+ *
+ * A real Electron bundle always carries framework links:
+ * `Versions/Current -> A`, `Resources -> Versions/Current/Resources`, and the
+ * binary link beside them.  On 2026-10-08 the update to main 8ccf02725 was
+ * refused because the first version of this guard treated every link as an
+ * attack.  This rule admits them and still refuses every escape:
+ *
+ * - The link must sit strictly inside `BotFleet.app/`.  It may not sit at the
+ *   archive root or under `__MACOSX/`, and it may not be `BotFleet.app` itself.
+ * - Its target must have been read from the archive.  It must be non-empty,
+ *   carry no NUL, be relative, and contain no `..` segment.
+ *
+ * That is provably contained on its own.  `BotFleet.app` itself is a real
+ * directory, because a link by that name is refused.  Every step of resolving
+ * a path under it either enters a directory or replaces a link with that
+ * link's own directory plus more descending components, and that directory is
+ * already under `BotFleet.app/`.  No step climbs, so however links compose,
+ * nothing resolves above the bundle.  The caller's "nothing under a link" rule
+ * is defence in depth on top: even if APFS folded a name differently from
+ * `foldPath`, or ditto read a name differently from zipinfo, a write through a
+ * link would still land inside the bundle, where the post-extraction walk and
+ * codesign's sealed resources both see it.  Every framework link in the real
+ * artifact fits this rule, and none of them needs `..`.
+ *
+ * A lexical check that allowed `..` would not be enough.  `Contents/b -> ..`
+ * and `Contents/c -> b/../x` each look contained on paper, yet `c` resolves
+ * outside the bundle, because the kernel applies `..` after following `b`.
+ */
+function symlinkRefusal(segments, target, symlinkRoot) {
+  if (!symlinkRoot) return "symlink entry";
+  if (segments.length < 2 || foldPath(segments[0]) !== foldPath(symlinkRoot)) {
+    return `symlink entry outside ${symlinkRoot}/`;
+  }
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- archive boundary: the lister leaves this undefined when a target could not be read.
+  if (typeof target !== "string") return "symlink entry whose target could not be read";
+  if (target === "") return "symlink entry with an empty target";
+  if (target.includes("\0")) return "symlink entry whose target contains NUL";
+  if (target.startsWith("/")) return `symlink entry with an absolute target ${JSON.stringify(target)}`;
+  if (target.split("/").includes("..")) return `symlink entry whose target ${JSON.stringify(target)} climbs with ..`;
+  return null;
 }
 
 /**
@@ -407,34 +509,76 @@ export function manifestArtifactName(manifest) {
  *
  * `ditto` refuses some of these, but relying on the extractor's behaviour is not
  * a check — it varies by version, and the failure would be whatever it happens to
- * do rather than a refusal we chose.  Every entry is therefore resolved against
- * the destination and rejected if it lands outside, before a single byte is
- * written.  Absolute paths, `..` segments, and symlink entries are all refused:
- * a symlink entry is a Zip Slip that survives extraction, because the link is
- * created in the tree and a LATER entry can then be written through it.
+ * do rather than a refusal we chose.  Every entry is therefore judged here,
+ * directory entries included, before a single byte is written:
+ *
+ * - An absolute path or a `..` segment is refused.
+ * - A duplicate name is refused, compared the way APFS compares names, because
+ *   the second copy would replace whatever the first one made.
+ * - An entry with a symlink entry as an ancestor is refused, so nothing is ever
+ *   written THROUGH a link.  That is the Zip Slip that survives extraction: a
+ *   link is created inside the tree, and a later, innocent-looking entry is
+ *   written through it to wherever the link points.
+ * - Device, FIFO, and socket entries are refused.
+ * - A symlink entry is refused unless `symlinkRoot` names the bundle directory
+ *   and the link passes `symlinkRefusal` above.  GitHub's artifact wrapper is
+ *   checked with no `symlinkRoot`, so every link in it is still refused.
+ *
+ * Type comes from the archive, never from the name.  The `__MACOSX/._*`
+ * sidecars are legitimate ordinary files that carry the resource fork
+ * `--sequesterRsrc` exists to preserve, so guessing from names would refuse
+ * every real build.
  */
-export function assertSafeArchiveEntries(entries, { label = "artifact" } = {}) {
+export function assertSafeArchiveEntries(entries, { label = "artifact", symlinkRoot = null } = {}) {
   const unsafe = [];
-  for (const { name, mode } of entries) {
-    const clean = String(name).replace(/\\/g, "/");
-    if (!clean || clean.endsWith("/")) continue; // directory entries carry no payload
+  const seen = new Set();
+  const links = new Map();
+  const judged = [];
+  for (const { name, mode, target } of entries) {
+    const raw = String(name);
+    const type = String(mode || "-").charAt(0);
+    const clean = raw.replace(/\\/g, "/");
     if (clean.startsWith("/") || /^[A-Za-z]:/.test(clean)) {
-      unsafe.push(`${name} (absolute path)`);
+      unsafe.push(`${raw} (absolute path)`);
       continue;
     }
     const segments = clean.split("/").filter((part) => part && part !== ".");
     if (segments.includes("..")) {
-      unsafe.push(`${name} (traverses out of the destination)`);
+      unsafe.push(`${raw} (traverses out of the destination)`);
       continue;
     }
-    // A symlink entry is a Zip Slip that survives extraction: the link is created
-    // inside the tree and a LATER entry is then written THROUGH it, so the entry
-    // name can look perfectly innocent.  Type comes from the archive, not from the
-    // name — `__MACOSX/._*` sidecars are legitimate (they carry the resource fork
-    // that --sequesterRsrc exists to preserve) and are ordinary files, so
-    // guessing from the name would refuse every real build.
-    if (String(mode || "").startsWith("l")) {
-      unsafe.push(`${name} (symlink entry)`);
+    if (segments.length === 0) {
+      // `./` names the destination itself.  As a directory it carries nothing.
+      // As anything else it would replace the destination.
+      if (type !== "d") unsafe.push(`${JSON.stringify(raw)} (names the destination itself)`);
+      continue;
+    }
+    if ("bcps".includes(type)) {
+      unsafe.push(`${raw} (device, FIFO, or socket entry)`);
+      continue;
+    }
+    const key = foldPath(segments.join("/"));
+    if (seen.has(key)) {
+      unsafe.push(`${raw} (duplicate entry)`);
+      continue;
+    }
+    seen.add(key);
+    judged.push({ raw, segments, type, target });
+    if (type === "l") links.set(key, raw);
+  }
+  for (const { raw, segments, type, target } of judged) {
+    // Nothing may be written through a link, whatever the link points at.
+    let through = null;
+    for (let depth = 1; depth < segments.length && through === null; depth += 1) {
+      through = links.get(foldPath(segments.slice(0, depth).join("/"))) ?? null;
+    }
+    if (through !== null) {
+      unsafe.push(`${raw} (written through the symlink entry ${through})`);
+      continue;
+    }
+    if (type === "l") {
+      const why = symlinkRefusal(segments, target, symlinkRoot);
+      if (why) unsafe.push(`${raw} (${why})`);
     }
   }
   if (unsafe.length) {
@@ -503,11 +647,14 @@ async function runBoundedText(command, args, { timeoutMs = 60_000, maxBytes = AR
  * shaped so the parser could not read it.  A line-oriented listing has no field
  * boundaries to get wrong, so every name is necessarily checked.
  *
- * TYPES come from `zipinfo -l` and are matched by name.  If that listing cannot
- * be read, the archive is refused: we would not know which entries are symlinks,
- * and a symlink entry is a Zip Slip that survives extraction.
+ * TYPES come from `zipinfo -l`, matched to names by POSITION.  Both listings
+ * walk the central directory in the same order, so row i of one is entry i of
+ * the other.  Each typed row must end with its own name, and the row count must
+ * equal the name count.  Any mismatch refuses the archive: we would not know
+ * which entries are symlinks.  A symlink is the one entry type that changes
+ * where later writes land.
  */
-async function listArchiveEntries(archivePath) {
+export async function listArchiveEntries(archivePath) {
   let nameList;
   let typeList;
   try {
@@ -522,7 +669,9 @@ async function listArchiveEntries(archivePath) {
     );
   }
 
-  const names = nameList.split("\n").map((line) => line.trim()).filter(Boolean);
+  // Names are NOT trimmed.  An entry called ` x` or `x ` is a different path
+  // from `x`, and trimming it would check one name and extract another.
+  const names = nameList.split("\n").filter((line) => line !== "");
   if (names.length === 0) {
     throw new ResolutionError(
       `The hosted artifact's entry list came back empty, so its names cannot be checked; refusing to extract it`,
@@ -530,40 +679,199 @@ async function listArchiveEntries(archivePath) {
     );
   }
 
-  // The permission string's first character is the type: d directory,
-  // l symlink, - regular file.  The first character alone is matched, so a
-  // name that contains spaces or odd characters cannot shift the columns and
-  // make a line unparseable — which was the original hole.
-  const symlinks = new Set();
-  let typedLines = 0;
-  for (const line of typeList.split("\n")) {
-    const match = line.match(/^([-dlbcps])[-rwxsStT]{9}\s+(.*)$/);
-    if (!match) continue;
-    typedLines += 1;
-    // The NAME is the last field, not the rest of the line.  A `zipinfo -l`
-    // row is `-rw-r--r--  3.0 unx  123 tx  defN 26-Jan-01 12:00 some/path`,
-    // so capturing group 2 whole stored the whole tail — permissions, sizes,
-    // dates and the name — in the set.  `symlinks.has(name)` then never
-    // matched, so every symlinked entry was recorded as a plain file and the
-    // archive check passed on the exact thing it exists to catch.
-    if (match[1] === "l") {
-      const name = match[2].trim().split(/\s+/).pop();
-      if (name) symlinks.add(name);
-    }
-  }
-  // Zero PARSED type lines means the format is not what we expect, so we cannot
-  // tell a symlink from a regular file and must refuse.  A parsed listing with
-  // no symlinks in it is an ordinary archive and is fine — that distinction is
-  // the whole point, and conflating them would refuse every real build.
-  if (typedLines === 0) {
+  // A `zipinfo -l` row is `<mode> <version> <os> <size> <flags> <csize>
+  // <method> <date> <time> <name>`.  The mode's first character is the type:
+  // d directory, l symlink, - regular file, b/c/p/s special.  The mode is taken
+  // as a whole token, so Unix modes and FAT-style attributes both read.
+  //
+  // The previous version took the NAME as the last whitespace-separated token
+  // of a symlink row.  A link whose name contains a space, such as
+  // `Electron Framework.framework/Versions/Current`, was recorded as
+  // `Framework.framework/Versions/Current`, never matched, and was typed as a
+  // regular file.  That is why the 2026-10-08 refusal named nine links and not
+  // the fourteen the real bundle carries.  Pairing by position has no field
+  // boundary in the name to get wrong.
+  const typedRows = typeList.split("\n").filter((line) => /^[-dlbcps]\S*\s+\d+\.\d+\s+\S+\s+\d+\s/.test(line));
+  if (typedRows.length !== names.length) {
     throw new ResolutionError(
-      `Could not read the hosted artifact's entry types, so its symlink entries cannot be ruled out; refusing to extract it`,
+      `The hosted artifact lists ${names.length} names but ${typedRows.length} typed entries, so its symlink entries cannot be ruled out; refusing to extract it`,
       "unsafe-archive",
     );
   }
+  return names.map((name, index) => {
+    const row = typedRows[index];
+    if (!row.endsWith(` ${name}`)) {
+      throw new ResolutionError(
+        `The hosted artifact's typed listing does not line up with its names at entry ${index + 1}, so its symlink entries cannot be ruled out; refusing to extract it`,
+        "unsafe-archive",
+      );
+    }
+    return { name, mode: row.split(/\s/, 1)[0] };
+  });
+}
 
-  return names.map((name) => ({ name, mode: symlinks.has(name) ? "lrwxrwxrwx" : "-rw-r--r--" }));
-}/**
+/**
+ * More links than any real bundle carries.  The 8ccf02725 build has fourteen,
+ * all framework links.  The cap bounds how many `unzip -p` reads a hostile
+ * archive can make this resolver spawn while the updater holds its lock.
+ */
+const MAX_SYMLINK_ENTRIES = 256;
+// PATH_MAX is 1024 on macOS, so a longer target is not a target.
+const SYMLINK_TARGET_MAX_BYTES = 4096;
+/**
+ * The TOTAL wall-clock budget for reading every target, plus a per-read cap
+ * and a concurrency limit.  A per-read timeout alone bounds nothing useful:
+ * 256 links read one after another at 30 seconds each would hold the updater
+ * lock for over two hours.  The real bundle's fourteen reads take about three
+ * seconds in all, even on a heavily loaded Mac.
+ */
+const SYMLINK_READ_BUDGET_MS = 60_000;
+const SYMLINK_READ_TIMEOUT_MS = 30_000;
+const SYMLINK_READ_CONCURRENCY = 8;
+
+function readTargetWithUnzip(archivePath, name, timeoutMs) {
+  return runBoundedText("unzip", ["-p", archivePath, name], { timeoutMs, maxBytes: SYMLINK_TARGET_MAX_BYTES });
+}
+
+/**
+ * Read each symlink entry's target from the archive, before anything is
+ * extracted.  A zip stores a link's target as the entry's content, so
+ * `unzip -p` prints it.
+ *
+ * The name goes to unzip as a PATTERN, so a name with wildcard characters could
+ * read a different entry's content.  Such a link is left without a target, and
+ * `assertSafeArchiveEntries` refuses a link it could not read.  So does a read
+ * that fails, times out, or overruns the cap.  A name never starts with `-`,
+ * because every link that can pass the check sits under `BotFleet.app/`.
+ *
+ * The bytes are decoded as UTF-8.  Decoding never creates or hides a `/`, a
+ * `.`, or a NUL, because ASCII bytes always decode as themselves.  So the
+ * checks on the decoded string hold for the bytes ditto will write.
+ *
+ * At most `concurrency` reads run at once, and no read is given longer than
+ * what is left of `budgetMs`.  Each read also races one overall deadline, so
+ * even a read that ignored its own timeout cannot stretch the wait.  Running
+ * out of budget refuses the archive outright.  `readTarget` is injectable only
+ * so a test can stand in a read that hangs.
+ */
+export async function readSymlinkTargets(archivePath, entries, {
+  budgetMs = SYMLINK_READ_BUDGET_MS,
+  concurrency = SYMLINK_READ_CONCURRENCY,
+  readTarget = readTargetWithUnzip,
+} = {}) {
+  const links = entries.filter(({ mode }) => String(mode).startsWith("l"));
+  if (links.length > MAX_SYMLINK_ENTRIES) {
+    throw new ResolutionError(
+      `The hosted artifact has ${links.length} symlink entries, more than the ${MAX_SYMLINK_ENTRIES} any real bundle needs; refusing to extract it`,
+      "unsafe-archive",
+    );
+  }
+  const queue = links.filter(({ name }) => !/[[\]*?\\]/.test(name) && !name.startsWith("-"));
+  const deadline = Date.now() + budgetMs;
+  const EXPIRED = Symbol("expired");
+  let timer;
+  const overall = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(EXPIRED), budgetMs);
+  });
+  let expired = false;
+  const worker = async () => {
+    while (queue.length && !expired) {
+      const entry = queue.shift();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        expired = true;
+        return;
+      }
+      const outcome = await Promise.race([
+        // A failed read is left unread on purpose.  An unread target is a
+        // refusal, not a pass.
+        readTarget(archivePath, entry.name, Math.min(SYMLINK_READ_TIMEOUT_MS, remaining)).then(
+          (target) => ({ target }),
+          () => ({}),
+        ),
+        overall,
+      ]);
+      if (outcome === EXPIRED) {
+        expired = true;
+        return;
+      }
+      if ("target" in outcome) entry.target = outcome.target;
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), queue.length) }, worker));
+  } finally {
+    clearTimeout(timer);
+  }
+  if (expired) {
+    throw new ResolutionError(
+      `Reading the hosted artifact's ${links.length} symlink targets took longer than ${budgetMs >= 1000 ? `${Math.round(budgetMs / 1000)}s` : `${budgetMs}ms`}; refusing to extract an archive that cannot be inspected in time`,
+      "unsafe-archive",
+    );
+  }
+  return entries;
+}
+
+/**
+ * List an archive, read its link targets when links are allowed, and refuse it
+ * unless every entry passes `assertSafeArchiveEntries`.  Nothing is extracted.
+ */
+export async function inspectArchive(archivePath, { label = "artifact", symlinkRoot = null } = {}) {
+  const entries = await listArchiveEntries(archivePath);
+  if (symlinkRoot) await readSymlinkTargets(archivePath, entries);
+  return assertSafeArchiveEntries(entries, { label, symlinkRoot });
+}
+
+/**
+ * The ground truth after extraction: every link ditto actually created must
+ * resolve inside the bundle, and nothing else may be a device, FIFO, or socket.
+ *
+ * The pre-extraction checks read the archive through `zipinfo` and `unzip`, and
+ * `ditto` is a different parser.  If the two ever disagree about a name, a
+ * type, or a target, this walk sees what really landed on disk and refuses it
+ * before the bundle is moved anywhere.  The walk reads with `lstat` and never
+ * descends into a link, so every path it visits has only real directories
+ * above it.  It cannot see a write that already escaped, which is why the
+ * "nothing under a link" rule runs before extraction rather than here.
+ */
+export async function assertExtractedBundleContained(bundlePath) {
+  const top = await lstat(bundlePath).catch(() => null);
+  if (!top?.isDirectory()) {
+    throw new ResolutionError(`The hosted app bundle did not unpack to a real ${BUNDLE_ROOT} directory`, "unsafe-archive");
+  }
+  const rootReal = await realpath(bundlePath);
+  const shown = (path) => `${BUNDLE_ROOT}${path.slice(bundlePath.length)}`;
+  const unsafe = [];
+  const pending = [bundlePath];
+  while (pending.length) {
+    const directory = pending.pop();
+    for (const name of await readdir(directory)) {
+      const path = join(directory, name);
+      const info = await lstat(path);
+      if (info.isSymbolicLink()) {
+        const target = await readlink(path);
+        const resolved = await realpath(path).catch(() => null);
+        if (resolved === null) {
+          unsafe.push(`${shown(path)} -> ${target} (dangling)`);
+        } else if (resolved !== rootReal && !resolved.startsWith(rootReal + sep)) {
+          unsafe.push(`${shown(path)} -> ${target} (resolves outside the bundle)`);
+        }
+      } else if (info.isDirectory()) {
+        pending.push(path);
+      } else if (!info.isFile()) {
+        unsafe.push(`${shown(path)} (device, FIFO, or socket)`);
+      }
+    }
+  }
+  if (unsafe.length) {
+    throw new ResolutionError(
+      `The unpacked hosted app bundle has ${unsafe.length} unsafe entr${unsafe.length === 1 ? "y" : "ies"}, refusing to install it: ${unsafe.slice(0, 5).join(", ")}`,
+      "unsafe-archive",
+    );
+  }
+}
+
+/**
  * Unpack the artifact zip, verify it, and leave a real `.app` directory.
  *
  * The outer zip is GitHub's artifact wrapper; the inner one is the bundle the
@@ -585,22 +893,37 @@ export async function materializeBuild({ artifactBytes, commit, destination, man
     // `manifestArtifactName` checks the network-supplied FILENAME, which is one
     // untrusted input; the entry names are the other and larger one, and an
     // entry called ../../.ssh/authorized_keys is the actual Zip Slip vector.
-    assertSafeArchiveEntries(await listArchiveEntries(wrapper), { label: "artifact" });
+    // The wrapper is GitHub's, and it never holds a link, so every link in it
+    // is still refused.
+    await inspectArchive(wrapper, { label: "artifact" });
     // -j matters: GitHub nests every artifact entry inside a directory named
     // after the artifact, so without it the bundle lands one level down and
     // this lookup silently misses.
     await run("unzip", ["-q", "-j", "-o", wrapper, "-d", scratch]);
     const verified = verifyManifest(manifest, { commit, bytes: await readFile(inner) });
     // And again for the bundle, which is the archive that becomes an app here.
-    assertSafeArchiveEntries(await listArchiveEntries(inner), { label: "app bundle" });
+    // A real bundle carries framework links, so links under BotFleet.app/ are
+    // allowed, and only with targets that stay inside it.
+    await inspectArchive(inner, { label: "app bundle", symlinkRoot: BUNDLE_ROOT });
     // Unpack fresh: a leftover directory from a previous attempt would let
     // `ditto` merge into stale files instead of replacing them.
     await rm(appPath, { recursive: true, force: true });
-    // Extract to the *parent*, not to the app path.  `ditto -x -k` extracts
-    // INTO its destination, and the zip's single top-level entry is
-    // `BotFleet.app` (the workflow packs it with --keepParent), so naming the
-    // app as the destination would produce BotFleet.app/BotFleet.app.
-    await run("ditto", ["-x", "-k", inner, destination]);
+    // Extract into a FRESH, private, empty directory that nothing else uses.
+    // Nothing in it predates this archive, so the only links ditto can meet are
+    // ones this archive made, and every one of those was checked above.
+    // `ditto -x -k` extracts INTO its destination, and the zip's single
+    // top-level entry is `BotFleet.app` (the workflow packs it with
+    // --keepParent), so the app lands at `<extraction>/BotFleet.app`.
+    const extraction = await mkdtemp(join(destination, ".extract-"));
+    try {
+      await run("ditto", ["-x", "-k", inner, extraction]);
+      const extracted = join(extraction, BUNDLE_ROOT);
+      await assertExtractedBundleContained(extracted);
+      // Same directory, so the same volume: the move is a rename, never a copy.
+      await rename(extracted, appPath);
+    } finally {
+      await rm(extraction, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+    }
     return { appPath, manifest: verified };
   } finally {
     await rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
@@ -619,11 +942,12 @@ export async function downloadBuiltBundle({
   fetchImpl = fetch,
   env = process.env,
   log = () => {},
+  execFileSyncImpl,
 } = {}) {
   if (!FULL_COMMIT.test(commit || "")) {
     throw new ResolutionError(`Refusing to resolve a hosted build for a non-commit target: ${commit}`, "bad-target");
   }
-  const headers = authHeaders(env);
+  const headers = authHeaders(env, { execFileSyncImpl });
   const runsUrl = `${apiBase(repository)}/actions/workflows/${WORKFLOW_FILE}/runs?head_sha=${commit}&per_page=20`;
   const runs = (await requestJson(runsUrl, { headers, fetchImpl }))?.workflow_runs;
   const run_ = selectCommitRun(runs, commit);
@@ -671,14 +995,14 @@ export async function downloadBuiltBundle({
     );
   }
   log(`Using hosted build run ${run_.id} for ${commit.slice(0, 12)} (${artifact.name})`);
-  const bytes = await requestBytes(`${artifact.archive_download_url}`, { headers, fetchImpl, label: artifact.name });
+  const bytes = await requestBytes(`${artifact.archive_download_url}`, { headers, fetchImpl, label: artifact.name, commit });
   // The artifact wrapper is a zip holding the manifest and the bundle.
   const scratch = await mkdtemp(join(tmpdir(), "botfleet-ci-manifest-"));
   let manifest;
   try {
     const wrapper = join(scratch, "artifact.zip");
     await writeFile(wrapper, bytes, { mode: 0o600 });
-    assertSafeArchiveEntries(await listArchiveEntries(wrapper), { label: "artifact" });
+    await inspectArchive(wrapper, { label: "artifact" });
     await run("unzip", ["-q", "-j", "-o", wrapper, "build-manifest.json", "-d", scratch]);
     manifest = JSON.parse(await readFile(join(scratch, "build-manifest.json"), "utf8"));
   } catch (error) {

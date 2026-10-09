@@ -41,7 +41,7 @@ export function apnsKeyStamp(path = apnsKeyPath()): string | null {
 export function loadApnsConfig(): ApnsConfig | null {
   const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
   const teamId = process.env.APNS_TEAM_ID?.trim() || "CC8UTF7ATG";
-  const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet";
+  const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet.ios";
   const p8Path = apnsKeyPath();
   if (!existsSync(p8Path)) return null;
   let p8: string;

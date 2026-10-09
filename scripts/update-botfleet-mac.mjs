@@ -284,7 +284,7 @@ export function prunablePath(path, roots) {
  * deleted.  Both kinds are swept — the bundle beside the installed app and
  * the dependency tree beside the live checkout.
  */
-export function staleCandidateNames(names, { prefix, suffix = "", keepNames = [], isAlive = processIsAlive } = {}) {
+export function staleCandidateNames(names, { prefix, suffix = "", keepNames = [], isAlive = processExists } = {}) {
   const stale = [];
   const unrecognised = [];
   for (const name of names) {
@@ -572,7 +572,7 @@ async function acquireDirectoryLock(path, mode) {
       try { owner = JSON.parse(await readFile(join(path, "owner.json"), "utf8")); } catch {
         throw new Error(`Updater lock ${path} exists without a readable owner; inspect it before retrying`);
       }
-      if (Number.isInteger(owner?.pid) && processIsAlive(owner.pid)) {
+      if (Number.isInteger(owner?.pid) && await processIsAlive(owner.pid)) {
         throw new Error(`Another BotFleet update is running (pid ${owner.pid}, phase ${owner.mode || "unknown"})`);
       }
       if (attempt > 0) throw new Error(`Could not recover stale updater lock ${path}`);
@@ -582,13 +582,88 @@ async function acquireDirectoryLock(path, mode) {
   throw new Error(`Could not acquire updater lock ${path}`);
 }
 
-function processIsAlive(pid) {
+/**
+ * The raw signal-0 probe.  ESRCH is the only proof of absence: EPERM means the
+ * pid exists and belongs to someone else.  A zombie still has a pid, so this
+ * answers true for one; processIsAlive below is the check that knows better.
+ */
+function processExists(pid) {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
     return error?.code !== "ESRCH";
   }
+}
+
+/**
+ * A `ps` state column that begins with Z names a zombie: the process has
+ * exited and only its pid and exit status remain, waiting for a parent that
+ * never reaped it.  On 2026-10-08 a long-running grok CLI left two of
+ * BotFleet's bundled `cua-driver` processes in that state, `kill -0` kept
+ * answering success for them, and every apply refused to go on with "BotFleet
+ * did not exit after graceful quit and SIGTERM ... refusing SIGKILL".
+ */
+export function isZombieState(state) {
+  return String(state ?? "").trim().startsWith("Z");
+}
+
+/**
+ * The `ps` state column for every pid in one spawn, as a Map of pid to state.
+ * `ps` exits nonzero when some listed pid has gone but still prints the rest,
+ * so the rows are read whatever the exit code says.  A pid with no row is
+ * simply absent from the map.
+ */
+export async function processStates(pids) {
+  const states = new Map();
+  if (!pids.length) return states;
+  const result = await run("ps", ["-o", "pid=,stat=", "-p", pids.join(",")], { allowFailure: true });
+  for (const line of result.stdout.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(\S+)$/);
+    if (match) states.set(Number(match[1]), match[2]);
+  }
+  return states;
+}
+
+/**
+ * The pids in `pids` that are still running.  Every place the updater asks
+ * "does anything still hold BotFleet state" goes through this, so a zombie is
+ * never captured, waited on, signalled, or reported as a survivor.  A zombie
+ * holds no files, no ports and no database handle, so it can never hold
+ * BotFleet state, and no signal can make it exit sooner (only its parent
+ * reaping it can).
+ *
+ * `kill -0` runs first (ESRCH is the proof of absence), then ONE `ps` spawn
+ * reads the state of everything left, so a poll over N pids costs one spawn,
+ * not N.  This fails toward alive: a pid with no `ps` row, or a `ps` that
+ * fails, proves nothing, and reading that as "exited" would let the swap
+ * proceed under a live process.  Only a state beginning with Z says exited.
+ * (A `ps` that hangs blocks this check, as it blocks processCommand; run()
+ * has no timeout.)
+ *
+ * A caller may inject `isAlive`, synchronous or asynchronous.  The verdicts
+ * are awaited together because a Promise is always truthy and cannot be
+ * filtered on directly.
+ */
+export async function withoutExitedPids(pids, { isAlive, exists = processExists, statesOf = processStates } = {}) {
+  if (isAlive) {
+    const verdicts = await Promise.all(pids.map((pid) => isAlive(pid)));
+    return pids.filter((_, index) => verdicts[index]);
+  }
+  const present = pids.filter((pid) => exists(pid));
+  if (!present.length) return [];
+  let states;
+  try {
+    states = await statesOf(present);
+  } catch {
+    return present;
+  }
+  return present.filter((pid) => !isZombieState(states.get(pid)));
+}
+
+/** Is this one pid still running?  See withoutExitedPids; a zombie is not. */
+export async function processIsAlive(pid, options) {
+  return (await withoutExitedPids([pid], options)).length === 1;
 }
 
 async function parseJsonFile(path, label) {
@@ -657,7 +732,10 @@ async function sqliteHolders(dataDirectory) {
   if (!present.length) return [];
   const result = await run("lsof", ["-t", "--", ...present], { allowFailure: true });
   if (![0, 1].includes(result.code)) throw new Error("Could not inspect BotFleet database ownership with lsof");
-  return [...new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger))];
+  // lsof lists open files, which a zombie no longer has, so this filter is
+  // belt and braces: a zombie reported here would hold the database "open"
+  // forever and no signal could ever close it.
+  return withoutExitedPids([...new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger))]);
 }
 
 export function healthTopologyResult(results, { allowMultiple = false } = {}) {
@@ -715,7 +793,7 @@ async function ownerRecordState(dataDirectory) {
     if (error?.code === "ENOENT") return { state: "absent" };
     throw error;
   }
-  if (!processIsAlive(owner.pid)) return { state: "stale", owner };
+  if (!(await processIsAlive(owner.pid))) return { state: "stale", owner };
   return { state: "live", owner };
 }
 
@@ -1000,6 +1078,7 @@ export function smokeTestEnabled(env = process.env) {
  * checking its shape" — adding zod here would break updater bootstrap on every
  * Mac, which is a far worse failure than a longer predicate.
  */
+/* oxlint-disable anti-slop/no-runtime-typeof -- hand-written health body boundary parse; zod is unavailable in the updater bootstrap graph (see comment above). */
 export function parseHealthBody(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
   // The health contract is an object with an explicit boolean `ready` and an app
@@ -1007,6 +1086,7 @@ export function parseHealthBody(body) {
   if (typeof body.ready !== "boolean" || typeof body.app !== "string") return false;
   return body.ready;
 }
+/* oxlint-enable anti-slop/no-runtime-typeof */
 
 export function classifySmokeFailure({ exitCode, signal, spawnError, spawnTimedOut } = {}) {
   if (spawnError) return "spawn-failed";
@@ -1025,7 +1105,7 @@ const SMOKE_CAUSES = {
   "owner-mismatch": "wrote an owner record naming a different process",
 };
 
-export function smokeFailureMessage({ cause, exitCode, signal, spawnError, targetCommit, output, bundlePath }) {
+export function smokeFailureMessage({ cause, exitCode, signal, spawnError, targetCommit, output, bundlePath: _bundlePath }) {
   const summary = SMOKE_CAUSES[cause] || cause;
   const detail = [];
   if (exitCode !== null && exitCode !== undefined) detail.push(`exit=${exitCode}`);
@@ -1150,7 +1230,7 @@ async function freeLoopbackPort() {
     probe.on("error", rejectPort);
     probe.listen(0, "127.0.0.1", () => {
       const address = probe.address();
-      const chosen = typeof address === "object" && address ? address.port : 0;
+      const chosen = address?.port ?? 0;
       probe.close(() => resolvePort(chosen));
     });
   });
@@ -1328,13 +1408,22 @@ export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scr
 }
 
 
-async function exactAppPids(appPath) {
-  const result = await run("ps", ["-axo", "pid=,command="], { allowFailure: true });
-  const executable = join(appPath, "Contents/MacOS/BotFleet");
-  return result.stdout.split("\n").flatMap((line) => {
-    const match = line.trim().match(/^(\d+)\s+(.+)$/);
-    return match && (match[2] === executable || match[2].startsWith(`${executable} `)) ? [Number(match[1])] : [];
+/**
+ * The pids in `ps -axo pid=,stat=,command=` output whose arguments name
+ * `executable`.  Rows in a zombie state are skipped: the process is gone, and
+ * `ps` may keep printing its recorded command line until the parent reaps it.
+ */
+export function exactAppPidsFromPs(psOutput, executable) {
+  return psOutput.split("\n").flatMap((line) => {
+    const match = line.trim().match(/^(\d+)\s+(\S+)\s+(.+)$/);
+    if (!match || isZombieState(match[2])) return [];
+    return match[3] === executable || match[3].startsWith(`${executable} `) ? [Number(match[1])] : [];
   });
+}
+
+async function exactAppPids(appPath) {
+  const result = await run("ps", ["-axo", "pid=,stat=,command="], { allowFailure: true });
+  return exactAppPidsFromPs(result.stdout, join(appPath, "Contents/MacOS/BotFleet"));
 }
 
 /**
@@ -1356,7 +1445,7 @@ async function bundleHolderPids(bundlePath) {
   }
   const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
   if (![0, 1].includes(result.code)) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
-  return txtHolderPids(result.stdout, root);
+  return withoutExitedPids(txtHolderPids(result.stdout, root));
 }
 
 /**
@@ -1651,12 +1740,12 @@ export function credentialPreparationReceiptPath(prepared) {
   return join(prepared.stageDirectory, "credential-migration.json");
 }
 
-async function waitForExit(pids, timeoutMs, { isAlive = processIsAlive, wait = sleep, now = Date.now } = {}) {
+async function waitForExit(pids, timeoutMs, { isAlive, wait = sleep, now = Date.now } = {}) {
   const deadline = now() + timeoutMs;
-  let remaining = pids.filter((pid) => isAlive(pid));
+  let remaining = await withoutExitedPids(pids, { isAlive });
   while (remaining.length && now() < deadline) {
     await wait(250);
-    remaining = remaining.filter((pid) => isAlive(pid));
+    remaining = await withoutExitedPids(remaining, { isAlive });
   }
   return remaining;
 }
@@ -1682,6 +1771,35 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
 }
 
 /**
+ * Record the identity of every running process that holds BotFleet state, so
+ * quiesce can tell the process it captured from a recycled pid.  Exited pids
+ * (a zombie above all) are dropped first: they hold nothing, and a zombie's
+ * command line and working directory are unreliable or empty, so verifying
+ * one would refuse a healthy machine with "owns BotFleet state but does not
+ * match an expected BotFleet executable".  Returns the surviving pids too, so
+ * the caller records only those.
+ */
+export async function captureProcessIdentities(pids, config, {
+  isAlive,
+  commandOf = processCommand,
+  cwdOf = processCwd,
+} = {}) {
+  const live = await withoutExitedPids([...new Set(pids)], { isAlive });
+  const processCommands = {};
+  const processCwds = {};
+  for (const pid of live) {
+    const command = await commandOf(pid);
+    const cwd = await cwdOf(pid);
+    if (!(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
+      throw new Error(`Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`);
+    }
+    processCommands[pid] = command;
+    processCwds[pid] = cwd;
+  }
+  return { pids: live, processCommands, processCwds };
+}
+
+/**
  * Stop the BotFleet processes in `pids`: wait for a graceful exit, SIGTERM
  * whatever is left once its identity checks out, then wait again.  Never
  * SIGKILL.
@@ -1696,6 +1814,12 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
  * never signalled, and never waited on.  Without `current` every pid is
  * held to the strict rule.
  *
+ * A zombie counts as exited.  It has already died and holds nothing; only its
+ * parent can reap it, so it is neither waited on nor signalled, and its parent
+ * is never touched.  `kill -0` cannot tell the difference, which is how two
+ * defunct `cua-driver` processes left by a grok CLI that never reaped them
+ * blocked every apply on 2026-10-08 (processIsAlive reads the `ps` state).
+ *
  * A process exiting on its own is success at every point.  Under load `ps`
  * and `lsof` take seconds, so a process can pass the liveness check and be
  * gone by the time its identity comes back (empty), or by the time the
@@ -1706,7 +1830,7 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
  */
 export async function terminateVerified(pids, previous, config, {
   current,
-  isAlive = processIsAlive,
+  isAlive,
   commandOf = processCommand,
   cwdOf = processCwd,
   kill,
@@ -1725,7 +1849,7 @@ export async function terminateVerified(pids, previous, config, {
     if (!sameAsCaptured && !(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
       // Exited while ps and lsof were still describing it: there was no
       // process left to describe, so its identity came back empty.
-      if (!isAlive(pid)) continue;
+      if ((await withoutExitedPids([pid], { isAlive })).length === 0) continue;
       // A captured pid that now names something else: the process the
       // capture saw is gone, and this one never held BotFleet state.
       if (resolvedNow && !resolvedNow.has(pid)) continue;
@@ -2270,20 +2394,18 @@ function createOperations(config) {
       // Every process inside the bundle, not only its main binary: the swap
       // renames the whole directory, so an embedded driver or helper app has
       // to be accounted for too.
-      const appPids = await bundleProcessPids(config.appPath);
+      const bundlePids = await bundleProcessPids(config.appPath);
       const holders = await sqliteHolders(config.dataDirectory);
-      const runtimePids = [...new Set([...(lastPreflight?.pids || []), lastPreflight?.pid, ...holders].filter(Number.isInteger))];
-      const processCommands = {};
-      const processCwds = {};
-      for (const pid of new Set([...runtimePids, ...appPids])) {
-        const command = await processCommand(pid);
-        const cwd = await processCwd(pid);
-        if (!(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
-          throw new Error(`Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`);
-        }
-        processCommands[pid] = command;
-        processCwds[pid] = cwd;
-      }
+      const runtimeCandidates = [...new Set([...(lastPreflight?.pids || []), lastPreflight?.pid, ...holders].filter(Number.isInteger))];
+      // Exited processes (zombies above all) are not captured: quiesce would
+      // wait on a pid that can never go away, and a defunct process fails the
+      // identity check below.
+      const { pids: livePids, processCommands, processCwds } = await captureProcessIdentities(
+        [...runtimeCandidates, ...bundlePids],
+        config,
+      );
+      const runtimePids = runtimeCandidates.filter((pid) => livePids.includes(pid));
+      const appPids = bundlePids.filter((pid) => livePids.includes(pid));
       const stamp = Date.now();
       const generation = `${stamp}-${checkoutCommit.slice(0, 12)}`;
       const rollback = await resolveRollbackPlacement({

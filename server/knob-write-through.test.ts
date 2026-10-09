@@ -168,6 +168,6 @@ describe("writeThroughKnobs", () => {
     expect(calls.get("BOTFLEET_TRACES_SAMPLE_RATE")).toBe("0.5");
     expect(calls.get("BOTFLEET_SPEND_CEILING_USD")).toBe("25.5");
     expect(calls.get("BOTFLEET_INFISICAL_REFRESH_MINUTES")).toBe("10");
-    expect(KNOB_FIELDS.length).toBe(12);
+    expect(KNOB_FIELDS.length).toBe(13);
   });
 });

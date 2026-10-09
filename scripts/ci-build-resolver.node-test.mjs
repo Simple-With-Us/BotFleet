@@ -1,21 +1,27 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
 import {
   artifactNameFor,
+  assertExtractedBundleContained,
   assertSafeArchiveEntries,
+  authHeaders,
+  BUNDLE_ROOT,
   classifyResolutionFailure,
   downloadBuiltBundle,
   findCommitArtifact,
+  inspectArchive,
   manifestArtifactName,
+  readSymlinkTargets,
   maskedKeyPreview,
   materializeBuild,
+  resetGhAuthCacheForTests,
   ResolutionError,
   selectCommitRun,
   updateSourcePolicy,
@@ -25,8 +31,6 @@ import {
 const run = promisify(execFile);
 const COMMIT = "a".repeat(40);
 const OTHER = "b".repeat(40);
-const REPO = "jaywedgeworth22/BotFleet";
-
 function json(body, status = 200) {
   return async () => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 }
@@ -414,6 +418,87 @@ function escapeForRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+test("authHeaders falls back to gh auth token when env tokens are absent", () => {
+  resetGhAuthCacheForTests();
+  const GH_PREFIX = "ghp";
+  const cliToken = [GH_PREFIX, "cli_fallback_token_0123456789abcd"].join("_");
+  let ghCalls = 0;
+  const execFileSyncImpl = (command, args) => {
+    ghCalls += 1;
+    assert.equal(command, "gh");
+    assert.deepEqual(args, ["auth", "token"]);
+    return `${cliToken}\n`;
+  };
+  assert.deepEqual(authHeaders({}, { execFileSyncImpl }), { authorization: `Bearer ${cliToken}` });
+  assert.equal(ghCalls, 1, "gh is consulted once and then cached");
+  assert.deepEqual(authHeaders({}, { execFileSyncImpl }), { authorization: `Bearer ${cliToken}` });
+  assert.equal(ghCalls, 1, "the cached token is reused");
+});
+
+test("authHeaders skips gh when an env token is present", () => {
+  resetGhAuthCacheForTests();
+  const execFileSyncImpl = () => {
+    throw new Error("gh must not run when GITHUB_TOKEN is set");
+  };
+  assert.deepEqual(
+    authHeaders({ GITHUB_TOKEN: "env-only-token" }, { execFileSyncImpl }),
+    { authorization: "Bearer env-only-token" },
+  );
+  assert.deepEqual(
+    authHeaders({ GH_TOKEN: "gh-env-token" }, { execFileSyncImpl }),
+    { authorization: "Bearer gh-env-token" },
+  );
+});
+
+test("authHeaders swallows gh failures and leaves authorization unset", () => {
+  resetGhAuthCacheForTests();
+  const execFileSyncImpl = (command) => {
+    throw new Error(`${command} unavailable`);
+  };
+  assert.deepEqual(authHeaders({}, { execFileSyncImpl }), {});
+});
+
+test("an artifact download 401 names the commit and explains token setup", async (t) => {
+  resetGhAuthCacheForTests();
+  const execFileSyncImpl = () => {
+    throw new Error("no gh in this fixture");
+  };
+  let calls = 0;
+  const fetchImpl = async (url) => {
+    calls += 1;
+    if (calls === 1) {
+      return { ok: true, status: 200, json: async () => successfulRuns };
+    }
+    if (calls === 2) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ artifacts: [anArtifact({})] }),
+      };
+    }
+    return { ok: false, status: 401, arrayBuffer: async () => new ArrayBuffer(0) };
+  };
+  await assert.rejects(
+    downloadBuiltBundle({
+      commit: COMMIT,
+      destination: await fixture(t),
+      fetchImpl,
+      env: {},
+      execFileSyncImpl,
+    }),
+    (error) => {
+      assert.equal(error.cause, "unauthorized");
+      assert.match(error.message, new RegExp(COMMIT));
+      assert.match(error.message, /gh auth login/);
+      assert.match(error.message, /GITHUB_TOKEN/);
+      assert.doesNotMatch(error.message, /public repo/);
+      assert.doesNotMatch(error.message, /not a full commit/);
+      return true;
+    },
+  );
+  assert.equal(calls, 3, "two lookups plus one download attempt");
+});
+
 test("a rejected key is named by a masked preview, never printed", async () => {
   // A 401 that cannot say WHICH key was rejected is not a diagnosis, and the
   // answer must never be the key itself.
@@ -442,4 +527,373 @@ test("a rejected key is named by a masked preview, never printed", async () => {
       return true;
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// In-bundle framework symlinks.
+//
+// On 2026-10-08 the safe updater refused the green hosted build of main
+// 8ccf02725, because the guard treated every symlink as a Zip Slip.  A real
+// Electron bundle always carries framework links, so the hosted path could
+// never install a real build.  These tests pin the replacement rule: links
+// strictly inside BotFleet.app/ with relative, non-climbing targets are
+// accepted.  Every way a link could carry a write or a resolution out of the
+// bundle is still refused.
+
+const FW = `${BUNDLE_ROOT}/Contents/Frameworks`;
+const fileEntry = (name) => ({ name, mode: "-rw-r--r--" });
+const dirEntry = (name) => ({ name, mode: "drwxr-xr-x" });
+const linkEntry = (name, target) => ({ name, mode: "lrwxr-xr-x", target });
+
+/** The entry list ditto produces for one framework, sidecars included. */
+function frameworkEntries(framework = "Squirrel", binary = framework) {
+  const root = `${FW}/${framework}.framework`;
+  return [
+    dirEntry(`${BUNDLE_ROOT}/`),
+    dirEntry(`${BUNDLE_ROOT}/Contents/`),
+    dirEntry(`${FW}/`),
+    dirEntry(`${root}/`),
+    dirEntry(`${root}/Versions/`),
+    dirEntry(`${root}/Versions/A/`),
+    dirEntry(`${root}/Versions/A/Resources/`),
+    fileEntry(`${root}/Versions/A/${binary}`),
+    fileEntry(`${root}/Versions/A/Resources/Info.plist`),
+    linkEntry(`${root}/Versions/Current`, "A"),
+    linkEntry(`${root}/Resources`, "Versions/Current/Resources"),
+    linkEntry(`${root}/${binary}`, `Versions/Current/${binary}`),
+    // ditto writes a sidecar for a link too.  It is an ordinary file under
+    // __MACOSX/, not an entry under the link.
+    fileEntry(`__MACOSX/${root}/Versions/._Current`),
+  ];
+}
+
+function assertRefused(entries, why, message) {
+  assert.throws(
+    () => assertSafeArchiveEntries(entries, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }),
+    (error) => {
+      assert.equal(error.cause, "unsafe-archive", message);
+      assert.match(error.message, why, message);
+      return true;
+    },
+    message,
+  );
+}
+
+test("in-bundle framework links are accepted, and only inside the bundle", () => {
+  // The shape of the real 8ccf02725 bundle, including a framework whose name
+  // has a space in it.
+  const real = [...frameworkEntries("Squirrel"), ...frameworkEntries("Electron Framework").slice(3)];
+  assert.doesNotThrow(() => assertSafeArchiveEntries(real, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }));
+
+  // GitHub's wrapper is checked with no symlinkRoot, and there even a
+  // well-formed link is refused, exactly as before.
+  assert.throws(
+    () => assertSafeArchiveEntries(real, { label: "artifact" }),
+    (error) => error.cause === "unsafe-archive" && /symlink entry/.test(error.message),
+  );
+});
+
+test("a link whose target is absolute, climbs, or cannot be read is refused", () => {
+  const base = frameworkEntries();
+  for (const [target, why] of [
+    ["/etc", /absolute target/],
+    ["/Users/someone/.ssh", /absolute target/],
+    ["../../../../../../outside", /climbs with \.\./],
+    // A sibling of the bundle: `<destination>/Sibling.app`.
+    ["../../../Sibling.app/Contents", /climbs with \.\./],
+    // The lexical trap.  `b -> ..` looks contained, and `c -> b/../x` looks
+    // contained, but the kernel applies `..` after following `b`, so `c`
+    // lands outside the bundle.  Refusing every `..` refuses both halves.
+    ["..", /climbs with \.\./],
+    ["b/../x", /climbs with \.\./],
+    ["", /empty target/],
+    ["A\0/x", /contains NUL/],
+    [undefined, /could not be read/],
+  ]) {
+    assertRefused(
+      [...base, linkEntry(`${BUNDLE_ROOT}/Contents/escape`, target)],
+      why,
+      `a link to ${JSON.stringify(target)} must be refused`,
+    );
+  }
+});
+
+test("a link outside BotFleet.app is refused, wherever it sits", () => {
+  const base = frameworkEntries();
+  for (const name of ["Sibling", "__MACOSX/BotFleet.app/Contents/link"]) {
+    assertRefused([...base, linkEntry(name, "A")], /outside BotFleet\.app\//, `${name} must be refused`);
+  }
+  // The bundle itself as a link would make every other entry a write through
+  // it, to wherever it points.
+  assertRefused([linkEntry(BUNDLE_ROOT, "Contents")], /outside BotFleet\.app\//, "the bundle itself as a link");
+  assertRefused([...base, linkEntry("botfleet.APP", "Contents")], /duplicate entry/, "a case-variant bundle link collides with the bundle");
+});
+
+test("nothing may be written through a link, however the name is spelled", () => {
+  const base = frameworkEntries();
+  const current = `${FW}/Squirrel.framework/Versions/Current`;
+  for (const name of [
+    `${current}/payload`,
+    `${current}/nested/dir/`,
+    // APFS is case-insensitive, so this lands inside `Versions/Current`.
+    `${BUNDLE_ROOT.toLowerCase()}/contents/frameworks/squirrel.framework/VERSIONS/current/payload`,
+  ]) {
+    assertRefused([...base, fileEntry(name)], /written through the symlink entry/, `${name} must be refused`);
+  }
+
+  // APFS is normalization-insensitive too.  A link spelled with a composed é
+  // and a payload spelled with a decomposed one are the same directory.
+  assertRefused(
+    [...base, linkEntry(`${BUNDLE_ROOT}/Contents/café`, "Frameworks"), fileEntry(`${BUNDLE_ROOT}/Contents/café/payload`)],
+    /written through the symlink entry/,
+    "a normalization-variant spelling must still be caught",
+  );
+});
+
+test("duplicates, climbing directories, and special files are refused", () => {
+  const base = frameworkEntries();
+  assertRefused(
+    [...base, fileEntry(`${BUNDLE_ROOT}/contents/frameworks/SQUIRREL.framework/Versions/A/Squirrel`)],
+    /duplicate entry/,
+    "a case-folded duplicate would replace the first copy",
+  );
+  // Directory entries used to be skipped outright, so a climbing directory was
+  // never looked at.
+  assertRefused([...base, dirEntry(`${BUNDLE_ROOT}/../../escape/`)], /traverses out of the destination/, "a climbing directory");
+  assertRefused([...base, dirEntry("/abs/dir/")], /absolute path/, "an absolute directory");
+  assertRefused([...base, { name: `${BUNDLE_ROOT}/Contents/fifo`, mode: "prw-r--r--" }], /FIFO/, "a FIFO entry");
+});
+
+// Reading targets.  A per-read timeout alone let 256 links read one after
+// another hold the updater lock for over two hours, so the reads share one
+// wall-clock budget and run a few at a time.
+
+const manyLinks = (count) => Array.from({ length: count }, (_, index) => linkEntry(`${FW}/L${index}.framework/Versions/Current`, undefined));
+
+/** A stand-in reader that records how many reads are in flight at once. */
+function trackingReader(settle) {
+  const seen = { calls: 0, inFlight: 0, maxInFlight: 0, timeouts: [] };
+  const read = (_archive, name, timeoutMs) => {
+    seen.calls += 1;
+    seen.inFlight += 1;
+    seen.maxInFlight = Math.max(seen.maxInFlight, seen.inFlight);
+    seen.timeouts.push(timeoutMs);
+    return settle(name, timeoutMs).finally(() => {
+      seen.inFlight -= 1;
+    });
+  };
+  return { read, seen };
+}
+
+test("a read that hangs forever still hits the overall budget, and the archive is refused", async () => {
+  // This reader ignores its timeout entirely and never settles.  Only the
+  // shared deadline can end the wait.
+  const { read, seen } = trackingReader(() => new Promise(() => {}));
+  const started = Date.now();
+  await assert.rejects(
+    readSymlinkTargets("unused.zip", manyLinks(256), { budgetMs: 150, readTarget: read }),
+    (error) => {
+      assert.equal(error.cause, "unsafe-archive");
+      assert.match(error.message, /256 symlink targets took longer than 150ms/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 5_000, "the budget, not 256 per-read timeouts, bounds the wait");
+  assert.equal(seen.maxInFlight, 8, "no more than eight reads run at once");
+  assert.equal(seen.calls, 8, "no new read starts once the budget is spent");
+});
+
+test("slow reads that honour their timeouts cannot stretch the budget either", async () => {
+  // This reader behaves like runBoundedText: it gives up when its timeout
+  // passes.  Every timeout it is handed must fit inside what is left of the
+  // budget, so the last read cannot run past the deadline.
+  const { read, seen } = trackingReader((_name, timeoutMs) => new Promise((_resolve, reject) => {
+    setTimeout(() => reject(new Error("killed at its timeout")), timeoutMs);
+  }));
+  const started = Date.now();
+  await assert.rejects(
+    readSymlinkTargets("unused.zip", manyLinks(256), { budgetMs: 200, readTarget: read }),
+    (error) => error.cause === "unsafe-archive" && /took longer than 200ms/.test(error.message),
+  );
+  assert.ok(Date.now() - started < 5_000);
+  assert.ok(seen.maxInFlight <= 8);
+  assert.ok(seen.timeouts.every((ms) => ms > 0 && ms <= 200), `every read fits inside the budget: ${seen.timeouts}`);
+});
+
+test("link targets are read in parallel, and a pattern-shaped name is never handed to unzip", async () => {
+  const { read, seen } = trackingReader(async (name) => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return `target-of-${name.split("/").at(-3)}`;
+  });
+  const entries = [...manyLinks(20), linkEntry(`${FW}/W[1].framework/Versions/Current`, undefined), fileEntry(`${FW}/plain`)];
+  await readSymlinkTargets("unused.zip", entries, { readTarget: read });
+  assert.equal(seen.calls, 20, "the wildcard-named link is not read, and plain files never are");
+  assert.equal(seen.maxInFlight, 8);
+  assert.equal(entries[0].target, "target-of-L0.framework");
+  assert.equal(entries[19].target, "target-of-L19.framework");
+  assert.equal(entries[20].target, undefined, "an unread link stays unread, which the checker refuses");
+
+  // Over the cap, nothing is read at all.
+  const capped = trackingReader(async () => "A");
+  await assert.rejects(
+    readSymlinkTargets("unused.zip", manyLinks(257), { readTarget: capped.read }),
+    (error) => error.cause === "unsafe-archive" && /257 symlink entries, more than the 256/.test(error.message),
+  );
+  assert.equal(capped.seen.calls, 0);
+});
+
+const posixOnly = process.platform === "win32" ? "symlinks need privileges on Windows" : false;
+const macOnly = process.platform === "darwin" ? false : "needs ditto, which is macOS only";
+
+/** A real BotFleet.app tree on disk, with frameworks shaped like Electron's. */
+async function stageBundle(root) {
+  const app = join(root, BUNDLE_ROOT);
+  for (const [framework, binary] of [["Squirrel", "Squirrel"], ["Electron Framework", "Electron Framework"]]) {
+    const fw = join(app, "Contents", "Frameworks", `${framework}.framework`);
+    await mkdir(join(fw, "Versions", "A", "Resources"), { recursive: true });
+    await writeFile(join(fw, "Versions", "A", binary), `${framework} binary\n`);
+    await writeFile(join(fw, "Versions", "A", "Resources", "Info.plist"), `${framework} plist\n`);
+    await symlink("A", join(fw, "Versions", "Current"));
+    await symlink("Versions/Current/Resources", join(fw, "Resources"));
+    await symlink(`Versions/Current/${binary}`, join(fw, binary));
+  }
+  await mkdir(join(app, "Contents", "Resources"), { recursive: true });
+  await writeFile(join(app, "Contents", "Resources", "marker.txt"), "staged\n");
+  return app;
+}
+
+/** Pack an app the way the hosted workflow does. */
+async function packBundle(app, zipPath) {
+  await run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", app, zipPath]);
+  return zipPath;
+}
+
+/** Wrap a bundle zip the way GitHub does, with a manifest that matches it. */
+async function wrapBundle(scratch, innerZip) {
+  const innerBytes = await readFile(innerZip);
+  const manifest = {
+    schemaVersion: 1,
+    commit: COMMIT,
+    artifact: "BotFleet-mac-arm64.zip",
+    sha256: createHash("sha256").update(innerBytes).digest("hex"),
+  };
+  const wrapperDir = await mkdtemp(join(scratch, "wrapper-"));
+  await writeFile(join(wrapperDir, "BotFleet-mac-arm64.zip"), innerBytes);
+  await writeFile(join(wrapperDir, "build-manifest.json"), JSON.stringify(manifest));
+  const wrapperZip = join(wrapperDir, "artifact.zip");
+  await run("zip", ["-q", wrapperZip, "BotFleet-mac-arm64.zip", "build-manifest.json"], { cwd: wrapperDir });
+  return { artifactBytes: await readFile(wrapperZip), manifest };
+}
+
+test("a framework-shaped bundle packed by ditto is accepted and unpacks with its links intact", { skip: macOnly }, async (t) => {
+  const scratch = await fixture(t);
+  const app = await stageBundle(join(scratch, "src"));
+  const innerZip = await packBundle(app, join(scratch, "BotFleet-mac-arm64.zip"));
+
+  const entries = await inspectArchive(innerZip, { label: "app bundle", symlinkRoot: BUNDLE_ROOT });
+  // The old listing typed a link with a space in its name as a regular file.
+  // It must come back as a link, with its real target read from the archive.
+  const spaced = entries.find(({ name }) => name === `${FW}/Electron Framework.framework/Electron Framework`);
+  assert.ok(spaced, "the spaced framework binary link is listed");
+  assert.equal(spaced.mode.charAt(0), "l", "a link with a space in its name is typed as a link");
+  assert.equal(spaced.target, "Versions/Current/Electron Framework");
+  assert.equal(entries.filter(({ mode }) => mode.startsWith("l")).length, 6);
+
+  const destination = join(scratch, "staging", "hosted");
+  const built = await materializeBuild({ ...(await wrapBundle(scratch, innerZip)), commit: COMMIT, destination });
+  assert.equal(built.appPath, join(destination, BUNDLE_ROOT));
+  const current = join(built.appPath, "Contents/Frameworks/Squirrel.framework/Versions/Current");
+  assert.ok((await lstat(current)).isSymbolicLink(), "Versions/Current is still a link after unpacking");
+  assert.equal(await readlink(current), "A");
+  assert.equal(
+    await readFile(join(built.appPath, "Contents/Frameworks/Electron Framework.framework/Resources/Info.plist"), "utf8"),
+    "Electron Framework plist\n",
+    "a file reads through the framework links",
+  );
+  // The private extraction directory is gone, and only the app is left.
+  assert.deepEqual(await readdir(destination), [BUNDLE_ROOT]);
+});
+
+test("real archives with escaping links are refused before anything is written", { skip: macOnly }, async (t) => {
+  const scratch = await fixture(t);
+  for (const [label, linkPath, target, why] of [
+    ["an absolute target", "Contents/abs", "/etc", /absolute target/],
+    ["an escape via ../..", "Contents/Frameworks/esc", "../../../outside", /climbs with \.\./],
+    ["a sibling outside the bundle", "Contents/sib", "../../Sibling.app/Contents", /climbs with \.\./],
+  ]) {
+    const root = await mkdtemp(join(scratch, "case-"));
+    const app = await stageBundle(join(root, "src"));
+    await symlink(target, join(app, linkPath));
+    const innerZip = await packBundle(app, join(root, "BotFleet-mac-arm64.zip"));
+    await assert.rejects(
+      inspectArchive(innerZip, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }),
+      (error) => {
+        assert.equal(error.cause, "unsafe-archive", label);
+        assert.match(error.message, why, label);
+        assert.match(error.message, new RegExp(escapeForRegExp(`${BUNDLE_ROOT}/${linkPath}`)), `${label} names the link`);
+        return true;
+      },
+    );
+  }
+});
+
+test("an entry written through a link in a real archive is refused, and nothing lands outside", { skip: macOnly }, async (t) => {
+  const scratch = await fixture(t);
+  const outside = join(scratch, "outside");
+  await mkdir(outside);
+
+  // Stage 1: a bundle whose link points out of it, packed by ditto.
+  const first = await stageBundle(join(scratch, "stage1"));
+  await symlink("../../outside", join(first, "Contents", "evil"));
+  const innerZip = await packBundle(first, join(scratch, "BotFleet-mac-arm64.zip"));
+  // Stage 2: append an innocent-looking file whose path runs through that link.
+  // `zip` cannot hold both on one disk at once, so it comes from a second tree.
+  const second = join(scratch, "stage2");
+  await mkdir(join(second, BUNDLE_ROOT, "Contents", "evil"), { recursive: true });
+  await writeFile(join(second, BUNDLE_ROOT, "Contents", "evil", "pwned"), "pwned\n");
+  await run("zip", ["-q", "-y", innerZip, `${BUNDLE_ROOT}/Contents/evil/pwned`], { cwd: second });
+
+  await assert.rejects(
+    inspectArchive(innerZip, { label: "app bundle", symlinkRoot: BUNDLE_ROOT }),
+    (error) => {
+      assert.equal(error.cause, "unsafe-archive");
+      assert.match(error.message, /BotFleet\.app\/Contents\/evil\/pwned \(written through the symlink entry BotFleet\.app\/Contents\/evil\)/);
+      return true;
+    },
+  );
+
+  // The full materialise path refuses it too, and writes nothing anywhere.
+  const destination = join(scratch, "staging", "hosted");
+  await assert.rejects(
+    materializeBuild({ ...(await wrapBundle(scratch, innerZip)), commit: COMMIT, destination }),
+    (error) => error.cause === "unsafe-archive",
+  );
+  assert.deepEqual(await readdir(outside), [], "nothing was written through the link");
+  assert.deepEqual(await readdir(destination), [], "nothing was unpacked");
+});
+
+test("the unpacked tree is checked again on disk", { skip: posixOnly }, async (t) => {
+  const scratch = await fixture(t);
+  const app = await stageBundle(join(scratch, "good"));
+  await assert.doesNotReject(assertExtractedBundleContained(app));
+
+  // Whatever the archive listing said, a link that really resolves outside the
+  // bundle, or nowhere, is refused before the bundle is moved.
+  for (const [label, linkPath, target, why] of [
+    ["an absolute target", "Contents/abs", scratch, /resolves outside the bundle/],
+    ["a climbing target", "Contents/Frameworks/up", "../../..", /resolves outside the bundle/],
+    ["a dangling target", "Contents/gone", "Nowhere/at/all", /dangling/],
+  ]) {
+    const bad = await stageBundle(await mkdtemp(join(scratch, "bad-")));
+    await mkdir(dirname(join(bad, linkPath)), { recursive: true });
+    await symlink(target, join(bad, linkPath));
+    await assert.rejects(
+      assertExtractedBundleContained(bad),
+      (error) => {
+        assert.equal(error.cause, "unsafe-archive", label);
+        assert.match(error.message, why, label);
+        return true;
+      },
+    );
+  }
 });
