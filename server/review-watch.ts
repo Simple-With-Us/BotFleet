@@ -341,7 +341,9 @@ export class ReviewWatch {
     for (const key of keys) {
       // the queue key and the budget key are built the same way
       const left = this.deps.budget?.remaining(key);
-      const lateBudget = left === undefined ? undefined : snapshotSpend(left, this.deps.budget!.limit());
+      // the snapshot's `limit` is the actual remaining for late reviews, so
+      // the "review limit of N reached" log reads what was budgeted for them
+      const lateBudget = left === undefined ? undefined : snapshotSpend(left, left);
       // the step the drain is waiting on or reviewing is no longer in the
       // queue, and is as much a step of the turn that ended as the rest
       const current = this.handling.get(key);
