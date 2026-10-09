@@ -59,6 +59,15 @@ import {
 
 const scripts = dirname(fileURLToPath(import.meta.url));
 
+/** Wrapper tests must not read ~/.botfleet or /Applications/BotFleet.app. */
+function wrapperFixtureEnv(checkout, fixture) {
+  return {
+    BOTFLEET_CHECKOUT: checkout,
+    BOTFLEET_DATA_DIR: join(fixture, "data"),
+    BOTFLEET_APP_PATH: join(fixture, "no-app.app"),
+  };
+}
+
 // A real 40-char commit, so the resolver is driven with a target it will accept.
 const COMMIT = "c".repeat(40);
 
@@ -714,14 +723,14 @@ test("the stable wrapper detects a linked worktree checkout, where .git is a fil
 
   // Up-to-date check: the worktree is already at origin/main, so an unforced
   // run must short-circuit instead of running any updater.
-  const current = await run("bash", [wrapper], { env: { BOTFLEET_CHECKOUT: checkout }, allowFailure: true });
+  const current = await run("bash", [wrapper], { env: wrapperFixtureEnv(checkout, fixture), allowFailure: true });
   assert.equal(current.code, 0, current.stderr);
   assert.match(current.stdout, /Already at .*Nothing to update/);
   assert.equal(await readFile(marker, "utf8").catch(() => null), null, "an up-to-date worktree runs no updater");
 
   // Bootstrap: a forced run must archive and run the target's updater from
   // the worktree, not fall back to the installed implementation.
-  const forced = await run("bash", [wrapper], { env: { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1" }, allowFailure: true });
+  const forced = await run("bash", [wrapper], { env: { ...wrapperFixtureEnv(checkout, fixture), BOTFLEET_FORCE: "1" }, allowFailure: true });
   assert.equal(forced.code, 0, forced.stderr);
   assert.doesNotMatch(forced.stderr, /using the installed implementation/);
   const mainCommit = (await git(checkout, ["rev-parse", "origin/main"])).stdout.trim();
@@ -774,7 +783,7 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
   // No BOTFLEET_FORCE anywhere below: every run sees HEAD == origin/main.
   const invoke = async (args, extraEnv = {}) => {
     await rm(marker, { force: true });
-    const result = await run("bash", [wrapper, ...args], { env: { BOTFLEET_CHECKOUT: checkout, ...extraEnv }, allowFailure: true });
+    const result = await run("bash", [wrapper, ...args], { env: { ...wrapperFixtureEnv(checkout, fixture), ...extraEnv }, allowFailure: true });
     const executed = await readFile(marker, "utf8").then(JSON.parse, () => null);
     return { ...result, executed };
   };
@@ -816,6 +825,29 @@ test("the stable wrapper does not test for a .git directory to find the checkout
   const source = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
   assert.doesNotMatch(source, /-d "\$BOTFLEET_CHECKOUT\/\.git"/);
   assert.match(source, /git -C "\$BOTFLEET_CHECKOUT" rev-parse --git-dir/);
+});
+
+test("the up-to-date runtime probe reads the bearer credential from BOTFLEET_OWNER_NONCE only", async () => {
+  const wrapper = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const helper = await readFile(join(scripts, "update-botfleet-runtime-commit.mjs"), "utf8");
+  assert.match(wrapper, /update-botfleet-runtime-commit\.mjs/);
+  assert.match(wrapper, /BOTFLEET_OWNER_NONCE/);
+  assert.match(wrapper, /BOTFLEET_OWNER_NONCE is required when a harness owner record exists/);
+  assert.doesNotMatch(wrapper, /\|\| RUNTIME_COMMIT=""/);
+  assert.doesNotMatch(wrapper, /owner\.nonce/);
+  assert.doesNotMatch(wrapper, /console\.log\(.*nonce/);
+  assert.match(helper, /process\.env\.BOTFLEET_OWNER_NONCE/);
+  assert.doesNotMatch(helper, /owner\.nonce/);
+  assert.match(helper, /BOTFLEET_OWNER_NONCE is required/);
+  assert.match(helper, /res\.statusCode === 401 \|\| res\.statusCode === 403/);
+  assert.match(helper, /maskedCredentialEnvRef/);
+});
+
+test("the mac updater authenticates runtime calls with BOTFLEET_OWNER_NONCE only", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  assert.match(source, /requireHarnessBearerCredential/);
+  assert.match(source, /process\.env\.BOTFLEET_OWNER_NONCE/);
+  assert.doesNotMatch(source, /Authorization: `Bearer \$\{owner\.nonce\}`/);
 });
 
 test("apply bootstraps the updater recorded in the stage manifest, not a newer origin/main", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
@@ -1030,6 +1062,7 @@ function processTable(entries) {
       if (entry.exitDuringLsof) entry.alive = false;
       return entry.cwd;
     },
+    txtPathsOf: async () => [],
     kill: (pid, signal) => {
       const entry = table.get(pid);
       if (entry?.killError) throw entry.killError;
@@ -1536,9 +1569,15 @@ test("unused foreign fallback ports do not hide one valid BotFleet owner", () =>
   assert.match(healthTopologyResult([owner, { kind: "unavailable" }]).reason, /unavailable or ambiguous/);
 });
 
-test("a post-fence ownership exception releases runtime admission", async () => {
+test("a post-fence ownership exception releases runtime admission", async (t) => {
   const releases = [];
   const owner = { version: 1, pid: 42, port: 8799, nonce: "a".repeat(64) };
+  const previousNonce = process.env.BOTFLEET_OWNER_NONCE;
+  process.env.BOTFLEET_OWNER_NONCE = owner.nonce;
+  t.after(() => {
+    if (previousNonce === undefined) delete process.env.BOTFLEET_OWNER_NONCE;
+    else process.env.BOTFLEET_OWNER_NONCE = previousNonce;
+  });
   const result = await fenceRuntimeAdmission(
     { dataDirectory: "/private/data", ports: [8799] },
     {
