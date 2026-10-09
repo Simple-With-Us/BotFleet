@@ -435,6 +435,7 @@ class ZulipSession {
       fetch: this.hub.deps.fetch,
       sleep: this.hub.sleep,
       eventsTimeoutMs: this.hub.deps.timings?.eventsTimeoutMs,
+      onInvalid: (what) => this.hub.log(`[zulip] ${this.role}: dropped ${what}`),
     });
     return this.client;
   }
@@ -448,7 +449,7 @@ class ZulipSession {
     this.queueId = undefined;
     if (leftover) await client.deleteQueue(leftover).catch(() => {});
     const me = await client.me(signal);
-    if (String(me.email ?? "").toLowerCase() !== this.creds!.email.toLowerCase()) {
+    if (me.email.toLowerCase() !== this.creds!.email.toLowerCase()) {
       throw new RoleRefused(`users/me answered as a different user than ${this.creds!.source} names; refusing it`);
     }
     if (me.is_admin || me.is_owner || !ALLOWED_ROLES.has(Number(me.role))) {
@@ -466,16 +467,14 @@ class ZulipSession {
     this.state.userId = me.user_id;
     const registered = await client.register(signal);
     this.queueId = registered.queue_id;
-    this.lastEventId = registered.last_event_id ?? -1;
-    const longpoll = Number(registered.event_queue_longpoll_timeout_seconds);
+    this.lastEventId = registered.last_event_id;
+    const longpoll = registered.event_queue_longpoll_timeout_seconds;
     this.longpollMs =
-      (Number.isFinite(longpoll) && longpoll > 0 ? longpoll : DEFAULT_LONGPOLL_SECONDS) * 1000 + LONGPOLL_MARGIN_MS;
+      (longpoll !== undefined && longpoll > 0 ? longpoll : DEFAULT_LONGPOLL_SECONDS) * 1000 + LONGPOLL_MARGIN_MS;
     this.users.clear();
-    for (const user of registered.realm_users ?? []) {
-      if (typeof user?.user_id === "number") this.users.set(user.user_id, user);
-    }
+    for (const user of registered.realm_users) this.users.set(user.user_id, user);
     this.followed.clear();
-    for (const entry of registered.user_topics ?? []) this.applyUserTopic(entry);
+    for (const entry of registered.user_topics) this.applyUserTopic(entry);
     if (this.state.cursor === null) {
       // First connection: start from now.  History is not a wake.
       this.state.cursor = typeof registered.max_message_id === "number" ? registered.max_message_id : 0;
@@ -513,10 +512,12 @@ class ZulipSession {
     for (const { narrow, pages } of narrows) {
       let anchor = floor;
       for (let page = 0; page < pages; page++) {
-        const messages = await client.messages(narrow, { anchor, numAfter: PAGE }, signal);
-        for (const message of messages) if (message.id > floor) found.set(message.id, message);
-        if (messages.length < PAGE) break;
-        anchor = Math.max(...messages.map((m) => m.id));
+        const result = await client.messages(narrow, { anchor, numAfter: PAGE }, signal);
+        for (const message of result.messages) if (message.id > floor) found.set(message.id, message);
+        // Paged by what Zulip sent, not by what parsed: a dropped message
+        // must neither end the paging early nor move the anchor.
+        if (result.received < PAGE || result.newestId === null) break;
+        anchor = result.newestId;
       }
     }
     const ordered = [...found.keys()].sort((a, b) => a - b);

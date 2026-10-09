@@ -12,15 +12,42 @@
 //     retried after a network failure: it may already have posted.
 //   - Every error text is scrubbed of the key and the Basic token, so a
 //     server that echoes the header cannot leak it into a log.
+//   - Every success body is parsed with a zod schema (wire.ts) before anything
+//     reads it.  A body of the wrong shape is a `ZulipApiError` coded
+//     `invalid_response`, so the hub backs off and retries it like any other
+//     failed call; a bad element inside a list is dropped and reported
+//     through `onInvalid` instead.
+
+import type { z } from "zod";
 
 import type { ZulipCredentials } from "./credentials.ts";
-import type { ZulipMessage, ZulipUser } from "./types.ts";
+import {
+  ZULIP_PAYLOAD_EVENT_TYPES,
+  zulipAckSchema,
+  zulipEventSchema,
+  zulipEventsSchema,
+  zulipMessageSchema,
+  zulipMessagesSchema,
+  zulipRegisterSchema,
+  zulipSelfSchema,
+  zulipSentSchema,
+  zulipSubscriptionsSchema,
+  type ZulipEvent,
+  type ZulipMessage,
+  type ZulipRegisterResult,
+  type ZulipSelf,
+  type ZulipUserTopic,
+} from "./wire.ts";
+
+export type { ZulipEvent, ZulipRegisterResult, ZulipSelf, ZulipUserTopic };
 
 const USER_AGENT = "BotFleet-Zulip/1";
 const MAX_RATE_LIMIT_RETRIES = 3;
 const RETRY_AFTER_CAP_MS = 30_000;
 const GET_RETRY_BACKOFF_MS = [1_000, 3_000];
 const GATEWAY_STATUSES = new Set([502, 503, 504]);
+/** `ZulipApiError.code` of a success body that is not the shape the call needs. */
+export const INVALID_RESPONSE = "invalid_response";
 
 // No constructor parameter properties in this module tree: the server runs
 // under Node's strip-only TypeScript, which refuses them at load time.
@@ -69,6 +96,9 @@ export interface ZulipClientOptions {
   timeoutMs?: number;
   /** A long poll is held up to ~90 s by Zulip, which then sends a heartbeat. */
   eventsTimeoutMs?: number;
+  /** Told when elements of a good response were dropped for being malformed
+   *  ("2 message(s) from messages").  A count and a call, never the content. */
+  onInvalid?: (what: string) => void;
 }
 
 export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -86,40 +116,18 @@ export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> 
   });
 }
 
-/** One row of the bot's topic visibility settings: register's
- *  `user_topics`, and the body of a `user_topic` event. */
-export interface ZulipUserTopic {
-  stream_id?: number;
-  topic_name?: string;
-  /** 0 none, 1 muted, 2 unmuted, 3 followed. */
-  visibility_policy?: number;
-}
-
 /** Zulip's visibility_policy for a followed topic, and for "no setting". */
 export const ZULIP_TOPIC_FOLLOWED = 3;
 export const ZULIP_TOPIC_NONE = 0;
 
-export interface ZulipRegisterResult {
-  queue_id: string;
-  last_event_id: number;
-  max_message_id?: number;
-  realm_users?: ZulipUser[];
-  user_topics?: ZulipUserTopic[];
-  event_queue_longpoll_timeout_seconds?: number;
-}
-
-export interface ZulipEvent {
-  id: number;
-  type: string;
-  message?: ZulipMessage;
-  flags?: string[];
-  /** `realm_user` events: "add", "remove" or "update", and who. */
-  op?: string;
-  person?: Partial<ZulipUser>;
-  /** `user_topic` events: the topic and its new visibility policy. */
-  stream_id?: number;
-  topic_name?: string;
-  visibility_policy?: number;
+/** One page of GET /messages.  `messages` are the ones that parsed;
+ *  `received` and `newestId` describe the page as Zulip sent it, so paging
+ *  (a full page means there may be more; the next page starts after the
+ *  newest id) is not thrown off by a message that was dropped. */
+export interface ZulipMessagePage {
+  messages: ZulipMessage[];
+  received: number;
+  newestId: number | null;
 }
 
 export class ZulipClient {
@@ -131,6 +139,7 @@ export class ZulipClient {
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly timeoutMs: number;
   private readonly eventsTimeoutMs: number;
+  private readonly onInvalid: ((what: string) => void) | undefined;
 
   constructor(creds: ZulipCredentials, realm: string, opts: ZulipClientOptions = {}) {
     this.realm = new URL(realm).origin;
@@ -142,6 +151,7 @@ export class ZulipClient {
     this.sleep = opts.sleep ?? abortableSleep;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.eventsTimeoutMs = opts.eventsTimeoutMs ?? 100_000;
+    this.onInvalid = opts.onInvalid;
   }
 
   /** Text with the key and the Basic token replaced. */
@@ -151,12 +161,15 @@ export class ZulipClient {
     return out;
   }
 
-  async request<T extends object>(
+  /** One call.  `schema` is what a success must look like; the result is the
+   *  schema's output, never the raw body. */
+  async request<S extends z.ZodType>(
     method: "GET" | "POST" | "DELETE" | "PATCH",
     path: string,
+    schema: S,
     params?: Record<string, ParamValue>,
     opts: { signal?: AbortSignal; timeoutMs?: number; longPoll?: boolean } = {},
-  ): Promise<T> {
+  ): Promise<z.output<S>> {
     const query = encodeParams(params);
     let url = this.base + path.replace(/^\/+/, "");
     let body: string | undefined;
@@ -224,10 +237,23 @@ export class ZulipClient {
         const code = typeof parsed.code === "string" ? this.scrub(parsed.code) : undefined;
         throw new ZulipApiError(msg, code, res.status);
       }
-      // SAFETY: a successful Zulip response; each caller names the fields it
-      // reads as optional and checks their types before use.
-      return parsed as T;
+      const checked = schema.safeParse(parsed);
+      if (!checked.success) {
+        // Where the body went wrong, never what it held: the text is logged
+        // and shown to the model, and a hostile body could put anything in it.
+        const where = [...new Set(checked.error.issues.map((issue) => issue.path.map(String).join(".") || "the body"))].slice(0, 3);
+        throw new ZulipApiError(
+          this.scrub(`Zulip answered ${method} ${path} with a response of an unexpected shape (${where.join(", ")})`),
+          INVALID_RESPONSE,
+          res.status,
+        );
+      }
+      return checked.data;
     }
+  }
+
+  private invalid(count: number, what: string): void {
+    if (count > 0) this.onInvalid?.(`${count} malformed ${what}`);
   }
 
   private retryAfterMs(res: Response, body: string): number {
@@ -245,8 +271,8 @@ export class ZulipClient {
     return Math.min(seconds * 1000, RETRY_AFTER_CAP_MS);
   }
 
-  me(signal?: AbortSignal): Promise<ZulipUser & { email: string; user_id: number }> {
-    return this.request("GET", "users/me", undefined, { signal });
+  me(signal?: AbortSignal): Promise<ZulipSelf> {
+    return this.request("GET", "users/me", zulipSelfSchema, undefined, { signal });
   }
 
   /** One unnarrowed queue: the bot's DMs and every channel it is subscribed
@@ -255,10 +281,11 @@ export class ZulipClient {
    *  subscribed to so a deactivation reaches the cache without a restart.
    *  `user_topic` likewise: the topics the bot follows wake it, and a follow
    *  or unfollow (from the tool, or from the Zulip app) arrives as an event. */
-  register(signal?: AbortSignal): Promise<ZulipRegisterResult> {
-    return this.request(
+  async register(signal?: AbortSignal): Promise<ZulipRegisterResult> {
+    const registered = await this.request(
       "POST",
       "register",
+      zulipRegisterSchema,
       {
         event_types: ["message", "realm_user", "user_topic"],
         fetch_event_types: ["message", "realm_user", "user_topic"],
@@ -267,32 +294,50 @@ export class ZulipClient {
       },
       { signal },
     );
+    this.invalid(registered.dropped, "member or topic row(s) from register");
+    return registered;
   }
 
   /** One long poll.  `timeoutMs` is the queue's own limit plus a margin
-   *  (register's `event_queue_longpoll_timeout_seconds`), when known. */
+   *  (register's `event_queue_longpoll_timeout_seconds`), when known.  An
+   *  event whose payload does not parse comes back as a bare `{ id, type }`:
+   *  the hub ignores it, and the queue is still acknowledged past it. */
   async events(queueId: string, lastEventId: number, signal?: AbortSignal, timeoutMs?: number): Promise<ZulipEvent[]> {
-    const result = await this.request<{ events?: ZulipEvent[] }>(
+    const result = await this.request(
       "GET",
       "events",
+      zulipEventsSchema,
       { queue_id: queueId, last_event_id: lastEventId },
       { signal, timeoutMs: timeoutMs ?? this.eventsTimeoutMs, longPoll: true },
     );
-    return Array.isArray(result.events) ? result.events : [];
+    const events: ZulipEvent[] = [];
+    let dropped = 0;
+    for (const raw of result.events) {
+      const full = zulipEventSchema.safeParse(raw);
+      if (full.success) {
+        events.push(full.data);
+        continue;
+      }
+      events.push({ id: raw.id, type: raw.type });
+      if (ZULIP_PAYLOAD_EVENT_TYPES.has(raw.type)) dropped += 1;
+    }
+    this.invalid(dropped, "event payload(s) from events");
+    return events;
   }
 
   async deleteQueue(queueId: string): Promise<void> {
-    await this.request("DELETE", "events", { queue_id: queueId }, { timeoutMs: 3_000 });
+    await this.request("DELETE", "events", zulipAckSchema, { queue_id: queueId }, { timeoutMs: 3_000 });
   }
 
   async messages(
     narrow: Array<{ operator: string; operand: string | number }>,
     opts: { anchor: number | "newest" | "oldest"; numBefore?: number; numAfter?: number; includeAnchor?: boolean },
     signal?: AbortSignal,
-  ): Promise<ZulipMessage[]> {
-    const result = await this.request<{ messages?: ZulipMessage[] }>(
+  ): Promise<ZulipMessagePage> {
+    const result = await this.request(
       "GET",
       "messages",
+      zulipMessagesSchema,
       {
         narrow,
         anchor: opts.anchor,
@@ -303,27 +348,27 @@ export class ZulipClient {
       },
       { signal },
     );
-    return Array.isArray(result.messages) ? result.messages : [];
+    const messages: ZulipMessage[] = [];
+    let newestId: number | null = null;
+    for (const raw of result.messages) {
+      newestId = newestId === null ? raw.id : Math.max(newestId, raw.id);
+      const parsed = zulipMessageSchema.safeParse(raw);
+      if (parsed.success) messages.push(parsed.data);
+    }
+    this.invalid(result.messages.length - messages.length, "message(s) from messages");
+    return { messages, received: result.messages.length, newestId };
   }
 
   /** The channels this bot is subscribed to, by id and name. */
   async subscriptions(signal?: AbortSignal): Promise<Array<{ stream_id: number; name: string }>> {
-    const result = await this.request<{ subscriptions?: Array<{ stream_id?: unknown; name?: unknown }> }>(
-      "GET",
-      "users/me/subscriptions",
-      undefined,
-      { signal },
-    );
-    const out: Array<{ stream_id: number; name: string }> = [];
-    for (const sub of Array.isArray(result.subscriptions) ? result.subscriptions : []) {
-      if (typeof sub?.stream_id === "number" && typeof sub.name === "string") out.push({ stream_id: sub.stream_id, name: sub.name });
-    }
-    return out;
+    const result = await this.request("GET", "users/me/subscriptions", zulipSubscriptionsSchema, undefined, { signal });
+    this.invalid(result.dropped, "subscription(s) from users/me/subscriptions");
+    return result.subscriptions;
   }
 
   /** Follow (3) or clear (0) one topic for this bot. */
   async setTopicVisibility(streamId: number, topic: string, visibilityPolicy: number): Promise<void> {
-    await this.request("POST", "user_topics", { stream_id: streamId, topic, visibility_policy: visibilityPolicy });
+    await this.request("POST", "user_topics", zulipAckSchema, { stream_id: streamId, topic, visibility_policy: visibilityPolicy });
   }
 
   async send(
@@ -334,7 +379,7 @@ export class ZulipClient {
       target.kind === "stream"
         ? { type: "stream", to: target.channel, topic: target.topic, content }
         : { type: "direct", to: target.userIds, content };
-    const result = await this.request<{ id?: number }>("POST", "messages", params);
-    return typeof result.id === "number" ? result.id : -1;
+    const result = await this.request("POST", "messages", zulipSentSchema, params);
+    return result.id ?? -1;
   }
 }

@@ -3,47 +3,10 @@
 // module (including the tool executors under server/tools/) can import it
 // without dragging the client or the hub in behind it.
 
-/** One Zulip message as the register/events and GET /messages APIs return it,
- *  narrowed to the fields this module reads.  `flags` lives on the event for
- *  the events API and on the message for GET /messages; the queue copies the
- *  event's flags onto the message so the router only ever reads one place. */
-export interface ZulipMessage {
-  id: number;
-  sender_id: number;
-  sender_email?: string;
-  sender_full_name?: string;
-  /** What the sending request said it was ("website", "ZulipMobile", or an
-   *  API client name).  Part of the owner rule, never authority on its own. */
-  client?: string;
-  /** "stream" for a channel message; "private" (older servers) or "direct"
-   *  for a DM. */
-  type: string;
-  /** Channel name for a channel message; the participant list for a DM. */
-  display_recipient: string | Array<{ id: number; email?: string; full_name?: string }>;
-  stream_id?: number;
-  subject?: string;
-  topic?: string;
-  content: string;
-  /** Seconds since the epoch. */
-  timestamp: number;
-  flags?: string[];
-}
-
-/** A realm member as the register response's `realm_users` lists one. */
-export interface ZulipUser {
-  user_id: number;
-  email?: string;
-  full_name?: string;
-  is_bot?: boolean;
-  /** 1 generic, 2 incoming webhook, 3 outgoing webhook, 4 embedded. */
-  bot_type?: number | null;
-  role?: number;
-  is_admin?: boolean;
-  is_owner?: boolean;
-  /** Absent in register's `realm_users` (every one listed is active); set on
-   *  `realm_user` events. */
-  is_active?: boolean;
-}
+// The wire shapes (a message, a realm member) are derived from their zod
+// schemas in wire.ts and re-exported here, so this stays the one import for
+// every Zulip type.  A type-only re-export: nothing of wire.ts loads with it.
+export type { ZulipMessage, ZulipUser } from "./wire.ts";
 
 /** Who this bot is on Zulip, from GET /users/me. */
 export interface ZulipIdentity {

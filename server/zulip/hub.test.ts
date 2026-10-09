@@ -923,3 +923,28 @@ describe("review fixes: outbound", () => {
     expect(fake.postsBy(PLUMBER)).toHaveLength(0);
   });
 });
+
+describe("review fixes: a response of the wrong shape", () => {
+  const registers = () => fake.requests.filter((request) => request.path === "register").length;
+
+  it("fails a register without a queue id into the backoff, then connects on the retry", async () => {
+    fake.answerNext("POST", "register", { result: "success", last_event_id: -1 });
+    const hub = makeHub();
+    await waitFor(() => logs.some((line) => line.includes("unexpected shape")), "the refusal");
+    expect(logs.join("\n")).toContain("queue_id");
+    await connected(hub);
+    expect(registers()).toBe(2);
+  });
+
+  it("fails a poll whose events are not a list the same way, and re-registers", async () => {
+    const hub = makeHub();
+    await connected(hub);
+    fake.answerNext("GET", "events", { result: "success", events: "none" });
+    await waitFor(() => registers() === 2, "the re-register");
+    await connected(hub);
+    expect(logs.some((line) => line.includes("unexpected shape"))).toBe(true);
+    // and the bot still hears what arrives on the new queue
+    fake.postStream(JAY, "agent-sync", "BF shape", "@**BF-Plumber** still there?", "website");
+    await waitFor(() => turns.length === 1, "the wake after the retry");
+  });
+});

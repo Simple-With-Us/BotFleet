@@ -93,6 +93,7 @@ export class FakeZulip {
   private nextQueue = 1;
   private rateLimits: Array<{ path: string; retryAfter: number }> = [];
   private failures: Array<{ method: string; path: string; status: number }> = [];
+  private answers: Array<{ method: string; path: string; body: Record<string, unknown> }> = [];
   heartbeatMs = 150;
   url = "";
   /** Seconds since the epoch for the next message; tests move it. */
@@ -122,6 +123,13 @@ export class FakeZulip {
     for (const queue of this.queues.values()) for (const wake of queue.waiters) wake();
     this.server?.closeAllConnections?.();
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
+  }
+
+  /** The next `method path` request answers 200 with exactly this body,
+   *  whatever it would have said: a malformed success, for the client's
+   *  boundary tests. */
+  answerNext(method: string, path: string, body: Record<string, unknown>): void {
+    this.answers.push({ method, path, body });
   }
 
   /** The next request to `path` answers 429 with this Retry-After. */
@@ -337,6 +345,12 @@ export class FakeZulip {
     if (failure >= 0) {
       const [entry] = this.failures.splice(failure, 1);
       return send(entry!.status, { result: "error", msg: "Internal Server Error", code: "BAD_REQUEST" });
+    }
+
+    const answer = this.answers.findIndex((entry) => entry.path === path && entry.method === req.method);
+    if (answer >= 0) {
+      const [entry] = this.answers.splice(answer, 1);
+      return send(200, entry!.body);
     }
 
     if (req.method === "GET" && path === "users/me") {
