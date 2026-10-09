@@ -203,6 +203,7 @@ and on CI.  Exact commands, with `DOCKER_HOST=unix:///nonexistent.sock`:
 | `npx vitest run server/steer-queue.test.ts server/update-drain.test.ts server/room-queue.test.ts server/routines.test.ts server/update-control.test.ts server/bot-off-wiring.test.ts server/bot-power.test.ts` | pass |
 | `pnpm test` (each step run separately) | `node scripts/test-floor.mjs` failed at load ~950 (55 of 9135 in 22 files, mostly harness-boot timeouts); rerun of those files at lower load: 6 fail, in `unattended`, `http-lane-e2e`, `decision-log-wiring` and `env-path`, which fail identically on `origin/main` here (A/B) and pass on CI.  `test:packaged-server` timed out booting at load ~950 and passed on rerun.  Every other step passes. |
 | CI `typecheck + test` (ubuntu, macos, windows) on `f5ffc1432` | failed only `bot-off-wiring.test.ts` (all three) and a POSIX mode check in `update-drain.test.ts` (windows); both fixed in `082a74c4a` |
+| CI on `f50b4822b` | lint, ubuntu and macos `typecheck + test` pass; windows failed only the wrapper-shortcut test, which spawns `/bin/bash`, now skipped on Windows (`e2949554a`) |
 
 ### What The Tests Cover
 
