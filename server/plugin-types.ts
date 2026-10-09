@@ -125,19 +125,19 @@ export const PluginListingSchema = z.object({
       description: z.string().optional(),
       layout: z.enum(["stat-grid", "key-value", "list"]),
       fields: z.array(z.string()).optional(),
-    })).optional(),
+    }).strict()).optional(),
     commands: z.array(z.object({
       name: z.string(),
       description: z.string(),
       args: z.array(z.string()).optional(),
-    })).optional(),
-  }).optional(),
+    }).strict()).optional(),
+  }).strict().optional(),
 });
 
 /** The full response body of `GET /api/plugins`. */
 export const PluginsResponseSchema = z.object({
   plugins: z.array(PluginListingSchema),
-});
+}).strict();
 
 export type PluginListing = z.infer<typeof PluginListingSchema>;
 export type PluginsResponse = z.infer<typeof PluginsResponseSchema>;
