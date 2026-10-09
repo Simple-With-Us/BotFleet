@@ -2,6 +2,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  BOTFLEET_ROLES,
+  fleetSeatPromptsEnabled,
+  resolveBotfleetRole,
+  type KnownBotfleetRole,
+} from "./launch-identity.ts";
+
+export { fleetSeatPromptsEnabled };
+
 /** Unique substrings in `bots/_shared.md` — tests assert each appears exactly
  *  once in a composed seat prompt.  Keep them stable; they are the contract. */
 export const FLEET_SHARED_RULE_MARKERS = [
@@ -12,25 +21,14 @@ export const FLEET_SHARED_RULE_MARKERS = [
   "Extra-ship: NO",
 ] as const;
 
-/** Seat ids with a `bots/<id>.md` file (lowercase). */
-export const FLEET_SEAT_IDS = [
-  "claude",
-  "cursor",
-  "grok",
-  "codex",
-  "ag",
-  "minimax",
-  "monet",
-  "producer",
-  "oracle",
-  "deployer",
-  "fixer",
-] as const;
+/** Seat ids with a `bots/<id>.md` file (lowercase): the ten BotFleet roles. */
+export const FLEET_SEAT_IDS = BOTFLEET_ROLES.map((role) => role.id);
 
-export type FleetSeatId = (typeof FLEET_SEAT_IDS)[number];
+export type FleetSeatId = KnownBotfleetRole["id"];
 
 let cachedBotsRoot: string | undefined;
 let cachedShared: string | undefined;
+let cachedSeatTemplate: string | undefined;
 const cachedSeat = new Map<string, string>();
 
 /** Directory containing `_shared.md` and seat files — packaged, dev, and test. */
@@ -99,52 +97,47 @@ function fleetSeatSpecificText(seatId: FleetSeatId): string {
   return text;
 }
 
-/** True when the harness should inject fleet seat prompts (Mac operator fleet). */
-export function fleetSeatPromptsEnabled(): boolean {
-  return process.env.BOTFLEET_FLEET_SEAT_PROMPTS === "1";
-}
-
-const BF_NAME = /^BF[-\s](.+)$/i;
-const DESC_SEAT = /@fleet-seat:\s*([a-z0-9_-]+)/i;
-
-function normalizeSeatSlug(raw: string): FleetSeatId | null {
-  const slug = raw.trim().toLowerCase().replace(/\s+/g, "-");
-  for (const seatId of FLEET_SEAT_IDS) {
-    if (seatId === slug) return seatId;
-  }
-  return null;
-}
-
-/** Resolve a bot record to a fleet seat id, or null when this bot is not a seat. */
+/** Resolve a bot record to a fleet seat id, or null when this bot is not a seat.
+ *  The same rule decides the seat in the bot's environment (launch-identity.ts). */
 export function resolveFleetSeatId(bot: {
   name: string;
   description?: string | null;
 }): FleetSeatId | null {
-  const fromDesc = bot.description?.match(DESC_SEAT)?.[1];
-  if (fromDesc) {
-    const seat = normalizeSeatSlug(fromDesc);
-    if (seat) return seat;
-  }
-  const fromName = bot.name.match(BF_NAME)?.[1];
-  if (fromName) {
-    return normalizeSeatSlug(fromName);
-  }
-  return null;
+  return resolveBotfleetRole(bot)?.id ?? null;
 }
 
-/** Shared preamble plus seat-specific lines, joined once. */
+function fleetSeatTemplate(): string {
+  if (cachedSeatTemplate === undefined) {
+    const text = readBotsFile("_seat.md");
+    if (!text) {
+      throw new Error(`Fleet seat template missing under ${fleetBotsDirectory()}`);
+    }
+    cachedSeatTemplate = text;
+  }
+  return cachedSeatTemplate;
+}
+
+/** The seat sentence for one role: the template with the role's name and seat. */
+function renderSeatSection(template: string, seatId: FleetSeatId): string {
+  const role = BOTFLEET_ROLES.find((candidate) => candidate.id === seatId)!;
+  return template.replaceAll("{name}", role.name).replaceAll("{seat}", role.seat);
+}
+
+/** The seat sentence, the shared preamble, then the role's own lines, joined once. */
 export function composeFleetSeatPrompt(seatId: FleetSeatId): string {
+  const seat = renderSeatSection(fleetSeatTemplate(), seatId);
   const shared = fleetSharedPreambleText();
   const specific = fleetSeatSpecificText(seatId);
-  return `${shared}\n\n${specific}`;
+  return `${seat}\n\n${shared}\n\n${specific}`;
 }
 
 /** Like `composeFleetSeatPrompt`, but returns null when assets are missing (no throw). */
 export function tryComposeFleetSeatPrompt(seatId: FleetSeatId): string | null {
+  const template = readBotsFile("_seat.md");
   const shared = readBotsFile("_shared.md");
   const specific = readBotsFile(`${seatId}.md`);
-  if (!shared || !specific) return null;
-  return `${shared}\n\n${specific}`;
+  if (!template || !shared || !specific) return null;
+  return `${renderSeatSection(template, seatId)}\n\n${shared}\n\n${specific}`;
 }
 
 export function fleetComposedPromptBytes(seatId: FleetSeatId): number {
@@ -191,5 +184,6 @@ export function countMarker(haystack: string, marker: string): number {
 export function resetFleetSeatPromptCacheForTests(): void {
   cachedBotsRoot = undefined;
   cachedShared = undefined;
+  cachedSeatTemplate = undefined;
   cachedSeat.clear();
 }

@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import {
   CLAUDE_CONTAINMENT_DISALLOWED_TOOLS,
   CLAUDE_CONTAINMENT_ENV,
@@ -846,6 +847,71 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(readFileSync(dump, "utf8")).toBe(dumpBefore);
     expect(recorder.events.filter((e) => e.type === "turn.started")).toHaveLength(2);
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
+  });
+
+  describe("launch identity (the launcher contract)", () => {
+    let restore: () => void;
+    beforeEach(() => {
+      restore = inheritHarnessIdentity();
+    });
+    afterEach(() => {
+      restore();
+    });
+
+    const run = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+      const dump = join(scratch, `dump-${threadId}-${Date.now()}.json`);
+      process.env.FAKE_CLAUDE_DUMP = dump;
+      const started = await instance.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+      return readEngineDump(dump);
+    };
+
+    it("gives each bot on one engine instance its own seat and session, and none of the harness's identity", async () => {
+      // The instance's own environment tries to carry a credential too.
+      await create(undefined, { ZULIP_API_KEY: "instance-key", AGENT_SEAT: "CODEX" });
+
+      const plumber = await run("t-plumber", { seat: "BF-PLUMBER", session: "t-plumber" });
+      const fixer = await run("t-fixer", { seat: "BF-FIXER", session: "t-fixer" });
+
+      expectLaunchedAs(plumber.env, { seat: "BF-PLUMBER", session: "t-plumber" });
+      expectLaunchedAs(fixer.env, { seat: "BF-FIXER", session: "t-fixer" });
+      expect(JSON.stringify([plumber.env, fixer.env])).not.toContain("instance-key");
+    });
+
+    it("marks a bot with no role as launched and gives it no seat", async () => {
+      await create();
+      const seen = await run("t-no-role", { seat: null, session: "t-no-role" });
+      expectLaunchedAs(seen.env, { seat: null, session: "t-no-role" });
+    });
+
+    it("fails closed when a caller passes no identity at all", async () => {
+      await create();
+      const seen = await run("t-bare", undefined);
+      expectLaunchedAs(seen.env, { seat: null });
+    });
+
+    it("respawns rather than hand a second seat to the process the first one started", async () => {
+      await create();
+      // A room's members share one thread.
+      const first = await run("t-room", { seat: "BF-PLUMBER", session: "t-room" });
+      const firstDump = process.env.FAKE_CLAUDE_DUMP!;
+
+      // The same identity reuses the warm process: the fake writes its dump once per process.
+      const again = await instance.adapter.sendTurn({
+        threadId: "t-room",
+        text: "again",
+        launchIdentity: { seat: "BF-PLUMBER", session: "t-room" },
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === again.turnId);
+      expect(readEngineDump(firstDump).pid).toBe(first.pid);
+
+      // A different seat on the same thread is a new process with its own env.
+      const other = await run("t-room", { seat: "BF-FIXER", session: "t-room" });
+      expect(other.pid).not.toBe(first.pid);
+      expect(first.env.AGENT_LAUNCH_SEAT).toBe("BF-PLUMBER");
+      expect(other.env.AGENT_LAUNCH_SEAT).toBe("BF-FIXER");
+      expect(other.env.AGENT_SEAT).toBe("BF-FIXER");
+    });
   });
 
   it("relaunches the live turn, not the first turn, when a warm process crashes (E3)", async () => {

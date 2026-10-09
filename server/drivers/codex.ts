@@ -37,6 +37,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { applyLaunchIdentity, codexShellPolicyArgs } from "../launch-identity.ts";
 import {
   decodeCodexSelection,
   readCodexModelCatalogDetailed,
@@ -308,8 +309,16 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       let promptText = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
 
       const launchAttempt = async (attempt: number): Promise<void> => {
-        const env = childEnv();
-        const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
+        // `childEnv()` is the instance's; the launch identity is this bot's
+        // and this turn's, so it goes on last (a relaunch rebuilds it).
+        const env = applyLaunchIdentity(childEnv(), turn.launchIdentity);
+        const appServerArgs = [
+          "app-server",
+          ...codexLocalProviderArgs(env, turn.model),
+          // The model's shell commands run under Codex's own environment
+          // policy, which a user config can narrow to an allowlist.
+          ...codexShellPolicyArgs(turn.launchIdentity),
+        ];
         if (turn.integrations?.composio) {
           mountMcpServer(appServerArgs, env, "botfleet_connectors", turn.integrations.composio);
         }
