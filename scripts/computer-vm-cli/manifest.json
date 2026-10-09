@@ -566,6 +566,12 @@
           "rel": ".config/cloudflare"
         },
         {
+          "rel": ".config/cf"
+        },
+        {
+          "rel": ".cf"
+        },
+        {
           "rel": ".wrangler"
         }
       ]
@@ -605,6 +611,9 @@
       "recipe": "npm_global",
       "npmPackage": "@kodus/cli",
       "credentialPaths": [
+        {
+          "rel": ".kodus"
+        },
         {
           "rel": ".config/kodus"
         }

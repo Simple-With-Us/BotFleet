@@ -1182,6 +1182,15 @@ final class Session: ObservableObject {
         )
     }
 
+    /// Allow every permission request waiting in this conversation (the
+    /// desktop's "Approve All").  The cards settle through the stream as the
+    /// harness answers each one, so nothing is folded in here.
+    @discardableResult
+    func approveAll(chat: Chat) async -> Bool {
+        let threadId = chat.threadId
+        return await perform { _ = try await $0.approveAll(threadId: threadId) }
+    }
+
     /// The same answer, from something that only has the ids — the Live
     /// Activity's buttons.  Returns whether it reached the harness; the
     /// intent ignores that, a notification action does not.
@@ -1476,6 +1485,34 @@ final class Session: ObservableObject {
         }
     }
 
+    /// Duplicate a bot: make a new one, then copy onto it the profile fields a
+    /// paired phone is allowed to set (`BotDuplicate.profilePatch`).  The new
+    /// bot is folded in as soon as it exists, so if filling in its profile
+    /// fails the person still sees the bot that was made, with the reason.
+    @discardableResult
+    func duplicateBot(_ source: Bot) async -> Bot? {
+        guard let client else { return nil }
+        let patch = BotDuplicate.profilePatch(from: source)
+        let created: Bot
+        do {
+            created = try await client.createBot()
+            state.apply(.bot(created))
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+        do {
+            let patched = try await client.updateProfile(botId: created.id, patch: patch)
+            state.apply(.bot(patched))
+            return patched
+        } catch {
+            if !isCancellation(error) {
+                actionError = "The new bot was made, but its profile could not be copied.\u{00A0} \(error.localizedDescription)"
+            }
+            return created
+        }
+    }
+
     /// Make a room from the phone. Same shape as `createBot`: fold it in
     /// rather than wait for a broadcast, and hand it back so it can be opened.
     @discardableResult
@@ -1742,6 +1779,38 @@ final class Session: ObservableObject {
     func deleteTask(_ task: BotTask, for bot: Bot) async {
         guard let client else { return }
         do { state.apply(.bot(try await client.deleteTask(botId: bot.id, threadId: task.threadId))) }
+        catch { recordActionError(error) }
+    }
+
+    // MARK: - Room tasks
+    //
+    // A channel's separate conversations, mirrored from the bot task methods
+    // above.  Create, switch and delete answer with the room as it now stands,
+    // transcript included, so the answer is folded in directly.
+
+    func createRoomTask(for room: Room, title: String?) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.createRoomTask(roomId: room.id, title: title))) }
+        catch { recordActionError(error) }
+    }
+
+    func switchRoomTask(_ task: BotTask, for room: Room) async {
+        guard let client, task.threadId != room.threadId else { return }
+        do { state.apply(.room(try await client.switchRoomTask(roomId: room.id, threadId: task.threadId))) }
+        catch { recordActionError(error) }
+    }
+
+    func renameRoomTask(_ task: BotTask, for room: Room, title: String) async {
+        guard let client else { return }
+        do {
+            try await client.renameRoomTask(roomId: room.id, threadId: task.threadId, title: title)
+            await refresh()
+        } catch { recordActionError(error) }
+    }
+
+    func deleteRoomTask(_ task: BotTask, for room: Room) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.deleteRoomTask(roomId: room.id, threadId: task.threadId))) }
         catch { recordActionError(error) }
     }
 
@@ -3013,6 +3082,27 @@ final class Session: ObservableObject {
     func deleteRoutine(_ routine: Routine) async -> Bool {
         guard let client else { return false }
         do { try await client.deleteRoutine(id: routine.id); return true }
+        catch { recordActionError(error); return false }
+    }
+
+    /// Stop a routine run that is queued, running or waiting.
+    func cancelRoutineRun(_ run: RoutineRun) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.cancelRoutineRun(id: run.id); return true }
+        catch { recordActionError(error); return false }
+    }
+
+    /// Acknowledge one failed or missed run.  It keeps its status and error.
+    func markRoutineRunSeen(_ run: RoutineRun) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.markRoutineRunSeen(id: run.id); return true }
+        catch { recordActionError(error); return false }
+    }
+
+    /// Acknowledge every unseen failure at once.
+    func markAllRoutineRunsSeen() async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.markAllRoutineRunsSeen(); return true }
         catch { recordActionError(error); return false }
     }
 

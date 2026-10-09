@@ -103,7 +103,7 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   /** A "Job Finished" row: a background job of the bot's ended. */
   job?: import("../../shared/jobs").JobRowData;
@@ -354,6 +354,11 @@ export interface Bot {
   computers?: Array<"cloud" | "vm" | "local" | "off">;
   /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
   cloudBackend?: CloudBackend;
+  /** The backend this bot really uses once the workspace default fills in for
+   * an unpinned one.  Read-only on the wire: the phone uses it to decide
+   * whether a live desktop exists; the settings UI keeps reading the raw
+   * `cloudBackend` so "inherited" and "pinned" stay distinguishable. */
+  effectiveCloudBackend?: CloudBackend;
   /** Allow Auto to prepare/start the managed VPS container. Off by default. */
   autoStartVps?: boolean;
   /** where new tasks run their shell tools; absent = the private bot workspace */

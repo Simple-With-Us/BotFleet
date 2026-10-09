@@ -3025,6 +3025,27 @@ describe("harness HTTP API", () => {
         }, { timeout: 5_000 }).toBe(true);
 
         if (reloadInstanceId === "gatedQuota") {
+          // Assistant text precedes the result frame.  Reloading after text alone
+          // can interrupt a still-active turn instead of its deferred terminal
+          // fold, correctly clearing busy before the successor is posted.
+          // Wait for the terminal event, then prove the held health probe still
+          // owns busy before exercising the targeted reload.
+          await expect.poll(() => {
+            const file = join(home, ".botfleet", "events", `${bot.threadId}.ndjson`);
+            if (!existsSync(file)) return false;
+            return readFileSync(file, "utf8").split("\n").some((line) => {
+              if (!line.trim()) return false;
+              try {
+                return JSON.parse(line).type === "turn.completed";
+              } catch {
+                return false; // The asynchronous log writer may be mid-append.
+              }
+            });
+          }, { timeout: 5_000 }).toBe(true);
+          expect((await api("GET", "/api/bots?messages=0")).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          )?.busy).toBe(true);
+
           reload = api("PATCH", `/api/instances/${reloadInstanceId}`, { fullAuto: true });
           await expect.poll(async () => {
             const transcript = await api("GET", `/api/threads/${bot.threadId}/messages?limit=200`);
@@ -4603,6 +4624,48 @@ describe("harness HTTP API", () => {
     expect((await api("PATCH", `/api/bots/${bot.id}`, { autoStartVps: "yes" })).status).toBe(400);
     const invalid = await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "daytona" });
     expect(invalid.status).toBe(400);
+  });
+
+  it("sends the backend a bot really uses without disturbing the raw value", async () => {
+    // The workspace default fills in for a bot that was never pinned, and the
+    // join route resolves it that way.  A phone deciding whether to offer the
+    // live cloud desktop must see that answer, while the desktop keeps the
+    // stored value to tell an inherited backend from a pinned one.
+    const originalDefault = (await api("GET", "/api/config")).body.botDefaults.cloudBackend ?? "box";
+    const unpinned = (await api("POST", "/api/bots", { name: "Unpinned Backend" })).body.bot;
+    const pinned = (await api("POST", "/api/bots", { name: "Pinned Backend" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${pinned.id}`, { cloudBackend: "box" })).status).toBe(200);
+      const find = async (id: string) =>
+        (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === id);
+
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      let unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("box");
+
+      // The workspace now sends unpinned bots to the VPS: the stored value is
+      // still unset, the effective one follows the default, and a bot pinned
+      // to Box stays on Box.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "vps" } })).status).toBe(200);
+      unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("vps");
+      const pinnedWire = await find(pinned.id);
+      expect(pinnedWire.cloudBackend).toBe("box");
+      expect(pinnedWire.effectiveCloudBackend).toBe("box");
+
+      // A pin to the VPS wins over a Box default.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      const repinned = await api("PATCH", `/api/bots/${unpinned.id}`, { cloudBackend: "vps" });
+      expect(repinned.status).toBe(200);
+      expect(repinned.body.bot.cloudBackend).toBe("vps");
+      expect(repinned.body.bot.effectiveCloudBackend).toBe("vps");
+    } finally {
+      await api("DELETE", `/api/bots/${unpinned.id}`);
+      await api("DELETE", `/api/bots/${pinned.id}`);
+      await api("PUT", "/api/config", { botDefaults: { cloudBackend: originalDefault } });
+    }
   });
 
   it("validates a Composio project key, creates a Session, and keeps externally stored secrets off disk", async () => {
