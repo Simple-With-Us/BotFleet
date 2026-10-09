@@ -134,7 +134,10 @@ export function setFileAside(path: string, how: "move" | "copy", now: number = D
   } catch (error) {
     const failure = error instanceof Error ? error : new Error(String(error));
     const code = fsFailureCode(failure);
-    if (how === "move" && code === "ENOENT") return { ok: true, path: null };
+    // ENOENT means "already gone" only while the source really is gone.  Windows reports a target
+    // name that is too long as ENOENT too, and reading that as another process having moved the
+    // file would let the next save replace a file that was never set aside.
+    if (how === "move" && code === "ENOENT" && !existsSync(path)) return { ok: true, path: null };
     return { ok: false, reason: `it could not be ${how === "move" ? "moved aside" : "copied aside"} (${code})` };
   }
 }

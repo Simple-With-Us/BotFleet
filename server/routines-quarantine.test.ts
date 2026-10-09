@@ -191,7 +191,8 @@ describe("RoutineManager with an unusable routines.json", () => {
     writeFileSync(join(file, "keep.txt"), "x");
     const manager = build(file);
     manager.create({ name: "In Memory", prompt: "x", botId: "bot-1", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
-    const pending = (): boolean => (manager as unknown as { dirty: boolean }).dirty;
+    // `dirty` is private, so read it off the instance's own fields rather than asserting a type.
+    const pending = (): boolean => new Map(Object.entries(manager)).get("dirty") === true;
     expect(pending()).toBe(true);
 
     manager.flushNow();

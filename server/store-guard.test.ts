@@ -297,6 +297,25 @@ describe("store-guard", () => {
       }
     });
 
+    // ENOENT from the rename means "another process already moved it" only while the file is really
+    // gone.  Windows answers a too-long target name with ENOENT too, so reading every ENOENT as the
+    // race let the next save replace a file that was never set aside.  `now` is spliced into the
+    // target name, so a slash in it aims the rename at a directory that does not exist: ENOENT with
+    // the source still in place, on every platform.
+    it("does not read an ENOENT as 'already moved' while the file is still there", () => {
+      const file = join(dir, "bots.json");
+      writeFileSync(file, "{ not json");
+      // SAFETY: only ever spliced into the target name by a template literal, so a string is as good as a number here.
+      const result = setFileAside(file, "move", "no-such-dir/1" as never);
+      expect(result).toEqual({ ok: false, reason: expect.stringContaining("ENOENT") });
+      expect(readFileSync(file, "utf8")).toBe("{ not json");
+      expect(readdirSync(dir)).toEqual(["bots.json"]);
+    });
+
+    it("reads an ENOENT as 'already moved' once the file is gone", () => {
+      expect(setFileAside(join(dir, "bots.json"), "move", 1790000000000)).toEqual({ ok: true, path: null });
+    });
+
     it("refuses to save when the copy of a partly usable file cannot be made", () => {
       const long = join(dir, `${"b".repeat(240)}.json`);
       writeFileSync(long, "[1,2]");

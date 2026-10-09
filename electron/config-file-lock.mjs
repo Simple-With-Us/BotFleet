@@ -514,7 +514,12 @@ function setConfigFileAside(configPath, now) {
   try {
     renameSync(configPath, target);
   } catch (error) {
-    if (error?.code === "ENOENT") return null;
+    // ENOENT means "another process got there first" only while the file is
+    // really gone.  Windows reports a target name that is too long as ENOENT
+    // as well; trusting it would let the write that follows replace a file
+    // that was never set aside.  (Found by the windows-latest run of the
+    // refuses-to-overwrite test, which saw no throw and no set-aside file.)
+    if (error?.code === "ENOENT" && !existsSync(configPath)) return null;
     throw error;
   }
   return target;

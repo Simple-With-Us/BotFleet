@@ -636,6 +636,52 @@ test("updateConfigFile refuses to overwrite an unusable file it cannot set aside
   }
 });
 
+// ENOENT from the set-aside rename means "another process already moved it"
+// only while the file is really gone.  Windows answers a too-long target name
+// with ENOENT as well, and the first windows-latest run of this branch showed
+// that trusting it replaced a file that was never set aside.  `now` is spliced
+// into the target name, so a slash in it points the rename at a directory that
+// does not exist: ENOENT with the source still there, on every platform.
+test("an ENOENT from the set-aside rename is a refusal while the unusable file is still there", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "{ not json");
+    assert.throws(
+      () => updateConfigFile(path, (disk) => { disk.fresh = true; }, { now: "no-such-dir/1" }),
+      /could not be moved aside \(ENOENT\), so it was not overwritten/,
+    );
+    assert.equal(readFileSync(path, "utf8"), "{ not json", "the unusable file is untouched");
+    assert.equal(existsSync(lockPathFor(path)), false, "the lock is released");
+    assert.deepEqual(readdirSync(dir), ["config.json"], "nothing staged and nothing set aside");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an ENOENT from the set-aside rename is the race it always was once the file is gone", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "{ not json");
+    const told = [];
+    // Another process sets the file aside between this one reading it and
+    // renaming it: the file is gone by the time of the rename.
+    updateConfigFile(
+      path,
+      (disk) => {
+        rmSync(path);
+        disk.fresh = true;
+      },
+      { onSetAside: (info) => told.push(info) },
+    );
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { fresh: true });
+    assert.equal(told.length, 1);
+    assert.equal(told[0].setAsidePath, null, "told that someone else already moved it");
+    assert.deepEqual(readdirSync(dir), ["config.json"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // What the lock validates, and what it must leave alone.  The lock checks the
 // envelope (a readable JSON object) and the shape of what it is about to
