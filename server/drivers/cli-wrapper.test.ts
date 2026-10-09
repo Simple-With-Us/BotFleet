@@ -138,6 +138,7 @@ describe("CliWrapperDriver turns (real child process)", () => {
       const { turnId } = await instance.adapter.sendTurn(turn("hi"));
       await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
 
+      // SAFETY: the filter keeps only content.delta events, which carry a string delta.
       const out = recorder.events
         .filter((e) => e.type === "content.delta")
         .map((e) => (e as { delta: string }).delta)
@@ -182,6 +183,7 @@ describe("CliWrapperDriver turns (real child process)", () => {
       const { turnId } = await instance.adapter.sendTurn(turn("hi"));
       await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
 
+      // SAFETY: the filter keeps only content.delta events, which carry a string delta.
       const out = recorder.events
         .filter((e) => e.type === "content.delta")
         .map((e) => (e as { delta: string }).delta)
