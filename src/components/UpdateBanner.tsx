@@ -6,10 +6,14 @@ import { useEffect, useState } from "react";
 import { ArrowDownToLine, Loader2, RefreshCw, Sparkles, X } from "lucide-react";
 import { useUpdaterState } from "@/lib/updater";
 import {
+  activeDrain,
   availableLabel,
   bannerDismissKey,
   bannerIsActionable,
+  drainLabel,
+  HOLDING_COPY,
   installPausesWork,
+  isUpdateDrain,
   PAUSES_WORK_COPY,
   installBlockedReason,
   installBlockedReasonDetail,
@@ -17,7 +21,9 @@ import {
   lastRunLabel,
   mayUseLegacyLocalUpdate,
   runningLabel,
+  runningPercent,
   updateSource,
+  useNow,
   useUpdateControl,
 } from "@/lib/update-control";
 import { cn } from "@/lib/cn";
@@ -265,12 +271,22 @@ function LocalUpdateCard({
   onDismiss: (key: string) => void;
 }) {
   const status = local.status;
+  // The hold an update has on new work: present whether or not the harness
+  // started the run, so an update started from a terminal still shows here.
+  // A countdown, so it ticks; a hook, so it comes before any early return.
+  const now = useNow(isUpdateDrain(status?.drain) ? 1_000 : null);
+  // Past its lease a hold is a harness that went away mid-update, not one
+  // still holding anything.
+  const holding = activeDrain(status, now);
   if (!status) return null;
   const running = status.running;
+  // Not dismissible while it is happening: the card IS the report.
+  const inProgress = Boolean(running) || holding !== null;
   const key = bannerDismissKey(status);
-  if (!running && dismissed === key) return null;
+  if (!inProgress && dismissed === key) return null;
+  const holdLine = drainLabel(holding, now);
 
-  const title = running
+  const title = inProgress
     ? "Updating BotFleet…"
     : (availableLabel(status) ?? "The last update did not finish");
   // The harness ships a reason with every refusal it can see coming, and no
@@ -281,7 +297,9 @@ function LocalUpdateCard({
   const isBlocked = blockedReason !== null;
   const subtitle = running
     ? runningLabel(running)
-    : status.available
+    : holding
+      ? HOLDING_COPY
+      : status.available
       ? (blockedReason ?? (installPausesWork(status) ? `${PAUSES_WORK_COPY}.` : "This Mac can build and install it."))
       : (lastRunLabel(status.lastRun) ?? "");
   // The harness's own diagnostic sentence — a checkout path, a script path,
@@ -289,14 +307,15 @@ function LocalUpdateCard({
   // already what a person should read; this is a fallback so a truncated
   // subtitle is still readable on hover even when there is nothing extra to
   // add.
-  const subtitleDetail = running
+  const subtitleDetail = running || holding
     ? null
     : status.available
       ? installBlockedReasonDetail(status)
       : lastRunDetail(status.lastRun);
-  const percent = running && typeof running.progress === "number"
-    ? Math.round(Math.min(1, Math.max(0, running.progress)) * 100)
-    : null;
+  // No percent while a step waits on something outside the run (bots
+  // finishing): the run's own step count does not move then, and a bar parked
+  // at 40% for a minute reads as stuck.  An indeterminate bar says "waiting".
+  const percent = running ? runningPercent(running) : null;
 
   return (
     <div className="animate-panel-in fixed bottom-4 left-4 max-md:bottom-24 z-50 w-[300px] rounded-xl border border-hairline/40 bg-panel p-3.5 shadow-2xl shadow-black/50">
@@ -309,8 +328,13 @@ function LocalUpdateCard({
           <div className="mt-0.5 truncate text-[12.5px] text-ink-secondary" title={subtitleDetail ?? subtitle}>
             {subtitle}
           </div>
+          {holdLine && (
+            <div data-testid="update-hold-line" className="mt-1 text-[12px] leading-snug text-ink-secondary">
+              {holdLine}
+            </div>
+          )}
         </div>
-        {!running && (
+        {!inProgress && (
           <button
             onClick={() => onDismiss(key)}
             className="shrink-0 rounded-md p-1 text-ink-secondary hover:bg-control hover:text-ink"
@@ -321,7 +345,7 @@ function LocalUpdateCard({
         )}
       </div>
 
-      {running && (
+      {inProgress && (
         <div className="mb-1.5 mt-2.5 h-1 overflow-hidden rounded-full bg-control">
           <div
             className={cn(
@@ -339,7 +363,7 @@ function LocalUpdateCard({
         </div>
       )}
 
-      {!running && (
+      {!inProgress && (
         <div className="mt-2.5 flex gap-2">
           {status.available && (
             <button

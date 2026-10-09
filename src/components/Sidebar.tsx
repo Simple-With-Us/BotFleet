@@ -1,6 +1,9 @@
 import { track } from "@/lib/analytics";
 import {
+  activeDrain,
   availableLabel,
+  drainLabel,
+  HOLDING_COPY,
   installPausesWork,
   PAUSES_WORK_COPY,
   installBlockedReason,
@@ -181,7 +184,10 @@ function UpdateButton() {
   if (source === "none") return null;
 
   if (harnessStatus) {
-    const busy = local.busy !== null || Boolean(harnessRunning);
+    // An update holding new work counts as running even when the harness did
+    // not start it (an updater launched from a terminal).
+    const hold = activeDrain(harnessStatus, Date.now());
+    const busy = local.busy !== null || Boolean(harnessRunning) || hold !== null;
     // An install affordance that cannot install.  The button used to fall
     // through to a plain check whenever `canRun` was false — a different
     // action under the same label, with no install, no error and no icon
@@ -192,18 +198,21 @@ function UpdateButton() {
     const isBlocked = blockedReason !== null;
     const label = harnessRunning
       ? runningLabel(harnessRunning)
-      : harnessAvailable
-        ? `${availableLabel(harnessStatus)} — ${blockedReason ?? (pausesWork ? "pause & install" : "install")}`
-        : upToDate
-          ? "You're up to date"
-          : "Check for Updates";
+      : hold
+        ? HOLDING_COPY
+        : harnessAvailable
+          ? `${availableLabel(harnessStatus)} — ${blockedReason ?? (pausesWork ? "pause & install" : "install")}`
+          : upToDate
+            ? "You're up to date"
+            : "Check for Updates";
     // The harness's own diagnostic sentence behind a mapped reason, for the
     // hover only — the label above stays short.  Falls back to the label
     // itself when there is nothing extra to say.
     const tooltipReason = blockedReasonDetail ?? (pausesWork ? PAUSES_WORK_COPY : null);
-    const tooltip = harnessAvailable && tooltipReason
+    const holdLine = drainLabel(hold, Date.now());
+    const tooltip = harnessAvailable && tooltipReason && !hold
       ? `${availableLabel(harnessStatus)} — ${tooltipReason}`
-      : label;
+      : holdLine ? `${label}\n${holdLine}` : label;
     return (
       // The title rides on the wrapper: a disabled button is not hovered, so
       // its own tooltip never appears, and the reason has to be readable.

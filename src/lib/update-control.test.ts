@@ -4,31 +4,45 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  activeDrain,
   availableLabel,
   bannerDismissKey,
   bannerIsActionable,
+  drainLabel,
+  drainNoticeCopy,
+  DRAIN_POLL_MS,
   fetchUpdateStatus,
+  heldMessageCount,
+  HOLDING_COPY,
   idleLabel,
   installPausesWork,
   PAUSES_WORK_COPY,
   installBlockedReason,
   installBlockedReasonDetail,
   installedLabel,
+  isUpdateDrain,
   isUpdateStatus,
   keepLocalError,
   lastRunDetail,
   lastRunLabel,
   mayUseLegacyLocalUpdate,
   requestUpdateCheck,
+  queuedChipLabel,
   requestUpdateRun,
   runningLabel,
+  runningPercent,
   scheduleStatusRetries,
   shortCommit,
   STATUS_RETRY_DELAYS_MS,
   STATUS_RETRY_STEADY_MS,
   statusRetryDelay,
+  subscribeDrain,
   updateSource,
   visibleUpdateError,
+  waitLabel,
+  currentDrain,
+  UPDATE_STATUS_EVENT,
+  type UpdateDrain,
   type UpdateStatus,
 } from "./update-control";
 
@@ -212,7 +226,10 @@ describe("what it says", () => {
       progress: 0.25,
       logTail: [],
     })).toBe("Installing dependencies (25%)…");
-    // What the step is waiting on reads better than the step's own name.
+    // What the step is waiting on reads better than the step's own name, and
+    // it replaces the percent: `progress` is the run's own step count, which
+    // does not move while bots finish, so "(40%)" was a number the wait never
+    // reached and then sat on for a minute.
     expect(runningLabel({
       runId: "r",
       startedAt: "",
@@ -220,7 +237,24 @@ describe("what it says", () => {
       detail: "Waiting for 3 bots to finish",
       progress: 0.4,
       logTail: [],
-    })).toBe("Waiting for 3 bots to finish (40%)…");
+    })).toBe("Waiting for 3 bots to finish…");
+  });
+
+  it("draws a percent, in the label or a bar, only when it is still moving", () => {
+    const base = { runId: "r", startedAt: "", step: "Installing dependencies", logTail: [] };
+    expect(runningPercent({ ...base, progress: 0.25 })).toBe(25);
+    // Zero is a real percent; absent is not one.
+    expect(runningPercent({ ...base, progress: 0 })).toBe(0);
+    expect(runningPercent(base)).toBeNull();
+    // Out of range is clamped and not a number is left off, never "NaN%".
+    expect(runningPercent({ ...base, progress: 1.5 })).toBe(100);
+    expect(runningPercent({ ...base, progress: -1 })).toBe(0);
+    expect(runningPercent({ ...base, progress: Number.NaN })).toBeNull();
+    // A wait detail takes the percent away, whatever the number.
+    expect(runningPercent({ ...base, progress: 0.4, detail: "Waiting for 3 bots to finish" })).toBeNull();
+    expect(runningPercent({ ...base, progress: 0, detail: "Waiting for work in flight to finish" })).toBeNull();
+    // The next step reports no detail, and the percent is true again.
+    expect(runningLabel({ ...base, progress: 0.5 })).toBe("Installing dependencies (50%)…");
   });
 
   it("distinguishes the four outcomes", () => {
@@ -319,8 +353,10 @@ describe("what it says", () => {
   });
 
   it("says an install pauses busy bots only when Install is actually available", () => {
+    // The harness's sentence joins its two halves with GAP, which is
+    // U+00A0 plus a space (server/update-control.ts), never two ASCII spaces.
     const updaterOutdated = "The updater in /Users/jay/Code/BotFleet predates this build."
-      + "  Run it once from a terminal to pick up the new one.";
+      + "  Run it once from a terminal to pick up the new one.";
     const offer = { sourceCommit: NEXT, aheadBy: 2, commits: [] };
     // Busy is not a blocker: Install stays available and says it will pause.
     expect(installPausesWork(status({
@@ -497,5 +533,185 @@ describe("talking to the harness", () => {
     expect(isUpdateStatus(status())).toBe(true);
     expect(isUpdateStatus({ installed: { version: "1.0.30" } })).toBe(false);
     expect(isUpdateStatus("<!doctype html>")).toBe(false);
+  });
+});
+
+const SECOND = 1_000;
+const MINUTE = 60 * SECOND;
+
+/** A hold that began at t=0 and whose updater window ends at `windowMs`. */
+function drain(patch: Partial<UpdateDrain> = {}, windowMs = 6 * MINUTE): UpdateDrain {
+  return {
+    startedAt: 0,
+    windowEndsAt: windowMs,
+    deadline: windowMs + 2 * MINUTE,
+    bots: 3,
+    rooms: 0,
+    held: { sends: 0, rooms: 0, routineRuns: 0 },
+    ...patch,
+  };
+}
+
+describe("the hold an update has on new work", () => {
+  it("says what happens to a message sent now, and when the restart begins", () => {
+    expect(drainNoticeCopy(drain(), 0))
+      .toBe("BotFleet is updating.\u00a0 Messages you send now are saved and will run after the restart.\u00a0 The restart begins within about 6 minutes.");
+    // The wait shrinks as the window runs down, in the words a person uses.
+    expect(drainNoticeCopy(drain(), 4 * MINUTE)).toContain("within about 2 minutes.");
+    expect(drainNoticeCopy(drain(), 6 * MINUTE - 40 * SECOND)).toContain("within about 40 seconds.");
+    expect(drainNoticeCopy(drain(), 6 * MINUTE - 3 * SECOND)).toContain("The restart begins shortly.");
+    // Past the window is still a sentence, never "about -20 seconds".
+    expect(drainNoticeCopy(drain(), 7 * MINUTE)).toContain("The restart begins shortly.");
+  });
+
+  it("follows the copy rules: a wide gap between sentences, and a bot, not an agent", () => {
+    const sentences = [drainNoticeCopy(drain(), 0), drainLabel(drain({ held: { sends: 2, rooms: 0, routineRuns: 0 } }), 0) ?? ""];
+    for (const text of sentences) {
+      expect(text).toContain(".\u00a0 ");
+      // No ordinary two-space gap, which renders as one.
+      expect(text).not.toMatch(/\.  [A-Z]/);
+      expect(text).not.toMatch(/agent/i);
+    }
+    expect(HOLDING_COPY).not.toMatch(/agent/i);
+  });
+
+  it("rounds a wait up to a figure a person can plan around", () => {
+    expect(waitLabel(5 * SECOND)).toBeNull();
+    expect(waitLabel(0)).toBeNull();
+    expect(waitLabel(-30 * SECOND)).toBeNull();
+    expect(waitLabel(Number.NaN)).toBeNull();
+    expect(waitLabel(6 * SECOND)).toBe("about 10 seconds");
+    expect(waitLabel(41 * SECOND)).toBe("about 50 seconds");
+    expect(waitLabel(89 * SECOND)).toBe("about 90 seconds");
+    expect(waitLabel(90 * SECOND)).toBe("about 2 minutes");
+    expect(waitLabel(5 * MINUTE + 1)).toBe("about 6 minutes");
+  });
+
+  it("counts a send waiting in a queue and a room round waiting to speak as messages", () => {
+    expect(heldMessageCount(drain({ held: { sends: 2, rooms: 1, routineRuns: 9 } }))).toBe(3);
+    expect(drainLabel(drain({ held: { sends: 1, rooms: 0, routineRuns: 0 } }), 0))
+      .toBe("1 message is saved and will run after the restart.\u00a0 The restart begins within about 6 minutes.");
+    expect(drainLabel(drain({ held: { sends: 2, rooms: 1, routineRuns: 0 } }), 0))
+      .toBe("3 messages are saved and will run after the restart.\u00a0 The restart begins within about 6 minutes.");
+    // Nothing waiting yet still tells a person what a send would do.
+    expect(drainLabel(drain(), 0))
+      .toBe("New messages are saved and will run after the restart.\u00a0 The restart begins within about 6 minutes.");
+    expect(drainLabel(null, 0)).toBeNull();
+    expect(drainLabel(undefined, 0)).toBeNull();
+  });
+
+  it("tells a chip's reason apart: the update, or a busy bot", () => {
+    expect(queuedChipLabel({ text: "ship it", busyName: "Director", draining: false }))
+      .toBe("Queued — sends when Director finishes: “ship it”");
+    // The bot may be idle; what the message waits for is the restart.
+    expect(queuedChipLabel({ text: "ship it", busyName: "Director", draining: true }))
+      .toBe("Saved — runs after the update restarts: “ship it”");
+  });
+
+  it("trusts a hold only by shape, and not once its lease has run out", () => {
+    // What crosses the wire is JSON, so the malformed shapes are parsed, not typed.
+    const wire = (text: string): UpdateDrain => JSON.parse(text);
+    const good = JSON.stringify(drain());
+    expect(isUpdateDrain(drain())).toBe(true);
+    expect(isUpdateDrain(wire(good))).toBe(true);
+    expect(isUpdateDrain(null)).toBe(false);
+    expect(isUpdateDrain(undefined)).toBe(false);
+    expect(isUpdateDrain(wire(good.replace(/"held":\{[^}]*\}/, '"held":null')))).toBe(false);
+    expect(isUpdateDrain(wire(good.replace('"bots":3', '"bots":"3"')))).toBe(false);
+    expect(isUpdateDrain(wire(good.replace(/"deadline":\d+/, '"deadline":null')))).toBe(false);
+    expect(isUpdateDrain(wire('{"nonsense":true}'))).toBe(false);
+    expect(isUpdateDrain({ ...drain(), deadline: Number.NaN })).toBe(false);
+    const held = status({ drain: drain() });
+    expect(activeDrain(held, 5 * MINUTE)).toEqual(drain());
+    expect(activeDrain(held, 8 * MINUTE - 1)).toEqual(drain());
+    // A harness that went away mid-update stops looking like it is holding.
+    expect(activeDrain(held, 8 * MINUTE)).toBeNull();
+    expect(activeDrain(status(), 0)).toBeNull();
+    expect(activeDrain(null, 0)).toBeNull();
+    expect(activeDrain(status({ drain: wire('{"nonsense":true}') }), 0)).toBeNull();
+  });
+
+  it("makes the floating card actionable while a hold lasts, however it was started", () => {
+    // No run: an updater started from a terminal is not one the harness tracks.
+    const held = status({ drain: drain() });
+    expect(held.running).toBeNull();
+    expect(bannerIsActionable(held)).toBe(true);
+    expect(bannerIsActionable(status())).toBe(false);
+    // It cannot be dismissed into a stale key, and a finished run still brings the card back.
+    expect(bannerDismissKey(held)).toBe("holding");
+    expect(bannerDismissKey(status())).not.toBe("holding");
+    expect(bannerIsActionable(status({ drain: JSON.parse('{"nonsense":true}') }))).toBe(false);
+  });
+});
+
+describe("watching the hold from a chat", () => {
+  /** The little of `window` the watcher uses, with a clock the test owns. */
+  function stubWindow() {
+    const target = new EventTarget();
+    vi.stubGlobal("window", target);
+    return target;
+  }
+  const answer = (patch: Partial<UpdateStatus> = {}) => new Response(JSON.stringify(status(patch)), { status: 200 });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("reads the hold once, follows the push, polls only while it lasts, and stops when nothing is watching", async () => {
+    vi.useFakeTimers();
+    const target = stubWindow();
+    let next: UpdateDrain | undefined = drain({ held: { sends: 1, rooms: 0, routineRuns: 0 } });
+    const fetcher = vi.fn(async () => answer(next ? { drain: next } : {}));
+    vi.stubGlobal("fetch", fetcher);
+
+    let heard = 0;
+    const stop = subscribeDrain(() => { heard += 1; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(currentDrain()).toEqual(next);
+    expect(heard).toBe(1);
+
+    // A second chat mounting shares the watcher: no second fetch.
+    const stopSecond = subscribeDrain(() => {});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    // The harness pushes a change; listeners hear it once, an identical frame not at all.
+    const pushed = drain({ held: { sends: 2, rooms: 0, routineRuns: 0 } });
+    target.dispatchEvent(new CustomEvent(UPDATE_STATUS_EVENT, { detail: status({ drain: pushed }) }));
+    expect(currentDrain()).toEqual(pushed);
+    expect(heard).toBe(2);
+    target.dispatchEvent(new CustomEvent(UPDATE_STATUS_EVENT, { detail: status({ drain: { ...pushed } }) }));
+    expect(heard).toBe(2);
+    // A frame that is not a status is ignored.
+    target.dispatchEvent(new CustomEvent(UPDATE_STATUS_EVENT, { detail: { nonsense: true } }));
+    expect(currentDrain()).toEqual(pushed);
+
+    // While a hold lasts the stream gets a backstop; the hold ending clears it.
+    next = undefined;
+    await vi.advanceTimersByTimeAsync(DRAIN_POLL_MS);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(currentDrain()).toBeNull();
+    expect(heard).toBe(3);
+    await vi.advanceTimersByTimeAsync(DRAIN_POLL_MS * 4);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+
+    // A harness that is restarting says nothing; the last answer stands.
+    target.dispatchEvent(new CustomEvent(UPDATE_STATUS_EVENT, { detail: status({ drain: pushed }) }));
+    fetcher.mockImplementationOnce(async () => new Response("{}", { status: 503 }));
+    await vi.advanceTimersByTimeAsync(DRAIN_POLL_MS);
+    expect(currentDrain()).toEqual(pushed);
+
+    // The last chat leaving stops everything and forgets the hold.
+    stop();
+    expect(currentDrain()).toEqual(pushed);
+    stopSecond();
+    expect(currentDrain()).toBeNull();
+    const calls = fetcher.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(DRAIN_POLL_MS * 4);
+    expect(fetcher).toHaveBeenCalledTimes(calls);
+    target.dispatchEvent(new CustomEvent(UPDATE_STATUS_EVENT, { detail: status({ drain: pushed }) }));
+    expect(currentDrain()).toBeNull();
   });
 });

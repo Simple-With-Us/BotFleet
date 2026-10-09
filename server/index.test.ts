@@ -815,10 +815,24 @@ describe("harness HTTP API", () => {
       await expect.poll(async () => (await runtime()).drain?.held.sends, SLOW).toBe(1);
       await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(0);
 
+      // The app and a paired phone cannot read /api/runtime (loopback plus the
+      // owner's token), so the same hold rides on the update status they do
+      // read, with no token: what is waiting, and when the window ends.
+      const shown = await api("GET", "/api/update/status");
+      expect(shown.status).toBe(200);
+      expect(shown.body.drain).toMatchObject({ held: { sends: 1, rooms: 0 }, bots: 0, rooms: 0 });
+      expect(shown.body.drain.windowEndsAt).toBeGreaterThan(Date.now());
+      expect(shown.body.drain.windowEndsAt).toBeLessThan(shown.body.drain.deadline);
+      // Counts and times only: nothing of the person's words, and none of the
+      // runtime route's own bookkeeping.
+      expect(JSON.stringify(shown.body.drain)).not.toContain("held until released");
+      expect(shown.body.drain).not.toHaveProperty("inFlight");
+
       // Giving up on the update lets it run now, once.
       const released = await quiesce("DELETE");
       expect(released.status).toBe(200);
       expect(await released.json()).toMatchObject({ draining: false, quiescing: false });
+      expect((await api("GET", "/api/update/status")).body).not.toHaveProperty("drain");
       await expect.poll(busy, SLOW).toBe(true);
       expect(await said("held until released")).toBe(1);
       await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
