@@ -16135,6 +16135,13 @@ zulipHub = new ZulipHub({
   startTurn: async (botId, text, conversation) => {
     const bot = store.bot(botId);
     if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
+    // The refusals startTurn would make anyway, made before a task exists:
+    // an Off or stopped bot must not collect an empty Zulip task per
+    // conversation (or a re-broadcast of one on every retry).
+    if (botIsOff(bot)) throw botOffError();
+    if (routines?.isBotSnoozed(botId) === true) {
+      throw Object.assign(new Error(botStopRefusalMessage()), { status: 409, code: "bot_stopped" });
+    }
     // Each Zulip conversation runs in a task of its own, created the way a
     // routine's or a webhook's is and never activated: never the owner's
     // active thread, whose transcript a peer-woken turn must not be able to
