@@ -15,10 +15,12 @@ import { describe, expect, it, vi } from "vitest";
 import { ReviewBudget, type Reviewer, type ReviewResult } from "./auto-review.ts";
 import type { DecisionRow } from "./decision-log.ts";
 import {
+  HELD_ASK_GRACE_MS,
   MAX_PENDING_STEPS,
   ReviewWatch,
   RunningTurns,
   watchesKind,
+  watchesStep,
   type StopTarget,
   type WatchPlan,
   type WatchedStep,
@@ -173,6 +175,16 @@ describe("what is watched", () => {
   it("reviews commands, edits, fetches, connected-app calls and unknown kinds, not reads or planning", () => {
     for (const kind of ["execute", "edit", "fetch", "other", undefined] as const) expect(watchesKind(kind)).toBe(true);
     for (const kind of ["read", "search", "think", "task", "notice"] as const) expect(watchesKind(kind)).toBe(false);
+  });
+
+  it("reviews a message to another bot, which is classed as a delegation, but not a helper launch", () => {
+    for (const tool of ["mcp__agents__ask_bot", "ask_bot", "mcp__agents__delegate_bot"]) {
+      expect(watchesStep({ tool, toolKind: "task" })).toBe(true);
+    }
+    for (const tool of ["Task", "mcp__agents__list_bots", "ask_bot_later"]) {
+      expect(watchesStep({ tool, toolKind: "task" })).toBe(false);
+    }
+    expect(watchesStep({ tool: "bash", toolKind: "execute" })).toBe(true);
   });
 
   it("does nothing without a plan, with review off, or for a read", async () => {
@@ -362,7 +374,7 @@ describe("a held turn: steps that ask go to the card, steps that never ask are w
 
   it("leaves a step whose ask already reached the card to the card", async () => {
     const h = harness([{ allow: false, reason: "never asked" }]);
-    h.watch.markAsked("thread-1", "toolu_bash");
+    h.watch.markAsked("thread-1", "turn-1", "toolu_bash");
     h.watch.observe(step("rm -rf build", { itemId: "toolu_bash" }), plan("enforce"));
     await h.watch.settled();
     expect(h.asked).toEqual([]);
@@ -390,7 +402,7 @@ describe("a held turn: steps that ask go to the card, steps that never ask are w
     watch.observe(step("deploy.sh", { itemId: "toolu_edit", toolKind: "edit" }), plan("enforce"));
     watch.observe(step("rm -rf build", { itemId: "toolu_bash" }), plan("enforce"));
     // Claude shows the step before the CLI calls the prompt tool
-    watch.markAsked("thread-1", "toolu_bash");
+    watch.markAsked("thread-1", "turn-1", "toolu_bash");
     release();
     await watch.settled();
     expect(reviewed).toEqual(["deploy.sh"]);
@@ -418,11 +430,172 @@ describe("a held turn: steps that ask go to the card, steps that never ask are w
     watch.observe(step("rm -rf build", { itemId: "toolu_bash" }), plan("enforce"));
     await Promise.resolve();
     // a person may already be clicking Allow on this card
-    watch.markAsked("thread-1", "toolu_bash");
+    watch.markAsked("thread-1", "turn-1", "toolu_bash");
     release();
     await watch.settled();
     expect(stops).toEqual([]);
     expect(rows).toEqual([expect.objectContaining({ decision: "review-would-deny", source: "auto-review-watch", rule: "risky" })]);
+  });
+});
+
+// The grace a held turn's step gives its ask.  An engine reports a step as it
+// starts and asks about it a moment later, so reviewing at once judged every
+// asked step twice and spent the turn's review limit at double the rate.
+describe("a held turn gives each step's ask a moment to arrive", () => {
+  /** A watch whose clock and sleep are the test's own. */
+  function graceHarness(answer: { allow: boolean; reason: string }) {
+    let clock = 0;
+    const sleeps: Array<{ ms: number; resolve: () => void }> = [];
+    const reviewed: string[] = [];
+    const stops: StopTarget[] = [];
+    const watch = new ReviewWatch({
+      turnRunning: () => true,
+      stopTurn: (target) => {
+        stops.push(target);
+      },
+      note: () => {},
+      log: () => {},
+      now: () => clock,
+      sleep: (ms) =>
+        new Promise<void>((resolve) => {
+          sleeps.push({
+            ms,
+            resolve: () => {
+              clock += ms;
+              resolve();
+            },
+          });
+        }),
+      review: async (_reviewers, request) => {
+        reviewed.push(request.summary);
+        return { kind: "verdict", verdict: answer, reviewer };
+      },
+    });
+    return { watch, sleeps, reviewed, stops };
+  }
+  const held = (): WatchPlan => ({ ...plan("enforce"), askGraceMs: HELD_ASK_GRACE_MS });
+
+  it("never reviews, or stops over, a step whose ask lands inside the grace, even with an instant reviewer", async () => {
+    const h = graceHarness({ allow: false, reason: "would delete the build" });
+    h.watch.observe(step("rm -rf build", { itemId: "toolu_bash" }), held());
+    await Promise.resolve();
+    // the step is waiting, not being reviewed
+    expect(h.sleeps).toHaveLength(1);
+    expect(h.sleeps[0]?.ms).toBe(HELD_ASK_GRACE_MS);
+    expect(h.reviewed).toEqual([]);
+    // the ask reaches the card inside the window
+    h.watch.markAsked("thread-1", "turn-1", "toolu_bash");
+    h.sleeps[0]?.resolve();
+    await h.watch.settled();
+    expect(h.reviewed).toEqual([]);
+    expect(h.stops).toEqual([]);
+  });
+
+  it("reviews, once, a step that never asks after the grace has passed", async () => {
+    const h = graceHarness({ allow: false, reason: "edits a deploy script" });
+    h.watch.observe(step("deploy.sh", { itemId: "toolu_edit", tool: "Edit", toolKind: "edit" }), held());
+    await Promise.resolve();
+    expect(h.reviewed).toEqual([]);
+    h.sleeps[0]?.resolve();
+    await h.watch.settled();
+    expect(h.reviewed).toEqual(["deploy.sh"]);
+    expect(h.stops).toHaveLength(1);
+  });
+
+  it("does not hold back a step on a turn that is not held, or a step with no id to match", async () => {
+    const h = graceHarness({ allow: true, reason: "routine" });
+    h.watch.observe(step("ls", { itemId: "toolu_a" }), plan("enforce"));
+    h.watch.observe(step("pwd"), held());
+    await h.watch.settled();
+    expect(h.sleeps).toEqual([]);
+    expect(h.reviewed).toEqual(["ls", "pwd"]);
+  });
+
+  it("an ask is its own turn's: another turn reusing the step id is still watched", async () => {
+    const h = graceHarness({ allow: true, reason: "routine" });
+    h.watch.markAsked("thread-1", "turn-1", "item-1");
+    h.watch.observe(step("echo two", { turnId: "turn-2", itemId: "item-1" }), plan("enforce"));
+    await h.watch.settled();
+    expect(h.reviewed).toEqual(["echo two"]);
+    // an ask that named no turn counts for the thread's every turn
+    h.watch.markAsked("thread-1", undefined, "item-9");
+    h.watch.observe(step("echo nine", { turnId: "turn-3", itemId: "item-9" }), plan("enforce"));
+    await h.watch.settled();
+    expect(h.reviewed).toEqual(["echo two"]);
+  });
+});
+
+// One queue per turn, not per thread: in a room, one member's backlog neither
+// delays the other's reviews nor pushes the other's next step into the limit.
+describe("each turn has its own review queue", () => {
+  it("reviews a second member's step while the first member's reviews are still waiting", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const reviewed: string[] = [];
+    const stops: StopTarget[] = [];
+    const watch = new ReviewWatch({
+      turnRunning: () => true,
+      stopTurn: (target) => {
+        stops.push(target);
+      },
+      note: () => {},
+      log: () => {},
+      review: async (_reviewers, request) => {
+        if (request.summary.startsWith("a-")) await gate;
+        reviewed.push(request.summary);
+        return { kind: "verdict", verdict: { allow: true, reason: "routine" }, reviewer };
+      },
+    });
+    // member A: one review in flight and a full queue behind it
+    for (let index = 0; index <= MAX_PENDING_STEPS; index += 1) {
+      watch.observe(step(`a-${index}`, { turnId: "turn-a", instanceId: "pi-a" }), { ...plan("enforce"), botId: "bot-a" });
+    }
+    watch.observe(step("b-0", { turnId: "turn-b", instanceId: "pi-b" }), { ...plan("enforce"), botId: "bot-b" });
+    await Promise.resolve();
+    await Promise.resolve();
+    // B was reviewed ahead of A's backlog, and A's full queue did not stop B
+    expect(reviewed).toEqual(["b-0"]);
+    expect(stops).toEqual([]);
+    release();
+    await watch.settled();
+    expect(reviewed).toHaveLength(MAX_PENDING_STEPS + 2);
+    expect(stops).toEqual([]);
+  });
+});
+
+// A stop is latched for its own turn only.  Without this a step that named no
+// turn latched `thread:` for good, and every later turn on the thread was
+// silently not reviewed.
+describe("a stop does not outlive its turn", () => {
+  it("watches the next turn on the thread again once the stopped turn has ended", async () => {
+    const h = harness([
+      { allow: false, reason: "sends email" },
+      { allow: false, reason: "sends email again" },
+    ]);
+    const noTurn = (target: string) => step(target, { turnId: undefined });
+    h.watch.observe(noTurn("mail one"), plan("enforce"));
+    await h.watch.settled();
+    expect(h.stops).toHaveLength(1);
+    // the same stopped turn: later steps are ignored
+    h.watch.observe(noTurn("mail two"), plan("enforce"));
+    await h.watch.settled();
+    expect(h.asked).toEqual(["mail one"]);
+    h.watch.turnEnded("thread-1", undefined);
+    h.watch.observe(noTurn("mail three"), plan("enforce"));
+    await h.watch.settled();
+    expect(h.asked).toEqual(["mail one", "mail three"]);
+    expect(h.stops).toHaveLength(2);
+  });
+
+  it("forgets the asked steps and the queue of a turn that ended", async () => {
+    const h = harness([{ allow: true, reason: "routine" }]);
+    h.watch.markAsked("thread-1", "turn-1", "item-1");
+    h.watch.turnEnded("thread-1", "turn-1");
+    h.watch.observe(step("ls", { itemId: "item-1" }), plan("enforce"));
+    await h.watch.settled();
+    expect(h.asked).toEqual(["ls"]);
   });
 });
 

@@ -376,7 +376,7 @@ export function autoReviewGate(
   } else if (nativeHook === "before") {
     summary = `${who}${GAP}Each approval it asks for is reviewed before it runs, including one Auto or Bypass would grant.${GAP}Steps it takes without asking are not reviewed.${GAP}Existing safety rules, unattended turns, local-computer access, and questions still wait for you.`;
   } else if (asksWhenHeld) {
-    summary = `${name} is set to full auto.${GAP}On runs this bot's turns in asking mode, so what it asks about is reviewed before it runs.${GAP}Steps it still takes without asking, such as file edits, are checked as they start, and On stops the turn when the reviewer refuses one or cannot check it.${GAP}The stop is not instant, so a few more steps can run first.${GAP}Watch only records each step, and turns nobody started are watched, not held.${GAP}${who}`;
+    summary = `${name} is set to full auto.${GAP}On runs this bot's turns in asking mode, so what it asks about is reviewed before it runs.${GAP}Steps it still takes without asking, such as file edits and messages to other bots, are checked as they start, and On stops the turn when the reviewer refuses one or cannot check it.${GAP}The stop is not instant, so a few more steps can run first.${GAP}Watch only records each step, and turns nobody started are watched, not held.${GAP}${who}`;
   } else {
     summary = `${name} runs its tools without asking first, so review can only watch.${GAP}Each step is checked as it starts, and On stops the turn when the reviewer refuses one or cannot check it.${GAP}The stop is not instant, so a few more steps can run first, and it cannot undo a step that already started.${GAP}${who}`;
   }

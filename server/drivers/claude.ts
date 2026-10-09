@@ -634,7 +634,7 @@ function createPermissionBroker(opts: {
       tool: msg.tool ?? "tool",
       input: msg.input ?? {},
       at: Date.now(),
-      toolUseId: typeof msg.toolUseId === "string" && msg.toolUseId ? msg.toolUseId : undefined,
+      toolUseId: String(msg.toolUseId ?? "") || undefined,
     };
     const finish = (behavior: AskBehavior, message: string | undefined, source: AskResolutionSource) => {
       if (!pending.delete(askId)) return;
@@ -1162,7 +1162,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // the bot through the permission-prompt tool instead of pre-allowing
       // them: a connected-app call (an email, a message) and a phone call
       // then reach the reviewer BEFORE they run, where a pre-allowed call
-      // could only be watched after it had already gone out.
+      // could only be watched after it had already gone out.  The `agents`
+      // server stays pre-allowed on purpose: it is the harness's own fleet
+      // comms, jobs and Zulip, each guarded by the endpoint it calls (comms
+      // depth, peer approval), and the owner ruled that a full-auto bot's own
+      // `job_start` never becomes a card, which routing it through the broker
+      // would break.  The step watch reviews those calls as they start, a
+      // message to another bot (`ask_bot`) included.
       const heldForReview = turn.holdForReview === true && permissionMode !== "bypassPermissions";
       if (turn.integrations?.composio) {
         mcpServers.composio = { ...turn.integrations.composio };
@@ -2143,18 +2149,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
      * only the action under review on stdin, so text inside the action reads
      * as data rather than as part of the brief.  The brief is fixed text
      * with nothing from the action in it, so argv is fine for it. */
-    const generateReview = async (prompt: string | ReviewPrompt, signal?: AbortSignal): Promise<string> => {
+    const generateReview = async (stdin: string, system: string | undefined, signal?: AbortSignal): Promise<string> => {
       if (signal?.aborted) throw new Error("Claude review aborted");
       await requireStrictMcp();
       if (signal?.aborted) throw new Error("Claude review aborted");
-      const stdin = typeof prompt === "string" ? prompt : prompt.data;
       return new Promise((resolve, reject) => {
         const child = spawnCli(
           config.cli,
           [
             "-p", "--model", "claude-haiku-4-5", "--output-format", "text",
             "--tools", "", "--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config",
-            ...(typeof prompt === "string" ? [] : ["--append-system-prompt", prompt.system]),
+            ...(system === undefined ? [] : ["--append-system-prompt", system]),
           ],
           {
             stdio: ["pipe", "pipe", "pipe"],
@@ -2266,8 +2271,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return () => listeners.delete(listener);
         },
       },
-      generateText: (prompt) => generateReview(prompt),
-      reviewPermission: generateReview,
+      generateText: (prompt) => generateReview(prompt, undefined),
+      reviewPermission: (prompt: ReviewPrompt, signal) => generateReview(prompt.data, prompt.system, signal),
       dispose: async () => {
         for (const { stop } of active.values()) stop();
         for (const threadId of [...sessions.keys()]) closeSession(threadId, "dispose");

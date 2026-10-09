@@ -64,7 +64,7 @@ import {
   shouldReview,
   type Reviewer,
 } from "./auto-review.ts";
-import { ReviewWatch, RunningTurns, type StopTarget } from "./review-watch.ts";
+import { HELD_ASK_GRACE_MS, ReviewWatch, RunningTurns, type StopTarget } from "./review-watch.ts";
 import { fallbackReviewerSetting, pickAutoReviewer, reviewerHealth } from "../shared/auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions, type DecisionRow, type DecisionSource } from "./decision-log.ts";
@@ -3276,7 +3276,7 @@ function automaticFallbackReviewerId(): string | null {
     registry.instances().map((instance) => ({
       instanceId: instance.instanceId,
       driverKind: instance.driverKind,
-      canReview: instance.enabled !== false && typeof instance.reviewPermission === "function",
+      canReview: instance.enabled !== false && instance.reviewPermission !== undefined,
       health: reviewerHealth(registry.lastKnown(instance.instanceId)?.snapshot),
     })),
   );
@@ -3523,7 +3523,14 @@ bus.subscribe((event: RuntimeEvent) => {
     runningTurns.started(event.threadId, event.turnId);
   } else if (event.type === "turn.completed") {
     runningTurns.completed(event.threadId, event.turnId);
+    reviewWatch.turnEnded(event.threadId, event.turnId);
     reviewBudget.release(ReviewBudget.key(event.threadId, event.turnId));
+    // An in-process ask carries no turn id and, with two turns running on one
+    // thread (a room), is charged to the thread as a whole.  That shared
+    // budget is released once the thread has no turn left running.
+    if (!runningTurns.running(event.threadId, undefined)) {
+      reviewBudget.release(ReviewBudget.key(event.threadId, undefined));
+    }
   }
 });
 
@@ -4169,9 +4176,6 @@ bus.subscribe((event: RuntimeEvent) => {
         // the other bot replies (minutes, or a person's approval), and left
         // unclocked it would all be billed to the model.
         if (bot && event.itemId) turnStats.toolStarted(event.threadId, event.itemId);
-        // ask_bot's raw tool chip is redundant — the internal endpoint
-        // appends a richer "Messaged @X" chip linking to the channel
-        if (event.title?.endsWith("__ask_bot")) break;
         const name = event.title ?? "tool";
         // Auto-review on an engine that can run steps without asking: the
         // step watch reviews each one as it starts (server/review-watch.ts).
@@ -4180,11 +4184,15 @@ bus.subscribe((event: RuntimeEvent) => {
         // Codex runs sandboxed commands unasked.  A step whose ask did reach
         // the card is recognised by its item id and left to the card.  An
         // engine whose every action asks first ("before") is not watched.
+        // The check comes before the ask_bot exit below, so a message to
+        // another bot is watched like any other step the engine took without
+        // asking.  A step with no turn id is charged to, and stopped with,
+        // the thread's one running turn, as an in-process review is.
         const instanceId = event.providerInstanceId;
         reviewWatch.observe(
           {
             threadId: event.threadId,
-            turnId: event.turnId,
+            turnId: event.turnId ?? runningTurns.only(event.threadId),
             itemId: event.itemId,
             instanceId,
             tool: name,
@@ -4206,10 +4214,15 @@ bus.subscribe((event: RuntimeEvent) => {
               persona: reviewPersona(actor),
               mode,
               reviewers: reviewersForInstance(instance),
+              // a held turn's steps give their ask a moment to reach the card
+              askGraceMs: holdTurnForReview(actor, instance) ? HELD_ASK_GRACE_MS : undefined,
               unattended: isUnattended(actor.id),
             };
           })(),
         );
+        // ask_bot's raw tool chip is redundant — the internal endpoint
+        // appends a richer "Messaged @X" chip linking to the channel
+        if (event.title?.endsWith("__ask_bot")) break;
         // narration is folded in here, once, so call mode can read the
         // chip aloud without re-deriving it — and so the phrase a user
         // hears and the chip they see can never drift apart
@@ -4231,7 +4244,7 @@ bus.subscribe((event: RuntimeEvent) => {
       }
       // This step reached a card, which reviews it before it runs and which
       // a person may answer: the step watch leaves it alone from here on.
-      if (event.itemId) reviewWatch.markAsked(event.threadId, event.itemId);
+      if (event.itemId) reviewWatch.markAsked(event.threadId, event.turnId, event.itemId);
       const permission = event.requestType === "permission";
       // Auto mode / always-allow: answer routine tool permissions for the
       // bot so it keeps working. A QUESTION always reaches the human — the

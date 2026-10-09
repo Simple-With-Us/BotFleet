@@ -14,7 +14,11 @@
 // under acceptEdits and calls the MCP servers it pre-allows, and Codex still
 // runs sandboxed commands, without asking.  A step that did reach a card is
 // recognised by its item id (`markAsked`) and left to the card, so the watch
-// never stops a turn over an action a person may already have allowed.
+// never stops a turn over an action a person may already have allowed.  An
+// engine reports a step as it starts and asks about it a moment later, so a
+// held turn's steps wait a short grace (`HELD_ASK_GRACE_MS`) for that ask
+// before they are reviewed: a step that asks is judged once, at the card,
+// instead of twice.
 //
 // What it can honestly promise is narrower than a card, and the Bot Profile
 // says exactly this:
@@ -31,10 +35,12 @@
 //
 // It never approves anything, so it is safe on an unattended turn too.
 //
-// Steps are reviewed one at a time per thread, in the order they started, so
-// a chatty engine costs one reviewer call at a time rather than a burst, and
-// a refusal stops the turn before the reviewer is asked about anything that
-// came after it.
+// Steps are reviewed one at a time per TURN, in the order they started, so a
+// chatty engine costs one reviewer call at a time rather than a burst, and a
+// refusal stops the turn before the reviewer is asked about anything that came
+// after it.  The queue belongs to the turn, not the thread: in a room two
+// members run side by side, and one member's backlog must neither delay the
+// other's reviews nor push the other's next step into the queue limit.
 
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { AutoReviewMode } from "../shared/auto-review.ts";
@@ -56,16 +62,35 @@ import type { DecisionRow } from "./decision-log.ts";
  *  whose kind the engine did not report is reviewed — unknown is not safe. */
 export const WATCHED_KINDS: ReadonlySet<ToolKind> = new Set<ToolKind>(["execute", "edit", "fetch", "other"]);
 
-/** How many steps may wait for review on one thread.  Past this Watch logs
- *  the step as skipped and On stops the turn. */
+/** How many steps may wait for review on one turn.  Past this Watch logs the
+ *  step as skipped and On stops the turn. */
 export const MAX_PENDING_STEPS = 20;
 
-/** How many stopped turns, and asked steps, are remembered. */
+/** How long a step on a held turn waits before it is reviewed, in case its
+ *  ask is about to reach the card.  An engine reports a step as it starts and
+ *  asks about it a moment later, so reviewing at once would judge every step
+ *  that asks twice (once here, once at the card) and spend the turn's review
+ *  limit at double the rate.  A step that never asks is reviewed after this
+ *  delay, which only makes the stop a little later. */
+export const HELD_ASK_GRACE_MS = 750;
+
+/** How many stopped turns, and turns with asked steps, are remembered. */
 const STOPPED_TURN_MEMORY = 500;
-const ASKED_STEP_MEMORY = 2_000;
+const ASKED_TURN_MEMORY = 500;
+const ASKED_STEPS_PER_TURN = 2_000;
 
 export function watchesKind(kind: ToolKind | undefined): boolean {
   return kind === undefined || WATCHED_KINDS.has(kind);
+}
+
+/** A message to another bot, however the engine spells the tool
+ *  (`mcp__agents__ask_bot`, a bare `ask_bot`).  It is classed as a delegation
+ *  (`task`), which is not watched, but a peer acts on it, so it is. */
+const PEER_MESSAGE_TOOL = /(?:^|__)(?:ask_bot|delegate_bot)$/;
+
+/** Whether a step is worth a reviewer call: its kind, or a message to a peer. */
+export function watchesStep(step: Pick<WatchedStep, "tool" | "toolKind">): boolean {
+  return watchesKind(step.toolKind) || PEER_MESSAGE_TOOL.test(step.tool);
 }
 
 export interface WatchedStep {
@@ -91,6 +116,10 @@ export interface WatchPlan {
   mode: AutoReviewMode;
   reviewers: Reviewer[];
   unattended?: boolean;
+  /** Set on a turn held in its asking mode for review: how long a step waits
+   *  for its ask to reach the card before the watch reviews it (see
+   *  `HELD_ASK_GRACE_MS`).  Absent on an engine that never asks. */
+  askGraceMs?: number;
 }
 
 /** Exactly which turn to stop: one bot's turn on one engine, never the
@@ -113,6 +142,9 @@ export interface ReviewWatchDeps {
   log(row: Omit<DecisionRow, "at">): void;
   /** The per-turn review budget every review path shares. */
   budget?: ReviewBudget;
+  /** Injectable for tests: wait this long, and read the clock. */
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
   /** Injectable for tests. */
   review?: (
     reviewers: readonly Reviewer[],
@@ -124,6 +156,9 @@ export interface ReviewWatchDeps {
 interface Pending {
   step: WatchedStep;
   plan: WatchPlan;
+  /** Not reviewed before this time (ms on the watch's clock): a held turn's
+   *  step gives its ask a moment to arrive. */
+  readyAt: number;
 }
 
 /** Why On stopped a turn without a refusal: the rule for the log and the
@@ -134,10 +169,13 @@ interface FailClosed {
 }
 
 export class ReviewWatch {
+  // One queue, and one drain, per turn (thread + turn id).
   private readonly queues = new Map<string, Pending[]>();
-  private readonly draining = new Map<string, Promise<void>>();
+  private readonly draining = new Map<string, { threadId: string; run: Promise<void> }>();
   private readonly stoppedTurns = new Set<string>();
-  private readonly asked = new Set<string>();
+  // The steps whose ask reached the card, by turn.  An id is only meaningful
+  // inside its turn: an engine may number its steps again in the next one.
+  private readonly asked = new Map<string, Set<string>>();
   // A plain field, not a parameter property: the server runs under Node's
   // strip-only TypeScript, which refuses parameter properties.
   private readonly deps: ReviewWatchDeps;
@@ -151,7 +189,7 @@ export class ReviewWatch {
    *  all reach the card first). */
   observe(step: WatchedStep, plan: WatchPlan | null): void {
     if (!plan || plan.mode === "off") return;
-    if (!watchesKind(step.toolKind)) return;
+    if (!watchesStep(step)) return;
     if (this.isStopped(step) || this.wasAsked(step)) return;
     if (plan.reviewers.length === 0) {
       // Watch has nothing to record.  On has nobody to check this step, and
@@ -169,7 +207,8 @@ export class ReviewWatch {
       this.capped(step, plan, this.deps.budget.limit());
       return;
     }
-    const queue = this.queues.get(step.threadId) ?? [];
+    const turnKey = this.key(step.threadId, step.turnId);
+    const queue = this.queues.get(turnKey) ?? [];
     if (queue.length >= MAX_PENDING_STEPS) {
       this.failClosed(step, plan, {
         rule: `more than ${MAX_PENDING_STEPS} steps were waiting for review`,
@@ -177,12 +216,12 @@ export class ReviewWatch {
       });
       return;
     }
-    queue.push({ step, plan });
-    this.queues.set(step.threadId, queue);
-    if (!this.draining.has(step.threadId)) {
-      const run = this.drain(step.threadId).finally(() => this.draining.delete(step.threadId));
-      this.draining.set(step.threadId, run);
-    }
+    // Only a step that carries an id can be matched to an ask, so only one
+    // that does is held back for it.
+    const grace = step.itemId !== undefined ? (plan.askGraceMs ?? 0) : 0;
+    queue.push({ step, plan, readyAt: this.now() + grace });
+    this.queues.set(turnKey, queue);
+    this.startDrain(turnKey, step.threadId);
   }
 
   /** An ask for this step reached the permission card (`request.opened`
@@ -190,28 +229,50 @@ export class ReviewWatch {
    *  a person may answer it, so the watch drops the step, or, when its
    *  review is already under way, records the answer instead of acting on
    *  it. */
-  markAsked(threadId: string, itemId: string): void {
-    this.asked.add(`${threadId}:${itemId}`);
-    if (this.asked.size > ASKED_STEP_MEMORY) {
-      const oldest = this.asked.values().next().value;
+  markAsked(threadId: string, turnId: string | undefined, itemId: string): void {
+    const turnKey = this.key(threadId, turnId);
+    const items = this.asked.get(turnKey) ?? new Set<string>();
+    // re-inserted so the turns asked about most recently are the ones kept
+    this.asked.delete(turnKey);
+    this.asked.set(turnKey, items);
+    items.add(itemId);
+    if (items.size > ASKED_STEPS_PER_TURN) {
+      const oldest = items.values().next().value;
+      if (oldest !== undefined) items.delete(oldest);
+    }
+    if (this.asked.size > ASKED_TURN_MEMORY) {
+      const oldest = this.asked.keys().next().value;
       if (oldest !== undefined) this.asked.delete(oldest);
     }
-    const queue = this.queues.get(threadId);
+    const queue = this.queues.get(turnKey);
     if (queue) {
       this.queues.set(
-        threadId,
+        turnKey,
         queue.filter((pending) => pending.step.itemId !== itemId),
       );
     }
+  }
+
+  /** A turn settled: forget what was latched, queued or asked for it.
+   *  Without a turn id nothing says which one, so everything on the thread
+   *  goes, as `RunningTurns.completed` does.  A stop is latched only for the
+   *  life of its turn, so the next turn on the thread is watched again. */
+  turnEnded(threadId: string, turnId: string | undefined): void {
+    const prefix = `${threadId}:`;
+    const onThread = (key: string) => (turnId === undefined ? key.startsWith(prefix) : key === this.key(threadId, turnId));
+    // deleting the entry being visited is well defined for a Set or a Map
+    for (const key of this.stoppedTurns) if (onThread(key)) this.stoppedTurns.delete(key);
+    for (const key of this.asked.keys()) if (onThread(key)) this.asked.delete(key);
+    for (const key of this.queues.keys()) if (onThread(key)) this.queues.delete(key);
   }
 
   /** Resolves once every step queued on the thread (or on every thread) has
    *  been reviewed.  For tests and for an orderly shutdown. */
   async settled(threadId?: string): Promise<void> {
     for (;;) {
-      const runs = threadId
-        ? [this.draining.get(threadId)].filter((run): run is Promise<void> => run !== undefined)
-        : [...this.draining.values()];
+      const runs = [...this.draining.values()]
+        .filter((entry) => threadId === undefined || entry.threadId === threadId)
+        .map((entry) => entry.run);
       if (runs.length === 0) return;
       await Promise.all(runs);
     }
@@ -221,12 +282,26 @@ export class ReviewWatch {
     return `${threadId}:${turnId ?? ""}`;
   }
 
+  private now(): number {
+    return (this.deps.now ?? Date.now)();
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return this.deps.sleep ? this.deps.sleep(ms) : new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   private isStopped(step: WatchedStep): boolean {
     return this.stoppedTurns.has(this.key(step.threadId, step.turnId));
   }
 
+  /** Whether this step's ask reached the card.  An ask that named no turn is
+   *  filed under the thread alone, and counts for every turn on it. */
   private wasAsked(step: WatchedStep): boolean {
-    return step.itemId !== undefined && this.asked.has(`${step.threadId}:${step.itemId}`);
+    if (step.itemId === undefined) return false;
+    return (
+      this.asked.get(this.key(step.threadId, step.turnId))?.has(step.itemId) === true ||
+      this.asked.get(this.key(step.threadId, undefined))?.has(step.itemId) === true
+    );
   }
 
   private markStopped(step: WatchedStep): void {
@@ -239,13 +314,7 @@ export class ReviewWatch {
 
   /** Drop whatever else this turn queued. */
   private dropTurn(step: WatchedStep): void {
-    const queue = this.queues.get(step.threadId);
-    if (queue) {
-      this.queues.set(
-        step.threadId,
-        queue.filter((pending) => pending.step.turnId !== step.turnId),
-      );
-    }
+    this.queues.delete(this.key(step.threadId, step.turnId));
   }
 
   private rowBase(step: WatchedStep, plan: WatchPlan): Omit<DecisionRow, "at" | "decision" | "source"> {
@@ -259,15 +328,34 @@ export class ReviewWatch {
     };
   }
 
-  private async drain(threadId: string): Promise<void> {
+  /** Start the turn's drain unless one is running. */
+  private startDrain(turnKey: string, threadId: string): void {
+    if (this.draining.has(turnKey)) return;
+    const run = this.drain(turnKey).finally(() => {
+      this.draining.delete(turnKey);
+      // a step queued in the instant between the drain finding the queue
+      // empty and this cleanup would otherwise wait for the next one
+      if ((this.queues.get(turnKey)?.length ?? 0) > 0) this.startDrain(turnKey, threadId);
+    });
+    this.draining.set(turnKey, { threadId, run });
+  }
+
+  private async drain(turnKey: string): Promise<void> {
     for (;;) {
-      const queue = this.queues.get(threadId);
+      const queue = this.queues.get(turnKey);
       const next = queue?.shift();
       if (!next) {
-        this.queues.delete(threadId);
+        this.queues.delete(turnKey);
         return;
       }
       if (this.isStopped(next.step) || this.wasAsked(next.step)) continue;
+      const wait = next.readyAt - this.now();
+      if (wait > 0) {
+        await this.sleep(wait);
+        // its ask may have reached the card, or the turn been stopped, while
+        // the step waited
+        if (this.isStopped(next.step) || this.wasAsked(next.step)) continue;
+      }
       try {
         await this.reviewStep(next);
       } catch (error) {

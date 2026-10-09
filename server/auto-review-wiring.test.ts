@@ -25,6 +25,8 @@
 //  13. Bypass + On: a reviewer answer outside the contract holds the ask
 //  14. A held card offers "always" only for what an ordinary card would
 //  15. An HTTP lane's own action is reviewed first by a different engine
+//  16. A held turn's asked step is judged once, at the card, not twice
+//  17. A message to another bot (ask_bot) is watched like any other step
 import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type ServerResponse } from "node:http";
@@ -238,6 +240,16 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
             environment: { FAKE_ACP_MODE: "quiet-tool-call", FAKE_ACP_QUIET_MS: "1500" },
             config: { cli: FAKE_CLI, fullAuto: true },
           },
+          // a full-auto engine that messages another bot without asking
+          acpAskBot: {
+            driver: "grokAgent",
+            environment: {
+              FAKE_ACP_MODE: "quiet-tool-call",
+              FAKE_ACP_QUIET_MS: "1500",
+              FAKE_ACP_QUIET_TITLE: "mcp__agents__ask_bot",
+            },
+            config: { cli: FAKE_CLI, fullAuto: true },
+          },
           pi: {
             driver: "piAgent",
             environment: { FAKE_PI_MODE: "slow-tool", FAKE_PI_TOOL_MS: "60000" },
@@ -384,6 +396,7 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
     // stopping a turn they may be about to allow.
     verdict = { allow: false, reason: "asked and refused" };
     actionVerdicts.set("run", { allow: true, reason: "a harmless step" });
+    const promptsBefore = reviewPrompts.length;
     try {
       const bot = await makeBot("acpAutoAsk", { name: "Held Asker", autoReview: "enforce" });
       await send(bot);
@@ -396,6 +409,12 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
       const rows: DecisionRow[] = (await api("GET", "/api/decisions")).body.decisions;
       expect(rows.some((r) => r.botId === bot.id && r.decision === "review-stopped-turn")).toBe(false);
       expect((await card(bot.threadId))?.card?.answered).toBeUndefined();
+      // and the asked step was judged once, at the card, not again as a step
+      // the engine "took on its own": that second review spent the turn's
+      // review limit at double the rate
+      const sent = reviewPrompts.slice(promptsBefore).filter((prompt) => prompt.includes("echo hi"));
+      expect(sent.filter((prompt) => prompt.includes("has just started on its own"))).toEqual([]);
+      expect(sent).toHaveLength(1);
       await release(bot, open!.card!.requestId!);
     } finally {
       actionVerdicts.clear();
@@ -478,6 +497,21 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
     // Watch never stops anything
     const rows: DecisionRow[] = (await api("GET", "/api/decisions")).body.decisions;
     expect(rows.some((r) => r.botId === bot.id && r.decision === "review-stopped-turn")).toBe(false);
+  }, 90_000);
+
+  it("Watch: a message to another bot is a step like any other, reviewed after the fact", async () => {
+    // ask_bot has no transcript row of its own, and its handler used to leave
+    // before the step watch, so the one tool that messages another bot was
+    // never reviewed on an engine that runs it without asking.
+    verdict = { allow: false, reason: "messaging a peer was not requested" };
+    const bot = await makeBot("acpAskBot", { name: "Messenger", autoReview: "shadow" });
+    await send(bot);
+    const row = await decision((r) => r.botId === bot.id && r.decision === "review-would-deny");
+    expect(row, `the ask_bot step was never reviewed. stderr:\n${stderr.slice(-2000)}`).toMatchObject({
+      source: "auto-review-watch",
+      tool: "mcp__agents__ask_bot",
+      reviewer: "reviewer",
+    });
   }, 90_000);
 
   it("On, an engine that never asks: a refused step stops the turn instead of claiming to hold it", async () => {
