@@ -166,6 +166,22 @@ describe("what it may not", () => {
     }
   });
 
+  it("lets the phone turn a bot Off and back On, and only through the profile route", () => {
+    // The phone's disabled composer has one button, Turn On, so a refusal here
+    // would strand an Off bot on the phone.
+    expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("off");
+    expect(companionProfilePatchDenial({ off: true })).toBeNull();
+    expect(companionProfilePatchDenial({ off: false })).toBeNull();
+    // Switching it is not a way to smuggle a host-control field along.
+    expect(companionProfilePatchDenial({ off: false, autoApprove: true })).toEqual({
+      status: 403,
+      error: "autoApprove can only be changed in BotFleet on your computer",
+    });
+    // The general bot PATCH is not on the phone's route list.
+    expect(allowed("PATCH", "/api/bots/b_1")).toBe(false);
+    expect(allowed("PATCH", "/api/bots/b_1/profile")).toBe(true);
+  });
+
   it("lets the phone write per-device voices", () => {
     expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("voices");
     expect(companionProfilePatchDenial({ voices: { iphone: "English_Graceful_Lady" } })).toBeNull();
