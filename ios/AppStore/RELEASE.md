@@ -5,7 +5,7 @@ The app is native Swift and uses XcodeGen; EAS commands do not apply.
 ## One-time Apple setup
 
 1. Enrol in the Apple Developer Program.
-2. App Store Connect.  Hosted ios-ship and `ios/project.yml` use **`app.botfleet.ios`** (ASC appleId **`6820175685`**).  Legacy **`app.botfleet`** / `6806379515` must not receive uploads.  Register **`app.botfleet.ios.widgets`** in the Developer Portal before shipping the widget extension.
+2. App Store Connect.  Hosted ios-ship and `ios/project.yml` use **`app.botfleet.ios`** (ASC appleId **`6820175685`**).  Legacy **`app.botfleet`** / `6806379515` must not receive uploads.  Widget extension **`app.botfleet.ios.widgets`** is registered in the Developer Portal.
 3. Create the matching app in App Store Connect with the name **BotFleet** and SKU **botfleet-ios** (appleId `6820175685`).  Primary App Store category (for example Developer Tools) is set only in App Store Connect; hosted TestFlight ships do not read category metadata from this repo.
 4. Use the existing Apple Distribution identity (team `CC8UTF7ATG`).  Hosted ships import that certificate, then `scripts/ios-install-appstore-profiles.sh` reuses or creates App Store profiles over the App Store Connect API and archives Release with manual signing (`ios/appstore-profiles.json` + `ios/project.yml`).
 5. Add the review contact details in App Store Connect; do not commit private contact data or App Store Connect keys.

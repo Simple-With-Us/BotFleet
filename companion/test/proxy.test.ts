@@ -335,7 +335,12 @@ describe("the sidecar in front of an unmodified harness", () => {
     // verbs instead, so a stolen device token cannot smuggle those fields.
     const { body } = await device("GET", "/api/bots");
     const botId = body.bots[0].id;
-    expect((await device("PATCH", `/api/bots/${botId}`, { body: { autoApprove: true } })).status).toBe(404);
+    // The bot PATCH is open only for roster organization (see
+    // companion/test/bot-organize.test.ts), so an execution-policy field on
+    // it is refused by the sidecar itself, before the harness sees it.
+    const policy = await device("PATCH", `/api/bots/${botId}`, { body: { autoApprove: true } });
+    expect(policy.status).toBe(403);
+    expect(policy.body.error).toBe("autoApprove can only be changed in BotFleet on your computer");
     expect((await device("PATCH", `/api/groups/not-a-room`, { body: { unread: false } })).status).toBe(404);
   });
 
@@ -611,6 +616,21 @@ describe("the sidecar in front of an unmodified harness", () => {
         body: { memberIds: [botId], cwd: join(home, "projects", "missing") },
       });
       expect(missing.status).toBe(400);
+      // The shapes are parsed at the boundary: a wrong type is a 400 that
+      // names the field, never a half-made room or a coerced value.
+      const badInputs: Array<{ body: Record<string, unknown>; error: string }> = [
+        { body: { bulletin: 7 }, error: "bulletin must be a string" },
+        { body: { bulletin: "x".repeat(12_001) }, error: "bulletin must be at most 12000 characters" },
+        { body: { defaultResponder: "everyone" }, error: "invalid default responder" },
+        { body: { defaultResponder: { kind: "somebody" } }, error: "invalid default responder" },
+        { body: { defaultResponder: { kind: "member" } }, error: "invalid default responder" },
+        { body: { cwd: 7 }, error: "cwd must be a string" },
+      ];
+      for (const wrong of badInputs) {
+        const refused = await device("POST", "/api/groups", { body: { memberIds: [botId], ...wrong.body } });
+        expect(refused.status, JSON.stringify(wrong.body)).toBe(400);
+        expect(refused.body.error, JSON.stringify(wrong.body)).toBe(wrong.error);
+      }
       expect(await roomCount()).toBe(before);
 
       const made = await device("POST", "/api/groups", {

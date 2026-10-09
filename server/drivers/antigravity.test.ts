@@ -15,6 +15,7 @@ import { isQuotaOrCapText, parseQuotaResetTime } from "../model-fallback.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import { buildTurnEvents } from "../telemetry.ts";
 import {
   ANTIGRAVITY_COMPUTER_MCP_KEY,
@@ -405,6 +406,42 @@ describe("Antigravity turns (fake CLI)", () => {
   it("respondToRequest resolves `unavailable` — no interactive permission channel, so the caller denies", async () => {
     await create();
     await expect(instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" })).resolves.toBe("unavailable");
+  });
+
+  it("launches each bot's agy with its own seat and none of the harness's identity, from one shared instance", async () => {
+    const restore = inheritHarnessIdentity();
+    const dir = mkdtempSync(join(tmpdir(), "omb-agy-launch-"));
+    const dump = join(dir, "dump.json");
+    const inst = await AntigravityDriver.create({
+      instanceId: "agy-launch",
+      displayName: undefined,
+      // an instance-level identity must not survive either
+      environment: { FAKE_AGY_DUMP: dump, AGENT_SEAT: "CODEX", ZULIP_API_KEY: "instance-api-key" },
+      enabled: true,
+      config: AntigravityDriver.decodeConfig({ cli: FAKE_CLI }),
+    });
+    const rec = recordEvents(inst.adapter);
+    const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+      const started = await inst.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+      await rec.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+      return readEngineDump(dump).env;
+    };
+    try {
+      const plumber = await seenFor("t-agy-plumber", { seat: "BF-PLUMBER", session: "t-agy-plumber" });
+      const fixer = await seenFor("t-agy-fixer", { seat: "BF-FIXER", session: "t-agy-fixer" });
+      const none = await seenFor("t-agy-none", { seat: null, session: "t-agy-none" });
+      const bare = await seenFor("t-agy-bare", undefined);
+      expectLaunchedAs(plumber, { seat: "BF-PLUMBER", session: "t-agy-plumber" });
+      expectLaunchedAs(fixer, { seat: "BF-FIXER", session: "t-agy-fixer" });
+      expectLaunchedAs(none, { seat: null, session: "t-agy-none" });
+      expectLaunchedAs(bare, { seat: null });
+      expect(JSON.stringify([plumber, fixer, none, bare])).not.toContain("instance-api-key");
+    } finally {
+      rec.stop();
+      await inst.dispose();
+      restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("spawns agy with --mode accept-edits by default, and the bypass only when opted in", async () => {
@@ -894,6 +931,12 @@ describe("Antigravity computer MCP config", () => {
       expect(acceptEdits.adapter.capabilities.computerMcp).toBe(true);
       expect(acceptEdits.adapter.capabilities.localComputerMcp).toBe(true);
       expect(acceptEdits.adapter.capabilities.agentsMcp).toBe(true);
+      // No permission hook in print mode, in either mode: auto-review can
+      // only watch each step as it streams, and no turn can be held.
+      for (const instance of [fullAuto, acceptEdits]) {
+        expect(instance.adapter.capabilities.reviewHook).toBe("after");
+        expect(instance.adapter.capabilities.asksWhenHeld).toBeUndefined();
+      }
     } finally {
       await fullAuto.dispose();
       await acceptEdits.dispose();

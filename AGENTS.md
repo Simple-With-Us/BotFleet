@@ -12,7 +12,9 @@ Consult the private operations inventory for hosting and routing details.
 
 ## Seat Identity And Branches
 
-Post and claim as your own seat tag — `[CLAUDE]`, `[MONET]`, `[CODEX]`, `[AG]`, `[GROK]`, `[CURSOR]`, `[PRODUCER]`, `[GROK-BOT]` — never a hardcoded one.  Branch prefixes follow the seat (`claude/*`, `monet/*`, `codex/*`, `grok/*`, `ag/*`, `producer/*`).  Being inside another seat's worktree does not change your identity; do not claim or land that lane's work from there.  Canonical: `/Users/jay/apps/AGENT-SYNC.md` § Overview and § Message Structure.
+Post and claim as your own seat tag — `[CLAUDE]`, `[CODEX]`, `[AG]`, `[GROK]`, `[CURSOR]`, `[PRODUCER]` — never a hardcoded one.  Branch prefixes follow the seat (`claude/*`, `codex/*`, `grok/*`, `ag/*`, `producer/*`).  Being inside another seat's worktree does not change your identity; do not claim or land that lane's work from there.  Canonical: `/Users/jay/apps/AGENT-SYNC.md` § Overview and § Message Structure.
+
+A session BotFleet launched keeps the role seat BotFleet assigned it, on whatever engine runs it:  `BF-BUILDER`, `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER`, or `BF-PUBLISHER`.  `AGENT_LAUNCH_SEAT` in the environment is that assignment, and it overrides any default seat in the engine's own rules files.  `AGENT_LAUNCHER=botfleet` without `AGENT_LAUNCH_SEAT` means no seat:  take no fleet action.  How BotFleet sets these is in `docs/launch-identity.md`.
 
 ## THE BOARD Comes First
 
@@ -40,6 +42,12 @@ Effort logs: live board `/Users/jay/apps/BOTFLEET-EFFORT-LOG.md` (update first),
 ## Fleet Recall
 
 Search the `fleet-agents` corpus before re-deriving a lesson (`recall "query"` on the Mac, or the `fleet-recall` MCP; cloud seats use `https://agents.jays.services/mcp`), and contribute a one-paragraph lesson after you learn one.  A hit is a lead, not a verdict.  Canonical: `AGENT-SYNC.md` § Fleet recall.
+
+## Kody Review Rules (Fleet Policy)
+
+Fleet-wide Kody review rules live in **`Simple-With-Us/Kodus-Config`**, not in this repo.  Edit or add rules under `.kody-rules/review/` there (and under `BotFleet/.kody-rules/review/` for BotFleet-only rules).  Read that repo's `README.md` and `AGENTS.md` before changing rules — especially the no-allowlist secret-scan policy.
+
+This repository keeps only **`kodus-config.yml`** at the root: per-repo review toggles for BotFleet pull requests (for example suggestion filters and request-changes behavior).  Do not recreate a `.kody-rules/` tree here; it was a stale duplicate of the centralized config.
 
 ## Prior Messages Stay In Scope (owner preference — ALL agents, ALL platforms)
 
@@ -91,7 +99,7 @@ Two spaces between sentences in every paragraph a human reads: product UI, App S
 
 ## Secret Handoff (owner -> agent)
 
-When the owner gives you a secret, read it from `chmod 600` files under `/Users/jay/.secrets/` and NEVER print or echo it.  Never grep `KEY=value` lines (names only: `grep -oE '^[A-Z][A-Z0-9_]*' file`).  Never read `~/.botfleet/config.json` values, plist environment blocks, or `.env*` contents into a transcript.  The product server must not read fleet handoff files; runtime secrets come from the app's own config or Infisical.
+When the owner gives you a secret, read it from `chmod 600` files under `/Users/jay/.secrets/` and NEVER print or echo it.  Never grep `KEY=value` lines (names only: `grep -oE '^[A-Z][A-Z0-9_]*' file`).  Never read `~/.botfleet/config.json` values, plist environment blocks, or `.env*` contents into a transcript.  The product server must not read fleet handoff files; runtime secrets come from the app's own config or Infisical.  A fleet secret that already lives in another Infisical project is read there with the harness's own machine identity, never copied into BotFleet's project:  the BF bots' Zulip keys are read from AI Fleet Coordinator `prod` `/zulip` (`zulip.infisicalProjectId`, `docs/zulip.md`).
 
 ## Infisical Sole Source Of Truth (owner directive, 2026-10-03)
 
@@ -112,7 +120,7 @@ Naming convention `app.<name>.<platform>` for executables, `app.<name>` for the 
 | macOS Speech helper | `app.botfleet.speech.macos` | `electron/resources/speech-helper-Info.plist` |
 | Always-on LaunchAgent (harness) | `app.botfleet.server` | `~/Library/LaunchAgents/app.botfleet.server.plist` `Label` |
 | iOS app | `app.botfleet.ios` (ASC appleId `6820175685`) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `ios/Sources/CompanionCore/TestFlightUpdateCheck.swift`, `scripts/ios-fleet/apps.json` |
-| iOS widgets | `app.botfleet.ios.widgets` (register in ASC before widget ships) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |
+| iOS widgets | `app.botfleet.ios.widgets` (registered in Developer Portal) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |
 | App group | `group.app.botfleet` | `ios/App/BotFleet.entitlements`, `ios/Widgets/BotFleetWidgets.entitlements` |
 | Associated domain | `botfleet.app` (Universal Links + web credentials) | `ios/project.yml` `com.apple.developer.associated-domains` |
 

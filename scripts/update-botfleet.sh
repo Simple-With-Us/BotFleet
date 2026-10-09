@@ -188,54 +188,23 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
       if [[ "$IS_UP_TO_DATE" == "1" ]]; then
         OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/harness-owner.json"
         if [[ -f "$OWNER_FILE" ]]; then
-          # The owner file holds a bearer secret.  Read it and perform the
-          # authenticated GET inside one Node process so the secret never
-          # crosses a process boundary as command output, argv, or a shell
-          # variable.  Only the file path is passed in (via OWNER_FILE_PATH).
-          # On any failure that process exits non-zero and writes nothing and
-          # IS_UP_TO_DATE stays 1: a missing or unreachable harness is not
-          # evidence of an outdated checkout.
-          RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" "$NODE_BIN" -e '
-            const fs = require("fs");
-            const http = require("http");
-            const ownerPath = process.env.OWNER_FILE_PATH;
-            if (typeof ownerPath !== "string" || ownerPath.length === 0) process.exit(1);
-            let owner;
-            try {
-              owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
-            } catch {
-              process.exit(1);
-            }
-            const port = owner && owner.port;
-            const credential = owner && owner.nonce;
-            if (typeof port !== "number" && typeof port !== "string") process.exit(1);
-            if (typeof credential !== "string" || credential.length === 0) process.exit(1);
-            const portNum = Number(port);
-            if (!Number.isInteger(portNum) || portNum <= 0 || portNum > 65535) process.exit(1);
-            const req = http.request({
-              hostname: "127.0.0.1",
-              port: portNum,
-              path: "/api/runtime",
-              method: "GET",
-              headers: { "Authorization": "Bearer " + credential },
-              timeout: 1000,
-            }, (res) => {
-              let body = "";
-              res.setEncoding("utf8");
-              res.on("data", (c) => { body += c; });
-              res.on("end", () => {
-                if (res.statusCode !== 200) process.exit(1);
-                let commit;
-                try { commit = JSON.parse(body).sourceCommit; } catch { process.exit(1); }
-                if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) process.exit(1);
-                process.stdout.write(commit);
-                process.exit(0);
-              });
-            });
-            req.on("error", () => process.exit(1));
-            req.on("timeout", () => { req.destroy(); process.exit(1); });
-            req.end();
-          ' 2>/dev/null) || RUNTIME_COMMIT=""
+          # The bearer credential is never read from harness-owner.json in this
+          # wrapper: it must arrive via BOTFLEET_OWNER_NONCE.  A live owner
+          # record means the harness was adopted, so a missing or rejected
+          # credential must fail fast instead of pretending the runtime check
+          # passed.  The helper reads only the port from the owner file and
+          # writes just a commit SHA to stdout.
+          : "${BOTFLEET_OWNER_NONCE:?BotFleet updater: BOTFLEET_OWNER_NONCE is required when a harness owner record exists.}"
+          RUNTIME_PROBE_ERR="$(mktemp "${TMPDIR:-/tmp}/botfleet-runtime-probe.XXXXXX")"
+          if ! RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" BOTFLEET_OWNER_NONCE="$BOTFLEET_OWNER_NONCE" "$NODE_BIN" "$SCRIPT_DIR/update-botfleet-runtime-commit.mjs" 2>"$RUNTIME_PROBE_ERR"); then
+            if [[ -s "$RUNTIME_PROBE_ERR" ]]; then
+              cat "$RUNTIME_PROBE_ERR" >&2
+            fi
+            rm -f "$RUNTIME_PROBE_ERR"
+            echo "BotFleet updater: could not verify the running harness commit (credential BOTFLEET_OWNER_NONCE)." >&2
+            exit 1
+          fi
+          rm -f "$RUNTIME_PROBE_ERR"
           if [[ "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
             IS_UP_TO_DATE=0
           fi
