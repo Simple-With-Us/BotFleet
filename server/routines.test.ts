@@ -2000,6 +2000,34 @@ describe("RoutineManager", () => {
       expect(h.manager.listRuns()[0]?.status).toBe("queued");
     });
 
+    it("never requeues a run that is already running again", async () => {
+      // An update's rollback requeues the runs its forced quiesce cancelled.
+      // A run something else already restarted (a release that resumed it
+      // first) is running, and queueing it again would run it twice.
+      const h = harness();
+      h.manager.enqueueWebhook({
+        webhookId: "compile-gates",
+        webhookName: "Compile gates",
+        prompt: "classify this",
+        botId: "maus-1",
+        runOn: "bot",
+        deliveryId: "wh-requeue",
+        receivedAt: 1,
+      });
+      await h.manager.tick();
+      const run = h.manager.listRuns()[0]!;
+      expect(run.status).toBe("running");
+      expect(h.manager.requeueRun(run.id)).toBe(false);
+      expect(h.manager.listRuns()[0]?.status).toBe("running");
+      expect(h.started).toHaveLength(1);
+
+      await h.manager.cancelRun(run.id);
+      expect(h.manager.requeueRun(run.id)).toBe(true);
+      expect(h.manager.listRuns()[0]?.status).toBe("queued");
+      // Queued is not cancelled either: a second requeue is a no-op.
+      expect(h.manager.requeueRun(run.id)).toBe(false);
+    });
+
     it("persists bot snoozes across manager restarts", () => {
       const h = harness();
       h.manager.snoozeBot("compiler-bot");
