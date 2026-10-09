@@ -72,7 +72,12 @@ test('visual: Projects row with channel labels interpolates the singular room wo
 
   await expect(row).toHaveScreenshot(
     'conversation-mode-row-channels.png',
-    { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 },
+    {
+      ...stableShot,
+      maxDiffPixelRatio: 0.02,
+      threshold: 0.2,
+      mask: [page.locator('[data-fixture-clock]'), page.locator('[data-fixture-timestamp]')],
+    },
   );
 });
 
@@ -99,7 +104,12 @@ test('visual: Projects row with room labels interpolates the singular room word'
 
   await expect(row).toHaveScreenshot(
     'conversation-mode-row-rooms.png',
-    { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 },
+    {
+      ...stableShot,
+      maxDiffPixelRatio: 0.02,
+      threshold: 0.2,
+      mask: [page.locator('[data-fixture-clock]'), page.locator('[data-fixture-timestamp]')],
+    },
   );
 });
 
@@ -123,6 +133,11 @@ test('visual: switching from Projects to Simple opens the merge panel with the n
 
   await expect(row).toHaveScreenshot(
     'conversation-mode-row-merge.png',
-    { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 },
+    {
+      ...stableShot,
+      maxDiffPixelRatio: 0.02,
+      threshold: 0.2,
+      mask: [page.locator('[data-fixture-clock]'), page.locator('[data-fixture-timestamp]')],
+    },
   );
 });
