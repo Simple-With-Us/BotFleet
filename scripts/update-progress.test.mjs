@@ -127,6 +127,21 @@ describe("the progress file", () => {
     expect(seen[0].stepCount).toBe(UPDATE_STEPS.length);
   });
 
+  it("carries what a step is waiting on, and clears it when the step moves on", () => {
+    const path = progressFile();
+    const progress = createUpdateProgress({ path, runId: "run_one" });
+    expect(read(path).detail).toBeNull();
+    progress.begin("fence");
+    progress.note({ detail: "Waiting for 3 bots to finish" });
+    expect(read(path)).toMatchObject({ step: "fence", detail: "Waiting for 3 bots to finish" });
+    progress.end("fence", true);
+    expect(read(path).detail).toBeNull();
+    progress.begin("quiesce");
+    progress.note({ detail: "stale" });
+    progress.finish("refused", "Bots were still busy after 20 minutes; nothing was interrupted.");
+    expect(read(path)).toMatchObject({ step: null, detail: null, outcome: "refused" });
+  });
+
   it("marks the failing step and leaves the rest of the record intact", async () => {
     const path = progressFile();
     const progress = createUpdateProgress({ path, runId: "run_one" });

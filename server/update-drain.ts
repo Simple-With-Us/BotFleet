@@ -111,8 +111,13 @@ function defaultTimer(fn: () => void, ms: number): UpdateDrainTimer {
 export class UpdateDrain {
   private current: UpdateDrainStatus | null = null;
   private timer: UpdateDrainTimer | null = null;
+  // A plain field, not a parameter property: the harness runs this file with
+  // Node's type stripping, which refuses parameter properties.
+  private readonly options: UpdateDrainOptions;
 
-  constructor(private readonly options: UpdateDrainOptions) {}
+  constructor(options: UpdateDrainOptions) {
+    this.options = options;
+  }
 
   private now(): number {
     return (this.options.now ?? Date.now)();

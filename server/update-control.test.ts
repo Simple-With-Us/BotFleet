@@ -13,6 +13,7 @@ import {
   launchPlanCommand,
   listLaunchJobCommand,
   parseProgressRecord,
+  runningFrom,
   pruneRunArtifacts,
   pruneUpdateStages,
   removeLaunchJobCommand,
@@ -924,6 +925,19 @@ describe("reading what another process wrote", () => {
       .toMatchObject({ outcome: null });
     expect(parseProgressRecord({ schemaVersion: 1, runId: "x", startedAt: "t", progress: 7 }))
       .toMatchObject({ progress: 1 });
+  });
+
+  it("passes a step's detail through to the running status, bounded", () => {
+    const record = parseProgressRecord({
+      schemaVersion: 1, runId: "x", startedAt: "t", step: "fence", detail: "  Waiting for 3 bots to finish  ",
+    });
+    expect(record).toMatchObject({ detail: "Waiting for 3 bots to finish" });
+    expect(runningFrom(record!, [])).toMatchObject({ step: "Holding new work", detail: "Waiting for 3 bots to finish" });
+    expect(parseProgressRecord({ schemaVersion: 1, runId: "x", startedAt: "t", detail: 7 })).toMatchObject({ detail: null });
+    expect(parseProgressRecord({ schemaVersion: 1, runId: "x", startedAt: "t", detail: "x".repeat(500) })?.detail)
+      .toHaveLength(200);
+    expect(runningFrom(parseProgressRecord({ schemaVersion: 1, runId: "x", startedAt: "t", step: "fence" })!, []))
+      .not.toHaveProperty("detail");
   });
 
   it("names a step in words, and falls back to the raw name", () => {
