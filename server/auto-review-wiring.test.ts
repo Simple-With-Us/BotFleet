@@ -15,6 +15,18 @@
 //   7. Watch, full-auto instance     → each step is watched after the fact
 //   8. On, an engine that never asks → a refused step stops the turn (pi)
 //   9. An HTTP lane reviews its own asks: the same stub, as the bot's engine
+//
+// and, from the review of that change:
+//
+//  10. Automatic picks the fallback reviewer: nobody chose one in config
+//  11. On, held full-auto turn: a step that never asks is still watched, and
+//      a refusal stops the turn; a step that asked is left to its card
+//  12. Auto (not Bypass) + On: the reviewer screens an Auto grant too
+//  13. Bypass + On: a reviewer answer outside the contract holds the ask
+//  14. A held card offers "always" only for what an ordinary card would
+//  15. An HTTP lane's own action is reviewed first by a different engine
+//  16. A held turn's asked step is judged once, at the card, not twice
+//  17. A message to another bot (ask_bot) is watched like any other step
 import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type ServerResponse } from "node:http";
@@ -24,6 +36,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 
+import { approvalKey, offerableApprovalKey } from "./auto-approve.ts";
 import type { DecisionRow } from "./decision-log.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
@@ -54,8 +67,22 @@ interface ChatRequest {
 
 /** What the stub reviewer answers next. */
 let verdict: Verdict = { allow: true, reason: "routine" };
-/** Every prompt the stub reviewer was sent. */
+/** Per-action answers that win over `verdict`, keyed by the reviewed action. */
+const actionVerdicts = new Map<string, Verdict>();
+/** Answer every review with prose instead of the strict JSON contract. */
+let malformed = false;
+/** Every prompt the stub reviewer was sent, all its messages joined. */
 const reviewPrompts: string[] = [];
+/** The role of each message in the last review the stub was sent. */
+let lastReviewRoles: string[] = [];
+
+/** The action under review, read back out of the delimited user message. */
+function reviewedAction(body: ChatRequest): string | null {
+  const data = String(body.messages?.find((message) => message.role === "user")?.content ?? "");
+  const match = data.match(/"action":"((?:[^"\\]|\\.)*)"/);
+  // SAFETY: the capture group is the body of a JSON string literal, so parsing it re-quoted yields a string.
+  return match ? (JSON.parse(`"${match[1]}"`) as string) : null;
+}
 /** The tools the stub was last offered as a bot's engine. */
 let offeredTools: string[] = [];
 
@@ -114,7 +141,7 @@ const decision = (pred: (row: DecisionRow) => boolean, ms?: number) =>
 interface Card {
   id: string;
   kind: string;
-  card?: { requestId?: string; answered?: string; held?: string };
+  card?: { requestId?: string; answered?: string; held?: string; allowKey?: string };
   tool?: { name?: string };
 }
 
@@ -166,9 +193,16 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
           answerTurn(res, body);
           return;
         }
-        reviewPrompts.push(String(body.messages?.[0]?.content ?? ""));
+        reviewPrompts.push((body.messages ?? []).map((message) => String(message.content ?? "")).join("\n"));
+        lastReviewRoles = (body.messages ?? []).map((message) => String(message.role));
+        const action = reviewedAction(body);
+        const answer = (action !== null && actionVerdicts.get(action)) || verdict;
         res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(verdict) } }] }));
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { content: malformed ? "Sure, that looks fine to me!" : JSON.stringify(answer) } }],
+          }),
+        );
       });
     });
     await new Promise<void>((resolve) => reviewer.listen(0, "127.0.0.1", resolve));
@@ -182,13 +216,39 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
     writeFileSync(
       join(home, ".botfleet", "config.json"),
       JSON.stringify({
-        autoReview: { fallbackReviewer: "reviewer" },
+        // No fallback reviewer chosen: Automatic picks one (the stub, the only
+        // engine here that can review).
         instances: {
           acp: { driver: "grokAgent", environment: { FAKE_ACP_MODE: "permission" }, config: { cli: FAKE_CLI, fullAuto: false } },
+          acpRm: {
+            driver: "grokAgent",
+            environment: { FAKE_ACP_MODE: "permission", FAKE_ACP_PERMISSION_COMMAND: "rm -rf build" },
+            config: { cli: FAKE_CLI, fullAuto: false },
+          },
           acpAuto: { driver: "grokAgent", environment: { FAKE_ACP_MODE: "permission" }, config: { cli: FAKE_CLI, fullAuto: true } },
+          acpAutoAsk: {
+            driver: "grokAgent",
+            environment: { FAKE_ACP_MODE: "permission", FAKE_ACP_PERMISSION_CALL_ID: "tc-ask" },
+            config: { cli: FAKE_CLI, fullAuto: true },
+          },
+          acpHeld: {
+            driver: "grokAgent",
+            environment: { FAKE_ACP_MODE: "quiet-tool-call", FAKE_ACP_QUIET_MS: "15000" },
+            config: { cli: FAKE_CLI, fullAuto: true },
+          },
           acpSteps: {
             driver: "grokAgent",
             environment: { FAKE_ACP_MODE: "quiet-tool-call", FAKE_ACP_QUIET_MS: "1500" },
+            config: { cli: FAKE_CLI, fullAuto: true },
+          },
+          // a full-auto engine that messages another bot without asking
+          acpAskBot: {
+            driver: "grokAgent",
+            environment: {
+              FAKE_ACP_MODE: "quiet-tool-call",
+              FAKE_ACP_QUIET_MS: "1500",
+              FAKE_ACP_QUIET_TITLE: "mcp__agents__ask_bot",
+            },
             config: { cli: FAKE_CLI, fullAuto: true },
           },
           pi: {
@@ -199,6 +259,12 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
           reviewer: {
             driver: "openai-compat",
             displayName: "Stub Reviewer",
+            config: { url: reviewerUrl, models: ["stub-reviewer"], key: "test-key" },
+          },
+          // a second API engine, listed after the first, as a bot's own engine
+          lane: {
+            driver: "openai-compat",
+            displayName: "Second Lane",
             config: { url: reviewerUrl, models: ["stub-reviewer"], key: "test-key" },
           },
         },
@@ -230,11 +296,12 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
     await new Promise<void>((resolve) => reviewer.close(() => resolve()));
   });
 
-  it("ships the hook and the fallback reviewer the Bot Profile reads", async () => {
-    const config = (await api("GET", "/api/config")).body;
-    expect(config.autoReview).toEqual({ fallbackReviewer: "reviewer" });
+  it("ships the hook, the automatic fallback reviewer and the review limit the Bot Profile reads", async () => {
     const instances: Array<{ instanceId: string; capabilities: Record<string, unknown> }> =
       (await api("GET", "/api/instances")).body.instances;
+    const config = (await api("GET", "/api/config")).body;
+    // nobody chose a reviewer, and review still has one
+    expect(config.autoReview).toEqual({ fallbackReviewer: null, automaticReviewer: "reviewer", maxReviewsPerTurn: 50 });
     const caps = (id: string) => instances.find((instance) => instance.instanceId === id)?.capabilities;
     expect(caps("acp")).toMatchObject({ reviewHook: "before", approvalReview: false });
     expect(caps("acpAuto")).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
@@ -307,14 +374,118 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
 
   it("On, full-auto instance: the attended turn is held in asking mode so the reviewer sees the ask", async () => {
     verdict = { allow: false, reason: "held and refused" };
-    const bot = await makeBot("acpAuto", { name: "Held", autoReview: "enforce" });
+    // the fake's own unasked "run" step is fine; only the ask is refused
+    actionVerdicts.set("run", { allow: true, reason: "a harmless step" });
+    try {
+      const bot = await makeBot("acpAuto", { name: "Held", autoReview: "enforce" });
+      await send(bot);
+      // a full-auto instance would have answered this itself; held, it asks
+      const row = await decision((r) => r.botId === bot.id && r.decision === "card-shown" && r.source === "auto-review");
+      expect(row).toMatchObject({ rule: "held and refused", tool: "shell" });
+      const open = await card(bot.threadId);
+      expect(open?.card?.answered).toBeUndefined();
+      await release(bot, open!.card!.requestId!);
+    } finally {
+      actionVerdicts.clear();
+    }
+  }, 90_000);
+
+  it("On, held turn: a step that asked is left to its card, never stopped by the step watch", async () => {
+    // The fake announces the call as a step, then asks about that same call
+    // by id.  The step watch sees the step first; the ask's id tells it the
+    // card has it, so a refusal holds the card for the person instead of
+    // stopping a turn they may be about to allow.
+    verdict = { allow: false, reason: "asked and refused" };
+    actionVerdicts.set("run", { allow: true, reason: "a harmless step" });
+    const promptsBefore = reviewPrompts.length;
+    try {
+      const bot = await makeBot("acpAutoAsk", { name: "Held Asker", autoReview: "enforce" });
+      await send(bot);
+      const row = await decision((r) => r.botId === bot.id && r.decision === "card-shown" && r.source === "auto-review");
+      expect(row).toMatchObject({ rule: "asked and refused", tool: "shell" });
+      const open = await card(bot.threadId);
+      expect(open?.card?.answered).toBeUndefined();
+      // give a late watch review time to land, then prove it stopped nothing
+      await new Promise((r) => setTimeout(r, 1_500));
+      const rows: DecisionRow[] = (await api("GET", "/api/decisions")).body.decisions;
+      expect(rows.some((r) => r.botId === bot.id && r.decision === "review-stopped-turn")).toBe(false);
+      expect((await card(bot.threadId))?.card?.answered).toBeUndefined();
+      // and the asked step was judged once, at the card, not again as a step
+      // the engine "took on its own": that second review spent the turn's
+      // review limit at double the rate
+      const sent = reviewPrompts.slice(promptsBefore).filter((prompt) => prompt.includes("echo hi"));
+      expect(sent.filter((prompt) => prompt.includes("has just started on its own"))).toEqual([]);
+      expect(sent).toHaveLength(1);
+      await release(bot, open!.card!.requestId!);
+    } finally {
+      actionVerdicts.clear();
+    }
+  }, 90_000);
+
+  it("On, held turn: a step the engine takes without asking is still watched, and a refusal stops the turn", async () => {
+    // Held in asking mode, the engine still runs this step unasked.  Before
+    // the fix a held turn skipped the step watch entirely, so On reviewed
+    // less than Watch.
+    verdict = { allow: false, reason: "a build was not requested" };
+    const bot = await makeBot("acpHeld", { name: "Held Stepper", autoReview: "enforce" });
     await send(bot);
-    // a full-auto instance would have answered this itself; held, it asks
-    const row = await decision((r) => r.botId === bot.id && r.decision === "card-shown" && r.source === "auto-review");
-    expect(row).toMatchObject({ rule: "held and refused", tool: "shell" });
-    const open = await card(bot.threadId);
-    expect(open?.card?.answered).toBeUndefined();
-    await release(bot, open!.card!.requestId!);
+    const stopped = await decision((r) => r.botId === bot.id && r.decision === "review-stopped-turn", 45_000);
+    expect(stopped, `the unasked step was never reviewed. stderr:\n${stderr.slice(-2000)}`).not.toBeNull();
+    expect(stopped).toMatchObject({ source: "auto-review", rule: "a build was not requested", summary: "pnpm build", reviewer: "reviewer" });
+    // and the turn really ended, well before the step's own 15 seconds
+    const idle = await waitFor(async () => {
+      const bots: Array<{ id: string; busy?: boolean }> = (await api("GET", "/api/bots")).body.bots;
+      return bots.find((candidate) => candidate.id === bot.id && !candidate.busy);
+    }, 12_000);
+    expect(idle).toBeTruthy();
+  }, 90_000);
+
+  it("Auto + On: the reviewer screens an Auto grant, not only a Bypass one", async () => {
+    verdict = { allow: false, reason: "not routine enough" };
+    const refused = await makeBot("acp", { name: "Auto Refused", autoApprove: true, autoReview: "enforce" });
+    await send(refused);
+    const held = await card(refused.threadId);
+    expect(held?.card?.held).toBe("Auto mode is on, but the reviewer (Stub Reviewer) did not approve this: not routine enough");
+    expect(held?.card?.answered).toBeUndefined();
+    const rows: DecisionRow[] = (await api("GET", "/api/decisions")).body.decisions;
+    expect(rows.some((r) => r.botId === refused.id && r.decision === "auto-approved")).toBe(false);
+    await release(refused, held!.card!.requestId!);
+
+    verdict = { allow: true, reason: "a harmless echo" };
+    const allowed = await makeBot("acp", { name: "Auto Allowed", autoApprove: true, autoReview: "enforce" });
+    await send(allowed);
+    const row = await decision((r) => r.botId === allowed.id && r.decision === "auto-approved");
+    expect(row).toMatchObject({ source: "auto-review", rule: "a harmless echo", reviewer: "reviewer" });
+  }, 120_000);
+
+  it("Bypass + On: a reviewer answer outside the contract never lets the ask through", async () => {
+    malformed = true;
+    try {
+      const bot = await makeBot("acp", { name: "Bypass Garbled", bypassPermissions: true, autoReview: "enforce" });
+      await send(bot);
+      const held = await card(bot.threadId);
+      expect(held?.card?.held).toBe("Bypass is on, but no reviewer could check this one, so it waits for you.");
+      expect(held?.card?.answered).toBeUndefined();
+      const row = await decision((r) => r.botId === bot.id && r.decision === "card-shown" && r.source === "auto-review");
+      expect(row).toMatchObject({ rule: "no reviewer answered" });
+      await release(bot, held!.card!.requestId!);
+    } finally {
+      malformed = false;
+    }
+  }, 90_000);
+
+  it("a held card offers \"always\" only for what an ordinary card would", async () => {
+    verdict = { allow: false, reason: "deletes the build" };
+    const bot = await makeBot("acpRm", { name: "Bypass Remover", bypassPermissions: true, autoReview: "enforce" });
+    await send(bot);
+    const held = await card(bot.threadId);
+    expect(held?.card?.held).toBe("Bypass is on, but the reviewer (Stub Reviewer) did not approve this: deletes the build");
+    // the old held card offered the raw key, a standing grant for a
+    // destructive command; the ordinary card never does
+    expect(approvalKey("shell", "rm -rf build")).toBeTruthy();
+    expect(offerableApprovalKey("shell", "rm -rf build")).toBeUndefined();
+    expect(held?.card?.allowKey).toBeUndefined();
+    await release(bot, held!.card!.requestId!);
   }, 90_000);
 
   it("Watch, full-auto instance: the turn is not held, and each step is reviewed after the fact", async () => {
@@ -327,6 +498,21 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
     // Watch never stops anything
     const rows: DecisionRow[] = (await api("GET", "/api/decisions")).body.decisions;
     expect(rows.some((r) => r.botId === bot.id && r.decision === "review-stopped-turn")).toBe(false);
+  }, 90_000);
+
+  it("Watch: a message to another bot is a step like any other, reviewed after the fact", async () => {
+    // ask_bot has no transcript row of its own, and its handler used to leave
+    // before the step watch, so the one tool that messages another bot was
+    // never reviewed on an engine that runs it without asking.
+    verdict = { allow: false, reason: "messaging a peer was not requested" };
+    const bot = await makeBot("acpAskBot", { name: "Messenger", autoReview: "shadow" });
+    await send(bot);
+    const row = await decision((r) => r.botId === bot.id && r.decision === "review-would-deny");
+    expect(row, `the ask_bot step was never reviewed. stderr:\n${stderr.slice(-2000)}`).toMatchObject({
+      source: "auto-review-watch",
+      tool: "mcp__agents__ask_bot",
+      reviewer: "reviewer",
+    });
   }, 90_000);
 
   it("On, an engine that never asks: a refused step stops the turn instead of claiming to hold it", async () => {
@@ -386,6 +572,20 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
     expect(open?.card?.held).toBe("The reviewer (Stub Reviewer) did not approve this: not a file the owner wants");
     const rows: DecisionRow[] = (await api("GET", "/api/decisions")).body.decisions;
     expect(rows.some((r) => r.botId === bot.id && r.decision === "auto-approved")).toBe(false);
+    await release(bot, open!.card!.requestId!);
+  }, 90_000);
+
+  it("HTTP lane, On: a different engine reviews the lane's own action first, so a model is not its own first judge", async () => {
+    verdict = { allow: false, reason: "not this file" };
+    const bot = await makeBot("lane", { name: "Second Lane Bot", autoReview: "enforce" }, "stub-reviewer");
+    await send(bot);
+    const row = await decision((r) => r.botId === bot.id && r.decision === "card-shown" && r.source === "auto-review");
+    if (!row) throw new Error(`no reviewed card.  stderr:\n${stderr.slice(-2000)}`);
+    // Automatic's pick, not the lane itself, answered
+    expect(row).toMatchObject({ rule: "not this file", reviewer: "reviewer" });
+    // the brief went in the system role, the action in the user turn
+    expect(lastReviewRoles).toEqual(["system", "user"]);
+    const open = await card(bot.threadId);
     await release(bot, open!.card!.requestId!);
   }, 90_000);
 

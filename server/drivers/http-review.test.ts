@@ -3,15 +3,18 @@
 // The `reviewPermission` contract (server/contracts.ts) asks for an isolated,
 // tool-free call on the same provider with the prompt kept out of argv.  The
 // HTTP lanes are the easiest engines to hold to that: one chat-completions
-// request with no `tools`, the prompt in the request body, cancelled by the
-// reviewer's own deadline.  These pin exactly that for each of the three, and
+// request with no `tools`, the brief as the system message and the action as
+// the user message, cancelled by the reviewer's own deadline.  These pin exactly that for each of the three, and
 // that each one says its asks reach the card before they run.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInstance } from "../contracts.ts";
+import { buildReviewPrompt } from "../auto-review.ts";
 import { GrokDriver } from "./grok.ts";
 import { MinimaxDriver } from "./minimax.ts";
 import { OpenAICompatDriver } from "./openai-compat.ts";
+
+const REVIEW = buildReviewPrompt({ tool: "shell", summary: "echo hi", persona: "Scout" });
 
 interface Seen {
   url: string;
@@ -96,10 +99,10 @@ describe.each(ENGINES)("$name reviews its own approvals", ({ create }) => {
     await instance.dispose();
   });
 
-  it("sends one tool-free request with the prompt in the body and returns the answer text", async () => {
+  it("sends one tool-free request, the brief as the system message and the action as the user message", async () => {
     const seen = stubFetch('{"allow":false,"reason":"deletes data"}');
     const instance = await create();
-    const prompt = "review this: rm -rf build";
+    const prompt = buildReviewPrompt({ tool: "shell", summary: "rm -rf build", persona: "Scout" });
     await expect(instance.reviewPermission!(prompt, new AbortController().signal)).resolves.toBe(
       '{"allow":false,"reason":"deletes data"}',
     );
@@ -107,15 +110,18 @@ describe.each(ENGINES)("$name reviews its own approvals", ({ create }) => {
     expect(reviews).toHaveLength(1);
     const body = reviews[0]!.body;
     expect(body).not.toHaveProperty("tools");
-    expect(body).toMatchObject({ stream: false, messages: [{ role: "user", content: prompt }] });
-    expect(body).toHaveProperty("messages", [{ role: "user", content: prompt }]);
+    expect(body).toMatchObject({ stream: false });
+    expect(body).toHaveProperty("messages", [
+      { role: "system", content: prompt.system },
+      { role: "user", content: prompt.data },
+    ]);
     await instance.dispose();
   });
 
   it("never turns the model's reasoning into a verdict", async () => {
     stubFetch("");
     const instance = await create();
-    await expect(instance.reviewPermission!("review", new AbortController().signal)).resolves.toBe("");
+    await expect(instance.reviewPermission!(REVIEW, new AbortController().signal)).resolves.toBe("");
     await instance.dispose();
   });
 
@@ -123,7 +129,7 @@ describe.each(ENGINES)("$name reviews its own approvals", ({ create }) => {
     stubFetch("", { hang: true });
     const instance = await create();
     const controller = new AbortController();
-    const pending = instance.reviewPermission!("review", controller.signal);
+    const pending = instance.reviewPermission!(REVIEW, controller.signal);
     controller.abort();
     await expect(pending).rejects.toThrow();
     await instance.dispose();
