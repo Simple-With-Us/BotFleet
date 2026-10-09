@@ -1373,9 +1373,11 @@ struct MessageRow: View {
     /// arrival; one condition keeps the two from drifting apart.
     static func offersVoice(from bot: Bot?, hasAudio: Bool, config: ConfigStatus?) -> Bool {
         guard let bot else { return false }
+        // Read Aloud is offered by this iPhone's voice, not the Mac's.
+        let voice = bot.voice(for: .iphone)
         return hasAudio
-            || PersonalVoiceContract.isPersonalVoice(bot.voice)
-            || config?.canSpeak(agentVoice: bot.voice) == true
+            || PersonalVoiceContract.isPersonalVoice(voice)
+            || config?.canSpeak(agentVoice: voice) == true
     }
 
     private var senderDriverKind: String? {
@@ -1857,6 +1859,10 @@ struct TextBubble: View {
                             .foregroundStyle(Color.primary)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
+                            // While this reply is read aloud, its words
+                            // follow the voice (Karaoke.swift).  Only this
+                            // bubble's blocks observe the per-word paint.
+                            .environment(\.messageKaraoke, KaraokeCenter.shared.karaoke(for: message.id))
                     }
                     ForEach(Array(split.images.enumerated()), id: \.offset) { _, path in
                         AttachedImageView(path: path)

@@ -26,8 +26,10 @@ import {
   DRIVER_LABEL,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
+  MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   MANAGED_LABEL,
 } from "./container-computer.ts";
+import { resolveRuntimeCommand } from "./container-runtime-guard.ts";
 import {
   ensureSharedVpsSessionExecArgs,
   isSharedVpsMode,
@@ -53,6 +55,7 @@ import {
   credentialPermissionHardeningShell,
   guestCredentialOwnershipRepairShell,
   guestPathForCredentialRel,
+  listArchiveRelPaths,
   packageCredentialArchive,
   prepareCredentialSyncWorkspace,
   VM_CLI_GUEST_HOME,
@@ -426,7 +429,10 @@ function tailCollector() {
 
 export function defaultRunner(args: string[], options: VpsCommandOptions = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("docker", args, {
+    // `docker -H ssh://…` ignores DOCKER_HOST, so the container-runtime kill
+    // switch is enforced here, before the spawn.  A throw in this executor
+    // rejects the promise.
+    const child = spawn(resolveRuntimeCommand("docker"), args, {
       shell: false,
       env: { ...process.env, PATH: augmentedPath() },
       stdio: ["pipe", "pipe", "pipe"],
@@ -925,7 +931,7 @@ async function prepareVpsImage(alias: string, runner: VpsCommandRunner) {
   await runner(vpsDockerArgs(alias, ["pull", BASE_IMAGE]), { timeoutMs: 10 * 60_000 });
   await runner(vpsDockerArgs(alias, ["build", "-t", VPS_IMAGE, "-"]), {
     input: managedImageDockerfile(),
-    timeoutMs: 10 * 60_000,
+    timeoutMs: MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   });
 }
 
@@ -1177,7 +1183,15 @@ export async function vpsSyncCliCredentials(
       };
     }
 
-    const plannedGuestPaths = [
+    // Verify every member the archive actually packed, not just the top-level
+    // directories.  A directory can exist on the guest while the credential
+    // file inside it was refused (disk full, per-member permission), and a
+    // directory-level probe calls that a complete sync.
+    const plannedGuestPaths = (await listArchiveRelPaths(tarArchive)).map((rel) => guestPathForCredentialRel(rel));
+    // Repair still works on the credential ROOTS: what blocks an extract is a
+    // root-owned parent directory, and a member that failed to arrive is by
+    // definition absent, so there is nothing for the repair to remove.
+    const repairGuestPaths = [
       ...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths].map((rel) => guestPathForCredentialRel(rel))),
     ].sort();
     const extractArgs = ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", VM_CLI_GUEST_HOME];
@@ -1200,11 +1214,11 @@ export async function vpsSyncCliCredentials(
       // minutes).
       let missing = await missingGuestCredentialPaths(run, target.containerName, plannedGuestPaths);
       // A destination can also be absent because a root-owned leftover sits
-      // exactly where the archive wants to put it.  Clear those and re-run the
-      // extract once before deciding the sync failed.
+      // exactly where the archive wants to put it.  Clear those roots and
+      // re-run the extract once before deciding the sync failed.
       if (
         missing.length > 0 &&
-        (await repairGuestCredentialOwnership(run, target.containerName, missing))
+        (await repairGuestCredentialOwnership(run, target.containerName, repairGuestPaths))
       ) {
         try {
           await extractArchive();
@@ -1221,11 +1235,11 @@ export async function vpsSyncCliCredentials(
         missing = await missingGuestCredentialPaths(run, target.containerName, plannedGuestPaths);
         if (missing.length > 0) {
           throw new Error(
-            `credential extract failed and ${missing.length} destination(s) are missing: ${missing.slice(0, 5).join(", ")} (tar: ${detail})`,
+            `credential extract failed and ${missing.length} of ${plannedGuestPaths.length} packed member(s) are missing: ${missing.slice(0, 5).join(", ")} (tar: ${detail})`,
           );
         }
         console.warn(
-          `[vps] credential extract reported errors but all ${plannedGuestPaths.length} destination(s) are present (tar: ${detail})`,
+          `[vps] credential extract reported errors but all ${plannedGuestPaths.length} packed member(s) are present (tar: ${detail})`,
         );
       }
     }

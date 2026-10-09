@@ -344,7 +344,12 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var userNotes: String?
     public var speakReplies: Bool?
     public var speechDevices: [String]?
+    /// The shared voice.  Read it through `voice(for:)`, which applies the
+    /// per-device override in `voices`.
     public var voice: String?
+    /// Per-device overrides (`shared/bot-voice.ts`).  Nil on a harness that
+    /// predates them, and on the wire as `null` when neither device has one.
+    public var voices: BotVoices? = nil
     public var mascotExpression: String?
     public var tasks: [BotTask]?
     public var messages: [Message]?
@@ -898,6 +903,9 @@ public struct BotProfilePatch: Encodable, Sendable {
     public var avatarUrl: AvatarURL?
     public var avatarCrop: AvatarCrop?
     public var voice: String?
+    /// Per-device voice overrides.  Only the device keys it carries are sent;
+    /// the type cannot express `voices: null`, which would clear both.
+    public var voices: VoicesPatch?
     public var speakReplies: Bool?
     public var speechDevices: [String]?
     public var modelSelection: ModelSelection?
@@ -935,6 +943,40 @@ public struct BotProfilePatch: Encodable, Sendable {
         case clear
     }
 
+    /// One device's voice override: a voice id, or `.clear` (JSON null) to go
+    /// back to the bot's shared voice.  A device left nil is not sent.
+    public struct VoicesPatch: Equatable, Sendable {
+        public enum Value: Equatable, Sendable {
+            case set(String)
+            case clear
+        }
+
+        public var mac: Value?
+        public var iphone: Value?
+
+        public init(mac: Value? = nil, iphone: Value? = nil) {
+            self.mac = mac
+            self.iphone = iphone
+        }
+
+        public var isEmpty: Bool { mac == nil && iphone == nil }
+
+        public subscript(device: SpeechDevice) -> Value? {
+            get {
+                switch device {
+                case .mac: return mac
+                case .iphone: return iphone
+                }
+            }
+            set {
+                switch device {
+                case .mac: mac = newValue
+                case .iphone: iphone = newValue
+                }
+            }
+        }
+    }
+
     public init(
         name: String? = nil,
         title: String? = nil,
@@ -943,6 +985,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         avatarUrl: AvatarURL? = nil,
         avatarCrop: AvatarCrop? = nil,
         voice: String? = nil,
+        voices: VoicesPatch? = nil,
         speakReplies: Bool? = nil,
         speechDevices: [String]? = nil,
         modelSelection: ModelSelection? = nil,
@@ -961,6 +1004,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.avatarUrl = avatarUrl
         self.avatarCrop = avatarCrop
         self.voice = voice
+        self.voices = voices
         self.speakReplies = speakReplies
         self.speechDevices = speechDevices
         self.modelSelection = modelSelection
@@ -974,8 +1018,10 @@ public struct BotProfilePatch: Encodable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, computers, cwd
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, computers, cwd
     }
+
+    private enum DeviceKeys: String, CodingKey { case mac, iphone }
 
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
@@ -991,6 +1037,16 @@ public struct BotProfilePatch: Encodable, Sendable {
         }
         try values.encodeIfPresent(avatarCrop, forKey: .avatarCrop)
         try values.encodeIfPresent(voice, forKey: .voice)
+        if let voices, !voices.isEmpty {
+            var devices = values.nestedContainer(keyedBy: DeviceKeys.self, forKey: .voices)
+            for (device, key) in [(SpeechDevice.mac, DeviceKeys.mac), (.iphone, .iphone)] {
+                switch voices[device] {
+                case let .set(id)?: try devices.encode(id, forKey: key)
+                case .clear?: try devices.encodeNil(forKey: key)
+                case nil: break
+                }
+            }
+        }
         try values.encodeIfPresent(speakReplies, forKey: .speakReplies)
         try values.encodeIfPresent(speechDevices, forKey: .speechDevices)
         try values.encodeIfPresent(modelSelection, forKey: .modelSelection)

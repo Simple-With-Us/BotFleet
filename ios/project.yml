@@ -24,7 +24,7 @@ packages:
     path: .
   Sentry:
     url: https://github.com/getsentry/sentry-cocoa.git
-    from: 8.44.0
+    from: 9.30.0
 targets:
   BotFleet:
     type: application
@@ -99,6 +99,7 @@ targets:
           a chat. They are uploaded to your paired computer.
         UIBackgroundModes:
         - remote-notification
+        - audio
         NSMicrophoneUsageDescription: BotFleet listens while you dictate a message
           to a bot.
         NSSpeechRecognitionUsageDescription: BotFleet converts your speech into text

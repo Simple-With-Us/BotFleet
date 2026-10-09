@@ -109,7 +109,8 @@ describe("browser Sentry", () => {
   it("iOS Cocoa reads SENTRY_DSN from Info.plist only", () => {
     const swift = readFileSync(join(ROOT, "ios/App/SentryTelemetry.swift"), "utf8");
     expect(swift).toMatch(/forInfoDictionaryKey: "SENTRY_DSN"/);
-    expect(swift).toMatch(/profilesSampleRate = 0\.1/);
+    // sentry-cocoa 9 replaced profilesSampleRate with configureProfiling.
+    expect(swift).toMatch(/configureProfiling = \{[^}]*sessionSampleRate = 0\.1/);
     expect(swift).toMatch(/sessionReplay\.onErrorSampleRate = 0\.1/);
     expect(swift).not.toMatch(/ingest\.sentry\.io/);
     expect(swift).not.toMatch(/\?\? "https:\/\//);

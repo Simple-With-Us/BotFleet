@@ -1,0 +1,41 @@
+{
+  "about": "Per-device voice resolution, asserted by shared/bot-voice.test.ts (vitest) and by the CompanionCore Swift tests.  expected null means no voice at all (undefined in TypeScript, nil in Swift).  An empty-string voice means the workspace default and is returned as-is.  A device override that is empty or whitespace-only does not count.  Values are returned exactly as stored, never trimmed.  mergeVoices is the harness PATCH rule; the Swift side may assert it too.",
+  "voiceForDevice": [
+    { "name": "no override uses the shared voice on the Mac", "bot": { "voice": "English_Graceful_Lady" }, "device": "mac", "expected": "English_Graceful_Lady" },
+    { "name": "no override uses the shared voice on the iPhone", "bot": { "voice": "English_Graceful_Lady" }, "device": "iphone", "expected": "English_Graceful_Lady" },
+    { "name": "voices null uses the shared voice", "bot": { "voice": "vx", "voices": null }, "device": "iphone", "expected": "vx" },
+    { "name": "empty voices object uses the shared voice", "bot": { "voice": "vx", "voices": {} }, "device": "mac", "expected": "vx" },
+    { "name": "the Mac override wins on the Mac", "bot": { "voice": "vx", "voices": { "mac": "personal:mac-voice-1" } }, "device": "mac", "expected": "personal:mac-voice-1" },
+    { "name": "the Mac override does not leak to the iPhone", "bot": { "voice": "vx", "voices": { "mac": "personal:mac-voice-1" } }, "device": "iphone", "expected": "vx" },
+    { "name": "the iPhone override wins on the iPhone", "bot": { "voice": "vx", "voices": { "mac": "personal:mac-voice-1", "iphone": "English_Persuasive_Man" } }, "device": "iphone", "expected": "English_Persuasive_Man" },
+    { "name": "both overrides, Mac side", "bot": { "voice": "vx", "voices": { "mac": "personal:mac-voice-1", "iphone": "English_Persuasive_Man" } }, "device": "mac", "expected": "personal:mac-voice-1" },
+    { "name": "an empty override falls back", "bot": { "voice": "vx", "voices": { "iphone": "" } }, "device": "iphone", "expected": "vx" },
+    { "name": "a whitespace-only override falls back", "bot": { "voice": "vx", "voices": { "iphone": "   " } }, "device": "iphone", "expected": "vx" },
+    { "name": "a null override falls back", "bot": { "voice": "vx", "voices": { "mac": null } }, "device": "mac", "expected": "vx" },
+    { "name": "an override is returned untrimmed", "bot": { "voice": "vx", "voices": { "mac": " vy " } }, "device": "mac", "expected": " vy " },
+    { "name": "override with no shared voice", "bot": { "voices": { "iphone": "apple-personal:phone-voice" } }, "device": "iphone", "expected": "apple-personal:phone-voice" },
+    { "name": "empty shared voice means the workspace default", "bot": { "voice": "" }, "device": "mac", "expected": "" },
+    { "name": "null shared voice and no override is no voice", "bot": { "voice": null }, "device": "mac", "expected": null },
+    { "name": "missing voice and missing voices is no voice", "bot": {}, "device": "iphone", "expected": null }
+  ],
+  "isPersonalVoiceId": [
+    { "id": "personal:com.apple.speech.personalvoice.ABC", "expected": true },
+    { "id": "apple-personal:ABC", "expected": true },
+    { "id": "personal:", "expected": true },
+    { "id": "English_Graceful_Lady", "expected": false },
+    { "id": "Personal:ABC", "expected": false },
+    { "id": " personal:ABC", "expected": false },
+    { "id": "", "expected": false },
+    { "id": null, "expected": false }
+  ],
+  "mergeVoices": [
+    { "name": "set one device on an empty record", "existing": null, "patch": { "iphone": "vx" }, "expected": { "iphone": "vx" } },
+    { "name": "an absent device is left alone", "existing": { "mac": "personal:m" }, "patch": { "iphone": "vx" }, "expected": { "mac": "personal:m", "iphone": "vx" } },
+    { "name": "null clears one device", "existing": { "mac": "personal:m", "iphone": "vx" }, "patch": { "mac": null }, "expected": { "iphone": "vx" } },
+    { "name": "an empty string clears one device", "existing": { "mac": "personal:m", "iphone": "vx" }, "patch": { "iphone": "" }, "expected": { "mac": "personal:m" } },
+    { "name": "clearing the last device drops the record", "existing": { "mac": "personal:m" }, "patch": { "mac": null }, "expected": null },
+    { "name": "voices null clears both", "existing": { "mac": "personal:m", "iphone": "vx" }, "patch": null, "expected": null },
+    { "name": "an empty patch changes nothing", "existing": { "mac": "personal:m" }, "patch": {}, "expected": { "mac": "personal:m" } },
+    { "name": "stored values are trimmed", "existing": null, "patch": { "mac": "  vy  " }, "expected": { "mac": "vy" } }
+  ]
+}

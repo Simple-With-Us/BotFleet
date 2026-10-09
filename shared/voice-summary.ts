@@ -6,21 +6,28 @@ export type VoiceSummaryMode = "off" | "on_demand" | "always";
 
 /**
  * Resolves the effective voice summary mode for a bot.
- * Standard for bots with voice replies enabled (speakReplies or speechDevices)
- * is "always". For text-only bots, standard is "on_demand" (distills only when
- * played). An explicit voiceSummaryMode setting ("off" | "on_demand" | "always")
- * always takes precedence.
+ *
+ * Unset means "off": the voice reads the reply as written, through the
+ * deterministic speakable pass (code blocks named, links by their label,
+ * markdown dropped), so the spoken words line up with the message on screen
+ * and the karaoke highlight can follow them.  The owner's ruling (board
+ * 8cc3c806) is that the speech pass may not paraphrase or summarize, so a
+ * model-written summary is only ever spoken when the owner picked one for the
+ * bot: an explicit "on_demand" (summarize when played) or "always" (summarize
+ * every reply ahead of time).
  */
 export function resolveVoiceSummaryMode(bot?: {
   voiceSummaryMode?: VoiceSummaryMode;
-  speakReplies?: boolean;
-  speechDevices?: string[];
 } | null): VoiceSummaryMode {
-  if (bot?.voiceSummaryMode) return bot.voiceSummaryMode;
-  if (bot?.speakReplies || (bot?.speechDevices && bot.speechDevices.length > 0)) {
-    return "always";
-  }
-  return "on_demand";
+  return bot?.voiceSummaryMode ?? "off";
+}
+
+/** What a bot's voice reads: the reply as written (span-aligned, so karaoke
+ * applies) or a model-written summary (no karaoke). */
+export type VoiceScriptKind = "written" | "summary";
+
+export function voiceScriptKind(bot?: { voiceSummaryMode?: VoiceSummaryMode } | null): VoiceScriptKind {
+  return resolveVoiceSummaryMode(bot) === "off" ? "written" : "summary";
 }
 
 /**

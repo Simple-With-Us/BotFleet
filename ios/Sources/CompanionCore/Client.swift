@@ -360,6 +360,12 @@ public enum APIError: Error, LocalizedError, Sendable {
         return false
     }
 
+    /// The HTTP status the harness answered with, when it answered at all.
+    public var statusCode: Int? {
+        if case let .status(code, _) = self { return code }
+        return nil
+    }
+
     public var isCancellation: Bool {
         if case let .transport(detail) = self {
             let lower = detail.lowercased()
@@ -1001,16 +1007,45 @@ public struct CompanionClient: Sendable {
         ).bot
     }
 
-    public func messageVoice(threadId: String, messageId: String) async throws -> [VoiceClip] {
+    /// Ask the computer to voice a reply for `device`.
+    ///
+    /// `device` makes the harness resolve that device's own voice
+    /// (`voiceForDevice`), and the clip GETs must name the same device.
+    /// `progressive` makes it answer once the first clip is ready (or with
+    /// none, still preparing) instead of after every clip, which a long reply
+    /// cannot do inside the companion's 30-second header deadline.  An older
+    /// harness ignores both and answers with every clip, which decodes the
+    /// same way.  `spans` is always asked for (see `MessageVoice.script`);
+    /// an older harness ignores it too.
+    public func messageVoice(
+        threadId: String,
+        messageId: String,
+        device: SpeechDevice,
+        progressive: Bool
+    ) async throws -> MessageVoice {
         guard Self.validVoiceId(threadId), Self.validVoiceId(messageId) else { throw APIError.badURL }
-        var request = try makeRequest("POST", "/api/threads/\(threadId)/messages/\(messageId)/audio")
+        var request = try makeRequest(
+            "POST", "/api/threads/\(threadId)/messages/\(messageId)/audio",
+            // `spans` asks for the script kind and, for a reply read as
+            // written, the source spans karaoke lines the voice up with.
+            body: ["device": device.rawValue, "progressive": progressive, "spans": true]
+        )
+        // A progressive answer arrives within about 20 seconds.  The long
+        // ceiling is for an older harness that still makes every clip first.
         request.timeoutInterval = 150
-        return try await send(request, as: MessageVoiceResponse.self).audio
+        return try await send(request, as: MessageVoice.self)
     }
 
-    public func voiceClip(threadId: String, messageId: String, index: Int) async throws -> Data {
+    /// One clip of a reply.  The harness holds the request for up to 15
+    /// seconds while that clip is still being made, then answers 425 with
+    /// Retry-After, so the timeout leaves room for that wait plus the trip.
+    public func voiceClip(threadId: String, messageId: String, index: Int, device: SpeechDevice) async throws -> Data {
         guard Self.validVoiceId(threadId), Self.validVoiceId(messageId), index >= 0 else { throw APIError.badURL }
-        let request = try makeRequest("GET", "/api/threads/\(threadId)/messages/\(messageId)/audio/\(index)")
+        var request = try makeRequest(
+            "GET", "/api/threads/\(threadId)/messages/\(messageId)/audio/\(index)",
+            query: [URLQueryItem(name: "device", value: device.rawValue)]
+        )
+        request.timeoutInterval = 30
         let (data, response) = try await perform(request)
         try Self.check(response, data)
         return data
@@ -1432,5 +1467,3 @@ public struct CompanionClient: Sendable {
         return eventStream(request: streamRequest, session: Self.streaming)
     }
 }
-
-private struct MessageVoiceResponse: Decodable { let audio: [VoiceClip] }

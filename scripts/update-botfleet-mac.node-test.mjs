@@ -6,9 +6,16 @@ import { fileURLToPath } from "node:url";
 import { downloadBuiltBundle, ResolutionError } from "./ci-build-resolver.mjs";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import {
   applicationAttachmentError,
+  captureProcessIdentities,
+  exactAppPidsFromPs,
+  isZombieState,
+  processIsAlive,
+  processStates,
+  withoutExitedPids,
   applicationIdentitiesCanTransition,
   classifySmokeFailure,
   SAFE_STORAGE_EXPORT_FLAG,
@@ -1028,11 +1035,27 @@ function processTable(entries) {
       if (entry?.killError) throw entry.killError;
       if (!entry?.alive) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH", errno: -3, syscall: "kill" });
       signals.push([pid, signal]);
-      if (signal === "SIGTERM" && !entry.ignoresTerm) entry.alive = false;
+      if (signal === "SIGTERM" && !entry.ignoresTerm) {
+        // zombieOnTerm: the process exits on SIGTERM but its parent never
+        // reaps it, so the pid stays (kill -0 still succeeds) in state Z.
+        if (entry.zombieOnTerm) entry.zombie = true;
+        else entry.alive = false;
+      }
     },
     wait: async () => {},
   };
   return { table, signals, deps };
+}
+
+// The real zombie-aware liveness check over a process table: `kill -0` answers
+// for every pid still in the table, and the `ps` state column says Z for the
+// ones marked zombie.  A zombie entry keeps `alive: true` because that is
+// exactly what kill -0 reports for one.
+function zombieAwareIsAlive(table) {
+  return (pid) => processIsAlive(pid, {
+    exists: (target) => table.get(target)?.alive === true,
+    statesOf: async (targets) => new Map(targets.map((target) => [target, table.get(target)?.zombie ? "Z" : "S"])),
+  });
 }
 
 const quiesceConfig = {
@@ -1150,6 +1173,208 @@ test("quiesce still refuses a process that rejects or survives SIGTERM, and neve
     /BotFleet did not exit after graceful quit and SIGTERM \(pid 501\); refusing SIGKILL/,
   );
   assert.deepEqual(stubborn.signals, [[501, "SIGTERM"]]);
+});
+
+// 2026-10-08 apply: "BotFleet did not exit after graceful quit and SIGTERM
+// (pid 61872, 89539); refusing SIGKILL".  Both pids were `cua-driver`
+// processes that had already exited, state Z, parent a grok CLI that never
+// reaped them.  kill -0 succeeds on a zombie, so the old probe counted them as
+// running forever and the apply rolled back.
+const cuaDriver = "/Applications/BotFleet.app/Contents/Resources/cua-driver mcp";
+
+test("processIsAlive treats a zombie as exited, and any doubt as alive", async () => {
+  const exists = () => true;
+  assert.equal(isZombieState("Z"), true);
+  assert.equal(isZombieState("Z+"), true);
+  assert.equal(isZombieState(" Zs \n"), true);
+  for (const state of ["S", "Ss", "R+", "U", "T", "I", "", undefined]) {
+    assert.equal(isZombieState(state), false, `state ${JSON.stringify(state)} is not a zombie`);
+  }
+  const statesOf = (state) => async (pids) => new Map(pids.map((pid) => [pid, state]));
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Z") }), false);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Z+") }), false);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Ss") }), true);
+  // ESRCH is still the proof of absence, and ps is not even consulted.
+  let asked = 0;
+  assert.equal(await processIsAlive(61872, { exists: () => false, statesOf: async () => { asked += 1; return new Map(); } }), false);
+  assert.equal(asked, 0);
+  // A ps that prints nothing for the pid, or fails, proves nothing: the process
+  // is treated as running, so the swap never proceeds under a live BotFleet
+  // because of a ps hiccup on a loaded Mac.
+  assert.equal(await processIsAlive(61872, { exists, statesOf: async () => new Map() }), true);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("") }), true);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: async () => { throw new Error("spawn ps EAGAIN"); } }), true);
+});
+
+test("withoutExitedPids awaits an asynchronous verdict instead of treating every Promise as alive", async () => {
+  assert.deepEqual(await withoutExitedPids([1, 2, 3], { isAlive: async (pid) => pid === 2 }), [2]);
+  assert.deepEqual(await withoutExitedPids([1, 2, 3], { isAlive: (pid) => pid !== 2 }), [1, 3]);
+  assert.deepEqual(await withoutExitedPids([], { isAlive: async () => true }), []);
+});
+
+test("withoutExitedPids reads every state with one ps spawn per poll, not one per pid", async () => {
+  // A quiesce polls every 250 ms for up to 20 s: one spawn per pid per tick
+  // would burn the budget on a loaded Mac before any process exits.
+  const seen = [];
+  const states = new Map([[10, "Ss"], [11, "Z"], [12, "R+"], [13, "Z+"]]);
+  const options = {
+    exists: (pid) => pid !== 14,
+    statesOf: async (pids) => { seen.push([...pids]); return states; },
+  };
+  assert.deepEqual(await withoutExitedPids([10, 11, 12, 13, 14], options), [10, 12]);
+  assert.deepEqual(seen, [[10, 11, 12, 13]], "one lookup for the four pids kill -0 still sees; the gone pid never reaches ps");
+  // Nothing left after kill -0: no spawn at all.
+  assert.deepEqual(await withoutExitedPids([14], options), []);
+  assert.equal(seen.length, 1);
+  // A pid with no ps row stays alive, and a failed lookup keeps every pid.
+  assert.deepEqual(await withoutExitedPids([10, 11, 12], { ...options, statesOf: async () => new Map([[11, "Z"]]) }), [10, 12]);
+  assert.deepEqual(await withoutExitedPids([10, 11], { ...options, statesOf: async () => { throw new Error("spawn ps EAGAIN"); } }), [10, 11]);
+});
+
+test("processStates parses one real ps row per pid and ignores a pid that is not there", { skip: process.platform === "win32" ? "ps is not available on win32" : false }, async () => {
+  // A reaped child's pid is a real pid that no longer exists.
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await once(child, "exit");
+  const states = await processStates([process.pid, child.pid]);
+  assert.equal(states.has(process.pid), true);
+  assert.equal(isZombieState(states.get(process.pid)), false);
+  assert.equal(states.has(child.pid), false, "a pid with no row is absent, and does not hide the others");
+  assert.equal((await processStates([])).size, 0);
+});
+
+test("quiesce treats a zombie as exited: it is never waited on, inspected or signalled", async () => {
+  const { table, signals, deps } = processTable({
+    61872: { command: cuaDriver, cwd: "/", zombie: true },
+    89539: { command: cuaDriver, cwd: "/", zombie: true },
+  });
+  const inspected = [];
+  const previous = {
+    runtimePids: [],
+    appPids: [61872, 89539],
+    processCommands: { 61872: cuaDriver, 89539: cuaDriver },
+    processCwds: { 61872: "/", 89539: "/" },
+  };
+  const zombieDeps = {
+    ...deps,
+    isAlive: zombieAwareIsAlive(table),
+    commandOf: async (pid) => { inspected.push(pid); return deps.commandOf(pid); },
+  };
+  await terminateVerified([61872, 89539], previous, quiesceConfig, { current: [61872, 89539], ...zombieDeps });
+  await terminateVerified([61872, 89539], previous, quiesceConfig, zombieDeps);
+  assert.deepEqual(signals, [], "no signal reaches a zombie, and nothing is sent to its parent");
+  assert.deepEqual(inspected, []);
+
+  // The same table under the old kill -0 probe is the 2026-10-08 failure.
+  const naive = processTable({
+    61872: { command: cuaDriver, cwd: "/", ignoresTerm: true },
+    89539: { command: cuaDriver, cwd: "/", ignoresTerm: true },
+  });
+  await assert.rejects(
+    terminateVerified([61872, 89539], previous, quiesceConfig, { current: [61872, 89539], ...naive.deps }),
+    /BotFleet did not exit after graceful quit and SIGTERM \(pid 61872, 89539\); refusing SIGKILL/,
+  );
+});
+
+test("quiesce waits for a process that exits on SIGTERM but is never reaped, because the zombie has already exited", async () => {
+  // The likely production sequence: BotFleet's helper is live when quiesce
+  // starts, exits on SIGTERM, and its parent leaves it defunct.
+  const { table, signals, deps } = processTable({
+    501: { command: electronMain, cwd: "/", zombieOnTerm: true },
+  });
+  await terminateVerified([501], { processCommands: {}, processCwds: {} }, quiesceConfig, {
+    current: [501],
+    ...deps,
+    isAlive: zombieAwareIsAlive(table),
+  });
+  assert.deepEqual(signals, [[501, "SIGTERM"]]);
+  assert.equal(table.get(501).zombie, true);
+});
+
+test("quiesce ignores a zombie yet still refuses a live process that ignores SIGTERM, naming only the live pid", async () => {
+  const { table, signals, deps } = processTable({
+    61872: { command: cuaDriver, cwd: "/", zombie: true },
+    501: { command: electronMain, cwd: "/", ignoresTerm: true },
+  });
+  const previous = { runtimePids: [], appPids: [], processCommands: {}, processCwds: {} };
+  await assert.rejects(
+    terminateVerified([61872, 501], previous, quiesceConfig, { current: [61872, 501], ...deps, isAlive: zombieAwareIsAlive(table) }),
+    (error) => error.message.endsWith("(pid 501); refusing SIGKILL") && !error.message.includes("61872"),
+  );
+  assert.deepEqual(signals, [[501, "SIGTERM"]], "only the live process is signalled, and never with SIGKILL");
+});
+
+// quiesce helpers shell out to lsof, which is unavailable on win32 CI hosts.
+test("capture skips zombies instead of recording or verifying them, and still refuses a live foreign process", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
+  const { table, deps } = processTable({
+    501: { command: electronMain, cwd: "/" },
+    // A zombie's command line and working directory are gone or unreliable:
+    // verifying it would refuse the whole update with "owns BotFleet state".
+    61872: { command: "(cua-driver)", cwd: "", zombie: true },
+    89539: { command: "", cwd: "", zombie: true },
+  });
+  const captured = await captureProcessIdentities([61872, 501, 89539, 501], quiesceConfig, {
+    isAlive: zombieAwareIsAlive(table),
+    commandOf: deps.commandOf,
+    cwdOf: deps.cwdOf,
+  });
+  assert.deepEqual(captured.pids, [501], "duplicates collapse and zombies are dropped");
+  assert.deepEqual(captured.processCommands, { 501: electronMain });
+  assert.deepEqual(captured.processCwds, { 501: "/" });
+
+  // A live process that is not BotFleet is still a refusal, not a skip.
+  const foreign = processTable({ 987654: { command: "/usr/libexec/unrelated-daemon --serve", cwd: "/" } });
+  await assert.rejects(
+    captureProcessIdentities([987654], quiesceConfig, {
+      isAlive: zombieAwareIsAlive(foreign.table),
+      commandOf: foreign.deps.commandOf,
+      cwdOf: foreign.deps.cwdOf,
+    }),
+    /Process 987654 owns BotFleet state but does not match an expected BotFleet executable/,
+  );
+});
+
+test("the process list match for the installed bundle skips rows in a zombie state", () => {
+  const executable = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
+  const psOutput = [
+    `  501 Ss   ${executable}`,
+    `  502 Z    ${executable}`,
+    `  503 S+   ${executable} --flag value`,
+    `  504 Z+   ${executable} --flag value`,
+    "  505 S    /usr/libexec/unrelated-daemon --serve",
+    `  506 S    ${executable}-other`,
+    "",
+  ].join("\n");
+  assert.deepEqual(exactAppPidsFromPs(psOutput, executable), [501, 503]);
+  assert.deepEqual(exactAppPidsFromPs("", executable), []);
+});
+
+// A real zombie, made the way the grok CLI made them: a child that has exited
+// whose parent never calls wait().  The shell backgrounds a `sleep 0`, prints
+// its pid, then execs into a `sleep` that never reaps it.  Only this test's
+// own child is ever signalled, and only to clean up.
+test("a real unreaped child is a zombie: kill -0 still succeeds, processIsAlive says exited, and quiesce passes it", { skip: process.platform === "win32" ? "ps and sh semantics differ on win32" : false }, async () => {
+  const parent = spawn("/bin/sh", ["-c", "/bin/sleep 0 & echo $!; exec /bin/sleep 30"], { stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    let stdout = "";
+    parent.stdout.setEncoding("utf8");
+    parent.stdout.on("data", (chunk) => { stdout += chunk; });
+    const deadline = Date.now() + 10_000;
+    while (!stdout.includes("\n") && Date.now() < deadline) await delay(25);
+    const zombiePid = Number(stdout.trim());
+    assert.ok(Number.isInteger(zombiePid) && zombiePid > 0, `the shell reported a pid, got ${JSON.stringify(stdout)}`);
+    // The pid keeps answering kill -0 until the parent reaps it, which is the
+    // premise of the bug; processIsAlive must see through it once it has exited.
+    while (await processIsAlive(zombiePid) && Date.now() < deadline) await delay(25);
+    assert.equal(await processIsAlive(zombiePid), false, "an unreaped, exited child reads as exited");
+    assert.doesNotThrow(() => process.kill(zombiePid, 0), "kill -0 alone still reports the zombie as present");
+    assert.equal(await processIsAlive(parent.pid), true, "the parent that never reaped it is a live process");
+    assert.equal(await processIsAlive(process.pid), true);
+    const previous = { runtimePids: [], appPids: [zombiePid], processCommands: {}, processCwds: {} };
+    await terminateVerified([zombiePid], previous, { ...quiesceConfig, gracefulExitMs: 1_000, termExitMs: 1_000 }, { current: [zombiePid] });
+  } finally {
+    parent.kill("SIGKILL");
+    await once(parent, "exit");
+  }
 });
 
 test("quiesce confirms a harness bootout with launchctl print and boots out a job loaded since capture", async () => {

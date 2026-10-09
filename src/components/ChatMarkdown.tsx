@@ -109,7 +109,8 @@ function CodeBlock({ code, lang, streaming }: { code: string; lang: string; stre
 
   return (
     <div className="my-2 overflow-hidden rounded-lg border border-hairline/40 bg-inset">
-      <div className="flex items-center justify-between border-b border-hairline/30 px-3 py-1">
+      {/* The language label is chrome, not reply text: karaoke skips it. */}
+      <div data-karaoke-skip className="flex items-center justify-between border-b border-hairline/30 px-3 py-1">
         <span className="text-[11px] uppercase tracking-wide text-ink-secondary">{lang || "code"}</span>
         <button
           onClick={copy}

@@ -19,6 +19,14 @@ import type { CompanionEndpoint } from "../src/endpoints.ts";
 import { harnessReady } from "../../server/testing/harness-ready.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+/** What the stand-in harness saw of the phone's audio request. */
+interface SeenAudioRequest {
+  method?: string;
+  url?: string;
+  contentType?: string;
+  body: string;
+}
 const ROOT = join(HERE, "..", "..");
 
 /** Ports nothing is listening on.
@@ -342,6 +350,122 @@ describe("the sidecar in front of an unmodified harness", () => {
 
     const unchanged = await device("GET", "/api/bots");
     expect(unchanged.body.bots.find((bot: { id: string }) => bot.id === botId).title).toBe("Paired title");
+  });
+
+  it("lets the phone set its own voice without wiping the Mac's", async () => {
+    const fleet = await device("GET", "/api/bots");
+    const botId = fleet.body.bots[0].id;
+    try {
+      // The Mac (straight to the harness) picks a Personal Voice for itself.
+      const mac = await fetch(`${HARNESS}/api/bots/${botId}/profile`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ voices: { mac: "personal:mac-voice" } }),
+      });
+      expect(mac.status).toBe(200);
+
+      // The phone sets only its own device through the sidecar.
+      const phone = await device("PATCH", `/api/bots/${botId}/profile`, {
+        body: { voices: { iphone: "English_Graceful_Lady" } },
+      });
+      expect(phone.status).toBe(200);
+      expect(phone.body.bot.voices).toEqual({ mac: "personal:mac-voice", iphone: "English_Graceful_Lady" });
+
+      const malformed = await device("PATCH", `/api/bots/${botId}/profile`, { body: { voices: { watch: "vx" } } });
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error).toBe("voices only accepts mac and iphone, not watch");
+
+      const cleared = await device("PATCH", `/api/bots/${botId}/profile`, { body: { voices: null } });
+      expect(cleared.status).toBe(200);
+      // null on the wire, so a client merging bot frames drops its stale copy
+      expect(cleared.body.bot.voices).toBeNull();
+    } finally {
+      await device("PATCH", `/api/bots/${botId}/profile`, { body: { voices: null } });
+    }
+  });
+
+  it("carries a clip that is not ready yet back to the phone as retryable", async () => {
+    let seenUrl = "";
+    const clipHarness = createServer((req, res) => {
+      seenUrl = req.url ?? "";
+      res.writeHead(425, { "content-type": "application/json", "retry-after": "1", "cache-control": "no-store" });
+      res.end(JSON.stringify({ error: "This voice clip is still being prepared.", retryable: true, ready: 1, total: 3 }));
+    });
+    await new Promise<void>((resolve) => clipHarness.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
+    const clipHarnessPort = (clipHarness.address() as { port: number }).port;
+    const clipProxy = createServer(createProxyHandler({
+      harnessPort: clipHarnessPort,
+      authenticate: () => ({ id: "phone-clip", cloudDesktopAccess: false }),
+      redeem: () => ({ error: "not pairing" }),
+      serverName: () => "Test computer",
+    }));
+    await new Promise<void>((resolve) => clipProxy.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
+    const clipProxyPort = (clipProxy.address() as { port: number }).port;
+    try {
+      const response = await fetch(`http://127.0.0.1:${clipProxyPort}/api/threads/th_1/messages/msg_1/audio/1?device=iphone`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(response.status).toBe(425);
+      expect(response.headers.get("retry-after")).toBe("1");
+      expect(await response.json()).toMatchObject({ retryable: true, ready: 1, total: 3 });
+      // The device query reaches the harness intact.
+      expect(seenUrl).toBe("/api/threads/th_1/messages/msg_1/audio/1?device=iphone");
+    } finally {
+      await new Promise<void>((resolve) => clipProxy.close(() => resolve()));
+      await new Promise<void>((resolve) => clipHarness.close(() => resolve()));
+    }
+  });
+
+  it("carries the phone's audio request body to the harness intact", async () => {
+    // The iPhone names its device and asks for progressive clips in the
+    // POST body.  Dropped on the way, the harness would read `{}`, speak the
+    // shared voice, and block on every clip again, with nothing failing.
+    let seen: SeenAudioRequest = { body: "" };
+    const audioHarness = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        seen = {
+          method: req.method,
+          url: req.url,
+          contentType: req.headers["content-type"],
+          body: Buffer.concat(chunks).toString("utf8"),
+        };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ audio: [], voiceText: "Hi.", utterances: ["Hi."], total: 1, complete: false, voice: "vx" }));
+      });
+    });
+    await new Promise<void>((resolve) => audioHarness.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
+    const audioHarnessPort = (audioHarness.address() as { port: number }).port;
+    const audioProxy = createServer(createProxyHandler({
+      harnessPort: audioHarnessPort,
+      authenticate: () => ({ id: "phone-audio", cloudDesktopAccess: false }),
+      redeem: () => ({ error: "not pairing" }),
+      serverName: () => "Test computer",
+    }));
+    await new Promise<void>((resolve) => audioProxy.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
+    const audioProxyPort = (audioProxy.address() as { port: number }).port;
+    try {
+      const response = await fetch(`http://127.0.0.1:${audioProxyPort}/api/threads/th_1/messages/msg_1/audio`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ device: "iphone", progressive: true }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ total: 1, complete: false, voice: "vx" });
+      expect(seen.method).toBe("POST");
+      expect(seen.url).toBe("/api/threads/th_1/messages/msg_1/audio");
+      // The harness 415s a JSON body without its content type.
+      expect(seen.contentType).toBe("application/json");
+      expect(JSON.parse(seen.body)).toEqual({ device: "iphone", progressive: true });
+    } finally {
+      await new Promise<void>((resolve) => audioProxy.close(() => resolve()));
+      await new Promise<void>((resolve) => audioHarness.close(() => resolve()));
+    }
   });
 
   it("rejects non-object profile bodies at the sidecar boundary", async () => {

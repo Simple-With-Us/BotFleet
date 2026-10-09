@@ -626,6 +626,9 @@ posixOnly("room turns carry the same computers as a direct chat", () => {
       USERPROFILE: home,
       OMB_PORT: String(port),
       OMB_EXTRA_PATH: fakeBin,
+      // spawnDetached switches container runtimes off; this fake `docker` is
+      // the one runtime the harness may run, by absolute path.
+      BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: fakeBin,
       FAKE_DOCKER_DIR: fakeBin,
       FAKE_DOCKER_LOG: dockerLog,
     };
