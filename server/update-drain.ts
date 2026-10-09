@@ -258,11 +258,14 @@ const HeldRoomRoundSchema = z.object({
 });
 export type HeldRoomRound = z.infer<typeof HeldRoomRoundSchema>;
 
-export interface HeldWork {
-  sends: HeldSend[];
-  queued: HeldQueueEntry[];
-  rooms: HeldRoomRound[];
-}
+/** Everything one update carries: the shape `appendHeldWork` writes, checked
+ *  against its schema before it is written, and the type derived from it. */
+const HeldWorkSchema = z.object({
+  sends: z.array(HeldSendSchema),
+  queued: z.array(HeldQueueEntrySchema),
+  rooms: z.array(HeldRoomRoundSchema),
+});
+export type HeldWork = z.infer<typeof HeldWorkSchema>;
 
 /** The file as written.  Entries are checked one at a time, so one bad entry
  *  costs only itself; a file from before `queued` existed reads as sends only. */
@@ -308,11 +311,16 @@ export function appendHeldWork(dataDir: string, work: Partial<HeldWork>): void {
   } catch {
     // An unreadable leftover is not a reason to lose the work in hand.
   }
+  // What is written is checked against the same schema the next boot reads
+  // with, so a malformed entry fails here, loudly, while the caller can still
+  // run the work instead, rather than being dropped silently at boot.
   const file = {
     version: 1,
-    sends: [...existing.sends, ...sends],
-    queued: [...existing.queued, ...queued],
-    rooms: [...existing.rooms, ...rooms],
+    ...HeldWorkSchema.parse({
+      sends: [...existing.sends, ...sends],
+      queued: [...existing.queued, ...queued],
+      rooms: [...existing.rooms, ...rooms],
+    }),
   };
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });

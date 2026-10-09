@@ -4,7 +4,7 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
 
 import {
   availableIsStale,
@@ -13,6 +13,7 @@ import {
   launchPlanCommand,
   listLaunchJobCommand,
   parseProgressRecord,
+  type ProgressRecord,
   runningFrom,
   pruneRunArtifacts,
   pruneUpdateStages,
@@ -1005,6 +1006,13 @@ describe("reading what another process wrote", () => {
     expect(parseProgressRecord({ ...full, startedAt: 7 })).toBeNull();
     expect(parseProgressRecord({ ...full, runId: 7 })).toBeNull();
     expect(parseProgressRecord([full])).toBeNull();
+    // Kody 4228535404: the type is the schema's, so the two cannot drift.
+    const { updatedAt: _updatedAt, ...withoutUpdatedAt } = full;
+    expect(parseProgressRecord(withoutUpdatedAt)).toMatchObject({ updatedAt: full.startedAt });
+    expectTypeOf<ProgressRecord>().toHaveProperty("command").toEqualTypeOf<string>();
+    expectTypeOf<ProgressRecord>().toHaveProperty("pid").toEqualTypeOf<number>();
+    expectTypeOf<ProgressRecord>().toHaveProperty("updatedAt").toEqualTypeOf<string>();
+    expectTypeOf<ProgressRecord>().toHaveProperty("outcome").toEqualTypeOf<"verified" | "rolled-back" | "failed" | "refused" | null>();
   });
 
   it("passes a step's detail through to the running status, bounded", () => {

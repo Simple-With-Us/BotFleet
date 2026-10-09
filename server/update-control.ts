@@ -256,22 +256,9 @@ export interface UpdateControlDeps {
 }
 
 /** What one run's progress file holds, once validated. */
-export interface ProgressRecord {
-  schemaVersion: number;
-  runId: string;
-  command: string;
-  pid: number;
-  startedAt: string;
-  updatedAt: string;
-  step: string | null;
-  detail: string | null;
-  progress: number | null;
-  targetCommit: string | null;
-  receiptPath: string | null;
-  finishedAt: string | null;
-  outcome: UpdateOutcome | null;
-  message: string | null;
-}
+/** A progress record as this build reads it: derived from the schema that
+ *  checks it (`ProgressRecordSchema`), so the type and the check cannot drift. */
+export type ProgressRecord = z.infer<typeof ProgressRecordSchema>;
 
 interface CurrentRunRecord {
   runId: string;
@@ -341,29 +328,14 @@ const ProgressRecordSchema = z.object({
   finishedAt: optionalString,
   outcome: z.string().nullable().catch(null).transform((outcome) => (isOutcome(outcome) ? outcome : null)),
   message: optionalString,
-});
+})
+  // A record that never said when it last moved last moved when it started.
+  .transform((record) => ({ ...record, updatedAt: record.updatedAt ?? record.startedAt }));
 
 /** Validate a progress file written by `scripts/update-progress.mjs`. */
 export function parseProgressRecord(value: unknown): ProgressRecord | null {
   const parsed = ProgressRecordSchema.safeParse(value);
-  if (!parsed.success) return null;
-  const raw = parsed.data;
-  return {
-    schemaVersion: UPDATE_PROGRESS_SCHEMA_VERSION,
-    runId: raw.runId,
-    command: raw.command,
-    pid: raw.pid,
-    startedAt: raw.startedAt,
-    updatedAt: raw.updatedAt ?? raw.startedAt,
-    step: raw.step,
-    detail: raw.detail,
-    progress: raw.progress,
-    targetCommit: raw.targetCommit,
-    receiptPath: raw.receiptPath,
-    finishedAt: raw.finishedAt,
-    outcome: raw.outcome,
-    message: raw.message,
-  };
+  return parsed.success ? parsed.data : null;
 }
 
 /** Sentences a person reads while they wait.  Kept here rather than in the

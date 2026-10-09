@@ -188,6 +188,18 @@ describe("the held-work carrier", () => {
     expect(takeHeldWork(dir).rooms).toEqual([round]);
   });
 
+  it("refuses to write an entry the next boot would drop, so the caller can still run it", () => {
+    // The written shape is checked against the schema the boot reads with
+    // (`HeldWorkSchema`), and the type is derived from it.
+    const dir = dataDir();
+    expect(() => appendHeldWork(dir, { sends: [send({ heldAt: Number.NaN })] })).toThrow();
+    expect(existsSync(join(dir, HELD_SENDS_FILE))).toBe(false);
+    appendHeldWork(dir, { sends: [send()] });
+    expect(() => appendHeldWork(dir, { queued: [queued({ items: [] })] })).toThrow();
+    // What was already carried is untouched by the refused write.
+    expect(takeHeldWork(dir).sends).toEqual([send()]);
+  });
+
   it("writes nothing when nothing is held", () => {
     const dir = dataDir();
     appendHeldWork(dir, { sends: [], queued: [] });
