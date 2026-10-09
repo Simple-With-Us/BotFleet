@@ -188,10 +188,18 @@ struct ChatView: View {
     /// replaces child accessibility content, so the provider mark must be
     /// named here or it would become silent chrome.
     private var headerProfileAccessibilityLabel: String {
+        let bypass = headerShowsBypass ? ", Bypass Permissions is on" : ""
         if let currentDriverKind {
-            return "Open \(current.name) profile, \(ProviderMarkView.displayName(for: currentDriverKind, model: currentModelSelection?.model))"
+            return "Open \(current.name) profile, \(ProviderMarkView.displayName(for: currentDriverKind, model: currentModelSelection?.model))\(bypass)"
         }
-        return "Open \(current.name) profile"
+        return "Open \(current.name) profile\(bypass)"
+    }
+
+    /// A bot with Bypass Permissions on carries a mark beside its name.  A room
+    /// has no switch of its own: each member keeps theirs.
+    private var headerShowsBypass: Bool {
+        if case let .bot(bot) = current { return bot.bypassPermissions == true }
+        return false
     }
 
     var body: some View {
@@ -662,10 +670,13 @@ struct ChatView: View {
                             }
                         }
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(current.name)
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(Color.primary)
-                                .lineLimit(1)
+                            HStack(spacing: 6) {
+                                Text(current.name)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(Color.primary)
+                                    .lineLimit(1)
+                                if headerShowsBypass { BypassBadge() }
+                            }
                             if !current.subtitle.isEmpty {
                                 Text(current.subtitle)
                                     .font(.system(size: 12))

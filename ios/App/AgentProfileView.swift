@@ -39,12 +39,16 @@ struct AgentProfileView: View {
     @State private var busy = false
     @State private var confirmingDuplicate = false
     @State private var player: AVAudioPlayer?
-    @State private var autoApprove: Bool
-    @State private var autoReview: String
-    @State private var approvePeerComms: Bool
     @State private var isOff: Bool
     @State private var computers: Set<String>
     @State private var cwd: String
+    /// The execution policy, saved with the rest of the sheet.  Bypass is
+    /// switched on only through `confirmingBypass`, never by the toggle alone.
+    @State private var autoApprove: Bool
+    @State private var autoReview: AutoReviewMode
+    @State private var approvePeerComms: Bool
+    @State private var bypassPermissions: Bool
+    @State private var confirmingBypass = false
     @State private var baseline: ProfileFormSnapshot
     @ObservedObject private var personalVoice = PersonalVoiceService.shared
 
@@ -63,12 +67,13 @@ struct AgentProfileView: View {
         _effort = State(initialValue: bot.modelSelection.effort)
         _fallbacks = State(initialValue: bot.modelSelection.fallbacks ?? [])
         _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
-        _autoApprove = State(initialValue: bot.autoApprove ?? false)
-        _autoReview = State(initialValue: bot.autoReview ?? "off")
-        _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
         _isOff = State(initialValue: bot.isOff)
         _computers = State(initialValue: Set(bot.computers ?? []))
         _cwd = State(initialValue: bot.cwd ?? "")
+        _autoApprove = State(initialValue: bot.autoApprove ?? false)
+        _autoReview = State(initialValue: AutoReviewMode(stored: bot.autoReview))
+        _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
+        _bypassPermissions = State(initialValue: bot.bypassPermissions ?? false)
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
     }
 
@@ -324,6 +329,7 @@ struct AgentProfileView: View {
                 }
 
                 automationAndApprovalsSection
+                bypassPermissionsSection
                 computersSection
                 workingDirectorySection
                 skillsSection
@@ -436,6 +442,12 @@ struct AgentProfileView: View {
                 guard let item else { return }
                 Task { await upload(item) }
             }
+            .modifier(BypassConfirmation(
+                isPresented: $confirmingBypass,
+                botName: current.name,
+                model: modelId,
+                confirm: { bypassPermissions = true }
+            ))
         }
     }
 
@@ -556,7 +568,6 @@ struct AgentProfileView: View {
             guard cwd != baseline.cwd else { return nil }
             return trimmedCwd.isEmpty ? .clear : .set(trimmedCwd)
         }()
-        let computersArray = ["cloud", "vm", "local"].filter { computers.contains($0) }
         return BotProfilePatch(
             name: name == baseline.name ? nil : name.trimmingCharacters(in: .whitespacesAndNewlines),
             title: title == baseline.title ? nil : title.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -572,7 +583,14 @@ struct AgentProfileView: View {
             autoApprove: autoApprove == baseline.autoApprove ? nil : autoApprove,
             autoReview: autoReview == baseline.autoReview ? nil : autoReview,
             approvePeerComms: approvePeerComms == baseline.approvePeerComms ? nil : approvePeerComms,
-            computers: computers == baseline.computers ? nil : computersArray,
+            bypassPermissions: bypassPermissions == baseline.bypassPermissions ? nil : bypassPermissions,
+            // The bot as it is now, with only the person's two switches applied,
+            // so This Mac is never part of what this phone asks to change.
+            computers: BotComputers.updated(
+                current: current.computers,
+                baseline: baseline.computers,
+                picks: computers
+            ),
             cwd: cwdPatch,
             off: isOff == baseline.isOff ? nil : isOff
         )
@@ -616,27 +634,94 @@ struct AgentProfileView: View {
         }
     }
 
+    /// The execution policy, which the phone owns since the owner's ruling of
+    /// 2026-10-09 (`BotExecutionPolicy` has the history).  The one thing it
+    /// does not offer is turning Auto Mode ON for a bot that holds This Mac:
+    /// the computer would refuse, because that pair's warning is the Mac's.
+    /// Turning Auto Mode off always works, and so does Bypass Permissions.
     @ViewBuilder
     private var automationAndApprovalsSection: some View {
         Section {
-            Toggle("Automatic approvals", isOn: $autoApprove)
-            Picker("Auto review", selection: $autoReview) {
-                Text("Off").tag("off")
-                Text("Shadow (advisory)").tag("shadow")
-                Text("Enforce (blocks unsafe)").tag("enforce")
+            Toggle("Auto Mode", isOn: $autoApprove)
+                .disabled(!autoApprove && !BotExecutionPolicy.mayTurnOnAuto(computers: current.computers))
+            Picker("Auto Review", selection: $autoReview) {
+                ForEach(autoReviewChoices, id: \.self) { mode in
+                    Text(mode.label).tag(mode)
+                }
             }
-            Toggle("Ask before contacting other bots", isOn: $approvePeerComms)
+            .disabled(autoReviewChoices.count < 2)
+            Toggle("Ask Before Contacting Other Bots", isOn: $approvePeerComms)
+                .disabled(!approvePeerComms && !peerCommsSupport.allowsTurningOn)
         } header: {
             Text("Automation & Approvals")
         } footer: {
-            Text("Automatic approvals run safe read-only and non-destructive tool operations without confirmation. Auto review inspects changes for syntax and safety.")
+            VStack(alignment: .leading, spacing: 8) {
+                Text(BotExecutionPolicy.autoSummary(isOn: autoApprove))
+                Text(BotExecutionPolicy.autoReviewSummary(bypassIsOn: bypassPermissions, support: autoReviewSupport))
+                Text(BotExecutionPolicy.peerCommsSummary(isOn: approvePeerComms, support: peerCommsSupport))
+                Text(BotExecutionPolicy.thisMacNote)
+            }
+        }
+    }
+
+    /// Bypass Permissions has its own section because it is the one switch here
+    /// that drops every approval card, destructive actions included.  Turning
+    /// it on goes through `confirmingBypass`; turning it off does not ask.
+    @ViewBuilder
+    private var bypassPermissionsSection: some View {
+        Section {
+            Toggle("Bypass Permissions", isOn: bypassBinding)
+        } header: {
+            Text("Bypass Permissions")
+        } footer: {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(BotExecutionPolicy.bypassSummary(isOn: bypassPermissions))
+                if let note = BypassCoverage(engine: policyEngine).note {
+                    Text(note)
+                }
+            }
+        }
+    }
+
+    /// Switching on asks first; the toggle stays where it was until the person
+    /// confirms, because `get` reads the unconfirmed state.
+    private var bypassBinding: Binding<Bool> {
+        Binding(
+            get: { bypassPermissions },
+            set: { wantsOn in
+                if wantsOn {
+                    confirmingBypass = true
+                } else {
+                    bypassPermissions = false
+                }
+            }
+        )
+    }
+
+    /// The engine the form is set to, which is what the next turn runs on.
+    private var policyEngine: Instance? {
+        instances.first(where: { $0.id == instanceId })
+    }
+
+    private var autoReviewSupport: EngineSupport { BotExecutionPolicy.autoReviewSupport(policyEngine) }
+    private var peerCommsSupport: EngineSupport { BotExecutionPolicy.peerCommsSupport(policyEngine) }
+
+    /// Off, what is set now, and the others only on an engine that can review,
+    /// the way the desktop disables them.
+    private var autoReviewChoices: [AutoReviewMode] {
+        AutoReviewMode.allCases.filter { mode in
+            mode == .off || mode == autoReview || autoReviewSupport.allowsTurningOn
         }
     }
 
     @ViewBuilder
     private var computersSection: some View {
         Section {
-            if computers.isEmpty {
+            if current.computers == nil && computers == baseline.computers {
+                // No list stored: the computer picks for this bot.  Showing
+                // that as "(no computer)" would say the opposite.
+                LabeledContent("Assigned computers", value: "Automatic")
+            } else if computers.isEmpty && !BotComputers.holdsThisMac(current.computers) {
                 HStack {
                     Text("Assigned computers")
                     Spacer()
@@ -645,10 +730,6 @@ struct AgentProfileView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Toggle("Local Mac desktop", isOn: Binding(
-                get: { computers.contains("local") },
-                set: { if $0 { computers.insert("local") } else { computers.remove("local") } }
-            ))
             Toggle("Self-hosted VPS / Box", isOn: Binding(
                 get: { computers.contains("cloud") },
                 set: { if $0 { computers.insert("cloud") } else { computers.remove("cloud") } }
@@ -657,10 +738,21 @@ struct AgentProfileView: View {
                 get: { computers.contains("vm") },
                 set: { if $0 { computers.insert("vm") } else { computers.remove("vm") } }
             ))
+            // Read-only: This Mac is the person's real desktop, so the
+            // computer, not the phone, turns it on or off.  The state shown is
+            // the computer's, live.
+            // An Auto bot has no list: on a Mac the computer may still hand it
+            // this desktop, so "Off" would overstate what is known.
+            LabeledContent(
+                "This Mac",
+                value: current.computers == nil
+                    ? "Automatic"
+                    : (BotComputers.holdsThisMac(current.computers) ? "On" : "Off")
+            )
         } header: {
             Text("Computers")
         } footer: {
-            Text("Controls which execution environments this bot can mount for shell commands, browser tools, and desktop control.")
+            Text("Controls which execution environments this bot can mount for shell commands, browser tools, and desktop control.\u{00A0} Change On Mac:\u{00A0} This Mac is your real desktop, so it is turned on or off in BotFleet on your computer.")
         }
     }
 
@@ -673,7 +765,7 @@ struct AgentProfileView: View {
         } header: {
             Text("Working Directory")
         } footer: {
-            Text("Default repository or workspace folder path on the paired Mac.")
+            Text("Default repository or workspace folder path on the paired Mac.\u{00A0} From this iPhone, choose a folder that a bot or room on your computer already uses.\u{00A0} Any other folder is chosen in BotFleet on your computer.")
         }
     }
 
@@ -935,8 +1027,32 @@ struct AgentProfileView: View {
                     withoutDeviceVoices: profilePatchWithoutDeviceVoices()
                 )
             },
-            accept: synchronizeForm(with:)
+            accept: synchronizeForm(with:),
+            rejected: revertRefusableFields
         )
+    }
+
+    /// A refused save puts the fields the computer can say no to back to what
+    /// it holds, so the sheet stops showing a switch or folder as saved after
+    /// the banner says it was not.  The computer's own sentence is the banner
+    /// (`Session.updateProfile` records it).  A name, a voice or a model stays
+    /// as typed for the retry.  Auto Mode is on the list because the computer
+    /// declines it for a bot that can use This Mac; the other three are only
+    /// here because a refused save refuses them all.
+    private func revertRefusableFields() {
+        let held = current
+        computers = Set(held.computers ?? [])
+        baseline.computers = computers
+        cwd = held.cwd ?? ""
+        baseline.cwd = cwd
+        autoApprove = held.autoApprove ?? false
+        baseline.autoApprove = autoApprove
+        autoReview = AutoReviewMode(stored: held.autoReview)
+        baseline.autoReview = autoReview
+        approvePeerComms = held.approvePeerComms ?? false
+        baseline.approvePeerComms = approvePeerComms
+        bypassPermissions = held.bypassPermissions ?? false
+        baseline.bypassPermissions = bypassPermissions
     }
 
     /// The same save for a computer that predates per-device voices and so
@@ -1091,13 +1207,38 @@ struct AgentProfileView: View {
         effort = bot.modelSelection.effort
         fallbacks = bot.modelSelection.fallbacks ?? []
         maxToolRoundsText = Self.roundsText(bot.maxToolRounds)
-        autoApprove = bot.autoApprove ?? false
-        autoReview = bot.autoReview ?? "off"
-        approvePeerComms = bot.approvePeerComms ?? false
         isOff = bot.isOff
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
+        autoApprove = bot.autoApprove ?? false
+        autoReview = AutoReviewMode(stored: bot.autoReview)
+        approvePeerComms = bot.approvePeerComms ?? false
+        bypassPermissions = bot.bypassPermissions ?? false
         baseline = ProfileFormSnapshot(bot: bot)
+    }
+}
+
+/// The question before Bypass Permissions goes on.  A separate modifier so the
+/// sheet's already long body does not carry the alert's closures too.
+private struct BypassConfirmation: ViewModifier {
+    @Binding var isPresented: Bool
+    let botName: String
+    let model: String
+    let confirm: () -> Void
+
+    private var confirmTitle: String {
+        BypassModelRisk.isHighRisk(model: model)
+            ? BotExecutionPolicy.bypassRiskyConfirmButton
+            : BotExecutionPolicy.bypassConfirmButton
+    }
+
+    func body(content: Content) -> some View {
+        content.alert(BotExecutionPolicy.bypassTitle, isPresented: $isPresented) {
+            Button("Cancel", role: .cancel) {}
+            Button(confirmTitle, role: .destructive, action: confirm)
+        } message: {
+            Text(BotExecutionPolicy.bypassWarning(botName: botName, model: model))
+        }
     }
 }
 
@@ -1113,12 +1254,13 @@ private struct ProfileFormSnapshot {
     var speechDevices: Set<String>
     var modelSelection: ModelSelection
     var maxToolRoundsText: String
-    var autoApprove: Bool
-    var autoReview: String
-    var approvePeerComms: Bool
     var isOff: Bool
     var computers: Set<String>
     var cwd: String
+    var autoApprove: Bool
+    var autoReview: AutoReviewMode
+    var approvePeerComms: Bool
+    var bypassPermissions: Bool
 
     init(bot: Bot) {
         name = bot.name
@@ -1131,12 +1273,13 @@ private struct ProfileFormSnapshot {
         speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         modelSelection = bot.modelSelection
         maxToolRoundsText = bot.maxToolRounds.map(String.init) ?? ""
-        autoApprove = bot.autoApprove ?? false
-        autoReview = bot.autoReview ?? "off"
-        approvePeerComms = bot.approvePeerComms ?? false
         isOff = bot.isOff
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
+        autoApprove = bot.autoApprove ?? false
+        autoReview = AutoReviewMode(stored: bot.autoReview)
+        approvePeerComms = bot.approvePeerComms ?? false
+        bypassPermissions = bot.bypassPermissions ?? false
     }
 }
 

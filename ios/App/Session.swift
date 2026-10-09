@@ -1516,10 +1516,22 @@ final class Session: ObservableObject {
     /// Make a room from the phone. Same shape as `createBot`: fold it in
     /// rather than wait for a broadcast, and hand it back so it can be opened.
     @discardableResult
-    func createRoom(name: String?, memberIds: [String]) async -> Room? {
+    func createRoom(
+        name: String?,
+        memberIds: [String],
+        cwd: String? = nil,
+        bulletin: String? = nil,
+        defaultResponder: GroupResponder? = nil
+    ) async -> Room? {
         guard let client else { return nil }
         do {
-            let room = try await client.createRoom(name: name, memberIds: memberIds)
+            let room = try await client.createRoom(
+                name: name,
+                memberIds: memberIds,
+                cwd: cwd,
+                bulletin: bulletin,
+                defaultResponder: defaultResponder
+            )
             state.apply(.room(room))
             return room
         } catch {

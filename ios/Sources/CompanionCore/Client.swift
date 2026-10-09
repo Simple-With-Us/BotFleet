@@ -1160,10 +1160,52 @@ public struct CompanionClient: Sendable {
 
     /// Make a room. The harness names it after the first member when `name`
     /// is empty, exactly as the desktop's dialog does.
-    public func createRoom(name: String?, memberIds: [String]) async throws -> Room {
+    ///
+    /// The first settings travel in this one request.  They used to follow in a
+    /// PATCH, so a folder the computer would not let a phone choose (403) left
+    /// a half-made room behind.  Sent here, the computer checks them before it
+    /// creates anything.
+    public func createRoom(
+        name: String?,
+        memberIds: [String],
+        cwd: String? = nil,
+        bulletin: String? = nil,
+        defaultResponder: GroupResponder? = nil
+    ) async throws -> Room {
+        let body = Self.roomCreateBody(
+            name: name,
+            memberIds: memberIds,
+            cwd: cwd,
+            bulletin: bulletin,
+            defaultResponder: defaultResponder
+        )
+        return try await send(try makeRequest("POST", "/api/groups", body: body), as: CreatedRoom.self).group
+    }
+
+    /// The wire body for `createRoom`.  Blank values are left out, so a room
+    /// made with nothing to say about a folder or bulletin sends what it
+    /// always did.
+    static func roomCreateBody(
+        name: String?,
+        memberIds: [String],
+        cwd: String?,
+        bulletin: String?,
+        defaultResponder: GroupResponder?
+    ) -> [String: Any] {
         var body: [String: Any] = ["memberIds": memberIds]
         if let name, !name.trimmingCharacters(in: .whitespaces).isEmpty { body["name"] = name }
-        return try await send(try makeRequest("POST", "/api/groups", body: body), as: CreatedRoom.self).group
+        if let cwd, !cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["cwd"] = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let bulletin, !bulletin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["bulletin"] = bulletin.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let defaultResponder {
+            var responder: [String: Any] = ["kind": defaultResponder.kind]
+            if let botId = defaultResponder.botId { responder["botId"] = botId }
+            body["defaultResponder"] = responder
+        }
+        return body
     }
 
     @discardableResult
