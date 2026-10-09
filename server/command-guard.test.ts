@@ -360,6 +360,18 @@ describe("commandRisk: edges", () => {
     expect(commandRisk(`ls; ${wrapped("env", 33)}`)).toEqual({ kind: "system", rule: "opaque-wrapper" });
   });
 
+  it("cards a find -exec command still behind a wrapper when the peel budget runs out", () => {
+    const stacked = (flag: string, depth: number) => `find . ${flag} ${"env ".repeat(depth)}rm -rf /tmp/x`;
+    for (const flag of ["-exec", "-execdir", "-ok", "-okdir"]) {
+      // thirty-two wrappers still unwrap to the remover
+      expect(commandRisk(stacked(flag, 32))).toEqual({ kind: "destructive", rule: "find-exec-rm" });
+      // one more and the program behind them was never seen: ask, don't clear it
+      expect(commandRisk(stacked(flag, 33))).toEqual({ kind: "system", rule: "opaque-wrapper" });
+    }
+    // a destructive stage elsewhere in the line still wins over the opaque one
+    expect(commandRisk(`${stacked("-exec", 33)}; git clean -fd`)).toEqual({ kind: "destructive", rule: "git-clean" });
+  });
+
   it("fails closed on shells nested past the unwrap depth instead of recursing forever", () => {
     let nested = "git clean -fd";
     for (let i = 0; i < 3; i += 1) nested = `sh -c ${JSON.stringify(nested)}`;
