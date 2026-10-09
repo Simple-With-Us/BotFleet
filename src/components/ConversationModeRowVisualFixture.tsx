@@ -19,7 +19,8 @@ import { ConversationModeRow } from "./SettingsModal";
 
 const noopDispatch: Dispatch<Action> = () => {};
 
-const roomSchema = z.enum(["channel", "room"]).default("channel");
+// catch, not default:  an empty or unknown ?room= falls back to channel too.
+const roomSchema = z.enum(["channel", "room"]).catch("channel");
 
 const ROOM_LABELS = {
   channel: { singular: "Channel", plural: "Channels" },
@@ -27,8 +28,7 @@ const ROOM_LABELS = {
 } satisfies Record<"channel" | "room", RoomLabels>;
 
 export default function ConversationModeRowVisualFixture() {
-  const raw = new URLSearchParams(window.location.search).get("room") ?? undefined;
-  const room = roomSchema.parse(raw);
+  const room = roomSchema.parse(new URLSearchParams(window.location.search).get("room"));
   // Typed as AppState so conversationMode keeps the literal "projects"
   // instead of widening to string.
   const value = useMemo(() => {
