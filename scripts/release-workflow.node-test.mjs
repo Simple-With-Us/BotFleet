@@ -221,6 +221,17 @@ test("release tags must resolve to the pinned build, including nested annotated 
   ]);
 });
 
+test("the README does not claim a DMG-only feed can update an installed app", () => {
+  // The macOS updater downloads a ZIP: electron-updater throws ERR_UPDATER_ZIP_FILE_NOT_FOUND when the
+  // feed lists none.  The v0.1.38 feed lists two DMGs, so it cannot update anything, as docs/releasing.md says.
+  const readme = readFileSync(join(ROOT, "README.md"), "utf8");
+  const feedRow = readme.split("\n").find((line) => line.startsWith("| Update feed |"));
+  assert.ok(feedRow, "README keeps an Update feed row");
+  assert.doesNotMatch(feedRow, /in-app updates install the DMG/i);
+  assert.match(feedRow, /ZIP/);
+  assert.match(feedRow, /cannot install from this feed/);
+});
+
 test("only a missing ref permits tag creation; failed queries and broken chains fail closed", async () => {
   const identity = { repo: "Simple-With-Us/BotFleet", tag: `v${VERSION}`, sha: "a".repeat(40) };
   assert.deepEqual(await verifyReleaseTag({ ...identity, request: async () => ({ status: 404 }) }), { exists: false });
