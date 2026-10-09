@@ -314,6 +314,30 @@ describe("saveConfig over a config.json it cannot use", () => {
     });
   });
 
+  // The lock validates the envelope only; the section schema is zod, here in
+  // config.ts (electron/config-file-lock.mjs, inspectConfigFile).  So a section
+  // this build does not know, a key a newer build added inside one it does, and
+  // a section of the wrong shape must all come through a save, with nothing
+  // set aside.  A strict schema at the lock would drop or reject exactly these.
+  it("carries a newer build's keys and a wrong-shaped section through a save", () => {
+    const stored = {
+      futureSection: { nested: [1, { deep: true }] },
+      profile: { name: "Ada", addedByANewerBuild: 7 },
+      autoUpdate: { enabled: "yes" },
+      instances: "not an object",
+    };
+    writeFileSync(path, JSON.stringify(stored));
+    saveConfig({ tts: { provider: "system" } });
+    expect(setAside()).toEqual([]);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ ...stored, tts: { provider: "system" } });
+    // The bad sections are still reported on the next load, and the good one is still in use.
+    loadConfig();
+    expect(listDataFaults()).toEqual([
+      expect.objectContaining({ file: "config.json", kind: "config-partial", sections: expect.arrayContaining(["autoUpdate", "instances"]) }),
+    ]);
+    expect(loadConfig().tts?.provider).toBe("system");
+  });
+
   it("keeps every key when the file starts with a byte-order mark", () => {
     writeFileSync(path, `\uFEFF${JSON.stringify({ profile: { name: "Ada" }, tts: { provider: "system" } })}`);
     saveConfig({ profile: { name: "Grace" } });

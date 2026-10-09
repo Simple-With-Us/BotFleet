@@ -49,6 +49,12 @@ export function writeFileAtomic(
   data: string,
   options?: { mode?: number; beforeRename?: () => void },
 ): void;
+/** Locked read-modify-write of config.json.  Throws, leaving the file
+ * untouched, when `mutate` returns anything but a plain object, `null` or
+ * nothing.  Keys `mutate` does not touch round-trip unchanged, including
+ * ones this build does not know and sections of the wrong shape: the lock
+ * checks the envelope (a readable JSON object), and the section schema is
+ * zod in server/config.ts, which the packaged Electron process cannot load. */
 export function updateConfigFile(
   configPath: string,
   mutate: (disk: ConfigFileObject) => ConfigFileObject | null | undefined,

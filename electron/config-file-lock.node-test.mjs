@@ -635,3 +635,106 @@ test("updateConfigFile refuses to overwrite an unusable file it cannot set aside
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// What the lock validates, and what it must leave alone.  The lock checks the
+// envelope (a readable JSON object) and the shape of what it is about to
+// persist (a plain object).  It does not check sections: those belong to
+// server/config.ts's zod schema, and a stricter check here would drop settings
+// a newer build wrote or set aside a file for one bad section.  See the doc
+// comment on inspectConfigFile.
+// ---------------------------------------------------------------------------
+
+test("updateConfigFile carries keys it does not know and sections of the wrong shape through untouched", () => {
+  const { dir, path } = tempConfig();
+  try {
+    // A section a newer build added, an unknown key inside a known section,
+    // and three known sections holding the wrong kind of value.  A strict
+    // schema in the lock would have rejected or stripped every one of them.
+    const original = {
+      futureSection: { nested: [1, { deep: true }], flag: "on" },
+      profile: { name: "Ada", addedByANewerBuild: 7 },
+      instances: "not an object",
+      autoUpdate: [1, 2, 3],
+      botDefaults: null,
+    };
+    writeFileSync(path, JSON.stringify(original));
+    updateConfigFile(path, (disk) => {
+      disk.touched = true;
+    });
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { ...original, touched: true });
+    assert.deepEqual(setAsideNames(dir), [], "a file with a wrong-shaped section is not an unusable file");
+    assert.deepEqual(readConfigFile(path), { ...original, touched: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile refuses a mutate result that is not a plain object, and leaves the file and the lock alone", () => {
+  const healthy = '{"profile":{"name":"Ada"},"autoUpdate":{"enabled":true}}';
+  const wrong = [
+    ["an array", () => [{ profile: {} }], /an array/],
+    ["a string", () => '{"profile":{}}', /a string/],
+    ["a number", () => 0, /a number/],
+    ["a boolean", () => false, /a boolean/],
+    ["a Map, which JSON.stringify would turn into {}", () => new Map([["profile", {}]]), /not a plain JSON object/],
+    ["a class instance", () => new (class Config {})(), /not a plain JSON object/],
+  ];
+  for (const [label, mutate, message] of wrong) {
+    const { dir, path } = tempConfig();
+    try {
+      writeFileSync(path, healthy);
+      assert.throws(() => updateConfigFile(path, mutate), message, label);
+      assert.equal(readFileSync(path, "utf8"), healthy, `${label}: the file is exactly as it was`);
+      assert.equal(existsSync(lockPathFor(path)), false, `${label}: the lock is released`);
+      assert.deepEqual(readdirSync(dir), ["config.json"], `${label}: nothing staged and nothing set aside`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a refused mutate result does not create a missing file or move an unusable one", () => {
+  const { dir, path } = tempConfig();
+  try {
+    assert.throws(() => updateConfigFile(path, () => []), /an array/);
+    assert.deepEqual(readdirSync(dir), [], "a fresh install gains no file from a refused write");
+
+    writeFileSync(path, "{ not json");
+    assert.throws(() => updateConfigFile(path, () => "x"), /a string/);
+    assert.equal(readFileSync(path, "utf8"), "{ not json", "the unusable file is still where it was");
+    assert.deepEqual(setAsideNames(dir), [], "a refused write sets nothing aside: only a write that replaces the file does");
+    assert.deepEqual(readdirSync(dir), ["config.json"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the refusal message names the kind of value and never its contents", () => {
+  const { dir, path } = tempConfig();
+  try {
+    const secret = "ak_live_SECRET_VALUE";
+    let message = "";
+    try {
+      updateConfigFile(path, () => secret);
+    } catch (error) {
+      message = String(error);
+    }
+    assert.match(message, /a string/);
+    assert.equal(message.includes(secret), false, "config.json holds API keys; an error must not quote what was refused");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the lock imports only node: built-ins and sibling files, so the packaged app can load it", () => {
+  // The packaged app ships no node_modules (electron-builder.yml `files`,
+  // scripts/bundle-server.mjs).  A bare import here, zod included, would fail
+  // the packaged boot with ERR_MODULE_NOT_FOUND.  That is why the section
+  // schema stays in server/config.ts and this module checks only the envelope.
+  const source = readFileSync(new URL("./config-file-lock.mjs", import.meta.url), "utf8");
+  const specifiers = [...source.matchAll(/^\s*(?:import|export)\b[^"'`;]*?\bfrom\s+["']([^"']+)["']/gms)].map((match) => match[1]);
+  assert.ok(specifiers.length > 0, "found the module's imports");
+  const bare = specifiers.filter((specifier) => !specifier.startsWith("node:") && !specifier.startsWith("./") && !specifier.startsWith("../"));
+  assert.deepEqual(bare, []);
+});
