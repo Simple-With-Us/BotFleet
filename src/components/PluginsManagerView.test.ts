@@ -12,7 +12,7 @@ import {
 
 // The view's types are derived from the schemas that read the plugins route, so
 // they cannot drift apart.  These checks pin that, and the one runtime behaviour
-// the derivation chose: unknown fields are stripped, not rejected.
+// the derivation chose: unknown fields are rejected at the boundary.
 
 const listing = {
   name: "weather",
@@ -39,13 +39,10 @@ describe("plugins manager schemas", () => {
     expectTypeOf<Extract<PluginSource, { kind: "git" }>["url"]>().toEqualTypeOf<string>();
   });
 
-  it("strips a field the server adds instead of blanking the list", () => {
-    const parsed = PluginsResponseSchema.parse({
+  it("rejects a field the server adds instead of silently dropping it", () => {
+    expect(PluginsResponseSchema.safeParse({
       plugins: [{ ...listing, addedLater: true, source: { ...listing.source, extra: 1 } }],
-    });
-    expect(parsed.plugins).toHaveLength(1);
-    expect(Object.keys(parsed.plugins[0]!)).not.toContain("addedLater");
-    expect(Object.keys(parsed.plugins[0]!.source)).not.toContain("extra");
+    }).success).toBe(false);
   });
 
   it("rejects a listing whose source cannot be shown", () => {

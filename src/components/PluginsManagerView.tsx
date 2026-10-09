@@ -73,16 +73,16 @@ async function readApiError(response: Response): Promise<ApiError | null> {
 // The schemas below are the one definition of what the plugins route returns.
 // The types the view uses are derived from them (`z.infer`), so a field added or
 // renamed on one side cannot drift from the other, and no cast is needed where a
-// response is read.  Unknown fields are stripped rather than rejected: the server
-// may add one, and a strict schema would blank the whole list when it does.
+// response is read.  Each object is strict: an unknown key fails `safeParse` and
+// the view treats the payload as unreadable instead of silently dropping fields.
 export const PluginSourceSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("folder"), path: z.string().min(1) }),
+  z.object({ kind: z.literal("folder"), path: z.string().min(1) }).strict(),
   z.object({
     kind: z.literal("git"),
     url: z.string().min(1),
     ref: z.string().nullable().optional(),
     path: z.string().optional(),
-  }),
+  }).strict(),
 ]);
 
 export const PluginListingSchema = z.object({
@@ -106,18 +106,18 @@ export const PluginListingSchema = z.object({
       description: z.string().optional(),
       layout: z.enum(["stat-grid", "key-value", "list"]),
       fields: z.array(z.string()).optional(),
-    })).optional(),
+    }).strict()).optional(),
     commands: z.array(z.object({
       name: z.string(),
       description: z.string(),
       args: z.array(z.string()).optional(),
-    })).optional(),
-  }).optional(),
-});
+    }).strict()).optional(),
+  }).strict().optional(),
+}).strict();
 
 export const PluginsResponseSchema = z.object({
   plugins: z.array(PluginListingSchema),
-});
+}).strict();
 
 export type PluginSource = z.infer<typeof PluginSourceSchema>;
 export type PluginListing = z.infer<typeof PluginListingSchema>;
