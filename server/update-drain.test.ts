@@ -161,7 +161,8 @@ describe("the held-work carrier", () => {
     appendHeldWork(dir, { sends: [send()] });
     appendHeldWork(dir, { sends: [send({ botId: "bot_two", relayed: true, linqChatId: "chat_1" })], queued: [queued()] });
     const path = join(dir, HELD_SENDS_FILE);
-    expect(statSync(path).mode & 0o777).toBe(0o600);
+    // POSIX permissions: Windows reports 0o666 for any writable file.
+    if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o600);
     const taken = takeHeldWork(dir);
     expect(taken.sends.map((item) => [item.botId, item.relayed, item.linqChatId])).toEqual([
       ["bot_one", false, undefined],
