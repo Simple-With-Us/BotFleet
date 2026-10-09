@@ -233,6 +233,10 @@ export class ReviewWatch {
   // key: an engine that reports no turn id shares one key across turns, and a
   // late step must never be taken for part of the turn running now.
   private readonly endedSteps = new WeakSet<WatchedStep>();
+  // The step each turn's drain has taken off the queue and not finished with,
+  // whether it is waiting out its grace or being reviewed: `turnEnded` cannot
+  // find it in the queue, and it is just as much a step of the turn that ended.
+  private readonly handling = new Map<string, Pending>();
   // The steps whose ask reached the card, by turn.  An id is only meaningful
   // inside its turn: an engine may number its steps again in the next one.
   private readonly asked = new Map<string, Set<string>>();
@@ -331,12 +335,15 @@ export class ReviewWatch {
     // deleting the entry being visited is well defined for a Set or a Map
     for (const key of this.stoppedTurns) if (onThread(key)) this.stoppedTurns.delete(key);
     for (const key of this.asked.keys()) if (onThread(key)) this.asked.delete(key);
-    for (const [key, queue] of this.queues) {
-      if (!onThread(key)) continue;
+    const keys = new Set([...this.handling.keys(), ...this.queues.keys()].filter(onThread));
+    for (const key of keys) {
       // the queue key and the budget key are built the same way
       const left = this.deps.budget?.remaining(key);
       const lateBudget = left === undefined ? undefined : snapshotSpend(left, this.deps.budget!.limit());
-      for (const pending of queue) {
+      // the step the drain is waiting on or reviewing is no longer in the
+      // queue, and is as much a step of the turn that ended as the rest
+      const current = this.handling.get(key);
+      for (const pending of [...(current ? [current] : []), ...(this.queues.get(key) ?? [])]) {
         this.endedSteps.add(pending.step);
         pending.readyAt = 0;
         pending.lateBudget = lateBudget;
@@ -368,8 +375,12 @@ export class ReviewWatch {
     return this.deps.sleep ? this.deps.sleep(ms) : new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  /** Whether the step's turn was stopped.  A step whose turn ended is never
+   *  covered by a stop: with no turn id every turn on the thread shares one
+   *  key, so the stop latched for the turn running now is not the end of a
+   *  review owed for an earlier one. */
   private isStopped(step: WatchedStep): boolean {
-    return this.stoppedTurns.has(this.key(step.threadId, step.turnId));
+    return !this.endedSteps.has(step) && this.stoppedTurns.has(this.key(step.threadId, step.turnId));
   }
 
   /** Whether this step's ask reached the card.  An ask that named no turn is
@@ -439,30 +450,38 @@ export class ReviewWatch {
         this.queues.delete(turnKey);
         return;
       }
-      // a stop latched for the turn running now does not cancel a review owed
-      // for an earlier turn that shared its key
-      if ((this.isStopped(next.step) && !this.endedSteps.has(next.step)) || this.wasAsked(next.step)) continue;
-      const wait = next.readyAt - this.now();
-      if (wait > 0) {
-        await this.sleep(wait);
-        // its ask may have reached the card, or the turn been stopped, while
-        // the step waited
-        if (this.isStopped(next.step) || this.wasAsked(next.step)) continue;
-      }
+      this.handling.set(turnKey, next);
       try {
-        await this.reviewStep(next);
-      } catch (error) {
-        // An audit that throws must never take the harness down with it, and
-        // under On a step nobody finished checking is not let through.
-        console.error("review-watch: a step review failed", error);
-        try {
-          this.failClosed(next.step, next.plan, {
-            rule: "the review failed",
-            chip: `review stopped the turn at ${next.step.tool}: the review failed`,
-          });
-        } catch (stopError) {
-          console.error("review-watch: could not stop the turn", stopError);
-        }
+        await this.handle(next);
+      } finally {
+        this.handling.delete(turnKey);
+      }
+    }
+  }
+
+  /** One step off the queue: wait out its grace, then review it. */
+  private async handle(next: Pending): Promise<void> {
+    if (this.isStopped(next.step) || this.wasAsked(next.step)) return;
+    const wait = next.readyAt - this.now();
+    if (wait > 0) {
+      await this.sleep(wait);
+      // its ask may have reached the card, or the turn been stopped, while
+      // the step waited
+      if (this.isStopped(next.step) || this.wasAsked(next.step)) return;
+    }
+    try {
+      await this.reviewStep(next);
+    } catch (error) {
+      // An audit that throws must never take the harness down with it, and
+      // under On a step nobody finished checking is not let through.
+      console.error("review-watch: a step review failed", error);
+      try {
+        this.failClosed(next.step, next.plan, {
+          rule: "the review failed",
+          chip: `review stopped the turn at ${next.step.tool}: the review failed`,
+        });
+      } catch (stopError) {
+        console.error("review-watch: could not stop the turn", stopError);
       }
     }
   }
