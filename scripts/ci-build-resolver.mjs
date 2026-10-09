@@ -1237,9 +1237,10 @@ export async function selectUpdateTarget({
   const { tip, candidates, truncated } = listed;
   const found = await selectNewestGreenCommit({ candidates, tip, repository, fetchImpl, env, execFileSyncImpl, log });
   if (found.commit) {
+    const ahead = `${truncated ? "more than " : ""}${plural(found.behind)}`;
     const message = found.behind === 0
       ? `Updating to ${short(found.commit)} (main's tip; its build succeeded)`
-      : `Updating to ${short(found.commit)} (main is ${plural(found.behind)} ahead; its build ${found.tipBuild})`;
+      : `Updating to ${short(found.commit)} (main is ${ahead} ahead; its build ${found.tipBuild})`;
     return { status: "selected", commit: found.commit, tip, behind: found.behind, message };
   }
   if (policy === "auto") {
