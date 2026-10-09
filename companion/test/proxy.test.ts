@@ -355,7 +355,7 @@ describe("the sidecar in front of an unmodified harness", () => {
   it("lets the phone switch cloud and Local VM, and leaves This Mac to the computer", async () => {
     const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
     const botId = (await created.json()).bot.id as string;
-    const profile = (body: unknown) => device("PATCH", `/api/bots/${botId}/profile`, { body });
+    const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
     const botNow = async () =>
       (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
     const thisMacRefusal = "This Mac can only be turned on or off in BotFleet on your computer";
@@ -415,7 +415,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     const made = async () => (await (await fetch(`${HARNESS}/api/bots`, { method: "POST" })).json()).bot.id as string;
     const lead = await made();
     const botId = await made();
-    const profile = (body: unknown) => device("PATCH", `/api/bots/${botId}/profile`, { body });
+    const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
     const botNow = async () =>
       (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
     try {
