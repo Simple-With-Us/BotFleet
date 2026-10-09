@@ -179,10 +179,12 @@ async function invoke(message: Extract<ParentToChildMessage, { type: "invoke" }>
 /** Runtime shape check mirroring ParentToChildMessageSchema without
  *  importing zod (this process cannot read node_modules under the
  *  permission model when the .ts entry is strip-typed in dev). */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- type guard at the IPC boundary
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- type guard at the IPC boundary
 function isHostSnapshot(value: unknown): value is SandboxHostSnapshot {
   if (!isPlainObject(value)) return false;
   if (typeof value.statusAllowed !== "boolean") return false;
@@ -201,6 +203,7 @@ function isHostSnapshot(value: unknown): value is SandboxHostSnapshot {
   return true;
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- parser for the untrusted IPC message
 function parseParentMessage(raw: unknown): ParentToChildMessage | null {
   if (!isPlainObject(raw) || typeof raw.type !== "string") return null;
   if (raw.type === "load") {
@@ -223,6 +226,7 @@ function parseParentMessage(raw: unknown): ParentToChildMessage | null {
 
 // Messages on this channel come from the trusted parent.  Still reject
 // anything that fails the shape check before dispatch.
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- IPC message handler; shape-checked by parseParentMessage
 process.on("message", (raw: unknown) => {
   const message = parseParentMessage(raw);
   if (!message) {
