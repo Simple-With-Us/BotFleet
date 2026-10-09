@@ -243,6 +243,28 @@ final class ParityLogicTests: XCTestCase {
         XCTAssertEqual(state.transcript(forThread: "th_old").map(\.id), ["old1"])
     }
 
+    func testARoomFrameThatMovesToAnotherThreadWithoutItsTranscriptDoesNotBorrowTheOldOnes() throws {
+        var state = CompanionState()
+        state.hydrate(Fleet(bots: [], groups: [
+            try decodeRoom(threadId: "th_old", messages: #"[{"id":"old1","role":"user","kind":"text","at":1,"text":"old"}]"#),
+        ]))
+        XCTAssertEqual(state.rooms.first?.messages?.map(\.id), ["old1"])
+
+        // A slim frame: the room names a different thread and carries no messages.
+        let slim = try JSONDecoder().decode(Room.self, from: Data("""
+        {"id":"room-1","threadId":"th_new","name":"Launch","memberIds":["b1"],
+         "defaultResponder":{"kind":"everyone"},"bulletin":"","unread":false,"createdAt":1}
+        """.utf8))
+        state.apply(.room(slim))
+
+        let room = try XCTUnwrap(state.rooms.first)
+        XCTAssertEqual(room.threadId, "th_new")
+        XCTAssertNil(room.messages, "the old thread's messages must not be attached to the new thread")
+        // The old thread's own transcript is still held under its own id.
+        XCTAssertEqual(state.transcript(forThread: "th_old").map(\.id), ["old1"])
+        XCTAssertTrue(state.transcript(forThread: "th_new").isEmpty)
+    }
+
     func testChannelTaskChangesWaitForAWorkingChannelOrAWaitingRequest() throws {
         var state = CompanionState()
         state.hydrate(Fleet(bots: [], groups: [try decodeRoom(threadId: "th_1")]))

@@ -445,9 +445,12 @@ public struct CompanionState: Sendable {
                     merged.messages = replacement
                     clearStream(previous.threadId)
                     clearStream(room.threadId)
-                } else {
+                } else if previous.threadId == room.threadId {
                     merged.messages = previous.messages
                 }
+                // A frame that moved the room to another thread without
+                // carrying its transcript leaves `merged.messages` empty
+                // rather than naming the old thread's messages as the new one's.
                 rooms[index] = merged
             } else {
                 rooms.append(room)
