@@ -150,7 +150,7 @@ final class SkillsTests: XCTestCase {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [SkillsRequestStub.self]
         let connection = Connection(id: "c1", name: "Mac", host: "192.168.1.5", port: 4748)
-        return CompanionClient(connection: connection, token: "tok", session: URLSession(configuration: configuration))
+        return CompanionClient(connection: connection, token: TestFixtures.fakeCompanionToken, session: URLSession(configuration: configuration))
     }
 
     override func setUp() {

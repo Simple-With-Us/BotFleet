@@ -56,7 +56,17 @@ public struct CompanionState: Sendable {
     /// Background jobs by conversation (thread id), from `jobs` frames and
     /// `GET /api/jobs`.  A thread with none has no entry, so the header can ask
     /// "does this have a pill" with one lookup.
-    public var jobsByThread: [String: [JobSnapshot]] = [:]
+    public private(set) var jobsByThread: [String: [JobSnapshot]] = [:] {
+        didSet {
+            var index: [String: JobSnapshot] = [:]
+            for jobs in jobsByThread.values {
+                for job in jobs { index[job.id] = job }
+            }
+            jobIndex = index
+        }
+    }
+    /// Every job by id, rebuilt whenever `jobsByThread` changes (see `job(id:)`).
+    private var jobIndex: [String: JobSnapshot] = [:]
     /// Monotonic reducer position used to reject snapshots fetched before a
     /// newer stream frame was folded.
     private let hydrationStateID = UUID()
@@ -307,6 +317,13 @@ public struct CompanionState: Sendable {
         } else {
             jobsByThread[threadId] = jobs
         }
+    }
+
+    /// One job by id, wherever it lives.  A single lookup in an index kept in
+    /// step with `jobsByThread`, so a screen that watches one job does not
+    /// scan every conversation on each redraw.
+    public func job(id: String) -> JobSnapshot? {
+        jobIndex[id]
     }
 
     /// Replace every conversation's jobs with what `GET /api/jobs` answered.

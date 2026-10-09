@@ -139,6 +139,29 @@ final class JobsTests: XCTestCase {
         XCTAssertNil(state.jobsByThread["gone"])
     }
 
+    func testOneJobIsFoundByIdThroughEveryWayTheSetChanges() {
+        var state = CompanionState()
+        XCTAssertNil(state.job(id: "job_1"))
+        state.hydrateJobs([
+            JobSnapshot(id: "job_1", threadId: "t1", status: .running),
+            JobSnapshot(id: "job_2", threadId: "t2", status: .completed),
+        ])
+        XCTAssertEqual(state.job(id: "job_1")?.threadId, "t1")
+        XCTAssertEqual(state.job(id: "job_2")?.status, .completed)
+        // a frame replaces its conversation's set, and the index follows
+        state.apply(.jobs(threadId: "t1", jobs: [JobSnapshot(id: "job_3", threadId: "t1", status: .running)]))
+        XCTAssertNil(state.job(id: "job_1"))
+        XCTAssertEqual(state.job(id: "job_3")?.status, .running)
+        XCTAssertEqual(state.job(id: "job_2")?.threadId, "t2", "another conversation is untouched")
+        // an update to a job shows its new status
+        state.apply(.jobs(threadId: "t1", jobs: [JobSnapshot(id: "job_3", threadId: "t1", status: .killed, killedBy: .owner)]))
+        XCTAssertEqual(state.job(id: "job_3")?.killedBy, .owner)
+        state.apply(.jobs(threadId: "t1", jobs: []))
+        XCTAssertNil(state.job(id: "job_3"))
+        state.hydrateJobs([])
+        XCTAssertNil(state.job(id: "job_2"))
+    }
+
     func testDeletingABotDropsItsJobs() throws {
         let fleet = try JSONDecoder().decode(Fleet.self, from: Data(
             #"{"bots":[{"id":"b1","threadId":"t1","name":"Scout","title":"","description":"","notifications":false,"color":"green","unread":false,"modelSelection":{"instanceId":"dsh","model":"m"},"createdAt":1}],"groups":[]}"#.utf8
@@ -148,6 +171,7 @@ final class JobsTests: XCTestCase {
         state.setJobs([job(.running)], forThread: "t1")
         state.apply(.botDeleted(botId: "b1"))
         XCTAssertNil(state.jobsByThread["t1"])
+        XCTAssertNil(state.job(id: "job_a"), "the index drops with the conversation")
     }
 
     func testTheOutputResponseReadsTheTextAndSaysWhenEarlierOutputExists() throws {
@@ -286,7 +310,7 @@ final class JobsTests: XCTestCase {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [JobsRequestStub.self]
         let connection = Connection(id: "c1", name: "Mac", host: "192.168.1.5", port: 4748)
-        return CompanionClient(connection: connection, token: "tok", session: URLSession(configuration: configuration))
+        return CompanionClient(connection: connection, token: TestFixtures.fakeCompanionToken, session: URLSession(configuration: configuration))
     }
 
     override func setUp() {
@@ -302,7 +326,7 @@ final class JobsTests: XCTestCase {
         XCTAssertEqual(jobs.count, 1)
         XCTAssertEqual(JobsRequestStub.capturedRequest?.httpMethod, "GET")
         XCTAssertEqual(JobsRequestStub.capturedRequest?.url?.path, "/api/jobs")
-        XCTAssertEqual(JobsRequestStub.capturedRequest?.value(forHTTPHeaderField: "Authorization"), "Bearer tok")
+        XCTAssertEqual(JobsRequestStub.capturedRequest?.value(forHTTPHeaderField: "Authorization"), "Bearer \(TestFixtures.fakeCompanionToken)")
     }
 
     func testOutputReadsTheOutputRouteOfThatJob() async throws {

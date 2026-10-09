@@ -313,7 +313,7 @@ final class QuotasTests: XCTestCase {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [QuotasRequestStub.self]
         let connection = Connection(id: "c1", name: "Mac", host: "192.168.1.5", port: 4748)
-        return CompanionClient(connection: connection, token: "tok", session: URLSession(configuration: configuration))
+        return CompanionClient(connection: connection, token: TestFixtures.fakeCompanionToken, session: URLSession(configuration: configuration))
     }
 
     override func setUp() {
@@ -337,6 +337,6 @@ final class QuotasTests: XCTestCase {
         _ = try await client().sharedMemoryStatus()
         XCTAssertEqual(QuotasRequestStub.capturedRequest?.httpMethod, "GET")
         XCTAssertEqual(QuotasRequestStub.capturedRequest?.url?.path, "/api/qdrant/status")
-        XCTAssertEqual(QuotasRequestStub.capturedRequest?.value(forHTTPHeaderField: "Authorization"), "Bearer tok")
+        XCTAssertEqual(QuotasRequestStub.capturedRequest?.value(forHTTPHeaderField: "Authorization"), "Bearer \(TestFixtures.fakeCompanionToken)")
     }
 }

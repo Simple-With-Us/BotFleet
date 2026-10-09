@@ -291,12 +291,7 @@ struct JobOutputView: View {
     /// Only the newest request may fill the screen.
     @State private var requestNumber = 0
 
-    private var job: JobSnapshot? {
-        for jobs in session.state.jobsByThread.values {
-            if let match = jobs.first(where: { $0.id == jobId }) { return match }
-        }
-        return nil
-    }
+    private var job: JobSnapshot? { session.state.job(id: jobId) }
 
     var body: some View {
         ScrollView {
