@@ -1126,7 +1126,7 @@ export class ZulipHub {
       return { ok: false, text: `Zulip is not connected for this bot (${session?.status.state ?? "not configured"}).` };
     }
     if (this.dryRun()) return { ok: false, text: "Not posted: Zulip is in a dry run (zulip.dryRun), which posts nothing." };
-    if (request.tool === "follow") return this.follow(session, request.args);
+    if (request.tool === "follow") return this.follow(session, request);
     const parsed = zulipToolArgsSchema.safeParse(request.args ?? {});
     if (!parsed.success) {
       return { ok: false, text: "Not posted: content, channel and topic must be text, and dm_user_id a Zulip user id." };
@@ -1207,8 +1207,8 @@ export class ZulipHub {
    *  It posts nothing.  The channel must be one the bot is subscribed to:
    *  a queue never delivers any other, so following one there would wake
    *  nothing. */
-  private async follow(session: ZulipSession, rawArgs: unknown): Promise<ZulipSendResult> {
-    const parsed = zulipFollowArgsSchema.safeParse(rawArgs ?? {});
+  private async follow(session: ZulipSession, request: ZulipSendRequest): Promise<ZulipSendResult> {
+    const parsed = zulipFollowArgsSchema.safeParse(request.args ?? {});
     if (!parsed.success) {
       return { ok: false, text: "Not changed: zulip_follow_topic needs a channel and a topic (text) and follow (true or false)." };
     }
