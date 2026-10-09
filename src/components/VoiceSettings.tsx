@@ -33,7 +33,7 @@ import {
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
-import { defaultVoiceOptionLabel, isPersonalVoiceId, voiceForDevice } from "../../shared/bot-voice";
+import { defaultVoiceOptionLabel, isPersonalVoiceId, voiceDisplayName, voiceForDevice, withDisplayNames } from "../../shared/bot-voice";
 import { DefaultVoicePicker, PronunciationSettings } from "./WorkspaceVoiceSettings";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
@@ -210,7 +210,9 @@ export function VoiceSettings({
         } catch {
           r = { voices: [] };
         }
-        setVoices(r.voices ?? []);
+        // One name per voice in every picker, even from a harness that
+        // lists a clone by its raw id.
+        setVoices(withDisplayNames(r.voices ?? []));
         if (r.error) setError(r.error);
       })
       .finally(() => {
@@ -510,7 +512,7 @@ export function VoiceSettings({
   const macLabelFor = (id: string): string => {
     const listed = macOptions.find((voice) => voice.id === id);
     if (listed) return listed.label;
-    if (!isPersonalVoice(id)) return id;
+    if (!isPersonalVoice(id)) return voiceDisplayName(id, voices);
     // A Personal Voice this Mac lists is in macOptions.  One it does not
     // list is named without claiming a device until the list is known.
     if (notOnThisMac(id)) return "Personal Voice not on this Mac";
@@ -537,7 +539,7 @@ export function VoiceSettings({
   const iphoneLabelFor = (id: string): string => {
     const listed = iphoneOptions.find((voice) => voice.id === id);
     if (listed) return listed.label;
-    if (!isPersonalVoice(id)) return id;
+    if (!isPersonalVoice(id)) return voiceDisplayName(id, voices);
     return macPersonalIds.has(id) ? "Personal Voice from this Mac" : "Personal Voice from your iPhone";
   };
   const iphoneSharedLabel = loadingVoices
@@ -749,7 +751,7 @@ export function VoiceSettings({
             <option value="">{macSharedLabel}</option>
             {macOverride && !macOptions.some((voice) => voice.id === macOverride) && (
               <option value={macOverride}>
-                {isPersonalVoice(macOverride) ? macLabelFor(macOverride) : `${macOverride} (Current)`}
+                {isPersonalVoice(macOverride) ? macLabelFor(macOverride) : `${macLabelFor(macOverride)} (Current)`}
               </option>
             )}
             {macOptions.map((v) => (
@@ -811,7 +813,7 @@ export function VoiceSettings({
             <option value="">{iphoneSharedLabel}</option>
             {iphoneOverride && !iphoneOptions.some((voice) => voice.id === iphoneOverride) && (
               <option value={iphoneOverride} disabled={isPersonalVoice(iphoneOverride)}>
-                {isPersonalVoice(iphoneOverride) ? iphoneLabelFor(iphoneOverride) : `${iphoneOverride} (Current)`}
+                {isPersonalVoice(iphoneOverride) ? iphoneLabelFor(iphoneOverride) : `${iphoneLabelFor(iphoneOverride)} (Current)`}
               </option>
             )}
             {iphoneOptions.map((v) => (

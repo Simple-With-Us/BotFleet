@@ -3,7 +3,7 @@
 // (system-voices.ts, no key).  This file is only the part that reads
 // ~/.botfleet/config.json, picks the engine, and decides whether there
 // is a voice at all.
-import { isPersonalVoiceId, readableVoiceId } from "../../shared/bot-voice.ts";
+import { isPersonalVoiceId, readableVoiceId, withDisplayNames } from "../../shared/bot-voice.ts";
 import { applyPronunciations, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
 import type { AppConfig } from "../config.ts";
 import * as minimax from "./minimax.ts";
@@ -109,6 +109,10 @@ export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Pro
   } else {
     voices = [...minimax.listClonedVoices(), ...minimax.CANNED_VOICES];
   }
+  // A clone is saved with its id as its label, and MiniMax falls back to the
+  // id too; name each one readably here, so the Mac, the iPhone and shipped
+  // builds all list "Jay Wedgeworth 001", never the raw id beside it.
+  voices = withDisplayNames(voices);
   if (cfg.tts?.voice && !voices.some((v) => v.id === cfg.tts?.voice)) {
     const defaultVoiceId = cfg.tts.voice;
     voices.unshift({ id: defaultVoiceId, label: readableVoiceId(defaultVoiceId), description: "Workspace default" });

@@ -82,8 +82,10 @@ describe("VoiceSettings", () => {
     expect(html).toContain("Voice on iPhone");
     expect(html).toContain("aria-label=\"Assistant&#x27;s voice on this Mac\"");
     expect(html).toContain("aria-label=\"Assistant&#x27;s voice on iPhone\"");
-    // Neither device has its own choice, so both offer the shared voice.
-    expect(html.match(/voice-1 \(bot default\)/g)).toHaveLength(2);
+    // Neither device has its own choice, so both offer the shared voice,
+    // by name (an unlisted id made readable), never by its raw id.
+    expect(html.match(/Voice 1 \(bot default\)/g)).toHaveLength(2);
+    expect(html).not.toContain("voice-1 (bot default)");
   });
 
   it("does not claim on-device synthesis when Personal Voice is off", () => {
@@ -137,8 +139,9 @@ describe("VoiceSettings", () => {
   it("renders a device's own hosted voice that the list does not have as current", () => {
     const html = render(sampleBot(undefined, { mac: "custom-voice-id", iphone: "phone-voice-id" }));
 
-    expect(html).toContain("custom-voice-id (Current)");
-    expect(html).toContain("phone-voice-id (Current)");
+    // By name, the id made readable, as every other option is.
+    expect(html).toContain("Custom Voice Id (Current)");
+    expect(html).toContain("Phone Voice Id (Current)");
     expect(html).not.toContain("Apple Personal Voice:");
   });
 

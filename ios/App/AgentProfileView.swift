@@ -875,7 +875,7 @@ struct AgentProfileView: View {
                     .tag(iphoneVoice)
                     .disabled(true)
             } else {
-                Text("Current voice").tag(iphoneVoice)
+                Text("\(BotVoice.displayName(iphoneVoice, voices: voices)) (Current)").tag(iphoneVoice)
             }
         }
         if !personalVoice.personalVoiceOptions.isEmpty {
@@ -888,7 +888,7 @@ struct AgentProfileView: View {
         if !hostedVoices.isEmpty {
             Section(personalVoice.personalVoiceOptions.isEmpty ? "Voices" : "Server & System Voices") {
                 ForEach(hostedVoices) { option in
-                    Text(option.label).tag(option.id)
+                    Text(BotVoice.displayName(option.id, voices: hostedVoices)).tag(option.id)
                 }
             }
         }
@@ -905,10 +905,12 @@ struct AgentProfileView: View {
                 .tag(macVoice)
                 .disabled(true)
         } else if !macVoice.isEmpty, !hostedVoices.contains(where: { $0.id == macVoice }) {
-            Text("Current voice").tag(macVoice)
+            Text("\(BotVoice.displayName(macVoice, voices: voices)) (Current)").tag(macVoice)
         }
+        // One name per voice, the same as the default option above: a clone
+        // listed by its raw id reads "Jay Wedgeworth 001".
         ForEach(hostedVoices) { option in
-            Text(option.label).tag(option.id)
+            Text(BotVoice.displayName(option.id, voices: hostedVoices)).tag(option.id)
         }
     }
 
