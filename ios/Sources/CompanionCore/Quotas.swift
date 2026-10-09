@@ -394,6 +394,13 @@ public struct SpeechUsage: Decodable, Hashable, Sendable {
     }
 }
 
+/// The windows of one provider, under the provider's own name.
+public struct QuotaWindowGroup: Hashable, Identifiable, Sendable {
+    public var title: String
+    public var windows: [QuotaWindow]
+    public var id: String { title }
+}
+
 /// What the Quotas section says.  Pure, with the clock passed in.
 public enum QuotaDisplay {
     private static let supportedProviders: Set<String> = [
@@ -444,7 +451,7 @@ public enum QuotaDisplay {
 
     /// The windows worth a row, grouped under the provider's own name, in the
     /// order providers first appear and by label within one.
-    public static func groupedWindows(_ windows: [QuotaWindow]) -> [(title: String, windows: [QuotaWindow])] {
+    public static func groupedWindows(_ windows: [QuotaWindow]) -> [QuotaWindowGroup] {
         var order: [String] = []
         var groups: [String: [QuotaWindow]] = [:]
         for window in windows where isBotFleetWindow(window) && !window.skip {
@@ -455,7 +462,7 @@ public enum QuotaDisplay {
             groups[title, default: []].append(window)
         }
         return order.map { title in
-            (title: title, windows: (groups[title] ?? []).sorted { $0.label < $1.label })
+            QuotaWindowGroup(title: title, windows: (groups[title] ?? []).sorted { $0.label < $1.label })
         }
     }
 
@@ -527,6 +534,19 @@ public enum QuotaDisplay {
         let value = (producer ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if value == "usage-monitor" { return "Usage Monitor" }
         return "CodeCaps"
+    }
+
+    /// The past week's priced spend scaled to thirty days.  A pace, not a
+    /// forecast: it assumes next month looks like this week, and it is a floor
+    /// when an engine has turns it could not price.
+    public static func monthlyPace(_ spend: EngineSpend) -> Double {
+        spend.spend7dUsd * 30 / 7
+    }
+
+    /// The pace across every row.  Rows are one per engine, so the sum counts
+    /// each turn once.
+    public static func monthlyPace(_ rows: [EngineSpendRow]) -> Double {
+        rows.reduce(0) { $0 + monthlyPace($1.spend) }
     }
 
     /// Engines the desktop hides from its quota section: unused ones stay

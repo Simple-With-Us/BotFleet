@@ -118,6 +118,30 @@ struct SettingsView: View {
                         }
                     }
 
+                    NavigationLink {
+                        UsageView()
+                    } label: {
+                        Label {
+                            Text("Usage & Cost")
+                        } icon: {
+                            SettingsIcon(symbol: "chart.bar.xaxis", color: .green)
+                        }
+                    }
+
+                    NavigationLink {
+                        SharedMemoryView()
+                    } label: {
+                        HStack {
+                            Label {
+                                Text("Shared Memory")
+                            } icon: {
+                                SettingsIcon(symbol: "memorychip", color: .pink)
+                            }
+                            Spacer()
+                            SharedMemoryStateText()
+                        }
+                    }
+
                     Picker(selection: Binding(
                         get: { session.config?.isProjectsMode == true ? "projects" : "simple" },
                         set: { mode in

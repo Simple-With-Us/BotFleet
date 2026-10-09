@@ -96,6 +96,12 @@ struct ChatView: View {
         }
     }
 
+    /// Whether this is a shared room, where the jobs list names each member.
+    private var isRoomChat: Bool {
+        if case .room = current { return true }
+        return false
+    }
+
     /// The live chat record, so busy/unread stay current as frames land.
     private var current: Chat {
         switch chat {
@@ -689,6 +695,10 @@ struct ChatView: View {
                 }
             }
             .padding(.horizontal, 16)
+
+            // Background jobs: draws nothing until a bot in this conversation
+            // has one worth showing (running, or ended in the last half hour).
+            JobsPill(threadId: threadId, showsBotNames: isRoomChat)
 
             if case let .bot(bot) = current,
                session.config?.allowsMultipleBotThreads == true {

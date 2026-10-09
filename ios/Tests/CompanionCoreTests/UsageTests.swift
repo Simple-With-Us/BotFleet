@@ -187,6 +187,79 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(UsageMath.botUsageByModel(bot).map(\.model), ["paid", "free-big", "free-small"])
     }
 
+    // MARK: - The summary and a bot's sessions
+
+    private func fleet(_ bots: String) throws -> [Bot] {
+        let json = #"{"bots":[\#(bots)],"groups":[]}"#
+        return try JSONDecoder().decode(Fleet.self, from: Data(json.utf8)).bots
+    }
+
+    private func botJSON(_ id: String, name: String, extra: String) -> String {
+        #"{"id":"\#(id)","threadId":"t-\#(id)","name":"\#(name)","title":"","description":"","notifications":false,"color":"green","unread":false,"modelSelection":{"instanceId":"claude","model":"m"},"createdAt":1\#(extra)}"#
+    }
+
+    func testTheSummaryListsBotsThatSpentMoneyFirstThenVolume() throws {
+        let bots = try fleet([
+            botJSON("free", name: "Free", extra: #","tasks":[{"threadId":"a","title":"","createdAt":0,"usage":{"input":900,"output":100,"costUsd":null,"turns":2}}]"#),
+            botJSON("paid", name: "Paid", extra: #","tasks":[{"threadId":"b","title":"","createdAt":0,"usage":{"input":10,"output":10,"costUsd":1.5,"turns":1}}]"#),
+            botJSON("idle", name: "Idle", extra: ""),
+            botJSON("hid", name: "Hidden", extra: #","hidden":true,"tasks":[{"threadId":"c","title":"","createdAt":0,"usage":{"input":1,"output":1,"costUsd":9,"turns":1}}]"#),
+            botJSON("busy", name: "Busy", extra: #","tasks":[{"threadId":"d","title":"","createdAt":0,"usage":{"input":5000,"output":5000,"costUsd":null,"turns":9}}]"#),
+        ].joined(separator: ","))
+        let rows = UsageMath.summaryRows(bots)
+        XCTAssertEqual(rows.map(\.botId), ["paid", "busy", "free"], "money first, then volume; idle and hidden bots have no row")
+        let total = UsageMath.total(rows)
+        XCTAssertEqual(total.turns, 12)
+        close(total.costUsd, 1.5)
+    }
+
+    func testTheCostCaptionNamesTheBillingOrSaysTheyDiffer() {
+        XCTAssertEqual(UsageMath.summaryCostCaption(billings: ["metered"]), "billed to your API key")
+        XCTAssertTrue(UsageMath.summaryCostCaption(billings: ["subscription"]).contains("not billed"))
+        XCTAssertTrue(UsageMath.summaryCostCaption(billings: [nil]).contains("reported"))
+        XCTAssertTrue(UsageMath.summaryCostCaption(billings: ["metered", "subscription"]).hasPrefix("as each engine reports it"))
+        XCTAssertTrue(UsageMath.summaryCostCaption(billings: []).hasPrefix("as each engine reports it"))
+    }
+
+    func testSessionsRunNewestFirstWithTotalsThatGrowOldestFirst() throws {
+        let bot = try XCTUnwrap(fleet(botJSON("b", name: "B", extra: #"""
+        ,"tasks":[
+          {"threadId":"new","title":"Newest","createdAt":1,"lastActivity":300,"usage":{"input":30,"output":0,"costUsd":0.3,"turns":3}},
+          {"threadId":"old","title":"","createdAt":1,"lastActivity":100,"usage":{"input":10,"output":0,"costUsd":0.1,"turns":1}},
+          {"threadId":"mid","title":"Middle","createdAt":1,"lastActivity":200,"usage":{"input":20,"output":0,"turns":2}},
+          {"threadId":"none","title":"Unused","createdAt":1,"lastActivity":400}],
+        "roomUsageByInstance":{"minimax":{"input":5,"output":5,"costUsd":0.05,"turns":1,"lastAt":250,"byModel":{"MiniMax-M3":{"input":5,"output":5,"turns":1}}}}
+        """#)).first)
+        let rows = UsageMath.sessionRows(bot)
+        XCTAssertEqual(rows.map(\.id), ["new", "room:minimax", "mid", "old"])
+        XCTAssertEqual(rows.map(\.title), ["Newest", "Shared rooms", "Middle", "old"], "an untitled task shows its id")
+        // oldest first: old 10 -> mid 30 -> room 40 -> new 70
+        XCTAssertEqual(rows.map(\.cumulativeTokens), [70, 40, 30, 10])
+        close(rows[0].cumulativeCost, 0.1 + 0.05 + 0.3)
+        close(rows[3].cumulativeCost, 0.1)
+        close(rows[0].perTurnCost, 0.1)
+        XCTAssertNil(rows[2].perTurnCost, "no cost, no per-turn cost")
+        XCTAssertTrue(rows[1].isRoom)
+        XCTAssertEqual(rows[1].model, "MiniMax-M3")
+    }
+
+    func testASessionIsLabelledByTheModelThatRanItAndSaysWhenHistoryIsIncomplete() throws {
+        let bot = try XCTUnwrap(fleet(botJSON("b", name: "B", extra: #"""
+        ,"tasks":[
+          {"threadId":"whole","title":"Whole","createdAt":1,"usage":{"input":10,"output":0,"turns":2},
+           "modelSelection":{"instanceId":"claude","model":"configured"},
+           "usageByInstance":{"x":{"turns":2,"byModel":{"opus":{"input":6,"turns":1},"haiku":{"input":4,"turns":1}}}}},
+          {"threadId":"partial","title":"Partial","createdAt":2,"usage":{"input":10,"output":0,"turns":5},
+           "modelSelection":{"instanceId":"claude","model":"configured"},
+           "usageByInstance":{"x":{"turns":1,"byModel":{"haiku":{"input":2,"turns":1}}}}},
+          {"threadId":"legacy","title":"Legacy","createdAt":3,"usage":{"input":10,"output":0,"turns":1}}]
+        """#)).first)
+        let rows = Dictionary(uniqueKeysWithValues: UsageMath.sessionRows(bot).map { ($0.id, $0.model) })
+        XCTAssertEqual(rows["whole"], "haiku, opus")
+        XCTAssertEqual(rows["partial"], "haiku, configured + earlier usage")
+        XCTAssertEqual(rows["legacy"], "m", "falls back to the bot's own model")
+    }
+
     // MARK: - A ledger the phone cannot read costs the figure, not the bot
 
     func testAMalformedLedgerLeavesTheBotInTheFleet() throws {

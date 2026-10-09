@@ -632,6 +632,11 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     /// The probe gave no answer yet (a slow CLI on a busy Mac) and nothing
     /// definitive stood in: the engine is being checked, not missing or signed out.
     public var transient: Bool?
+    /// How the engine bills: `metered` (a charge to an API key) or
+    /// `subscription` (a flat plan, so a cost figure is an equivalent, not a
+    /// charge).  A raw string so a new mode from a newer harness still decodes.
+    /// Absent means the engine did not say.
+    public var billing: String?
 
     public var isAvailable: Bool { state == "available" }
     public var isHidden: Bool { hidden == true }

@@ -373,3 +373,171 @@ public enum UsageMath {
         }
     }
 }
+
+// MARK: - The summary's rows
+
+/// One bot's line in the summary.
+public struct BotUsageRow: Hashable, Identifiable, Sendable {
+    public var botId: String
+    public var name: String
+    public var instanceId: String
+    public var usage: UsageTotals
+    public var id: String { botId }
+}
+
+/// One session (task) of a bot, or its shared-room turns, in the detail.
+public struct UsageSessionRow: Hashable, Identifiable, Sendable {
+    public var id: String
+    public var title: String
+    /// Last activity, epoch milliseconds.
+    public var at: Double
+    public var usage: UsageTotals
+    /// The model that produced the usage, or the configured one for history
+    /// banked before per-model splits existed.
+    public var model: String
+    public var isRoom: Bool
+    public var perTurnCost: Double?
+    /// Running totals, oldest first, so the figures grow down the page the
+    /// way a ledger does.
+    public var cumulativeTokens: Double
+    public var cumulativeCost: Double
+}
+
+extension UsageMath {
+    /// Every visible bot that has spent anything: money first, then volume.
+    /// Non-finite and missing costs sort last.
+    public static func summaryRows(_ bots: [Bot]) -> [BotUsageRow] {
+        let rows = bots
+            .filter { $0.hidden != true }
+            .map { BotUsageRow(botId: $0.id, name: $0.name, instanceId: $0.modelSelection.instanceId, usage: botUsage($0)) }
+            .filter { $0.usage.turns > 0 }
+        func cost(_ row: BotUsageRow) -> Double {
+            hasFiniteCost(row.usage.costUsd) ? (row.usage.costUsd ?? 0) : -Double.infinity
+        }
+        return rows.sorted { a, b in
+            let aCost = cost(a)
+            let bCost = cost(b)
+            if aCost != bCost { return aCost > bCost }
+            if a.usage.tokens != b.usage.tokens { return a.usage.tokens > b.usage.tokens }
+            return a.name < b.name
+        }
+    }
+
+    /// The "All bots" line.
+    public static func total(_ rows: [BotUsageRow]) -> UsageTotals {
+        sum(rows.map(\.usage))
+    }
+
+    /// A bot's sessions, newest first, each with a running total taken
+    /// oldest first.  Shared-room turns bank per engine on the bot rather than
+    /// on a task, so each bucket becomes one "Shared rooms" row, or the detail
+    /// would disagree with the header total.
+    public static func sessionRows(_ bot: Bot) -> [UsageSessionRow] {
+        struct Entry {
+            var id: String
+            var title: String
+            var at: Double
+            var usage: UsageTotals
+            var model: String
+            var isRoom: Bool
+        }
+        func spent(_ usage: UsageTotals) -> Bool {
+            usage.turns > 0 || usage.input + usage.output > 0
+        }
+        var entries: [Entry] = []
+        for task in bot.tasks ?? [] {
+            guard let taskUsage = task.usage else { continue }
+            let usage = UsageTotals(taskUsage)
+            guard spent(usage) else { continue }
+            // The model that PRODUCED the usage when per-instance buckets
+            // banked one; the configured selection is only the fallback for
+            // history from before, since it is the task's current setting and
+            // not necessarily what ran.
+            var ran: [String] = []
+            var bankedTurns = 0.0
+            let buckets = task.usageByInstance?.byKey ?? [:]
+            for key in buckets.keys.sorted() {
+                let models = buckets[key]?.byModel ?? [:]
+                for name in models.keys.sorted() {
+                    if !ran.contains(name) { ran.append(name) }
+                    bankedTurns += models[name]?.turns ?? 0
+                }
+            }
+            let configured = task.modelSelection?.model ?? bot.modelSelection.model
+            // A session that mostly ran before per-model banking has only its
+            // newest turns in the split, so labelling it by those alone would
+            // hide the model that produced the bulk.
+            let incomplete = !ran.isEmpty && bankedTurns < usage.turns
+            var labelled = ran
+            if incomplete, !configured.isEmpty, !ran.contains(configured) { labelled.append(configured) }
+            let model = labelled.isEmpty
+                ? configured
+                : labelled.joined(separator: ", ") + (incomplete ? " + earlier usage" : "")
+            entries.append(Entry(
+                id: task.threadId,
+                title: task.title.isEmpty ? String(task.threadId.prefix(12)) : task.title,
+                at: task.lastActivity ?? task.createdAt,
+                usage: usage,
+                model: model,
+                isRoom: false
+            ))
+        }
+        let rooms = bot.roomUsageByInstance?.byKey ?? [:]
+        for instanceId in rooms.keys.sorted() {
+            guard let bucket = rooms[instanceId] else { continue }
+            let usage = UsageTotals(bucket)
+            guard spent(usage) else { continue }
+            let split = (bucket.byModel ?? [:]).keys.sorted().joined(separator: ", ")
+            entries.append(Entry(
+                id: "room:\(instanceId)",
+                title: "Shared rooms",
+                at: bucket.lastAt ?? 0,
+                usage: usage,
+                model: split.isEmpty ? (instanceId.isEmpty ? "room" : instanceId) : split,
+                isRoom: true
+            ))
+        }
+        // Oldest first for the running totals; ties keep their order.
+        let chronological = entries.enumerated().sorted { a, b in
+            a.element.at != b.element.at ? a.element.at < b.element.at : a.offset < b.offset
+        }.map { $0.element }
+        var tokens = 0.0
+        var cost = 0.0
+        var running: [String: (tokens: Double, cost: Double)] = [:]
+        for entry in chronological {
+            tokens += entry.usage.tokens
+            if hasFiniteCost(entry.usage.costUsd) { cost += entry.usage.costUsd ?? 0 }
+            running[entry.id] = (tokens, cost)
+        }
+        let newestFirst = entries.enumerated().sorted { a, b in
+            a.element.at != b.element.at ? a.element.at > b.element.at : a.offset < b.offset
+        }.map { $0.element }
+        return newestFirst.map { entry in
+            let totals = running[entry.id] ?? (0, 0)
+            let perTurn: Double? = hasFiniteCost(entry.usage.costUsd) && entry.usage.turns > 0
+                ? (entry.usage.costUsd ?? 0) / entry.usage.turns
+                : nil
+            return UsageSessionRow(
+                id: entry.id,
+                title: entry.title,
+                at: entry.at,
+                usage: entry.usage,
+                model: entry.model,
+                isRoom: entry.isRoom,
+                perTurnCost: perTurn,
+                cumulativeTokens: totals.tokens,
+                cumulativeCost: totals.cost
+            )
+        }
+    }
+
+    /// The caption under the summary's cost column.  One billing mode across
+    /// every engine in play captions it by that mode; a mix says each engine
+    /// reports its own, and that a subscription's figure is an equivalent.
+    public static func summaryCostCaption(billings: Set<String?>) -> String {
+        if billings.count == 1, let only = billings.first {
+            return costCaption(billing: only)
+        }
+        return "as each engine reports it \u{2014} on a subscription it's an equivalent, not a charge"
+    }
+}

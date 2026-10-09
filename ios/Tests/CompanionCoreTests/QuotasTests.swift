@@ -248,6 +248,16 @@ final class QuotasTests: XCTestCase {
         XCTAssertEqual(rows.count, 1)
     }
 
+    func testThePaceScalesAWeekToThirtyDaysAndCountsEachEngineOnce() throws {
+        XCTAssertEqual(QuotaDisplay.monthlyPace(EngineSpend(spend7dUsd: 7)), 30, accuracy: 1e-9)
+        XCTAssertEqual(QuotaDisplay.monthlyPace(EngineSpend(spend5hUsd: 99)), 0, "the 5-hour figure is not part of a weekly pace")
+        let rows = QuotaDisplay.spendRows(
+            ["claudeAgent": EngineSpend(spend7dUsd: 7), "claude": EngineSpend(spend7dUsd: 7), "codex": EngineSpend(spend7dUsd: 14)],
+            instances: [try instance("claude", driver: "claudeAgent"), try instance("codex", driver: "codex")]
+        )
+        XCTAssertEqual(QuotaDisplay.monthlyPace(rows), 90, accuracy: 1e-9, "the doubled booking is not counted twice")
+    }
+
     func testHiddenDisabledAndIdleEnginesHaveNoRow() throws {
         let table = [
             "kimi": EngineSpend(spend7dUsd: 5),
