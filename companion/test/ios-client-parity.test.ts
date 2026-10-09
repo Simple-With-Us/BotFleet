@@ -65,9 +65,8 @@ describe("the native client against the allowlist", () => {
     // type can carry must be on the list, so the compiler, not a reviewer,
     // is what stops the sheet asking for a field that will be refused.
     const declaredButUnused = new Set(["section"]);
-    const refused = sendable.filter(
-      (key) => !declaredButUnused.has(key) && !(COMPANION_PROFILE_PATCH_FIELDS as readonly string[]).includes(key),
-    );
+    const allowed = new Set<string>(COMPANION_PROFILE_PATCH_FIELDS);
+    const refused = sendable.filter((key) => !declaredButUnused.has(key) && !allowed.has(key));
     expect(refused).toEqual([]);
   });
 });

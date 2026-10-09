@@ -10905,7 +10905,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // a phone choose left a half-made room behind.  Sent here, a refusal
       // leaves nothing.  Left unmarked as "set up": the desktop's setup
       // prompt still offers itself, exactly as it does for a phone room.
-      const first: { bulletin?: string; defaultResponder?: GroupDefaultResponder; cwd?: string } = {};
+      interface FirstSettings {
+        bulletin?: string;
+        defaultResponder?: GroupDefaultResponder;
+        cwd?: string;
+      }
+      const first: FirstSettings = {};
       if (body.bulletin !== undefined) {
         if (typeof body.bulletin !== "string") return json(res, 400, { error: "bulletin must be a string" });
         if (body.bulletin.length > 12_000) {

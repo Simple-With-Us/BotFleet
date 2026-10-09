@@ -111,6 +111,15 @@ const device = async (
   return { status: res.status, body, headers: res.headers };
 };
 
+/** A bot made straight on the harness, the way the computer's own route makes
+ * one, and its id.  `Response.json()` is `unknown` under the server tsconfig
+ * (no DOM lib), so the shape is stated once here. */
+const createHarnessBot = async (): Promise<string> => {
+  const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
+  const made: { bot: { id: string } } = JSON.parse(await created.text());
+  return made.bot.id;
+};
+
 /** raw request with a chosen Host header — fetch will not let us set one */
 const withHost = (port: number, host: string, path = "/api/health", headers: Record<string, string> = {}) =>
   new Promise<number>((resolve, reject) => {
@@ -353,8 +362,7 @@ describe("the sidecar in front of an unmodified harness", () => {
   });
 
   it("lets the phone switch cloud and Local VM, and leaves This Mac to the computer", async () => {
-    const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
-    const botId = (await created.json()).bot.id as string;
+    const botId = await createHarnessBot();
     const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
     const botNow = async () =>
       (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
@@ -412,7 +420,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     const other = join(home, "projects", "other");
     mkdirSync(join(shared, "sub"), { recursive: true });
     mkdirSync(other, { recursive: true });
-    const made = async () => (await (await fetch(`${HARNESS}/api/bots`, { method: "POST" })).json()).bot.id as string;
+    const made = createHarnessBot;
     const lead = await made();
     const botId = await made();
     const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
@@ -468,8 +476,8 @@ describe("the sidecar in front of an unmodified harness", () => {
     const other = join(home, "projects", "room-other");
     mkdirSync(shared, { recursive: true });
     mkdirSync(other, { recursive: true });
-    const botId = (await (await fetch(`${HARNESS}/api/bots`, { method: "POST" })).json()).bot.id as string;
-    const roomCount = async () => (await device("GET", "/api/bots")).body.groups.length as number;
+    const botId = await createHarnessBot();
+    const roomCount = async () => Number((await device("GET", "/api/bots")).body.groups.length);
     let roomId: string | undefined;
     try {
       const grant = await fetch(`${HARNESS}/api/bots/${botId}`, {
@@ -531,8 +539,7 @@ describe("the sidecar in front of an unmodified harness", () => {
   });
 
   it("lets the phone set the tool-round budget", async () => {
-    const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
-    const botId = (await created.json()).bot.id as string;
+    const botId = await createHarnessBot();
     try {
       const set = await device("PATCH", `/api/bots/${botId}/profile`, { body: { maxToolRounds: 40 } });
       expect(set.status).toBe(200);
