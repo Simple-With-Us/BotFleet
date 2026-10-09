@@ -182,16 +182,30 @@ struct ChatView: View {
     /// replaces child accessibility content, so the provider mark must be
     /// named here or it would become silent chrome.
     private var headerProfileAccessibilityLabel: String {
+        let bypass = headerShowsBypass ? ", Bypass Permissions is on" : ""
         if let currentDriverKind {
-            return "Open \(current.name) profile, \(ProviderMarkView.displayName(for: currentDriverKind, model: currentModelSelection?.model))"
+            return "Open \(current.name) profile, \(ProviderMarkView.displayName(for: currentDriverKind, model: currentModelSelection?.model))\(bypass)"
         }
-        return "Open \(current.name) profile"
+        return "Open \(current.name) profile\(bypass)"
+    }
+
+    /// A bot with Bypass Permissions on carries a mark beside its name.  A room
+    /// has no switch of its own: each member keeps theirs.
+    private var headerShowsBypass: Bool {
+        if case let .bot(bot) = current { return bot.bypassPermissions == true }
+        return false
     }
 
     var body: some View {
         VStack(spacing: 0) {
             transcriptColumn
-            composer
+            // An Off bot refuses every new turn, so the input is replaced by
+            // the way out of that state.  The transcript above stays as it was.
+            if current.isOff, case let .bot(bot) = current {
+                offComposer(for: bot)
+            } else {
+                composer
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .overlay(alignment: .bottom) { plusSheet }
@@ -287,7 +301,11 @@ struct ChatView: View {
             if listening { composerFocused = false }
         }
         .sheet(isPresented: $showingTasks) {
-            if case let .bot(bot) = current { TaskManagerView(bot: bot) }
+            if case let .bot(bot) = current {
+                TaskManagerView(bot: bot)
+            } else if case let .room(room) = current {
+                RoomTaskManagerView(room: room)
+            }
         }
         .navigationDestination(isPresented: $showingRoutines) {
             TasksRoutinesView()
@@ -646,10 +664,13 @@ struct ChatView: View {
                             }
                         }
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(current.name)
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(Color.primary)
-                                .lineLimit(1)
+                            HStack(spacing: 6) {
+                                Text(current.name)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(Color.primary)
+                                    .lineLimit(1)
+                                if headerShowsBypass { BypassBadge() }
+                            }
                             if !current.subtitle.isEmpty {
                                 Text(current.subtitle)
                                     .font(.system(size: 12))
@@ -827,6 +848,24 @@ struct ChatView: View {
                 subtitle: "Live view of what \(bot.name) is doing"
             ) { showingComputer = true })
         }
+        // A channel keeps separate conversations of its own.  A bot-to-bot DM
+        // has exactly one, and a workspace on "one conversation per channel"
+        // cannot add another, so each control appears only where it can work.
+        if case let .room(room) = current, !room.isBotToBot {
+            if session.config?.allowsMultipleBotThreads == true {
+                out.append(PlusAction(
+                    id: "room-task", systemImage: "plus.square.on.square", title: "New task",
+                    subtitle: "Start a fresh thread in \(room.name)",
+                    disabled: session.state.roomTaskChangesBlocked(room)
+                ) { Task { await session.createRoomTask(for: room, title: nil) } })
+            }
+            if session.config?.allowsMultipleBotThreads == true || (room.tasks?.count ?? 0) > 1 {
+                out.append(PlusAction(
+                    id: "room-tasks", systemImage: "square.stack", title: "Tasks",
+                    subtitle: "Switch, rename or remove one"
+                ) { showingTasks = true })
+            }
+        }
         out.append(PlusAction(
             id: "share", systemImage: "doc.plaintext", title: "Share transcript",
             subtitle: "This chat as Markdown"
@@ -983,7 +1022,7 @@ struct ChatView: View {
                     isVisible: $showCommandHUD,
                     commands: current.isBot
                         ? CommandSkillHUDView.defaultCommands
-                        : CommandSkillHUDView.defaultCommands.filter { $0.id != "computer" && $0.id != "tasks" },
+                        : CommandSkillHUDView.defaultCommands.filter { $0.id != "computer" && ($0.id != "tasks" || current.isBotToBot) },
                     accentColor: BotPalette.color(current.color)
                 ) { command in
                     switch command.id {
@@ -1155,6 +1194,41 @@ struct ChatView: View {
             Task { await addDropItems(providers) }
             return true
         }
+    }
+
+    /// What replaces the composer while the bot is Off (`shared/bot-power.ts`):
+    /// the disabled notice and one button, Turn On.  The two-space gap is a
+    /// non-breaking space plus a space so the layout cannot collapse it.
+    private func offComposer(for bot: Bot) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "power")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color.secondary)
+                .accessibilityHidden(true)
+            Text("This bot is off.\u{00A0} Turn it on to chat.")
+                .font(.system(size: 15))
+                .foregroundStyle(Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button {
+                Task { _ = await session.updateProfile(BotProfilePatch(off: false), for: bot) }
+            } label: {
+                Text("Turn On")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Capsule().fill(BubbleColor.mine))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Turn on \(bot.name)")
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 52)
+        .glassRounded(cornerRadius: 18, interactive: false)
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+        .accessibilityElement(children: .contain)
     }
 
     private func pasteFromClipboard() {
@@ -2193,12 +2267,47 @@ struct CardView: View {
     let message: Message
     @EnvironmentObject private var session: Session
     @State private var answering = false
+    @State private var approvingAll = false
 
     /// One definition of "the refusal", shared by the button tint and the
     /// choice above so the two cannot drift apart.
     private static func isRefusal(_ option: String) -> Bool { OptionCard.isRefusal(option) }
 
     private var tint: Color { BotPalette.color(chat.color) }
+
+    /// How many waiting permission requests "Approve All" would allow, when
+    /// this is the card that carries the button.  One card per conversation
+    /// carries it — the newest, beside the composer — and only once there are
+    /// two or more, as on the desktop.
+    private var approveAllCount: Int? {
+        guard message.card?.isPending == true, message.card?.isPermission == true else { return nil }
+        let offer = ApproveAll.offer(in: session.state.visibleTranscript(forThread: chat.threadId))
+        guard let offer, offer.messageId == message.id else { return nil }
+        return offer.count
+    }
+
+    @ViewBuilder
+    private func approveAllButton(count: Int) -> some View {
+        Button {
+            answering = true
+            approvingAll = true
+            Task {
+                await session.approveAll(chat: chat)
+                approvingAll = false
+                answering = false
+            }
+        } label: {
+            Text(ApproveAll.label(count: count))
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(maxWidth: .infinity)
+                .frame(height: 40)
+                .background(Capsule().strokeBorder(tint, lineWidth: 1.5))
+        }
+        .buttonStyle(.plain)
+        .disabled(answering || approvingAll)
+        .accessibilityHint(ApproveAll.hint)
+    }
 
     var body: some View {
         if let card = message.card {
@@ -2251,6 +2360,9 @@ struct CardView: View {
                     }
                     .padding(.top, 2)
 
+                    if let count = approveAllCount {
+                        approveAllButton(count: count)
+                    }
                 } else if let answered = card.answered {
                     Label(answered, systemImage: "checkmark.circle")
                         .font(.system(size: 14))

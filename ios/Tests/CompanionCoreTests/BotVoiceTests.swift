@@ -24,8 +24,21 @@ final class BotVoiceTests: XCTestCase {
             var expected: Bool
         }
 
+        struct LabelCase: Decodable {
+            struct ListedVoice: Decodable {
+                var id: String
+                var label: String
+            }
+
+            var name: String
+            var defaultVoice: String?
+            var voices: [ListedVoice]?
+            var expected: String
+        }
+
         var voiceForDevice: [VoiceCase]
         var isPersonalVoiceId: [PersonalCase]
+        var defaultVoiceOptionLabel: [LabelCase]
     }
 
     private func fixture() throws -> Fixture {
@@ -54,6 +67,15 @@ final class BotVoiceTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(cases.count, 8)
         for item in cases {
             XCTAssertEqual(BotVoice.isPersonalVoiceId(item.id), item.expected, String(describing: item.id))
+        }
+    }
+
+    func testDefaultVoiceOptionLabelMatchesTheSharedFixture() throws {
+        let cases = try fixture().defaultVoiceOptionLabel
+        XCTAssertGreaterThanOrEqual(cases.count, 8)
+        for item in cases {
+            let voices = item.voices?.map { Voice(id: $0.id, label: $0.label) }
+            XCTAssertEqual(BotVoice.defaultOptionLabel(item.defaultVoice, voices: voices), item.expected, item.name)
         }
     }
 

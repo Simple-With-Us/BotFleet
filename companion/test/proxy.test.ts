@@ -349,7 +349,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     expect(safe.status).toBe(200);
     expect(safe.body.bot).toMatchObject({ title: "Paired title", notifications: false });
 
-    for (const field of ["autoApprove", "autoReview", "approvePeerComms", "composio", "userNotes"]) {
+    for (const field of ["composio", "userNotes"]) {
       const denied = await device("PATCH", `/api/bots/${botId}/profile`, {
         body: { title: "must not apply", [field]: true },
       });
@@ -410,6 +410,111 @@ describe("the sidecar in front of an unmodified harness", () => {
       expect(dropped.status).toBe(403);
       expect(dropped.body.error).toBe(thisMacRefusal);
       expect((await botNow()).computers).toEqual(["cloud", "vm", "local"]);
+    } finally {
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+    }
+  });
+
+  it("lets the phone set Auto Mode, Auto Review, peer-contact approval and Bypass Permissions, but not put a bot that can use This Mac in Auto Mode", async () => {
+    // Owner ruling 2026-10-09: bots get bypass permissions from the phone too.
+    // Host control stays the computer's: Auto Mode is the one switch that lets
+    // a click on the real desktop go unasked, and the warning dialog for that
+    // pair is the Mac's.  Bypass never answers a host-control request
+    // (server/auto-approve.ts), so it is the phone's on every bot.
+    const botId = await createHarnessBot();
+    const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
+    const botNow = async () =>
+      (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
+    const loopback = (body: Record<string, unknown>) =>
+      fetch(`${HARNESS}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const autoOnThisMac =
+      "Auto Mode can only be turned on in BotFleet on your computer for a bot that can use This Mac";
+    try {
+      // A new bot is on Auto, which on a Mac may reach the desktop.  Name its
+      // sandboxed computers so the answer does not depend on the machine
+      // running this test.
+      expect((await profile({ computers: ["cloud", "vm"] })).status).toBe(200);
+
+      const set = await profile({
+        autoApprove: true,
+        autoReview: "enforce",
+        approvePeerComms: true,
+        bypassPermissions: true,
+      });
+      expect(set.status).toBe(200);
+      expect(set.body.bot).toMatchObject({
+        autoApprove: true,
+        autoReview: "enforce",
+        approvePeerComms: true,
+        bypassPermissions: true,
+      });
+      expect(await botNow()).toMatchObject({ autoApprove: true, bypassPermissions: true, autoReview: "enforce" });
+
+      // The values are the harness's to validate, and a bad one writes nothing.
+      for (const bad of [{ autoApprove: "yes" }, { bypassPermissions: 1 }, { autoReview: "always" }, { approvePeerComms: null }]) {
+        const refused = await profile({ title: "must not apply", ...bad });
+        expect(refused.status, JSON.stringify(bad)).toBe(400);
+      }
+      expect((await botNow()).title).not.toBe("must not apply");
+
+      // Off is always the phone's to do.
+      const off = await profile({ autoApprove: false, bypassPermissions: false, autoReview: "off", approvePeerComms: false });
+      expect(off.status).toBe(200);
+      expect(await botNow()).toMatchObject({ autoApprove: false, bypassPermissions: false, autoReview: "off" });
+
+      // The computer hands the bot This Mac.  The phone still cannot put it in
+      // Auto Mode, and nothing in the same save is written.
+      expect((await loopback({ computers: ["vm", "local"] })).status).toBe(200);
+      const refused = await profile({ title: "must not apply", autoApprove: true, bypassPermissions: true });
+      expect(refused.status).toBe(403);
+      expect(refused.body.error).toBe(autoOnThisMac);
+      const afterRefusal = await botNow();
+      expect(afterRefusal.title).not.toBe("must not apply");
+      expect(afterRefusal.autoApprove).not.toBe(true);
+      expect(afterRefusal.bypassPermissions).not.toBe(true);
+      // Bypass, review mode and peer-contact approval do not let a click on
+      // the desktop go unasked, so they stay the phone's on this bot too.
+      const others = await profile({ bypassPermissions: true, autoReview: "shadow", approvePeerComms: true });
+      expect(others.status).toBe(200);
+      expect(others.body.bot).toMatchObject({ bypassPermissions: true, autoReview: "shadow", approvePeerComms: true });
+      // Bypass is not a stand-in for the Mac's warning: a bot in bypass is not
+      // "already in Auto Mode", so Auto Mode is still refused.
+      const stillRefused = await profile({ autoApprove: true });
+      expect(stillRefused.status).toBe(403);
+      expect(stillRefused.body.error).toBe(autoOnThisMac);
+      // Taking This Mac away is still refused, as before.
+      const dropped = await profile({ computers: ["vm"], bypassPermissions: false });
+      expect(dropped.status).toBe(403);
+      expect(dropped.body.error).toBe("This Mac can only be turned on or off in BotFleet on your computer");
+      expect((await botNow()).bypassPermissions).toBe(true);
+
+      // The phone-set bypass is not a stand-in on the computer's own route
+      // either: Auto Mode without the acknowledgement is refused there too,
+      // and the dialog's request, which carries it, is accepted.
+      const unacknowledged = await loopback({ autoApprove: true });
+      expect(unacknowledged.status).toBe(400);
+      expect(JSON.parse(await unacknowledged.text())).toEqual({
+        error: "Auto mode on this computer requires confirming the warning first (acknowledgeLocalAuto)",
+      });
+      expect((await botNow()).autoApprove).not.toBe(true);
+      // A rename or re-save that does not turn Auto Mode on is left alone.
+      expect((await loopback({ title: "renamed on the computer" })).status).toBe(200);
+
+      // The computer answers its own warning.  A bot it put in Auto Mode on
+      // This Mac keeps the phone's switches: re-saving is not a new pair.
+      const acknowledged = await loopback({ autoApprove: true, acknowledgeLocalAuto: true });
+      expect(acknowledged.status).toBe(200);
+      expect((await profile({ autoApprove: true })).status).toBe(200);
+      expect((await profile({ autoApprove: false, bypassPermissions: false })).status).toBe(200);
+      // Off, then on again, is a new pair: the Mac's dialog again.
+      const again = await profile({ autoApprove: true });
+      expect(again.status).toBe(403);
+      expect(again.body.error).toBe(autoOnThisMac);
+      expect((await profile({ bypassPermissions: true })).status).toBe(200);
     } finally {
       await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
     }

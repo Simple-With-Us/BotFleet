@@ -47,8 +47,8 @@ export function isCloudDesktopJoin(method: string, path: string): boolean {
 }
 
 /** The profile fields a paired phone owns.  Engine choice is deliberately
- * included: the native model picker is a companion feature.  Execution
- * policy, connected apps, and host paths remain Mac-only.
+ * included: the native model picker is a companion feature.  Connected apps
+ * and host paths remain Mac-only.
  *
  * `computers` is on the list since 2026-10-08, and only partly.  The phone
  * may switch the sandboxed destinations (cloud, vm).  Whether the bot holds
@@ -65,10 +65,25 @@ export function isCloudDesktopJoin(method: string, path: string): boolean {
  * computer already shares with a bot or room, as a room folder set from the
  * phone is confined, and anything else is a 403 with the reason.
  *
- * Still refused, on purpose, until the owner rules: `autoApprove`,
- * `autoReview` and `approvePeerComms`.  They decide what runs unattended and
- * who a bot may contact without asking, which #323 kept off the phone (audit
- * BF-IOS-001).  The native sheet shows them read-only. */
+ * `autoApprove`, `autoReview`, `approvePeerComms` and `bypassPermissions` are
+ * on the list since 2026-10-09, by owner ruling.  Asked whether the phone may
+ * change the execution policy, with "as close to full parity as possible" as
+ * the standing goal, the owner answered "Bots should have bypass permissions
+ * options too or YOLO or whatever."  #323 (audit BF-IOS-001) had kept all of
+ * them on the computer, and the native sheet showed them read-only.  What did
+ * NOT move is host control of the person's real desktop:
+ *   - The harness profile route refuses to turn Auto-Approve ON for a bot that
+ *     can use This Mac, with the same acknowledgement rule the desktop applies
+ *     (`localAutoAcknowledgementError` in server/index.ts).  Auto-Approve is the
+ *     one switch that lets a click on the real desktop go unasked, and its
+ *     warning dialog is the Mac's, so a phone cannot create that pair.  Like
+ *     `computers`, that check needs the stored bot and lives there rather than
+ *     here.  Turning it off is always the phone's.
+ *   - Bypass Permissions never answers a request that controls This Mac
+ *     (server/auto-approve.ts excludes `scope === "local-computer"`), so host
+ *     control still asks even on a bot the phone put in bypass, and the phone
+ *     may switch it on for any bot.
+ *   - The This Mac grant itself is still the Mac's alone (see `computers`). */
 export const COMPANION_PROFILE_PATCH_FIELDS = [
   "name",
   "title",
@@ -87,6 +102,18 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "computers",
   "maxToolRounds",
   "cwd",
+  // Execution policy, open to the phone by the 2026-10-09 owner ruling above.
+  // The harness validates each value, and refuses to turn autoApprove ON for
+  // a bot that can use This Mac.
+  "autoApprove",
+  "autoReview",
+  "approvePeerComms",
+  "bypassPermissions",
+  // The bot's On/Off switch (shared/bot-power.ts).  It only ever stops or
+  // resumes work the person could already start by messaging the bot, grants
+  // no capability, and the phone has to be able to turn a bot back On: the
+  // disabled composer's one button is Turn On.
+  "off",
 ] as const;
 
 const COMPANION_PROFILE_PATCH_FIELD_SET = new Set<string>(COMPANION_PROFILE_PATCH_FIELDS);
@@ -188,6 +215,12 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // workspace MiniMax key; the phone receives labels or audio only.
   { method: "GET", path: /^\/api\/tts\/voices$/ },
   { method: "POST", path: /^\/api\/tts\/speak$/ },
+  // The workspace default voice and the pronunciation list: settings, not
+  // credentials.  Each is its own narrow harness route that validates and
+  // saves only that field, the way terminology does, so /api/config (which
+  // carries the voice key) stays write-closed to a phone.
+  { method: "PATCH", path: /^\/api\/tts\/default-voice$/ },
+  { method: "PATCH", path: /^\/api\/tts\/pronunciations$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio\/\d+$/ },
 
@@ -206,15 +239,20 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "PATCH", path: /^\/api\/routines\/[\w-]+$/ },
   { method: "DELETE", path: /^\/api\/routines\/[\w-]+$/ },
   { method: "POST", path: /^\/api\/routines\/[\w-]+\/run$/ },
+  // Run receipts: stop one that is queued, running or waiting, and mark a
+  // failure as seen.  Both act on a run that already exists and neither
+  // creates, edits or deletes a routine, so a lost phone gains no new reach.
+  // The bare `POST /api/routine-runs/seen` is the "mark every failure seen"
+  // sweep; it clears the badge and keeps every run, status and error.
+  { method: "POST", path: /^\/api\/routine-runs\/[\w-]+\/(?:cancel|seen)$/ },
+  { method: "POST", path: /^\/api\/routine-runs\/seen$/ },
 
   // Checking for a newer BotFleet and installing it.  The phone is the one
   // place an update is convenient to start — the Mac is usually mid-work when
-  // someone notices a build is stale.  `POST /api/update/run` takes the same
-  // runtime-readiness reading `POST /api/runtime/quiesce` takes and answers
-  // 409 while any turn, queued send or routine run is in flight, so a tap
-  // from a pocket does not interrupt work; `{ "force": true }` talks past
-  // that check, and the updater's own preflight then refuses instead.
-  // `status` is a read; `check` and `run` are the two actions.
+  // someone notices a build is stale.  A busy Mac does not refuse: the
+  // updater holds new work, gives running bots a short grace, then pauses
+  // and resumes what is left (server/update-drain.ts); `{ "force": true }`
+  // skips the grace.  `status` is a read; `check` and `run` are the two actions.
   { method: "GET", path: /^\/api\/update\/status$/ },
   { method: "POST", path: /^\/api\/update\/check$/ },
   { method: "POST", path: /^\/api\/update\/run$/ },

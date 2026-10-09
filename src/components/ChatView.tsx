@@ -39,6 +39,7 @@ import {
   type Message,
 } from "@/state/store";
 import { BotAvatar, BotMascot } from "./Avatar";
+import { BotOffBadge } from "./BotOffBadge";
 import { usePageVisible } from "@/lib/page-visible";
 import { ProviderMark } from "./ProviderIcons";
 import { TurnPresence } from "./TurnPresence";
@@ -306,7 +307,9 @@ function Bubble({
   const spokenRef = useRef<HTMLDivElement>(null);
   const speakable = message.role === "bot" && message.kind === "text";
   const writtenSource = useMemo(() => (speakable ? writtenReply(message.text ?? "") : ""), [speakable, message.text]);
-  useMessageKaraoke(spokenRef, message.id, writtenSource, speakable);
+  // The workspace pronunciation list, so a respelled term ("sequel") lights
+  // up the term on screen ("SQL").
+  useMessageKaraoke(spokenRef, message.id, writtenSource, speakable, state.config?.tts?.pronunciations);
   const playRecording = () => {
     if (recordingAudio.current) {
       recordingAudio.current.pause();
@@ -1539,6 +1542,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
               <span className="@max-2xl/chathead:hidden">Chief of Staff</span>
             </span>
           )}
+          {bot.off === true && <BotOffBadge />}
           {bot.busy && <Loader2 size={14} className="shrink-0 animate-spin text-ink-secondary" />}
         </div>
         <div style={noDragStyle} className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 md:gap-2">

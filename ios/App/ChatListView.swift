@@ -34,6 +34,9 @@ struct ChatListView: View {
     @FocusState private var searchFocused: Bool
     /// Drives the live-session "Open BotFleet on Mac" header control.
     @State private var isOpeningMacApp = false
+    /// DEBUG `-store-preview -open-settings`: land on Settings, for the
+    /// screenshot harness.
+    @State private var showingDebugSettings = false
 
     /// Room for the floating bar, so the last row can scroll clear of it.
     private static let barClearance: CGFloat = 96
@@ -75,6 +78,7 @@ struct ChatListView: View {
                 NavigationStack(path: $path) {
                     roster
                         .navigationDestination(for: Chat.self) { ChatView(chat: $0) }
+                        .navigationDestination(isPresented: $showingDebugSettings) { SettingsView() }
                 }
             }
         }
@@ -99,6 +103,9 @@ struct ChatListView: View {
             if ProcessInfo.processInfo.arguments.contains("-open-first"),
                let first = chats.first {
                 open(first.chat)
+            }
+            if ProcessInfo.processInfo.arguments.contains("-open-settings") {
+                showingDebugSettings = true
             }
         }
 #endif
@@ -811,7 +818,12 @@ struct ChatRow: View {
             .frame(maxHeight: .infinity)
 
             HStack(alignment: .top, spacing: 14) {
+                // An Off bot keeps its place in the list, dimmed and grey, so
+                // it reads as switched off rather than merely quiet.
                 ChatAvatarView(chat: chat, size: 52, state: state, animated: state.showsActivity)
+                    .opacity(chat.isOff ? 0.5 : 1)
+                    .saturation(chat.isOff ? 0 : 1)
+                    // After the dimming, so the provider badge stays legible on an Off bot.
                     .providerBadge(for: chat, avatarSize: 52)
                     .padding(.top, 12)
 
@@ -822,6 +834,16 @@ struct ChatRow: View {
                             .foregroundStyle(Color.primary)
                             .lineLimit(1)
                             .layoutPriority(1)
+
+                        if chat.isOff {
+                            Text("Off")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Color.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.secondary.opacity(0.18)))
+                                .accessibilityLabel("Off")
+                        }
 
                         // the bot's job, the way the desktop shows it
                         if !chat.subtitle.isEmpty {

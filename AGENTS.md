@@ -73,6 +73,14 @@ Plans, designs, reviews, handoffs, rollouts, and completion notes also go to App
 
 Two spaces between sentences in every paragraph a human reads: product UI, App Store fields, docs, PR bodies, commit messages, Slack posts, Apple Notes, this file (`&nbsp; ` inside HTML strings).  Title Case headings.  System theme is the first-visit default (follows OS appearance; marketing captures default light).  The product word is "bot", not "agent".  No agent seat names on public surfaces (botfleet.app, App Store, TestFlight notes).  Timestamps in Central Time.
 
+**HOW to emit it so it's actually visible (owner ruling 2026-10-08, every agent on every platform):**  intent is not enough, the gap has to survive the renderer.  Pick by destination.
+
+- **Chat reply in a Markdown-rendering pane** (the Claude Code desktop app Code tab, owner-verified 2026-10-08; other agent chat panes by the same ruling, not individually verified): type the literal HTML entity text `&nbsp;` right after the period, then a normal space, outside code spans, as in `Sentence one.&nbsp; Sentence two.`  The renderer decodes it into a visibly wider gap.  Two literal spaces collapse, and a raw U+00A0 typed by the model arrives as a plain space.
+- **GitHub PR and issue titles, bodies and comments, review comments, and Zulip posts** (anything a tool writes that a Markdown or HTML renderer then shows): a real U+00A0 plus a space after each sentence.  Never the `&nbsp;` entity there, because GitHub can copy a PR body into a plain-text squash commit, where the entity would show literally.
+- **Plain-text surfaces** (git commit messages, source files and repo docs read as source, terminal output, terminal TUI chat, Slack): two literal ASCII spaces.  Do not write `&nbsp;` or U+00A0 into files.  A terminal TUI chat is unverified, and a terminal would print the entity literally.
+- **HTML, JSX and SwiftUI product copy:** a real U+00A0 plus a space, or a shared `SENTENCE_GAP` constant.
+- The owner must never see the six characters `&nbsp;`.  If a chat surface shows them, stop using the entity there and report the surface in #agent-sync, because that surface then needs a different mechanism, which is unknown until tested.  When a surface is known to collapse two typed spaces, use its working mechanism without asking.
+
 ## App Icon And Logo Policy: Full-Bleed Square Only, Never Squircle
 
 **Never generate or deliver app icons or logos solely in a pre-baked squircle format.**  All icon assets and design explorations must be generated as standard, uncropped, full-bleed 1:1 squares with 90° sharp corners.  (Channel and avatar crops inside the app are a different thing and may be rounded.)
@@ -104,7 +112,7 @@ Naming convention `app.<name>.<platform>` for executables, `app.<name>` for the 
 | macOS Speech helper | `app.botfleet.speech.macos` | `electron/resources/speech-helper-Info.plist` |
 | Always-on LaunchAgent (harness) | `app.botfleet.server` | `~/Library/LaunchAgents/app.botfleet.server.plist` `Label` |
 | iOS app | `app.botfleet.ios` (ASC appleId `6820175685`) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `ios/Sources/CompanionCore/TestFlightUpdateCheck.swift`, `scripts/ios-fleet/apps.json` |
-| iOS widgets | `app.botfleet.ios.widgets` (register in ASC before widget ships) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |
+| iOS widgets | `app.botfleet.ios.widgets` (registered in Developer Portal) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |
 | App group | `group.app.botfleet` | `ios/App/BotFleet.entitlements`, `ios/Widgets/BotFleetWidgets.entitlements` |
 | Associated domain | `botfleet.app` (Universal Links + web credentials) | `ios/project.yml` `com.apple.developer.associated-domains` |
 

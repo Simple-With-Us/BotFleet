@@ -9,6 +9,8 @@ import { z } from 'zod';
 // - The per-device pickers (&variant=per-device): this Mac speaks its own
 //   Personal Voice, and the iPhone's Personal Voice is shown greyed with the
 //   reason.
+// - The workspace sections: the Default Voice picker by name (never a
+//   Personal Voice) and the Pronunciations list, two fields a row.
 // There is no visual-tests/ directory; this follows tests/e2e/visual.spec.ts.
 const stableShot = { animations: 'disabled', caret: 'hide', maxDiffPixelRatio: 0.02, threshold: 0.2 } as const;
 
@@ -32,7 +34,23 @@ const config = {
   box: { configured: false },
   vps: { configured: false, sshAlias: '' },
   rooms: { turnTimeoutMinutes: 30 },
-  tts: { provider: 'minimax', configured: true, ready: true, voice: 'standard-default' },
+  tts: {
+    provider: 'minimax',
+    configured: true,
+    ready: true,
+    voice: 'jay-wedgeworth-001',
+    pronunciations: [
+      { term: 'JSON', say: 'Jason' },
+      { term: 'SaaS', say: 'sass' },
+      { term: 'SQL', say: 'sequel' },
+      { term: 'REGEX', say: 'redge ex' },
+      { term: 'GUI', say: 'gooey' },
+      { term: 'CAPTCHA', say: 'cap cha' },
+      { term: 'sudo', say: 'soo doo' },
+      { term: 'cron', say: 'kron' },
+      { term: 'OAuth', say: 'oh auth' },
+    ],
+  },
 };
 
 test('visual: Personal Voice denial after a personal: voice id is submitted', async ({ page }) => {
@@ -171,4 +189,58 @@ test('visual: a Personal Voice on this Mac and the iPhone\'s own, side by side',
   await expect(board.getByText(/Personal Voice from your iPhone\.\s+Choose it on the iPhone\./).first()).toBeVisible();
 
   await expect(board).toHaveScreenshot('voice-settings-per-device.png', stableShot);
+});
+
+test('visual: the workspace Default Voice by name, and the Pronunciations list', async ({ page }) => {
+  await page.route('**/api/**', async (route) => {
+    const url = route.request().url();
+    const method = route.request().method();
+    if (url.includes('/api/tts/voices') && method === 'GET') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          voices: [
+            // A clone with no friendly label: shown as the id made readable.
+            { id: 'jay-wedgeworth-001', label: 'jay-wedgeworth-001', description: 'Custom' },
+            { id: 'English_Graceful_Lady', label: 'Graceful Lady', description: 'Standard · Female' },
+            // Device-local: never offered as the default.
+            { id: 'personal:Jay', label: "Jay's Personal Voice", description: 'Apple Personal Voice' },
+          ],
+        }),
+      });
+      return;
+    }
+    if (url.includes('/api/config') && method === 'GET') {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(config) });
+      return;
+    }
+    await route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
+  });
+
+  await page.goto('/?fixture=voice-settings-personal');
+  await pinFonts(page);
+
+  const board = page.getByTestId('voice-settings-board');
+  await expect(board).toBeVisible();
+  await expect(board.getByText('Loading voices…')).toHaveCount(0);
+
+  const defaultVoice = board.getByTestId('default-voice');
+  const picker = defaultVoice.getByRole('combobox', { name: 'Default voice for every bot' });
+  await expect(picker).toHaveValue('jay-wedgeworth-001');
+  await expect(picker.locator('option[value="jay-wedgeworth-001"]')).toHaveText('Jay Wedgeworth 001 — Custom');
+  await expect(picker.locator('option[value="personal:Jay"]')).toHaveCount(0);
+  await expect(defaultVoice.getByText(/Personal Voices stay on the device that made them/)).toBeVisible();
+  // Every per-device picker's default option says which voice it is.
+  const mac = board.getByRole('combobox', { name: "Assistant's voice on this Mac" });
+  await expect(mac.locator('option[value=""]')).toHaveText('Jay Wedgeworth 001 (default)');
+
+  const pronunciations = board.getByTestId('pronunciations');
+  await expect(pronunciations.getByRole('textbox', { name: /^Term / })).toHaveCount(9);
+  await expect(pronunciations.getByRole('textbox', { name: 'Term 3' })).toHaveValue('SQL');
+  await expect(pronunciations.getByRole('textbox', { name: 'Say SQL as' })).toHaveValue('sequel');
+  await expect(pronunciations.getByRole('button', { name: 'Save Pronunciations' })).toBeDisabled();
+
+  await expect(defaultVoice).toHaveScreenshot('workspace-default-voice.png', stableShot);
+  await expect(pronunciations).toHaveScreenshot('workspace-pronunciations.png', stableShot);
 });

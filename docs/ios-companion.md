@@ -260,9 +260,25 @@ the computer would refuse.
 - Working folder: from a paired phone it may only reuse or narrow a folder this
   computer already shares with a bot or room, the same confinement a room
   folder gets.  Anything else is a 403 that says so.
-- Computer-only, pending the owner's ruling: Automatic approvals, Auto review,
-  and Ask before contacting other bots.  The sheet shows their current values
-  read-only.
+- Execution policy, open to the phone since the owner's ruling of 2026-10-09
+  ("Bots should have bypass permissions options too or YOLO or whatever"):
+  Auto Mode (`autoApprove`), Auto Review (`autoReview`: off, watch, on), Ask
+  Before Contacting Other Bots (`approvePeerComms`) and Bypass Permissions
+  (`bypassPermissions`).  #323 had kept all of them on the computer.
+  - Bypass Permissions asks first, with a short form of the desktop's warning,
+    and a bot that has it on carries a **Bypass** mark beside its name in the
+    chat header.  It answers every request the engine raises, destructive and
+    credential-file ones included, and ones from webhook turns, except a
+    request that controls This Mac, which still asks
+    (`server/auto-approve.ts`).  The sheet says so on the engines where it
+    changes nothing or works differently (`shared/bypass-coverage.ts`, shipped
+    as `capabilities.bypassCoverage`).
+  - Auto Mode is the one switch the phone cannot turn ON for a bot that can
+    use This Mac: it is what lets a click on the real desktop go unasked, and
+    its warning dialog is the computer's.  The harness refuses with a 403
+    (`PAIRED_AUTO_ON_THIS_MAC_ERROR`), and turning it off always works.
+  - Auto Review's On and Watch, and the peer-contact switch, follow the
+    engine's `approvalReview` and `agentsMcp` capabilities, as on the desktop.
 
 Intentionally refused:
 
