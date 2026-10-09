@@ -307,6 +307,7 @@ import { jobsPrompt, noticeWithoutJobTools } from "./jobs/prompt.ts";
 import { JobRegistry, resolveJobsSettings } from "./jobs/registry.ts";
 import { JobWakeCoordinator } from "./jobs/wake.ts";
 import { ZulipHub } from "./zulip/hub.ts";
+import { cachedVaultReader } from "./zulip/credentials.ts";
 import { zulipToolsMounted } from "./zulip/mount.ts";
 import { zulipPeerScreenRules } from "./zulip/format.ts";
 import type { ZulipOrigin } from "./zulip/types.ts";
@@ -16005,6 +16006,10 @@ console.log(`botfleet server ready on http://127.0.0.1:${PORT}`);
 zulipHub = new ZulipHub({
   dataDir: DATA_DIR,
   settings: () => cfg.zulip,
+  // `credentialSource: "infisical"` only: one read of BotFleet's own vault
+  // folder per 15 minutes, shared by every bot.  The keys stay in the hub's
+  // memory, never in `cfg`, `process.env` or a log (docs/zulip.md, D0).
+  vault: cachedVaultReader((secretPath) => infisical.readPath(secretPath)),
   botExists: (botId) => Boolean(store.bot(botId)),
   // A bot holding a crash marker is not free either: its interrupted turn
   // belongs to boot recovery (or to the person, for one left over the cap),

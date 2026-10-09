@@ -30,7 +30,7 @@ A BF bot can follow a topic, and a new message in a topic it follows wakes it th
 - **Posts are checked by the harness, not by the schema.**  `zulip_reply` always goes to the origin; the model cannot redirect it.  `zulip_post` needs a channel AND a topic (at most 58 characters, never the bot's own name), and the channel must be the origin's (any topic in it, so a new unit of work gets its own topic) or one listed in `zulip.postChannels`.  A DM (`zulip_post` with `dm_user_id`) may go to the person whose 1:1 DM started the turn, or to any active realm member who is the owner or a bot, looked up in the member list the session cached at register (kept current by `realm_user` events).  It is refused for the bot itself, an incoming-webhook bot, a deactivated or unknown user (the check fails closed), and a person who is not the owner.  DMs that are not replies to the DM that woke the turn are capped per bot per hour (`budgets.dmsPerHour`, default 20, persisted in the bot's state file), and the log names the recipient's id, never the text.  Text that looks like a secret (any loaded Zulip key or its Basic token, anything `redactSecretsInText` would mask, a 32-character mixed-case token) is refused in the content and in a new topic, and the refusal names the kind of match, never the text.
 - **Every post carries the role tag** on its first line, added by the harness: `[BF-PLUMBER] …`.  The casing is one function (`zulipTag` in `server/zulip/format.ts`).
 - **Budgets and the loop guard.**  Peer wakes are capped per bot per hour (default 6) and per topic per hour (default 2).  After 4 peer wakes in one topic with no message from Jay there, the topic stops waking the bot until Jay speaks in it.  Jay cannot speak in a peer's DM with the bot, so a DM conversation's chain resets after an hour with no peer wake in it instead.  Owner wakes have their own hourly cap (default 30).  Peer messages older than 30 minutes (backfill after an outage) do not wake; Jay's do.  The rolling spend ceiling holds peer work, never Jay's.
-- **Keys stay out of reach.**  A key lives only in the session and in the Authorization header.  It never enters `process.env`, so no spawned CLI inherits it, and every client error is scrubbed of it.  The auto-approve sensitive list cards any read of `~/.secrets/` or a `*-zuliprc` file, so one bot cannot read another role's key without Jay approving it.
+- **Keys stay out of reach.**  A key lives only in the session and in the Authorization header (and, with the Infisical source, in the hub's in-memory read of the vault folder).  It never enters `process.env` or `cfg`, so no spawned CLI inherits it, and every client error is scrubbed of it.  The auto-approve sensitive list cards any read of `~/.secrets/` or a `*-zuliprc` file, so one bot cannot read another role's key without Jay approving it.
 
 ## Restarts and Outages
 
@@ -48,7 +48,11 @@ State is kept per bot in `~/.botfleet/zulip/<botId>.json` (mode 600): a message-
 
 Do these in order.  Nothing below runs until `zulip.enabled` is `true`.
 
-1. **Keys.**  Each BF bot already exists on the realm (owner-created).  Put each bot's zuliprc in one folder, named `<Role>-zuliprc` (`BF-Plumber-zuliprc`), mode 600:
+1. **Keys.**  Each BF bot already exists on the realm (owner-created).  Two sources are built, and neither is on until the owner picks one (Open Decisions, D0).
+
+   **The Infisical source.**  Put `ZULIP_<ROLE>_EMAIL` and `ZULIP_<ROLE>_API_KEY` (`ZULIP_BF_PLUMBER_EMAIL`, `ZULIP_BF_PLUMBER_API_KEY`; an optional `ZULIP_<ROLE>_SITE`, else the realm) in the `/zulip` folder of BotFleet's own Infisical project, in the environment its machine identity reads, and set `"credentialSource": "infisical"` (and `"infisicalPath"` for another folder).  The hub reads that folder through the harness's InfisicalManager (`readPath`), at most once per 15 minutes for all bots, and keeps the values in memory only:  never in the Infisical snapshot, `cfg`, `process.env`, a log or the status view.  Infisical must be configured and turned on in Settings.
+
+   **The file source.**  Put each bot's zuliprc in one folder, named `<Role>-zuliprc` (`BF-Plumber-zuliprc`), mode 600, and set `credentialDir`:
 
    ```ini
    [api]
@@ -57,7 +61,9 @@ Do these in order.  Nothing below runs until `zulip.enabled` is `true`.
    site=https://simplewithus.zulipchat.com
    ```
 
-   On Jay's Mac these files are in `~/.secrets/Zulip/`.  See Open Decisions: BotFleet does not read that folder until the owner names it in `zulip.credentialDir`.
+   On Jay's Mac these files are in `~/.secrets/Zulip/`.  BotFleet does not read that folder until the owner names it in `zulip.credentialDir`, and `AGENTS.md` does not allow it today (D0).
+
+   With `credentialSource` unset, a `credentialDir` means the file source and nothing else means no source.  `"credentialSource": "infisical"` wins over a `credentialDir`; `OMB_ZULIP_CREDENTIAL_DIR` (tests and soak rigs) wins over both.
 2. **Subscriptions.**  An event queue delivers only channels the bot is subscribed to.  Subscribe each BF bot to the channels where it should be woken (the fleet guide's Bot Setup step 5).  BotFleet does not subscribe bots itself.
 3. **Bot ids.**  `GET http://127.0.0.1:8799/api/bots` lists each bot's `id`.  The mapping is by id, never by display name.
 4. **Jay's user id.**  From Zulip (his profile, or `GET /api/v1/users`).
@@ -87,7 +93,7 @@ Do these in order.  Nothing below runs until `zulip.enabled` is `true`.
 
 `peerDmAllow` is retired: a peer's DM no longer needs an allowlist.  It never shipped on `main`, so no stored config carries it, and the settings parser drops the key if one does.
 
-Other settings: `autoReply` (`"final"` or `"off"`), `staleMinutes`, `budgets` (`dmsPerHour`, `peerWakesPerHour`, `peerWakesPerTopicPerHour`, `ownerWakesPerHour`, `peerChainLimit`), `realm`, `ownerClients`.
+Other settings: `credentialSource` (`"file"` or `"infisical"`), `infisicalPath` (default `/zulip`), `autoReply` (`"final"` or `"off"`), `staleMinutes`, `budgets` (`dmsPerHour`, `peerWakesPerHour`, `peerWakesPerTopicPerHour`, `ownerWakesPerHour`, `peerChainLimit`), `realm`, `ownerClients`.
 
 Environment overrides, for tests and soak rigs: `OMB_ZULIP_REALM`, `OMB_ZULIP_CREDENTIAL_DIR`, and `OMB_ZULIP_DISABLE=1` (a kill switch, read at boot and on every reconcile: with it set, no session runs).
 
@@ -116,11 +122,15 @@ All three are offered only to a bot whose Zulip session is connected, never in a
 
 ## Open Decisions and Follow-Ups
 
-- **D0, credentials (owner).**  `AGENTS.md` ("Secret Handoff") and `docs/secrets.md` say the product server does not read fleet handoff files.  The zuliprc files are runtime copies of the Infisical keys, but `credentialDir` therefore has no default: the file source is off until the owner sets it.  If the owner confirms that reading `~/.secrets/Zulip` is allowed, amend those two documents in the same change.  The planned second source is Infisical (the keys sit in the "AI Fleet Coordinator" project, `/zulip`; BotFleet's vault reads only the "BotFleet" project today).
+- **D0, credentials (owner).**  Where the BF bots' keys come from is the owner's call, and nothing is on until it is made.
+  - The keys live today in Infisical project "AI Fleet Coordinator", environment `prod`, folder `/zulip`, as `ZULIP_BF_<ROLE>_EMAIL` and `ZULIP_BF_<ROLE>_API_KEY`, with runtime copies in `~/.secrets/Zulip/BF-<Role>-zuliprc` on Jay's Mac.  BotFleet's own vault is its "BotFleet" project.
+  - **Option A, Infisical (built, fits the rules as written).**  Copy (or import by reference) those names into the BotFleet project's `/zulip` folder, in the environment BotFleet's machine identity reads, and set `"credentialSource": "infisical"`.  Rotation then has to reach both projects, unless the BotFleet folder imports from the AFC one.  The source reads the folder directly rather than through `server/secret-map.ts`'s table, because the names are per role and the values must stay out of `cfg`; the owner may want that recorded against the Infisical directive in `AGENTS.md`.
+  - **Option B, the file source (built, off).**  Set `credentialDir` to `~/.secrets/Zulip`.  `AGENTS.md` ("Secret Handoff") and `docs/secrets.md` say the product server does not read fleet handoff files, so this needs the owner's ruling and an amendment to those two documents in the same change.  This PR does not change them.
+  - **Precedence** when both are set: as built, `credentialSource: "infisical"` wins over `credentialDir`.
 - **Tag casing (owner).**  The harness writes `[BF-PLUMBER]` per the seat-tag rule; the fleet guide's example shows `[BF-Deployer]`.
 - **Model downgrade (owner).**  Zulip turns are unattended, so `unattendedModelDowngrade` moves them to the cheaper model, as it does for webhooks.  Background jobs have an owner ruling that exempts them; Zulip has none yet.
 - **Owner messages and stopped bots.**  Jay's Zulip messages run unattended and do not wake a bot he stopped in BotFleet.  Lifting either needs an owner ruling.
 - **Routine posts (owner).**  Scheduled and manual routine runs do not get the Zulip tools, even though their prompt is Jay's own.  If a routine should post to Zulip (a daily digest), that needs a ruling: mount them for `schedule` and `manual` runs, or card any post that does not go to an origin.
-- **Not built yet.**  Rollover for long-lived Zulip conversation tasks (routine tasks have it), topic re-keying on resolve, a Settings panel, `zulip_read_topic`, ack reactions, the Infisical credential source, and keeping a reply binding across a harness restart (a turn recovered after a restart does not auto-reply).
+- **Not built yet.**  Rollover for long-lived Zulip conversation tasks (routine tasks have it), topic re-keying on resolve, a Settings panel, `zulip_read_topic`, ack reactions, Zulip knobs in `server/knob-map.ts` (the budgets are config-file settings today), and keeping a reply binding across a harness restart (a turn recovered after a restart does not auto-reply).
 - **Director** has no Zulip bot, so it cannot be bound.
 - **Seat prompts** (`bots/_shared.md`, `server/seat-prompt.ts`) still tell bots to post to Slack.

@@ -1,12 +1,18 @@
-// Where a BF role bot's Zulip key comes from.
+// Where a BF role bot's Zulip key comes from.  Two implementations of
+// `ZulipCredentialSource`, and neither is on by default:
 //
-// One source today: a `<Role>-zuliprc` file in the folder `zulip.credentialDir`
-// names (INI `[api]` with email, key and site, mode 600).  The folder has NO
-// default on purpose: BotFleet's own rule is that the product server does not
-// read fleet handoff files (AGENTS.md "Secret Handoff", docs/secrets.md), so
-// the file source stays off until the operator points it at a folder.  An
-// Infisical-backed source is the planned second implementation of
-// `ZulipCredentialSource` (docs/zulip.md, follow-ups).
+//   - the file source: a `<Role>-zuliprc` file in the folder
+//     `zulip.credentialDir` names (INI `[api]` with email, key and site, mode
+//     600).  The folder has NO default on purpose: BotFleet's own rule is
+//     that the product server does not read fleet handoff files (AGENTS.md
+//     "Secret Handoff", docs/secrets.md), so it stays off until the operator
+//     points it at a folder.
+//   - the Infisical source: `ZULIP_<ROLE>_EMAIL` and `ZULIP_<ROLE>_API_KEY`
+//     (optionally `_SITE`) in one folder of BotFleet's own Infisical project
+//     (`zulip.infisicalPath`, default `/zulip`), read through the harness's
+//     InfisicalManager.  On only when `zulip.credentialSource` is
+//     "infisical".  Which source the fleet uses is an open owner decision
+//     (docs/zulip.md, Open Decisions D0).
 //
 // The key lives only in the returned object and in the client's
 // Authorization header.  It never enters `process.env` (so a spawned CLI
@@ -50,8 +56,14 @@ export function validZulipRole(role: string): boolean {
 export interface ZulipCredentialSource {
   /** A short, secret-free description for status ("file ~/.secrets/…"). */
   describe(role: string): string;
-  load(role: string): ZulipCredentials;
+  /** The role's credentials.  Throws ZulipCredentialError ("missing" when
+   *  the role is simply not set up there). */
+  load(role: string): ZulipCredentials | Promise<ZulipCredentials>;
 }
+
+/** Reads one folder of BotFleet's Infisical project: names to values, kept
+ *  in memory by the caller and nowhere else. */
+export type ZulipVaultReader = (secretPath: string) => Promise<ReadonlyMap<string, string>>;
 
 function expandHome(path: string): string {
   if (path === "~") return homedir();
@@ -139,13 +151,90 @@ export function fileCredentialSource(dir: string): ZulipCredentialSource {
   };
 }
 
+/** The vault names for one role: `BF-Plumber` -> `ZULIP_BF_PLUMBER_*`. */
+export function zulipVaultNames(role: string): { email: string; key: string; site: string } {
+  const stem = `ZULIP_${role.trim().toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+  return { email: `${stem}_EMAIL`, key: `${stem}_API_KEY`, site: `${stem}_SITE` };
+}
+
+export const ZULIP_DEFAULT_INFISICAL_PATH = "/zulip";
+
+/** The Infisical source.  `read` is the harness's InfisicalManager (wrap it
+ *  in `cachedVaultReader` so reconnects do not each hit the vault).  The
+ *  key stays in the returned object; error text names the vault names and
+ *  the folder, never a value.  Without a `_SITE` name the site is the
+ *  realm, and `verifyCredentialRealm` still checks it. */
+export function infisicalCredentialSource(
+  read: ZulipVaultReader,
+  opts: { path?: string; realm: string },
+): ZulipCredentialSource {
+  const path = opts.path?.trim() || ZULIP_DEFAULT_INFISICAL_PATH;
+  return {
+    describe: (role) => (validZulipRole(role) ? `infisical ${path} ${zulipVaultNames(role).key.replace(/_API_KEY$/, "_*")}` : "invalid role"),
+    load: async (role) => {
+      if (!validZulipRole(role)) throw new ZulipCredentialError(`"${role}" is not a valid Zulip role name`, "invalid");
+      const names = zulipVaultNames(role);
+      let values: ReadonlyMap<string, string>;
+      try {
+        values = await read(path);
+      } catch (e) {
+        // The manager's errors are value-free; keep only its message.
+        const why = e instanceof Error ? e.message : "unknown error";
+        throw new ZulipCredentialError(`cannot read Infisical ${path}: ${why}`, "invalid");
+      }
+      const email = values.get(names.email)?.trim();
+      const key = values.get(names.key)?.trim();
+      const missing = [!email && names.email, !key && names.key].filter(Boolean);
+      if (missing.length) throw new ZulipCredentialError(`Infisical ${path} has no ${missing.join(" or ")}`, "missing");
+      const site = (values.get(names.site)?.trim() || opts.realm).replace(/\/+$/, "");
+      return { email: email!, key: key!, site: site.includes("://") ? site : `https://${site}`, source: `infisical ${path}` };
+    },
+  };
+}
+
+/** One vault read per folder per `ttlMs`, shared by every role and every
+ *  reconnect.  A failed read is not cached, so the next retry reads again. */
+export function cachedVaultReader(
+  read: ZulipVaultReader,
+  opts: { ttlMs?: number; now?: () => number } = {},
+): ZulipVaultReader {
+  const ttlMs = opts.ttlMs ?? 15 * 60_000;
+  const now = opts.now ?? Date.now;
+  const cache = new Map<string, { at: number; values: Promise<ReadonlyMap<string, string>> }>();
+  return (path) => {
+    const hit = cache.get(path);
+    if (hit && now() - hit.at < ttlMs) return hit.values;
+    const values = read(path);
+    cache.set(path, { at: now(), values });
+    values.catch(() => {
+      if (cache.get(path)?.values === values) cache.delete(path);
+    });
+    return values;
+  };
+}
+
 /** The credential source for these settings, or null when none is set up.
- *  `OMB_ZULIP_CREDENTIAL_DIR` overrides the setting (tests, a soak rig). */
+ *
+ *  - `OMB_ZULIP_CREDENTIAL_DIR` (tests, a soak rig) always means the file
+ *    source.
+ *  - `credentialSource: "infisical"` means the Infisical source, and needs
+ *    the harness's vault reader.
+ *  - Otherwise (`"file"` or unset) the file source, when `credentialDir`
+ *    names an absolute folder. */
 export function credentialSourceFor(
-  settings: { credentialDir?: string } | undefined,
+  settings: { credentialDir?: string; credentialSource?: "file" | "infisical"; infisicalPath?: string; realm?: string } | undefined,
   env: NodeJS.ProcessEnv = process.env,
+  deps: { vault?: ZulipVaultReader; realm?: string } = {},
 ): ZulipCredentialSource | null {
-  const dir = env.OMB_ZULIP_CREDENTIAL_DIR?.trim() || settings?.credentialDir?.trim();
+  const envDir = env.OMB_ZULIP_CREDENTIAL_DIR?.trim();
+  if (!envDir && settings?.credentialSource === "infisical") {
+    if (!deps.vault) return null;
+    return infisicalCredentialSource(deps.vault, {
+      path: settings.infisicalPath,
+      realm: deps.realm ?? settings.realm ?? ZULIP_DEFAULT_REALM,
+    });
+  }
+  const dir = envDir || settings?.credentialDir?.trim();
   if (!dir) return null;
   const expanded = expandHome(dir);
   if (!isAbsolute(expanded)) return null;

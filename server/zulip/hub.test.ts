@@ -255,6 +255,26 @@ describe("credentials and identity", () => {
     expect(disabledLogs()).toBe(4);
   });
 
+  it("connects with keys from BotFleet's own vault when the Infisical source is chosen", async () => {
+    settings.credentialDir = undefined;
+    settings.credentialSource = "infisical";
+    const reads: string[] = [];
+    const hub = makeHub({
+      vault: async (path) => {
+        reads.push(path);
+        return new Map([
+          ["ZULIP_BF_PLUMBER_EMAIL", "bf-plumber-bot@zulip.test"],
+          ["ZULIP_BF_PLUMBER_API_KEY", "plumber-test-key"],
+          // the realm's own site: verifyCredentialRealm still checks it
+          ["ZULIP_BF_PLUMBER_SITE", fake.url],
+        ]);
+      },
+    });
+    await connected(hub);
+    expect(reads).toEqual(["/zulip"]);
+    expect(botStatus(hub, "bot-plumber")?.userId).toBe(PLUMBER);
+  });
+
   it("refuses an admin key", async () => {
     fake.addUser({ user_id: ADMIN, full_name: "BF-Admin", email: "bf-admin-bot@zulip.test", key: "admin-test-key", role: 200 });
     writeRc("BF-Admin", "bf-admin-bot@zulip.test", "admin-test-key");

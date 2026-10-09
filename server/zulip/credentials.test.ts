@@ -7,12 +7,15 @@ import { describe, expect, it } from "vitest";
 import { looksSensitive } from "../auto-approve.ts";
 import {
   ZulipCredentialError,
+  cachedVaultReader,
   credentialSourceFor,
   fileCredentialSource,
+  infisicalCredentialSource,
   parseZuliprc,
   readZuliprc,
   resolveRealm,
   verifyCredentialRealm,
+  zulipVaultNames,
 } from "./credentials.ts";
 
 const FAKE_KEY = "fake-test-key-not-real";
@@ -78,6 +81,89 @@ describe("the credential source", () => {
     expect(credentialSourceFor({ credentialDir: "/a" }, { OMB_ZULIP_CREDENTIAL_DIR: "/b" })?.describe("BF-Plumber")).toBe(
       "file /b/BF-Plumber-zuliprc",
     );
+  });
+});
+
+describe("the Infisical source", () => {
+  const REALM = "https://z.test";
+  const vault = (rows: Record<string, string>) => {
+    const calls: string[] = [];
+    const read = async (path: string) => {
+      calls.push(path);
+      return new Map(Object.entries(rows));
+    };
+    return { read, calls };
+  };
+
+  it("is off unless chosen, needs the harness's reader, and never wins over the env's test folder", () => {
+    const { read } = vault({});
+    expect(credentialSourceFor({ credentialSource: "infisical" }, {})).toBeNull();
+    expect(credentialSourceFor({ credentialSource: "infisical" }, {}, { vault: read })?.describe("BF-Plumber")).toBe(
+      "infisical /zulip ZULIP_BF_PLUMBER_*",
+    );
+    expect(
+      credentialSourceFor({ credentialSource: "infisical", infisicalPath: "/bots" }, {}, { vault: read })?.describe("BF-Plumber"),
+    ).toBe("infisical /bots ZULIP_BF_PLUMBER_*");
+    // a folder alone is still the file source, and a reader alone turns nothing on
+    expect(credentialSourceFor({ credentialDir: "/a" }, {}, { vault: read })?.describe("BF-Plumber")).toBe("file /a/BF-Plumber-zuliprc");
+    expect(credentialSourceFor({}, {}, { vault: read })).toBeNull();
+    expect(
+      credentialSourceFor({ credentialSource: "infisical" }, { OMB_ZULIP_CREDENTIAL_DIR: "/b" }, { vault: read })?.describe("BF-Plumber"),
+    ).toBe("file /b/BF-Plumber-zuliprc");
+  });
+
+  it("maps a role to its vault names and loads email, key and the realm as the site", async () => {
+    expect(zulipVaultNames("BF-Plumber")).toEqual({
+      email: "ZULIP_BF_PLUMBER_EMAIL",
+      key: "ZULIP_BF_PLUMBER_API_KEY",
+      site: "ZULIP_BF_PLUMBER_SITE",
+    });
+    const { read, calls } = vault({ ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test", ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY });
+    const creds = await infisicalCredentialSource(read, { realm: REALM }).load("BF-Plumber");
+    expect(creds).toEqual({ email: "bf-plumber-bot@z.test", key: FAKE_KEY, site: REALM, source: "infisical /zulip" });
+    expect(calls).toEqual(["/zulip"]);
+    // the key never lands in the environment
+    expect(Object.values(process.env)).not.toContain(FAKE_KEY);
+  });
+
+  it("names what is missing, never a value, and turns a vault failure into a value-free error", async () => {
+    const { read } = vault({ ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test" });
+    const missing = await Promise.resolve()
+      .then(() => infisicalCredentialSource(read, { realm: REALM }).load("BF-Plumber"))
+      .catch((e: ZulipCredentialError) => e);
+    expect(missing).toBeInstanceOf(ZulipCredentialError);
+    expect((missing as ZulipCredentialError).reason).toBe("missing");
+    expect((missing as ZulipCredentialError).message).toBe("Infisical /zulip has no ZULIP_BF_PLUMBER_API_KEY");
+    const failing = infisicalCredentialSource(
+      async () => {
+        throw new Error("Infisical secrets list failed (403)");
+      },
+      { realm: REALM },
+    );
+    await expect(failing.load("BF-Plumber")).rejects.toThrow("cannot read Infisical /zulip: Infisical secrets list failed (403)");
+    await expect(infisicalCredentialSource(read, { realm: REALM }).load("../etc")).rejects.toThrow(/not a valid Zulip role/);
+  });
+
+  it("reads the vault once per folder per window, and does not cache a failure", async () => {
+    let now = 0;
+    let fail = true;
+    let reads = 0;
+    const cached = cachedVaultReader(
+      async () => {
+        reads += 1;
+        if (fail) throw new Error("down");
+        return new Map([["A", "1"]]);
+      },
+      { ttlMs: 1_000, now: () => now },
+    );
+    await expect(cached("/zulip")).rejects.toThrow("down");
+    fail = false;
+    await cached("/zulip");
+    await cached("/zulip");
+    expect(reads).toBe(2);
+    now = 1_500;
+    await cached("/zulip");
+    expect(reads).toBe(3);
   });
 });
 

@@ -106,6 +106,14 @@ export interface ZulipSettings {
   /** Folder holding `<Role>-zuliprc` files (INI [api] email/key/site, mode
    *  600).  No default: the file source is off until this is set. */
   credentialDir?: string;
+  /** Where the keys come from: "file" (`credentialDir`) or "infisical"
+   *  (BotFleet's own vault, `infisicalPath`).  Unset means the file source
+   *  when `credentialDir` is set, and none otherwise.  An open owner
+   *  decision (docs/zulip.md, D0). */
+  credentialSource?: "file" | "infisical";
+  /** The Infisical folder holding `ZULIP_<ROLE>_EMAIL` / `_API_KEY`.
+   *  Default `/zulip`. */
+  infisicalPath?: string;
   /** BotFleet bot id -> its Zulip role (the file code, e.g. "BF-Plumber"). */
   bots?: Record<string, { role: string; enabled?: boolean }>;
   /** Channels a bot may post to outside the conversation it was woken by. */

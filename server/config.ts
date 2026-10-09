@@ -248,6 +248,8 @@ const zulipConfigSchema = z.object({
   ownerUserId: z.number().int().positive().optional(),
   ownerClients: z.array(z.string().trim().min(1)).max(20).optional(),
   credentialDir: optionalText,
+  credentialSource: z.enum(["file", "infisical"]).optional(),
+  infisicalPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
   bots: z
     .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
     .optional(),
@@ -354,7 +356,7 @@ const appConfigSchema = z.object({
   /** The Zulip source (docs/zulip.md): which BotFleet bots hold a Zulip
    *  identity, where their keys come from, and the wake and post rules.  No
    *  key lives here — `credentialDir` names the folder of `<Role>-zuliprc`
-   *  files.  A malformed section reads as absent rather than failing the
+   *  files, and `credentialSource: "infisical"` reads the vault instead.  A malformed section reads as absent rather than failing the
    *  whole stored config, so a typo turns Zulip off and nothing else. */
   zulip: zulipConfigSchema.optional().catch(undefined),
   ingress: z.object({

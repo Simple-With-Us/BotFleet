@@ -38,6 +38,7 @@ import {
   verifyCredentialRealm,
   type ZulipCredentialSource,
   type ZulipCredentials,
+  type ZulipVaultReader,
 } from "./credentials.ts";
 import { buildInboundPrompt, followKey, originKey, withTag, ZULIP_INBOUND_UNIT_MAX_ITEMS } from "./format.ts";
 import {
@@ -142,6 +143,10 @@ export interface ZulipHubDeps {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Test override for the credential source. */
   credentialSource?: (settings: ZulipSettings | undefined) => ZulipCredentialSource | null;
+  /** Reads a folder of BotFleet's own Infisical project, for
+   *  `credentialSource: "infisical"` (the harness passes its
+   *  InfisicalManager, cached).  Without it that source is off. */
+  vault?: ZulipVaultReader;
   timings?: {
     coalesceMs?: number;
     drainIntervalMs?: number;
@@ -404,16 +409,16 @@ class ZulipSession {
     return this.hub.deps.timings?.eventsTimeoutMs ?? this.longpollMs;
   }
 
-  private loadClient(): ZulipClient {
+  private async loadClient(): Promise<ZulipClient> {
     if (this.client) return this.client;
     const source = this.hub.credentialSource();
     if (!source) {
       throw new ZulipCredentialError(
-        "no credential source: set zulip.credentialDir to the folder holding <Role>-zuliprc files",
+        'no credential source: set zulip.credentialDir to the folder holding <Role>-zuliprc files, or zulip.credentialSource to "infisical"',
         "missing",
       );
     }
-    const creds = source.load(this.role);
+    const creds = await source.load(this.role);
     verifyCredentialRealm(creds, this.realm);
     this.creds = creds;
     this.client = new ZulipClient(creds, this.realm, {
@@ -425,7 +430,7 @@ class ZulipSession {
   }
 
   private async connect(signal: AbortSignal): Promise<void> {
-    const client = this.loadClient();
+    const client = await this.loadClient();
     // A queue left over from a failed connection: delete it before
     // registering another, so reconnects never pile orphaned queues (each
     // holding events for ~10 minutes) on the realm.  Best effort.
@@ -659,7 +664,12 @@ export class ZulipHub {
 
   credentialSource(): ZulipCredentialSource | null {
     const settings = this.settings();
-    return this.deps.credentialSource ? this.deps.credentialSource(settings) : credentialSourceFor(settings, this.env);
+    if (this.deps.credentialSource) return this.deps.credentialSource(settings);
+    const realm = resolveRealm(settings, this.env);
+    return credentialSourceFor(settings, this.env, {
+      vault: this.deps.vault,
+      realm: "realm" in realm ? realm.realm : undefined,
+    });
   }
 
   /** Whether the Zulip source should run at all. */
