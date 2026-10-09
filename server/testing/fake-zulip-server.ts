@@ -93,7 +93,7 @@ export class FakeZulip {
   private nextQueue = 1;
   private rateLimits: Array<{ path: string; retryAfter: number }> = [];
   private failures: Array<{ method: string; path: string; status: number }> = [];
-  private answers: Array<{ method: string; path: string; body: Record<string, unknown> }> = [];
+  private answers: Array<{ method: string; path: string; json: string }> = [];
   heartbeatMs = 150;
   /** Leave `max_message_id` out of register's answer: a realm that does not
    *  say which message is the newest. */
@@ -128,11 +128,11 @@ export class FakeZulip {
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
   }
 
-  /** The next `method path` request answers 200 with exactly this body,
+  /** The next `method path` request answers 200 with exactly this JSON text,
    *  whatever it would have said: a malformed success, for the client's
    *  boundary tests. */
-  answerNext(method: string, path: string, body: Record<string, unknown>): void {
-    this.answers.push({ method, path, body });
+  answerNext(method: string, path: string, json: string): void {
+    this.answers.push({ method, path, json });
   }
 
   /** The next request to `path` answers 429 with this Retry-After. */
@@ -353,7 +353,11 @@ export class FakeZulip {
     const answer = this.answers.findIndex((entry) => entry.path === path && entry.method === req.method);
     if (answer >= 0) {
       const [entry] = this.answers.splice(answer, 1);
-      return send(200, entry!.body);
+      if (!res.writableEnded) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(entry!.json);
+      }
+      return;
     }
 
     if (req.method === "GET" && path === "users/me") {
@@ -375,7 +379,8 @@ export class FakeZulip {
         result: "success",
         queue_id: id,
         last_event_id: -1,
-        ...(this.omitMaxMessageId ? {} : { max_message_id: this.maxMessageId }),
+        // undefined is left out of the JSON: a realm that does not say
+        max_message_id: this.omitMaxMessageId ? undefined : this.maxMessageId,
         realm_users: [...this.users.values()]
           .filter((entry) => entry.is_active !== false)
           .map(({ key: _key, is_active: _active, ...rest }) => rest),

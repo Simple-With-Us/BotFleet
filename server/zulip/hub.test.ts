@@ -931,7 +931,7 @@ describe("review fixes: a response of the wrong shape", () => {
   const registers = () => fake.requests.filter((request) => request.path === "register").length;
 
   it("fails a register without a queue id into the backoff, then connects on the retry", async () => {
-    fake.answerNext("POST", "register", { result: "success", last_event_id: -1 });
+    fake.answerNext("POST", "register", JSON.stringify({ result: "success", last_event_id: -1 }));
     const hub = makeHub();
     await waitFor(() => logs.some((line) => line.includes("unexpected shape")), "the refusal");
     expect(logs.join("\n")).toContain("queue_id");
@@ -942,7 +942,7 @@ describe("review fixes: a response of the wrong shape", () => {
   it("fails a poll whose events are not a list the same way, and re-registers", async () => {
     const hub = makeHub();
     await connected(hub);
-    fake.answerNext("GET", "events", { result: "success", events: "none" });
+    fake.answerNext("GET", "events", JSON.stringify({ result: "success", events: "none" }));
     await waitFor(() => registers() === 2, "the re-register");
     await connected(hub);
     expect(logs.some((line) => line.includes("unexpected shape"))).toBe(true);

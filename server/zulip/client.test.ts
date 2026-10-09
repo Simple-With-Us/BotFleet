@@ -10,7 +10,7 @@ const creds = { email: "bf-plumber-bot@zulip.test", key: "fake-test-key-not-real
 
 /** A client whose every call is answered with `body` (status 200 unless
  *  told), and the notes it was given about dropped elements. */
-function clientAnswering(body: unknown, status = 200) {
+function clientAnswering<Body extends object>(body: Body, status = 200) {
   const dropped: string[] = [];
   const client = new ZulipClient(creds, REALM, {
     fetch: async () =>
@@ -21,7 +21,8 @@ function clientAnswering(body: unknown, status = 200) {
   return { client, dropped };
 }
 
-const message = (id: number, over: Record<string, unknown> = {}) => ({
+/** A message body as Zulip sends it; `over` swaps in a wrong-typed field. */
+const message = (id: number, over: { content?: string | number; timestamp?: string | number } = {}) => ({
   id,
   sender_id: 9,
   sender_email: "jay@zulip.test",
@@ -63,7 +64,7 @@ describe("a malformed response is refused", () => {
     expect(error.message).not.toContain("leak-me");
   });
 
-  it("a success body that is not an object, or has no result, is refused for every call", async () => {
+  it("a success body with no result, or a result other than success, is refused for every call", async () => {
     for (const body of [{}, { queue_id: "q1", last_event_id: 1 }, { result: "weird" }]) {
       const { client } = clientAnswering(body);
       expect((await failure(client.register())).code).toBe(INVALID_RESPONSE);

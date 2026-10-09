@@ -28,11 +28,12 @@ import { z } from "zod";
 /** The envelope every Zulip success carries.  An error never reaches a
  *  schema: the client turns `result: "error"` and any non-2xx into a
  *  `ZulipApiError` first. */
-const successEnvelope = z.object({
+const envelopeFields = {
   result: z.literal("success"),
   msg: z.string().optional(),
   code: z.string().optional(),
-});
+};
+const successEnvelope = z.object(envelopeFields);
 
 /** A list whose bad elements are dropped and counted instead of failing the
  *  response.  `items` are the parsed elements; `dropped` is how many were not. */
@@ -128,7 +129,7 @@ export type ZulipEvent = z.infer<typeof zulipEventSchema>;
 export const ZULIP_PAYLOAD_EVENT_TYPES: ReadonlySet<string> = new Set(["message", "realm_user", "user_topic"]);
 
 /** GET /users/me: who the key belongs to. */
-export const zulipSelfSchema = successEnvelope.extend({ ...zulipUserSchema.shape, email: z.string() });
+export const zulipSelfSchema = zulipUserSchema.extend({ ...envelopeFields, email: z.string() });
 export type ZulipSelf = z.infer<typeof zulipSelfSchema>;
 
 /** POST /register.  The member and topic lists are cleaned here (a bad row is
