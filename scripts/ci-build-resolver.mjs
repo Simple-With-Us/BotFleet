@@ -341,6 +341,21 @@ function assertArtifact(value) {
 }
 /* oxlint-enable anti-slop/no-runtime-typeof */
 
+/**
+ * The array a GitHub list endpoint wraps its results in.  A 200 whose JSON lacks
+ * it (`{}`, `null`, `{"workflow_runs": "x"}`) is a malformed response, not "no
+ * build".  `no-build` is recoverable, so `auto` would quietly package locally
+ * and hide an API change or a proxy fault; `bad-response` is not.  An honestly
+ * empty list still comes back as an empty array and stays `no-build`.
+ */
+function envelopeList(body, field, url) {
+  const list = body?.[field];
+  if (!Array.isArray(list)) {
+    throw new ResolutionError(`GitHub returned HTTP 200 for ${url} without a "${field}" list`, "bad-response");
+  }
+  return list;
+}
+
 /** The newest attempt at this commit, for diagnosis when none succeeded. */
 function anyRunForCommit(runs, commit) {
   return Array.isArray(runs) ? runs.find((item) => item?.head_sha === commit) || null : null;
@@ -949,7 +964,7 @@ export async function downloadBuiltBundle({
   }
   const headers = authHeaders(env, { execFileSyncImpl });
   const runsUrl = `${apiBase(repository)}/actions/workflows/${WORKFLOW_FILE}/runs?head_sha=${commit}&per_page=20`;
-  const runs = (await requestJson(runsUrl, { headers, fetchImpl }))?.workflow_runs;
+  const runs = envelopeList(await requestJson(runsUrl, { headers, fetchImpl }), "workflow_runs", runsUrl);
   const run_ = selectCommitRun(runs, commit);
   if (!run_) {
     // A run that exists for this commit but failed, was cancelled, or is still
@@ -985,7 +1000,8 @@ export async function downloadBuiltBundle({
       "no-build",
     );
   }
-  const artifacts = (await requestJson(`${apiBase(repository)}/actions/runs/${run_.id}/artifacts?per_page=100`, { headers, fetchImpl }))?.artifacts;
+  const artifactsUrl = `${apiBase(repository)}/actions/runs/${run_.id}/artifacts?per_page=100`;
+  const artifacts = envelopeList(await requestJson(artifactsUrl, { headers, fetchImpl }), "artifacts", artifactsUrl);
   const artifact = findCommitArtifact(artifacts, commit);
   if (!artifact) {
     throw new ResolutionError(
