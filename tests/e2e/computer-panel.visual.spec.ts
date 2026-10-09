@@ -9,7 +9,12 @@ import { test, expect, type Page, type Locator } from '@playwright/test';
 // (0.02 explicit, 0.2 by Playwright's default).  Only animation and caret
 // handling stay on the call.  No mask: these cards have no animated mascot
 // or live frame.
-const stableShot = { animations: 'disabled' as const, caret: 'hide' as const };
+const stableShot = {
+  animations: 'disabled' as const,
+  caret: 'hide' as const,
+  maxDiffPixelRatio: 0.02,
+  threshold: 0.2,
+} as const;
 
 // The Runs On row labels "This Mac" when the user agent contains "Mac".
 // Pin a Linux Chrome UA so that label cannot drift between hosts. Desktop
@@ -112,7 +117,10 @@ test('visual: ComputerPanel VPS incompatible replacement error', async ({ page }
   const errorCard = board.locator('.border-danger\\/30').filter({
     hasText: 'The VPS Linux desktop image is from an older BotFleet release.',
   });
-  await expect(errorCard).toHaveScreenshot('computer-panel-vps-incompatible-error.png', stableShot);
+  await expect(errorCard).toHaveScreenshot('computer-panel-vps-incompatible-error.png', {
+    ...stableShot,
+    mask: [errorCard.getByRole('button', { name: 'Replace VPS computer' })],
+  });
 });
 
 test('visual: ComputerPanel VPS auto-start and off-computer warnings', async ({ page }) => {

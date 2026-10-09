@@ -58,12 +58,13 @@ const req = http.request({
       process.exit(3);
     }
     if (res.statusCode !== 200) process.exit(1);
-    let commit;
+    let parsed;
     try {
-      commit = JSON.parse(body).sourceCommit;
+      parsed = JSON.parse(body);
     } catch {
       process.exit(1);
     }
+    const commit = parsed && typeof parsed === "object" && parsed !== null ? parsed.sourceCommit : undefined;
     if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) process.exit(1);
     process.stdout.write(commit);
     process.exit(0);

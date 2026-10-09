@@ -210,6 +210,8 @@ export interface LaunchPlan {
   force?: boolean;
   /** Harness owner bearer credential for the ubf runtime shortcut probe only. */
   harnessOwnerNonce?: string;
+  /** Mode-0600 env file sourced by the launchd job (avoids secret export lines in `-c`). */
+  launchEnvFilePath?: string;
 }
 
 export interface LaunchResult {
@@ -665,10 +667,11 @@ export function pruneRunArtifacts(runsDirectory: string, options: {
 export function launchPlanCommand(plan: LaunchPlan): { command: string; args: string[] } {
   const quote = (value: string) => `'${value.split("'").join(`'\\''`)}'`;
   const forceArg = plan.force ? " --force" : "";
-  const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
   const script = [
     `export PATH=${quote(plan.nodeDirectory)}:"$PATH"`,
-    ...(harnessOwnerNonce ? [`export BOTFLEET_OWNER_NONCE=${quote(harnessOwnerNonce)}`] : []),
+    ...(plan.launchEnvFilePath
+      ? [`set -a && . ${quote(plan.launchEnvFilePath)} && set +a`]
+      : []),
     `exec /bin/bash ${quote(plan.scriptPath)} --progress ${quote(plan.progressPath)} --run-id ${quote(plan.runId)}${forceArg}`,
   ].join("\n");
   return {
@@ -745,7 +748,15 @@ async function defaultLaunch(plan: LaunchPlan): Promise<LaunchResult> {
   // A finished label stays registered and makes the next `submit` fail
   // outright, so it is cleared — but only now that it is known to be dead.
   await execCommand("/bin/launchctl", ["remove", plan.label]);
-  const { command, args } = launchPlanCommand(plan);
+  const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
+  const launchPlan: LaunchPlan = { ...plan };
+  if (harnessOwnerNonce && !plan.launchEnvFilePath) {
+    const envPath = join(dirname(plan.progressPath), `${plan.runId}.launch.env`);
+    mkdirSync(dirname(envPath), { recursive: true, mode: 0o700 });
+    writeFileSync(envPath, `BOTFLEET_OWNER_NONCE=${harnessOwnerNonce}\n`, { mode: 0o600 });
+    launchPlan.launchEnvFilePath = envPath;
+  }
+  const { command, args } = launchPlanCommand(launchPlan);
   const submitted = await execCommand(command, args);
   if (submitted.code === 0) return { launcher: "launchd" };
   // launchd refused (an old label still settling, a sandboxed domain).  A

@@ -162,13 +162,28 @@ export function registerUpdaterIpc() {
     try { mkdirSync(logDir, { recursive: true, mode: 0o700 }); } catch { /* already exists */ }
 
     const dataDir = process.env.OMB_DATA_DIR || process.env.BOTFLEET_DATA_DIR || join(homedir(), ".botfleet");
-    const harnessOwner = readHarnessOwner(dataDir);
+    let harnessOwner;
+    try {
+      harnessOwner = readHarnessOwner(dataDir);
+    } catch {
+      setState({ status: "error", message: "Could not read harness ownership for the local update." });
+      return;
+    }
     const childEnv = {
       ...process.env,
       PATH: childPath,
       BOTFLEET_CHECKOUT: join(homedir(), "apps", "botfleet-server"),
     };
-    if (harnessOwner?.nonce) childEnv.BOTFLEET_OWNER_NONCE = harnessOwner.nonce;
+    if (harnessOwner) {
+      if (!harnessOwner.nonce) {
+        setState({
+          status: "error",
+          message: "Harness bearer credential is missing.\u00A0 Restart the harness before updating locally.",
+        });
+        return;
+      }
+      childEnv.BOTFLEET_OWNER_NONCE = harnessOwner.nonce;
+    }
     const child = spawn("/bin/bash", [script], {
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],

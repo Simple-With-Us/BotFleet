@@ -7,7 +7,12 @@ import { test, expect, type Page, type Locator } from '@playwright/test';
 // Screenshot tolerance is expect.toHaveScreenshot in playwright.config.ts:
 // maxDiffPixelRatio 0.02 and threshold 0.2.  Only animation and caret
 // handling stay on the call.
-const stableShot = { animations: 'disabled' as const, caret: 'hide' as const };
+const stableShot = {
+  animations: 'disabled' as const,
+  caret: 'hide' as const,
+  maxDiffPixelRatio: 0.02,
+  threshold: 0.2,
+} as const;
 
 const LINUX_CHROME_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
