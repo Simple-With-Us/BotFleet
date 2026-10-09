@@ -26,6 +26,7 @@ Verification uses these isolated fixtures:
 - [Mac updater transaction](mac-updater.md) — signed update delivery and application
 - [Staged candidate smoke test](staged-candidate-smoke.md) — the pre-activation probe that runs a candidate before anything live is touched
 - [Connector grants](connector-grants.md) — per-bot third-party tool authorization
+- [Bot On/Off switch](bot-off.md) — an Off bot starts nothing new and finishes a running turn
 
 ### Test Fixtures
 
