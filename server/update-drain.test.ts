@@ -136,6 +136,13 @@ describe("what a drain waits for", () => {
     // Nothing to subtract from is not invented.
     expect(inFlightCounts({ boot: 1 }, { queuedRoutineRuns: 2 })).toEqual({ boot: 1 });
   });
+
+  it("does not count room rounds waiting in the room queue: they are held and carried", () => {
+    // Finding 7: a room whose bots kept answering each other kept an update
+    // waiting for about six minutes.
+    expect(inFlightCounts({ turns: 1, queuedRooms: 2, groupOperations: 1 }, { queuedRoutineRuns: 0 }))
+      .toEqual({ turns: 1, queuedRooms: 0, groupOperations: 1 });
+  });
 });
 
 function queued(patch: Partial<HeldQueueEntry> = {}): HeldQueueEntry {
@@ -164,7 +171,20 @@ describe("the held-work carrier", () => {
     expect(taken.queued).toEqual([queued()]);
     // Taken means gone: the next boot does not run them again.
     expect(existsSync(path)).toBe(false);
-    expect(takeHeldWork(dir)).toEqual({ sends: [], queued: [] });
+    expect(takeHeldWork(dir)).toEqual({ sends: [], queued: [], rooms: [] });
+  });
+
+  it("carries held room rounds, and a round it cannot read costs only itself", () => {
+    const dir = dataDir();
+    const round = {
+      groupId: "room_1", threadId: "thread_room", botId: "bot_member", hop: 1,
+      turnSelection: { instanceId: "claude", model: "sonnet", effort: "high" }, heldAt: 1_000,
+    };
+    appendHeldWork(dir, { rooms: [round] });
+    appendHeldWork(dir, { sends: [send()] });
+    expect(takeHeldWork(dir)).toMatchObject({ sends: [send()], rooms: [round] });
+    writeFileSync(join(dir, HELD_SENDS_FILE), JSON.stringify({ version: 1, sends: [], rooms: [round, { groupId: "x" }] }));
+    expect(takeHeldWork(dir).rooms).toEqual([round]);
   });
 
   it("writes nothing when nothing is held", () => {
@@ -186,10 +206,10 @@ describe("the held-work carrier", () => {
     expect(taken.queued).toHaveLength(1);
     // A file from before queued entries existed reads as sends only.
     writeFileSync(path, JSON.stringify({ version: 1, sends: [send()] }));
-    expect(takeHeldWork(dir)).toMatchObject({ sends: [send()], queued: [] });
+    expect(takeHeldWork(dir)).toMatchObject({ sends: [send()], queued: [], rooms: [] });
     writeFileSync(path, "{ not json");
     const lines: string[] = [];
-    expect(takeHeldWork(dir, (line: string) => lines.push(line))).toEqual({ sends: [], queued: [] });
+    expect(takeHeldWork(dir, (line: string) => lines.push(line))).toEqual({ sends: [], queued: [], rooms: [] });
     expect(lines[0]).toContain(HELD_SENDS_FILE);
     expect(existsSync(path)).toBe(false);
   });

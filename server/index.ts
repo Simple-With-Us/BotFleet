@@ -75,6 +75,7 @@ import {
   takeHeldWork,
   UpdateDrain,
   type HeldQueueEntry,
+  type HeldRoomRound,
   type HeldSend,
   type HeldWork,
   type DrainWindowInput,
@@ -343,7 +344,16 @@ import {
   jobRunningLine,
   type JobSnapshot,
 } from "../shared/jobs.ts";
-import { cancelRoomRounds, drainRoomRounds, hasQueuedRoomRound, queueRoomRound, _queuedRoomCount } from "./room-queue.ts";
+import {
+  cancelRoomRounds,
+  drainRoomRounds,
+  hasQueuedRoomRound,
+  queueRoomRound,
+  refreshRoomRounds,
+  restoreRoomRounds,
+  takeRoomRounds,
+  _queuedRoomCount,
+} from "./room-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ITEM_ID_MAX_LENGTH, ItemIoStore } from "./item-io-store.ts";
 import {
@@ -4695,6 +4705,9 @@ bus.subscribe((event: RuntimeEvent) => {
 /** Room rounds that waited on a busy bot.  Registered after the main fold
  * like the steer drain above, so `busy` is already false when it looks. */
 function drainRoomQueue() {
+  // Held for an update, like the steer queue: released or carried, never
+  // started into a fence that would refuse it.
+  if (updateDrain.active || runtimeQuiescing) return;
   drainRoomRounds(store, Date.now(), (round) => {
     credentialPendingRoomRounds.delete(`${round.groupId}:${round.threadId}:${round.botId}`);
     // The drained round runs on the room's operation queue, behind any
@@ -4889,6 +4902,39 @@ function restoreHeldWork(work: HeldWork, context: string) {
         ok: false,
       },
     });
+  }
+  // Room rounds go back in the room queue; a stale one is said in its room.
+  const rooms = partitionByAge(work.rooms, now);
+  for (const round of rooms.stale) {
+    if (!store.group(round.groupId)) continue;
+    const bot = store.bot(round.botId);
+    store.appendMessage(round.threadId, {
+      role: "bot",
+      kind: "activity",
+      ...(bot ? { from: { botId: bot.id, name: bot.name, color: bot.color } } : {}),
+      tool: {
+        name: "error: this reply waited for an update that did not finish, so it was not run — ask again if you still need it",
+        ok: false,
+      },
+    });
+  }
+  const restoredRooms = restoreRoomRounds(rooms.run.filter((round) => store.group(round.groupId) && store.bot(round.botId)).map((round) => {
+    const restored: Parameters<typeof restoreRoomRounds>[0][number] = {
+      groupId: round.groupId,
+      threadId: round.threadId,
+      botId: round.botId,
+      hop: round.hop,
+    };
+    if (round.cardContinuation !== undefined) restored.cardContinuation = round.cardContinuation;
+    if (round.turnSelection) {
+      restored.turnSelection = { instanceId: round.turnSelection.instanceId, model: round.turnSelection.model };
+      if (isEffortLevel(round.turnSelection.effort)) restored.turnSelection.effort = round.turnSelection.effort;
+      if (round.turnSelection.latest) restored.turnSelection.latest = round.turnSelection.latest;
+    }
+    return restored;
+  }), now);
+  if (work.rooms.length > 0) {
+    console.log(`[${context}] requeued ${restoredRooms} held room round(s), ${rooms.stale.length} too old to run`);
   }
   const pending: Array<{ heldAt: number; entry: SteerQueueSnapshot }> = [];
   for (const send of sends.run) {
@@ -7398,6 +7444,17 @@ async function runGroupMemberTurn(
     queueRoomRound({ groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection }, Date.now());
     return true;
   }
+  // An update is holding new work (server/update-drain.ts), and a round is new
+  // work: it waits in the room queue like a round waiting on a busy member,
+  // and runs when the hold lets go or after the restart (`persistHeldWork`
+  // carries it).  Nothing in flight waits on it — a member's mentions run
+  // after its own turn has settled — so the room goes quiet after the turn it
+  // is on instead of keeping the update waiting while its bots answer each
+  // other.
+  if (updateDrain.active) {
+    queueRoomRound({ groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection }, Date.now());
+    return true;
+  }
   // A busy bot is queued below and reconciled when its turn replays; its saved
   // chain is not rewritten from here.
   if (!turnSelection) reconcileModelLineage({ botIds: [bot.id], skipBusy: true });
@@ -9694,14 +9751,12 @@ function drainSnapshot() {
       deadline: status.deadline,
       inFlight: readiness.activeWorkCount,
       bots: readiness.bots,
-      // Room work: the one kind a forced update still will not interrupt.  A
-      // live room turn refuses the forced quiesce outright, and a room round
-      // queued behind a busy member is still counted after the interrupt, so
-      // the forced quiesce rolls back.  The updater waits for both to clear
-      // before it forces, rather than interrupting everyone for nothing.
-      rooms: store.bots.filter((bot) => bot.busy && store.groupByThread(bot.inflightThreadId ?? bot.threadId)).length +
-        _queuedRoomCount(),
-      held: readiness.held,
+      // A live room turn: the one kind of work a forced update still will not
+      // interrupt (a room turn cannot be resumed without repeating it), so the
+      // updater waits for it before it forces.  Rounds waiting in the room
+      // queue are not counted: they are held, and carried across the restart.
+      rooms: store.bots.filter((bot) => bot.busy && store.groupByThread(bot.inflightThreadId ?? bot.threadId)).length,
+      held: { ...readiness.held, rooms: _queuedRoomCount() },
     },
   };
 }
@@ -9982,7 +10037,8 @@ async function drainAfterInterrupt(): Promise<void> {
   // Sends queued behind an interrupted bot are not work in flight: they stay
   // in the steer queue (`drainQueuedSends` holds them under the fence) and
   // are committed for the restart once the bots settle.
-  const settled = () => runtimeReadiness({ ...runtimeWorkCounts(), queuedSends: 0 }).safeToRestart;
+  // Room rounds waiting in the room queue are carried the same way.
+  const settled = () => runtimeReadiness({ ...runtimeWorkCounts(), queuedSends: 0, queuedRooms: 0 }).safeToRestart;
   // The first check is immediate: a bot whose fold already ran needs no wait.
   if (settled()) return;
   while (Date.now() < deadline) {
@@ -10053,7 +10109,10 @@ function releaseHeldWork() {
   queueMicrotask(() => {
     if (runtimeQuiescing || updateDrain.active) return;
     restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-released");
+    // The time a hold kept rounds waiting does not count against them.
+    refreshRoomRounds(Date.now());
     drainQueuedSends();
+    drainRoomQueue();
     void routines?.tick();
     for (const bot of store.bots) if (!bot.busy) jobWakes.botSettled(bot.id);
   });
@@ -10078,12 +10137,24 @@ function persistHeldWork(context: string, interrupted: ReadonlySet<string> = new
     })),
   }));
   const sends = commitHeldSends();
+  // Room rounds: a request to speak, nothing in the transcript yet.
+  const rooms: HeldRoomRound[] = takeRoomRounds().map((round) => {
+    const held: HeldRoomRound = { groupId: round.groupId, threadId: round.threadId, botId: round.botId, hop: round.hop, heldAt };
+    if (round.cardContinuation !== undefined) held.cardContinuation = round.cardContinuation;
+    if (round.turnSelection) {
+      const { instanceId, model, effort, latest } = round.turnSelection;
+      held.turnSelection = { instanceId, model };
+      if (effort) held.turnSelection.effort = effort;
+      if (latest) held.turnSelection.latest = latest;
+    }
+    return held;
+  });
   try {
-    appendHeldWork(DATA_DIR, { sends, queued });
-    return { sends: [], queued: [] };
+    appendHeldWork(DATA_DIR, { sends, queued, rooms });
+    return { sends: [], queued: [], rooms: [] };
   } catch (error) {
     console.warn(`[${context}] could not save held messages; refusing the update and putting them back:`, error);
-    return { sends, queued };
+    return { sends, queued, rooms };
   }
 }
 
@@ -10107,7 +10178,7 @@ function convertDrainToFence() {
   // A bot an earlier forced attempt paused (and parked) resumes its own turn
   // first after the restart, so its sends are carried uncommitted.
   const unsaved = persistHeldWork("update-drain", pausedBotIds(readResumeSnapshot()));
-  if (unsaved.sends.length > 0 || unsaved.queued.length > 0) {
+  if (unsaved.sends.length > 0 || unsaved.queued.length > 0 || unsaved.rooms.length > 0) {
     // Refuse rather than fence: let everything else the drain held go too.
     returnUnsavedWork(unsaved, "update-drain");
     updateDrain.release("updater");
@@ -10279,7 +10350,7 @@ async function takeRuntimeFence(force: boolean) {
     // them with the steer queue.  A bot paused by an earlier attempt counts as
     // interrupted too: its own turn resumes first.
     const unsaved = persistHeldWork("update-quiesce", pausedBotIds(paused));
-    if (unsaved.sends.length > 0 || unsaved.queued.length > 0) {
+    if (unsaved.sends.length > 0 || unsaved.queued.length > 0 || unsaved.rooms.length > 0) {
       rollbackForcedQuiesce(interruptedRuns, interruptedBots, { park: park() });
       returnUnsavedWork(unsaved, "update-quiesce");
       return { ...currentRuntimeReadiness(), quiescing: false };
@@ -16434,6 +16505,7 @@ setTimeout(() => {
     .finally(() => {
       restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-held");
       drainQueuedSends();
+      drainRoomQueue();
     });
 }, BOOT_RECOVERY_DELAY_MS);
 

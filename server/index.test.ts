@@ -1089,6 +1089,58 @@ describe("harness HTTP API", () => {
     }
   }, 60_000);
 
+  it("holds a room round for an update like other work, and carries it across the fence", async () => {
+    // Finding 7: room messages and rounds were not held, so a room whose bots
+    // kept answering each other kept an update waiting for about six minutes.
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    const runtime = async () => (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json() as Promise<{
+      drain: { inFlight: number; rooms: number; held: { rooms: number } } | null;
+    }>;
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const room = (await api("POST", "/api/groups", { name: "Held room", memberIds: [bot.id] })).body.group;
+    const busy = async () =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy);
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      await api("PATCH", `/api/groups/${room.id}/setup`, { action: "skip" });
+      await api("PATCH", `/api/groups/${room.id}`, { defaultResponder: { kind: "member", botId: bot.id } });
+
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      // A person's room message lands in the room; the member's reply waits.
+      expect((await api("POST", `/api/groups/${room.id}/messages`, { text: "Held until the update" })).status).toBe(202);
+      await expect.poll(async () => (await runtime()).drain?.held.rooms, SLOW).toBe(1);
+      expect(await busy()).toBe(false);
+      // Held is not in flight, and is not a live room turn to wait for.
+      await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(0);
+      expect((await runtime()).drain?.rooms).toBe(0);
+
+      // The fence carries the round for the restart.
+      const fenced = await quiesce("POST");
+      expect(fenced.status).toBe(200);
+      const saved = JSON.parse(readFileSync(carrier, "utf8")) as { rooms: Array<{ groupId: string; botId: string }> };
+      expect(saved.rooms).toEqual([expect.objectContaining({ groupId: room.id, botId: bot.id })]);
+
+      // No restart came: standing down puts the round back and the member answers.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+      await expect.poll(busy, SLOW).toBe(true);
+    } finally {
+      await quiesce("DELETE");
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await api("POST", `/api/groups/${room.id}/interrupt`, {});
+      await expect.poll(busy, SLOW).toBe(false);
+      await api("DELETE", `/api/groups/${room.id}`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+    }
+  }, 120_000);
+
   it("serves packaged UI assets and preserves API 404s", async () => {
     const root = await fetch(`${BASE}/`);
     expect(root.status).toBe(200);

@@ -21,13 +21,19 @@
 //     and jobs.json still carries them as `pending` across a restart;
 //   - a person's message waits in the steer queue, exactly as it would for a
 //     busy bot, and is committed to its transcript plus this file's carrier
-//     when the fence goes up.
+//     when the fence goes up;
+//   - a room round (a person's room message, or members answering each other)
+//     waits in the room queue, as it would for a busy member, and is carried
+//     in this file's carrier when the fence goes up.  Nothing in flight waits
+//     on a round: a member's mentions run after its own turn has settled.  So
+//     a busy room goes quiet after the turn it is on, instead of keeping an
+//     update waiting while its bots answer each other.
 //
 // Everything else keeps working: every route stays open (approvals, Stop,
 // peer comms and webhook deliveries are how work in flight gets to finish),
-// and turns a running bot starts for itself (delegations, room rounds) still
-// start, because holding them would only deadlock the bot that is waiting on
-// them.  When nothing is left in flight the updater converts the drain into
+// and delegations a running bot starts still start, because holding them
+// could deadlock the bot that is waiting on them.  When nothing is left in
+// flight the updater converts the drain into
 // the ordinary fence without interrupting anything.  When it gives up
 // instead, it releases the drain and every held thing runs now.
 //
@@ -79,6 +85,9 @@ export function inFlightCounts(
 ) {
   const result = { ...counts };
   if ("queuedSends" in result) result.queuedSends = 0;
+  // Room rounds waiting in the room queue are held too: carried across the
+  // restart (`HeldRoomRound`) or run when the hold lets go.
+  if ("queuedRooms" in result) result.queuedRooms = 0;
   if ("routineRuns" in result) result.routineRuns = Math.max(0, result.routineRuns - Math.max(0, held.queuedRoutineRuns));
   return result;
 }
@@ -229,9 +238,30 @@ const HeldQueueEntrySchema = z.object({
 });
 export type HeldQueueEntry = z.infer<typeof HeldQueueEntrySchema>;
 
+/** A room round an update held (a member asked to speak while new work was
+ *  held, or a round waiting on a busy member), carried across the restart.
+ *  Nothing of it is in the transcript yet: a round reads the room when it
+ *  runs, so it is carried as the request to speak it is. */
+const HeldRoomRoundSchema = z.object({
+  groupId: nonEmpty,
+  threadId: nonEmpty,
+  botId: nonEmpty,
+  hop: z.number().int().min(0),
+  cardContinuation: z.string().optional(),
+  turnSelection: z.object({
+    instanceId: nonEmpty,
+    model: nonEmpty,
+    effort: z.string().optional(),
+    latest: z.string().optional(),
+  }).optional(),
+  heldAt: z.number().finite(),
+});
+export type HeldRoomRound = z.infer<typeof HeldRoomRoundSchema>;
+
 export interface HeldWork {
   sends: HeldSend[];
   queued: HeldQueueEntry[];
+  rooms: HeldRoomRound[];
 }
 
 /** The file as written.  Entries are checked one at a time, so one bad entry
@@ -240,6 +270,7 @@ const HeldSendsFileSchema = z.object({
   version: z.literal(1),
   sends: z.array(z.unknown()),
   queued: z.array(z.unknown()).optional(),
+  rooms: z.array(z.unknown()).optional(),
 });
 
 function keepValid<T>(entries: readonly unknown[], schema: z.ZodType<T>): T[] {
@@ -252,12 +283,13 @@ function keepValid<T>(entries: readonly unknown[], schema: z.ZodType<T>): T[] {
 }
 
 function readHeldWorkFile(path: string): HeldWork {
-  if (!existsSync(path)) return { sends: [], queued: [] };
+  if (!existsSync(path)) return { sends: [], queued: [], rooms: [] };
   const parsed = HeldSendsFileSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
   if (!parsed.success) throw new Error("held sends file has an unknown shape");
   return {
     sends: keepValid(parsed.data.sends, HeldSendSchema),
     queued: keepValid(parsed.data.queued ?? [], HeldQueueEntrySchema),
+    rooms: keepValid(parsed.data.rooms ?? [], HeldRoomRoundSchema),
   };
 }
 
@@ -267,9 +299,10 @@ function readHeldWorkFile(path: string): HeldWork {
 export function appendHeldWork(dataDir: string, work: Partial<HeldWork>): void {
   const sends = work.sends ?? [];
   const queued = work.queued ?? [];
-  if (sends.length === 0 && queued.length === 0) return;
+  const rooms = work.rooms ?? [];
+  if (sends.length === 0 && queued.length === 0 && rooms.length === 0) return;
   const path = join(dataDir, HELD_SENDS_FILE);
-  let existing: HeldWork = { sends: [], queued: [] };
+  let existing: HeldWork = { sends: [], queued: [], rooms: [] };
   try {
     existing = readHeldWorkFile(path);
   } catch {
@@ -279,6 +312,7 @@ export function appendHeldWork(dataDir: string, work: Partial<HeldWork>): void {
     version: 1,
     sends: [...existing.sends, ...sends],
     queued: [...existing.queued, ...queued],
+    rooms: [...existing.rooms, ...rooms],
   };
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
@@ -289,8 +323,8 @@ export function appendHeldWork(dataDir: string, work: Partial<HeldWork>): void {
  *  reported), so it cannot fail every boot after it. */
 export function takeHeldWork(dataDir: string, log?: (line: string) => void): HeldWork {
   const path = join(dataDir, HELD_SENDS_FILE);
-  if (!existsSync(path)) return { sends: [], queued: [] };
-  let work: HeldWork = { sends: [], queued: [] };
+  if (!existsSync(path)) return { sends: [], queued: [], rooms: [] };
+  let work: HeldWork = { sends: [], queued: [], rooms: [] };
   try {
     work = readHeldWorkFile(path);
   } catch (error) {
