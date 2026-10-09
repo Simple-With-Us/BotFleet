@@ -301,7 +301,11 @@ struct ChatView: View {
             if listening { composerFocused = false }
         }
         .sheet(isPresented: $showingTasks) {
-            if case let .bot(bot) = current { TaskManagerView(bot: bot) }
+            if case let .bot(bot) = current {
+                TaskManagerView(bot: bot)
+            } else if case let .room(room) = current {
+                RoomTaskManagerView(room: room)
+            }
         }
         .navigationDestination(isPresented: $showingRoutines) {
             TasksRoutinesView()
@@ -844,6 +848,24 @@ struct ChatView: View {
                 subtitle: "Live view of what \(bot.name) is doing"
             ) { showingComputer = true })
         }
+        // A channel keeps separate conversations of its own.  A bot-to-bot DM
+        // has exactly one, and a workspace on "one conversation per channel"
+        // cannot add another, so each control appears only where it can work.
+        if case let .room(room) = current, !room.isBotToBot {
+            if session.config?.allowsMultipleBotThreads == true {
+                out.append(PlusAction(
+                    id: "room-task", systemImage: "plus.square.on.square", title: "New task",
+                    subtitle: "Start a fresh thread in \(room.name)",
+                    disabled: session.state.roomTaskChangesBlocked(room)
+                ) { Task { await session.createRoomTask(for: room, title: nil) } })
+            }
+            if session.config?.allowsMultipleBotThreads == true || (room.tasks?.count ?? 0) > 1 {
+                out.append(PlusAction(
+                    id: "room-tasks", systemImage: "square.stack", title: "Tasks",
+                    subtitle: "Switch, rename or remove one"
+                ) { showingTasks = true })
+            }
+        }
         out.append(PlusAction(
             id: "share", systemImage: "doc.plaintext", title: "Share transcript",
             subtitle: "This chat as Markdown"
@@ -1000,7 +1022,7 @@ struct ChatView: View {
                     isVisible: $showCommandHUD,
                     commands: current.isBot
                         ? CommandSkillHUDView.defaultCommands
-                        : CommandSkillHUDView.defaultCommands.filter { $0.id != "computer" && $0.id != "tasks" },
+                        : CommandSkillHUDView.defaultCommands.filter { $0.id != "computer" && ($0.id != "tasks" || current.isBotToBot) },
                     accentColor: BotPalette.color(current.color)
                 ) { command in
                     switch command.id {
@@ -2245,12 +2267,47 @@ struct CardView: View {
     let message: Message
     @EnvironmentObject private var session: Session
     @State private var answering = false
+    @State private var approvingAll = false
 
     /// One definition of "the refusal", shared by the button tint and the
     /// choice above so the two cannot drift apart.
     private static func isRefusal(_ option: String) -> Bool { OptionCard.isRefusal(option) }
 
     private var tint: Color { BotPalette.color(chat.color) }
+
+    /// How many waiting permission requests "Approve All" would allow, when
+    /// this is the card that carries the button.  One card per conversation
+    /// carries it — the newest, beside the composer — and only once there are
+    /// two or more, as on the desktop.
+    private var approveAllCount: Int? {
+        guard message.card?.isPending == true, message.card?.isPermission == true else { return nil }
+        let offer = ApproveAll.offer(in: session.state.visibleTranscript(forThread: chat.threadId))
+        guard let offer, offer.messageId == message.id else { return nil }
+        return offer.count
+    }
+
+    @ViewBuilder
+    private func approveAllButton(count: Int) -> some View {
+        Button {
+            answering = true
+            approvingAll = true
+            Task {
+                await session.approveAll(chat: chat)
+                approvingAll = false
+                answering = false
+            }
+        } label: {
+            Text(ApproveAll.label(count: count))
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(maxWidth: .infinity)
+                .frame(height: 40)
+                .background(Capsule().strokeBorder(tint, lineWidth: 1.5))
+        }
+        .buttonStyle(.plain)
+        .disabled(answering || approvingAll)
+        .accessibilityHint(ApproveAll.hint)
+    }
 
     var body: some View {
         if let card = message.card {
@@ -2303,6 +2360,9 @@ struct CardView: View {
                     }
                     .padding(.top, 2)
 
+                    if let count = approveAllCount {
+                        approveAllButton(count: count)
+                    }
                 } else if let answered = card.answered {
                     Label(answered, systemImage: "checkmark.circle")
                         .font(.system(size: 14))

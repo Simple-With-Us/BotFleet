@@ -2313,6 +2313,15 @@ const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
     ...rest,
     avatarUrl: rest.avatarUrl ?? null,
     voices: rest.voices ?? null,
+    // Which cloud computer this bot really uses, after the workspace default
+    // fills in for a bot that was never pinned.  `cloudBackend` stays the raw
+    // stored value: the desktop compares it with the workspace default to say
+    // "inherited" or "pinned", and Duplicate copies it as-is.  A client that
+    // only wants to know whether the live desktop exists reads this instead,
+    // the same answer the join route gives (see resolveCloudBackend).  It is
+    // resolved when the bot is serialized, so a later change to the workspace
+    // default reaches a client with its next bot frame or fleet fetch.
+    effectiveCloudBackend: resolveCloudBackend(rest.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend),
     ...(tasks ? { tasks: tasks.map(wireTask) } : {}),
   };
 };

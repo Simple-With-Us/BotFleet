@@ -37,6 +37,7 @@ struct AgentProfileView: View {
     @State private var instancesLoaded = false
     @State private var config: ConfigStatus?
     @State private var busy = false
+    @State private var confirmingDuplicate = false
     @State private var player: AVAudioPlayer?
     @State private var isOff: Bool
     @State private var computers: Set<String>
@@ -344,6 +345,8 @@ struct AgentProfileView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                duplicateSection
+
                 if let tasks = current.tasks, !tasks.isEmpty {
                     let totalTurns = tasks.compactMap { $0.usage?.turns }.reduce(0, +)
                     let totalInput = tasks.compactMap { $0.usage?.input }.reduce(0, +)
@@ -396,6 +399,12 @@ struct AgentProfileView: View {
                 }
             }
             .overlay { if busy { ProgressView().controlSize(.large) } }
+            .confirmationDialog("Duplicate Bot?", isPresented: $confirmingDuplicate, titleVisibility: .visible) {
+                Button("Duplicate Bot") { Task { await duplicate() } }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(BotDuplicate.summary)
+            }
             .task {
                 if !session.cachedInstances.isEmpty {
                     instances = profileEngines(from: session.cachedInstances)
@@ -436,6 +445,32 @@ struct AgentProfileView: View {
                 confirm: { bypassPermissions = true }
             ))
         }
+    }
+
+    /// Copies the bot as it is saved, not the form: edits not yet saved are
+    /// not part of what gets duplicated.
+    private var duplicateSection: some View {
+        Section {
+            Button("Duplicate Bot", systemImage: "plus.square.on.square") {
+                confirmingDuplicate = true
+            }
+            .disabled(busy)
+        } footer: {
+            Text(BotDuplicate.notCopiedNote)
+        }
+    }
+
+    /// Make the copy, then close this sheet and open it.  If the profile could
+    /// not be copied the session has already said why; the new bot still opens.
+    private func duplicate() async {
+        // Held before the sheet closes: this keeps running after `dismiss()`.
+        let session = self.session
+        busy = true
+        let copy = await session.duplicateBot(current)
+        busy = false
+        guard let copy else { return }
+        dismiss()
+        await session.openChat(botId: copy.id, threadId: copy.threadId)
     }
 
     /// Re-fetch the engine list after a slow or failed load.
