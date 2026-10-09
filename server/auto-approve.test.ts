@@ -401,6 +401,22 @@ describe("job_start approvals", () => {
     expect(autoVerdict({ autoApprove: true }, "job_start", "job: pnpm test", { ownJobStart: true }).approve).toBe("auto-approved job:pnpm");
   });
 
+  it("starts a Bypass Permissions bot's job without a card too, on the host computer as anywhere", () => {
+    // The MCP lane tags every job start local-computer (a job runs on this
+    // computer), and bypass skips local-computer requests, so a bot the person
+    // put in bypass was carded on every job it started.
+    const verdict = autoVerdict({ bypassPermissions: true }, "job_start", "job: pnpm test", own);
+    expect(verdict.approve).toBe("auto-approved local-computer:job:pnpm");
+    expect(verdict.source).toBe("auto-mode");
+    expect(autoVerdict({ bypassPermissions: true }, "job_start", "job: pnpm test", { ownJobStart: true }).approve)
+      .toMatch(/^auto-approved /);
+    // The ruling is about the harness's own job_start, by origin: a mounted
+    // MCP server's tool of the same name is not it, and still cards.
+    expect(autoVerdict({ bypassPermissions: true }, "job_start", "job: pnpm test", host).approve).toBeNull();
+    // Bypass alone does not make the host-control exclusion go away.
+    expect(autoVerdict({ bypassPermissions: true }, "mouse_click", "click at 1, 2", own).approve).toBeNull();
+  });
+
   it("asks a bot that is not full-auto for every job start, whatever it always-allows", () => {
     const bot = {
       autoApprove: false,
