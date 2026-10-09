@@ -14,7 +14,7 @@ import type { BotColor } from "@/lib/mascot";
 import { SecretSourceBadge } from "./SecretSourceBadge";
 import { UsageMonitorQuotaGrid } from "./UsageMonitorQuotaGrid";
 import { UsageWhatIfProjection } from "./UsageWhatIfProjection";
-import { HeldBotsNotice, RedundantChainsNotice } from "../../site/src/components/UsageNotices";
+import { HeldBotsNotice, RedundantChainsNotice } from "./UsageNotices";
 import { ENGINE_CAPABILITIES, engineIdFromDriverKind, uniqueModelToEngineId } from "@/lib/engine-capabilities";
 import { telemetryBadge, telemetryHost, type TelemetryStatusView } from "@/lib/telemetry-status";
 import { buildUsageConfigPatch } from "@/lib/usage-config";

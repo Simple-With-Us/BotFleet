@@ -6,7 +6,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { HeldBotsNotice, RedundantChainsNotice } from "../../site/src/components/UsageNotices";
+import { HeldBotsNotice, RedundantChainsNotice } from "./UsageNotices";
 import type { DoomedPair, RedundantChain } from "./UsageSection";
 
 const pair = (botId: string, instanceId: string, extra: Partial<DoomedPair> = {}): DoomedPair => ({
@@ -48,6 +48,14 @@ describe("HeldBotsNotice", () => {
     );
     expect(html).toContain("2 Bots Are Being Held");
     expect(html).toContain(": not signed in");
+  });
+
+  it("keeps a visible gap between the two sentences of the explanation", () => {
+    // Rendered copy: two ASCII spaces collapse to one in HTML, so the gap is a
+    // real U+00A0 plus a space.
+    const html = renderToStaticMarkup(createElement(HeldBotsNotice, { heldPairs: [pair("bot-a-0001", "dsh")] }));
+    expect(html).toContain("comes back.\u00a0 Each attempt");
+    expect(html).not.toContain("comes back.  Each attempt");
   });
 });
 

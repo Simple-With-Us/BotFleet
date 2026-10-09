@@ -3,7 +3,7 @@
 // and fallback chains that are shorter at runtime than in the picker.  They
 // live here, apart from the Usage panel's six data sources, so a visual spec
 // can mount the real markup with fixed data (tests/e2e/usage-notices.visual.spec.ts).
-import type { DoomedPair, RedundantChain } from "../../../src/components/UsageSection";
+import type { DoomedPair, RedundantChain } from "./UsageSection";
 
 /** Bots whose engine the dispatcher is refusing to start.  Renders nothing when
  *  no pair is held.  `heldPairs` are the pairs already filtered to the ones that
@@ -19,7 +19,7 @@ export function HeldBotsNotice({ heldPairs }: { heldPairs: readonly DoomedPair[]
       </div>
       <div className="mt-1">
         These bots cannot start their engine, so their scheduled work is queued rather than failed
-        &#8212; it runs on its own once the engine comes back.{" "} Each attempt is being counted, so this
+        &#8212; it runs on its own once the engine comes back.{"\u00a0"} Each attempt is being counted, so this
         is not a stuck scheduler.
       </div>
       <ul className="mt-1.5 space-y-0.5">
