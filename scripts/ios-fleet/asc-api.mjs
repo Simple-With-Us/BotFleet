@@ -809,7 +809,9 @@ async function main() {
   // Exit codes: 0 ready | 2 usage/API error | 3 readiness timeout (build found,
   // still processing) | 4 the uploaded build never appeared within the discovery
   // budget, so compliance was NOT declared on it | 5 the build is ready but the
-  // app has no internal tester who could install it (see countInternalTesters).
+  // app has no internal tester who could install it (see countInternalTesters) |
+  // 6 the build is ready but the internal-tester count could not be read, so
+  // whether anyone can install it is unverified.
   if (method === "ensure-appstore-profiles") {
     const mapPath = path;
     if (!mapPath) {
@@ -1274,7 +1276,8 @@ async function main() {
           usesNonExemptEncryption: attrs.usesNonExemptEncryption,
           internalTesterCount: internalTesters.ok ? internalTesters.testers : null
         }));
-        process.exit(nobody ? 5 : 0);
+        // 5 = read and zero; 6 = could not be read, so installability is unverified.
+        process.exit(nobody ? 5 : internalTesters.ok ? 0 : 6);
       }
       await sleep(POLL_MS);
     }

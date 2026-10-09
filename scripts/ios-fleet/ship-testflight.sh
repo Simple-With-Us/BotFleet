@@ -1132,6 +1132,15 @@ ensure_tf_ready() {
     fi
     return 0
   fi
+  if [[ $rc -eq 6 ]]; then
+    # Processed, but the internal-tester count could not be read, so we cannot
+    # say anyone can install it.  Say so instead of printing the success line.
+    log "warning: build ${BUILD_NUM} is processed but the internal TestFlight tester count could not be read for ${BUNDLE_ID}; installability is unverified"
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+      echo "::warning title=TestFlight installability unverified::${BUNDLE_ID} build ${BUILD_NUM} is processed but the internal tester count could not be read.  Check TestFlight."
+    fi
+    return 0
+  fi
   if [[ $rc -eq 3 ]]; then
     log "warning: upload succeeded but ASC has not reached IN_BETA_TESTING yet; watch TestFlight"
     return 0

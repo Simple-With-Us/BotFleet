@@ -578,13 +578,20 @@ test("the ship no longer claims internal testers can install when none exist", (
   const sh = read("scripts/ios-fleet/ship-testflight.sh");
   const mjs = read("scripts/ios-fleet/asc-api.mjs");
   // asc-api exits 5 only when the count was READ and is zero.
-  assert.match(mjs, /process\.exit\(nobody \? 5 : 0\)/);
+  assert.match(mjs, /process\.exit\(nobody \? 5 : internalTesters\.ok \? 0 : 6\)/);
   assert.match(mjs, /const nobody = internalTesters\.ok && internalTesters\.testers === 0;/);
   // The wrapper turns rc=5 into a warning plus a CI annotation, not a success line.
   const rc5 = sh.slice(sh.indexOf("if [[ $rc -eq 5 ]]"), sh.indexOf("if [[ $rc -eq 3 ]]"));
   assert.match(rc5, /has no internal TestFlight tester/);
   assert.match(rc5, /::warning title=TestFlight has no internal tester::/);
   assert.doesNotMatch(rc5, /internal testers can install this build/);
+  // An unreadable count (rc=6) must not print the success line either.
+  const rc6 = sh.slice(sh.indexOf("if [[ $rc -eq 6 ]]"), sh.indexOf("if [[ $rc -eq 3 ]]"));
+  assert.match(rc6, /installability is unverified/);
+  assert.match(rc6, /::warning title=TestFlight installability unverified::/);
+  assert.doesNotMatch(rc6, /internal testers can install this build/);
+  // The only place the success line is printed is the rc=0 branch.
+  assert.equal(sh.split("TestFlight internal testers can install this build").length - 1, 1);
   // The sync step creates the group, so the workflow must keep calling it.
   assert.match(mjs, /await ensureInternalTesterGroup\(/);
 });
