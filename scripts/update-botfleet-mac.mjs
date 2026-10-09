@@ -829,6 +829,7 @@ function validOwner(owner) {
 
 /** Runtime calls authenticate with BOTFLEET_OWNER_NONCE only — never read the
  *  bearer credential back out of harness-owner.json in this process. */
+/* oxlint-disable anti-slop/no-runtime-typeof -- env bearer credential boundary; zod is unavailable in the updater bootstrap graph. */
 export function requireHarnessBearerCredential() {
   const credential = process.env.BOTFLEET_OWNER_NONCE;
   if (typeof credential !== "string" || credential.length === 0) {
@@ -839,6 +840,7 @@ export function requireHarnessBearerCredential() {
   }
   return credential;
 }
+/* oxlint-enable anti-slop/no-runtime-typeof */
 
 function harnessAuthorizationHeader() {
   return { Authorization: `Bearer ${requireHarnessBearerCredential()}` };
