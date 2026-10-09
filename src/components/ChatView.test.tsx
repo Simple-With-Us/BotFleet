@@ -127,7 +127,8 @@ describe("ChatView karaoke on the reply itself", () => {
   });
 
   it("follows the voice over the rendered markdown, keyed by the message and its written text", () => {
-    expect(SRC).toContain("useMessageKaraoke(spokenRef, message.id, writtenSource, speakable);");
+    // The workspace pronunciation list rides along, so "sequel" lights up "SQL".
+    expect(SRC).toContain("useMessageKaraoke(spokenRef, message.id, writtenSource, speakable, state.config?.tts?.pronunciations);");
     expect(SRC).toContain("writtenReply(message.text ?? \"\")");
     const wrapper = SRC.indexOf("<div ref={spokenRef}>");
     const markdown = SRC.indexOf("<ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />");

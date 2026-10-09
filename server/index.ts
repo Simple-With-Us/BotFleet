@@ -383,6 +383,8 @@ import {
   spokenReply,
   resolveVoiceSummaryMode,
 } from "../shared/voice-summary.ts";
+import { isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
+import { checkPronunciations, PronunciationDraftListSchema } from "../shared/pronunciations.ts";
 import { deterministicSpokenText, summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
 import { isWrittenScript, MessageAudio, type SummarizedSpeech } from "./tts/message-audio.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
@@ -9921,6 +9923,7 @@ function voiceSummaryFor(
         const summary = await summarizeForVoiceDetailed(scrubbedInput, {
           key: currentCfg.deepseek?.key,
           baseUrl: currentCfg.deepseek?.url,
+          pronunciations: tts.pronunciations(currentCfg),
         });
         const safeSummary = summary.text ? redactSecretsInText(summary.text) : "";
         const worthStoring = voiceSummaryWorthStoring(summary);
@@ -9985,6 +9988,7 @@ const messageAudio = new MessageAudio({
     return name ? readAttachment(name) : null;
   },
   defaultVoice: () => cfg.tts?.voice ?? "",
+  pronunciations: () => tts.pronunciations(cfg),
   credentialPending: () => cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey"),
   isNoVoiceConfigured: (error) => error instanceof tts.NoVoiceConfigured,
 });
@@ -14448,6 +14452,61 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, status);
     }
     // Profile name + email only. Skins stay on the Mac.
+    // The workspace default voice and the pronunciation list are settings,
+    // not credentials.  Like terminology, each gets its own narrow route the
+    // paired phone is allowed through (companion/src/routes.ts), so
+    // /api/config, which carries the voice key, stays closed to a device in
+    // a pocket.  Both validate exactly as PUT /api/config does (the tts
+    // schema in server/config.ts) and save only their own field.
+    if (method === "PATCH" && path === "/api/tts/default-voice") {
+      const body = await readBody(req);
+      const voice = typeof body?.voice === "string" ? body.voice.trim() : "";
+      if (!voice) return json(res, 400, { error: "Pick a voice for the workspace default." });
+      // Built-in Mac voice names have spaces ("Bad News"); control and
+      // format characters are never part of a voice id.
+      if (voice.length > MAX_DEFAULT_VOICE_ID_LENGTH || /[\p{Cc}\p{Cf}]/u.test(voice)) {
+        return json(res, 400, { error: "That voice id is not one BotFleet can use." });
+      }
+      // A Personal Voice belongs to the device that made it, so it cannot be
+      // what every bot on every device falls back to.
+      if (isPersonalVoiceId(voice)) return json(res, 400, { error: PERSONAL_VOICE_NOT_DEFAULT });
+      let patch;
+      try {
+        patch = parseConfigPatch({ tts: { voice } });
+      } catch (error) {
+        return json(res, 400, { error: error instanceof Error ? error.message : "Invalid configuration" });
+      }
+      const nextVoice = patch.tts?.voice;
+      if (!nextVoice) return json(res, 400, { error: "nothing to save" });
+      cfg.tts = { ...cfg.tts, voice: nextVoice };
+      // Section-scoped: never `cfg.tts` whole, which holds the resolved key.
+      saveConfig({ tts: { voice: nextVoice } });
+      const status = configStatus();
+      broadcast({ kind: "config", ...status });
+      return json(res, 200, status);
+    }
+    if (method === "PATCH" && path === "/api/tts/pronunciations") {
+      const body = await readBody(req);
+      // The shared validator first, for its plain-language message; the
+      // config schema then runs the same check on the way to disk.
+      const drafts = PronunciationDraftListSchema.safeParse(body?.pronunciations);
+      if (!drafts.success) return json(res, 400, { error: "Each pronunciation needs a term and how to say it." });
+      const checked = checkPronunciations(drafts.data);
+      if (!checked.ok) return json(res, 400, { error: checked.error });
+      let patch;
+      try {
+        patch = parseConfigPatch({ tts: { pronunciations: checked.list } });
+      } catch (error) {
+        return json(res, 400, { error: error instanceof Error ? error.message : "Invalid configuration" });
+      }
+      const list = patch.tts?.pronunciations;
+      if (!list) return json(res, 400, { error: "nothing to save" });
+      cfg.tts = { ...cfg.tts, pronunciations: list };
+      saveConfig({ tts: { pronunciations: list } });
+      const status = configStatus();
+      broadcast({ kind: "config", ...status });
+      return json(res, 200, status);
+    }
     if (method === "PATCH" && path === "/api/profile") {
       const body = await readBody(req);
       const patch = parseConfigPatch({

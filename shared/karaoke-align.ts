@@ -17,7 +17,10 @@
 //   - a display word nobody spoke is "skipped" and is swept quickly between
 //     its neighbours, the way a reader's eye skips a word;
 //   - a spoken word with no display word ("a link") is "inserted" and its time
-//     goes to the display word before it.
+//     goes to the display word before it;
+//   - the words a term on the workspace pronunciation list is said as stand
+//     for the term (shared/pronunciations.ts): "sequel" lands on "SQL", "oh
+//     auth" on "OAuth".
 //
 // Spans make it precise: when the script came from speakableWithSpans(), each
 // spoken word knows the markdown it came from, the markdown is projected onto
@@ -36,6 +39,7 @@
 // both read ios/Tests/CompanionCoreTests/Fixtures/karaoke-align.json.  Offsets
 // are UTF-16 code units.  Times are milliseconds.
 
+import type { Pronunciation } from "./pronunciations.ts";
 import { sourceOffsetAt, type SpeechSpan } from "./speech-spans.ts";
 import { maskPauseTags } from "./spoken-script.ts";
 
@@ -500,6 +504,7 @@ function alignCore(
   params: Params,
   anchors: Array<[number, number]>,
   band: number,
+  pronunciations: readonly Pronunciation[] = [],
 ): CoreResult {
   const R = rows.length;
   const C = cols.length;
@@ -617,6 +622,23 @@ function alignCore(
           if (numId !== undefined) put(numExpansions, i, numId, ks);
         }
       }
+    }
+  }
+  // The pronunciation list: a run of spoken words that is exactly how a term
+  // is said expands to the term's (first) display word.  In list order and
+  // after the number readings, so the Swift mirror breaks ties the same way.
+  for (const entry of pronunciations) {
+    const termWords = tokenizeWords(entry.term);
+    if (!termWords.length) continue;
+    const id = ids.get(termWords[0].key);
+    if (id === undefined) continue;
+    const sayKeys = tokenizeWords(entry.say).map((w) => w.key);
+    const k = sayKeys.length;
+    if (k === 0 || k > MAX_JOINED) continue;
+    for (let i = 0; i + k <= R; i += 1) {
+      let same = true;
+      for (let q = 0; q < k && same; q += 1) same = rows[i + q].key === sayKeys[q];
+      if (same) put(expansions, i, id, [k]);
     }
   }
   const classify = (i: number, j: number): number => {
@@ -846,7 +868,7 @@ export function guideFromSpans(
 export function alignWords(
   spokenWords: readonly WordToken[],
   displayWords: readonly WordToken[],
-  options: { guide?: ArrayLike<number> | null } = {},
+  options: { guide?: ArrayLike<number> | null; pronunciations?: readonly Pronunciation[] | null } = {},
 ): KaraokeMapping {
   const S = spokenWords.length;
   const D = displayWords.length;
@@ -854,7 +876,14 @@ export function alignWords(
   const anchors = options.guide
     ? guideAnchors(options.guide, S, D)
     : uniqueAnchors(spokenWords, displayWords);
-  const core = alignCore(spokenWords, displayWords, SPOKEN_PARAMS, anchors, guided ? GUIDED_BAND : SPOKEN_PARAMS.band);
+  const core = alignCore(
+    spokenWords,
+    displayWords,
+    SPOKEN_PARAMS,
+    anchors,
+    guided ? GUIDED_BAND : SPOKEN_PARAMS.band,
+    options.pronunciations ?? [],
+  );
   const spokenToDisplay = new Int32Array(S).fill(-1);
   let previous = -1;
   for (let s = 0; s < S; s += 1) {
@@ -989,6 +1018,9 @@ export interface KaraokeAlignment {
  * - `segments` + `sourceText`: the script's spans and the markdown they index
  *   into.  Optional; without them the alignment falls back to unique-word
  *   anchors, which is what an LLM-written script gets.
+ * - `pronunciations`: the workspace list in force (config
+ *   `tts.pronunciations`), so a respelled term pairs with the term on
+ *   screen.  Optional.
  */
 export function alignSpokenToDisplay(input: {
   spokenText: string;
@@ -997,6 +1029,7 @@ export function alignSpokenToDisplay(input: {
   sourceText?: string | null;
   spokenWords?: WordToken[];
   displayWords?: WordToken[];
+  pronunciations?: readonly Pronunciation[] | null;
 }): KaraokeAlignment {
   const spokenWords = input.spokenWords ?? tokenizeWords(maskPauseTags(input.spokenText));
   const displayWords = input.displayWords ?? tokenizeWords(input.displayText);
@@ -1004,7 +1037,7 @@ export function alignSpokenToDisplay(input: {
     ? guideFromSpans(spokenWords, input.segments, input.sourceText, displayWords)
     : null;
   const guided = Boolean(guide && guide.some((g) => g >= 0));
-  const mapping = alignWords(spokenWords, displayWords, { guide: guided ? guide : null });
+  const mapping = alignWords(spokenWords, displayWords, { guide: guided ? guide : null, pronunciations: input.pronunciations });
   const quality = alignmentQuality(spokenWords, displayWords, mapping);
   // Spans tie every spoken word to its source, so a guided script is always
   // followed, however much of the message it reads as "a link" or skips.

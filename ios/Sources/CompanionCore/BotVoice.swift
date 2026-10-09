@@ -85,6 +85,43 @@ public enum BotVoice {
         }
         return voice
     }
+
+    /// `NO_DEFAULT_VOICE` in `shared/bot-voice.ts`.
+    public static let noDefaultVoice = "No default voice"
+
+    /// `PERSONAL_VOICE_NOT_DEFAULT` in `shared/bot-voice.ts`.
+    public static let personalVoiceNotDefault =
+        "Personal Voices stay on the device that made them, so they cannot be the default."
+
+    /// `readableVoiceId`: the Personal Voice prefix dropped, `-` and `_`
+    /// read as spaces, each word starting with a capital.
+    public static func readableVoiceId(_ voiceId: String) -> String {
+        var bare = Substring(voiceId)
+        for prefix in [PersonalVoiceContract.prefix, PersonalVoiceContract.legacyPrefix] where bare.hasPrefix(prefix) {
+            bare = bare.dropFirst(prefix.count)
+            break
+        }
+        let words = bare.split(whereSeparator: { $0 == "-" || $0 == "_" || $0.isWhitespace })
+        if words.isEmpty { return voiceId }
+        return words.map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+    }
+
+    /// `voiceDisplayName`: the listed label unless it is only the id again,
+    /// then the id made readable.  The lookup is exact; MiniMax ids are
+    /// case-sensitive.
+    public static func displayName(_ voiceId: String, voices: [Voice]?) -> String {
+        let label = voices?.first(where: { $0.id == voiceId })?.label.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !label.isEmpty && label != voiceId ? label : readableVoiceId(voiceId)
+    }
+
+    /// `defaultVoiceOptionLabel`: what every per-device picker's first option
+    /// says, "Jay Wedgeworth 001 (default)", never a bare "(default)".
+    public static func defaultOptionLabel(_ defaultVoice: String?, voices: [Voice]?) -> String {
+        guard let defaultVoice, !defaultVoice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return noDefaultVoice
+        }
+        return "\(displayName(defaultVoice, voices: voices)) (default)"
+    }
 }
 
 extension Bot {

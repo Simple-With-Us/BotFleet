@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { Pronunciation } from "../../shared/pronunciations.ts";
 import { utterancesWithSpans } from "../../shared/speech-spans.ts";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
 import { sanitizeForTTS } from "./minimax.ts";
@@ -86,6 +87,27 @@ OUTPUT: "Here are your options for the flight. <#0.3#> First, American Airlines 
 </system_prompt>`;
 
 /**
+ * The system prompt with the workspace pronunciation list appended, so a
+ * distilled script made after the list changes already says each term the
+ * way the owner asked ("sequel" for SQL).  Scripts stored before the change
+ * are reused as they are, with their clips (server/index.ts voiceSummaryFor),
+ * so the list reaches them only through the engine-side pass in
+ * server/tts/index.ts speak.  Kept deliberately small; the prompt itself is
+ * rewritten separately.
+ */
+export function voiceSummarySystemPrompt(pronunciations: readonly Pronunciation[] = []): string {
+  if (!pronunciations.length) return DEEPSEEK_FLASH_TTS_PROMPT;
+  // JSON-quoted, so a term or a respelling can never close the block or
+  // read as an instruction of its own.
+  const pairs = pronunciations.map((p) => `- ${JSON.stringify(p.term)} is said ${JSON.stringify(p.say)}`).join("\n");
+  return `${DEEPSEEK_FLASH_TTS_PROMPT}
+<pronunciations>
+Always say these terms exactly as given.  Write the respelling in place of the term, wherever the term appears as a whole word in the spoken text.  This overrides the acronym rule above: do not spell these terms out letter by letter.
+${pairs}
+</pronunciations>`;
+}
+
+/**
  * The deterministic spoken text for `text`: speakable()'s rules, split into
  * utterances and joined with single spaces.  This is exactly the written-mode
  * script (shared/speech-spans.ts utterancesWithSpans), so when the distiller
@@ -105,6 +127,10 @@ export interface SummarizeVoiceOptions {
   url?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** The workspace pronunciation list, appended to the prompt
+   * (voiceSummarySystemPrompt).  The deterministic fallback leaves it to
+   * the engine-side pass. */
+  pronunciations?: readonly Pronunciation[];
 }
 
 /** Where the speech text came from.  "summary" is the model's rewrite;
@@ -231,6 +257,7 @@ export async function summarizeForVoiceDetailed(
   const endpoint = completionsUrl(options.baseUrl || options.url || extraOptions.url);
   const timeoutMs = options.timeoutMs ?? extraOptions.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxTokens = voiceSummaryMaxTokens(cleanInput.length);
+  const systemPrompt = voiceSummarySystemPrompt(options.pronunciations);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => {
     timeoutController.abort(new Error("Voice summary request timed out"));
@@ -279,7 +306,7 @@ export async function summarizeForVoiceDetailed(
       body: JSON.stringify({
         model: "deepseek-flash",
         messages: [
-          { role: "system", content: DEEPSEEK_FLASH_TTS_PROMPT },
+          { role: "system", content: systemPrompt },
           { role: "user", content: cleanInput },
         ],
         max_tokens: maxTokens,
@@ -305,7 +332,7 @@ export async function summarizeForVoiceDetailed(
       body: JSON.stringify({
         model: "deepseek-chat",
         messages: [
-          { role: "system", content: DEEPSEEK_FLASH_TTS_PROMPT },
+          { role: "system", content: systemPrompt },
           { role: "user", content: cleanInput },
         ],
         max_tokens: maxTokens,
