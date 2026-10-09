@@ -3,12 +3,12 @@ import type { z } from "zod";
 
 import {
   PluginListingSchema,
+  PluginListingSourceSchema,
   PluginsResponseSchema,
-  PluginSourceSchema,
   type PluginListing,
+  type PluginListingSource,
   type PluginsResponse,
-  type PluginSource,
-} from "./PluginsManagerView";
+} from "../../server/plugin-types";
 
 // The view's types are derived from the schemas that read the plugins route, so
 // they cannot drift apart.  These checks pin that, and the one runtime behaviour
@@ -33,11 +33,11 @@ describe("plugins manager schemas", () => {
   it("derives the view types from the schemas", () => {
     expectTypeOf<PluginListing>().toEqualTypeOf<z.infer<typeof PluginListingSchema>>();
     expectTypeOf<PluginsResponse>().toEqualTypeOf<z.infer<typeof PluginsResponseSchema>>();
-    expectTypeOf<PluginSource>().toEqualTypeOf<z.infer<typeof PluginSourceSchema>>();
+    expectTypeOf<PluginListingSource>().toEqualTypeOf<z.infer<typeof PluginListingSourceSchema>>();
     // A folder source always has a path, and a git source always has a url: the old
     // hand-written interface made both optional on both kinds.
-    expectTypeOf<Extract<PluginSource, { kind: "folder" }>["path"]>().toEqualTypeOf<string>();
-    expectTypeOf<Extract<PluginSource, { kind: "git" }>["url"]>().toEqualTypeOf<string>();
+    expectTypeOf<Extract<PluginListingSource, { kind: "folder" }>["path"]>().toEqualTypeOf<string>();
+    expectTypeOf<Extract<PluginListingSource, { kind: "git" }>["url"]>().toEqualTypeOf<string>();
   });
 
   it("silently drops a field the server adds instead of rejecting it", () => {
@@ -52,8 +52,8 @@ describe("plugins manager schemas", () => {
   });
 
   it("rejects a listing whose source cannot be shown", () => {
-    expect(PluginSourceSchema.safeParse({ kind: "folder" }).success).toBe(false);
-    expect(PluginSourceSchema.safeParse({ kind: "git" }).success).toBe(false);
+    expect(PluginListingSourceSchema.safeParse({ kind: "folder" }).success).toBe(false);
+    expect(PluginListingSourceSchema.safeParse({ kind: "git" }).success).toBe(false);
     expect(PluginsResponseSchema.safeParse({ plugins: [{ ...listing, source: { kind: "git" } }] }).success).toBe(false);
   });
 });

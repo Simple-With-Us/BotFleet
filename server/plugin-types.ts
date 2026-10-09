@@ -8,7 +8,7 @@
 // every entry.  No hand-written predicate stands in for the schema.
 import { z } from "zod";
 
-import { PLUGIN_NAME, PLUGIN_NAME_MAX, SEMVER, type PluginManifest } from "../shared/plugin-manifest.ts";
+import { PLUGIN_NAME, PLUGIN_NAME_MAX, SEMVER } from "../shared/plugin-manifest.ts";
 
 const PLUGIN_NAME_FIELD = z.string().min(1).max(PLUGIN_NAME_MAX).regex(PLUGIN_NAME);
 const ISO_TIMESTAMP = z.string().min(1).max(64).refine((value) => !Number.isNaN(Date.parse(value)), {
@@ -82,25 +82,65 @@ export const PluginExportsSchema = z.object({
 }).strict();
 export type PluginExports = z.infer<typeof PluginExportsSchema>;
 
-/** A listing for the UI: the manifest fields plus registry state. */
-export interface PluginListing {
-  name: string;
-  version: string;
-  description: string;
-  author?: string;
-  license?: string;
+/** Permissive source shape for the API listing.  Distinct from the
+ *  strict `PluginSourceSchema` used by the on-disk registry: the API
+ *  layer must accept a server-added field without blanking the list. */
+export const PluginListingSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("folder"), path: z.string().min(1) }),
+  z.object({
+    kind: z.literal("git"),
+    url: z.string().min(1),
+    ref: z.string().nullable().optional(),
+    path: z.string().optional(),
+  }),
+]);
+export type PluginListingSource = z.infer<typeof PluginListingSourceSchema>;
+
+/** The shape returned by the plugins listing API.  The view reads the
+ *  `/api/plugins` response through this schema so the wire format and the
+ *  consumer type cannot drift apart.  The schema strips unknown keys: a
+ *  server-added field is dropped from `parsed.data` instead of failing
+ *  the parse and blanking the list.  The stricter on-disk registry
+ *  schema above is a separate trust boundary. */
+export const PluginListingSchema = z.object({
+  name: z.string().min(1),
+  version: z.string().min(1),
+  description: z.string(),
+  author: z.string().optional(),
+  license: z.string().optional(),
   /** Host API version constraint, e.g. ">=1". */
-  botfleet: string;
+  botfleet: z.string().min(1),
   /** Manifest-declared entry path. */
-  entry: string;
-  enabled: boolean;
-  installedAt: string;
-  updatedAt: string;
-  source: PluginSource;
-  warnings: string[];
-  capabilities: string[];
-  contributes?: PluginManifest["contributes"];
-}
+  entry: z.string().min(1),
+  enabled: z.boolean(),
+  installedAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+  source: PluginListingSourceSchema,
+  warnings: z.array(z.string()),
+  capabilities: z.array(z.string()),
+  contributes: z.object({
+    cards: z.array(z.object({
+      id: z.string(),
+      title: z.string(),
+      description: z.string().optional(),
+      layout: z.enum(["stat-grid", "key-value", "list"]),
+      fields: z.array(z.string()).optional(),
+    })).optional(),
+    commands: z.array(z.object({
+      name: z.string(),
+      description: z.string(),
+      args: z.array(z.string()).optional(),
+    })).optional(),
+  }).optional(),
+});
+
+/** The full response body of `GET /api/plugins`. */
+export const PluginsResponseSchema = z.object({
+  plugins: z.array(PluginListingSchema),
+});
+
+export type PluginListing = z.infer<typeof PluginListingSchema>;
+export type PluginsResponse = z.infer<typeof PluginsResponseSchema>;
 
 /** The fetch shape used by plugin-fetch and plugin-folder.  Mirrors
  *  the skill shape so we can reuse the validation flow. */

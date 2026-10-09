@@ -9,11 +9,11 @@
 // contributes from its manifest — text summaries only, the host does
 // not render plugin-supplied UI here.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { z } from "zod";
 import { ArrowUpCircle, Loader2, Power, PowerOff, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { PluginsResponseSchema, type PluginListing, type PluginsResponse } from "../../server/plugin-types";
 
 interface PluginInstallIssue {
   field: string;
@@ -70,60 +70,11 @@ async function readApiError(response: Response): Promise<ApiError | null> {
   return { error: errorText, issues };
 }
 
-// The schemas below are the one definition of what the plugins route returns.
-// The types the view uses are derived from them (`z.infer`), so a field added or
-// renamed on one side cannot drift from the other, and no cast is needed where a
-// response is read.  The boundary objects strip unknown keys by default: a
-// server-added field is dropped from `parsed.data` instead of failing the parse
-// and blanking the list.  Required fields stay required (a folder source has
-// `path`, a git source has `url`).
-export const PluginSourceSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("folder"), path: z.string().min(1) }),
-  z.object({
-    kind: z.literal("git"),
-    url: z.string().min(1),
-    ref: z.string().nullable().optional(),
-    path: z.string().optional(),
-  }),
-]);
-
-export const PluginListingSchema = z.object({
-  name: z.string().min(1),
-  version: z.string().min(1),
-  description: z.string(),
-  author: z.string().optional(),
-  license: z.string().optional(),
-  botfleet: z.string().min(1),
-  entry: z.string().min(1),
-  enabled: z.boolean(),
-  installedAt: z.string().min(1),
-  updatedAt: z.string().min(1),
-  source: PluginSourceSchema,
-  warnings: z.array(z.string()),
-  capabilities: z.array(z.string()),
-  contributes: z.object({
-    cards: z.array(z.object({
-      id: z.string(),
-      title: z.string(),
-      description: z.string().optional(),
-      layout: z.enum(["stat-grid", "key-value", "list"]),
-      fields: z.array(z.string()).optional(),
-    })).optional(),
-    commands: z.array(z.object({
-      name: z.string(),
-      description: z.string(),
-      args: z.array(z.string()).optional(),
-    })).optional(),
-  }).optional(),
-});
-
-export const PluginsResponseSchema = z.object({
-  plugins: z.array(PluginListingSchema),
-});
-
-export type PluginSource = z.infer<typeof PluginSourceSchema>;
-export type PluginListing = z.infer<typeof PluginListingSchema>;
-export type PluginsResponse = z.infer<typeof PluginsResponseSchema>;
+// The schemas are the single definition of what the plugins route returns, and
+// they live in server/plugin-types so the server and the view cannot drift
+// apart.  The view's types are derived from them (`z.infer`), and the boundary
+// strips unknown keys by default: a server-added field is dropped from
+// `parsed.data` instead of failing the parse and blanking the list.
 
 async function readPluginsResponse(response: Response): Promise<PluginsResponse | null> {
   let body: unknown;
