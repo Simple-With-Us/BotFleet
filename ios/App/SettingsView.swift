@@ -133,6 +133,21 @@ struct SettingsView: View {
                     }
 
                     NavigationLink {
+                        FleetModelsView()
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Models")
+                                Text("Every bot's primary and fallbacks")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            SettingsIcon(symbol: "cpu", color: .green)
+                        }
+                    }
+
+                    NavigationLink {
                         UsageView()
                     } label: {
                         Label {
