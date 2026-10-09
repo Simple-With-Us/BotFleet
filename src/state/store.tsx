@@ -884,6 +884,14 @@ export interface AppState {
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
+  /** Counts the times the person picked something to look at: every `select`,
+   *  including one that lands on the chat already open, and a `botAdded` that
+   *  moves the selection to the new bot.  `selectedId` alone cannot tell a click
+   *  on the open chat from no click, and the store also rewrites it by itself (a
+   *  hydrate that lost the selection, a delete that falls back).  UI that must
+   *  yield to a deliberate pick, such as the Fleet Matrix overview, watches this
+   *  instead; background updates never move it. */
+  selectionNonce: number;
   /** Explicitly selected thread for the active bot (e.g., from App Matrix). Null follows bot.threadId. */
   viewedThreadId: string | null;
   /** Local task-creation dialog; never changes the bot's running thread. */
@@ -1501,6 +1509,7 @@ export function reducer(state: AppState, action: Action): AppState {
           ...state,
           activeView: "chat",
           selectedId: action.id,
+          selectionNonce: state.selectionNonce + 1,
           // A group is not the bot the pin belongs to.  Leaving it set would
           // show the next bot the previous thread.
           viewedThreadId: null,
@@ -1510,7 +1519,7 @@ export function reducer(state: AppState, action: Action): AppState {
       }
       const wasUnread = state.bots.find((b) => b.id === action.id)?.unread;
       const next = updateBot(
-        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id, viewedThreadId: action.viewedThreadId ?? null }, action.id, "switch"),
+        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id, selectionNonce: state.selectionNonce + 1, viewedThreadId: action.viewedThreadId ?? null }, action.id, "switch"),
         action.id,
         (b) => ({ ...b, unread: false }),
       );
@@ -1546,6 +1555,9 @@ export function reducer(state: AppState, action: Action): AppState {
         bots: [action.bot, ...state.bots.filter((bot) => bot.id !== action.bot.id)],
         activeView: "chat",
         selectedId: action.bot.id,
+        // Same rule as the pin above: the new bot counts as a pick, a second
+        // fold of the bot already on screen does not.
+        selectionNonce: action.bot.id === state.selectedId ? state.selectionNonce : state.selectionNonce + 1,
         viewedThreadId,
       }, action.bot.id, "arrive");
     }
@@ -2148,6 +2160,7 @@ export const initialState: AppState = {
   instancesDescribedAt: 0,
   config: null,
   selectedId: "",
+  selectionNonce: 0,
   viewedThreadId: null,
   taskCreationBotId: null,
   activeView: "chat",

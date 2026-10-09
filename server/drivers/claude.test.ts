@@ -1515,6 +1515,36 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     }
   });
 
+  it("reads a tool name that is not a string as the generic tool, and keeps serving the socket", async () => {
+    await create("hang");
+    await instance.adapter.sendTurn({ threadId: "t-perm-badtool", text: "go" });
+    await recorder.until((e) => e.type === "session.started");
+    const conn = await connectSocket(permissionSocketPath("t-perm-badtool"));
+    const ask = (id: string, tool: number | string | Record<string, string>) =>
+      conn.write(JSON.stringify({ t: "ask", id, tool, input: { file_path: "/tmp/x" } }) + "\n");
+
+    // The frame is untrusted.  A number used to throw out of the socket
+    // listener (`tool.replace is not a function` in fileWritePaths), after the
+    // ask was already pending, which takes the server process down.
+    ask("bad-number", 123);
+    ask("bad-object", { name: "Write" });
+    ask("bad-empty", "");
+    ask("after", "Write");
+    const opened = async (id: string) => recorder.until((e) => e.type === "request.opened" && e.requestId === id);
+
+    for (const id of ["bad-number", "bad-object", "bad-empty"]) {
+      const event = await opened(id);
+      expect(event).toMatchObject({ tool: "tool" });
+      expect(event).toHaveProperty("paths", undefined);
+    }
+    // the listener survived, and a real file tool afterwards is still read
+    expect(await opened("after")).toMatchObject({ tool: "Write", paths: ["/tmp/x"] });
+
+    conn.end();
+    await instance.adapter.interruptTurn("t-perm-badtool");
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
   it("answers to unknown or already-resolved asks resolve `unavailable` — typed, never a throw", async () => {
     await create("hang");
     await instance.adapter.sendTurn({ threadId: "t-perm-2", text: "go" });
