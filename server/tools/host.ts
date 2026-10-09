@@ -49,6 +49,7 @@ import { createGithubTools } from "./github.ts";
 import { createPhoneTools } from "./phone.ts";
 import { createRecallTools } from "./recall.ts";
 import { createLinqTools, type LinqToolDeps } from "./linq.ts";
+import { createZulipTools, type ZulipToolSend } from "./zulip.ts";
 import type { RecallSettings } from "../recall-transport.ts";
 import { harnessTool, toolsFor, type ToolApproval, type ToolGateContext } from "./registry.ts";
 
@@ -104,6 +105,10 @@ export interface TurnToolHostContext {
    *  the dispatch offered them in the catalog — the same one boolean feeds
    *  both, so a job tool the model was not offered finds no executor here. */
   jobs?: Pick<JobToolsOptions, "registry" | "onComplete" | "wakes" | "maxWaitSeconds">;
+  /** This bot's Zulip identity is connected, so `zulip_reply` and
+   *  `zulip_post` are offered.  `send` is the hub's, bound by the dispatch;
+   *  the host hands it this turn's identity, never the model's arguments. */
+  zulip?: { send: ZulipToolSend };
   /** Job notices waiting for this turn (server/steer-queue.ts): the driver's
    *  tool loop drains them between model rounds. */
   drainNotices?: () => string[];
@@ -229,6 +234,7 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
           ),
         )
       : []),
+    ...(ctx.zulip ? Object.entries(createZulipTools({ send: ctx.zulip.send })) : []),
   ]);
   const gate: ToolGateContext = {
     // The dispatch only builds a host when the agents integration is
@@ -254,6 +260,7 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
     github: Boolean(ctx.localComputer),
     linq: Boolean(ctx.linq),
     jobs: Boolean(ctx.jobs),
+    zulip: Boolean(ctx.zulip),
   };
   // The same gate the catalog handed the model.  A hallucinated name, or a
   // real name the model was not offered this turn, finds no executor.

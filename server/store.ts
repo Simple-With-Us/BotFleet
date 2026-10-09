@@ -122,7 +122,7 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */

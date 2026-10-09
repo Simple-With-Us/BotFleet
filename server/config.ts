@@ -241,6 +241,30 @@ const featureConfigSchema = z.object({
   /** Per-turn Git worktree isolation for bots working in a shared repository. */
   gitWorktreeLeases: z.boolean().optional(),
 });
+const zulipConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  dryRun: z.boolean().optional(),
+  realm: optionalText,
+  ownerUserId: z.number().int().positive().optional(),
+  ownerClients: z.array(z.string().trim().min(1)).max(20).optional(),
+  credentialDir: optionalText,
+  bots: z
+    .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
+    .optional(),
+  postChannels: z.array(z.string().trim().min(1)).max(50).optional(),
+  autoReply: z.enum(["final", "off"]).optional(),
+  staleMinutes: z.number().int().min(1).max(10_080).optional(),
+  peerDmAllow: z.array(z.number().int().positive()).max(100).optional(),
+  budgets: z
+    .object({
+      peerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerWakesPerTopicPerHour: z.number().int().min(0).max(1000).optional(),
+      ownerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerChainLimit: z.number().int().min(0).max(1000).optional(),
+    })
+    .optional(),
+});
+
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -327,6 +351,12 @@ const appConfigSchema = z.object({
      *  without the operator's explicit consent. */
     allowVoiceByDefault: z.boolean().optional(),
   }).optional(),
+  /** The Zulip source (docs/zulip.md): which BotFleet bots hold a Zulip
+   *  identity, where their keys come from, and the wake and post rules.  No
+   *  key lives here — `credentialDir` names the folder of `<Role>-zuliprc`
+   *  files.  A malformed section reads as absent rather than failing the
+   *  whole stored config, so a typo turns Zulip off and nothing else. */
+  zulip: zulipConfigSchema.optional().catch(undefined),
   ingress: z.object({
     publicUrl: z
       .string()
@@ -461,7 +491,11 @@ const appConfigSchema = z.object({
 // check, busy-bot check, atomic reassignment), so accepting it here would let
 // `PATCH /api/config {"deleteInstance":"claude"}` bypass all of them and
 // strand bots on a protected engine that no longer exists.
-const appConfigPatchSchema = appConfigSchema.omit({ instances: true, deleteInstance: true });
+// A save is strict about the Zulip section (a bad value is a 400 the panel
+// can show), while a stored file stays lenient (a bad value turns Zulip off).
+const appConfigPatchSchema = appConfigSchema
+  .omit({ instances: true, deleteInstance: true })
+  .extend({ zulip: zulipConfigSchema.optional() });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
 export interface AppConfig {
@@ -540,6 +574,8 @@ export interface AppConfig {
     allowVoiceByDefault?: boolean;
   };
   ingress?: { publicUrl?: string; enabled?: boolean };
+  /** The Zulip source (docs/zulip.md, server/zulip/types.ts). */
+  zulip?: import("./zulip/types.ts").ZulipSettings;
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
   localVm?: {
@@ -1429,7 +1465,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);

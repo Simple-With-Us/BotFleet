@@ -94,6 +94,10 @@ export interface ToolGateContext {
    *  independent of `agents` and the comms depth: a job is the bot's own
    *  work, not a hop to a peer. */
   jobs?: boolean;
+  /** This bot holds a connected Zulip identity (server/zulip/hub.ts), so
+   *  `zulip_reply` and `zulip_post` are offered.  Independent of `agents`
+   *  and the comms depth: posting as yourself is not a hop to a peer. */
+  zulip?: boolean;
 }
 
 /** How a tool asks a person before it runs.  Consumed by the permission
@@ -1143,6 +1147,66 @@ const LINQ_VOICE_MESSAGE: HarnessTool = {
   },
 };
 
+// ── Zulip (docs/zulip.md) ──
+// Offered only to a bot whose Zulip session is connected.  Neither tool
+// carries an approval record, and that is deliberate: every rule that makes
+// a post safe is enforced by the harness, not asked of a person — the reply
+// target is the conversation that woke the turn and the model cannot move
+// it, an off-origin post must name a channel the owner allowed, a DM may go
+// only to the person whose DM started the turn, and text that looks like a
+// secret is refused (server/zulip/outbound.ts).  A card would only stall an
+// unattended Zulip turn.
+
+const zulipEnabled = (ctx: ToolGateContext) => Boolean(ctx.zulip);
+
+const ZULIP_REPLY: HarnessTool = {
+  name: "zulip_reply",
+  description:
+    "Answer the Zulip message that woke this turn: posts in the same channel topic, or answers the direct message, as your own Zulip bot with your role tag added. Only works on a turn started from Zulip. Never include secrets, keys or tokens: the post is refused.",
+  schema: {
+    type: "object",
+    properties: {
+      content: {
+        type: "string",
+        description: "The reply, in Zulip markdown. Do not add your [BF-...] tag; the harness adds it.",
+      },
+    },
+    required: ["content"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: zulipEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use zulip_reply to answer a Zulip message in the conversation it came from.",
+};
+
+const ZULIP_POST: HarnessTool = {
+  name: "zulip_post",
+  description:
+    "Post to Zulip as your own bot. A channel post needs a channel AND a topic: one topic per unit of work, at most 58 characters, never your own name. Only the channel that woke you (any topic there) or a channel the owner allowed is accepted. dm_user_id answers a direct message, and only to the person whose DM started this turn. Never include secrets, keys or tokens: the post is refused.",
+  schema: {
+    type: "object",
+    properties: {
+      channel: { type: "string", description: "Channel name without the #, for example agent-sync." },
+      topic: { type: "string", description: "The topic (thread) to post in. Required with channel." },
+      dm_user_id: {
+        type: "integer",
+        description: "Zulip user id to answer by direct message. Only the sender of the DM that started this turn.",
+      },
+      content: {
+        type: "string",
+        description: "The message, in Zulip markdown. Do not add your [BF-...] tag; the harness adds it.",
+      },
+    },
+    required: ["content"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: zulipEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use zulip_post to post in an allowed Zulip channel topic.",
+};
+
 // ── background jobs (P1, docs/plans/2026-10-01-background-jobs-and-subagents-decision.md) ──
 // HTTP lane only in P1: a CLI engine reaches them over MCP in P2.  The
 // numbers below (16 KB, 75 s) are literals because this file imports
@@ -1319,6 +1383,8 @@ export const HARNESS_TOOLS: readonly HarnessTool[] = [
   JOB_OUTPUT,
   JOB_LIST,
   JOB_KILL,
+  ZULIP_REPLY,
+  ZULIP_POST,
 ];
 
 const BY_NAME = new Map(HARNESS_TOOLS.map((tool) => [tool.name, tool]));
