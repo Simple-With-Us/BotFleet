@@ -16,6 +16,7 @@ import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
 import { noEngineCanRun } from "@/lib/engine-status";
 import { threadIdForApp } from "@/lib/task-app-thread";
+import { useDismissOnSelection } from "@/lib/use-dismiss-on-selection";
 
 // UI2: every one of these is already conditionally rendered — near-modal
 // panels/pages that most sessions never open in a given launch — so they
@@ -118,11 +119,19 @@ function Shell() {
     }
   }, [group?.id, group?.dm]);
 
-  // When selection changes via sidebar or store, yield matrix overview to the selected chat
+  // The overview covers the chat pane, so a pick from anywhere (sidebar, ⌘1–9,
+  // command palette, notification) has to close it.  Only a pick: the store
+  // streams bot and room updates all session and hydrate selects the first bot
+  // at launch, and none of that may dismiss the overview.  The deck, the matrix
+  // and the "All" tab close or open it in their own handlers below.
+  const dismissMatrixOverview = useCallback(() => setMatrixOverviewActive(false), []);
+  useDismissOnSelection(state.selectionNonce, dismissMatrixOverview);
+
+  // A bot opened outside an app context must not leave selectedAppId on the
+  // previous app, or ⌘1–9 would keep routing through openBotInApp (#854).  This
+  // one reads bots, groups and the viewed thread, which is why it stays apart
+  // from the overview dismissal above: those inputs change all the time.
   useEffect(() => {
-    if (state.selectedId) {
-      setMatrixOverviewActive(false);
-    }
     const selectedGroup = state.groups.find((g) => g.id === state.selectedId);
     if (selectedGroup && !selectedGroup.dm) return;
     const selectedBot = state.bots.find((b) => b.id === state.selectedId);
