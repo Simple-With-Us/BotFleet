@@ -20,7 +20,7 @@ import {
   type Reviewer,
   type ReviewerCandidate,
 } from "./auto-review.ts";
-import { autoVerdict, PERMISSION_BYPASS_RULE, type AutoVerdictSource } from "./auto-approve.ts";
+import { approvalKey, autoVerdict, PERMISSION_BYPASS_RULE, type AutoVerdictSource } from "./auto-approve.ts";
 import {
   effectiveReviewHook,
   fallbackReviewerSetting,
@@ -249,8 +249,48 @@ describe("Auto and Bypass grants and auto-review", () => {
     expect(grantLabel(bypass.rule)).toBe("Bypass");
   });
 
-  it("leaves a person's always-allow alone", () => {
-    expect(reviewsGrant({ ...grant, source: "always-allow", mode: "enforce" })).toBe(false);
+  it("leaves a person's always-allow alone, except under On on a turn held for review", () => {
+    const always = { ...grant, source: "always-allow" as const };
+    expect(reviewsGrant({ ...always, mode: "enforce" })).toBe(false);
+    expect(reviewsGrant({ ...always, mode: "enforce", heldTurn: false })).toBe(false);
+    expect(reviewsGrant({ ...always, mode: "shadow", heldTurn: true })).toBe(false);
+    expect(reviewsGrant({ ...always, mode: "off", heldTurn: true })).toBe(false);
+  });
+
+  // Finding 1 of the follow-up review.  A held turn hands every ask to its
+  // card (the step watch drops the step once it asks), and an always-allow
+  // answered at the card with no review, so On reviewed less than Watch did
+  // for exactly the actions a person had pre-approved.
+  it("screens a person's always-allow on a held turn, so On never reviews less than Watch", () => {
+    const always = { ...grant, source: "always-allow" as const, heldTurn: true };
+    expect(reviewsGrant({ ...always, mode: "enforce" })).toBe(true);
+    // the same two grants stay out of review whatever granted them
+    expect(reviewsGrant({ ...always, mode: "enforce", approvalScope: "local-computer" })).toBe(false);
+    expect(reviewsGrant({ ...always, mode: "enforce", ownJobStart: true })).toBe(false);
+    expect(reviewsGrant({ ...always, mode: "enforce", approvalScope: "disposable-computer" })).toBe(true);
+  });
+
+  it("keeps screening an Auto or Bypass grant whether or not the turn is held", () => {
+    for (const heldTurn of [true, false, undefined]) {
+      expect(reviewsGrant({ ...grant, mode: "enforce", heldTurn })).toBe(true);
+      expect(reviewsGrant({ ...grant, mode: "shadow", heldTurn })).toBe(true);
+    }
+  });
+
+  it("the held card names an always-allow by its source, because its rule is the grant key", () => {
+    const key = approvalKey("shell", "echo hi");
+    const verdict = autoVerdict({ alwaysAllow: [key] }, "shell", "echo hi");
+    expect(verdict).toMatchObject({ source: "always-allow", rule: key });
+    // the rule is the key, never PERMISSION_BYPASS_RULE, so it would read as Auto mode
+    expect(grantLabel(verdict.rule)).toBe("Auto mode");
+    expect(grantLabel(verdict.rule, verdict.source)).toBe("Always allow");
+    expect(grantLabel(PERMISSION_BYPASS_RULE, "auto-mode")).toBe("Bypass");
+    expect(heldGrantText("Always allow", { kind: "no-answer" })).toBe(
+      "You set this to always allow, but no reviewer could check this one, so it waits for you.",
+    );
+    expect(heldGrantText("Always allow", { kind: "capped", limit: 3 })).toBe(
+      "You set this to always allow, but auto-review reached its limit of 3 reviews for this turn, so this waits for you.",
+    );
   });
 
   it("never touches host control, which neither grant covers for review", () => {
@@ -321,6 +361,21 @@ describe("the per-turn review budget", () => {
     expect(budget.spend(ReviewBudget.key("thread-1", "turn-2"))).toBe(true);
     budget.release(key);
     expect(budget.exhausted(key)).toBe(false);
+  });
+
+  it("says how many reviews a turn has left, which a late review of a finished turn spends", () => {
+    const budget = new ReviewBudget(() => 3);
+    const key = ReviewBudget.key("thread-1", "turn-1");
+    expect(budget.remaining(key)).toBe(3);
+    budget.spend(key);
+    expect(budget.remaining(key)).toBe(2);
+    budget.spend(key);
+    budget.spend(key);
+    expect(budget.remaining(key)).toBe(0);
+    expect(budget.spend(key)).toBe(false);
+    expect(budget.remaining(key)).toBe(0);
+    budget.release(key);
+    expect(budget.remaining(key)).toBe(3);
   });
 
   it("announces a capped turn once", () => {

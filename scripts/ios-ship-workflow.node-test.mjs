@@ -50,6 +50,16 @@ test("ios-ship.yml targets botfleet / ios on the GitHub-hosted xcode-27 image", 
   // Every group/tester/build mutation is gated on a successful tester listing.
   assert.match(read("scripts/ios-fleet/asc-api.mjs"), /if \(!inGroupRes\.ok\)/);
   assert.match(read("scripts/ios-fleet/ship-testflight.sh"), /sentry_redact/);
+  // Sentry org is centralized, not triple-hardcoded: verified 2026-10-09 the
+  // botfleet project lives in org simple-with-us while the vault token was
+  // still scoped to the retired slug jays-services ("organization not found",
+  // issue #1023).  A mismatch must name the rotation, never a secret value.
+  const shipScript = read("scripts/ios-fleet/ship-testflight.sh");
+  assert.match(shipScript, /sentry_org="\$\{SENTRY_ORG:-simple-with-us\}"/);
+  assert.doesNotMatch(shipScript, /SENTRY_ORG=simple-with-us/);
+  assert.match(shipScript, /sentry_org_mismatch_hint/);
+  assert.match(shipScript, /organization not found\|embedded in token/);
+  assert.match(shipScript, /mint an org token for/);
   const ci = read(".github/workflows/ci.yml");
   assert.match(ci, /\|\| 'xcode-27' \}\}/);
   assert.match(ci, /DEVELOPER_DIR:\s*\/Applications\/Xcode_27\.0\.app\/Contents\/Developer/);

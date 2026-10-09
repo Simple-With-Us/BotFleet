@@ -629,10 +629,22 @@ function createPermissionBroker(opts: {
       } catch {}
       return;
     }
+    // The frame is untrusted socket input.  A `tool` that is not a string
+    // (`{"t":"ask","tool":123}`) used to reach `fileWritePaths` in `onAsk`,
+    // whose first statement calls `tool.replace`; the throw came out of this
+    // socket listener, after the ask was already pending with a 15-minute
+    // timer, and an uncaught listener exception takes the server down.
+    // An unreadable name falls back to the generic "tool", the same name a
+    // frame with no tool at all has always carried.
+    const toolName = z.string().min(1).safeParse(msg.tool);
+    if (!toolName.success) {
+      console.warn("permission broker: non-string tool name on ask frame", toolName.error.issues);
+    }
+    const tool = toolName.success ? toolName.data : "tool";
     const ask: Ask = {
       id: askId,
       kind,
-      tool: msg.tool ?? "tool",
+      tool,
       input: msg.input ?? {},
       at: Date.now(),
       toolUseId: String(msg.toolUseId ?? "") || undefined,
@@ -1168,8 +1180,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // comms, jobs and Zulip, each guarded by the endpoint it calls (comms
       // depth, peer approval), and the owner ruled that a full-auto bot's own
       // `job_start` never becomes a card, which routing it through the broker
-      // would break.  The step watch reviews those calls as they start, a
-      // message to another bot (`ask_bot`) included.
+      // would break.  The step watch reviews the ones that change something
+      // as they start (server/review-watch.ts `isWatchedHarnessTool`):
+      // `ask_bot`, `delegate_bot`, `create_bot`, `request_credential`,
+      // `propose_routine`, `propose_routine_action`, `zulip_post`,
+      // `zulip_reply`, `zulip_follow_topic`, `job_start`, `job_kill` — every
+      // MCP tool the registry marks `write`.  A `job_start` is watched, not
+      // carded: a refusal stops the turn, it never becomes a card.  The
+      // server's read tools (`list_bots`, `list_routines`, `job_output`,
+      // `job_list`) are not reviewed.
       const heldForReview = turn.holdForReview === true && permissionMode !== "bypassPermissions";
       if (turn.integrations?.composio) {
         mcpServers.composio = { ...turn.integrations.composio };
