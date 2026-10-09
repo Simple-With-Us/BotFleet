@@ -3,7 +3,7 @@
 
 ## 2026-10-07 — iOS Ship IDs On `app.botfleet.ios` (ASC Live)
 
-Owner confirmed the App Store Connect app for **`app.botfleet.ios`** (appleId **`6820175685`**).  Hosted ios-ship, `scripts/ios-fleet/apps.json`, `ios/project.yml`, and `TestFlightUpdateCheck.swift` now target that record.  `ship-testflight.sh` refuses legacy **`app.botfleet`** / `6806379515`.  Widget extension bundle is **`app.botfleet.ios.widgets`**; register that App ID in ASC before shipping widgets.  Universal Links AASA on `botfleet.app` still lists the legacy app ID until the owner updates hosting (out of scope for repo-only ship-ID flips).
+Owner confirmed the App Store Connect app for **`app.botfleet.ios`** (appleId **`6820175685`**).  Hosted ios-ship, `scripts/ios-fleet/apps.json`, `ios/project.yml`, and `TestFlightUpdateCheck.swift` now target that record.  `ship-testflight.sh` refuses legacy **`app.botfleet`** / `6806379515`.  Widget extension bundle **`app.botfleet.ios.widgets`** is registered in the Developer Portal (owner 2026-10-08).  Universal Links AASA on `botfleet.app` still lists the legacy app ID until the owner updates hosting (out of scope for repo-only ship-ID flips).
 
 ## 2026-10-01 — iOS Ship IDs Stayed On `app.botfleet` Until ASC App ID Exists (superseded 2026-10-07)
 

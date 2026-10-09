@@ -25,7 +25,7 @@ import { hashStaticUi, readSourceBuildIdentity } from "../electron/runtime-ident
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const server = join(root, "server");
-const buildIdentity = { ...readSourceBuildIdentity(root), uiHash: hashStaticUi(join(root, "dist")) };
+const buildIdentity = { ...readSourceBuildIdentity(root, { requireGit: true }), uiHash: hashStaticUi(join(root, "dist")) };
 
 // yaml's Node export is CommonJS and contains dynamic requires that cannot run
 // after it is inlined into our ESM-only packaged server. Its browser export is

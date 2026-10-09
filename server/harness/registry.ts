@@ -16,6 +16,7 @@ import { clockReadingAt, elapsedSince, KNOWN_VERSION_MAX_AGE_MS, readClock, type
 import { applyMiniMaxBalanceToRegistry, getCachedLocalMiniMaxConfig, getMiniMaxBalance } from "../minimax-balance.ts";
 import { quotaCooldowns } from "../model-fallback.ts";
 import { computerReach, type ComputerReach } from "../computer-capability.ts";
+import type { ReviewHook } from "../../shared/auto-review.ts";
 import { quotaProviderForDriver } from "../quota-window-map.ts";
 import { bypassCoverage, type BypassCoverage } from "../../shared/bypass-coverage.ts";
 import type {
@@ -232,7 +233,13 @@ export interface DescribedInstance {
     images?: boolean;
     effortLevels?: readonly string[];
     queueing?: boolean;
+    /** The engine can answer a review prompt on its own (`reviewPermission`). */
     approvalReview?: boolean;
+    /** Where auto-review sees this instance's tool calls.  Absent on a
+     *  shadow, which the client reads as "not reported yet", not as none. */
+    reviewHook?: ReviewHook;
+    /** A full-auto instance can run a held turn in its asking mode. */
+    asksWhenHeld?: boolean;
     /** What a bot's Bypass Permissions switch does on this engine
      *  (shared/bypass-coverage.ts): answers its approval requests, turns on
      *  its own skip-approvals mode, or nothing because it never asks. */
@@ -1154,6 +1161,8 @@ export class ProviderRegistry {
         queueing: inst.adapter.capabilities.queueing === true,
         localComputerMcp: inst.adapter.capabilities.localComputerMcp === true,
         approvalReview: inst.reviewPermission !== undefined,
+        reviewHook: inst.adapter.capabilities.reviewHook ?? "none",
+        asksWhenHeld: inst.adapter.capabilities.asksWhenHeld === true,
         toolLoop: inst.adapter.capabilities.toolLoop === true,
         bypassCoverage: bypassCoverage(inst.driverKind),
       },

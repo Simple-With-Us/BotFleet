@@ -764,6 +764,24 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(shell.mcpConfig.mcpServers.botfleet).toBeUndefined();
   });
 
+  it("runs a bypassPermissions turn held for auto-review through the broker, so each ask is reviewed first", async () => {
+    await create(undefined, {}, { permissionMode: "bypassPermissions" });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+    const dump = join(scratch, "bypass-held-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-bypass-held", text: "list the files", holdForReview: true });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-bypass-held");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--permission-mode") + 1]).not.toBe("bypassPermissions");
+    expect(seen.argv[seen.argv.indexOf("--permission-prompt-tool") + 1]).toBe("mcp__botfleet__approve");
+    expect(seen.mcpConfig.mcpServers.botfleet).toBeDefined();
+  });
+
+  it("asks through the permission-prompt tool when not in bypass, which is where review holds each ask", async () => {
+    await create();
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "before", asksWhenHeld: true });
+  });
+
   it("resumes with --resume when a cursor exists and reports that session id", async () => {
     await create();
     const dump = join(scratch, "dump.json");
