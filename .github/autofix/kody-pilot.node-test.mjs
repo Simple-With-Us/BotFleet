@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { applyEdits, sourcePath, validateInput, validatePull, selectFindings, collectThreads,
-  snapshot, publish, startProxy, claudeArguments, LIMITS, MODEL, KODY, fixBranch } from './kody-pilot.mjs';
+  snapshot, publish, startProxy, claudeArguments, credentialKeyPreview, requireDeepSeekApiKey, LIMITS, MODEL, KODY, fixBranch } from './kody-pilot.mjs';
 
 const head = 'a'.repeat(40);
 const input = {repository: 'Simple-With-Us/BotFleet', number: 123, head};
@@ -177,15 +177,27 @@ test('malformed branch refs fail validation before string-method use', () => {
     assert.throws(()=>validatePull(p,input),/Malformed source branch ref/);}
 });
 test('credential, payment, permission and quota refusals stop upstream retries without key disclosure', async () => {
+  const sampleKey = 'sk-live-abcdefgh1234567890wxyz';
   for(const status of [401,402,403,429]) {
     let calls=0;const events=[];
-    const proxy=await startProxy('not-a-real-secret',async()=>{calls++;return new Response('sensitive upstream body',{status});},event=>events.push(event));
+    const proxy=await startProxy(sampleKey,async()=>{calls++;return new Response('sensitive upstream body',{status});},event=>events.push(event));
     try {
       const call=()=>fetch(proxy.url+'/v1/messages',{method:'POST',body:JSON.stringify({model:MODEL,max_tokens:100})});
       assert.equal((await call()).status,status);assert.equal((await call()).status,status);
-      assert.equal(calls,1);assert.deepEqual(events,[JSON.stringify({event:'kody_pilot.provider_rejected',keyRef:'KODY_DEEPSEEK_API_KEY',status})]);
+      assert.equal(calls,1);
+      assert.deepEqual(events,[JSON.stringify({
+        event:'kody_pilot.provider_rejected',
+        keyRef:'KODY_DEEPSEEK_API_KEY',
+        keyPreview:credentialKeyPreview(sampleKey),
+        status,
+      })]);
+      assert(!events[0].includes(sampleKey));
     } finally {await proxy.close();}
   }
+});
+test('provider keys are required from the environment at runtime', () => {
+  assert.throws(()=>requireDeepSeekApiKey({}),/DEEPSEEK_API_KEY is missing/);
+  assert.equal(requireDeepSeekApiKey({DEEPSEEK_API_KEY:'sk-test-key-12345678'}), 'sk-test-key-12345678');
 });
 test('model scratch home is removed after CLI startup failure and no provider call occurs', async () => {
   const {generate}=await import('./kody-pilot.mjs');
@@ -193,7 +205,7 @@ test('model scratch home is removed after CLI startup failure and no provider ca
   const {tmpdir}=await import('node:os');
   const before=new Set((await readdir(tmpdir())).filter(name=>name.startsWith('kody-pilot-')));
   let calls=0;
-  await assert.rejects(generate(packageData(),'/unused-output.json',{PATH:'/nonexistent-kody-fixture',DEEPSEEK_API_KEY:'fixture-only'},
+  await assert.rejects(generate(packageData(),'/unused-output.json',{PATH:'/nonexistent-kody-fixture',DEEPSEEK_API_KEY:'sk-fixture-only-key-0001'},
     async()=>{calls++;assert.fail('No upstream request is permitted.');}),/failed to start/);
   assert.equal(calls,0);
   const after=(await readdir(tmpdir())).filter(name=>name.startsWith('kody-pilot-')&&!before.has(name));

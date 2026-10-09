@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
-import {generate, MODEL} from './kody-pilot.mjs';
+import {generate, MODEL, requireDeepSeekApiKey} from './kody-pilot.mjs';
 import {readFile, mkdtemp, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+
+const providerKey = requireDeepSeekApiKey(process.env);
 const dir = await mkdtemp(join(tmpdir(), 'kody-cli-fixture-'));
 const outputPath = join(dir, 'answer.json');
-// This fixture never reads a real provider credential.  All upstream requests are
-// intercepted in memory; the placeholder is deliberately not an API key.
 let calls=0;
 const data={findings:[{path:'server/a.ts',line:1,body:'Change n to 2.'}],files:[{path:'server/a.ts',content:'const n = 1;\n'}]};
 try {
-await generate(data,outputPath,{PATH:process.env.PATH,DEEPSEEK_API_KEY:'synthetic-local-only'},async(url,options)=>{
+await generate(data,outputPath,{PATH:process.env.PATH,DEEPSEEK_API_KEY:providerKey},async(url,options)=>{
   calls++;const request=JSON.parse(options.body);
   assert.equal(url, 'https://api.deepseek.com/anthropic/v1/messages');
   assert.equal(request.model, MODEL);
