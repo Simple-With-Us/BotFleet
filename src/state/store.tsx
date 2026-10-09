@@ -387,6 +387,10 @@ export interface Bot {
   voiceSummaryMode?: "off" | "on_demand" | "always";
   pinned?: boolean;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  True = Off: nothing new
+   *  starts for it from any source, but its chat stays visible and a turn
+   *  already running finishes.  Absent or false = on. */
+  off?: boolean;
   /** Sidebar section this bot renders under; absent = unsectioned. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread */

@@ -4,7 +4,7 @@ import { acceptComposerTranscript } from "@/lib/composer-dictation";
 import { pickSTTProvider } from "@/lib/transcription-provider";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { currentCall, useOnCall } from "@/lib/call";
 import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
@@ -12,6 +12,7 @@ import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
 import { foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
+import { BotOffComposer } from "./BotOffComposer";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import {
@@ -136,8 +137,34 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
   );
 }
 
-/** Renders the editable message composer and its pending attachments. */
-export function Composer({
+/** Renders the editable message composer and its pending attachments.
+ *
+ *  A 1:1 bot that is switched Off (shared/bot-power.ts) gets the disabled
+ *  state instead: the harness refuses every new turn for it, so offering an
+ *  input would only collect a message that can never send.  The chat above
+ *  stays as it was, and the draft survives (it is keyed by bot, not by this
+ *  component).  Rooms keep their composer: a message there still lands in the
+ *  transcript, and an Off member is skipped with a notice. */
+export function Composer(props: ComponentProps<typeof ComposerInner>) {
+  const { state: store, dispatch: send } = useStore();
+  const bot = props.bot;
+  if (bot && !props.group && bot.off === true) {
+    // Read the live record, not the prop, so a Turn On from another window
+    // swaps the real composer back in without a remount of the whole chat.
+    const live = store.bots.find((candidate) => candidate.id === bot.id) ?? bot;
+    if (live.off === true) {
+      return (
+        <BotOffComposer
+          botName={live.name}
+          onTurnOn={() => send({ type: "updateBot", botId: live.id, patch: { off: false } })}
+        />
+      );
+    }
+  }
+  return <ComposerInner {...props} />;
+}
+
+function ComposerInner({
   bot,
   group,
   members,

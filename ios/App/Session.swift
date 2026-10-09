@@ -295,6 +295,9 @@ final class Session: ObservableObject {
             if ProcessInfo.processInfo.arguments.contains("-preview-voice") {
                 seedVoicePreview(&fleet)
             }
+            if ProcessInfo.processInfo.arguments.contains("-preview-off") {
+                seedOffPreview(&fleet)
+            }
             state.hydrate(fleet)
             // StorePreview bots all select instanceId "preview"; seed the
             // driver map so the chat-header provider mark appears in the
@@ -325,6 +328,16 @@ final class Session: ObservableObject {
     /// aloud, so its bubble wears Stop Voice.
     func debugSetSpeaking(_ messageId: String?) {
         speakingMessageId = messageId
+    }
+
+    /// `-preview-off`: Pixel is switched Off, so the chat list's dimmed row and
+    /// Off label, the disabled composer and the profile's Power section can be
+    /// screenshotted without a paired computer.  Pass `-open-first` as well to
+    /// land on Scout, then open Pixel from the list.
+    private func seedOffPreview(_ fleet: inout Fleet) {
+        for index in fleet.bots.indices where fleet.bots[index].id == "preview-pixel" {
+            fleet.bots[index].off = true
+        }
     }
 
     /// `-preview-voice`: every preview bot speaks a MiniMax voice on this
@@ -3437,6 +3450,15 @@ enum Chat: Identifiable, Hashable {
         switch self {
         case let .bot(bot): return bot.busy ?? false
         case let .room(room): return room.isWorking
+        }
+    }
+
+    /// A bot switched Off.  Rooms are never Off themselves: an Off member is
+    /// skipped inside the room with a notice, and the room composer stays.
+    var isOff: Bool {
+        switch self {
+        case let .bot(bot): return bot.isOff
+        case .room: return false
         }
     }
 

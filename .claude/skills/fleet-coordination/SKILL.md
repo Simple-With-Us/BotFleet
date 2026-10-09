@@ -135,8 +135,10 @@ Visibly wider gap (two visible spaces) after terminal punctuation (`.`, `!`, `?`
 
 | Surface | Syntax | Why |
 | :--- | :--- | :--- |
-| **Markdown Chat UIs / HTML** | `&nbsp;` plus normal space (`Sentence one.&nbsp; Sentence two.`) | Survives HTML/Markdown whitespace collapse |
-| **Source Files** (docs, commit messages, PRs, comments) | Two literal ASCII spaces | Read in raw text editors / terminals |
+| **Markdown chat panes** (Claude Code desktop Code tab, owner-verified 2026-10-08; other panes by ruling, unverified) | `&nbsp;` plus normal space after each sentence, outside code spans (`Sentence one.&nbsp; Sentence two.`) | The renderer decodes the entity; a raw U+00A0 from the model arrives as a plain space |
+| **GitHub PR and issue titles, bodies and comments, Zulip posts, other rendered tool output** | A real U+00A0 plus a space (never the entity) | Tools preserve the character; the entity would show literally in a plain-text squash commit |
+| **Terminal TUI chat, Slack, source files** (docs, commit messages, code comments, config) | Two literal ASCII spaces | Read in raw text editors / terminals; an entity would print literally |
+| **HTML / JSX / SwiftUI product copy** | A real U+00A0 plus a space, or `SENTENCE_GAP` | Raw doubles collapse in HTML |
 
 *Do not apply after abbreviations (`e.g.`, `v1.2.3`) or in URLs/identifiers.*
 

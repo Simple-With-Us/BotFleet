@@ -138,6 +138,7 @@ struct GroupProfileView: View {
                         )) {
                             HStack(spacing: 10) {
                                 BotAvatarView(bot: bot, size: 28)
+                                    .providerBadge(for: bot, avatarSize: 28)
                                 VStack(alignment: .leading) {
                                     Text(bot.name)
                                         .font(.body)

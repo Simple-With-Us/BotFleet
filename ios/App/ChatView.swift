@@ -191,7 +191,13 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             transcriptColumn
-            composer
+            // An Off bot refuses every new turn, so the input is replaced by
+            // the way out of that state.  The transcript above stays as it was.
+            if current.isOff, case let .bot(bot) = current {
+                offComposer(for: bot)
+            } else {
+                composer
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .overlay(alignment: .bottom) { plusSheet }
@@ -1177,6 +1183,41 @@ struct ChatView: View {
             Task { await addDropItems(providers) }
             return true
         }
+    }
+
+    /// What replaces the composer while the bot is Off (`shared/bot-power.ts`):
+    /// the disabled notice and one button, Turn On.  The two-space gap is a
+    /// non-breaking space plus a space so the layout cannot collapse it.
+    private func offComposer(for bot: Bot) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "power")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color.secondary)
+                .accessibilityHidden(true)
+            Text("This bot is off.\u{00A0} Turn it on to chat.")
+                .font(.system(size: 15))
+                .foregroundStyle(Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button {
+                Task { _ = await session.updateProfile(BotProfilePatch(off: false), for: bot) }
+            } label: {
+                Text("Turn On")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Capsule().fill(BubbleColor.mine))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Turn on \(bot.name)")
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 52)
+        .glassRounded(cornerRadius: 18, interactive: false)
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+        .accessibilityElement(children: .contain)
     }
 
     private func pasteFromClipboard() {

@@ -25,6 +25,7 @@ struct TaskManagerView: View {
                 Section {
                     HStack(spacing: 12) {
                         BotAvatarView(bot: current, size: 48, state: .idle, animated: false)
+                            .providerBadge(for: current, avatarSize: 48)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(current.name).font(.headline)
                             Text(current.title.isEmpty ? "Agent tasks" : current.title)
