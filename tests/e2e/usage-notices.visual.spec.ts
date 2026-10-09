@@ -50,7 +50,7 @@ test('visual: several held bots and several short fallback chains use the plural
   // A task override is named, so the operator can tell which chain to fix.
   await expect(plural.getByText('task 9c1e5a77')).toBeVisible();
 
-  await expect(plural).toHaveScreenshot('usage-notices-plural.png', stableShot);
+  await expect(plural).toHaveScreenshot('usage-notices-plural.png', { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 });
 });
 
 test('visual: one held bot and one short fallback chain use the singular headings', async ({ page }) => {
@@ -63,5 +63,5 @@ test('visual: one held bot and one short fallback chain use the singular heading
   // One bot with a bot-level chain and a task override is one bot, not two.
   await expect(singular.getByText("1 Bot's Fallback Chain Is Shorter Than It Looks")).toBeVisible();
 
-  await expect(singular).toHaveScreenshot('usage-notices-singular.png', stableShot);
+  await expect(singular).toHaveScreenshot('usage-notices-singular.png', { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 });
 });

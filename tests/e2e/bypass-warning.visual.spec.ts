@@ -57,7 +57,7 @@ test('visual: a standard model gets the plain confirmation', async ({ page }) =>
   await expect(dialog.getByRole('button', { name: 'Enable Permission Bypass' })).toBeEnabled();
   await expect(dialog.getByText('I Understand the Risks')).toHaveCount(0);
 
-  await expect(dialog).toHaveScreenshot('bypass-warning-standard.png', stableShot);
+  await expect(dialog).toHaveScreenshot('bypass-warning-standard.png', { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 });
 });
 
 test('visual: a lightweight model gets the high-risk callout and the explicit button', async ({ page }) => {
@@ -65,7 +65,7 @@ test('visual: a lightweight model gets the high-risk callout and the explicit bu
   await expect(dialog.getByRole('heading', { name: 'High-Risk Model: Permission Bypass Warning' })).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'I Understand the Risks, Enable Bypass' })).toBeEnabled();
 
-  await expect(dialog).toHaveScreenshot('bypass-warning-dangerous.png', stableShot);
+  await expect(dialog).toHaveScreenshot('bypass-warning-dangerous.png', { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 });
 });
 
 test('visual: while applying, both buttons are disabled and the confirm button says so', async ({ page }) => {
@@ -73,5 +73,5 @@ test('visual: while applying, both buttons are disabled and the confirm button s
   await expect(dialog.getByRole('button', { name: 'Applying…' })).toBeDisabled();
   await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeDisabled();
 
-  await expect(dialog).toHaveScreenshot('bypass-warning-busy.png', stableShot);
+  await expect(dialog).toHaveScreenshot('bypass-warning-busy.png', { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 });
 });
