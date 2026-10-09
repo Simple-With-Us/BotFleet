@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import { CodexDriver, codexLoginAnswer } from "./codex.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 
@@ -81,6 +82,42 @@ describe("CodexDriver turns (fake app-server)", () => {
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
+  });
+
+  it("launches each bot's turn with its own seat and none of the harness's identity", async () => {
+    const restore = inheritHarnessIdentity();
+    try {
+      // an instance-level identity must not survive either
+      await create({ environment: { AGENT_SEAT: "CLAUDE", ZULIP_API_KEY: "instance-api-key" } });
+      const dump = join(scratch, "launch-dump.json");
+      process.env.FAKE_CODEX_DUMP = dump;
+      const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+        const started = await instance.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+        await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+        return readEngineDump(dump);
+      };
+
+      const plumber = await seenFor("t-cx-plumber", { seat: "BF-PLUMBER", session: "t-cx-plumber" });
+      const fixer = await seenFor("t-cx-fixer", { seat: "BF-FIXER", session: "t-cx-fixer" });
+      const none = await seenFor("t-cx-none", { seat: null, session: "t-cx-none" });
+      expectLaunchedAs(plumber.env, { seat: "BF-PLUMBER", session: "t-cx-plumber" });
+      expectLaunchedAs(fixer.env, { seat: "BF-FIXER", session: "t-cx-fixer" });
+      expectLaunchedAs(none.env, { seat: null, session: "t-cx-none" });
+      expect(JSON.stringify([plumber.env, fixer.env, none.env])).not.toContain("instance-api-key");
+
+      // The model's shell runs under Codex's own environment policy, so the
+      // same values ride as `-c` overrides, quoted, for the right bot only.
+      expect(plumber.argv).toContain('shell_environment_policy.set.AGENT_LAUNCH_SEAT="BF-PLUMBER"');
+      expect(plumber.argv).toContain('shell_environment_policy.set.AGENT_SESSION="t-cx-plumber"');
+      expect(plumber.argv).toContain('shell_environment_policy.set.AGENT_LAUNCHER="botfleet"');
+      expect(fixer.argv).toContain('shell_environment_policy.set.AGENT_SEAT="BF-FIXER"');
+      expect(fixer.argv.join(" ")).not.toContain("BF-PLUMBER");
+      expect(none.argv).toContain('shell_environment_policy.set.AGENT_LAUNCHER="botfleet"');
+      expect(none.argv.join(" ")).not.toContain("AGENT_LAUNCH_SEAT");
+      expect(none.argv.join(" ")).not.toContain("ZULIP");
+    } finally {
+      restore();
+    }
   });
 
   it("runs the handshake and normalizes a full turn", async () => {

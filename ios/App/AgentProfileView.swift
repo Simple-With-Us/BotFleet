@@ -336,6 +336,7 @@ struct AgentProfileView: View {
                 bypassPermissionsSection
                 computersSection
                 workingDirectorySection
+                skillsSection
 
                 if !Self.voiceSectionFirst { voiceSection }
 
@@ -379,6 +380,9 @@ struct AgentProfileView: View {
                                     Text(String(format: "$%.2f", totalCost))
                                         .foregroundStyle(.secondary)
                                 }
+                            }
+                            NavigationLink("By Model And Session") {
+                                BotUsageDetailView(botId: current.id)
                             }
                         }
                     }
@@ -799,6 +803,22 @@ struct AgentProfileView: View {
             Text("Working Directory")
         } footer: {
             Text("Default repository or workspace folder path on the paired Mac.\u{00A0} From this iPhone, choose a folder that a bot or room on your computer already uses.\u{00A0} Any other folder is chosen in BotFleet on your computer.")
+        }
+    }
+
+    /// The bot's imported Agent Skills: read each one, then turn it on or off.
+    /// Those switches act at once and are not part of this form's Save, the
+    /// same as on the Mac.
+    @ViewBuilder
+    private var skillsSection: some View {
+        Section {
+            NavigationLink {
+                BotSkillsView(bot: current)
+            } label: {
+                Label(SkillsDisplay.title, systemImage: "book.closed")
+            }
+        } footer: {
+            Text("Reference material this bot reads when a task matches.\u{00A0} Read a skill, then turn it on or off.")
         }
     }
 

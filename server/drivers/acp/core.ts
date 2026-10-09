@@ -71,6 +71,7 @@ import type {
   ProviderErrorCode,
 } from "../../contracts.ts";
 import { newEventId, newId } from "../../contracts.ts";
+import { applyLaunchIdentity } from "../../launch-identity.ts";
 import { computerProxyEnv } from "../../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../../computer-grants.ts";
 import { augmentedPath } from "../../env-path.ts";
@@ -807,7 +808,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           };
           child = spawnCli(spawned.cli, spawned.args, {
             cwd,
-            env: spawned.env ? { ...env, ...spawned.env } : env,
+            // Last, over the instance's env and a wrapper's additions alike:
+            // the launch identity is this bot's and this turn's.
+            env: applyLaunchIdentity(spawned.env ? { ...env, ...spawned.env } : env, turn.launchIdentity),
             stdio: ["pipe", "pipe", "pipe"],
           });
         } catch (error) {

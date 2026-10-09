@@ -243,6 +243,18 @@ export type RuntimeEventListener = (event: RuntimeEvent) => void;
  * no action. */
 export type RequestOutcome = "allowed-once" | "rejected" | "answered" | "unavailable";
 
+/** Who BotFleet, as the launcher, says an engine child is for one turn of one
+ *  bot (server/launch-identity.ts).  Per turn and per bot, never per engine
+ *  instance: two bots can share one instance and must not share a seat. */
+export interface LaunchIdentity {
+  /** The fleet seat BotFleet assigned this bot, or null when it has none.  A
+   *  child with no seat is still marked as launched, so fleet tools refuse
+   *  instead of falling back to a platform default. */
+  seat: string | null;
+  /** BotFleet's id for the thread this turn runs on. */
+  session: string;
+}
+
 // ── adapter contract (upstream ProviderAdapterShape, promise-flavored) ──
 // The conversation runtime every provider is flattened into. streamEvents
 // becomes onEvent(listener) → unsubscribe; sessions start implicitly on
@@ -423,6 +435,10 @@ export interface SendTurnInput {
    *  an ask the reviewer turns down would wait on a card nobody is there to
    *  answer. */
   holdForReview?: boolean;
+  /** The identity an engine child is launched with (`LaunchIdentity`).  A
+   *  driver that spawns a child for the turn applies it to that child's
+   *  environment; absent means a launched child with no seat. */
+  launchIdentity?: LaunchIdentity;
 }
 
 /** The decoded `arguments` object of one tool call.

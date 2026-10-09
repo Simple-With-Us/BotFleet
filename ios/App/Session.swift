@@ -82,6 +82,12 @@ final class Session: ObservableObject {
     /// predates PR #383 and does not report the route.  Distinct from
     /// "have not fetched yet" so the row can render the right copy.
     @Published private(set) var pushSenderHealthNotReported = false
+    /// Shared memory (the recall corpus) status, read-only, for the Settings
+    /// row.  `nil` until the first fetch resolves; a failed fetch keeps the
+    /// last answer, and a 404 (a sidecar that predates the route) is
+    /// `sharedMemoryNotReported`.
+    @Published private(set) var sharedMemoryStatus: SharedMemoryStatus?
+    @Published private(set) var sharedMemoryNotReported = false
 
     /// instanceId -> driverKind, cached from the last `instances()` fetch so
     /// the chat header can resolve a bot's current-model provider mark
@@ -601,6 +607,8 @@ final class Session: ObservableObject {
         state = CompanionState()
         pushSenderHealth = nil
         pushSenderHealthNotReported = false
+        sharedMemoryStatus = nil
+        sharedMemoryNotReported = false
         instanceDriverKinds = [:]
         cachedInstances = []
         instanceRoster.reset()
@@ -812,6 +820,10 @@ final class Session: ObservableObject {
                         // Refresh provider marks after reconnect — instances
                         // may have changed while the phone was backgrounded.
                         Task { await self.warmInstanceDriverKinds() }
+                        // Jobs only ride the stream as they change, so a
+                        // connect, or a reconnect that missed frames, asks
+                        // for the whole set once.
+                        Task { await self.loadJobs() }
                         // The last frame this phone saw before the gap may
                         // have said a run was in progress — and the restart
                         // that gap likely IS took the connection down with
@@ -3342,6 +3354,112 @@ final class Session: ObservableObject {
             recordActionError(error)
             return nil
         }
+    }
+
+    // MARK: - Background jobs
+
+    /// Read every conversation's jobs and replace what the phone holds.
+    ///
+    /// Silent on failure: an older harness or sidecar has no jobs route, and
+    /// then the pill simply never appears.  A pairing that changed while the
+    /// request was out keeps the answer out of the new pairing's state.
+    func loadJobs() async {
+        guard let client else { return }
+        let generation = pairingGeneration
+        do {
+            let jobs = try await client.jobs()
+            guard pairingGeneration == generation else { return }
+            state.hydrateJobs(jobs)
+        } catch {
+            return
+        }
+    }
+
+    /// One job's newest output.  Throws, so the sheet can say what failed in
+    /// place rather than raising an alert over the screen.
+    func readJobOutput(_ jobId: String) async throws -> JobOutputResponse {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.jobOutput(id: jobId)
+    }
+
+    /// The owner's Stop for one job.  The next `jobs` frame shows it
+    /// stopping, then stopped; this only reports whether the request went in.
+    @discardableResult
+    func stopJob(_ jobId: String) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.stopJob(id: jobId)
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    /// Stop every running job of one conversation.
+    @discardableResult
+    func stopAllJobs(threadId: String) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.stopAllJobs(threadId: threadId)
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    // MARK: - Usage and cost
+
+    /// Quota windows, rolling spend and held engines.  `nil` on any failure,
+    /// and never an alert: the screen polls this, and a computer that is
+    /// asleep should not raise an alert every half minute.
+    func loadQuotas() async -> QuotasSnapshot? {
+        guard let client else { return nil }
+        return try? await client.quotas()
+    }
+
+    func loadSpeechUsage() async -> SpeechUsage? {
+        guard let client else { return nil }
+        return try? await client.speechUsage()
+    }
+
+    // MARK: - Shared memory
+
+    /// Refresh the shared-memory status.  Informational, like push health: a
+    /// failure keeps the last answer so a transient blip never blanks the row.
+    func refreshSharedMemoryStatus() async {
+        guard let client else { return }
+        let generation = pairingGeneration
+        do {
+            let fetched = try await client.sharedMemoryStatus()
+            guard pairingGeneration == generation else { return }
+            sharedMemoryStatus = fetched
+            sharedMemoryNotReported = false
+        } catch let error as APIError where error.isNotFound {
+            guard pairingGeneration == generation else { return }
+            sharedMemoryStatus = nil
+            sharedMemoryNotReported = true
+        } catch {
+            return
+        }
+    }
+
+    // MARK: - Skills
+
+    func loadBotSkills(botId: String) async throws -> SkillsResponse {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.botSkills(botId: botId)
+    }
+
+    func loadSkillText(botId: String, name: String) async throws -> String {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.skillText(botId: botId, name: name)
+    }
+
+    func setSkillEnabled(botId: String, name: String, enabled: Bool) async throws -> SkillListing {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.setSkillEnabled(botId: botId, name: name, enabled: enabled)
     }
 
     // MARK: - Connected apps
