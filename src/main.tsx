@@ -130,6 +130,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "bot-off") {
+  // Visual-spec harness (tests/e2e/bot-off.visual.spec.ts): the bot On/Off
+  // switch — sidebar rows, the Bot Profile card and the disabled composer.
+  // Dynamically imported so the real app boot path never pays for it.
+  void import("./components/BotOffVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "runtime-cards") {
   // Visual-spec harness: mounts the real LocalVmRuntimeCard and
   // SharedVpsRuntimeCard under a StoreContext with a hand-built

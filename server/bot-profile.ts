@@ -31,6 +31,7 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "bypassPermissions",
   "autoReview",
   "composio",
+  "off",
   "connectorTools",
   "cloudBackend",
   "autoStartVps",
@@ -143,6 +144,10 @@ const profilePatchSchema = z.object({
   bypassPermissions: z.boolean({ error: "bypassPermissions must be true or false" }).optional(),
   autoReview: z.enum(["off", "shadow", "enforce"], { error: "autoReview must be off, shadow, or enforce" }).optional(),
   composio: z.boolean({ error: "composio must be true or false" }).optional(),
+  // The bot's On/Off switch (shared/bot-power.ts).  Writable from a paired
+  // phone as well as the desktop: turning a bot Off only ever STOPS work, and
+  // the phone has to be able to turn it back On.  Same validation both ways.
+  off: z.boolean({ error: "off must be true or false" }).optional(),
   connectorTools: z.union([connectorToolsSchema, z.null()]).optional(),
   cloudBackend: z.enum(["box", "vps"], { error: "cloudBackend must be box or vps" }).optional(),
   autoStartVps: z.boolean({ error: "autoStartVps must be true or false" }).optional(),
@@ -178,6 +183,7 @@ export type BotProfilePatch = Partial<
     | "bypassPermissions"
     | "autoReview"
     | "composio"
+    | "off"
     | "connectorTools"
     | "cloudBackend"
     | "autoStartVps"

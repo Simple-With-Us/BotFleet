@@ -180,10 +180,10 @@ describe("what it may not", () => {
     // #323 (audit BF-IOS-001) kept these on the computer and the native sheet
     // showed them read-only.  The owner then ruled that bots get bypass
     // permissions and the rest from the phone too.  What a bot may do on This
-    // Mac is not moved by this list: the harness refuses to turn Auto-Approve
-    // or Bypass Permissions on for a bot that can use it, and bypass never
-    // answers a host-control request.  Both are tested against a real harness
-    // in companion/test/proxy.test.ts.
+    // Mac is not moved by this list: the harness refuses to turn Auto Mode on
+    // for a bot that can use it, and bypass never answers a host-control
+    // request.  Both are tested against a real harness in
+    // companion/test/proxy.test.ts.
     for (const field of ["autoApprove", "autoReview", "approvePeerComms", "bypassPermissions"]) {
       expect(COMPANION_PROFILE_PATCH_FIELDS, field).toContain(field);
       expect(companionProfilePatchDenial({ [field]: true }), field).toBeNull();
@@ -212,6 +212,22 @@ describe("what it may not", () => {
     expect(allowed("GET", "/api/threads/th_1/messages/msg_1/recording/../../config")).toBe(false);
     expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/threads/th_1/messages/msg_1/recording-review", false)?.status).toBe(401);
+  });
+
+  it("lets the phone turn a bot Off and back On, and only through the profile route", () => {
+    // The phone's disabled composer has one button, Turn On, so a refusal here
+    // would strand an Off bot on the phone.
+    expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("off");
+    expect(companionProfilePatchDenial({ off: true })).toBeNull();
+    expect(companionProfilePatchDenial({ off: false })).toBeNull();
+    // Switching it is not a way to smuggle a host-control field along.
+    expect(companionProfilePatchDenial({ off: false, composio: true })).toEqual({
+      status: 403,
+      error: "composio can only be changed in BotFleet on your computer",
+    });
+    // The general bot PATCH is not on the phone's route list.
+    expect(allowed("PATCH", "/api/bots/b_1")).toBe(false);
+    expect(allowed("PATCH", "/api/bots/b_1/profile")).toBe(true);
   });
 
   it("lets the phone write per-device voices", () => {

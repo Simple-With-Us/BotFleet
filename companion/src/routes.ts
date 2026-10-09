@@ -109,6 +109,11 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "autoReview",
   "approvePeerComms",
   "bypassPermissions",
+  // The bot's On/Off switch (shared/bot-power.ts).  It only ever stops or
+  // resumes work the person could already start by messaging the bot, grants
+  // no capability, and the phone has to be able to turn a bot back On: the
+  // disabled composer's one button is Turn On.
+  "off",
 ] as const;
 
 const COMPANION_PROFILE_PATCH_FIELD_SET = new Set<string>(COMPANION_PROFILE_PATCH_FIELDS);

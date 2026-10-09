@@ -38,6 +38,7 @@ struct AgentProfileView: View {
     @State private var config: ConfigStatus?
     @State private var busy = false
     @State private var player: AVAudioPlayer?
+    @State private var isOff: Bool
     @State private var computers: Set<String>
     @State private var cwd: String
     /// The execution policy, saved with the rest of the sheet.  Bypass is
@@ -65,6 +66,7 @@ struct AgentProfileView: View {
         _effort = State(initialValue: bot.modelSelection.effort)
         _fallbacks = State(initialValue: bot.modelSelection.fallbacks ?? [])
         _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
+        _isOff = State(initialValue: bot.isOff)
         _computers = State(initialValue: Set(bot.computers ?? []))
         _cwd = State(initialValue: bot.cwd ?? "")
         _autoApprove = State(initialValue: bot.autoApprove ?? false)
@@ -205,6 +207,17 @@ struct AgentProfileView: View {
                     Text(imageGenerationReady
                          ? "Generation uses the shared image provider configured on your computer. No provider key is sent to or stored on this phone."
                          : "To generate images, configure the shared image provider in BotFleet on your computer. Provider keys cannot be added from a phone.")
+                }
+
+                Section {
+                    Toggle("On", isOn: Binding(get: { !isOff }, set: { isOff = !$0 }))
+                } header: {
+                    Text("Power")
+                } footer: {
+                    // Two spaces between sentences, held with a non-breaking space.
+                    Text(isOff
+                         ? "Nothing new starts for this bot.\u{00A0} Chat, routines, webhooks and rooms are skipped, and a turn already running finishes.\u{00A0} Its chat stays visible."
+                         : "This bot answers chat, runs its routines and webhooks, and speaks in rooms.\u{00A0} Turn it off to stop all new work.")
                 }
 
                 Section("Identity") {
@@ -539,7 +552,8 @@ struct AgentProfileView: View {
                 baseline: baseline.computers,
                 picks: computers
             ),
-            cwd: cwdPatch
+            cwd: cwdPatch,
+            off: isOff == baseline.isOff ? nil : isOff
         )
     }
 
@@ -1131,6 +1145,7 @@ struct AgentProfileView: View {
         effort = bot.modelSelection.effort
         fallbacks = bot.modelSelection.fallbacks ?? []
         maxToolRoundsText = Self.roundsText(bot.maxToolRounds)
+        isOff = bot.isOff
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
         autoApprove = bot.autoApprove ?? false
@@ -1177,6 +1192,7 @@ private struct ProfileFormSnapshot {
     var speechDevices: Set<String>
     var modelSelection: ModelSelection
     var maxToolRoundsText: String
+    var isOff: Bool
     var computers: Set<String>
     var cwd: String
     var autoApprove: Bool
@@ -1195,6 +1211,7 @@ private struct ProfileFormSnapshot {
         speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         modelSelection = bot.modelSelection
         maxToolRoundsText = bot.maxToolRounds.map(String.init) ?? ""
+        isOff = bot.isOff
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
         autoApprove = bot.autoApprove ?? false

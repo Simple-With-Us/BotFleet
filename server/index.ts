@@ -68,7 +68,13 @@ import { authorizedRuntime } from "../electron/runtime-identity.mjs";
 import { planCredentialRestore } from "../electron/credential-restore.mjs";
 import { workspaceCredentialPending } from "../electron/workspace-credentials.mjs";
 import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
-import { botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
+import { botOffError, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
+import {
+  BOT_OFF_CODE,
+  BOT_OFF_REFUSAL,
+  botIsOff,
+  botOffRoomNotice,
+} from "../shared/bot-power.ts";
 import { createUpdateControl, packagedInstalledAt } from "./update-control.ts";
 import {
   avatarGenerationRequestSchema,
@@ -296,6 +302,7 @@ import {
   drainSteeredMessages,
   dropJobNotices,
   dropJobNoticesForBot,
+  dropQueuedForOffBot,
   pendingJobNotices,
   queueJobNotice,
   queueSteeredMessage,
@@ -1005,6 +1012,10 @@ function instancesHeldByQueuedRuns(
 ): Set<string> {
   const instances = new Set<string>();
   if (!routines) return instances;
+  // An Off bot's queued receipts are skipped, never dispatched, so they hold
+  // no engine.  Reporting one would show an Off bot as blocked on an engine
+  // it will never touch.
+  if (botIsOffId(bot.id)) return instances;
   for (const run of routines.listRuns()) {
     if (run.coalescedInto || run.botId !== bot.id || run.status !== "queued") continue;
     const task = run.threadId ? store.taskByThread(bot.id, run.threadId) : undefined;
@@ -1988,6 +1999,9 @@ const jobWakes = new JobWakeCoordinator({
   // started.  A wake there would send it to a tool it does not have.
   botHasJobTools: (botId) => {
     const bot = store.bot(botId);
+    // An Off bot is never woken by a job ending: the notice waits in its
+    // thread instead, and no wake turn is attempted and then retried.
+    if (botIsOff(bot)) return false;
     const instance = bot ? registry.get(bot.modelSelection.instanceId) : undefined;
     return jobSettings().enabled && instance?.adapter.capabilities.backgroundJobs === "emulated";
   },
@@ -4853,6 +4867,10 @@ async function startTurn(
   }
   const bot = store.bot(botId);
   if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
+  // Off outranks everything below, even a person's own message, and runs
+  // BEFORE the stop decision so a refused message cannot clear a stop.  It
+  // gates STARTING a turn only; room turns have their own gate.
+  if (botIsOff(bot)) throw botOffError();
   // A stop is a decision about the BOT, not about the turn in flight, so it
   // is enforced here — the one place every dispatch passes through — rather
   // than in each caller.  A resume used to clear the stop on its way past
@@ -5954,7 +5972,7 @@ routines = new RoutineManager({
   // context — and that is now where it is.
   botState: (botId) => {
     const bot = store.bot(botId);
-    return !bot ? "missing" : bot.busy ? "busy" : "ready";
+    return !bot ? "missing" : botIsOff(bot) ? "off" : bot.busy ? "busy" : "ready";
   },
   conversationMode: () => parseConversationMode(cfg.conversationMode),
   // The gap is a property of the trigger definition, so it is read live —
@@ -6254,7 +6272,7 @@ const webhooks = new WebhookManager({
   emit: broadcast,
   botState: (botId) => {
     const bot = store.bot(botId);
-    return !bot ? "missing" : bot.busy ? "busy" : "ready";
+    return !bot ? "missing" : botIsOff(bot) ? "off" : bot.busy ? "busy" : "ready";
   },
   findBotIdByName: (name) => {
     const needle = name.trim().toLowerCase();
@@ -6486,7 +6504,7 @@ const resourceTriggers = new ResourceTriggerManager({
   admit: () => !runtimeQuiescing,
   botState: (botId) => {
     const bot = store.bot(botId);
-    return !bot ? "missing" : bot.busy ? "busy" : "ready";
+    return !bot ? "missing" : botIsOff(bot) ? "off" : bot.busy ? "busy" : "ready";
   },
   enqueue: (input) => routines!.enqueueResource(input),
   pendingRuns: (triggerId) => routines!.activeWebhookRunCount(triggerId),
@@ -6582,6 +6600,10 @@ export function executeListRoutinesRequest(input: {
   };
 }
 
+/** What ask_bot and delegate_bot answer for a peer that is switched Off.  One
+ *  value rather than two literals, so the two paths cannot drift apart. */
+const BOT_OFF_PEER_REFUSAL = Object.freeze({ status: 403, body: Object.freeze({ error: "that bot is off" }) });
+
 /** Guarded ask_bot path used by MCP proxy and the HTTP tool host.
  * Section, hidden, approval, mirroring, and depth all live here so a
  * driver that guessed an id cannot skip the gate. */
@@ -6602,6 +6624,9 @@ export async function executeAskBotRequest(input: {
   const target = store.bot(toBotId);
   if (!target) return { status: 404, body: { error: "no such bot" } };
   if (target.hidden) return { status: 403, body: { error: "that bot is hidden" } };
+  // An Off bot is not a peer anyone can hand work to; say so plainly rather
+  // than let askBotAndWait fail after the exchange was mirrored into a channel.
+  if (botIsOff(target)) return BOT_OFF_PEER_REFUSAL;
   if (target.busy) return { status: 200, body: { busy: true } };
   const from = store.bot(fromBotId);
   if (!from) return { status: 403, body: { error: "unknown sender" } };
@@ -6671,6 +6696,9 @@ export function executeDelegateBotRequest(input: {
   if (sectionKey(from.section) !== sectionKey(target.section)) {
     return { status: 403, body: { error: "that bot belongs to a different section" } };
   }
+  // Refused at the door, before anything is queued or persisted: a delegation
+  // is a promise that the peer will pick the work up, and an Off bot will not.
+  if (botIsOff(target)) return BOT_OFF_PEER_REFUSAL;
   const fromThreadId = String(input.fromThreadId ?? from.threadId);
   if (!store.threadBelongsToBot(from.id, fromThreadId)) {
     return { status: 403, body: { error: "source thread does not belong to sender" } };
@@ -7125,7 +7153,7 @@ function recoverInflightTurn(botId: string, action: BootRecoveryAction = "contin
     // stopping the bot, drop the marker, and do NOT remember a failure — a
     // remembered one is permanent noise on a thread nobody is trying to run.
     if (isBotStoppedError(error)) {
-      console.log(`boot recovery: not resuming ${bot.name} (${threadId}) — the bot is stopped`);
+      console.log(`boot recovery: not resuming ${bot.name} (${threadId}) — the bot is stopped or off`);
       releaseBootResume(bot.id, threadId);
       store.patchBot(bot.id, { inflightThreadId: undefined });
       return;
@@ -7256,6 +7284,24 @@ async function runGroupMemberTurn(
     ? group.threadId === threadId
     : Boolean(group && store.groupTaskByThread(group.id, threadId));
   if (!group || !bot || !ownsThread) return false;
+  // Room turns never pass through startTurn, so the Off gate lives here too.
+  // Selection (startGroupTurn, chained mentions) already skips an Off member;
+  // this catches a member switched Off after it was chosen: a queued round, a
+  // card continuation, a fallback relaunch.  The member is skipped, not the
+  // whole round, so `true` lets the rest of the responders speak.
+  if (botIsOff(bot)) {
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: botOffRoomNotice(bot.name), ok: false },
+    });
+    // A connector or secret card is waiting on this turn to continue (its
+    // dispatcher passes `onDispatchError`).  Settle it as failed, with the
+    // reason, rather than leave it stuck on "Resumed" for a turn that will
+    // never start — the same outcome the 1:1 path gets from the thrown refusal.
+    onDispatchError?.(BOT_OFF_REFUSAL);
+    return true;
+  }
   if (providerReloadInProgress) {
     queueRoomRound({ groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection }, Date.now());
     return true;
@@ -7990,8 +8036,12 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, record
   const members = group.memberIds
     .map((id) => store.bot(id))
     .filter((b): b is NonNullable<typeof b> => Boolean(b));
-  const availableMembers = members.filter((member) => !member.hidden);
+  // An Off member is neither archived nor available: it stays in the room,
+  // visible, but cannot speak.  `roomResponders` and `mentionedBots` skip it
+  // the same way they skip an archived one, so it never reaches the queue.
+  const availableMembers = members.filter((member) => !member.hidden && !botIsOff(member));
   const archived = members.filter((member) => member.hidden);
+  const offMembers = members.filter((member) => !member.hidden && botIsOff(member));
   const mentionedArchived = mentionedBots(text, archived.map(({ name }) => ({ name })))[0];
   if (mentionedArchived) {
     store.appendMessage(threadId, {
@@ -8001,6 +8051,14 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, record
         name: `${mentionedArchived.name} is archived and can't respond — restore it or mention an active room member.`,
         ok: false,
       },
+    });
+  }
+  const mentionedOff = mentionedBots(text, offMembers.map(({ name }) => ({ name })))[0];
+  if (mentionedOff) {
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: botOffRoomNotice(mentionedOff.name), ok: false },
     });
   }
   let responders = roomResponders(text, members, group.defaultResponder);
@@ -8015,11 +8073,16 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message, record
   if (!responders.length) {
     const defaultArchivedId = group.defaultResponder.kind === "member" ? group.defaultResponder.botId : undefined;
     const defaultArchived = archived.find((member) => member.id === defaultArchivedId);
+    const defaultOff = offMembers.find((member) => member.id === defaultArchivedId);
     let unavailableMessage: string | undefined;
-    if (!mentionedArchived && !availableMembers.length) {
-      unavailableMessage = "No active room members can respond — restore an archived bot or add an active member.";
-    } else if (!mentionedArchived && defaultArchived) {
+    if (!mentionedArchived && !mentionedOff && !availableMembers.length) {
+      unavailableMessage = offMembers.length
+        ? "No room members can respond — turn a bot on, restore an archived bot, or add an active member."
+        : "No active room members can respond — restore an archived bot or add an active member.";
+    } else if (!mentionedArchived && !mentionedOff && defaultArchived) {
       unavailableMessage = `${defaultArchived.name} is archived and can't respond — restore it or mention an active room member.`;
+    } else if (!mentionedArchived && !mentionedOff && defaultOff) {
+      unavailableMessage = botOffRoomNotice(defaultOff.name);
     }
     if (unavailableMessage) {
       store.appendMessage(threadId, {
@@ -8212,7 +8275,8 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
     // A stopped bot is a decision, not a fault: settle the card quietly rather
     // than parking it in a retry loop that can never succeed.
     if (isBotStoppedError(error)) {
-      markConnectorResumeFailed(entry.threadId, entry.resumeKey, botStopRefusalMessage());
+      // The refusal's own message says which: turn the bot on, or start it again.
+      markConnectorResumeFailed(entry.threadId, entry.resumeKey, error instanceof Error ? error.message : botStopRefusalMessage());
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -8323,7 +8387,7 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
     // See the connector resume above: a stopped bot settles the card instead
     // of retrying forever.
     if (isBotStoppedError(error)) {
-      markSecretResumeFailed(entry.threadId, entry.messageId, botStopRefusalMessage());
+      markSecretResumeFailed(entry.threadId, entry.messageId, error instanceof Error ? error.message : botStopRefusalMessage());
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -9544,11 +9608,14 @@ function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueu
     turns: store.bots.filter((bot) => bot.busy).length,
     completions: completionFolds.size,
     groupOperations: groupTurnOperations.size,
-    queuedSends: queuedMessageCount(),
-    queuedRooms: Math.max(0, _queuedRoomCount() - (allowCredentialQueues ? pendingRoundCount : 0)),
-    delegations: pendingDelegationSnapshot().length,
-    connectors: pendingConnectorResumes.size,
-    secrets: pendingSecretResumes.size,
+    // An Off bot counts as idle: whatever is queued for it will be dropped
+    // or refused, never run, so it must not hold an update.  Its RUNNING turn
+    // (`turns` above) still counts: that work is real and is not interrupted.
+    queuedSends: queuedMessageCount(botIsOffId),
+    queuedRooms: Math.max(0, _queuedRoomCount(botIsOffId) - (allowCredentialQueues ? pendingRoundCount : 0)),
+    delegations: pendingDelegationSnapshot().filter((item) => !botIsOffId(item.toBotId)).length,
+    connectors: [...pendingConnectorResumes.values()].filter((entry) => !botIsOffId(entry.botId)).length,
+    secrets: [...pendingSecretResumes.values()].filter((entry) => !botIsOffId(entry.botId)).length,
     vps: activeVpsThreads.size,
     vpsModeChange: Number(vpsModeChangeBusy),
     localVm: localVmActiveThreads.size + localVmLifecycleBusy.size,
@@ -9557,8 +9624,32 @@ function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueu
     reloads: pendingProviderReloads + Number(providerConfigBusy),
     routineRuns: routines?.listRuns().filter((run) =>
       (allowCredentialQueues ? ["running", "waiting"] : ["queued", "running", "waiting"]).includes(run.status)
+      && !(run.status === "queued" && botIsOffId(run.botId))
     ).length ?? 0,
   });
+}
+
+/** Whether the bot with this id is switched Off (a missing bot is not). */
+function botIsOffId(botId: string): boolean {
+  return botIsOff(store.bot(botId));
+}
+
+/** A bot was just switched Off: settle what was waiting for it.
+ *
+ *  - Queued routine, webhook and resource receipts become `Skipped: this bot
+ *    is off` history entries (cancelled, outcome `bot_off`).  They are not
+ *    held for the bot's return and are never retried.
+ *  - When the bot is idle, the sends a person queued behind a turn and the
+ *    room rounds waiting for it are settled now (the person is told their
+ *    queued messages were not sent).  When it is mid-turn they are left to the
+ *    drain that runs when the turn ends, which settles them the same way.
+ *  - A running turn is never touched: it finishes, and nothing new follows. */
+function settleWorkForOffBot(botId: string): void {
+  routines?.skipQueuedRunsForBot(botId);
+  const bot = store.bot(botId);
+  if (!bot || bot.busy) return;
+  dropQueuedForOffBot(store, botId);
+  cancelRoomRounds((round) => round.botId === botId);
 }
 
 function beginUpdateAdmission(): (() => void) | null {
@@ -9636,7 +9727,7 @@ async function resumeInterruptedChatTurns(
         if (isBotStoppedError(error)) {
           // Their stop outranks our replay.  Say so in the log rather than
           // retrying: the thread stays put until the person starts the bot.
-          console.log(`[${context}] not resuming ${resumeBot.name} — the bot is stopped`);
+          console.log(`[${context}] not resuming ${resumeBot.name} — the bot is stopped or off`);
           continue;
         }
         // The provider rejected the redispatch before it could emit a
@@ -11935,6 +12026,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 
       const bot = store.patchBot(m[1], parsed.patch);
       if (!bot) return json(res, 404, { error: "no such bot" });
+      // A paired phone can switch a bot Off too: settle what was waiting for
+      // it exactly as the desktop's PATCH does.
+      if (parsed.patch.off === true && existingBot.off !== true) settleWorkForOffBot(bot.id);
       const visible = wireBot(bot);
       broadcast({ kind: "bot", bot: visible });
       return json(res, 200, { bot: visible });
@@ -12107,6 +12201,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (section !== undefined) patch.section = section ?? undefined;
       if (body.chiefOfStaff === false) patch.chiefOfStaff = false;
+      // The On/Off switch arrives through `profile.patch` above (the shared
+      // schema validates it as a boolean, 400 otherwise).  It is stored as an
+      // explicit boolean in both directions, never deleted, so every frame
+      // carries it and a client that merges frames cannot keep a stale
+      // `off: true`.  Same auth as every other bot edit.
       // per-bot gate on the workspace's connected apps (Composio)
       if (body.composio !== undefined) {
         if (typeof body.composio !== "boolean") return json(res, 400, { error: "composio must be true or false" });
@@ -12242,6 +12341,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         sectionKey(existingBot?.section) !== sectionKey(section);
       const bot = store.patchBot(m[1], patch);
       if (!bot) return json(res, 404, { error: "no such bot" });
+      // Switching Off settles what was waiting for the bot, so nothing sits in
+      // a queue (or holds an update) for a bot that will not run it.  A turn
+      // that is already running is left alone.
+      if (patch.off === true && existingBot?.off !== true) settleWorkForOffBot(bot.id);
       const chiefChanges =
         body.chiefOfStaff === true || chiefMovedSections
           ? store.setChiefOfStaff(bot.id)
@@ -12563,6 +12666,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!rawText) return json(res, 400, { error: "text required" });
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
+      // Every channel lands here (the app, the phone, the iMessage relay, Linq),
+      // and a busy bot's message would be steered into the running turn or
+      // queued for the next one before startTurn ever saw it.  An Off bot takes
+      // neither: refuse up front so nothing is accepted, queued or half-written.
+      if (botIsOff(bot)) return json(res, 409, { error: BOT_OFF_REFUSAL, code: BOT_OFF_CODE });
       if (body.threadId !== undefined && (typeof body.threadId !== "string" || !/^[\w-]+$/.test(body.threadId))) {
         return json(res, 400, { error: "threadId must be a task id" });
       }
@@ -12722,6 +12830,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const body = await readBody(req);
       const text = String(body.text ?? "").trim();
       if (!text) return json(res, 400, { error: "text required" });
+      // An edit forks the transcript before it dispatches, so refuse an Off bot
+      // first rather than leave a branch behind a turn that cannot start.
+      if (botIsOff(bot)) return json(res, 409, { error: BOT_OFF_REFUSAL, code: BOT_OFF_CODE });
       // everything from here down is synchronous, so two racing edits can
       // never both get past this check: startTurn flips busy before the
       // next request is handled
