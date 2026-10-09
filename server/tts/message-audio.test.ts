@@ -1093,7 +1093,9 @@ describe("the pronunciation list (shared/pronunciations.ts)", () => {
     const result = await post(fixture, { voice: "personal:x", voiceSummaryMode: "off" }, { device: "iphone", progressive: true, spans: true });
     expect(result.body.onDevice).toBe(true);
     expect(result.body.utterances).toEqual(["Run the sequel migration, then check kron.", "Use oh auth for the gooey."]);
-    expect(result.body.voiceText).toBe("Run the sequel migration, then check kron. Use oh auth for the gooey.");
+    // A caption shows the words as written; the device says the respelling.
+    expect(result.body.voiceText).toBe("Run the SQL migration, then check cron. Use OAuth for the GUI.");
+    expect(result.body.captions).toEqual(["Run the SQL migration, then check cron.", "Use OAuth for the GUI."]);
     expect(result.body.script).toBe("written");
     const source = writtenReply(REPLY);
     const script = karaokeScriptFromWire(result.body.utterances ?? [], result.body.spans);
@@ -1115,6 +1117,8 @@ describe("the pronunciation list (shared/pronunciations.ts)", () => {
     });
     const result = await post(fixture, { voice: "personal:x", voiceSummaryMode: "always" }, { device: "mac", progressive: true, spans: true });
     expect(result.body.utterances?.join(" ")).toBe("Run the sequel migration. Then check kron and oh auth.");
+    expect(result.body.voiceText).toBe("Run the SQL migration. Then check cron and OAuth.");
+    expect(result.body.captions?.join(" ")).toBe("Run the SQL migration. Then check cron and OAuth.");
     expect(result.body.script).toBe("summary");
     // The stored script is the distiller's, as it was written.
     expect(fixture.row.voiceText).toBeUndefined();

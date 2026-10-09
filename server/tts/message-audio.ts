@@ -234,6 +234,11 @@ export type AudioResponseBody = {
   script?: SpokenScriptKind;
   /** Only with `spans: true` and a written script. */
   spans?: SpokenSpansWire;
+  /** On-device answers only, and only when the pronunciation list changed
+   * something: each utterance as written, for a caption, beside
+   * `utterances`, which is what the device says ("Jason" for "JSON").  The
+   * owner's rule is that text on screen shows the original words. */
+  captions?: string[];
 };
 
 export type AudioJsonResult = { kind: "json"; status: number; body: AudioResponseBody; headers?: Record<string, string> };
@@ -612,18 +617,22 @@ export class MessageAudio {
       // goes in here, with the written script's spans rebuilt around it.
       const list = this.deps.pronunciations?.() ?? [];
       let onDevice: string[];
+      /** The same utterances as written, for captions and voiceText. */
+      let asWritten: string[];
       let onDeviceSpans = spansWire;
       if (label === "written" && written) {
         const respelled = list.length ? written.map((u) => pronounceUtterance(u, list)) : written;
         onDevice = respelled.map((u) => u.text);
+        asWritten = written.map((u) => u.text);
         if (spans && respelled !== written) onDeviceSpans = encodeSpokenSpans(source, respelled);
       } else {
         const respell = pronouncer(list);
-        onDevice = utterances
+        asWritten = utterances
           .map(stripPauseTags)
-          .filter((u) => /[\p{L}\p{N}]/u.test(u))
-          .map(respell);
+          .filter((u) => /[\p{L}\p{N}]/u.test(u));
+        onDevice = asWritten.map(respell);
       }
+      const respelledAny = onDevice.some((u, i) => u !== asWritten[i]);
       // `script` and `spans` only for a client that asked, as extra() does,
       // with the spans of what the device is actually handed.
       const script: Partial<AudioResponseBody> = {};
@@ -636,8 +645,10 @@ export class MessageAudio {
         status: 200,
         body: {
           audio: [],
-          voiceText: onDevice.join(" "),
+          // What a caption shows: the words as written, never the respelling.
+          voiceText: asWritten.join(" "),
           utterances: onDevice,
+          ...(respelledAny ? { captions: asWritten } : {}),
           total: onDevice.length,
           complete: true,
           onDevice: true,

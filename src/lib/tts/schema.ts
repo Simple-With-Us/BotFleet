@@ -42,6 +42,10 @@ export const TtsAudioBodySchema = z.object({
    * malformed value is dropped rather than failing the whole answer: the
    * voice still plays, it just has no guided highlight. */
   spans: SpokenSpansWireSchema.optional().catch(undefined),
+  /** On-device answers, when the pronunciation list respelled something:
+   * each utterance as written, for the caption, beside `utterances`, which
+   * the device says.  Dropped when it does not line up with them. */
+  captions: z.array(z.string()).optional().catch(undefined),
 });
 
 export type TtsAudioBody = z.infer<typeof TtsAudioBodySchema>;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { toUtterances } from "../server/tts/speech-text.ts";
-import { utterancesWithSpans } from "./speech-spans.ts";
+import { pronounceUtterance, utterancesWithSpans } from "./speech-spans.ts";
 import { encodeSpokenSpans, karaokeScriptFromWire, localKaraokeScript, SPOKEN_SPANS_FORMAT } from "./spoken-script.ts";
 
 const SOURCE = [
@@ -71,6 +71,18 @@ describe("spoken spans on the wire", () => {
     const fromWire = karaokeScriptFromWire(spoken.map((u) => u.text), encodeSpokenSpans(SOURCE, spoken));
     const local = localKaraokeScript(SOURCE);
     expect(local.utterances).toEqual(spoken.map((u) => u.text));
+    expect(local.script).toEqual(fromWire);
+    expect(local.captions).toEqual(local.utterances);
+  });
+
+  it("applies the pronunciation list locally as the harness does for an on-device voice", () => {
+    const list = [{ term: "SQL", say: "sequel" }, { term: "cron", say: "kron" }];
+    const source = "Run the **SQL** migration, then check `cron`.";
+    const spoken = utterancesWithSpans(source).map((u) => pronounceUtterance(u, list));
+    const fromWire = karaokeScriptFromWire(spoken.map((u) => u.text), encodeSpokenSpans(source, spoken));
+    const local = localKaraokeScript(source, list);
+    expect(local.utterances).toEqual(["Run the sequel migration, then check kron."]);
+    expect(local.captions).toEqual(["Run the SQL migration, then check cron."]);
     expect(local.script).toEqual(fromWire);
   });
 });

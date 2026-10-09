@@ -73,7 +73,9 @@ struct WorkspaceVoiceSection: View {
             Text(footer)
         }
         .task(id: session.connection?.id) {
-            voices = await session.voiceOptions()
+            // Quietly: opening Settings while the computer is asleep is not
+            // an error, and the default voice is named from the config.
+            voices = await session.voiceOptions(quietly: true)
         }
     }
 
@@ -131,11 +133,27 @@ struct PronunciationsView: View {
     @State private var seeded = false
     @State private var saving = false
     @State private var error = ""
+    /// The row field being typed in.
+    @FocusState private var focused: Field?
+    /// Rows focus has left since they were added; only these are told what
+    /// they are missing, so typing a new term never shows an error.
+    @State private var left: Set<UUID> = []
 
     struct Row: Identifiable, Equatable {
         let id = UUID()
         var term: String
         var say: String
+    }
+
+    enum Field: Hashable {
+        case term(UUID)
+        case say(UUID)
+
+        var row: UUID {
+            switch self {
+            case .term(let id), .say(let id): return id
+            }
+        }
     }
 
     private var saved: [Pronunciation] { session.config?.pronunciations ?? [] }
@@ -150,12 +168,24 @@ struct PronunciationsView: View {
         }
     }
 
-    private var incomplete: String? {
-        for entry in entries {
-            if entry.term.isEmpty { return "Add the term that is said as \u{201C}\(entry.say)\u{201D}." }
-            if entry.say.isEmpty { return "Add how to say \(entry.term)." }
+    /// What the first row with one field filled is missing, among `rows`.
+    private func missing(in rows: [Row]) -> String? {
+        for row in rows {
+            let term = row.term.trimmingCharacters(in: .whitespacesAndNewlines)
+            let say = row.say.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            if term.isEmpty && say.isEmpty { continue }
+            if term.isEmpty { return "Add the term that is said as \u{201C}\(say)\u{201D}." }
+            if say.isEmpty { return "Add how to say \(term)." }
         }
         return nil
+    }
+
+    /// Any row still missing a field: Save waits for it.
+    private var incomplete: String? { missing(in: rows) }
+
+    /// What is shown: only a row focus has left, never the one being typed.
+    private var hint: String? {
+        missing(in: rows.filter { left.contains($0.id) && focused?.row != $0.id })
     }
 
     private var dirty: Bool { entries != saved }
@@ -170,16 +200,21 @@ struct PronunciationsView: View {
                             .autocorrectionDisabled()
                             .frame(maxWidth: 120, alignment: .leading)
                             .accessibilityLabel("Term")
+                            .focused($focused, equals: .term(row.id))
                         Divider()
                         TextField("Say It As", text: $row.say)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .accessibilityLabel(row.term.isEmpty ? "Say It As" : "Say \(row.term) As")
+                            .focused($focused, equals: .say(row.id))
                     }
                 }
                 .onDelete { rows.remove(atOffsets: $0) }
                 Button {
-                    rows.append(Row(term: "", say: ""))
+                    // A new row is typed into straight away.
+                    let row = Row(term: "", say: "")
+                    rows.append(row)
+                    focused = .term(row.id)
                 } label: {
                     Label("Add Term", systemImage: "plus")
                 }
@@ -194,13 +229,18 @@ struct PronunciationsView: View {
                 Text("How the voice says terms it keeps getting wrong, for every bot.\u{00A0} A term in lowercase matches any case; one with capitals matches only as written or in all capitals.\u{00A0} A change applies to every reply not voiced yet, and a reply already voiced keeps its sound.")
             }
 
-            if let message = incomplete ?? (error.isEmpty ? nil : error) {
+            if let message = hint ?? (error.isEmpty ? nil : error) {
                 Section {
                     Text(message)
                         .font(.footnote)
                         .foregroundStyle(.red)
                 }
             }
+        }
+        .onChange(of: focused) { previous, _ in
+            // Leaving a row (not moving between its two fields) lets it say
+            // what it is missing.
+            if let row = previous?.row, focused?.row != row { left.insert(row) }
         }
         .navigationTitle("Pronunciations")
         .navigationBarTitleDisplayMode(.inline)
