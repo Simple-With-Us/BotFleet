@@ -21,6 +21,8 @@
 
 import { randomBytes } from "node:crypto";
 
+import { BOT_OFF_CODE } from "../../shared/bot-power.ts";
+
 import {
   ZULIP_TOPIC_FOLLOWED,
   ZULIP_TOPIC_NONE,
@@ -231,6 +233,14 @@ function statusOf(error: unknown): number | undefined {
   // other thrown value has no such field and reads as undefined below.
   const status = (error as { status?: unknown } | null)?.status;
   return typeof status === "number" ? status : undefined;
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+function codeOf(error: unknown): string | undefined {
+  // SAFETY: a harness refusal may carry a string `code` (bot_off, …); any
+  // other thrown value has none and reads as undefined below.
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : undefined;
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters
@@ -1113,7 +1123,13 @@ export class ZulipHub {
       );
     } catch (e) {
       const status = statusOf(e);
-      if (status === 409 || status === 503) {
+      if (codeOf(e) === BOT_OFF_CODE) {
+        // Switched Off in BotFleet: every automation is skipped, never
+        // retried, and only an explicit Turn On clears it.  Zulip work is the
+        // same, so the batch is dropped rather than held for the bot.
+        retireBatch();
+        this.log(`[zulip] ${session.role}: turn not started (the bot is off); dropped`);
+      } else if (status === 409 || status === 503) {
         unit.attempts += 1;
         const base = this.deps.timings?.retryBaseMs ?? 5_000;
         unit.notBefore = now + Math.min(base * 2 ** Math.min(unit.attempts - 1, 6), 5 * 60_000);

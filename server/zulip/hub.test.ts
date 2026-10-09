@@ -765,6 +765,24 @@ describe("review fixes: delivery order and races", () => {
   });
 });
 
+describe("a bot switched Off", () => {
+  it("drops the unit instead of retrying it, as every other automation does", async () => {
+    let attempts = 0;
+    const hub = makeHub({
+      startTurn: async () => {
+        attempts += 1;
+        throw Object.assign(new Error("This bot is off."), { status: 409, code: "bot_off" });
+      },
+    });
+    await connected(hub);
+    fake.postStream(JAY, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "website");
+    await waitFor(() => logs.some((line) => line.includes("the bot is off")), "the drop");
+    await settle(300);
+    expect(attempts).toBe(1);
+    expect(botStatus(hub, "bot-plumber")?.pending).toBe(0);
+  });
+});
+
 describe("review fixes: reconnects", () => {
   it("polls the same queue again after a long-poll timeout instead of registering another", async () => {
     fake.heartbeatMs = 2_000;
