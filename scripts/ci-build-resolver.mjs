@@ -1210,7 +1210,35 @@ export async function selectNewestGreenCommit({
     const tipBuild = index === 0 ? "succeeded" : await describeTipBuild({ tip, repository, headers, fetchImpl });
     return { commit, behind: index, tipBuild };
   }
-  return { commit: null, behind: null, tipBuild: await describeTipBuild({ tip, repository, headers, fetchImpl }) };
+  // `withoutArtifact` counts green builds passed over because their artifact
+  // is missing or expired, so the caller can say "re-run the build" rather
+  // than "wait for one".  `capped` means the lookups stopped before every
+  // candidate was checked.
+  return {
+    commit: null,
+    behind: null,
+    withoutArtifact: checked,
+    capped: checked >= SELECTION_ARTIFACT_CHECKS,
+    tipBuild: await describeTipBuild({ tip, repository, headers, fetchImpl }),
+  };
+}
+
+/**
+ * Why `selectNewestGreenCommit` found nothing to install, and what to do about
+ * it.  Green builds whose artifact expired need a re-run, not a wait.
+ */
+function noneReason({ withoutArtifact = 0, capped = false }) {
+  if (withoutArtifact > 0) {
+    const one = withoutArtifact === 1;
+    const which = capped
+      ? `The newest ${plural(withoutArtifact)} with a successful hosted build have`
+      : `${plural(withoutArtifact)} in between ${one ? "has a successful hosted build, but its" : "have successful hosted builds, but their"} artifact${one ? " is" : "s are"}`;
+    const state = capped ? "no artifact left to download" : "missing or expired";
+    return `${which} ${state}.  ` +
+      `Re-run the Mac Commit Build workflow on main's tip, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.`;
+  }
+  return "None of the commits in between has a successful hosted build yet.  " +
+    "Wait for a build to finish, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.";
 }
 
 /**
@@ -1268,7 +1296,6 @@ export async function selectUpdateTarget({
     tip,
     message:
       `No newer hosted build to install.  The installed build is ${short(installed)}.  Main is at ${short(tip)}, ` +
-      `${ahead} ahead, and its build ${found.tipBuild}.  None of the commits in between has a successful hosted build yet.  ` +
-      `Wait for a build to finish, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.`,
+      `${ahead} ahead, and its build ${found.tipBuild}.  ${noneReason(found)}`,
   };
 }

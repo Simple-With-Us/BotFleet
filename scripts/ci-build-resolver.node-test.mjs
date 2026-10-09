@@ -1077,6 +1077,7 @@ test("only a handful of artifact lookups are made before giving up", async () =>
   const found = await select(many, { fetchImpl: actionsFetch({ green: many, expired: many, urls }) });
   assert.equal(found.commit, null);
   assert.equal(urls.filter((url) => url.includes("/artifacts")).length, 5);
+  assert.deepEqual([found.withoutArtifact, found.capped], [5, true]);
 });
 
 test("a GitHub failure surfaces as a classified error the wrapper can fail open on", async () => {
@@ -1208,6 +1209,23 @@ test("nothing newer than the installed build is green: a clear refusal, never th
   assert.match(decision.message, /its build is still running/);
   assert.match(decision.message, /BOTFLEET_UPDATE_SOURCE=local/);
   assert.ok(!decision.message.includes("\n"), "the explanation is one line, because the wrapper hands it over in a variable");
+});
+
+test("green builds whose artifacts expired ask for a re-run, not a wait", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [, c1, c2, c3, c4] = commits;
+  const common = { git: gitSync, installedCommit: c1, env: SELECT_ENV };
+  const tipRun = { head_sha: c4, status: "completed", conclusion: "success" };
+
+  const all = await selectUpdateTarget({ ...common, fetchImpl: actionsFetch({ green: [c4, c3, c2], expired: [c4, c3, c2], tipRun }) });
+  assert.equal(all.status, "none");
+  assert.match(all.message, /3 commits in between have successful hosted builds, but their artifacts are missing or expired\./);
+  assert.match(all.message, /Re-run the Mac Commit Build workflow on main's tip/);
+  assert.doesNotMatch(all.message, /None of the commits in between has a successful hosted build/);
+  assert.ok(!all.message.includes("\n"));
+
+  const one = await selectUpdateTarget({ ...common, fetchImpl: actionsFetch({ green: [c4], expired: [c4], tipRun }) });
+  assert.match(one.message, /1 commit in between has a successful hosted build, but its artifact is missing or expired\./);
 });
 
 test("a truncated window changes what is said about the span searched, never the distance to the chosen commit", async (t) => {
