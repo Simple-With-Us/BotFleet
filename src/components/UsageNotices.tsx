@@ -19,7 +19,7 @@ export function HeldBotsNotice({ heldPairs }: { heldPairs: readonly DoomedPair[]
       </div>
       <div className="mt-1">
         These bots cannot start their engine, so their scheduled work is queued rather than failed
-        &#8212; it runs on its own once the engine comes back.  Each attempt is being counted, so this
+        &#8212; it runs on its own once the engine comes back.{" "} Each attempt is being counted, so this
         is not a stuck scheduler.
       </div>
       <ul className="mt-1.5 space-y-0.5">
