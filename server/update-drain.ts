@@ -217,6 +217,14 @@ const HeldQueueEntrySchema = z.object({
     linqChatId: z.string().optional(),
     automationSource: z.string().optional(),
     relayed: z.boolean(),
+    /** Already in the transcript (an earlier update committed it): it runs
+     *  as its own turn with nothing appended (server/steer-queue.ts). */
+    committed: z.object({
+      userMessageId: nonEmpty,
+      excludeIds: z.array(z.string()),
+      relayed: z.boolean(),
+      heldAt: z.number().finite(),
+    }).optional(),
   })).min(1),
 });
 export type HeldQueueEntry = z.infer<typeof HeldQueueEntrySchema>;

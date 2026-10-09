@@ -69,6 +69,7 @@ function fakeStore(bots: BotRecord[]): SteerStore & { messages: Message[] } {
       messages[at] = { ...messages[at], ...patch };
       return messages[at];
     },
+    messagesFor: (threadId) => messages.filter((m) => m.id.endsWith(`-${threadId}`)),
   };
 }
 
@@ -241,6 +242,91 @@ describe("steer-queue module", () => {
     const run = vi.fn();
     drainSteeredMessages(fakeStore([fakeBot("bot-c", "thread-c", false)]), run);
     expect(run).not.toHaveBeenCalled();
+  });
+
+  it("runs batches an update already committed one at a time, in their place, without appending them again", () => {
+    // Finding 3: carried sends used to start all at once after a restart, so a
+    // second one for the same bot ended as "already working" and never ran.
+    const bot = fakeBot("bot-carried", "thread-carried", false);
+    const store = fakeStore([bot]);
+    const committed = (text: string, heldAt: number) => {
+      const line = store.appendMessage("thread-carried", { role: "user", kind: "text", text });
+      return {
+        messageId: line.id,
+        text,
+        prompt: text,
+        committed: { userMessageId: line.id, excludeIds: [line.id], relayed: text.includes("relayed"), heldAt },
+      };
+    };
+    const first = committed("first carried send", 1);
+    const second = committed("second carried send, relayed", 2);
+    restoreSteeredEntries([{ threadId: "thread-carried", botId: "bot-carried", items: [first, second] }]);
+    // Something queued since waits behind both.
+    bot.busy = true;
+    queueSteeredMessage(bot, "typed after the restart");
+    bot.busy = false;
+    const before = store.messages.length;
+
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]).toEqual([
+      "bot-carried", "thread-carried", "first carried send",
+      expect.objectContaining({ id: first.messageId }), [first.messageId], undefined, first.committed,
+    ]);
+    expect(store.messages).toHaveLength(before);
+
+    // The first one is running: the second waits, and nothing errors.
+    bot.busy = true;
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    bot.busy = false;
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1][2]).toBe("second carried send, relayed");
+    expect(run.mock.calls[1][6]).toMatchObject({ relayed: true });
+    expect(store.messages).toHaveLength(before);
+
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(run.mock.calls[2][2]).toBe("typed after the restart");
+    expect(run.mock.calls[2][6]).toBeUndefined();
+    expect(store.messages.at(-1)).toMatchObject({ text: "typed after the restart" });
+    expect(_queuedCount("thread-carried")).toBe(0);
+  });
+
+  it("skips a committed batch whose line has left the thread", () => {
+    const bot = fakeBot("bot-gone-line", "thread-gone-line", false);
+    const store = fakeStore([bot]);
+    restoreSteeredEntries([{
+      threadId: "thread-gone-line",
+      botId: "bot-gone-line",
+      items: [
+        { messageId: "gone", text: "gone", prompt: "gone", committed: { userMessageId: "gone", excludeIds: ["gone"], relayed: false, heldAt: 1 } },
+        { messageId: "q1", text: "still here", prompt: "still here" },
+      ],
+    }]);
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][2]).toBe("still here");
+    expect(_queuedCount("thread-gone-line")).toBe(0);
+  });
+
+  it("starts one batch per bot per pass, even across two of its threads", () => {
+    const bot = fakeBot("bot-two-threads", "thread-one", true);
+    const store = fakeStore([bot]);
+    queueSteeredMessage(bot, "on the first thread");
+    bot.threadId = "thread-two";
+    queueSteeredMessage(bot, "on the second thread");
+    bot.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][2]).toBe("on the first thread");
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1][2]).toBe("on the second thread");
   });
 
   it("drops the queue of a deleted bot without running it", () => {

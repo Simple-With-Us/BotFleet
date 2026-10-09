@@ -25,6 +25,22 @@ export interface SteerStore {
   bot(id: string): BotRecord | null;
   appendMessage(threadId: string, message: Omit<Message, "id" | "at">): Message;
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null;
+  messagesFor(threadId: string): Message[];
+}
+
+/** A batch already in the transcript: an update committed it for a restart
+ *  (server/update-drain.ts) and it waits here again, after the restart or
+ *  because the restart did not come.  It drains as a turn of its own, in its
+ *  place in line, with nothing appended. */
+export interface CommittedBatch {
+  /** The last line of the batch; the turn answers it. */
+  userMessageId: string;
+  /** Every line of the batch, kept out of transcript replay. */
+  excludeIds: string[];
+  /** Any line came over a relay, so the turn runs unattended (S8). */
+  relayed: boolean;
+  /** When the update first held it, for the carrier's staleness rule. */
+  heldAt: number;
 }
 
 interface QueuedItem {
@@ -36,6 +52,7 @@ interface QueuedItem {
   /** Set when the words came from an outside channel (iMessage relay), so
    * the drained turn keeps running unattended (S8). */
   automationSource?: Message["automationSource"];
+  committed?: CommittedBatch;
 }
 
 interface QueueEntry {
@@ -84,9 +101,15 @@ export function drainSteeredMessages(
     userMessage: Message,
     excludeIds: string[],
     linqChatId?: string,
+    /** Set for a batch that was already committed (`CommittedBatch`). */
+    carried?: CommittedBatch,
   ) => void | Promise<void>,
 ): void {
   const leftovers: Array<[string, QueueEntry]> = [];
+  // One batch per bot per pass.  A bot can have sends waiting on more than
+  // one of its threads, and two starts in one pass would leave the second
+  // refused as "already working"; the next settle runs the next one.
+  const started = new Set<string>();
   // deleting only the entry being visited is safe under Map iteration
   for (const [threadId, entry] of queues) {
     const bot = store.bot(entry.botId);
@@ -95,21 +118,37 @@ export function drainSteeredMessages(
       queues.delete(threadId);
       continue;
     }
-    if (bot.busy) continue; // still working — the next settle tries again
+    if (bot.busy || started.has(entry.botId)) continue; // still working — the next settle tries again
     // committed to draining: the entry leaves the map before anything runs,
     // so a settle racing another settle can never fire the same queue twice
     queues.delete(threadId);
-    const firstLinq = entry.items.findIndex((item) => item.linqChatId);
-    const batch = firstLinq === 0
-      ? entry.items.slice(0, 1)
-      : firstLinq > 0
-        ? entry.items.slice(0, firstLinq)
-        : entry.items;
-    const rest = firstLinq === 0
-      ? entry.items.slice(1)
-      : firstLinq > 0
-        ? entry.items.slice(firstLinq)
-        : [];
+    let items = entry.items;
+    // A batch an update already committed runs alone, as the turn it was.
+    // One whose line has gone from the thread has nothing left to answer.
+    let carried: { item: QueuedItem; committed: CommittedBatch; userMessage: Message } | null = null;
+    while (!carried && items.length > 0) {
+      const head = items[0];
+      const committed = head?.committed;
+      if (!head || !committed) break;
+      items = items.slice(1);
+      const userMessage = store.messagesFor(threadId).find((message) => message.id === committed.userMessageId);
+      if (userMessage) carried = { item: head, committed, userMessage };
+    }
+    if (carried) {
+      if (items.length) leftovers.push([threadId, { botId: entry.botId, items }]);
+      started.add(entry.botId);
+      const { item, committed, userMessage } = carried;
+      void run(entry.botId, threadId, item.prompt, userMessage, committed.excludeIds, item.linqChatId, committed);
+      continue;
+    }
+    if (!items.length) continue;
+    const firstLinq = items.findIndex((item) => item.linqChatId);
+    // A committed batch further down is a boundary too: it keeps its place.
+    const firstCommitted = items.findIndex((item) => item.committed);
+    let end = firstLinq === 0 ? 1 : firstLinq > 0 ? firstLinq : items.length;
+    if (firstCommitted > 0) end = Math.min(end, firstCommitted);
+    const batch = items.slice(0, end);
+    const rest = items.slice(end);
     // Requeue after this pass so a same-loop Map insert cannot start the
     // next Linq chat before the current startTurn marks the bot busy.
     if (rest.length) leftovers.push([threadId, { botId: entry.botId, items: rest }]);
@@ -130,6 +169,7 @@ export function drainSteeredMessages(
     }
     const last = appended.at(-1);
     if (!last) continue;
+    started.add(entry.botId);
     const prompt = batch.map((item) => item.prompt).join("\n");
     void run(
       entry.botId,
@@ -172,6 +212,7 @@ export interface SteerQueueSnapshot {
     replyToId?: string;
     linqChatId?: string;
     automationSource?: Message["automationSource"];
+    committed?: CommittedBatch;
   }>;
 }
 

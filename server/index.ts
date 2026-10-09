@@ -4740,7 +4740,7 @@ function takeRelayMark(threadId: string, excludeIds: readonly string[]): boolean
 }
 
 /** Run one drained batch: the turn typing the same words would have run. */
-function runQueuedSend(send: Omit<HeldSend, "heldAt">, userMessage: Message) {
+function runQueuedSend(send: Omit<HeldSend, "heldAt">, userMessage: Message, heldAt = Date.now()) {
   // A plain attended turn — no automationSource, no unattended, no comms
   // depth: exactly what typing the same words into an idle bot would run.
   // Drain just appended the held lines; userMessage keeps startTurn
@@ -4757,15 +4757,36 @@ function runQueuedSend(send: Omit<HeldSend, "heldAt">, userMessage: Message) {
     // stopped bot — the same as typing them into an idle bot.
     personInitiated: true,
   }).catch((err) => {
+    // The bot was taken first (a routine the scheduler ticked, a resumed
+    // turn), or an update fenced in between: the words are in the thread
+    // already, so they wait again, at the head of the line, as the batch they
+    // are.  Never an error line for a send that simply was not its turn yet.
+    const message = err instanceof Error ? err.message : String(err);
+    if (store.bot(send.botId) && (/already working/i.test(message) || /quiescing for an update/i.test(message))) {
+      restoreSteeredEntries([committedEntry(send, heldAt)]);
+      return;
+    }
     store.appendMessage(send.threadId, {
       role: "bot",
       kind: "activity",
       tool: {
-        name: `error: queued message could not start — ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`,
+        name: `error: queued message could not start — ${message.slice(0, 120)}`,
         ok: false,
       },
     });
   });
+}
+
+/** A batch already in its thread, as the steer queue holds it to run again. */
+function committedEntry(send: Omit<HeldSend, "heldAt">, heldAt: number): SteerQueueSnapshot {
+  const item: SteerQueueSnapshot["items"][number] = {
+    messageId: send.userMessageId,
+    text: send.prompt,
+    prompt: send.prompt,
+    committed: { userMessageId: send.userMessageId, excludeIds: [...send.excludeIds], relayed: send.relayed, heldAt },
+  };
+  if (send.linqChatId) item.linqChatId = send.linqChatId;
+  return { threadId: send.threadId, botId: send.botId, items: [item] };
 }
 
 function drainQueuedSends() {
@@ -4774,33 +4795,42 @@ function drainQueuedSends() {
   // or carried across the restart (`persistHeldWork`) —
   // never started into a fence that would refuse it.
   if (updateDrain.active || runtimeQuiescing) return;
-  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId) =>
+  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId, carried) =>
     runQueuedSend(
-      { botId, threadId, prompt, userMessageId: userMessage.id, excludeIds, linqChatId, relayed: takeRelayMark(threadId, excludeIds) },
+      {
+        botId,
+        threadId,
+        prompt,
+        userMessageId: userMessage.id,
+        excludeIds,
+        linqChatId,
+        relayed: carried ? carried.relayed : takeRelayMark(threadId, excludeIds),
+      },
       userMessage,
+      carried?.heldAt,
     ));
 }
 
 /** Commit every held send to its transcript without running it, and say what
- *  each would have run.  Called when a drain becomes the real fence: the
+ *  each would have run.  Called when the fence goes up for a restart: the
  *  steer queue is memory-only, so a send still in it would die with the
- *  restart.  Every bot is idle by then (a drain only converts with nothing
- *  in flight), so nothing waits behind a busy turn. */
+ *  restart.  A batch committed by an earlier update is carried as it is. */
 function commitHeldSends(): HeldSend[] {
   const held: HeldSend[] = [];
   const heldAt = Date.now();
-  // One pass per Linq-chat boundary in the longest queue; bounded anyway.
+  // One pass per Linq-chat or committed-batch boundary, and per extra thread
+  // of the same bot, in the longest queue; bounded anyway.
   for (let pass = 0; pass < 100 && queuedMessageCount() > 0; pass += 1) {
     const before = queuedMessageCount();
-    drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId) => {
+    drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId, carried) => {
       const send: HeldSend = {
         botId,
         threadId,
         prompt,
         userMessageId: userMessage.id,
         excludeIds,
-        relayed: takeRelayMark(threadId, excludeIds),
-        heldAt,
+        relayed: carried ? carried.relayed : takeRelayMark(threadId, excludeIds),
+        heldAt: carried?.heldAt ?? heldAt,
       };
       if (linqChatId) send.linqChatId = linqChatId;
       held.push(send);
@@ -4810,11 +4840,20 @@ function commitHeldSends(): HeldSend[] {
   return held;
 }
 
-/** Run sends a drain committed to their transcripts.  Too-old ones are not
- *  run (see HELD_SENDS_MAX_AGE_MS); the thread says so instead of going quiet. */
-function runHeldSends(sends: readonly HeldSend[], context: string) {
-  const { run, stale } = partitionByAge(sends, Date.now());
-  for (const send of stale) {
+/** Put work an update carried back where it waits its turn: every send — the
+ *  ones committed to their threads and the ones carried uncommitted behind an
+ *  interrupted bot — into the steer queue, per thread in the order they were
+ *  held and ahead of anything queued since.  Nothing starts here: the next
+ *  drain runs each when its bot is idle, one at a time, so a second send for
+ *  the same bot waits for the first instead of failing as "already working",
+ *  and a send whose bot something else took first (a routine, a resumed turn)
+ *  waits for it.  Too-old work is written into its thread unrun, so the words
+ *  are never lost (HELD_SENDS_MAX_AGE_MS). */
+function restoreHeldWork(work: HeldWork, context: string) {
+  const now = Date.now();
+  const sends = partitionByAge(work.sends, now);
+  const queued = partitionByAge(work.queued, now);
+  for (const send of sends.stale) {
     if (!store.bot(send.botId)) continue;
     store.appendMessage(send.threadId, {
       role: "bot",
@@ -4825,28 +4864,10 @@ function runHeldSends(sends: readonly HeldSend[], context: string) {
       },
     });
   }
-  for (const send of run) {
-    const userMessage = store.bot(send.botId)
-      ? store.messagesFor(send.threadId).find((message) => message.id === send.userMessageId)
-      : undefined;
-    if (!userMessage) {
-      console.log(`[${context}] held message for bot ${send.botId} is no longer in its thread; nothing to run`);
-      continue;
-    }
-    void runQueuedSend(send, userMessage);
-  }
-  if (sends.length > 0) console.log(`[${context}] ran ${run.length} held message(s), ${stale.length} too old to run`);
-}
-
-/** Put sends carried uncommitted (`HeldQueueEntry`) back in the steer queue,
- *  ahead of anything queued since, with their relay marks.  They run when
- *  their bot is next idle, which is after its own resumed turn.  Too-old ones
- *  are written into their thread unrun, so the words are never lost. */
-function restoreHeldQueue(entries: readonly HeldQueueEntry[], context: string) {
-  const { run, stale } = partitionByAge(entries, Date.now());
-  for (const entry of stale) {
+  for (const entry of queued.stale) {
     if (!store.bot(entry.botId)) continue;
     for (const item of entry.items) {
+      if (item.committed) continue; // already in the thread
       store.appendMessage(entry.threadId, { role: "user", kind: "text", text: item.text, replyToId: item.replyToId });
     }
     store.appendMessage(entry.threadId, {
@@ -4858,24 +4879,50 @@ function restoreHeldQueue(entries: readonly HeldQueueEntry[], context: string) {
       },
     });
   }
-  const live = run.filter((entry) => store.bot(entry.botId));
-  for (const entry of live) {
-    for (const item of entry.items) if (item.relayed) relayQueuedMessageIds.add(item.messageId);
+  const pending: Array<{ heldAt: number; entry: SteerQueueSnapshot }> = [];
+  for (const send of sends.run) {
+    if (!store.bot(send.botId)) continue;
+    if (!store.messagesFor(send.threadId).some((message) => message.id === send.userMessageId)) {
+      console.log(`[${context}] held message for bot ${send.botId} is no longer in its thread; nothing to run`);
+      continue;
+    }
+    pending.push({ heldAt: send.heldAt, entry: committedEntry(send, send.heldAt) });
   }
-  restoreSteeredEntries(live.map((entry) => ({
-    threadId: entry.threadId,
-    botId: entry.botId,
-    items: entry.items.map((item) => {
-      const restored: SteerQueueSnapshot["items"][number] = { messageId: item.messageId, text: item.text, prompt: item.prompt };
-      if (item.replyToId) restored.replyToId = item.replyToId;
-      if (item.linqChatId) restored.linqChatId = item.linqChatId;
-      // SAFETY: the carrier only ever holds what `persistHeldWork` copied out
-      // of a steer-queue item, whose automationSource is already this type.
-      if (item.automationSource) restored.automationSource = item.automationSource as Message["automationSource"];
-      return restored;
-    }),
-  })));
-  if (entries.length > 0) console.log(`[${context}] requeued ${live.length} held thread(s), ${stale.length} too old to run`);
+  for (const entry of queued.run) {
+    if (!store.bot(entry.botId)) continue;
+    for (const item of entry.items) if (item.relayed && !item.committed) relayQueuedMessageIds.add(item.messageId);
+    pending.push({
+      heldAt: entry.heldAt,
+      entry: {
+        threadId: entry.threadId,
+        botId: entry.botId,
+        items: entry.items.map((item) => {
+          const restored: SteerQueueSnapshot["items"][number] = { messageId: item.messageId, text: item.text, prompt: item.prompt };
+          if (item.replyToId) restored.replyToId = item.replyToId;
+          if (item.linqChatId) restored.linqChatId = item.linqChatId;
+          // SAFETY: the carrier only ever holds what `persistHeldWork` copied out
+          // of a steer-queue item, whose automationSource is already this type.
+          if (item.automationSource) restored.automationSource = item.automationSource as Message["automationSource"];
+          if (item.committed) restored.committed = { ...item.committed, excludeIds: [...item.committed.excludeIds] };
+          return restored;
+        }),
+      },
+    });
+  }
+  // Oldest first within each thread; `restoreSteeredEntries` then puts the
+  // whole thread's line ahead of anything queued there since.
+  pending.sort((a, b) => a.heldAt - b.heldAt);
+  const byThread = new Map<string, SteerQueueSnapshot>();
+  for (const { entry } of pending) {
+    const line = byThread.get(entry.threadId);
+    if (line) line.items.push(...entry.items);
+    else byThread.set(entry.threadId, { ...entry, items: [...entry.items] });
+  }
+  restoreSteeredEntries([...byThread.values()]);
+  const total = work.sends.length + work.queued.length;
+  if (total > 0) {
+    console.log(`[${context}] requeued ${pending.length} held batch(es) on ${byThread.size} thread(s), ${sends.stale.length + queued.stale.length} too old to run`);
+  }
 }
 
 // ── turn dispatch (upstream ProviderCommandReactor, miniature) ──────────
@@ -9867,9 +9914,7 @@ function beginRuntimeDrain(timeoutMs: DrainWindowInput) {
 function releaseHeldWork() {
   queueMicrotask(() => {
     if (runtimeQuiescing || updateDrain.active) return;
-    const carried = takeHeldWork(DATA_DIR, (line) => console.warn(line));
-    runHeldSends(carried.sends, "update-released");
-    restoreHeldQueue(carried.queued, "update-released");
+    restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-released");
     drainQueuedSends();
     void routines?.tick();
     for (const bot of store.bots) if (!bot.busy) jobWakes.botSettled(bot.id);
@@ -9889,7 +9934,10 @@ function persistHeldWork(context: string, interrupted: ReadonlySet<string> = new
     botId: entry.botId,
     threadId: entry.threadId,
     heldAt,
-    items: entry.items.map((item) => ({ ...item, relayed: relayQueuedMessageIds.delete(item.messageId) })),
+    items: entry.items.map((item) => ({
+      ...item,
+      relayed: item.committed ? item.committed.relayed : relayQueuedMessageIds.delete(item.messageId),
+    })),
   }));
   const sends = commitHeldSends();
   try {
@@ -9901,10 +9949,10 @@ function persistHeldWork(context: string, interrupted: ReadonlySet<string> = new
   }
 }
 
-/** Work `persistHeldWork` could not save, back where it came from. */
+/** Work `persistHeldWork` could not save, back in the queue it came from.  It
+ *  runs when the caller lets held work go (`releaseHeldWork`). */
 function returnUnsavedWork(unsaved: HeldWork, context: string) {
-  runHeldSends(unsaved.sends, context);
-  restoreHeldQueue(unsaved.queued, context);
+  restoreHeldWork(unsaved, context);
 }
 
 /** Turn a drain into the real fence, once nothing is left in flight.
@@ -16108,11 +16156,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
   }
 };
 
-// Messages an update drain held and committed before the restart.  Run before
-// the scheduler starts, so a routine receipt queued behind the same bot cannot
-// take it first and leave the person's own words refused as "already working".
-const carriedAcrossUpdate = takeHeldWork(DATA_DIR, (line) => console.warn(line));
-runHeldSends(carriedAcrossUpdate.sends, "update-held");
 routines?.start();
 resourceTriggers.start();
 if (!process.env.OMB_DISABLE_ANTIGRAVITY_QUOTA) {
@@ -16228,13 +16271,16 @@ console.log(`botfleet server ready on http://127.0.0.1:${PORT}`);
 // provider fleet, the shutdown record read at the top of this file, and the
 // post-update snapshot folded into it a few lines above.
 setTimeout(() => {
-  // Sends that waited behind an interrupted bot go back in its queue only
-  // once recovery has decided about that bot's own turn: resumed, it is busy
-  // and they wait for it to settle; not resumed, they run now.
+  // Messages an update held for this restart (update-held-sends.json) go
+  // back in their bots' queues only now: after `jobRegistry.adopt()` settled
+  // the jobs an earlier run left (no turn starts before that), and after
+  // recovery decided about each interrupted bot's own turn — resumed, it is
+  // busy and they wait for it to settle.  Each runs when its bot is idle, in
+  // the order it was held; a routine that takes the bot first only delays it.
   void runBootRecovery()
     .catch((error) => console.error("[boot-recovery] failed:", error))
     .finally(() => {
-      restoreHeldQueue(carriedAcrossUpdate.queued, "update-held");
+      restoreHeldWork(takeHeldWork(DATA_DIR, (line) => console.warn(line)), "update-held");
       drainQueuedSends();
     });
 }, BOOT_RECOVERY_DELAY_MS);
