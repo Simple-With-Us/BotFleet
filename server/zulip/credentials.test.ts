@@ -1,6 +1,6 @@
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -20,6 +20,9 @@ import {
 
 const FAKE_KEY = "fake-test-key-not-real";
 const posix = process.platform !== "win32";
+/** What `describe` says for a role file in `dir`: the folder is resolved, so
+ *  "/a" is "D:\a" on Windows.  Built the way the source builds it. */
+const fileIn = (dir: string, role = "BF-Plumber") => `file ${join(resolve(dir), `${role}-zuliprc`)}`;
 
 function rc(dir: string, name: string, body: string, mode = 0o600): string {
   const path = join(dir, name);
@@ -77,9 +80,9 @@ describe("the credential source", () => {
   it("is off until a folder is named, and the env override wins", () => {
     expect(credentialSourceFor({}, {})).toBeNull();
     expect(credentialSourceFor({ credentialDir: "relative/dir" }, {})).toBeNull();
-    expect(credentialSourceFor({ credentialDir: "/a" }, {})?.describe("BF-Plumber")).toBe("file /a/BF-Plumber-zuliprc");
+    expect(credentialSourceFor({ credentialDir: "/a" }, {})?.describe("BF-Plumber")).toBe(fileIn("/a"));
     expect(credentialSourceFor({ credentialDir: "/a" }, { OMB_ZULIP_CREDENTIAL_DIR: "/b" })?.describe("BF-Plumber")).toBe(
-      "file /b/BF-Plumber-zuliprc",
+      fileIn("/b"),
     );
   });
 });
@@ -105,11 +108,11 @@ describe("the Infisical source", () => {
       credentialSourceFor({ credentialSource: "infisical", infisicalPath: "/bots" }, {}, { vault: read })?.describe("BF-Plumber"),
     ).toBe("infisical /bots ZULIP_BF_PLUMBER_*");
     // a folder alone is still the file source, and a reader alone turns nothing on
-    expect(credentialSourceFor({ credentialDir: "/a" }, {}, { vault: read })?.describe("BF-Plumber")).toBe("file /a/BF-Plumber-zuliprc");
+    expect(credentialSourceFor({ credentialDir: "/a" }, {}, { vault: read })?.describe("BF-Plumber")).toBe(fileIn("/a"));
     expect(credentialSourceFor({}, {}, { vault: read })).toBeNull();
     expect(
       credentialSourceFor({ credentialSource: "infisical" }, { OMB_ZULIP_CREDENTIAL_DIR: "/b" }, { vault: read })?.describe("BF-Plumber"),
-    ).toBe("file /b/BF-Plumber-zuliprc");
+    ).toBe(fileIn("/b"));
   });
 
   it("maps a role to its vault names and loads email, key and the realm as the site", async () => {
