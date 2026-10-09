@@ -186,6 +186,7 @@ export function compareSemver(a: string, b: string): number {
 }
 
 /** Map a filesystem failure into the plugins API error shape. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-clause error is unknown at the fs boundary
 function fsErrorMessage(action: string, name: string, error: unknown): string {
   const detail = error instanceof Error ? error.message : String(error);
   return `plugin "${name}" ${action}: ${detail}`;
