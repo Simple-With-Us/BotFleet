@@ -636,7 +636,8 @@ function createPermissionBroker(opts: {
     // timer, and an uncaught listener exception takes the server down.
     // An unreadable name falls back to the generic "tool", the same name a
     // frame with no tool at all has always carried.
-    const tool = typeof msg.tool === "string" && msg.tool ? msg.tool : "tool";
+    const toolName = z.string().min(1).safeParse(msg.tool);
+    const tool = toolName.success ? toolName.data : "tool";
     const ask: Ask = {
       id: askId,
       kind,
