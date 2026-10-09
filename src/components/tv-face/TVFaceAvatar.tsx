@@ -19,6 +19,13 @@ const RESTING: TVFaceExpression = "resting";
  */
 export const TVFACE_TRANSITION_MS = 1000;
 
+/** Expressions that should cut in/out instantly — no enter/return dwell. */
+export const TVFACE_URGENT: ReadonlySet<TVFaceExpression> = new Set([
+  "crash",
+  "alerting",
+  "angry",
+]);
+
 export type TVFaceSkin = BotColor | "default";
 
 export interface TVFaceAvatarProps {
@@ -84,15 +91,24 @@ export type FrameStep = {
  * transition, so a change between two active states cuts straight to the new
  * hold: enter only from rest, return only to rest.
  */
-export function planFrame(prev: TVFaceExpression, next: TVFaceExpression): FrameStep[] {
+export type PlanFrameOpts = { interrupt?: boolean };
+
+export function planFrame(
+  prev: TVFaceExpression,
+  next: TVFaceExpression,
+  opts: PlanFrameOpts = {},
+): FrameStep[] {
+  const interrupt =
+    opts.interrupt ?? (TVFACE_URGENT.has(prev) || TVFACE_URGENT.has(next));
+
   if (prev === next) {
     return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
   }
 
   if (next === RESTING) {
     // Return sequence: play the leaving expression's return, then land on the
-    // resting still. The return is skipped if the expression has none.
-    if (!TVFACE_HAS_ENTER_RETURN.has(prev)) {
+    // resting still. Skipped when the expression has none or the cut is urgent.
+    if (!TVFACE_HAS_ENTER_RETURN.has(prev) || interrupt) {
       return [{ expression: RESTING, kind: "still", delayAfterMs: 0 }];
     }
     return [
@@ -102,7 +118,7 @@ export function planFrame(prev: TVFaceExpression, next: TVFaceExpression): Frame
   }
 
   if (prev === RESTING) {
-    if (!TVFACE_HAS_ENTER_RETURN.has(next)) {
+    if (!TVFACE_HAS_ENTER_RETURN.has(next) || interrupt) {
       return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
     }
     return [
@@ -116,6 +132,65 @@ export function planFrame(prev: TVFaceExpression, next: TVFaceExpression): Frame
   return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
 }
 
+function tvFaceAssetPath(
+  skinDir: string,
+  expr: TVFaceExpression,
+  type: "enter" | "hold" | "return",
+  animated: boolean,
+  isStill = false,
+): string {
+  const base = `/tv-face/skins/${skinDir}`;
+  if (isStill || !animated) {
+    return `${base}/stills/${expr}.png`;
+  }
+  return `${base}/gifs/${expr}_${type}.gif`;
+}
+
+function imgKeyForStep(skinDir: string, step: FrameStep, holdEpoch: number): string {
+  if (step.kind === "hold") {
+    return `${skinDir}:${step.expression}:hold:${holdEpoch}`;
+  }
+  return `${skinDir}:${step.expression}:${step.kind}`;
+}
+
+function pathForStepMedia(skinDir: string, step: FrameStep, animated: boolean): string {
+  if (step.kind === "still") return tvFaceAssetPath(skinDir, step.expression, "hold", animated, true);
+  return tvFaceAssetPath(skinDir, step.expression, step.kind, animated);
+}
+
+/** First paint must match the mount effect's first frame so `key` does not flip. */
+function initialFrameMedia(
+  expression: TVFaceExpression,
+  skinDir: string,
+  animated: boolean,
+): { src: string; imgKey: string; holdEpoch: number } {
+  if (!animated) {
+    return {
+      src: tvFaceAssetPath(skinDir, expression, "hold", false, true),
+      imgKey: `${skinDir}:${expression}:still`,
+      holdEpoch: 0,
+    };
+  }
+
+  const prevFrame: TVFaceFrame = { expression: RESTING, skin: skinDir };
+  const nextFrame: TVFaceFrame = { expression, skin: skinDir };
+
+  if (tvFaceFrameChanged(prevFrame, nextFrame)) {
+    const step = planFrame(prevFrame.expression, expression)[0];
+    return {
+      src: pathForStepMedia(skinDir, step, true),
+      imgKey: imgKeyForStep(skinDir, step, step.kind === "hold" ? 1 : 0),
+      holdEpoch: step.kind === "hold" ? 0 : 0,
+    };
+  }
+
+  return {
+    src: tvFaceAssetPath(skinDir, expression, "hold", true),
+    imgKey: `${skinDir}:${expression}:hold:1`,
+    holdEpoch: 1,
+  };
+}
+
 export function TVFaceAvatar({
   state = "idle",
   color = "orange",
@@ -126,26 +201,23 @@ export function TVFaceAvatar({
   const expression = TVFACE_MANIFEST[state] || RESTING;
   const skinDir = tvFaceSkinDir(color);
 
-  const [currentGif, setCurrentGif] = useState<string>("");
+  const initialFrame = useRef(initialFrameMedia(expression, skinDir, animated));
+  const [currentGif, setCurrentGif] = useState(initialFrame.current.src);
+  const [imgKey, setImgKey] = useState(initialFrame.current.imgKey);
+  const holdEpochRef = useRef(initialFrame.current.holdEpoch);
   const previousFrame = useRef<TVFaceFrame>({ expression: RESTING, skin: skinDir });
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  const getAssetPath = (expr: TVFaceExpression, type: "enter" | "hold" | "return", isStill = false) => {
-    const base = `/tv-face/skins/${skinDir}`;
-    if (isStill || !animated) {
-      return `${base}/stills/${expr}.png`;
-    }
-    return `${base}/gifs/${expr}_${type}.gif`;
-  };
+  const getAssetPath = (expr: TVFaceExpression, type: "enter" | "hold" | "return", isStill = false) =>
+    tvFaceAssetPath(skinDir, expr, type, animated, isStill);
 
-  const pathForStep = (step: FrameStep): string => {
-    if (step.kind === "still") return getAssetPath(step.expression, "hold", true);
-    return getAssetPath(step.expression, step.kind);
-  };
+  const pathForStep = (step: FrameStep): string => pathForStepMedia(skinDir, step, animated);
 
   useEffect(() => {
     if (!animated) {
-      setCurrentGif(getAssetPath(expression, "hold", true));
+      const still = getAssetPath(expression, "hold", true);
+      setCurrentGif(still);
+      setImgKey(`${skinDir}:${expression}:still`);
       return;
     }
 
@@ -158,7 +230,14 @@ export function TVFaceAvatar({
       let i = 0;
       const advance = () => {
         const step = steps[i];
-        setCurrentGif(pathForStep(step));
+        const src = pathForStep(step);
+        if (step.kind === "hold") {
+          holdEpochRef.current += 1;
+          setImgKey(imgKeyForStep(skinDir, step, holdEpochRef.current));
+        } else {
+          setImgKey(imgKeyForStep(skinDir, step, 0));
+        }
+        setCurrentGif(src);
         i += 1;
         if (i < steps.length) {
           timeoutRef.current = setTimeout(advance, steps[i - 1].delayAfterMs);
@@ -166,6 +245,8 @@ export function TVFaceAvatar({
       };
       advance();
     } else if (!currentGif) {
+      holdEpochRef.current += 1;
+      setImgKey(`${skinDir}:${expression}:hold:${holdEpochRef.current}`);
       setCurrentGif(getAssetPath(expression, "hold"));
     }
 
@@ -183,6 +264,7 @@ export function TVFaceAvatar({
       title={label}
     >
       <img
+        key={imgKey}
         src={currentGif}
         alt={label || `Bot ${expression} face`}
         className="w-full h-full object-contain"

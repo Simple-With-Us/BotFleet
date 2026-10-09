@@ -3,17 +3,19 @@ title: >-
   agent-written paragraph
 rule: >-
   Every human-facing string, and every paragraph an agent writes (chat replies
-  to the owner, PR titles/bodies, commit messages, Slack posts, docs), must use
-  two spaces between sentences (owner strengthened 2026-08-19: "For any and all
-  paragraphs in any context, always use 2 spaces..."). Emit it so the gap
-  survives the renderer: in a chat reply (Claude Code terminal/desktop
-  transcript, any agent chat UI) type the literal HTML entity text `&nbsp;`
-  right after the period, then a normal space — `Sentence one.&nbsp; Sentence
-  two.`. Two literal spaces are collapsed by GitHub-flavored markdown in chat,
-  and a raw U+00A0 character typed directly is normalized away in the transcript
-  view — neither works in chat. In a file (read as source, never through that
-  renderer), keep literal two ASCII spaces and do not switch file content to
-  NBSP or `&nbsp;`. Theme default is light.
+  to the owner, PR and issue titles/bodies/comments, commit messages, docs),
+  must show a wider gap between sentences (owner strengthened 2026-08-19: "For
+  any and all paragraphs in any context, always use 2 spaces..."). The gap has
+  to survive the renderer, so pick the mechanism by surface (owner ruling
+  2026-10-08). In a Markdown-rendering chat pane (Claude Code desktop Code tab,
+  owner-verified) type the literal HTML entity text `&nbsp;` right after the
+  period, then a normal space — `Sentence one.&nbsp; Sentence two.`. In GitHub
+  PR and issue titles, bodies and comments, and in Zulip, use a real U+00A0
+  plus a space and never the entity. In a file read as source (docs, commit
+  messages, code comments, config), keep literal two ASCII spaces and do not
+  write NBSP or `&nbsp;`. Two ASCII spaces collapse in chat renderers, and a
+  raw U+00A0 typed by the model arrives as a plain space. The owner must never
+  see the literal text `&nbsp;`.  Default UI theme is system.
 severity: medium
 scope: pull-request
 path: '**/*'
@@ -23,6 +25,8 @@ examples:
   - snippet: |-
       Chat: "Adds visual spec.&nbsp; Masks dynamic regions."
       File: "Adds visual spec.  Masks dynamic regions."
+    isCorrect: true
+  - snippet: 'PR body: "Adds visual spec." then U+00A0 plus a space, then "Masks dynamic regions."'
     isCorrect: true
 inheritance:
   inheritable: true

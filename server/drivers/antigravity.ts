@@ -356,7 +356,7 @@ const mcpConfigFileSchema = z.looseObject({
 /** The computer MCP server for this turn, or null when the turn has none.
  * Cloud boxes go through BotFleet's REST-to-MCP adapter (the same spec
  * claude.ts and codex.ts build); Local VM and VPS connections arrive as a
- * ready-made Cua Driver stdio command and pass through unchanged. */
+ * ready-made CUA Driver stdio command and pass through unchanged. */
 export function antigravityMcpServers(
   integrations: SendTurnInput["integrations"],
 ): Record<string, { command: string; args: string[]; env: Record<string, string> }> {
@@ -649,7 +649,12 @@ export function antigravityTurnErrorMessage(result: AntigravityTurnResult): stri
 
 export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Antigravity", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Antigravity",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "curl -fsSL https://antigravity.google/cli/install.sh | bash",

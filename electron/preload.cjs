@@ -10,6 +10,10 @@ ipcRenderer.on("package:install", (_event, url) => {
   for (const listener of packageInstallListeners) listener(url);
 });
 
+// Each Personal Voice speak call gets its own id so word ranges from a call
+// that was replaced never reach the newer call's listener.
+let personalVoiceProgressSeq = 0;
+
 contextBridge.exposeInMainWorld("ogb", {
   /** Host platform ("darwin" | "win32" | "linux") — for platform-aware UI. */
   platform: process.platform,
@@ -71,6 +75,29 @@ contextBridge.exposeInMainWorld("ogb", {
     const handler = (_event, info) => cb(info);
     ipcRenderer.on("speech:end", handler);
     return () => ipcRenderer.removeListener("speech:end", handler);
+  },
+  personalVoice: {
+    isAvailable: () => ipcRenderer.invoke("personal-voice:available"),
+    list: () => ipcRenderer.invoke("personal-voice:list"),
+    /** `options.onRange({ location, length, elapsedMs })` fires as each word
+     * is about to be spoken; offsets are UTF-16 indices into `text`.  The
+     * callback stays in this preload: only a numeric id crosses IPC, and the
+     * listener is removed when the speech settles. */
+    speak: (text, voiceId, options) => {
+      const onRange = typeof options?.onRange === "function" ? options.onRange : null;
+      if (!onRange) return ipcRenderer.invoke("personal-voice:speak", text, voiceId);
+      personalVoiceProgressSeq += 1;
+      const progressId = personalVoiceProgressSeq;
+      const handler = (_event, payload) => {
+        if (!payload || payload.id !== progressId) return;
+        onRange({ location: payload.location, length: payload.length, elapsedMs: payload.elapsedMs ?? null });
+      };
+      ipcRenderer.on("personal-voice:range", handler);
+      return ipcRenderer
+        .invoke("personal-voice:speak", text, voiceId, { progressId })
+        .finally(() => ipcRenderer.removeListener("personal-voice:range", handler));
+    },
+    stop: () => ipcRenderer.invoke("personal-voice:stop"),
   },
   /** A local-first demonstration recorder. Global events stay in main; the
    * renderer receives only the privacy-filtered event stream. */

@@ -13,7 +13,7 @@ reaches it — there is no shipped default, and none has ever been in source.
   the BotFleet project, `env=prod`, `path=/`.  These two names are the source
   of truth; every CI workflow resolves from here first.
 - **GitHub Actions secret (synced copy).**  `SENTRY_DSN` on
-  `jaywedgeworth22/BotFleet` is a fallback for when a workflow's Infisical
+  `Simple-With-Us/BotFleet` is a fallback for when a workflow's Infisical
   login fails (CLI install hiccup, a rotated machine identity, and so on).
   It is read only from step `env:`, never from an `if:` condition — GitHub's
   dispatch parser rejects `secrets.*` inside `if:` with an HTTP 422 (the same

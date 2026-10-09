@@ -13,7 +13,7 @@ jobs:
   gitleaks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
       # The gitleaks-action wrapper needs a license for organization repos.  This
       # runs the open-source CLI directly and scans the same commit range the

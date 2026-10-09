@@ -1,4 +1,5 @@
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
+import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statfsSync } from "node:fs";
@@ -7,6 +8,8 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
+import { loadPerCore, MAX_INIT_LOAD_FACTOR, type HostLoad } from "./drivers/acp/init-deadline.ts";
+import { DEFAULT_ADMISSION } from "./jobs/admission.ts";
 import { DATA_DIR } from "./config.ts";
 import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
 
@@ -207,6 +210,51 @@ function darwinRamUsedPct(): number | null {
   }
 }
 
+/** Whether a new unattended webhook wake should wait.
+ *
+ *  Reuses two signals that already exist.  No new sampler:
+ *  - swap at or above the jobs admission ceiling (`DEFAULT_ADMISSION`,
+ *    98%).  macOS swap percent sits near 90% in ordinary use, so the
+ *    Housekeeper UI example of 80% is not this gate.
+ *  - 1-minute load per core at or above the ACP init saturation ceiling
+ *    (`MAX_INIT_LOAD_FACTOR`, 3).  That is the same "saturated host" the
+ *    init deadline already treats as maxed out.
+ *  A missing reading admits.  A broken probe must not stop webhooks.
+ */
+export function webhookDispatchHot(input: {
+  swapUsedPercent: number | null;
+  load: HostLoad | null;
+}): boolean {
+  const swap = input.swapUsedPercent;
+  if (swap !== null && Number.isFinite(swap) && swap >= DEFAULT_ADMISSION.maxSwapPercent) return true;
+  const perCore = loadPerCore(input.load);
+  return perCore !== null && perCore >= MAX_INIT_LOAD_FACTOR;
+}
+
+function formatLoadPerCore(value: number): string {
+  const rounded = Math.round(value * 10) / 10;
+  if (!Number.isFinite(rounded)) return "unknown";
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+/** Why a webhook wake is waiting, or null when the host can take it.
+ *
+ *  The string is the hold reason the automations receipt already renders.
+ *  A missing reading is named as unknown so the receipt still says the host
+ *  is what parked the wake.  A cool host returns null and must not invent
+ *  a reason. */
+export function webhookDispatchHoldReason(input: {
+  swapUsedPercent: number | null;
+  load: HostLoad | null;
+}): string | null {
+  if (!webhookDispatchHot(input)) return null;
+  const perCore = loadPerCore(input.load);
+  const loadText = perCore === null ? "unknown" : formatLoadPerCore(perCore);
+  const swap = input.swapUsedPercent;
+  const swapText = swap === null || !Number.isFinite(swap) ? "unknown" : `${Math.round(swap)}%`;
+  return `Host is busy (load ${loadText} per core, swap ${swapText})`;
+}
+
 export function sampleHost(now = Date.now()): HostSample {
   const total = totalmem();
   const free = freemem();
@@ -309,7 +357,7 @@ export interface ResourceTriggerManagerOptions {
   now?: () => number;
   sample?: () => HostSample;
   emit?: (event: ResourceTriggerManagerEvent) => void;
-  botState: (botId: string) => "ready" | "busy" | "missing";
+  botState: (botId: string) => BotDispatchState;
   /** Synchronous admission fence used during an update boundary. */
   admit?: () => boolean;
   enqueue: (input: {

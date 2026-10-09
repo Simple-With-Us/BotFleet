@@ -13,6 +13,7 @@ import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { isJsonString, type JsonValue } from "./json.ts";
 import { DATA_DIR, ensureDataDir, writeFileAtomic } from "./state.ts";
 
 /** One paired phone, as it is written to disk. */
@@ -94,6 +95,13 @@ function sameCredential(a: string, b: string): boolean {
 
 /** Device names come from the phone, so they are untrusted display text:
  * clamp the length and drop control characters before they reach a UI. */
+/** Parse the optional pairing idempotency key from a JSON pairing body. */
+export function parsePairRequestId(value: JsonValue | undefined): string | null {
+  if (value === undefined) return null;
+  if (!isJsonString(value) || !/^[A-Za-z0-9._-]{16,128}$/.test(value)) return null;
+  return value;
+}
+
 export function cleanDeviceName(raw: unknown): string {
   const name = String(raw ?? "")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
@@ -176,7 +184,7 @@ export class DeviceRegistry {
 
   /** Every paired device, without the hash — this is what the page renders. */
   list(): PublicDevice[] {
-    return this.devices.map(({ tokenHash, pushToken: _push, ...rest }) => rest);
+    return this.devices.map(({ tokenHash: _tokenHash, pushToken: _push, ...rest }) => rest);
   }
 
   /** How many phones are paired, against MAX_DEVICES. */
@@ -229,14 +237,12 @@ export class DeviceRegistry {
    * response while changing routes. There is no general token-read endpoint. */
   redeem(
     credential: string,
-    name: unknown,
-    pairRequestId?: unknown,
+    name: string,
+    pairRequestId?: string | null,
   ): { device: PublicDevice; token: string } | { error: string } {
     const presented = String(credential ?? "");
     const requestId =
-      typeof pairRequestId === "string" && /^[A-Za-z0-9._-]{16,128}$/.test(pairRequestId)
-        ? pairRequestId
-        : null;
+      pairRequestId && /^[A-Za-z0-9._-]{16,128}$/.test(pairRequestId) ? pairRequestId : null;
 
     // A route can die after the registry committed the device but before the
     // phone received the response. Retrying the same logical request through
@@ -303,7 +309,7 @@ export class DeviceRegistry {
       this.devices.pop();
       return { error: `could not save the pairing: ${(e as Error).message}` };
     }
-    const { tokenHash, pushToken: _push, ...pub } = device;
+    const { tokenHash: _tokenHash, pushToken: _push, ...pub } = device;
     const result = { device: pub, token };
     if (requestId) {
       this.replay = {

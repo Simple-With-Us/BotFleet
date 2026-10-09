@@ -98,6 +98,7 @@ const html = template
   .replaceAll("{{UPSTREAM_URL}}", data.site.upstream)
   .replaceAll("{{RELEASES_URL}}", data.site.releases)
   .replaceAll("{{MAC_DOWNLOAD_URL}}", data.site.macDownload)
+  .replaceAll("{{MAC_DOWNLOAD_INTEL_URL}}", data.site.macDownloadIntel)
   .replaceAll("{{ROSTER}}", data.exampleFleet.map((b) => `<span>${b}</span>`).join(""))
   .replaceAll("{{UPDATED}}", updated)
   .replaceAll("{{SECTIONS}}", data.sections.map(sectionHtml).join("\n\n"))

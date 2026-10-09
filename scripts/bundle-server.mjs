@@ -109,4 +109,8 @@ const piMcpExtSrc = join(server, "drivers", "pi-mcp-extension.ts");
 const piMcpExtDest = join(root, "dist-server", "drivers", "pi-mcp-extension.ts");
 mkdirSync(dirname(piMcpExtDest), { recursive: true });
 copyFileSync(piMcpExtSrc, piMcpExtDest);
+const vmCliManifestSrc = join(root, "scripts", "computer-vm-cli", "manifest.json");
+const vmCliManifestDest = join(root, "dist-server", "computer-vm-cli", "manifest.json");
+mkdirSync(dirname(vmCliManifestDest), { recursive: true });
+copyFileSync(vmCliManifestSrc, vmCliManifestDest);
 writeFileSync(join(root, "dist-server", "build-identity.json"), `${JSON.stringify(buildIdentity)}\n`);

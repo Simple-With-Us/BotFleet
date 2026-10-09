@@ -2,7 +2,7 @@
  * DSH ACP driver — BotFleet runtime composed with the Clutch engine shape.
  *
  * Engine catalog, version gate, error classifier, and model-id round-trip
- * live in `jaywedgeworth22/Clutch` (`clutch/dsh/acp`).  This file keeps
+ * live in `Simple-With-Us/Clutch` (`clutch/dsh/acp`).  This file keeps
  * `wrapSpawn` and `createAcpDriver` here because they need BotFleet's ACP
  * core and the Node stdio bridge.  Edit engine shape in Clutch, not here.
  */
@@ -327,6 +327,7 @@ export const DSH_INIT_TIMEOUT_MS = 120_000;
 export const dshSupport = {
   ...clutchDshSupport,
   initTimeoutMs: DSH_INIT_TIMEOUT_MS,
+  images: true,
   models: STATIC_DSH_MODELS,
   resolveModels: (environment) => readDshModelCatalog(environment),
   loginNote: clutchDshSupport.loginNote ?? "DSH CLI auth missing — add ~/.dsh/.credentials.yaml",

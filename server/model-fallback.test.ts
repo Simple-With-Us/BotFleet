@@ -35,6 +35,7 @@ import { eligibleAutoFallbackChain, type AutoFallbackCandidate } from "./turn-sa
 import { doomedDispatches } from "./doomed-dispatch.ts";
 import { MODEL_REJECTION_TTL_MS, ModelRejectionRegistry, modelRejections } from "./model-rejections.ts";
 import { STATIC_MCODE_MODELS } from "./drivers/acp/mcode.ts";
+import { STATIC_DSH_MODELS } from "./drivers/acp/dsh.ts";
 
 const fallbacks: ModelSelection[] = [
   { instanceId: "grok", model: "grok-4" },
@@ -990,6 +991,14 @@ describe("inheritedUnattended", () => {
   });
 });
 
+describe("non-thinking Flash catalog", () => {
+  it("is a DSH row and not an mcode picker row", () => {
+    expect(STATIC_DSH_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash-Preview")).toBe(true);
+    expect(STATIC_MCODE_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash-Preview")).toBe(false);
+    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+  });
+});
+
 describe("unattendedModelDowngrade", () => {
   const gemini: ModelSelection = { instanceId: "gemini", model: "gemini-3.1-pro-preview" };
   const claude: ModelSelection = { instanceId: "claude", model: "claude-sonnet-5" };
@@ -1073,6 +1082,69 @@ describe("unattendedModelDowngrade", () => {
     expect(
       unattendedModelDowngrade(m27, { unattended: true, driverKind: "mcodeAgent", effortLevels: levelsFor }),
     ).toEqual(m27);
+  });
+
+  it("moves a webhook classify seat off thinking Flash onto a live non-thinking row", () => {
+    // mcode's shipped catalog does not offer MiniMax-M3.1-Flash-Preview
+    // (0.5.5 advertises the no-variant wire value and then fails the turn).
+    // DSH's static catalog does.  The caller passes that row.  A cross-engine
+    // move drops effort so DSH is not handed mcode's "low".
+    const levelsFor = (model: string) =>
+      STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
+    const thinking: ModelSelection = {
+      instanceId: "mcode",
+      model: "MiniMax-M3.1-Flash-Preview-thinking",
+      effort: "max",
+    };
+    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" };
+    expect(
+      unattendedModelDowngrade(thinking, {
+        automationSource: "webhook",
+        driverKind: "mcodeAgent",
+        effortLevels: levelsFor,
+        nonThinkingFlash: live,
+      }),
+    ).toEqual(live);
+    // No live row: keep today's behavior, thinking Flash at low effort.
+    expect(
+      unattendedModelDowngrade(thinking, {
+        automationSource: "webhook",
+        driverKind: "mcodeAgent",
+        effortLevels: levelsFor,
+      }),
+    ).toEqual({ ...thinking, effort: "low" });
+    // Same engine already offers the id: stay there and still stamp low.
+    const onMinimax: ModelSelection = { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview-thinking" };
+    expect(
+      unattendedModelDowngrade(onMinimax, {
+        automationSource: "webhook",
+        driverKind: "minimax",
+        effortLevels: (model) => (model === "MiniMax-M3.1-Flash-Preview" ? ["low", "max"] : []),
+        nonThinkingFlash: { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
+      }),
+    ).toEqual({ instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview", effort: "low" });
+  });
+
+  it("does not move human, job, or resource turns, or a cooling non-thinking row", () => {
+    const levelsFor = (model: string) =>
+      STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
+    const thinking: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" };
+    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" };
+    const base = { driverKind: "mcodeAgent" as const, effortLevels: levelsFor, nonThinkingFlash: live };
+    expect(unattendedModelDowngrade(thinking, base)).toEqual(thinking);
+    expect(
+      unattendedModelDowngrade(thinking, { ...base, unattended: true, automationSource: "job" }),
+    ).toEqual(thinking);
+    expect(
+      unattendedModelDowngrade(thinking, { ...base, automationSource: "resource" }),
+    ).toEqual({ ...thinking, effort: "low" });
+    expect(
+      unattendedModelDowngrade(thinking, {
+        ...base,
+        automationSource: "webhook",
+        isCooling: (instanceId, model) => instanceId === "dsh" && model === "MiniMax-M3.1-Flash-Preview",
+      }),
+    ).toEqual({ ...thinking, effort: "low" });
   });
 
   it("replaces a bot's own saved effort with low on an unattended run, since only a caller-supplied selection is exempt", () => {

@@ -11,6 +11,9 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { AppConfig } from "../config.ts";
+import { DEFAULT_PRONUNCIATIONS } from "../../shared/pronunciations.ts";
+
+const SEEDED = DEFAULT_PRONUNCIATIONS.map(({ term, say }) => ({ term, say }));
 
 let server: Server;
 /** every request the stub saw, so tests can assert on what we sent */
@@ -103,8 +106,28 @@ describe("configuration", () => {
   it("defaults the provider to MiniMax and never reports the key itself", async () => {
     const { describeVoice } = await voice();
     const described = describeVoice(cfg({ key: "sk-secret", voice: "English_Graceful_Lady" }));
-    expect(described).toEqual({ configured: true, ready: true, voice: "English_Graceful_Lady", provider: "minimax", optimizedSummary: false });
+    expect(described).toEqual({
+      configured: true,
+      ready: true,
+      voice: "English_Graceful_Lady",
+      provider: "minimax",
+      optimizedSummary: false,
+      pronunciations: SEEDED,
+    });
     expect(JSON.stringify(described)).not.toContain("sk-secret");
+  });
+
+  it("reports the workspace default voice by id and the pronunciation list in force", async () => {
+    const { describeVoice, pronunciations } = await voice();
+    // The default voice is a setting, not a secret: the snapshot carries it.
+    expect(describeVoice(cfg({ key: "k", voice: "jay-wedgeworth-001" })).voice).toBe("jay-wedgeworth-001");
+    expect(describeVoice(cfg({ key: "k" })).voice).toBe("");
+    // Never saved: the seeded list.  Saved, even empty: the saved list.
+    expect(pronunciations(cfg({}))).toEqual(SEEDED);
+    expect(describeVoice(cfg({ pronunciations: [] })).pronunciations).toEqual([]);
+    expect(describeVoice(cfg({ pronunciations: [{ term: "SQL", say: "S Q L" }] })).pronunciations).toEqual([
+      { term: "SQL", say: "S Q L" },
+    ]);
   });
 
   it("distinguishes 'no key' from 'no voice picked'", async () => {
@@ -189,6 +212,22 @@ describe("MiniMax (default provider)", () => {
     expect(body.audio_setting.format).toBe("mp3");
     const { speechUsageTotals } = await import("./usage.ts");
     expect(speechUsageTotals().minimax.characters).toBeGreaterThanOrEqual("hello there".length);
+  });
+
+  it("says each term on the pronunciation list as given, only in the text sent to the engine", async () => {
+    refuse = null;
+    seen.length = 0;
+    const { speak } = await voice();
+    await speak(cfg(ready), "Run the SQL query on config.json with sudo.");
+    expect(JSON.parse(seen.at(-1)!.body).text).toBe("Run the sequel query on config.json with soo doo.");
+    // A saved list replaces the seeded one, and an empty one turns it off.
+    await speak(cfg({ ...ready, pronunciations: [{ term: "SQL", say: "S Q L" }] }), "Run the SQL query with sudo.");
+    expect(JSON.parse(seen.at(-1)!.body).text).toBe("Run the S Q L query with sudo.");
+    await speak(cfg({ ...ready, pronunciations: [] }), "Run the SQL query.");
+    expect(JSON.parse(seen.at(-1)!.body).text).toBe("Run the SQL query.");
+    // Text that already says it is left alone.
+    await speak(cfg(ready), "Run the sequel query.");
+    expect(JSON.parse(seen.at(-1)!.body).text).toBe("Run the sequel query.");
   });
 
   it("lets a caller override the voice per bot", async () => {
@@ -279,6 +318,7 @@ describe("built-in macOS voices", () => {
       ready: onMac,
       voice: "Albert",
       provider: "system", optimizedSummary: false,
+      pronunciations: SEEDED,
     });
   });
 
@@ -305,6 +345,11 @@ describe("built-in macOS voices", () => {
     expect(args[args.indexOf("-v") + 1]).toBe("Albert");
     expect(args.at(-1)).toBe("hello there");
 
+    // The built-in voices get the pronunciation list too.
+    const respelled: string[][] = [];
+    await speak(cfg({ provider: "system" }), "the GUI says JSON", "Albert", fakeSay(respelled));
+    expect(respelled.find((argv) => argv[0] === "-o")!.at(-1)).toBe("the gooey says Jason");
+
     // the utterance temp dir does not outlive the call
     const { access } = await import("node:fs/promises");
     const { dirname } = await import("node:path");
@@ -329,16 +374,16 @@ describe("Apple Personal Voice", () => {
     expect(isPersonalVoice(undefined)).toBe(false);
   });
 
-  it("reports voiceReady as false for server synthesis", async () => {
+  it("reports voiceReady as true for on-device Apple platforms", async () => {
     const { voiceReady } = await voice();
-    expect(voiceReady(cfg({ key: "k" }), "personal:com.apple.speech.voice.Jay")).toBe(false);
-    expect(voiceReady(cfg({ provider: "system" }), "personal:com.apple.speech.voice.Jay")).toBe(false);
+    expect(voiceReady(cfg({ key: "k" }), "personal:com.apple.speech.voice.Jay")).toBe(true);
+    expect(voiceReady(cfg({ provider: "system" }), "personal:com.apple.speech.voice.Jay")).toBe(true);
   });
 
   it("throws clear error when server speak is attempted with personal voice", async () => {
     const { speak } = await voice();
     expect(() => speak(cfg({ key: "k" }), "Hello", "personal:com.apple.speech.voice.Jay")).toThrow(
-      "Apple Personal Voices speak on-device on authorized iOS companion devices and cannot be synthesized on the server.",
+      "Apple Personal Voices speak on-device on authorized Apple devices (macOS and iOS) and cannot be synthesized on the server.",
     );
   });
 });

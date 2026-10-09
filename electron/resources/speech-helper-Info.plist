@@ -20,5 +20,7 @@
     <string>BotFleet listens while you dictate messages or talk to a bot.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>BotFleet converts your speech into text during dictation and calls.</string>
+    <key>NSSpeechSynthesisUsageDescription</key>
+    <string>BotFleet uses your Apple Personal Voice to speak aloud during calls and voice replies.</string>
   </dict>
 </plist>

@@ -25,9 +25,24 @@ import {
 } from "../shared/terminology.ts";
 import { DEFAULT_VPS_MODE, migrateAllowedComputersToProviders } from "../shared/local-auto-consent.ts";
 import { fsFailureCode, jsonFailureReason, stripBom } from "./store-guard.ts";
+import {
+  checkPronunciations,
+  PronunciationDraftListSchema,
+  sanitizeStoredPronunciations,
+  type Pronunciation,
+} from "../shared/pronunciations.ts";
 
 const optionalText = z.string().optional();
 const externalCredentialStorage = z.literal("external").optional();
+/** The workspace pronunciation list (shared/pronunciations.ts), checked and
+ * canonicalized by the one validator every client also runs.  Absent means
+ * the seeded defaults; a saved list, even an empty one, is used as is. */
+const pronunciationListSchema = PronunciationDraftListSchema.transform((drafts, ctx): Pronunciation[] => {
+  const checked = checkPronunciations(drafts);
+  if (checked.ok) return checked.list;
+  ctx.addIssue({ code: "custom", message: checked.error });
+  return z.NEVER;
+});
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
@@ -225,7 +240,13 @@ const localVmConfigSchema = z.object({
     .max(MAX_LOCAL_VM_MAX_INSTANCES)
     .optional(),
   shareCliCredentials: z.boolean().optional(),
+  shareGpgPrivateKeys: z.boolean().optional(),
   allowHostTerminal: z.boolean().optional(),
+  /** Optional ceilings for the Local VM container.  Absent means "request about
+   * 2 CPUs and 3 GiB, then adapt to what the container runtime actually has,
+   * up to 4 CPUs / 8 GiB". */
+  cpus: z.number().int().min(1).max(4).optional(),
+  memoryGib: z.number().int().min(1).max(8).optional(),
 });
 const featureConfigSchema = z.object({
   /** Experimental desktop workflow recorder. Hidden unless explicitly enabled. */
@@ -234,7 +255,35 @@ const featureConfigSchema = z.object({
   showToolCalls: z.boolean().optional(),
   /** Summarize consecutive tool actions into an expandable live summary card. On by default. */
   summarizeToolCalls: z.boolean().optional(),
+  /** Per-turn Git worktree isolation for bots working in a shared repository. */
+  gitWorktreeLeases: z.boolean().optional(),
 });
+const zulipConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  dryRun: z.boolean().optional(),
+  realm: optionalText,
+  ownerUserId: z.number().int().positive().optional(),
+  ownerClients: z.array(z.string().trim().min(1)).max(20).optional(),
+  credentialDir: optionalText,
+  credentialSource: z.enum(["file", "infisical"]).optional(),
+  infisicalPath: z.string().trim().regex(/^\/[A-Za-z0-9/_-]*$/).max(200).optional(),
+  bots: z
+    .record(z.string(), z.object({ role: z.string().trim().min(1).max(48), enabled: z.boolean().optional() }))
+    .optional(),
+  postChannels: z.array(z.string().trim().min(1)).max(50).optional(),
+  autoReply: z.enum(["final", "off"]).optional(),
+  staleMinutes: z.number().int().min(1).max(10_080).optional(),
+  budgets: z
+    .object({
+      dmsPerHour: z.number().int().min(0).max(1000).optional(),
+      peerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerWakesPerTopicPerHour: z.number().int().min(0).max(1000).optional(),
+      ownerWakesPerHour: z.number().int().min(0).max(1000).optional(),
+      peerChainLimit: z.number().int().min(0).max(1000).optional(),
+    })
+    .optional(),
+});
+
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
@@ -270,10 +319,11 @@ const appConfigSchema = z.object({
    * engine does not need the key to function. "for my user" — workspace
    * scope, not per-bot. */
   deepseek: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
-  /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "minimax" (default; needs a key) or "system" (the Mac's
-   * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
+  /** Voice credentials, the workspace default voice id (what every bot
+   * without a voice of its own speaks with), and the pronunciation list.
+   * `provider` picks the engine: "minimax" (default; needs a key) or
+   * "system" (the Mac's built-in voices, no key). */
+  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), pronunciations: pronunciationListSchema.optional(), credentialStorage: externalCredentialStorage }).optional(),
   callStt: z.object({ provider: z.enum(["apple", "assemblyai"]).nullable().optional(), keyterms: z.array(z.string().trim().min(1)).max(100).optional() }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
@@ -321,6 +371,12 @@ const appConfigSchema = z.object({
      *  without the operator's explicit consent. */
     allowVoiceByDefault: z.boolean().optional(),
   }).optional(),
+  /** The Zulip source (docs/zulip.md): which BotFleet bots hold a Zulip
+   *  identity, where their keys come from, and the wake and post rules.  No
+   *  key lives here — `credentialDir` names the folder of `<Role>-zuliprc`
+   *  files, and `credentialSource: "infisical"` reads the vault instead.  A malformed section reads as absent rather than failing the
+   *  whole stored config, so a typo turns Zulip off and nothing else. */
+  zulip: zulipConfigSchema.optional().catch(undefined),
   ingress: z.object({
     publicUrl: z
       .string()
@@ -398,6 +454,11 @@ const appConfigSchema = z.object({
       maxSwapPercent: z.number().min(1).max(100).optional(),
       minFreeDiskMb: z.number().min(0).optional(),
     }).optional(),
+    // How long a webhook may sit queued while the host is hot before the
+    // scheduler dispatches it anyway.  Absent means 20 minutes
+    // (DEFAULT_WEBHOOK_HOT_DEFER_MINUTES).  The vault knob of the same
+    // field overrides the file.
+    webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
   }).optional(),
   // Error and performance reporting.  The kill switch is explicit: a DSN
   // with no `enabled` flag reports.  Only a stored `false` stops it, so an
@@ -450,7 +511,11 @@ const appConfigSchema = z.object({
 // check, busy-bot check, atomic reassignment), so accepting it here would let
 // `PATCH /api/config {"deleteInstance":"claude"}` bypass all of them and
 // strand bots on a protected engine that no longer exists.
-const appConfigPatchSchema = appConfigSchema.omit({ instances: true, deleteInstance: true });
+// A save is strict about the Zulip section (a bad value is a 400 the panel
+// can show), while a stored file stays lenient (a bad value turns Zulip off).
+const appConfigPatchSchema = appConfigSchema
+  .omit({ instances: true, deleteInstance: true })
+  .extend({ zulip: zulipConfigSchema.optional() });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
 export interface AppConfig {
@@ -464,7 +529,10 @@ export interface AppConfig {
   vps?: { sshAlias?: string; memoryGib?: number; cpus?: number };
   opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
   deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
-  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
+  /** `voice` is the workspace default voice; `pronunciations` is the
+   *  workspace list of terms and how to say them (shared/pronunciations.ts),
+   *  absent until first saved, which means the seeded defaults. */
+  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; pronunciations?: Pronunciation[]; credentialStorage?: "external" };
   /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
    *  falls back to platform defaults when `provider` is absent (Apple on
    *  macOS without a cloud key, AssemblyAI on every other platform, and
@@ -529,13 +597,18 @@ export interface AppConfig {
     allowVoiceByDefault?: boolean;
   };
   ingress?: { publicUrl?: string; enabled?: boolean };
+  /** The Zulip source (docs/zulip.md, server/zulip/types.ts). */
+  zulip?: import("./zulip/types.ts").ZulipSettings;
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
   localVm?: {
     mode?: "shared" | "per-bot";
     maxInstances?: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
+    cpus?: number;
+    memoryGib?: number;
   };
   /** Shared Qdrant Agent RAG vector database settings.  `accessClientId` /
    * `accessClientSecret` are a Cloudflare Access service token: a pair of
@@ -562,6 +635,9 @@ export interface AppConfig {
     maxMinutes?: number;
     cpuCores?: number;
     admission?: { maxSwapPercent?: number; minFreeDiskMb?: number };
+    /** Minutes a hot host may park a webhook before the wake dispatches
+     *  anyway.  Absent means 20. */
+    webhookHotDeferMinutes?: number;
   };
   usage?: {
     ingestUrl?: string;
@@ -615,7 +691,12 @@ export interface AppConfig {
     refreshMinutes?: number;
   };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillRecorder?: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
+  features?: {
+    skillRecorder?: boolean;
+    showToolCalls?: boolean;
+    summarizeToolCalls?: boolean;
+    gitWorktreeLeases?: boolean;
+  };
   /** How the roster and threads are laid out.  Absent means simple. */
   conversationMode?: ConversationMode;
   /** What this person calls a room: one of the presets, or "custom" with a
@@ -639,6 +720,20 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
       value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
       value.tts.provider === "elevenlabs") {
     value = { ...value, tts: { ...value.tts, provider: "minimax" } };
+  }
+  // A hand-edited pronunciation list must not cost every other setting: the
+  // strict schema below would reject the whole file over one bad entry, and
+  // loadConfig reads a rejection as a first run.  Keep the entries that pass
+  // on their own; a value that is not a list at all reads as never saved.
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
+      Object.hasOwn(value.tts, "pronunciations")) {
+    const { pronunciations: stored, ...ttsRest } = value.tts;
+    const kept = sanitizeStoredPronunciations(stored);
+    value = {
+      ...value,
+      tts: kept === undefined ? ttsRest : { ...ttsRest, pronunciations: kept.map(({ term, say }) => ({ term, say })) },
+    };
   }
   const parsed = appConfigSchema.safeParse(value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
@@ -1583,7 +1678,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
@@ -1923,6 +2018,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     antigravity: { driver: "antigravityAgent" },
     minimax: { driver: "minimax" },
     mcode: { driver: "mcodeAgent" },
+    muse: { driver: "museAgent" },
     opencodeGo: { driver: "opencodeGo" },
     computer: { driver: "boxAgent" },
     openaiCompat: { driver: "openai-compat" },
@@ -1945,6 +2041,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     dsh: { driver: "dshAgent" },
     minimax: { driver: "minimax" },
     mcode: { driver: "mcodeAgent" },
+    muse: { driver: "museAgent" },
     ...CUSTOM_ONLY,
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;

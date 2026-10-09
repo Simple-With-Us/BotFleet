@@ -10,7 +10,7 @@ import {
   semanticBrowserCommand,
 } from "./remote-computer.ts";
 
-describe("remote Cua computer setup", () => {
+describe("remote CUA computer setup", () => {
   it("installs one exact checksummed 0.20.0 driver and disables telemetry", () => {
     const command = remoteComputerBootstrapCommand("Test Bot");
     expect(REMOTE_CUA_VERSION).toBe("0.20.0");

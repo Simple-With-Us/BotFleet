@@ -35,7 +35,7 @@ export function vpsSharedDisplayForBot(botId: string): string {
   return botDesktopDisplayFor(botId);
 }
 
-/** Deterministic display + Cua socket for one bot on the shared container. */
+/** Deterministic display + CUA socket for one bot on the shared container. */
 export function vpsSharedBotSession(botId: string): VpsSharedBotSession {
   return { occupancyKey: perBotOccupancyKey(botId), ...botDesktopSession(botId, "vps") };
 }
@@ -101,7 +101,7 @@ export function ensureSharedVpsSessionExecArgs(
     `  ${CUA_EXECUTABLE} status --socket "$socket" >/dev/null 2>&1 && exit 0`,
     `  sleep 0.25`,
     `done`,
-    `echo "Cua Driver did not answer on $socket" >&2`,
+    `echo "CUA Driver did not answer on $socket" >&2`,
     `exit 1`,
   ].join("\n");
   return [

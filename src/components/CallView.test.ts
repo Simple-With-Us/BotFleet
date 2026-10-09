@@ -18,11 +18,14 @@ describe("CallTargetButton visibility", () => {
     expect(SRC).toMatch(/if \(!voiceProviderConfigured\) return null;/);
   });
 
-  it("derives that flag from the provider-scoped tts.configured, not from a raw key check", () => {
+  it("derives that flag from the shared readiness rule, not from a raw key check", () => {
     // Server-side `configured` means: MiniMax -> a key is on file; system -> Mac voices exist.
-    // Reading it (rather than inventing a key check) is what keeps built-in voices working.
+    // Reading it (rather than inventing a key check) is what keeps built-in voices working.  A
+    // Personal Voice this Mac can speak is an engine too; callVoiceReadiness (unit-tested in
+    // src/lib/tts/readiness.test.ts) folds both into engineAvailable.
     expect(SRC).toMatch(/const configured = Boolean\(state\.config\?\.tts\?\.configured\);/);
-    expect(SRC).toMatch(/const voiceProviderConfigured = configured;/);
+    expect(SRC).toMatch(/const readiness = callVoiceReadiness\(\{/);
+    expect(SRC).toMatch(/const voiceProviderConfigured = readiness\.engineAvailable;/);
   });
 
   it("places the guard after every hook so hook order stays stable", () => {
@@ -50,20 +53,31 @@ describe("CallTargetButton visibility", () => {
   });
 });
 
-describe("Personal Voice cannot start a desktop call", () => {
-  it("treats a personal voice id as unspeakable on the desktop call path", () => {
-    // Server-side voiceReady refuses personal voices; passing entry on a
-    // non-empty-but-unspeakable id connected the call and stayed silent.
-    expect(SRC).toMatch(/voice\.startsWith\("personal:"\)/);
-    expect(SRC).toMatch(/voice\.startsWith\("apple-personal:"\)/);
-    expect(SRC).toMatch(/voices\.every\(\(voice\) => !isPersonalVoiceId\(voice\)\)/);
-    expect(SRC).toMatch(/!isPersonalVoiceId\(state\.config\?\.tts\?\.voice\)/);
-    // An explicit Personal Voice must not pass via an otherwise ready workspace fallback.
-    expect(SRC).toMatch(/configured && !voices\.some\(\(voice\) => isPersonalVoiceId\(voice\)\)/);
+describe("Personal Voice desktop call support", () => {
+  it("calls with this Mac's voice for the bot", () => {
+    // Personal Voice ids are device-local, so the call resolves the Mac's own choice.
+    expect(SRC).toMatch(/voices=\{\[voiceForDevice\(bot, "mac"\)\]\}/);
+    expect(SRC).toMatch(/const macVoice = voiceForDevice\(bot, "mac"\);/);
+    expect(SRC).toMatch(/voiceId: macVoice/);
+    expect(SRC).not.toMatch(/voiceId: bot\.voice/);
   });
 
-  it("says Personal Voice is iPhone-only instead of a generic pick-a-voice", () => {
-    expect(SRC).toMatch(/Personal Voice is iPhone-only/);
-    expect(SRC).toMatch(/Apple Personal Voice speaks on iPhone only/);
+  it("enables personal voice only when the host advertises the capability", () => {
+    // The version gate lives in electron/capabilities.cjs (macOS 14+), so the
+    // renderer reads the flag rather than re-deriving it from the platform.
+    expect(SRC).toMatch(/const isPersonalSpeakable = capabilities\.dictation\.personalVoice === true;/);
+    expect(SRC).not.toMatch(/const isPersonalSpeakable = isMac;/);
+    expect(SRC).toMatch(/personalVoiceAvailable: isPersonalSpeakable,/);
+    // A MiniMax key is required only when a hosted voice is in play.
+    expect(SRC).toMatch(/const hostedEngineMissing = readiness\.needsHostedEngine && !configured;/);
+  });
+
+  it("reads requires-macos-14 instead of telling a Mac user they need a Mac", () => {
+    expect(SRC).toMatch(/capabilities\.dictation\.reasonCode === "requires-macos-14"/);
+    expect(SRC).toMatch(/Personal Voice needs macOS 14 or later, or an iPhone/);
+    expect(SRC).toMatch(/Apple Personal Voice needs macOS 14 or later, or an iPhone/);
+    // A non-Apple computer may still be told the feature is Mac or iPhone.
+    expect(SRC).toMatch(/Personal Voice needs a Mac or iPhone/);
+    expect(SRC).toMatch(/Apple Personal Voice speaks on Apple devices \(Mac and iPhone\)/);
   });
 });

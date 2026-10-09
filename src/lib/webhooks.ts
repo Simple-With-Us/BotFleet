@@ -20,6 +20,7 @@ export interface WebhookTrigger {
   /** Minutes this webhook stays quiet after it runs.  Requests that arrive
    * inside the gap wait and go into one turn when it closes. */
   minGapMinutes?: number;
+  oneShotWake?: boolean;
 }
 
 export interface WebhookTriggerInput {
@@ -31,6 +32,7 @@ export interface WebhookTriggerInput {
   verificationPending?: boolean;
   eventTypes?: string[];
   minGapMinutes?: number;
+  oneShotWake?: boolean;
 }
 
 export interface WebhookVerificationSample {

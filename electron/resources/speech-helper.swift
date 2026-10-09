@@ -2,6 +2,10 @@
 //   {"partial":true,"text":"…"}   while recognizing
 //   {"partial":false,"text":"…"}  final result, then exit 0
 //   {"error":"…"}                 then exit 1
+// With --speak-personal-voice it speaks instead, and streams:
+//   {"range":[location,length],"elapsedMs":n}  as each word is about to be
+//                                 spoken (UTF-16 offsets into --text-file)
+//   {"finished":true}             then exit 0
 // Runs until the final result or a per-session stop marker. Launched by
 // electron/speech.mjs as this background app bundle so macOS can resolve the
 // microphone and speech purpose strings in its Info.plist.
@@ -127,6 +131,346 @@ final class SilenceEndpointer {
   }
 }
 
+// ── Personal Voice listing and synthesis (macOS 14+) ──────────────────────
+if CommandLine.arguments.contains("--list-personal-voices") {
+  if #available(macOS 14.0, *) {
+    let status = AVSpeechSynthesizer.personalVoiceAuthorizationStatus
+    if status == .authorized {
+      let voices = AVSpeechSynthesisVoice.speechVoices()
+        .filter { $0.voiceTraits.contains(.isPersonalVoice) }
+        .map { [
+          "id": "personal:\($0.identifier)",
+          "name": $0.name,
+          "locale": $0.language
+        ] }
+      emit(["status": "authorized", "voices": voices])
+      exit(0)
+    } else if status == .notDetermined {
+      AVSpeechSynthesizer.requestPersonalVoiceAuthorization { newStatus in
+        if newStatus == .authorized {
+          let voices = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.voiceTraits.contains(.isPersonalVoice) }
+            .map { [
+              "id": "personal:\($0.identifier)",
+              "name": $0.name,
+              "locale": $0.language
+            ] }
+          emit(["status": "authorized", "voices": voices])
+        } else {
+          emit(["status": "denied", "voices": []])
+        }
+        exit(0)
+      }
+      RunLoop.main.run()
+    } else {
+      emit(["status": "denied", "voices": []])
+      exit(0)
+    }
+  } else {
+    emit(["status": "unsupported", "voices": []])
+    exit(0)
+  }
+}
+
+if CommandLine.arguments.contains("--speak-personal-voice") {
+  guard #available(macOS 14.0, *) else {
+    fail("unsupported-platform")
+  }
+  let args = CommandLine.arguments
+  guard let voiceIdx = args.firstIndex(of: "--voice-id"), voiceIdx + 1 < args.count else {
+    fail("missing-voice-id")
+  }
+  // The reply text arrives in a 0600 file rather than on argv: argv is
+  // world-readable through `ps`, and this text is a voice summary of the
+  // user's own messages.
+  guard let textIdx = args.firstIndex(of: "--text-file"), textIdx + 1 < args.count else {
+    fail("missing-text")
+  }
+  let requestedVoiceId = args[voiceIdx + 1]
+  let textPath = args[textIdx + 1]
+  guard let text = try? String(contentsOfFile: textPath, encoding: .utf8) else {
+    fail("missing-text")
+  }
+  let rawId = requestedVoiceId
+    .replacingOccurrences(of: "apple-personal:", with: "")
+    .replacingOccurrences(of: "personal:", with: "")
+
+  final class PersonalVoiceSpeaker: NSObject, @unchecked Sendable, AVSpeechSynthesizerDelegate {
+    let synth = AVSpeechSynthesizer()
+    var chunks: [String] = []
+    /// UTF-16 offset of each chunk's first unit in the original text, so a
+    /// range inside a chunk becomes a range inside the text the caller sent.
+    var chunkBases: [Int] = []
+    var currentChunkIndex = 0
+    var attempts = 0
+    var voice: AVSpeechSynthesisVoice?
+    var isStopped = false
+    /// UTF-16 index of the range AVSpeechSynthesizer is about to speak.
+    /// Ranges before this have already been spoken.  A cancel retries from
+    /// here instead of from the start of the chunk.
+    var nextRangeUTF16 = 0
+    var startedAt: DispatchTime?
+
+    /// Chunk boundaries as UTF-16 ranges into the ORIGINAL text, so word
+    /// ranges can be reported against it.  Sentences first, then clauses at
+    /// punctuation, then words; atoms are packed greedily up to the limit and
+    /// each chunk is the original text between its first and last atom.
+    static func chunkRanges(_ text: String, maxCharacters: Int = 750) -> [NSRange] {
+      let ns = text as NSString
+      let blank = CharacterSet.whitespacesAndNewlines
+      func isBlank(_ index: Int) -> Bool {
+        let unit = ns.character(at: index)
+        guard let scalar = Unicode.Scalar(unit) else { return false }
+        return blank.contains(scalar)
+      }
+      func trimmed(_ range: NSRange) -> NSRange {
+        var start = range.location
+        var end = range.location + range.length
+        while start < end && isBlank(start) { start += 1 }
+        while end > start && isBlank(end - 1) { end -= 1 }
+        return NSRange(location: start, length: end - start)
+      }
+      let whole = trimmed(NSRange(location: 0, length: ns.length))
+      guard whole.length > 0 else { return [] }
+      guard whole.length > maxCharacters else { return [whole] }
+
+      var sentences: [NSRange] = []
+      ns.enumerateSubstrings(in: whole, options: [.bySentences, .localized]) { _, range, _, _ in
+        let sentence = trimmed(range)
+        if sentence.length > 0 { sentences.append(sentence) }
+      }
+      if sentences.isEmpty { sentences = [whole] }
+
+      let delimiters: Set<unichar> = [59, 58, 10, 0x2014, 0x2013, 44] // ; : \n — – ,
+      let clauseMinimum = min(200, maxCharacters / 3)
+      var atoms: [NSRange] = []
+      for sentence in sentences {
+        if sentence.length <= maxCharacters {
+          atoms.append(sentence)
+          continue
+        }
+        var clauses: [NSRange] = []
+        var clauseStart = sentence.location
+        let sentenceEnd = sentence.location + sentence.length
+        var i = sentence.location
+        while i < sentenceEnd {
+          if delimiters.contains(ns.character(at: i)) && i + 1 - clauseStart >= clauseMinimum {
+            let clause = trimmed(NSRange(location: clauseStart, length: i + 1 - clauseStart))
+            if clause.length > 0 { clauses.append(clause) }
+            clauseStart = i + 1
+          }
+          i += 1
+        }
+        let rest = trimmed(NSRange(location: clauseStart, length: sentenceEnd - clauseStart))
+        if rest.length > 0 { clauses.append(rest) }
+
+        for clause in clauses {
+          if clause.length <= maxCharacters {
+            atoms.append(clause)
+            continue
+          }
+          // Words: runs between spaces.  A word longer than the limit is cut
+          // at composed-character boundaries.
+          let clauseEnd = clause.location + clause.length
+          var wordStart = clause.location
+          var j = clause.location
+          while j <= clauseEnd {
+            if j == clauseEnd || ns.character(at: j) == 32 {
+              if j > wordStart {
+                var piece = wordStart
+                while j - piece > maxCharacters {
+                  var cut = piece + maxCharacters
+                  cut = ns.rangeOfComposedCharacterSequence(at: cut).location
+                  if cut <= piece { cut = piece + maxCharacters }
+                  atoms.append(NSRange(location: piece, length: cut - piece))
+                  piece = cut
+                }
+                atoms.append(NSRange(location: piece, length: j - piece))
+              }
+              wordStart = j + 1
+            }
+            j += 1
+          }
+        }
+      }
+
+      var result: [NSRange] = []
+      var current: NSRange?
+      for atom in atoms {
+        guard let open = current else {
+          current = atom
+          continue
+        }
+        let merged = NSRange(location: open.location, length: atom.location + atom.length - open.location)
+        if merged.length <= maxCharacters {
+          current = merged
+        } else {
+          result.append(open)
+          current = atom
+        }
+      }
+      if let open = current { result.append(open) }
+      return result
+    }
+
+    static func chunkText(_ text: String, maxCharacters: Int = 750) -> [String] {
+      let ns = text as NSString
+      return chunkRanges(text, maxCharacters: maxCharacters).map { ns.substring(with: $0) }
+    }
+
+    /// Retry text after didCancel.  `nextRangeLocation` is the UTF-16 start
+    /// of the range that was about to be spoken.  Zero means nothing audible
+    /// was committed, so the whole chunk is retried.  The in-progress range
+    /// may be repeated once; ranges before it are not.
+    static func remainderAfterCancel(chunk: String, nextRangeLocation: Int) -> String {
+      let ns = chunk as NSString
+      let location = min(max(nextRangeLocation, 0), ns.length)
+      if location == 0 { return chunk }
+      return ns.substring(from: location)
+    }
+
+    func speak(voice: AVSpeechSynthesisVoice, text: String) {
+      synth.delegate = self
+      self.voice = voice
+      let ns = text as NSString
+      let ranges = Self.chunkRanges(text)
+      self.chunks = ranges.map { ns.substring(with: $0) }
+      self.chunkBases = ranges.map { $0.location }
+      self.startedAt = DispatchTime.now()
+      guard !chunks.isEmpty else {
+        emit(["finished": true])
+        exit(0)
+      }
+      self.currentChunkIndex = 0
+      self.attempts = 0
+      self.isStopped = false
+      self.nextRangeUTF16 = 0
+      speakCurrentChunk()
+    }
+
+    func speakCurrentChunk() {
+      guard !isStopped, let voice = self.voice, currentChunkIndex < chunks.count else {
+        emit(["finished": true])
+        exit(0)
+      }
+      nextRangeUTF16 = 0
+      let utterance = AVSpeechUtterance(string: chunks[currentChunkIndex])
+      utterance.voice = voice
+      utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+      utterance.postUtteranceDelay = 0.05
+      synth.speak(utterance)
+    }
+
+    func speechSynthesizer(
+      _ synthesizer: AVSpeechSynthesizer,
+      willSpeakRangeOfSpeechString characterRange: NSRange,
+      utterance: AVSpeechUtterance
+    ) {
+      nextRangeUTF16 = characterRange.location
+      // One line per word, flushed by emit(): UTF-16 offsets into the text
+      // the caller sent (the chunk's base plus the range inside the chunk),
+      // and the helper's own clock so a reader can undo polling batches.
+      guard currentChunkIndex < chunkBases.count else { return }
+      let elapsedNs = DispatchTime.now().uptimeNanoseconds - (startedAt ?? DispatchTime.now()).uptimeNanoseconds
+      emit([
+        "range": [chunkBases[currentChunkIndex] + characterRange.location, characterRange.length],
+        "elapsedMs": Int(elapsedNs / 1_000_000),
+      ])
+    }
+
+    func advanceAfterChunk() {
+      nextRangeUTF16 = 0
+      currentChunkIndex += 1
+      attempts = 0
+      if currentChunkIndex >= chunks.count {
+        emit(["finished": true])
+        exit(0)
+      } else {
+        speakCurrentChunk()
+      }
+    }
+
+    func stop() {
+      isStopped = true
+      synth.stopSpeaking(at: .immediate)
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+      advanceAfterChunk()
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+      if isStopped {
+        exit(0)
+      }
+      // Internal synthesis drop/error: retry once, but not from character 0
+      // when part of this chunk was already spoken.
+      attempts += 1
+      if attempts < 2 {
+        let chunk = chunks[currentChunkIndex]
+        let remainder = Self.remainderAfterCancel(
+          chunk: chunk,
+          nextRangeLocation: nextRangeUTF16
+        )
+        // The retried utterance starts where the remainder starts, so its
+        // ranges are offset by what was cut off the front.
+        let cut = (chunk as NSString).length - (remainder as NSString).length
+        nextRangeUTF16 = 0
+        if remainder.isEmpty {
+          advanceAfterChunk()
+        } else {
+          chunks[currentChunkIndex] = remainder
+          chunkBases[currentChunkIndex] += cut
+          speakCurrentChunk()
+        }
+      } else {
+        advanceAfterChunk()
+      }
+    }
+  }
+
+  let speaker = PersonalVoiceSpeaker()
+
+  let doSpeak = {
+    let allVoices = AVSpeechSynthesisVoice.speechVoices()
+    let matched = allVoices.first(where: {
+      $0.identifier == rawId || $0.name == rawId ||
+      "personal:\($0.identifier)" == requestedVoiceId ||
+      "apple-personal:\($0.identifier)" == requestedVoiceId
+    })
+    // Guess only when the caller named no voice at all. A named-but-absent
+    // voice — one not synced to this Mac — must fail loudly rather than be
+    // replaced by a different Personal Voice speaking the user's words.
+    let voice = matched ?? (rawId.isEmpty
+      ? allVoices.first(where: { $0.voiceTraits.contains(.isPersonalVoice) })
+      : nil)
+
+    guard let selectedVoice = voice else {
+      fail("voice-not-found")
+    }
+
+    speaker.speak(voice: selectedVoice, text: text)
+  }
+
+  let status = AVSpeechSynthesizer.personalVoiceAuthorizationStatus
+  if status == .authorized {
+    doSpeak()
+  } else if status == .notDetermined {
+    AVSpeechSynthesizer.requestPersonalVoiceAuthorization { newStatus in
+      if newStatus == .authorized {
+        DispatchQueue.main.async { doSpeak() }
+      } else {
+        fail("personal-voice-not-authorized")
+      }
+    }
+  } else {
+    fail("personal-voice-not-authorized")
+  }
+
+  RunLoop.main.run()
+}
+
+// ── Speech-to-text dictation (Speech framework) ──────────────────────────
 SFSpeechRecognizer.requestAuthorization { status in
   guard status == .authorized else { fail("speech-not-authorized") }
   // Recognize in the user's language: a hardcoded en-US recognizer

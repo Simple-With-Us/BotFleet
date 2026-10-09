@@ -74,7 +74,16 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
   // billed to the user's own XAI_API_KEY — the same shape as openai-compat.
   // Omitting access defaulted to "subscription" and put a BYOK engine above
   // the picker's Custom divider alongside Claude and Codex.
-  metadata: { displayName: "Grok (API)", supportsMultipleInstances: true, access: "custom" },
+  metadata: {
+    displayName: "Grok (API)",
+    supportsMultipleInstances: true,
+    access: "custom",
+    // The direct HTTP driver.  No Composio bridge, no screen channel, no
+    // image input — the image row on the `grok` matrix row is carried by the
+    // Grok Build ACP driver, not by this one, which is why the matrix check
+    // aggregates across every driver that maps to an engine id.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
+  },
   models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),

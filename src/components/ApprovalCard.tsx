@@ -13,12 +13,12 @@ interface ToolLabels {
 }
 
 const ROUTINE_SETTLED_LABEL = {
-  create: "Routine scheduled",
-  update: "Routine updated",
-  pause: "Routine paused",
-  resume: "Routine resumed",
-  run_now: "Routine run queued",
-  delete: "Routine deleted",
+  create: "Routine Scheduled",
+  update: "Routine Updated",
+  pause: "Routine Paused",
+  resume: "Routine Resumed",
+  run_now: "Routine Run Queued",
+  delete: "Routine Deleted",
 } as const;
 
 /** The tool's own name is noise to a human: mcp__botfleet__computer_batch is
@@ -100,7 +100,7 @@ export function ApprovalCard({
         {settled === "allow" ? (
           <>
             <Check size={14} className="text-success" />
-            {routineSettledLabel ?? (isRoutineRequest ? "Routine confirmed" : "Allowed")}
+            {routineSettledLabel ?? (isRoutineRequest ? "Routine Confirmed" : "Allowed")}
           </>
         ) : settled ? (
           <>
@@ -109,7 +109,7 @@ export function ApprovalCard({
         ) : (
           <>
             <ShieldCheck size={14} className="text-accent" />
-            {isRoutineRequest ? "Waiting for your confirmation below" : "Waiting for your answer below"}
+            {isRoutineRequest ? "Waiting for Your Confirmation Below" : "Waiting for Your Answer Below"}
           </>
         )}
       </div>

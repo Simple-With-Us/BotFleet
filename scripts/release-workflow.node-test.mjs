@@ -168,8 +168,11 @@ test("release workflow defaults to artifacts and requires explicit release mutat
   const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
 
   assert.equal(pkg.version, VERSION);
-  assert.match(pkg.scripts["package:mac:release"], /electron-builder --mac --arm64 --x64 --publish never/);
-  assert.match(workflow, /Package both architectures\n\s+run: pnpm package:mac:release/);
+  assert.match(pkg.scripts["package:mac:arm64:release"], /electron-builder --mac --arm64 --publish never/);
+  assert.match(pkg.scripts["package:mac:x64:release"], /electron-builder --mac --x64 --publish never/);
+  assert.match(workflow, /fail-fast: false/);
+  assert.match(workflow, /name: mac-release-\$\{\{ matrix\.arch \}\}/);
+  assert.match(workflow, /mac-merge:/);
   assert.match(workflow, /draft:\n\s+description:[^\n]+\n\s+required: false\n\s+type: boolean\n\s+default: false/);
   assert.match(workflow, /publish:\n\s+description:[^\n]+\n\s+required: false\n\s+type: boolean\n\s+default: false/);
   assert.match(workflow, /Publish \(only when asked to\)[\s\S]*?if: \$\{\{ inputs\.publish \}\}/);
@@ -186,11 +189,21 @@ test("release workflow defaults to artifacts and requires explicit release mutat
   assert.match(workflow, /node scripts\/verify-release-assets\.mjs uploaded "\$VERSION"/);
 });
 
+test("the windows packaging gate asserts the owner as well as the repo it names", () => {
+  const workflow = readFileSync(join(ROOT, ".github/workflows/package-win.yml"), "utf8").replace(/\r\n/g, "\n");
+  const builder = readFileSync(join(ROOT, "electron-builder.yml"), "utf8").replace(/\r\n/g, "\n");
+  // The error text names Simple-With-Us/BotFleet, so the gate has to check both halves.
+  assert.match(workflow, /grep -q "\^owner: Simple-With-Us\$" "\$res\/app-update\.yml"/);
+  assert.match(workflow, /grep -q "\^repo: BotFleet\$" "\$res\/app-update\.yml"/);
+  // …and both halves have to match what electron-builder actually publishes.
+  assert.match(builder, /publish:\n\s+- provider: github\n\s+owner: Simple-With-Us\n\s+repo: BotFleet/);
+});
+
 test("release tags must resolve to the pinned build, including nested annotated tags", async () => {
   const sha = "a".repeat(40);
   const annotation = "b".repeat(40);
   const nested = "c".repeat(40);
-  const identity = { repo: "jaywedgeworth22/BotFleet", tag: `v${VERSION}`, sha };
+  const identity = { repo: "Simple-With-Us/BotFleet", tag: `v${VERSION}`, sha };
   const commit = (value) => ({ status: 200, body: { object: { type: "commit", sha: value } } });
   assert.deepEqual(await verifyReleaseTag({ ...identity, request: async () => commit(sha) }), { exists: true });
   await assert.rejects(verifyReleaseTag({ ...identity, request: async () => commit("d".repeat(40)) }), /different commit/);
@@ -209,7 +222,7 @@ test("release tags must resolve to the pinned build, including nested annotated 
 });
 
 test("only a missing ref permits tag creation; failed queries and broken chains fail closed", async () => {
-  const identity = { repo: "jaywedgeworth22/BotFleet", tag: `v${VERSION}`, sha: "a".repeat(40) };
+  const identity = { repo: "Simple-With-Us/BotFleet", tag: `v${VERSION}`, sha: "a".repeat(40) };
   assert.deepEqual(await verifyReleaseTag({ ...identity, request: async () => ({ status: 404 }) }), { exists: false });
   for (const status of [401, 403, 429, 500]) {
     await assert.rejects(verifyReleaseTag({ ...identity, request: async () => ({ status }) }), /Cannot verify release tag/);

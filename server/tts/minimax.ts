@@ -319,7 +319,38 @@ interface T2AResponse {
   base_resp?: BaseResponse;
 }
 
-/** Synthesize one utterance to mp3 bytes. Throws if MiniMax returns a
+/**
+ * MiniMax TTS acoustic model (t2a_v2) drops pauses on em-dashes, en-dashes,
+ * and isolated hyphens, slurring words together without breaths.  Deterministically
+ * normalize dashes to natural pauses (comma/space) and clean up ellipses.
+ */
+export function sanitizeForTTS(text: string): string {
+  if (!text) return "";
+  return text
+    // Collapse whitespace runs first to prevent regex backtracking on long runs
+    .replace(/\s+/g, " ")
+    // Replace em-dashes (—) and en-dashes (–) with a comma and space for natural breathing pause
+    .replace(/ ?[—–] ?/g, ", ")
+    // Replace floating/isolated hyphens (" - ") with a comma and space, but
+    // keep the operator in "5 - 3 = 2" — a minus sign between two numbers is
+    // arithmetic, not a clause dash, and reads as "five, three" otherwise
+    .replace(
+      /(\S) - (?=(\S))/g,
+      (_m, before: string, after: string) =>
+        (/\d/.test(before) && /\d/.test(after)) ? `${before} - ` : `${before}, `,
+    )
+    // Replace ellipses (ASCII "..." and the Unicode "…") with a single period
+    .replace(/(?:\.{2,}|…+)/g, ".")
+    // Clean up multiple consecutive commas or comma-periods
+    .replace(/,\s*,+/g, ",")
+    .replace(/,\s*\./g, ".")
+    .replace(/\.\s*,/g, ".")
+    // Clean up multiple spaces
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
+/** Synthesize one utterance to mp3 bytes.  Throws if MiniMax returns a
  * non-zero status_code or the audio payload is empty. */
 export async function synthesize(
   text: string,
@@ -327,8 +358,8 @@ export async function synthesize(
   key: string,
   options: SynthesizeOptions = { voiceId: "" },
 ): Promise<Audio> {
-  const trimmed = text.trim();
-  if (!trimmed) return { bytes: new Uint8Array(), mime: "audio/mpeg" };
+  const trimmed = sanitizeForTTS(text);
+  if (!trimmed || !/[\p{L}\p{N}]/u.test(trimmed)) return { bytes: new Uint8Array(), mime: "audio/mpeg" };
   if (trimmed.length > MAX_CHARS) {
     throw new Error(`utterance is ${trimmed.length} chars; MiniMax accepts at most ${MAX_CHARS} per request`);
   }

@@ -87,7 +87,7 @@ export default async function afterPack(context) {
     } catch (err) {
       if (err?.code === "ENOENT") {
         const content = [
-          "owner: jaywedgeworth22",
+          "owner: Simple-With-Us",
           "repo: BotFleet",
           "provider: github",
           "updaterCacheDirName: botfleet-updater",

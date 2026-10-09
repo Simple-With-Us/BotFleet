@@ -1,0 +1,1725 @@
+{
+  "schemaVersion": 1,
+  "tools": [
+    {
+      "name": "curl",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "curl",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "curl"
+      ]
+    },
+    {
+      "name": "jq",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "jq",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "jq"
+      ]
+    },
+    {
+      "name": "rsync",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "rsync",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "rsync"
+      ]
+    },
+    {
+      "name": "vim",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "vim",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "vim"
+      ]
+    },
+    {
+      "name": "tmux",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "tmux",
+        "args": [
+          "-V"
+        ]
+      },
+      "apt": [
+        "tmux"
+      ]
+    },
+    {
+      "name": "sqlite3",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "sqlite3",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "sqlite3"
+      ]
+    },
+    {
+      "name": "python3",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "python3",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "python3",
+        "python3-pip",
+        "python3-venv"
+      ],
+      "credentialPaths": [
+        {
+          "rel": ".pypirc"
+        }
+      ]
+    },
+    {
+      "name": "openssl",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "openssl",
+        "args": [
+          "version"
+        ]
+      },
+      "apt": [
+        "openssl"
+      ]
+    },
+    {
+      "name": "gpg",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "gpg",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "gnupg"
+      ],
+      "credentialPaths": [
+        {
+          "rel": ".gnupg",
+          "transform": "gpg-public-tree"
+        },
+        {
+          "rel": ".gnupg",
+          "transform": "gpg-private-tree"
+        }
+      ]
+    },
+    {
+      "name": "zip",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "zip",
+        "args": [
+          "-v"
+        ]
+      },
+      "apt": [
+        "zip"
+      ]
+    },
+    {
+      "name": "unzip",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "unzip",
+        "args": [
+          "-v"
+        ]
+      },
+      "apt": [
+        "unzip"
+      ]
+    },
+    {
+      "name": "ssh",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "ssh",
+        "args": [
+          "-V"
+        ]
+      },
+      "apt": [
+        "openssh-client"
+      ],
+      "credentialPaths": [
+        {
+          "rel": ".ssh"
+        }
+      ]
+    },
+    {
+      "name": "scp",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "command",
+        "args": [
+          "-v",
+          "scp"
+        ]
+      },
+      "apt": [
+        "openssh-client"
+      ]
+    },
+    {
+      "name": "sftp",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "command",
+        "args": [
+          "-v",
+          "sftp"
+        ]
+      },
+      "apt": [
+        "openssh-client"
+      ]
+    },
+    {
+      "name": "awk",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "awk",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "gawk"
+      ]
+    },
+    {
+      "name": "sed",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "sed",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "sed"
+      ]
+    },
+    {
+      "name": "grep",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "grep",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "grep"
+      ]
+    },
+    {
+      "name": "tar",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "tar",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "tar"
+      ]
+    },
+    {
+      "name": "make",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "make",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "make"
+      ]
+    },
+    {
+      "name": "clang",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "clang",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "clang"
+      ]
+    },
+    {
+      "name": "gcc",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "gcc",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "gcc"
+      ]
+    },
+    {
+      "name": "java",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "java",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "openjdk-17-jre-headless"
+      ]
+    },
+    {
+      "name": "ruby",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "ruby",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "ruby"
+      ]
+    },
+    {
+      "name": "gem",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "gem",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "ruby"
+      ]
+    },
+    {
+      "name": "perl",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "perl",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "perl"
+      ]
+    },
+    {
+      "name": "psql",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "psql",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "postgresql-client"
+      ],
+      "credentialPaths": [
+        {
+          "rel": ".pgpass"
+        }
+      ]
+    },
+    {
+      "name": "ffmpeg",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "ffmpeg",
+        "args": [
+          "-version"
+        ]
+      },
+      "apt": [
+        "ffmpeg"
+      ]
+    },
+    {
+      "name": "fzf",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "fzf",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "fzf"
+      ]
+    },
+    {
+      "name": "fd",
+      "targets": [
+        "both"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "fd",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "fd-find"
+      ],
+      "postInstall": "fd_symlink"
+    },
+    {
+      "name": "node",
+      "targets": [
+        "both"
+      ],
+      "version": "24.11.0",
+      "verify": {
+        "command": "node",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "node"
+    },
+    {
+      "name": "npm",
+      "targets": [
+        "both"
+      ],
+      "version": "bundled-with-node",
+      "verify": {
+        "command": "npm",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "node",
+      "credentialPaths": [
+        {
+          "rel": ".npmrc"
+        }
+      ]
+    },
+    {
+      "name": "pnpm",
+      "targets": [
+        "both"
+      ],
+      "version": "10.33.0",
+      "verify": {
+        "command": "pnpm",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "pnpm",
+      "credentialPaths": [
+        {
+          "rel": ".config/pnpm"
+        }
+      ]
+    },
+    {
+      "name": "cf",
+      "targets": [
+        "both"
+      ],
+      "version": "latest",
+      "verify": {
+        "command": "cf",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "npm_global",
+      "npmPackage": "cf",
+      "credentialPaths": [
+        {
+          "rel": ".config/cloudflare"
+        },
+        {
+          "rel": ".wrangler"
+        }
+      ]
+    },
+    {
+      "name": "vercel",
+      "targets": [
+        "both"
+      ],
+      "version": "latest",
+      "verify": {
+        "command": "vercel",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "npm_global",
+      "npmPackage": "vercel",
+      "credentialPaths": [
+        {
+          "rel": ".vercel"
+        }
+      ]
+    },
+    {
+      "name": "kodus",
+      "targets": [
+        "both"
+      ],
+      "version": "0.4.21",
+      "verify": {
+        "command": "kodus",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "npm_global",
+      "npmPackage": "@kodus/cli",
+      "credentialPaths": [
+        {
+          "rel": ".config/kodus"
+        }
+      ]
+    },
+    {
+      "name": "aws",
+      "targets": [
+        "both"
+      ],
+      "version": "2.27.50",
+      "verify": {
+        "command": "aws",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "awscli",
+      "credentialPaths": [
+        {
+          "rel": ".aws"
+        }
+      ]
+    },
+    {
+      "name": "gcloud",
+      "targets": [
+        "both"
+      ],
+      "version": "latest",
+      "verify": {
+        "command": "gcloud",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "gcloud",
+      "credentialPaths": [
+        {
+          "rel": ".config/gcloud"
+        }
+      ]
+    },
+    {
+      "name": "gh",
+      "targets": [
+        "both"
+      ],
+      "version": "2.63.2",
+      "verify": {
+        "command": "gh",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "gh",
+      "credentialPaths": [
+        {
+          "rel": ".config/gh"
+        }
+      ]
+    },
+    {
+      "name": "kubectl",
+      "targets": [
+        "both"
+      ],
+      "version": "1.32.0",
+      "verify": {
+        "command": "kubectl",
+        "args": [
+          "version",
+          "--client=true"
+        ]
+      },
+      "recipe": "kubectl",
+      "credentialPaths": [
+        {
+          "rel": ".kube"
+        }
+      ]
+    },
+    {
+      "name": "docker",
+      "targets": [
+        "both"
+      ],
+      "version": "27.4.1",
+      "verify": {
+        "command": "docker",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "docker_cli",
+      "credentialPaths": [
+        {
+          "rel": ".docker/config.json",
+          "transform": "docker-linux-config"
+        }
+      ]
+    },
+    {
+      "name": "turso",
+      "targets": [
+        "both"
+      ],
+      "version": "latest",
+      "verify": {
+        "command": "turso",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "turso",
+      "credentialPaths": [
+        {
+          "rel": ".turso"
+        }
+      ]
+    },
+    {
+      "name": "deno",
+      "targets": [
+        "both"
+      ],
+      "version": "2.2.0",
+      "verify": {
+        "command": "deno",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "deno",
+      "credentialPaths": [
+        {
+          "rel": ".deno"
+        }
+      ]
+    },
+    {
+      "name": "cargo",
+      "targets": [
+        "both"
+      ],
+      "version": "stable",
+      "verify": {
+        "command": "cargo",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "rustup",
+      "credentialPaths": [
+        {
+          "rel": ".cargo/credentials.toml"
+        },
+        {
+          "rel": ".cargo/credentials"
+        },
+        {
+          "rel": ".cargo/config.toml"
+        },
+        {
+          "rel": ".cargo/config"
+        }
+      ]
+    },
+    {
+      "name": "rustc",
+      "targets": [
+        "both"
+      ],
+      "version": "stable",
+      "verify": {
+        "command": "rustc",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "rustup"
+    },
+    {
+      "name": "pbcopy",
+      "targets": [
+        "local"
+      ],
+      "version": "shim",
+      "verify": {
+        "command": "pbcopy",
+        "args": [
+          "--help"
+        ]
+      },
+      "recipe": "pbcopy_shim"
+    },
+    {
+      "name": "pbpaste",
+      "targets": [
+        "local"
+      ],
+      "version": "shim",
+      "verify": {
+        "command": "pbpaste",
+        "args": [
+          "--help"
+        ]
+      },
+      "recipe": "pbcopy_shim"
+    },
+    {
+      "name": "infisical",
+      "targets": [
+        "both"
+      ],
+      "version": "host-auth",
+      "credentialPaths": [
+        {
+          "rel": ".infisical"
+        },
+        {
+          "rel": ".config/infisical"
+        }
+      ]
+    },
+    {
+      "name": "git",
+      "targets": [
+        "both"
+      ],
+      "version": "host-auth",
+      "credentialPaths": [
+        {
+          "rel": ".gitconfig"
+        },
+        {
+          "rel": ".config/git"
+        }
+      ]
+    },
+    {
+      "name": "netrc",
+      "targets": [
+        "both"
+      ],
+      "version": "host-auth",
+      "credentialPaths": [
+        {
+          "rel": ".netrc"
+        }
+      ]
+    },
+    {
+      "name": "azure",
+      "targets": [
+        "both"
+      ],
+      "version": "host-auth",
+      "credentialPaths": [
+        {
+          "rel": ".azure"
+        }
+      ]
+    },
+    {
+      "name": "fly",
+      "targets": [
+        "both"
+      ],
+      "version": "host-auth",
+      "credentialPaths": [
+        {
+          "rel": ".fly"
+        }
+      ]
+    },
+    {
+      "name": "zsh",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "sh",
+        "args": [
+          "-c",
+          "getent passwd cua | cut -d: -f7 | grep -qx /usr/bin/zsh && zsh --version"
+        ]
+      },
+      "apt": [
+        "zsh"
+      ],
+      "recipe": "zsh_shell"
+    },
+    {
+      "name": "brew",
+      "targets": [
+        "local"
+      ],
+      "version": "7.0.8",
+      "verify": {
+        "command": "sh",
+        "args": [
+          "-c",
+          "if [ \"$(id -u)\" -eq 0 ]; then exec runuser -u cua -- env HOME=/home/cua brew --version; else exec brew --version; fi"
+        ]
+      },
+      "apt": [
+        "file",
+        "git",
+        "procps"
+      ],
+      "recipe": "homebrew"
+    },
+    {
+      "name": "open",
+      "targets": [
+        "local"
+      ],
+      "version": "shim",
+      "verify": {
+        "command": "test",
+        "args": [
+          "-x",
+          "/usr/local/bin/open"
+        ]
+      },
+      "apt": [
+        "xdg-utils"
+      ],
+      "recipe": "open_shim"
+    },
+    {
+      "name": "rg",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "rg",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "ripgrep"
+      ]
+    },
+    {
+      "name": "shellcheck",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "shellcheck",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "shellcheck"
+      ]
+    },
+    {
+      "name": "tesseract",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "tesseract",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "tesseract-ocr",
+        "tesseract-ocr-eng"
+      ]
+    },
+    {
+      "name": "pdftotext",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "pdftotext",
+        "args": [
+          "-v"
+        ]
+      },
+      "apt": [
+        "poppler-utils"
+      ]
+    },
+    {
+      "name": "pdfimages",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "pdfimages",
+        "args": [
+          "-v"
+        ]
+      },
+      "apt": [
+        "poppler-utils"
+      ]
+    },
+    {
+      "name": "protoc",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "protoc",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "protobuf-compiler"
+      ]
+    },
+    {
+      "name": "gdu",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "gdu",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "gdu"
+      ]
+    },
+    {
+      "name": "mosh",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "mosh",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "mosh"
+      ]
+    },
+    {
+      "name": "git-filter-repo",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "git",
+        "args": [
+          "filter-repo",
+          "--version"
+        ]
+      },
+      "apt": [
+        "git",
+        "git-filter-repo"
+      ]
+    },
+    {
+      "name": "git-cli",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "git",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "git"
+      ]
+    },
+    {
+      "name": "tree",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "tree",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "tree"
+      ]
+    },
+    {
+      "name": "wget",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "wget",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "wget"
+      ]
+    },
+    {
+      "name": "htop",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "htop",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "htop"
+      ]
+    },
+    {
+      "name": "lsof",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "lsof",
+        "args": [
+          "-v"
+        ]
+      },
+      "apt": [
+        "lsof"
+      ]
+    },
+    {
+      "name": "dig",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "dig",
+        "args": [
+          "-v"
+        ]
+      },
+      "apt": [
+        "dnsutils"
+      ]
+    },
+    {
+      "name": "nc",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "command",
+        "args": [
+          "-v",
+          "nc"
+        ]
+      },
+      "apt": [
+        "netcat-openbsd"
+      ]
+    },
+    {
+      "name": "less",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "less",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "less"
+      ]
+    },
+    {
+      "name": "file",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "file",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "file"
+      ]
+    },
+    {
+      "name": "patch",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "patch",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "patch"
+      ]
+    },
+    {
+      "name": "bc",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "bc",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "bc"
+      ]
+    },
+    {
+      "name": "xz",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "xz",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "xz-utils"
+      ]
+    },
+    {
+      "name": "zstd",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "zstd",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "zstd"
+      ]
+    },
+    {
+      "name": "7z",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "command",
+        "args": [
+          "-v",
+          "7z"
+        ]
+      },
+      "apt": [
+        "p7zip-full"
+      ]
+    },
+    {
+      "name": "convert",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "convert",
+        "args": [
+          "-version"
+        ]
+      },
+      "apt": [
+        "imagemagick"
+      ]
+    },
+    {
+      "name": "strace",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "strace",
+        "args": [
+          "-V"
+        ]
+      },
+      "apt": [
+        "strace"
+      ]
+    },
+    {
+      "name": "ping",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "ping",
+        "args": [
+          "-V"
+        ]
+      },
+      "apt": [
+        "iputils-ping"
+      ]
+    },
+    {
+      "name": "ps",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "ps",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "procps"
+      ]
+    },
+    {
+      "name": "bat",
+      "targets": [
+        "local"
+      ],
+      "version": "apt",
+      "verify": {
+        "command": "bat",
+        "args": [
+          "--version"
+        ]
+      },
+      "apt": [
+        "bat"
+      ],
+      "postInstall": "bat_symlink"
+    },
+    {
+      "name": "wrangler",
+      "targets": [
+        "local"
+      ],
+      "version": "4.148.0",
+      "verify": {
+        "command": "wrangler",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "npm_global",
+      "npmPackage": "wrangler"
+    },
+    {
+      "name": "pm2",
+      "targets": [
+        "local"
+      ],
+      "version": "7.0.4",
+      "verify": {
+        "command": "pm2",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "npm_global",
+      "npmPackage": "pm2"
+    },
+    {
+      "name": "sentry-cli",
+      "targets": [
+        "local"
+      ],
+      "version": "3.8.0",
+      "verify": {
+        "command": "sentry-cli",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "npm_global",
+      "npmPackage": "@sentry/cli"
+    },
+    {
+      "name": "cloudflared",
+      "targets": [
+        "local"
+      ],
+      "version": "2026.10.0",
+      "verify": {
+        "command": "cloudflared",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "pinned_binary",
+      "download": {
+        "format": "raw",
+        "assets": {
+          "x86_64": {
+            "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.0/cloudflared-linux-amd64",
+            "sha256": "d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db",
+            "files": [
+              {
+                "as": "cloudflared"
+              }
+            ]
+          },
+          "aarch64": {
+            "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.0/cloudflared-linux-arm64",
+            "sha256": "e6422b9d4f72d3194bc5a38676f13667c06666523217b842a877d72a80b5ac08",
+            "files": [
+              {
+                "as": "cloudflared"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "actionlint",
+      "targets": [
+        "local"
+      ],
+      "version": "1.7.12",
+      "verify": {
+        "command": "actionlint",
+        "args": [
+          "-version"
+        ]
+      },
+      "recipe": "pinned_binary",
+      "download": {
+        "format": "tar.gz",
+        "assets": {
+          "x86_64": {
+            "url": "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz",
+            "sha256": "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+            "files": [
+              {
+                "path": "actionlint",
+                "as": "actionlint"
+              }
+            ]
+          },
+          "aarch64": {
+            "url": "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_arm64.tar.gz",
+            "sha256": "325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6",
+            "files": [
+              {
+                "path": "actionlint",
+                "as": "actionlint"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "gitleaks",
+      "targets": [
+        "local"
+      ],
+      "version": "8.30.1",
+      "verify": {
+        "command": "gitleaks",
+        "args": [
+          "version"
+        ]
+      },
+      "recipe": "pinned_binary",
+      "download": {
+        "format": "tar.gz",
+        "assets": {
+          "x86_64": {
+            "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz",
+            "sha256": "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+            "files": [
+              {
+                "path": "gitleaks",
+                "as": "gitleaks"
+              }
+            ]
+          },
+          "aarch64": {
+            "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_arm64.tar.gz",
+            "sha256": "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+            "files": [
+              {
+                "path": "gitleaks",
+                "as": "gitleaks"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "mise",
+      "targets": [
+        "local"
+      ],
+      "version": "2026.10.4",
+      "verify": {
+        "command": "mise",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "pinned_binary",
+      "download": {
+        "format": "tar.xz",
+        "assets": {
+          "x86_64": {
+            "url": "https://github.com/jdx/mise/releases/download/v2026.10.4/mise-v2026.10.4-linux-x64.tar.xz",
+            "sha256": "291654b97aec3ad9e3391dffe57e45432cb0c264eb55836b29ee089d7c435e45",
+            "files": [
+              {
+                "path": "mise/bin/mise",
+                "as": "mise"
+              }
+            ]
+          },
+          "aarch64": {
+            "url": "https://github.com/jdx/mise/releases/download/v2026.10.4/mise-v2026.10.4-linux-arm64.tar.xz",
+            "sha256": "7e4ab0a7451e6b355c42e4a244989d4f8845149e086b154050bc3a854b7a634e",
+            "files": [
+              {
+                "path": "mise/bin/mise",
+                "as": "mise"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "uv",
+      "targets": [
+        "local"
+      ],
+      "version": "0.12.23",
+      "verify": {
+        "command": "uv",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "pinned_binary",
+      "download": {
+        "format": "tar.gz",
+        "assets": {
+          "x86_64": {
+            "url": "https://github.com/astral-sh/uv/releases/download/0.12.23/uv-x86_64-unknown-linux-gnu.tar.gz",
+            "sha256": "9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6",
+            "files": [
+              {
+                "path": "uv-x86_64-unknown-linux-gnu/uv",
+                "as": "uv"
+              },
+              {
+                "path": "uv-x86_64-unknown-linux-gnu/uvx",
+                "as": "uvx"
+              }
+            ]
+          },
+          "aarch64": {
+            "url": "https://github.com/astral-sh/uv/releases/download/0.12.23/uv-aarch64-unknown-linux-gnu.tar.gz",
+            "sha256": "6524bd338177ed50d035d39354e12545e993bbeba2ecbddf0480c5b3a81d313f",
+            "files": [
+              {
+                "path": "uv-aarch64-unknown-linux-gnu/uv",
+                "as": "uv"
+              },
+              {
+                "path": "uv-aarch64-unknown-linux-gnu/uvx",
+                "as": "uvx"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "uvx",
+      "targets": [
+        "local"
+      ],
+      "version": "0.12.23",
+      "verify": {
+        "command": "uvx",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "pinned_binary",
+      "download": {
+        "format": "tar.gz",
+        "assets": {
+          "x86_64": {
+            "url": "https://github.com/astral-sh/uv/releases/download/0.12.23/uv-x86_64-unknown-linux-gnu.tar.gz",
+            "sha256": "9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6",
+            "files": [
+              {
+                "path": "uv-x86_64-unknown-linux-gnu/uv",
+                "as": "uv"
+              },
+              {
+                "path": "uv-x86_64-unknown-linux-gnu/uvx",
+                "as": "uvx"
+              }
+            ]
+          },
+          "aarch64": {
+            "url": "https://github.com/astral-sh/uv/releases/download/0.12.23/uv-aarch64-unknown-linux-gnu.tar.gz",
+            "sha256": "6524bd338177ed50d035d39354e12545e993bbeba2ecbddf0480c5b3a81d313f",
+            "files": [
+              {
+                "path": "uv-aarch64-unknown-linux-gnu/uv",
+                "as": "uv"
+              },
+              {
+                "path": "uv-aarch64-unknown-linux-gnu/uvx",
+                "as": "uvx"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "yq",
+      "targets": [
+        "local"
+      ],
+      "version": "4.54.1",
+      "verify": {
+        "command": "yq",
+        "args": [
+          "--version"
+        ]
+      },
+      "recipe": "pinned_binary",
+      "download": {
+        "format": "raw",
+        "assets": {
+          "x86_64": {
+            "url": "https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64",
+            "sha256": "8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f",
+            "files": [
+              {
+                "as": "yq"
+              }
+            ]
+          },
+          "aarch64": {
+            "url": "https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_arm64",
+            "sha256": "189088da0c6429ec5178dfaab1a114805f6cab0b61b165ab236efedf1d57a71b",
+            "files": [
+              {
+                "as": "yq"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

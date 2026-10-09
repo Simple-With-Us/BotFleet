@@ -16,7 +16,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyPreparedUpdate, prepareUpdate, runUpdate } from "./mac-update-transaction.mjs";
@@ -27,6 +27,12 @@ import {
   outcomeMessage,
 } from "./update-progress.mjs";
 import { validUpdateCredentialReceipt } from "../electron/update-credential-preparation.mjs";
+import { stageIsPrunable } from "./stage-entries.mjs";
+import {
+  downloadBuiltBundle,
+  ResolutionError,
+  updateSourcePolicy,
+} from "./ci-build-resolver.mjs";
 
 const EXPECTED_TEAM_ID = "CC8UTF7ATG";
 // Transition release: main still BUILDS com.botfleet.app (LEGACY_BUNDLE_ID).
@@ -278,7 +284,7 @@ export function prunablePath(path, roots) {
  * deleted.  Both kinds are swept — the bundle beside the installed app and
  * the dependency tree beside the live checkout.
  */
-export function staleCandidateNames(names, { prefix, suffix = "", keepNames = [], isAlive = processIsAlive } = {}) {
+export function staleCandidateNames(names, { prefix, suffix = "", keepNames = [], isAlive = processExists } = {}) {
   const stale = [];
   const unrecognised = [];
   for (const name of names) {
@@ -299,13 +305,10 @@ export const CANDIDATE_DEPENDENCY_PREFIX = ".botfleet-server.node_modules.update
 // every later update forever.  It carries the updater's pid so the ordinary
 // candidate rule sweeps it once that process is gone.
 export const FAILED_DEPENDENCY_PREFIX = ".botfleet-server.node_modules.failed-";
-// Entries a stage directory is allowed to contain and still be swept
-// unattended.  Anything else in there was put there by a person, and a person
-// gets to decide when it goes.
-const KNOWN_STAGE_ENTRIES = new Set([
-  "BotFleet.app", "node_modules", "prepared.json", "rollback", "source",
-  "pending-recovery.json", "credential-migration.json",
-]);
+// The allowlist lives in scripts/stage-entries.mjs because
+// server/update-control.ts sweeps with the same rules, and two copies of it
+// already drifted once — which leaked a full copy of the app and a
+// multi-gigabyte dependency tree on every update.
 export const ABANDONED_STAGE_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -375,7 +378,7 @@ export function abandonedStages(entries, { now = Date.now(), referenced = [], ag
     }
     const stamp = stageStamp(entry.name) ?? entry.mtimeMs;
     const stale = Number.isFinite(stamp) && now - stamp > ageMs;
-    if (stale && entry.names.every((name) => KNOWN_STAGE_ENTRIES.has(name))) prune.push(entry.path);
+    if (stale && stageIsPrunable(entry.names)) prune.push(entry.path);
     else report.push(entry.path);
   }
   return { prune, report };
@@ -569,7 +572,7 @@ async function acquireDirectoryLock(path, mode) {
       try { owner = JSON.parse(await readFile(join(path, "owner.json"), "utf8")); } catch {
         throw new Error(`Updater lock ${path} exists without a readable owner; inspect it before retrying`);
       }
-      if (Number.isInteger(owner?.pid) && processIsAlive(owner.pid)) {
+      if (Number.isInteger(owner?.pid) && await processIsAlive(owner.pid)) {
         throw new Error(`Another BotFleet update is running (pid ${owner.pid}, phase ${owner.mode || "unknown"})`);
       }
       if (attempt > 0) throw new Error(`Could not recover stale updater lock ${path}`);
@@ -579,13 +582,88 @@ async function acquireDirectoryLock(path, mode) {
   throw new Error(`Could not acquire updater lock ${path}`);
 }
 
-function processIsAlive(pid) {
+/**
+ * The raw signal-0 probe.  ESRCH is the only proof of absence: EPERM means the
+ * pid exists and belongs to someone else.  A zombie still has a pid, so this
+ * answers true for one; processIsAlive below is the check that knows better.
+ */
+function processExists(pid) {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
     return error?.code !== "ESRCH";
   }
+}
+
+/**
+ * A `ps` state column that begins with Z names a zombie: the process has
+ * exited and only its pid and exit status remain, waiting for a parent that
+ * never reaped it.  On 2026-10-08 a long-running grok CLI left two of
+ * BotFleet's bundled `cua-driver` processes in that state, `kill -0` kept
+ * answering success for them, and every apply refused to go on with "BotFleet
+ * did not exit after graceful quit and SIGTERM ... refusing SIGKILL".
+ */
+export function isZombieState(state) {
+  return String(state ?? "").trim().startsWith("Z");
+}
+
+/**
+ * The `ps` state column for every pid in one spawn, as a Map of pid to state.
+ * `ps` exits nonzero when some listed pid has gone but still prints the rest,
+ * so the rows are read whatever the exit code says.  A pid with no row is
+ * simply absent from the map.
+ */
+export async function processStates(pids) {
+  const states = new Map();
+  if (!pids.length) return states;
+  const result = await run("ps", ["-o", "pid=,stat=", "-p", pids.join(",")], { allowFailure: true });
+  for (const line of result.stdout.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(\S+)$/);
+    if (match) states.set(Number(match[1]), match[2]);
+  }
+  return states;
+}
+
+/**
+ * The pids in `pids` that are still running.  Every place the updater asks
+ * "does anything still hold BotFleet state" goes through this, so a zombie is
+ * never captured, waited on, signalled, or reported as a survivor.  A zombie
+ * holds no files, no ports and no database handle, so it can never hold
+ * BotFleet state, and no signal can make it exit sooner (only its parent
+ * reaping it can).
+ *
+ * `kill -0` runs first (ESRCH is the proof of absence), then ONE `ps` spawn
+ * reads the state of everything left, so a poll over N pids costs one spawn,
+ * not N.  This fails toward alive: a pid with no `ps` row, or a `ps` that
+ * fails, proves nothing, and reading that as "exited" would let the swap
+ * proceed under a live process.  Only a state beginning with Z says exited.
+ * (A `ps` that hangs blocks this check, as it blocks processCommand; run()
+ * has no timeout.)
+ *
+ * A caller may inject `isAlive`, synchronous or asynchronous.  The verdicts
+ * are awaited together because a Promise is always truthy and cannot be
+ * filtered on directly.
+ */
+export async function withoutExitedPids(pids, { isAlive, exists = processExists, statesOf = processStates } = {}) {
+  if (isAlive) {
+    const verdicts = await Promise.all(pids.map((pid) => isAlive(pid)));
+    return pids.filter((_, index) => verdicts[index]);
+  }
+  const present = pids.filter((pid) => exists(pid));
+  if (!present.length) return [];
+  let states;
+  try {
+    states = await statesOf(present);
+  } catch {
+    return present;
+  }
+  return present.filter((pid) => !isZombieState(states.get(pid)));
+}
+
+/** Is this one pid still running?  See withoutExitedPids; a zombie is not. */
+export async function processIsAlive(pid, options) {
+  return (await withoutExitedPids([pid], options)).length === 1;
 }
 
 async function parseJsonFile(path, label) {
@@ -654,7 +732,10 @@ async function sqliteHolders(dataDirectory) {
   if (!present.length) return [];
   const result = await run("lsof", ["-t", "--", ...present], { allowFailure: true });
   if (![0, 1].includes(result.code)) throw new Error("Could not inspect BotFleet database ownership with lsof");
-  return [...new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger))];
+  // lsof lists open files, which a zombie no longer has, so this filter is
+  // belt and braces: a zombie reported here would hold the database "open"
+  // forever and no signal could ever close it.
+  return withoutExitedPids([...new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger))]);
 }
 
 export function healthTopologyResult(results, { allowMultiple = false } = {}) {
@@ -712,7 +793,7 @@ async function ownerRecordState(dataDirectory) {
     if (error?.code === "ENOENT") return { state: "absent" };
     throw error;
   }
-  if (!processIsAlive(owner.pid)) return { state: "stale", owner };
+  if (!(await processIsAlive(owner.pid))) return { state: "stale", owner };
   return { state: "live", owner };
 }
 
@@ -929,13 +1010,420 @@ export async function validateBuiltBundle(bundlePath, expectedCommit) {
   return { ...(await signatureIdentity(bundlePath, { allowLegacyBundleId: true })), version: build.version, apiVersion: build.apiVersion, uiHash: build.uiHash };
 }
 
-async function exactAppPids(appPath) {
-  const result = await run("ps", ["-axo", "pid=,command="], { allowFailure: true });
-  const executable = join(appPath, "Contents/MacOS/BotFleet");
-  return result.stdout.split("\n").flatMap((line) => {
-    const match = line.trim().match(/^(\d+)\s+(.+)$/);
-    return match && (match[2] === executable || match[2].startsWith(`${executable} `)) ? [Number(match[1])] : [];
+// ---------------------------------------------------------------------------
+// Pre-activation smoke test.
+//
+// validateBuiltBundle above reads files: it proves the bytes are signed, from
+// the expected team, and stamped with the expected commit.  None of that proves
+// the artifact runs.  0.1.24 shipped a server that passed every one of those
+// checks and died on every launch with ERR_MODULE_NOT_FOUND, because tsc
+// leaves bare imports verbatim and the packaged tree carries no node_modules.
+// The hosted release pipeline has caught that class of bug since
+// (scripts/smoke-packaged-server.mjs), but only for artifacts GitHub built.
+// A candidate downloaded from a CI build, imported from a stage, or produced
+// by a local fallback has had no equivalent gate on this Mac.
+//
+// So mirror MCode's validatePrefixPackage here: before the stage is published
+// or anything live is touched, actually run the candidate — boot the packaged
+// server with no node_modules in reach, wait for real readiness, and prove the
+// native SQLite binding initializes.  Three properties, deliberately, because
+// a busy Mac produces timeouts and a timeout must never be reported as a
+// corrupt artifact.  That mistake shipped twice on this machine already (see
+// scripts/native-version-probe.mjs); the classifier below exists so the same
+// mistake cannot ship a third time here.
+// ---------------------------------------------------------------------------
+
+// Generous on purpose.  prepare runs on the owner's Mac, often while five to
+// ten agent seats are compiling; the Sep 17 and Oct 1 outages were both a
+// healthy binary plus a starved CPU.  One retry on timeout only — a genuinely
+// bad artifact fails identically a second later, so retrying it would only
+// delay the real error, and a missing file cannot become present by waiting.
+// Not a lesson learned here: fleet recall ("busy host update timeout
+// classified as corrupt artifact not a failure", 2026-10-04) returns the Oct 1
+// cloudflared probe incident (PR #780, board fd1736f8) and an open board sweep
+// for six more short-timeout probes with the same failure.  This is the third
+// place that mistake has been paid for.
+const SMOKE_BOOT_TIMEOUT_MS = 180_000;
+const SMOKE_BOOT_ATTEMPTS = 2;
+const SMOKE_SQLITE_TIMEOUT_MS = 60_000;
+const SMOKE_HEALTH_REQUEST_TIMEOUT_MS = 3_000;
+const SMOKE_OUTPUT_EXCERPT = 2_000;
+// What we hold, versus what we show.  Generous enough to keep a full stack trace
+// and a boot log, small enough that two failed attempts cannot exhaust memory.
+const SMOKE_OUTPUT_CAPTURE = 256 * 1024;
+
+export function smokeTestEnabled(env = process.env) {
+  const value = (env.BOTFLEET_UPDATE_SMOKE ?? "").trim().toLowerCase();
+  return !(value === "0" || value === "off" || value === "false" || value === "no");
+}
+
+/**
+ * Turn a failed boot into a cause a human can act on.  The distinction that
+ * matters most is "this artifact is broken" versus "this Mac was too busy to
+ * finish the probe" — the two look identical to a naive boolean and call for
+ * opposite responses, so they must never collapse into one value.  A child
+ * still alive with no readiness and no exit is the busy case by elimination,
+ * so the default has to be the busy case rather than an unlabelled unknown.
+ */
+/**
+ * Decide readiness from an untrusted response body, strictly.
+ *
+ * `body?.ready !== false` treats a truncated body, an HTML error page, and a
+ * bare `{}` as ready, because every one of them is "not false".  This is a
+ * hand-written shape check rather than zod for a structural reason: the updater
+ * bootstraps itself by archiving a five-file graph into a temp directory with no
+ * node_modules beside it, so it cannot import a third-party validator at all.
+ * Every other module in that graph imports nothing but node: builtins.  The rule
+ * being satisfied is "never read a field off an untrusted response without
+ * checking its shape" — adding zod here would break updater bootstrap on every
+ * Mac, which is a far worse failure than a longer predicate.
+ */
+/* oxlint-disable anti-slop/no-runtime-typeof -- hand-written health body boundary parse; zod is unavailable in the updater bootstrap graph (see comment above). */
+export function parseHealthBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  // The health contract is an object with an explicit boolean `ready` and an app
+  // name.  Anything else is not a health response we recognise.
+  if (typeof body.ready !== "boolean" || typeof body.app !== "string") return false;
+  return body.ready;
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
+export function classifySmokeFailure({ exitCode, signal, spawnError, spawnTimedOut } = {}) {
+  if (spawnError) return "spawn-failed";
+  if (spawnTimedOut) return "sqlite-probe-timed-out";
+  if (exitCode !== null && exitCode !== undefined) return "server-exited";
+  if (signal) return `server-killed-${signal}`;
+  return "server-never-ready";
+}
+
+const SMOKE_CAUSES = {
+  "spawn-failed": "could not be started",
+  "server-exited": "exited during boot",
+  "server-never-ready": "never reported ready",
+  "sqlite-probe-timed-out": "timed out initializing its native SQLite binding",
+  "sqlite-unavailable": "could not initialize its native SQLite binding",
+  "owner-mismatch": "wrote an owner record naming a different process",
+};
+
+export function smokeFailureMessage({ cause, exitCode, signal, spawnError, targetCommit, output, bundlePath: _bundlePath }) {
+  const summary = SMOKE_CAUSES[cause] || cause;
+  const detail = [];
+  if (exitCode !== null && exitCode !== undefined) detail.push(`exit=${exitCode}`);
+  if (signal) detail.push(`signal=${signal}`);
+  if (spawnError) detail.push(`spawn=${spawnError}`);
+  detail.push(`commit=${targetCommit?.slice(0, 12) || "unknown"}`);
+  const excerpt = (output || "").trim().slice(-SMOKE_OUTPUT_EXCERPT);
+  const headline = `Staged BotFleet candidate ${summary} (${detail.join(", ")}); nothing was installed.`;
+  if (cause === "server-never-ready" || cause === "sqlite-probe-timed-out") {
+    return `${headline}  This Mac may simply have been too busy to finish the probe — re-run when it is quieter before treating the build as bad.${excerpt ? `\n--- candidate output ---\n${excerpt}` : ""}`;
+  }
+  return `${headline}${excerpt ? `\n--- candidate output ---\n${excerpt}` : ""}`;
+}
+
+/**
+ * `run` has no timeout, and a probe that can hang forever is worse than no
+ * probe at all — it would strand the updater lock.  Bound it explicitly and
+ * report a timeout as its own outcome rather than as a non-zero exit, for the
+ * same reason the boot classifier has a distinct "too busy" cause.
+ */
+function runBounded(command, args, { cwd, env, timeoutMs, maxBytes = 1024 * 1024 } = {}) {
+  return new Promise((resolveRun) => {
+    const child = spawn(command, args, {
+      cwd,
+      // A probe this runs must not inherit the updater's real environment.
+      // It writes a probe file and, in the SQLite case, touches HOME and the
+      // Sentry/OMB variables; a smoke test that can reach the owner's real
+      // state, or ship the owner's real telemetry under the updater's key, is
+      // not a smoke test.  PATH is carried because the probe needs node; the
+    // rest of the ambient environment is not.
+      env: env ? { PATH: process.env.PATH, ...env } : { PATH: process.env.PATH },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    // Capped, unlike the sibling helpers' absence of a cap elsewhere: a command
+    // that writes without bound would grow these strings until the updater
+    // itself ran out of memory, which is a worse outcome than a truncated
+    // diagnostic.  `overflow` is reported so the caller can tell a truncated
+    // capture from a short one.
+    let overflow = false;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    const append = (which, chunk) => {
+      if (overflow) return;
+      if (stdout.length + stderr.length + chunk.length > maxBytes) {
+        overflow = true;
+        stdout = stdout.slice(0, Math.max(0, maxBytes - stderr.length));
+        stderr = stderr.slice(0, Math.max(0, maxBytes - stdout.length));
+        child.kill("SIGKILL");
+        return;
+      }
+      if (which === "out") stdout += chunk;
+      else stderr += chunk;
+    };
+    child.stdout.on("data", (chunk) => append("out", chunk));
+    child.stderr.on("data", (chunk) => append("err", chunk));
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolveRun({ code: null, signal: "SIGKILL", stdout, stderr, timedOut: true, overflow });
+    }, timeoutMs);
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveRun(result);
+    };
+    child.once("error", (error) => settle({ code: null, signal: null, stdout, stderr, spawnError: error, timedOut: false, overflow }));
+    child.once("close", (code, signal) => settle({ code, signal, stdout, stderr, timedOut: false, overflow }));
   });
+}
+
+/**
+ * Prove `node:sqlite` initializes in the runtime that will actually serve the
+ * candidate.  The store opens its database through DatabaseSync from node:sqlite
+ * (server/message-db.ts), a native binding that has to load before the harness
+ * can run at all — the same reason MCode initializes better-sqlite3 in memory
+ * before it trusts a downloaded release.  In-memory keeps the probe from
+ * depending on the store's own file lifecycle: a lazy database is not a broken
+ * one, and this gate must never fail a healthy build for being lazy.
+ */
+async function smokeNativeSqlite({ serverDirectory, nodeBin, nodeEnv, runImpl = runBounded }) {
+  const script = [
+    'import { DatabaseSync } from "node:sqlite";',
+    'const db = new DatabaseSync(":memory:");',
+    'db.exec("CREATE TABLE smoke (id INTEGER PRIMARY KEY, value TEXT)");',
+    'db.prepare("INSERT INTO smoke (value) VALUES (?)").run("botfleet");',
+    'const row = db.prepare("SELECT value FROM smoke WHERE id = 1").get();',
+    'if (row?.value !== "botfleet") throw new Error(`unexpected row: ${JSON.stringify(row)}`);',
+    'db.close();',
+    'console.log("sqlite-ok");',
+  ].join("\n");
+  const probePath = join(serverDirectory, `smoke-sqlite-${process.pid}-${randomUUID()}.mjs`);
+  await writeFile(probePath, `${script}\n`, { mode: 0o600 });
+  try {
+    const result = await runImpl(nodeBin, [probePath], {
+      cwd: serverDirectory,
+      env: nodeEnv,
+      timeoutMs: SMOKE_SQLITE_TIMEOUT_MS,
+    });
+    if (result.timedOut) return { ok: false, timedOut: true, detail: "probe exceeded its time budget" };
+    if (result.spawnError) return { ok: false, timedOut: false, detail: `probe could not start: ${result.spawnError.message}` };
+    if (result.stdout.includes("sqlite-ok")) return { ok: true, timedOut: false, detail: null };
+    return {
+      ok: false,
+      timedOut: false,
+      detail: `node:sqlite did not initialize (exit=${result.code}, signal=${result.signal}): ${(result.stderr || result.stdout).trim().slice(0, 400)}`,
+    };
+  } finally {
+    await rm(probePath, { force: true });
+  }
+}
+
+async function freeLoopbackPort() {
+  const { createServer } = await import("node:net");
+  return new Promise((resolvePort, rejectPort) => {
+    const probe = createServer();
+    probe.unref();
+    probe.on("error", rejectPort);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const chosen = address?.port ?? 0;
+      probe.close(() => resolvePort(chosen));
+    });
+  });
+}
+
+/**
+ * The attempt policy, separated from the probe so it can be tested without a
+ * real candidate.  Retry exactly one readiness timeout and nothing else: a
+ * candidate that exited, or whose native SQLite binding will not load, fails
+ * identically a second later, so waiting again would only delay the real
+ * diagnosis.  A busy Mac and a broken build must not produce the same verdict.
+ */
+export async function runStagedSmokeTest({ builtBundle, targetCommit, smokeImpl, attempts = SMOKE_BOOT_ATTEMPTS, onRetry } = {}) {
+  const scratchRoot = join(tmpdir(), "botfleet-update-smoke");
+  await mkdir(scratchRoot, { recursive: true, mode: 0o700 });
+  let lastFailure = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // A structural problem (no entry point, ditto failed, no free port) is not
+    // a busy-host symptom, so it propagates without earning a retry.
+    const result = await smokeImpl({ bundlePath: builtBundle, targetCommit, attempt, scratchRoot });
+    if (result.ready && result.sqlite?.ok) return { ok: true, attempts: attempt };
+    if (result.ready && result.sqlite?.timedOut) {
+      lastFailure = { cause: "sqlite-probe-timed-out", output: result.output };
+    } else if (result.ready) {
+      // Booted, but the native binding would not initialize.  That is a real
+      // defect in the artifact, and the probe's own detail is the diagnosis.
+      lastFailure = { cause: "sqlite-unavailable", output: `${result.output}\n${result.sqlite?.detail || ""}` };
+    } else {
+      // The probe may know more than the process state does (an owner record
+      // that names the wrong pid looks exactly like a live, unready child).
+      // Its explicit cause wins; otherwise classify from what the process did.
+      lastFailure = {
+        cause: result.cause || classifySmokeFailure({
+          exitCode: result.exitCode,
+          signal: result.signal,
+          spawnError: result.spawnError,
+        }),
+        exitCode: result.exitCode,
+        signal: result.signal,
+        spawnError: result.spawnError,
+        output: result.output,
+      };
+    }
+    if (lastFailure.cause !== "server-never-ready" || attempt === attempts) break;
+    onRetry?.({ attempt, attempts });
+  }
+  throw new Error(smokeFailureMessage({ ...lastFailure, targetCommit, bundlePath: builtBundle }));
+}
+
+/**
+ * Boot the candidate's packaged server with no node_modules in reach and wait
+ * for genuine readiness.  Health answers as soon as the port binds, which is
+ * before boot work finishes, so `ready` — not the first 200 — is the signal.
+ * Readiness plus the owner record together are the same contract
+ * scripts/smoke-packaged-server.mjs asserts in CI; proving it locally is what
+ * makes a CI-built or imported candidate as trustworthy as a locally built one.
+ */
+export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scratchRoot }) {
+  const serverDirectory = join(bundlePath, "Contents/Resources/server");
+  if (!(await exists(join(serverDirectory, "index.js")))) {
+    throw new Error(`Staged BotFleet candidate has no packaged server entry point: ${serverDirectory}/index.js`);
+  }
+  // Checked BEFORE any scratch directory exists.  This used to sit after the
+  // ditto below, so a candidate with no packaged executable threw with a full
+  // copy of Contents/Resources/server already on disk, and the cleanup
+  // finally-block had not been entered yet — a structural throw is not retried,
+  // so every imported --bundle candidate without that binary leaked a /tmp
+  // directory for the life of the machine.
+  const packagedBinary = join(bundlePath, "Contents/MacOS/BotFleet");
+  if (!(await exists(packagedBinary))) {
+    throw new Error(`Staged BotFleet candidate has no packaged executable: ${packagedBinary}`);
+  }
+  const scratch = join(scratchRoot, `smoke-${targetCommit.slice(0, 12)}-${attempt}-${randomUUID()}`);
+  const staging = join(scratch, "server");
+  const home = join(scratch, "home");
+  await mkdir(home, { recursive: true, mode: 0o700 });
+  // Copy out of the bundle before running, exactly as the CI smoke test does.
+  // A bare import resolves differently depending on what sits above the tree,
+  // and the point of the probe is the layout the candidate will really ship.
+  await run("ditto", [serverDirectory, staging]);
+  const port = await freeLoopbackPort();
+  if (!port || DEFAULT_PORTS.includes(port)) {
+    throw new Error(`Could not reserve a loopback port for the staged smoke test (got ${port})`);
+  }
+
+  // Run the candidate on the runtime that will actually serve it: the packaged
+  // Electron binary under ELECTRON_RUN_AS_NODE=1, which is exactly how the
+  // harness launches it (server/index.ts's AGENTS_NODE_FLAG) and why
+  // electron-builder.yml keeps the runAsNode fuse on.  Using the updater's own
+  // Node would test a different runtime than the one under test — the
+  // Homebrew/nvm Node could have node:sqlite while Electron's bundled Node does
+  // not, or the reverse, and the probe would be answering a question nobody
+  // asked.  Dropping the flag would launch GUI Electron instead of the server.
+  const child = spawn(packagedBinary, [join(staging, "index.js")], {
+    cwd: staging,
+    env: {
+      PATH: process.env.PATH,
+      HOME: home,
+      ELECTRON_RUN_AS_NODE: "1",
+      OMB_PORT: String(port),
+      // No Sentry configuration at all, deliberately.  This child environment is
+      // built from scratch rather than inherited, so omitting the variable is
+      // what guarantees the probe cannot reach a real project.  A hard-coded
+      // loopback DSN would still be a DSN in source, and still one edit away
+      // from a real one.
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  // Bounded, because only the tail is ever rendered (SMOKE_OUTPUT_EXCERPT) and a
+  // candidate stuck in a crash loop — precisely the case this gate exists to
+  // diagnose — would otherwise append to this for two full boot windows and get
+  // the updater OOM-killed by the thing it was diagnosing.  Keep the tail: that
+  // is the part that names the failure.
+  let output = "";
+  const capture = (chunk) => {
+    output = (output + chunk).slice(-SMOKE_OUTPUT_CAPTURE);
+  };
+  child.stdout.on("data", capture);
+  child.stderr.on("data", capture);
+
+  try {
+    const deadline = Date.now() + SMOKE_BOOT_TIMEOUT_MS;
+    let ready = false;
+    let spawnError = null;
+    child.on("error", (error) => { spawnError = error; });
+    while (Date.now() < deadline) {
+      if (spawnError || child.exitCode !== null) break;
+      try {
+        // Bound each request, not just the loop: the deadline is only checked
+        // between iterations, so a candidate that accepts the connection and
+        // never answers would otherwise hold the updater lock for undici's
+        // default 300s headers timeout instead of returning at 180s.
+        const response = await fetch(`http://127.0.0.1:${port}/api/health`, {
+          signal: AbortSignal.timeout(SMOKE_HEALTH_REQUEST_TIMEOUT_MS),
+        });
+        if (response.ok && parseHealthBody(await response.json().catch(() => null))) {
+          ready = true;
+          break;
+        }
+      } catch {
+        /* not up yet */
+      }
+      await sleep(300);
+    }
+    if (!ready) {
+      return { ready: false, output, spawnError, exitCode: child.exitCode, signal: child.signalCode };
+    }
+    // The owner record is written at the end of a successful boot, so its
+    // presence and matching pid prove the candidate finished starting rather
+    // than merely binding a port.
+    const owner = await parseJsonFile(join(home, ".botfleet", "harness-owner.json"), "Staged runtime owner record");
+    if (owner?.pid !== child.pid) {
+      // A wrong owner record is a real defect, not a slow host, so it carries
+      // its own cause: without this it would classify as a readiness timeout,
+      // earn a retry, and be reported as "too busy".
+      return {
+        ready: false,
+        cause: "owner-mismatch",
+        output: `${output}\nowner record pid ${owner?.pid} does not match the staged server pid ${child.pid}`,
+        exitCode: child.exitCode,
+        signal: child.signalCode,
+      };
+    }
+    const sqlite = await smokeNativeSqlite({
+      serverDirectory: staging,
+      nodeBin: packagedBinary,
+      nodeEnv: { ELECTRON_RUN_AS_NODE: "1" },
+    });
+    return { ready: true, output, sqlite };
+  } finally {
+    child.kill("SIGKILL");
+    await rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+  }
+}
+
+
+/**
+ * The pids in `ps -axo pid=,stat=,command=` output whose arguments name
+ * `executable`.  Rows in a zombie state are skipped: the process is gone, and
+ * `ps` may keep printing its recorded command line until the parent reaps it.
+ */
+export function exactAppPidsFromPs(psOutput, executable) {
+  return psOutput.split("\n").flatMap((line) => {
+    const match = line.trim().match(/^(\d+)\s+(\S+)\s+(.+)$/);
+    if (!match || isZombieState(match[2])) return [];
+    return match[3] === executable || match[3].startsWith(`${executable} `) ? [Number(match[1])] : [];
+  });
+}
+
+async function exactAppPids(appPath) {
+  const result = await run("ps", ["-axo", "pid=,stat=,command="], { allowFailure: true });
+  return exactAppPidsFromPs(result.stdout, join(appPath, "Contents/MacOS/BotFleet"));
 }
 
 /**
@@ -957,7 +1445,7 @@ async function bundleHolderPids(bundlePath) {
   }
   const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
   if (![0, 1].includes(result.code)) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
-  return txtHolderPids(result.stdout, root);
+  return withoutExitedPids(txtHolderPids(result.stdout, root));
 }
 
 /**
@@ -989,7 +1477,39 @@ async function processCwd(pid) {
   return result.code === 0 ? result.stdout.split("\n").find((line) => line.startsWith("n"))?.slice(1) || "" : "";
 }
 
-export function isExpectedBotFleetProcess(command, cwd, config) {
+async function processTxtPaths(pid) {
+  const result = await run("lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"], { allowFailure: true });
+  return result.code === 0 ? result.stdout.split("\n").filter((line) => line.startsWith("n")).map(line => line.slice(1)) : [];
+}
+
+/**
+ * Which resolution failures justify quietly packaging on this Mac instead.
+ *
+ * Only "this commit was never built on CI" is a legitimate reason: the point of
+ * `auto` is to install a commit that predates the workflow.  A network failure,
+ * a rate limit, or a checksum mismatch must NOT fall back, because a silent
+ * 15-minute local build would turn a broken pipeline or a tampered artifact
+ * into "it worked, just slowly".
+ */
+export function isRecoverableResolutionFailure(error) {
+  if (!(error instanceof ResolutionError)) return false;
+  if (error.cause === "no-build") return true;
+  // Only a run the workflow was *expected* to cancel justifies a local
+  // fallback.  A genuinely failed build is a signal: its signature gate, its
+  // tests, or its packaging step rejected the commit, and quietly building the
+  // same commit locally for 15 minutes would turn a broken pipeline into a
+  // deceptively successful install.  `cancelled` is the expected outcome
+  // whenever a newer commit lands on main; `in_progress` is worth a moment.
+  if (error.cause === "build-failed") {
+    return ["cancelled", "in_progress"].includes(error.conclusion);
+  }
+  // Network, rate limit, checksum, and bad manifest must all surface: a silent
+  // local package would turn a broken pipeline or a tampered artifact into "it
+  // worked, just slowly".
+  return false;
+}
+
+export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
   const appExecutable = join(config.appPath, "Contents/MacOS/BotFleet");
   if (command === appExecutable || command.startsWith(`${appExecutable} `) || command.startsWith(`${config.appPath}/Contents/`)) {
     return true;
@@ -997,7 +1517,17 @@ export function isExpectedBotFleetProcess(command, cwd, config) {
   const executable = command.trim().split(/\s+/)[0] || "";
   const isNode = ["node", "nodejs"].includes(basename(executable));
   const serverArgument = command.split(/\s+/).some((argument) => argument === "server/index.ts" || argument === join(config.checkout, "server/index.ts"));
-  return isNode && serverArgument && cwd === config.checkout;
+  if (isNode && serverArgument && cwd === config.checkout) {
+    return true;
+  }
+  if (pid) {
+    const txtPaths = await processTxtPaths(pid);
+    const helperPrefix = join(config.appPath, "Contents/Frameworks/BotFleet Helper");
+    if (txtPaths.includes(appExecutable) || txtPaths.some((p) => p.startsWith(helperPrefix))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function stableApplicationProcessError(firstPids, secondPids, openApplication) {
@@ -1210,12 +1740,12 @@ export function credentialPreparationReceiptPath(prepared) {
   return join(prepared.stageDirectory, "credential-migration.json");
 }
 
-async function waitForExit(pids, timeoutMs, { isAlive = processIsAlive, wait = sleep, now = Date.now } = {}) {
+async function waitForExit(pids, timeoutMs, { isAlive, wait = sleep, now = Date.now } = {}) {
   const deadline = now() + timeoutMs;
-  let remaining = pids.filter((pid) => isAlive(pid));
+  let remaining = await withoutExitedPids(pids, { isAlive });
   while (remaining.length && now() < deadline) {
     await wait(250);
-    remaining = remaining.filter((pid) => isAlive(pid));
+    remaining = await withoutExitedPids(remaining, { isAlive });
   }
   return remaining;
 }
@@ -1241,6 +1771,35 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
 }
 
 /**
+ * Record the identity of every running process that holds BotFleet state, so
+ * quiesce can tell the process it captured from a recycled pid.  Exited pids
+ * (a zombie above all) are dropped first: they hold nothing, and a zombie's
+ * command line and working directory are unreliable or empty, so verifying
+ * one would refuse a healthy machine with "owns BotFleet state but does not
+ * match an expected BotFleet executable".  Returns the surviving pids too, so
+ * the caller records only those.
+ */
+export async function captureProcessIdentities(pids, config, {
+  isAlive,
+  commandOf = processCommand,
+  cwdOf = processCwd,
+} = {}) {
+  const live = await withoutExitedPids([...new Set(pids)], { isAlive });
+  const processCommands = {};
+  const processCwds = {};
+  for (const pid of live) {
+    const command = await commandOf(pid);
+    const cwd = await cwdOf(pid);
+    if (!(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
+      throw new Error(`Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`);
+    }
+    processCommands[pid] = command;
+    processCwds[pid] = cwd;
+  }
+  return { pids: live, processCommands, processCwds };
+}
+
+/**
  * Stop the BotFleet processes in `pids`: wait for a graceful exit, SIGTERM
  * whatever is left once its identity checks out, then wait again.  Never
  * SIGKILL.
@@ -1255,6 +1814,12 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
  * never signalled, and never waited on.  Without `current` every pid is
  * held to the strict rule.
  *
+ * A zombie counts as exited.  It has already died and holds nothing; only its
+ * parent can reap it, so it is neither waited on nor signalled, and its parent
+ * is never touched.  `kill -0` cannot tell the difference, which is how two
+ * defunct `cua-driver` processes left by a grok CLI that never reaped them
+ * blocked every apply on 2026-10-08 (processIsAlive reads the `ps` state).
+ *
  * A process exiting on its own is success at every point.  Under load `ps`
  * and `lsof` take seconds, so a process can pass the liveness check and be
  * gone by the time its identity comes back (empty), or by the time the
@@ -1265,7 +1830,7 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
  */
 export async function terminateVerified(pids, previous, config, {
   current,
-  isAlive = processIsAlive,
+  isAlive,
   commandOf = processCommand,
   cwdOf = processCwd,
   kill,
@@ -1281,10 +1846,10 @@ export async function terminateVerified(pids, previous, config, {
     const cwd = await cwdOf(pid);
     const sameAsCaptured = Boolean(previous.processCommands?.[pid]) && previous.processCommands[pid] === command &&
       previous.processCwds?.[pid] === cwd;
-    if (!sameAsCaptured && !isExpectedBotFleetProcess(command, cwd, config)) {
+    if (!sameAsCaptured && !(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
       // Exited while ps and lsof were still describing it: there was no
       // process left to describe, so its identity came back empty.
-      if (!isAlive(pid)) continue;
+      if ((await withoutExitedPids([pid], { isAlive })).length === 0) continue;
       // A captured pid that now names something else: the process the
       // capture saw is gone, and this one never held BotFleet state.
       if (resolvedNow && !resolvedNow.has(pid)) continue;
@@ -1660,6 +2225,26 @@ function createOperations(config) {
 
     buildBundle: async (source, targetCommit) => {
       if (source.providedBundle) return source.providedBundle;
+      // Owner ruling 2026-10-01: GitHub's Mac runners do the building, always.
+      // `pnpm package:mac:local` below is the 10-15 minute electron-builder run
+      // that every recorded update failure was inside, so it is now the
+      // explicit bypass rather than the default.
+      const policy = updateSourcePolicy();
+      if (policy !== "local") {
+        try {
+          const hosted = await downloadBuiltBundle({
+            commit: targetCommit,
+            destination: join(source.stageDirectory, "hosted"),
+          });
+          console.log(`Using the hosted build of ${targetCommit.slice(0, 12)} instead of packaging on this Mac`);
+          return hosted.appPath;
+        } catch (error) {
+          // `ci` must fail loudly: silently falling back to a 15-minute local
+          // build would make the ruling a suggestion and hide a broken pipeline.
+          if (policy === "ci" || !isRecoverableResolutionFailure(error)) throw error;
+          console.error(`No usable hosted build, so packaging on this Mac instead: ${error.message}`);
+        }
+      }
       const identities = await output("security", ["find-identity", "-v", "-p", "codesigning"]);
       if (!identities.includes(EXPECTED_SIGN_IDENTITY)) {
         throw new Error(`Required stable signing identity is unavailable: ${EXPECTED_SIGN_IDENTITY}`);
@@ -1690,6 +2275,21 @@ function createOperations(config) {
 
     validateBundle: validateBuiltBundle,
 
+    smokeTestBundle: async (builtBundle, targetCommit) => {
+      if (!smokeTestEnabled()) {
+        console.log("Skipping the staged smoke test (BOTFLEET_UPDATE_SMOKE=0); the candidate is unproven.");
+        return;
+      }
+      const result = await runStagedSmokeTest({
+        builtBundle,
+        targetCommit,
+        smokeImpl: smokeStagedServer,
+        onRetry: ({ attempt, attempts }) =>
+          console.log(`Staged candidate did not report ready (attempt ${attempt}/${attempts}); retrying once for a busy host.`),
+      });
+      console.log(`Staged candidate ${targetCommit.slice(0, 12)} booted, reported ready, and initialized node:sqlite ✓ (attempt ${result.attempts})`);
+    },
+
     persistPrepared: async ({ source, targetCommit, builtBundle, identity }) => {
       const bundlePath = join(source.stageDirectory, "BotFleet.app");
       if (resolve(builtBundle) !== resolve(bundlePath)) {
@@ -1699,6 +2299,17 @@ function createOperations(config) {
       const copiedIdentity = await validateBuiltBundle(bundlePath, targetCommit);
       if (copiedIdentity.designatedRequirement !== identity.designatedRequirement) {
         throw new Error("Staged copy changed the BotFleet signing requirement");
+      }
+      // The download unpacked into <stage>/hosted and the app was just copied out
+      // of it, so that directory is now a second full copy of the bundle sitting
+      // in the stage.  A stage holding prepared.json is never prunable — it is a
+      // build a later `apply` can still install — so leaving it there means every
+      // prepared stage, which is the normal state between two updates, holds a
+      // duplicate of the app for as long as it exists.  Removed only after the
+      // copy has been validated, so a failure still leaves it for diagnosis.
+      const hostedScratch = join(source.stageDirectory, "hosted");
+      if (resolve(hostedScratch) !== resolve(bundlePath) && await exists(hostedScratch)) {
+        await rm(hostedScratch, { recursive: true, force: true });
       }
       const dependenciesPath = join(source.stageDirectory, "node_modules");
       const sourceDependencies = source.providedDependencies || join(source.path, "node_modules");
@@ -1783,20 +2394,18 @@ function createOperations(config) {
       // Every process inside the bundle, not only its main binary: the swap
       // renames the whole directory, so an embedded driver or helper app has
       // to be accounted for too.
-      const appPids = await bundleProcessPids(config.appPath);
+      const bundlePids = await bundleProcessPids(config.appPath);
       const holders = await sqliteHolders(config.dataDirectory);
-      const runtimePids = [...new Set([...(lastPreflight?.pids || []), lastPreflight?.pid, ...holders].filter(Number.isInteger))];
-      const processCommands = {};
-      const processCwds = {};
-      for (const pid of new Set([...runtimePids, ...appPids])) {
-        const command = await processCommand(pid);
-        const cwd = await processCwd(pid);
-        if (!isExpectedBotFleetProcess(command, cwd, config)) {
-          throw new Error(`Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`);
-        }
-        processCommands[pid] = command;
-        processCwds[pid] = cwd;
-      }
+      const runtimeCandidates = [...new Set([...(lastPreflight?.pids || []), lastPreflight?.pid, ...holders].filter(Number.isInteger))];
+      // Exited processes (zombies above all) are not captured: quiesce would
+      // wait on a pid that can never go away, and a defunct process fails the
+      // identity check below.
+      const { pids: livePids, processCommands, processCwds } = await captureProcessIdentities(
+        [...runtimeCandidates, ...bundlePids],
+        config,
+      );
+      const runtimePids = runtimeCandidates.filter((pid) => livePids.includes(pid));
+      const appPids = bundlePids.filter((pid) => livePids.includes(pid));
       const stamp = Date.now();
       const generation = `${stamp}-${checkoutCommit.slice(0, 12)}`;
       const rollback = await resolveRollbackPlacement({
@@ -1997,26 +2606,34 @@ function createOperations(config) {
     },
 
     verifySingleOwner: async (prepared, previous) => {
-      let firstAppPids = [];
-      let secondAppPids = [];
       if (config.parsed.openApplication !== false) {
-        await sleep(2_000);
-        firstAppPids = await exactAppPids(config.appPath);
-        await sleep(1_000);
-        secondAppPids = await exactAppPids(config.appPath);
+        const deadline = Date.now() + config.startupTimeoutMs;
+        let appError = "Timeout waiting for application to stabilize";
+        let attachmentError = "Timeout waiting for UI attachment";
+        while (Date.now() < deadline) {
+          const firstAppPids = await exactAppPids(config.appPath);
+          await sleep(1_000);
+          const secondAppPids = await exactAppPids(config.appPath);
+          
+          appError = stableApplicationProcessError(firstAppPids, secondAppPids, true);
+          if (!appError) {
+            const snapshot = await runtimeIdentityPreflight(config, prepared);
+            if (!snapshot.safe || snapshot.mode !== "authenticated") {
+              attachmentError = snapshot.reason || "Updated application did not attach to the authenticated single data owner";
+            } else {
+              attachmentError = applicationAttachmentError(snapshot, true);
+            }
+            if (!attachmentError) break;
+          }
+        }
+        if (appError) throw new Error(appError);
+        if (attachmentError) throw new Error(attachmentError);
+      } else {
+        const snapshot = await runtimeIdentityPreflight(config, prepared);
+        if (!snapshot.safe || snapshot.mode !== "authenticated") {
+          throw new Error(snapshot.reason || "Updated application did not attach to the authenticated single data owner");
+        }
       }
-      const appError = stableApplicationProcessError(
-        firstAppPids,
-        secondAppPids,
-        config.parsed.openApplication !== false,
-      );
-      if (appError) throw new Error(appError);
-      const snapshot = await runtimeIdentityPreflight(config, prepared);
-      if (!snapshot.safe || snapshot.mode !== "authenticated") {
-        throw new Error(snapshot.reason || "Updated application did not attach to the authenticated single data owner");
-      }
-      const attachmentError = applicationAttachmentError(snapshot, config.parsed.openApplication !== false);
-      if (attachmentError) throw new Error(attachmentError);
       const survivors = await bundleProcessPids(previous.rollbackPath);
       const survivingError = survivingRollbackProcessError(survivors, previous.rollbackPath);
       if (survivingError) throw new Error(survivingError);

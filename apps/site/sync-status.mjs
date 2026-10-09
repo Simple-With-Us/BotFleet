@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Semi-automated feature-status sync.  Refreshes each feature's PR state
 // (open/merged/closed) in features.json from the GitHub API, and reports
-// merged PRs in jaywedgeworth22/BotFleet that no feature card cites yet —
+// merged PRs in Simple-With-Us/BotFleet that no feature card cites yet —
 // candidates for a new card.  Every BotFleet add-on stays in testing.
 // It never moves a feature between sections; that stays a human/agent judgment call.
 //
@@ -9,14 +9,92 @@
 //        node sync-status.mjs --check  (report only, do not rewrite json)
 import { readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { z } from "zod";
 
 const checkOnly = process.argv.includes("--check");
 const path = new URL("./features.json", import.meta.url);
-const data = JSON.parse(readFileSync(path, "utf8"));
 
+// Both of these cross a trust boundary: one is an external API response and
+// the other is a file this script then rewrites.  A shape change or an error
+// body that happens to parse would otherwise map `undefined` states straight
+// into features.json and be committed as fact.
+//
+// The response is projected down with `--jq` before it ever reaches this
+// process.  That is not only cheaper — a full 100-PR page carries every PR
+// body and blew execFileSync's 1 MiB default maxBuffer, so this script was
+// failing outright on the current repo size — it also means a body that
+// violates the schema cannot leak the rest of the payload into an error
+// message.  maxBuffer is raised anyway, as defence in depth.
+// A jq ARRAY, not a bare `.[]` — jq emits one value per line otherwise, which
+// is not the JSON document this parses.
+const PR_FIELDS = "[.[] | {number, title, state, merged_at}]";
+const prSchema = z.object({
+  number: z.number().int(),
+  title: z.string(),
+  state: z.string(),
+  merged_at: z.string().nullable(),
+});
+const provSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("pr"),
+    prs: z.array(z.number().int()).min(1),
+    state: z.string().optional(),
+    note: z.string().optional(),
+  }),
+  z.object({
+    type: z.enum(["host", "main"]),
+    note: z.string().optional(),
+  }),
+]);
+
+const featureSchema = z
+  .object({
+    title: z.string(),
+    prov: provSchema,
+  })
+  .passthrough();
+
+const sectionSchema = z
+  .object({
+    features: z.array(featureSchema),
+  })
+  .passthrough();
+
+const featuresSchema = z
+  .object({
+    sections: z.array(sectionSchema),
+  })
+  .passthrough();
+
+/** Validate, or explain precisely — a ZodError carries the whole input.
+ *
+ *  Returns NOTHING.  The parsed value is deliberately discarded: `z.object()`
+ * strips undeclared keys unless every level opts out, and this script rewrites
+ * the very file it validated.  Handing the parse result onward would make the
+ * schema a silent transform, so a missing `.passthrough()` anywhere below would
+ * write features.json back stripped of `site`, `exampleFleet`, section ids,
+ * badges and descriptions — committed as if it were the truth.  Validation is a
+ * gate here, never an edit.
+ */
+function assertSchemaMatch(label, schema, value) {
+  const result = schema.safeParse(value);
+  if (result.success) return;
+  const where = result.error.issues
+    .slice(0, 10)
+    .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+    .join("; ");
+  throw new Error(`${label} did not match the expected shape — ${where}`);
+}
+
+const data = JSON.parse(readFileSync(path, "utf8"));
+assertSchemaMatch("features.json", featuresSchema, data);
 const prs = JSON.parse(
-  execFileSync("gh", ["api", "repos/jaywedgeworth22/BotFleet/pulls?state=all&per_page=100"], { encoding: "utf8" })
+  execFileSync("gh", ["api", "repos/Simple-With-Us/BotFleet/pulls?state=all&per_page=100", "--jq", PR_FIELDS], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  }),
 );
+assertSchemaMatch("the GitHub pulls response", z.array(prSchema), prs);
 const stateOf = new Map(prs.map((p) => [p.number, p.merged_at ? "merged" : p.state]));
 
 let changed = 0;

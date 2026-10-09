@@ -8,7 +8,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { startCua, stopCua, registerCuaIpc, setCuaStateListener } from "./cua.mjs";
 import { createAndroidDeviceController } from "./android-device.mjs";
 import { assemblyAICredential, mintAssemblyAIStreamingToken } from "./assemblyai.mjs";
-import { finishSpeech, startSpeech, stopSpeech } from "./speech.mjs";
+import {
+  finishSpeech,
+  listPersonalVoices,
+  speakPersonalVoice,
+  startSpeech,
+  stopPersonalVoice,
+  stopSpeech,
+} from "./speech.mjs";
 import {
   recorderPermissionStatus,
   saveSkillRecording,
@@ -906,6 +913,7 @@ async function startServerOn(port) {
     OMB_STATIC_DIR: path.join(process.resourcesPath, "ui"),
     OMB_RESOURCES_PATH: process.resourcesPath,
     OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
+    OMB_BOTS_DIR: path.join(process.resourcesPath, "bots"),
     OMB_PORT: String(port),
     OMB_USER_DATA: app.getPath("userData"),
     ...(secureCredentials.composioApiKey
@@ -1797,6 +1805,30 @@ ipcMain.handle("speech:finish", () => {
   if (nativeActions.appleSpeech) finishSpeech();
 });
 
+ipcMain.handle("personal-voice:available", () => nativeActions.appleSpeech);
+ipcMain.handle("personal-voice:list", async () => {
+  if (!nativeActions.appleSpeech) return [];
+  return listPersonalVoices();
+});
+ipcMain.handle("personal-voice:speak", async (event, text, voiceId, options) => {
+  if (!nativeActions.appleSpeech) throw new Error("Personal Voice requires macOS.");
+  // Word ranges go back only to the window that asked, tagged with the id
+  // its preload chose, and carry numbers only: no text crosses back.
+  const progressId = Number(options?.progressId);
+  const sender = event.sender;
+  const onRange = Number.isSafeInteger(progressId) && progressId > 0
+    ? ({ location, length, elapsedMs }) => {
+      if (!sender.isDestroyed()) {
+        sender.send("personal-voice:range", { id: progressId, location, length, elapsedMs });
+      }
+    }
+    : undefined;
+  return speakPersonalVoice(text, voiceId, { onRange });
+});
+ipcMain.handle("personal-voice:stop", () => {
+  if (nativeActions.appleSpeech) stopPersonalVoice();
+});
+
 ipcMain.handle("skill-recorder:permissions", () => recorderPermissionStatus());
 ipcMain.handle("skill-recorder:start", (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
@@ -2215,7 +2247,7 @@ function setupApplicationMenu() {
       submenu: [
         {
           label: "BotFleet Documentation",
-          click: () => shell.openExternal("https://github.com/jaywedgeworth22/BotFleet"),
+          click: () => shell.openExternal("https://github.com/Simple-With-Us/BotFleet"),
         },
         {
           label: "Open Logs & Data Folder",
@@ -2489,6 +2521,9 @@ app.on("before-quit", (e) => {
   // a live dictation session runs its own helper child that holds the mic —
   // stop it here so quitting never orphans a recording process
   if (nativeActions.appleSpeech) stopSpeech();
+  // a speaking Personal Voice helper parks in its own run loop until the stop
+  // marker appears; write it so quitting never leaves one behind
+  if (nativeActions.appleSpeech) stopPersonalVoice();
   stopRecorder();
   const cleanup = Promise.race([
     Promise.all([

@@ -30,7 +30,7 @@ To prevent runaway token consumption, BotFleet enforces a strict separation:
    - The message posted to the App Channel is an **Event Capsule** strictly capped at 250 tokens (~1 KB).
    - An Event Capsule contains only high-signal structured fields:
      - `Event Type`: e.g.  `workflow_job.completed`
-     - `Source / Target`: Repository or service name (e.g.  `jaywedgeworth22/BotFleet`)
+     - `Source / Target`: Repository or service name (e.g.  `Simple-With-Us/BotFleet`)
      - `Status / Severity`: `failure` / `error`
      - `Headline`: Single-sentence summary of the failure (e.g.  `Job 'build-test' failed on branch main at commit 4a12bc8`)
      - `Payload Reference`: `delivery_id: wh_del_...`

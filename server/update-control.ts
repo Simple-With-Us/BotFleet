@@ -32,6 +32,10 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+// One definition, shared with the updater's own sweeper.  Two copies of this
+// allowlist existed and drifted, and the drift was a multi-gigabyte disk leak
+// rather than a cosmetic bug — see scripts/stage-entries.mjs.
+import { stageIsPrunable } from "../scripts/stage-entries.mjs";
 import { fileURLToPath } from "node:url";
 
 export const UPDATE_PROGRESS_SCHEMA_VERSION = 1;
@@ -75,19 +79,7 @@ const KEPT_RUN_ARTIFACTS = 8;
 /** What the updater itself puts in a stage directory — the same list
  * `scripts/update-botfleet-mac.mjs` sweeps by.  Anything else in there was
  * put there by a person, and a person decides when it goes. */
-const KNOWN_STAGE_ENTRIES = new Set([
-  "BotFleet.app",
-  "node_modules",
-  "prepared.json",
-  "rollback",
-  "source",
-  "pending-recovery.json",
-  "credential-migration.json",
-]);
-/** A stage holding either of these is load-bearing: `prepared.json` is a
- * build a later `apply` can still install, and `rollback` holds the verified
- * bundle the installed app would be rolled back to. */
-const PROTECTED_STAGE_ENTRIES = new Set(["prepared.json", "rollback"]);
+
 
 export interface UpdateCommit {
   sha: string;
@@ -99,6 +91,24 @@ export interface UpdateAvailable {
   version?: string;
   aheadBy: number;
   commits: UpdateCommit[];
+  /** The INSTALLED commit this `aheadBy` was counted from.
+   *
+   *  `aheadBy` is a distance, so it means nothing without its baseline.  The
+   *  baseline used to be implied by the install's own timestamp, which cannot
+   *  survive an update: the replacement bundle's `build-identity.json` mtime
+   *  dates the BUILD, not the install, and a build staged hours before the
+   *  install left a remembered answer looking newer than the install it
+   *  predated.  The status route then served that answer forever — a Mac that
+   *  had just installed and verified the newest build still advertised "125
+   *  commits behind" when the true distance was 4.
+   *
+   *  Recording the baseline makes staleness a question of identity instead of
+   *  clock comparison: an answer counted from any commit other than the one
+   *  installed now describes a Mac that no longer exists.  Answers written
+   *  before this field existed have no baseline and are refused as
+   *  unplaceable, which is the same treatment an unparseable `checkedAt`
+   *  already gets below. */
+  baselineCommit?: string;
 }
 
 export interface UpdateRunning {
@@ -332,6 +342,7 @@ export const UPDATE_STEP_LABELS: Record<string, string> = {
   installDependencies: "Installing dependencies",
   buildBundle: "Building and signing the app",
   validateBundle: "Verifying the signature and identity",
+  smokeTestBundle: "Verifying the new build actually starts",
   persistPrepared: "Recording the prepared build",
   validatePrepared: "Re-checking the prepared build",
   preflight: "Checking for work in flight",
@@ -444,6 +455,12 @@ export function availableIsStale(input: {
 }): boolean {
   if (!input.available) return true;
   if (input.available.sourceCommit === input.installedCommit) return true;
+  // Identity before clock.  An answer counted from a commit other than the one
+  // installed now cannot be refreshed into a correct one, whatever its
+  // timestamp says, so refuse it outright.  An answer carrying no baseline
+  // predates this field and is equally unplaceable; both cases drop to a fresh
+  // check instead of being served.
+  if (input.available.baselineCommit !== input.installedCommit) return true;
   const recorded = input.checkedAt ? Date.parse(input.checkedAt) : Number.NaN;
   // An answer with no readable timestamp cannot be placed relative to the
   // install, and an unplaceable answer is not one to act on.
@@ -545,8 +562,7 @@ export function stagesToPrune(entries: StageDirectoryEntry[], options: {
   const protect = options.protect ?? [];
   const prunable = entries.filter((entry) => {
     if (protect.includes(entry.path)) return false;
-    if (entry.names.some((name) => PROTECTED_STAGE_ENTRIES.has(name))) return false;
-    return entry.names.every((name) => KNOWN_STAGE_ENTRIES.has(name));
+    return stageIsPrunable(entry.names);
   });
   return [...prunable]
     .sort((left, right) => right.stamp - left.stamp)
@@ -983,6 +999,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       sourceCommit: value.sourceCommit,
       version: typeof value.version === "string" ? value.version : undefined,
       aheadBy: Number.isInteger(value.aheadBy) ? (value.aheadBy as number) : 0,
+      baselineCommit: typeof value.baselineCommit === "string" && /^[a-f0-9]{40}$/.test(value.baselineCommit)
+        ? value.baselineCommit
+        : undefined,
       commits: Array.isArray(value.commits)
         ? (value.commits as unknown[])
             .filter((one): one is UpdateCommit =>
@@ -1291,6 +1310,10 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
           sourceCommit: target,
           version,
           aheadBy: Number.isFinite(aheadBy) ? aheadBy : 0,
+          // `aheadBy` is counted from whatever is installed right now, so say
+          // so in the same breath.  A remembered answer whose baseline no
+          // longer matches is refused on sight.
+          baselineCommit: deps.installed.sourceCommit,
           commits: listed.code === 0
             ? listed.stdout
                 .split("\n")

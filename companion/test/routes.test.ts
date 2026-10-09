@@ -77,6 +77,8 @@ describe("what the app may do", () => {
     ["GET", "/api/attachments/avatar-123.webp"],
     ["GET", "/api/tts/voices"],
     ["POST", "/api/tts/speak"],
+    ["PATCH", "/api/tts/default-voice"],
+    ["PATCH", "/api/tts/pronunciations"],
     ["POST", "/api/threads/th_1/messages/msg_2/audio"],
     ["GET", "/api/threads/th_1/messages/msg_2/audio/0"],
     ["GET", "/api/routines"],
@@ -136,6 +138,7 @@ describe("what it may not", () => {
     // fields on profile are still refused by the harness, not widened here.
     expect(ask("PATCH", "/api/bots/bot_123/profile")).toBeNull();
     expect(ask("POST", "/api/threads/th_1/respond")).toBeNull();
+    expect(ask("POST", "/api/threads/th_1/approve-all")).toBeNull();
   });
 
   it("accepts every paired profile field and refuses host-control fields", () => {
@@ -145,6 +148,7 @@ describe("what it may not", () => {
     for (const field of [
       "autoApprove",
       "autoReview",
+      "bypassPermissions",
       "composio",
       "connectorTools",
       "computers",
@@ -162,6 +166,34 @@ describe("what it may not", () => {
         error: `${field} can only be changed in BotFleet on your computer`,
       });
     }
+  });
+
+  it("lets the phone turn a bot Off and back On, and only through the profile route", () => {
+    // The phone's disabled composer has one button, Turn On, so a refusal here
+    // would strand an Off bot on the phone.
+    expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("off");
+    expect(companionProfilePatchDenial({ off: true })).toBeNull();
+    expect(companionProfilePatchDenial({ off: false })).toBeNull();
+    // Switching it is not a way to smuggle a host-control field along.
+    expect(companionProfilePatchDenial({ off: false, autoApprove: true })).toEqual({
+      status: 403,
+      error: "autoApprove can only be changed in BotFleet on your computer",
+    });
+    // The general bot PATCH is not on the phone's route list.
+    expect(allowed("PATCH", "/api/bots/b_1")).toBe(false);
+    expect(allowed("PATCH", "/api/bots/b_1/profile")).toBe(true);
+  });
+
+  it("lets the phone write per-device voices", () => {
+    expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("voices");
+    expect(companionProfilePatchDenial({ voices: { iphone: "English_Graceful_Lady" } })).toBeNull();
+    expect(companionProfilePatchDenial({ voices: null, speechDevices: ["mac", "iphone"] })).toBeNull();
+  });
+
+  it("permits a device-qualified clip GET", () => {
+    // The sidecar matches the path with the query removed and forwards the
+    // query untouched, so `?device=` needs no allowlist entry of its own.
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/audio/0")).toBeNull();
   });
 
   it("permits message-linked audio but not arbitrary attachment audio", () => {
@@ -351,5 +383,25 @@ describe("settings display preferences", () => {
     expect(ask("PATCH", "/api/features", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/room-turn-timeout", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/profile", false)?.status).toBe(401);
+  });
+});
+
+describe("workspace voice settings", () => {
+  it("lets the phone change the default voice and the pronunciation list, and nothing else under tts", () => {
+    expect(allowed("PATCH", "/api/tts/default-voice")).toBe(true);
+    expect(allowed("PATCH", "/api/tts/pronunciations")).toBe(true);
+    expect(allowed("PUT", "/api/tts/default-voice")).toBe(false);
+    expect(allowed("POST", "/api/tts/pronunciations")).toBe(false);
+    expect(allowed("GET", "/api/tts/pronunciations")).toBe(false);
+    expect(allowed("PATCH", "/api/tts/default-voice/extra")).toBe(false);
+    expect(allowed("PATCH", "/api/tts/key")).toBe(false);
+    expect(allowed("POST", "/api/tts/voice-clone")).toBe(false);
+    expect(allowed("PATCH", "/api/config")).toBe(false);
+    expect(allowed("PUT", "/api/config")).toBe(false);
+  });
+
+  it("still refuses an unpaired device", () => {
+    expect(ask("PATCH", "/api/tts/default-voice", false)?.status).toBe(401);
+    expect(ask("PATCH", "/api/tts/pronunciations", false)?.status).toBe(401);
   });
 });

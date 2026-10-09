@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   computeRoomAttentionIndex,
+  isBotTurnError,
   summarizeFleetAttention,
   type MinimalBot,
   type MinimalGroup,
@@ -82,6 +83,7 @@ describe("computeRoomAttentionIndex", () => {
     const st = result.find((r) => r.roomId === "group-st")!;
     expect(st.errors.count).toBe(1);
     expect(st.errors.bots[0].botName).toBe("Scout");
+    expect(st.errors.bots[0].reason).toBe("Process terminated");
     expect(st.working.count).toBe(0);
     expect(st.needsAction.count).toBe(0);
     expect(st.unread.count).toBe(1); // group unread is true
@@ -183,5 +185,196 @@ describe("computeRoomAttentionIndex", () => {
     expect(summary.totalWorking).toBe(1);
     expect(summary.roomsWithUnread).toBe(1);
     expect(summary.totalUnread).toBe(2);
+  });
+
+  it("includes bots with active turn errors in room errors and reasons", () => {
+    const groups: MinimalGroup[] = [
+      {
+        id: "group-bf",
+        name: "BotFleet",
+        memberIds: ["bot-err"],
+        unread: false,
+      },
+    ];
+
+    const bots: MinimalBot[] = [
+      {
+        id: "bot-err",
+        name: "Builder",
+        activity: "idle",
+        messages: [
+          { kind: "text" },
+          { kind: "activity", tool: { name: "error: rate limit from provider" } },
+        ],
+      },
+    ];
+
+    expect(isBotTurnError(bots[0])).toBe(true);
+    const result = computeRoomAttentionIndex(groups, bots);
+    expect(result[0].errors.count).toBe(1);
+    expect(result[0].errors.bots[0].botName).toBe("Builder");
+    expect(result[0].errors.bots[0].reason).toBe("Turn error: rate limit from provider");
+  });
+
+  it("reads a turn error from the visible branch, not the flat message tail", () => {
+    const groups: MinimalGroup[] = [
+      {
+        id: "group-bf",
+        name: "BotFleet",
+        memberIds: ["bot-fork", "bot-stale"],
+        unread: false,
+      },
+    ];
+
+    const bots: MinimalBot[] = [
+      {
+        id: "bot-fork",
+        name: "Builder",
+        activity: "idle",
+        activeLeafId: "err",
+        messages: [
+          { id: "root", kind: "text", parentId: null },
+          { id: "err", kind: "activity", parentId: "root", tool: { name: "error: rate limit from provider" } },
+          { id: "abandoned", kind: "text", parentId: "root" },
+        ],
+      },
+      {
+        id: "bot-stale",
+        name: "Scout",
+        activity: "idle",
+        activeLeafId: "live",
+        messages: [
+          { id: "root", kind: "text", parentId: null },
+          { id: "live", kind: "text", parentId: "root" },
+          { id: "old-err", kind: "activity", parentId: "root", tool: { name: "error: abandoned branch" } },
+        ],
+      },
+    ];
+
+    expect(isBotTurnError(bots[0])).toBe(true);
+    expect(isBotTurnError(bots[1])).toBe(false);
+    const result = computeRoomAttentionIndex(groups, bots);
+    expect(result[0].errors.count).toBe(1);
+    expect(result[0].errors.bots.map((bot) => bot.botName)).toEqual(["Builder"]);
+    expect(result[0].errors.bots[0].reason).toBe("Turn error: rate limit from provider");
+  });
+
+  it("reuses one transcript for a bot shared by two rooms", () => {
+    const messages = [
+      { id: "root", kind: "text", parentId: null },
+      { id: "err", kind: "activity", parentId: "root", tool: { name: "error: rate limit from provider" } },
+      { id: "abandoned", kind: "text", parentId: "root" },
+    ];
+    const bot: MinimalBot = {
+      id: "bot-shared",
+      name: "Builder",
+      activity: "idle",
+      activeLeafId: "err",
+      messages,
+    };
+    const groups: MinimalGroup[] = [
+      { id: "room-a", name: "A", memberIds: ["bot-shared"], unread: false },
+      { id: "room-b", name: "B", memberIds: ["bot-shared"], unread: false },
+    ];
+
+    const result = computeRoomAttentionIndex(groups, [bot]);
+    expect(result.map((room) => room.errors.bots[0]?.reason)).toEqual([
+      "Turn error: rate limit from provider",
+      "Turn error: rate limit from provider",
+    ]);
+    expect(isBotTurnError(bot)).toBe(true);
+
+    const again = computeRoomAttentionIndex(groups, [bot]);
+    expect(again.map((room) => room.roomId)).toEqual(["room-a", "room-b"]);
+    expect(again.map((room) => room.errors.count)).toEqual([1, 1]);
+    expect(again.map((room) => room.errors.bots[0].reason)).toEqual([
+      "Turn error: rate limit from provider",
+      "Turn error: rate limit from provider",
+    ]);
+  });
+
+  it("uses the leaf as the visible tail, including a deep chain and a cycle", () => {
+    const deep = [
+      { id: "m0", kind: "text", parentId: null },
+      ...Array.from({ length: 40 }, (_, i) => ({
+        id: `m${i + 1}`,
+        kind: "text",
+        parentId: `m${i}`,
+      })),
+      {
+        id: "leaf",
+        kind: "activity",
+        parentId: "m40",
+        tool: { name: "error: leaf on the visible branch" },
+      },
+      {
+        id: "flat-tail",
+        kind: "activity",
+        parentId: "m0",
+        tool: { name: "error: abandoned flat tail" },
+      },
+    ];
+    const deepBot: MinimalBot = {
+      id: "bot-deep",
+      name: "Builder",
+      activity: "idle",
+      activeLeafId: "leaf",
+      messages: deep,
+    };
+
+    const cycle: MinimalBot = {
+      id: "bot-cycle",
+      name: "Scout",
+      activity: "idle",
+      activeLeafId: "loop-leaf",
+      messages: [
+        { id: "loop-leaf", kind: "activity", parentId: "loop-mid", tool: { name: "error: cycle leaf" } },
+        { id: "loop-mid", kind: "activity", parentId: "loop-leaf", tool: { name: "error: cycle parent" } },
+        { id: "flat-tail", kind: "activity", parentId: null, tool: { name: "error: cycle flat tail" } },
+      ],
+    };
+
+    const missingLeaf: MinimalBot = {
+      id: "bot-missing",
+      name: "Fixer",
+      activity: "idle",
+      activeLeafId: "not-in-transcript",
+      messages: [
+        { id: "root", kind: "text", parentId: null },
+        { id: "flat-tail", kind: "activity", parentId: "root", tool: { name: "error: flat fallback" } },
+      ],
+    };
+
+    const ancestorOnly: MinimalBot = {
+      id: "bot-ancestor",
+      name: "Archivist",
+      activity: "idle",
+      activeLeafId: "clean-leaf",
+      messages: [
+        { id: "root", kind: "activity", parentId: null, tool: { name: "error: ancestor only" } },
+        { id: "clean-leaf", kind: "text", parentId: "root" },
+        { id: "flat-tail", kind: "activity", parentId: "root", tool: { name: "error: not the leaf" } },
+      ],
+    };
+
+    expect(isBotTurnError(deepBot)).toBe(true);
+    expect(isBotTurnError(cycle)).toBe(true);
+    expect(isBotTurnError(missingLeaf)).toBe(true);
+    expect(isBotTurnError(ancestorOnly)).toBe(false);
+
+    const groups: MinimalGroup[] = [
+      {
+        id: "room",
+        name: "BotFleet",
+        memberIds: ["bot-deep", "bot-cycle", "bot-missing", "bot-ancestor"],
+        unread: false,
+      },
+    ];
+    const result = computeRoomAttentionIndex(groups, [deepBot, cycle, missingLeaf, ancestorOnly]);
+    expect(result[0].errors.bots.map((bot) => [bot.botName, bot.reason])).toEqual([
+      ["Builder", "Turn error: leaf on the visible branch"],
+      ["Scout", "Turn error: cycle leaf"],
+      ["Fixer", "Turn error: flat fallback"],
+    ]);
   });
 });

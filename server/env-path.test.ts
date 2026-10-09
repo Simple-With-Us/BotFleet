@@ -2,12 +2,12 @@
 // well-known install dir — or an nvm bin dir — must be findable even
 // when the process itself started with a bare GUI PATH.
 import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { augmentedPath, resetPathCache, resetPathCacheForTests, splitCliString } from "./env-path.ts";
+import { augmentedPath, findCliCandidates, resetPathCache, resetPathCacheForTests, splitCliString } from "./env-path.ts";
 import { resolveCli } from "./procs.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
 
@@ -119,6 +119,275 @@ describe("augmentedPath", () => {
     const parts = augmentedPath().split(delimiter);
     // temp home: .volta was never created, so it must not appear
     expect(parts).not.toContain(join(homedir(), ".volta", "bin"));
+  });
+
+  const posixIt2 = it.skipIf(process.platform === "win32");
+
+  // Hoisting is gated on the farm really shadowing the CLI, so the tests that
+  // expect a hoist plant the shape the MiniMax Code installer leaves behind:
+  // the real CLI in the canonical dir and a symlink to it in the farm.  A
+  // symlink, not a copy, so findCliCandidates' dedupeByInode collapses the two
+  // into one row and only PATH order decides which path that row is.
+  const plantShims = (installerDir: string, symlinkFarm: string, name = "mcode"): void => {
+    const real = join(installerDir, name);
+    const shim = join(symlinkFarm, name);
+    writeFileSync(real, "#!/bin/sh\nexit 0\n");
+    chmodSync(real, 0o755);
+    rmSync(shim, { force: true });
+    symlinkSync(real, shim);
+  };
+
+  // setup.ts shares one throwaway home across this file, so shims an earlier
+  // test planted would otherwise still be there for the gating tests below.
+  const freshDirs = (...dirs: string[]): void => {
+    for (const d of dirs) {
+      rmSync(d, { recursive: true, force: true });
+      mkdirSync(d, { recursive: true });
+    }
+  };
+
+  posixIt2("puts a canonical installer dir ahead of the ~/.local/bin symlink farm", () => {
+    // The MiniMax Code installer drops a ~/.local/bin/mcode symlink to a
+    // launcher that is not symlink-safe: it resolves its data dir from the
+    // parent of its own path, so through the symlink it exits non-zero.  This
+    // ordering is what decides whether the engine can start.
+    //
+    // The dirs are created rather than probed for: setup.ts points homedir()
+    // at a throwaway home, so without them knownDirs()'s existsSync filter
+    // drops both and this test would assert nothing at all.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    mkdirSync(installerDir, { recursive: true });
+    mkdirSync(symlinkFarm, { recursive: true });
+    resetPathCacheForTests();
+    const parts = augmentedPath().split(delimiter);
+    const installer = parts.indexOf(installerDir);
+    const symlinks = parts.indexOf(symlinkFarm);
+    expect(installer).toBeGreaterThanOrEqual(0);
+    expect(symlinks).toBeGreaterThanOrEqual(0);
+    expect(installer).toBeLessThan(symlinks);
+  });
+
+  posixIt2("keeps the canonical installer dir first when the inherited PATH carries the symlink farm", () => {
+    // knownDirs() order is not enough on its own: augmentedPath() merges
+    // OMB_EXTRA_PATH, the inherited PATH and the login-shell probe AHEAD of
+    // knownDirs(), and any of those can carry ~/.local/bin.  A GUI launch hits
+    // exactly that case, and every resetPathCache() rebuilds the merge with
+    // those sources first — so the symlink farm reclaimed first position on
+    // the next rescan even with knownDirs() ordered correctly.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    mkdirSync(installerDir, { recursive: true });
+    mkdirSync(symlinkFarm, { recursive: true });
+    plantShims(installerDir, symlinkFarm);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      const installer = parts.indexOf(installerDir);
+      const symlinks = parts.indexOf(symlinkFarm);
+      expect(installer).toBeGreaterThanOrEqual(0);
+      expect(symlinks).toBeGreaterThanOrEqual(0);
+      expect(installer).toBeLessThan(symlinks);
+      // The farm entry is a symlink to the canonical CLI, so dedupeByInode
+      // keeps one row: whichever path PATH order reaches first.  Without the
+      // hoist that row would be the farm symlink, the copy that cannot run.
+      // (Only the head is pinned: the inherited PATH may carry a real mcode.)
+      const candidates = findCliCandidates("mcode");
+      expect(candidates[0]).toBe(join(installerDir, "mcode"));
+      expect(candidates).not.toContain(join(symlinkFarm, "mcode"));
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("emits every PATH entry exactly once, including a hoisted dir", () => {
+    // The hoisting fix hoists the canonical dir ahead of the symlink farm, but
+    // mergePaths dedupes BEFORE promoteCanonicalDirs runs — so without dropping
+    // the original slot the dir appears twice, once hoisted and once in place.
+    // An index comparison cannot see that (the two tests above both passed with
+    // the duplicate present), so uniqueness is asserted directly here.
+    //
+    // The symlink farm is put into the inherited PATH explicitly: hoisting only
+    // happens when the farm is present in the merged list, so without this the
+    // assertion would pass on an unhoisted PATH and test nothing.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    mkdirSync(installerDir, { recursive: true });
+    mkdirSync(symlinkFarm, { recursive: true });
+    plantShims(installerDir, symlinkFarm);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      // the hoisting path must actually have run, or this is vacuous again
+      expect(parts.indexOf(installerDir)).toBeGreaterThanOrEqual(0);
+      expect(parts.indexOf(symlinkFarm)).toBeGreaterThanOrEqual(0);
+      expect(parts.length).toBeGreaterThan(0);
+      expect(new Set(parts).size).toBe(parts.length);
+      // and the hoisted dir specifically appears once, in its promoted slot
+      expect(parts.filter((p) => p === installerDir)).toHaveLength(1);
+      expect(parts.indexOf(installerDir)).toBeLessThan(parts.indexOf(symlinkFarm));
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("leaves a canonical dir already ahead of the farm where it is", () => {
+    // Hoisting exists to keep the installer dirs ahead of the ~/.local/bin
+    // symlink farm — not to promote them ahead of everything else.  When a
+    // canonical dir already outranks the farm it keeps its inherited place,
+    // so no other CLI's resolution changes.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    const systemDir = join(homedir(), ".system-bin");
+    mkdirSync(installerDir, { recursive: true });
+    mkdirSync(symlinkFarm, { recursive: true });
+    mkdirSync(systemDir, { recursive: true });
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [installerDir, systemDir, symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      const installer = parts.indexOf(installerDir);
+      const system = parts.indexOf(systemDir);
+      const symlinks = parts.indexOf(symlinkFarm);
+      expect(installer).toBeGreaterThanOrEqual(0);
+      expect(system).toBeGreaterThanOrEqual(0);
+      expect(symlinks).toBeGreaterThanOrEqual(0);
+      // The canonical dir keeps its inherited position relative to the
+      // system dir — hoisting only closes the gap to the farm.
+      expect(installer).toBeLessThan(system);
+      expect(installer).toBeLessThan(symlinks);
+      // Pin the exact order rather than the two inequalities above.  Those
+      // also admit [installerDir, symlinkFarm, systemDir], which hoisting
+      // across the system dir would produce; the tuple pins the whole
+      // relative order, so a relocation anywhere in the first three fails.
+      expect(parts.slice(0, 3)).toEqual([installerDir, systemDir, symlinkFarm]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("leaves the merged PATH order alone when the farm carries no shim", () => {
+    // Kody #759: the GUI-launch shape puts the farm at index 0, so an
+    // unconditional hoist moved ~/.minimax-code/bin ahead of /usr/bin and
+    // every other inherited entry, changing resolution for any binary the
+    // canonical dir shares with them.  With no ~/.local/bin/mcode to shadow,
+    // there is nothing to fix and the order must be exactly the merge order.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    const systemDir = join(homedir(), ".system-bin");
+    freshDirs(installerDir, symlinkFarm, systemDir);
+    // The canonical dir has the real CLI; only the farm's shim is missing.
+    writeFileSync(join(installerDir, "mcode"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(installerDir, "mcode"), 0o755);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, systemDir, installerDir, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      expect(parts.slice(0, 3)).toEqual([symlinkFarm, systemDir, installerDir]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("does not hoist a canonical dir that lacks the CLI the farm shadows", () => {
+    // A farm shim with no canonical copy behind it gains nothing from the
+    // move, so the dir stays where the merge put it.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    const systemDir = join(homedir(), ".system-bin");
+    freshDirs(installerDir, symlinkFarm, systemDir);
+    writeFileSync(join(symlinkFarm, "mcode"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(symlinkFarm, "mcode"), 0o755);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, systemDir, installerDir, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      expect(parts.slice(0, 3)).toEqual([symlinkFarm, systemDir, installerDir]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("hoists only the installer whose CLI the farm shadows", () => {
+    // Each canonical dir is gated on its own shim: a farm carrying only
+    // `mcode` moves ~/.minimax-code/bin and leaves ~/.kimi-code/bin in place.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const kimiDir = join(homedir(), ".kimi-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    const systemDir = join(homedir(), ".system-bin");
+    freshDirs(installerDir, kimiDir, symlinkFarm, systemDir);
+    plantShims(installerDir, symlinkFarm);
+    writeFileSync(join(kimiDir, "kimi"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(kimiDir, "kimi"), 0o755);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, systemDir, kimiDir, installerDir, ...(previous ?? "").split(delimiter)].join(
+        delimiter,
+      );
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      expect(parts.slice(0, 4)).toEqual([installerDir, symlinkFarm, systemDir, kimiDir]);
+      expect(new Set(parts).size).toBe(parts.length);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("resolves the canonical mcode ahead of the ~/.local/bin one", async () => {
+    // The reason any of the ordering above matters.  Every ordering assertion
+    // in this file is an index comparison, and an index comparison cannot see
+    // a swap of two real files: both dirs sit in the merged PATH either way
+    // and only their order decides which one a bare `mcode` executes.  This
+    // asserts the resolved binary instead, then runs the winner to prove it.
+    //
+    // The inherited PATH carries the symlink farm and no canonical dir —
+    // the GUI-launch shape, and the case knownDirs() ordering alone loses,
+    // since the farm arrives ahead of every known dir in the merge.
+    // plantShims mirrors the installer: a real CLI in the canonical dir and a
+    // farm symlink to it, so findCliCandidates' dedupeByInode path is exercised
+    // the same way production does.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    freshDirs(installerDir, symlinkFarm);
+    plantShims(installerDir, symlinkFarm);
+    const canonical = join(installerDir, "mcode");
+    writeFileSync(canonical, "#!/bin/sh\necho canonical\n");
+    chmodSync(canonical, 0o755);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const candidates = findCliCandidates("mcode");
+      expect(candidates[0]).toBe(canonical);
+      expect(candidates).toHaveLength(1);
+      const stdout = await new Promise<string>((resolve, reject) => {
+        execFile("mcode", [], { env: { PATH: augmentedPath() } }, (err, out) => (err ? reject(err) : resolve(out)));
+      });
+      expect(stdout.trim()).toBe("canonical");
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
   });
 
   it.skipIf(process.platform !== "win32")("finds Antigravity installed after launch", () => {

@@ -101,7 +101,7 @@ Reviewers originally tagged some layout/theme items P0.  Those are restated here
 | C6 | README Quick start still points at OpenMausBot.dmg / `~/.openmausbot` | `README.md` | Runtime is `~/.botfleet`; docs install page is already BotFleet. |
 | C7 | botfleet.app Download CTA hits source-repo Releases | `apps/site/index.html` | Artifacts live in `milind-soni/botfleet-releases`.  Docs are correct; the site is not. |
 | C8 | Marketing TestFlight CTA uses undefined CSS vars | `apps/site/index.html` | `--card` / `--hairline` / `--ink-muted` are not defined. |
-| C9 | Docs “Build from source” clones `milind-soni/BotFleet` | `apps/docs/.../installation.mdx` | Canonical source is `jaywedgeworth22/BotFleet`. |
+| C9 | Docs “Build from source” clones `milind-soni/BotFleet` | `apps/docs/.../installation.mdx` | Canonical source is `Simple-With-Us/BotFleet`. |
 
 ### Drivers / engines
 
@@ -208,7 +208,7 @@ Work these as separate PRs.  Land #18 and #12 rather than rewriting them.
 5. **Electron trust:** allowlist `setWindowOpenHandler`; confine `open-file`/`show-in-folder`; `fileURLToPath` on Windows; `setAppUserModelId`.
 6. **Auto-approve:** fail closed on pipe-to-interpreter; never Always-allow network fetch tools by program name alone; control-client fail **closed** while configured.
 7. **Composio broker:** `REGISTRATION_MODE=closed` in prod; persist Session upgrade in D1; add disable/rotate.
-8. **Download truth:** README + `apps/site` CTA → `milind-soni/botfleet-releases`; docs clone → `jaywedgeworth22/BotFleet`; fix site CSS vars; demote Established features that still have `state: "open"` PRs.
+8. **Download truth:** README + `apps/site` CTA → `milind-soni/botfleet-releases`; docs clone → `Simple-With-Us/BotFleet`; fix site CSS vars; demote Established features that still have `state: "open"` PRs.
 9. **Recovery UX** — board `92a254df` as specified (toast + computer-dispatch cards + Switch-model / Add-key).
 10. **Layout:** overlay right rails below ~1100px; Settings as a sheet on `max-md`; 44px tap targets; show hover-only actions on coarse pointers.
 

@@ -86,6 +86,6 @@ export const CONVERSATION_MODE_COPY: Record<
   projects: {
     title: "Projects",
     subtitle:
-      "Categories with any number of threads under them.  Each thread picks a model.  Named bots stay hidden.",
+      "Categories with any number of threads under them.\u00a0 Each thread picks a model.\u00a0 Named bots stay hidden.",
   },
 };

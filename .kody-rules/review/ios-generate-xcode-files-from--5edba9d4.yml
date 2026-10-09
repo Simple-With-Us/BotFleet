@@ -29,7 +29,7 @@ rule: >-
   `group.com.socratictrade` App Group entitlement until it is assigned in the
   Developer Portal. SwiftUI rules: `@Observable` + `@MainActor` on stores (never
   `ObservableObject`), `NavigationStack` + value-based `NavigationLink` (never
-  `NavigationView`), light theme default, two spaces between sentences in
+  `NavigationView`), system theme default, two spaces between sentences in
   user-visible copy, and secrets stay in `~/.secrets/`/Infisical and are never
   printed.
 severity: high

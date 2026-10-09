@@ -28,6 +28,10 @@ import {
   type UpdateControl,
   type UpdateStatus,
 } from "./update-control.ts";
+// Test-only import of the updater's own step list.  It keeps the two files
+// honest about each other without the production bundle depending on a script.
+import { APPLY_STEPS, PREPARE_STEPS } from "../scripts/mac-update-transaction.mjs";
+import { UPDATE_STEP_LABELS } from "./update-control.ts";
 
 const INSTALLED_COMMIT = "a".repeat(40);
 const NEW_COMMIT = "b".repeat(40);
@@ -246,6 +250,8 @@ describe("check", () => {
       sourceCommit: NEW_COMMIT,
       version: "1.0.31",
       aheadBy: 12,
+      // The distance is only meaningful alongside what it was measured from.
+      baselineCommit: INSTALLED_COMMIT,
       commits: [
         { sha: NEW_COMMIT, subject: "feat(engines): room turns on the HTTP lane" },
         { sha: "c".repeat(40), subject: "fix(usage): dual-window quota display" },
@@ -308,7 +314,7 @@ describe("refusals", () => {
 
   it("calls an answer stale when it cannot describe anything newer", () => {
     const at = (iso: string) => iso;
-    const answer = { sourceCommit: NEW_COMMIT, aheadBy: 3, commits: [] };
+    const answer = { sourceCommit: NEW_COMMIT, aheadBy: 3, commits: [], baselineCommit: INSTALLED_COMMIT };
     const base = {
       available: answer,
       installedCommit: INSTALLED_COMMIT,
@@ -328,6 +334,43 @@ describe("refusals", () => {
     // An answer with no usable timestamp cannot be placed, so it is not acted on.
     expect(availableIsStale({ ...base, checkedAt: null })).toBe(true);
     expect(availableIsStale({ ...base, checkedAt: "not a date" })).toBe(true);
+  });
+
+  it("refuses an answer counted from a commit that is no longer installed", () => {
+    // The 2026-10-08 incident.  A check ran against an OLD installed build and
+    // remembered `aheadBy: 125`; the Mac then installed and verified a newer
+    // build.  `installedAt` could not catch it because it dates the build
+    // manifest, and this bundle was packaged hours before it was installed — so
+    // the install boundary sat BEHIND the remembered answer and every timestamp
+    // comparison said "fresh".  The status route kept advertising 125 commits
+    // behind on a Mac four commits behind, until restart.
+    const stale = {
+      sourceCommit: "e".repeat(40),
+      aheadBy: 125,
+      commits: [],
+      baselineCommit: "a".repeat(40),
+    };
+    expect(availableIsStale({
+      available: stale,
+      installedCommit: "b".repeat(40),
+      checkedAt: "2026-10-09T02:18:46.983Z",
+      // The build predates the install, so time alone cannot refute it.
+      installedAt: "2026-10-08T18:25:02.000Z",
+    })).toBe(true);
+    // Same answer, same install — the baseline is what decides, not the clock.
+    expect(availableIsStale({
+      available: stale,
+      installedCommit: "a".repeat(40),
+      checkedAt: "2026-10-09T02:18:46.983Z",
+      installedAt: "2026-10-08T18:25:02.000Z",
+    })).toBe(false);
+    // An answer written before baselines were recorded cannot be placed either.
+    expect(availableIsStale({
+      available: { ...stale, baselineCommit: undefined },
+      installedCommit: "a".repeat(40),
+      checkedAt: "2026-10-09T02:18:46.983Z",
+      installedAt: "2026-10-08T18:25:02.000Z",
+    })).toBe(true);
   });
 
   it("will not interrupt a turn, and force is the one thing that talks past it", () => {
@@ -511,7 +554,13 @@ describe("an unsuccessful run", () => {
     }));
     writeFileSync(join(paths.stateDirectory, "available.json"), JSON.stringify({
       checkedAt: "2026-09-13T12:00:00.000Z",
-      available: { sourceCommit: NEW_COMMIT, version: "1.0.31", aheadBy: 4, commits: [] },
+      available: {
+        sourceCommit: NEW_COMMIT,
+        version: "1.0.31",
+        aheadBy: 4,
+        commits: [],
+        baselineCommit: INSTALLED_COMMIT,
+      },
     }));
   };
 
@@ -913,6 +962,9 @@ describe("reading what another process wrote", () => {
 
   it("names a step in words, and falls back to the raw name", () => {
     expect(stepLabel("installDependencies")).toBe("Installing dependencies");
+    // Every step the updater can report needs a sentence, or the Mac and the
+    // phone show the raw camelCase op name to the person waiting.
+    expect(stepLabel("smokeTestBundle")).toBe("Verifying the new build actually starts");
     expect(stepLabel("somethingNew")).toBe("somethingNew");
     expect(stepLabel(null)).toBe("Working");
   });
@@ -1293,5 +1345,22 @@ describe("paths named by current-run.json", () => {
     // real progress file rather than the planted one.
     expect(running?.logTail).toEqual([]);
     expect(running?.step).toBe(stepLabel("buildBundle"));
+  });
+});
+
+describe("update step labels", () => {
+  it("covers every step the updater can report, so no raw op name reaches a person", () => {
+    const uncovered = [...PREPARE_STEPS, ...APPLY_STEPS]
+      .filter((step) => !UPDATE_STEP_LABELS[step]);
+    expect(uncovered).toEqual([]);
+  });
+
+  it("uses Title Case sentences rather than op names", () => {
+    // A label that is just the step name is the bug this whole table exists to
+    // prevent, so assert on the shape rather than trusting a reviewer's eye.
+    for (const [step, label] of Object.entries(UPDATE_STEP_LABELS)) {
+      expect(label, `${step} label is the raw step name`).not.toBe(step);
+      expect(label.length).toBeGreaterThan(0);
+    }
   });
 });

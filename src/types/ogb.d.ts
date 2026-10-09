@@ -77,6 +77,7 @@ type SkillRecordingPayload = {
       available: boolean;
       engine: "apple-speech" | "none";
       onDevice: boolean;
+      personalVoice?: boolean;
       reasonCode?: string;
     };
     localComputer: {
@@ -145,6 +146,22 @@ type SkillRecordingPayload = {
         cb: (line: { partial?: boolean; text?: string; error?: string }) => void,
       ): () => void;
       onSpeechEnd(cb: (info: { code: number | null; reason?: string }) => void): () => void;
+      personalVoice?: {
+        isAvailable(): Promise<boolean>;
+        list(): Promise<Array<{ id: string; name: string; locale?: string }>>;
+        /** `onRange` fires as each word is about to be spoken.  `location`
+         * and `length` are UTF-16 offsets into `text` (JavaScript string
+         * indices); `elapsedMs` is the synthesizer's own clock since speech
+         * began, or null. */
+        speak(
+          text: string,
+          voiceId?: string,
+          options?: {
+            onRange?: (range: { location: number; length: number; elapsedMs: number | null }) => void;
+          },
+        ): Promise<void>;
+        stop(): Promise<void>;
+      };
       skillRecorder?: {
         permissions(): Promise<{ supported: boolean; reason?: string }>;
         start(): Promise<{ recording: boolean }>;

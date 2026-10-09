@@ -322,7 +322,7 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
 
           {state.enabled && !hosted && state.tailscale && !state.tailnetName && (
             <div className="rounded-lg bg-warning/10 px-3 py-2 text-[11.5px] leading-relaxed text-ink-secondary">
-              Tailscale is connected, but its device name could not be read. Check MagicDNS in Tailscale or use the secure account above.
+              Tailscale is connected, but its device name could not be read.{"\u00a0 "}Check MagicDNS in Tailscale or use the secure account above.
             </div>
           )}
           {state.enabled && !hosted && !state.tailscale && (

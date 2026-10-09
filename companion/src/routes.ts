@@ -18,6 +18,8 @@
 // calls. Adding a feature to the phone means adding its route here, on
 // purpose, in a diff someone can read. That cost is the feature.
 
+import type { JsonObject } from "./json.ts";
+
 /** A refusal to send back, or null to let the request through. */
 export interface Denial {
   status: number;
@@ -55,9 +57,18 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "avatarUrl",
   "avatarCrop",
   "voice",
+  // Per-device overrides of voice ({ mac?, iphone? }).  The phone sets its
+  // own Personal Voice here and may pick a hosted voice for the Mac; the
+  // harness validates the shape and merges it with the stored record.
+  "voices",
   "speakReplies",
   "speechDevices",
   "modelSelection",
+  // The bot's On/Off switch (shared/bot-power.ts).  It only ever stops or
+  // resumes work the person could already start by messaging the bot, grants
+  // no capability, and the phone has to be able to turn a bot back On: the
+  // disabled composer's one button is Turn On.
+  "off",
 ] as const;
 
 const COMPANION_PROFILE_PATCH_FIELD_SET = new Set<string>(COMPANION_PROFILE_PATCH_FIELDS);
@@ -69,7 +80,7 @@ export function isCompanionProfilePatch(method: string, path: string): boolean {
 /** Validate the paired-device field boundary before a profile body reaches
  * the broader loopback harness route.  Reject the whole request rather than
  * silently stripping a field the person expected to save. */
-export function companionProfilePatchDenial(body: Record<string, unknown>): Denial | null {
+export function companionProfilePatchDenial(body: JsonObject): Denial | null {
   const unsupported = Object.keys(body).find((field) => !COMPANION_PROFILE_PATCH_FIELD_SET.has(field));
   return unsupported
     ? { status: 403, error: `${unsupported} can only be changed in BotFleet on your computer` }
@@ -147,6 +158,7 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/reactions$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/export$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/respond$/ },
+  { method: "POST", path: /^\/api\/threads\/[\w-]+\/approve-all$/ },
   { method: "GET", path: /^\/api\/search$/ },
 
   // App-owned profile images. Upload is image-only and capped at 10 MB by
@@ -158,6 +170,12 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // workspace MiniMax key; the phone receives labels or audio only.
   { method: "GET", path: /^\/api\/tts\/voices$/ },
   { method: "POST", path: /^\/api\/tts\/speak$/ },
+  // The workspace default voice and the pronunciation list: settings, not
+  // credentials.  Each is its own narrow harness route that validates and
+  // saves only that field, the way terminology does, so /api/config (which
+  // carries the voice key) stays write-closed to a phone.
+  { method: "PATCH", path: /^\/api\/tts\/default-voice$/ },
+  { method: "PATCH", path: /^\/api\/tts\/pronunciations$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio\/\d+$/ },
 

@@ -39,12 +39,62 @@ struct ChatView: View {
     @State private var pickingFile = false
     @State private var sending = false
     @State private var shareFile: ShareFile?
+    @State private var composerFocusAfterPlusDismiss = false
     @FocusState private var composerFocused: Bool
     @StateObject private var dictation = SpeechDictation()
+    /// Whether the transcript follows the newest message.  Off while the
+    /// reader is scrolled up, so arriving text never moves what they are
+    /// reading; `BottomFollow` holds the rules.
+    @State private var follow = BottomFollow()
+    @State private var scrollTracker = TranscriptScrollTracker()
+    /// Bumped to ask the transcript for the newest message from outside the
+    /// scroll reader, such as a send that never gets as far as a pending row.
+    @State private var bottomScrollRequest = 0
+    /// Older messages are loading above the reader.  The size-change anchor
+    /// stays on the bottom while they land, which is what keeps the rows on
+    /// screen in place.
+    @State private var prepending = false
 
     /// The live bubble's scroll target. A constant because there is at most
     /// one per chat and it has no message id to borrow.
     static let liveBubbleId = "companion.live"
+
+    /// A scroll target at the very end of the transcript, under the live
+    /// row.  It is only ever scrolled to.  Nothing reads whether it is on
+    /// screen: inside an eager `VStack` it always counts as appeared, which
+    /// is why the old onAppear/onDisappear "at bottom" guard never worked.
+    static let bottomId = "companion.bottom"
+
+    /// iOS 17 lacks scroll phases and per-role anchors, so it follows with a
+    /// drag gesture and a content probe instead.  The deployment floor is
+    /// now iOS 27, so only the DEBUG `-legacy-follow` flag reaches that
+    /// path.  It can check the opening position and the repin: from iOS 18
+    /// on, a simultaneous drag gesture stops the scroll view itself from
+    /// scrolling, so stopping follow and scrolling up were never checkable
+    /// without a real iOS 17 runtime or device.
+    private var useLegacyFollow: Bool {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-legacy-follow") { return true }
+#endif
+        if #available(iOS 18.0, *) { return false }
+        return true
+    }
+
+    /// What sits after the last settled row while the bot works.
+    private var liveRow: BottomFollow.LiveRow {
+        if let live = session.state.streaming[threadId], !live.isEmpty { return .text }
+        if let thinking = session.state.reasoning[threadId], !thinking.isEmpty { return .reasoning }
+        return current.busy ? .typing : .none
+    }
+
+    /// The bot whose reply is streaming: the chat's bot, or in a room the
+    /// member holding the turn.
+    private var liveSender: Bot? {
+        switch current {
+        case let .bot(bot): return bot
+        case let .room(room): return room.busyBotId.flatMap { session.state.bot($0) }
+        }
+    }
 
     /// The live chat record, so busy/unread stay current as frames land.
     private var current: Chat {
@@ -141,7 +191,13 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             transcriptColumn
-            composer
+            // An Off bot refuses every new turn, so the input is replaced by
+            // the way out of that state.  The transcript above stays as it was.
+            if current.isOff, case let .bot(bot) = current {
+                offComposer(for: bot)
+            } else {
+                composer
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .overlay(alignment: .bottom) { plusSheet }
@@ -179,6 +235,10 @@ struct ChatView: View {
         .onChange(of: threadId) { _, newId in
             dictation.stop()
             NotificationCoordinator.shared.viewingThreadId = newId
+            // `.id(threadId)` rebuilds the scroll view, but this state lives
+            // on ChatView and would carry over to the new thread.
+            follow = BottomFollow()
+            scrollTracker.reset()
         }
         .onDisappear {
             dictation.stop()
@@ -208,8 +268,16 @@ struct ChatView: View {
         .onChange(of: showingProfile) { _, shown in
             if shown { dictation.stop() }
         }
-        .onChange(of: showingPlus) { _, shown in
+        .onChange(of: showingPlus) { wasShowing, shown in
             if shown { dictation.stop() }
+            if ComposerSendRecovery.shouldReassertComposerFocusAfterPlusDismisses(
+                wasShowingPlus: wasShowing,
+                isShowingPlus: shown,
+                focusAfterDismiss: composerFocusAfterPlusDismiss
+            ) {
+                composerFocusAfterPlusDismiss = false
+                composerFocused = true
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { note in
             let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey]
@@ -256,6 +324,8 @@ struct ChatView: View {
     private var transcriptColumn: some View {
         let transcript = messages
         let items = groupActivityRuns(transcript)
+        let live = liveRow
+        let newestSettled = BottomFollow.newestSettledId(in: transcript)
         return ScrollViewReader { proxy in
                 ScrollView {
                     // VStack, not LazyVStack. A lazy stack does not know how
@@ -270,12 +340,24 @@ struct ChatView: View {
                         if session.state.hasMore[threadId] == true {
                             Button("Load earlier messages") {
                                 // keep the reader where they were: after older
-                                // messages are prepended, sit back on the one
+                                // messages are prepended, sit back on the row
                                 // that used to be at the top
-                                let anchor = transcript.first?.id
+                                let firstMessageId = transcript.first?.id
+                                follow.leaveBottom(newestSettledId: newestSettled)
+                                prepending = true
                                 Task {
                                     await session.loadOlder(threadId: threadId)
-                                    if let anchor { proxy.scrollTo(anchor, anchor: .top) }
+                                    // Found again in the new rows: the old top
+                                    // row may have joined a longer tool run
+                                    // from the loaded page, under a new id.
+                                    if let firstMessageId,
+                                       let row = transcriptRowId(containing: firstMessageId, in: groupActivityRuns(messages)) {
+                                        proxy.scrollTo(row, anchor: .top)
+                                    }
+                                    // Let the prepended rows lay out under the
+                                    // bottom anchor before handing it back.
+                                    try? await Task.sleep(for: .milliseconds(250))
+                                    prepending = false
                                 }
                             }
                             .font(.footnote)
@@ -287,20 +369,15 @@ struct ChatView: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 // a gap in time is worth marking; a timestamp
                                 // on every message is just noise
-                                if startsANewStretch(at: index, in: items) {
-                                    Text(RelativeStamp.separator(item.date))
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(Color.secondary.opacity(0.7))
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.top, 10)
-                                        .padding(.bottom, 4)
+                                if transcriptRowStartsAStretch(at: index, in: items) {
+                                    stretchSeparator(item.date)
                                 }
                                 switch item {
                                 case let .message(message):
                                     MessageRow(
                                         chat: current,
                                         message: message,
-                                        endsRun: endsRun(at: index, in: items)
+                                        endsRun: endsRun(at: index, in: items, live: live)
                                     )
                                 case let .run(_, runMessages):
                                     ActivityRunView(
@@ -317,24 +394,24 @@ struct ChatView: View {
                         // one arrives — the store clears it on the same frame
                         // that appends the message, so there is never a beat
                         // where both are on screen.
-                        if let live = session.state.streaming[threadId], !live.isEmpty {
-                            StreamingBubble(text: live, reasoning: nil, color: current.color)
-                                .id(Self.liveBubbleId)
-                        } else if let thinking = session.state.reasoning[threadId], !thinking.isEmpty {
-                            // Only while there is no answer yet. Once tokens
-                            // of the reply exist, the reasoning is behind us
-                            // and showing both is just noise.
-                            StreamingBubble(text: nil, reasoning: thinking, color: current.color)
-                                .id(Self.liveBubbleId)
-                        } else if current.busy {
-                            TypingIndicatorView(tintColor: BotPalette.color(current.color))
-                                .id(Self.liveBubbleId)
-                                .accessibilityLabel("\(current.name) is working")
-                        }
+                        liveRowView(live, after: items)
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay(alignment: .bottom) {
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.bottomId)
+                            .accessibilityHidden(true)
+                    }
+                    .modifier(LegacyTranscriptProbe(
+                        enabled: useLegacyFollow,
+                        follow: $follow,
+                        tracker: scrollTracker,
+                        newestSettledId: newestSettled,
+                        repin: { repinToBottom(proxy) }
+                    ))
                 }
                 // Opaque header: the transcript starts below the tabs and
                 // never shows through them.  Glass over the bubbles was
@@ -342,37 +419,187 @@ struct ChatView: View {
                 .safeAreaInset(edge: .top, spacing: 0) { chatHeader }
                 // A conversation grows from the bottom: a transcript shorter
                 // than the screen rests at the bottom, and opening a chat
-                // starts on the newest message rather than the oldest.
-                .defaultScrollAnchor(.bottom)
-                .onChange(of: transcript.last?.id) { _, _ in
-                    guard let last = transcript.last else { return }
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                // starts on the newest message rather than the oldest.  While
+                // the reader is scrolled up, growth leaves them where they
+                // are (see TranscriptFollowModifier).
+                .modifier(TranscriptFollowModifier(
+                    follow: $follow,
+                    tracker: scrollTracker,
+                    newestSettledId: newestSettled,
+                    legacy: useLegacyFollow,
+                    prepending: prepending,
+                    repin: { repinToBottom(proxy) }
+                ))
+                .overlay(alignment: .bottom) {
+                    jumpToLatest(transcript: transcript, proxy: proxy)
                 }
-                // Follow the text as it arrives. Keyed on length rather than
-                // the string so this fires once per delta batch, and without
-                // animation — animating every token turns a smooth stream
-                // into a stutter, because each scroll interrupts the last.
+                // Follow a new message, a send, or the live row appearing —
+                // only while following, and never animated: a glide on every
+                // message is the movement this screen must not make.  Keyed
+                // so a pending send's id swap does not count as new.
+                .onChange(of: BottomFollow.followKey(for: transcript, live: live)) { _, _ in
+                    guard follow.isFollowing else { return }
+                    let now = TranscriptScrollTracker.now
+                    if scrollTracker.holdsFollow(at: now) || scrollTracker.appScrollUntil > now {
+                        // Something else is moving the transcript; follow
+                        // once it has finished.
+                        followStream(proxy)
+                    } else {
+                        scrollToBottom(proxy)
+                    }
+                }
+                .onChange(of: bottomScrollRequest) { _, _ in
+                    guard follow.isFollowing else { return }
+                    scrollToBottom(proxy)
+                }
+                // Follow the text as it arrives, at most ten times a second
+                // and without animation.  Animating every token turns a
+                // smooth stream into a stutter, because each scroll
+                // interrupts the last.
                 .onChange(of: session.state.streaming[threadId]?.count ?? 0) { _, length in
-                    guard length > 0 else { return }
-                    proxy.scrollTo(Self.liveBubbleId, anchor: .bottom)
+                    guard length > 0, follow.isFollowing else { return }
+                    followStream(proxy)
                 }
+                // A search hit: go to its row (a folded tool step is reached
+                // through its run) and stop following, so the next token does
+                // not pull the reader straight back to the bottom.
                 .onChange(of: session.focusedMessageId) { _, messageId in
                     guard let messageId,
-                          messages.contains(where: { $0.id == messageId })
+                          let row = transcriptRowId(containing: messageId, in: items)
                     else { return }
-                    withAnimation { proxy.scrollTo(messageId, anchor: .center) }
+                    follow.leaveBottom(newestSettledId: newestSettled)
+                    withAnimation(reduceMotion ? nil : .default) { proxy.scrollTo(row, anchor: .center) }
                     session.consumeFocus(messageId)
                 }
                 .task {
                     guard let messageId = session.focusedMessageId,
-                          messages.contains(where: { $0.id == messageId })
+                          let row = transcriptRowId(containing: messageId, in: items)
                     else { return }
-                    proxy.scrollTo(messageId, anchor: .center)
+                    follow.leaveBottom(newestSettledId: newestSettled)
+                    proxy.scrollTo(row, anchor: .center)
                     session.consumeFocus(messageId)
                 }
             }
             .id(threadId)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// "Jump to Latest", while the reader is away from the bottom.
+    private func jumpToLatest(transcript: [Message], proxy: ScrollViewProxy) -> some View {
+        ZStack {
+            if !follow.isFollowing {
+                JumpToLatestPill(count: follow.unseenCount(in: transcript)) {
+                    follow.resume()
+                    // Follow scrolls wait for the glide rather than cutting
+                    // it short with a jump.
+                    if !reduceMotion { scrollTracker.appScrollStarted(duration: 0.45) }
+                    withAnimation(reduceMotion ? nil : .snappy(duration: 0.3)) {
+                        proxy.scrollTo(Self.bottomId, anchor: .bottom)
+                    }
+                    Haptics.selection()
+                }
+                .padding(.bottom, 10)
+                .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: follow.isFollowing)
+    }
+
+    /// Back to the newest message after layout left a following reader
+    /// short of it.  Checked again here because the request was queued.
+    /// While a reply streams the size anchor does not hold on every token,
+    /// so this shares the streaming throttle rather than adding scrolls.
+    private func repinToBottom(_ proxy: ScrollViewProxy) {
+        guard follow.isFollowing else { return }
+        followStream(proxy)
+    }
+
+    /// Straight to the end, with no animation.
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            proxy.scrollTo(Self.bottomId, anchor: .bottom)
+        }
+    }
+
+    /// One follow scroll per streaming interval, plus a trailing one so the
+    /// last tokens of a burst are not left below the fold.
+    ///
+    /// Never while a finger, its coast, or an animated scroll is moving the
+    /// transcript: the scroll waits, checking again each interval, so it
+    /// neither pulls text out from under the reader nor cuts the glide to
+    /// the newest message short.  The trailing scroll checks again when it
+    /// fires, since a touch can begin after it was queued.
+    private func followStream(_ proxy: ScrollViewProxy) {
+        let now = TranscriptScrollTracker.now
+        let notBefore: Double?
+        if scrollTracker.holdsFollow(at: now) {
+            notBefore = now + BottomFollow.streamingScrollInterval
+        } else if scrollTracker.appScrollUntil > now {
+            notBefore = scrollTracker.appScrollUntil
+        } else {
+            notBefore = nil
+        }
+        switch StreamingFollowThrottle.decide(
+            now: now,
+            lastScroll: scrollTracker.lastStreamingScroll,
+            trailingScheduled: scrollTracker.trailingScrollScheduled,
+            notBefore: notBefore
+        ) {
+        case .now:
+            scrollTracker.lastStreamingScroll = now
+            scrollToBottom(proxy)
+        case let .after(delay):
+            scrollTracker.trailingScrollScheduled = true
+            let tracker = scrollTracker
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                tracker.trailingScrollScheduled = false
+                guard follow.isFollowing else { return }
+                followStream(proxy)
+            }
+        case .skip:
+            break
+        }
+    }
+
+    private func stretchSeparator(_ date: Date) -> some View {
+        Text(RelativeStamp.separator(date))
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(Color.secondary.opacity(0.7))
+            .frame(maxWidth: .infinity)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+    }
+
+    /// The reply being typed, shaped like the row it settles into, or the
+    /// typing indicator before any text exists.
+    @ViewBuilder
+    private func liveRowView(_ live: BottomFollow.LiveRow, after items: [TranscriptItem]) -> some View {
+        switch live {
+        case .text, .reasoning:
+            VStack(alignment: .leading, spacing: 6) {
+                // The settled message gets a stretch separator when it
+                // follows a long gap; show it now so it is not added on
+                // arrival.
+                if liveReplyStartsAStretch(after: items, now: Date()) {
+                    stretchSeparator(Date())
+                }
+                LiveReplyRow(
+                    chat: current,
+                    sender: liveSender,
+                    text: live == .text ? session.state.streaming[threadId] : nil,
+                    reasoning: live == .reasoning ? session.state.reasoning[threadId] : nil
+                )
+            }
+            .id(Self.liveBubbleId)
+        case .typing:
+            TypingIndicatorView(tintColor: BotPalette.color(current.color))
+                .id(Self.liveBubbleId)
+                .accessibilityLabel("\(current.name) is working")
+        case .none:
+            EmptyView()
+        }
     }
 
     // MARK: - Header
@@ -571,8 +798,8 @@ struct ChatView: View {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
                 showCommandHUD = true
             }
-            if !draft.hasPrefix("/") { draft = "/" }
-            composerFocused = true
+            draft = ComposerSendRecovery.slashCommandDraft(from: draft)
+            composerFocusAfterPlusDismiss = true
         })
         if current.busy, case .bot = current {
             out.append(PlusAction(
@@ -642,26 +869,20 @@ struct ChatView: View {
         return out
     }
 
-    /// True when this message opens a fresh stretch of conversation — the
-    /// first one, or one that follows a gap of half an hour or more.
-    private func startsANewStretch(at index: Int, in items: [TranscriptItem]) -> Bool {
-        guard index > 0 else { return true }
-        return items[index].date.timeIntervalSince(items[index - 1].date) > 30 * 60
-    }
-
-    /// True when the next message is from someone else (or there is none),
-    /// which is where a run of bubbles gets its tail — one per run, like
-    /// every messaging app, rather than one per bubble.
-    private func endsRun(at index: Int, in items: [TranscriptItem]) -> Bool {
-        guard index + 1 < items.count else { return true }
-        guard case let .message(this) = items[index],
-              case let .message(next) = items[index + 1] else {
-            return true
-        }
-        if this.role != next.role { return true }
-        if this.from?.name != next.from?.name { return true }
-        // a card or a tool chip between two texts breaks the run visually
-        return next.kind != .text
+    /// Where a run of bubbles gets its tail; `transcriptRowEndsRun` holds
+    /// the rule, including the reply being typed counting as the next
+    /// message.
+    private func endsRun(at index: Int, in items: [TranscriptItem], live: BottomFollow.LiveRow) -> Bool {
+        // In a room the settled reply is attributed to the member holding
+        // the turn; in a bot chat it carries no speaker.
+        let liveSpeaker: String?
+        if case .room = current { liveSpeaker = liveSender?.name } else { liveSpeaker = nil }
+        return transcriptRowEndsRun(
+            at: index,
+            in: items,
+            liveReply: live == .text || live == .reasoning,
+            liveSpeaker: liveSpeaker
+        )
     }
 
     private var canSend: Bool {
@@ -707,18 +928,36 @@ struct ChatView: View {
         pendingAttachments = []
         dictation.discardRecording()
         showCommandHUD = false
+        // Sending is the reader asking to be at the newest message again,
+        // like Messages: the pending row is followed into view.  The request
+        // covers a send that fails before that row exists.
+        follow.resume()
+        bottomScrollRequest &+= 1
         SoundEffects.playSent()
         Haptics.impact(.medium)
+        let threadId = current.threadId
+        let priorUserMessageIDs = Set(
+            session.state.transcript(forThread: threadId)
+                .filter { $0.role == .user }
+                .map(\.id)
+        )
+        let sentText = text
         sending = true
         Task {
-            let ok = await session.send(text, to: current, attachments: outgoing, recording: recording)
+            let outcome = await session.send(sentText, to: current, attachments: outgoing, recording: recording)
             sending = false
-            if !ok {
-                if draft.isEmpty { draft = text }
-                if pendingAttachments.isEmpty { pendingAttachments = outgoing }
-                if let recording, dictation.recordedWAV == nil {
-                    dictation.restoreRecording(recording.data, transcript: recording.transcript)
-                }
+            let transcript = session.state.transcript(forThread: threadId)
+            guard ComposerSendRecovery.shouldRestoreClearedDraft(
+                sendSucceeded: outcome.ok,
+                clientNonce: outcome.clientNonce,
+                sentText: sentText,
+                priorUserMessageIDs: priorUserMessageIDs,
+                transcript: transcript
+            ) else { return }
+            if draft.isEmpty { draft = sentText }
+            if pendingAttachments.isEmpty { pendingAttachments = outgoing }
+            if let recording, dictation.recordedWAV == nil {
+                dictation.restoreRecording(recording.data, transcript: recording.transcript)
             }
         }
     }
@@ -924,6 +1163,41 @@ struct ChatView: View {
         }
     }
 
+    /// What replaces the composer while the bot is Off (`shared/bot-power.ts`):
+    /// the disabled notice and one button, Turn On.  The two-space gap is a
+    /// non-breaking space plus a space so the layout cannot collapse it.
+    private func offComposer(for bot: Bot) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "power")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color.secondary)
+                .accessibilityHidden(true)
+            Text("This bot is off.\u{00A0} Turn it on to chat.")
+                .font(.system(size: 15))
+                .foregroundStyle(Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button {
+                Task { _ = await session.updateProfile(BotProfilePatch(off: false), for: bot) }
+            } label: {
+                Text("Turn On")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Capsule().fill(BubbleColor.mine))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Turn on \(bot.name)")
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 52)
+        .glassRounded(cornerRadius: 18, interactive: false)
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+        .accessibilityElement(children: .contain)
+    }
+
     private func pasteFromClipboard() {
         let board = UIPasteboard.general
         if board.hasImages, let image = board.image {
@@ -1119,14 +1393,32 @@ struct MessageRow: View {
     }
 
     private var senderModelSelection: ModelSelection? {
-        guard let bot = senderBot else { return nil }
-        if let currentTask = bot.tasks?.first(where: { $0.threadId == chat.threadId }) {
+        senderBot.flatMap { Self.modelSelection(of: $0, inThread: chat.threadId) }
+    }
+
+    /// The model a bot is answering with in this thread, for the provider
+    /// mark on its avatar.  Shared with the live reply row so the mark is
+    /// already there while the reply is typed.
+    static func modelSelection(of bot: Bot, inThread threadId: String) -> ModelSelection? {
+        if let currentTask = bot.tasks?.first(where: { $0.threadId == threadId }) {
             if let taskSelection = currentTask.modelSelection {
                 return currentTask.activeModelSelection ?? taskSelection
             }
             return currentTask.activeModelSelection ?? bot.activeModelSelection ?? bot.modelSelection
         }
         return bot.activeModelSelection ?? bot.modelSelection
+    }
+
+    /// Whether a settled reply from `bot` carries the Read Aloud capsule.
+    /// The live reply reserves the same space, so the row does not grow on
+    /// arrival; one condition keeps the two from drifting apart.
+    static func offersVoice(from bot: Bot?, hasAudio: Bool, config: ConfigStatus?) -> Bool {
+        guard let bot else { return false }
+        // Read Aloud is offered by this iPhone's voice, not the Mac's.
+        let voice = bot.voice(for: .iphone)
+        return hasAudio
+            || PersonalVoiceContract.isPersonalVoice(voice)
+            || config?.canSpeak(agentVoice: voice) == true
     }
 
     private var senderDriverKind: String? {
@@ -1242,8 +1534,8 @@ struct MessageRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if message.role == .bot, message.kind == .text, senderBot != nil,
-               (message.audio?.isEmpty == false || PersonalVoiceContract.isPersonalVoice(senderBot?.voice) || session.config?.canSpeak(agentVoice: senderBot?.voice) == true) {
+            if message.role == .bot, message.kind == .text,
+               Self.offersVoice(from: senderBot, hasAudio: message.audio?.isEmpty == false, config: session.config) {
                 Button {
                     session.playVoice(message, threadId: chat.threadId)
                 } label: {
@@ -1608,6 +1900,10 @@ struct TextBubble: View {
                             .foregroundStyle(Color.primary)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
+                            // While this reply is read aloud, its words
+                            // follow the voice (Karaoke.swift).  Only this
+                            // bubble's blocks observe the per-word paint.
+                            .environment(\.messageKaraoke, KaraokeCenter.shared.karaoke(for: message.id))
                     }
                     ForEach(Array(split.images.enumerated()), id: \.offset) { _, path in
                         AttachedImageView(path: path)
@@ -2082,9 +2378,76 @@ struct ScreenShot: View {
     }
 }
 
+/// The live reply as a transcript row, shaped like the `MessageRow` it
+/// settles into: the 28pt avatar column and 8pt gap, the bubble, and the
+/// Read Aloud capsule's space held open underneath.  Any difference is the
+/// message jumping on arrival — text rewrapping when the column narrows by
+/// 36pt, or the row growing when the capsule appears.
+struct LiveReplyRow: View {
+    let chat: Chat
+    /// The bot typing: the chat's bot, or the room member holding the turn.
+    let sender: Bot?
+    let text: String?
+    let reasoning: String?
+    @EnvironmentObject private var session: Session
+
+    /// The settled reply ends its run, so it shows the sender's face with
+    /// the provider mark; a room with no known speaker shows the room's.
+    @ViewBuilder
+    private var avatar: some View {
+        if let sender {
+            BotAvatarView(bot: sender, size: 28, state: .idle, animated: false)
+                .overlay(alignment: .bottomTrailing) {
+                    if let selection = MessageRow.modelSelection(of: sender, inThread: chat.threadId),
+                       let driverKind = session.instanceDriverKinds[selection.instanceId] {
+                        ProviderMarkView(driverKind: driverKind, model: selection.model, size: 16)
+                            .offset(x: 3, y: 3)
+                    }
+                }
+        } else if case let .room(room) = chat {
+            RoomAvatarView(room: room, size: 28, state: .idle, animated: false)
+        }
+    }
+
+    /// Rooms attribute each reply to the member who said it.
+    private var speaker: (name: String, color: String)? {
+        guard case .room = chat, let sender else { return nil }
+        return (sender.name, sender.color)
+    }
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            avatar
+            VStack(alignment: .leading, spacing: 6) {
+                StreamingBubble(
+                    text: text,
+                    reasoning: reasoning,
+                    color: sender?.color ?? chat.color,
+                    speaker: speaker
+                )
+                if MessageRow.offersVoice(from: sender, hasAudio: false, config: session.config) {
+                    // Held open, not shown: the settled reply puts the real
+                    // capsule here, and reserving it means the row does not
+                    // grow when it does.
+                    Button {} label: {
+                        Label("Read Aloud", systemImage: "speaker.wave.2")
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .hidden()
+                    .disabled(true)
+                    .accessibilityHidden(true)
+                }
+            }
+        }
+    }
+}
+
 /// The reply as it is being typed, styled to match the settled bubble it is
 /// about to become — the handover should be invisible, and any difference in
-/// padding or corner radius reads as the message jumping on arrival.
+/// padding, width or corner radius reads as the message jumping on arrival.
+/// The modifiers below mirror `TextBubble` one for one; change them together.
 ///
 /// A caret rather than a spinner: a spinner says "something is happening
 /// somewhere", which the reader already knows. A caret at the end of real
@@ -2100,10 +2463,19 @@ struct StreamingBubble: View {
     let text: String?
     let reasoning: String?
     var color: String = "blue"
+    /// The room member speaking, shown above the text as the settled
+    /// bubble will show it.  `nil` in a bot chat.
+    var speaker: (name: String, color: String)?
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
+                if let speaker {
+                    Text(speaker.name)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(BotPalette.color(speaker.color))
+                }
                 if let reasoning, !reasoning.isEmpty, text?.isEmpty != false {
                     AgentThoughtChamberView(
                         reasoning: String(reasoning.suffix(2_000)),
@@ -2122,10 +2494,12 @@ struct StreamingBubble: View {
                     // characters typed so far.
                     MarkdownText(source: text, caret: true)
                         .foregroundStyle(Color.primary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(.horizontal, 15)
             .padding(.vertical, 11)
+            .frame(maxWidth: sizeClass == .regular ? 560 : .infinity, alignment: .leading)
             .background(SpeechBubble(tail: .leading).fill(BubbleColor.theirs))
             .padding(.bottom, SpeechBubble.tailDrop())
             Spacer(minLength: 44)

@@ -16,6 +16,7 @@ import { z } from "zod";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
+import { CONTAINER_RUNTIME_DISABLED_MESSAGE } from "./container-runtime-guard.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 import { DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
@@ -65,11 +66,17 @@ let fakeSlowProbeStarted: string;
 let fakeRecallCli: string;
 let stderr = "";
 
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+const api = async (
+  method: string,
+  path: string,
+  body?: unknown,
+  init?: { signal?: AbortSignal },
+): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
+    signal: init?.signal,
   });
   return { status: res.status, body: await res.json() };
 };
@@ -82,6 +89,55 @@ const vi_waitFor = async <T,>(read: () => T, ok: (value: T) => boolean, timeoutM
     const value = read();
     if (ok(value) || Date.now() > deadline) return value;
     await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+};
+
+/** Abort in-flight `api()` fetches slightly before `expect.poll`'s deadline so
+ *  a slow tick surfaces as the configured settle message instead of AbortError. */
+const SETTLE_ABORT_SKEW_MS = 75;
+
+/** Polls `read` until it satisfies, using vitest's own primitive.
+ *
+ *  The Windows runner is roughly a third slower than the others and its test
+ *  files overlap more, so anything that asserts a settled instance state or a
+ *  write landing *immediately* is a coin flip there and a certainty here.
+ *
+ *  `expect.poll`'s `interval` is a minimum gap between attempts, not an
+ *  observation count: the runner keeps trying until `timeoutMs` elapses, and
+ *  each `read()` can take arbitrarily long (a `GET /api/instances?fresh=1` on a
+ *  busy fleet can consume the whole window on one tick).  Do not pass `fresh=1`
+ *  on every tick — request it once before polling if a single re-probe is
+ *  needed, then read the memoized snapshot.
+ *
+ *  `signal` is aborted `SETTLE_ABORT_SKEW_MS` before the poll deadline so a
+ *  hung fetch is abandoned without racing Vitest's failure message.
+ */
+const settlesWithin = async (
+  read: (opts: { signal: AbortSignal }) => Promise<boolean>,
+  timeoutMs: number,
+  intervalMs: number,
+  what: string,
+): Promise<void> => {
+  const abort = new AbortController();
+  const abortAtMs = Math.max(0, timeoutMs - SETTLE_ABORT_SKEW_MS);
+  const timer = setTimeout(() => abort.abort(), abortAtMs);
+  const message = `${what} did not settle within ${timeoutMs}ms`;
+  try {
+    await expect
+      .poll(
+        async () => {
+          try {
+            return await read({ signal: abort.signal });
+          } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") return false;
+            throw error;
+          }
+        },
+        { timeout: timeoutMs, interval: intervalMs, message },
+      )
+      .toBe(true);
+  } finally {
+    clearTimeout(timer);
   }
 };
 
@@ -3066,11 +3122,23 @@ describe("harness HTTP API", () => {
         await api("POST", `/api/bots/${bot.id}/interrupt`, {});
         await api("DELETE", `/api/bots/${bot.id}`);
       }
-      for (const instanceId of otherInstances) {
-        expect((await api("PATCH", `/api/instances/${instanceId}`, { enabled: true })).status).toBe(200);
-      }
-      expect((await api("PATCH", "/api/instances/gatedQuota", { enabled: false, fullAuto: false })).status).toBe(200);
-      expect((await api("PATCH", "/api/instances/slowProbe", { enabled: false, fullAuto: false })).status).toBe(200);
+      let next = 0;
+      await settlesWithin(
+        async ({ signal }) => {
+          for (; next < otherInstances.length; next++) {
+            if ((await api("PATCH", `/api/instances/${otherInstances[next]}`, { enabled: true }, { signal })).status !== 200) {
+              return false;
+            }
+          }
+          for (const path of ["/api/instances/gatedQuota", "/api/instances/slowProbe"]) {
+            if ((await api("PATCH", path, { enabled: false, fullAuto: false }, { signal })).status !== 200) return false;
+          }
+          return true;
+        },
+        6_000,
+        200,
+        "instance cleanup writes",
+      );
     }
   }, 40_000);
 
@@ -3401,6 +3469,31 @@ describe("harness HTTP API", () => {
       behavior: "allow",
     });
     expect(nothing.status).toBe(404);
+  });
+
+  it("approves all pending approvals for a thread or bot", async () => {
+    const listRes = await api("GET", "/api/bots");
+    const bot = listRes.body.bots[0];
+
+    // non-existent bot returns 404
+    const notFound = await api("POST", "/api/bots/non-existent-bot-id/approve-all");
+    expect(notFound.status).toBe(404);
+
+    // bot with no pending approvals returns ok with approvedCount: 0
+    const emptyApprove = await api("POST", `/api/bots/${bot.id}/approve-all`);
+    expect(emptyApprove.status).toBe(200);
+    expect(emptyApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // thread approve-all endpoint
+    const threadApprove = await api("POST", `/api/threads/${bot.threadId}/approve-all`);
+    expect(threadApprove.status).toBe(200);
+    expect(threadApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // invalid route parameters return 400
+    const invalidBot = await api("POST", "/api/bots/bad%20bot%20id/approve-all");
+    expect(invalidBot.status).toBe(400);
+    const invalidThread = await api("POST", "/api/threads/bad%20thread%20id/approve-all");
+    expect(invalidThread.status).toBe(400);
   });
 
   it("closes the approvals a cancelled turn can no longer answer", async () => {
@@ -3931,7 +4024,15 @@ describe("harness HTTP API", () => {
     const first = (await api("POST", "/api/bots")).body.bot;
     const second = (await api("POST", "/api/bots")).body.bot;
     const before = await api("GET", "/api/config");
-    expect(before.body.localVm).toEqual({ mode: "shared", maxInstances: 2 });
+    // The Host & CLI Integration booleans ride in the same section: a status
+    // that omitted them made the Settings checkboxes snap back after a save.
+    expect(before.body.localVm).toEqual({
+      mode: "shared",
+      maxInstances: 2,
+      shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
+      allowHostTerminal: false,
+    });
 
     const shared = await api("GET", `/api/bots/${first.id}/local-computer`);
     expect(shared.status).toBe(200);
@@ -3941,7 +4042,13 @@ describe("harness HTTP API", () => {
       localVm: { mode: "per-bot", maxInstances: 3 },
     });
     expect(saved.status).toBe(200);
-    expect(saved.body.localVm).toEqual({ mode: "per-bot", maxInstances: 3 });
+    expect(saved.body.localVm).toEqual({
+      mode: "per-bot",
+      maxInstances: 3,
+      shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
+      allowHostTerminal: false,
+    });
 
     const [firstStatus, secondStatus] = await Promise.all([
       api("GET", `/api/bots/${first.id}/local-computer`),
@@ -3960,6 +4067,56 @@ describe("harness HTTP API", () => {
     const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
     expect(disk.localVm).toEqual({ mode: "per-bot", maxInstances: 3 });
     await api("PATCH", "/api/config", { localVm: { mode: "shared", maxInstances: 2 } });
+  });
+
+  it("persists the Host & CLI Integration toggles across a save and a fresh read", async () => {
+    // The Settings checkboxes are controlled inputs bound to this response.
+    // They used to snap back because the status dropped both flags.
+    // Restored in `finally`: both flags are process-global, and a leaked
+    // `shareCliCredentials` would let a later VPS test mount real host
+    // credentials into a container.
+    try {
+      const saved = await api("PUT", "/api/config", {
+        localVm: { shareCliCredentials: true, shareGpgPrivateKeys: true, allowHostTerminal: true },
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
+
+      const reread = await api("GET", "/api/config");
+      expect(reread.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
+
+      const status = await api("GET", "/api/config");
+      expect(status.body.localVm).toMatchObject({ shareGpgPrivateKeys: true });
+
+      // Turning one off must not disturb the other.
+      const half = await api("PUT", "/api/config", { localVm: { allowHostTerminal: false } });
+      expect(half.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
+
+      // The in-memory status above is served from the same `cfg` the PUT
+      // wrote, so only the file on disk proves the save round trip.
+      const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+      expect(disk.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
+    } finally {
+      await api("PUT", "/api/config", {
+        localVm: { shareCliCredentials: false, shareGpgPrivateKeys: false, allowHostTerminal: false },
+      });
+    }
   });
 
   it("keeps an active turn alive when only the room timeout changes", async () => {
@@ -4627,11 +4784,16 @@ describe("harness HTTP API", () => {
       });
       expect(renamed.body.task).not.toHaveProperty("resumeCursors");
 
-      // and the same on the wire, not just in the HTTP responses
+      // and the same on the wire, not just in the HTTP responses.  Wait for
+      // hello before the unread nudge — every other SSE test in this file does
+      // the same, and under windows-latest parallel suite load the unread PATCH
+      // can otherwise land before the client has proved it can receive frames
+      // (seen as a bare 20s vitest timeout rather than until's own message).
       const stream = await openSse(`${BASE}/api/events`);
       try {
+        await stream.until((f) => f.kind === "hello");
         await api("PATCH", `/api/bots/${botId}`, { unread: true });
-        const frame = await stream.until((f) => f.kind === "bot");
+        const frame = await stream.until((f) => f.kind === "bot" && f.bot?.id === botId);
         expect(frame.bot).not.toHaveProperty("resumeCursors");
         expect(JSON.stringify(frame)).not.toContain("resumeCursors");
       } finally {
@@ -4640,7 +4802,9 @@ describe("harness HTTP API", () => {
     } finally {
       await api("DELETE", `/api/bots/${botId}`);
     }
-  });
+    // Bot create + task + SSE + delete; windows-latest is about a third slower
+    // and overlaps its files more, so the default 20s budget is a coin flip.
+  }, 30_000);
 
   it("validates the event inspector limit at the HTTP boundary", async () => {
     const bot = (await api("GET", "/api/bots")).body.bots[0];
@@ -5281,7 +5445,7 @@ describe("resumable event stream", () => {
   });
 
   it("refuses a cursor it cannot honour instead of replaying the wrong run", async () => {
-    for (const cursor of ["deadbeef:1", "not-a-cursor", "12345678:999999"]) {
+    for (const cursor of ["deadbeef:1", "12345678:999999"]) {
       const stream = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`);
       try {
         const hello = await stream.until((f) => f.kind === "hello");
@@ -5292,6 +5456,12 @@ describe("resumable event stream", () => {
         stream.close();
       }
     }
+  });
+
+  it("rejects a malformed cursor with HTTP 400", async () => {
+    const res = await fetch(`${BASE}/api/events?since=not-a-cursor`);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, error: "invalid_cursor" });
   });
 });
 
@@ -5457,28 +5627,50 @@ describe("instance CLI override API", () => {
       boxTurnGate = null;
       releaseBoxTurnGate = null;
 
-      const persistedTask = () => {
-        const bots = JSON.parse(readFileSync(join(home, ".botfleet", "bots.json"), "utf8")) as Array<{
+      const botsJsonPath = join(home, ".botfleet", "bots.json");
+      const readSuccessorPersistence = () => {
+        const bots = JSON.parse(readFileSync(botsJsonPath, "utf8")) as Array<{
           id: string;
           tasks: Array<{ threadId: string; lastInstanceId?: string; resumeCursors: Record<string, unknown> }>;
         }>;
-        return bots.find((candidate) => candidate.id === bot.id)?.tasks.find((task) => task.threadId === bot.threadId);
-      };
-      await expect.poll(() => ({
-        launches: existsSync(launchLog)
+        const task = bots
+          .find((candidate) => candidate.id === bot.id)
+          ?.tasks.find((candidate) => candidate.threadId === bot.threadId);
+        const launches = existsSync(launchLog)
           ? readFileSync(launchLog, "utf8").split("\n").filter(Boolean).length
-          : 0,
-        lastInstanceId: persistedTask()?.lastInstanceId,
-        cursor: persistedTask()?.resumeCursors.claude,
-      }), { timeout: 5_000 }).toEqual({
+          : 0;
+        return { launches, task };
+      };
+      // Gate release unblocks the box and the hanging CLI; on Windows the
+      // successor dispatch, markTaskDispatched, and debounced bots.json flush
+      // can land several seconds later.  Read the files fresh each tick — do
+      // not memoize a task snapshot — and abort in-flight bot polls before the
+      // settle deadline so a hung tick cannot eat the whole window.
+      await settlesWithin(
+        async ({ signal }) => {
+          const { launches, task } = readSuccessorPersistence();
+          const cursor = task?.resumeCursors?.claude;
+          if (launches !== 1) return false;
+          if (task?.lastInstanceId !== "claude" || typeof cursor !== "string" || cursor.length === 0) return false;
+          const live = (await api("GET", "/api/bots?messages=0", undefined, { signal })).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          );
+          return live?.busy === true;
+        },
+        10_000,
+        200,
+        "successor dispatch persisting lastInstanceId and claude resume cursor without a stale launch",
+      );
+      const settled = readSuccessorPersistence();
+      expect({
+        launches: settled.launches,
+        lastInstanceId: settled.task?.lastInstanceId,
+        cursor: settled.task?.resumeCursors.claude,
+      }).toEqual({
         launches: 1,
         lastInstanceId: "claude",
         cursor: expect.any(String),
       });
-      const live = (await api("GET", "/api/bots?messages=0")).body.bots.find(
-        (candidate: { id: string }) => candidate.id === bot.id,
-      );
-      expect(live?.busy).toBe(true);
     } finally {
       releaseBoxTurnGate?.();
       boxTurnGate = null;
@@ -5490,7 +5682,7 @@ describe("instance CLI override API", () => {
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI, fullAuto: false })).status).toBe(200);
       expect((await api("PUT", "/api/config", { box: { token: "" } })).status).toBe(200);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
@@ -5506,8 +5698,26 @@ describe("instance CLI override API", () => {
     let roomId = "";
     let roomThreadId = "";
     try {
-      const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
-      const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+      // An engine a neighbouring test left reloading is still settling;
+      // `unavailable` here means "asked too early", not "broken".  Poll at the
+      // fleet re-probe cadence with `fresh=1` each tick so a 15s describe memo
+      // cannot freeze an early `unavailable` for the whole wait (~4 probes in 8s).
+      await settlesWithin(
+        async ({ signal }) => {
+          const instances = (
+            await api("GET", "/api/instances?fresh=1", undefined, { signal })
+          ).body.instances;
+          return instances.find(
+            (instance: { instanceId: string }) => instance.instanceId === "claude",
+          )?.snapshot?.state === "available";
+        },
+        8_000,
+        2_000,
+        "the claude engine reaching available",
+      );
+      const claude = (await api("GET", "/api/instances")).body.instances.find(
+        (instance: { instanceId: string }) => instance.instanceId === "claude",
+      );
       expect(claude?.snapshot.state).toBe("available");
 
       const bot = (await api("POST", "/api/bots")).body.bot as { id: string; threadId: string };
@@ -5551,7 +5761,7 @@ describe("instance CLI override API", () => {
       if (botId) await api("DELETE", `/api/bots/${botId}`);
       expect((await api("PATCH", "/api/instances/claude", { fullAuto: false })).status).toBe(200);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("creates, describes, and deletes a custom OpenAI-compatible engine", async () => {
     expect((await api("POST", "/api/instances", { name: "" })).status).toBe(400);
@@ -6905,6 +7115,60 @@ describe("PATCH /api/terminology", () => {
   });
 });
 
+describe("workspace voice settings", () => {
+  it("hands every client the default voice by id and the pronunciation list in force", async () => {
+    const saved = await api("PUT", "/api/config", { tts: { voice: "jay-wedgeworth-001" } });
+    expect(saved.status).toBe(200);
+    expect(saved.body.tts.voice).toBe("jay-wedgeworth-001");
+    const status = await api("GET", "/api/config");
+    expect(status.body.tts.voice).toBe("jay-wedgeworth-001");
+    // Never saved yet: the seeded list, so a client never has to know it.
+    expect(status.body.tts.pronunciations).toEqual(expect.arrayContaining([
+      { term: "SQL", say: "sequel" },
+      { term: "OAuth", say: "oh auth" },
+    ]));
+  });
+
+  it("saves the list through PUT /api/config with the shared validation", async () => {
+    const ok = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "SQL", say: "S Q L" }] } });
+    expect(ok.status).toBe(200);
+    expect(ok.body.tts.pronunciations).toEqual([{ term: "SQL", say: "S Q L" }]);
+    const dup = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "a", say: "x" }, { term: "A", say: "y" }] } });
+    expect(dup.status).toBe(400);
+  });
+
+  it("lets the phone's narrow route change the default voice, and nothing else", async () => {
+    const res = await api("PATCH", "/api/tts/default-voice", { voice: "English_Graceful_Lady", profile: { name: "Side Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.voice).toBe("English_Graceful_Lady");
+    expect((await api("GET", "/api/config")).body.profile?.name).not.toBe("Side Door");
+    // A Personal Voice belongs to one device; blank and junk are refused.
+    const personal = await api("PATCH", "/api/tts/default-voice", { voice: "personal:Jay" });
+    expect(personal.status).toBe(400);
+    expect(personal.body.error).toContain("Personal Voices stay on the device");
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "  " })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "a\u0000b" })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: 7 })).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.voice).toBe("English_Graceful_Lady");
+    // The MiniMax id is kept exactly; MiniMax ids are case-sensitive.
+    const exact = await api("PATCH", "/api/tts/default-voice", { voice: "jay-wedgeworth-001" });
+    expect(exact.body.tts.voice).toBe("jay-wedgeworth-001");
+  });
+
+  it("lets the phone's narrow route replace the pronunciation list, with a plain-language refusal", async () => {
+    const list = [{ term: "JSON", say: "Jason" }, { term: "kubectl", say: "cube control" }];
+    const res = await api("PATCH", "/api/tts/pronunciations", { pronunciations: list, tts: { voice: "Side_Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.pronunciations).toEqual(list);
+    expect(res.body.tts.voice).not.toBe("Side_Door");
+    const bad = await api("PATCH", "/api/tts/pronunciations", { pronunciations: [{ term: "JSON", say: "my JSON" }] });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toContain("which is also on the list");
+    expect((await api("PATCH", "/api/tts/pronunciations", {})).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.pronunciations).toEqual(list);
+  });
+});
+
 describe("local Auto consent for inherited and discovered computers", () => {
   it("guards config defaults and per-bot Auto while preserving explicit Off", async () => {
     expect((await api("PUT", "/api/config", {
@@ -7110,9 +7374,14 @@ describe("Local VM lifecycle routes honor the provider toggle", () => {
       expect(on.status).toBe(200);
       // Shared mode allows the bot endpoint to run or create the shared container;
       // it is not blocked by the provider gate or by a legacy App Settings referral.
+      // This harness runs with container runtimes switched off (spawnDetached),
+      // so the request must reach the runtime layer and be refused THERE, with
+      // exactly that message — nothing is created on the machine running the
+      // suite.  An unqualified "no gate text" assertion once let a real
+      // `docker run` through and orphaned the owner's real Local VM container.
       const perBot = await api("POST", `/api/bots/${bot.id}/local-computer/run`, {});
-      expect(String(perBot.body.error ?? "")).not.toContain("turned off in Computer settings");
-      expect(String(perBot.body.error ?? "")).not.toContain("Shared mode manages this desktop in App Settings");
+      expect(perBot.status).toBe(409);
+      expect(perBot.body.error).toBe(CONTAINER_RUNTIME_DISABLED_MESSAGE);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }

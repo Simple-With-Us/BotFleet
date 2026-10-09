@@ -14,6 +14,7 @@ describe("FleetMatrixView", () => {
           onSelectApp: () => {},
           onSelectBot: () => {},
           onOpenAppRoom: () => {},
+          onSelectBotInApp: (_botId: string, _appId: string) => {},
         }),
       ),
     );

@@ -34,6 +34,9 @@ struct ChatListView: View {
     @FocusState private var searchFocused: Bool
     /// Drives the live-session "Open BotFleet on Mac" header control.
     @State private var isOpeningMacApp = false
+    /// DEBUG `-store-preview -open-settings`: land on Settings, for the
+    /// screenshot harness.
+    @State private var showingDebugSettings = false
 
     /// Room for the floating bar, so the last row can scroll clear of it.
     private static let barClearance: CGFloat = 96
@@ -75,6 +78,7 @@ struct ChatListView: View {
                 NavigationStack(path: $path) {
                     roster
                         .navigationDestination(for: Chat.self) { ChatView(chat: $0) }
+                        .navigationDestination(isPresented: $showingDebugSettings) { SettingsView() }
                 }
             }
         }
@@ -99,6 +103,9 @@ struct ChatListView: View {
             if ProcessInfo.processInfo.arguments.contains("-open-first"),
                let first = chats.first {
                 open(first.chat)
+            }
+            if ProcessInfo.processInfo.arguments.contains("-open-settings") {
+                showingDebugSettings = true
             }
         }
 #endif
@@ -811,7 +818,13 @@ struct ChatRow: View {
             .frame(maxHeight: .infinity)
 
             HStack(alignment: .top, spacing: 14) {
+                // An Off bot keeps its place in the list, dimmed and grey, so
+                // it reads as switched off rather than merely quiet.
                 ChatAvatarView(chat: chat, size: 52, state: state, animated: state.showsActivity)
+                    .opacity(chat.isOff ? 0.5 : 1)
+                    .saturation(chat.isOff ? 0 : 1)
+                    // After the dimming, so the provider badge stays legible on an Off bot.
+                    .providerBadge(for: chat, avatarSize: 52)
                     .padding(.top, 12)
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -821,6 +834,16 @@ struct ChatRow: View {
                             .foregroundStyle(Color.primary)
                             .lineLimit(1)
                             .layoutPriority(1)
+
+                        if chat.isOff {
+                            Text("Off")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Color.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Capsule().fill(Color.secondary.opacity(0.18)))
+                                .accessibilityLabel("Off")
+                        }
 
                         // the bot's job, the way the desktop shows it
                         if !chat.subtitle.isEmpty {
@@ -890,7 +913,10 @@ struct UpdatesPill: View {
         Button(action: action) {
             HStack(spacing: 8) {
                 if !updates.isEmpty {
-                    MascotStack(colors: Array(updates.prefix(3).map(\.chat.color)))
+                    MascotStack(
+                        colors: Array(updates.prefix(3).map(\.chat.color)),
+                        chats: Array(updates.prefix(3).map(\.chat))
+                    )
                 }
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 4) {
@@ -945,15 +971,22 @@ struct UpdatesPill: View {
 /// Up to three mascots overlapping, the way a group of faces reads at a glance.
 struct MascotStack: View {
     let colors: [String]
+    /// The chats behind `colors`, when they are known: each bot's face then
+    /// wears its model badge like every other avatar.
+    var chats: [Chat] = []
     var size: CGFloat = 28
     var overlap: CGFloat = 12
 
     var body: some View {
         HStack(spacing: -overlap) {
-            ForEach(Array(colors.enumerated()), id: \.offset) { _, color in
+            ForEach(Array(colors.enumerated()), id: \.offset) { index, color in
                 BotMascot(color: color, size: size, state: .idle, animated: false)
+                    .providerBadge(for: chats.indices.contains(index) ? chats[index] : nil, avatarSize: size)
                     .padding(2)
                     .background(Circle().fill(Color(uiColor: .systemBackground)))
+                    // Each face sits above the next, so its badge is not
+                    // covered by the face that overlaps it.
+                    .zIndex(Double(colors.count - index))
             }
         }
     }

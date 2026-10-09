@@ -309,6 +309,12 @@ export interface SendTurnInput {
    *  or neither is (see drivers/prompt-split.ts promptHalves). */
   systemStable?: string;
   systemVolatile?: string;
+  /** Ordered non-empty system-prompt sections, the same list joined into
+   *  `system`.  ACP uses it to drop the oldest volatile sections under a
+   *  byte budget.  The stable sections are interleaved with them, so the
+   *  two joined halves are not enough to put a section back.  Optional: a
+   *  driver that does not budget the prompt ignores it. */
+  systemSections?: Array<{ id: string; text: string; volatile: boolean }>;
   /** sha256 hex of `systemVolatile`, computed once by the server so a driver
    *  comparing halves against a receipt need not hash the text itself. */
   volatileDigest?: string;
@@ -353,7 +359,7 @@ export interface SendTurnInput {
       gatewayUrl?: string;
       control?: { url: string; token: string };
     };
-    /** Direct stdio connection to a Cua Driver MCP server (host, sandbox, or
+    /** Direct stdio connection to a CUA Driver MCP server (host, sandbox, or
      * VPS). `scope` is set only for the user's host desktop; isolated and
      * remote computers intentionally omit it so host-only approval rules
      * cannot change their semantics. */
@@ -750,12 +756,39 @@ export interface ProviderInstance {
  *  `custom` — no subscription catalog; Custom is the product. */
 export type EngineAccess = "subscription" | "custom";
 
+/** The channel wiring a driver declares, resolved ONCE at registration so a
+ *  static consumer can read it without creating an instance.  Each field is
+ *  the exact counterpart of one cell the capability matrix can therefore
+ *  never overclaim, because a "yes" requires the driver to say yes here:
+ *
+ *    composioMcp       -> connectedApps
+ *    localComputerMcp  -> thisComputer
+ *    computerMcp       -> computerUse
+ *    agentsMcp         -> crossBotCoordination
+ *    images            -> imageAttachments
+ *
+ *  Deliberately per-channel rather than one `mcpServers` boolean: a driver
+ *  can mount a local-computer channel and no Composio bridge, which is exactly
+ *  the MiniMax engine's shape, and a single boolean would have to lie about
+ *  one half of it.  The remaining matrix cells — files, terminal, web access,
+ *  rooms, voice, long context, live research — are product judgments rather
+ *  than flags the runtime resolves, so they stay prose.  See
+ *  `engine-capabilities.drivers.test.ts`. */
+export interface EngineChannelWiring {
+  agentsMcp: boolean;
+  computerMcp: boolean;
+  composioMcp: boolean;
+  localComputerMcp: boolean;
+  images: boolean;
+}
+
 export interface ProviderDriver<Config = unknown> {
   readonly driverKind: DriverKind;
   readonly metadata: {
     displayName: string;
     supportsMultipleInstances?: boolean;
     access?: EngineAccess;
+    channelWiring?: EngineChannelWiring;
   };
   /** How to get this engine installed. Omit for engines that need no local
    * binary (API-key drivers), which is what makes it optional. */

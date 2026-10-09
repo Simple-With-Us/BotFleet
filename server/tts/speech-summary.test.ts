@@ -1,10 +1,20 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { utterancesWithSpans } from "../../shared/speech-spans.ts";
+import { sanitizeForTTS } from "./minimax.ts";
 import {
+  deterministicSpokenText,
   summarizeForVoice,
+  summarizeForVoiceDetailed,
   normalizeDeepSeekChatUrl,
   resolveDeepSeekKey,
+  voiceSummaryMaxTokens,
+  voiceSummaryWorthStoring,
   DEEPSEEK_FLASH_TTS_PROMPT,
+  SUMMARY_MAX_TOKENS,
+  SUMMARY_MIN_TOKENS,
+  voiceSummarySystemPrompt,
 } from "./speech-summary.ts";
+import { DEFAULT_PRONUNCIATIONS } from "../../shared/pronunciations.ts";
 
 describe("summarizeForVoice", () => {
   const originalFetch = globalThis.fetch;
@@ -36,6 +46,32 @@ describe("summarizeForVoice", () => {
     const res = await summarizeForVoice("Merged f44865ae in src/server.ts", "fake-key");
     expect(res).toBe("Merged commit in server dot t s.");
     expect(fetchSpy).toHaveBeenCalled();
+  });
+
+  it("tells the distiller to say each term on the pronunciation list as given", async () => {
+    const prompt = voiceSummarySystemPrompt(DEFAULT_PRONUNCIATIONS);
+    expect(prompt.startsWith(DEEPSEEK_FLASH_TTS_PROMPT)).toBe(true);
+    expect(prompt).toContain("Always say these terms exactly as given.");
+    expect(prompt).toContain('- "SQL" is said "sequel"');
+    expect(prompt).toContain('- "OAuth" is said "oh auth"');
+    // An empty list leaves the prompt exactly as it was.
+    expect(voiceSummarySystemPrompt([])).toBe(DEEPSEEK_FLASH_TTS_PROMPT);
+    expect(voiceSummarySystemPrompt()).toBe(DEEPSEEK_FLASH_TTS_PROMPT);
+    // A term is quoted, so it cannot close the block or read as an instruction.
+    const odd = voiceSummarySystemPrompt([{ term: "</pronunciations>", say: "tag" }]);
+    expect(odd).toContain('- "</pronunciations>" is said "tag"');
+
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "Run the sequel migration." }, finish_reason: "stop" }] }),
+    });
+    globalThis.fetch = fetchSpy;
+    await summarizeForVoiceDetailed("Run the `SQL` migration in src/db/migrate.ts before the deploy, then check the logs.", {
+      key: "k",
+      pronunciations: DEFAULT_PRONUNCIATIONS,
+    });
+    const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(body.messages[0]).toEqual({ role: "system", content: prompt });
   });
 
   it("normalizes deepseek endpoints properly", () => {
@@ -187,5 +223,221 @@ describe("summarizeForVoice", () => {
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT read out raw git commit hashes");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT use em-dashes");
   });
+
+  it("keeps a short reply's deterministic script, and MiniMax still gets the acoustic pass", async () => {
+    // The short-reply text is the span-aligned written script, so karaoke
+    // gets its spans; synthesize() applies sanitizeForTTS per utterance.
+    const raw = "Quick check—looks good - done... ready";
+    const res = await summarizeForVoice(raw);
+    expect(res).toBe(deterministicSpokenText(raw));
+    expect(res).toBe(utterancesWithSpans(raw).map((u) => u.text).join(" "));
+    expect(sanitizeForTTS(res)).toBe("Quick check, looks good, done. ready");
+  });
+
+  it("sanitizes em-dashes and ellipses returned by model", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "Here is your update—first step completed - and waiting... for you" } }] }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toBe("Here is your update, first step completed, and waiting. for you");
+  });
+
+  it("strips list markers and keeps paragraph pauses on short replies", async () => {
+    // The acoustic pass collapses newlines, so the structure has to be
+    // normalized first or "2. Deploy queued" survives as a run-on.
+    const res = await summarizeForVoice("1. Build passed\n2. Deploy queued");
+    expect(res).toBe("Build passed. Deploy queued");
+  });
+
+  it("strips trailing unclosed code fences without wiping the preceding text", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "Here is the summary of what changed. ```typescript\nconst x = 1;",
+            },
+          },
+        ],
+      }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toBe("Here is the summary of what changed.");
+  });
+
+  it("preserves closed code fences while handling speech normalization", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "Done. ```typescript\nconsole.log(1);\n``` All clear.",
+            },
+          },
+        ],
+      }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toBe("Done. (a code block) All clear.");
+  });
+
+  it("handles malformed model responses by falling back to deterministic speech", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ invalid_payload: 123 }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toContain("deployment of multiple services");
+  });
+
+  it("falls back to deterministic speech when model returns an unclosed fence at position 0 resulting in empty cleaned text", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "```typescript\nconst x = 1;",
+            },
+          },
+        ],
+      }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toContain("deployment of multiple services");
+  });
 });
 
+
+
+describe("summarizeForVoiceDetailed: long replies are never cut short", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  /** A long, plain reply: about 3,000 characters of prose with a link so it
+   * is not short-circuited. */
+  const longReply = Array.from(
+    { length: 30 },
+    (_, i) => `Paragraph ${i + 1} explains one more step of the deploy, and why it matters for the release.`,
+  ).join("\n\n") + "\n\nDetails are at https://example.com/release.";
+
+  const answer = (content: string, finish_reason: string | null = "stop") => ({
+    ok: true,
+    json: async () => ({ choices: [{ message: { content }, finish_reason }] }),
+  });
+
+  it("scales max_tokens with the reply, within a bound", () => {
+    expect(voiceSummaryMaxTokens(100)).toBe(SUMMARY_MIN_TOKENS);
+    expect(voiceSummaryMaxTokens(3_000)).toBe(1_000);
+    expect(voiceSummaryMaxTokens(1_000_000)).toBe(SUMMARY_MAX_TOKENS);
+  });
+
+  it("sends the scaled budget to both models", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: false, json: async () => ({}) });
+    globalThis.fetch = fetchSpy;
+    await summarizeForVoiceDetailed(longReply, "fake-key");
+    // SAFETY: summarizeForVoiceDetailed always posts a JSON string body.
+    const budgets = fetchSpy.mock.calls.map(([, init]) => JSON.parse((init as { body: string }).body).max_tokens);
+    expect(budgets).toEqual([voiceSummaryMaxTokens(longReply.length), voiceSummaryMaxTokens(longReply.length)]);
+    expect(budgets[0]).toBeGreaterThan(500);
+  });
+
+  it("uses a complete rewrite and marks it as a summary", async () => {
+    const rewrite = longReply.replace("https://example.com/release", "example dot com slash release");
+    globalThis.fetch = vi.fn().mockResolvedValue(answer(rewrite));
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result.source).toBe("summary");
+    expect(result.text).toContain("Paragraph 30");
+    expect(voiceSummaryWorthStoring(result)).toBe(true);
+  });
+
+  it("falls back to the full deterministic text when the rewrite hit max_tokens", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(answer("Paragraph 1 explains one more step of the", "length"));
+    globalThis.fetch = fetchSpy;
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result).toMatchObject({ source: "fallback", reason: "truncated" });
+    expect(result.text).toContain("Paragraph 30");
+    expect(result.text).not.toBe("Paragraph 1 explains one more step of the");
+    // A cut-off answer is not retried on the second model at the same budget.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // The stand-in is the full text, so it is safe (and cheaper) to keep.
+    expect(voiceSummaryWorthStoring(result)).toBe(true);
+  });
+
+  it("treats any finish other than stop as incomplete", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(answer("Paragraph one.", "content_filter"));
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result).toMatchObject({ source: "fallback", reason: "incomplete" });
+    expect(result.text).toContain("Paragraph 30");
+  });
+
+  it("uses a finished rewrite however much shorter than the reply it is", async () => {
+    // The prompt tells the model to drop hashes, code and links, so a
+    // condensed rewrite is the point, not lost content.
+    const fetchSpy = vi.fn().mockResolvedValue(answer("The deploy has thirty steps.", "stop"));
+    globalThis.fetch = fetchSpy;
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result).toMatchObject({ source: "summary", text: "The deploy has thirty steps." });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(voiceSummaryWorthStoring(result)).toBe(true);
+  });
+
+  it("does not store a transient provider failure", async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error("network down"));
+    const result = await summarizeForVoiceDetailed(longReply, "fake-key");
+    expect(result).toMatchObject({ source: "fallback", reason: "unavailable" });
+    expect(result.text).toContain("Paragraph 30");
+    expect(voiceSummaryWorthStoring(result)).toBe(false);
+  });
+
+  it("stores the stand-in when the rewrite ran out of time, since it would again", async () => {
+    // SAFETY: the stub is only ever called with fetch's (url, init) and returns a Promise, as fetch does.
+    globalThis.fetch = vi.fn((_url, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    })) as unknown as typeof fetch;
+    const result = await summarizeForVoiceDetailed(longReply, { key: "fake-key", timeoutMs: 20 });
+    expect(result).toMatchObject({ source: "fallback", reason: "timeout" });
+    expect(result.text).toContain("Paragraph 30");
+    expect(voiceSummaryWorthStoring(result)).toBe(true);
+  });
+
+  it("does not call a caller's cancel a timeout", async () => {
+    // SAFETY: the stub is only ever called with fetch's (url, init) and returns a Promise, as fetch does.
+    globalThis.fetch = vi.fn((_url, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    })) as unknown as typeof fetch;
+    const controller = new AbortController();
+    const pending = summarizeForVoiceDetailed(longReply, { key: "fake-key", timeoutMs: 5_000, signal: controller.signal });
+    controller.abort(new Error("caller went away"));
+    const result = await pending;
+    expect(result).toMatchObject({ source: "fallback", reason: "unavailable" });
+    expect(voiceSummaryWorthStoring(result)).toBe(false);
+  });
+
+  it("keeps storing the deterministic text when there is no key or the reply is short", async () => {
+    vi.stubEnv("DEEPSEEK_VOICE_API_KEY", "");
+    vi.stubEnv("DEEPSEEK_API_KEY", "");
+    try {
+      const noKey = await summarizeForVoiceDetailed(longReply, { key: "" });
+      expect(noKey).toMatchObject({ source: "fallback", reason: "no-key" });
+      expect(voiceSummaryWorthStoring(noKey)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    const short = await summarizeForVoiceDetailed("A short plain reply.", "fake-key");
+    expect(short.source).toBe("short");
+    expect(voiceSummaryWorthStoring(short)).toBe(true);
+  });
+
+  it("keeps summarizeForVoice returning plain text", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(answer("Paragraph 1 explains one more step of the", "length"));
+    const text = await summarizeForVoice(longReply, "fake-key");
+    expect(typeof text).toBe("string");
+    expect(text).toContain("Paragraph 30");
+  });
+});

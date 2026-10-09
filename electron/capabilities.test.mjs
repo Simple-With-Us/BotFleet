@@ -7,10 +7,22 @@ const {
   linuxLocalControlSupport,
   linuxSession,
   localComputerReady,
+  macOSMajorVersion,
   nativeDesktopActions,
 } = require("./capabilities.cjs");
 
+// Darwin kernel 23 is the macOS 14 release train.
+const MACOS_14_RELEASE = "23.6.0";
+
 describe("desktop capabilities", () => {
+  it("maps a Darwin kernel release to its macOS major version", () => {
+    expect(macOSMajorVersion("23.6.0")).toBe(14);
+    expect(macOSMajorVersion("22.6.0")).toBe(13);
+    expect(macOSMajorVersion("24.0.0")).toBe(15);
+    expect(macOSMajorVersion("")).toBe(0);
+    expect(macOSMajorVersion("not-a-version")).toBe(0);
+  });
+
   it("keeps Apple permissions, Settings, and speech actions unreachable on Linux", () => {
     expect(nativeDesktopActions("linux")).toEqual({
       appleMediaPermissions: false,
@@ -30,15 +42,49 @@ describe("desktop capabilities", () => {
       platform: "darwin",
       packaged: true,
       localConnection: { mode: "embedded" },
+      osRelease: MACOS_14_RELEASE,
     });
 
     expect(capabilities).toMatchObject({
       host: { platform: "darwin", label: "macOS", session: "unknown", packaged: true },
       windowChrome: "mac-inset",
       screenPreview: { available: true, interaction: "direct" },
-      dictation: { available: true, engine: "apple-speech", onDevice: true },
+      dictation: { available: true, engine: "apple-speech", onDevice: true, personalVoice: true },
       localComputer: { available: true, support: "supported", enabled: true, status: "ready" },
     });
+  });
+
+  it("does not advertise Personal Voice below macOS 14", () => {
+    // The speech helper hard-fails with `unsupported-platform` under macOS 14,
+    // so a macOS 13 host must not be shown an enabled Personal Voice call button.
+    const capabilities = desktopCapabilities({
+      platform: "darwin",
+      packaged: true,
+      localConnection: { mode: "embedded" },
+      osRelease: "22.6.0",
+    });
+
+    expect(capabilities.dictation).toMatchObject({
+      available: true,
+      engine: "apple-speech",
+      onDevice: true,
+      personalVoice: false,
+      reasonCode: "requires-macos-14",
+    });
+  });
+
+  it("fails the Personal Voice gate closed when the host release is unreadable", () => {
+    // An omitted release means "ask the host", which is a real macOS; an
+    // unreadable one must not pass the gate by accident.
+    for (const osRelease of ["", "not-a-version"]) {
+      const capabilities = desktopCapabilities({
+        platform: "darwin",
+        localConnection: { mode: "embedded" },
+        osRelease,
+      });
+      expect(capabilities.dictation.personalVoice).toBe(false);
+      expect(capabilities.dictation.reasonCode).toBe("requires-macos-14");
+    }
   });
 
   it.each(["win32", "freebsd"])("fails closed on %s", (platform) => {

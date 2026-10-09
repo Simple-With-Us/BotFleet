@@ -27,6 +27,7 @@ export const UPDATE_STEPS = Object.freeze([
   "installDependencies",
   "buildBundle",
   "validateBundle",
+  "smokeTestBundle",
   "persistPrepared",
   "validatePrepared",
   "preflight",

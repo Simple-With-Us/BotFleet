@@ -353,15 +353,15 @@ function geometryFrom(stdout: string): Frame["geometry"] {
 function automationSummary(stdout: string): string {
   if (/^BACKEND CUA$/m.test(stdout)) {
     const encoded = stdout.match(/^CUA_RESULT\s+([^\s]+)$/m)?.[1];
-    if (!encoded) return `Cua Driver ${REMOTE_CUA_VERSION}`;
+    if (!encoded) return `CUA Driver ${REMOTE_CUA_VERSION}`;
     try {
       const result = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as Record<string, unknown>;
       const details = [result.effect, result.route, result.escalation]
         .filter((value): value is string => typeof value === "string" && Boolean(value))
         .slice(0, 3);
-      return [`Cua Driver ${REMOTE_CUA_VERSION}`, ...details].join(" · ");
+      return [`CUA Driver ${REMOTE_CUA_VERSION}`, ...details].join(" · ");
     } catch {
-      return `Cua Driver ${REMOTE_CUA_VERSION}`;
+      return `CUA Driver ${REMOTE_CUA_VERSION}`;
     }
   }
   return /^BACKEND X11$/m.test(stdout) ? "X11 fallback" : "automation backend unavailable";
@@ -528,7 +528,7 @@ const TOOLS = [
   },
   {
     name: "computer_status",
-    description: "Report whether the cloud computer is using Cua Driver or the degraded X11 fallback.",
+    description: "Report whether the cloud computer is using CUA Driver or the degraded X11 fallback.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -936,10 +936,10 @@ async function call(id: unknown, name: string, args: any) {
     ].join("\n");
     const out = await runOnBox(command, 20_000);
     if (!/^CUA /m.test(out.stdout)) {
-      return text(id, "Cloud computer automation: X11 fallback (Cua Driver is still installing or needs repair).", true);
+      return text(id, "Cloud computer automation: X11 fallback (CUA Driver is still installing or needs repair).", true);
     }
     const overall = out.stdout.match(/"overall"\s*:\s*"(ok|degraded|failed)"/)?.[1] ?? "unknown";
-    return text(id, `Cloud computer automation: Cua Driver ${REMOTE_CUA_VERSION} (${overall}).`);
+    return text(id, `Cloud computer automation: CUA Driver ${REMOTE_CUA_VERSION} (${overall}).`);
   }
   if (name === "click") {
     const x = Math.round(Number(args.x));
