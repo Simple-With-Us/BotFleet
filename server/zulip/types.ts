@@ -70,13 +70,22 @@ export interface ZulipSettings {
    *  600).  No default: the file source is off until this is set. */
   credentialDir?: string;
   /** Where the keys come from: "file" (`credentialDir`) or "infisical"
-   *  (BotFleet's own vault, `infisicalPath`).  Unset means the file source
-   *  when `credentialDir` is set, and none otherwise.  An open owner
-   *  decision (docs/zulip.md, D0). */
+   *  (`infisicalPath`, read with the harness's machine identity).  Unset
+   *  means the file source when `credentialDir` is set, and none otherwise
+   *  (docs/zulip.md, D0). */
   credentialSource?: "file" | "infisical";
   /** The Infisical folder holding `ZULIP_<ROLE>_EMAIL` / `_API_KEY`.
    *  Default `/zulip`. */
   infisicalPath?: string;
+  /** The Infisical project that folder is in, when it is not BotFleet's
+   *  own (the fleet's is AI Fleet Coordinator,
+   *  `9bf7417a-fbbb-42ca-870c-2b45207233f5`).  Unset or empty: the
+   *  harness's own project.  The harness's machine identity must be able to
+   *  read it. */
+  infisicalProjectId?: string;
+  /** The environment slug that folder is in (`prod`).  Unset or empty: the
+   *  harness's own environment. */
+  infisicalEnv?: string;
   /** BotFleet bot id -> its Zulip role (the file code, e.g. "BF-Plumber"). */
   bots?: Record<string, { role: string; enabled?: boolean }>;
   /** Channels a bot may post to outside the conversation it was woken by. */
