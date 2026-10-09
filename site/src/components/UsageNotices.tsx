@@ -3,7 +3,7 @@
 // and fallback chains that are shorter at runtime than in the picker.  They
 // live here, apart from the Usage panel's six data sources, so a visual spec
 // can mount the real markup with fixed data (tests/e2e/usage-notices.visual.spec.ts).
-import type { DoomedPair, RedundantChain } from "./UsageSection";
+import type { DoomedPair, RedundantChain } from "../../../src/components/UsageSection";
 
 /** Bots whose engine the dispatcher is refusing to start.  Renders nothing when
  *  no pair is held.  `heldPairs` are the pairs already filtered to the ones that

@@ -6,7 +6,7 @@
 // or a fallback chain is shorter than the picker shows.  Two states: several
 // bots (plural headings) and exactly one bot (singular headings).  Nothing
 // here talks to a server, so the spec needs no route mocking.
-import { HeldBotsNotice, RedundantChainsNotice } from "./UsageNotices";
+import { HeldBotsNotice, RedundantChainsNotice } from "../../site/src/components/UsageNotices";
 import { Card } from "./SettingsPrimitives";
 import type { DoomedPair, RedundantChain } from "./UsageSection";
 

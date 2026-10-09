@@ -6,7 +6,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { HeldBotsNotice, RedundantChainsNotice } from "./UsageNotices";
+import { HeldBotsNotice, RedundantChainsNotice } from "../../site/src/components/UsageNotices";
 import type { DoomedPair, RedundantChain } from "./UsageSection";
 
 const pair = (botId: string, instanceId: string, extra: Partial<DoomedPair> = {}): DoomedPair => ({
