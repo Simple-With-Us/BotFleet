@@ -10137,6 +10137,36 @@ async function drainAfterInterrupt(): Promise<void> {
   }
 }
 
+/** A quiesce request's flags: "1"/"true" on, "0"/"false" off. */
+const QUIESCE_FLAG = z.enum(["1", "true", "0", "false"]);
+/** A window in whole milliseconds, as a query string carries it. */
+const QUIESCE_MS = z.string().regex(/^\d{1,10}$/u, "must be whole milliseconds");
+
+/** The query a quiesce, hold, renewal or release may carry (Kody
+ *  4226532374).  Parameters this route does not read are left alone. */
+const QuiesceQuerySchema = z.object({
+  force: QUIESCE_FLAG.optional(),
+  drain: QUIESCE_FLAG.optional(),
+  renew: QUIESCE_FLAG.optional(),
+  timeoutMs: QUIESCE_MS.optional(),
+  leaseMs: QUIESCE_MS.optional(),
+});
+
+/** The JSON body a quiesce may carry instead: strict, so a misspelled or
+ *  mistyped field is refused rather than ignored. */
+const QuiesceBodySchema = z.object({
+  force: z.boolean().optional(),
+  drain: z.boolean().optional(),
+  timeoutMs: z.union([z.number().int().positive(), QUIESCE_MS]).optional(),
+}).strict();
+
+/** The first thing wrong with a quiesce request, said in one line. */
+function quiesceInputError(error: z.ZodError): string {
+  const issue = error.issues[0];
+  const where = issue?.path.length ? `${issue.path.join(".")}: ` : "";
+  return `invalid quiesce request: ${where}${issue?.message ?? "malformed"}`;
+}
+
 /** Arm (or renew) the fence's lease for `value` milliseconds, clamped.  An
  *  unreadable value arms nothing: a fence without a lease is the old one. */
 function armFenceLease(value: string | null): void {
@@ -14082,29 +14112,42 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!isLoopbackAddress(req.socket.remoteAddress) || !authorizedRuntime(harnessOwner, req.headers.authorization)) {
         return json(res, 401, { error: "unauthorized" });
       }
-      const flag = (value: string | null) => value === "1" || value === "true";
-      let force = flag(url.searchParams.get("force"));
+      // What a quiesce or release asks for, checked against a strict shape:
+      // a malformed flag or window is refused with 400, never read loosely
+      // into drain, fence or lease state.
+      const quiesceQuery = path === "/api/runtime/quiesce"
+        ? QuiesceQuerySchema.safeParse(Object.fromEntries(url.searchParams))
+        : null;
+      if (quiesceQuery && !quiesceQuery.success) return json(res, 400, { error: quiesceInputError(quiesceQuery.error) });
+      const query = quiesceQuery?.data ?? {};
+      const flag = (value: string | undefined) => value === "1" || value === "true";
+      let force = flag(query.force);
       // `drain` asks the harness to hold new work and let work in flight
       // finish (server/update-drain.ts), instead of fencing now or refusing.
       // A harness that predates it treats the request as a plain quiesce,
       // which is exactly what a drain-capable updater falls back to.
-      let drain = flag(url.searchParams.get("drain"));
-      let drainTimeoutMs: DrainWindowInput = url.searchParams.get("timeoutMs");
-      if (method === "POST" && req.headers["content-type"]?.includes("application/json")) {
+      let drain = flag(query.drain);
+      let drainTimeoutMs: DrainWindowInput = query.timeoutMs ?? null;
+      if (method === "POST" && path === "/api/runtime/quiesce" && req.headers["content-type"]?.includes("application/json")) {
+        let raw: unknown;
         try {
-          const body = await readBody(req);
-          if (body?.force === true) force = true;
-          if (body?.drain === true) drain = true;
-          if (typeof body?.timeoutMs === "number" || typeof body?.timeoutMs === "string") drainTimeoutMs = body.timeoutMs;
-        } catch {}
+          raw = await readBody(req);
+        } catch {
+          return json(res, 400, { error: "invalid quiesce request: the body is not JSON" });
+        }
+        const body = QuiesceBodySchema.safeParse(raw);
+        if (!body.success) return json(res, 400, { error: quiesceInputError(body.error) });
+        if (body.data.force === true) force = true;
+        if (body.data.drain === true) drain = true;
+        if (body.data.timeoutMs !== undefined) drainTimeoutMs = body.data.timeoutMs;
       }
       // `renew` keeps the fence's lease alive and does nothing else: it never
       // raises a fence and never starts a hold.  (A harness that predates it
       // would read it as a plain quiesce, so an updater only renews a fence
       // whose answer carried a `lease`.)
-      if (method === "POST" && path === "/api/runtime/quiesce" && flag(url.searchParams.get("renew"))) {
+      if (method === "POST" && path === "/api/runtime/quiesce" && flag(query.renew)) {
         const renewed = runtimeQuiescing && !runtimeFencing;
-        if (renewed) armFenceLease(url.searchParams.get("leaseMs"));
+        if (renewed) armFenceLease(query.leaseMs ?? null);
         return json(res, 200, {
           ...runtimeBuildIdentity, pid: process.pid, ...currentRuntimeReadiness(),
           renewed,
@@ -14127,7 +14170,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // Armed here, after the request settled, so a forced quiesce whose
       // answer the updater lost still gets one.
       if (method === "POST" && path === "/api/runtime/quiesce" && !draining && runtimeQuiescing && !runtimeFencing) {
-        armFenceLease(url.searchParams.get("leaseMs"));
+        armFenceLease(query.leaseMs ?? null);
       }
       // Starting a drain on a busy Mac is the point of it, not a refusal.
       const refused = method === "POST" && path === "/api/runtime/quiesce" && !draining && !readiness.safeToRestart;

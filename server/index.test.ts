@@ -735,6 +735,47 @@ describe("harness HTTP API", () => {
     expect((await fetch(`${BASE}/api/config`)).status).toBe(200);
   });
 
+  it("refuses a malformed quiesce request with 400 and changes nothing", async () => {
+    // Kody 4226532374: force, drain and the windows were read loosely.
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const post = (query: string, body?: string) => fetch(`${BASE}/api/runtime/quiesce${query}`, {
+      method: "POST",
+      headers: body === undefined ? authorization : { ...authorization, "content-type": "application/json" },
+      body,
+    });
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      quiescing: boolean;
+      draining: boolean;
+    };
+    try {
+      for (const [query, body] of [
+        ["?drain=maybe", undefined],
+        ["?force=yes", undefined],
+        ["?drain=1&timeoutMs=soon", undefined],
+        ["?leaseMs=-5", undefined],
+        ["", JSON.stringify({ force: "yes" })],
+        ["", JSON.stringify({ drain: true, timeoutMs: -1 })],
+        ["", JSON.stringify({ drain: true, extra: 1 })],
+        ["", "{ not json"],
+      ] as const) {
+        const refused = await post(query, body);
+        expect(refused.status, `${query} ${body ?? ""}`).toBe(400);
+        expect(await refused.json()).toMatchObject({ error: expect.stringMatching(/^invalid quiesce request/) });
+      }
+      expect(await runtime()).toMatchObject({ quiescing: false, draining: false });
+
+      // A well-formed body still works.
+      const held = await post("", JSON.stringify({ drain: true, timeoutMs: 60_000 }));
+      expect(held.status).toBe(200);
+      expect(await held.json()).toMatchObject({ draining: true, quiescing: false });
+    } finally {
+      await fetch(`${BASE}/api/runtime/quiesce`, { method: "DELETE", headers: authorization });
+    }
+    expect(await runtime()).toMatchObject({ quiescing: false, draining: false });
+  });
+
   it("holds new work for an update without closing routes, and never drops a held message", async () => {
     const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
     const authorization = { Authorization: `Bearer ${owner.nonce}` };
