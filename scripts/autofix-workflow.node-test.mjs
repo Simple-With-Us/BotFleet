@@ -20,7 +20,7 @@ const steps = workflow.jobs.autofix.steps;
 function run(name) {
   const step = steps.find((candidate) => candidate.name === name);
   assert.ok(step, `step "${name}" exists in autofix.yml`);
-  assert.equal(typeof step.run, "string", `step "${name}" is a run step`);
+  assert.ok(step.run != null && `${step.run}` === step.run, `step "${name}" is a run step`);
   return step.run;
 }
 
