@@ -48,7 +48,27 @@ export function isCloudDesktopJoin(method: string, path: string): boolean {
 
 /** The profile fields a paired phone owns.  Engine choice is deliberately
  * included: the native model picker is a companion feature.  Execution
- * policy, connected apps, computer grants, and host paths remain Mac-only. */
+ * policy, connected apps, and host paths remain Mac-only.
+ *
+ * `computers` is on the list since 2026-10-08, and only partly.  The phone
+ * may switch the sandboxed destinations (cloud, vm).  Whether the bot holds
+ * This Mac (`local`, the person's real desktop) is still the Mac's decision,
+ * and the sidecar cannot enforce that half: telling "kept local" from "added
+ * local" needs the stored bot.  The harness's profile route owns that check
+ * (`PAIRED_LOCAL_COMPUTER_ERROR` in server/index.ts) and answers 403 with its
+ * own message, so the guard binds every caller of the route, not only this
+ * proxy.  `maxToolRounds` is a 1 to 200 budget the harness clamps, added
+ * because the native control shipped (#649) without anyone extending this
+ * list, not because anyone decided to keep it off the phone.  `cwd` is open
+ * only because the harness confines it: from a paired phone (the proxy stamps
+ * `x-botfleet-companion`) a bot's folder may reuse or narrow one this
+ * computer already shares with a bot or room, as a room folder set from the
+ * phone is confined, and anything else is a 403 with the reason.
+ *
+ * Still refused, on purpose, until the owner rules: `autoApprove`,
+ * `autoReview` and `approvePeerComms`.  They decide what runs unattended and
+ * who a bot may contact without asking, which #323 kept off the phone (audit
+ * BF-IOS-001).  The native sheet shows them read-only. */
 export const COMPANION_PROFILE_PATCH_FIELDS = [
   "name",
   "title",
@@ -64,6 +84,9 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "speakReplies",
   "speechDevices",
   "modelSelection",
+  "computers",
+  "maxToolRounds",
+  "cwd",
 ] as const;
 
 const COMPANION_PROFILE_PATCH_FIELD_SET = new Set<string>(COMPANION_PROFILE_PATCH_FIELDS);
@@ -167,6 +190,14 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/api\/tts\/speak$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio\/\d+$/ },
+
+  // The phone's own voice recordings.  Playing one back reads a WAV the
+  // harness stored for that user message, and the review route stores a text
+  // note on it; neither forks the thread, reruns a bot, or rewrites the
+  // recognizer's original.  The native chat view calls both, and they used to
+  // answer "no route" because nobody added them here.
+  { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/recording$/ },
+  { method: "PATCH", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/recording-review$/ },
 
   // Routines create ordinary tasks using an existing agent configuration.
   // Webhook management remains explicitly denied below.

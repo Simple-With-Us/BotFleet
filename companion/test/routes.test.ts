@@ -149,10 +149,8 @@ describe("what it may not", () => {
       "bypassPermissions",
       "composio",
       "connectorTools",
-      "computers",
       "cloudBackend",
       "autoStartVps",
-      "cwd",
       "extraCwds",
       "userNotes",
       "chiefOfStaff",
@@ -164,6 +162,56 @@ describe("what it may not", () => {
         error: `${field} can only be changed in BotFleet on your computer`,
       });
     }
+  });
+
+  it("lets the phone switch computers, the tool-round budget and a bot's folder", () => {
+    // The Computers, round-budget and folder controls of the native bot sheet
+    // shipped (#709, #649) without anyone extending this list, so every save
+    // of any of them came back "can only be changed in BotFleet on your
+    // computer".  What the harness does with each is tested end to end in
+    // companion/test/proxy.test.ts: it checks This Mac against the stored bot
+    // and confines the folder, neither of which the sidecar can see.
+    for (const field of ["computers", "maxToolRounds", "cwd"]) {
+      expect(COMPANION_PROFILE_PATCH_FIELDS, field).toContain(field);
+    }
+    expect(companionProfilePatchDenial({ computers: ["cloud", "vm"] })).toBeNull();
+    expect(companionProfilePatchDenial({ maxToolRounds: null, name: "Scout" })).toBeNull();
+    expect(companionProfilePatchDenial({ cwd: "/Users/jay/Code/BotFleet", name: "Scout" })).toBeNull();
+    expect(companionProfilePatchDenial({ cwd: null })).toBeNull();
+  });
+
+  it("keeps execution policy on the Mac until the owner rules, and refuses the whole save for it", () => {
+    // They decide what runs unattended and who a bot may contact without
+    // asking (#323, audit BF-IOS-001).  The native sheet shows them read-only.
+    for (const field of ["autoApprove", "autoReview", "approvePeerComms"]) {
+      expect(COMPANION_PROFILE_PATCH_FIELDS, field).not.toContain(field);
+      expect(companionProfilePatchDenial({ [field]: true }), field).toEqual({
+        status: 403,
+        error: `${field} can only be changed in BotFleet on your computer`,
+      });
+      // One refused field refuses the request, including the edits that
+      // would have been fine on their own.
+      expect(companionProfilePatchDenial({ name: "Scout", computers: ["vm"], [field]: true }), field).toEqual({
+        status: 403,
+        error: `${field} can only be changed in BotFleet on your computer`,
+      });
+    }
+  });
+
+  it("lets the phone play back and annotate its own recordings, and nothing nearby", () => {
+    // The native chat view calls both; they answered "no route".
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording")).toBeNull();
+    expect(ask("PATCH", "/api/threads/th_1/messages/msg_1/recording-review")).toBeNull();
+    // Exactly those two verbs on exactly those two paths, and a device that
+    // has not paired gets neither.
+    expect(ask("PUT", "/api/threads/th_1/messages/msg_1/recording")?.status).toBe(404);
+    expect(ask("DELETE", "/api/threads/th_1/messages/msg_1/recording")?.status).toBe(404);
+    expect(ask("POST", "/api/threads/th_1/messages/msg_1/recording-review")?.status).toBe(404);
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording-review")?.status).toBe(404);
+    expect(allowed("GET", "/api/threads/th_1/messages/msg_1/recording/extra")).toBe(false);
+    expect(allowed("GET", "/api/threads/th_1/messages/msg_1/recording/../../config")).toBe(false);
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording", false)?.status).toBe(401);
+    expect(ask("PATCH", "/api/threads/th_1/messages/msg_1/recording-review", false)?.status).toBe(401);
   });
 
   it("lets the phone write per-device voices", () => {

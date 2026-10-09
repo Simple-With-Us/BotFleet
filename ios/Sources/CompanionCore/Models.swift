@@ -932,10 +932,18 @@ public struct BotProfilePatch: Encodable, Sendable {
         case clear
     }
 
-    public var autoApprove: Bool?
-    public var autoReview: String?
-    public var approvePeerComms: Bool?
+    /// Not here on purpose: `autoApprove`, `autoReview` and `approvePeerComms`.
+    /// They decide what a bot runs unattended and who it may contact without
+    /// asking, which the companion keeps on the computer
+    /// (`companion/src/routes.ts`, audit BF-IOS-001), so a request carrying one
+    /// is refused whole.  The type cannot express them, and the sheet shows
+    /// them read-only.
+    ///
+    /// `BotComputers.updated` builds this: the sandboxed destinations only,
+    /// with This Mac carried through as the computer has it.
     public var computers: [String]?
+    /// A folder on the computer.  The harness confines it from a phone to
+    /// folders a bot or room there already uses, and answers 403 otherwise.
     public var cwd: CwdString?
 
     public enum CwdString: Equatable, Sendable {
@@ -991,9 +999,6 @@ public struct BotProfilePatch: Encodable, Sendable {
         modelSelection: ModelSelection? = nil,
         section: SectionString? = nil,
         maxToolRounds: MaxToolRounds? = nil,
-        autoApprove: Bool? = nil,
-        autoReview: String? = nil,
-        approvePeerComms: Bool? = nil,
         computers: [String]? = nil,
         cwd: CwdString? = nil
     ) {
@@ -1010,15 +1015,12 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.modelSelection = modelSelection
         self.section = section
         self.maxToolRounds = maxToolRounds
-        self.autoApprove = autoApprove
-        self.autoReview = autoReview
-        self.approvePeerComms = approvePeerComms
         self.computers = computers
         self.cwd = cwd
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, computers, cwd
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, computers, cwd
     }
 
     private enum DeviceKeys: String, CodingKey { case mac, iphone }
@@ -1062,9 +1064,6 @@ public struct BotProfilePatch: Encodable, Sendable {
             case .clear: try values.encodeNil(forKey: .maxToolRounds)
             }
         }
-        try values.encodeIfPresent(autoApprove, forKey: .autoApprove)
-        try values.encodeIfPresent(autoReview, forKey: .autoReview)
-        try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
         try values.encodeIfPresent(computers, forKey: .computers)
         if let cwd {
             switch cwd {

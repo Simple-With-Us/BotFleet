@@ -83,7 +83,7 @@ struct SettingsView: View {
                     .accessibilityHint(notificationAccessibilityHint)
                 }
             } footer: {
-                Text("Alerts arrive while BotFleet is open or was recently in the background. Closed-app delivery is not available yet.")
+                Text("Alerts reach this iPhone while BotFleet is open or in the background.\u{00A0} Closed-app delivery needs push set up on your computer, and the section below says whether it is working.")
             }
 
             if session.connection != nil {

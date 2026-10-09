@@ -38,9 +38,6 @@ struct AgentProfileView: View {
     @State private var config: ConfigStatus?
     @State private var busy = false
     @State private var player: AVAudioPlayer?
-    @State private var autoApprove: Bool
-    @State private var autoReview: String
-    @State private var approvePeerComms: Bool
     @State private var computers: Set<String>
     @State private var cwd: String
     @State private var baseline: ProfileFormSnapshot
@@ -61,9 +58,6 @@ struct AgentProfileView: View {
         _effort = State(initialValue: bot.modelSelection.effort)
         _fallbacks = State(initialValue: bot.modelSelection.fallbacks ?? [])
         _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
-        _autoApprove = State(initialValue: bot.autoApprove ?? false)
-        _autoReview = State(initialValue: bot.autoReview ?? "off")
-        _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
         _computers = State(initialValue: Set(bot.computers ?? []))
         _cwd = State(initialValue: bot.cwd ?? "")
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
@@ -503,7 +497,6 @@ struct AgentProfileView: View {
             guard cwd != baseline.cwd else { return nil }
             return trimmedCwd.isEmpty ? .clear : .set(trimmedCwd)
         }()
-        let computersArray = ["cloud", "vm", "local"].filter { computers.contains($0) }
         return BotProfilePatch(
             name: name == baseline.name ? nil : name.trimmingCharacters(in: .whitespacesAndNewlines),
             title: title == baseline.title ? nil : title.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -516,10 +509,13 @@ struct AgentProfileView: View {
             speechDevices: savedDevices == baseline.speechDevices ? nil : ["mac", "iphone"].filter { savedDevices.contains($0) },
             modelSelection: newModelSelection == baseline.modelSelection ? nil : newModelSelection,
             maxToolRounds: maxToolRoundsPatch,
-            autoApprove: autoApprove == baseline.autoApprove ? nil : autoApprove,
-            autoReview: autoReview == baseline.autoReview ? nil : autoReview,
-            approvePeerComms: approvePeerComms == baseline.approvePeerComms ? nil : approvePeerComms,
-            computers: computers == baseline.computers ? nil : computersArray,
+            // The bot as it is now, with only the person's two switches applied,
+            // so This Mac is never part of what this phone asks to change.
+            computers: BotComputers.updated(
+                current: current.computers,
+                baseline: baseline.computers,
+                picks: computers
+            ),
             cwd: cwdPatch
         )
     }
@@ -562,27 +558,39 @@ struct AgentProfileView: View {
         }
     }
 
+    /// Read-only on purpose.  These decide what a bot runs without asking and
+    /// who it may contact without asking, and the companion keeps them on the
+    /// computer (`companion/src/routes.ts`), so a switch here would only ever
+    /// come back refused.  The values are the computer's, live.
     @ViewBuilder
     private var automationAndApprovalsSection: some View {
         Section {
-            Toggle("Automatic approvals", isOn: $autoApprove)
-            Picker("Auto review", selection: $autoReview) {
-                Text("Off").tag("off")
-                Text("Shadow (advisory)").tag("shadow")
-                Text("Enforce (blocks unsafe)").tag("enforce")
-            }
-            Toggle("Ask before contacting other bots", isOn: $approvePeerComms)
+            LabeledContent("Automatic approvals", value: (current.autoApprove ?? false) ? "On" : "Off")
+            LabeledContent("Auto review", value: Self.autoReviewLabel(current.autoReview))
+            LabeledContent("Ask before contacting other bots", value: (current.approvePeerComms ?? false) ? "On" : "Off")
         } header: {
             Text("Automation & Approvals")
         } footer: {
-            Text("Automatic approvals run safe read-only and non-destructive tool operations without confirmation. Auto review inspects changes for syntax and safety.")
+            Text("Change On Mac:\u{00A0} these decide what a bot may do without asking, so they are changed in BotFleet on your computer.\u{00A0} Automatic approvals run safe read-only and non-destructive tool operations without confirmation.\u{00A0} Auto review inspects changes for syntax and safety.")
+        }
+    }
+
+    private static func autoReviewLabel(_ value: String?) -> String {
+        switch value {
+        case "shadow": return "Shadow (advisory)"
+        case "enforce": return "Enforce (blocks unsafe)"
+        default: return "Off"
         }
     }
 
     @ViewBuilder
     private var computersSection: some View {
         Section {
-            if computers.isEmpty {
+            if current.computers == nil && computers == baseline.computers {
+                // No list stored: the computer picks for this bot.  Showing
+                // that as "(no computer)" would say the opposite.
+                LabeledContent("Assigned computers", value: "Automatic")
+            } else if computers.isEmpty && !BotComputers.holdsThisMac(current.computers) {
                 HStack {
                     Text("Assigned computers")
                     Spacer()
@@ -591,10 +599,6 @@ struct AgentProfileView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Toggle("Local Mac desktop", isOn: Binding(
-                get: { computers.contains("local") },
-                set: { if $0 { computers.insert("local") } else { computers.remove("local") } }
-            ))
             Toggle("Self-hosted VPS / Box", isOn: Binding(
                 get: { computers.contains("cloud") },
                 set: { if $0 { computers.insert("cloud") } else { computers.remove("cloud") } }
@@ -603,10 +607,14 @@ struct AgentProfileView: View {
                 get: { computers.contains("vm") },
                 set: { if $0 { computers.insert("vm") } else { computers.remove("vm") } }
             ))
+            // Read-only: This Mac is the person's real desktop, so the
+            // computer, not the phone, turns it on or off.  The state shown is
+            // the computer's, live.
+            LabeledContent("This Mac", value: BotComputers.holdsThisMac(current.computers) ? "On" : "Off")
         } header: {
             Text("Computers")
         } footer: {
-            Text("Controls which execution environments this bot can mount for shell commands, browser tools, and desktop control.")
+            Text("Controls which execution environments this bot can mount for shell commands, browser tools, and desktop control.\u{00A0} Change On Mac:\u{00A0} This Mac is your real desktop, so it is turned on or off in BotFleet on your computer.")
         }
     }
 
@@ -619,7 +627,7 @@ struct AgentProfileView: View {
         } header: {
             Text("Working Directory")
         } footer: {
-            Text("Default repository or workspace folder path on the paired Mac.")
+            Text("Default repository or workspace folder path on the paired Mac.\u{00A0} From this iPhone, choose a folder that a bot or room on your computer already uses.\u{00A0} Any other folder is chosen in BotFleet on your computer.")
         }
     }
 
@@ -858,8 +866,22 @@ struct AgentProfileView: View {
                     withoutDeviceVoices: profilePatchWithoutDeviceVoices()
                 )
             },
-            accept: synchronizeForm(with:)
+            accept: synchronizeForm(with:),
+            rejected: revertRefusableFields
         )
+    }
+
+    /// A refused save puts the two fields the computer can say no to back to
+    /// what it holds, so the sheet stops showing a switch or folder as saved
+    /// after the banner says it was not.  The computer's own sentence is the
+    /// banner (`Session.updateProfile` records it).  A name, a voice or a
+    /// model stays as typed for the retry.
+    private func revertRefusableFields() {
+        let held = current
+        computers = Set(held.computers ?? [])
+        baseline.computers = computers
+        cwd = held.cwd ?? ""
+        baseline.cwd = cwd
     }
 
     /// The same save for a computer that predates per-device voices and so
@@ -1014,9 +1036,6 @@ struct AgentProfileView: View {
         effort = bot.modelSelection.effort
         fallbacks = bot.modelSelection.fallbacks ?? []
         maxToolRoundsText = Self.roundsText(bot.maxToolRounds)
-        autoApprove = bot.autoApprove ?? false
-        autoReview = bot.autoReview ?? "off"
-        approvePeerComms = bot.approvePeerComms ?? false
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
         baseline = ProfileFormSnapshot(bot: bot)
@@ -1035,9 +1054,6 @@ private struct ProfileFormSnapshot {
     var speechDevices: Set<String>
     var modelSelection: ModelSelection
     var maxToolRoundsText: String
-    var autoApprove: Bool
-    var autoReview: String
-    var approvePeerComms: Bool
     var computers: Set<String>
     var cwd: String
 
@@ -1052,9 +1068,6 @@ private struct ProfileFormSnapshot {
         speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         modelSelection = bot.modelSelection
         maxToolRoundsText = bot.maxToolRounds.map(String.init) ?? ""
-        autoApprove = bot.autoApprove ?? false
-        autoReview = bot.autoReview ?? "off"
-        approvePeerComms = bot.approvePeerComms ?? false
         computers = Set(bot.computers ?? [])
         cwd = bot.cwd ?? ""
     }

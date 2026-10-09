@@ -340,7 +340,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     expect(safe.status).toBe(200);
     expect(safe.body.bot).toMatchObject({ title: "Paired title", notifications: false });
 
-    for (const field of ["autoApprove", "composio", "computers", "cwd", "userNotes"]) {
+    for (const field of ["autoApprove", "autoReview", "approvePeerComms", "composio", "userNotes"]) {
       const denied = await device("PATCH", `/api/bots/${botId}/profile`, {
         body: { title: "must not apply", [field]: true },
       });
@@ -350,6 +350,199 @@ describe("the sidecar in front of an unmodified harness", () => {
 
     const unchanged = await device("GET", "/api/bots");
     expect(unchanged.body.bots.find((bot: { id: string }) => bot.id === botId).title).toBe("Paired title");
+  });
+
+  it("lets the phone switch cloud and Local VM, and leaves This Mac to the computer", async () => {
+    const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
+    const botId = (await created.json()).bot.id as string;
+    const profile = (body: unknown) => device("PATCH", `/api/bots/${botId}/profile`, { body });
+    const botNow = async () =>
+      (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
+    const thisMacRefusal = "This Mac can only be turned on or off in BotFleet on your computer";
+    try {
+      // A new bot is on Auto (no list stored).  The phone cannot hand it This
+      // Mac from there either.
+      expect((await botNow()).computers ?? null).toBeNull();
+      const fromAuto = await profile({ computers: ["local"] });
+      expect(fromAuto.status).toBe(403);
+      expect(fromAuto.body.error).toBe(thisMacRefusal);
+
+      // Cloud and Local VM are the phone's to switch, through the same
+      // validation the desktop gets, and the stored bot carries the result.
+      const switched = await profile({ computers: ["cloud", "vm"] });
+      expect(switched.status).toBe(200);
+      expect(switched.body.bot.computers).toEqual(["cloud", "vm"]);
+      expect((await profile({ computers: ["vm", "vm"] })).body.bot.computers).toEqual(["vm"]);
+      expect((await profile({ computers: [] })).body.bot.computers).toEqual([]);
+      expect((await profile({ computers: ["laptop"] })).status).toBe(400);
+
+      // Handing a bot the person's real desktop is not.  Refused with the
+      // harness's own sentence, and nothing is written, including the
+      // unguarded field that rode along in the same request.
+      const added = await profile({ title: "must not apply", computers: ["vm", "local"] });
+      expect(added.status).toBe(403);
+      expect(added.body.error).toBe(thisMacRefusal);
+      const afterRefusal = await botNow();
+      expect(afterRefusal.computers).toEqual([]);
+      expect(afterRefusal.title).not.toBe("must not apply");
+
+      // The Mac grants it (through the desktop's own route), and from then
+      // on the phone keeps it while it switches the rest.  Taking it away is
+      // refused the same way.
+      const granted = await fetch(`${HARNESS}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ computers: ["vm", "local"] }),
+      });
+      expect(granted.status).toBe(200);
+      const kept = await profile({ computers: ["cloud", "vm", "local"] });
+      expect(kept.status).toBe(200);
+      expect(kept.body.bot.computers).toEqual(["cloud", "vm", "local"]);
+      const dropped = await profile({ computers: ["cloud", "vm"] });
+      expect(dropped.status).toBe(403);
+      expect(dropped.body.error).toBe(thisMacRefusal);
+      expect((await botNow()).computers).toEqual(["cloud", "vm", "local"]);
+    } finally {
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+    }
+  });
+
+  it("lets the phone point a bot at a folder the computer already shares, and no other", async () => {
+    const shared = join(home, "projects", "shared");
+    const other = join(home, "projects", "other");
+    mkdirSync(join(shared, "sub"), { recursive: true });
+    mkdirSync(other, { recursive: true });
+    const made = async () => (await (await fetch(`${HARNESS}/api/bots`, { method: "POST" })).json()).bot.id as string;
+    const lead = await made();
+    const botId = await made();
+    const profile = (body: unknown) => device("PATCH", `/api/bots/${botId}/profile`, { body });
+    const botNow = async () =>
+      (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
+    try {
+      // The computer (straight to the harness, no phone stamp) grants a folder.
+      const granted = await fetch(`${HARNESS}/api/bots/${lead}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cwd: shared }),
+      });
+      expect(granted.status).toBe(200);
+
+      // The phone may reuse it, or narrow to something inside it.
+      expect((await profile({ cwd: shared })).body.bot.cwd).toBe(shared);
+      expect((await profile({ cwd: join(shared, "sub") })).body.bot.cwd).toBe(join(shared, "sub"));
+
+      // It may not introduce a folder.  The 403 names the folder and where to
+      // choose it, and nothing rides through, including the field that was
+      // fine on its own.
+      const refused = await profile({ name: "must not apply", cwd: other });
+      expect(refused.status).toBe(403);
+      expect(refused.body.error).toContain(other);
+      expect(refused.body.error).toContain("pick it in BotFleet on your computer");
+      expect((await botNow()).cwd).toBe(join(shared, "sub"));
+      expect((await botNow()).name).not.toBe("must not apply");
+
+      // A folder that is not there is the same 400 the desktop gets, and
+      // clearing is always allowed.
+      expect((await profile({ cwd: join(home, "projects", "missing") })).status).toBe(400);
+      expect((await profile({ cwd: shared + "/../other" })).status).toBe(403);
+      const cleared = await profile({ cwd: "" });
+      expect(cleared.status).toBe(200);
+      expect((await botNow()).cwd ?? null).toBeNull();
+
+      // The desktop is at the keyboard, so the same route unconfined from
+      // loopback accepts a folder no bot holds yet.
+      const unconfined = await fetch(`${HARNESS}/api/bots/${botId}/profile`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cwd: other }),
+      });
+      expect(unconfined.status).toBe(200);
+    } finally {
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+      await fetch(`${HARNESS}/api/bots/${lead}`, { method: "DELETE" });
+    }
+  });
+
+  it("makes a room with its folder, bulletin and responder in one request, or makes nothing", async () => {
+    const shared = join(home, "projects", "room-shared");
+    const other = join(home, "projects", "room-other");
+    mkdirSync(shared, { recursive: true });
+    mkdirSync(other, { recursive: true });
+    const botId = (await (await fetch(`${HARNESS}/api/bots`, { method: "POST" })).json()).bot.id as string;
+    const roomCount = async () => (await device("GET", "/api/bots")).body.groups.length as number;
+    let roomId: string | undefined;
+    try {
+      const grant = await fetch(`${HARNESS}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cwd: shared }),
+      });
+      expect(grant.status).toBe(200);
+      const before = await roomCount();
+
+      // Each refusal leaves the fleet as it was: no half-made room.
+      const outside = await device("POST", "/api/groups", {
+        body: { memberIds: [botId], name: "Refused", cwd: other, bulletin: "Ship it" },
+      });
+      expect(outside.status).toBe(403);
+      expect(outside.body.error).toContain("pick it in BotFleet on your computer");
+      const badResponder = await device("POST", "/api/groups", {
+        body: { memberIds: [botId], defaultResponder: { kind: "member", botId: "not-a-bot" } },
+      });
+      expect(badResponder.status).toBe(400);
+      const longBulletin = await device("POST", "/api/groups", {
+        body: { memberIds: [botId], bulletin: "x".repeat(12_001) },
+      });
+      expect(longBulletin.status).toBe(400);
+      const missing = await device("POST", "/api/groups", {
+        body: { memberIds: [botId], cwd: join(home, "projects", "missing") },
+      });
+      expect(missing.status).toBe(400);
+      expect(await roomCount()).toBe(before);
+
+      const made = await device("POST", "/api/groups", {
+        body: {
+          memberIds: [botId],
+          name: "Planning",
+          cwd: shared,
+          bulletin: "Ship it",
+          defaultResponder: { kind: "mentions" },
+        },
+      });
+      expect(made.status).toBe(201);
+      roomId = made.body.group.id;
+      expect(made.body.group).toMatchObject({
+        name: "Planning",
+        cwd: shared,
+        bulletin: "Ship it",
+        defaultResponder: { kind: "mentions" },
+      });
+      expect(await roomCount()).toBe(before + 1);
+
+      // A room made with none of that is the room it always was.
+      const plain = await device("POST", "/api/groups", { body: { memberIds: [botId] } });
+      expect(plain.status).toBe(201);
+      expect(plain.body.group.cwd ?? null).toBeNull();
+      await fetch(`${HARNESS}/api/groups/${plain.body.group.id}`, { method: "DELETE" });
+    } finally {
+      if (roomId) await fetch(`${HARNESS}/api/groups/${roomId}`, { method: "DELETE" });
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+    }
+  });
+
+  it("lets the phone set the tool-round budget", async () => {
+    const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
+    const botId = (await created.json()).bot.id as string;
+    try {
+      const set = await device("PATCH", `/api/bots/${botId}/profile`, { body: { maxToolRounds: 40 } });
+      expect(set.status).toBe(200);
+      expect(set.body.bot.maxToolRounds).toBe(40);
+      const cleared = await device("PATCH", `/api/bots/${botId}/profile`, { body: { maxToolRounds: null } });
+      expect(cleared.status).toBe(200);
+      expect(cleared.body.bot.maxToolRounds ?? null).toBeNull();
+    } finally {
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+    }
   });
 
   it("lets the phone set its own voice without wiping the Mac's", async () => {

@@ -1850,6 +1850,46 @@ async function interruptIfHostRevoked(
     .catch(() => {});
 }
 
+/** What a paired phone is told when its save would give a bot This Mac or take
+ * it away.  Host control hands the bot the person's real desktop, so the phone
+ * may switch the sandboxed destinations (cloud, vm) and leave this one to the
+ * computer, where the Auto Mode warning and the mid-turn interrupt live. */
+const PAIRED_LOCAL_COMPUTER_ERROR =
+  "This Mac can only be turned on or off in BotFleet on your computer";
+
+/** The paired-device rules for a `computers` write: a refusal with the status
+ * to send, or null when it may go ahead.  Called by the profile route, which
+ * is the one a phone reaches through the sidecar (the desktop uses the broad
+ * bot PATCH).  The sidecar cannot make this call: telling "kept This Mac" from
+ * "added This Mac" needs the stored bot, so the check lives where the bot
+ * does, and a loopback caller of the same route gets the same guard.
+ *
+ * Membership of `local` must come out the way it went in.  Everything else the
+ * desktop PATCH does for a `computers` write is either unreachable once that
+ * holds (the mid-turn interrupt only fires when `local` is removed) or runs
+ * here too (the Auto Mode acknowledgement, whose doc says every route that
+ * grants `computers` calls it). */
+function pairedComputersRefusal(
+  existing: ComputerGrantSubject | null | undefined,
+  next: Array<"cloud" | "vm" | "local">,
+): { status: number; error: string } | null {
+  const heldLocal = currentComputerGrants(existing).includes("local");
+  if (next.includes("local") !== heldLocal) return { status: 403, error: PAIRED_LOCAL_COMPUTER_ERROR };
+  const ackError = localAutoAcknowledgementError(
+    existing,
+    next,
+    existing?.autoApprove === true || existing?.bypassPermissions === true,
+    false,
+    {
+      currentDefault: cfg.botDefaults?.computers,
+      nextDefault: cfg.botDefaults?.computers,
+      currentAllowed: consentAllowedComputers(cfg),
+      nextAllowed: consentAllowedComputers(cfg),
+    },
+  );
+  return ackError ? { status: 400, error: ackError } : null;
+}
+
 function checkedGroupResponder(value: unknown, memberIds: string[]): GroupDefaultResponder | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const responder = value as { kind?: unknown; botId?: unknown };
@@ -10842,9 +10882,42 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 400, { error: "context must be at most 60 characters" });
         }
       }
+      // First settings, checked BEFORE the room exists.  The phone's New Room
+      // sheet used to create the room and then patch the folder, bulletin and
+      // responder in a second request, so a folder this computer would not let
+      // a phone choose left a half-made room behind.  Sent here, a refusal
+      // leaves nothing.  Left unmarked as "set up": the desktop's setup
+      // prompt still offers itself, exactly as it does for a phone room.
+      const first: { bulletin?: string; defaultResponder?: GroupDefaultResponder; cwd?: string } = {};
+      if (body.bulletin !== undefined) {
+        if (typeof body.bulletin !== "string") return json(res, 400, { error: "bulletin must be a string" });
+        if (body.bulletin.length > 12_000) {
+          return json(res, 400, { error: "bulletin must be at most 12000 characters" });
+        }
+        first.bulletin = body.bulletin;
+      }
+      if (body.defaultResponder !== undefined) {
+        const responder = checkedGroupResponder(body.defaultResponder, memberIds);
+        if (!responder) return json(res, 400, { error: "invalid default responder" });
+        first.defaultResponder = responder;
+      }
+      if (body.cwd !== undefined && body.cwd !== null && body.cwd !== "") {
+        const checked = validateBotCwd(body.cwd);
+        if (!checked.ok) return json(res, 400, { error: checked.error });
+        // Same confinement as a phone-set room folder (the room PATCH below).
+        if (checked.cwd && req.headers["x-botfleet-companion"] === "1") {
+          const refusedFolder = cwdConfinementError(checked.cwd, phoneCwdConfinement());
+          if (refusedFolder) {
+            return json(res, 403, { error: `${refusedFolder} — pick it in BotFleet on your computer` });
+          }
+        }
+        if (checked.cwd) first.cwd = checked.cwd;
+      }
       let setup:
-        | { bulletin: string; defaultResponder: GroupDefaultResponder; completed: true }
-        | undefined;
+        | { bulletin?: string; defaultResponder?: GroupDefaultResponder; completed?: true }
+        | undefined = first.bulletin !== undefined || first.defaultResponder
+        ? { bulletin: first.bulletin, defaultResponder: first.defaultResponder }
+        : undefined;
       if (body.setup !== undefined) {
         if (!body.setup || typeof body.setup !== "object" || Array.isArray(body.setup)) {
           return json(res, 400, { error: "setup must be an object" });
@@ -10860,7 +10933,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (!responder) return json(res, 400, { error: "invalid setup.defaultResponder" });
         setup = { bulletin: requested.bulletin, defaultResponder: responder, completed: true };
       }
-      const group = store.createGroup(name, memberIds, false, section, setup);
+      const created = store.createGroup(name, memberIds, false, section, setup);
+      const group = first.cwd ? (store.patchGroup(created.id, { cwd: first.cwd }) ?? created) : created;
       return json(res, 201, { group: { ...publicGroupState(group), messages: [] } });
     }
     // Every conversation on this computer, as one JSON document.
@@ -11761,8 +11835,30 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // existingBot lets a one-device `voices` change keep the other device's.
       const parsed = parseBotProfilePatch(body, true, existingBot);
       if (!parsed.ok) return json(res, 400, { error: parsed.error });
-      if (localAutoConsentConfigBusy && parsed.patch.name !== undefined) {
+      if (localAutoConsentConfigBusy && (parsed.patch.name !== undefined || parsed.patch.computers !== undefined)) {
         return json(res, 409, { error: localAutoConsentConfigBusyError });
+      }
+      if (parsed.patch.computers !== undefined) {
+        // De-duplicated the way the broad PATCH stores it.
+        parsed.patch.computers = [...new Set(parsed.patch.computers)];
+        const refused = pairedComputersRefusal(existingBot, parsed.patch.computers);
+        if (refused) return json(res, refused.status, { error: refused.error });
+      }
+      if (Object.prototype.hasOwnProperty.call(body, "cwd")) {
+        // The profile schema only types `cwd`; the folder itself is checked
+        // here, the way the broad PATCH does.  From a paired phone (the
+        // sidecar stamps every request it forwards) it may only reuse or
+        // narrow a folder this computer already handed to a bot or room,
+        // exactly as a phone-set room folder is confined.  Clearing passes.
+        const checked = validateBotCwd(body.cwd);
+        if (!checked.ok) return json(res, 400, { error: checked.error });
+        if (checked.cwd && req.headers["x-botfleet-companion"] === "1") {
+          const refusedFolder = cwdConfinementError(checked.cwd, phoneCwdConfinement());
+          if (refusedFolder) {
+            return json(res, 403, { error: `${refusedFolder} — pick it in BotFleet on your computer` });
+          }
+        }
+        parsed.patch.cwd = checked.cwd ?? undefined;
       }
       if (parsed.patch.avatarUrl && !storedAvatarExists(parsed.patch.avatarUrl)) {
         return json(res, 400, { error: "avatarUrl must reference an existing stored image" });
