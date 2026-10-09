@@ -343,6 +343,11 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     /// the user's own server, which has no interactive desktop to offer a
     /// phone.
     public var cloudBackend: String?
+    /// The backend this bot really uses once the workspace default has filled
+    /// in for an unpinned one.  `cloudBackend` stays the raw stored value; this
+    /// is the answer the join route gives.  Absent on a harness that predates
+    /// it, where `cloudDesktopAvailability` falls back to `cloudBackend`.
+    public var effectiveCloudBackend: String?
     public var autoStartVps: Bool?
     public var cwd: String?
     public var extraCwds: [String]?
@@ -777,11 +782,30 @@ public enum VoiceProvider: Hashable, Sendable {
     case unknown
 }
 
+/// One entry of the workspace pronunciation list (`shared/pronunciations.ts`):
+/// a term the voice keeps saying wrong, and how to say it.
+public struct Pronunciation: Codable, Hashable, Sendable, Identifiable {
+    public var term: String
+    public var say: String
+
+    public var id: String { term.lowercased() }
+
+    public init(term: String, say: String) {
+        self.term = term
+        self.say = say
+    }
+}
+
 public struct ConfigFlag: Codable, Hashable, Sendable {
     public var configured: Bool
     public var apiKeyConfigured: Bool?
     public var ready: Bool?
+    /// On the `tts` section: the workspace default voice id, what every bot
+    /// without a voice of its own speaks with.  Empty or absent is none.
     public var voice: String?
+    /// On the `tts` section: the pronunciation list in force, the seeded
+    /// defaults included.  Absent from a computer older than the list.
+    public var pronunciations: [Pronunciation]?
     /// The voice engine, absent on a computer that predates the choice. Read
     /// it through `ConfigStatus.voiceProvider`, which applies the server's own
     /// fallback; nothing should compare this string directly.
@@ -891,6 +915,13 @@ public struct ConfigStatus: Codable, Sendable {
     public var hasWorkspaceDefaultVoice: Bool {
         !(tts?.voice?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
+
+    /// The workspace default voice id, or "" when none is picked.
+    public var workspaceDefaultVoice: String { hasWorkspaceDefaultVoice ? (tts?.voice ?? "") : "" }
+
+    /// The pronunciation list in force, or nil from a computer that predates
+    /// it (the list cannot be edited there).
+    public var pronunciations: [Pronunciation]? { tts?.pronunciations }
 
     public func canSpeak(agentVoice: String?) -> Bool {
         if PersonalVoiceContract.isPersonalVoice(agentVoice) {
@@ -1236,6 +1267,20 @@ public struct RoutineRun: Codable, Hashable, Identifiable, Sendable {
     public var error: String?
     public var createdAt: Double
     public var seenAt: Double?
+
+    /// Runs the harness will still stop.  Mirrors `cancelRun` in
+    /// server/routines.ts and the desktop's "Cancel Run" button, so a run
+    /// that has already settled never shows a button that answers 404.
+    public var canCancel: Bool {
+        status == "queued" || status == "running" || status == "waiting"
+    }
+
+    /// Failures that raise the badge until someone acknowledges them
+    /// (`ROUTINE_ATTENTION_STATUSES` in shared/routine-outcomes.ts), and have
+    /// not been yet.
+    public var needsAcknowledgement: Bool {
+        (status == "failed" || status == "missed") && seenAt == nil
+    }
 }
 
 public struct RoutineInput: Encodable, Sendable {
@@ -1505,6 +1550,7 @@ struct RoutinesResponse: Codable, Sendable {
 
 struct RoutineResponse: Codable, Sendable { var routine: Routine }
 struct RoutineRunResponse: Codable, Sendable { var run: RoutineRun }
+struct MarkedRoutineRunsResponse: Codable, Sendable { var acknowledged: Int?; var runs: [RoutineRun] }
 
 struct ConnectorAuthorizationResponse: Codable, Sendable {
     var url: String

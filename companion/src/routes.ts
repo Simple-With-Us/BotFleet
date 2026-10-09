@@ -278,6 +278,12 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // workspace MiniMax key; the phone receives labels or audio only.
   { method: "GET", path: /^\/api\/tts\/voices$/ },
   { method: "POST", path: /^\/api\/tts\/speak$/ },
+  // The workspace default voice and the pronunciation list: settings, not
+  // credentials.  Each is its own narrow harness route that validates and
+  // saves only that field, the way terminology does, so /api/config (which
+  // carries the voice key) stays write-closed to a phone.
+  { method: "PATCH", path: /^\/api\/tts\/default-voice$/ },
+  { method: "PATCH", path: /^\/api\/tts\/pronunciations$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio\/\d+$/ },
 
@@ -288,6 +294,13 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "PATCH", path: /^\/api\/routines\/[\w-]+$/ },
   { method: "DELETE", path: /^\/api\/routines\/[\w-]+$/ },
   { method: "POST", path: /^\/api\/routines\/[\w-]+\/run$/ },
+  // Run receipts: stop one that is queued, running or waiting, and mark a
+  // failure as seen.  Both act on a run that already exists and neither
+  // creates, edits or deletes a routine, so a lost phone gains no new reach.
+  // The bare `POST /api/routine-runs/seen` is the "mark every failure seen"
+  // sweep; it clears the badge and keeps every run, status and error.
+  { method: "POST", path: /^\/api\/routine-runs\/[\w-]+\/(?:cancel|seen)$/ },
+  { method: "POST", path: /^\/api\/routine-runs\/seen$/ },
 
   // Checking for a newer BotFleet and installing it.  The phone is the one
   // place an update is convenient to start — the Mac is usually mid-work when

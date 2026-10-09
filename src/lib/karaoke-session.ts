@@ -26,6 +26,7 @@ import {
   wordIndexAtOffset,
   type KaraokeAlignment,
 } from "../../shared/karaoke-align";
+import type { Pronunciation } from "../../shared/pronunciations";
 import { createKaraokeHighlighter, type KaraokeHighlighter, type KaraokeHighlightOptions } from "./karaoke-highlight";
 import type { KaraokeFeed } from "./tts/karaoke-feed";
 
@@ -44,6 +45,9 @@ export interface AttachKaraokeOptions extends KaraokeHighlightOptions {
   /** setTimeout seam for the linger after a finished reply.  Returns a
    * function that cancels it. */
   schedule?: (fn: () => void, ms: number) => () => void;
+  /** The workspace pronunciation list (config tts.pronunciations), so a
+   * respelled term pairs with the term on screen. */
+  pronunciations?: readonly Pronunciation[] | null;
 }
 
 function scheduleTimeout(fn: () => void, ms: number): () => void {
@@ -62,7 +66,7 @@ export function attachKaraoke(
   sourceText: string,
   options: AttachKaraokeOptions = {},
 ): KaraokeSession {
-  const { schedule = scheduleTimeout, ...highlightOptions } = options;
+  const { schedule = scheduleTimeout, pronunciations, ...highlightOptions } = options;
   const highlighter = createKaraokeHighlighter(container, { dimAhead: false, ...highlightOptions });
   let disposed = false;
   let cancelLinger: (() => void) | null = null;
@@ -88,6 +92,7 @@ export function attachKaraoke(
     segments: guided ? script.segments : null,
     sourceText: guided ? sourceText : null,
     displayWords: [...highlighter.words],
+    pronunciations,
   });
   // Lighting scattered words would be worse than lighting none.
   if (!alignment.followable) return { highlighter, alignment, dispose };
