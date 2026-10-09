@@ -471,6 +471,9 @@ import { readHostDispatchHoldReason, readHostDispatchHot } from "./host-dispatch
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
+import { isPluginConfigKey, narrowPluginConfigSection, PLUGIN_CONFIG_ALLOWLIST } from "./plugin-loader.ts";
+import * as pluginsModule from "./plugins.ts";
+import type { PluginListing } from "./plugin-types.ts";
 import { createBotPackageExport } from "./package-export.ts";
 import { installTestParentWatchdog } from "./test-parent-watchdog.ts";
 import { installTimestampedConsole } from "./console-timestamps.ts";
@@ -866,6 +869,54 @@ console.log(observabilityBootLine(await observability.apply()));
 // that keeps a rotated credential current, not the one boot depends on.
 infisical.start();
 bus.subscribe((event: RuntimeEvent) => observeRuntimeEvent(event));
+
+// ── plugin runtime bootstrap ───────────────────────────────────────────────
+// The plugin system is user data: it lives in <DATA_DIR>/plugins, ships
+// disabled, and runs in the server process.  Wire it after observability
+// so a plugin's logger can route through the same Sentry path; wire it
+// after registry.load so a plugin's getBots() sees the live fleet.
+// Request schemas for the /api/plugins routes.  Bodies and path params
+// are untrusted input; the lifecycle only ever sees parsed values.
+const PLUGIN_INSTALL_BODY = z.object({ source: z.string().trim().min(1).max(4096) }).strip();
+const PLUGIN_COMMAND_BODY = z.object({ args: z.string().max(8192).default("") }).strip();
+const PLUGIN_SLUG = z.string().min(1).max(64).regex(/^[\w][\w-]*$/);
+const PLUGIN_PATH_PARAMS = z.tuple([PLUGIN_SLUG]);
+const PLUGIN_ITEM_PATH_PARAMS = z.tuple([PLUGIN_SLUG, PLUGIN_SLUG]);
+
+pluginsModule.initPluginRuntime({
+  listBots: () => store.bots.map((bot) => ({
+    id: bot.id,
+    name: bot.name,
+    // `bot.busy` is typed `boolean | undefined` upstream; truthiness is the
+    // domain check, and the falsy branch covers both `false` and absent.
+    status: bot.busy === true ? "running" : bot.busy === false ? "stopped" : "unknown",
+    driver: bot.modelSelection?.instanceId ?? "unknown",
+  })),
+  // DESIGN.md: a small allowlist of non-secret settings, not every
+  // AppConfig section minus a denylist.  Only keys present on the live
+  // config are advertised so plugins do not probe absent sections.
+  listConfigKeys: () => PLUGIN_CONFIG_ALLOWLIST.filter((key) => Object.prototype.hasOwnProperty.call(cfg, key)),
+  // Refuse anything outside the allowlist, then return a narrowed /
+  // redacted copy.  The live AppConfig object must not cross into plugin
+  // code.
+  readConfig: <T = unknown>(key: string): T | undefined => {
+    if (!isPluginConfigKey(key)) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(cfg, key)) return undefined;
+    // SAFETY: `key` was confirmed as an own allowlisted property of the resolved AppConfig.  narrowPluginConfigSection copies and drops secret-looking / out-of-scope fields; the caller names T.
+    return narrowPluginConfigSection(key, cfg[key as keyof typeof cfg]) as T | undefined;
+  },
+  // Plugin events are allow-listed structures from plugin-loader.ts: an
+  // event name, a level, a hashed plugin id, and a length or stable code.
+  // Plugin-supplied text (log messages, error messages, names from the
+  // manifest) never reaches this sink.
+  logger: (event) => {
+    const line = JSON.stringify(event);
+    if (event.level === "error") console.error(line);
+    else if (event.level === "warn") console.warn(line);
+    else console.log(line);
+  },
+});
+await pluginsModule.bootPluginRuntime();
 
 // ── peer-agent comms wiring ────────────────────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
@@ -15785,6 +15836,76 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (m && method === "DELETE") return json(res, 200, await composio.removeAccount(cfg, m[1], m[2]));
     m = path.match(/^\/api\/connectors\/([\w-]+)$/);
     if (m && method === "DELETE") return json(res, 200, await composio.removeService(cfg, m[1]));
+
+    // ── plugins (drop-in extensions, see docs/plugins/DESIGN.md) ──
+    // The plugin system lives outside the repo.  It ships DISABLED until
+    // the user enables it after reading the manifest, mirrors the skills
+    // trust model, and uses the same route dispatch style as the rest of
+    // this file.  Validation errors return { error, issues: [...] } so
+    // the UI can render one row per problem.
+    // Every body and path parameter is parsed with a zod schema before it
+    // reaches the plugin lifecycle; a parse failure is a 400.
+    if (method === "GET" && path === "/api/plugins") {
+      return json(res, 200, { plugins: pluginsModule.listPlugins() });
+    }
+    if (method === "POST" && path === "/api/plugins/install") {
+      const body = PLUGIN_INSTALL_BODY.safeParse(await readBody(req));
+      if (!body.success) return json(res, 400, { error: "source is required" });
+      const result = await pluginsModule.installPlugin(body.data.source);
+      if ("error" in result) {
+        return json(res, 400, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
+      }
+      return json(res, 200, result);
+    }
+    const pluginPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)$/)?.slice(1));
+    if (pluginPath.success && method === "GET") {
+      const result = pluginsModule.getPlugin(pluginPath.data[0]);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    if (pluginPath.success && method === "DELETE") {
+      const result = await pluginsModule.removePlugin(pluginPath.data[0]);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    const pluginAction = method === "POST" ? pluginsModule.matchPluginActionRoute(path) : null;
+    if (pluginAction) {
+      const { name, action } = pluginAction;
+      let result: PluginListing | { error: string; issues?: Array<{ field: string; message: string }> } | { removed: true };
+      if (action === "enable") result = await pluginsModule.enablePlugin(name);
+      else if (action === "disable") result = await pluginsModule.disablePlugin(name);
+      else if (action === "update") result = await pluginsModule.updatePlugin(name);
+      else result = await pluginsModule.reloadPlugin(name);
+      // Status mapping: 404 when the action target is unknown (the plugin
+      // is not installed), 400 for everything else (bad request shape,
+      // host-version mismatch, etc.).  Mirrors the GET delete pattern.
+      const status = "error" in result && result.error.startsWith("no plugin named") ? 404 : 400;
+      if ("error" in result) {
+        return json(res, status, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
+      }
+      return json(res, 200, result);
+    }
+    const cardPath = PLUGIN_ITEM_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/cards\/([\w][\w-]*)$/)?.slice(1));
+    if (cardPath.success && method === "GET") {
+      const result = await pluginsModule.getPluginCardData(cardPath.data[0], cardPath.data[1]);
+      if ("error" in result) {
+        // DESIGN.md: unknown plugin names → 404; disabled / other → 409.
+        const status = result.error.startsWith("no plugin named") ? 404 : 409;
+        return json(res, status, { error: result.error });
+      }
+      return json(res, 200, { data: result.data });
+    }
+    const cmdPath = PLUGIN_ITEM_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/commands\/([\w][\w-]*)$/)?.slice(1));
+    if (cmdPath.success && method === "POST") {
+      const body = PLUGIN_COMMAND_BODY.safeParse(await readBody(req));
+      if (!body.success) return json(res, 400, { error: "expected a JSON object with an optional string `args`" });
+      const result = await pluginsModule.runPluginCommand(cmdPath.data[0], cmdPath.data[1], body.data.args);
+      if ("error" in result) {
+        const status = result.error.startsWith("no plugin named") ? 404 : 409;
+        return json(res, status, { error: result.error });
+      }
+      return json(res, 200, result);
+    }
 
     // Inline credential cards never receive the credential value. Electron
     // saves it through the OS-backed store first; this route only verifies

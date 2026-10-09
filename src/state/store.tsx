@@ -878,6 +878,9 @@ export interface AppState {
   resourceTriggers: ResourceTrigger[];
   settingsOpen: boolean;
   pluginsOpen: boolean;
+  /** The Plugins manager view (drop-in extensions).  Distinct from
+   *  `pluginsOpen`, which is the Composio connectors surface. */
+  pluginsManagerOpen: boolean;
   computerOpen: boolean;
   /** the per-thread event inspector (runtime stream + native protocol tee) */
   inspectorOpen: boolean;
@@ -1109,6 +1112,7 @@ export type Action =
   | { type: "error"; message: string | null }
   | { type: "toggleSettings"; open?: boolean }
   | { type: "togglePlugins"; open?: boolean }
+  | { type: "togglePluginsManager"; open?: boolean }
   | { type: "toggleComputer"; open?: boolean }
   | { type: "toggleInspector"; open?: boolean }
   | { type: "focusMessage"; threadId: string; messageId: string }
@@ -1723,6 +1727,18 @@ export function reducer(state: AppState, action: Action): AppState {
     }
     case "togglePlugins":
       return { ...state, pluginsOpen: action.open ?? !state.pluginsOpen };
+    case "togglePluginsManager": {
+      const open = action.open ?? !state.pluginsManagerOpen;
+      return {
+        ...state,
+        pluginsManagerOpen: open,
+        pluginsOpen: open ? false : state.pluginsOpen,
+        settingsOpen: open ? false : state.settingsOpen,
+        appSettingsOpen: open ? false : state.appSettingsOpen,
+        computerOpen: open ? false : state.computerOpen,
+        inspectorOpen: open ? false : state.inspectorOpen,
+      };
+    }
     case "focusMessage":
       return {
         ...state,
@@ -2124,6 +2140,7 @@ export const initialState: AppState = {
   resourceTriggers: [],
   settingsOpen: false,
   pluginsOpen: false,
+  pluginsManagerOpen: false,
   computerOpen: false,
   inspectorOpen: false,
   appSettingsOpen: false,
