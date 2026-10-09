@@ -44,7 +44,10 @@ async function openDialog(page: Page, variant: 'standard' | 'dangerous' | 'busy'
   await pinFonts(page);
   const dialog = page.getByRole('dialog');
   await expect(dialog).toBeVisible();
-  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  await page.evaluate(() => {
+    const focused = document.activeElement;
+    if (focused instanceof HTMLElement) focused.blur();
+  });
   return dialog;
 }
 
