@@ -40,12 +40,7 @@ async function askThroughProxy(args: Record<string, unknown>): Promise<Record<st
         buffered += chunk;
         const line = buffered.split("\n").find((candidate) => candidate.trim());
         if (!line) return;
-<<<<<<< HEAD
         // SAFETY: the line is the proxy's own JSON object frame, which this test reads only for its `id`.
-=======
-        // SAFETY: this fake broker only ever receives the one JSON object the proxy
-        // under test writes, and the test reads `message.id` and compares fields.
->>>>>>> 812130162 (test(permission-proxy): mark the JSON.parse assertion so the lint ratchet passes on main)
         const message = JSON.parse(line) as Record<string, unknown>;
         // answer, so the proxy's tool call completes
         conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "deny", message: "no" }) + "\n");
