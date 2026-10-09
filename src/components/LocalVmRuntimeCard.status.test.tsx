@@ -195,7 +195,8 @@ describe("LocalVmRuntimeCard header for the other setup states", () => {
     });
     expect(card.pill).toBe("Docker is slow to respond right now; try again in a moment");
     expect(card.text).toContain("Waiting for docker to respond");
-    expect(card.text).toContain("did not answer in time");
+    expect(card.text).toContain("The container runtime (docker) is installed but did not answer in time");
+    expect(card.text).toContain("because this Mac is busy");
     expect(card.text).toContain("Waiting for the container runtime to respond.");
     expect(card.text).not.toMatch(/start docker first/i);
     expect(card.text).not.toMatch(/Open and start/i);

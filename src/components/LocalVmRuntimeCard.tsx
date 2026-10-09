@@ -402,7 +402,7 @@ export function LocalVmRuntimeCard() {
           >
             {!status?.runtime ? null : status.daemonSlow && !status.daemonUp ? (
               <div className="text-[13px] text-ink-secondary">
-                {status.runtime} is installed but did not answer in time, usually because this Mac is busy.{"  "}BotFleet keeps checking.
+                The container runtime ({status.runtime}) is installed but did not answer in time, usually because this {host} is busy.{"  "}BotFleet keeps checking.
               </div>
             ) : c?.runtimeStart ? (
               <CommandLine command={c.runtimeStart} />
