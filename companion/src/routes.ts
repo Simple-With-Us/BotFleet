@@ -178,12 +178,10 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
 
   // Checking for a newer BotFleet and installing it.  The phone is the one
   // place an update is convenient to start — the Mac is usually mid-work when
-  // someone notices a build is stale.  `POST /api/update/run` takes the same
-  // runtime-readiness reading `POST /api/runtime/quiesce` takes and answers
-  // 409 while any turn, queued send or routine run is in flight, so a tap
-  // from a pocket does not interrupt work; `{ "force": true }` talks past
-  // that check, and the updater's own preflight then refuses instead.
-  // `status` is a read; `check` and `run` are the two actions.
+  // someone notices a build is stale.  A busy Mac does not refuse: the
+  // updater holds new work, gives running bots a short grace, then pauses
+  // and resumes what is left (server/update-drain.ts); `{ "force": true }`
+  // skips the grace.  `status` is a read; `check` and `run` are the two actions.
   { method: "GET", path: /^\/api\/update\/status$/ },
   { method: "POST", path: /^\/api\/update\/check$/ },
   { method: "POST", path: /^\/api\/update\/run$/ },

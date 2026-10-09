@@ -16,8 +16,8 @@ A locally built app has no release feed at all, so **Check for Updates** could o
 ## What the card shows
 
 - The installed build, by version and short commit — two builds of the same version are common on a machine that builds its own.
-- **Update Available: `<version>`, N commits ahead** once a check finds `origin/main` past the installed commit, with the newest commit subjects behind it.
-- Live progress while an update runs: the step the updater is on, and a percentage when it has one.  The tail of the updater's own log rides along on the status as `running.logTail` for a client that wants to show it; the card does not.
+- **Update Available: `<version>`, N commits ahead** once a check finds `origin/main` past the installed commit, with the newest commit subjects behind it.  When bots are working, the card says they get a minute to finish and then pause and resume after the update; **Install Update** stays available.
+- Live progress while an update runs: the step the updater is on, what it is waiting for when it is waiting (**Waiting for 3 bots to finish**), and a percentage when it has one.  The tail of the updater's own log rides along on the status as `running.logTail` for a client that wants to show it; the card does not.
 - The last run's outcome — verified, rolled back, failed, or refused — with the updater's own sentence.
 - `checkError`, when the last check could not reach the source.  `checkedAt` does not move in that case, so the previous answer and its age both stay honest.
 
@@ -40,10 +40,24 @@ Status changes arrive on the existing event stream as `update.status` frames, so
 The updater cannot be a child of either thing it stops, so it is launched detached as a one-shot launchd job (`com.jay.botfleet-update`) and reports through a progress file.  It then:
 
 1. Builds and signs a candidate from `origin/main` in a throwaway stage under `~/Library/Caches/BotFleet/updates/`, and verifies its signature, Team ID, bundle ID, build identity, and dependency fingerprint.
-2. Checks again that no work is in flight, fences new work, and lets the harness and the desktop app stop.
+2. Asks the harness to hold new work, gives the work already running a short grace to finish on its own, pauses whatever is still running, and lets the harness and the desktop app stop.  See [Busy bots](#busy-bots).
 3. Advances the checkout, installs the new bundle and dependencies with receipts, restarts the harness, verifies its identity and that it is the single owner, and reopens the app.
 
 Any failure after the interruption boundary rolls the previous bundle, dependency tree, and checkout commit back.  Because the harness is restarted partway through, the run outlives it: the next harness reads the same progress file on boot and keeps describing the run it did not start.
+
+## Busy bots
+
+Busy bots never block an update.  On a Mac fed by webhooks and routines there is almost never an idle moment to wait for, so the updater makes one:
+
+1. **Hold new work.**  `POST /api/runtime/quiesce?drain=1` tells the harness to start nothing new.  Routine, webhook and resource runs stay `queued` in `routines.json`; a job wake puts its notice back; a message you send to an idle bot waits in the same queue a busy bot's would.  Nothing is refused or dropped, and every route stays open, so approvals, **Stop** and webhook deliveries keep working.
+2. **Grace.**  The work already running gets 60 seconds to finish on its own (`--grace SECONDS`, or `BOTFLEET_UPDATE_GRACE_MS`).  If it does, the update goes ahead without interrupting anything.
+3. **Pause and resume.**  Whatever is still running is interrupted and saved to `pending-update-resume.json`, the forced quiesce `--force` has always used, and it resumes after the restart.  Held messages are carried across in `update-held-sends.json` and run after the restart too; a message that waited behind a paused bot runs after that bot's own turn resumes.
+
+A room conversation is the one thing that is never interrupted, because a room turn cannot be resumed without repeating its prompt.  The updater waits up to 5 more minutes for rooms to go quiet (`BOTFLEET_UPDATE_ROOM_WAIT_MS`).  If a room is still talking after that, it lets everything go, changes nothing, and the run ends refused with a sentence that says so.  A room whose bots keep answering each other can therefore still turn an update away, though never for more than about 6 minutes per attempt.
+
+If the updater stops partway (a signal, a lost harness), it releases the hold on its way out, and the harness also lets go by itself a couple of minutes past the updater's window, so new work is never left waiting.
+
+From a terminal, `--wait-for-idle [MINUTES]` is the opt-in that never interrupts anything: it holds new work and waits up to 20 minutes (or `MINUTES`) for the running work to finish, and if it does not, everything held runs and the update stops without changing anything.  `--force` skips the grace and pauses at once.
 
 ## When it refuses
 
@@ -53,8 +67,8 @@ Any failure after the interruption boundary rolls the previous bundle, dependenc
 - **The always-on checkout has uncommitted changes, so the updater would refuse.**  Clean `~/apps/botfleet-server` first — the updater refuses on any `git status --porcelain` output, untracked files included.
 - **BotFleet is already on the newest build.**  Send `{ "force": true }` to build and install the current `origin/main` anyway.
 - **The updater in `~/apps/botfleet-server` predates this build.**  Run it once from a terminal to advance the checkout, after which the button works.
-- **BotFleet is working right now.**  The harness takes the same runtime-readiness reading `POST /api/runtime/quiesce` takes — turns, queued sends, routine runs, in-flight mutations — and will not start an update that would interrupt one.  This is also the only refusal `{ "force": true }` is meant to override, and forcing does not make it safe: the updater's own preflight refuses a busy machine too, and the run then ends `refused` without touching anything.
+A busy Mac is not on this list: `capabilities.busy` says bots are working, and the run gives them their grace and then pauses them.  `{ "force": true }` skips the grace.
 
-Three of them also appear in `capabilities.reasons` — **An update is already running.**, **The updater in `~/apps/botfleet-server` predates this build.** and **BotFleet is working right now.** — alongside the structural ones (this is not a Mac, the checkout is missing, the updater is not installed), so a client can disable **Install Update** and say why before anyone presses it.
+Two of them also appear in `capabilities.reasons` — **An update is already running.** and **The updater in `~/apps/botfleet-server` predates this build.** — alongside the structural ones (this is not a Mac, the checkout is missing, the updater is not installed), so a client can disable **Install Update** and say why before anyone presses it.
 
 The other two are only decided when a run is actually asked for.  The dirty-checkout state is deliberately kept out of the structural path, and **BotFleet is already on the newest build.** is settled by `git merge-base` against what is installed at that moment.  A client learns both from the `409`.
