@@ -68,7 +68,7 @@ struct TasksRoutinesView: View {
                         .foregroundStyle(.secondary)
                 }
                 if unseenFailureCount > 0 {
-                    Button("Mark \(unseenFailureCount) Unseen \(unseenFailureCount == 1 ? "Failure" : "Failures") Seen", systemImage: "checkmark.circle") {
+                    Button("Mark All Seen (\(unseenFailureCount))", systemImage: "checkmark.circle") {
                         confirmingMarkAllSeen = true
                     }
                 }
