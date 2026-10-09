@@ -12,7 +12,9 @@ Consult the private operations inventory for hosting and routing details.
 
 ## Seat Identity And Branches
 
-Post and claim as your own seat tag — `[CLAUDE]`, `[MONET]`, `[CODEX]`, `[AG]`, `[GROK]`, `[CURSOR]`, `[PRODUCER]`, `[GROK-BOT]` — never a hardcoded one.  Branch prefixes follow the seat (`claude/*`, `monet/*`, `codex/*`, `grok/*`, `ag/*`, `producer/*`).  Being inside another seat's worktree does not change your identity; do not claim or land that lane's work from there.  Canonical: `/Users/jay/apps/AGENT-SYNC.md` § Overview and § Message Structure.
+Post and claim as your own seat tag — `[CLAUDE]`, `[CODEX]`, `[AG]`, `[GROK]`, `[CURSOR]`, `[PRODUCER]` — never a hardcoded one.  Branch prefixes follow the seat (`claude/*`, `codex/*`, `grok/*`, `ag/*`, `producer/*`).  Being inside another seat's worktree does not change your identity; do not claim or land that lane's work from there.  Canonical: `/Users/jay/apps/AGENT-SYNC.md` § Overview and § Message Structure.
+
+A session BotFleet launched keeps the role seat BotFleet assigned it, on whatever engine runs it:  `BF-BUILDER`, `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER`, or `BF-PUBLISHER`.  `AGENT_LAUNCH_SEAT` in the environment is that assignment, and it overrides any default seat in the engine's own rules files.  `AGENT_LAUNCHER=botfleet` without `AGENT_LAUNCH_SEAT` means no seat:  take no fleet action.  How BotFleet sets these is in `docs/launch-identity.md`.
 
 ## THE BOARD Comes First
 

@@ -57,6 +57,10 @@ if (process.env.FAKE_PI_DUMP) {
         envConfigured: ["PATH", "HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "BOX_TOKEN"].filter(
           (k) => process.env[k] !== undefined,
         ),
+        // the launcher contract's variables, with values (see server/launch-identity.ts)
+        identityEnv: Object.fromEntries(
+          Object.entries(process.env).filter(([k]) => /^(AGENT_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(k)),
+        ),
         mcpConfig,
       }) + "\n",
     );

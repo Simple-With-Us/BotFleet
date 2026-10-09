@@ -50,6 +50,7 @@ export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { applyLaunchIdentity } from "../launch-identity.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import {
   applyClaudeInject,
@@ -1259,13 +1260,26 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       args.push("--mcp-config", mcpConfigPath, "--strict-mcp-config");
       args.push("--allowedTools", allowed.join(","));
 
-      const env = claudeEnvironment(turnModel, turnEnvironment);
+      // The launch identity is per bot and per turn (`turnEnvironment` is the
+      // instance's), and a retained process keeps the env it was spawned with,
+      // so it is part of the contract key below.
+      const env = applyLaunchIdentity(claudeEnvironment(turnModel, turnEnvironment), turn.launchIdentity);
       const cwd = turn.cwd ?? homedir();
       // everything that shapes the process, minus session/turn specifics
       // (the --mcp-config file is a fresh temp path each time; its CONTENT
       // is what matters and mcpServers carries that)
       const keyArgs = args.filter((a, i) => a !== "--mcp-config" && args[i - 1] !== "--mcp-config");
-      const argsKey = JSON.stringify({ args: keyArgs, mcpServers, cwd, model: injected.model ?? null, base: env.ANTHROPIC_BASE_URL ?? null });
+      const argsKey = JSON.stringify({
+        args: keyArgs,
+        mcpServers,
+        cwd,
+        model: injected.model ?? null,
+        base: env.ANTHROPIC_BASE_URL ?? null,
+        // A room's members share one thread: a second bot there must not
+        // write into the process spawned for the first one's seat.
+        seat: env.AGENT_LAUNCH_SEAT ?? null,
+        session: env.AGENT_SESSION ?? null,
+      });
 
       // What the user turn carries besides its text.  The volatile half rides
       // as a labelled block when this native session has not carried this

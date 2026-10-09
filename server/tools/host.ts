@@ -29,6 +29,7 @@ import { isAbsolute, resolve } from "node:path";
 
 import { looksSensitive } from "../auto-approve.ts";
 import type {
+  LaunchIdentity,
   RequestOutcome,
   ToolArguments,
   TurnToolCall,
@@ -42,6 +43,7 @@ import {
   type AgentToolDeps,
   type AgentToolExecutor,
 } from "./agents.ts";
+import { launchEnvironment } from "../launch-identity.ts";
 import { createComputerTools } from "./computer.ts";
 import { createJobTools, jobCommandRefusal, type JobToolsOptions } from "./jobs.ts";
 import { TurnProcessGroups } from "./process-group.ts";
@@ -80,6 +82,10 @@ export interface TurnToolHostContext {
   workspace?: boolean;
   /** Working directory for file and shell operations. */
   cwd?: string;
+  /** Who BotFleet says this bot is for this turn (server/launch-identity.ts).
+   *  `bash` runs with it in its environment.  Absent, the shell is still
+   *  marked as launched, with no seat. */
+  launchIdentity?: LaunchIdentity;
   /** When set, the file tools refuse any path whose realpath escapes this
    *  workspace root.  Passed straight through to `createComputerTools`'s
    *  `confinement` option.  A bot with a workspace but no This Computer
@@ -189,7 +195,12 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
   // Every process group this turn's `bash` calls start; what is still alive
   // when the turn ends is stopped by `settle` below.
   const processGroups = new TurnProcessGroups();
-  const computerTools = createComputerTools({ cwd: ctx.cwd, confinement: ctx.confinement, processGroups });
+  const computerTools = createComputerTools({
+    cwd: ctx.cwd,
+    confinement: ctx.confinement,
+    processGroups,
+    launchEnv: launchEnvironment(ctx.launchIdentity),
+  });
   const executors = new Map<string, AgentToolExecutor>([
     ...Object.entries(createAgentTools(ctx.deps)),
     ...Object.entries(computerTools),
