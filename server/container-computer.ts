@@ -15,6 +15,7 @@ import { promisify } from "node:util";
 import { z } from "zod";
 
 import { augmentedPath } from "./env-path.ts";
+import { judgeDesktopProbeFailure, problemText } from "./desktop-probe.ts";
 import {
   CONTAINER_RUNTIME_DISABLED_MESSAGE,
   containerRuntimeDisabled,
@@ -609,6 +610,10 @@ export interface ContainerComputerStatus {
   persistence: "durable" | "unsafe" | "unknown";
   desktopReady: boolean;
   desktop_error: string | null;
+  /** One desktop check timed out, so the desktop's state is unknown right
+   * now.  Never a "failed to start": the container is known to be running, and
+   * the next poll re-checks. */
+  desktopUnreachable: boolean;
   create_supported: boolean;
   ready: boolean;
   problem: string | null;
@@ -639,6 +644,7 @@ function emptyStatus(platform: NodeJS.Platform, target: LocalVmTarget): Containe
     persistence: "unknown",
     desktopReady: false,
     desktop_error: null,
+    desktopUnreachable: false,
     create_supported: true,
     ready: false,
     problem: "Install a supported container runtime first",
@@ -669,6 +675,7 @@ function statusProblem(status: ContainerComputerStatus): string | null {
   if (status.security === "unsafe") return "The existing Local VM is missing safety limits; recreate it";
   if (status.persistence === "unsafe") return "The existing Local VM is missing its durable workspace; recreate it";
   if (status.container === "stopped") return "This desktop image cannot safely resume; recreate the Local VM";
+  if (status.desktopUnreachable) return "Couldn't reach the Local VM desktop just now; retrying";
   if (status.desktop_error) return `The Local VM desktop failed to start: ${status.desktop_error}`;
   if (!status.desktopReady) return "The Local VM started, but CUA Driver is not ready yet";
   return null;
@@ -954,7 +961,9 @@ export async function containerComputerStatus(
     try {
       const expected = `cua-driver ${CUA_DRIVER_VERSION}`;
       const version = await runner(status.runtime, cuaExecArgs(["--version"], { container: target.containerName }), 8000);
-      if (version.stdout.trim() !== expected) throw new Error(`expected ${expected}`);
+      if (version.stdout.trim() !== expected) {
+        throw new Error(`expected ${expected}, found "${problemText(version.stdout, 60) || "none"}"`);
+      }
       await runner(status.runtime, cuaExecArgs(["status", "--socket", CUA_SOCKET], { container: target.containerName }), 8000);
       const health = await runner(
         status.runtime,
@@ -993,26 +1002,32 @@ export async function containerComputerStatus(
       }
       status.desktopReady = true;
     } catch (error) {
-      // An empty log means XFCE and the supervisor-owned CUA daemon are
-      // probably still starting. A real startup failure should be actionable
-      // in the panel instead of looking like an endless readiness wait.
-      status.desktop_error = error instanceof Error ? error.message.slice(0, 320) : null;
+      // A real startup failure should be actionable in the panel instead of
+      // looking like an endless readiness wait, so the supervisor's error log
+      // is read for the reason.  It is judged, not pasted: a healthy Driver
+      // writes its update notice and WARN lines to that same file, and a probe
+      // that merely timed out says nothing about the desktop (see
+      // desktop-probe.ts).
+      let supervisorLog: string | null = null;
       try {
         const errorLog = await runner(
           status.runtime,
-          ["exec", target.containerName, "tail", "-n", "4", "/var/log/supervisor/cua-driver.error.log"],
+          ["exec", target.containerName, "tail", "-n", "12", "/var/log/supervisor/cua-driver.error.log"],
           4000,
         );
-        status.desktop_error =
-          errorLog.stdout.replace(/\s+/g, " ").trim().slice(0, 320) ||
-          status.desktop_error;
+        supervisorLog = errorLog.stdout;
       } catch {
         // The log may not exist during the first seconds of container boot.
       }
+      const verdict = judgeDesktopProbeFailure(error, supervisorLog);
+      status.desktop_error = verdict.desktopError;
+      status.desktopUnreachable = verdict.unreachable;
     }
   }
 
   status.problem = statusProblem(status);
+  // Strip terminal colour codes from whatever reached the problem text.
+  if (status.problem) status.problem = problemText(status.problem, 600);
   status.ready = status.problem === null;
   return status;
 }

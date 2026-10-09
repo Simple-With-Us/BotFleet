@@ -19,6 +19,7 @@ import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { redactCommandSecrets } from "@/lib/redact-command-secrets";
+import { localVmSetupLine } from "@/lib/local-vm-setup-line";
 import { PersistentActionErrorCard } from "./PersistentActionErrorCard";
 
 const STATUS_TIMEOUT_MS = 15_000;
@@ -291,7 +292,7 @@ export function LocalVmRuntimeCard() {
                     ? "Per-bot mode requires Docker or Podman"
                   : ready
                     ? "Ready"
-                    : (status?.problem ?? "Not ready")}
+                    : localVmSetupLine(status, perBot)}
           </span>
           <button
             onClick={() => {
@@ -445,6 +446,13 @@ export function LocalVmRuntimeCard() {
               <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={13} className="animate-spin" /> Waiting for the desktop…</div>
             ) : status?.image ? (
               <ActionButton action="run" pending={pending} onClick={() => void act("run")} disabled={localVmOff}>Create Local VM</ActionButton>
+            ) : status ? (
+              // The VM comes last: say which step is still ahead of it.
+              <div className="text-[13px] text-ink-secondary">
+                {status.daemonUp
+                  ? "Prepare the Linux desktop above first.\u00a0 Then create the VM here."
+                  : "Start the container runtime above first."}
+              </div>
             ) : null}
             {localVmOff && !perBot && (
               <div className="text-[13px] text-ink-secondary">Local VM is turned off in Computer settings.{"\u00a0 "}Turn it on above to create or start it.</div>

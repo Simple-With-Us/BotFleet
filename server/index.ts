@@ -424,6 +424,7 @@ import {
 } from "./local-vm-shared-session.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
+import { stripAnsi } from "./desktop-probe.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
 import { fleetSeatPromptPart } from "./seat-prompt.ts";
@@ -8370,7 +8371,9 @@ function localComputerActionError(error: unknown): LocalComputerActionFailure {
         ? Number(statusField)
         : 500;
   const raw = error instanceof Error ? error.message : String(error);
-  return { status, error: redactSecrets(raw) };
+  // A failed `docker exec` carries the Driver's coloured stderr; the panel
+  // would print the escape codes as `[2m` and `[0m`.
+  return { status, error: redactSecrets(stripAnsi(raw)) };
 }
 
 
