@@ -602,10 +602,11 @@ test("countInternalTesters counts only members of internal all-builds groups", a
 test("countInternalTesters follows pagination and reports an unreadable later page as unreadable, not as a smaller count", async () => {
   const { countInternalTesters } = await import("./ios-fleet/asc-api.mjs");
   const group = { id: "int1", type: "betaGroups", attributes: { name: "Internal Testers", isInternalGroup: true, hasAccessToAllBuilds: true } };
-  const page = (emails, next) => ({
-    status: 200, ok: true, text: "",
-    parsed: { data: emails.map((e) => ({ type: "betaTesters", id: e, attributes: { email: e } })), ...(next ? { links: { next } } : {}) }
-  });
+  const page = (emails, next) => {
+    const parsed = { data: emails.map((e) => ({ type: "betaTesters", id: e, attributes: { email: e } })) };
+    if (next) parsed.links = { next };
+    return { status: 200, ok: true, text: "", parsed };
+  };
   const make = (failSecond) => async (method, path) => {
     if (path.startsWith("/v1/apps/1/betaGroups")) return { status: 200, ok: true, parsed: { data: [group] }, text: "" };
     if (path.startsWith("/v1/betaGroups/int1/betaTesters")) return page(["a@example.com", "b@example.com"], "https://api.appstoreconnect.apple.com/v1/betaGroups/int1/betaTesters?cursor=2");
