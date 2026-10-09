@@ -472,12 +472,21 @@ export async function ensureInternalTesterGroup({ api, appId, emails, log, warn 
 
   // Internal testers must be App Store Connect users.  Read the team's users to
   // know which standing emails qualify; when the list is unreadable, try them
-  // all and let Apple answer.
-  const usersRes = await api("GET", "/v1/users?limit=200&fields[users]=username");
-  const ascUsers = usersRes.ok
-    ? new Set(ascRows(usersRes).map((u) => String(u.attributes?.username || "").toLowerCase()))
-    : null;
-  if (!ascUsers) log(`could not read App Store Connect users (${ascErrorText(usersRes)}); trying every standing email`);
+  // all and let Apple answer.  Paginate so teams with >200 users are not silently
+  // truncated (GH #1018: the internal group must hold every ASC standing email).
+  const ascUsers = new Set();
+  let usersUrl = "/v1/users?limit=200&fields[users]=username";
+  let usersReadable = false;
+  for (let page = 0; page < 50 && usersUrl; page++) {
+    const usersRes = await api("GET", usersUrl);
+    if (!usersRes.ok) { ascUsers.clear(); break; }
+    usersReadable = true;
+    for (const u of ascRows(usersRes)) {
+      ascUsers.add(String(u.attributes?.username || "").toLowerCase());
+    }
+    usersUrl = usersRes.parsed?.links?.next || "";
+  }
+  if (!usersReadable) log(`could not read App Store Connect users; trying every standing email`);
 
   const inGroupRes = await api("GET", `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email`);
   if (!inGroupRes.ok) return fail(`could not list testers in internal group (${ascErrorText(inGroupRes)}); not re-adding anyone`);
@@ -490,7 +499,7 @@ export async function ensureInternalTesterGroup({ api, appId, emails, log, warn 
       log(`${maskEmail(email)} already in internal group`);
       continue;
     }
-    if (ascUsers && !ascUsers.has(key)) {
+    if (usersReadable && !ascUsers.has(key)) {
       out.external += 1;
       log(`${maskEmail(email)} is not an App Store Connect user; external group only`);
       continue;
