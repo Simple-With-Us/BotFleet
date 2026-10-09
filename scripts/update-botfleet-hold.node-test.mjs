@@ -19,6 +19,7 @@ import {
   drainProgressDetail,
   fenceMode,
   fenceRuntimeAdmission,
+  keepFenceLease,
   parseArguments,
   pauseTimeoutMessage,
   releaseRuntimeAdmission,
@@ -62,6 +63,11 @@ function scriptedHarness({
   rollsBack = false,
   // The first hold request's answer is lost this many times.
   loseFirstAnswers = 0,
+  // The harness keeps a lease on its fence (server/index.ts armFenceLease).
+  leases = false,
+  // Called with each request before it is answered: a test sends a signal
+  // from inside one, the way Ctrl-C lands while a request is in flight.
+  onRequest = () => {},
 } = {}) {
   let clock = 0;
   let firstAnswersLost = 0;
@@ -116,6 +122,7 @@ function scriptedHarness({
       quiescing: state.quiescing,
     };
     if (reportsFencing) answer.fencing = fencing();
+    if (leases) answer.lease = state.lease;
     // An older harness has never heard of a hold, so says nothing about one.
     if (drains) Object.assign(answer, { draining: state.draining, drain: state.draining ? drain() : null });
     return { ...answer, ...extra };
@@ -126,6 +133,19 @@ function scriptedHarness({
     const method = options.method ?? "GET";
     const { pathname, searchParams } = new URL(url);
     state.requests.push(`${method} ${pathname}${searchParams.size ? `?${searchParams}` : ""}`);
+    onRequest(method, searchParams);
+    if (leases && searchParams.get("renew") === "1") {
+      state.renewals += 1;
+      const renewed = state.quiescing && !fencing();
+      if (renewed) state.lease = { expiresAt: clock + Number(searchParams.get("leaseMs")) };
+      return { kind: "ok", status: 200, body: body({ renewed }) };
+    }
+    if (leases && searchParams.get("leaseMs")) {
+      // Armed once the request settles on a fence, as the route does.
+      queueMicrotask(() => {
+        if (state.quiescing && !fencing()) state.lease ??= { expiresAt: clock + Number(searchParams.get("leaseMs")) };
+      });
+    }
     if (method === "GET" && pathname === "/api/runtime") {
       state.polls += 1;
       return { kind: "ok", status: 200, body: body() };
@@ -390,7 +410,7 @@ test("--force skips the hold and the grace entirely", async () => {
   const harness = scriptedHarness({ inFlight: () => 5 });
   const result = await fenceRuntimeAdmission(config({ force: true }), harness.adapters);
   assert.equal(result.safe, true);
-  assert.deepEqual(harness.state.requests, ["POST /api/runtime/quiesce?force=true"]);
+  assert.deepEqual(harness.state.requests, ["POST /api/runtime/quiesce?force=true&leaseMs=180000"]);
 });
 
 test("a rollback takes the fence on the replacement at once: no hold, no grace, no hours of waiting", async () => {
@@ -399,7 +419,7 @@ test("a rollback takes the fence on the replacement at once: no hold, no grace, 
   const busy = scriptedHarness({ inFlight: () => 3 });
   const paused = await fenceRuntimeAdmission(rollbackFenceConfig(config()), busy.adapters);
   assert.equal(paused.safe, true);
-  assert.deepEqual(busy.state.requests, ["POST /api/runtime/quiesce?force=true"]);
+  assert.deepEqual(busy.state.requests, ["POST /api/runtime/quiesce?force=true&leaseMs=180000"]);
   assert.equal(busy.clock(), 0);
 
   // --wait-for-idle never interrupts, so the rollback asks once and defers.
@@ -407,7 +427,7 @@ test("a rollback takes the fence on the replacement at once: no hold, no grace, 
   const deferred = await fenceRuntimeAdmission(rollbackFenceConfig(config({ waitForIdleMs: 6 * 60 * 60_000 })), patient.adapters);
   assert.equal(deferred.safe, false);
   assert.equal(patient.state.forced, 0);
-  assert.deepEqual(patient.state.requests, ["POST /api/runtime/quiesce"]);
+  assert.deepEqual(patient.state.requests, ["POST /api/runtime/quiesce?leaseMs=180000"]);
   assert.equal(patient.clock(), 0);
 
   const idle = scriptedHarness({ inFlight: () => 0 });
@@ -432,6 +452,166 @@ test("a signal while holding lifts the hold before the run ends", async () => {
   assert.equal(harness.state.released, 1);
   assert.equal(harness.state.forced, 0);
   assert.equal(signals.listenerCount("SIGTERM"), 0, "listeners are removed");
+});
+
+/** Timers the lease loop schedules, fired by hand. */
+function manualTimers() {
+  const pending = [];
+  return {
+    pending,
+    setTimer: (fn) => {
+      const handle = { fn, cleared: false, unref() {} };
+      pending.push(handle);
+      return handle;
+    },
+    clearTimer: (handle) => {
+      if (handle) handle.cleared = true;
+    },
+    async fire() {
+      // A renewal in flight schedules the next one when it settles.
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+      const due = pending.splice(0).filter((handle) => !handle.cleared);
+      for (const handle of due) handle.fn();
+      // Let the renewal's request settle and reschedule.
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    },
+  };
+}
+
+test("a signal during the checks after the fence releases it instead of leaving BotFleet fenced", async () => {
+  // Finding 6: the 30-second health retry after the fence ran with no signal
+  // handler, so Ctrl-C there killed the updater with the harness fenced.
+  const signals = new EventEmitter();
+  const harness = scriptedHarness({ inFlight: () => 0 });
+  let asked = 0;
+  harness.adapters.healthTopology = async () => {
+    asked += 1;
+    if (asked === 2) signals.emit("SIGINT");
+    return { safe: false, reason: "A BotFleet port returned an unavailable or ambiguous response" };
+  };
+  const result = await fenceRuntimeAdmission(config(), { ...harness.adapters, signals });
+  assert.equal(result.safe, false);
+  assert.match(result.reason, /^Stopped by SIGINT before the update started; the fence was released/);
+  assert.equal(harness.state.released, 1);
+  assert.equal(harness.state.quiescing, false);
+  assert.ok(harness.clock() < 30_000, "the retry was cut short");
+  assert.equal(signals.listenerCount("SIGINT"), 0, "Node's default is back once the step returns");
+
+  // The same during the database holder wait.
+  const holding = scriptedHarness({ inFlight: () => 0 });
+  const stays = holderTable({ 77004: { command: "sqlite3 messages.db", cwd: "/", executable: "/usr/bin/sqlite3" } });
+  holding.adapters.sqliteHolders = async () => [42, 77004];
+  holding.adapters.processIdentity = stays.deps;
+  const sleep = holding.adapters.sleep;
+  holding.adapters.sleep = async (ms) => {
+    await sleep(ms);
+    if (holding.clock() >= 6_000) signals.emit("SIGTERM");
+  };
+  const stopped = await fenceRuntimeAdmission(config(holderConfig), { ...holding.adapters, signals });
+  assert.match(stopped.reason, /^Stopped by SIGTERM/);
+  assert.equal(holding.state.released, 1);
+  assert.ok(holding.clock() < 90_000);
+  assert.deepEqual(stays.signals, []);
+});
+
+test("Ctrl-C that lands while a request is in flight is honoured even when that request fenced", async () => {
+  // Finding 11: a signal during the request that then fenced was ignored, and
+  // the update went ahead.
+  const signals = new EventEmitter();
+  const converting = scriptedHarness({
+    inFlight: (t) => (t < 10_000 ? 1 : 0),
+    onRequest: (method, params) => {
+      if (method === "POST" && !params.get("drain") && !params.get("force")) signals.emit("SIGINT");
+    },
+  });
+  const result = await fenceRuntimeAdmission(config(), { ...converting.adapters, signals });
+  assert.equal(result.safe, false);
+  assert.match(result.reason, /^Stopped by SIGINT before the update started; nothing was interrupted\./);
+  assert.equal(converting.state.plain, 1, "the fence was raised");
+  assert.equal(converting.state.released, 1, "and let go");
+  assert.equal(converting.state.quiescing, false);
+
+  // The forced quiesce of the grace mode, and of --force.
+  for (const extra of [{}, { force: true }]) {
+    const forcing = scriptedHarness({
+      inFlight: () => 2,
+      onRequest: (_method, params) => {
+        if (params.get("force") === "true") signals.emit("SIGINT");
+      },
+    });
+    const stopped = await fenceRuntimeAdmission(config(extra), { ...forcing.adapters, signals });
+    assert.equal(stopped.safe, false);
+    assert.match(stopped.reason, /^Stopped by SIGINT before the update started; .*resumed/);
+    assert.equal(forcing.state.forced, 1);
+    assert.equal(forcing.state.released, 1);
+    assert.equal(forcing.state.quiescing, false);
+    assert.equal(signals.listenerCount("SIGINT"), 0);
+  }
+});
+
+test("a fence this run takes carries a lease, renewed until the run lets go or the harness is gone", async () => {
+  // Finding 6: an updater killed after the fence left BotFleet fenced until
+  // someone ran `unquiesce`.  The harness now releases a fence nobody renews.
+  const timers = manualTimers();
+  const harness = scriptedHarness({ inFlight: () => 0, leases: true });
+  const result = await fenceRuntimeAdmission(config(), { ...harness.adapters, ...timers });
+  assert.equal(result.safe, true);
+  assert.ok(harness.state.requests.includes("POST /api/runtime/quiesce?leaseMs=180000"), "the fence asked for its lease");
+  assert.ok(result.lease?.active);
+  assert.equal(harness.state.renewals, 1, "renewed at once");
+  await timers.fire();
+  await timers.fire();
+  assert.equal(harness.state.renewals, 3, "and on, past the fence step, while the harness lives");
+
+  // A refusal after the fence stops renewing BEFORE it releases, so a renewal
+  // can never land after the release.
+  const refusing = scriptedHarness({ inFlight: () => 0, leases: true });
+  refusing.adapters.sqliteHolders = async () => [42, 43];
+  refusing.adapters.processIdentity = holderTable({ 43: { command: APP_EXECUTABLE, cwd: "/" } }).deps;
+  const refusalTimers = manualTimers();
+  const refused = await fenceRuntimeAdmission(config(holderConfig), { ...refusing.adapters, ...refusalTimers });
+  assert.equal(refused.safe, false);
+  const lastRenewal = refusing.state.requests.lastIndexOf("POST /api/runtime/quiesce?renew=1&leaseMs=180000");
+  const releasedAt = refusing.state.requests.indexOf("DELETE /api/runtime/quiesce");
+  assert.ok(lastRenewal >= 0 && lastRenewal < releasedAt);
+  await refusalTimers.fire();
+  assert.equal(refusing.state.requests.lastIndexOf("POST /api/runtime/quiesce?renew=1&leaseMs=180000"), lastRenewal,
+    "no renewal after the release");
+
+  // A harness that predates leases is never sent a renewal: it would read one
+  // as a plain quiesce.
+  const older = scriptedHarness({ inFlight: () => 0 });
+  const olderTimers = manualTimers();
+  const plain = await fenceRuntimeAdmission(config(), { ...older.adapters, ...olderTimers });
+  assert.equal(plain.safe, true);
+  assert.equal(plain.lease, null);
+  assert.ok(!older.state.requests.some((line) => line.includes("renew")));
+});
+
+test("the lease loop stops on its own once the fence is down or the harness has changed", async () => {
+  const timers = manualTimers();
+  let answer = { kind: "ok", status: 200, body: { pid: 42, quiescing: true } };
+  let asked = 0;
+  const loop = keepFenceLease(OWNER, {
+    request: async () => {
+      asked += 1;
+      return answer;
+    },
+    ...timers,
+  });
+  await timers.fire();
+  assert.equal(asked, 2);
+  assert.equal(loop.active, true);
+  answer = { kind: "http", status: 401, body: null };
+  await timers.fire();
+  assert.equal(loop.active, false);
+  await timers.fire();
+  assert.equal(asked, 3, "nothing after a restarted harness refused it");
+
+  const down = keepFenceLease(OWNER, { request: async () => ({ kind: "ok", status: 200, body: { pid: 42, quiescing: false } }), ...manualTimers() });
+  await Promise.resolve();
+  await down.stop();
+  assert.equal(down.active, false);
 });
 
 test("a harness that stopped holding on its own ends the run without a second release", async () => {

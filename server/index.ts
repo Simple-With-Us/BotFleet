@@ -752,6 +752,17 @@ let runtimeFencing = false;
 // the release waits for the settle and is honoured the moment it completes
 // (`beginRuntimeQuiesce`).
 let releaseWhenSettled = false;
+// The fence's own lease (review finding 6).  An updater asks for one when it
+// takes the fence (`leaseMs`) and renews it (`renew=1`) until it has stopped
+// this harness; one killed in between — mid-check, mid-wait, before bootout —
+// stops renewing, and the fence releases itself when the lease runs out
+// instead of leaving every bot on this Mac refused until someone runs
+// `unquiesce`.  It cannot fire mid-install: the updater renews until this
+// process is gone, and the shutdown handler cancels it the moment the
+// updater's bootout or SIGTERM arrives.
+let fenceLease: { timer: ReturnType<typeof setTimeout>; expiresAt: number } | null = null;
+const FENCE_LEASE_MIN_MS = 1_000;
+const FENCE_LEASE_MAX_MS = 30 * 60_000;
 let activeUpdateAdmissions = 0;
 // An update waiting for work in flight to finish (server/update-drain.ts).
 // Unlike `runtimeQuiescing` it closes no route: it only holds NEW turns.
@@ -9980,6 +9991,28 @@ async function drainAfterInterrupt(): Promise<void> {
   }
 }
 
+/** Arm (or renew) the fence's lease for `value` milliseconds, clamped.  An
+ *  unreadable value arms nothing: a fence without a lease is the old one. */
+function armFenceLease(value: string | null): void {
+  const requested = value === null || value.trim() === "" ? Number.NaN : Number(value);
+  if (!Number.isFinite(requested) || requested <= 0) return;
+  const leaseMs = Math.min(FENCE_LEASE_MAX_MS, Math.max(FENCE_LEASE_MIN_MS, Math.round(requested)));
+  cancelFenceLease();
+  const timer = setTimeout(() => {
+    fenceLease = null;
+    if (!runtimeQuiescing) return;
+    console.warn("[update-fence] the updater stopped renewing its fence; released it");
+    endRuntimeQuiesce();
+  }, leaseMs);
+  timer.unref?.();
+  fenceLease = { timer, expiresAt: Date.now() + leaseMs };
+}
+
+function cancelFenceLease(): void {
+  if (fenceLease) clearTimeout(fenceLease.timer);
+  fenceLease = null;
+}
+
 /** Start holding new work for an update, or renew the hold (server/update-drain.ts).
  *  Already fenced is reported as fenced: there is nothing left to drain. */
 function beginRuntimeDrain(timeoutMs: DrainWindowInput) {
@@ -10287,6 +10320,7 @@ function endRuntimeQuiesce(): RuntimeQuiesceAnswer {
   }
   // A drain the updater is giving up on, or a fence it will not use: either
   // way everything held for the update runs now (`releaseHeldWork` below).
+  cancelFenceLease();
   const wasDraining = updateDrain.stop();
   const wasQuiescing = runtimeQuiescing;
   if (runtimeQuiescing) {
@@ -13861,6 +13895,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           if (typeof body?.timeoutMs === "number" || typeof body?.timeoutMs === "string") drainTimeoutMs = body.timeoutMs;
         } catch {}
       }
+      // `renew` keeps the fence's lease alive and does nothing else: it never
+      // raises a fence and never starts a hold.  (A harness that predates it
+      // would read it as a plain quiesce, so an updater only renews a fence
+      // whose answer carried a `lease`.)
+      if (method === "POST" && path === "/api/runtime/quiesce" && flag(url.searchParams.get("renew"))) {
+        const renewed = runtimeQuiescing && !runtimeFencing;
+        if (renewed) armFenceLease(url.searchParams.get("leaseMs"));
+        return json(res, 200, {
+          ...runtimeBuildIdentity, pid: process.pid, ...currentRuntimeReadiness(),
+          renewed,
+          quiescing: runtimeQuiescing,
+          fencing: runtimeFencing,
+          lease: fenceLease ? { expiresAt: fenceLease.expiresAt } : null,
+          ...drainSnapshot(),
+          dataOwner: { pid: harnessOwner.pid, port: harnessOwner.port },
+        });
+      }
       const draining = method === "POST" && path === "/api/runtime/quiesce" && drain && !force;
       const readiness = path !== "/api/runtime/quiesce"
         ? currentRuntimeReadiness()
@@ -13869,12 +13920,19 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           : draining
             ? beginRuntimeDrain(drainTimeoutMs)
             : await beginRuntimeQuiesce(force);
+      // A fence this request raised (or found up) gets the lease it asked for.
+      // Armed here, after the request settled, so a forced quiesce whose
+      // answer the updater lost still gets one.
+      if (method === "POST" && path === "/api/runtime/quiesce" && !draining && runtimeQuiescing && !runtimeFencing) {
+        armFenceLease(url.searchParams.get("leaseMs"));
+      }
       // Starting a drain on a busy Mac is the point of it, not a refusal.
       const refused = method === "POST" && path === "/api/runtime/quiesce" && !draining && !readiness.safeToRestart;
       return json(res, refused ? 409 : 200, {
         ...runtimeBuildIdentity, pid: process.pid, ...readiness,
         quiescing: runtimeQuiescing,
         fencing: runtimeFencing,
+        lease: fenceLease ? { expiresAt: fenceLease.expiresAt } : null,
         ...drainSnapshot(),
         dataOwner: { pid: harnessOwner.pid, port: harnessOwner.port },
       });
@@ -16416,6 +16474,8 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // — least of all re-record an already-recorded stop.
     if (shuttingDown) return;
     shuttingDown = true;
+    // An update stopping this harness: its fence must not lapse mid-shutdown.
+    cancelFenceLease();
 
     // FIRST, while the store still says who was working: write down what
     // this stop is interrupting.  Without it a clean SIGTERM and a crash look

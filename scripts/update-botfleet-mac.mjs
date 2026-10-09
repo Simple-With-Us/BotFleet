@@ -1112,6 +1112,116 @@ function runtimeQuiesced(response) {
 
 const STOPPED_HOLDING = "BotFleet stopped holding new work before the update could start; nothing was interrupted.  Try again.";
 
+/** How long the harness keeps a fence this run took without hearing from it
+ *  (server/index.ts `armFenceLease`).  Long enough for a loaded Mac to miss a
+ *  few renewals; short enough that an updater killed between the fence and
+ *  the shutdown does not leave every bot refused for long. */
+export const FENCE_LEASE_MS = 3 * 60_000;
+/** How often this run renews it, from the fence until the harness is gone. */
+export const FENCE_LEASE_RENEW_MS = 20_000;
+const LEASE_QUERY = `leaseMs=${FENCE_LEASE_MS}`;
+
+/**
+ * SIGINT and SIGTERM, watched for the whole fence step: the hold, every
+ * request (one that fences after the signal arrived included), the pause,
+ * and the checks after the fence.  A signal anywhere in that window lifts
+ * what this run took — hold, fence, or a forced quiesce still settling — and
+ * ends the run with a refusal, instead of killing the updater with BotFleet
+ * fenced until someone runs `unquiesce`.  A listener replaces Node's default
+ * exit for these signals, which is why the run must end by returning: every
+ * path out of the step checks `stoppedBy`.
+ */
+export function watchStopSignals(signals) {
+  let stoppedBy = null;
+  const wakers = new Set();
+  const listeners = ["SIGINT", "SIGTERM"].map((signal) => {
+    const listener = () => {
+      stoppedBy ??= signal;
+      for (const wake of [...wakers]) wake();
+    };
+    signals?.on?.(signal, listener);
+    return [signal, listener];
+  });
+  return {
+    get stoppedBy() {
+      return stoppedBy;
+    },
+    /** `sleepFor`, cut short by a signal. */
+    sleeper(sleepFor) {
+      return (ms) => new Promise((resolve) => {
+        if (stoppedBy) return resolve();
+        const wake = () => {
+          wakers.delete(wake);
+          resolve();
+        };
+        wakers.add(wake);
+        sleepFor(ms).then(wake, wake);
+      });
+    },
+    dispose() {
+      for (const [signal, listener] of listeners) signals?.off?.(signal, listener);
+    },
+  };
+}
+
+/**
+ * Keep the fence's lease alive from the moment this run holds the fence until
+ * it lets go or the harness that holds it is gone: refused, restarted (a new
+ * nonce), or the fence down.  Renews at once, which also arms a lease the
+ * fence answer did not carry.  Runs past the fence step on purpose: the
+ * harness lives on through `quiesce` until bootout or SIGTERM reaches it, and
+ * an updater killed in between must not leave it fenced.  Only ever started
+ * on a harness that reports `lease`: one that predates it would read the
+ * renewal as a plain quiesce.  `stop()` waits for a renewal in flight, so a
+ * release that follows can never be overtaken by one.
+ */
+export function keepFenceLease(owner, {
+  request = requestJson,
+  leaseMs = FENCE_LEASE_MS,
+  everyMs = FENCE_LEASE_RENEW_MS,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+} = {}) {
+  const url = `http://127.0.0.1:${owner.port}/api/runtime/quiesce?renew=1&leaseMs=${leaseMs}`;
+  const headers = { Authorization: `Bearer ${owner.nonce}` };
+  let stopped = false;
+  let timer = null;
+  let inFlight = Promise.resolve();
+  let renewals = 0;
+  const renew = () => {
+    timer = null;
+    if (stopped) return;
+    renewals += 1;
+    inFlight = Promise.resolve()
+      .then(() => request(url, { method: "POST", headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS }))
+      .then((answer) => {
+        const gone = answer.kind === "http" || answer.kind === "none" ||
+          (answer.kind === "ok" && (answer.body?.pid !== owner.pid || answer.body?.quiescing !== true));
+        if (gone) stopped = true;
+      }, () => {})
+      .finally(() => {
+        if (stopped) return;
+        timer = setTimer(renew, everyMs);
+        timer?.unref?.();
+      });
+  };
+  renew();
+  return {
+    get active() {
+      return !stopped;
+    },
+    get renewals() {
+      return renewals;
+    },
+    async stop() {
+      stopped = true;
+      if (timer) clearTimer(timer);
+      timer = null;
+      await inFlight;
+    },
+  };
+}
+
 /**
  * Hold new work, give the work in flight its window, then take the fence.
  *
@@ -1136,7 +1246,7 @@ const STOPPED_HOLDING = "BotFleet stopped holding new work before the update cou
  * wait retries the plain fence, and the grace mode then forces as before.
  */
 async function holdAndFence(config, owner, deps) {
-  const { request, now, pause: sleepFor, report, releaseAdmission, signals, mode, windowMs, roomWaitMs, pollMs } = deps;
+  const { request, now, pause: sleepFor, report, releaseAdmission, stop, mode, windowMs, roomWaitMs, pollMs } = deps;
   const base = `http://127.0.0.1:${owner.port}`;
   const headers = { Authorization: `Bearer ${owner.nonce}` };
   const quiesce = (query = "", timeoutMs = QUIESCE_TIMEOUT_MS) => request(`${base}/api/runtime/quiesce${query}`, {
@@ -1145,15 +1255,39 @@ async function holdAndFence(config, owner, deps) {
     accept: [200, 409],
     timeoutMs,
   });
-  const forceQuiesce = () => quiesce("?force=true", FORCED_QUIESCE_TIMEOUT_MS);
+  // Every request that can raise the fence asks for its lease.
+  const fenceQuiesce = () => quiesce(`?${LEASE_QUERY}`);
+  let forcedYet = false;
+  const forceQuiesce = () => {
+    forcedYet = true;
+    return quiesce(`?force=true&${LEASE_QUERY}`, FORCED_QUIESCE_TIMEOUT_MS);
+  };
+  const pause = stop.sleeper(sleepFor);
+  // A signal: lift whatever this run may hold — the hold, a fence an answer
+  // raised after the signal arrived, or a forced quiesce still settling
+  // (the release waits for it) — and end the run.
+  const stopped = async () => {
+    const reason = `Stopped by ${stop.stoppedBy} before the update started; `
+      + (forcedYet ? "anything paused was resumed." : "nothing was interrupted.");
+    try {
+      await releaseAdmission(config);
+      return { ok: false, reason };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `${reason}  Releasing BotFleet also failed; run update-botfleet.sh unquiesce: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  };
   const waitDeadline = now() + windowMs;
   const finalDeadline = mode === "grace" ? waitDeadline + roomWaitMs : waitDeadline;
   // The harness holds a little past the updater's whole window, so its lease
   // never runs out under a run that is still deciding.
   const first = await retryTransient(async () => {
     const answer = await quiesce(`?drain=1&timeoutMs=${Math.max(1_000, finalDeadline - now())}`);
-    return { ...answer, transient: answer.kind === "unavailable" };
-  }, { windowMs: DRAIN_SILENCE_LIMIT_MS, now, wait: sleepFor });
+    return { ...answer, transient: answer.kind === "unavailable" && !stop.stoppedBy };
+  }, { windowMs: DRAIN_SILENCE_LIMIT_MS, now, wait: pause });
+  if (stop.stoppedBy) return stopped();
   if (first.kind !== "ok") {
     // The harness may have started holding and only the answer was lost:
     // let go of whatever it holds rather than leave automations waiting on a
@@ -1183,37 +1317,21 @@ async function holdAndFence(config, owner, deps) {
     }
   };
 
-  let stoppedBy = null;
-  let wake = () => {};
-  const listeners = ["SIGINT", "SIGTERM"].map((signal) => {
-    const listener = () => {
-      stoppedBy = signal;
-      wake();
-    };
-    signals?.on?.(signal, listener);
-    return [signal, listener];
-  });
-  const pause = (ms) => new Promise((resolvePause) => {
-    wake = resolvePause;
-    if (stoppedBy) return resolvePause();
-    sleepFor(ms).then(resolvePause, resolvePause);
-  });
-
-  try {
+  {
     let last = first.body;
     let phase = "wait";
     let silentSince = null;
     let nextForceAt = 0;
     let lastDetail = null;
     for (;;) {
-      if (stoppedBy) {
-        return release(`Stopped by ${stoppedBy} while waiting for bots to finish; nothing was interrupted.`);
-      }
+      if (stop.stoppedBy) return stopped();
       if (phase === "wait" && draining && last?.draining === true && last.drain?.inFlight === 0) {
         // Nothing in flight: ask for the fence.  Work can land between the
         // poll and this request; the harness then keeps holding and answers
         // 409, and this simply goes round again.
-        const fenced = await quiesce();
+        const fenced = await fenceQuiesce();
+        // A signal that arrived while this was in flight wins over the fence.
+        if (stop.stoppedBy) return stopped();
         if (runtimeQuiesced(fenced)) {
           holding = false;
           return { ok: true, response: fenced, forced: false };
@@ -1236,6 +1354,7 @@ async function holdAndFence(config, owner, deps) {
         // Never a second forced ask while the first is still fencing.
         if (rooms === 0 && now() >= nextForceAt && last?.fencing !== true) {
           const forced = await forceQuiesce();
+          if (stop.stoppedBy) return stopped();
           if (runtimeQuiesced(forced)) {
             holding = false;
             return { ok: true, response: forced, forced: true };
@@ -1260,19 +1379,21 @@ async function holdAndFence(config, owner, deps) {
       }
       const deadline = phase === "wait" ? waitDeadline : finalDeadline;
       await pause(Math.max(0, Math.min(pollMs, deadline - now())));
-      if (stoppedBy) continue;
+      if (stop.stoppedBy) continue;
       if (!draining) {
         // An older harness: nothing is held, so there is nothing to poll.
         // While waiting, retry the plain fence for an idle moment; the pause
         // phase above asks for the forced one itself.
         if (phase === "wait") {
-          const retried = await quiesce();
+          const retried = await fenceQuiesce();
+          if (stop.stoppedBy) return stopped();
           if (runtimeQuiesced(retried)) return { ok: true, response: retried, forced: false };
           if (retried.kind === "ok") last = retried.body;
         }
         continue;
       }
       const polled = await request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
+      if (stop.stoppedBy) return stopped();
       if (polled.kind !== "ok") {
         silentSince ??= now();
         if (now() - silentSince >= DRAIN_SILENCE_LIMIT_MS) {
@@ -1307,8 +1428,6 @@ async function holdAndFence(config, owner, deps) {
       }
       last = polled.body;
     }
-  } finally {
-    for (const [signal, listener] of listeners) signals?.off?.(signal, listener);
   }
 }
 
@@ -1320,22 +1439,26 @@ async function holdAndFence(config, owner, deps) {
  * until the fence settles one way or the other.  Resolves the settled answer,
  * or `{ kind: "unavailable" }` when it never could tell.
  */
-async function forceFence(owner, { request, now, wait, pollMs }) {
+async function forceFence(owner, { request, now, wait, pollMs, stop }) {
   const base = `http://127.0.0.1:${owner.port}`;
   const headers = { Authorization: `Bearer ${owner.nonce}` };
-  const answer = await request(`${base}/api/runtime/quiesce?force=true`, {
+  const answer = await request(`${base}/api/runtime/quiesce?force=true&${LEASE_QUERY}`, {
     method: "POST",
     headers,
     accept: [200, 409],
     timeoutMs: FORCED_QUIESCE_TIMEOUT_MS,
   });
+  // A signal that arrived while the forced quiesce ran wins over its fence.
+  if (stop?.stoppedBy) return { kind: "stopped" };
   if (runtimeQuiesced(answer)) return answer;
   if (answer.kind === "ok" && answer.body?.quiescing !== true) return answer;
   const deadline = now() + FORCED_QUIESCE_TIMEOUT_MS;
   const interval = Number.isFinite(pollMs) && pollMs > 0 ? pollMs : DEFAULT_DRAIN_POLL_MS;
   while (now() < deadline) {
     await wait(Math.min(interval, Math.max(0, deadline - now())));
+    if (stop?.stoppedBy) return { kind: "stopped" };
     const polled = await request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
+    if (stop?.stoppedBy) return { kind: "stopped" };
     if (polled.kind !== "ok" || polled.body?.pid !== owner.pid) continue;
     if (polled.body?.fencing === true) continue;
     // No fence: the forced quiesce rolled itself back (or never started).
@@ -1360,26 +1483,46 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
     ((cfg) => releaseRuntimeAdmission(cfg, { readOwner: readRuntimeOwner, requestJson: request, now, sleep: wait }));
   const owner = await readRuntimeOwner(config.dataDirectory);
   if (!owner) return { safe: false, reason: "Authenticated runtime owner is unavailable for the admission fence" };
+  // One watcher for the whole fenced window (finding 6): from the first ask to
+  // the last check after the fence.  Handed back to Node's default the moment
+  // this step returns, by which time the run either holds a leased fence or
+  // has let go of everything.
+  const stop = watchStopSignals(adapters.signals === undefined ? process : adapters.signals);
+  try {
+    return await fenceWithin(config, owner, {
+      request, inspectTopology, inspectHolders, now, wait, releaseAdmission, stop, adapters,
+    });
+  } finally {
+    stop.dispose();
+  }
+}
+
+async function fenceWithin(config, owner, { request, inspectTopology, inspectHolders, now, wait, releaseAdmission, stop, adapters }) {
+  const pause = stop.sleeper(wait);
   const mode = fenceMode(config);
+  const stopReason = (what) => `Stopped by ${stop.stoppedBy} before the update started; ${what}`;
   let response;
   let forced = mode === "force";
   if (mode === "force" || mode === "now") {
     response = mode === "force"
-      ? await forceFence(owner, { request, now, wait, pollMs: config?.drainPollMs })
-      : await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce`, {
+      ? await forceFence(owner, { request, now, wait: pause, pollMs: config?.drainPollMs, stop })
+      : await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce?${LEASE_QUERY}`, {
         method: "POST",
         headers: { Authorization: `Bearer ${owner.nonce}` },
         accept: [200, 409],
         timeoutMs: QUIESCE_TIMEOUT_MS,
       });
-    if (response.kind !== "ok") {
-      // No answer, and the harness may be fenced: never leave it that way.
-      const reason = "Runtime admission fence could not be established";
+    if (stop.stoppedBy || response.kind !== "ok") {
+      // A signal, or no answer and the harness may be fenced: never leave it
+      // that way.  The release waits for a forced quiesce still settling.
+      const reason = stop.stoppedBy
+        ? stopReason(mode === "force" ? "the fence was released and anything paused was resumed." : "nothing was interrupted.")
+        : "Runtime admission fence could not be established";
       try {
         await releaseAdmission(config);
         return { safe: false, reason };
       } catch {
-        return { safe: false, reason: `${reason}.  If BotFleet is fenced, run update-botfleet.sh unquiesce.` };
+        return { safe: false, reason: `${reason}${stop.stoppedBy ? "" : "."}  If BotFleet is fenced, run update-botfleet.sh unquiesce.` };
       }
     }
   } else {
@@ -1394,7 +1537,7 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
       now,
       pause: wait,
       report: adapters.report ?? config?.reportDetail ?? (() => {}),
-      signals: adapters.signals === undefined ? process : adapters.signals,
+      stop,
     });
     if (!held.ok) return { safe: false, reason: held.reason };
     response = held.response;
@@ -1403,7 +1546,13 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
   if (response.kind !== "ok") return { safe: false, reason: "Runtime admission fence could not be established" };
   const runtime = response.body;
   const fenceHeld = response.status === 200 && runtime?.quiescing === true;
+  // The fence's lease, renewed from now until this run lets go or the harness
+  // is gone.  Only a harness that reports `lease` gets renewals.
+  const lease = fenceHeld && runtime && Object.hasOwn(runtime, "lease")
+    ? keepFenceLease(owner, { request, setTimer: adapters.setTimer, clearTimer: adapters.clearTimer })
+    : null;
   const refuseAfterFence = async (reason) => {
+    await lease?.stop();
     if (!fenceHeld) return { safe: false, reason };
     try {
       await releaseAdmission(config);
@@ -1415,6 +1564,8 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
       };
     }
   };
+  const stoppedAfterFence = () => refuseAfterFence(stopReason("the fence was released and anything paused was resumed."));
+  if (stop.stoppedBy) return stoppedAfterFence();
   // A fence taken without forcing must be idle on the harness's own terms;
   // a forced one has interrupted and saved whatever was running.
   const identityError = authenticatedRuntimeError(runtime, owner, undefined, { requireIdle: !forced });
@@ -1427,21 +1578,24 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
     [topology, settled] = await Promise.all([
       retryTransient(async () => {
         const result = await inspectTopology(config.ports);
-        return { ...result, transient: !result.safe && TOPOLOGY_UNAVAILABLE.test(result.reason || "") };
-      }, { windowMs: 30_000, now, wait }),
+        return { ...result, transient: !stop.stoppedBy && !result.safe && TOPOLOGY_UNAVAILABLE.test(result.reason || "") };
+      }, { windowMs: 30_000, now, wait: pause }),
       // A bot's own tool holding the database for a moment is waited out,
       // never signalled, and named if it stays (finding 5).
       settledDatabaseHolders(config, owner.pid, {
         inspect: inspectHolders,
         identify: adapters.processIdentity ?? {},
         now,
-        wait,
+        wait: pause,
         report: adapters.report ?? config?.reportDetail,
+        stopped: () => Boolean(stop.stoppedBy),
       }),
     ]);
   } catch {
+    if (stop.stoppedBy) return stoppedAfterFence();
     return refuseAfterFence("Runtime ownership could not be verified after the admission fence");
   }
+  if (stop.stoppedBy) return stoppedAfterFence();
   if (!topology.safe || topology.pid !== owner.pid) {
     return refuseAfterFence(topology.reason || "Health endpoints do not share the fenced runtime owner");
   }
@@ -1450,7 +1604,7 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
   if (holders.length !== 1 || holders[0] !== owner.pid) {
     return refuseAfterFence(`Database ownership is ambiguous after admission fence (${holders.length} live holders)`);
   }
-  return { safe: true, mode: "authenticated", pid: owner.pid, port: owner.port, runtime, holders, health: topology.health };
+  return { safe: true, mode: "authenticated", pid: owner.pid, port: owner.port, runtime, holders, health: topology.health, lease };
 }
 
 /** How long a release waits for a forced quiesce the harness says is settling. */

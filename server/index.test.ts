@@ -1049,6 +1049,46 @@ describe("harness HTTP API", () => {
     }
   }, 240_000);
 
+  it("releases a fence whose updater stopped renewing its lease, and never fences on a renewal", async () => {
+    // Finding 6: an updater killed between the fence and the shutdown left
+    // every bot refused until someone ran `unquiesce`.
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const runtime = async () => (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json() as Promise<{
+      quiescing: boolean;
+      lease: { expiresAt: number } | null;
+    }>;
+    try {
+      // A renewal never raises a fence.
+      const stray = await quiesce("POST", "?renew=1&leaseMs=60000");
+      expect(stray.status).toBe(200);
+      expect(await stray.json()).toMatchObject({ renewed: false, quiescing: false, lease: null });
+
+      const fenced = await quiesce("POST", "?leaseMs=3000");
+      expect(fenced.status).toBe(200);
+      const first = await fenced.json() as { quiescing: boolean; lease: { expiresAt: number } | null };
+      expect(first.quiescing).toBe(true);
+      expect(first.lease?.expiresAt).toBeGreaterThan(Date.now());
+
+      // Renewed, it holds past its first deadline.
+      for (let renewal = 0; renewal < 3; renewal += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        const renewed = await quiesce("POST", "?renew=1&leaseMs=3000");
+        expect(await renewed.json()).toMatchObject({ renewed: true, quiescing: true });
+      }
+      expect((await runtime()).quiescing).toBe(true);
+
+      // Left alone, it lets go.
+      await expect.poll(async () => (await runtime()).quiescing, { timeout: 20_000, interval: 250 }).toBe(false);
+      expect((await runtime()).lease).toBeNull();
+      expect((await api("GET", "/api/config")).status).toBe(200);
+    } finally {
+      await quiesce("DELETE");
+    }
+  }, 60_000);
+
   it("serves packaged UI assets and preserves API 404s", async () => {
     const root = await fetch(`${BASE}/`);
     expect(root.status).toBe(200);
