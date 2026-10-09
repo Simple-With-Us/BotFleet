@@ -23,6 +23,8 @@
 // The rules here must stay in lockstep with speakable(): a rule changed there
 // and not here fails the parity test rather than drifting silently.
 
+import { findPronunciations, type Pronunciation } from "./pronunciations.ts";
+
 /** `copy`: the spoken characters are the source characters, one for one.
  * `insert`: literal text the rules wrote in place of the source span (it may
  * be empty, e.g. the space that joins two merged utterances). */
@@ -502,4 +504,63 @@ export function sourceOffsetAt(segments: readonly SpeechSpan[], spokenOffset: nu
   if (seg.kind === "copy") return Math.min(seg.srcEnd, seg.srcStart + into);
   const spokenLength = Math.max(1, seg.spokenEnd - seg.spokenStart);
   return seg.srcStart + Math.floor((into * (seg.srcEnd - seg.srcStart)) / spokenLength);
+}
+
+// ── the pronunciation list, on a finished utterance ──────────────────────
+
+/** The tracked form of an utterance, rebuilt from its segments (which cover
+ * its text in order with no gaps). */
+function trackedFromUtterance(u: SpokenUtterance): Tracked {
+  const n = u.text.length;
+  const srcStart = new Array<number>(n).fill(-1);
+  const srcEnd = new Array<number>(n).fill(-1);
+  const kind = new Array<number>(n).fill(KIND_INSERT);
+  for (const seg of u.segments) {
+    for (let i = Math.max(0, seg.spokenStart); i < Math.min(n, seg.spokenEnd); i += 1) {
+      if (seg.kind === "copy") {
+        srcStart[i] = seg.srcStart + (i - seg.spokenStart);
+        srcEnd[i] = srcStart[i] + 1;
+        kind[i] = KIND_COPY;
+      } else {
+        srcStart[i] = seg.srcStart;
+        srcEnd[i] = seg.srcEnd;
+      }
+    }
+  }
+  // Defensive only: a unit no segment covered points at the end of the one
+  // before it, so the spans stay in source order.
+  let point = n > 0 && srcStart[0] >= 0 ? srcStart[0] : 0;
+  for (let i = 0; i < n; i += 1) {
+    if (srcStart[i] < 0) {
+      srcStart[i] = point;
+      srcEnd[i] = point;
+    }
+    point = srcEnd[i];
+  }
+  return { text: u.text, srcStart, srcEnd, kind };
+}
+
+/**
+ * `u` as the voice should say it: every term on the pronunciation list
+ * (shared/pronunciations.ts) replaced by its respelling, with the spans kept
+ * valid.  A replaced term becomes one `insert` segment whose source span is
+ * the term's own, so karaoke still lands "sequel" on "SQL".  Utterance
+ * offsets are not shifted for later utterances; consumers read the local
+ * segments, which is all encodeSpokenSpans sends.
+ */
+export function pronounceUtterance(u: SpokenUtterance, list: readonly Pronunciation[]): SpokenUtterance {
+  const matches = findPronunciations(u.text, list);
+  if (!matches.length) return u;
+  const t = trackedFromUtterance(u);
+  const out = new TrackedBuilder();
+  let last = 0;
+  for (const m of matches) {
+    out.copy(t, last, m.start);
+    const [a, b] = spanOf(t, m.start, m.end);
+    out.literal(m.replacement, a, b);
+    last = m.end;
+  }
+  out.copy(t, last, t.text.length);
+  const built = out.build();
+  return { text: built.text, spokenStart: u.spokenStart, spokenEnd: u.spokenStart + built.text.length, segments: segmentsOf(built) };
 }
