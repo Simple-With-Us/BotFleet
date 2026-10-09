@@ -220,6 +220,8 @@ Every BotFleet-layer add-on listed above is in testing.
 
 Contributions welcome — the driver SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately small; adding a provider is one file in [`server/drivers/`](server/drivers/) plus a one-line registration.
 
+Fleet Kody review rules are maintained in [`Simple-With-Us/Kodus-Config`](https://github.com/Simple-With-Us/Kodus-Config), not in this tree.  See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how that relates to the repo-local `kodus-config.yml`.
+
 ## License
 
 [Apache License 2.0](LICENSE) © 2026 Milind Soni and BotFleet contributors.

@@ -4,10 +4,3 @@ minVersion = "v8.25.0"
 
 [extend]
 useDefault = true
-
-# Kody review-rule YAMLs contain intentional test examples. Scope this exception
-# to the two default rules that false-positive here, and only these file paths.
-[[allowlists]]
-description = "Kody review rules contain intentional fake-secret examples"
-targetRules = ["stripe-access-token", "generic-api-key"]
-paths = ['''^\.kody-rules/''']

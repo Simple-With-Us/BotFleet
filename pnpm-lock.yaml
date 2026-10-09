@@ -37,8 +37,8 @@ importers:
         specifier: github:Simple-With-Us/Clutch#93bbbfdb26a84970dc9083a887dad93ca3eee0cf
         version: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf(4ddccbaa2b63eedb5c1df74043dbedd4)
       lucide-react:
-        specifier: ^0.577.0
-        version: 0.577.0(react@19.3.0)
+        specifier: ^1.0.0
+        version: 1.50.0(@types/react@19.3.0)(react@19.3.0)
       mermaid:
         specifier: ^12.0.0
         version: 12.1.0
@@ -4761,7 +4761,7 @@ packages:
     engines: {node: '>=6'}
 
   clutch@https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837:
-    resolution: {gitHosted: true, integrity: sha512-RvOViIrRaeDtbGje2h7urWva+rYX73abQKvg02S6p5DTDT5jgX5W19AUq+sET7rhp9KNJSBFkZRLu+ikbvNo8g==, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837}
+    resolution: {gitHosted: true, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837}
     version: 0.4.0
     engines: {node: '>=22.0.0'}
     hasBin: true
@@ -5615,7 +5615,7 @@ packages:
     engines: {node: '>=20.0.0'}
 
   harness@https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf:
-    resolution: {gitHosted: true, integrity: sha512-0EOxsZ5kEyLlC24heebCFIDr8ckwixQ6zTT2pxACcxbZ53yFEM/qK36fkhawQ94F5ZchfIRUbz+uIrbp7g3GoQ==, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf}
+    resolution: {gitHosted: true, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf}
     version: 0.1.0
     engines: {node: '>=22.0.0'}
     hasBin: true
@@ -6061,11 +6061,6 @@ packages:
   lru-cache@6.0.0:
     resolution: {integrity: sha512-Jo6dJ04CmSjuznwJSS3pUeWmd/H0ffTlkXXgwZi+eq1UCmqQwCh+eLsYOYCwY991i2Fah4h1BEMCx4qThGbsiA==}
     engines: {node: '>=10'}
-
-  lucide-react@0.577.0:
-    resolution: {integrity: sha512-4LjoFv2eEPwYDPg/CUdBJQSDfPyzXCRrVW1X7jrx/trgxnxkHFjnVZINbzvzxjN70dxychOfg+FTYwBiS3pQ5A==}
-    peerDependencies:
-      react: ^16.5.1 || ^17.0.0 || ^18.0.0 || ^19.0.0
 
   lucide-react@1.50.0:
     resolution: {integrity: sha512-RqHPQtKX6S9IE1xOL4oTHHsVQbcwJWTnmlxI6AdI9IpOwKiy7q+COPCQyMepI/Qu1x3h7sunpyEMvqtgFbgNiQ==}
@@ -14357,10 +14352,6 @@ snapshots:
   lru-cache@6.0.0:
     dependencies:
       yallist: 4.0.0
-
-  lucide-react@0.577.0(react@19.3.0):
-    dependencies:
-      react: 19.3.0
 
   lucide-react@1.50.0(@types/react@19.3.0)(react@19.3.0):
     dependencies:

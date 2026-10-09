@@ -577,6 +577,9 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           // BotFleet's own job tools run in this loop (jobs P1).
           backgroundJobs: "emulated",
           helpers: "none",
+          // Every tool with an `ask` policy opens a card on the in-process
+          // permission broker (server/tools/approvals.ts) before it runs.
+          reviewHook: "before",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
@@ -607,6 +610,17 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           { stream: false },
         );
         return text.trim() ? text : reasoning;
+      },
+      // Auto-review on this same endpoint: one chat-completions call with no
+      // `tools`, the prompt in the request body (never argv), cancelled by
+      // the reviewer's own deadline.  Only the answer text is returned, never
+      // the reasoning: a verdict has to be the model's actual reply.
+      reviewPermission: async (prompt: string, signal?: AbortSignal) => {
+        const { text } = await complete([{ role: "user", content: prompt }], catalog.default, {
+          stream: false,
+          signal,
+        });
+        return text;
       },
       dispose: async () => {
         for (const { abort } of active.values()) abort.abort();

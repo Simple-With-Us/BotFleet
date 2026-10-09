@@ -611,6 +611,21 @@ describe("the sidecar in front of an unmodified harness", () => {
         body: { memberIds: [botId], cwd: join(home, "projects", "missing") },
       });
       expect(missing.status).toBe(400);
+      // The shapes are parsed at the boundary: a wrong type is a 400 that
+      // names the field, never a half-made room or a coerced value.
+      const badInputs: Array<{ body: Record<string, unknown>; error: string }> = [
+        { body: { bulletin: 7 }, error: "bulletin must be a string" },
+        { body: { bulletin: "x".repeat(12_001) }, error: "bulletin must be at most 12000 characters" },
+        { body: { defaultResponder: "everyone" }, error: "invalid default responder" },
+        { body: { defaultResponder: { kind: "somebody" } }, error: "invalid default responder" },
+        { body: { defaultResponder: { kind: "member" } }, error: "invalid default responder" },
+        { body: { cwd: 7 }, error: "cwd must be a string" },
+      ];
+      for (const wrong of badInputs) {
+        const refused = await device("POST", "/api/groups", { body: { memberIds: [botId], ...wrong.body } });
+        expect(refused.status, JSON.stringify(wrong.body)).toBe(400);
+        expect(refused.body.error, JSON.stringify(wrong.body)).toBe(wrong.error);
+      }
       expect(await roomCount()).toBe(before);
 
       const made = await device("POST", "/api/groups", {
