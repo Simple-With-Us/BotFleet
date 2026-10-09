@@ -40,6 +40,7 @@ const TRANSIENT_RM_CODES = new Set(["EPERM", "EBUSY", "ENOTEMPTY"]);
  *  here: install/update/remove run on the server event loop. */
 const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- catch-clause error is unknown at the fs boundary
 function errnoCode(error: unknown): string {
   if (error && typeof error === "object" && "code" in error) {
     const code = (error as { code: unknown }).code;
