@@ -16,6 +16,7 @@ import { z } from "zod";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
+import { CONTAINER_RUNTIME_DISABLED_MESSAGE } from "./container-runtime-guard.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 import { DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
@@ -3024,6 +3025,27 @@ describe("harness HTTP API", () => {
         }, { timeout: 5_000 }).toBe(true);
 
         if (reloadInstanceId === "gatedQuota") {
+          // Assistant text precedes the result frame.  Reloading after text alone
+          // can interrupt a still-active turn instead of its deferred terminal
+          // fold, correctly clearing busy before the successor is posted.
+          // Wait for the terminal event, then prove the held health probe still
+          // owns busy before exercising the targeted reload.
+          await expect.poll(() => {
+            const file = join(home, ".botfleet", "events", `${bot.threadId}.ndjson`);
+            if (!existsSync(file)) return false;
+            return readFileSync(file, "utf8").split("\n").some((line) => {
+              if (!line.trim()) return false;
+              try {
+                return JSON.parse(line).type === "turn.completed";
+              } catch {
+                return false; // The asynchronous log writer may be mid-append.
+              }
+            });
+          }, { timeout: 5_000 }).toBe(true);
+          expect((await api("GET", "/api/bots?messages=0")).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          )?.busy).toBe(true);
+
           reload = api("PATCH", `/api/instances/${reloadInstanceId}`, { fullAuto: true });
           await expect.poll(async () => {
             const transcript = await api("GET", `/api/threads/${bot.threadId}/messages?limit=200`);
@@ -4602,6 +4624,48 @@ describe("harness HTTP API", () => {
     expect((await api("PATCH", `/api/bots/${bot.id}`, { autoStartVps: "yes" })).status).toBe(400);
     const invalid = await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "daytona" });
     expect(invalid.status).toBe(400);
+  });
+
+  it("sends the backend a bot really uses without disturbing the raw value", async () => {
+    // The workspace default fills in for a bot that was never pinned, and the
+    // join route resolves it that way.  A phone deciding whether to offer the
+    // live cloud desktop must see that answer, while the desktop keeps the
+    // stored value to tell an inherited backend from a pinned one.
+    const originalDefault = (await api("GET", "/api/config")).body.botDefaults.cloudBackend ?? "box";
+    const unpinned = (await api("POST", "/api/bots", { name: "Unpinned Backend" })).body.bot;
+    const pinned = (await api("POST", "/api/bots", { name: "Pinned Backend" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${pinned.id}`, { cloudBackend: "box" })).status).toBe(200);
+      const find = async (id: string) =>
+        (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === id);
+
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      let unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("box");
+
+      // The workspace now sends unpinned bots to the VPS: the stored value is
+      // still unset, the effective one follows the default, and a bot pinned
+      // to Box stays on Box.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "vps" } })).status).toBe(200);
+      unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("vps");
+      const pinnedWire = await find(pinned.id);
+      expect(pinnedWire.cloudBackend).toBe("box");
+      expect(pinnedWire.effectiveCloudBackend).toBe("box");
+
+      // A pin to the VPS wins over a Box default.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      const repinned = await api("PATCH", `/api/bots/${unpinned.id}`, { cloudBackend: "vps" });
+      expect(repinned.status).toBe(200);
+      expect(repinned.body.bot.cloudBackend).toBe("vps");
+      expect(repinned.body.bot.effectiveCloudBackend).toBe("vps");
+    } finally {
+      await api("DELETE", `/api/bots/${unpinned.id}`);
+      await api("DELETE", `/api/bots/${pinned.id}`);
+      await api("PUT", "/api/config", { botDefaults: { cloudBackend: originalDefault } });
+    }
   });
 
   it("validates a Composio project key, creates a Session, and keeps externally stored secrets off disk", async () => {
@@ -7114,6 +7178,60 @@ describe("PATCH /api/terminology", () => {
   });
 });
 
+describe("workspace voice settings", () => {
+  it("hands every client the default voice by id and the pronunciation list in force", async () => {
+    const saved = await api("PUT", "/api/config", { tts: { voice: "jay-wedgeworth-001" } });
+    expect(saved.status).toBe(200);
+    expect(saved.body.tts.voice).toBe("jay-wedgeworth-001");
+    const status = await api("GET", "/api/config");
+    expect(status.body.tts.voice).toBe("jay-wedgeworth-001");
+    // Never saved yet: the seeded list, so a client never has to know it.
+    expect(status.body.tts.pronunciations).toEqual(expect.arrayContaining([
+      { term: "SQL", say: "sequel" },
+      { term: "OAuth", say: "oh auth" },
+    ]));
+  });
+
+  it("saves the list through PUT /api/config with the shared validation", async () => {
+    const ok = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "SQL", say: "S Q L" }] } });
+    expect(ok.status).toBe(200);
+    expect(ok.body.tts.pronunciations).toEqual([{ term: "SQL", say: "S Q L" }]);
+    const dup = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "a", say: "x" }, { term: "A", say: "y" }] } });
+    expect(dup.status).toBe(400);
+  });
+
+  it("lets the phone's narrow route change the default voice, and nothing else", async () => {
+    const res = await api("PATCH", "/api/tts/default-voice", { voice: "English_Graceful_Lady", profile: { name: "Side Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.voice).toBe("English_Graceful_Lady");
+    expect((await api("GET", "/api/config")).body.profile?.name).not.toBe("Side Door");
+    // A Personal Voice belongs to one device; blank and junk are refused.
+    const personal = await api("PATCH", "/api/tts/default-voice", { voice: "personal:Jay" });
+    expect(personal.status).toBe(400);
+    expect(personal.body.error).toContain("Personal Voices stay on the device");
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "  " })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "a\u0000b" })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: 7 })).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.voice).toBe("English_Graceful_Lady");
+    // The MiniMax id is kept exactly; MiniMax ids are case-sensitive.
+    const exact = await api("PATCH", "/api/tts/default-voice", { voice: "jay-wedgeworth-001" });
+    expect(exact.body.tts.voice).toBe("jay-wedgeworth-001");
+  });
+
+  it("lets the phone's narrow route replace the pronunciation list, with a plain-language refusal", async () => {
+    const list = [{ term: "JSON", say: "Jason" }, { term: "kubectl", say: "cube control" }];
+    const res = await api("PATCH", "/api/tts/pronunciations", { pronunciations: list, tts: { voice: "Side_Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.pronunciations).toEqual(list);
+    expect(res.body.tts.voice).not.toBe("Side_Door");
+    const bad = await api("PATCH", "/api/tts/pronunciations", { pronunciations: [{ term: "JSON", say: "my JSON" }] });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toContain("which is also on the list");
+    expect((await api("PATCH", "/api/tts/pronunciations", {})).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.pronunciations).toEqual(list);
+  });
+});
+
 describe("local Auto consent for inherited and discovered computers", () => {
   it("guards config defaults and per-bot Auto while preserving explicit Off", async () => {
     expect((await api("PUT", "/api/config", {
@@ -7319,9 +7437,14 @@ describe("Local VM lifecycle routes honor the provider toggle", () => {
       expect(on.status).toBe(200);
       // Shared mode allows the bot endpoint to run or create the shared container;
       // it is not blocked by the provider gate or by a legacy App Settings referral.
+      // This harness runs with container runtimes switched off (spawnDetached),
+      // so the request must reach the runtime layer and be refused THERE, with
+      // exactly that message — nothing is created on the machine running the
+      // suite.  An unqualified "no gate text" assertion once let a real
+      // `docker run` through and orphaned the owner's real Local VM container.
       const perBot = await api("POST", `/api/bots/${bot.id}/local-computer/run`, {});
-      expect(String(perBot.body.error ?? "")).not.toContain("turned off in Computer settings");
-      expect(String(perBot.body.error ?? "")).not.toContain("Shared mode manages this desktop in App Settings");
+      expect(perBot.status).toBe(409);
+      expect(perBot.body.error).toBe(CONTAINER_RUNTIME_DISABLED_MESSAGE);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }

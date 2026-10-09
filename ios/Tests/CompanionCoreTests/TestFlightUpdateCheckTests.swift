@@ -10,17 +10,17 @@ final class TestFlightUpdateCheckTests: XCTestCase {
     // MARK: - Manifest decoding
 
     /// The real published manifest, verbatim, minus unrelated apps. Proves
-    /// this app's bundle id (`app.botfleet`) round-trips through the shape
+    /// this app's bundle id (`app.botfleet.ios`) round-trips through the shape
     /// the fleet actually serves, not a shape invented for this test.
     private let realManifestJSON = Data(#"""
     {
       "schemaVersion": 1,
       "updatedAt": "2026-09-04T03:58:13Z",
       "apps": {
-        "app.botfleet": {
+        "app.botfleet.ios": {
           "marketingVersion": "1.0.29",
           "build": "202609032050",
-          "appleId": 6806379515,
+          "appleId": 6820175685,
           "displayName": "BotFleet"
         },
         "trade.socratic.app": {
@@ -38,7 +38,7 @@ final class TestFlightUpdateCheckTests: XCTestCase {
         let entry = try XCTUnwrap(manifest.apps[TestFlightUpdateCheck.bundleId])
         XCTAssertEqual(entry.marketingVersion, "1.0.29")
         XCTAssertEqual(entry.build, "202609032050")
-        XCTAssertEqual(entry.appleId, 6_806_379_515)
+        XCTAssertEqual(entry.appleId, 6_820_175_685)
     }
 
     func testAnUnlistedBundleIdOffersNoUpdateRatherThanThrowing() throws {

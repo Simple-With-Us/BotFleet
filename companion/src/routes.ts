@@ -57,9 +57,18 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "avatarUrl",
   "avatarCrop",
   "voice",
+  // Per-device overrides of voice ({ mac?, iphone? }).  The phone sets its
+  // own Personal Voice here and may pick a hosted voice for the Mac; the
+  // harness validates the shape and merges it with the stored record.
+  "voices",
   "speakReplies",
   "speechDevices",
   "modelSelection",
+  // The bot's On/Off switch (shared/bot-power.ts).  It only ever stops or
+  // resumes work the person could already start by messaging the bot, grants
+  // no capability, and the phone has to be able to turn a bot back On: the
+  // disabled composer's one button is Turn On.
+  "off",
 ] as const;
 
 const COMPANION_PROFILE_PATCH_FIELD_SET = new Set<string>(COMPANION_PROFILE_PATCH_FIELDS);
@@ -161,6 +170,12 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // workspace MiniMax key; the phone receives labels or audio only.
   { method: "GET", path: /^\/api\/tts\/voices$/ },
   { method: "POST", path: /^\/api\/tts\/speak$/ },
+  // The workspace default voice and the pronunciation list: settings, not
+  // credentials.  Each is its own narrow harness route that validates and
+  // saves only that field, the way terminology does, so /api/config (which
+  // carries the voice key) stays write-closed to a phone.
+  { method: "PATCH", path: /^\/api\/tts\/default-voice$/ },
+  { method: "PATCH", path: /^\/api\/tts\/pronunciations$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio\/\d+$/ },
 
@@ -171,6 +186,13 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "PATCH", path: /^\/api\/routines\/[\w-]+$/ },
   { method: "DELETE", path: /^\/api\/routines\/[\w-]+$/ },
   { method: "POST", path: /^\/api\/routines\/[\w-]+\/run$/ },
+  // Run receipts: stop one that is queued, running or waiting, and mark a
+  // failure as seen.  Both act on a run that already exists and neither
+  // creates, edits or deletes a routine, so a lost phone gains no new reach.
+  // The bare `POST /api/routine-runs/seen` is the "mark every failure seen"
+  // sweep; it clears the badge and keeps every run, status and error.
+  { method: "POST", path: /^\/api\/routine-runs\/[\w-]+\/(?:cancel|seen)$/ },
+  { method: "POST", path: /^\/api\/routine-runs\/seen$/ },
 
   // Checking for a newer BotFleet and installing it.  The phone is the one
   // place an update is convenient to start — the Mac is usually mid-work when

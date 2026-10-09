@@ -1,4 +1,5 @@
 import SwiftUI
+import CompanionCore
 
 /// A small brand mark for the provider driving a bot's current model — the
 /// Claude, Grok, OpenAI, etc. logo.  Mirrors `ProviderMark(driverKind:)` in
@@ -166,5 +167,52 @@ struct ProviderMarkView: View {
         .overlay(Circle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.75))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(displayName)
+    }
+}
+
+// MARK: - The mark on an avatar
+
+extension View {
+    /// The provider mark at an avatar's lower-right corner, the treatment the
+    /// chat header and message rows use, for a bot answering in its own
+    /// thread.  Draws nothing when the engine is unknown (a cold roster), so
+    /// the avatar is left as it was.  Apply it to every bot avatar.
+    func providerBadge(for bot: Bot, avatarSize: CGFloat) -> some View {
+        modifier(ProviderBadge(bot: bot, avatarSize: avatarSize))
+    }
+
+    /// A chat's avatar: a bot gets the mark, a room (many bots, no single
+    /// model) gets nothing.
+    func providerBadge(for chat: Chat?, avatarSize: CGFloat) -> some View {
+        modifier(ProviderBadge(bot: chat?.bot, avatarSize: avatarSize))
+    }
+}
+
+private extension Chat {
+    var bot: Bot? {
+        if case let .bot(bot) = self { return bot }
+        return nil
+    }
+}
+
+private struct ProviderBadge: ViewModifier {
+    let bot: Bot?
+    let avatarSize: CGFloat
+    @EnvironmentObject private var session: Session
+
+    /// The header's 21pt on a 36pt avatar and a message row's 16pt on a 28pt
+    /// one, held to the same proportion; capped so a hero avatar's badge
+    /// stays a badge.
+    private var diameter: CGFloat { min(30, max(14, (avatarSize * 0.57).rounded())) }
+
+    func body(content: Content) -> some View {
+        content.overlay(alignment: .bottomTrailing) {
+            if let bot,
+               let selection = MessageRow.modelSelection(of: bot, inThread: bot.threadId),
+               let driverKind = session.instanceDriverKinds[selection.instanceId] {
+                ProviderMarkView(driverKind: driverKind, model: selection.model, size: diameter)
+                    .offset(x: 3, y: 3)
+            }
+        }
     }
 }

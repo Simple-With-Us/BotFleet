@@ -77,6 +77,8 @@ describe("what the app may do", () => {
     ["GET", "/api/attachments/avatar-123.webp"],
     ["GET", "/api/tts/voices"],
     ["POST", "/api/tts/speak"],
+    ["PATCH", "/api/tts/default-voice"],
+    ["PATCH", "/api/tts/pronunciations"],
     ["POST", "/api/threads/th_1/messages/msg_2/audio"],
     ["GET", "/api/threads/th_1/messages/msg_2/audio/0"],
     ["GET", "/api/routines"],
@@ -84,6 +86,9 @@ describe("what the app may do", () => {
     ["PATCH", "/api/routines/routine_1"],
     ["DELETE", "/api/routines/routine_1"],
     ["POST", "/api/routines/routine_1/run"],
+    ["POST", "/api/routine-runs/run_1/cancel"],
+    ["POST", "/api/routine-runs/run_1/seen"],
+    ["POST", "/api/routine-runs/seen"],
     ["GET", "/api/connectors/catalog"],
     ["GET", "/api/connectors/connected"],
     ["GET", "/api/connectors"],
@@ -166,6 +171,54 @@ describe("what it may not", () => {
     }
   });
 
+  it("lets the phone turn a bot Off and back On, and only through the profile route", () => {
+    // The phone's disabled composer has one button, Turn On, so a refusal here
+    // would strand an Off bot on the phone.
+    expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("off");
+    expect(companionProfilePatchDenial({ off: true })).toBeNull();
+    expect(companionProfilePatchDenial({ off: false })).toBeNull();
+    // Switching it is not a way to smuggle a host-control field along.
+    expect(companionProfilePatchDenial({ off: false, autoApprove: true })).toEqual({
+      status: 403,
+      error: "autoApprove can only be changed in BotFleet on your computer",
+    });
+    // The general bot PATCH is not on the phone's route list.
+    expect(allowed("PATCH", "/api/bots/b_1")).toBe(false);
+    expect(allowed("PATCH", "/api/bots/b_1/profile")).toBe(true);
+  });
+
+  it("lets the phone write per-device voices", () => {
+    expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("voices");
+    expect(companionProfilePatchDenial({ voices: { iphone: "English_Graceful_Lady" } })).toBeNull();
+    expect(companionProfilePatchDenial({ voices: null, speechDevices: ["mac", "iphone"] })).toBeNull();
+  });
+
+  it("accepts the profile body the phone's Duplicate Bot sends", () => {
+    // `POST /api/bots` then `PATCH /api/bots/:id/profile` with the fields the
+    // phone owns.  The iOS client (BotDuplicate.profilePatch) keeps to exactly
+    // these keys; the sidecar refuses a body with any other, so if this list
+    // ever narrows, Duplicate Bot would start failing at the second request.
+    expect(allowed("POST", "/api/bots")).toBe(true);
+    expect(allowed("PATCH", "/api/bots/bot_new/profile")).toBe(true);
+    const body = {
+      name: "Scout copy",
+      title: "Researcher",
+      description: "Reads things",
+      notifications: false,
+      avatarUrl: "/api/attachments/face.png",
+      avatarCrop: "circle",
+      voice: "English_Graceful_Lady",
+      modelSelection: { instanceId: "claude", model: "sonnet", fallbacks: [] },
+    };
+    expect(companionProfilePatchDenial(body)).toBeNull();
+  });
+
+  it("permits a device-qualified clip GET", () => {
+    // The sidecar matches the path with the query removed and forwards the
+    // query untouched, so `?device=` needs no allowlist entry of its own.
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/audio/0")).toBeNull();
+  });
+
   it("permits message-linked audio but not arbitrary attachment audio", () => {
     expect(ask("POST", "/api/threads/th_1/messages/msg_1/audio")).toBeNull();
     expect(ask("GET", "/api/threads/th_1/messages/msg_1/audio/0")).toBeNull();
@@ -239,6 +292,32 @@ describe("what it may not", () => {
     expect(ask("POST", "/api/routines/routine_1/run")).toBeNull();
   });
 
+  it("lets the phone cancel a routine run and mark runs seen, and nothing else about them", () => {
+    expect(ask("POST", "/api/routine-runs/run_1/cancel")).toBeNull();
+    expect(ask("POST", "/api/routine-runs/run_1/seen")).toBeNull();
+    // The sweep that marks every failure seen.
+    expect(ask("POST", "/api/routine-runs/seen")).toBeNull();
+    // Method is part of the allowance.
+    for (const method of ["GET", "PUT", "PATCH", "DELETE"]) {
+      expect(ask(method, "/api/routine-runs/run_1/cancel")?.status, method).toBe(404);
+      expect(ask(method, "/api/routine-runs/run_1/seen")?.status, method).toBe(404);
+      expect(ask(method, "/api/routine-runs/seen")?.status, method).toBe(404);
+    }
+    // Only those two action words, and the runs listing is not a route.
+    expect(ask("POST", "/api/routine-runs/run_1/retry")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/run_1")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs")?.status).toBe(404);
+    expect(ask("GET", "/api/routine-runs")?.status).toBe(404);
+    // Anchored at both ends: no traversal, no trailing segment, no encoded dot.
+    expect(ask("POST", "/api/routine-runs/../config/cancel")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/run_1/cancel/extra")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/run%2E1/cancel")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/seen/extra")?.status).toBe(404);
+    // And it is still a paired-device route rather than an open one.
+    expect(ask("POST", "/api/routine-runs/run_1/cancel", false)?.status).toBe(401);
+    expect(ask("POST", "/api/routine-runs/seen", false)?.status).toBe(401);
+  });
+
   it("denies the peer-agent endpoints exist at all", () => {
     expect(ask("GET", "/api/internal/peers")?.status).toBe(404);
     expect(ask("POST", "/api/internal/ask-bot")?.status).toBe(404);
@@ -269,7 +348,9 @@ describe("what it may not", () => {
     expect(allowed("PATCH", "/api/bots/bot_123/profile/execution-policy")).toBe(false);
     expect(allowed("PUT", "/api/config")).toBe(false);
     expect(allowed("GET", "/api/attachments/../config.json")).toBe(false);
-    expect(allowed("POST", "/api/routine-runs/run_1/cancel")).toBe(false);
+    // Cancelling and marking a run seen are allowed (see the routine-runs
+    // test below); every other way to reach a run still is not.
+    expect(allowed("GET", "/api/routine-runs/run_1/cancel")).toBe(false);
     expect(allowed("DELETE", "/api/connectors/slack")).toBe(false);
     expect(allowed("GET", "/api/connectors/connected/all")).toBe(false);
     // listing, authorizing and detaching ONE account are allowed; an account
@@ -353,5 +434,25 @@ describe("settings display preferences", () => {
     expect(ask("PATCH", "/api/features", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/room-turn-timeout", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/profile", false)?.status).toBe(401);
+  });
+});
+
+describe("workspace voice settings", () => {
+  it("lets the phone change the default voice and the pronunciation list, and nothing else under tts", () => {
+    expect(allowed("PATCH", "/api/tts/default-voice")).toBe(true);
+    expect(allowed("PATCH", "/api/tts/pronunciations")).toBe(true);
+    expect(allowed("PUT", "/api/tts/default-voice")).toBe(false);
+    expect(allowed("POST", "/api/tts/pronunciations")).toBe(false);
+    expect(allowed("GET", "/api/tts/pronunciations")).toBe(false);
+    expect(allowed("PATCH", "/api/tts/default-voice/extra")).toBe(false);
+    expect(allowed("PATCH", "/api/tts/key")).toBe(false);
+    expect(allowed("POST", "/api/tts/voice-clone")).toBe(false);
+    expect(allowed("PATCH", "/api/config")).toBe(false);
+    expect(allowed("PUT", "/api/config")).toBe(false);
+  });
+
+  it("still refuses an unpaired device", () => {
+    expect(ask("PATCH", "/api/tts/default-voice", false)?.status).toBe(401);
+    expect(ask("PATCH", "/api/tts/pronunciations", false)?.status).toBe(401);
   });
 });

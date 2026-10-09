@@ -1,14 +1,14 @@
 # Bring Your Own VPS
 
-BotFleet can turn a Linux server you already own into a bot's computer. The agent process stays on your
+BotFleet can turn a Linux server you already own into a bot's computer.  The agent process stays on your
 machine; Docker's own SSH transport reaches the daemon on the VPS, and each bot gets one managed, hardened
-Cua container there — a Linux desktop it can see and control. SSH is the only credential involved and the
+CUA container there — a Linux desktop it can see and control.  SSH is the only credential involved and the
 only surface exposed: BotFleet never opens a public port on the VPS, never stores your SSH key or
 passphrase, and never runs an agent remotely.
 
 ## What works
 
-- A per-bot Linux desktop in a managed container on your VPS, driven through the official Cua tools.
+- A per-bot Linux desktop in a managed container on your VPS, driven through the official CUA tools.
 - Live screen preview in the Computer panel and in transcripts, same as a Box.
 - Explicit **Cloud** with the **Self-hosted VPS** backend provisions or starts the container. **Auto** reuses
   a ready container by default; an off-by-default **Start VPS automatically** switch lets that bot prepare
@@ -109,33 +109,33 @@ disposability the rest of this page describes, but it is worth knowing before yo
 Each bot owns one container on the VPS, named `botfleet-vps-<bot>-<hash>` — stable across restarts and
 independent of the bot's display name.
 
-- **Provision** (choosing **Cloud** for the bot, or the panel's button): builds the pinned Cua image on the
+- **Provision** (choosing **Cloud** for the bot, or the panel's button): builds the pinned CUA image on the
   VPS if needed, creates the container if missing, starts it if stopped, and waits until the desktop answers.
 - **Start** only wakes an existing stopped container; it never creates one.
-- **Sleep** stops the container. The VPS stops spending CPU on it; the filesystem stays put.
+- **Sleep** stops the container.  The VPS stops spending CPU on it; the filesystem stays put.
 - **Remove** is yours, done by hand when a bot no longer needs the server:
-  `docker -H ssh://my-vps rm -f <container>`. BotFleet never deletes a container on its own.
+  `docker -H ssh://my-vps rm -f <container>`.  BotFleet never deletes a container on its own.
 
 What survives what: sleep/start preserves the container's filesystem; removal — including the recreate that
-follows a Cua image upgrade, since a container pinned to an old image is refused rather than reused — wipes
-it. Treat the container filesystem as **disposable**: anything a bot must keep should leave the VPS (pushed,
+follows a CUA image upgrade, since a container pinned to an old image is refused rather than reused — wipes
+it.  Treat the container filesystem as **disposable**: anything a bot must keep should leave the VPS (pushed,
 uploaded, or pasted back into chat) before the container is removed.
 
-A bot set to **Auto** is lifecycle-read-only by default. It attaches only when the container is already
-running and verified. If no local fallback exists, the turn now explains why the VPS was unavailable instead
-of silently running without a computer. Enable **Start VPS automatically** per bot to let Auto prepare or wake
+A bot set to **Auto** is lifecycle-read-only by default.  It attaches only when the container is already
+running and verified.  If no local fallback exists, the turn now explains why the VPS was unavailable instead
+of silently running without a computer.  Enable **Start VPS automatically** per bot to let Auto prepare or wake
 that bot's managed container; the switch is deliberately off by default.
 
 ## Troubleshooting
 
 Work up the same path the app takes, cheapest signal first:
 
-1. **The alias works by hand:** `ssh my-vps true` returns silently. A password prompt means the key/agent is
+1. **The alias works by hand:** `ssh my-vps true` returns silently.  A password prompt means the key/agent is
    not set up; a host-key prompt means the first manual connect has not happened yet.
-2. **Docker over SSH reaches the daemon:** `docker -H ssh://my-vps info` prints server details. A permission
+2. **Docker over SSH reaches the daemon:** `docker -H ssh://my-vps info` prints server details.  A permission
    error means the SSH user is not in the `docker` group.
-3. **Provision:** choose **Cloud** with the **Self-hosted VPS** backend in the bot's Computer panel. The
-   first provision pulls and builds the Cua image on the VPS, which can take minutes; later ones are fast.
+3. **Provision:** choose **Cloud** with the **Self-hosted VPS** backend in the bot's Computer panel.  The
+   first provision pulls and builds the CUA image on the VPS, which can take minutes; later ones are fast.
 4. **Read the status states.** The panel surfaces exactly what the server found, in check order: alias not
    configured → daemon unreachable → image missing → container missing / stopped → container unmanaged or
    unsafe (ports, mounts, hardening) → desktop not ready. Each message names the step to fix.

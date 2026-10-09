@@ -13,7 +13,7 @@ of Linux desktop on your own server instead of this machine, see [byo-vps.md](by
 - External documentation and OAuth links in the default browser.
 - An explicit, view-only local screen preview on GNOME Xorg and GNOME Wayland. The Wayland path uses the
   native portal chooser and keeps the selected PipeWire stream open until the user stops sharing.
-- Explicit opt-in local computer control on GNOME Xorg using the bundled, pinned Cua Driver without its
+- Explicit opt-in local computer control on GNOME Xorg using the bundled, pinned CUA Driver without its
   decorative full-screen cursor overlay.
 - A fail-closed local-control state on GNOME Wayland while its separate real-seat input-safety gate in issue #345
   is resolved.
@@ -152,14 +152,14 @@ fail-closed on Wayland. XWayland's `DISPLAY` never bypasses the Wayland safety g
 
 ## Enable local control
 
-Installed `.deb` and AppImage builds include the certified **Cua Driver 0.19.3** CLI and cursor-theme sidecar.
+Installed `.deb` and AppImage builds include the certified **CUA Driver 0.19.3** CLI and cursor-theme sidecar.
 On GNOME Xorg, open Settings, choose **Enable local control (Beta)**, wait for **Ready**, then explicitly assign a bot
-to **This computer**. No driver download, terminal command, `chmod`, or daemon setup is required. The owned daemon
-starts with `--no-overlay`, so Cua's decorative full-screen X11 cursor surface is never created. BotFleet also
+to **This computer**.  No driver download, terminal command, `chmod`, or daemon setup is required.  The owned daemon
+starts with `--no-overlay`, so CUA's decorative full-screen X11 cursor surface is never created.  BotFleet also
 uses Electron software rendering on Linux to avoid the reproduced NVIDIA/libGLES GPU-process failure that could
 leave an invisible focused app window receiving input.
 
-Cua actions use a private logical cursor. With the decorative overlay disabled, `move_cursor` does not move the
+CUA actions use a private logical cursor.  With the decorative overlay disabled, `move_cursor` does not move the
 user's physical pointer; approved click and typing actions still target the requested window, while the user's own
 mouse remains under their control.
 
@@ -177,7 +177,7 @@ explicit reviewed digest as its trust anchor:
 - packaged cursor-theme SHA-256: `e589b2b7521bbfeaf9e2bfce668a38e80ed1b9790b1327b13d374fc331d8312a`.
 
 Packaging verifies the exact archive size, checksum, member names/types/sizes, and inner hashes before extracting
-only those two executables. The app performs no runtime driver download or self-update. Cua's MIT license, the
+only those two executables.  The app performs no runtime driver download or self-update.  CUA's MIT license, the
 embedded Inter font's SIL OFL 1.1 notice, full dependency license texts, MPL source locations, and a CycloneDX
 inventory ship beside the binary; the reviewed source records live in [`third_party/cua-driver`](../third_party/cua-driver/).
 The reviewed native runtime adds roughly 11–13 MiB to a compressed Ubuntu artifact. The ELF
@@ -210,13 +210,13 @@ node scripts/verify-linux-package.mjs
 pnpm smoke:linux-package
 ```
 
-The verifier checks `.deb` metadata, desktop identity, the exact dormant Cua resource tree and provenance,
-SquashFS/DEB directory modes, runtime path policy, and matching binary hashes across all artifacts. The local smoke
+The verifier checks `.deb` metadata, desktop identity, the exact dormant CUA resource tree and provenance,
+SquashFS/DEB directory modes, runtime path policy, and matching binary hashes across all artifacts.  The local smoke
 launches the unpacked app and AppImage without `--no-sandbox`; CI first reproduces a `0.1.7` in-place DEB upgrade and
-then runs the same smoke against `/opt/BotFleet/botfleet`. These lanes prove the embedded server and UI are
+then runs the same smoke against `/opt/BotFleet/botfleet`.  These lanes prove the embedded server and UI are
 usable while an optional Composio broker stalls, verify that an old local-control opt-in is cleared, and assert that
-no Cua executable starts on Xorg or simulated Wayland. Low-level runtime tests retain the future private-daemon
-contract without activating it in a packaged app. Only a real-seat acceptance matrix can authorize re-enablement.
+no CUA executable starts on Xorg or simulated Wayland.  Low-level runtime tests retain the future private-daemon
+contract without activating it in a packaged app.  Only a real-seat acceptance matrix can authorize re-enablement.
 
 ## Troubleshooting
 

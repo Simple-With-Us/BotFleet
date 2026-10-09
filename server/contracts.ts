@@ -309,6 +309,12 @@ export interface SendTurnInput {
    *  or neither is (see drivers/prompt-split.ts promptHalves). */
   systemStable?: string;
   systemVolatile?: string;
+  /** Ordered non-empty system-prompt sections, the same list joined into
+   *  `system`.  ACP uses it to drop the oldest volatile sections under a
+   *  byte budget.  The stable sections are interleaved with them, so the
+   *  two joined halves are not enough to put a section back.  Optional: a
+   *  driver that does not budget the prompt ignores it. */
+  systemSections?: Array<{ id: string; text: string; volatile: boolean }>;
   /** sha256 hex of `systemVolatile`, computed once by the server so a driver
    *  comparing halves against a receipt need not hash the text itself. */
   volatileDigest?: string;
@@ -353,7 +359,7 @@ export interface SendTurnInput {
       gatewayUrl?: string;
       control?: { url: string; token: string };
     };
-    /** Direct stdio connection to a Cua Driver MCP server (host, sandbox, or
+    /** Direct stdio connection to a CUA Driver MCP server (host, sandbox, or
      * VPS). `scope` is set only for the user's host desktop; isolated and
      * remote computers intentionally omit it so host-only approval rules
      * cannot change their semantics. */

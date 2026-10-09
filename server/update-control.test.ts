@@ -250,6 +250,8 @@ describe("check", () => {
       sourceCommit: NEW_COMMIT,
       version: "1.0.31",
       aheadBy: 12,
+      // The distance is only meaningful alongside what it was measured from.
+      baselineCommit: INSTALLED_COMMIT,
       commits: [
         { sha: NEW_COMMIT, subject: "feat(engines): room turns on the HTTP lane" },
         { sha: "c".repeat(40), subject: "fix(usage): dual-window quota display" },
@@ -312,7 +314,7 @@ describe("refusals", () => {
 
   it("calls an answer stale when it cannot describe anything newer", () => {
     const at = (iso: string) => iso;
-    const answer = { sourceCommit: NEW_COMMIT, aheadBy: 3, commits: [] };
+    const answer = { sourceCommit: NEW_COMMIT, aheadBy: 3, commits: [], baselineCommit: INSTALLED_COMMIT };
     const base = {
       available: answer,
       installedCommit: INSTALLED_COMMIT,
@@ -332,6 +334,43 @@ describe("refusals", () => {
     // An answer with no usable timestamp cannot be placed, so it is not acted on.
     expect(availableIsStale({ ...base, checkedAt: null })).toBe(true);
     expect(availableIsStale({ ...base, checkedAt: "not a date" })).toBe(true);
+  });
+
+  it("refuses an answer counted from a commit that is no longer installed", () => {
+    // The 2026-10-08 incident.  A check ran against an OLD installed build and
+    // remembered `aheadBy: 125`; the Mac then installed and verified a newer
+    // build.  `installedAt` could not catch it because it dates the build
+    // manifest, and this bundle was packaged hours before it was installed — so
+    // the install boundary sat BEHIND the remembered answer and every timestamp
+    // comparison said "fresh".  The status route kept advertising 125 commits
+    // behind on a Mac four commits behind, until restart.
+    const stale = {
+      sourceCommit: "e".repeat(40),
+      aheadBy: 125,
+      commits: [],
+      baselineCommit: "a".repeat(40),
+    };
+    expect(availableIsStale({
+      available: stale,
+      installedCommit: "b".repeat(40),
+      checkedAt: "2026-10-09T02:18:46.983Z",
+      // The build predates the install, so time alone cannot refute it.
+      installedAt: "2026-10-08T18:25:02.000Z",
+    })).toBe(true);
+    // Same answer, same install — the baseline is what decides, not the clock.
+    expect(availableIsStale({
+      available: stale,
+      installedCommit: "a".repeat(40),
+      checkedAt: "2026-10-09T02:18:46.983Z",
+      installedAt: "2026-10-08T18:25:02.000Z",
+    })).toBe(false);
+    // An answer written before baselines were recorded cannot be placed either.
+    expect(availableIsStale({
+      available: { ...stale, baselineCommit: undefined },
+      installedCommit: "a".repeat(40),
+      checkedAt: "2026-10-09T02:18:46.983Z",
+      installedAt: "2026-10-08T18:25:02.000Z",
+    })).toBe(true);
   });
 
   it("will not interrupt a turn, and force is the one thing that talks past it", () => {
@@ -515,7 +554,13 @@ describe("an unsuccessful run", () => {
     }));
     writeFileSync(join(paths.stateDirectory, "available.json"), JSON.stringify({
       checkedAt: "2026-09-13T12:00:00.000Z",
-      available: { sourceCommit: NEW_COMMIT, version: "1.0.31", aheadBy: 4, commits: [] },
+      available: {
+        sourceCommit: NEW_COMMIT,
+        version: "1.0.31",
+        aheadBy: 4,
+        commits: [],
+        baselineCommit: INSTALLED_COMMIT,
+      },
     }));
   };
 

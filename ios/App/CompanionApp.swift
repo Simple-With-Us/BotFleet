@@ -60,7 +60,9 @@ struct CompanionApp: App {
                         Task { await session.refreshNotificationAuthorization() }
                         Task { await testFlightUpdate.checkIfDue() }
                     case .background:
-                        session.stopVoice()
+                        // A reply being read keeps going: the `audio`
+                        // background mode lets it outlast auto-lock, which
+                        // used to cut every long read off partway.
                         session.linger()
                     case .inactive: break
                     @unknown default: break

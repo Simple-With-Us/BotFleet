@@ -18,6 +18,7 @@ import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { MODEL_REJECTED_STOP_REASON } from "../../model-fallback.ts";
 import { classifyError } from "../retry.ts";
 import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
+import { ACP_PROMPT_SECTION_OMITTED } from "./prompt-budget.ts";
 import { GrokAgentDriver } from "./grok.ts";
 import { DshAgentDriver } from "./dsh.ts";
 import { KimiAgentDriver } from "./kimi.ts";
@@ -219,6 +220,14 @@ describe("ACP decodeConfig", () => {
     expect(GrokAgentDriver.decodeConfig({ fullAuto: true }).fullAuto).toBe(true);
   });
 
+  it("accepts a prompt byte budget and treats zero as disabled", () => {
+    expect(GrokAgentDriver.decodeConfig({ promptBudgetBytes: 0 }).promptBudgetBytes).toBe(0);
+    expect(GrokAgentDriver.decodeConfig({ promptBudgetBytes: 128 * 1024 }).promptBudgetBytes).toBe(128 * 1024);
+    expect(GrokAgentDriver.decodeConfig({ promptBudgetBytes: 1.5 }).promptBudgetBytes).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ promptBudgetBytes: -5 }).promptBudgetBytes).toBeUndefined();
+    expect("promptBudgetBytes" in GrokAgentDriver.decodeConfig({})).toBe(false);
+  });
+
   it("accepts only bounded prompt deadlines", () => {
     expect(GrokAgentDriver.decodeConfig({ promptTimeoutMs: 1_000 }).promptTimeoutMs).toBe(1_000);
     expect(GrokAgentDriver.decodeConfig({ promptTimeoutMs: 20 * 60_000 }).promptTimeoutMs).toBe(20 * 60_000);
@@ -397,6 +406,27 @@ describe("ACP turns (fake CLI)", () => {
     const done = recorder.events.at(-1)!;
     expect(done).toMatchObject({ type: "turn.completed", ok: true });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("sends a budgeted prompt: oldest volatile section becomes the one-line marker", async () => {
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 512 });
+    const stable = "STABLE-BLOCK";
+    const volOld = `VOLATILE-OLD ${"alpha ".repeat(400)}`;
+    const volNew = "VOLATILE-NEW kept";
+    const current = "CURRENT USER MESSAGE";
+    await instance.adapter.sendTurn({
+      threadId: "t-budget",
+      text: current,
+      system: stable + volOld + volNew,
+      systemSections: [
+        { id: "persona", text: stable, volatile: false },
+        { id: "memory", text: volOld, volatile: true },
+        { id: "mentions", text: volNew, volatile: true },
+      ],
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const echoed = recorder.events.find((event) => event.type === "item.completed" && event.itemType === "assistant_text");
+    expect(echoed && echoed.type === "item.completed" ? echoed.text : "").toContain(`echo: ${stable}${ACP_PROMPT_SECTION_OMITTED}${volNew}\n\n${current}`);
   });
 
   it("fails closed when a saved ACP session cannot be resumed", async () => {

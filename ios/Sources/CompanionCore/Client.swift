@@ -360,6 +360,12 @@ public enum APIError: Error, LocalizedError, Sendable {
         return false
     }
 
+    /// The HTTP status the harness answered with, when it answered at all.
+    public var statusCode: Int? {
+        if case let .status(code, _) = self { return code }
+        return nil
+    }
+
     public var isCancellation: Bool {
         if case let .transport(detail) = self {
             let lower = detail.lowercased()
@@ -875,6 +881,33 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("GET", "/api/tts/voices"), as: VoiceListResponse.self).voices
     }
 
+    /// The workspace default voice: what every bot without a voice of its
+    /// own speaks with.  Its own narrow route, so /api/config (which carries
+    /// the voice key) stays closed to writes from a phone.  The harness
+    /// refuses a Personal Voice, which belongs to one device.
+    public func updateDefaultVoice(_ voiceId: String) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let voice: String
+        }
+        return try await send(
+            try makeRequest("PATCH", "/api/tts/default-voice", encodedBody: Body(voice: voiceId)),
+            as: ConfigStatus.self
+        )
+    }
+
+    /// Replace the workspace pronunciation list.  The harness validates it
+    /// with the same rules as the Mac (`shared/pronunciations.ts`) and
+    /// answers a refusal in words the person can act on.
+    public func updatePronunciations(_ list: [Pronunciation]) async throws -> ConfigStatus {
+        struct Body: Encodable {
+            let pronunciations: [Pronunciation]
+        }
+        return try await send(
+            try makeRequest("PATCH", "/api/tts/pronunciations", encodedBody: Body(pronunciations: list)),
+            as: ConfigStatus.self
+        )
+    }
+
     public func routines() async throws -> (routines: [Routine], runs: [RoutineRun]) {
         let response = try await send(try makeRequest("GET", "/api/routines"), as: RoutinesResponse.self)
         return (response.routines, response.runs)
@@ -1001,16 +1034,45 @@ public struct CompanionClient: Sendable {
         ).bot
     }
 
-    public func messageVoice(threadId: String, messageId: String) async throws -> [VoiceClip] {
+    /// Ask the computer to voice a reply for `device`.
+    ///
+    /// `device` makes the harness resolve that device's own voice
+    /// (`voiceForDevice`), and the clip GETs must name the same device.
+    /// `progressive` makes it answer once the first clip is ready (or with
+    /// none, still preparing) instead of after every clip, which a long reply
+    /// cannot do inside the companion's 30-second header deadline.  An older
+    /// harness ignores both and answers with every clip, which decodes the
+    /// same way.  `spans` is always asked for (see `MessageVoice.script`);
+    /// an older harness ignores it too.
+    public func messageVoice(
+        threadId: String,
+        messageId: String,
+        device: SpeechDevice,
+        progressive: Bool
+    ) async throws -> MessageVoice {
         guard Self.validVoiceId(threadId), Self.validVoiceId(messageId) else { throw APIError.badURL }
-        var request = try makeRequest("POST", "/api/threads/\(threadId)/messages/\(messageId)/audio")
+        var request = try makeRequest(
+            "POST", "/api/threads/\(threadId)/messages/\(messageId)/audio",
+            // `spans` asks for the script kind and, for a reply read as
+            // written, the source spans karaoke lines the voice up with.
+            body: ["device": device.rawValue, "progressive": progressive, "spans": true]
+        )
+        // A progressive answer arrives within about 20 seconds.  The long
+        // ceiling is for an older harness that still makes every clip first.
         request.timeoutInterval = 150
-        return try await send(request, as: MessageVoiceResponse.self).audio
+        return try await send(request, as: MessageVoice.self)
     }
 
-    public func voiceClip(threadId: String, messageId: String, index: Int) async throws -> Data {
+    /// One clip of a reply.  The harness holds the request for up to 15
+    /// seconds while that clip is still being made, then answers 425 with
+    /// Retry-After, so the timeout leaves room for that wait plus the trip.
+    public func voiceClip(threadId: String, messageId: String, index: Int, device: SpeechDevice) async throws -> Data {
         guard Self.validVoiceId(threadId), Self.validVoiceId(messageId), index >= 0 else { throw APIError.badURL }
-        let request = try makeRequest("GET", "/api/threads/\(threadId)/messages/\(messageId)/audio/\(index)")
+        var request = try makeRequest(
+            "GET", "/api/threads/\(threadId)/messages/\(messageId)/audio/\(index)",
+            query: [URLQueryItem(name: "device", value: device.rawValue)]
+        )
+        request.timeoutInterval = 30
         let (data, response) = try await perform(request)
         try Self.check(response, data)
         return data
@@ -1063,6 +1125,23 @@ public struct CompanionClient: Sendable {
 
     public func deleteRoutine(id: String) async throws {
         try await send(try makeRequest("DELETE", "/api/routines/\(id)"))
+    }
+
+    /// Stop a run that is queued, running or waiting.  The harness answers 404
+    /// once the run has already settled.
+    public func cancelRoutineRun(id: String) async throws -> RoutineRun {
+        try await send(try makeRequest("POST", "/api/routine-runs/\(id)/cancel"), as: RoutineRunResponse.self).run
+    }
+
+    /// Acknowledge one run.  It keeps its status and error; it just stops
+    /// counting toward the unseen-failure badge.
+    public func markRoutineRunSeen(id: String) async throws -> RoutineRun {
+        try await send(try makeRequest("POST", "/api/routine-runs/\(id)/seen"), as: RoutineRunResponse.self).run
+    }
+
+    /// Acknowledge every unseen failure at once.  Returns the runs it marked.
+    public func markAllRoutineRunsSeen() async throws -> [RoutineRun] {
+        try await send(try makeRequest("POST", "/api/routine-runs/seen"), as: MarkedRoutineRunsResponse.self).runs
     }
 
     private static func routineBody(_ input: RoutineInput) -> [String: Any] {
@@ -1164,6 +1243,19 @@ public struct CompanionClient: Sendable {
         var body: [String: Any] = ["requestId": requestId, "behavior": behavior]
         if let message { body["message"] = message }
         try await send(try makeRequest("POST", "/api/threads/\(threadId)/respond", body: body))
+    }
+
+    /// Allow every permission request waiting in a thread (the desktop's
+    /// "Approve All").  Returns how many the harness approved, which can be
+    /// fewer than the card count the phone showed when one was answered
+    /// somewhere else in the meantime.
+    @discardableResult
+    public func approveAll(threadId: String) async throws -> Int {
+        let response = try await send(
+            try makeRequest("POST", "/api/threads/\(threadId)/approve-all"),
+            as: ApproveAllResponse.self
+        )
+        return response.approvedCount ?? 0
     }
 
     /// Starts one more account authorization for a toolkit. Revocation is
@@ -1273,6 +1365,38 @@ public struct CompanionClient: Sendable {
 
     public func deleteTask(botId: String, threadId: String) async throws -> Bot {
         try await send(try makeRequest("DELETE", "/api/bots/\(botId)/tasks/\(threadId)"), as: BotResponse.self).bot
+    }
+
+    // MARK: - Room tasks
+    //
+    // A channel's separate conversations.  The route answers each of create,
+    // switch and delete with the room as it now stands, transcript included.
+
+    public func createRoomTask(roomId: String, title: String? = nil) async throws -> Room {
+        var body: [String: Any] = [:]
+        if let title, !title.isEmpty { body["title"] = title }
+        return try await send(
+            try makeRequest("POST", "/api/groups/\(roomId)/tasks", body: body),
+            as: CreatedRoom.self
+        ).group
+    }
+
+    public func switchRoomTask(roomId: String, threadId: String) async throws -> Room {
+        try await send(
+            try makeRequest("POST", "/api/groups/\(roomId)/tasks/\(threadId)"),
+            as: CreatedRoom.self
+        ).group
+    }
+
+    public func renameRoomTask(roomId: String, threadId: String, title: String) async throws {
+        try await send(try makeRequest("PATCH", "/api/groups/\(roomId)/tasks/\(threadId)", body: ["title": title]))
+    }
+
+    public func deleteRoomTask(roomId: String, threadId: String) async throws -> Room {
+        try await send(
+            try makeRequest("DELETE", "/api/groups/\(roomId)/tasks/\(threadId)"),
+            as: CreatedRoom.self
+        ).group
     }
 
     public func interrupt(botId: String, threadId: String) async throws {
@@ -1432,5 +1556,3 @@ public struct CompanionClient: Sendable {
         return eventStream(request: streamRequest, session: Self.streaming)
     }
 }
-
-private struct MessageVoiceResponse: Decodable { let audio: [VoiceClip] }

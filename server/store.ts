@@ -17,6 +17,7 @@ import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { withoutNestedFallbacks } from "../shared/model-limits.ts";
+import type { BotVoices } from "../shared/bot-voice.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
@@ -121,15 +122,27 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
-  /** Persisted audio clips for this exact reply, in playback order. */
+  /** Persisted audio clips for this exact reply, in playback order.  They
+   * belong to `audioVoice`, or to the owner's shared voice on rows written
+   * before audioVoice existed (server/tts/message-audio.ts). */
   audio?: Array<{ path: string; mime: string }>;
-  /** Distilled speech-friendly text generated for TTS synthesis. */
+  /** The voice `audio` was synthesized with. */
+  audioVoice?: string;
+  /** Clips for a device voice that differs from the owner's shared voice,
+   * keyed by voice id, so a Mac and an iPhone with different hosted voices
+   * do not overwrite (and re-bill) each other's clips. */
+  audioByVoice?: Record<string, Array<{ path: string; mime: string }>>;
+  /** The text this reply's voice reads, and its stored clips were made from. */
   voiceText?: string;
+  /** What voiceText is: "written" (the reply as written, the "off" mode) or
+   * "summary" (the distiller path, the default).  Absent on rows from before
+   * karaoke, whose voiceText is reused as a summary (shared/spoken-script.ts). */
+  voiceTextKind?: "written" | "summary";
   /** Original incoming microphone recording and recognizer output never change. */
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   /** Corrections are annotations, not edits to the audio or original transcript. */
@@ -631,6 +644,10 @@ export interface BotRecord {
   /** This bot's own voice id, so a room of bots doesn't sound like one
    * person. Falls back to the app-wide voice in config. */
   voice?: string;
+  /** Per-device overrides of `voice` (shared/bot-voice.ts): an Apple
+   * Personal Voice only exists on the device that made it, so the Mac and
+   * the iPhone each pick their own.  A device without one uses `voice`. */
+  voices?: BotVoices;
   /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
    * "on_demand" (default/opt-in) runs only on manual speak; "always" runs on every turn. */
   voiceSummaryMode?: "off" | "on_demand" | "always";
@@ -640,6 +657,14 @@ export interface BotRecord {
   rewound?: boolean;
   pinned?: boolean;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  Absent or false = on.
+   *  While true, no NEW turn starts for this bot from any source — chat from
+   *  every channel, routines, webhooks, resource triggers, room fan-out,
+   *  peer delegation, resumes — but the chat stays visible and a turn that was
+   *  already running finishes.  Unlike `hidden` (an archive) it keeps the bot
+   *  in the roster, and unlike a routine-manager "stop" no message clears it:
+   *  only an explicit Turn On does.  Persisted with the roster. */
+  off?: boolean;
   /** Optional labeled divider used to organize this bot in the sidebar. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread; a pin
@@ -734,9 +759,9 @@ export const sectionKey = (section?: string | null): string => section?.trim() |
  * "New Bot"), names match case-insensitively, longest name wins (so
  * "@New Bot 2" never half-matches "New Bot"), hidden bots skipped, results
  * deduped. Callers pre-filter the sender out of `peers`. */
-export function mentionedBots<T extends { name: string; hidden?: boolean }>(text: string, peers: T[]): T[] {
+export function mentionedBots<T extends { name: string; hidden?: boolean; off?: boolean }>(text: string, peers: T[]): T[] {
   const candidates = peers
-    .filter((p) => !p.hidden && p.name.trim())
+    .filter((p) => !p.hidden && !p.off && p.name.trim())
     .sort((a, b) => b.name.length - a.name.length);
   const lower = text.toLowerCase();
   const found: T[] = [];
@@ -804,12 +829,13 @@ export function normalizeGroupDefaultResponder(
 
 /** Resolve the bots invoked by a human room message. Explicit targets win;
  * otherwise the room policy chooses one member, everyone, or nobody. */
-export function roomResponders<T extends { id: string; name: string; hidden?: boolean }>(
+export function roomResponders<T extends { id: string; name: string; hidden?: boolean; off?: boolean }>(
   text: string,
   members: T[],
   defaultResponder: GroupDefaultResponder,
 ): T[] {
-  const available = members.filter((member) => !member.hidden);
+  // An Off member cannot speak, so it is skipped exactly like an archived one.
+  const available = members.filter((member) => !member.hidden && !member.off);
   if (/(?:^|\s)@everyone\b/i.test(text)) return available;
   const mentioned = mentionedBots(text, available);
   if (mentioned.length) return mentioned;

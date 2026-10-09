@@ -66,6 +66,11 @@ const REGISTRY_TOOLS = mcpToolDefinitions({
   // reads are the same per-turn values the HTTP lane's tool host gets, so the
   // two lanes' descriptions cannot drift.
   jobs: process.env.OMB_JOBS === "1",
+  // Zulip (docs/zulip.md).  Same shape as jobs: the harness sets OMB_ZULIP=1
+  // only for a bot whose Zulip identity is connected, and the
+  // `/api/internal/zulip` endpoints decide every target from this process's
+  // comms grant, never from the arguments.
+  zulip: process.env.OMB_ZULIP === "1",
 });
 
 // The publication order shipped CLI engines already see.  Spelled out so
@@ -83,6 +88,8 @@ const MCP_TOOL_ORDER = [
   // Background jobs (jobs P2).  Listed after the fleet tools so a turn that
   // mounts them publishes its existing surface unchanged first.
   ...(process.env.OMB_JOBS === "1" ? ["job_start", "job_output", "job_list", "job_kill"] : []),
+  // Zulip, last: a turn without it publishes the existing surface unchanged.
+  ...(process.env.OMB_ZULIP === "1" ? ["zulip_reply", "zulip_post", "zulip_follow_topic"] : []),
 ];
 
 const TOOLS_BY_NAME = new Map(REGISTRY_TOOLS.map((tool) => [tool.name, tool]));
@@ -317,6 +324,17 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
   }
   if (name === "job_kill") {
     return jobCall("kill", args);
+  }
+  // Zulip.  A thin hop like the job tools: the comms token is the identity,
+  // and the harness answers a refusal as `isError` so the model reads it as
+  // "not posted" rather than as a post that happened.
+  if (name === "zulip_reply" || name === "zulip_post" || name === "zulip_follow_topic") {
+    const route = name === "zulip_reply" ? "reply" : name === "zulip_post" ? "post" : "follow";
+    const r = await api(`/api/internal/zulip/${route}`, {
+      method: "POST",
+      body: JSON.stringify(args),
+    });
+    return { text: String(r.text ?? JSON.stringify(r)), isError: r.isError === true };
   }
   return { text: `Unknown tool: ${name}`, isError: true };
 }

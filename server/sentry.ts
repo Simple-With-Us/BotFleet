@@ -6,6 +6,7 @@
 // SDK tax.  Browser Replay/Feedback live in src/lib/sentry.ts.
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import { resetSentryCronsForTests } from "./sentry-crons.ts";
 
 export type SentryNode = typeof import("@sentry/node");
 type SentryIntegration = Parameters<SentryNode["addIntegration"]>[0];
@@ -714,4 +715,5 @@ export function resetSentryForTests(): void {
   loaderForTests = null;
   applyQueue = Promise.resolve();
   runtimeState = { ...DORMANT };
+  resetSentryCronsForTests();
 }

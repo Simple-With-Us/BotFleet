@@ -130,7 +130,7 @@ describe("buildMcpServers", () => {
     });
   });
 
-  it("passes a local computer (Cua/VPS) through as a direct stdio server", () => {
+  it("passes a local computer (CUA/VPS) through as a direct stdio server", () => {
     const servers = buildMcpServers({
       threadId: "t",
       text: "hi",

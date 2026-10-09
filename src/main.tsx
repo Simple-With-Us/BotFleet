@@ -106,11 +106,35 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "karaoke") {
+  // Visual-spec harness (tests/e2e/karaoke.visual.spec.ts): a reply being
+  // read aloud, highlighted on the message itself.  Dynamically imported so
+  // the real app boot path never pays for it.
+  void import("./components/KaraokeVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "routine-hold") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
   // for in the real app boot path. The App render below is unchanged for any
   // other URL.
   void import("./components/RoutineHoldVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "bot-off") {
+  // Visual-spec harness (tests/e2e/bot-off.visual.spec.ts): the bot On/Off
+  // switch — sidebar rows, the Bot Profile card and the disabled composer.
+  // Dynamically imported so the real app boot path never pays for it.
+  void import("./components/BotOffVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>

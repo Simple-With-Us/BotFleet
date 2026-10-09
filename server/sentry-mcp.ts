@@ -2,7 +2,7 @@
 // (`scripts/mcp-server.ts`).  That server is not built on
 // `@modelcontextprotocol/sdk`'s `McpServer`, so `wrapMcpServerWithSentry`
 // cannot attach.  We emit the same `mcp.server` / `tools/call` shape the
-// wrapper would.  Connector/Cua bridges that only forward bytes are out of
+// wrapper would.  Connector/CUA bridges that only forward bytes are out of
 // scope — they define no tools here.
 import { getSentry, isSentryActive } from "./sentry.ts";
 
