@@ -14,6 +14,12 @@ import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 
+import {
+  CONTAINER_RUNTIME_IDS,
+  daemonSlowProblem,
+  runtimeProductName,
+  type ContainerRuntimeId,
+} from "../shared/container-runtime-name.ts";
 import { augmentedPath } from "./env-path.ts";
 import { isTransientProbeFailure, judgeDesktopProbeFailure, problemText } from "./desktop-probe.ts";
 import {
@@ -145,8 +151,8 @@ export const DISPLAY = ":1";
 export const CUA_SOCKET = "/run/user/1000/botfleet-cua.sock";
 export const CUA_EXECUTABLE = "/usr/local/libexec/botfleet/cua-driver";
 
-const RUNTIMES = ["docker", "podman", "container"] as const;
-export type Runtime = (typeof RUNTIMES)[number];
+const RUNTIMES = CONTAINER_RUNTIME_IDS;
+export type Runtime = ContainerRuntimeId;
 export type LifecycleAction = "pull" | "run" | "start" | "stop" | "remove";
 
 const INTERNAL_VIEWER_PORT = 6901;
@@ -230,21 +236,6 @@ export function adaptContainerLimits(
   const memoryGib =
     hostGib === null ? ceiling.memoryGib : Math.min(ceiling.memoryGib, hostGib < MIN_CONTAINER_MEMORY_GIB ? Math.max(1, hostGib) : hostGib);
   return { cpus: Math.max(1, cpus), memoryGib };
-}
-
-function runtimeProductName(runtime: Runtime): string {
-  switch (runtime) {
-    case "docker":
-      return "Docker";
-    case "podman":
-      return "Podman";
-    case "container":
-      return "Apple Container";
-    default: {
-      const never: never = runtime;
-      return never;
-    }
-  }
 }
 
 /** Parsed capacity from `docker info` / `podman info` format templates — trust boundary. */
@@ -740,14 +731,6 @@ function emptyStatus(platform: NodeJS.Platform, target: LocalVmTarget): Containe
     viewer_port: target.viewerPort,
     viewer_url: target.viewerPort ? `http://127.0.0.1:${target.viewerPort}/vnc.html` : "",
   };
-}
-
-/** What to say when the runtime is installed but did not answer in time.  One
- * sentence that is true wherever it lands: the Local VM card, the 409 a
- * lifecycle action returns, and the error a bot turn gets, which do not
- * retry by themselves. */
-function daemonSlowProblem(runtime: Runtime): string {
-  return `${runtimeProductName(runtime)} is slow to respond right now; try again in a moment`;
 }
 
 function statusProblem(status: ContainerComputerStatus): string | null {

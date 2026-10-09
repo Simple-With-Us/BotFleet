@@ -8,6 +8,11 @@
 // header is derived from the structured facts for the setup states, in setup
 // order, and the harness's wording is used only where it describes something
 // the facts cannot (a VM that exists but is unsafe, a desktop still starting).
+// A slow daemon is one of the derived states: the sentence is
+// `daemonSlowProblem` (the product name, capitalized), and `problem` is not
+// consulted.  A stale "Start docker first" must not override it.
+
+import { daemonSlowProblem } from "../../shared/container-runtime-name";
 
 export interface LocalVmSetupFacts {
   runtime: string | null;
@@ -30,7 +35,7 @@ export function localVmSetupLine(status: LocalVmSetupFacts | null, perBot: boole
     // is running fine.  That is not "stopped", and telling someone to start a
     // runtime that is running sends them to restart it for nothing.
     if (status.daemonSlow) {
-      return status.problem ?? `${status.runtime} is slow to respond right now; try again in a moment`;
+      return daemonSlowProblem(status.runtime);
     }
     return `Start ${status.runtime} first`;
   }
