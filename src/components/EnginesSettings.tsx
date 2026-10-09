@@ -14,6 +14,10 @@ import { EngineCallout } from "./EngineCallout";
 import { EngineCapabilitiesMatrix } from "./EngineCapabilitiesMatrix";
 import { ProviderMark } from "./ProviderIcons";
 import { splitEngineRail } from "@/lib/engine-rail";
+import {
+  INSTANCE_AUTONOMOUS_MODE_NO_OP_NOTE,
+  instanceAutonomousModeApplies,
+} from "../../shared/bypass-coverage";
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
 import {
@@ -437,6 +441,9 @@ function EngineRow({
       </div>
       {reason && (
         <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{reason}</p>
+      )}
+      {!instanceAutonomousModeApplies(instance.driverKind) && (
+        <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{INSTANCE_AUTONOMOUS_MODE_NO_OP_NOTE}</p>
       )}
       {instance.driverKind === "antigravityAgent" && (
         <div className="mt-2 rounded bg-raised/40 px-2 py-1.5 text-[11px] leading-relaxed text-ink-secondary border border-hairline/40">

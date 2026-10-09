@@ -811,6 +811,10 @@ export interface InstanceInfo {
     /** This engine can answer a bounded review prompt without changing the
      * bot's active conversation. */
     approvalReview?: boolean;
+    /** What a bot's Bypass Permissions switch does on this engine
+     * (shared/bypass-coverage.ts).  Absent from an older server, which reads
+     * as "asks": the switch works as described. */
+    bypassCoverage?: "asks" | "native" | "none";
     /** The harness runs this engine's tool loop, so Maximum Tool Rounds applies. */
     toolLoop?: boolean;
   };

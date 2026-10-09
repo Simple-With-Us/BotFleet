@@ -1968,6 +1968,86 @@ async function interruptIfHostRevoked(
     .catch(() => {});
 }
 
+/** What a paired phone is told when its save would give a bot This Mac or take
+ * it away.  Host control hands the bot the person's real desktop, so the phone
+ * may switch the sandboxed destinations (cloud, vm) and leave this one to the
+ * computer, where the Auto Mode warning and the mid-turn interrupt live. */
+const PAIRED_LOCAL_COMPUTER_ERROR =
+  "This Mac can only be turned on or off in BotFleet on your computer";
+
+/** What a paired phone is told when its save would turn Auto Mode ON for a bot
+ * that can use This Mac.  Auto Mode on the person's real desktop is the one
+ * switch that lets a click or keystroke on it go unasked, and its warning
+ * dialog is only shown by the computer (`localAutoAcknowledgementError`), so
+ * the phone cannot create that pair.  Turning Auto Mode OFF, or ON for a bot
+ * that cannot use This Mac, is the phone's to do (owner ruling, 2026-10-09). */
+const PAIRED_AUTO_ON_THIS_MAC_ERROR =
+  "Auto Mode can only be turned on in BotFleet on your computer for a bot that can use This Mac";
+
+/** A bot as the Auto Mode consent check should see it: its Bypass Permissions
+ * left out, because bypass never answers a request that controls This Mac and
+ * so is not what that warning is about (see `pairedProfileRefusal`). */
+function withoutBypass<T extends { bypassPermissions?: boolean }>(bot: T): Omit<T, "bypassPermissions"> {
+  const { bypassPermissions: _bypass, ...rest } = bot;
+  return rest;
+}
+
+/** The paired-device rules for a profile write that touches `computers` or
+ * `autoApprove`: a refusal with the status to send, or null when it may go
+ * ahead.  Called by the profile route, which is the one a phone reaches
+ * through the sidecar (the desktop uses the broad bot PATCH).  The sidecar
+ * cannot make this call: telling "kept This Mac" from "added This Mac", or
+ * "already Auto on this Mac" from "newly Auto", needs the stored bot, so the
+ * check lives where the bot does, and a loopback caller of the same route gets
+ * the same guard.
+ *
+ * Membership of `local` must come out the way it went in.  Everything else the
+ * desktop PATCH does for a `computers` write is either unreachable once that
+ * holds (the mid-turn interrupt only fires when `local` is removed) or runs
+ * here too (the Auto Mode acknowledgement, whose doc says every route that
+ * grants `computers` calls it).  The same acknowledgement stops a switch to
+ * Auto Mode: the profile schema carries no `acknowledgeLocalAuto`, so a bot
+ * that can use This Mac and is not already in Auto Mode cannot be put there
+ * from here, only from the desktop's own dialog.
+ *
+ * Bypass Permissions is NOT part of that consent here, on purpose.  The
+ * desktop route counts it (AG, #870), but it cannot do what the dialog warns
+ * about: `autoVerdict` never answers a `local-computer` request in bypass, and
+ * no driver turns the bot's bypass into an engine switch on a turn that
+ * controls This Mac.  Counting it would make the phone's bypass switch fail on
+ * every Auto bot on a Mac (an Auto bot has no computer list, so it may reach
+ * the desktop), which would defeat the owner's 2026-10-09 ruling that bots get
+ * Bypass Permissions from the phone.  It is read as off when judging whether a
+ * bot is "already" in Auto Mode, so a phone-set bypass can never stand in for
+ * the Auto Mode acknowledgement. */
+function pairedProfileRefusal(
+  existing: ComputerGrantSubject | null | undefined,
+  patch: { computers?: Array<"cloud" | "vm" | "local">; autoApprove?: boolean },
+): { status: number; error: string } | null {
+  if (patch.computers !== undefined) {
+    const heldLocal = currentComputerGrants(existing).includes("local");
+    if (patch.computers.includes("local") !== heldLocal) return { status: 403, error: PAIRED_LOCAL_COMPUTER_ERROR };
+  }
+  const ackError = localAutoAcknowledgementError(
+    existing ? withoutBypass(existing) : existing,
+    patch.computers ?? storedComputerGrants(existing),
+    patch.autoApprove !== undefined ? patch.autoApprove : existing?.autoApprove === true,
+    false,
+    {
+      currentDefault: cfg.botDefaults?.computers,
+      nextDefault: cfg.botDefaults?.computers,
+      currentAllowed: consentAllowedComputers(cfg),
+      nextAllowed: consentAllowedComputers(cfg),
+    },
+  );
+  if (!ackError) return null;
+  // A request to turn Auto Mode on is declined for the computer to answer.
+  // Anything else gets the same 400 the desktop route would give.
+  return patch.autoApprove === true
+    ? { status: 403, error: PAIRED_AUTO_ON_THIS_MAC_ERROR }
+    : { status: 400, error: ackError };
+}
+
 function checkedGroupResponder(value: unknown, memberIds: string[]): GroupDefaultResponder | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const responder = value as { kind?: unknown; botId?: unknown };
@@ -5874,6 +5954,7 @@ async function startTurn(
         integrations,
         cwd,
         autoApprove: bot.autoApprove === true,
+        bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
       };
       // What the harness put in front of the model that the person did not
@@ -8006,6 +8087,7 @@ async function runGroupMemberTurn(
         tools: roomTurnTools,
         toolHost: roomToolHost,
         autoApprove: bot.autoApprove === true,
+        bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
         ...memberTurnSelection(selection),
       });
@@ -11153,9 +11235,47 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 400, { error: "context must be at most 60 characters" });
         }
       }
+      // First settings, checked BEFORE the room exists.  The phone's New Room
+      // sheet used to create the room and then patch the folder, bulletin and
+      // responder in a second request, so a folder this computer would not let
+      // a phone choose left a half-made room behind.  Sent here, a refusal
+      // leaves nothing.  Left unmarked as "set up": the desktop's setup
+      // prompt still offers itself, exactly as it does for a phone room.
+      interface FirstSettings {
+        bulletin?: string;
+        defaultResponder?: GroupDefaultResponder;
+        cwd?: string;
+      }
+      const first: FirstSettings = {};
+      if (body.bulletin !== undefined) {
+        if (typeof body.bulletin !== "string") return json(res, 400, { error: "bulletin must be a string" });
+        if (body.bulletin.length > 12_000) {
+          return json(res, 400, { error: "bulletin must be at most 12000 characters" });
+        }
+        first.bulletin = body.bulletin;
+      }
+      if (body.defaultResponder !== undefined) {
+        const responder = checkedGroupResponder(body.defaultResponder, memberIds);
+        if (!responder) return json(res, 400, { error: "invalid default responder" });
+        first.defaultResponder = responder;
+      }
+      if (body.cwd !== undefined && body.cwd !== null && body.cwd !== "") {
+        const checked = validateBotCwd(body.cwd);
+        if (!checked.ok) return json(res, 400, { error: checked.error });
+        // Same confinement as a phone-set room folder (the room PATCH below).
+        if (checked.cwd && req.headers["x-botfleet-companion"] === "1") {
+          const refusedFolder = cwdConfinementError(checked.cwd, phoneCwdConfinement());
+          if (refusedFolder) {
+            return json(res, 403, { error: `${refusedFolder} — pick it in BotFleet on your computer` });
+          }
+        }
+        if (checked.cwd) first.cwd = checked.cwd;
+      }
       let setup:
-        | { bulletin: string; defaultResponder: GroupDefaultResponder; completed: true }
-        | undefined;
+        | { bulletin?: string; defaultResponder?: GroupDefaultResponder; completed?: true }
+        | undefined = first.bulletin !== undefined || first.defaultResponder
+        ? { bulletin: first.bulletin, defaultResponder: first.defaultResponder }
+        : undefined;
       if (body.setup !== undefined) {
         if (!body.setup || typeof body.setup !== "object" || Array.isArray(body.setup)) {
           return json(res, 400, { error: "setup must be an object" });
@@ -11171,7 +11291,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (!responder) return json(res, 400, { error: "invalid setup.defaultResponder" });
         setup = { bulletin: requested.bulletin, defaultResponder: responder, completed: true };
       }
-      const group = store.createGroup(name, memberIds, false, section, setup);
+      const created = store.createGroup(name, memberIds, false, section, setup);
+      const group = first.cwd ? (store.patchGroup(created.id, { cwd: first.cwd }) ?? created) : created;
       return json(res, 201, { group: { ...publicGroupState(group), messages: [] } });
     }
     // Every conversation on this computer, as one JSON document.
@@ -12072,8 +12193,37 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // existingBot lets a one-device `voices` change keep the other device's.
       const parsed = parseBotProfilePatch(body, true, existingBot);
       if (!parsed.ok) return json(res, 400, { error: parsed.error });
-      if (localAutoConsentConfigBusy && parsed.patch.name !== undefined) {
+      if (
+        localAutoConsentConfigBusy &&
+        (parsed.patch.name !== undefined ||
+          parsed.patch.computers !== undefined ||
+          parsed.patch.autoApprove !== undefined)
+      ) {
         return json(res, 409, { error: localAutoConsentConfigBusyError });
+      }
+      if (parsed.patch.computers !== undefined) {
+        // De-duplicated the way the broad PATCH stores it.
+        parsed.patch.computers = [...new Set(parsed.patch.computers)];
+      }
+      if (parsed.patch.computers !== undefined || parsed.patch.autoApprove !== undefined) {
+        const refused = pairedProfileRefusal(existingBot, parsed.patch);
+        if (refused) return json(res, refused.status, { error: refused.error });
+      }
+      if (Object.prototype.hasOwnProperty.call(body, "cwd")) {
+        // The profile schema only types `cwd`; the folder itself is checked
+        // here, the way the broad PATCH does.  From a paired phone (the
+        // sidecar stamps every request it forwards) it may only reuse or
+        // narrow a folder this computer already handed to a bot or room,
+        // exactly as a phone-set room folder is confined.  Clearing passes.
+        const checked = validateBotCwd(body.cwd);
+        if (!checked.ok) return json(res, 400, { error: checked.error });
+        if (checked.cwd && req.headers["x-botfleet-companion"] === "1") {
+          const refusedFolder = cwdConfinementError(checked.cwd, phoneCwdConfinement());
+          if (refusedFolder) {
+            return json(res, 403, { error: `${refusedFolder} — pick it in BotFleet on your computer` });
+          }
+        }
+        parsed.patch.cwd = checked.cwd ?? undefined;
       }
       if (parsed.patch.avatarUrl && !storedAvatarExists(parsed.patch.avatarUrl)) {
         return json(res, 400, { error: "avatarUrl must reference an existing stored image" });
@@ -12338,8 +12488,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const wantsAuto =
         (body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true) ||
         (body.bypassPermissions !== undefined ? body.bypassPermissions : existingBot?.bypassPermissions === true);
+      // Turning Auto Mode ON is judged as Auto Mode alone.  A paired phone may
+      // put a bot in Bypass Permissions without the Mac's warning (the profile
+      // route, `pairedProfileRefusal`), so a bypass that was never
+      // acknowledged cannot count as "already granted" here, or a request
+      // without `acknowledgeLocalAuto` would slip Auto Mode in behind it.  The
+      // desktop's own dialog always sends the acknowledgement in this case.
+      const turningAutoOn = body.autoApprove === true && existingBot?.autoApprove !== true;
       const ackError = localAutoAcknowledgementError(
-        existingBot,
+        turningAutoOn && existingBot ? withoutBypass(existingBot) : existingBot,
         wantsComputers,
         wantsAuto === true,
         body.acknowledgeLocalAuto === true,
