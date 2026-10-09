@@ -19,7 +19,41 @@ scheduled `ubf` did not.  Separately, a single slow `/api/runtime` answer under 
 load average around 480 aborted a whole apply ("Authenticated runtime readiness
 could not be verified").
 
-## What Ships
+## Changes Made
+
+- `server/update-drain.ts`: the hold (`UpdateDrain`, its lease, what counts as in
+  flight) and the carrier `update-held-sends.json` (sends, uncommitted queue
+  entries, room rounds), parsed with zod.
+- `server/index.ts`: the hold on the quiesce route (`drain=1`), with its input
+  checked by a strict zod schema; held sends, job wakes, routine receipts and
+  room rounds; the forced path's `fencing` flag, its release-when-settled, its
+  merged and parked resume snapshot; the fence lease (`leaseMs`, `renew=1`);
+  restoring carried work after `jobRegistry.adopt()` and boot recovery.
+- `server/steer-queue.ts`: committed batches that drain alone, one batch per
+  bot per pass, `drainEveryReadyBatch` (no pass cap), carry and restore.
+- `server/room-queue.ts`: take, restore and re-date held room rounds.
+- `server/routines.ts`: `requeueRun` requeues only cancelled runs.
+- `server/update-control.ts`: busy is never a refusal, the progress `detail`,
+  and the progress record parsed through a zod schema.
+- `scripts/update-botfleet-mac.mjs`: hold, grace, pause; `--wait-for-idle`;
+  the fence predicate; the settle-aware release; the signal watcher and lease
+  renewal; rollback's immediate fence; the foreign-holder wait at preflight and
+  after the fence; preflight retry.
+- `scripts/update-botfleet.sh`, `scripts/update-progress.mjs`: the new flags
+  and the progress `detail`.
+- `src/lib/update-control.ts`, `src/components/UpdateBanner.tsx`,
+  `src/components/SettingsModal.tsx`, `src/components/Sidebar.tsx`,
+  `companion/src/routes.ts`: no `force: true`, busy copy, and `detail` shown.
+- `apps/docs/content/docs/self-hosting/updating-this-mac.mdx`: the owner page.
+- Tests: `scripts/update-botfleet-hold.node-test.mjs`,
+  `server/update-held-boot.test.ts`, `server/update-drain.test.ts`,
+  `server/steer-queue.test.ts`, `server/room-queue.test.ts`,
+  `server/routines.test.ts`, `server/index.test.ts`,
+  `server/update-control.test.ts`, `src/lib/update-control.test.ts`,
+  `scripts/update-progress.test.mjs`, `server/bot-off-wiring.test.ts`,
+  `server/bot-power.test.ts`.
+
+### How An Update Runs Now
 
 The default `update` and `apply`, the in-app button and the phone all do the same
 thing now:
@@ -117,26 +151,48 @@ gets the full hold.
   minutes; `update-botfleet.sh unquiesce` releases it at once, waiting for a forced
   quiesce that is still settling.
 
-## Verification
+## Verification State
+
+Run on this Mac (a linked worktree, load average 130 to 950 during the runs)
+and on CI.  Exact commands, with `DOCKER_HOST=unix:///nonexistent.sock`:
+
+| Command | Result |
+| --- | --- |
+| `pnpm typecheck` | pass |
+| `pnpm lint` | pass (4802 warnings, baseline 4890) |
+| `git diff --check origin/main...HEAD` | pass |
+| `node --test scripts/update-botfleet-hold.node-test.mjs` | pass (36 of 36) |
+| `pnpm test:mac-updater` | 245 pass, 2 fail: "the stable wrapper detects a linked worktree checkout" and "the up-to-date shortcut only swallows a plain update to origin/main", which fail the same way with the base updater (A/B), because this checkout is a linked worktree |
+| `npx vitest run server/index.test.ts -t "<the update tests>"` | pass: the hold, the forced fence, a release while settling, a rolled-back attempt that keeps work paused, the fence lease, a held room round, and malformed quiesce input |
+| `npx vitest run server/update-held-boot.test.ts` | pass (two boots); fails against the base harness with one of two carried sends run (A/B) |
+| `npx vitest run server/steer-queue.test.ts server/update-drain.test.ts server/room-queue.test.ts server/routines.test.ts server/update-control.test.ts server/bot-off-wiring.test.ts server/bot-power.test.ts` | pass |
+| `pnpm test` (each step run separately) | `node scripts/test-floor.mjs` failed at load ~950 (55 of 9135 in 22 files, mostly harness-boot timeouts); rerun of those files at lower load: 6 fail, in `unattended`, `http-lane-e2e`, `decision-log-wiring` and `env-path`, which fail identically on `origin/main` here (A/B) and pass on CI.  `test:packaged-server` timed out booting at load ~950 and passed on rerun.  Every other step passes. |
+| CI `typecheck + test` (ubuntu, macos, windows) on `f5ffc1432` | failed only `bot-off-wiring.test.ts` (all three) and a POSIX mode check in `update-drain.test.ts` (windows); both fixed in `082a74c4a` |
+
+### What The Tests Cover
 
 - `scripts/update-botfleet-hold.node-test.mjs`: grace, pause, rooms, wait-for-idle,
-  signals, lost answers, the old-harness path, preflight retry, the flags, and the
+  signals (including mid-request and after the fence), lost answers, the installed
+  harness's response shape, settle-aware release, the fence lease, rollback's
+  immediate fence, foreign database holders, preflight retry, the flags, and the
   wrapper's up-to-date shortcut, all on a fake clock.
-- `server/update-drain.test.ts`, `server/steer-queue.test.ts`: the hold's lease,
-  what counts as in flight, and the carrier.
+- `server/update-drain.test.ts`, `server/steer-queue.test.ts`,
+  `server/room-queue.test.ts`: the hold's lease, what counts as in flight, the
+  carrier, committed batches, the uncapped commit, and held room rounds.
 - `server/index.test.ts`: a live harness holding a message across release, across
   the fence, and across a forced fence with a busy bot; a release that arrives
   while a forced quiesce settles; a rolled-back attempt that keeps its paused work
-  paused and is not interrupted again; the fence lease; and a held room round.
+  paused and is not interrupted again; the fence lease; a held room round and a
+  live room turn; malformed quiesce input.
 - `server/update-held-boot.test.ts`: two boots, the carrier read at boot, and two
   carried messages for one bot run once each, in order.
 
-### Review Fixes (head 1666ec28b, DO NOT MERGE)
+## Review Fixes
 
 The PR body maps each finding to its commit and test.  In short: a release
 mid-settle is deferred (1); the installed harness's fence is only used once its
 work count is zero (2); carried sends go through the steer queue after jobs settle
 (3, 8, 9); rollback fences at once (4); foreign database holders are waited out at
 preflight and after the fence (5); signals cover the whole fence step and the
-fence has a lease (6, 11); room rounds are held and carried (7); work is paused at
-most once per update (10).
+fence has a lease (6, 11); room rounds are held and carried, while a live room turn
+is still waited for (7); work is paused at most once per update (10).
