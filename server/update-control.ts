@@ -184,6 +184,8 @@ export interface LaunchPlan {
    * `exec node` would not resolve without it. */
   nodeDirectory: string;
   force?: boolean;
+  /** Harness owner bearer credential for the ubf runtime shortcut probe only. */
+  harnessOwnerNonce?: string;
 }
 
 export interface LaunchResult {
@@ -215,6 +217,8 @@ export interface UpdateControlDeps {
    * busy because of the question.  This one answers `GET /api/update/status`,
    * which holds no admission. */
   readiness: () => RuntimeReadiness;
+  /** Live harness-owner nonce for updater child env (BOTFLEET_OWNER_NONCE). */
+  harnessOwnerNonce?: () => string | null;
   /** How a state file reaches disk.  A seam rather than a detail: the
    * behaviour that matters here is what happens when it THROWS, and a test
    * that arranged that with directory permissions would only be testing them
@@ -629,8 +633,10 @@ export function pruneRunArtifacts(runsDirectory: string, options: {
 export function launchPlanCommand(plan: LaunchPlan): { command: string; args: string[] } {
   const quote = (value: string) => `'${value.split("'").join(`'\\''`)}'`;
   const forceArg = plan.force ? " --force" : "";
+  const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
   const script = [
     `export PATH=${quote(plan.nodeDirectory)}:"$PATH"`,
+    ...(harnessOwnerNonce ? [`export BOTFLEET_OWNER_NONCE=${quote(harnessOwnerNonce)}`] : []),
     `exec /bin/bash ${quote(plan.scriptPath)} --progress ${quote(plan.progressPath)} --run-id ${quote(plan.runId)}${forceArg}`,
   ].join("\n");
   return {
@@ -716,13 +722,18 @@ async function defaultLaunch(plan: LaunchPlan): Promise<LaunchResult> {
   // launchd kickstart, not a signal to this process group.
   const log = openSync(plan.logPath, "a");
   try {
+    const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
     const child = spawn(
       "/bin/bash",
       [plan.scriptPath, "--progress", plan.progressPath, "--run-id", plan.runId, ...(plan.force ? ["--force"] : [])],
       {
         detached: true,
         stdio: ["ignore", log, log],
-        env: { ...process.env, PATH: `${plan.nodeDirectory}:${process.env.PATH ?? ""}` },
+        env: {
+          ...process.env,
+          PATH: `${plan.nodeDirectory}:${process.env.PATH ?? ""}`,
+          ...(harnessOwnerNonce ? { BOTFLEET_OWNER_NONCE: harnessOwnerNonce } : {}),
+        },
       },
     );
     child.unref();
@@ -1418,6 +1429,7 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
         label: deps.label,
         nodeDirectory: deps.nodeDirectory,
         force,
+        harnessOwnerNonce: deps.harnessOwnerNonce?.() ?? undefined,
       });
     } catch (error) {
       // Nothing started, so the record must not outlive the attempt.

@@ -811,6 +811,18 @@ test("the stable wrapper does not test for a .git directory to find the checkout
   assert.match(source, /git -C "\$BOTFLEET_CHECKOUT" rev-parse --git-dir/);
 });
 
+test("the up-to-date runtime probe reads the bearer credential from BOTFLEET_OWNER_NONCE only", async () => {
+  const wrapper = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const helper = await readFile(join(scripts, "update-botfleet-runtime-commit.mjs"), "utf8");
+  assert.match(wrapper, /update-botfleet-runtime-commit\.mjs/);
+  assert.match(wrapper, /BOTFLEET_OWNER_NONCE/);
+  assert.doesNotMatch(wrapper, /owner\.nonce/);
+  assert.doesNotMatch(wrapper, /console\.log\(.*nonce/);
+  assert.match(helper, /process\.env\.BOTFLEET_OWNER_NONCE/);
+  assert.doesNotMatch(helper, /owner\.nonce/);
+  assert.match(helper, /BOTFLEET_OWNER_NONCE is required/);
+});
+
 test("apply bootstraps the updater recorded in the stage manifest, not a newer origin/main", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
   const fixture = await mkdtemp(join(tmpdir(), "ubf-stage-bootstrap-"));
   t.after(() => rm(fixture, { recursive: true, force: true }));
