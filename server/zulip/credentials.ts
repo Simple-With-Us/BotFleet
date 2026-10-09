@@ -73,9 +73,12 @@ export interface ZulipVaultLocation {
   projectId?: string;
   /** Another environment's slug.  Unset: the harness's own environment. */
   environment?: string;
-  /** When set, only these names are kept from the folder.  A shared folder
-   *  (AI Fleet Coordinator's `/zulip` holds every seat's key) then never
-   *  leaves another seat's key in this process's memory. */
+  /** When set, only these names are kept from the folder.  The Infisical
+   *  call (`/api/v3/secrets/raw`) has no name filter and returns the whole
+   *  folder, so on a shared folder (AI Fleet Coordinator's `/zulip` holds
+   *  every seat's key) another seat's key is in this process's memory for
+   *  the length of the fetch.  `names` only stops it being kept after the
+   *  read returns. */
   names?: readonly string[];
 }
 
@@ -85,9 +88,18 @@ export type ZulipVaultReader = (location: ZulipVaultLocation) => Promise<Readonl
 
 /** A short, value-free label for a location, for status and error text:
  *  `/zulip` in the harness's own project and environment, otherwise
- *  `<project> <env> /zulip`. */
+ *  `<project> <env> /zulip`.  When only one of the two is set, the other
+ *  reads `own-project` or `own-env`, since `readPath` falls back to the
+ *  harness's own for whichever is unset. */
 export function describeVaultLocation(location: Pick<ZulipVaultLocation, "secretPath" | "projectId" | "environment">): string {
-  return [location.projectId, location.environment, location.secretPath].filter((part) => part?.trim()).join(" ");
+  const projectId = location.projectId?.trim() || undefined;
+  const environment = location.environment?.trim() || undefined;
+  const parts = [
+    projectId ?? (environment ? "own-project" : undefined),
+    environment ?? (projectId ? "own-env" : undefined),
+    location.secretPath,
+  ];
+  return parts.filter((part) => part?.trim()).join(" ");
 }
 
 function expandHome(path: string): string {
@@ -240,9 +252,10 @@ export function zulipVaultNamesFor(roles: readonly string[]): string[] {
 /** The Infisical source.  `read` is the harness's InfisicalManager (wrap it
  *  in `cachedVaultReader` so reconnects do not each hit the vault).  The
  *  folder is in another project or environment when `projectId` or
- *  `environment` is set.  With `roles` (the bound bots' roles), each read
- *  asks for those roles' names only, so one read serves every bot and a
- *  shared folder's other keys are not kept.  The key stays in the returned
+ *  `environment` is set.  With `roles` (the bound bots' roles), the reader
+ *  is told to keep those roles' names only, so one read serves every bot and
+ *  a shared folder's other keys are not kept after the read (the Infisical
+ *  call itself still returns the whole folder).  The key stays in the returned
  *  object; error text names the vault names and the folder, never a value.
  *  Without a `_SITE` name the site is the realm, and
  *  `verifyCredentialRealm` still checks it. */
@@ -284,7 +297,9 @@ export function infisicalCredentialSource(
 /** One vault read per location per `ttlMs`, shared by every role and every
  *  reconnect.  A location's `names`, when set, are the only names kept: the
  *  rest of the folder is dropped as soon as the read returns, so the cache
- *  holds the bound roles' keys and nothing else.  A failed read is not
+ *  holds the bound roles' keys and nothing else.  The read itself still
+ *  returns the whole folder, so the other names are in memory only until the
+ *  filter runs.  A failed read is not
  *  cached, so the next retry reads again. */
 export function cachedVaultReader(
   read: ZulipVaultReader,
@@ -326,7 +341,7 @@ export function cachedVaultReader(
  *    source.
  *  - `credentialSource: "infisical"` means the Infisical source, and needs
  *    the harness's vault reader.  It reads `infisicalPath` in
- *    `infisicalProjectId` / `infisicalEnv` when those are set, and asks for
+ *    `infisicalProjectId` / `infisicalEnv` when those are set, and keeps
  *    the names of the roles in `bots` only.
  *  - Otherwise (`"file"` or unset) the file source, when `credentialDir`
  *    names an absolute folder. */

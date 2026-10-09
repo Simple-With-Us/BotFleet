@@ -269,6 +269,11 @@ describe("the Infisical source", () => {
     // empty means the harness's own project and environment
     const own = credentialSourceFor({ credentialSource: "infisical", infisicalProjectId: "", infisicalEnv: " " }, {}, { vault: read });
     expect(own?.describe("BF-Plumber")).toBe("infisical /zulip ZULIP_BF_PLUMBER_*");
+    // one set and the other empty: the empty one is the harness's own, and the label says so
+    const projectOnly = credentialSourceFor({ credentialSource: "infisical", infisicalProjectId: "p1", infisicalEnv: " " }, {}, { vault: read });
+    expect(projectOnly?.describe("BF-Plumber")).toBe("infisical p1 own-env /zulip ZULIP_BF_PLUMBER_*");
+    const envOnly = credentialSourceFor({ credentialSource: "infisical", infisicalEnv: "prod" }, {}, { vault: read });
+    expect(envOnly?.describe("BF-Plumber")).toBe("infisical own-project prod /zulip ZULIP_BF_PLUMBER_*");
     // a missing name says which project and folder it looked in, never a value
     const { read: emptyRead } = vault({});
     await expect(

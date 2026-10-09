@@ -17467,9 +17467,10 @@ zulipHub = new ZulipHub({
   settings: () => cfg.zulip,
   // `credentialSource: "infisical"` only: one read of the vault folder
   // (BotFleet's own, or `infisicalProjectId` / `infisicalEnv`) per 15
-  // minutes, shared by every bot and kept to the bound roles' names.  The
-  // keys stay in the hub's memory, never in `cfg`, `process.env` or a log
-  // (docs/zulip.md, D0).
+  // minutes, shared by every bot.  The Infisical call returns the whole
+  // folder, so only the bound roles' names are kept once it returns; the
+  // rest are in memory for the length of the fetch.  The keys stay in the
+  // hub's memory, never in `cfg`, `process.env` or a log (docs/zulip.md, D0).
   vault: cachedVaultReader((location) =>
     infisical.readPath(location.secretPath, { projectId: location.projectId, environment: location.environment }),
   ),
