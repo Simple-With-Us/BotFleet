@@ -18,12 +18,14 @@ import {
   PROGRESSIVE_RESPONSE_BUDGET_MS,
   SCRIPT_CHANGED,
   STILL_PREPARING,
+  isWrittenScript,
   parseAudioRequest,
   parseClipDevice,
   type AudioMessage,
   type AudioOwner,
   type AudioRequestBody,
   type AudioRouteResult,
+  type SummarizedSpeech,
 } from "./message-audio.ts";
 import { deterministicSpokenText } from "./speech-summary.ts";
 import { toUtterances } from "./speech-text.ts";
@@ -48,7 +50,7 @@ function setup(options: {
   defaultVoice?: string;
   credentialPending?: boolean;
   failOn?: number;
-  summary?: (text: string) => string;
+  summary?: (text: string) => string | SummarizedSpeech;
 } = {}) {
   const row: AudioMessage = {
     id: MESSAGE,
@@ -69,7 +71,8 @@ function setup(options: {
     },
     summarize: async (_threadId, _messageId, text) => {
       summarized.push(text);
-      return options.summary ? options.summary(text) : text;
+      const answer = options.summary ? options.summary(text) : text;
+      return typeof answer === "string" ? { text: answer } : answer;
     },
     speak: (text, voice) => {
       speakCalls.push({ text, voice });
@@ -225,7 +228,7 @@ describe("POST /audio, legacy request (no device, not progressive)", () => {
     const audio = new MessageAudio({
       message: () => ({ ...fixture.row }),
       patchMessage: () => {},
-      summarize: async (_t, _m, text) => text,
+      summarize: async (_t, _m, text) => ({ text }),
       speak: () => Promise.reject(new NoVoice("Add a MiniMax key in Settings on the computer to turn on voice.")),
       saveClip: () => ({ path: "/api/attachments/x.mp3", mime: "audio/mpeg" }),
       clipExists: () => false,
@@ -783,6 +786,95 @@ describe("the spoken script: distilled by default (owner correction, 2026-10-08)
     const calls = fixture.speakCalls.length;
     await post(fixture, { voice: "vA", speakReplies: true });
     expect(fixture.speakCalls).toHaveLength(calls);
+  });
+});
+
+describe("the distiller's stand-in and clips of the same text", () => {
+  const REPLY = [
+    "The deploy finished.  Here is what changed:",
+    "",
+    "- Bumped the API timeout to 3.5 seconds",
+    "- Fixed issue #749 in the webhook retry loop",
+    "",
+    "Details are in [the rollout doc](https://example.com/docs/rollout.md).",
+  ].join("\n");
+  const DISTILLED = "The deploy finished. First, the A P I timeout is now three point five seconds. Next, issue seven four nine is fixed.";
+  const OWNER: AudioOwner = { voice: "vA", speakReplies: true };
+  const withWrittenClips = (fixture: ReturnType<typeof setup>) => {
+    const written = toUtterances(deterministicSpokenText(REPLY));
+    fixture.row.voiceText = deterministicSpokenText(REPLY);
+    fixture.row.voiceTextKind = "written";
+    fixture.row.audio = written.map((_, i) => {
+      fixture.files.set(`w-${i}.mp3`, { bytes: new Uint8Array([i]), mime: "audio/mpeg" });
+      return { path: `/api/attachments/w-${i}.mp3`, mime: "audio/mpeg" };
+    });
+    return [...fixture.row.audio];
+  };
+
+  it("recognizes the reply as written however it was reached", () => {
+    expect(isWrittenScript(REPLY, deterministicSpokenText(REPLY))).toBe(true);
+    expect(isWrittenScript(REPLY, DISTILLED)).toBe(false);
+  });
+
+  it("asks the distiller again after a passing failure, and reuses the stand-in's clips while it is down", async () => {
+    let down = true;
+    const fixture = setup({
+      text: REPLY,
+      summary: (text) => (down ? { text: deterministicSpokenText(text), retry: true } : DISTILLED),
+    });
+    const standIn = toUtterances(deterministicSpokenText(REPLY));
+    const first = await post(fixture, OWNER, { device: "mac", progressive: true, spans: true });
+    await fixture.settle();
+    expect(first.body.utterances).toEqual(standIn);
+    expect(fixture.speakCalls).toHaveLength(standIn.length);
+    // Stamped as the reply as written, not kept as the distilled script.
+    expect(fixture.row.voiceTextKind).toBe("written");
+
+    // Still down: asked again, and the same text is served from its clips.
+    const second = await post(fixture, OWNER);
+    expect(fixture.summarized).toHaveLength(2);
+    expect(fixture.speakCalls).toHaveLength(standIn.length);
+    expect(second.body.audio).toEqual(fixture.row.audio);
+
+    // Back up: the rewrite replaces the stand-in, and is kept from then on.
+    down = false;
+    const third = await post(fixture, OWNER);
+    expect(fixture.summarized).toHaveLength(3);
+    expect(third.body.utterances).toEqual(toUtterances(DISTILLED));
+    expect(fixture.speakCalls.slice(standIn.length).map((call) => call.text)).toEqual(toUtterances(DISTILLED));
+    expect(fixture.row.voiceTextKind).toBe("summary");
+    expect(fixture.row.voiceText).toBe(DISTILLED);
+    const calls = fixture.speakCalls.length;
+    await post(fixture, OWNER);
+    expect(fixture.summarized).toHaveLength(3);
+    expect(fixture.speakCalls).toHaveLength(calls);
+  });
+
+  it("keeps the clips of a reply read as written when the distiller settles on the very same text", async () => {
+    // Played while #952 made the written script the default, then the
+    // distiller skips it (a short plain reply) or has no key: the same text.
+    const fixture = setup({ text: REPLY, summary: (text) => deterministicSpokenText(text) });
+    const clips = withWrittenClips(fixture);
+    for (const device of ["mac", "iphone"] as const) {
+      const result = await post(fixture, OWNER, { device, progressive: true, spans: true });
+      expect(result.status).toBe(200);
+      expect(result.body.audio).toEqual(clips);
+      expect(result.body.script).toBe("written");
+    }
+    expect(fixture.speakCalls).toEqual([]);
+    expect(fixture.row.audio).toEqual(clips);
+    // Settled as the distilled script, so it is not asked for again.
+    expect(fixture.row.voiceTextKind).toBe("summary");
+    expect(fixture.summarized).toHaveLength(1);
+  });
+
+  it("keeps those clips through a passing failure too", async () => {
+    const fixture = setup({ text: REPLY, summary: (text) => ({ text: deterministicSpokenText(text), retry: true }) });
+    const clips = withWrittenClips(fixture);
+    const result = await post(fixture, OWNER);
+    expect(result.body.audio).toEqual(clips);
+    expect(fixture.speakCalls).toEqual([]);
+    expect(fixture.row.voiceTextKind).toBe("written");
   });
 });
 

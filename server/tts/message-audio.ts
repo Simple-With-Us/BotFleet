@@ -47,6 +47,12 @@
 //   before synthesis.  A row from before voiceTextKind holds what was spoken
 //   then (usually the distilled rewrite); the distiller path reuses it and
 //   its clips as they are, so nothing is rewritten or billed again.
+// - When the distiller is down for a moment (`retry`), its stand-in is the
+//   reply as written and is stamped "written", so the next play asks the
+//   distiller again instead of keeping the stand-in for good.  A script whose
+//   utterances are the same either way (the deterministic script, however it
+//   was reached) owns clips stamped with either kind, so the same text is
+//   never synthesized twice just because the stamp changed.
 // - `spans: true` in the request adds `script` to the answer, and `spans`
 //   when the utterances are the deterministic script ("written").  A
 //   distilled script answers "summary" with no spans; clients align it to the
@@ -138,12 +144,20 @@ export interface AudioMessage {
   audioByVoice?: Record<string, VoiceClip[]>;
 }
 
+/** What `summarize` hands back.  `retry` marks a stand-in for a rewrite that
+ * failed for a passing reason (speech-summary.ts voiceSummaryWorthStoring):
+ * it is spoken now, but not kept as the reply's distilled script. */
+export interface SummarizedSpeech {
+  text: string;
+  retry?: boolean;
+}
+
 export interface MessageAudioDeps {
   /** A fresh read of the stored message. */
   message(threadId: string, messageId: string): AudioMessage | undefined;
   patchMessage(threadId: string, messageId: string, patch: Partial<AudioMessage>): void;
   /** The speech text for a reply that has none stored yet (voiceSummaryFor). */
-  summarize(threadId: string, messageId: string, text: string): Promise<string>;
+  summarize(threadId: string, messageId: string, text: string): Promise<SummarizedSpeech>;
   speak(text: string, voice: string | undefined): Promise<{ bytes: Uint8Array; mime: string }>;
   saveClip(bytes: Uint8Array, mime: string): VoiceClip;
   clipExists(clip: VoiceClip): boolean;
@@ -212,6 +226,17 @@ export function parseAudioRequest(body: AudioRequestBody | null | undefined): { 
 export function parseClipDevice(value: string | null | undefined): { ok: true; device?: SpeechDevice } | { ok: false; error: string } {
   if (value === null || value === undefined || value === "") return { ok: true };
   return isSpeechDevice(value) ? { ok: true, device: value } : { ok: false, error: "device must be mac or iphone" };
+}
+
+function sameUtterances(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((u, i) => u === b[i]);
+}
+
+/** Whether `voiceText`, split the way a distilled script is, gives exactly
+ * the utterances of `replyText` as written.  Then clips stamped with either
+ * kind for this text are the same audio. */
+export function isWrittenScript(replyText: string, voiceText: string): boolean {
+  return sameUtterances(utterancesWithSpans(writtenReply(replyText)).map((u) => u.text), toUtterances(voiceText));
 }
 
 interface ClipJob {
@@ -322,9 +347,14 @@ export class MessageAudio {
     return { kind: "json", status: this.deps.isNoVoiceConfigured(error) ? 409 : 502, body: { error: error.message } };
   }
 
-  /** Whether the message's stored clips were made from this script. */
-  private ownsClips(message: AudioMessage, voiceText: string, kind: SpokenScriptKind): boolean {
-    if (message.voiceTextKind) return message.voiceTextKind === kind && message.voiceText === voiceText;
+  /** Whether the message's stored clips were made from this script.
+   * `eitherKind`: the script's utterances are the same whichever kind made
+   * them (the deterministic script reached through the distiller), so a
+   * stamp of the other kind with the same text owns them too. */
+  private ownsClips(message: AudioMessage, voiceText: string, kind: SpokenScriptKind, eitherKind = false): boolean {
+    if (message.voiceTextKind) {
+      return message.voiceText === voiceText && (message.voiceTextKind === kind || eitherKind);
+    }
     // A row from before voiceTextKind: its clips belong to whatever voiceText
     // it holds, as they always have, and only a summary may keep them.
     return kind === "summary" && (!message.voiceText || message.voiceText === voiceText);
@@ -346,6 +376,7 @@ export class MessageAudio {
     utterances: string[],
     voiceText: string,
     voiceTextKind: SpokenScriptKind,
+    eitherKind = false,
   ): ClipJob {
     const key = `${threadId}:${messageId}:${voice}`;
     const running = this.jobs.get(key);
@@ -367,7 +398,8 @@ export class MessageAudio {
     const ours = () => {
       if (!current()) return false;
       const latest = this.deps.message(threadId, messageId);
-      return !latest?.voiceTextKind || (latest.voiceTextKind === voiceTextKind && latest.voiceText === voiceText);
+      return !latest?.voiceTextKind
+        || (latest.voiceText === voiceText && (latest.voiceTextKind === voiceTextKind || eitherKind));
     };
     const stamp = { voiceText, voiceTextKind };
     // Registered before the body runs: the body checks current() each clip.
@@ -375,7 +407,7 @@ export class MessageAudio {
     job.done = (async () => {
       let message = this.deps.message(threadId, messageId);
       if (!message) throw new Error("The reply is no longer available.");
-      if (!this.ownsClips(message, voiceText, voiceTextKind)) {
+      if (!this.ownsClips(message, voiceText, voiceTextKind, eitherKind)) {
         // The stored clips (every voice's) speak another script.  Drop them
         // so no list ever pairs old audio with these utterances.
         this.deps.patchMessage(threadId, messageId, { audio: undefined, audioVoice: undefined, audioByVoice: undefined, ...stamp });
@@ -457,23 +489,36 @@ export class MessageAudio {
     let utterances: string[];
     let textToSpeak: string;
     let spansWire: SpokenSpansWire | undefined;
+    // The kind the clips are stamped with, and whether a stamp of the other
+    // kind with the same text owns them too (see ownsClips).
+    let stampKind: SpokenScriptKind = kind;
+    let eitherKind = false;
     const source = writtenReply(message.text);
     if (kind === "written") {
       const spoken = utterancesWithSpans(source);
       utterances = spoken.map((u) => u.text);
       textToSpeak = utterances.join(" ");
       if (spans) spansWire = encodeSpokenSpans(source, spoken);
+      eitherKind = sameUtterances(toUtterances(textToSpeak), utterances);
     } else {
       // A written-mode script is the reply as written, not a distilled one;
       // distill instead of reusing it.
-      textToSpeak = message.voiceText && message.voiceTextKind !== "written"
-        ? message.voiceText
+      const summarized: SummarizedSpeech = message.voiceText && message.voiceTextKind !== "written"
+        ? { text: message.voiceText }
         : await this.deps.summarize(threadId, messageId, message.text);
+      textToSpeak = summarized.text;
       utterances = toUtterances(textToSpeak);
       const deterministic = utterancesWithSpans(source);
-      if (deterministic.length === utterances.length && deterministic.every((u, i) => u.text === utterances[i])) {
+      if (sameUtterances(deterministic.map((u) => u.text), utterances)) {
         label = "written";
+        eitherKind = true;
         if (spans) spansWire = encodeSpokenSpans(source, deterministic);
+        // A stand-in for a rewrite that failed for a passing reason is the
+        // reply as written, and stamped so: the next play distills again.
+        // (A stand-in that is not exactly the written script, which only a
+        // redacted secret or the bot's own [voice_summary] makes, is kept as
+        // a summary; stamping it "written" would misdescribe its clips.)
+        if (summarized.retry) stampKind = "written";
       }
     }
     /** `script` and `spans`, only for a client that asked. */
@@ -541,7 +586,13 @@ export class MessageAudio {
     const cached = this.slotClips(message, voice, ownerVoice);
     const complete = (list: VoiceClip[] | undefined, count: number): list is VoiceClip[] =>
       list?.length === count && list.every((clip) => this.deps.clipExists(clip));
-    if (this.ownsClips(message, textToSpeak, kind) && complete(cached, utterances.length)) {
+    if (this.ownsClips(message, textToSpeak, stampKind, eitherKind) && complete(cached, utterances.length)) {
+      // Clips of this very script stamped "written" (a play in the "off" mode,
+      // or while #952 made that the default, or while the distiller was down)
+      // become the distilled script once the distiller has settled on it.
+      if (stampKind === "summary" && message.voiceTextKind === "written") {
+        this.deps.patchMessage(threadId, messageId, { voiceTextKind: "summary" });
+      }
       return {
         kind: "json",
         status: 200,
@@ -579,7 +630,7 @@ export class MessageAudio {
       }
     }
 
-    const job = this.ensureJob(threadId, messageId, voice, ownerVoice, utterances, textToSpeak, kind);
+    const job = this.ensureJob(threadId, messageId, voice, ownerVoice, utterances, textToSpeak, stampKind, eitherKind);
     if (!progressive) {
       await this.waitFor(job, () => false, startedAt + BLOCKING_RESPONSE_BUDGET_MS - this.now());
       if (job.error) return this.failure(job.error);
