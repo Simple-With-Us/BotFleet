@@ -629,10 +629,22 @@ function createPermissionBroker(opts: {
       } catch {}
       return;
     }
+    // The frame is untrusted socket input.  A `tool` that is not a string
+    // (`{"t":"ask","tool":123}`) used to reach `fileWritePaths` in `onAsk`,
+    // whose first statement calls `tool.replace`; the throw came out of this
+    // socket listener, after the ask was already pending with a 15-minute
+    // timer, and an uncaught listener exception takes the server down.
+    // An unreadable name falls back to the generic "tool", the same name a
+    // frame with no tool at all has always carried.
+    const toolName = z.string().min(1).safeParse(msg.tool);
+    if (!toolName.success) {
+      console.warn("permission broker: non-string tool name on ask frame", toolName.error.issues);
+    }
+    const tool = toolName.success ? toolName.data : "tool";
     const ask: Ask = {
       id: askId,
       kind,
-      tool: msg.tool ?? "tool",
+      tool,
       input: msg.input ?? {},
       at: Date.now(),
       toolUseId: String(msg.toolUseId ?? "") || undefined,
