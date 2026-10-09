@@ -200,20 +200,6 @@ export function museAuthenticated(env: Record<string, string | undefined>): bool
 export const MUSE_LOGIN_NOTE =
   "Muse Code needs an API key for BotFleet — a browser session signed into the Mac keychain works in the terminal but this engine cannot read it.  To sign in, run `muse auth set --provider meta --api-key-stdin`, paste the key when it prompts, then press Ctrl-D and Enter";
 
-/** The community ACP adapter that fronts `muse`, pinned to the release this
- *  driver was written and tested against (published 2026-09-26, integrity
- *  `sha512-CGjijywb3HlGiJ9nwE6ECvXr/yq8qFJc4zL52iaZlNROBtgV/N6Cihq/4t3nLU8oPbOjISp9bw2l+8wcoPX5lw==`,
- *  read with `npm view @bex-co/muse-code-acp@0.7.0 dist.integrity`).  The adapter
- *  is the one process between BotFleet and Muse: it terminates every prompt, MCP
- *  handshake and permission request.  An unpinned `npm install -g` takes whatever
- *  was published last, so a compromised or squatted release would sit in that
- *  path.  Move the pin deliberately, after reading the new release's changes and
- *  re-running the Muse suite; npm itself checks the tarball against the registry's
- *  recorded integrity. */
-export const MUSE_ACP_ADAPTER = "@bex-co/muse-code-acp";
-export const MUSE_ACP_ADAPTER_VERSION = "0.7.0";
-const MUSE_ACP_ADAPTER_SPEC = `${MUSE_ACP_ADAPTER}@${MUSE_ACP_ADAPTER_VERSION}`;
-
 const support: AcpSupport = {
   driverKind: "museAgent",
   displayName: "Muse Code",
@@ -254,11 +240,11 @@ const support: AcpSupport = {
       // Two steps: the `muse` binary, then the adapter that fronts it.  The
       // `&&` is load-bearing — a user with only the adapter gets a
       // "binary not found" turn instead of a setup card that says what broke.
-      darwin: `curl -fsSL https://dev.meta.ai/install.sh | sh && npm install -g ${MUSE_ACP_ADAPTER_SPEC}`,
-      linux: `curl -fsSL https://dev.meta.ai/install.sh | sh && npm install -g ${MUSE_ACP_ADAPTER_SPEC}`,
+      darwin: "curl -fsSL https://dev.meta.ai/install.sh | sh && npm install -g @bex-co/muse-code-acp",
+      linux: "curl -fsSL https://dev.meta.ai/install.sh | sh && npm install -g @bex-co/muse-code-acp",
       // Meta's Windows installer is PowerShell, and the adapter is npm on
       // every platform, so the two chain the same way here.
-      win32: `irm https://dev.meta.ai/install.ps1 | iex; npm install -g ${MUSE_ACP_ADAPTER_SPEC}`,
+      win32: "irm https://dev.meta.ai/install.ps1 | iex; npm install -g @bex-co/muse-code-acp",
     },
     docsUrl: "https://dev.meta.ai/docs/muse-code",
     // The API key path, matching `museAuthenticated` and `loginNote`.  Not
