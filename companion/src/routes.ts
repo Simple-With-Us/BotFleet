@@ -214,6 +214,43 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "GET", path: /^\/api\/connectors$/ },
   { method: "POST", path: /^\/api\/connectors\/[\w-]+\/authorize$/ },
   { method: "DELETE", path: /^\/api\/connectors\/[\w-]+\/accounts\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/ },
+
+  // Usage and cost, read-only.  The summary itself is computed on the phone
+  // from the bots it already holds; these two add what only the harness knows:
+  // quota windows, rolling per-engine spend and the engines it is holding back
+  // (`quotas`), and the speech provider's character counts (`tts/usage`).
+  // Neither carries a key or a token, and neither has a write side.
+  { method: "GET", path: /^\/api\/quotas$/ },
+  { method: "GET", path: /^\/api\/tts\/usage$/ },
+
+  // Shared memory (the recall corpus) status, as one read-only row in
+  // Settings.  Only the `qdrant` spelling: `/api/recall/status` is the same
+  // handler under a second name and stays closed so there is one door.
+  { method: "GET", path: /^\/api\/qdrant\/status$/ },
+
+  // Background jobs: the list, one job's output, and Stop.  The owner approved
+  // Stop and reading output from the phone (docs/plans/2026-10-01-background-
+  // jobs-and-subagents-decision.md, ruling d).  Nothing here starts a job: a
+  // job only starts from a bot's own tool call.  The bare `GET /api/jobs/:id`
+  // and `/api/jobs/wake-usage` reads are used by no screen, so they stay
+  // closed.  Ids are the harness's own `job_<ulid>` shape.  `stop` with no id
+  // is Stop All for one conversation (`{ threadId }`), which the Mac's jobs
+  // menu has too.
+  { method: "GET", path: /^\/api\/jobs$/ },
+  { method: "GET", path: /^\/api\/jobs\/job_[0-9A-Za-z]{10,40}\/output$/ },
+  { method: "POST", path: /^\/api\/jobs\/job_[0-9A-Za-z]{10,40}\/stop$/ },
+  { method: "POST", path: /^\/api\/jobs\/stop$/ },
+
+  // A bot's imported Agent Skills: read the list, read one SKILL.md, and turn
+  // one on or off, which is exactly what the Mac's Skills panel offers.
+  // Importing is NOT here and must not be: `POST /api/bots/:id/skills` can read
+  // a folder off the Mac's own disk, and the only thing standing between a
+  // caller and that read is "the connection is loopback", which the sidecar
+  // is.  There is no delete on the Mac's panel, so there is none here.  Skill
+  // names are the harness's own `[a-z0-9-]+`.
+  { method: "GET", path: /^\/api\/bots\/[\w-]+\/skills$/ },
+  { method: "GET", path: /^\/api\/bots\/[\w-]+\/skills\/[a-z0-9-]+$/ },
+  { method: "PATCH", path: /^\/api\/bots\/[\w-]+\/skills\/[a-z0-9-]+$/ },
 ];
 
 /** Route families worth naming in the refusal.
