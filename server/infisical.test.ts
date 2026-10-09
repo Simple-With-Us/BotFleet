@@ -393,6 +393,28 @@ describe("readPath", () => {
     expect(JSON.stringify(infisical.getStatus())).not.toContain(SENTINEL_VAULT_VALUE);
   });
 
+  it("reads another project's environment when the caller names one, with the same identity", async () => {
+    const settings = withSettings({});
+    const fetchMock = loginThenList([{ secretKey: "ZULIP_BF_PLUMBER_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const values = await infisical.readPath("/zulip", { projectId: "afc-project-id", environment: "staging" });
+
+    expect(values.get("ZULIP_BF_PLUMBER_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+    const listUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
+    expect(listUrl.searchParams.get("workspaceId")).toBe("afc-project-id");
+    expect(listUrl.searchParams.get("environment")).toBe("staging");
+    expect(listUrl.searchParams.get("secretPath")).toBe("/zulip");
+    // one login, with the harness's own identity
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/login"))).toHaveLength(1);
+
+    // blank overrides fall back to the configured project and environment
+    await infisical.readPath("/zulip", { projectId: " ", environment: "" });
+    const ownUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
+    expect(ownUrl.searchParams.get("workspaceId")).toBe(settings.projectId);
+    expect(ownUrl.searchParams.get("environment")).toBe(settings.environment);
+  });
+
   it("refuses with no request when Infisical is turned off", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

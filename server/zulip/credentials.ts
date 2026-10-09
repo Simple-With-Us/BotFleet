@@ -8,11 +8,14 @@
 //     "Secret Handoff", docs/secrets.md), so it stays off until the operator
 //     points it at a folder.
 //   - the Infisical source: `ZULIP_<ROLE>_EMAIL` and `ZULIP_<ROLE>_API_KEY`
-//     (optionally `_SITE`) in one folder of BotFleet's own Infisical project
-//     (`zulip.infisicalPath`, default `/zulip`), read through the harness's
-//     InfisicalManager.  On only when `zulip.credentialSource` is
-//     "infisical".  Which source the fleet uses is an open owner decision
-//     (docs/zulip.md, Open Decisions D0).
+//     (optionally `_SITE`) in one Infisical folder (`zulip.infisicalPath`,
+//     default `/zulip`), read through the harness's InfisicalManager with
+//     its machine identity.  The folder is in BotFleet's own project and
+//     environment unless `zulip.infisicalProjectId` / `zulip.infisicalEnv`
+//     name another:  the fleet keeps the BF keys in AI Fleet Coordinator's
+//     `prod` `/zulip`, and BotFleet reads them there rather than holding a
+//     copy (docs/zulip.md, D0).  On only when `zulip.credentialSource` is
+//     "infisical".
 //
 // The key lives only in the returned object and in the client's
 // Authorization header.  It never enters `process.env` (so a spawned CLI
@@ -61,9 +64,29 @@ export interface ZulipCredentialSource {
   load(role: string): ZulipCredentials | Promise<ZulipCredentials>;
 }
 
-/** Reads one folder of BotFleet's Infisical project: names to values, kept
- *  in memory by the caller and nowhere else. */
-export type ZulipVaultReader = (secretPath: string) => Promise<ReadonlyMap<string, string>>;
+/** One Infisical folder the Infisical source reads. */
+export interface ZulipVaultLocation {
+  secretPath: string;
+  /** Another Infisical project's id.  Unset: the harness's own project. */
+  projectId?: string;
+  /** Another environment's slug.  Unset: the harness's own environment. */
+  environment?: string;
+  /** When set, only these names are kept from the folder.  A shared folder
+   *  (AI Fleet Coordinator's `/zulip` holds every seat's key) then never
+   *  leaves another seat's key in this process's memory. */
+  names?: readonly string[];
+}
+
+/** Reads one Infisical folder: names to values, kept in memory by the
+ *  caller and nowhere else. */
+export type ZulipVaultReader = (location: ZulipVaultLocation) => Promise<ReadonlyMap<string, string>>;
+
+/** A short, value-free label for a location, for status and error text:
+ *  `/zulip` in the harness's own project and environment, otherwise
+ *  `<project> <env> /zulip`. */
+export function describeVaultLocation(location: Pick<ZulipVaultLocation, "secretPath" | "projectId" | "environment">): string {
+  return [location.projectId, location.environment, location.secretPath].filter((part) => part?.trim()).join(" ");
+}
 
 function expandHome(path: string): string {
   if (path === "~") return homedir();
@@ -159,41 +182,66 @@ export function zulipVaultNames(role: string): { email: string; key: string; sit
 
 export const ZULIP_DEFAULT_INFISICAL_PATH = "/zulip";
 
+/** Every vault name the given roles can use, sorted and de-duplicated, so
+ *  the same set of roles always yields the same list (and cache key). */
+export function zulipVaultNamesFor(roles: readonly string[]): string[] {
+  const names = new Set<string>();
+  for (const role of roles) {
+    if (!validZulipRole(role.trim())) continue;
+    const n = zulipVaultNames(role);
+    names.add(n.email).add(n.key).add(n.site);
+  }
+  return [...names].sort();
+}
+
 /** The Infisical source.  `read` is the harness's InfisicalManager (wrap it
  *  in `cachedVaultReader` so reconnects do not each hit the vault).  The
- *  key stays in the returned object; error text names the vault names and
- *  the folder, never a value.  Without a `_SITE` name the site is the
- *  realm, and `verifyCredentialRealm` still checks it. */
+ *  folder is in another project or environment when `projectId` or
+ *  `environment` is set.  With `roles` (the bound bots' roles), each read
+ *  asks for those roles' names only, so one read serves every bot and a
+ *  shared folder's other keys are not kept.  The key stays in the returned
+ *  object; error text names the vault names and the folder, never a value.
+ *  Without a `_SITE` name the site is the realm, and
+ *  `verifyCredentialRealm` still checks it. */
 export function infisicalCredentialSource(
   read: ZulipVaultReader,
-  opts: { path?: string; realm: string },
+  opts: { path?: string; projectId?: string; environment?: string; roles?: readonly string[]; realm: string },
 ): ZulipCredentialSource {
-  const path = opts.path?.trim() || ZULIP_DEFAULT_INFISICAL_PATH;
+  const secretPath = opts.path?.trim() || ZULIP_DEFAULT_INFISICAL_PATH;
+  const projectId = opts.projectId?.trim() || undefined;
+  const environment = opts.environment?.trim() || undefined;
+  const where = describeVaultLocation({ secretPath, projectId, environment });
+  const bound = opts.roles?.map((role) => role.trim());
   return {
-    describe: (role) => (validZulipRole(role) ? `infisical ${path} ${zulipVaultNames(role).key.replace(/_API_KEY$/, "_*")}` : "invalid role"),
+    describe: (role) => (validZulipRole(role) ? `infisical ${where} ${zulipVaultNames(role).key.replace(/_API_KEY$/, "_*")}` : "invalid role"),
     load: async (role) => {
       if (!validZulipRole(role)) throw new ZulipCredentialError(`"${role}" is not a valid Zulip role name`, "invalid");
       const names = zulipVaultNames(role);
+      // A role loaded outside the bound set still gets its own names.
+      const keep = bound ? zulipVaultNamesFor(bound.includes(role) ? bound : [...bound, role]) : undefined;
       let values: ReadonlyMap<string, string>;
       try {
-        values = await read(path);
+        values = await read({ secretPath, projectId, environment, names: keep });
       } catch (e) {
         // The manager's errors are value-free; keep only its message.
         const why = e instanceof Error ? e.message : "unknown error";
-        throw new ZulipCredentialError(`cannot read Infisical ${path}: ${why}`, "invalid");
+        throw new ZulipCredentialError(`cannot read Infisical ${where}: ${why}`, "invalid");
       }
       const email = values.get(names.email)?.trim();
       const key = values.get(names.key)?.trim();
       const missing = [!email && names.email, !key && names.key].filter(Boolean);
-      if (missing.length) throw new ZulipCredentialError(`Infisical ${path} has no ${missing.join(" or ")}`, "missing");
+      if (missing.length) throw new ZulipCredentialError(`Infisical ${where} has no ${missing.join(" or ")}`, "missing");
       const site = (values.get(names.site)?.trim() || opts.realm).replace(/\/+$/, "");
-      return { email: email!, key: key!, site: site.includes("://") ? site : `https://${site}`, source: `infisical ${path}` };
+      return { email: email!, key: key!, site: site.includes("://") ? site : `https://${site}`, source: `infisical ${where}` };
     },
   };
 }
 
-/** One vault read per folder per `ttlMs`, shared by every role and every
- *  reconnect.  A failed read is not cached, so the next retry reads again. */
+/** One vault read per location per `ttlMs`, shared by every role and every
+ *  reconnect.  A location's `names`, when set, are the only names kept: the
+ *  rest of the folder is dropped as soon as the read returns, so the cache
+ *  holds the bound roles' keys and nothing else.  A failed read is not
+ *  cached, so the next retry reads again. */
 export function cachedVaultReader(
   read: ZulipVaultReader,
   opts: { ttlMs?: number; now?: () => number } = {},
@@ -201,13 +249,28 @@ export function cachedVaultReader(
   const ttlMs = opts.ttlMs ?? 15 * 60_000;
   const now = opts.now ?? Date.now;
   const cache = new Map<string, { at: number; values: Promise<ReadonlyMap<string, string>> }>();
-  return (path) => {
-    const hit = cache.get(path);
+  return (location) => {
+    const names = location.names ? [...new Set(location.names)].sort() : null;
+    const cacheKey = JSON.stringify([
+      location.projectId?.trim() ?? "",
+      location.environment?.trim() ?? "",
+      location.secretPath,
+      names,
+    ]);
+    const hit = cache.get(cacheKey);
     if (hit && now() - hit.at < ttlMs) return hit.values;
-    const values = read(path);
-    cache.set(path, { at: now(), values });
+    const values = read(location).then((all): ReadonlyMap<string, string> => {
+      if (!names) return all;
+      const kept = new Map<string, string>();
+      for (const name of names) {
+        const value = all.get(name);
+        if (value !== undefined) kept.set(name, value);
+      }
+      return kept;
+    });
+    cache.set(cacheKey, { at: now(), values });
     values.catch(() => {
-      if (cache.get(path)?.values === values) cache.delete(path);
+      if (cache.get(cacheKey)?.values === values) cache.delete(cacheKey);
     });
     return values;
   };
@@ -218,11 +281,23 @@ export function cachedVaultReader(
  *  - `OMB_ZULIP_CREDENTIAL_DIR` (tests, a soak rig) always means the file
  *    source.
  *  - `credentialSource: "infisical"` means the Infisical source, and needs
- *    the harness's vault reader.
+ *    the harness's vault reader.  It reads `infisicalPath` in
+ *    `infisicalProjectId` / `infisicalEnv` when those are set, and asks for
+ *    the names of the roles in `bots` only.
  *  - Otherwise (`"file"` or unset) the file source, when `credentialDir`
  *    names an absolute folder. */
 export function credentialSourceFor(
-  settings: { credentialDir?: string; credentialSource?: "file" | "infisical"; infisicalPath?: string; realm?: string } | undefined,
+  settings:
+    | {
+        credentialDir?: string;
+        credentialSource?: "file" | "infisical";
+        infisicalPath?: string;
+        infisicalProjectId?: string;
+        infisicalEnv?: string;
+        bots?: Record<string, { role: string }>;
+        realm?: string;
+      }
+    | undefined,
   env: NodeJS.ProcessEnv = process.env,
   deps: { vault?: ZulipVaultReader; realm?: string } = {},
 ): ZulipCredentialSource | null {
@@ -231,6 +306,9 @@ export function credentialSourceFor(
     if (!deps.vault) return null;
     return infisicalCredentialSource(deps.vault, {
       path: settings.infisicalPath,
+      projectId: settings.infisicalProjectId,
+      environment: settings.infisicalEnv,
+      roles: Object.values(settings.bots ?? {}).map((bot) => bot.role),
       realm: deps.realm ?? settings.realm ?? ZULIP_DEFAULT_REALM,
     });
   }

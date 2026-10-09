@@ -86,6 +86,32 @@ describe("configuration boundaries", () => {
     expect(parseConfigPatch({ usage: { ingestUrl: "" } })).toEqual({ usage: { ingestUrl: "" } });
   });
 
+  it("accepts another Infisical project and environment for the Zulip keys, and refuses a malformed one", () => {
+    expect(
+      parseConfigPatch({
+        zulip: {
+          credentialSource: "infisical",
+          infisicalProjectId: " 9bf7417a-fbbb-42ca-870c-2b45207233f5 ",
+          infisicalEnv: "prod",
+          infisicalPath: "/zulip",
+        },
+      }),
+    ).toEqual({
+      zulip: {
+        credentialSource: "infisical",
+        infisicalProjectId: "9bf7417a-fbbb-42ca-870c-2b45207233f5",
+        infisicalEnv: "prod",
+        infisicalPath: "/zulip",
+      },
+    });
+    // empty clears it back to the harness's own project and environment
+    expect(parseConfigPatch({ zulip: { infisicalProjectId: "", infisicalEnv: "" } })).toEqual({
+      zulip: { infisicalProjectId: "", infisicalEnv: "" },
+    });
+    expect(() => parseConfigPatch({ zulip: { infisicalProjectId: "../other" } })).toThrow("zulip.infisicalProjectId");
+    expect(() => parseConfigPatch({ zulip: { infisicalEnv: "prod/zulip" } })).toThrow("zulip.infisicalEnv");
+  });
+
   it("accepts only a simple VPS SSH config alias and exposes no credentials", () => {
     expect(isValidSshAlias("production-vps")).toBe(true);
     expect(isValidSshAlias("prod; reboot")).toBe(false);
