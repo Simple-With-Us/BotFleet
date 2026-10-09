@@ -843,7 +843,8 @@ test("the mode flags parse, and contradictory ones are refused", () => {
   assert.equal(fenceMode({ force: true }), "force");
 });
 
-test("the wrapper's up-to-date shortcut survives the busy-work flags and nothing else new", async () => {
+// The wrapper is a macOS bash script; Windows has no /bin/bash to run it with.
+test("the wrapper's up-to-date shortcut survives the busy-work flags and nothing else new", { skip: process.platform === "win32" }, async () => {
   // Just the argument loop, lifted out of the wrapper: the full wrapper test
   // needs a real checkout at origin/main, which a linked worktree is not.
   const wrapper = await readFile(join(dirname(fileURLToPath(import.meta.url)), "update-botfleet.sh"), "utf8");
