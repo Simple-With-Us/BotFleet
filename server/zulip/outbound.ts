@@ -21,7 +21,8 @@
 import { z } from "zod";
 
 import { redactSecretsInText } from "../../shared/redact.ts";
-import { ZULIP_MAX_CONTENT_CHARS, sameOrigin, sentenceGap, splitContent, topicRefusal } from "./format.ts";
+import { ZULIP_MAX_CONTENT_CHARS, sameOrigin, splitContent, topicRefusal } from "./format.ts";
+import { sentenceGap } from "./sentence-gap.ts";
 import type { ZulipOrigin, ZulipUser } from "./types.ts";
 
 /** At most this many chunks per call; longer belongs in a file or a link. */
