@@ -228,6 +228,7 @@ import {
   sweepTranscriptRetention,
   removeTranscriptLogs,
 } from "./transcript-retention.ts";
+import { cleanupHoldReason, listDataFaults, registerLeftOverSetAsideFiles } from "./data-faults.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { findCliCandidates, resetPathCache } from "./env-path.ts";
 import { cliProbeEnvironment } from "./cli-probe-env.ts";
@@ -2072,6 +2073,9 @@ function checkedMemberIds(
 const bootSelection = await defaultSelection();
 const store = new Store(() => bootSelection);
 store.seedIfEmpty();
+// A set-aside bots.json, groups.json or routines.json from an earlier run still needs the owner's
+// attention after a restart, so it raises a notice again here.
+registerLeftOverSetAsideFiles(DATA_DIR);
 export { store };
 
 // ── background jobs (jobs P1, docs/plans/2026-10-01-background-jobs-and-subagents-decision.md) ──
@@ -2288,13 +2292,22 @@ function liveThreadIds(): Set<string> {
 // One flag covers all three sweeps: a preview before trusting a brand-new
 // class of delete against real data.
 const retentionDryRun = process.env.OMB_RETENTION_DRY_RUN === "1";
+// While a set-aside bots.json or groups.json is waiting in the data folder, the roster cannot say
+// which bots and threads still exist, so none of the three sweeps below may call anything an orphan.
+// `cleanupHoldReason` reads the folder on every call, so this holds across restarts.
 const stopOrphanTranscriptSweeps = startOrphanTranscriptSweeps(transcriptDirs, liveThreadIds, console.log, {
   dryRun: retentionDryRun,
+  hold: () => cleanupHoldReason(DATA_DIR),
 });
 // Workspaces and messages.db are swept once, shortly after boot, off the
 // request path — no recurring timer to unref, because a harness restart (29
 // in two days per the audit) already re-runs this often enough on its own.
 setTimeout(() => {
+  const retentionHold = cleanupHoldReason(DATA_DIR);
+  if (retentionHold) {
+    console.log(`[retention] workspace and message cleanup skipped: ${retentionHold}.`);
+    return;
+  }
   const workspaceResult = sweepOrphanedWorkspaces(new Set(store.bots.map((b) => b.id)), { dryRun: retentionDryRun });
   const workspaceLine = describeWorkspaceSweep(workspaceResult);
   if (workspaceLine) console.log(workspaceLine);
@@ -11987,7 +12000,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const threadIds = new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)]);
       for (const threadId of threadIds) lastReply.delete(threadId);
-      store.deleteGroup(group.id);
+      // Refuse before wiping transcripts when the roster cannot be saved: a
+      // false here means the room would reappear on the next boot pointing at
+      // logs that are already gone.
+      if (!store.deleteGroup(group.id)) {
+        return json(res, 409, { error: "the room roster could not be saved — fix or move groups.json, then retry" });
+      }
       stopJobsForDeleted(threadIds, "its conversation was deleted");
       // Both generations and any temp file, for every task this room had: a
       // `.ndjson.1` or a killed trim's `.tmp` left behind would outlive the
@@ -12622,6 +12640,22 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         cancelPeerApprovalsFor(bot.id);
         discardDelegations(commsBus, bot.threadId);
         computerControl.forget(bot.id);
+        // The snapshot above was taken before soft-cleanup awaits.  A task
+        // created while they ran has a record the delete below removes and a
+        // pair of logs the snapshot never heard of, so take the union rather
+        // than either list alone — before the roster delete, while the record
+        // still exists.
+        const current = store.bot(bot.id);
+        if (current) {
+          botThreadIds.add(current.threadId);
+          for (const task of current.tasks ?? []) botThreadIds.add(task.threadId);
+        }
+        // Refuse before destroying the workspace when the roster cannot be
+        // saved: a false here means the bot would reappear on the next boot
+        // pointing at a container and transcripts that are already gone.
+        if (!store.deleteBot(bot.id)) {
+          return json(res, 409, { error: "the bot roster could not be saved — fix or move bots.json, then retry" });
+        }
         // Its per-bot Local VM goes with it.  Nothing else can name that
         // container once the store record is gone — the name is derived from
         // the bot id — so a later shared/per-bot mode switch cannot clean it
@@ -12639,16 +12673,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const perBotVpsTarget = vps.perBotVpsTarget(bot.id);
         await vps.vpsRemoveTargetIfPresent(cfg, perBotVpsTarget).catch(() => {});
         vps.closeVpsDesktopTunnelForTarget(perBotVpsTarget.key);
-        // The snapshot above was taken before two awaits.  A task created
-        // while they ran has a record the delete below removes and a pair of
-        // logs the snapshot never heard of, so take the union rather than
-        // either list alone.
-        const current = store.bot(bot.id);
-        if (current) {
-          botThreadIds.add(current.threadId);
-          for (const task of current.tasks ?? []) botThreadIds.add(task.threadId);
-        }
-        store.deleteBot(bot.id);
       } finally {
         localVmLifecycleBusy.delete(localVmTarget.key);
       }
@@ -13897,6 +13921,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         ownerProof: harnessOwnerProof(harnessOwner, req.headers["x-botfleet-owner-challenge"]),
         ready: !booting, booting,
       });
+    }
+    // Saved data that could not be read or used, for the notice at the top of the app.  File base names
+    // and short reasons only: no paths, and never a fragment of a file.
+    if (method === "GET" && path === "/api/data-faults") {
+      return json(res, 200, { faults: listDataFaults() });
     }
     if (method === "GET" && path === "/api/telemetry/status") {
       return json(res, 200, telemetry.getStatus());
