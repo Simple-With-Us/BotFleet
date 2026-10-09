@@ -84,7 +84,7 @@ public struct VersionManifestFetcher: Sendable {
 /// build actually running.
 public enum TestFlightUpdateCheck {
     /// Matches `PRODUCT_BUNDLE_IDENTIFIER` in `ios/project.yml`.
-    public static let bundleId = "app.botfleet"
+    public static let bundleId = "app.botfleet.ios"
 
     /// Whether `candidate` is a newer build than `running`.
     ///

@@ -42,6 +42,12 @@ import {
   resolveInitDeadline,
   SLOW_INIT_LOG_MS,
 } from "./init-deadline.ts";
+import { annotatePromptBudget } from "../../sentry-ai.ts";
+import {
+  applyAcpPromptBudget,
+  decodeAcpPromptBudgetBytes,
+  resolveAcpPromptBudgetBytes,
+} from "./prompt-budget.ts";
 
 /**
  * A `host::model` pick talks to a loopback server with its own key.
@@ -106,8 +112,8 @@ export function acpMcpServers(turn: Pick<SendTurnInput, "integrations">): AcpStd
     });
   }
   // The bot's computers, mounted exactly like the Claude driver does.
-  // Cloud boxes use the REST adapter; host, sandbox, and VPS Cua
-  // connections expose Cua Driver's official MCP server directly. Every
+  // Cloud boxes use the REST adapter; host, sandbox, and VPS CUA
+  // connections expose CUA Driver's official MCP server directly. Every
   // grant gets its own server — this was an if/else if that dropped the
   // second computer a bot had been given.
   for (const mount of turnComputerMounts(turn.integrations)) {
@@ -174,6 +180,11 @@ export interface AcpConfig {
    * never cut off; only a fully wedged one is.  `promptTimeoutMs` still
    * applies underneath this as the absolute backstop. */
   promptIdleMs?: number;
+  /** UTF-8 byte ceiling for the composed `session/prompt` text.  Omitted
+   * uses the default.  `0` disables the budget and sends the prompt whole.
+   * The stable system block and the current user message are never cut to
+   * meet it. */
+  promptBudgetBytes?: number;
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -468,6 +479,7 @@ function decodeAcpConfig(defaultCli: string) {
       o.promptIdleMs <= MAX_PROMPT_IDLE_MS
         ? o.promptIdleMs
         : undefined;
+    const promptBudgetBytes = decodeAcpPromptBudgetBytes(o.promptBudgetBytes);
     return {
       cli: typeof o.cli === "string" ? o.cli : defaultCli,
       fullAuto: o.fullAuto === true,
@@ -475,6 +487,7 @@ function decodeAcpConfig(defaultCli: string) {
       ...(initTimeoutMs === undefined ? {} : { initTimeoutMs }),
       ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
       ...(promptIdleMs === undefined ? {} : { promptIdleMs }),
+      ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }),
     };
   };
 }
@@ -682,7 +695,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // full-auto bot mount the local computer at all.
         const computerMounts = turnComputerMounts(turn.integrations);
         const controlsHost = hostToolPrefix(computerMounts) !== null;
-        const turnConfig: AcpConfig = controlsHost && config.fullAuto ? { ...config, fullAuto: false } : config;
+        // A turn the harness holds for auto-review is spawned in the same
+        // asking mode, so each `session/request_permission` reaches the
+        // reviewer instead of being answered here.
+        const turnConfig: AcpConfig =
+          (controlsHost || turn.holdForReview === true) && config.fullAuto ? { ...config, fullAuto: false } : config;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         // Carried across a relaunch (see maybeRetry): `attempt` is how many
@@ -1642,11 +1659,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             emitSessionStarted();
             state.promptSent = true;
-            const text = support.buildPromptText
+            // Budget the prompt about to be sent.  This does not decide
+            // whether the system prompt is inlined on resume.  Under the
+            // ceiling the composed text is unchanged.
+            const composed = support.buildPromptText
               ? support.buildPromptText(turn)
               : turn.system
                 ? `${turn.system}\n\n${turn.text}`
                 : turn.text;
+            const budgeted = applyAcpPromptBudget({
+              composed,
+              sections: turn.systemSections,
+              userText: turn.text,
+              budgetBytes: resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes),
+            });
+            annotatePromptBudget(threadId, turnId, budgeted);
+            const text = budgeted.text;
             const result = await request(
               "session/prompt",
               {
@@ -1846,6 +1874,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // says so.  Named helper rows come in P3.
             backgroundJobs: mountsMcpServers ? "emulated" : "none",
             helpers: "none",
+            // `session/request_permission` becomes request.opened; a
+            // full-auto instance answers it itself unless the turn is held
+            reviewHook: config.fullAuto ? "after" : "before",
+            asksWhenHeld: true,
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

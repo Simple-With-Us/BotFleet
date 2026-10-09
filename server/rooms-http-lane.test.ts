@@ -502,7 +502,7 @@ posixOnly("room turns run on the HTTP lane", () => {
       // A driver-loop engine has no MCP client, so "This Computer" is not a
       // mount for it: `hasHostComputer` is `wantsLocal && localComputerMcp`
       // and the harness executor supplies the tools.  It must therefore stay
-      // true whether or not Cua Driver is running, and must not produce the
+      // true whether or not CUA Driver is running, and must not produce the
       // "local computer not mounted" chip a mounting engine would get.
       const member = await makeBot("quay", { computers: ["local"] });
       const room = await makeRoom("Hostage", [member.id], { kind: "member", botId: member.id });

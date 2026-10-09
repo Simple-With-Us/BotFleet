@@ -285,6 +285,27 @@ describe("ProviderRegistry", () => {
     expect((await registry.describe())[0].capabilities.approvalReview).toBe(true);
   });
 
+  it("ships where auto-review sees an instance's actions, and reads an undeclared hook as none", async () => {
+    const fake = makeFakeDriver();
+    const registry = new ProviderRegistry([fake.driver]);
+    await registry.load({ a: { driver: "fake" } });
+
+    expect((await registry.describe())[0].capabilities).toMatchObject({ reviewHook: "none", asksWhenHeld: false });
+    Object.assign(registry.get("a")!.adapter.capabilities, { reviewHook: "after", asksWhenHeld: true });
+    expect((await registry.describe())[0].capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+  });
+
+  it("reports what a bot's Bypass Permissions does on the engine, for the desktop and the phone", async () => {
+    // shared/bypass-coverage.ts owns the table; this proves it reaches the wire
+    // for a live instance and for the shadow an unknown driver becomes.
+    const fake = makeFakeDriver();
+    const registry = new ProviderRegistry([fake.driver]);
+    await registry.load({ a: { driver: "fake" }, ghost: { driver: "no-such-driver" } });
+    const described = await registry.describe();
+    expect(described.find((entry) => entry.instanceId === "a")!.capabilities.bypassCoverage).toBe("asks");
+    expect(described.find((entry) => entry.instanceId === "ghost")!.capabilities.bypassCoverage).toBe("asks");
+  });
+
   // GET /api/instances used to re-probe every CLI (--version, auth status,
   // model discovery) on every call, costing real seconds on a machine with
   // many engines installed — the engine rail's passive refreshes now pass

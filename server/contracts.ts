@@ -9,6 +9,7 @@ import type { ComputerMount } from "./computer-grants.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
+import type { ReviewHook } from "../shared/auto-review.ts";
 
 export type DriverKind = string;
 export type InstanceId = string;
@@ -309,6 +310,12 @@ export interface SendTurnInput {
    *  or neither is (see drivers/prompt-split.ts promptHalves). */
   systemStable?: string;
   systemVolatile?: string;
+  /** Ordered non-empty system-prompt sections, the same list joined into
+   *  `system`.  ACP uses it to drop the oldest volatile sections under a
+   *  byte budget.  The stable sections are interleaved with them, so the
+   *  two joined halves are not enough to put a section back.  Optional: a
+   *  driver that does not budget the prompt ignores it. */
+  systemSections?: Array<{ id: string; text: string; volatile: boolean }>;
   /** sha256 hex of `systemVolatile`, computed once by the server so a driver
    *  comparing halves against a receipt need not hash the text itself. */
   volatileDigest?: string;
@@ -353,7 +360,7 @@ export interface SendTurnInput {
       gatewayUrl?: string;
       control?: { url: string; token: string };
     };
-    /** Direct stdio connection to a Cua Driver MCP server (host, sandbox, or
+    /** Direct stdio connection to a CUA Driver MCP server (host, sandbox, or
      * VPS). `scope` is set only for the user's host desktop; isolated and
      * remote computers intentionally omit it so host-only approval rules
      * cannot change their semantics. */
@@ -394,12 +401,28 @@ export interface SendTurnInput {
   cwd?: string;
   /** True when the bot has autoApprove enabled by the user. */
   autoApprove?: boolean;
+  /** True when the bot has Bypass Permissions enabled by the user.  The
+   *  broker path reads the bot record itself (`autoVerdict`), so this exists
+   *  only for a driver that has a native skip-approvals mode and NO broker
+   *  path to carry the bot's choice (Antigravity's print mode).  It never
+   *  applies to a turn that controls This Mac, exactly as the broker's bypass
+   *  never answers a `local-computer` request, and unlike `autoApprove` it
+   *  applies to unattended turns too, as the broker's bypass does. */
+  bypassPermissions?: boolean;
   /** True when this turn began from an outside event (webhook, resource
    *  threshold) or was inherited from an already-unattended bot.  Auto Mode
    *  is something a person switched on for turns they are present for, so a
    *  driver that converts autoApprove into a permission bypass must treat an
    *  unattended turn as a hard stop (see auto-approve.ts). */
   unattended?: boolean;
+  /** True when the bot's auto-review is On, a reviewer is available, and a
+   *  person is present for this turn (server/auto-review.ts
+   *  `shouldHoldForReview`).  A driver that declares `asksWhenHeld` runs a
+   *  full-auto instance in its asking mode for this one turn, so each ask
+   *  reaches the reviewer before it runs.  Never set on an unattended turn:
+   *  an ask the reviewer turns down would wait on a card nobody is there to
+   *  answer. */
+  holdForReview?: boolean;
 }
 
 /** The decoded `arguments` object of one tool call.
@@ -573,6 +596,17 @@ export interface ProviderAdapter {
      * every helper event names the call that started it, so its steps nest
      * under that row.  Absent reads as `"none"`. */
     helpers?: HelperSupport;
+    /** Where auto-review can see this instance's tool calls
+     * (shared/auto-review.ts).  Decided from the instance's own config, so a
+     * full-auto instance that never asks says `"after"`.  Absent reads as
+     * `"none"`: an engine that does not say where its actions surface is never
+     * promised a review. */
+    reviewHook?: ReviewHook;
+    /** True when the driver honours `SendTurnInput.holdForReview`: a full-auto
+     * instance then runs that one turn in its asking mode, the same downgrade
+     * a host-control turn already gets, so every ask reaches the reviewer
+     * before it runs.  Meaningful only beside `reviewHook: "after"`. */
+    asksWhenHeld?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
@@ -740,7 +774,12 @@ export interface ProviderInstance {
   generateText?(prompt: string): Promise<string>;
   /** Isolated, tool-free permission review on this same provider. Kept
    * separate from generateText so the UI never infers a security capability
-   * from a generic helper that may expose prompts in argv or lack approvals. */
+   * from a generic helper that may expose prompts in argv or lack approvals.
+   * Implemented by Claude (a tool-free one-shot CLI with the prompt on
+   * stdin) and by the HTTP lanes (a chat-completions call with no `tools`,
+   * the prompt in the request body).  An engine without one is reviewed by
+   * the owner's fallback reviewer, never by an arbitrary sibling
+   * (server/auto-review.ts `reviewersFor`). */
   reviewPermission?(prompt: string, signal?: AbortSignal): Promise<string>;
   dispose(): Promise<void>;
 }

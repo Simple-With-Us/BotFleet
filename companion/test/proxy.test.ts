@@ -19,6 +19,14 @@ import type { CompanionEndpoint } from "../src/endpoints.ts";
 import { harnessReady } from "../../server/testing/harness-ready.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+/** What the stand-in harness saw of the phone's audio request. */
+interface SeenAudioRequest {
+  method?: string;
+  url?: string;
+  contentType?: string;
+  body: string;
+}
 const ROOT = join(HERE, "..", "..");
 
 /** Ports nothing is listening on.
@@ -101,6 +109,15 @@ const device = async (
     /* not JSON */
   }
   return { status: res.status, body, headers: res.headers };
+};
+
+/** A bot made straight on the harness, the way the computer's own route makes
+ * one, and its id.  `Response.json()` is `unknown` under the server tsconfig
+ * (no DOM lib), so the shape is stated once here. */
+const createHarnessBot = async (): Promise<string> => {
+  const created = await fetch(`${HARNESS}/api/bots`, { method: "POST" });
+  const made: { bot: { id: string } } = JSON.parse(await created.text());
+  return made.bot.id;
 };
 
 /** raw request with a chosen Host header — fetch will not let us set one */
@@ -332,7 +349,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     expect(safe.status).toBe(200);
     expect(safe.body.bot).toMatchObject({ title: "Paired title", notifications: false });
 
-    for (const field of ["autoApprove", "composio", "computers", "cwd", "userNotes"]) {
+    for (const field of ["composio", "userNotes"]) {
       const denied = await device("PATCH", `/api/bots/${botId}/profile`, {
         body: { title: "must not apply", [field]: true },
       });
@@ -342,6 +359,418 @@ describe("the sidecar in front of an unmodified harness", () => {
 
     const unchanged = await device("GET", "/api/bots");
     expect(unchanged.body.bots.find((bot: { id: string }) => bot.id === botId).title).toBe("Paired title");
+  });
+
+  it("lets the phone switch cloud and Local VM, and leaves This Mac to the computer", async () => {
+    const botId = await createHarnessBot();
+    const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
+    const botNow = async () =>
+      (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
+    const thisMacRefusal = "This Mac can only be turned on or off in BotFleet on your computer";
+    try {
+      // A new bot is on Auto (no list stored).  The phone cannot hand it This
+      // Mac from there either.
+      expect((await botNow()).computers ?? null).toBeNull();
+      const fromAuto = await profile({ computers: ["local"] });
+      expect(fromAuto.status).toBe(403);
+      expect(fromAuto.body.error).toBe(thisMacRefusal);
+
+      // Cloud and Local VM are the phone's to switch, through the same
+      // validation the desktop gets, and the stored bot carries the result.
+      const switched = await profile({ computers: ["cloud", "vm"] });
+      expect(switched.status).toBe(200);
+      expect(switched.body.bot.computers).toEqual(["cloud", "vm"]);
+      expect((await profile({ computers: ["vm", "vm"] })).body.bot.computers).toEqual(["vm"]);
+      expect((await profile({ computers: [] })).body.bot.computers).toEqual([]);
+      expect((await profile({ computers: ["laptop"] })).status).toBe(400);
+
+      // Handing a bot the person's real desktop is not.  Refused with the
+      // harness's own sentence, and nothing is written, including the
+      // unguarded field that rode along in the same request.
+      const added = await profile({ title: "must not apply", computers: ["vm", "local"] });
+      expect(added.status).toBe(403);
+      expect(added.body.error).toBe(thisMacRefusal);
+      const afterRefusal = await botNow();
+      expect(afterRefusal.computers).toEqual([]);
+      expect(afterRefusal.title).not.toBe("must not apply");
+
+      // The Mac grants it (through the desktop's own route), and from then
+      // on the phone keeps it while it switches the rest.  Taking it away is
+      // refused the same way.
+      const granted = await fetch(`${HARNESS}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ computers: ["vm", "local"] }),
+      });
+      expect(granted.status).toBe(200);
+      const kept = await profile({ computers: ["cloud", "vm", "local"] });
+      expect(kept.status).toBe(200);
+      expect(kept.body.bot.computers).toEqual(["cloud", "vm", "local"]);
+      const dropped = await profile({ computers: ["cloud", "vm"] });
+      expect(dropped.status).toBe(403);
+      expect(dropped.body.error).toBe(thisMacRefusal);
+      expect((await botNow()).computers).toEqual(["cloud", "vm", "local"]);
+    } finally {
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+    }
+  });
+
+  it("lets the phone set Auto Mode, Auto Review, peer-contact approval and Bypass Permissions, but not put a bot that can use This Mac in Auto Mode", async () => {
+    // Owner ruling 2026-10-09: bots get bypass permissions from the phone too.
+    // Host control stays the computer's: Auto Mode is the one switch that lets
+    // a click on the real desktop go unasked, and the warning dialog for that
+    // pair is the Mac's.  Bypass never answers a host-control request
+    // (server/auto-approve.ts), so it is the phone's on every bot.
+    const botId = await createHarnessBot();
+    const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
+    const botNow = async () =>
+      (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
+    const loopback = (body: Record<string, unknown>) =>
+      fetch(`${HARNESS}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const autoOnThisMac =
+      "Auto Mode can only be turned on in BotFleet on your computer for a bot that can use This Mac";
+    try {
+      // A new bot is on Auto, which on a Mac may reach the desktop.  Name its
+      // sandboxed computers so the answer does not depend on the machine
+      // running this test.
+      expect((await profile({ computers: ["cloud", "vm"] })).status).toBe(200);
+
+      const set = await profile({
+        autoApprove: true,
+        autoReview: "enforce",
+        approvePeerComms: true,
+        bypassPermissions: true,
+      });
+      expect(set.status).toBe(200);
+      expect(set.body.bot).toMatchObject({
+        autoApprove: true,
+        autoReview: "enforce",
+        approvePeerComms: true,
+        bypassPermissions: true,
+      });
+      expect(await botNow()).toMatchObject({ autoApprove: true, bypassPermissions: true, autoReview: "enforce" });
+
+      // The values are the harness's to validate, and a bad one writes nothing.
+      for (const bad of [{ autoApprove: "yes" }, { bypassPermissions: 1 }, { autoReview: "always" }, { approvePeerComms: null }]) {
+        const refused = await profile({ title: "must not apply", ...bad });
+        expect(refused.status, JSON.stringify(bad)).toBe(400);
+      }
+      expect((await botNow()).title).not.toBe("must not apply");
+
+      // Off is always the phone's to do.
+      const off = await profile({ autoApprove: false, bypassPermissions: false, autoReview: "off", approvePeerComms: false });
+      expect(off.status).toBe(200);
+      expect(await botNow()).toMatchObject({ autoApprove: false, bypassPermissions: false, autoReview: "off" });
+
+      // The computer hands the bot This Mac.  The phone still cannot put it in
+      // Auto Mode, and nothing in the same save is written.
+      expect((await loopback({ computers: ["vm", "local"] })).status).toBe(200);
+      const refused = await profile({ title: "must not apply", autoApprove: true, bypassPermissions: true });
+      expect(refused.status).toBe(403);
+      expect(refused.body.error).toBe(autoOnThisMac);
+      const afterRefusal = await botNow();
+      expect(afterRefusal.title).not.toBe("must not apply");
+      expect(afterRefusal.autoApprove).not.toBe(true);
+      expect(afterRefusal.bypassPermissions).not.toBe(true);
+      // Bypass, review mode and peer-contact approval do not let a click on
+      // the desktop go unasked, so they stay the phone's on this bot too.
+      const others = await profile({ bypassPermissions: true, autoReview: "shadow", approvePeerComms: true });
+      expect(others.status).toBe(200);
+      expect(others.body.bot).toMatchObject({ bypassPermissions: true, autoReview: "shadow", approvePeerComms: true });
+      // Bypass is not a stand-in for the Mac's warning: a bot in bypass is not
+      // "already in Auto Mode", so Auto Mode is still refused.
+      const stillRefused = await profile({ autoApprove: true });
+      expect(stillRefused.status).toBe(403);
+      expect(stillRefused.body.error).toBe(autoOnThisMac);
+      // Taking This Mac away is still refused, as before.
+      const dropped = await profile({ computers: ["vm"], bypassPermissions: false });
+      expect(dropped.status).toBe(403);
+      expect(dropped.body.error).toBe("This Mac can only be turned on or off in BotFleet on your computer");
+      expect((await botNow()).bypassPermissions).toBe(true);
+
+      // The phone-set bypass is not a stand-in on the computer's own route
+      // either: Auto Mode without the acknowledgement is refused there too,
+      // and the dialog's request, which carries it, is accepted.
+      const unacknowledged = await loopback({ autoApprove: true });
+      expect(unacknowledged.status).toBe(400);
+      expect(JSON.parse(await unacknowledged.text())).toEqual({
+        error: "Auto mode on this computer requires confirming the warning first (acknowledgeLocalAuto)",
+      });
+      expect((await botNow()).autoApprove).not.toBe(true);
+      // A rename or re-save that does not turn Auto Mode on is left alone.
+      expect((await loopback({ title: "renamed on the computer" })).status).toBe(200);
+
+      // The computer answers its own warning.  A bot it put in Auto Mode on
+      // This Mac keeps the phone's switches: re-saving is not a new pair.
+      const acknowledged = await loopback({ autoApprove: true, acknowledgeLocalAuto: true });
+      expect(acknowledged.status).toBe(200);
+      expect((await profile({ autoApprove: true })).status).toBe(200);
+      expect((await profile({ autoApprove: false, bypassPermissions: false })).status).toBe(200);
+      // Off, then on again, is a new pair: the Mac's dialog again.
+      const again = await profile({ autoApprove: true });
+      expect(again.status).toBe(403);
+      expect(again.body.error).toBe(autoOnThisMac);
+      expect((await profile({ bypassPermissions: true })).status).toBe(200);
+    } finally {
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+    }
+  });
+
+  it("lets the phone point a bot at a folder the computer already shares, and no other", async () => {
+    const shared = join(home, "projects", "shared");
+    const other = join(home, "projects", "other");
+    mkdirSync(join(shared, "sub"), { recursive: true });
+    mkdirSync(other, { recursive: true });
+    const made = createHarnessBot;
+    const lead = await made();
+    const botId = await made();
+    const profile = (body: Record<string, unknown>) => device("PATCH", `/api/bots/${botId}/profile`, { body });
+    const botNow = async () =>
+      (await device("GET", "/api/bots")).body.bots.find((bot: { id: string }) => bot.id === botId);
+    try {
+      // The computer (straight to the harness, no phone stamp) grants a folder.
+      const granted = await fetch(`${HARNESS}/api/bots/${lead}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cwd: shared }),
+      });
+      expect(granted.status).toBe(200);
+
+      // The phone may reuse it, or narrow to something inside it.
+      expect((await profile({ cwd: shared })).body.bot.cwd).toBe(shared);
+      expect((await profile({ cwd: join(shared, "sub") })).body.bot.cwd).toBe(join(shared, "sub"));
+
+      // It may not introduce a folder.  The 403 names the folder and where to
+      // choose it, and nothing rides through, including the field that was
+      // fine on its own.
+      const refused = await profile({ name: "must not apply", cwd: other });
+      expect(refused.status).toBe(403);
+      expect(refused.body.error).toContain(other);
+      expect(refused.body.error).toContain("pick it in BotFleet on your computer");
+      expect((await botNow()).cwd).toBe(join(shared, "sub"));
+      expect((await botNow()).name).not.toBe("must not apply");
+
+      // A folder that is not there is the same 400 the desktop gets, and
+      // clearing is always allowed.
+      expect((await profile({ cwd: join(home, "projects", "missing") })).status).toBe(400);
+      expect((await profile({ cwd: shared + "/../other" })).status).toBe(403);
+      const cleared = await profile({ cwd: "" });
+      expect(cleared.status).toBe(200);
+      expect((await botNow()).cwd ?? null).toBeNull();
+
+      // The desktop is at the keyboard, so the same route unconfined from
+      // loopback accepts a folder no bot holds yet.
+      const unconfined = await fetch(`${HARNESS}/api/bots/${botId}/profile`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cwd: other }),
+      });
+      expect(unconfined.status).toBe(200);
+    } finally {
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+      await fetch(`${HARNESS}/api/bots/${lead}`, { method: "DELETE" });
+    }
+  });
+
+  it("makes a room with its folder, bulletin and responder in one request, or makes nothing", async () => {
+    const shared = join(home, "projects", "room-shared");
+    const other = join(home, "projects", "room-other");
+    mkdirSync(shared, { recursive: true });
+    mkdirSync(other, { recursive: true });
+    const botId = await createHarnessBot();
+    const roomCount = async () => Number((await device("GET", "/api/bots")).body.groups.length);
+    let roomId: string | undefined;
+    try {
+      const grant = await fetch(`${HARNESS}/api/bots/${botId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cwd: shared }),
+      });
+      expect(grant.status).toBe(200);
+      const before = await roomCount();
+
+      // Each refusal leaves the fleet as it was: no half-made room.
+      const outside = await device("POST", "/api/groups", {
+        body: { memberIds: [botId], name: "Refused", cwd: other, bulletin: "Ship it" },
+      });
+      expect(outside.status).toBe(403);
+      expect(outside.body.error).toContain("pick it in BotFleet on your computer");
+      const badResponder = await device("POST", "/api/groups", {
+        body: { memberIds: [botId], defaultResponder: { kind: "member", botId: "not-a-bot" } },
+      });
+      expect(badResponder.status).toBe(400);
+      const longBulletin = await device("POST", "/api/groups", {
+        body: { memberIds: [botId], bulletin: "x".repeat(12_001) },
+      });
+      expect(longBulletin.status).toBe(400);
+      const missing = await device("POST", "/api/groups", {
+        body: { memberIds: [botId], cwd: join(home, "projects", "missing") },
+      });
+      expect(missing.status).toBe(400);
+      expect(await roomCount()).toBe(before);
+
+      const made = await device("POST", "/api/groups", {
+        body: {
+          memberIds: [botId],
+          name: "Planning",
+          cwd: shared,
+          bulletin: "Ship it",
+          defaultResponder: { kind: "mentions" },
+        },
+      });
+      expect(made.status).toBe(201);
+      roomId = made.body.group.id;
+      expect(made.body.group).toMatchObject({
+        name: "Planning",
+        cwd: shared,
+        bulletin: "Ship it",
+        defaultResponder: { kind: "mentions" },
+      });
+      expect(await roomCount()).toBe(before + 1);
+
+      // A room made with none of that is the room it always was.
+      const plain = await device("POST", "/api/groups", { body: { memberIds: [botId] } });
+      expect(plain.status).toBe(201);
+      expect(plain.body.group.cwd ?? null).toBeNull();
+      await fetch(`${HARNESS}/api/groups/${plain.body.group.id}`, { method: "DELETE" });
+    } finally {
+      if (roomId) await fetch(`${HARNESS}/api/groups/${roomId}`, { method: "DELETE" });
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+    }
+  });
+
+  it("lets the phone set the tool-round budget", async () => {
+    const botId = await createHarnessBot();
+    try {
+      const set = await device("PATCH", `/api/bots/${botId}/profile`, { body: { maxToolRounds: 40 } });
+      expect(set.status).toBe(200);
+      expect(set.body.bot.maxToolRounds).toBe(40);
+      const cleared = await device("PATCH", `/api/bots/${botId}/profile`, { body: { maxToolRounds: null } });
+      expect(cleared.status).toBe(200);
+      expect(cleared.body.bot.maxToolRounds ?? null).toBeNull();
+    } finally {
+      await fetch(`${HARNESS}/api/bots/${botId}`, { method: "DELETE" });
+    }
+  });
+
+  it("lets the phone set its own voice without wiping the Mac's", async () => {
+    const fleet = await device("GET", "/api/bots");
+    const botId = fleet.body.bots[0].id;
+    try {
+      // The Mac (straight to the harness) picks a Personal Voice for itself.
+      const mac = await fetch(`${HARNESS}/api/bots/${botId}/profile`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ voices: { mac: "personal:mac-voice" } }),
+      });
+      expect(mac.status).toBe(200);
+
+      // The phone sets only its own device through the sidecar.
+      const phone = await device("PATCH", `/api/bots/${botId}/profile`, {
+        body: { voices: { iphone: "English_Graceful_Lady" } },
+      });
+      expect(phone.status).toBe(200);
+      expect(phone.body.bot.voices).toEqual({ mac: "personal:mac-voice", iphone: "English_Graceful_Lady" });
+
+      const malformed = await device("PATCH", `/api/bots/${botId}/profile`, { body: { voices: { watch: "vx" } } });
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error).toBe("voices only accepts mac and iphone, not watch");
+
+      const cleared = await device("PATCH", `/api/bots/${botId}/profile`, { body: { voices: null } });
+      expect(cleared.status).toBe(200);
+      // null on the wire, so a client merging bot frames drops its stale copy
+      expect(cleared.body.bot.voices).toBeNull();
+    } finally {
+      await device("PATCH", `/api/bots/${botId}/profile`, { body: { voices: null } });
+    }
+  });
+
+  it("carries a clip that is not ready yet back to the phone as retryable", async () => {
+    let seenUrl = "";
+    const clipHarness = createServer((req, res) => {
+      seenUrl = req.url ?? "";
+      res.writeHead(425, { "content-type": "application/json", "retry-after": "1", "cache-control": "no-store" });
+      res.end(JSON.stringify({ error: "This voice clip is still being prepared.", retryable: true, ready: 1, total: 3 }));
+    });
+    await new Promise<void>((resolve) => clipHarness.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
+    const clipHarnessPort = (clipHarness.address() as { port: number }).port;
+    const clipProxy = createServer(createProxyHandler({
+      harnessPort: clipHarnessPort,
+      authenticate: () => ({ id: "phone-clip", cloudDesktopAccess: false }),
+      redeem: () => ({ error: "not pairing" }),
+      serverName: () => "Test computer",
+    }));
+    await new Promise<void>((resolve) => clipProxy.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
+    const clipProxyPort = (clipProxy.address() as { port: number }).port;
+    try {
+      const response = await fetch(`http://127.0.0.1:${clipProxyPort}/api/threads/th_1/messages/msg_1/audio/1?device=iphone`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(response.status).toBe(425);
+      expect(response.headers.get("retry-after")).toBe("1");
+      expect(await response.json()).toMatchObject({ retryable: true, ready: 1, total: 3 });
+      // The device query reaches the harness intact.
+      expect(seenUrl).toBe("/api/threads/th_1/messages/msg_1/audio/1?device=iphone");
+    } finally {
+      await new Promise<void>((resolve) => clipProxy.close(() => resolve()));
+      await new Promise<void>((resolve) => clipHarness.close(() => resolve()));
+    }
+  });
+
+  it("carries the phone's audio request body to the harness intact", async () => {
+    // The iPhone names its device and asks for progressive clips in the
+    // POST body.  Dropped on the way, the harness would read `{}`, speak the
+    // shared voice, and block on every clip again, with nothing failing.
+    let seen: SeenAudioRequest = { body: "" };
+    const audioHarness = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        seen = {
+          method: req.method,
+          url: req.url,
+          contentType: req.headers["content-type"],
+          body: Buffer.concat(chunks).toString("utf8"),
+        };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ audio: [], voiceText: "Hi.", utterances: ["Hi."], total: 1, complete: false, voice: "vx" }));
+      });
+    });
+    await new Promise<void>((resolve) => audioHarness.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
+    const audioHarnessPort = (audioHarness.address() as { port: number }).port;
+    const audioProxy = createServer(createProxyHandler({
+      harnessPort: audioHarnessPort,
+      authenticate: () => ({ id: "phone-audio", cloudDesktopAccess: false }),
+      redeem: () => ({ error: "not pairing" }),
+      serverName: () => "Test computer",
+    }));
+    await new Promise<void>((resolve) => audioProxy.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a server listening on a TCP port reports an AddressInfo, not a pipe name.
+    const audioProxyPort = (audioProxy.address() as { port: number }).port;
+    try {
+      const response = await fetch(`http://127.0.0.1:${audioProxyPort}/api/threads/th_1/messages/msg_1/audio`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ device: "iphone", progressive: true }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ total: 1, complete: false, voice: "vx" });
+      expect(seen.method).toBe("POST");
+      expect(seen.url).toBe("/api/threads/th_1/messages/msg_1/audio");
+      // The harness 415s a JSON body without its content type.
+      expect(seen.contentType).toBe("application/json");
+      expect(JSON.parse(seen.body)).toEqual({ device: "iphone", progressive: true });
+    } finally {
+      await new Promise<void>((resolve) => audioProxy.close(() => resolve()));
+      await new Promise<void>((resolve) => audioHarness.close(() => resolve()));
+    }
   });
 
   it("rejects non-object profile bodies at the sidecar boundary", async () => {

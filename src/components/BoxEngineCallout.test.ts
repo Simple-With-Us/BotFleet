@@ -29,7 +29,7 @@ function engineBox(src: string, needle: string): string {
 }
 
 /** A plain space between sentences collapses to one under HTML whitespace
- * rules, so every boundary must carry the {"  "} marker. */
+ * rules, so every boundary must carry the {"\u00a0 "} marker. */
 function expectNoCollapsingSentenceGaps(box: string): void {
   const NBSP_MARKER = '{"  "}';
   for (const m of box.matchAll(/[.;:]\s+([A-Z])/g)) {

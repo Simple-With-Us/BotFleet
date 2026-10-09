@@ -1,4 +1,10 @@
+import { mergeBotVoices, type BotVoices } from "../../shared/bot-voice";
 import type { Bot, BotAnnouncement } from "./store";
+
+/** A `voices` edit as the desktop sends it: only the device being changed.
+ * `null` (or "") clears that device.  The top-level `voices: null` clears
+ * both devices, so the desktop never sends it. */
+export type DeviceVoicesPatch = { mac?: string | null; iphone?: string | null };
 
 /** Every field written through the desktop's broad bot PATCH boundary. */
 export type BotUpdatePatch = Partial<
@@ -24,6 +30,7 @@ export type BotUpdatePatch = Partial<
     | "voiceSummaryMode"
     | "pinned"
     | "hidden"
+    | "off"
     | "section"
     | "pinnedMessageId"
     | "chiefOfStaff"
@@ -33,6 +40,9 @@ export type BotUpdatePatch = Partial<
     | "unread"
   >
 > & {
+  /** Per-device voice overrides.  Merged per device on every path, never
+   * replaced wholesale, so a Mac edit cannot drop the iPhone's value. */
+  voices?: DeviceVoicesPatch;
   /** Rides the PATCH body only: the server's proof that the local-auto
    * warning dialog was shown (see server/index.ts's consent gate). It must
    * reach the wire inside the coalesced body and must never fold into bot
@@ -84,6 +94,28 @@ const stateOverlay = (patch: BotUpdatePatch): BotUpdatePatch => {
   const { acknowledgeLocalAuto: _ack, ...fields } = patch;
   return fields;
 };
+
+/** Coalesce two patches.  Every field but `voices` is last-write-wins;
+ * `voices` merges per device, so a Mac edit followed by an iPhone edit inside
+ * one debounce window sends both. */
+export function mergeBotPatches(earlier: BotUpdatePatch, later: BotUpdatePatch): BotUpdatePatch {
+  const merged = { ...earlier, ...later };
+  if (earlier.voices && later.voices) merged.voices = { ...earlier.voices, ...later.voices };
+  return merged;
+}
+
+/** Fold an optimistic patch into a bot.  `voices` is applied per device
+ * (the same rule as the harness, shared/bot-voice.ts), so the device the
+ * patch does not name keeps its stored value. */
+export function applyBotPatch<T extends { voices?: BotVoices | null }>(bot: T, patch: BotUpdatePatch): T {
+  const { voices, ...rest } = stateOverlay(patch);
+  // SAFETY: `rest` holds only Bot fields from BotUpdatePatch (the consent
+  // flag and `voices` are removed above), so spreading it over a Bot-shaped
+  // T keeps T's shape; `voices` is then set to its merged BotVoices value.
+  const next = { ...bot, ...rest } as T;
+  if (voices !== undefined) next.voices = mergeBotVoices(bot.voices, voices) ?? null;
+  return next;
+}
 
 /**
  * A per-bot mutation lane: edits debounce together, requests never overtake
@@ -168,7 +200,7 @@ export function createBotPatchQueue(options: BotPatchQueueOptions): BotPatchQueu
         idleWaiters: [],
       };
       entries.set(botId, entry);
-      entry.pending = { ...entry.pending, ...patch };
+      entry.pending = mergeBotPatches(entry.pending, patch);
       schedule(entry);
     },
 
@@ -187,7 +219,7 @@ export function createBotPatchQueue(options: BotPatchQueueOptions): BotPatchQueu
 
     overlayFor(botId) {
       const entry = entries.get(botId);
-      return entry ? stateOverlay({ ...entry.inFlight, ...entry.pending }) : {};
+      return entry ? stateOverlay(mergeBotPatches(entry.inFlight, entry.pending)) : {};
     },
 
     cancel(botId) {

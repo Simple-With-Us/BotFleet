@@ -130,7 +130,7 @@ describe("buildMcpServers", () => {
     });
   });
 
-  it("passes a local computer (Cua/VPS) through as a direct stdio server", () => {
+  it("passes a local computer (CUA/VPS) through as a direct stdio server", () => {
     const servers = buildMcpServers({
       threadId: "t",
       text: "hi",
@@ -412,6 +412,12 @@ describe("PiDriver turns (fake CLI)", () => {
     await create();
     expect(instance.adapter.capabilities.images).toBe(true);
     expect(instance.adapter.capabilities.effortLevels).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
+  });
+
+  it("tells auto-review it can only watch: pi runs its own tools without a card", async () => {
+    await create();
+    expect(instance.adapter.capabilities.reviewHook).toBe("after");
+    expect(instance.adapter.capabilities.asksWhenHeld).toBeUndefined();
   });
 
   it("declares the shared-memory mount the dispatcher gates on", async () => {

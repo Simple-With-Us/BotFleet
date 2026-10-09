@@ -1,7 +1,8 @@
 import { track } from "@/lib/analytics";
 import {
   availableLabel,
-  installBlockedBusy,
+  installPausesWork,
+  PAUSES_WORK_COPY,
   installBlockedReason,
   installBlockedReasonDetail,
   mayUseLegacyLocalUpdate,
@@ -44,6 +45,7 @@ import {
   Sparkles,
   Settings,
   Puzzle,
+  ToyBrick,
   Trash2,
   Users,
   X,
@@ -61,6 +63,7 @@ import {
 } from "@/lib/thread-drag";
 
 import { BotAvatar, InitialsAvatar } from "./Avatar";
+import { BotOffBadge } from "./BotOffBadge";
 import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
 import { botActivityLocation, botStatusText, botWaitReason } from "@/lib/sidebar-activity";
@@ -185,20 +188,21 @@ function UpdateButton() {
     // change, so it read as dead.  It says why instead, and stays down.
     const blockedReason = installBlockedReason(harnessStatus);
     const blockedReasonDetail = installBlockedReasonDetail(harnessStatus);
-    const isBusyBlocked = installBlockedBusy(harnessStatus);
-    const isBlocked = blockedReason !== null && !isBusyBlocked;
+    const pausesWork = installPausesWork(harnessStatus);
+    const isBlocked = blockedReason !== null;
     const label = harnessRunning
       ? runningLabel(harnessRunning)
       : harnessAvailable
-        ? `${availableLabel(harnessStatus)} — ${isBusyBlocked ? "pause & install" : (blockedReason ?? "install")}`
+        ? `${availableLabel(harnessStatus)} — ${blockedReason ?? (pausesWork ? "pause & install" : "install")}`
         : upToDate
           ? "You're up to date"
           : "Check for Updates";
     // The harness's own diagnostic sentence behind a mapped reason, for the
     // hover only — the label above stays short.  Falls back to the label
     // itself when there is nothing extra to say.
-    const tooltip = harnessAvailable && (isBusyBlocked ? "Active work will pause and resume after update" : blockedReasonDetail)
-      ? `${availableLabel(harnessStatus)} — ${isBusyBlocked ? "Active work will pause and resume after update" : blockedReasonDetail}`
+    const tooltipReason = blockedReasonDetail ?? (pausesWork ? PAUSES_WORK_COPY : null);
+    const tooltip = harnessAvailable && tooltipReason
+      ? `${availableLabel(harnessStatus)} — ${tooltipReason}`
       : label;
     return (
       // The title rides on the wrapper: a disabled button is not hovered, so
@@ -207,7 +211,7 @@ function UpdateButton() {
         <button
           onClick={() => {
             if (harnessRunning) return;
-            if (harnessAvailable) return void local.install({ force: true });
+            if (harnessAvailable) return void local.install();
             setCheckedAt(Date.now());
             void local.check();
           }}
@@ -1848,7 +1852,7 @@ export function BotListItem({
   );
   const body = (
     <>
-      <div className="shrink-0 pointer-events-none relative">
+      <div className="shrink-0 pointer-events-none relative data-[off=true]:opacity-50 data-[off=true]:grayscale" data-off={bot.off === true ? "true" : undefined}>
         <BotAvatar
           bot={bot}
           state={stateForBot({ ...bot, messages: visible })}
@@ -1861,6 +1865,7 @@ export function BotListItem({
           // decorative; busy/unread/motion are the real signals).
           animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
         />
+        {iconOnly && bot.off === true && <BotOffBadge compact className="absolute -bottom-1 -right-1" />}
         {iconOnly && (
           hasError ? (
             <span
@@ -1907,6 +1912,7 @@ export function BotListItem({
                 </span>
               );
             })()}
+            {bot.off === true && <BotOffBadge className="ml-1" />}
           </span>
           {selected && activityAt > 0 && !renaming && (
             <span className="shrink-0 text-xs text-ink-secondary transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
@@ -3126,6 +3132,15 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         >
           <Puzzle size={20} className="text-ink-secondary" />
           <span className={cn("text-[14px] text-ink truncate", density === "icons" && "hidden")} title="Connected Apps via Composio">Connected Apps via Composio</span>
+        </button>
+        <button
+          onClick={() => dispatch({ type: "togglePluginsManager", open: true })}
+          className={cn("flex min-h-10 w-full items-center rounded-xl py-2 text-left hover:bg-raised/50", density === "icons" ? "justify-center px-2" : "gap-3 px-3")}
+          aria-label={density === "icons" ? "Drop-in plugins" : undefined}
+          title={density === "icons" ? "Drop-in plugins" : undefined}
+        >
+          <ToyBrick size={20} className="text-ink-secondary" />
+          <span className={cn("text-[14px] text-ink truncate", density === "icons" && "hidden")} title="Drop-in plugins">Plugins</span>
         </button>
         {density === "icons" && (
           <SidebarPhoneButton

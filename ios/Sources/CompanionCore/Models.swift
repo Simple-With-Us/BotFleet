@@ -323,11 +323,20 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var busy: Bool?
     public var pinned: Bool?
     public var hidden: Bool?
+    /// The bot's On/Off switch (`shared/bot-power.ts`).  True means Off:
+    /// nothing new starts for it, but its chat stays readable and a turn
+    /// already running finishes.  Absent (older harnesses included) or false
+    /// means on.  The harness sends an explicit `false` after turning it on.
+    public var off: Bool?
     public var chiefOfStaff: Bool?
     public var approvePeerComms: Bool?
     public var section: String?
     public var autoApprove: Bool?
     public var autoReview: String?
+    /// Auto-answers every request the engine raises, guards included, except
+    /// ones that control This Mac (`server/auto-approve.ts`).  Nil on a
+    /// harness that predates it, which reads as off.
+    public var bypassPermissions: Bool?
     public var alwaysAllow: [String]?
     public var composio: Bool?
     /// Which computers this bot may run on: "local", "cloud", and/or "vm".
@@ -338,19 +347,33 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     /// the user's own server, which has no interactive desktop to offer a
     /// phone.
     public var cloudBackend: String?
+    /// The backend this bot really uses once the workspace default has filled
+    /// in for an unpinned one.  `cloudBackend` stays the raw stored value; this
+    /// is the answer the join route gives.  Absent on a harness that predates
+    /// it, where `cloudDesktopAvailability` falls back to `cloudBackend`.
+    public var effectiveCloudBackend: String?
     public var autoStartVps: Bool?
     public var cwd: String?
     public var extraCwds: [String]?
     public var userNotes: String?
     public var speakReplies: Bool?
     public var speechDevices: [String]?
+    /// The shared voice.  Read it through `voice(for:)`, which applies the
+    /// per-device override in `voices`.
     public var voice: String?
+    /// Per-device overrides (`shared/bot-voice.ts`).  Nil on a harness that
+    /// predates them, and on the wire as `null` when neither device has one.
+    public var voices: BotVoices? = nil
     public var mascotExpression: String?
     public var tasks: [BotTask]?
     public var messages: [Message]?
     public var activeLeafId: String?
     /// Paged responses only: there is more transcript above what you got.
     public var hasMore: Bool?
+
+    /// Whether this bot is switched Off.  Total over a missing field, so a
+    /// payload from an older harness reads as on.
+    public var isOff: Bool { off == true }
 }
 
 public enum AvatarCrop: String, Codable, CaseIterable, Hashable, Sendable {
@@ -656,6 +679,16 @@ public struct InstanceCapabilities: Codable, Hashable, Sendable {
     public var effortLevels: [String]?
     /// True when this engine runs the harness HTTP tool loop.
     public var toolLoop: Bool? = nil
+    /// True when this engine can answer a bounded review prompt, which is
+    /// what Auto Review needs.  Nil means the computer did not say.
+    public var approvalReview: Bool? = nil
+    /// True when this engine can contact other bots.  Nil means the computer
+    /// did not say.
+    public var agentsMcp: Bool? = nil
+    /// What a bot's Bypass Permissions switch does on this engine: "asks",
+    /// "native" or "none" (`shared/bypass-coverage.ts`).  Read it through
+    /// `BypassCoverage(wire:)`; nil is a computer that predates it.
+    public var bypassCoverage: String? = nil
 }
 
 public struct Instance: Codable, Hashable, Identifiable, Sendable {
@@ -750,11 +783,30 @@ public enum VoiceProvider: Hashable, Sendable {
     case unknown
 }
 
+/// One entry of the workspace pronunciation list (`shared/pronunciations.ts`):
+/// a term the voice keeps saying wrong, and how to say it.
+public struct Pronunciation: Codable, Hashable, Sendable, Identifiable {
+    public var term: String
+    public var say: String
+
+    public var id: String { term.lowercased() }
+
+    public init(term: String, say: String) {
+        self.term = term
+        self.say = say
+    }
+}
+
 public struct ConfigFlag: Codable, Hashable, Sendable {
     public var configured: Bool
     public var apiKeyConfigured: Bool?
     public var ready: Bool?
+    /// On the `tts` section: the workspace default voice id, what every bot
+    /// without a voice of its own speaks with.  Empty or absent is none.
     public var voice: String?
+    /// On the `tts` section: the pronunciation list in force, the seeded
+    /// defaults included.  Absent from a computer older than the list.
+    public var pronunciations: [Pronunciation]?
     /// The voice engine, absent on a computer that predates the choice. Read
     /// it through `ConfigStatus.voiceProvider`, which applies the server's own
     /// fallback; nothing should compare this string directly.
@@ -862,6 +914,13 @@ public struct ConfigStatus: Codable, Sendable {
         !(tts?.voice?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
+    /// The workspace default voice id, or "" when none is picked.
+    public var workspaceDefaultVoice: String { hasWorkspaceDefaultVoice ? (tts?.voice ?? "") : "" }
+
+    /// The pronunciation list in force, or nil from a computer that predates
+    /// it (the list cannot be edited there).
+    public var pronunciations: [Pronunciation]? { tts?.pronunciations }
+
     public func canSpeak(agentVoice: String?) -> Bool {
         if PersonalVoiceContract.isPersonalVoice(agentVoice) {
             return true
@@ -898,6 +957,9 @@ public struct BotProfilePatch: Encodable, Sendable {
     public var avatarUrl: AvatarURL?
     public var avatarCrop: AvatarCrop?
     public var voice: String?
+    /// Per-device voice overrides.  Only the device keys it carries are sent;
+    /// the type cannot express `voices: null`, which would clear both.
+    public var voices: VoicesPatch?
     public var speakReplies: Bool?
     public var speechDevices: [String]?
     public var modelSelection: ModelSelection?
@@ -924,15 +986,63 @@ public struct BotProfilePatch: Encodable, Sendable {
         case clear
     }
 
+    /// The execution policy, which the owner put on the phone on 2026-10-09
+    /// (`companion/src/routes.ts`; #323 had kept it on the computer).  Each is
+    /// sent only when the person changed it.  The computer still refuses to
+    /// turn `autoApprove` or `bypassPermissions` ON for a bot that can use This
+    /// Mac (a 403 with its own sentence), so the sheet does not offer that.
     public var autoApprove: Bool?
-    public var autoReview: String?
+    public var autoReview: AutoReviewMode?
     public var approvePeerComms: Bool?
+    public var bypassPermissions: Bool?
+    /// `BotComputers.updated` builds this: the sandboxed destinations only,
+    /// with This Mac carried through as the computer has it.
     public var computers: [String]?
+    /// A folder on the computer.  The harness confines it from a phone to
+    /// folders a bot or room there already uses, and answers 403 otherwise.
     public var cwd: CwdString?
+    /// The On/Off switch.  `nil` leaves it alone, like every other field, so a
+    /// profile save that never touched it cannot flip a bot another device just
+    /// turned off.
+    public var off: Bool?
 
     public enum CwdString: Equatable, Sendable {
         case set(String)
         case clear
+    }
+
+    /// One device's voice override: a voice id, or `.clear` (JSON null) to go
+    /// back to the bot's shared voice.  A device left nil is not sent.
+    public struct VoicesPatch: Equatable, Sendable {
+        public enum Value: Equatable, Sendable {
+            case set(String)
+            case clear
+        }
+
+        public var mac: Value?
+        public var iphone: Value?
+
+        public init(mac: Value? = nil, iphone: Value? = nil) {
+            self.mac = mac
+            self.iphone = iphone
+        }
+
+        public var isEmpty: Bool { mac == nil && iphone == nil }
+
+        public subscript(device: SpeechDevice) -> Value? {
+            get {
+                switch device {
+                case .mac: return mac
+                case .iphone: return iphone
+                }
+            }
+            set {
+                switch device {
+                case .mac: mac = newValue
+                case .iphone: iphone = newValue
+                }
+            }
+        }
     }
 
     public init(
@@ -943,16 +1053,19 @@ public struct BotProfilePatch: Encodable, Sendable {
         avatarUrl: AvatarURL? = nil,
         avatarCrop: AvatarCrop? = nil,
         voice: String? = nil,
+        voices: VoicesPatch? = nil,
         speakReplies: Bool? = nil,
         speechDevices: [String]? = nil,
         modelSelection: ModelSelection? = nil,
         section: SectionString? = nil,
         maxToolRounds: MaxToolRounds? = nil,
         autoApprove: Bool? = nil,
-        autoReview: String? = nil,
+        autoReview: AutoReviewMode? = nil,
         approvePeerComms: Bool? = nil,
+        bypassPermissions: Bool? = nil,
         computers: [String]? = nil,
-        cwd: CwdString? = nil
+        cwd: CwdString? = nil,
+        off: Bool? = nil
     ) {
         self.name = name
         self.title = title
@@ -961,6 +1074,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.avatarUrl = avatarUrl
         self.avatarCrop = avatarCrop
         self.voice = voice
+        self.voices = voices
         self.speakReplies = speakReplies
         self.speechDevices = speechDevices
         self.modelSelection = modelSelection
@@ -969,13 +1083,17 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.autoApprove = autoApprove
         self.autoReview = autoReview
         self.approvePeerComms = approvePeerComms
+        self.bypassPermissions = bypassPermissions
         self.computers = computers
         self.cwd = cwd
+        self.off = off
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, computers, cwd
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, bypassPermissions, computers, cwd, off
     }
+
+    private enum DeviceKeys: String, CodingKey { case mac, iphone }
 
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
@@ -991,6 +1109,16 @@ public struct BotProfilePatch: Encodable, Sendable {
         }
         try values.encodeIfPresent(avatarCrop, forKey: .avatarCrop)
         try values.encodeIfPresent(voice, forKey: .voice)
+        if let voices, !voices.isEmpty {
+            var devices = values.nestedContainer(keyedBy: DeviceKeys.self, forKey: .voices)
+            for (device, key) in [(SpeechDevice.mac, DeviceKeys.mac), (.iphone, .iphone)] {
+                switch voices[device] {
+                case let .set(id)?: try devices.encode(id, forKey: key)
+                case .clear?: try devices.encodeNil(forKey: key)
+                case nil: break
+                }
+            }
+        }
         try values.encodeIfPresent(speakReplies, forKey: .speakReplies)
         try values.encodeIfPresent(speechDevices, forKey: .speechDevices)
         try values.encodeIfPresent(modelSelection, forKey: .modelSelection)
@@ -1007,9 +1135,11 @@ public struct BotProfilePatch: Encodable, Sendable {
             }
         }
         try values.encodeIfPresent(autoApprove, forKey: .autoApprove)
-        try values.encodeIfPresent(autoReview, forKey: .autoReview)
+        try values.encodeIfPresent(autoReview?.rawValue, forKey: .autoReview)
         try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
+        try values.encodeIfPresent(bypassPermissions, forKey: .bypassPermissions)
         try values.encodeIfPresent(computers, forKey: .computers)
+        try values.encodeIfPresent(off, forKey: .off)
         if let cwd {
             switch cwd {
             case let .set(val): try values.encode(val, forKey: .cwd)
@@ -1148,6 +1278,20 @@ public struct RoutineRun: Codable, Hashable, Identifiable, Sendable {
     public var error: String?
     public var createdAt: Double
     public var seenAt: Double?
+
+    /// Runs the harness will still stop.  Mirrors `cancelRun` in
+    /// server/routines.ts and the desktop's "Cancel Run" button, so a run
+    /// that has already settled never shows a button that answers 404.
+    public var canCancel: Bool {
+        status == "queued" || status == "running" || status == "waiting"
+    }
+
+    /// Failures that raise the badge until someone acknowledges them
+    /// (`ROUTINE_ATTENTION_STATUSES` in shared/routine-outcomes.ts), and have
+    /// not been yet.
+    public var needsAcknowledgement: Bool {
+        (status == "failed" || status == "missed") && seenAt == nil
+    }
 }
 
 public struct RoutineInput: Encodable, Sendable {
@@ -1417,6 +1561,7 @@ struct RoutinesResponse: Codable, Sendable {
 
 struct RoutineResponse: Codable, Sendable { var routine: Routine }
 struct RoutineRunResponse: Codable, Sendable { var run: RoutineRun }
+struct MarkedRoutineRunsResponse: Codable, Sendable { var acknowledged: Int?; var runs: [RoutineRun] }
 
 struct ConnectorAuthorizationResponse: Codable, Sendable {
     var url: String

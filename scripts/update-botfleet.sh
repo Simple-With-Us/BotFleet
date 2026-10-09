@@ -14,12 +14,14 @@
 # short circuit; the skip happens here so a second `ubf` an hour later is
 # sub-second instead of a 2-minute interruption.
 #
-# WARNING:  force is not only "reinstall anyway".  The updater also treats it as
-# permission to update while work is active: it skips the idle requirement and
-# POSTs /api/runtime/quiesce?force=true, which interrupts busy bots and running
-# or queued routines.  Their work is saved to pending-update-resume.json and
-# resumed after the update, and a live room turn still refuses the forced
-# update.  Do not use it casually while bots are working.
+# Busy bots never block an update.  The updater asks BotFleet to hold new work,
+# gives the work already running a 60-second grace (--grace SECONDS), then
+# interrupts what is left, saves it to pending-update-resume.json and resumes it
+# after the update.  A live room turn is never interrupted; the updater waits a
+# few more minutes for rooms to go quiet, then stops without updating.
+# --wait-for-idle [MINUTES] never interrupts: it waits (20 minutes by default)
+# and stops without updating if bots are still busy.  --force skips the grace
+# and interrupts at once, and reinstalls even when already current.
 set -euo pipefail
 
 # Extend PATH with every place node is commonly found on macOS (Homebrew Apple
@@ -124,7 +126,9 @@ fi
 #     writes and settles a run that never writes one as "never started", so
 #     that run must not end here without a record.
 # Anything not on this allowlist (including --help, --source, --stage) goes to
-# the updater unchanged.
+# the updater unchanged.  --grace SECONDS and --wait-for-idle [MINUTES] are on
+# it: how busy bots are treated says nothing about whether there is anything
+# new to install.
 UP_TO_DATE_SHORTCUT=1
 case "${BOTFLEET_UPDATE_TARGET:-origin/main}" in
   origin/main) ;;
@@ -132,6 +136,7 @@ case "${BOTFLEET_UPDATE_TARGET:-origin/main}" in
 esac
 SHORTCUT_ARG_INDEX=0
 EXPECT_SHORTCUT_TARGET=0
+EXPECT_SHORTCUT_VALUE=0
 for arg in "$@"; do
   SHORTCUT_ARG_INDEX=$((SHORTCUT_ARG_INDEX + 1))
   if [[ "$EXPECT_SHORTCUT_TARGET" == "1" ]]; then
@@ -139,16 +144,23 @@ for arg in "$@"; do
     [[ "$arg" == "origin/main" ]] || UP_TO_DATE_SHORTCUT=0
     continue
   fi
+  # How busy work is treated changes nothing about whether there is anything
+  # to install, so these keep the up-to-date shortcut.
+  if [[ "$EXPECT_SHORTCUT_VALUE" == "1" ]]; then
+    EXPECT_SHORTCUT_VALUE=0
+    [[ "$arg" =~ ^[0-9]+(\.[0-9]+)?$ ]] && continue
+  fi
   case "$arg" in
     update) [[ "$SHORTCUT_ARG_INDEX" == "1" ]] || UP_TO_DATE_SHORTCUT=0 ;;
-    --force|-f|--no-open|--target=origin/main) ;;
+    --force|-f|--no-open|--target=origin/main|--grace=*|--wait-for-idle=*) ;;
+    --grace|--wait-for-idle) EXPECT_SHORTCUT_VALUE=1 ;;
     --target) EXPECT_SHORTCUT_TARGET=1 ;;
     *) UP_TO_DATE_SHORTCUT=0 ;;
   esac
 done
 [[ "$EXPECT_SHORTCUT_TARGET" == "0" ]] || UP_TO_DATE_SHORTCUT=0
 if [[ "${BOTFLEET_FORCE:-}" == "1" ]]; then
-  echo "WARNING:  BOTFLEET_FORCE=1 - running updater even if $BOTFLEET_CHECKOUT is already at origin/main.  This also interrupts busy bots and routines (they resume after the update)."
+  echo "WARNING:  BOTFLEET_FORCE=1 - running updater even if $BOTFLEET_CHECKOUT is already at origin/main.  This also interrupts busy bots and routines at once, with no grace (they resume after the update)."
 elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
   if git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin main 2>/dev/null; then
     LOCAL_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse HEAD)

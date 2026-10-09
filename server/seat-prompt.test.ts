@@ -52,7 +52,7 @@ describe("fleet seat prompt composition", () => {
       expect(fleetSeatPromptsEnabled()).toBe(true);
       const part = fleetSeatPromptPart({ name: "BF-Grok" });
       expect(part?.seatId).toBe("grok");
-      expect(part?.text).toContain("fleet Slack coordination channel");
+      expect(part?.text).toContain("fleet Zulip coordination channel");
       for (const marker of FLEET_SHARED_RULE_MARKERS) {
         expect(countMarker(part!.text, marker)).toBe(1);
       }

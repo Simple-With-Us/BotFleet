@@ -10,6 +10,7 @@ import { unreadConversationCount } from "@/lib/unread";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatView } from "@/components/ChatView";
 import { GroupView } from "@/components/GroupView";
+import { DataFaultBanner } from "@/components/DataFaultBanner";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
@@ -33,6 +34,9 @@ const GroupSettingsPanel = lazy(() =>
 );
 const PluginsPanel = lazy(() =>
   import("@/components/PluginsPanel").then((m) => ({ default: m.PluginsPanel })),
+);
+const PluginsManagerView = lazy(() =>
+  import("@/components/PluginsManagerView").then((m) => ({ default: m.PluginsManagerView })),
 );
 const ComputerPanel = lazy(() =>
   import("@/components/ComputerPanel").then((m) => ({ default: m.ComputerPanel })),
@@ -348,6 +352,8 @@ function Shell() {
     <div className="flex h-full flex-col">
       {/* fixed-position popup, bottom-left — outside the layout flow */}
       <UpdateBanner />
+      {/* saved data that could not be used (set aside, never deleted); silent when there is none */}
+      <DataFaultBanner />
       {state.error && (
         <div
           role="alert"
@@ -562,6 +568,11 @@ function Shell() {
       {state.pluginsOpen && (
         <Suspense fallback={<PanelFallback />}>
           <PluginsPanel />
+        </Suspense>
+      )}
+      {state.pluginsManagerOpen && (
+        <Suspense fallback={<PanelFallback />}>
+          <PluginsManagerView onClose={() => dispatch({ type: "togglePluginsManager", open: false })} />
         </Suspense>
       )}
       {/* mounted after the modals: same z-50 tier, so DOM order keeps the

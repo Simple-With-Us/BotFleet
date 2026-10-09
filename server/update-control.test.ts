@@ -4,16 +4,17 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
 
 import {
   availableIsStale,
-  BUSY_REFUSAL,
   createUpdateControl,
   launchdJobIsAlive,
   launchPlanCommand,
   listLaunchJobCommand,
   parseProgressRecord,
+  type ProgressRecord,
+  runningFrom,
   pruneRunArtifacts,
   pruneUpdateStages,
   removeLaunchJobCommand,
@@ -203,6 +204,7 @@ describe("status", () => {
       canRun: false,
       reasons: ["Updating from this computer is macOS only."],
       codes: ["not-darwin"],
+      busy: false,
     });
 
     const noCheckout = rig();
@@ -250,6 +252,8 @@ describe("check", () => {
       sourceCommit: NEW_COMMIT,
       version: "1.0.31",
       aheadBy: 12,
+      // The distance is only meaningful alongside what it was measured from.
+      baselineCommit: INSTALLED_COMMIT,
       commits: [
         { sha: NEW_COMMIT, subject: "feat(engines): room turns on the HTTP lane" },
         { sha: "c".repeat(40), subject: "fix(usage): dual-window quota display" },
@@ -279,7 +283,7 @@ describe("check", () => {
 });
 
 describe("refusals", () => {
-  const capabilities: UpdateCapabilities = { canCheck: true, canRun: true, reasons: [], codes: [] };
+  const capabilities: UpdateCapabilities = { canCheck: true, canRun: true, reasons: [], codes: [], busy: false };
   const available = { sourceCommit: NEW_COMMIT, aheadBy: 3, commits: [] };
   const running = { runId: "run_one", startedAt: "", step: "Building", logTail: [] };
   const idle: RuntimeReadiness = { safeToRestart: true, activeWorkCount: 0 };
@@ -297,7 +301,9 @@ describe("refusals", () => {
   it("names the one blocking reason", () => {
     expect(ask({ running })).toBe("An update is already running.");
     expect(ask({
-      capabilities: { canCheck: false, canRun: false, reasons: ["Updating from this computer is macOS only."], codes: ["not-darwin"] },
+      capabilities: {
+        canCheck: false, canRun: false, reasons: ["Updating from this computer is macOS only."], codes: ["not-darwin"], busy: false,
+      },
     })).toBe("Updating from this computer is macOS only.");
     expect(ask({ dirty: true })).toContain("uncommitted changes");
     expect(ask({ available: null })).toBe("BotFleet is already on the newest build.");
@@ -312,7 +318,7 @@ describe("refusals", () => {
 
   it("calls an answer stale when it cannot describe anything newer", () => {
     const at = (iso: string) => iso;
-    const answer = { sourceCommit: NEW_COMMIT, aheadBy: 3, commits: [] };
+    const answer = { sourceCommit: NEW_COMMIT, aheadBy: 3, commits: [], baselineCommit: INSTALLED_COMMIT };
     const base = {
       available: answer,
       installedCommit: INSTALLED_COMMIT,
@@ -334,22 +340,56 @@ describe("refusals", () => {
     expect(availableIsStale({ ...base, checkedAt: "not a date" })).toBe(true);
   });
 
-  it("will not interrupt a turn, and force is the one thing that talks past it", () => {
-    expect(ask({ readiness: busy })).toBe(BUSY_REFUSAL);
+  it("refuses an answer counted from a commit that is no longer installed", () => {
+    // The 2026-10-08 incident.  A check ran against an OLD installed build and
+    // remembered `aheadBy: 125`; the Mac then installed and verified a newer
+    // build.  `installedAt` could not catch it because it dates the build
+    // manifest, and this bundle was packaged hours before it was installed — so
+    // the install boundary sat BEHIND the remembered answer and every timestamp
+    // comparison said "fresh".  The status route kept advertising 125 commits
+    // behind on a Mac four commits behind, until restart.
+    const stale = {
+      sourceCommit: "e".repeat(40),
+      aheadBy: 125,
+      commits: [],
+      baselineCommit: "a".repeat(40),
+    };
+    expect(availableIsStale({
+      available: stale,
+      installedCommit: "b".repeat(40),
+      checkedAt: "2026-10-09T02:18:46.983Z",
+      // The build predates the install, so time alone cannot refute it.
+      installedAt: "2026-10-08T18:25:02.000Z",
+    })).toBe(true);
+    // Same answer, same install — the baseline is what decides, not the clock.
+    expect(availableIsStale({
+      available: stale,
+      installedCommit: "a".repeat(40),
+      checkedAt: "2026-10-09T02:18:46.983Z",
+      installedAt: "2026-10-08T18:25:02.000Z",
+    })).toBe(false);
+    // An answer written before baselines were recorded cannot be placed either.
+    expect(availableIsStale({
+      available: { ...stale, baselineCommit: undefined },
+      installedCommit: "a".repeat(40),
+      checkedAt: "2026-10-09T02:18:46.983Z",
+      installedAt: "2026-10-08T18:25:02.000Z",
+    })).toBe(true);
+  });
+
+  it("never refuses because bots are working, forced or not", () => {
+    // The updater holds new work, gives the bots a grace, then pauses and
+    // resumes what is left (server/update-drain.ts): busy is not a blocker.
+    expect(ask({ readiness: busy })).toBeNull();
     expect(ask({ readiness: busy, force: true })).toBeNull();
-    // Busy closes canRun too, and forcing past busy must not then trip over
-    // the reason busy itself put in the list.
-    expect(ask({
-      readiness: busy,
-      capabilities: { canCheck: true, canRun: false, reasons: [BUSY_REFUSAL], codes: ["busy"] },
-      force: true,
-    })).toBeNull();
     // A structural reason still wins, forced or not.
-    expect(ask({
-      readiness: busy,
-      capabilities: { canCheck: true, canRun: false, reasons: [BUSY_REFUSAL, "The updater is not installed."], codes: ["busy", "updater-missing"] },
-      force: true,
-    })).toBe("The updater is not installed.");
+    for (const force of [false, true]) {
+      expect(ask({
+        readiness: busy,
+        capabilities: { canCheck: true, canRun: false, reasons: ["The updater is not installed."], codes: ["updater-missing"], busy: true },
+        force,
+      })).toBe("The updater is not installed.");
+    }
   });
 
   it("refuses to launch with nothing to install, and force overrides it", async () => {
@@ -374,24 +414,36 @@ describe("refusals", () => {
     expect(harness.launched).toHaveLength(0);
   });
 
-  it("refuses while a turn is in flight, and says so in the capabilities", async () => {
+  it("launches on a busy Mac and says it is busy without calling it a reason", async () => {
     const paths = rig();
     const harness = build(paths, { readiness: { safeToRestart: false, activeWorkCount: 3 } });
     const status = harness.control.status();
-    expect(status.capabilities.canRun).toBe(false);
-    expect(status.capabilities.reasons).toContain(BUSY_REFUSAL);
+    expect(status.capabilities.canRun).toBe(true);
+    expect(status.capabilities.busy).toBe(true);
+    expect(status.capabilities.reasons).toEqual([]);
+    expect(status.capabilities.codes).toEqual([]);
     expect(status.capabilities.canCheck).toBe(true);
-    // `codes` walks `reasons` in lockstep, so a client can match the busy
-    // refusal by code instead of comparing the sentence.
-    expect(status.capabilities.codes).toEqual(["busy"]);
-    const refused = await harness.control.start({ force: true });
-    // force is allowed past readiness; the refusal here is only that there is
-    // nothing newer, which proves readiness was not the blocker.
-    expect(refused.ok).toBe(true);
+    expect((await harness.control.start({ force: true })).ok).toBe(true);
 
-    const blocked = build(rig(), { readiness: { safeToRestart: false, activeWorkCount: 3 } });
-    expect(await blocked.control.start()).toMatchObject({ ok: false, error: BUSY_REFUSAL });
-    expect(blocked.launched).toHaveLength(0);
+    // An unforced start launches too: the updater gives busy bots a grace,
+    // then pauses and resumes them, and the launch carries no --force.
+    const unforced = build(rig(), {
+      readiness: { safeToRestart: false, activeWorkCount: 3 },
+      git: (args) => {
+        if (args[0] === "rev-parse") return ok(`${NEW_COMMIT}\n`);
+        if (args[0] === "rev-list") return ok("3\n");
+        if (args[0] === "log") return ok(`${NEW_COMMIT}${UNIT}feat: something newer`);
+        if (args[0] === "show") return ok(JSON.stringify({ version: "1.0.31" }));
+        // Not an ancestor of what is installed: there really is something newer.
+        if (args[0] === "merge-base") return fail();
+        return ok();
+      },
+    });
+    await unforced.control.check();
+    const started = await unforced.control.start();
+    expect(started.ok).toBe(true);
+    expect(unforced.launched).toHaveLength(1);
+    expect(JSON.stringify(unforced.launched[0])).not.toContain("--force");
   });
 
   it("takes the caller's readiness over its own when one is given", async () => {
@@ -515,7 +567,13 @@ describe("an unsuccessful run", () => {
     }));
     writeFileSync(join(paths.stateDirectory, "available.json"), JSON.stringify({
       checkedAt: "2026-09-13T12:00:00.000Z",
-      available: { sourceCommit: NEW_COMMIT, version: "1.0.31", aheadBy: 4, commits: [] },
+      available: {
+        sourceCommit: NEW_COMMIT,
+        version: "1.0.31",
+        aheadBy: 4,
+        commits: [],
+        baselineCommit: INSTALLED_COMMIT,
+      },
     }));
   };
 
@@ -915,6 +973,61 @@ describe("reading what another process wrote", () => {
       .toMatchObject({ progress: 1 });
   });
 
+  it("reads a well-formed record exactly, and lets one bad field cost only itself", () => {
+    // Kody 4226168326: the record crosses a trust boundary (another process
+    // writes it), so it is checked with a zod schema.  A valid record reads
+    // the same as before; a malformed optional field falls back alone.
+    const full = {
+      schemaVersion: 1,
+      runId: "run-1",
+      command: "apply",
+      pid: 4242,
+      startedAt: "2026-10-09T07:00:00.000Z",
+      updatedAt: "2026-10-09T07:01:00.000Z",
+      step: "fence",
+      detail: "Waiting for 2 bots to finish",
+      progress: 0.4,
+      targetCommit: "a".repeat(40),
+      receiptPath: "/tmp/receipt.json",
+      finishedAt: null,
+      outcome: null,
+      message: null,
+      rolledBack: false,
+    };
+    const { rolledBack: _ignored, ...expected } = full;
+    expect(parseProgressRecord(full)).toEqual(expected);
+    expect(parseProgressRecord({ ...full, outcome: "rolled-back", finishedAt: "2026-10-09T07:02:00.000Z", message: "Rolled back." }))
+      .toMatchObject({ outcome: "rolled-back", finishedAt: "2026-10-09T07:02:00.000Z", message: "Rolled back." });
+    // Each malformed optional field falls back to what an absent one reads as.
+    expect(parseProgressRecord({ ...full, pid: 1.5, command: 7, updatedAt: 3, step: false, progress: "0.4", targetCommit: 1 }))
+      .toMatchObject({ pid: 0, command: "update", updatedAt: full.startedAt, step: null, progress: null, targetCommit: null });
+    expect(parseProgressRecord({ ...full, progress: -2 })).toMatchObject({ progress: 0 });
+    // The identity fields are required.
+    expect(parseProgressRecord({ ...full, startedAt: 7 })).toBeNull();
+    expect(parseProgressRecord({ ...full, runId: 7 })).toBeNull();
+    expect(parseProgressRecord([full])).toBeNull();
+    // Kody 4228535404: the type is the schema's, so the two cannot drift.
+    const { updatedAt: _updatedAt, ...withoutUpdatedAt } = full;
+    expect(parseProgressRecord(withoutUpdatedAt)).toMatchObject({ updatedAt: full.startedAt });
+    expectTypeOf<ProgressRecord>().toHaveProperty("command").toEqualTypeOf<string>();
+    expectTypeOf<ProgressRecord>().toHaveProperty("pid").toEqualTypeOf<number>();
+    expectTypeOf<ProgressRecord>().toHaveProperty("updatedAt").toEqualTypeOf<string>();
+    expectTypeOf<ProgressRecord>().toHaveProperty("outcome").toEqualTypeOf<"verified" | "rolled-back" | "failed" | "refused" | null>();
+  });
+
+  it("passes a step's detail through to the running status, bounded", () => {
+    const record = parseProgressRecord({
+      schemaVersion: 1, runId: "x", startedAt: "t", step: "fence", detail: "  Waiting for 3 bots to finish  ",
+    });
+    expect(record).toMatchObject({ detail: "Waiting for 3 bots to finish" });
+    expect(runningFrom(record!, [])).toMatchObject({ step: "Holding new work", detail: "Waiting for 3 bots to finish" });
+    expect(parseProgressRecord({ schemaVersion: 1, runId: "x", startedAt: "t", detail: 7 })).toMatchObject({ detail: null });
+    expect(parseProgressRecord({ schemaVersion: 1, runId: "x", startedAt: "t", detail: "x".repeat(500) })?.detail)
+      .toHaveLength(200);
+    expect(runningFrom(parseProgressRecord({ schemaVersion: 1, runId: "x", startedAt: "t", step: "fence" })!, []))
+      .not.toHaveProperty("detail");
+  });
+
   it("names a step in words, and falls back to the raw name", () => {
     expect(stepLabel("installDependencies")).toBe("Installing dependencies");
     // Every step the updater can report needs a sentence, or the Mac and the
@@ -1122,13 +1235,13 @@ describe("a caller that holds an update admission of its own", () => {
 
     const uncorrected = await harness.control.check();
     expect(uncorrected.available?.sourceCommit).toBe(NEW_COMMIT);
-    expect(uncorrected.capabilities.canRun).toBe(false);
-    expect(uncorrected.capabilities.reasons).toContain(BUSY_REFUSAL);
+    expect(uncorrected.capabilities.canRun).toBe(true);
+    expect(uncorrected.capabilities.busy).toBe(true);
 
     const corrected = await harness.control.check({ readiness: IDLE });
     expect(corrected.available?.sourceCommit).toBe(NEW_COMMIT);
     expect(corrected.capabilities.canRun).toBe(true);
-    expect(corrected.capabilities.reasons).not.toContain(BUSY_REFUSAL);
+    expect(corrected.capabilities.busy).toBe(false);
     // And what every other client is told, not only the answer to this one.
     expect(harness.emitted.at(-1)?.capabilities.canRun).toBe(true);
   });
@@ -1148,7 +1261,7 @@ describe("a caller that holds an update admission of its own", () => {
     // busy is stored by the client, which then stops offering Install Update
     // until something unrelated refreshes it.
     expect(refused.status.capabilities.canRun).toBe(true);
-    expect(refused.status.capabilities.reasons).not.toContain(BUSY_REFUSAL);
+    expect(refused.status.capabilities.busy).toBe(false);
   });
 });
 

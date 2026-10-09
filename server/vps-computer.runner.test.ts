@@ -9,6 +9,7 @@ vi.mock("node:child_process", async () => ({
   spawn: spawnMock,
 }));
 
+import { CONTAINER_RUNTIME_DISABLED_ENV, CONTAINER_RUNTIME_DISABLED_MESSAGE } from "./container-runtime-guard.ts";
 import { defaultRunner } from "./vps-computer.ts";
 
 type FakeChild = EventEmitter & {
@@ -31,10 +32,23 @@ function fakeChild(): FakeChild {
 describe("default VPS command runner", () => {
   beforeEach(() => {
     spawnMock.mockReset();
+    // The suite runs with container runtimes switched off (server/testing/
+    // setup.ts).  The cases below drive the runner against a mocked spawn, so
+    // they turn the switch off for themselves; the kill-switch case turns it on.
+    vi.stubEnv(CONTAINER_RUNTIME_DISABLED_ENV, "0");
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
+  });
+
+  it("refuses to spawn docker while container runtimes are disabled", async () => {
+    vi.stubEnv(CONTAINER_RUNTIME_DISABLED_ENV, "1");
+    fakeChild();
+
+    await expect(defaultRunner(["-H", "ssh://some-vps", "info"])).rejects.toThrow(CONTAINER_RUNTIME_DISABLED_MESSAGE);
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   it("collects output and resolves after the child closes", async () => {

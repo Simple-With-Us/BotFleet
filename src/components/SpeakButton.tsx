@@ -1,15 +1,22 @@
 import { Loader2, Play, Square } from "lucide-react";
 
+import { voiceScriptKind } from "../../shared/voice-summary";
 import { speaker } from "@/lib/tts";
+import { speakButtonState } from "@/lib/tts/readiness";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { useStore } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
 
 /** Read one message aloud or replay existing audio. Hover-revealed beside the copy control, and it
  * becomes a stop button while this message is the one speaking — the same
  * button, because "play" and "stop" are the same intent twice.
  *
- * Without a key it stays visible on hover but disabled, saying what it needs. */
+ * The voice is this Mac's: the bot's Mac override, else its shared voice.
+ * A hosted voice needs a voice engine key; an Apple Personal Voice speaks
+ * on this Mac and needs only the Personal Voice capability.  Without what it
+ * needs the button stays visible on hover but disabled, saying what it needs.
+ * The rules are speakButtonState (src/lib/tts/readiness.ts). */
 export function SpeakButton({
   text,
   botId,
@@ -24,39 +31,39 @@ export function SpeakButton({
   messageId: string;
   threadId: string;
   hasAudio?: boolean;
+  /** The bot's voice as the caller knows it.  The store's copy of the bot,
+   * resolved for this Mac, wins when the bot is known. */
   voiceId?: string;
   className?: string;
 }) {
   const { state } = useStore();
+  const { capabilities } = useDesktopCapabilities();
   const speech = useSpeech();
-  const tts = state.config?.tts;
-  const configured = Boolean(tts?.configured);
-  const ready = hasAudio || (configured && Boolean(voiceId || tts?.voice));
-  const mine = speech.messageId === messageId && speech.status !== "idle";
-  const preparing = mine && speech.status === "preparing";
-
-  const label = hasAudio
-    ? (mine ? "Stop Audio" : "Play Audio")
-    : !configured
-      ? "Add a voice engine key in settings to play audio"
-      : !ready
-        ? "Pick a voice in settings to play audio"
-        : mine
-          ? "Stop Speaking"
-          : "Play (Speak Aloud)";
+  const owner = botId ? state.bots?.find((bot) => bot.id === botId) : undefined;
+  const { macVoice, ready, mine, preparing, failed, label } = speakButtonState({
+    owner,
+    voiceId,
+    tts: state.config?.tts,
+    personalVoiceAvailable: capabilities.dictation.personalVoice === true,
+    hasAudio,
+    messageId,
+    speech,
+  });
   return (
     <button
       onClick={() => {
         if (mine) return speaker.stop();
-        void speaker.speak(text, { botId, messageId, threadId, voiceId });
+        void speaker.speak(text, { botId, messageId, threadId, voiceId: macVoice, scriptKind: voiceScriptKind(owner) });
       }}
       disabled={!ready}
       aria-label={label}
       title={label}
       className={cn(
         "rounded-md p-1.5 text-ink-secondary transition-opacity hover:bg-raised hover:text-ink focus-visible:opacity-100 group-focus-within:opacity-100 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-ink-secondary",
-        // stays visible while speaking or when audio is already synthesized
-        mine || hasAudio ? "text-accent opacity-100" : "opacity-0 group-hover:opacity-100",
+        // stays visible while speaking, after a failure, or when audio is already synthesized
+        mine || hasAudio ? "text-accent opacity-100" : failed ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+        // the last attempt failed: the title says why
+        failed && !mine && "text-danger hover:text-danger",
         className,
       )}
     >

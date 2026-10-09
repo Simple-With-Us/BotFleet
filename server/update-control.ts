@@ -37,6 +37,7 @@ import { dirname, join, resolve, sep } from "node:path";
 // rather than a cosmetic bug — see scripts/stage-entries.mjs.
 import { stageIsPrunable } from "../scripts/stage-entries.mjs";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 
 export const UPDATE_PROGRESS_SCHEMA_VERSION = 1;
 export const UPDATE_LAUNCH_LABEL = "com.jay.botfleet-update";
@@ -51,6 +52,8 @@ const GAP = "\u00a0 ";
 const LOG_TAIL_LINES = 24;
 const LOG_TAIL_BYTES = 64 * 1024;
 const LOG_LINE_MAX = 400;
+/** A progress detail is one short line; anything longer is clipped. */
+const DETAIL_MAX = 200;
 /** Commit subjects shown in "what is new".  Beyond this the count carries it. */
 const MAX_LISTED_COMMITS = 20;
 /** A run with no progress file this long after launch never started. */
@@ -91,12 +94,33 @@ export interface UpdateAvailable {
   version?: string;
   aheadBy: number;
   commits: UpdateCommit[];
+  /** The INSTALLED commit this `aheadBy` was counted from.
+   *
+   *  `aheadBy` is a distance, so it means nothing without its baseline.  The
+   *  baseline used to be implied by the install's own timestamp, which cannot
+   *  survive an update: the replacement bundle's `build-identity.json` mtime
+   *  dates the BUILD, not the install, and a build staged hours before the
+   *  install left a remembered answer looking newer than the install it
+   *  predated.  The status route then served that answer forever — a Mac that
+   *  had just installed and verified the newest build still advertised "125
+   *  commits behind" when the true distance was 4.
+   *
+   *  Recording the baseline makes staleness a question of identity instead of
+   *  clock comparison: an answer counted from any commit other than the one
+   *  installed now describes a Mac that no longer exists.  Answers written
+   *  before this field existed have no baseline and are refused as
+   *  unplaceable, which is the same treatment an unparseable `checkedAt`
+   *  already gets below. */
+  baselineCommit?: string;
 }
 
 export interface UpdateRunning {
   runId: string;
   startedAt: string;
   step: string;
+  /** What the step is waiting on, when the updater says ("Waiting for 3 bots
+   * to finish" while it drains).  Absent the rest of the time. */
+  detail?: string;
   progress?: number;
   logTail: string[];
 }
@@ -122,8 +146,7 @@ export type UpdateCapabilityCode =
   | "checkout-missing"
   | "updater-missing"
   | "updater-outdated"
-  | "already-running"
-  | "busy";
+  | "already-running";
 
 export interface UpdateCapabilities {
   canCheck: boolean;
@@ -131,6 +154,11 @@ export interface UpdateCapabilities {
   reasons: string[];
   /** One code per `reasons` entry, same order and length. */
   codes: UpdateCapabilityCode[];
+  /** Bots are working right now.  Not a reason the update cannot run: the
+   * updater holds new work, gives this work a short grace, then pauses what
+   * is left and resumes it after the restart (server/update-drain.ts), so
+   * surfaces only say that will happen. */
+  busy: boolean;
 }
 
 /** What `currentRuntimeReadiness()` in the harness reports: whether any turn,
@@ -140,10 +168,6 @@ export interface RuntimeReadiness {
   activeWorkCount: number | null;
 }
 
-/** The one refusal `force` is meant to override, so the capability reason and
- * the refusal are the same string and can be compared. */
-export const BUSY_REFUSAL =
-  "BotFleet is working right now.\u00a0 The updater will not interrupt a turn in flight.";
 
 export interface UpdateInstalled {
   version: string;
@@ -236,21 +260,9 @@ export interface UpdateControlDeps {
 }
 
 /** What one run's progress file holds, once validated. */
-export interface ProgressRecord {
-  schemaVersion: number;
-  runId: string;
-  command: string;
-  pid: number;
-  startedAt: string;
-  updatedAt: string;
-  step: string | null;
-  progress: number | null;
-  targetCommit: string | null;
-  receiptPath: string | null;
-  finishedAt: string | null;
-  outcome: UpdateOutcome | null;
-  message: string | null;
-}
+/** A progress record as this build reads it: derived from the schema that
+ *  checks it (`ProgressRecordSchema`), so the type and the check cannot drift. */
+export type ProgressRecord = z.infer<typeof ProgressRecordSchema>;
 
 interface CurrentRunRecord {
   runId: string;
@@ -291,31 +303,43 @@ function writeJsonFile(path: string, value: unknown): void {
   renameSync(temporary, path);
 }
 
+/** A field the updater writes but a record can live without: its value when
+ *  it has the right shape, null otherwise.  One bad field costs only itself,
+ *  never the whole record — the status route reads this file while another
+ *  process writes it. */
+const optionalString = z.string().nullable().catch(null);
+
+/** A progress file written by `scripts/update-progress.mjs`, checked at the
+ *  trust boundary.  The identity fields are required and a record without
+ *  them is "no record"; everything else falls back field by field.  Fields
+ *  this build does not read (`rolledBack`, newer ones) are dropped. */
+const ProgressRecordSchema = z.object({
+  schemaVersion: z.literal(UPDATE_PROGRESS_SCHEMA_VERSION),
+  runId: z.string().min(1),
+  startedAt: z.string(),
+  command: z.string().catch("update"),
+  pid: z.number().int().catch(0),
+  updatedAt: optionalString,
+  step: optionalString,
+  // One short line: trimmed, clipped, and absent when empty.
+  detail: z.string().nullable().catch(null)
+    .transform((detail) => detail?.trim().slice(0, DETAIL_MAX) || null),
+  // A fraction of the run: clamped to [0, 1], absent when not a finite number.
+  progress: z.number().nullable().catch(null)
+    .transform((progress) => (progress === null || !Number.isFinite(progress) ? null : Math.min(1, Math.max(0, progress)))),
+  targetCommit: optionalString,
+  receiptPath: optionalString,
+  finishedAt: optionalString,
+  outcome: z.string().nullable().catch(null).transform((outcome) => (isOutcome(outcome) ? outcome : null)),
+  message: optionalString,
+})
+  // A record that never said when it last moved last moved when it started.
+  .transform((record) => ({ ...record, updatedAt: record.updatedAt ?? record.startedAt }));
+
 /** Validate a progress file written by `scripts/update-progress.mjs`. */
 export function parseProgressRecord(value: unknown): ProgressRecord | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
-  if (raw.schemaVersion !== UPDATE_PROGRESS_SCHEMA_VERSION) return null;
-  if (typeof raw.runId !== "string" || !raw.runId) return null;
-  if (typeof raw.startedAt !== "string") return null;
-  const progress = typeof raw.progress === "number" && Number.isFinite(raw.progress)
-    ? Math.min(1, Math.max(0, raw.progress))
-    : null;
-  return {
-    schemaVersion: UPDATE_PROGRESS_SCHEMA_VERSION,
-    runId: raw.runId,
-    command: typeof raw.command === "string" ? raw.command : "update",
-    pid: Number.isInteger(raw.pid) ? (raw.pid as number) : 0,
-    startedAt: raw.startedAt,
-    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : raw.startedAt,
-    step: typeof raw.step === "string" ? raw.step : null,
-    progress,
-    targetCommit: typeof raw.targetCommit === "string" ? raw.targetCommit : null,
-    receiptPath: typeof raw.receiptPath === "string" ? raw.receiptPath : null,
-    finishedAt: typeof raw.finishedAt === "string" ? raw.finishedAt : null,
-    outcome: isOutcome(raw.outcome) ? raw.outcome : null,
-    message: typeof raw.message === "string" ? raw.message : null,
-  };
+  const parsed = ProgressRecordSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
 }
 
 /** Sentences a person reads while they wait.  Kept here rather than in the
@@ -331,6 +355,8 @@ export const UPDATE_STEP_LABELS: Record<string, string> = {
   smokeTestBundle: "Verifying the new build actually starts",
   persistPrepared: "Recording the prepared build",
   validatePrepared: "Re-checking the prepared build",
+  sweepLeftovers: "Clearing what an earlier update left behind",
+  ensureRunning: "Making sure BotFleet is running",
   preflight: "Checking for work in flight",
   capturePrevious: "Snapshotting what is installed now",
   materializeCandidate: "Placing the new build alongside",
@@ -392,6 +418,7 @@ export function runningFrom(record: ProgressRecord, logTail: string[]): UpdateRu
     step: stepLabel(record.step),
     logTail,
   };
+  if (record.detail) running.detail = record.detail;
   if (record.progress !== null) running.progress = record.progress;
   return running;
 }
@@ -441,6 +468,12 @@ export function availableIsStale(input: {
 }): boolean {
   if (!input.available) return true;
   if (input.available.sourceCommit === input.installedCommit) return true;
+  // Identity before clock.  An answer counted from a commit other than the one
+  // installed now cannot be refreshed into a correct one, whatever its
+  // timestamp says, so refuse it outright.  An answer carrying no baseline
+  // predates this field and is equally unplaceable; both cases drop to a fresh
+  // check instead of being served.
+  if (input.available.baselineCommit !== input.installedCommit) return true;
   const recorded = input.checkedAt ? Date.parse(input.checkedAt) : Number.NaN;
   // An answer with no readable timestamp cannot be placed relative to the
   // install, and an unplaceable answer is not one to act on.
@@ -466,12 +499,11 @@ export function runRefusal(input: {
   force: boolean;
 }): string | null {
   if (input.running) return "An update is already running.";
-  // Readiness comes before the structural reasons because it is the one
-  // `force` is meant to override.  Forcing does not make it safe: the
-  // updater's own preflight refuses a busy machine too, and the run then
-  // ends `refused` rather than interrupting a turn.
-  if (!input.readiness.safeToRestart && !input.force) return BUSY_REFUSAL;
-  const structural = input.capabilities.reasons.find((reason) => reason !== BUSY_REFUSAL);
+  // A busy Mac is never a refusal.  A run holds new work, gives the work in
+  // flight a short grace to finish, then pauses what is left and resumes it
+  // after the restart (server/update-drain.ts); a forced run skips the grace.
+  // `readiness` only describes the Mac now.
+  const structural = input.capabilities.reasons[0];
   if (!input.capabilities.canRun && structural) return structural;
   if (input.dirty) {
     return "The always-on checkout has uncommitted changes, so the updater would refuse.";
@@ -909,9 +941,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
 
   /** What this Mac is equipped to do, before anything about what it is doing
    * right now.  Separated from `capabilities` because the dirty-checkout
-   * precheck has to run on a busy machine too: `force` talks past readiness,
-   * and a forced run on a dirty checkout must be refused here rather than
-   * launched for the updater to refuse a minute later. */
+   * precheck has to run on a busy machine too: a run on a dirty checkout must
+   * be refused here rather than launched for the updater to refuse a minute
+   * later. */
   const structural = () => {
     const darwin = deps.platform === "darwin";
     const checkoutPresent = darwin && existsSync(join(deps.checkout, ".git"));
@@ -929,9 +961,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
 
   /** What this Mac may do right now.  `readiness` overrides the harness-wide
    * reading for a caller that holds an admission of its own — without it a
-   * `POST` route answers with `canRun: false` and "BotFleet is working right
-   * now." on a completely idle Mac, and the client that stores that status
-   * stops offering Install Update until something else refreshes it. */
+   * `POST` route reports `busy` on a completely idle Mac, because the request
+   * asking is itself the work it counts. */
   const capabilities = (running: boolean, readiness?: RuntimeReadiness): UpdateCapabilities => {
     const able = structural();
     const reasons: string[] = [];
@@ -958,13 +989,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       reasons.push("An update is already running.");
       codes.push("already-running");
     }
-    // Listed last, and the only reason `force` can talk past — see runRefusal.
-    const idle = (readiness ?? deps.readiness()).safeToRestart;
-    if (!idle) {
-      reasons.push(BUSY_REFUSAL);
-      codes.push("busy");
-    }
-    return { canCheck: able.canCheck, canRun: able.canRun && !running && idle, reasons, codes };
+    // Not a reason: an update on a busy Mac waits for its bots (see runRefusal).
+    const busy = !(readiness ?? deps.readiness()).safeToRestart;
+    return { canCheck: able.canCheck, canRun: able.canRun && !running, reasons, codes, busy };
   };
 
   const loadAvailable = () => {
@@ -986,6 +1013,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       sourceCommit: value.sourceCommit,
       version: typeof value.version === "string" ? value.version : undefined,
       aheadBy: Number.isInteger(value.aheadBy) ? (value.aheadBy as number) : 0,
+      baselineCommit: typeof value.baselineCommit === "string" && /^[a-f0-9]{40}$/.test(value.baselineCommit)
+        ? value.baselineCommit
+        : undefined,
       commits: Array.isArray(value.commits)
         ? (value.commits as unknown[])
             .filter((one): one is UpdateCommit =>
@@ -1294,6 +1324,10 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
           sourceCommit: target,
           version,
           aheadBy: Number.isFinite(aheadBy) ? aheadBy : 0,
+          // `aheadBy` is counted from whatever is installed right now, so say
+          // so in the same breath.  A remembered answer whose baseline no
+          // longer matches is refused on sight.
+          baselineCommit: deps.installed.sourceCommit,
           commits: listed.code === 0
             ? listed.stdout
                 .split("\n")
@@ -1348,10 +1382,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       running: before.running,
       available: before.available,
       readiness: readiness ?? deps.readiness(),
-      // Asked whenever this Mac is equipped to run one at all, not only when
-      // it is free to: `force` talks past readiness, and a forced run on a
-      // dirty checkout has to be refused here rather than launched for the
-      // updater to refuse a minute later.
+      // Asked whenever this Mac is equipped to run one at all, busy or not:
+      // a run on a dirty checkout has to be refused here rather than
+      // launched for the updater to refuse a minute later.
       dirty: structural().canRun ? await dirtyCheckout() : false,
       force,
     });
