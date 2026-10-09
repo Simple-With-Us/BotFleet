@@ -1251,6 +1251,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             ...base(threadId, turnId),
             type: "request.opened",
             requestId,
+            // the tool call this ask is about, the same id its item.started
+            // carried, so the auto-review step watch leaves it to the card
+            itemId: z.string().min(1).safeParse(toolCall.toolCallId).data,
             requestType: "permission",
             tool,
             summary,

@@ -9,7 +9,7 @@ import type { ComputerMount } from "./computer-grants.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
-import type { ReviewHook } from "../shared/auto-review.ts";
+import type { ReviewHook, ReviewPrompt } from "../shared/auto-review.ts";
 
 export type DriverKind = string;
 export type InstanceId = string;
@@ -775,12 +775,13 @@ export interface ProviderInstance {
   /** Isolated, tool-free permission review on this same provider. Kept
    * separate from generateText so the UI never infers a security capability
    * from a generic helper that may expose prompts in argv or lack approvals.
-   * Implemented by Claude (a tool-free one-shot CLI with the prompt on
-   * stdin) and by the HTTP lanes (a chat-completions call with no `tools`,
-   * the prompt in the request body).  An engine without one is reviewed by
-   * the owner's fallback reviewer, never by an arbitrary sibling
+   * Implemented by Claude (a tool-free one-shot CLI, the brief as its
+   * system prompt and the action on stdin) and by the HTTP lanes (a
+   * chat-completions call with no `tools`, the brief as the system message
+   * and the action as the user message).  An engine without one is reviewed
+   * by the fleet's fallback reviewer, never by an arbitrary sibling
    * (server/auto-review.ts `reviewersFor`). */
-  reviewPermission?(prompt: string, signal?: AbortSignal): Promise<string>;
+  reviewPermission?(prompt: ReviewPrompt, signal?: AbortSignal): Promise<string>;
   dispose(): Promise<void>;
 }
 

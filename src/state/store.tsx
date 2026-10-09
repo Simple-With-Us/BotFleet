@@ -600,9 +600,13 @@ export interface ConfigStatus {
     projects: Array<{ slug: string; match: string[] }>;
     enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
   };
-  /** Auto-review's fallback reviewer: the engine that reviews a bot's
-   * approvals when the bot's own engine cannot.  An instance id, or null. */
-  autoReview?: { fallbackReviewer: string | null };
+  /** Auto-review's fleet settings.  `fallbackReviewer` is the stored choice
+   * of the engine that reviews a bot's approvals when its own engine cannot:
+   * null for Automatic, "none" for off, or an instance id.
+   * `automaticReviewer` is the engine Automatic picks right now (the card
+   * works it out live from the engine list by the same rule), and
+   * `maxReviewsPerTurn` is the per-turn reviewer-call cap. */
+  autoReview?: { fallbackReviewer: string | null; automaticReviewer?: string | null; maxReviewsPerTurn?: number };
   /** Opt-in flags. Absent means off. */
   features?: { skillRecorder: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
   /** Sentry diagnostics.  `configured` mirrors `hasDsn` — a key is on file,
