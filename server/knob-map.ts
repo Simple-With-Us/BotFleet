@@ -166,6 +166,18 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 1,
   },
   {
+    // Reviewer calls one turn may spend on auto-review (server/auto-review.ts
+    // `ReviewBudget`).  Bounds mirror shared/auto-review.ts.
+    id: "autoReview.maxReviewsPerTurn",
+    label: "Auto-review limit per turn",
+    section: "autoReview",
+    path: ["maxReviewsPerTurn"],
+    infisicalName: "BOTFLEET_AUTO_REVIEW_MAX_PER_TURN",
+    kind: "int",
+    min: 1,
+    max: 500,
+  },
+  {
     id: "infisical.refreshMinutes",
     label: "Infisical refresh cadence",
     section: "infisical",

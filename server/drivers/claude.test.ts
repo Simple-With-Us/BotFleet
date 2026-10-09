@@ -777,6 +777,38 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.mcpConfig.mcpServers.botfleet).toBeDefined();
   });
 
+  it("routes connected apps and the phone through the prompt tool on a held turn, so the reviewer sees them first", async () => {
+    await create(undefined, {}, { permissionMode: "bypassPermissions" });
+    const integrations = {
+      composio: { command: process.execPath, args: ["/tmp/connector-proxy.js"], env: {} },
+      phone: { command: process.execPath, args: ["/tmp/phone-proxy.js"], env: {} },
+      agents: { command: process.execPath, args: ["/tmp/agents-proxy.js"], env: {} },
+    };
+    const heldDump = join(scratch, "held-mcp-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = heldDump;
+    await instance.adapter.sendTurn({ threadId: "t-held-mcp", text: "send it", holdForReview: true, integrations });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-held-mcp");
+    const held = JSON.parse(readFileSync(heldDump, "utf8"));
+    const heldAllowed = String(held.argv[held.argv.indexOf("--allowedTools") + 1]).split(",");
+    // still mounted, no longer pre-allowed: each call asks, and is reviewed
+    expect(held.mcpConfig.mcpServers.composio).toBeDefined();
+    expect(held.mcpConfig.mcpServers.phone).toBeDefined();
+    expect(heldAllowed).not.toContain("mcp__composio");
+    expect(heldAllowed).not.toContain("mcp__phone");
+    // peer messages stay pre-allowed (the CLI's own look-alike would shadow
+    // them), and the step watch reviews them as they start
+    expect(heldAllowed).toContain("mcp__agents");
+
+    // an unheld bypass turn keeps every pre-allow: nothing asks there
+    const freeDump = join(scratch, "free-mcp-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = freeDump;
+    await instance.adapter.sendTurn({ threadId: "t-free-mcp", text: "send it", integrations });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-free-mcp");
+    const free = JSON.parse(readFileSync(freeDump, "utf8"));
+    const freeAllowed = String(free.argv[free.argv.indexOf("--allowedTools") + 1]).split(",");
+    expect(freeAllowed).toEqual(expect.arrayContaining(["mcp__composio", "mcp__phone", "mcp__agents"]));
+  });
+
   it("asks through the permission-prompt tool when not in bypass, which is where review holds each ask", async () => {
     await create();
     expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "before", asksWhenHeld: true });
@@ -1326,7 +1358,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       conn.on("connect", resolve);
       conn.on("error", reject);
     });
-    conn.write(JSON.stringify({ t: "ask", id: "ask-1", tool: "Bash", input: { command: "rm -rf scratch" } }) + "\n");
+    conn.write(
+      JSON.stringify({ t: "ask", id: "ask-1", tool: "Bash", input: { command: "rm -rf scratch" }, toolUseId: "toolu_rm" }) + "\n",
+    );
 
     const opened = await recorder.until((e) => e.type === "request.opened");
     expect(opened).toMatchObject({
@@ -1334,6 +1368,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       tool: "Bash",
       summary: "rm -rf scratch",
       requestId: "ask-1",
+      // the tool_use the CLI asked about, the id its item.started carried,
+      // so the auto-review step watch leaves this step to the card
+      itemId: "toolu_rm",
     });
     // a plain CLI tool never carries the desktop-control approval scope,
     // so the UI can offer a remembered grant for it
@@ -1699,10 +1736,14 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await create();
     const dump = join(scratch, "review-isolation.json");
     process.env.FAKE_CLAUDE_DUMP = dump;
-    await expect(instance.reviewPermission?.("review this request")).resolves.toBe("fake generated text");
+    const prompt = { system: "You review one request.", data: "<action_to_review>\nreview this request\n</action_to_review>" };
+    await expect(instance.reviewPermission?.(prompt)).resolves.toBe("fake generated text");
     const seen = JSON.parse(readFileSync(dump, "utf8"));
-    expect(seen.prompt).toBe("review this request");
-    expect(seen.argv).not.toContain("review this request");
+    // the action under review goes on stdin only, never argv
+    expect(seen.prompt).toBe(prompt.data);
+    expect(seen.argv.some((arg: string) => arg.includes("review this request"))).toBe(false);
+    // the fixed brief rides as the system prompt
+    expect(seen.argv[seen.argv.indexOf("--append-system-prompt") + 1]).toBe(prompt.system);
     expect(seen.argv).toContain("--strict-mcp-config");
     expect(JSON.parse(seen.argv[seen.argv.indexOf("--mcp-config") + 1])).toEqual({ mcpServers: {} });
     expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("");
@@ -1727,7 +1768,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     ).toBe(true);
     expect(recorder.events).toContainEqual(expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "spawn_error" }));
     await expect(instance.generateText?.("title")).rejects.toThrow(/Update Claude Code/);
-    await expect(instance.reviewPermission?.("review")).rejects.toThrow(/Update Claude Code/);
+    await expect(instance.reviewPermission?.({ system: "brief", data: "review" })).rejects.toThrow(/Update Claude Code/);
     expect(existsSync(dump)).toBe(false);
     expect(readFileSync(probes, "utf8")).toBe("probe\n");
   });
@@ -1762,7 +1803,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-supported", text: "go" });
     await recorder.until((e) => e.type === "turn.completed");
     await instance.generateText?.("title");
-    await instance.reviewPermission?.("review");
+    await instance.reviewPermission?.({ system: "brief", data: "review" });
     expect(readFileSync(probes, "utf8")).toBe("probe\n");
   });
 
@@ -1785,7 +1826,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await create();
     const controller = new AbortController();
     controller.abort();
-    await expect(instance.reviewPermission?.("review this request", controller.signal)).rejects.toThrow(/aborted/);
+    await expect(instance.reviewPermission?.({ system: "brief", data: "review this request" }, controller.signal)).rejects.toThrow(/aborted/);
   });
 
   it("declares the effort levels the CLI accepts", async () => {

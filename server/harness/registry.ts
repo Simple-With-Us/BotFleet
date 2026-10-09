@@ -556,6 +556,18 @@ export class ProviderRegistry {
     return () => this.describeListeners.delete(listener);
   }
 
+  /** The newest settled description of one engine, without probing it.
+   * Undefined before its first probe has settled.  For a synchronous health
+   * read on a hot path (auto-review's automatic fallback reviewer), where a
+   * describe per call would be far too slow. */
+  lastKnown(instanceId: InstanceId): DescribedInstance | undefined {
+    return (
+      this.latestSettled.get(instanceId)?.info ??
+      this.lastDefinitive.get(instanceId)?.info ??
+      this.lastDone?.result.find((info) => info.instanceId === instanceId)
+    );
+  }
+
   /** When a list this registry returned was produced (ms since epoch). */
   describedAtOf(result: DescribedInstance[]): number | undefined {
     return this.describedAtByResult.get(result);

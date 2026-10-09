@@ -528,10 +528,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         );
         timer.unref?.();
         asks.set(requestId, finish);
+        // The step this ask is about (v2 `itemId`, legacy `callId`), the
+        // same id its item.started carries, so the auto-review step watch
+        // leaves it to the card.
+        const askedItem = codexNonemptyString.safeParse(params.itemId ?? params.callId);
         emit({
           ...base(threadId, turnId),
           type: "request.opened",
           requestId,
+          ...(askedItem.success ? { itemId: askedItem.data } : {}),
           requestType: isQuestion ? "question" : "permission",
           tool,
           summary,

@@ -18,6 +18,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
 import { splitChatPrompt } from "./prompt-split.ts";
 import { withChatSpan } from "../sentry-ai.ts";
@@ -612,14 +613,18 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         return text.trim() ? text : reasoning;
       },
       // Auto-review on this same endpoint: one chat-completions call with no
-      // `tools`, the prompt in the request body (never argv), cancelled by
-      // the reviewer's own deadline.  Only the answer text is returned, never
+      // `tools`, the brief as the system message and the action as the user
+      // message (never argv), cancelled by the reviewer's own deadline.  Only the answer text is returned, never
       // the reasoning: a verdict has to be the model's actual reply.
-      reviewPermission: async (prompt: string, signal?: AbortSignal) => {
-        const { text } = await complete([{ role: "user", content: prompt }], catalog.default, {
-          stream: false,
-          signal,
-        });
+      reviewPermission: async (prompt: ReviewPrompt, signal?: AbortSignal) => {
+        const { text } = await complete(
+          [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.data },
+          ],
+          catalog.default,
+          { stream: false, signal },
+        );
         return text;
       },
       dispose: async () => {
