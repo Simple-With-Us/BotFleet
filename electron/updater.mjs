@@ -163,15 +163,16 @@ export function registerUpdaterIpc() {
 
     const dataDir = process.env.OMB_DATA_DIR || process.env.BOTFLEET_DATA_DIR || join(homedir(), ".botfleet");
     const harnessOwner = readHarnessOwner(dataDir);
+    const childEnv = {
+      ...process.env,
+      PATH: childPath,
+      BOTFLEET_CHECKOUT: join(homedir(), "apps", "botfleet-server"),
+    };
+    if (harnessOwner?.nonce) childEnv.BOTFLEET_OWNER_NONCE = harnessOwner.nonce;
     const child = spawn("/bin/bash", [script], {
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],
-      env: {
-        ...process.env,
-        PATH: childPath,
-        BOTFLEET_CHECKOUT: join(homedir(), "apps", "botfleet-server"),
-        ...(harnessOwner?.nonce ? { BOTFLEET_OWNER_NONCE: harnessOwner.nonce } : {}),
-      },
+      env: childEnv,
     });
 
     // Capture stderr to the log so a 127 / missing-node error is visible.

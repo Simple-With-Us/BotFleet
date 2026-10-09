@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* oxlint-disable anti-slop/no-runtime-typeof -- hand-written env/HTTP boundary parse; zod is unavailable in the updater bootstrap graph. */
 // Query the live harness /api/runtime sourceCommit for the ubf up-to-date
 // shortcut.  The bearer credential is read only from BOTFLEET_OWNER_NONCE; the
 // harness port is read from harness-owner.json via OWNER_FILE_PATH.  Only a
@@ -74,3 +75,4 @@ req.on("timeout", () => {
   process.exit(1);
 });
 req.end();
+/* oxlint-enable anti-slop/no-runtime-typeof */

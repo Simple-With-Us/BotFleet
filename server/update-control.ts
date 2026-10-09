@@ -755,17 +755,18 @@ async function defaultLaunch(plan: LaunchPlan): Promise<LaunchResult> {
   const log = openSync(plan.logPath, "a");
   try {
     const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `${plan.nodeDirectory}:${process.env.PATH ?? ""}`,
+    };
+    if (harnessOwnerNonce) childEnv.BOTFLEET_OWNER_NONCE = harnessOwnerNonce;
     const child = spawn(
       "/bin/bash",
       [plan.scriptPath, "--progress", plan.progressPath, "--run-id", plan.runId, ...(plan.force ? ["--force"] : [])],
       {
         detached: true,
         stdio: ["ignore", log, log],
-        env: {
-          ...process.env,
-          PATH: `${plan.nodeDirectory}:${process.env.PATH ?? ""}`,
-          ...(harnessOwnerNonce ? { BOTFLEET_OWNER_NONCE: harnessOwnerNonce } : {}),
-        },
+        env: childEnv,
       },
     );
     child.unref();
