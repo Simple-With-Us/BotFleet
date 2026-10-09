@@ -24,8 +24,11 @@ import {
   bootOutHarnessForQuiesce,
   credentialPreparationReceiptPath,
   DEFAULT_PORTS,
+  DEFAULT_STARTUP_TIMEOUT_MS,
   dependencyFingerprint,
+  describeLaunchdExit,
   isRecoverableResolutionFailure,
+  parseLaunchdJob,
   designatedRequirementFromOutput,
   fenceRuntimeAdmission,
   healthTopologyResult,
@@ -33,6 +36,7 @@ import {
   harnessLaunchdLabel,
   isExpectedBotFleetProcess,
   launchAgentPlistLabel,
+  launchdExitReason,
   loadPrepared,
   main,
   parseArguments,
@@ -51,10 +55,12 @@ import {
   smokeTestEnabled,
   stableApplicationProcessError,
   startedHarnessLabel,
+  startupProgress,
   swapPreparedFiles,
   terminateVerified,
   validateBuiltBundle,
   waitForLaunchdBootout,
+  waitForStartup,
 } from "./update-botfleet-mac.mjs";
 
 const scripts = dirname(fileURLToPath(import.meta.url));
@@ -2634,6 +2640,169 @@ test("the selection gives up long before the harness decides a run never started
   assert.ok(requests >= 3, "the selection still makes its Actions requests");
   assert.equal(bounded, requests, "every Actions request the selection makes carries the short timeout");
   assert.match(selection, /const SELECTION_REQUEST_TIMEOUT_MS = 10_000;/);
+});
+
+// ---------------------------------------------------------------------------
+// A slow boot is not a failure.  On 2026-10-09 a good build was rolled back
+// because the new harness logged "booting" and was still working through its
+// start-up when the old 90-second window closed (load averages of 150 to 900),
+// and the restored build then needed about two minutes of its own.
+// ---------------------------------------------------------------------------
+
+function fakeClock() {
+  let time = 0;
+  return { now: () => time, wait: async (ms) => { time += ms; }, at: () => time };
+}
+
+const notYet = { safe: false, reason: "Authenticated runtime readiness could not be verified" };
+
+test("the start-up wait is long by default and still overridable", async () => {
+  assert.ok(DEFAULT_STARTUP_TIMEOUT_MS >= 10 * 60_000 && DEFAULT_STARTUP_TIMEOUT_MS <= 15 * 60_000,
+    "a slow boot under load gets 10 to 15 minutes");
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  assert.match(source, /startupTimeoutMs: environmentMs\("BOTFLEET_STARTUP_TIMEOUT_MS", DEFAULT_STARTUP_TIMEOUT_MS\)/);
+  assert.doesNotMatch(source, /BOTFLEET_STARTUP_TIMEOUT_MS \|\| 90_000/);
+  // Both waits that follow a start go through the shared wait, so neither can
+  // quietly keep a fixed window of its own.
+  const verify = source.indexOf("verifyHarness: async");
+  assert.match(source.slice(verify, source.indexOf("startApplication:", verify)), /waitForStartup\(/);
+  const restored = source.indexOf("Restored BotFleet runtime did not regain safe single ownership");
+  assert.match(source.slice(restored - 900, restored), /waitForStartup\(/);
+});
+
+test("a slow but successful boot passes, and says how long it has been waiting", async () => {
+  const clock = fakeClock();
+  const reports = [];
+  const snapshot = await waitForStartup({
+    attempt: async () => (clock.at() >= 4 * 60_000 ? { safe: true, mode: "authenticated" } : notYet),
+    crashed: async () => null,
+    timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+    what: "the new version",
+    fallback: "never reached",
+    report: (line) => reports.push(line),
+    now: clock.now,
+    wait: clock.wait,
+  });
+  assert.equal(snapshot.safe, true);
+  assert.ok(clock.at() >= 4 * 60_000 && clock.at() < 5 * 60_000, `waited ${clock.at()}ms`);
+  assert.deepEqual(reports, [
+    "Waiting for the new version to start, 1 min so far",
+    "Waiting for the new version to start, 2 min so far",
+    "Waiting for the new version to start, 3 min so far",
+  ]);
+});
+
+test("a boot that crashed fails promptly with the reason, not after the whole window", async () => {
+  const clock = fakeClock();
+  let asked = 0;
+  await assert.rejects(
+    waitForStartup({
+      attempt: async () => ({ safe: false, reason: "BotFleet harness (pid 4242) is not running" }),
+      crashed: async () => (++asked >= 3 ? "launchd job app.botfleet.server: its process exited with code 1" : null),
+      timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+      what: "the new version",
+      fallback: "never reached",
+      now: clock.now,
+      wait: clock.wait,
+    }),
+    (error) => {
+      assert.match(error.message, /^The new version stopped before it was ready: launchd job app\.botfleet\.server: its process exited with code 1\./);
+      assert.match(error.message, /Last check: BotFleet harness \(pid 4242\) is not running/);
+      return true;
+    },
+  );
+  assert.ok(clock.at() < 5_000, `failed after ${clock.at()}ms, not after ${DEFAULT_STARTUP_TIMEOUT_MS}ms`);
+});
+
+test("a build that came up is never called crashed, and a boot that never finishes ends at the deadline", async () => {
+  const clock = fakeClock();
+  const up = await waitForStartup({
+    attempt: async () => ({ safe: true }),
+    crashed: async () => { throw new Error("must not be asked once the build is up"); },
+    timeoutMs: 1_000,
+    what: "the new version",
+    fallback: "never reached",
+    now: clock.now,
+    wait: clock.wait,
+  });
+  assert.equal(up.safe, true);
+
+  const late = fakeClock();
+  await assert.rejects(
+    waitForStartup({
+      attempt: async () => notYet,
+      timeoutMs: 120_000,
+      what: "the restored version",
+      fallback: "never reached",
+      now: late.now,
+      wait: late.wait,
+    }),
+    (error) => error.message === notYet.reason,
+  );
+  assert.equal(late.at(), 120_000, "the wait runs to the deadline and no further");
+});
+
+test("progress is quiet for the first minute and then reports once a minute", () => {
+  const clock = fakeClock();
+  const lines = [];
+  const tick = startupProgress("the app", { report: (line) => lines.push(line), now: clock.now });
+  // Elapsed: 0:30 (quiet), 1:00 (1 min), 1:59 (quiet), 2:00 (2 min), 3:00 (3 min).
+  // wait() is async but synchronous in effect for this clock.
+  for (const step of [30_000, 30_000, 59_000, 1_000, 60_000]) {
+    clock.wait(step);
+    tick();
+  }
+  assert.deepEqual(lines, [
+    "Waiting for the app to start, 1 min so far",
+    "Waiting for the app to start, 2 min so far",
+    "Waiting for the app to start, 3 min so far",
+  ]);
+});
+
+const LAUNCHD_RUNNING = `gui/501/app.botfleet.server = {
+\tactive count = 4
+\tpath = /Users/jay/Library/LaunchAgents/app.botfleet.server.plist
+\ttype = LaunchAgent
+\tstate = running
+
+\tprogram = /bin/bash
+\trun interval = 0 seconds
+\truns = 1
+\tpid = 62210
+\tlast exit code = (never exited)
+
+\tevent triggers = {
+\t}
+\tsubmitted by = launchd
+\tproperties = runatload | inferred program
+}`;
+
+test("only a launchd job that has exited counts as a crash; one that is still booting does not", async () => {
+  assert.deepEqual(parseLaunchdJob(LAUNCHD_RUNNING), { state: "running", runs: 1, lastExit: "(never exited)", signal: undefined });
+  assert.equal(describeLaunchdExit(parseLaunchdJob(LAUNCHD_RUNNING)), null);
+
+  const exited = LAUNCHD_RUNNING.replace("state = running", "state = not running").replace("(never exited)", "1").replace("\tpid = 62210\n", "");
+  assert.equal(describeLaunchdExit(parseLaunchdJob(exited)), "its process exited with code 1");
+
+  const signalled = `${LAUNCHD_RUNNING.replace("(never exited)", "9")}\n\tlast terminating signal = Segmentation fault: 11`;
+  assert.match(describeLaunchdExit(parseLaunchdJob(signalled)), /killed by a signal \(Segmentation fault: 11\)/);
+
+  const restarted = LAUNCHD_RUNNING.replace("runs = 1", "runs = 3");
+  assert.equal(describeLaunchdExit(parseLaunchdJob(restarted)), "launchd has had to start it 3 times");
+
+  const prints = { "app.botfleet.server": { code: 0, stdout: exited }, "com.jay.botfleet-server": { code: 113, stdout: "" } };
+  const print = async (label) => prints[label];
+  assert.equal(
+    await launchdExitReason(["com.jay.botfleet-server", "app.botfleet.server"], { print }),
+    "launchd job app.botfleet.server: its process exited with code 1",
+    "a label launchd does not know is skipped, not a crash",
+  );
+  assert.equal(
+    await launchdExitReason(["app.botfleet.server"], { print: async () => ({ code: 0, stdout: LAUNCHD_RUNNING }) }),
+    null,
+  );
+  assert.equal(await launchdExitReason(["app.botfleet.server"], { print: async () => ({ code: 1, stdout: "" }) }), null,
+    "a print that fails says nothing; the timeout is the backstop");
 });
 
 function escapeRegExp(value) {
