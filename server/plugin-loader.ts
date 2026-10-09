@@ -33,6 +33,10 @@ import { pathToFileURL } from "node:url";
 
 import { z } from "zod";
 
+import {
+  MAX_ROOM_TURN_TIMEOUT_MINUTES,
+  MIN_ROOM_TURN_TIMEOUT_MINUTES,
+} from "./config.ts";
 import { HOST_API_VERSION, satisfiesBotfleetVersion, type JsonValue } from "../shared/plugin-manifest.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { PLUGINS_DIR } from "./plugin-registry.ts";
@@ -78,7 +82,8 @@ export type PluginLogEvent =
 export interface PluginHostInputs {
   listBots: () => PluginHostBotSummary[];
   listConfigKeys: () => readonly string[];
-  readConfig: <T = unknown>(key: string) => T | undefined;
+  /** Returns one allow-listed, schema-validated JSON value, or undefined. */
+  readConfig: (key: string) => JsonValue | undefined;
   logger: (event: PluginLogEvent) => void;
 }
 
@@ -134,29 +139,46 @@ export function narrowPluginConfigSection(key: string, value: unknown): unknown 
   return redactPluginConfig(value);
 }
 
+/** Strict schemas for each plugin-visible AppConfig section.  Plugins cannot
+ *  probe arbitrary cfg keys: only these shapes cross the host boundary. */
+export const PluginHostRoomsConfigSchema = z.object({
+  turnTimeoutMinutes: z
+    .number()
+    .int()
+    .min(MIN_ROOM_TURN_TIMEOUT_MINUTES)
+    .max(MAX_ROOM_TURN_TIMEOUT_MINUTES),
+}).strict();
+
+export const PluginHostCallSttConfigSchema = z.object({
+  provider: z.enum(["apple", "assemblyai"]).nullable().optional(),
+}).strict();
+
+const PLUGIN_HOST_CONFIG_SCHEMA = {
+  rooms: PluginHostRoomsConfigSchema,
+  callStt: PluginHostCallSttConfigSchema,
+} as const satisfies Record<(typeof PLUGIN_CONFIG_ALLOWLIST)[number], z.ZodType<JsonValue>>;
+
+/** Validate one allow-listed config value for plugin host APIs.  Unknown keys,
+ *  secret-shaped fields, and shapes outside the closed schema are withheld. */
+export function parsePluginHostConfigValue(key: string, value: unknown): JsonValue | undefined {
+  if (!isPluginConfigKey(key)) return undefined;
+  const narrowed = narrowPluginConfigSection(key, value);
+  const schema = PLUGIN_HOST_CONFIG_SCHEMA[key as keyof typeof PLUGIN_HOST_CONFIG_SCHEMA];
+  const parsed = schema.safeParse(narrowed);
+  return parsed.success ? parsed.data : undefined;
+}
+
 /** Short, stable correlation id for a plugin in logs.  The raw name comes
  *  from a downloaded manifest, so logs carry this hash instead. */
 export function pluginLogId(name: string): string {
   return createHash("sha256").update(name).digest("hex").slice(0, 12);
 }
 
-const JSON_VALUE = z.json();
-
-/** Read one allow-listed config value, redact it, and accept it only when
- *  its JSON round-trip parses as a JSON value.  Functions, symbols, and
- *  undefined fields drop out; anything unserializable is withheld. */
+/** Read one allow-listed config value from the host inputs.  The host
+ *  readConfig implementation must already apply parsePluginHostConfigValue;
+ *  this path re-validates so tests cannot bypass the schema with a stub. */
 function redactedConfigValue(inputs: PluginHostInputs, key: string): JsonValue | undefined {
-  const redacted = narrowPluginConfigSection(key, inputs.readConfig(key));
-  if (redacted === undefined) return undefined;
-  let text: string | undefined;
-  try {
-    text = JSON.stringify(redacted);
-  } catch {
-    return undefined;
-  }
-  if (text === undefined) return undefined;
-  const parsed = JSON_VALUE.safeParse(JSON.parse(text));
-  return parsed.success ? parsed.data : undefined;
+  return parsePluginHostConfigValue(key, inputs.readConfig(key));
 }
 
 /** Capture the host data one call may see.  Capabilities the manifest did

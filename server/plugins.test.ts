@@ -50,7 +50,7 @@ function makeRuntimeInputs() {
       { id: "gamma", name: "Gamma", status: "errored", driver: "claude" },
     ],
     listConfigKeys: () => ["appearance.theme"],
-    readConfig: <T = unknown>(_key: string): T | undefined => undefined,
+    readConfig: (_key: string) => undefined,
     logger: (_event: PluginLogEvent) => {
       // Keep the test output clean.  Real callers wire this to console.
     },

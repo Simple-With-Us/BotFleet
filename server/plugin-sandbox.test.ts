@@ -30,14 +30,12 @@ function inputs(): PluginHostInputs {
   return {
     listBots: () => [{ id: "a", name: "Alpha", status: "running", driver: "claude" }],
     listConfigKeys: () => ["rooms", "providerApiKey"],
-    readConfig: <T = unknown>(key: string): T | undefined => {
+    readConfig: (key: string) => {
       if (key === "rooms") {
-        // SAFETY: test stub; the caller names T and the sandbox only forwards redacted JSON.
-        return { theme: "dark", accessToken: SECRET_VALUE } as T;
+        return { turnTimeoutMinutes: 30, accessToken: SECRET_VALUE };
       }
       if (key === "providerApiKey") {
-        // SAFETY: test stub returning a secret the host must never forward.
-        return SECRET_VALUE as T;
+        return SECRET_VALUE;
       }
       return undefined;
     },
@@ -239,7 +237,7 @@ describe("plugin host snapshot", () => {
   it("forwards only redacted, non-secret config keys", () => {
     const snapshot = buildHostSnapshot(inputs(), ["read.config"]);
     expect(snapshot.configKeys).toEqual(["rooms"]);
-    expect(snapshot.config).toEqual({ rooms: { theme: "dark" } });
+    expect(snapshot.config).toEqual({ rooms: { turnTimeoutMinutes: 30 } });
     expect(JSON.stringify(snapshot)).not.toContain(SECRET_VALUE);
     expect(snapshot.bots).toBeNull();
   });

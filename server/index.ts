@@ -444,7 +444,11 @@ import { readHostLoad } from "./drivers/acp/init-deadline.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
-import { isPluginConfigKey, narrowPluginConfigSection, PLUGIN_CONFIG_ALLOWLIST } from "./plugin-loader.ts";
+import {
+  isPluginConfigKey,
+  parsePluginHostConfigValue,
+  PLUGIN_CONFIG_ALLOWLIST,
+} from "./plugin-loader.ts";
 import * as pluginsModule from "./plugins.ts";
 import type { PluginListing } from "./plugin-types.ts";
 import { createBotPackageExport } from "./package-export.ts";
@@ -872,11 +876,10 @@ pluginsModule.initPluginRuntime({
   // Refuse anything outside the allowlist, then return a narrowed /
   // redacted copy.  The live AppConfig object must not cross into plugin
   // code.
-  readConfig: <T = unknown>(key: string): T | undefined => {
+  readConfig: (key: string) => {
     if (!isPluginConfigKey(key)) return undefined;
     if (!Object.prototype.hasOwnProperty.call(cfg, key)) return undefined;
-    // SAFETY: `key` was confirmed as an own allowlisted property of the resolved AppConfig.  narrowPluginConfigSection copies and drops secret-looking / out-of-scope fields; the caller names T.
-    return narrowPluginConfigSection(key, cfg[key as keyof typeof cfg]) as T | undefined;
+    return parsePluginHostConfigValue(key, cfg[key as keyof typeof cfg]);
   },
   // Plugin events are allow-listed structures from plugin-loader.ts: an
   // event name, a level, a hashed plugin id, and a length or stable code.

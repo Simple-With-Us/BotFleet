@@ -31,9 +31,14 @@ export type PluginSourceInput =
  *  - https://github.com/owner/repo
  *  - https://github.com/owner/repo/tree/<ref>/<path>
  */
+const GIT_PLUGIN_SOURCE_INPUT = z.string().trim().min(1).max(4096);
+
 export function parseGitPluginSource(input: string): PluginSourceInput {
-  const text = input.trim();
-  if (!text) return { ok: false, error: "paste a GitHub repository or folder URL" };
+  const parsedInput = GIT_PLUGIN_SOURCE_INPUT.safeParse(input);
+  if (!parsedInput.success) {
+    return { ok: false, error: "paste a GitHub repository or folder URL" };
+  }
+  const text = parsedInput.data;
 
   const tree = text.match(
     /^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/tree\/([^/]+)(?:\/(.*))?)?\/?$/i,
