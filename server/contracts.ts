@@ -401,6 +401,14 @@ export interface SendTurnInput {
   cwd?: string;
   /** True when the bot has autoApprove enabled by the user. */
   autoApprove?: boolean;
+  /** True when the bot has Bypass Permissions enabled by the user.  The
+   *  broker path reads the bot record itself (`autoVerdict`), so this exists
+   *  only for a driver that has a native skip-approvals mode and NO broker
+   *  path to carry the bot's choice (Antigravity's print mode).  It never
+   *  applies to a turn that controls This Mac, exactly as the broker's bypass
+   *  never answers a `local-computer` request, and unlike `autoApprove` it
+   *  applies to unattended turns too, as the broker's bypass does. */
+  bypassPermissions?: boolean;
   /** True when this turn began from an outside event (webhook, resource
    *  threshold) or was inherited from an already-unattended bot.  Auto Mode
    *  is something a person switched on for turns they are present for, so a

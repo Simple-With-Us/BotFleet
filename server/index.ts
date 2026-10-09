@@ -239,6 +239,7 @@ import {
   sweepTranscriptRetention,
   removeTranscriptLogs,
 } from "./transcript-retention.ts";
+import { cleanupHoldReason, listDataFaults, registerLeftOverSetAsideFiles } from "./data-faults.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { findCliCandidates, resetPathCache } from "./env-path.ts";
 import { cliProbeEnvironment } from "./cli-probe-env.ts";
@@ -482,6 +483,9 @@ import { readHostDispatchHoldReason, readHostDispatchHot } from "./host-dispatch
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
+import { isPluginConfigKey, narrowPluginConfigSection, PLUGIN_CONFIG_ALLOWLIST } from "./plugin-loader.ts";
+import * as pluginsModule from "./plugins.ts";
+import type { PluginListing } from "./plugin-types.ts";
 import { createBotPackageExport } from "./package-export.ts";
 import { installTestParentWatchdog } from "./test-parent-watchdog.ts";
 import { installTimestampedConsole } from "./console-timestamps.ts";
@@ -877,6 +881,54 @@ console.log(observabilityBootLine(await observability.apply()));
 // that keeps a rotated credential current, not the one boot depends on.
 infisical.start();
 bus.subscribe((event: RuntimeEvent) => observeRuntimeEvent(event));
+
+// ── plugin runtime bootstrap ───────────────────────────────────────────────
+// The plugin system is user data: it lives in <DATA_DIR>/plugins, ships
+// disabled, and runs in the server process.  Wire it after observability
+// so a plugin's logger can route through the same Sentry path; wire it
+// after registry.load so a plugin's getBots() sees the live fleet.
+// Request schemas for the /api/plugins routes.  Bodies and path params
+// are untrusted input; the lifecycle only ever sees parsed values.
+const PLUGIN_INSTALL_BODY = z.object({ source: z.string().trim().min(1).max(4096) }).strip();
+const PLUGIN_COMMAND_BODY = z.object({ args: z.string().max(8192).default("") }).strip();
+const PLUGIN_SLUG = z.string().min(1).max(64).regex(/^[\w][\w-]*$/);
+const PLUGIN_PATH_PARAMS = z.tuple([PLUGIN_SLUG]);
+const PLUGIN_ITEM_PATH_PARAMS = z.tuple([PLUGIN_SLUG, PLUGIN_SLUG]);
+
+pluginsModule.initPluginRuntime({
+  listBots: () => store.bots.map((bot) => ({
+    id: bot.id,
+    name: bot.name,
+    // `bot.busy` is typed `boolean | undefined` upstream; truthiness is the
+    // domain check, and the falsy branch covers both `false` and absent.
+    status: bot.busy === true ? "running" : bot.busy === false ? "stopped" : "unknown",
+    driver: bot.modelSelection?.instanceId ?? "unknown",
+  })),
+  // DESIGN.md: a small allowlist of non-secret settings, not every
+  // AppConfig section minus a denylist.  Only keys present on the live
+  // config are advertised so plugins do not probe absent sections.
+  listConfigKeys: () => PLUGIN_CONFIG_ALLOWLIST.filter((key) => Object.prototype.hasOwnProperty.call(cfg, key)),
+  // Refuse anything outside the allowlist, then return a narrowed /
+  // redacted copy.  The live AppConfig object must not cross into plugin
+  // code.
+  readConfig: <T = unknown>(key: string): T | undefined => {
+    if (!isPluginConfigKey(key)) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(cfg, key)) return undefined;
+    // SAFETY: `key` was confirmed as an own allowlisted property of the resolved AppConfig.  narrowPluginConfigSection copies and drops secret-looking / out-of-scope fields; the caller names T.
+    return narrowPluginConfigSection(key, cfg[key as keyof typeof cfg]) as T | undefined;
+  },
+  // Plugin events are allow-listed structures from plugin-loader.ts: an
+  // event name, a level, a hashed plugin id, and a length or stable code.
+  // Plugin-supplied text (log messages, error messages, names from the
+  // manifest) never reaches this sink.
+  logger: (event) => {
+    const line = JSON.stringify(event);
+    if (event.level === "error") console.error(line);
+    else if (event.level === "warn") console.warn(line);
+    else console.log(line);
+  },
+});
+await pluginsModule.bootPluginRuntime();
 
 // ── peer-agent comms wiring ────────────────────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
@@ -1928,6 +1980,86 @@ async function interruptIfHostRevoked(
     .catch(() => {});
 }
 
+/** What a paired phone is told when its save would give a bot This Mac or take
+ * it away.  Host control hands the bot the person's real desktop, so the phone
+ * may switch the sandboxed destinations (cloud, vm) and leave this one to the
+ * computer, where the Auto Mode warning and the mid-turn interrupt live. */
+const PAIRED_LOCAL_COMPUTER_ERROR =
+  "This Mac can only be turned on or off in BotFleet on your computer";
+
+/** What a paired phone is told when its save would turn Auto Mode ON for a bot
+ * that can use This Mac.  Auto Mode on the person's real desktop is the one
+ * switch that lets a click or keystroke on it go unasked, and its warning
+ * dialog is only shown by the computer (`localAutoAcknowledgementError`), so
+ * the phone cannot create that pair.  Turning Auto Mode OFF, or ON for a bot
+ * that cannot use This Mac, is the phone's to do (owner ruling, 2026-10-09). */
+const PAIRED_AUTO_ON_THIS_MAC_ERROR =
+  "Auto Mode can only be turned on in BotFleet on your computer for a bot that can use This Mac";
+
+/** A bot as the Auto Mode consent check should see it: its Bypass Permissions
+ * left out, because bypass never answers a request that controls This Mac and
+ * so is not what that warning is about (see `pairedProfileRefusal`). */
+function withoutBypass<T extends { bypassPermissions?: boolean }>(bot: T): Omit<T, "bypassPermissions"> {
+  const { bypassPermissions: _bypass, ...rest } = bot;
+  return rest;
+}
+
+/** The paired-device rules for a profile write that touches `computers` or
+ * `autoApprove`: a refusal with the status to send, or null when it may go
+ * ahead.  Called by the profile route, which is the one a phone reaches
+ * through the sidecar (the desktop uses the broad bot PATCH).  The sidecar
+ * cannot make this call: telling "kept This Mac" from "added This Mac", or
+ * "already Auto on this Mac" from "newly Auto", needs the stored bot, so the
+ * check lives where the bot does, and a loopback caller of the same route gets
+ * the same guard.
+ *
+ * Membership of `local` must come out the way it went in.  Everything else the
+ * desktop PATCH does for a `computers` write is either unreachable once that
+ * holds (the mid-turn interrupt only fires when `local` is removed) or runs
+ * here too (the Auto Mode acknowledgement, whose doc says every route that
+ * grants `computers` calls it).  The same acknowledgement stops a switch to
+ * Auto Mode: the profile schema carries no `acknowledgeLocalAuto`, so a bot
+ * that can use This Mac and is not already in Auto Mode cannot be put there
+ * from here, only from the desktop's own dialog.
+ *
+ * Bypass Permissions is NOT part of that consent here, on purpose.  The
+ * desktop route counts it (AG, #870), but it cannot do what the dialog warns
+ * about: `autoVerdict` never answers a `local-computer` request in bypass, and
+ * no driver turns the bot's bypass into an engine switch on a turn that
+ * controls This Mac.  Counting it would make the phone's bypass switch fail on
+ * every Auto bot on a Mac (an Auto bot has no computer list, so it may reach
+ * the desktop), which would defeat the owner's 2026-10-09 ruling that bots get
+ * Bypass Permissions from the phone.  It is read as off when judging whether a
+ * bot is "already" in Auto Mode, so a phone-set bypass can never stand in for
+ * the Auto Mode acknowledgement. */
+function pairedProfileRefusal(
+  existing: ComputerGrantSubject | null | undefined,
+  patch: { computers?: Array<"cloud" | "vm" | "local">; autoApprove?: boolean },
+): { status: number; error: string } | null {
+  if (patch.computers !== undefined) {
+    const heldLocal = currentComputerGrants(existing).includes("local");
+    if (patch.computers.includes("local") !== heldLocal) return { status: 403, error: PAIRED_LOCAL_COMPUTER_ERROR };
+  }
+  const ackError = localAutoAcknowledgementError(
+    existing ? withoutBypass(existing) : existing,
+    patch.computers ?? storedComputerGrants(existing),
+    patch.autoApprove !== undefined ? patch.autoApprove : existing?.autoApprove === true,
+    false,
+    {
+      currentDefault: cfg.botDefaults?.computers,
+      nextDefault: cfg.botDefaults?.computers,
+      currentAllowed: consentAllowedComputers(cfg),
+      nextAllowed: consentAllowedComputers(cfg),
+    },
+  );
+  if (!ackError) return null;
+  // A request to turn Auto Mode on is declined for the computer to answer.
+  // Anything else gets the same 400 the desktop route would give.
+  return patch.autoApprove === true
+    ? { status: 403, error: PAIRED_AUTO_ON_THIS_MAC_ERROR }
+    : { status: 400, error: ackError };
+}
+
 function checkedGroupResponder(value: unknown, memberIds: string[]): GroupDefaultResponder | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const responder = value as { kind?: unknown; botId?: unknown };
@@ -1952,6 +2084,9 @@ function checkedMemberIds(
 const bootSelection = await defaultSelection();
 const store = new Store(() => bootSelection);
 store.seedIfEmpty();
+// A set-aside bots.json, groups.json or routines.json from an earlier run still needs the owner's
+// attention after a restart, so it raises a notice again here.
+registerLeftOverSetAsideFiles(DATA_DIR);
 export { store };
 
 // ── background jobs (jobs P1, docs/plans/2026-10-01-background-jobs-and-subagents-decision.md) ──
@@ -2168,13 +2303,22 @@ function liveThreadIds(): Set<string> {
 // One flag covers all three sweeps: a preview before trusting a brand-new
 // class of delete against real data.
 const retentionDryRun = process.env.OMB_RETENTION_DRY_RUN === "1";
+// While a set-aside bots.json or groups.json is waiting in the data folder, the roster cannot say
+// which bots and threads still exist, so none of the three sweeps below may call anything an orphan.
+// `cleanupHoldReason` reads the folder on every call, so this holds across restarts.
 const stopOrphanTranscriptSweeps = startOrphanTranscriptSweeps(transcriptDirs, liveThreadIds, console.log, {
   dryRun: retentionDryRun,
+  hold: () => cleanupHoldReason(DATA_DIR),
 });
 // Workspaces and messages.db are swept once, shortly after boot, off the
 // request path — no recurring timer to unref, because a harness restart (29
 // in two days per the audit) already re-runs this often enough on its own.
 setTimeout(() => {
+  const retentionHold = cleanupHoldReason(DATA_DIR);
+  if (retentionHold) {
+    console.log(`[retention] workspace and message cleanup skipped: ${retentionHold}.`);
+    return;
+  }
   const workspaceResult = sweepOrphanedWorkspaces(new Set(store.bots.map((b) => b.id)), { dryRun: retentionDryRun });
   const workspaceLine = describeWorkspaceSweep(workspaceResult);
   if (workspaceLine) console.log(workspaceLine);
@@ -6059,6 +6203,7 @@ async function startTurn(
         integrations,
         cwd,
         autoApprove: bot.autoApprove === true,
+        bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, threadId, instance) || undefined,
       };
@@ -8192,6 +8337,7 @@ async function runGroupMemberTurn(
         tools: roomTurnTools,
         toolHost: roomToolHost,
         autoApprove: bot.autoApprove === true,
+        bypassPermissions: bot.bypassPermissions === true,
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, threadId, instance) || undefined,
         ...memberTurnSelection(selection),
@@ -11345,9 +11491,47 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 400, { error: "context must be at most 60 characters" });
         }
       }
+      // First settings, checked BEFORE the room exists.  The phone's New Room
+      // sheet used to create the room and then patch the folder, bulletin and
+      // responder in a second request, so a folder this computer would not let
+      // a phone choose left a half-made room behind.  Sent here, a refusal
+      // leaves nothing.  Left unmarked as "set up": the desktop's setup
+      // prompt still offers itself, exactly as it does for a phone room.
+      interface FirstSettings {
+        bulletin?: string;
+        defaultResponder?: GroupDefaultResponder;
+        cwd?: string;
+      }
+      const first: FirstSettings = {};
+      if (body.bulletin !== undefined) {
+        if (typeof body.bulletin !== "string") return json(res, 400, { error: "bulletin must be a string" });
+        if (body.bulletin.length > 12_000) {
+          return json(res, 400, { error: "bulletin must be at most 12000 characters" });
+        }
+        first.bulletin = body.bulletin;
+      }
+      if (body.defaultResponder !== undefined) {
+        const responder = checkedGroupResponder(body.defaultResponder, memberIds);
+        if (!responder) return json(res, 400, { error: "invalid default responder" });
+        first.defaultResponder = responder;
+      }
+      if (body.cwd !== undefined && body.cwd !== null && body.cwd !== "") {
+        const checked = validateBotCwd(body.cwd);
+        if (!checked.ok) return json(res, 400, { error: checked.error });
+        // Same confinement as a phone-set room folder (the room PATCH below).
+        if (checked.cwd && req.headers["x-botfleet-companion"] === "1") {
+          const refusedFolder = cwdConfinementError(checked.cwd, phoneCwdConfinement());
+          if (refusedFolder) {
+            return json(res, 403, { error: `${refusedFolder} — pick it in BotFleet on your computer` });
+          }
+        }
+        if (checked.cwd) first.cwd = checked.cwd;
+      }
       let setup:
-        | { bulletin: string; defaultResponder: GroupDefaultResponder; completed: true }
-        | undefined;
+        | { bulletin?: string; defaultResponder?: GroupDefaultResponder; completed?: true }
+        | undefined = first.bulletin !== undefined || first.defaultResponder
+        ? { bulletin: first.bulletin, defaultResponder: first.defaultResponder }
+        : undefined;
       if (body.setup !== undefined) {
         if (!body.setup || typeof body.setup !== "object" || Array.isArray(body.setup)) {
           return json(res, 400, { error: "setup must be an object" });
@@ -11363,7 +11547,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (!responder) return json(res, 400, { error: "invalid setup.defaultResponder" });
         setup = { bulletin: requested.bulletin, defaultResponder: responder, completed: true };
       }
-      const group = store.createGroup(name, memberIds, false, section, setup);
+      const created = store.createGroup(name, memberIds, false, section, setup);
+      const group = first.cwd ? (store.patchGroup(created.id, { cwd: first.cwd }) ?? created) : created;
       return json(res, 201, { group: { ...publicGroupState(group), messages: [] } });
     }
     // Every conversation on this computer, as one JSON document.
@@ -12058,7 +12243,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const threadIds = new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)]);
       for (const threadId of threadIds) lastReply.delete(threadId);
-      store.deleteGroup(group.id);
+      // Refuse before wiping transcripts when the roster cannot be saved: a
+      // false here means the room would reappear on the next boot pointing at
+      // logs that are already gone.
+      if (!store.deleteGroup(group.id)) {
+        return json(res, 409, { error: "the room roster could not be saved — fix or move groups.json, then retry" });
+      }
       stopJobsForDeleted(threadIds, "its conversation was deleted");
       // Both generations and any temp file, for every task this room had: a
       // `.ndjson.1` or a killed trim's `.tmp` left behind would outlive the
@@ -12264,8 +12454,37 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // existingBot lets a one-device `voices` change keep the other device's.
       const parsed = parseBotProfilePatch(body, true, existingBot);
       if (!parsed.ok) return json(res, 400, { error: parsed.error });
-      if (localAutoConsentConfigBusy && parsed.patch.name !== undefined) {
+      if (
+        localAutoConsentConfigBusy &&
+        (parsed.patch.name !== undefined ||
+          parsed.patch.computers !== undefined ||
+          parsed.patch.autoApprove !== undefined)
+      ) {
         return json(res, 409, { error: localAutoConsentConfigBusyError });
+      }
+      if (parsed.patch.computers !== undefined) {
+        // De-duplicated the way the broad PATCH stores it.
+        parsed.patch.computers = [...new Set(parsed.patch.computers)];
+      }
+      if (parsed.patch.computers !== undefined || parsed.patch.autoApprove !== undefined) {
+        const refused = pairedProfileRefusal(existingBot, parsed.patch);
+        if (refused) return json(res, refused.status, { error: refused.error });
+      }
+      if (Object.prototype.hasOwnProperty.call(body, "cwd")) {
+        // The profile schema only types `cwd`; the folder itself is checked
+        // here, the way the broad PATCH does.  From a paired phone (the
+        // sidecar stamps every request it forwards) it may only reuse or
+        // narrow a folder this computer already handed to a bot or room,
+        // exactly as a phone-set room folder is confined.  Clearing passes.
+        const checked = validateBotCwd(body.cwd);
+        if (!checked.ok) return json(res, 400, { error: checked.error });
+        if (checked.cwd && req.headers["x-botfleet-companion"] === "1") {
+          const refusedFolder = cwdConfinementError(checked.cwd, phoneCwdConfinement());
+          if (refusedFolder) {
+            return json(res, 403, { error: `${refusedFolder} — pick it in BotFleet on your computer` });
+          }
+        }
+        parsed.patch.cwd = checked.cwd ?? undefined;
       }
       if (parsed.patch.avatarUrl && !storedAvatarExists(parsed.patch.avatarUrl)) {
         return json(res, 400, { error: "avatarUrl must reference an existing stored image" });
@@ -12530,8 +12749,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const wantsAuto =
         (body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true) ||
         (body.bypassPermissions !== undefined ? body.bypassPermissions : existingBot?.bypassPermissions === true);
+      // Turning Auto Mode ON is judged as Auto Mode alone.  A paired phone may
+      // put a bot in Bypass Permissions without the Mac's warning (the profile
+      // route, `pairedProfileRefusal`), so a bypass that was never
+      // acknowledged cannot count as "already granted" here, or a request
+      // without `acknowledgeLocalAuto` would slip Auto Mode in behind it.  The
+      // desktop's own dialog always sends the acknowledgement in this case.
+      const turningAutoOn = body.autoApprove === true && existingBot?.autoApprove !== true;
       const ackError = localAutoAcknowledgementError(
-        existingBot,
+        turningAutoOn && existingBot ? withoutBypass(existingBot) : existingBot,
         wantsComputers,
         wantsAuto === true,
         body.acknowledgeLocalAuto === true,
@@ -12657,6 +12883,22 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         cancelPeerApprovalsFor(bot.id);
         discardDelegations(commsBus, bot.threadId);
         computerControl.forget(bot.id);
+        // The snapshot above was taken before soft-cleanup awaits.  A task
+        // created while they ran has a record the delete below removes and a
+        // pair of logs the snapshot never heard of, so take the union rather
+        // than either list alone — before the roster delete, while the record
+        // still exists.
+        const current = store.bot(bot.id);
+        if (current) {
+          botThreadIds.add(current.threadId);
+          for (const task of current.tasks ?? []) botThreadIds.add(task.threadId);
+        }
+        // Refuse before destroying the workspace when the roster cannot be
+        // saved: a false here means the bot would reappear on the next boot
+        // pointing at a container and transcripts that are already gone.
+        if (!store.deleteBot(bot.id)) {
+          return json(res, 409, { error: "the bot roster could not be saved — fix or move bots.json, then retry" });
+        }
         // Its per-bot Local VM goes with it.  Nothing else can name that
         // container once the store record is gone — the name is derived from
         // the bot id — so a later shared/per-bot mode switch cannot clean it
@@ -12674,16 +12916,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const perBotVpsTarget = vps.perBotVpsTarget(bot.id);
         await vps.vpsRemoveTargetIfPresent(cfg, perBotVpsTarget).catch(() => {});
         vps.closeVpsDesktopTunnelForTarget(perBotVpsTarget.key);
-        // The snapshot above was taken before two awaits.  A task created
-        // while they ran has a record the delete below removes and a pair of
-        // logs the snapshot never heard of, so take the union rather than
-        // either list alone.
-        const current = store.bot(bot.id);
-        if (current) {
-          botThreadIds.add(current.threadId);
-          for (const task of current.tasks ?? []) botThreadIds.add(task.threadId);
-        }
-        store.deleteBot(bot.id);
       } finally {
         localVmLifecycleBusy.delete(localVmTarget.key);
       }
@@ -13932,6 +14164,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         ownerProof: harnessOwnerProof(harnessOwner, req.headers["x-botfleet-owner-challenge"]),
         ready: !booting, booting,
       });
+    }
+    // Saved data that could not be read or used, for the notice at the top of the app.  File base names
+    // and short reasons only: no paths, and never a fragment of a file.
+    if (method === "GET" && path === "/api/data-faults") {
+      return json(res, 200, { faults: listDataFaults() });
     }
     if (method === "GET" && path === "/api/telemetry/status") {
       return json(res, 200, telemetry.getStatus());
@@ -16028,6 +16265,76 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (m && method === "DELETE") return json(res, 200, await composio.removeAccount(cfg, m[1], m[2]));
     m = path.match(/^\/api\/connectors\/([\w-]+)$/);
     if (m && method === "DELETE") return json(res, 200, await composio.removeService(cfg, m[1]));
+
+    // ── plugins (drop-in extensions, see docs/plugins/DESIGN.md) ──
+    // The plugin system lives outside the repo.  It ships DISABLED until
+    // the user enables it after reading the manifest, mirrors the skills
+    // trust model, and uses the same route dispatch style as the rest of
+    // this file.  Validation errors return { error, issues: [...] } so
+    // the UI can render one row per problem.
+    // Every body and path parameter is parsed with a zod schema before it
+    // reaches the plugin lifecycle; a parse failure is a 400.
+    if (method === "GET" && path === "/api/plugins") {
+      return json(res, 200, { plugins: pluginsModule.listPlugins() });
+    }
+    if (method === "POST" && path === "/api/plugins/install") {
+      const body = PLUGIN_INSTALL_BODY.safeParse(await readBody(req));
+      if (!body.success) return json(res, 400, { error: "source is required" });
+      const result = await pluginsModule.installPlugin(body.data.source);
+      if ("error" in result) {
+        return json(res, 400, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
+      }
+      return json(res, 200, result);
+    }
+    const pluginPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)$/)?.slice(1));
+    if (pluginPath.success && method === "GET") {
+      const result = pluginsModule.getPlugin(pluginPath.data[0]);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    if (pluginPath.success && method === "DELETE") {
+      const result = await pluginsModule.removePlugin(pluginPath.data[0]);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    const pluginAction = method === "POST" ? pluginsModule.matchPluginActionRoute(path) : null;
+    if (pluginAction) {
+      const { name, action } = pluginAction;
+      let result: PluginListing | { error: string; issues?: Array<{ field: string; message: string }> } | { removed: true };
+      if (action === "enable") result = await pluginsModule.enablePlugin(name);
+      else if (action === "disable") result = await pluginsModule.disablePlugin(name);
+      else if (action === "update") result = await pluginsModule.updatePlugin(name);
+      else result = await pluginsModule.reloadPlugin(name);
+      // Status mapping: 404 when the action target is unknown (the plugin
+      // is not installed), 400 for everything else (bad request shape,
+      // host-version mismatch, etc.).  Mirrors the GET delete pattern.
+      const status = "error" in result && result.error.startsWith("no plugin named") ? 404 : 400;
+      if ("error" in result) {
+        return json(res, status, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
+      }
+      return json(res, 200, result);
+    }
+    const cardPath = PLUGIN_ITEM_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/cards\/([\w][\w-]*)$/)?.slice(1));
+    if (cardPath.success && method === "GET") {
+      const result = await pluginsModule.getPluginCardData(cardPath.data[0], cardPath.data[1]);
+      if ("error" in result) {
+        // DESIGN.md: unknown plugin names → 404; disabled / other → 409.
+        const status = result.error.startsWith("no plugin named") ? 404 : 409;
+        return json(res, status, { error: result.error });
+      }
+      return json(res, 200, { data: result.data });
+    }
+    const cmdPath = PLUGIN_ITEM_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/commands\/([\w][\w-]*)$/)?.slice(1));
+    if (cmdPath.success && method === "POST") {
+      const body = PLUGIN_COMMAND_BODY.safeParse(await readBody(req));
+      if (!body.success) return json(res, 400, { error: "expected a JSON object with an optional string `args`" });
+      const result = await pluginsModule.runPluginCommand(cmdPath.data[0], cmdPath.data[1], body.data.args);
+      if ("error" in result) {
+        const status = result.error.startsWith("no plugin named") ? 404 : 409;
+        return json(res, status, { error: result.error });
+      }
+      return json(res, 200, result);
+    }
 
     // Inline credential cards never receive the credential value. Electron
     // saves it through the OS-backed store first; this route only verifies

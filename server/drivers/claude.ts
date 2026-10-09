@@ -776,9 +776,17 @@ function decodeConfig(raw: unknown): ClaudeConfig {
   }
   const tools = decodeToolList(o.tools, "tools");
   const disallowedTools = decodeToolList(o.disallowedTools, "disallowedTools");
+  // Settings > Engines > "Bypass permissions (autonomous mode)" stores
+  // `fullAuto: true` on the instance (server/config.ts patchInstanceConfig),
+  // which is every other CLI engine's native YOLO switch.  Claude had its own
+  // spelling, `permissionMode`, and nothing read `fullAuto`: the box ticked and
+  // the CLI kept running in acceptEdits.  An explicit `permissionMode` still
+  // wins, so a hand-written one is never overridden.  The host-control
+  // downgrade in sendTurn applies to either spelling.
+  const fullAuto = o.fullAuto === true;
   return {
     cli: typeof o.cli === "string" ? o.cli : "claude",
-    permissionMode: (mode as ClaudeConfig["permissionMode"]) ?? "acceptEdits",
+    permissionMode: (mode as ClaudeConfig["permissionMode"]) ?? (fullAuto ? "bypassPermissions" : "acceptEdits"),
     ...(tools !== undefined ? { tools } : {}),
     ...(disallowedTools !== undefined ? { disallowedTools } : {}),
   };

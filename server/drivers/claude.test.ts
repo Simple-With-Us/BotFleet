@@ -108,6 +108,19 @@ describe("ClaudeDriver.decodeConfig", () => {
     expect(() => ClaudeDriver.decodeConfig({ permissionMode: "yolo" })).toThrow(/permissionMode/);
   });
 
+  it("maps the Engines page's autonomous-mode switch (fullAuto) to Claude's bypassPermissions", () => {
+    // Settings > Engines stores `fullAuto: true`; Claude spelled the same
+    // thing `permissionMode`, and the box ticked with no effect on the CLI.
+    expect(ClaudeDriver.decodeConfig({ fullAuto: true }).permissionMode).toBe("bypassPermissions");
+    expect(ClaudeDriver.decodeConfig({ fullAuto: false }).permissionMode).toBe("acceptEdits");
+    expect(ClaudeDriver.decodeConfig({}).permissionMode).toBe("acceptEdits");
+    // Only a real boolean true counts: a stray string is not a YOLO switch.
+    expect(ClaudeDriver.decodeConfig({ fullAuto: "yes" }).permissionMode).toBe("acceptEdits");
+    // An explicit permissionMode is never overridden by the switch.
+    expect(ClaudeDriver.decodeConfig({ fullAuto: true, permissionMode: "acceptEdits" }).permissionMode).toBe("acceptEdits");
+    expect(ClaudeDriver.decodeConfig({ fullAuto: true, permissionMode: "auto" }).permissionMode).toBe("auto");
+  });
+
   it("normalizes and deduplicates built-in tool lists", () => {
     expect(
       ClaudeDriver.decodeConfig({
@@ -542,6 +555,27 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     const bypassed = JSON.parse(readFileSync(bypassDump, "utf8"));
     expect(bypassed.argv).not.toContain("--permission-prompt-tool");
     expect(bypassed.mcpConfig?.mcpServers?.botfleet).toBeUndefined();
+  });
+
+  it("starts the CLI in bypassPermissions when the Engines page's fullAuto switch is on", async () => {
+    // The end of the mapping decodeConfig does: the flag the CLI really gets.
+    // Built by hand, through decodeConfig the way the registry does it: the
+    // `create` helper above always supplies a permissionMode of its own.
+    instance = await ClaudeDriver.create({
+      instanceId: "claude-full-auto-test",
+      displayName: "Claude Full Auto Test",
+      environment: {},
+      enabled: true,
+      config: ClaudeDriver.decodeConfig({ cli: FAKE_CLI, fullAuto: true }),
+    });
+    recorder = recordEvents(instance.adapter);
+    const dump = join(scratch, "full-auto-switch.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-full-auto-switch", text: "hi" });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-full-auto-switch");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+    expect(seen.argv).not.toContain("--permission-prompt-tool");
   });
 
   it("passes normalized available and denied built-in tool sets to Claude", async () => {

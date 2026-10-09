@@ -1,7 +1,11 @@
 // The profile patch parser is the boundary that keeps paired clients from
-// writing anything but identity fields. The strict half is the one that
-// matters: a privileged bot field arriving here must be refused by NAME,
-// so a future field cannot silently become remotely writable.
+// writing a bot field nobody ruled on. The strict half is the one that
+// matters: a field arriving here that is not in the schema must be refused by
+// NAME, so a future field cannot silently become remotely writable.  The
+// execution-policy fields are in the schema since the owner's 2026-10-09
+// ruling that a paired phone may set them; which bots may have Auto or Bypass
+// switched on from a phone is decided in the profile route (see
+// companion/test/proxy.test.ts), where the stored bot is.
 import { describe, expect, it } from "vitest";
 
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
@@ -14,9 +18,51 @@ describe("parseBotProfilePatch (strict — the paired boundary)", () => {
     expect(result2).toEqual({ ok: false, error: "unsupported profile field: unknownProperty" });
   });
 
-  it("refuses bypassPermissions on the paired profile boundary", () => {
-    const result = parseBotProfilePatch({ bypassPermissions: true }, true);
-    expect(result).toEqual({ ok: false, error: "unsupported profile field: bypassPermissions" });
+  it("accepts the execution-policy switches on the paired boundary, in strict mode too", () => {
+    // Owner ruling 2026-10-09: bots get Bypass Permissions, Auto-Approve, Auto
+    // Review and peer-contact approval from the phone.  Strict mode used to
+    // refuse bypassPermissions by name (AG, #870).
+    for (const strict of [true, false]) {
+      expect(parseBotProfilePatch({ bypassPermissions: true }, strict)).toEqual({
+        ok: true,
+        patch: { bypassPermissions: true },
+      });
+      expect(parseBotProfilePatch({ bypassPermissions: false }, strict)).toEqual({
+        ok: true,
+        patch: { bypassPermissions: false },
+      });
+      expect(
+        parseBotProfilePatch(
+          { autoApprove: true, autoReview: "enforce", approvePeerComms: false, bypassPermissions: true },
+          strict,
+        ),
+      ).toEqual({
+        ok: true,
+        patch: { autoApprove: true, autoReview: "enforce", approvePeerComms: false, bypassPermissions: true },
+      });
+    }
+  });
+
+  it("still validates each switch's value, so a stray string or number writes nothing", () => {
+    // Parsed from JSON the way a request body arrives, so the wrong types are
+    // the wire's and need no cast.
+    const wire = (json: string) => parseBotProfilePatch(JSON.parse(json), true);
+    expect(wire('{"bypassPermissions":"true"}')).toEqual({
+      ok: false,
+      error: "bypassPermissions must be true or false",
+    });
+    expect(wire('{"autoApprove":1}')).toEqual({
+      ok: false,
+      error: "autoApprove must be true or false",
+    });
+    expect(wire('{"approvePeerComms":null}')).toEqual({
+      ok: false,
+      error: "approvePeerComms must be true or false",
+    });
+    expect(wire('{"autoReview":"always"}')).toEqual({
+      ok: false,
+      error: "autoReview must be off, shadow, or enforce",
+    });
   });
 
   it("accepts the full identity and configuration surface", () => {
