@@ -5,6 +5,9 @@
 // spec then submits a personal: voice id through Add Voice ID.  commitVoice
 // is what paints the denial; this file does not pre-render that error.
 //
+// Both variants show the workspace Default Voice at the top of the card and
+// the Pronunciations list at its foot.
+//
 // `&variant=per-device`: a macOS 14 Mac that lists one Personal Voice, and a
 // bot that speaks it on the Mac while the iPhone uses its own Personal
 // Voice.  The spec screenshots the two pickers, the iPhone one greyed with
@@ -14,6 +17,7 @@ import { DesktopCapabilitiesProvider, useDesktopCapabilities } from "./DesktopCa
 import { VoiceSettings } from "./VoiceSettings";
 import { StoreProvider, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { applyBotPatch } from "@/state/bot-patch-queue";
+import { DEFAULT_PRONUNCIATIONS } from "../../shared/pronunciations";
 
 const perDevice =
   typeof window !== "undefined" && new URLSearchParams(window.location.search).get("variant") === "per-device";
@@ -121,7 +125,15 @@ const configuredTts: ConfigStatus = {
   vps: { configured: false, sshAlias: "" },
   rooms: { turnTimeoutMinutes: 30 },
   localVm: { mode: "shared", maxInstances: 1 },
-  tts: { provider: "minimax", configured: true, ready: true, voice: "standard-default" },
+  // The owner's own setup: his MiniMax clone as the workspace default and
+  // the seeded pronunciation list.
+  tts: {
+    provider: "minimax",
+    configured: true,
+    ready: true,
+    voice: "jay-wedgeworth-001",
+    pronunciations: DEFAULT_PRONUNCIATIONS.map(({ term, say }) => ({ term, say })),
+  },
 };
 
 function CapabilitiesFlag() {

@@ -355,11 +355,20 @@ final class Session: ObservableObject {
             fleet.bots[index].voices = BotVoices(mac: "personal:com.apple.speech.personalvoice.preview-mac")
             fleet.bots[index].speechDevices = ["mac", "iphone"]
         }
+        // The owner's own setup: his MiniMax clone as the workspace default
+        // (listed with no friendly label, so it reads as the id made
+        // readable) and the seeded pronunciation list.
         config = try? JSONDecoder().decode(
             ConfigStatus.self,
-            from: Data(#"{"tts":{"configured":true,"voice":"English_Graceful_Lady","provider":"minimax"}}"#.utf8)
+            from: Data(#"""
+            {"tts":{"configured":true,"voice":"jay-wedgeworth-001","provider":"minimax","pronunciations":[
+              {"term":"JSON","say":"Jason"},{"term":"SaaS","say":"sass"},{"term":"SQL","say":"sequel"},
+              {"term":"REGEX","say":"redge ex"},{"term":"GUI","say":"gooey"},{"term":"CAPTCHA","say":"cap cha"},
+              {"term":"sudo","say":"soo doo"},{"term":"cron","say":"kron"},{"term":"OAuth","say":"oh auth"}]}}
+            """#.utf8)
         )
         previewVoiceOptions = [
+            Voice(id: "jay-wedgeworth-001", label: "jay-wedgeworth-001", description: "Custom"),
             Voice(id: "English_Graceful_Lady", label: "Graceful Lady"),
             Voice(id: "English_Persuasive_Man", label: "Persuasive Man"),
             Voice(id: "English_Wise_Woman", label: "Wise Woman"),
@@ -1892,6 +1901,50 @@ final class Session: ObservableObject {
         catch { recordActionError(error); return [] }
     }
 
+    // MARK: - Workspace voice settings
+
+    /// Save the workspace default voice.  Returns the refusal in words, or
+    /// nil when it saved.
+    @MainActor
+    func updateDefaultVoice(_ voiceId: String) async -> String? {
+        guard let client else {
+            // The store preview has no computer; apply it here so the screen
+            // can be exercised.
+            guard previewVoiceOptions != nil else { return "Connect a computer first." }
+            config?.tts?.voice = voiceId
+            return nil
+        }
+        let pairing = pairingGeneration
+        do {
+            let status = try await client.updateDefaultVoice(voiceId)
+            guard pairingGeneration == pairing else { return nil }
+            config = status
+            return nil
+        } catch {
+            return isCancellation(error) ? nil : error.localizedDescription
+        }
+    }
+
+    /// Replace the workspace pronunciation list.  Returns the refusal in
+    /// words, or nil when it saved.
+    @MainActor
+    func updatePronunciations(_ list: [Pronunciation]) async -> String? {
+        guard let client else {
+            guard previewVoiceOptions != nil else { return "Connect a computer first." }
+            config?.tts?.pronunciations = list
+            return nil
+        }
+        let pairing = pairingGeneration
+        do {
+            let status = try await client.updatePronunciations(list)
+            guard pairingGeneration == pairing else { return nil }
+            config = status
+            return nil
+        } catch {
+            return isCancellation(error) ? nil : error.localizedDescription
+        }
+    }
+
     func stopVoice() {
         let wasPlaying = voiceTask != nil || voicePlayer != nil || PersonalVoiceService.shared.isSpeaking
         voiceGeneration = UUID()
@@ -2073,7 +2126,11 @@ final class Session: ObservableObject {
         var karaoke: MessageKaraoke?
         if let follow {
             karaoke = KaraokeCenter.shared.begin(
-                messageId: follow.message.id, messageText: follow.message.text ?? "", script: follow.script, mode: .live
+                messageId: follow.message.id,
+                messageText: follow.message.text ?? "",
+                script: follow.script,
+                mode: .live,
+                pronunciations: config?.pronunciations ?? []
             )
             karaoke?.setChunks(segments.map(\.text))
         }
@@ -2120,7 +2177,13 @@ final class Session: ObservableObject {
         // replaces the estimate once it plays.
         var karaoke: MessageKaraoke?
         if let script = answer.karaokeScript, script.utterances.count == total {
-            karaoke = KaraokeCenter.shared.begin(messageId: messageId, messageText: message.text ?? "", script: script, mode: .clips)
+            karaoke = KaraokeCenter.shared.begin(
+                messageId: messageId,
+                messageText: message.text ?? "",
+                script: script,
+                mode: .clips,
+                pronunciations: config?.pronunciations ?? []
+            )
         }
         var next = prefetchClip(0, threadId: threadId, messageId: messageId, client: client)
         for index in 0..<total {

@@ -170,6 +170,12 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // workspace MiniMax key; the phone receives labels or audio only.
   { method: "GET", path: /^\/api\/tts\/voices$/ },
   { method: "POST", path: /^\/api\/tts\/speak$/ },
+  // The workspace default voice and the pronunciation list: settings, not
+  // credentials.  Each is its own narrow harness route that validates and
+  // saves only that field, the way terminology does, so /api/config (which
+  // carries the voice key) stays write-closed to a phone.
+  { method: "PATCH", path: /^\/api\/tts\/default-voice$/ },
+  { method: "PATCH", path: /^\/api\/tts\/pronunciations$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio\/\d+$/ },
 
