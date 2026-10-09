@@ -202,6 +202,18 @@ describe("plugin lifecycle", () => {
   });
 });
 
+describe("enable failure cleanup", () => {
+  it("enablePlugin stops the sandbox it just started when the registry write fails", async () => {
+    await installPlugin(FIXTURE, baseDir);
+    // A directory squatting on the registry temp path makes the write throw.
+    mkdirSync(join(baseDir, `registry.json.tmp-${process.pid}`));
+    const result = await enablePlugin("fleet-overview", baseDir);
+    if (!("error" in result)) throw new Error("expected enable to fail");
+    expect(_loadedNames()).not.toContain("fleet-overview");
+    expect(readRegistry(baseDir).plugins["fleet-overview"]?.enabled).toBe(false);
+  });
+});
+
 describe("host API version gate", () => {
   it("satisfiesBotfleetVersion recognizes >=1 against the host version", () => {
     expect(satisfiesBotfleetVersion(">=1", HOST_API_VERSION)).toBe(true);
