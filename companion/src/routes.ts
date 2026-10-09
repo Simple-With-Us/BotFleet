@@ -47,8 +47,43 @@ export function isCloudDesktopJoin(method: string, path: string): boolean {
 }
 
 /** The profile fields a paired phone owns.  Engine choice is deliberately
- * included: the native model picker is a companion feature.  Execution
- * policy, connected apps, computer grants, and host paths remain Mac-only. */
+ * included: the native model picker is a companion feature.  Connected apps
+ * and host paths remain Mac-only.
+ *
+ * `computers` is on the list since 2026-10-08, and only partly.  The phone
+ * may switch the sandboxed destinations (cloud, vm).  Whether the bot holds
+ * This Mac (`local`, the person's real desktop) is still the Mac's decision,
+ * and the sidecar cannot enforce that half: telling "kept local" from "added
+ * local" needs the stored bot.  The harness's profile route owns that check
+ * (`PAIRED_LOCAL_COMPUTER_ERROR` in server/index.ts) and answers 403 with its
+ * own message, so the guard binds every caller of the route, not only this
+ * proxy.  `maxToolRounds` is a 1 to 200 budget the harness clamps, added
+ * because the native control shipped (#649) without anyone extending this
+ * list, not because anyone decided to keep it off the phone.  `cwd` is open
+ * only because the harness confines it: from a paired phone (the proxy stamps
+ * `x-botfleet-companion`) a bot's folder may reuse or narrow one this
+ * computer already shares with a bot or room, as a room folder set from the
+ * phone is confined, and anything else is a 403 with the reason.
+ *
+ * `autoApprove`, `autoReview`, `approvePeerComms` and `bypassPermissions` are
+ * on the list since 2026-10-09, by owner ruling.  Asked whether the phone may
+ * change the execution policy, with "as close to full parity as possible" as
+ * the standing goal, the owner answered "Bots should have bypass permissions
+ * options too or YOLO or whatever."  #323 (audit BF-IOS-001) had kept all of
+ * them on the computer, and the native sheet showed them read-only.  What did
+ * NOT move is host control of the person's real desktop:
+ *   - The harness profile route refuses to turn Auto-Approve ON for a bot that
+ *     can use This Mac, with the same acknowledgement rule the desktop applies
+ *     (`localAutoAcknowledgementError` in server/index.ts).  Auto-Approve is the
+ *     one switch that lets a click on the real desktop go unasked, and its
+ *     warning dialog is the Mac's, so a phone cannot create that pair.  Like
+ *     `computers`, that check needs the stored bot and lives there rather than
+ *     here.  Turning it off is always the phone's.
+ *   - Bypass Permissions never answers a request that controls This Mac
+ *     (server/auto-approve.ts excludes `scope === "local-computer"`), so host
+ *     control still asks even on a bot the phone put in bypass, and the phone
+ *     may switch it on for any bot.
+ *   - The This Mac grant itself is still the Mac's alone (see `computers`). */
 export const COMPANION_PROFILE_PATCH_FIELDS = [
   "name",
   "title",
@@ -64,6 +99,16 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "speakReplies",
   "speechDevices",
   "modelSelection",
+  "computers",
+  "maxToolRounds",
+  "cwd",
+  // Execution policy, open to the phone by the 2026-10-09 owner ruling above.
+  // The harness validates each value, and refuses to turn autoApprove ON for
+  // a bot that can use This Mac.
+  "autoApprove",
+  "autoReview",
+  "approvePeerComms",
+  "bypassPermissions",
   // The bot's On/Off switch (shared/bot-power.ts).  It only ever stops or
   // resumes work the person could already start by messaging the bot, grants
   // no capability, and the phone has to be able to turn a bot back On: the
@@ -287,6 +332,14 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio\/\d+$/ },
 
+  // The phone's own voice recordings.  Playing one back reads a WAV the
+  // harness stored for that user message, and the review route stores a text
+  // note on it; neither forks the thread, reruns a bot, or rewrites the
+  // recognizer's original.  The native chat view calls both, and they used to
+  // answer "no route" because nobody added them here.
+  { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/recording$/ },
+  { method: "PATCH", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/recording-review$/ },
+
   // Routines create ordinary tasks using an existing agent configuration.
   // Webhook management remains explicitly denied below.
   { method: "GET", path: /^\/api\/routines$/ },
@@ -304,12 +357,10 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
 
   // Checking for a newer BotFleet and installing it.  The phone is the one
   // place an update is convenient to start — the Mac is usually mid-work when
-  // someone notices a build is stale.  `POST /api/update/run` takes the same
-  // runtime-readiness reading `POST /api/runtime/quiesce` takes and answers
-  // 409 while any turn, queued send or routine run is in flight, so a tap
-  // from a pocket does not interrupt work; `{ "force": true }` talks past
-  // that check, and the updater's own preflight then refuses instead.
-  // `status` is a read; `check` and `run` are the two actions.
+  // someone notices a build is stale.  A busy Mac does not refuse: the
+  // updater holds new work, gives running bots a short grace, then pauses
+  // and resumes what is left (server/update-drain.ts); `{ "force": true }`
+  // skips the grace.  `status` is a read; `check` and `run` are the two actions.
   { method: "GET", path: /^\/api\/update\/status$/ },
   { method: "POST", path: /^\/api\/update\/check$/ },
   { method: "POST", path: /^\/api\/update\/run$/ },

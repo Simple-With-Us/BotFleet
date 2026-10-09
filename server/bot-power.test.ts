@@ -197,6 +197,7 @@ function fakeStore(bots: BotRecord[]): SteerStore & { messages: Message[] } {
       return full;
     },
     patchMessage: () => null,
+    messagesFor: () => messages,
   };
 }
 
