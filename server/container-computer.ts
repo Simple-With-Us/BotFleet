@@ -98,17 +98,14 @@ export const IMAGE_REPOSITORY = "localhost/botfleet/cua-local-vm";
 // keep accepting it.  Any container built from v7 or earlier is replaced on the
 // next provision.
 //
-// v9 (2026-10-08): the baked `botfleet-vm-cli-verify` checks `ping` by presence
-// (`command -v ping`) instead of running `ping -V`.  The verifier is image
-// content (`renderDockerfileVerifyArtifacts` writes it into the image), and the
-// v8 copy fails as the desktop user in a live VM with "missing VM CLIs: ping":
-// the container drops every capability but SETUID and SETGID, and a binary
-// carrying file capabilities (ping's cap_net_raw) then cannot be exec'd at all
-// ("operation not permitted"), whatever its arguments.  The build-time verify
-// runs as root with the full default set, so it never noticed.  Any container
-// built from v8 or earlier is replaced on the next provision, and so is a
-// Self-Hosted VPS container, which shares this label (see vps-computer.ts).
-export const IMAGE_LAYER_VERSION = "9";
+// Deliberately NOT bumped for a verify-only change (2026-10-08): the baked
+// `botfleet-vm-cli-verify` now checks `ping` by presence instead of running
+// `ping -V`, which fails as the desktop user in a live VM (no NET_RAW).  A bump
+// would block every Local VM bot until Prepare and a recreate, and invalidate
+// Self-Hosted VPS containers (they share this label), to fix a script that only
+// matters when someone runs it by hand.  The new check ships with the next image
+// whose contents change for a real reason.
+export const IMAGE_LAYER_VERSION = "8";
 export const IMAGE_LAYER_LABEL = "com.botfleet.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export function sanitizeContainerSuffix(name: string): string {

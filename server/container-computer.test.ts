@@ -1795,15 +1795,14 @@ describe("PATH driver symlink repair", () => {
     expect(Number(IMAGE_LAYER_VERSION)).toBeGreaterThanOrEqual(8);
   });
 
-  // The baked verifier is image content too.  The v8 copy runs `ping -V`, which
-  // fails as the desktop user in a live Local VM (no NET_RAW), so a container
-  // built from it can never pass `botfleet-vm-cli-verify`.  Without the bump
-  // `imageLabelsMatch` keeps accepting that container.
-  it("is at least layer 9, which is the first to verify ping by presence", () => {
+  // The baked verifier checks ping by presence.  The layer version is NOT bumped
+  // for this verify-only change (a bump blocks Local VM bots and invalidates
+  // Self-Hosted VPS containers), so the fix reaches the next image that is built
+  // for a real reason.
+  it("bakes the presence-only ping check into newly built images", () => {
     const dockerfile = managedImageDockerfile();
     expect(dockerfile).toContain("command '-v' 'ping'");
     expect(dockerfile).not.toContain("ping '-V'");
-    expect(Number(IMAGE_LAYER_VERSION)).toBeGreaterThanOrEqual(9);
   });
 
 });
