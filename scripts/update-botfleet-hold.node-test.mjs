@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  captureProcessIdentities,
   DEFAULT_GRACE_MS,
   DEFAULT_ROOM_WAIT_MS,
   describeWindow,
@@ -22,7 +23,10 @@ import {
   pauseTimeoutMessage,
   retryTransient,
   runtimePreflight,
+  terminateVerified,
+  UnrecognizedHolderError,
   waitForIdleTimeoutMessage,
+  waitOutUnrecognizedHolders,
 } from "./update-botfleet-mac.mjs";
 
 const OWNER = { version: 1, pid: 42, port: 8799, nonce: "a".repeat(64) };
@@ -460,6 +464,124 @@ test("the wrapper's up-to-date shortcut survives the busy-work flags and nothing
   for (const args of [["apply"], ["--grace", "90", "stray"], ["--wait-for-idle", "soon"], ["--progress", "/tmp/p"], ["--target", "abc"]]) {
     assert.equal(shortcut(args), false, `${JSON.stringify(args)} reaches the updater`);
   }
+});
+
+// ── a process that is not BotFleet holding BotFleet state ───────────────────
+// 2026-10-08, 9:08pm: `apply --force` refused on "Process 59135 owns BotFleet
+// state but does not match an expected BotFleet executable", and the process
+// was gone seconds later — a bot's own sqlite3, node or curl.
+
+const holderConfig = {
+  appPath: "/Applications/BotFleet.app",
+  checkout: "/Users/test/apps/botfleet-server",
+  gracefulExitMs: 0,
+  termExitMs: 0,
+};
+const APP_EXECUTABLE = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
+
+/** A process table a test changes as time passes, with every signal recorded. */
+function holderTable(rows) {
+  const table = new Map(Object.entries(rows).map(([pid, row]) => [Number(pid), { alive: true, ...row }]));
+  const signals = [];
+  return {
+    table,
+    signals,
+    deps: {
+      isAlive: async (pid) => table.get(pid)?.alive === true,
+      commandOf: async (pid) => (table.get(pid)?.alive ? table.get(pid).command : ""),
+      cwdOf: async (pid) => (table.get(pid)?.alive ? table.get(pid).cwd : ""),
+      executableOf: async (pid) => (table.get(pid)?.alive ? table.get(pid).executable ?? "" : ""),
+      kill: (pid, signal) => {
+        signals.push([pid, signal]);
+        const row = table.get(pid);
+        if (row) row.alive = false;
+      },
+    },
+  };
+}
+
+test("a holder that lets go inside the window is waited out, re-resolved, and never signalled", async () => {
+  const { table, signals, deps } = holderTable({
+    59135: { command: "sqlite3 /Users/test/.botfleet/botfleet.sqlite", cwd: "/", executable: "/usr/bin/sqlite3" },
+    501: { command: APP_EXECUTABLE, cwd: "/" },
+  });
+  let clock = 0;
+  let passes = 0;
+  const reports = [];
+  const captured = await waitOutUnrecognizedHolders(async () => {
+    passes += 1;
+    // What holds BotFleet state is resolved again on every pass.
+    const holders = [...table.entries()].filter(([, row]) => row.alive).map(([pid]) => pid);
+    return captureProcessIdentities(holders, holderConfig, deps);
+  }, {
+    windowMs: 90_000,
+    now: () => clock,
+    wait: async (ms) => {
+      clock += ms;
+      if (clock >= 6_000) table.get(59135).alive = false;
+    },
+    report: (line) => reports.push(line),
+  });
+  assert.deepEqual(captured.pids, [501]);
+  assert.equal(passes, 4);
+  assert.deepEqual(reports, ["Waiting for sqlite3 to let go of BotFleet's files"]);
+  assert.deepEqual(signals, [], "nothing was signalled");
+});
+
+test("a holder still there when the window closes is refused by its executable, still unsignalled", async () => {
+  const { signals, deps } = holderTable({
+    59135: { command: "node /tmp/probe.js", cwd: "/tmp", executable: "/opt/homebrew/bin/node" },
+  });
+  let clock = 0;
+  await assert.rejects(
+    waitOutUnrecognizedHolders(() => captureProcessIdentities([59135], holderConfig, deps), {
+      windowMs: 90_000,
+      now: () => clock,
+      wait: async (ms) => {
+        clock += ms;
+      },
+    }),
+    (error) => {
+      assert.equal(error.name, "UnrecognizedHolderError");
+      assert.equal(error.pid, 59135);
+      assert.equal(error.executable, "/opt/homebrew/bin/node");
+      assert.match(error.message, /^Process 59135 still holds BotFleet state after 1\.5 minutes and is not a BotFleet process/);
+      assert.match(error.message, /\(\/opt\/homebrew\/bin\/node\)$/);
+      assert.match(error.message, /will not stop it\.  Quit it/);
+      return true;
+    },
+  );
+  assert.equal(clock, 90_000);
+  assert.deepEqual(signals, []);
+});
+
+test("other failures are not waited on", async () => {
+  let passes = 0;
+  await assert.rejects(
+    waitOutUnrecognizedHolders(async () => {
+      passes += 1;
+      throw new Error("Database ownership is ambiguous");
+    }, { windowMs: 90_000, now: () => 0, wait: async () => {} }),
+    /Database ownership is ambiguous/,
+  );
+  assert.equal(passes, 1);
+});
+
+test("quiesce identifies every survivor before signalling any, so a foreign holder stops nothing halfway", async () => {
+  const { signals, deps } = holderTable({
+    501: { command: APP_EXECUTABLE, cwd: "/" },
+    59135: { command: "curl http://127.0.0.1:8799/api/health", cwd: "/", executable: "/usr/bin/curl" },
+  });
+  const previous = { runtimePids: [], appPids: [501], processCommands: { 501: APP_EXECUTABLE }, processCwds: { 501: "/" } };
+  await assert.rejects(
+    terminateVerified([501, 59135], previous, holderConfig, { current: [501, 59135], ...deps }),
+    (error) => error instanceof UnrecognizedHolderError && error.executable === "/usr/bin/curl",
+  );
+  assert.deepEqual(signals, [], "the BotFleet process was not stopped ahead of the refusal");
+  // Once the foreign process lets go, the next pass stops BotFleet alone.
+  deps.isAlive = async (pid) => pid === 501 && !signals.length;
+  await terminateVerified([501], previous, holderConfig, { current: [501], ...deps });
+  assert.deepEqual(signals, [[501, "SIGTERM"]]);
 });
 
 test("progress sentences name what the update is waiting for, in a person's words", () => {

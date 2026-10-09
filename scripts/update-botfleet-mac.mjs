@@ -183,6 +183,10 @@ never interrupted is a live room turn, because a room turn cannot be resumed wit
 it; apply waits up to 5 more minutes for rooms to go quiet (BOTFLEET_UPDATE_ROOM_WAIT_MS), and
 then lets everything go and stops without updating.
 
+A process that is not BotFleet but holds BotFleet's files or ports (a bot's own sqlite3, node or
+curl) is never signalled.  apply waits up to 90 seconds for it to let go
+(BOTFLEET_UNKNOWN_HOLDER_WAIT_MS), and names its executable if it is still there after that.
+
 --wait-for-idle [MINUTES] never interrupts anything.  It waits for the work already running to
 finish, 20 minutes unless MINUTES says otherwise, and if bots are still busy when the time runs
 out, everything held runs now and the update stops without changing anything.
@@ -1927,6 +1931,12 @@ async function processCommand(pid) {
   return result.code === 0 ? result.stdout.trim() : "";
 }
 
+/** The executable a process runs, as a full path where `ps` knows it. */
+async function processExecutable(pid) {
+  const result = await run("ps", ["-p", String(pid), "-o", "comm="], { allowFailure: true });
+  return result.code === 0 ? result.stdout.trim() : "";
+}
+
 async function processCwd(pid) {
   const result = await run("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { allowFailure: true });
   return result.code === 0 ? result.stdout.split("\n").find((line) => line.startsWith("n"))?.slice(1) || "" : "";
@@ -2226,6 +2236,65 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
 }
 
 /**
+ * A running process holds BotFleet state — the database, the bundle, a BotFleet
+ * port — and is not a BotFleet process.  The updater never signals one.  It is
+ * usually brief: a bot's own tool (`sqlite3`, `node`, `curl` against a BotFleet
+ * port) opening something for a second, which is why the callers wait it out
+ * (`waitOutUnrecognizedHolders`) before they refuse.
+ */
+export class UnrecognizedHolderError extends Error {
+  constructor(pid, executable, message) {
+    super(`${message}${executable ? ` (${executable})` : ""}`);
+    this.name = "UnrecognizedHolderError";
+    this.pid = pid;
+    this.executable = executable || "";
+  }
+}
+
+/** How long apply waits for a non-BotFleet process to let go of BotFleet state. */
+export const DEFAULT_UNKNOWN_HOLDER_WAIT_MS = 90_000;
+const UNKNOWN_HOLDER_POLL_MS = 2_000;
+
+/**
+ * Run `attempt` again while it trips over an unrecognised holder, until the
+ * window closes.  `attempt` re-resolves what holds BotFleet state every time,
+ * so a holder that has gone simply is not there on the next pass.  One that is
+ * still there when the window closes is refused by name, and still never
+ * signalled: it is not ours to stop.
+ */
+export async function waitOutUnrecognizedHolders(attempt, {
+  windowMs = DEFAULT_UNKNOWN_HOLDER_WAIT_MS,
+  pollMs = UNKNOWN_HOLDER_POLL_MS,
+  now = Date.now,
+  wait = sleep,
+  report = () => {},
+} = {}) {
+  const deadline = now() + Math.max(0, windowMs);
+  let lastReport = null;
+  for (;;) {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!(error instanceof UnrecognizedHolderError)) throw error;
+      if (now() >= deadline) {
+        throw new UnrecognizedHolderError(
+          error.pid,
+          error.executable,
+          `Process ${error.pid} still holds BotFleet state after ${describeWindow(windowMs)} and is not a BotFleet process, `
+            + "so the updater will not stop it.  Quit it or let it finish, then update again",
+        );
+      }
+      const line = `Waiting for ${error.executable ? basename(error.executable) : `process ${error.pid}`} to let go of BotFleet's files`;
+      if (line !== lastReport) {
+        lastReport = line;
+        report(line);
+      }
+      await wait(Math.min(pollMs, Math.max(0, deadline - now())));
+    }
+  }
+}
+
+/**
  * Record the identity of every running process that holds BotFleet state, so
  * quiesce can tell the process it captured from a recycled pid.  Exited pids
  * (a zombie above all) are dropped first: they hold nothing, and a zombie's
@@ -2238,6 +2307,7 @@ export async function captureProcessIdentities(pids, config, {
   isAlive,
   commandOf = processCommand,
   cwdOf = processCwd,
+  executableOf = processExecutable,
 } = {}) {
   const live = await withoutExitedPids([...new Set(pids)], { isAlive });
   const processCommands = {};
@@ -2246,12 +2316,18 @@ export async function captureProcessIdentities(pids, config, {
     const command = await commandOf(pid);
     const cwd = await cwdOf(pid);
     if (!(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
-      throw new Error(`Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`);
+      // Gone while it was being described: it holds nothing any more.
+      if ((await withoutExitedPids([pid], { isAlive })).length === 0) continue;
+      throw new UnrecognizedHolderError(
+        pid,
+        (await executableOf(pid)) || command.trim().split(/\s+/)[0] || "",
+        `Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`,
+      );
     }
     processCommands[pid] = command;
     processCwds[pid] = cwd;
   }
-  return { pids: live, processCommands, processCwds };
+  return { pids: live.filter((pid) => processCommands[pid] !== undefined), processCommands, processCwds };
 }
 
 /**
@@ -2288,6 +2364,7 @@ export async function terminateVerified(pids, previous, config, {
   isAlive,
   commandOf = processCommand,
   cwdOf = processCwd,
+  executableOf = processExecutable,
   kill,
   wait = sleep,
   now = Date.now,
@@ -2295,7 +2372,9 @@ export async function terminateVerified(pids, previous, config, {
   const timing = { isAlive, wait, now };
   const resolvedNow = current ? new Set(current) : null;
   const survivors = await waitForExit([...new Set(pids)], config.gracefulExitMs, timing);
-  const signalled = [];
+  // Every survivor is identified before any is signalled, so an unrecognised
+  // holder stops the step with nothing half-stopped behind it.
+  const verified = [];
   for (const pid of survivors) {
     const command = await commandOf(pid);
     const cwd = await cwdOf(pid);
@@ -2308,8 +2387,16 @@ export async function terminateVerified(pids, previous, config, {
       // A captured pid that now names something else: the process the
       // capture saw is gone, and this one never held BotFleet state.
       if (resolvedNow && !resolvedNow.has(pid)) continue;
-      throw new Error(`Process ${pid} still holds BotFleet state but its executable is not an expected BotFleet path`);
+      throw new UnrecognizedHolderError(
+        pid,
+        (await executableOf(pid)) || command.trim().split(/\s+/)[0] || "",
+        `Process ${pid} still holds BotFleet state but its executable is not an expected BotFleet path`,
+      );
     }
+    verified.push(pid);
+  }
+  const signalled = [];
+  for (const pid of verified) {
     if (signalProcess(pid, "SIGTERM", kill)) signalled.push(pid);
   }
   const remaining = await waitForExit(signalled, config.termExitMs, timing);
@@ -2517,6 +2604,9 @@ function createConfig(parsed) {
     waitForIdleMs: parsed.waitForIdleMs,
     roomWaitMs: environmentMs("BOTFLEET_UPDATE_ROOM_WAIT_MS", DEFAULT_ROOM_WAIT_MS),
     preflightRetryMs: environmentMs("BOTFLEET_PREFLIGHT_RETRY_MS", DEFAULT_PREFLIGHT_RETRY_MS),
+    // How long a process that is not BotFleet may hold BotFleet state before
+    // apply refuses (it is never signalled either way).
+    unknownHolderWaitMs: environmentMs("BOTFLEET_UNKNOWN_HOLDER_WAIT_MS", DEFAULT_UNKNOWN_HOLDER_WAIT_MS),
     drainPollMs: environmentMs("BOTFLEET_DRAIN_POLL_MS", 5_000),
     force: Boolean(parsed.force || process.env.BOTFLEET_FORCE === "1"),
     // Set by main() once the progress record exists: what the drain is
@@ -2866,17 +2956,20 @@ function createOperations(config) {
       ]);
       // Every process inside the bundle, not only its main binary: the swap
       // renames the whole directory, so an embedded driver or helper app has
-      // to be accounted for too.
-      const bundlePids = await bundleProcessPids(config.appPath);
-      const holders = await sqliteHolders(config.dataDirectory);
-      const runtimeCandidates = [...new Set([...(lastPreflight?.pids || []), lastPreflight?.pid, ...holders].filter(Number.isInteger))];
-      // Exited processes (zombies above all) are not captured: quiesce would
-      // wait on a pid that can never go away, and a defunct process fails the
-      // identity check below.
-      const { pids: livePids, processCommands, processCwds } = await captureProcessIdentities(
-        [...runtimeCandidates, ...bundlePids],
-        config,
-      );
+      // to be accounted for too.  Resolved afresh on every pass: a bot's own
+      // tool holding the database for a moment is waited out, not refused
+      // (`waitOutUnrecognizedHolders`), and the next pass no longer sees it.
+      const { bundlePids, runtimeCandidates, pids: livePids, processCommands, processCwds } =
+        await waitOutUnrecognizedHolders(async () => {
+          const bundle = await bundleProcessPids(config.appPath);
+          const holders = await sqliteHolders(config.dataDirectory);
+          const candidates = [...new Set([...(lastPreflight?.pids || []), lastPreflight?.pid, ...holders].filter(Number.isInteger))];
+          // Exited processes (zombies above all) are not captured: quiesce
+          // would wait on a pid that can never go away, and a defunct process
+          // fails the identity check below.
+          const captured = await captureProcessIdentities([...candidates, ...bundle], config);
+          return { ...captured, bundlePids: bundle, runtimeCandidates: candidates };
+        }, { windowMs: config.unknownHolderWaitMs, report: config.reportDetail });
       const runtimePids = runtimeCandidates.filter((pid) => livePids.includes(pid));
       const appPids = bundlePids.filter((pid) => livePids.includes(pid));
       const stamp = Date.now();
@@ -2953,18 +3046,23 @@ function createOperations(config) {
       // gone or names someone else while the replacement owns the database
       // and port 8799.  The captured pids still go in, as hints that
       // terminateVerified drops once their identity no longer matches.
-      const [currentHolders, currentBundlePids, health] = await Promise.all([
-        sqliteHolders(config.dataDirectory),
-        bundleProcessPids(config.appPath),
-        Promise.all(config.ports.map(probeHealth)),
-      ]);
-      const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
-      await terminateVerified(
-        [...previous.runtimePids, ...previous.appPids, ...current],
-        previous,
-        config,
-        { current },
-      );
+      // Re-resolved on every pass, for the same reason as at capture: a
+      // non-BotFleet process holding BotFleet state is waited out and never
+      // signalled, and a refusal names it.
+      await waitOutUnrecognizedHolders(async () => {
+        const [currentHolders, currentBundlePids, health] = await Promise.all([
+          sqliteHolders(config.dataDirectory),
+          bundleProcessPids(config.appPath),
+          Promise.all(config.ports.map(probeHealth)),
+        ]);
+        const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
+        await terminateVerified(
+          [...previous.runtimePids, ...previous.appPids, ...current],
+          previous,
+          config,
+          { current },
+        );
+      }, { windowMs: config.unknownHolderWaitMs, report: config.reportDetail });
     },
 
     assertQuiesced: async () => {

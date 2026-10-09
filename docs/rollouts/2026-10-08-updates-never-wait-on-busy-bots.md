@@ -57,6 +57,18 @@ The preflight retries a slow harness with backoff for up to 60 seconds
 forced answer that times out is watched until the harness says the fence settled
 (`fencing` in `/api/runtime`), instead of being misread as a refusal.
 
+### A Foreign Process Holding BotFleet State Is Waited Out
+
+At 9:08pm the same evening `apply --force` refused with "Process 59135 owns
+BotFleet state but does not match an expected BotFleet executable", and the
+process was gone seconds later: a bot's own `sqlite3`, `node` or `curl` holding
+the database or a port for a moment.  Capture and quiesce now re-resolve what
+holds BotFleet state every two seconds for up to 90 seconds
+(`BOTFLEET_UNKNOWN_HOLDER_WAIT_MS`) before refusing, and the refusal names the
+process's executable.  An unrecognised process is never signalled, and quiesce
+identifies every survivor before it signals any, so a refusal never leaves
+BotFleet half-stopped.
+
 ## The First Update Carrying This
 
 The updater that runs is the one at `origin/main`; the harness answering it is the
