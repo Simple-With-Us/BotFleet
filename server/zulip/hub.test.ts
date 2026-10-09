@@ -452,6 +452,103 @@ describe("DMs out", () => {
   });
 });
 
+describe("followed topics", () => {
+  const follow = (hub: ZulipHub, args: Record<string, string | boolean>) =>
+    hub.send({ botId: "bot-plumber", threadId: PLUMBER_THREAD, tool: "follow", args });
+
+  it("follows a topic with zulip_follow_topic, wakes on any new message there, and never auto-replies for it", async () => {
+    const hub = makeHub();
+    await connected(hub);
+    const streamId = fake.streamId("agent-sync");
+    const followed = await follow(hub, { channel: "#agent-sync", topic: "BF watch", follow: true });
+    expect(followed).toMatchObject({ ok: true, text: expect.stringMatching(/^Following #agent-sync > BF watch\./) });
+    // as the bot itself, through Zulip's own user_topics endpoint
+    const call = fake.requests.find((r) => r.method === "POST" && r.path === "user_topics")!;
+    expect(call).toMatchObject({ userId: PLUMBER, params: { stream_id: String(streamId), topic: "BF watch", visibility_policy: "3" } });
+    expect(fake.followedBy(PLUMBER)).toEqual([`${streamId}/BF watch`]);
+    expect(botStatus(hub, "bot-plumber")?.following).toBe(1);
+
+    replies.set("thread-bot-plumber", "Noted.");
+    // no mention, another sender, the topic in other case: still the followed topic
+    const id = fake.postStream(PEER, "agent-sync", "bf WATCH", "deploy 4326 finished", "ZulipPython");
+    await waitFor(() => turns.length === 1, "the followed topic's wake");
+    expect(turns[0]!.text).toContain("new messages in a channel topic you follow");
+    expect(turns[0]!.text).toContain(`where no one @-mentioned you: ${id}.`);
+    expect(turns[0]!.text).toContain("Nothing is posted unless you call it.");
+    await finishTurn(hub);
+    await settle();
+    // following is listening: the final message is not posted for it
+    expect(fake.postsBy(PLUMBER)).toHaveLength(0);
+
+    // its own post there never wakes it
+    fake.postStream(PLUMBER, "agent-sync", "BF watch", "my own note", "BotFleet-Zulip");
+    await settle();
+    expect(turns).toHaveLength(1);
+
+    const unfollowed = await follow(hub, { channel: "agent-sync", topic: "BF watch", follow: "false" });
+    expect(unfollowed).toMatchObject({ ok: true, text: "Stopped following #agent-sync > BF watch." });
+    expect(fake.followedBy(PLUMBER)).toEqual([]);
+    fake.postStream(PEER, "agent-sync", "BF watch", "another update", "ZulipPython");
+    await settle(400);
+    expect(turns).toHaveLength(1);
+  });
+
+  it("still auto-replies when a mention joins a followed topic's unit", async () => {
+    fake.followTopic(PLUMBER, "agent-sync", "BF watch");
+    replies.set("thread-bot-plumber", "On it.");
+    busy.add("bot-plumber");
+    const hub = makeHub();
+    await connected(hub);
+    fake.postStream(PEER, "agent-sync", "BF watch", "build is red", "ZulipPython");
+    fake.postStream(JAY, "agent-sync", "BF watch", "@**BF-Plumber** can you look?", "website");
+    await waitFor(() => botStatus(hub, "bot-plumber")?.pending === 1, "one unit for the topic");
+    busy.delete("bot-plumber");
+    await waitFor(() => turns.length === 1, "the turn");
+    await finishTurn(hub);
+    await waitFor(() => fake.postsBy(PLUMBER).length === 1, "the auto-reply");
+    expect(fake.postsBy(PLUMBER)[0]!.content).toBe("[BF-PLUMBER] On it.");
+  });
+
+  it("loads the topics it follows at register, and applies a follow made in the Zulip app", async () => {
+    fake.followTopic(PLUMBER, "agent-sync", "BF app");
+    const hub = makeHub();
+    await connected(hub);
+    expect(botStatus(hub, "bot-plumber")?.following).toBe(1);
+    const id = fake.postStream(JAY, "agent-sync", "BF app", "heads up, deploying now", "website");
+    await waitFor(() => turns.length === 1, "Jay's message in the followed topic");
+    expect(turns[0]!.text).toContain(`Owner items: ${id}.`);
+    fake.followTopic(PLUMBER, "builds", "BF later");
+    await waitFor(() => botStatus(hub, "bot-plumber")?.following === 2, "the user_topic event");
+  });
+
+  it("backfills a followed topic's messages after the queue expired", async () => {
+    fake.followTopic(PLUMBER, "agent-sync", "BF watch");
+    const hub = makeHub();
+    await connected(hub);
+    fake.expireQueues(PLUMBER);
+    // posted while the bot has no queue, with no mention: only the followed
+    // topic's own backfill narrow can see it
+    const missed = fake.postStream(PEER, "agent-sync", "BF watch", "deploy finished while you were away", "ZulipPython");
+    await waitFor(() => turns.length === 1, "the backfilled wake");
+    expect(turns[0]!.text).toContain(`"id":${missed}`);
+    expect(
+      fake.requests.some((r) => r.path === "messages" && r.userId === PLUMBER && (r.params.narrow ?? "").includes('"topic"')),
+    ).toBe(true);
+  });
+
+  it("refuses to follow in a channel the bot is not subscribed to, or with bad arguments", async () => {
+    fake.unsubscribe(PLUMBER, "secret-room");
+    const hub = makeHub();
+    await connected(hub);
+    const refused = await follow(hub, { channel: "secret-room", topic: "BF x", follow: true });
+    expect(refused).toMatchObject({ ok: false, text: expect.stringMatching(/not subscribed to #secret-room/) });
+    expect((await follow(hub, { channel: "agent-sync", topic: "BF x" })).ok).toBe(false);
+    expect((await follow(hub, { channel: "agent-sync", topic: "   ", follow: true })).ok).toBe(false);
+    expect((await follow(hub, { channel: "agent-sync", topic: "x".repeat(61), follow: true })).text).toMatch(/at most 60/);
+    expect(fake.requests.some((r) => r.path === "user_topics")).toBe(false);
+  });
+});
+
 describe("posting", () => {
   it("auto-replies with the final message when the bot did not reply itself", async () => {
     const hub = makeHub();

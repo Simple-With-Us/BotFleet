@@ -21,7 +21,15 @@
 
 import { randomBytes } from "node:crypto";
 
-import { ZulipApiError, ZulipClient, ZulipNetworkError, abortableSleep } from "./client.ts";
+import {
+  ZULIP_TOPIC_FOLLOWED,
+  ZULIP_TOPIC_NONE,
+  ZulipApiError,
+  ZulipClient,
+  ZulipNetworkError,
+  abortableSleep,
+  type ZulipUserTopic,
+} from "./client.ts";
 import {
   ZulipCredentialError,
   credentialSourceFor,
@@ -31,8 +39,15 @@ import {
   type ZulipCredentialSource,
   type ZulipCredentials,
 } from "./credentials.ts";
-import { buildInboundPrompt, originKey, withTag, ZULIP_INBOUND_UNIT_MAX_ITEMS } from "./format.ts";
-import { checkContent, resolveTarget, secretRefusal, zulipToolArgsSchema, type ZulipTarget } from "./outbound.ts";
+import { buildInboundPrompt, followKey, originKey, withTag, ZULIP_INBOUND_UNIT_MAX_ITEMS } from "./format.ts";
+import {
+  checkContent,
+  resolveTarget,
+  secretRefusal,
+  zulipFollowArgsSchema,
+  zulipToolArgsSchema,
+  type ZulipTarget,
+} from "./outbound.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type RouterContext } from "./router.ts";
 import { ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
 import type { ZulipIdentity, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
@@ -44,6 +59,12 @@ const ALLOWED_ROLES = new Set([300, 400]);
 const BACKOFF_MS = [5_000, 30_000, 60_000, 120_000];
 const PAGE = 100;
 const MAX_PAGES = 20;
+/** Followed topics a reconnect backfills, and pages per topic: what was said
+ *  there while the queue was down (the fleet listener caps it the same way). */
+const FOLLOWED_BACKFILL_TOPICS = 25;
+const FOLLOWED_BACKFILL_PAGES = 2;
+/** Zulip's own limit on a topic name. */
+const ZULIP_TOPIC_NAME_MAX = 60;
 const DEFAULTS = {
   dmsPerHour: 20,
   staleMinutes: 30,
@@ -146,12 +167,16 @@ export interface ZulipBotStatus {
    *  means every DM to a peer would be refused. */
   members?: number;
   memberBots?: number;
+  /** Topics the bot follows (each wakes it on a new message). */
+  following?: number;
 }
 
 export interface ZulipSendRequest {
   botId: string;
   threadId: string;
-  tool: "reply" | "post";
+  /** "follow" is zulip_follow_topic: it changes a topic's visibility for
+   *  the bot and posts nothing. */
+  tool: "reply" | "post" | "follow";
   /** The model's arguments as they arrived; `send` parses them. */
   args: unknown;
 }
@@ -185,6 +210,10 @@ interface Binding {
   /** Another turn started in the thread: the binding answers nothing more. */
   closed: boolean;
   replied: boolean;
+  /** The final reply may be posted for the bot.  False for a unit that woke
+   *  only because the bot follows the topic: following is listening, and
+   *  two bots that follow one topic must not answer each other forever. */
+  autoReply: boolean;
 }
 
 class RoleRefused extends Error {}
@@ -212,6 +241,9 @@ class ZulipSession {
   creds?: ZulipCredentials;
   me?: ZulipIdentity;
   users = new Map<number, ZulipUser>();
+  /** Topics this bot follows, by followKey: register's `user_topics`, kept
+   *  current by `user_topic` events (the tool's own change, or the app's). */
+  readonly followed = new Map<string, { streamId: number; topic: string }>();
   state: ZulipBotState;
   queueId?: string;
   lastEventId = -1;
@@ -427,6 +459,8 @@ class ZulipSession {
     for (const user of registered.realm_users ?? []) {
       if (typeof user?.user_id === "number") this.users.set(user.user_id, user);
     }
+    this.followed.clear();
+    for (const entry of registered.user_topics ?? []) this.applyUserTopic(entry);
     if (this.state.cursor === null) {
       // First connection: start from now.  History is not a wake.
       this.state.cursor = typeof registered.max_message_id === "number" ? registered.max_message_id : 0;
@@ -448,9 +482,22 @@ class ZulipSession {
   private async backfill(client: ZulipClient, signal: AbortSignal): Promise<void> {
     const floor = this.floor ?? 0;
     const found = new Map<number, ZulipMessage>();
-    for (const narrow of [[{ operator: "is", operand: "dm" }], [{ operator: "is", operand: "mentioned" }]]) {
+    const narrows: Array<{ narrow: Array<{ operator: string; operand: string | number }>; pages: number }> = [
+      { narrow: [{ operator: "is", operand: "dm" }], pages: MAX_PAGES },
+      { narrow: [{ operator: "is", operand: "mentioned" }], pages: MAX_PAGES },
+      // A followed topic wakes on any message, so what was said there while
+      // the queue was down is fetched too: one narrow per topic, capped.
+      ...[...this.followed.values()].slice(0, FOLLOWED_BACKFILL_TOPICS).map(({ streamId, topic }) => ({
+        narrow: [
+          { operator: "stream", operand: streamId },
+          { operator: "topic", operand: topic },
+        ],
+        pages: FOLLOWED_BACKFILL_PAGES,
+      })),
+    ];
+    for (const { narrow, pages } of narrows) {
       let anchor = floor;
-      for (let page = 0; page < MAX_PAGES; page++) {
+      for (let page = 0; page < pages; page++) {
         const messages = await client.messages(narrow, { anchor, numAfter: PAGE }, signal);
         for (const message of messages) if (message.id > floor) found.set(message.id, message);
         if (messages.length < PAGE) break;
@@ -507,9 +554,23 @@ class ZulipSession {
           this.hub.handleMessage(this, { ...event.message, flags: event.flags ?? event.message.flags ?? [] });
         } else if (event.type === "realm_user") {
           this.applyRealmUser(event.op, event.person);
+        } else if (event.type === "user_topic") {
+          this.applyUserTopic(event);
         }
       }
       this.saveSoon();
+    }
+  }
+
+  /** One topic's visibility for this bot: followed (3) adds it, anything
+   *  else (none, muted, unmuted) removes it. */
+  applyUserTopic(entry: ZulipUserTopic | undefined): void {
+    if (typeof entry?.stream_id !== "number" || typeof entry.topic_name !== "string") return;
+    const key = followKey(entry.stream_id, entry.topic_name);
+    if (entry.visibility_policy === ZULIP_TOPIC_FOLLOWED) {
+      this.followed.set(key, { streamId: entry.stream_id, topic: entry.topic_name });
+    } else {
+      this.followed.delete(key);
     }
   }
 
@@ -696,9 +757,9 @@ export class ZulipHub {
       bots: [...this.sessions.values()].map((session) => ({
         ...session.status,
         pending: session.state.pending.length,
-        ...(session.users.size
-          ? { members: session.users.size, memberBots: [...session.users.values()].filter((user) => user.is_bot === true).length }
-          : {}),
+        following: session.followed.size,
+        members: session.users.size,
+        memberBots: [...session.users.values()].filter((user) => user.is_bot === true).length,
       })),
     };
   }
@@ -751,6 +812,7 @@ export class ZulipHub {
       users: session.users,
       nowMs: this.now(),
       staleMs: Math.max(1, settings?.staleMinutes ?? DEFAULTS.staleMinutes) * 60_000,
+      followed: new Set(session.followed.keys()),
     };
   }
 
@@ -808,10 +870,14 @@ export class ZulipHub {
       ownerViaApi: c.ownerViaApi,
       content: String(message.content ?? ""),
       timestamp: typeof message.timestamp === "number" ? message.timestamp : Math.floor(now / 1000),
+      via: verdict.via,
     };
     if (settings?.dryRun) {
       state.handled.push(id);
-      this.log(`[zulip] ${session.role}: dry run — message ${id} would wake (${verdict.wake})`);
+      this.log(
+        `[zulip] ${session.role}: dry run — message ${id} would wake (${verdict.wake})` +
+          (verdict.via === "followed" ? " from a followed topic" : ""),
+      );
       session.save(true);
       return;
     }
@@ -929,7 +995,7 @@ export class ZulipHub {
   }
 
   private async autoReply(threadId: string, binding: Binding): Promise<void> {
-    if (binding.replied || !binding.completed || !binding.ok) return;
+    if (binding.replied || !binding.completed || !binding.ok || !binding.autoReply) return;
     if ((this.settings()?.autoReply ?? "final") !== "final" || this.dryRun()) return;
     const session = this.sessions.get(binding.botId);
     if (!session?.ready) return;
@@ -992,13 +1058,17 @@ export class ZulipHub {
     // not be marked handled without ever reaching a prompt.
     const batch = unit.items.slice();
     const nonce = randomBytes(6).toString("hex");
+    // Only a mention or a DM is answered for the bot: a unit that woke only
+    // because the bot follows the topic is listening, not being asked.
+    const autoReply =
+      (this.settings()?.autoReply ?? "final") === "final" && batch.some((item) => item.via !== "followed");
     const text = buildInboundPrompt(
       { origin: unit.origin, items: batch },
       {
         role: session.role,
         me: session.me!,
         nonce,
-        autoReply: (this.settings()?.autoReply ?? "final") === "final",
+        autoReply,
         ownerUserId: this.ownerUserId(),
         realm: session.realm,
       },
@@ -1024,6 +1094,7 @@ export class ZulipHub {
         ok: false,
         closed: false,
         replied: false,
+        autoReply,
       });
       const left = retireBatch();
       this.log(
@@ -1055,6 +1126,7 @@ export class ZulipHub {
       return { ok: false, text: `Zulip is not connected for this bot (${session?.status.state ?? "not configured"}).` };
     }
     if (this.dryRun()) return { ok: false, text: "Not posted: Zulip is in a dry run (zulip.dryRun), which posts nothing." };
+    if (request.tool === "follow") return this.follow(session, request.args);
     const parsed = zulipToolArgsSchema.safeParse(request.args ?? {});
     if (!parsed.success) {
       return { ok: false, text: "Not posted: content, channel and topic must be text, and dm_user_id a Zulip user id." };
@@ -1130,6 +1202,54 @@ export class ZulipHub {
     }
   }
 
+
+  /** zulip_follow_topic: follow, or stop following, one topic as this bot.
+   *  It posts nothing.  The channel must be one the bot is subscribed to:
+   *  a queue never delivers any other, so following one there would wake
+   *  nothing. */
+  private async follow(session: ZulipSession, rawArgs: unknown): Promise<ZulipSendResult> {
+    const parsed = zulipFollowArgsSchema.safeParse(rawArgs ?? {});
+    if (!parsed.success) {
+      return { ok: false, text: "Not changed: zulip_follow_topic needs a channel and a topic (text) and follow (true or false)." };
+    }
+    const channel = parsed.data.channel.trim().replace(/^#/, "");
+    const topic = parsed.data.topic.trim();
+    const follow = parsed.data.follow === true || parsed.data.follow === "true";
+    if (!channel || !topic) return { ok: false, text: "Not changed: zulip_follow_topic needs a channel and a topic." };
+    if ([...topic].length > ZULIP_TOPIC_NAME_MAX) {
+      return { ok: false, text: `Not changed: a Zulip topic is at most ${ZULIP_TOPIC_NAME_MAX} characters.` };
+    }
+    const client = session.client!;
+    let subscriptions: Array<{ stream_id: number; name: string }>;
+    try {
+      subscriptions = await client.subscriptions();
+    } catch (e) {
+      return { ok: false, text: `Zulip refused the channel lookup: ${describe(e)}` };
+    }
+    const channelRow = subscriptions.find((sub) => sub.name.toLowerCase() === channel.toLowerCase());
+    if (!channelRow) {
+      return {
+        ok: false,
+        text: `Not changed: this bot is not subscribed to #${channel}, so no message there ever reaches it.  Ask the owner to subscribe it first.`,
+      };
+    }
+    const policy = follow ? ZULIP_TOPIC_FOLLOWED : ZULIP_TOPIC_NONE;
+    try {
+      await client.setTopicVisibility(channelRow.stream_id, topic, policy);
+    } catch (e) {
+      return { ok: false, text: `Zulip refused the change: ${describe(e)}` };
+    }
+    // The user_topic event confirms it; apply it now so the next message
+    // there is judged by the new setting even if the event is slow.
+    session.applyUserTopic({ stream_id: channelRow.stream_id, topic_name: topic, visibility_policy: policy });
+    this.log(`[zulip] ${session.role}: ${follow ? "followed" : "stopped following"} a topic in channel ${channelRow.stream_id}`);
+    return {
+      ok: true,
+      text: follow
+        ? `Following #${channelRow.name} > ${topic}.  New messages there wake you (never your own posts).  A wake from a followed topic is not auto-replied:  answer with zulip_reply only when the conversation needs you, and unfollow when it no longer concerns you.`
+        : `Stopped following #${channelRow.name} > ${topic}.`,
+    };
+  }
 }
 
 export type { ZulipSession };

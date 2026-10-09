@@ -13,8 +13,13 @@
 //     GET /messages carries them on each message.
 //   - `mentioned` is set only for `@**Name**` / `@**Name|id**` outside code
 //     spans, code blocks and quotes; `@**all**` sets the wildcard flag.
-//   - Every user is subscribed to every channel; a DM reaches its
-//     participants only.  A sender gets its own message back, as on Zulip.
+//   - Every user is subscribed to every channel (unless a test unsubscribes
+//     one from GET /users/me/subscriptions); a DM reaches its participants
+//     only.  A sender gets its own message back, as on Zulip.
+//   - Channels get numeric ids, carried as `stream_id` on channel messages.
+//     POST /user_topics sets a topic's visibility for the caller, register
+//     returns `user_topics`, and a change is pushed as a `user_topic` event
+//     to that user's queues.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
@@ -40,6 +45,7 @@ interface StoredMessage {
   type: "stream" | "private";
   display_recipient: string | Array<{ id: number; email: string; full_name: string }>;
   subject: string;
+  stream_id?: number;
   content: string;
   timestamp: number;
   /** Per-recipient flags. */
@@ -77,6 +83,13 @@ export class FakeZulip {
   private readonly queues = new Map<string, Queue>();
   private server?: Server;
   private nextMessageId = 1000;
+  /** Channel name (lowercase) -> id. */
+  private readonly streams = new Map<string, { id: number; name: string }>();
+  private nextStreamId = 7;
+  /** userId -> (stream id + lowercase topic) -> visibility row. */
+  private readonly userTopics = new Map<number, Map<string, { stream_id: number; topic_name: string; visibility_policy: number }>>();
+  /** userId -> channel names (lowercase) left out of its subscriptions. */
+  private readonly unsubscribed = new Map<number, Set<string>>();
   private nextQueue = 1;
   private rateLimits: Array<{ path: string; retryAfter: number }> = [];
   private failures: Array<{ method: string; path: string; status: number }> = [];
@@ -129,6 +142,49 @@ export class FakeZulip {
         for (const wake of queue.waiters) wake();
       }
     }
+  }
+
+  /** The channel's id, creating the channel on first use. */
+  streamId(channel: string): number {
+    const known = this.streams.get(channel.toLowerCase());
+    if (known) return known.id;
+    const id = this.nextStreamId++;
+    this.streams.set(channel.toLowerCase(), { id, name: channel });
+    return id;
+  }
+
+  /** Leave a channel out of one user's subscription list. */
+  unsubscribe(userId: number, channel: string): void {
+    this.streamId(channel);
+    const set = this.unsubscribed.get(userId) ?? new Set<string>();
+    set.add(channel.toLowerCase());
+    this.unsubscribed.set(userId, set);
+  }
+
+  /** Set a topic's visibility for a user, as the app or POST /user_topics
+   *  does, and push the user_topic event to that user's queues. */
+  setTopicVisibility(userId: number, streamId: number, topic: string, policy: number): void {
+    const rows = this.userTopics.get(userId) ?? new Map();
+    const key = `${streamId}\u0000${topic.toLowerCase()}`;
+    if (policy === 0) rows.delete(key);
+    else rows.set(key, { stream_id: streamId, topic_name: topic, visibility_policy: policy });
+    this.userTopics.set(userId, rows);
+    this.pushToAll(
+      { type: "user_topic", stream_id: streamId, topic_name: topic, last_updated: this.clock, visibility_policy: policy },
+      userId,
+    );
+  }
+
+  /** Follow a topic for a user (visibility policy 3). */
+  followTopic(userId: number, channel: string, topic: string): void {
+    this.setTopicVisibility(userId, this.streamId(channel), topic, 3);
+  }
+
+  /** The user's followed topics, as "channel id/topic". */
+  followedBy(userId: number): string[] {
+    return [...(this.userTopics.get(userId)?.values() ?? [])]
+      .filter((row) => row.visibility_policy === 3)
+      .map((row) => `${row.stream_id}/${row.topic_name}`);
   }
 
   /** Deactivate a user: register stops listing it, and every queue gets a
@@ -208,6 +264,7 @@ export class FakeZulip {
             })
           : where.channel,
       subject: "dm" in where ? "" : where.topic,
+      stream_id: "dm" in where ? undefined : this.streamId(where.channel),
       content,
       timestamp: this.clock,
       flags,
@@ -239,6 +296,8 @@ export class FakeZulip {
       type: message.type,
       display_recipient: message.display_recipient,
       subject: message.subject,
+      // Absent on a DM, as on Zulip (JSON drops an undefined field).
+      stream_id: message.stream_id,
       content: message.content,
       timestamp: message.timestamp,
     };
@@ -303,6 +362,7 @@ export class FakeZulip {
         realm_users: [...this.users.values()]
           .filter((entry) => entry.is_active !== false)
           .map(({ key: _key, is_active: _active, ...rest }) => rest),
+        user_topics: [...(this.userTopics.get(user.user_id)?.values() ?? [])],
       });
     }
     if (req.method === "GET" && path === "events") {
@@ -350,12 +410,36 @@ export class FakeZulip {
               return (message.flags.get(user.user_id) ?? []).some((flag) => flag === "mentioned" || flag.endsWith("wildcard_mentioned"));
             }
             if (term.operator === "sender") return message.sender_id === Number(term.operand);
+            if (term.operator === "stream" || term.operator === "channel") {
+              const id = typeof term.operand === "number" ? term.operand : this.streams.get(String(term.operand).toLowerCase())?.id;
+              return message.type === "stream" && message.stream_id === id;
+            }
+            if (term.operator === "topic") return message.type === "stream" && message.subject.toLowerCase() === String(term.operand).toLowerCase();
             return true;
           }),
         )
         .slice(0, after)
         .map((message) => this.wireFor(message, user.user_id));
       return send(200, { result: "success", messages: found });
+    }
+    if (req.method === "GET" && path === "users/me/subscriptions") {
+      const left = this.unsubscribed.get(user.user_id) ?? new Set<string>();
+      const subscriptions = [...this.streams.entries()]
+        .filter(([lower]) => !left.has(lower))
+        .map(([, stream]) => ({ stream_id: stream.id, name: stream.name }));
+      return send(200, { result: "success", subscriptions });
+    }
+    if (req.method === "POST" && path === "user_topics") {
+      const streamId = Number(params.stream_id);
+      const policy = Number(params.visibility_policy);
+      if (![...this.streams.values()].some((stream) => stream.id === streamId)) {
+        return send(400, { result: "error", msg: "Invalid channel ID", code: "BAD_REQUEST" });
+      }
+      if (!params.topic || ![0, 1, 2, 3].includes(policy)) {
+        return send(400, { result: "error", msg: "Invalid topic or visibility_policy", code: "BAD_REQUEST" });
+      }
+      this.setTopicVisibility(user.user_id, streamId, params.topic, policy);
+      return send(200, { result: "success" });
     }
     if (req.method === "POST" && path === "messages") {
       const content = params.content ?? "";

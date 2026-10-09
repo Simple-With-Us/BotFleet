@@ -1148,7 +1148,7 @@ const LINQ_VOICE_MESSAGE: HarnessTool = {
 };
 
 // ── Zulip (docs/zulip.md) ──
-// Offered only to a bot whose Zulip session is connected.  Neither tool
+// Offered only to a bot whose Zulip session is connected.  No Zulip tool
 // carries an approval record, and that is deliberate: every rule that makes
 // a post safe is enforced by the harness, not asked of a person — the reply
 // target is the conversation that woke the turn and the model cannot move
@@ -1206,6 +1206,26 @@ const ZULIP_POST: HarnessTool = {
   sideEffect: "write",
   settles: "immediate",
   promptFragment: "Use zulip_post to post in an allowed Zulip channel topic.",
+};
+
+const ZULIP_FOLLOW_TOPIC: HarnessTool = {
+  name: "zulip_follow_topic",
+  description:
+    "Follow or stop following a Zulip topic as your own bot. While you follow a topic, every new message in it wakes you as an @-mention does (never your own posts), and that wake is not auto-replied: answer only when the conversation needs you. The channel must be one your bot is subscribed to. Posts nothing.",
+  schema: {
+    type: "object",
+    properties: {
+      channel: { type: "string", description: "Channel name without the #, for example agent-sync." },
+      topic: { type: "string", description: "The topic (thread) to follow or stop following." },
+      follow: { type: "boolean", description: "true to follow the topic, false to stop following it." },
+    },
+    required: ["channel", "topic", "follow"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: zulipEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use zulip_follow_topic to follow a Zulip topic whose new messages should wake you, and to stop following it.",
 };
 
 // ── background jobs (P1, docs/plans/2026-10-01-background-jobs-and-subagents-decision.md) ──
@@ -1386,6 +1406,7 @@ export const HARNESS_TOOLS: readonly HarnessTool[] = [
   JOB_KILL,
   ZULIP_REPLY,
   ZULIP_POST,
+  ZULIP_FOLLOW_TOPIC,
 ];
 
 const BY_NAME = new Map(HARNESS_TOOLS.map((tool) => [tool.name, tool]));

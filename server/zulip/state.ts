@@ -72,6 +72,7 @@ const itemSchema = z.object({
   ownerViaApi: z.boolean().catch(false),
   content: z.string(),
   timestamp: z.number().catch(0),
+  via: z.enum(["mention", "dm", "followed"]).optional().catch(undefined),
 });
 const unitSchema = z.object({
   origin: originSchema,

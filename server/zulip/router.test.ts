@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { followKey } from "./format.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type RouterContext } from "./router.ts";
 import type { ZulipMessage, ZulipUser } from "./types.ts";
 
@@ -55,8 +56,8 @@ describe("who wakes a BF bot", () => {
   });
 
   it("wakes on Jay from a human app, and only then calls it the owner", () => {
-    expect(verdict(stream({ sender_id: 9, client: "website" }))).toEqual({ wake: "owner" });
-    expect(verdict(stream({ sender_id: 9, client: "ZulipMobile" }))).toEqual({ wake: "owner" });
+    expect(verdict(stream({ sender_id: 9, client: "website" }))).toEqual({ wake: "owner", via: "mention" });
+    expect(verdict(stream({ sender_id: 9, client: "ZulipMobile" }))).toEqual({ wake: "owner", via: "mention" });
     // Jay's id from an API client is a peer, flagged, and never wakes
     const c = classify(stream({ sender_id: 9, client: "ZulipPython" }), ctx);
     expect(c.owner).toBe(false);
@@ -65,10 +66,10 @@ describe("who wakes a BF bot", () => {
   });
 
   it("wakes a peer bot's direct mention, but not a stale one", () => {
-    expect(verdict(stream({}))).toEqual({ wake: "peer" });
+    expect(verdict(stream({}))).toEqual({ wake: "peer", via: "mention" });
     expect(verdict(stream({ timestamp: NOW / 1000 - 3600 }))).toEqual({ wake: null, reason: "stale" });
     // the owner is exempt from the stale cutoff
-    expect(verdict(stream({ sender_id: 9, client: "website", timestamp: NOW / 1000 - 3600 }))).toEqual({ wake: "owner" });
+    expect(verdict(stream({ sender_id: 9, client: "website", timestamp: NOW / 1000 - 3600 }))).toEqual({ wake: "owner", via: "mention" });
   });
 
   it("does not wake on a mention inside code or without the flag, or on a wildcard", () => {
@@ -85,11 +86,11 @@ describe("who wakes a BF bot", () => {
   });
 
   it("wakes on Jay's 1:1 DM, never on a group DM, and on a peer bot's 1:1 DM as a peer", () => {
-    expect(verdict(dm(9, [101], { client: "website" }))).toEqual({ wake: "owner" });
+    expect(verdict(dm(9, [101], { client: "website" }))).toEqual({ wake: "owner", via: "dm" });
     expect(classify(dm(9, [101], { client: "website" }), ctx).origin).toEqual({ kind: "dm", userId: 9 });
     expect(verdict(dm(9, [101, 50], { client: "website" }))).toEqual({ wake: null, reason: "group_dm" });
     // Peer requests are screened, not refused: no allowlist gates the wake.
-    expect(verdict(dm(50, [101]))).toEqual({ wake: "peer" });
+    expect(verdict(dm(50, [101]))).toEqual({ wake: "peer", via: "dm" });
     expect(verdict(dm(50, [101], { timestamp: NOW / 1000 - 3600 }))).toEqual({ wake: null, reason: "stale" });
     // An incoming-webhook bot never wakes, by DM or otherwise.
     expect(verdict(dm(60, [101]))).toEqual({ wake: null, reason: "webhook_sender" });
@@ -97,6 +98,38 @@ describe("who wakes a BF bot", () => {
 
   it("counts an unknown sender as a bot", () => {
     expect(classify(stream({ sender_id: 777 }), ctx).senderIsBot).toBe(true);
-    expect(verdict(dm(777, [101]))).toEqual({ wake: "peer" });
+    expect(verdict(dm(777, [101]))).toEqual({ wake: "peer", via: "dm" });
+  });
+});
+
+describe("followed topics", () => {
+  const followed = new Set([followKey(7, "BF watch")]);
+  const fctx: RouterContext = { ...ctx, followed };
+  const watch = (over: Partial<ZulipMessage>) =>
+    stream({ stream_id: 7, subject: "BF watch", content: "deploy finished", flags: [], ...over });
+  const fverdict = (message: ZulipMessage) => wakeVerdict(classify(message, fctx));
+
+  it("wakes on any new message in a followed topic, mention or not", () => {
+    expect(fverdict(watch({}))).toEqual({ wake: "peer", via: "followed" });
+    expect(fverdict(watch({ sender_id: 9, client: "website" }))).toEqual({ wake: "owner", via: "followed" });
+    // the topic is matched the way Zulip matches it: case and the resolved mark folded
+    expect(fverdict(watch({ subject: "✔ bf WATCH" }))).toEqual({ wake: "peer", via: "followed" });
+    // a mention there is still a mention
+    expect(fverdict(watch({ content: "@**BF-Plumber** look", flags: ["mentioned"] }))).toEqual({ wake: "peer", via: "mention" });
+  });
+
+  it("never wakes on its own post, an incoming-webhook bot, Jay's account from an API client, or a stale peer there", () => {
+    expect(fverdict(watch({ sender_id: 101 }))).toEqual({ wake: null, reason: "own" });
+    expect(fverdict(watch({ sender_id: 60 }))).toEqual({ wake: null, reason: "webhook_sender" });
+    expect(fverdict(watch({ sender_id: 9, client: "ZulipPython" }))).toEqual({ wake: null, reason: "owner_via_api" });
+    expect(fverdict(watch({ timestamp: NOW / 1000 - 3600 }))).toEqual({ wake: null, reason: "stale" });
+  });
+
+  it("does not wake on another topic, another channel with the same topic, or a message with no channel id", () => {
+    expect(fverdict(watch({ subject: "BF other" }))).toEqual({ wake: null, reason: "not_a_mention" });
+    expect(fverdict(watch({ stream_id: 8 }))).toEqual({ wake: null, reason: "not_a_mention" });
+    expect(fverdict(watch({ stream_id: undefined }))).toEqual({ wake: null, reason: "not_a_mention" });
+    // and nothing is followed without the set
+    expect(verdict(watch({}))).toEqual({ wake: null, reason: "not_a_mention" });
   });
 });

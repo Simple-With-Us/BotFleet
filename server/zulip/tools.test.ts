@@ -16,20 +16,28 @@ import { buildTurnTools } from "../turn-tools.ts";
 const gate = { agents: true, commsDepth: 0, maxCommsDepth: 1, chiefOfStaff: false };
 
 describe("the registry", () => {
-  it("offers zulip_reply and zulip_post on both lanes only when zulip is on", () => {
+  it("offers zulip_reply, zulip_post and zulip_follow_topic on both lanes only when zulip is on", () => {
     for (const surface of ["mcp", "http"] as const) {
       expect(toolsFor(surface, gate).map((t) => t.name)).not.toContain("zulip_reply");
       expect(toolsFor(surface, { ...gate, zulip: true }).map((t) => t.name)).toEqual(
-        expect.arrayContaining(["zulip_reply", "zulip_post"]),
+        expect.arrayContaining(["zulip_reply", "zulip_post", "zulip_follow_topic"]),
       );
     }
     // independent of peer comms: posting as yourself is not a hop
-    expect(httpToolDefinitions({ ...gate, agents: false, zulip: true }).map((t) => t.name)).toEqual(["zulip_reply", "zulip_post"]);
-    expect(mcpToolDefinitions({ ...gate, zulip: true }).map((t) => t.name).slice(-2)).toEqual(["zulip_reply", "zulip_post"]);
+    expect(httpToolDefinitions({ ...gate, agents: false, zulip: true }).map((t) => t.name)).toEqual([
+      "zulip_reply",
+      "zulip_post",
+      "zulip_follow_topic",
+    ]);
+    expect(mcpToolDefinitions({ ...gate, zulip: true }).map((t) => t.name).slice(-3)).toEqual([
+      "zulip_reply",
+      "zulip_post",
+      "zulip_follow_topic",
+    ]);
   });
 
   it("follows the dispatch's flag through buildTurnTools", () => {
-    expect(buildTurnTools({ zulip: true }).map((t) => t.name)).toEqual(["zulip_reply", "zulip_post"]);
+    expect(buildTurnTools({ zulip: true }).map((t) => t.name)).toEqual(["zulip_reply", "zulip_post", "zulip_follow_topic"]);
     expect(buildTurnTools({ zulip: false }).map((t) => t.name)).toEqual([]);
   });
 });
@@ -65,6 +73,28 @@ describe("the HTTP tool host", () => {
     expect(seen[0]).toMatchObject({ botId: "bot-plumber", threadId: "thread-1", tool: "reply" });
   });
 
+  it("changes a follow with the turn's identity, and reads it back as a change, not a post", async () => {
+    const seen: ZulipToolRequest[] = [];
+    const host = createTurnToolHost({
+      botId: "bot-plumber",
+      threadId: "thread-1",
+      commsDepth: 0,
+      deps,
+      zulip: {
+        send: async (request) => {
+          seen.push(request);
+          return { ok: true, text: "Following #agent-sync > BF watch." };
+        },
+      },
+    });
+    const outcome = await host.execute(
+      { id: "c1", name: "zulip_follow_topic", arguments: { channel: "agent-sync", topic: "BF watch", follow: true, botId: "bot-other" } },
+      runtime,
+    );
+    expect(outcome).toMatchObject({ kind: "result", detail: "changed" });
+    expect(seen[0]).toMatchObject({ botId: "bot-plumber", threadId: "thread-1", tool: "follow" });
+  });
+
   it("reads a refusal back to the model as an error", async () => {
     const host = createTurnToolHost({
       botId: "bot-plumber",
@@ -97,7 +127,7 @@ describe("the MCP lane (agents-proxy)", () => {
   const pending = new Map<number, (msg: any) => void>();
   let nextId = 1;
 
-  const rpc = (method: string, params?: Record<string, string | Record<string, string>>): Promise<any> =>
+  const rpc = (method: string, params?: Record<string, string | Record<string, string | boolean>>): Promise<any> =>
     new Promise((resolve, reject) => {
       const id = nextId++;
       pending.set(id, resolve);
@@ -156,7 +186,11 @@ describe("the MCP lane (agents-proxy)", () => {
   it("publishes the Zulip tools last when OMB_ZULIP=1", async () => {
     await rpc("initialize", { protocolVersion: "2024-11-05" });
     const list = await rpc("tools/list");
-    expect(list.result.tools.map((t: { name: string }) => t.name).slice(-2)).toEqual(["zulip_reply", "zulip_post"]);
+    expect(list.result.tools.map((t: { name: string }) => t.name).slice(-3)).toEqual([
+      "zulip_reply",
+      "zulip_post",
+      "zulip_follow_topic",
+    ]);
   });
 
   it("hops to the harness with the turn's token and nothing else to identify it", async () => {
@@ -168,5 +202,9 @@ describe("the MCP lane (agents-proxy)", () => {
     const refused = await rpc("tools/call", { name: "zulip_post", arguments: { channel: "c", topic: "t", content: "refuse me" } });
     expect(lastPath).toBe("/api/internal/zulip/post");
     expect(refused.result).toMatchObject({ isError: true, content: [{ type: "text", text: "Not posted: refused." }] });
+    await rpc("tools/call", { name: "zulip_follow_topic", arguments: { channel: "c", topic: "t", follow: true } });
+    expect(lastPath).toBe("/api/internal/zulip/follow");
+    expect(lastAuth).toBe(`Bearer ${TOKEN}`);
+    expect(lastBody).toEqual({ channel: "c", topic: "t", follow: true });
   });
 });

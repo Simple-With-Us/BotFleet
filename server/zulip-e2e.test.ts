@@ -32,6 +32,7 @@ posixOnly("Zulip source e2e", () => {
   let home: string;
   let dump: string;
   let stderr = "";
+  let botId = "";
   const fake = new FakeZulip();
 
   const api = async (
@@ -110,6 +111,7 @@ posixOnly("Zulip source e2e", () => {
     async () => {
       expect((await api("GET", "/api/zulip/status")).body).toMatchObject({ enabled: true, bots: [] });
       const created = (await api("POST", "/api/bots")).body.bot;
+      botId = created.id;
       await api("PATCH", `/api/bots/${created.id}`, { modelSelection: { instanceId: "claude", model: "claude-fake" } });
       const saved = await api("PUT", "/api/config", { zulip: { bots: { [created.id]: { role: "BF-Plumber" } } } });
       expect(saved.status).toBe(200);
@@ -159,5 +161,39 @@ posixOnly("Zulip source e2e", () => {
       expect(fake.postsBy(PLUMBER)).toHaveLength(1);
     },
     150_000,
+  );
+
+  it(
+    "a new message in a topic the bot follows wakes it in that topic's own task, and nothing is posted for it",
+    async () => {
+      expect(botId).not.toBe("");
+      // Followed from the Zulip app (the tool's call is covered in hub.test):
+      // the session learns it from the user_topic event.
+      fake.followTopic(PLUMBER, "agent-sync", "BF e2e watch");
+      await waitFor(async () => {
+        const status = (await api("GET", "/api/zulip/status")).body;
+        return status.bots.some((bot: any) => bot.botId === botId && bot.following === 1);
+      }, "the follow to reach the session");
+      const before = fake.postsBy(PLUMBER).length;
+      // no mention: only the follow makes this a wake
+      fake.postStream(JAY, "agent-sync", "BF e2e watch", "deploy 4326 finished", "website");
+      let threadId = "";
+      await waitFor(async () => {
+        const bot = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === botId);
+        const task = bot?.tasks.find((t: any) => t.title === "Zulip #agent-sync > BF e2e watch");
+        if (!task) return false;
+        threadId = task.threadId;
+        const thread = (await api("GET", `/api/threads/${threadId}/messages`)).body.messages;
+        return thread.some((m: any) => m.role === "bot" && m.kind === "text");
+      }, "the followed topic's turn to finish in its own task");
+      const thread = (await api("GET", `/api/threads/${threadId}/messages`)).body.messages;
+      const starter = thread.find((m: any) => m.automationSource === "zulip");
+      expect(starter.text).toContain("new messages in a channel topic you follow");
+      expect(starter.text).toContain("deploy 4326 finished");
+      // Several drain ticks later: a followed topic's wake is never auto-replied.
+      await new Promise((r) => setTimeout(r, 3_000));
+      expect(fake.postsBy(PLUMBER)).toHaveLength(before);
+    },
+    120_000,
   );
 });

@@ -73,6 +73,9 @@ export interface ZulipInboundItem {
   ownerViaApi: boolean;
   content: string;
   timestamp: number;
+  /** Why it woke the bot: an @-mention, a 1:1 DM, or a new message in a
+   *  topic the bot follows.  Absent on units saved before follows existed. */
+  via?: "mention" | "dm" | "followed";
 }
 
 /** One unit of work: every message for one origin that arrived before the

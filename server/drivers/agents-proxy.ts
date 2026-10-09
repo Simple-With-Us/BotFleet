@@ -89,7 +89,7 @@ const MCP_TOOL_ORDER = [
   // mounts them publishes its existing surface unchanged first.
   ...(process.env.OMB_JOBS === "1" ? ["job_start", "job_output", "job_list", "job_kill"] : []),
   // Zulip, last: a turn without it publishes the existing surface unchanged.
-  ...(process.env.OMB_ZULIP === "1" ? ["zulip_reply", "zulip_post"] : []),
+  ...(process.env.OMB_ZULIP === "1" ? ["zulip_reply", "zulip_post", "zulip_follow_topic"] : []),
 ];
 
 const TOOLS_BY_NAME = new Map(REGISTRY_TOOLS.map((tool) => [tool.name, tool]));
@@ -328,8 +328,9 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
   // Zulip.  A thin hop like the job tools: the comms token is the identity,
   // and the harness answers a refusal as `isError` so the model reads it as
   // "not posted" rather than as a post that happened.
-  if (name === "zulip_reply" || name === "zulip_post") {
-    const r = await api(`/api/internal/zulip/${name === "zulip_reply" ? "reply" : "post"}`, {
+  if (name === "zulip_reply" || name === "zulip_post" || name === "zulip_follow_topic") {
+    const route = name === "zulip_reply" ? "reply" : name === "zulip_post" ? "post" : "follow";
+    const r = await api(`/api/internal/zulip/${route}`, {
       method: "POST",
       body: JSON.stringify(args),
     });

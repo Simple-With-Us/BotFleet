@@ -86,11 +86,25 @@ export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> 
   });
 }
 
+/** One row of the bot's topic visibility settings: register's
+ *  `user_topics`, and the body of a `user_topic` event. */
+export interface ZulipUserTopic {
+  stream_id?: number;
+  topic_name?: string;
+  /** 0 none, 1 muted, 2 unmuted, 3 followed. */
+  visibility_policy?: number;
+}
+
+/** Zulip's visibility_policy for a followed topic, and for "no setting". */
+export const ZULIP_TOPIC_FOLLOWED = 3;
+export const ZULIP_TOPIC_NONE = 0;
+
 export interface ZulipRegisterResult {
   queue_id: string;
   last_event_id: number;
   max_message_id?: number;
   realm_users?: ZulipUser[];
+  user_topics?: ZulipUserTopic[];
   event_queue_longpoll_timeout_seconds?: number;
 }
 
@@ -102,6 +116,10 @@ export interface ZulipEvent {
   /** `realm_user` events: "add", "remove" or "update", and who. */
   op?: string;
   person?: Partial<ZulipUser>;
+  /** `user_topic` events: the topic and its new visibility policy. */
+  stream_id?: number;
+  topic_name?: string;
+  visibility_policy?: number;
 }
 
 export class ZulipClient {
@@ -234,14 +252,16 @@ export class ZulipClient {
   /** One unnarrowed queue: the bot's DMs and every channel it is subscribed
    *  to.  `realm_user` state is fetched so the router can tell bots from
    *  people and a DM can be checked against the realm's active members, and
-   *  subscribed to so a deactivation reaches the cache without a restart. */
+   *  subscribed to so a deactivation reaches the cache without a restart.
+   *  `user_topic` likewise: the topics the bot follows wake it, and a follow
+   *  or unfollow (from the tool, or from the Zulip app) arrives as an event. */
   register(signal?: AbortSignal): Promise<ZulipRegisterResult> {
     return this.request(
       "POST",
       "register",
       {
-        event_types: ["message", "realm_user"],
-        fetch_event_types: ["message", "realm_user"],
+        event_types: ["message", "realm_user", "user_topic"],
+        fetch_event_types: ["message", "realm_user", "user_topic"],
         apply_markdown: false,
         client_gravatar: true,
       },
@@ -284,6 +304,26 @@ export class ZulipClient {
       { signal },
     );
     return Array.isArray(result.messages) ? result.messages : [];
+  }
+
+  /** The channels this bot is subscribed to, by id and name. */
+  async subscriptions(signal?: AbortSignal): Promise<Array<{ stream_id: number; name: string }>> {
+    const result = await this.request<{ subscriptions?: Array<{ stream_id?: unknown; name?: unknown }> }>(
+      "GET",
+      "users/me/subscriptions",
+      undefined,
+      { signal },
+    );
+    const out: Array<{ stream_id: number; name: string }> = [];
+    for (const sub of Array.isArray(result.subscriptions) ? result.subscriptions : []) {
+      if (typeof sub?.stream_id === "number" && typeof sub.name === "string") out.push({ stream_id: sub.stream_id, name: sub.name });
+    }
+    return out;
+  }
+
+  /** Follow (3) or clear (0) one topic for this bot. */
+  async setTopicVisibility(streamId: number, topic: string, visibilityPolicy: number): Promise<void> {
+    await this.request("POST", "user_topics", { stream_id: streamId, topic, visibility_policy: visibilityPolicy });
   }
 
   async send(

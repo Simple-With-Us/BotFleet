@@ -10191,7 +10191,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // grant's thread, whatever the arguments say.  A refusal is a 200 with
       // `isError`, so the model reads "not posted" rather than a transport
       // failure.
-      if (method === "POST" && (path === "/api/internal/zulip/reply" || path === "/api/internal/zulip/post")) {
+      if (
+        method === "POST" &&
+        (path === "/api/internal/zulip/reply" || path === "/api/internal/zulip/post" || path === "/api/internal/zulip/follow")
+      ) {
         const token = bearerToken(req.headers.authorization);
         const grant = token ? commsGrants.get(token) : undefined;
         if (!grant) return json(res, 403, { error: "forbidden: Zulip tools need this turn's comms token" });
@@ -10210,7 +10213,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const result = await zulipHub.send({
           botId: grant.botId,
           threadId: grant.threadId,
-          tool: path.endsWith("/reply") ? "reply" : "post",
+          tool: path.endsWith("/reply") ? "reply" : path.endsWith("/follow") ? "follow" : "post",
           args,
         });
         return json(res, 200, { text: result.text, isError: !result.ok });

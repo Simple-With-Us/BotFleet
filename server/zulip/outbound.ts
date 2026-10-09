@@ -60,6 +60,14 @@ export const zulipToolArgsSchema = z.object({
 
 export type OutboundArgs = z.infer<typeof zulipToolArgsSchema>;
 
+/** zulip_follow_topic's arguments, parsed at the hub's boundary like the
+ *  post tools'.  `follow` may arrive as a JSON boolean or its text. */
+export const zulipFollowArgsSchema = z.object({
+  channel: z.string(),
+  topic: z.string(),
+  follow: z.union([z.boolean(), z.enum(["true", "false"])]),
+});
+
 /** An argument as trimmed text.  Absent and blank are both "not given". */
 function text(value: string | number | undefined): string {
   return value === undefined ? "" : String(value).trim();

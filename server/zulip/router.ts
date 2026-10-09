@@ -10,7 +10,7 @@
 // this catches honest API use and cannot stop someone holding his key: the
 // verdict labels a turn, it is never authority for a side effect.
 
-import { directlyMentions } from "./format.ts";
+import { directlyMentions, followKey } from "./format.ts";
 import type { ZulipIdentity, ZulipMessage, ZulipOrigin, ZulipUser } from "./types.ts";
 
 export const DEFAULT_OWNER_CLIENTS = ["website", "ZulipMobile", "ZulipFlutter", "ZulipElectron", "ZulipDesktop"];
@@ -26,6 +26,8 @@ export interface RouterContext {
   users: ReadonlyMap<number, ZulipUser>;
   nowMs: number;
   staleMs: number;
+  /** Topics this bot follows, by followKey(stream id, topic). */
+  followed?: ReadonlySet<string>;
 }
 
 export interface Classification {
@@ -35,6 +37,8 @@ export interface Classification {
   dm: boolean;
   groupDm: boolean;
   direct: boolean;
+  /** A channel message in a topic this bot follows. */
+  followed: boolean;
   wildcard: boolean;
   senderIsBot: boolean;
   webhookSender: boolean;
@@ -43,7 +47,11 @@ export interface Classification {
   origin: ZulipOrigin | null;
 }
 
-export type WakeVerdict = { wake: "owner" | "peer" } | { wake: null; reason: string };
+/** Why a message woke the bot: an @-mention, a 1:1 DM, or a new message in
+ *  a topic it follows. */
+export type WakeReason = "mention" | "dm" | "followed";
+
+export type WakeVerdict = { wake: "owner" | "peer"; via: WakeReason } | { wake: null; reason: string };
 
 export function isDirectMessage(message: Pick<ZulipMessage, "type">): boolean {
   return message.type === "private" || message.type === "direct";
@@ -79,6 +87,10 @@ export function classify(message: ZulipMessage, ctx: RouterContext): Classificat
     dm,
     groupDm,
     direct: directlyMentions(message.content ?? "", message.flags, ctx.me),
+    followed:
+      !dm &&
+      typeof message.stream_id === "number" &&
+      Boolean(ctx.followed?.has(followKey(message.stream_id, messageTopic(message)))),
     wildcard: WILDCARD_FLAGS.some((flag) => message.flags?.includes(flag)),
     senderIsBot: fromOwnerAccount ? false : (user?.is_bot ?? true),
     webhookSender: user?.bot_type === INCOMING_WEBHOOK_BOT,
@@ -87,8 +99,9 @@ export function classify(message: ZulipMessage, ctx: RouterContext): Classificat
   };
 }
 
-/** Whether this message wakes the bot, and as whom.  Only a direct
- *  @-mention or a 1:1 DM ever wakes; wildcard and group mentions, group DMs,
+/** Whether this message wakes the bot, as whom, and why.  A direct
+ *  @-mention, a 1:1 DM, or a new message in a topic the bot follows wakes
+ *  it; wildcard and group mentions outside a followed topic, group DMs,
  *  incoming-webhook bots and the bot's own posts never do.
  *
  *  A peer bot's mention or DM wakes the bot like anyone else's (the fleet's
@@ -100,8 +113,9 @@ export function wakeVerdict(c: Classification): WakeVerdict {
   if (!c.origin) return { wake: null, reason: c.groupDm ? "group_dm" : "no_origin" };
   if (c.ownerViaApi) return { wake: null, reason: "owner_via_api" };
   if (c.webhookSender) return { wake: null, reason: "webhook_sender" };
-  if (c.owner && (c.direct || c.dm)) return { wake: "owner" };
-  if (c.dm || c.direct) return c.stale ? { wake: null, reason: "stale" } : { wake: "peer" };
+  const via: WakeReason | null = c.dm ? "dm" : c.direct ? "mention" : c.followed ? "followed" : null;
+  if (c.owner && via) return { wake: "owner", via };
+  if (via) return c.stale ? { wake: null, reason: "stale" } : { wake: "peer", via };
   if (c.wildcard) return { wake: null, reason: "wildcard" };
   return { wake: null, reason: "not_a_mention" };
 }
