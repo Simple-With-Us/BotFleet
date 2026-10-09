@@ -133,10 +133,14 @@ export function listCustomVoices() {
  *
  * The pronunciation list is applied here, the one layer every hosted and
  * built-in synthesis goes through (message clips, Try, call mode), and only
- * to the text sent to the engine: scripts and clip caches never see it, so a
- * list edit re-bills nothing and applies to new synthesis only.  The list is
- * idempotent (shared/pronunciations.ts), so text that already says "sequel"
- * is left as it is. */
+ * to the text sent to the engine: clip caches never see it, so a list edit
+ * re-bills nothing.  This pass catches a term a script keeps as written (the
+ * reply as written, a call prompt, the deterministic fallback).  It cannot
+ * reach a term the distiller spelled out letter by letter ("G I F"), so a
+ * distilled script made with an older list is distilled again before it is
+ * first voiced (server/tts/distill.ts).  The list is idempotent
+ * (shared/pronunciations.ts), so text that already says "sequel" is left as
+ * it is. */
 export function speak(cfg: AppConfig, rawText: string, voiceId?: string, run?: systemVoices.Runner) {
   const text = applyPronunciations(rawText, pronunciations(cfg));
   // The workspace default can be a Personal Voice too; it must never reach

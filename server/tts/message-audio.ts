@@ -61,18 +61,23 @@
 // - An on-device (Personal Voice) answer has the distiller's MiniMax pause
 //   tags (`<#0.3#>`) taken out, since an Apple voice would read them; hosted
 //   clips keep them, because MiniMax turns them into the pauses they ask for.
-// - The workspace pronunciation list (shared/pronunciations.ts) is applied
-//   only where text leaves for a voice: each hosted utterance on its way to
-//   the engine (server/tts/index.ts speak) and the utterances an on-device
-//   answer hands the device, whose spans are rebuilt so a respelled term
-//   still maps to the term on screen.  voiceText, the stamps and the
-//   utterances every cache check compares never carry it, so a list edit
-//   never resets or re-bills a clip: clips already made keep their sound,
-//   and new synthesis uses the list.
+// - The workspace pronunciation list (shared/pronunciations.ts) reaches a
+//   distilled script through the distiller, so each stored script records
+//   the list it was made with (`voiceTextPronunciations`).  A script made
+//   with another list is distilled again on its next play, unless a clip was
+//   made from it (reusableSummary, server/tts/distill.ts): a voiced reply
+//   keeps its sound, and a list edit never re-bills a clip.  The list is
+//   also applied where text leaves for a voice: each hosted utterance on its
+//   way to the engine (server/tts/index.ts speak) and the utterances an
+//   on-device answer hands the device, whose spans are rebuilt so a
+//   respelled term still maps to the term on screen.  That second pass
+//   catches terms a script keeps as written (the reply as written, the
+//   deterministic fallback).  The stamps and the utterances every cache
+//   check compares never carry it.
 import { z } from "zod";
 
 import { isPersonalVoiceId, isSpeechDevice, SPEECH_DEVICES, voiceForDevice, type BotVoices, type SpeechDevice } from "../../shared/bot-voice.ts";
-import { pronouncer, type Pronunciation } from "../../shared/pronunciations.ts";
+import { pronouncer, pronunciationsFingerprint, type Pronunciation } from "../../shared/pronunciations.ts";
 import { pronounceUtterance, utterancesWithSpans, type SpokenUtterance } from "../../shared/speech-spans.ts";
 import { encodeSpokenSpans, stripPauseTags, type SpokenScriptKind, type SpokenSpansWire } from "../../shared/spoken-script.ts";
 import { voiceScriptKind, writtenReply, type VoiceSummaryMode } from "../../shared/voice-summary.ts";
@@ -148,9 +153,32 @@ export interface AudioMessage {
   /** What voiceText is (shared/spoken-script.ts SpokenScriptKind); absent on
    * rows from before karaoke. */
   voiceTextKind?: SpokenScriptKind;
+  /** The pronunciation list a distilled voiceText was made with
+   * (pronunciationsFingerprint).  Absent on rows from before the list,
+   * which is the same as the empty list. */
+  voiceTextPronunciations?: string;
   audio?: VoiceClip[];
   audioVoice?: string;
   audioByVoice?: Record<string, VoiceClip[]>;
+}
+
+/** Whether any voice has clips on this reply. */
+export function hasAnyClips(message: AudioMessage): boolean {
+  return Boolean(message.audio?.length) || Object.values(message.audioByVoice ?? {}).some((clips) => clips?.length);
+}
+
+/**
+ * The stored distilled script, when it can be spoken as it is: it was made
+ * with the pronunciation list in force (`listName`, a
+ * pronunciationsFingerprint), or a clip was already made from it, which
+ * distilling again would throw away and bill again.  Undefined means ask the
+ * distiller (server/tts/distill.ts).  A written-mode script is never a
+ * distilled one.
+ */
+export function reusableSummary(message: AudioMessage, listName: string): string | undefined {
+  if (!message.voiceText || message.voiceTextKind === "written") return undefined;
+  if ((message.voiceTextPronunciations ?? "") === listName || hasAnyClips(message)) return message.voiceText;
+  return undefined;
 }
 
 /** What `summarize` hands back.  `retry` marks a stand-in for a rewrite that
@@ -173,8 +201,10 @@ export interface MessageAudioDeps {
   readClip(clip: VoiceClip): { bytes: Uint8Array; mime: string } | null;
   /** cfg.tts.voice: what an empty bot voice means. */
   defaultVoice(): string;
-  /** The workspace pronunciation list in force, for on-device answers.
-   * Hosted clips get it from `speak`.  Absent means none. */
+  /** The workspace pronunciation list in force: whether a stored distilled
+   * script is out of date (reusableSummary), and the respelling for
+   * on-device answers.  Hosted clips get it from `speak`.  Absent means
+   * none. */
   pronunciations?(): readonly Pronunciation[];
   /** A hosted-voice key is saved but has not reached the harness yet. */
   credentialPending(): boolean;
@@ -517,10 +547,12 @@ export class MessageAudio {
       if (spans) spansWire = encodeSpokenSpans(source, spoken);
       eitherKind = sameUtterances(toUtterances(textToSpeak), utterances);
     } else {
-      // A written-mode script is the reply as written, not a distilled one;
-      // distill instead of reusing it.
-      const summarized: SummarizedSpeech = message.voiceText && message.voiceTextKind !== "written"
-        ? { text: message.voiceText }
+      // A written-mode script is the reply as written, not a distilled one,
+      // and a distilled script made with another pronunciation list and not
+      // voiced yet is out of date; distill instead of reusing either.
+      const stored = reusableSummary(message, pronunciationsFingerprint(this.deps.pronunciations?.() ?? []));
+      const summarized: SummarizedSpeech = stored !== undefined
+        ? { text: stored }
         : await this.deps.summarize(threadId, messageId, message.text);
       textToSpeak = summarized.text;
       utterances = toUtterances(textToSpeak);

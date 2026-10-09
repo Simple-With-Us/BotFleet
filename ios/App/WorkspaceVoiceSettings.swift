@@ -191,7 +191,7 @@ struct PronunciationsView: View {
                     Spacer()
                 }
             } footer: {
-                Text("How the voice says terms it keeps getting wrong, for every bot.\u{00A0} A change applies to replies voiced after you save; clips already made keep their sound.")
+                Text("How the voice says terms it keeps getting wrong, for every bot.\u{00A0} A term in lowercase matches any case; one with capitals matches only as written or in all capitals.\u{00A0} A change applies to every reply not voiced yet, and a reply already voiced keeps its sound.")
             }
 
             if let message = incomplete ?? (error.isEmpty ? nil : error) {

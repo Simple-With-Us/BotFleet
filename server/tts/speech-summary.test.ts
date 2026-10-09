@@ -52,6 +52,8 @@ describe("summarizeForVoice", () => {
     const prompt = voiceSummarySystemPrompt(DEFAULT_PRONUNCIATIONS);
     expect(prompt.startsWith(DEEPSEEK_FLASH_TTS_PROMPT)).toBe(true);
     expect(prompt).toContain("Always say these terms exactly as given.");
+    // The matching rule is the harness's own (shared/pronunciations.ts).
+    expect(prompt).toContain('so "IT" never changes the word "it".  A term in lowercase counts in any case.');
     expect(prompt).toContain('- "SQL" is said "sequel"');
     expect(prompt).toContain('- "OAuth" is said "oh auth"');
     // An empty list leaves the prompt exactly as it was.

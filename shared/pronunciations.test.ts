@@ -13,6 +13,7 @@ import {
   PRONUNCIATIONS_MAX,
   pronouncer,
   PronunciationDraftListSchema,
+  pronunciationsFingerprint,
   sanitizeStoredPronunciations,
   type Pronunciation,
 } from "./pronunciations.ts";
@@ -52,13 +53,41 @@ describe("DEFAULT_PRONUNCIATIONS", () => {
 });
 
 describe("applyPronunciations", () => {
-  it("replaces whole words without case", () => {
+  it("replaces whole words", () => {
     expect(say("The SQL query returns JSON.")).toBe("The sequel query returns Jason.");
-    expect(say("the sql query returns json")).toBe("the sequel query returns Jason");
     expect(say("Use OAuth with sudo and a cron job on the GUI.")).toBe("Use oh auth with soo doo and a kron job on the gooey.");
     expect(say("Solve the CAPTCHA, then the REGEX, then the SaaS bill.")).toBe(
       "Solve the cap cha, then the redge ex, then the sass bill.",
     );
+  });
+
+  it("matches a term with no capitals in any case", () => {
+    expect(say("Sudo first.  Then CRON, then Cron.")).toBe("soo doo first.  Then kron, then kron.");
+  });
+
+  it("matches a term with capitals only as written or in all capitals", () => {
+    expect(say("SAAS and OAUTH, as written in a heading")).toBe("sass and oh auth, as written in a heading");
+    // Lowercase or other spellings are another word, or the owner's to add.
+    expect(say("the sql query returns json")).toBe("the sql query returns json");
+    expect(say("Saas, Oauth and Json")).toBe("Saas, Oauth and Json");
+  });
+
+  it("never rewrites an ordinary word that shares an acronym's letters", () => {
+    const list = [
+      { term: "A", say: "ay" },
+      { term: "IT", say: "eye tee" },
+      { term: "AM", say: "ay em" },
+      { term: "US", say: "you ess" },
+      { term: "OR", say: "oh are" },
+    ];
+    expect(checkPronunciations(list)).toEqual({ ok: true, list });
+    expect(applyPronunciations("I have a dog and it is fine.  IT dept.", list)).toBe(
+      "I have a dog and it is fine.  eye tee dept.",
+    );
+    expect(applyPronunciations("Tell us, am I late or early?  A US flight at 9 AM, OR route.", list)).toBe(
+      "Tell us, am I late or early?  ay you ess flight at 9 ay em, oh are route.",
+    );
+    expect(applyPronunciations("It is.  Am I?  Us too.  Or not.", list)).toBe("It is.  Am I?  Us too.  Or not.");
   });
 
   it("keeps punctuation around a term", () => {
@@ -74,17 +103,39 @@ describe("applyPronunciations", () => {
     expect(say("jsonl files and parseJSON")).toBe("jsonl files and parseJSON");
     expect(say("MySQL and SQLite")).toBe("MySQL and SQLite");
     expect(say("my_json_file")).toBe("my_json_file");
-    expect(say("JSON5")).toBe("JSON5");
+    expect(say("JSONL5 and OAuth2Client")).toBe("JSONL5 and OAuth2Client");
+  });
+
+  it("reads a version number after a term as its own word", () => {
+    expect(say("Set up the OAuth2 flow.")).toBe("Set up the oh auth 2 flow.");
+    expect(say("JSON5, SQL2016 and GUI2")).toBe("Jason 5, sequel 2016 and gooey 2");
+    // Only after a term ending in a letter, and only when the digits end it.
+    expect(say("OAuth2x")).toBe("OAuth2x");
+    expect(applyPronunciations("C#5", [{ term: "C#", say: "C sharp" }])).toBe("C sharp 5");
   });
 
   it("never touches URLs, paths, emails, file names or dotted names", () => {
     expect(say("Open config.json now")).toBe("Open config.json now");
-    expect(say("Edit src/sql/x.ts today")).toBe("Edit src/sql/x.ts today");
-    expect(say("See https://example.com/json for JSON")).toBe("See https://example.com/json for Jason");
-    expect(say("Mail sql@example.com")).toBe("Mail sql@example.com");
+    expect(say("Edit src/SQL/x.ts and src/cron today")).toBe("Edit src/SQL/x.ts and src/cron today");
+    expect(say("See https://example.com/JSON for JSON")).toBe("See https://example.com/JSON for Jason");
+    expect(say("Mail SQL@example.com")).toBe("Mail SQL@example.com");
     expect(say("C:\\cron\\jobs")).toBe("C:\\cron\\jobs");
     expect(say("JSON.parse returns")).toBe("JSON.parse returns");
-    expect(say("json.org and sql.js")).toBe("json.org and sql.js");
+    expect(say("JSON.org and SQL.js")).toBe("JSON.org and SQL.js");
+    expect(say("Read /cron, ~/cron, ./cron, ../cron, cron/ and jobs/cron now")).toBe(
+      "Read /cron, ~/cron, ./cron, ../cron, cron/ and jobs/cron now",
+    );
+    expect(say("See (/etc/cron.d/job) and jobs/cron/daily")).toBe("See (/etc/cron.d/job) and jobs/cron/daily");
+  });
+
+  it("respells terms joined by a single slash, which is prose, not a path", () => {
+    expect(say("Use JSON/YAML configs and SQL/NoSQL stores.")).toBe("Use Jason/YAML configs and sequel/NoSQL stores.");
+    expect(say("The GUI/CLI split, (OAuth/OIDC) flows, GUI/cli too.")).toBe(
+      "The gooey/CLI split, (oh auth/OIDC) flows, gooey/cli too.",
+    );
+    expect(say("Set up the OAuth2 flow and convert JSON/YAML from SQL/NoSQL.")).toBe(
+      "Set up the oh auth 2 flow and convert Jason/YAML from sequel/NoSQL.",
+    );
   });
 
   it("never touches a MiniMax pause tag", () => {
@@ -120,6 +171,18 @@ describe("applyPronunciations", () => {
     const run = pronouncer(DEFAULT_PRONUNCIATIONS);
     expect(run("SQL and JSON")).toBe("sequel and Jason");
     expect(run("cron")).toBe("kron");
+  });
+});
+
+describe("pronunciationsFingerprint", () => {
+  it("names a list by its entries, in any order, and the empty list as \"\"", () => {
+    expect(pronunciationsFingerprint([])).toBe("");
+    const a = pronunciationsFingerprint(DEFAULT_PRONUNCIATIONS);
+    expect(a).toMatch(/^p1-9-[0-9a-f]{8}$/);
+    expect(pronunciationsFingerprint([...DEFAULT_PRONUNCIATIONS].reverse())).toBe(a);
+    const changed = DEFAULT_PRONUNCIATIONS.map((p) => (p.term === "REGEX" ? { term: "REGEX", say: "rej ex" } : p));
+    expect(pronunciationsFingerprint(changed)).not.toBe(a);
+    expect(pronunciationsFingerprint([...DEFAULT_PRONUNCIATIONS, { term: "GIF", say: "jif" }])).not.toBe(a);
   });
 });
 
