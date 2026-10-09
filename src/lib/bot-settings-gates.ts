@@ -28,6 +28,12 @@
 // not a vanished control.
 
 import { DEFAULT_MAX_TOOL_ROUNDS, toolRoundsCaption } from "../../shared/bot-profile";
+import {
+  effectiveReviewHook,
+  type AutoReviewMode,
+  type ReviewerRole,
+  type ReviewHook,
+} from "../../shared/auto-review";
 import type { Bot, InstanceInfo } from "@/state/store";
 
 /** The smallest bot shape these gates need.  Kept structural so tests can pass
@@ -60,7 +66,9 @@ export interface CapabilityGates {
   engine: InstanceInfo | undefined;
   /** Can this bot reach other bots? */
   canCoordinate: boolean;
-  /** Can this engine answer a bounded review prompt? */
+  /** Can this engine answer a bounded review prompt on its own?  Whether
+   *  auto-review is available at all is `autoReviewGate`: an engine that
+   *  cannot review itself is reviewed by the owner's fallback reviewer. */
   canAutoReview: boolean;
   /** Can this engine mount Composio? */
   canUseConnectedApps: boolean;
@@ -174,6 +182,187 @@ export function botCapabilityGates(
     canUseVps: capabilities?.computerMcp === true && engine?.driverKind !== "boxAgent",
     toolLoop: capabilities?.toolLoop === true,
   };
+}
+
+// ── auto-review ──────────────────────────────────────────────────────────
+// The owner was told "this engine cannot run an isolated review safely" for
+// every engine but Claude.  Two separate questions were collapsed into one:
+// where BotFleet can see the engine's actions (the hook), and who can review
+// them (the engine itself, or the fallback reviewer the owner picks).  This
+// gate answers both, in the words the panel shows, and keeps the file's rule:
+// an engine that has not reported yet is unknown, never "no".
+
+/** A sentence gap that survives HTML whitespace collapsing. */
+const GAP = "  ";
+
+/** One engine that can review for others. */
+export interface ReviewerOption {
+  instanceId: string;
+  name: string;
+}
+
+export interface AutoReviewGate {
+  /** Where review sees this bot's actions under On.  A full-auto instance
+   *  that can ask is held in its asking mode, so this reads `before`. */
+  hook: ReviewHook | "unknown";
+  /** Under Watch, which never changes what the engine does. */
+  watchHook: ReviewHook | "unknown";
+  /** Who reviews, or null when nobody can. */
+  reviewer: (ReviewerOption & { role: ReviewerRole }) | null;
+  canWatch: boolean;
+  canEnforce: boolean;
+  /** Why Watch and On are disabled, or null when they are not. */
+  disabledReason: string | null;
+  /** The engine cannot review its own actions, so the fallback reviewer
+   *  decides whether review is available. */
+  needsFallback: boolean;
+  /** Engines the owner may pick as the fallback reviewer. */
+  fallbackOptions: ReviewerOption[];
+  /** The card's description line. */
+  summary: string;
+  /** The tooltip for each mode button. */
+  hints: Record<AutoReviewMode, string>;
+  /** How Bypass Permissions combines with the current mode, or null when
+   *  Bypass is off. */
+  bypassNote: string | null;
+}
+
+/** Whether an engine can actually answer a review right now: it has an
+ *  isolated reviewer, it is switched on, and its last probe found it usable
+ *  (a keyless API engine or a missing CLI would fail every review).  A probe
+ *  that is still answering counts, so a slow engine is not dropped. */
+function canReview(instance: InstanceInfo | undefined): boolean {
+  if (!instance || instance.capabilities?.approvalReview !== true || instance.enabled === false) return false;
+  return instance.snapshot?.state === "available" || instance.snapshot?.transient === true;
+}
+
+/** Engines that can review for any bot. */
+export function reviewerOptions(instances: InstanceInfo[]): ReviewerOption[] {
+  return instances
+    .filter((instance) => canReview(instance))
+    .map((instance) => ({ instanceId: instance.instanceId, name: instance.displayName }));
+}
+
+/** What the Review Routine Approvals card offers this bot, and what it says.
+ *
+ *  `fallbackReviewerId` is the fleet's chosen fallback reviewer from config
+ *  (`autoReview.fallbackReviewer`), or null. */
+export function autoReviewGate(
+  instances: InstanceInfo[],
+  bot: Pick<Bot, "modelSelection" | "autoReview" | "bypassPermissions">,
+  fallbackReviewerId: string | null | undefined,
+): AutoReviewGate {
+  const engine = configuredEngine(instances, bot);
+  const name = engine?.displayName ?? "This engine";
+  const capabilities = engine?.capabilities;
+  const nativeHook: ReviewHook | "unknown" = capabilities?.reviewHook ?? "unknown";
+  const asksWhenHeld = capabilities?.asksWhenHeld === true;
+  const enforceHook: ReviewHook | "unknown" =
+    nativeHook === "unknown" ? "unknown" : effectiveReviewHook(nativeHook, asksWhenHeld, true);
+  const fallbackOptions = reviewerOptions(instances);
+  const reviewsItself = canReview(engine);
+  const fallback = fallbackReviewerId
+    ? fallbackOptions.find((option) => option.instanceId === fallbackReviewerId)
+    : undefined;
+  const reviewer = reviewsItself && engine
+    ? { instanceId: engine.instanceId, name: engine.displayName, role: "own" as const }
+    : fallback
+      ? { ...fallback, role: "fallback" as const }
+      : null;
+  const needsFallback = engine !== undefined && !reviewsItself;
+
+  const hints = {
+    off: "Every undecided approval waits for you.",
+    shadow:
+      nativeHook === "after"
+        ? "Record what the reviewer thinks of each step, without changing anything."
+        : "Record the review without answering the card.",
+    enforce:
+      enforceHook === "after"
+        ? "Stop the turn when the reviewer refuses a step."
+        : "Answer only reviews that return a strict approval.",
+  } satisfies Record<AutoReviewMode, string>;
+
+  // Unknown engine: say so and keep every mode open.  A saved choice must
+  // never look deleted because the instance list has not answered yet.
+  if (nativeHook === "unknown") {
+    return {
+      hook: "unknown",
+      watchHook: "unknown",
+      reviewer,
+      canWatch: true,
+      canEnforce: true,
+      disabledReason: null,
+      needsFallback,
+      fallbackOptions,
+      summary: `${name} has not reported how it handles approvals yet.`,
+      hints,
+      bypassNote: bypassNote(bot, "unknown"),
+    };
+  }
+
+  let disabledReason: string | null = null;
+  if (nativeHook === "none") {
+    disabledReason = `${name} reports no actions, so there is nothing to review.`;
+  } else if (!reviewer) {
+    disabledReason = fallbackOptions.length > 0
+      ? `${name} cannot review on its own.${GAP}Choose a fallback reviewer below to turn this on.`
+      : `${name} cannot review on its own, and no engine that can review is set up.${GAP}Set up Claude or an API engine to review for it.`;
+  }
+  const available = disabledReason === null;
+
+  const reviewerName = reviewer?.name ?? "the reviewer";
+  // The server falls through to the fallback reviewer when an engine's own
+  // review fails (no key, a dead CLI, a timeout), so say so: that reviewer
+  // then sees this bot's action too.
+  const standIn = fallback && fallback.instanceId !== engine?.instanceId ? fallback : undefined;
+  const who = reviewer?.role === "fallback"
+    ? `${name} cannot review on its own, so ${reviewerName} reviews for it.${GAP}${reviewerName} sees each action this bot asks to run.`
+    : standIn
+      ? `${name} reviews its own approvals, and ${standIn.name} stands in if that review fails.`
+      : `${name} reviews its own approvals.`;
+  let summary: string;
+  if (!available) {
+    summary = disabledReason!;
+  } else if (nativeHook === "before") {
+    summary = `${who}${GAP}Each approval it asks for is reviewed before it runs.${GAP}Existing safety rules, unattended turns, local-computer access, and questions still wait for you.`;
+  } else if (asksWhenHeld) {
+    summary = `${name} is set to full auto.${GAP}On runs this bot's turns in asking mode, so each ask is reviewed before it runs.${GAP}Watch only records each step, and turns nobody started are watched, not held.${GAP}${who}`;
+  } else {
+    summary = `${name} runs its tools without asking first, so review can only watch.${GAP}Each step is checked as it starts, and On stops the turn when the reviewer refuses one.${GAP}It cannot undo a step that already started.${GAP}${who}`;
+  }
+
+  return {
+    hook: enforceHook,
+    watchHook: nativeHook,
+    reviewer,
+    canWatch: available,
+    canEnforce: available,
+    disabledReason,
+    needsFallback,
+    fallbackOptions,
+    summary,
+    hints,
+    bypassNote: bypassNote(bot, enforceHook),
+  };
+}
+
+function bypassNote(
+  bot: Pick<Bot, "autoReview" | "bypassPermissions">,
+  enforceHook: ReviewHook | "unknown",
+): string | null {
+  if (!bot.bypassPermissions) return null;
+  const mode = bot.autoReview === "shadow" || bot.autoReview === "enforce" ? bot.autoReview : "off";
+  if (mode === "off") {
+    return "Bypass Permissions is on, so routine actions run without approval cards or review.";
+  }
+  if (mode === "shadow") {
+    return `Bypass Permissions is on, so routine actions are approved at once.${GAP}Watch only records what the reviewer would have done.`;
+  }
+  if (enforceHook === "after") {
+    return `Bypass Permissions does not change this engine, which never asks.${GAP}On still stops the turn when the reviewer refuses a step.`;
+  }
+  return `Bypass Permissions is on, but the reviewer still checks each action first.${GAP}Anything it refuses comes back to you as a card.`;
 }
 
 export { DEFAULT_MAX_TOOL_ROUNDS };

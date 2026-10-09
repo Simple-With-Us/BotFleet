@@ -1005,6 +1005,9 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           // server/tools/jobs.ts); helpers stay `delegate_bot`.
           backgroundJobs: "emulated",
           helpers: "none",
+          // Every tool with an `ask` policy opens a card on the in-process
+          // permission broker (server/tools/approvals.ts) before it runs.
+          reviewHook: "before",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
@@ -1038,6 +1041,16 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           stream: false,
         });
         return text.trim() ? text : reasoning;
+      },
+      // Auto-review on this same account: the utility model, no `tools`, the
+      // prompt in the request body, cancelled by the reviewer's deadline.
+      // Only the answer text counts as a verdict, never the reasoning.
+      reviewPermission: async (prompt: string, signal?: AbortSignal) => {
+        const { text } = await complete([{ role: "user", content: prompt }], UTILITY_MODEL, {
+          stream: false,
+          signal,
+        });
+        return text;
       },
       dispose: async () => {
         for (const { abort } of active.values()) abort.abort();

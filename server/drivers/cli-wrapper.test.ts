@@ -65,6 +65,11 @@ describe("CliWrapperDriver turns (real child process)", () => {
     await instance?.dispose();
   });
 
+  it("tells auto-review there is nothing to see: a wrapped command reports no actions", async () => {
+    await create({ command: NODE, args: ["-e", ""], passPromptAs: "arg" });
+    expect(instance.adapter.capabilities.reviewHook).toBe("none");
+  });
+
   it("opens the turn before any delta and settles it exactly once", async () => {
     await create({ command: NODE, args: ["-e", "process.stdout.write('hello')"], passPromptAs: "arg" });
     const { turnId } = await instance.adapter.sendTurn(turn("hi"));
