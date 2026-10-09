@@ -47,8 +47,8 @@ export function isCloudDesktopJoin(method: string, path: string): boolean {
 }
 
 /** The profile fields a paired phone owns.  Engine choice is deliberately
- * included: the native model picker is a companion feature.  Execution
- * policy, connected apps, and host paths remain Mac-only.
+ * included: the native model picker is a companion feature.  Connected apps
+ * and host paths remain Mac-only.
  *
  * `computers` is on the list since 2026-10-08, and only partly.  The phone
  * may switch the sandboxed destinations (cloud, vm).  Whether the bot holds
@@ -65,10 +65,23 @@ export function isCloudDesktopJoin(method: string, path: string): boolean {
  * computer already shares with a bot or room, as a room folder set from the
  * phone is confined, and anything else is a 403 with the reason.
  *
- * Still refused, on purpose, until the owner rules: `autoApprove`,
- * `autoReview` and `approvePeerComms`.  They decide what runs unattended and
- * who a bot may contact without asking, which #323 kept off the phone (audit
- * BF-IOS-001).  The native sheet shows them read-only. */
+ * `autoApprove`, `autoReview`, `approvePeerComms` and `bypassPermissions` are
+ * on the list since 2026-10-09, by owner ruling.  Asked whether the phone may
+ * change the execution policy, with "as close to full parity as possible" as
+ * the standing goal, the owner answered "Bots should have bypass permissions
+ * options too or YOLO or whatever."  #323 (audit BF-IOS-001) had kept all of
+ * them on the computer, and the native sheet showed them read-only.  What did
+ * NOT move is host control of the person's real desktop:
+ *   - The harness profile route refuses to turn Auto-Approve or Bypass
+ *     Permissions ON for a bot that can use This Mac, with the same
+ *     acknowledgement rule the desktop applies (`localAutoAcknowledgementError`
+ *     in server/index.ts).  The warning dialog is the Mac's, so a phone cannot
+ *     create that pair.  Like `computers`, that check needs the stored bot and
+ *     lives there rather than here.
+ *   - Bypass Permissions never answers a request that controls This Mac
+ *     (server/auto-approve.ts excludes `scope === "local-computer"`), so
+ *     host control still asks even on a bot the phone put in bypass.
+ *   - The This Mac grant itself is still the Mac's alone (see `computers`). */
 export const COMPANION_PROFILE_PATCH_FIELDS = [
   "name",
   "title",
@@ -87,6 +100,13 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "computers",
   "maxToolRounds",
   "cwd",
+  // Execution policy, open to the phone by the 2026-10-09 owner ruling above.
+  // The harness validates each value, and refuses the "on" switch for a bot
+  // that can use This Mac.
+  "autoApprove",
+  "autoReview",
+  "approvePeerComms",
+  "bypassPermissions",
 ] as const;
 
 const COMPANION_PROFILE_PATCH_FIELD_SET = new Set<string>(COMPANION_PROFILE_PATCH_FIELDS);

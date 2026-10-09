@@ -132,8 +132,8 @@ describe("what it may not", () => {
     // option failed at the tap.  Owner's call: parity (see routes.ts).
     expect(ask("POST", "/api/connectors/slack/authorize")).toBeNull();
     expect(ask("DELETE", "/api/connectors/slack/accounts/ca_123")).toBeNull();
-    // Profile subset and approval answers stay on the phone.  Privilege
-    // fields on profile are still refused by the harness, not widened here.
+    // Profile subset and approval answers stay on the phone.  Connected apps
+    // and host paths on profile are still refused by the allowlist.
     expect(ask("PATCH", "/api/bots/bot_123/profile")).toBeNull();
     expect(ask("POST", "/api/threads/th_1/respond")).toBeNull();
     expect(ask("POST", "/api/threads/th_1/approve-all")).toBeNull();
@@ -144,9 +144,6 @@ describe("what it may not", () => {
       expect(companionProfilePatchDenial({ [field]: "value" }), field).toBeNull();
     }
     for (const field of [
-      "autoApprove",
-      "autoReview",
-      "bypassPermissions",
       "composio",
       "connectorTools",
       "cloudBackend",
@@ -154,7 +151,6 @@ describe("what it may not", () => {
       "extraCwds",
       "userNotes",
       "chiefOfStaff",
-      "approvePeerComms",
       "futurePrivilege",
     ]) {
       expect(companionProfilePatchDenial({ name: "Scout", [field]: true }), field).toEqual({
@@ -180,22 +176,26 @@ describe("what it may not", () => {
     expect(companionProfilePatchDenial({ cwd: null })).toBeNull();
   });
 
-  it("keeps execution policy on the Mac until the owner rules, and refuses the whole save for it", () => {
-    // They decide what runs unattended and who a bot may contact without
-    // asking (#323, audit BF-IOS-001).  The native sheet shows them read-only.
-    for (const field of ["autoApprove", "autoReview", "approvePeerComms"]) {
-      expect(COMPANION_PROFILE_PATCH_FIELDS, field).not.toContain(field);
-      expect(companionProfilePatchDenial({ [field]: true }), field).toEqual({
-        status: 403,
-        error: `${field} can only be changed in BotFleet on your computer`,
-      });
-      // One refused field refuses the request, including the edits that
-      // would have been fine on their own.
-      expect(companionProfilePatchDenial({ name: "Scout", computers: ["vm"], [field]: true }), field).toEqual({
-        status: 403,
-        error: `${field} can only be changed in BotFleet on your computer`,
-      });
+  it("lets the phone set the execution policy, by the 2026-10-09 owner ruling", () => {
+    // #323 (audit BF-IOS-001) kept these on the computer and the native sheet
+    // showed them read-only.  The owner then ruled that bots get bypass
+    // permissions and the rest from the phone too.  What a bot may do on This
+    // Mac is not moved by this list: the harness refuses to turn Auto-Approve
+    // or Bypass Permissions on for a bot that can use it, and bypass never
+    // answers a host-control request.  Both are tested against a real harness
+    // in companion/test/proxy.test.ts.
+    for (const field of ["autoApprove", "autoReview", "approvePeerComms", "bypassPermissions"]) {
+      expect(COMPANION_PROFILE_PATCH_FIELDS, field).toContain(field);
+      expect(companionProfilePatchDenial({ [field]: true }), field).toBeNull();
+      expect(companionProfilePatchDenial({ name: "Scout", computers: ["vm"], [field]: true }), field).toBeNull();
     }
+    expect(companionProfilePatchDenial({ autoReview: "enforce", bypassPermissions: false })).toBeNull();
+    // The neighbours stay refused, and one refused field still refuses the
+    // whole request, including the edits that would have been fine alone.
+    expect(companionProfilePatchDenial({ bypassPermissions: true, composio: true })).toEqual({
+      status: 403,
+      error: "composio can only be changed in BotFleet on your computer",
+    });
   });
 
   it("lets the phone play back and annotate its own recordings, and nothing nearby", () => {

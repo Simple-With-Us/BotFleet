@@ -328,6 +328,10 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var section: String?
     public var autoApprove: Bool?
     public var autoReview: String?
+    /// Auto-answers every request the engine raises, guards included, except
+    /// ones that control This Mac (`server/auto-approve.ts`).  Nil on a
+    /// harness that predates it, which reads as off.
+    public var bypassPermissions: Bool?
     public var alwaysAllow: [String]?
     public var composio: Bool?
     /// Which computers this bot may run on: "local", "cloud", and/or "vm".
@@ -661,6 +665,12 @@ public struct InstanceCapabilities: Codable, Hashable, Sendable {
     public var effortLevels: [String]?
     /// True when this engine runs the harness HTTP tool loop.
     public var toolLoop: Bool? = nil
+    /// True when this engine can answer a bounded review prompt, which is
+    /// what Auto Review needs.  Nil means the computer did not say.
+    public var approvalReview: Bool? = nil
+    /// True when this engine can contact other bots.  Nil means the computer
+    /// did not say.
+    public var agentsMcp: Bool? = nil
 }
 
 public struct Instance: Codable, Hashable, Identifiable, Sendable {
@@ -932,13 +942,15 @@ public struct BotProfilePatch: Encodable, Sendable {
         case clear
     }
 
-    /// Not here on purpose: `autoApprove`, `autoReview` and `approvePeerComms`.
-    /// They decide what a bot runs unattended and who it may contact without
-    /// asking, which the companion keeps on the computer
-    /// (`companion/src/routes.ts`, audit BF-IOS-001), so a request carrying one
-    /// is refused whole.  The type cannot express them, and the sheet shows
-    /// them read-only.
-    ///
+    /// The execution policy, which the owner put on the phone on 2026-10-09
+    /// (`companion/src/routes.ts`; #323 had kept it on the computer).  Each is
+    /// sent only when the person changed it.  The computer still refuses to
+    /// turn `autoApprove` or `bypassPermissions` ON for a bot that can use This
+    /// Mac (a 403 with its own sentence), so the sheet does not offer that.
+    public var autoApprove: Bool?
+    public var autoReview: AutoReviewMode?
+    public var approvePeerComms: Bool?
+    public var bypassPermissions: Bool?
     /// `BotComputers.updated` builds this: the sandboxed destinations only,
     /// with This Mac carried through as the computer has it.
     public var computers: [String]?
@@ -999,6 +1011,10 @@ public struct BotProfilePatch: Encodable, Sendable {
         modelSelection: ModelSelection? = nil,
         section: SectionString? = nil,
         maxToolRounds: MaxToolRounds? = nil,
+        autoApprove: Bool? = nil,
+        autoReview: AutoReviewMode? = nil,
+        approvePeerComms: Bool? = nil,
+        bypassPermissions: Bool? = nil,
         computers: [String]? = nil,
         cwd: CwdString? = nil
     ) {
@@ -1015,12 +1031,16 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.modelSelection = modelSelection
         self.section = section
         self.maxToolRounds = maxToolRounds
+        self.autoApprove = autoApprove
+        self.autoReview = autoReview
+        self.approvePeerComms = approvePeerComms
+        self.bypassPermissions = bypassPermissions
         self.computers = computers
         self.cwd = cwd
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, computers, cwd
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, bypassPermissions, computers, cwd
     }
 
     private enum DeviceKeys: String, CodingKey { case mac, iphone }
@@ -1064,6 +1084,10 @@ public struct BotProfilePatch: Encodable, Sendable {
             case .clear: try values.encodeNil(forKey: .maxToolRounds)
             }
         }
+        try values.encodeIfPresent(autoApprove, forKey: .autoApprove)
+        try values.encodeIfPresent(autoReview?.rawValue, forKey: .autoReview)
+        try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
+        try values.encodeIfPresent(bypassPermissions, forKey: .bypassPermissions)
         try values.encodeIfPresent(computers, forKey: .computers)
         if let cwd {
             switch cwd {

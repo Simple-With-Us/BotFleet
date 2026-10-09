@@ -198,6 +198,13 @@ export type BotProfilePatchResult =
  * PATCH passes strict=false; paired clients use strict=true so a future bot
  * field cannot silently become remotely writable.
  *
+ * The execution-policy fields (`autoApprove`, `autoReview`,
+ * `approvePeerComms`, `bypassPermissions`) pass in both modes since the
+ * owner's 2026-10-09 ruling that a paired phone may set them.  Validating the
+ * VALUE is all this file does; whether a particular bot may have Auto or
+ * Bypass switched on from a phone (never when it can use This Mac) is decided
+ * where the stored bot is, in the profile route of server/index.ts.
+ *
  * avatarUrl deliberately uses `undefined` as the normalized clear value.
  * Store persistence already omits undefined fields, while wireBot sends null
  * back to clients so Codable and object-spread clients both clear stale data.
@@ -225,10 +232,6 @@ export function parseBotProfilePatch(
       return { ok: false, error: "avatarCrop must be mascot, circle, rounded, or square" };
     }
     return { ok: false, error: issue?.message ?? "invalid profile patch" };
-  }
-
-  if (strict && Object.prototype.hasOwnProperty.call(parsed.data, "bypassPermissions")) {
-    return { ok: false, error: "unsupported profile field: bypassPermissions" };
   }
 
   const { avatarUrl, cwd, connectorTools, voices, maxToolRounds: _maxToolRounds, ...fields } = parsed.data;

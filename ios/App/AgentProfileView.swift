@@ -40,6 +40,13 @@ struct AgentProfileView: View {
     @State private var player: AVAudioPlayer?
     @State private var computers: Set<String>
     @State private var cwd: String
+    /// The execution policy, saved with the rest of the sheet.  Bypass is
+    /// switched on only through `confirmingBypass`, never by the toggle alone.
+    @State private var autoApprove: Bool
+    @State private var autoReview: AutoReviewMode
+    @State private var approvePeerComms: Bool
+    @State private var bypassPermissions: Bool
+    @State private var confirmingBypass = false
     @State private var baseline: ProfileFormSnapshot
     @ObservedObject private var personalVoice = PersonalVoiceService.shared
 
@@ -60,6 +67,10 @@ struct AgentProfileView: View {
         _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
         _computers = State(initialValue: Set(bot.computers ?? []))
         _cwd = State(initialValue: bot.cwd ?? "")
+        _autoApprove = State(initialValue: bot.autoApprove ?? false)
+        _autoReview = State(initialValue: AutoReviewMode(stored: bot.autoReview))
+        _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
+        _bypassPermissions = State(initialValue: bot.bypassPermissions ?? false)
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
     }
 
@@ -510,6 +521,10 @@ struct AgentProfileView: View {
             speechDevices: savedDevices == baseline.speechDevices ? nil : ["mac", "iphone"].filter { savedDevices.contains($0) },
             modelSelection: newModelSelection == baseline.modelSelection ? nil : newModelSelection,
             maxToolRounds: maxToolRoundsPatch,
+            autoApprove: autoApprove == baseline.autoApprove ? nil : autoApprove,
+            autoReview: autoReview == baseline.autoReview ? nil : autoReview,
+            approvePeerComms: approvePeerComms == baseline.approvePeerComms ? nil : approvePeerComms,
+            bypassPermissions: bypassPermissions == baseline.bypassPermissions ? nil : bypassPermissions,
             // The bot as it is now, with only the person's two switches applied,
             // so This Mac is never part of what this phone asks to change.
             computers: BotComputers.updated(
