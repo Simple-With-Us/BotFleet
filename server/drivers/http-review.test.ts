@@ -15,7 +15,8 @@ import { OpenAICompatDriver } from "./openai-compat.ts";
 
 interface Seen {
   url: string;
-  body: Record<string, unknown>;
+  /** The parsed request body, asserted on by shape. */
+  body: unknown;
 }
 
 /** A fetch stub that answers a chat completion with `content` (and a
@@ -28,7 +29,7 @@ function stubFetch(content: string, options: { hang?: boolean } = {}): Seen[] {
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
-      seen.push({ url, body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown> });
+      seen.push({ url, body: JSON.parse(String(init?.body ?? "{}")) });
       if (options.hang) {
         return new Promise<Response>((_resolve, reject) => {
           const signal = init?.signal;
@@ -106,8 +107,8 @@ describe.each(ENGINES)("$name reviews its own approvals", ({ create }) => {
     expect(reviews).toHaveLength(1);
     const body = reviews[0]!.body;
     expect(body).not.toHaveProperty("tools");
-    expect(body.stream).toBe(false);
-    expect(body.messages).toEqual([{ role: "user", content: prompt }]);
+    expect(body).toMatchObject({ stream: false, messages: [{ role: "user", content: prompt }] });
+    expect(body).toHaveProperty("messages", [{ role: "user", content: prompt }]);
     await instance.dispose();
   });
 

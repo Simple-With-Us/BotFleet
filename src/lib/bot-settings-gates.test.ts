@@ -21,6 +21,7 @@ import {
   botCapabilityGates,
   configuredEngine,
   honorsToolRounds,
+  reviewerOptions,
   toolRoundsGate,
 } from "./bot-settings-gates";
 import type { Bot, InstanceInfo, ModelSelection } from "@/state/store";
@@ -32,12 +33,13 @@ const selection = (instanceId: string, model = "m"): ModelSelection => ({ instan
 function instance(
   instanceId: string,
   capabilities: Partial<NonNullable<InstanceInfo["capabilities"]>> = {},
-  extra: { driverKind?: string; displayName?: string } = {},
+  extra: { driverKind?: string; displayName?: string; state?: "available" | "unavailable" } = {},
 ): InstanceInfo {
   return {
     instanceId,
     driverKind: extra.driverKind ?? "openai-compat",
     displayName: extra.displayName ?? instanceId,
+    snapshot: { state: extra.state ?? "available" },
     capabilities: {
       computerMcp: false,
       agentsMcp: false,
@@ -262,10 +264,20 @@ describe("autoReviewGate: auto-review on every engine", () => {
     expect(gate.fallbackOptions).toEqual([]);
   });
 
-  it("ignores a fallback reviewer that is disabled or cannot review", () => {
-    const disabled = { ...COMPAT, enabled: false } as InstanceInfo;
+  it("ignores a fallback reviewer that is disabled, cannot review, or cannot run", () => {
+    const disabled: InstanceInfo = { ...COMPAT, enabled: false };
     expect(autoReviewGate([CODEX, disabled], bot("codex"), "compat").reviewer).toBeNull();
     expect(autoReviewGate([CODEX, AGY], bot("codex"), "agy").reviewer).toBeNull();
+    // a keyless API engine reports approvalReview but would fail every review
+    const keyless = instance("minimax", { approvalReview: true, reviewHook: "before" }, { displayName: "MiniMax", state: "unavailable" });
+    expect(reviewerOptions([CODEX, keyless])).toEqual([]);
+    expect(autoReviewGate([CODEX, keyless], bot("codex"), "minimax").reviewer).toBeNull();
+  });
+
+  it("says when the fallback reviewer stands in for an engine that reviews itself", () => {
+    const gate = autoReviewGate(all, bot("claude"), "compat");
+    expect(gate.reviewer?.role).toBe("own");
+    expect(gate.summary).toContain("OpenRouter stands in if that review fails");
   });
 
   it("an engine that has not reported yet keeps every mode open instead of reading as 'no'", () => {

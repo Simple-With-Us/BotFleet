@@ -14,10 +14,10 @@
 //   6. On, full-auto instance        → the turn is held in asking mode
 //   7. Watch, full-auto instance     → each step is watched after the fact
 //   8. On, an engine that never asks → a refused step stops the turn (pi)
+//   9. An HTTP lane reviews its own asks: the same stub, as the bot's engine
 import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,12 +38,54 @@ let child: ChildProcess;
 let home: string;
 let stderr = "";
 let reviewer: Server;
+
+interface Verdict {
+  allow: boolean;
+  reason: string;
+}
+
+/** The slice of a chat-completions request the stub reads. */
+interface ChatRequest {
+  stream?: boolean;
+  tools?: Array<{ function?: { name?: string } }>;
+  messages?: Array<{ role?: string; content?: unknown }>;
+}
+
 /** What the stub reviewer answers next. */
-let verdict: { allow: boolean; reason: string } = { allow: true, reason: "routine" };
+let verdict: Verdict = { allow: true, reason: "routine" };
 /** Every prompt the stub reviewer was sent. */
 const reviewPrompts: string[] = [];
+/** The tools the stub was last offered as a bot's engine. */
+let offeredTools: string[] = [];
 
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+/** The stub as a bot's own engine: ask for one tool that needs approval,
+ *  then, once the tool's result comes back, finish with a line of text. */
+function answerTurn(res: ServerResponse, body: ChatRequest): void {
+  offeredTools = (body.tools ?? []).map((tool) => tool.function?.name ?? "");
+  const tool = offeredTools.includes("write_file") ? "write_file" : offeredTools.includes("ask_bot") ? "ask_bot" : null;
+  const args = tool === "write_file" ? { path: "review-notes.txt", content: "hi" } : { bot_id: "nobody", message: "hi" };
+  const finished = body.messages?.at(-1)?.role === "tool" || tool === null;
+  const toolCall = { index: 0, id: "call_review", type: "function", function: { name: tool, arguments: JSON.stringify(args) } };
+  if (!body.stream) {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ choices: [{ message: finished ? { content: "done" } : { content: "", tool_calls: [toolCall] } }] }));
+    return;
+  }
+  const frames = finished
+    ? [
+        { choices: [{ index: 0, delta: { content: "done" }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      ]
+    : [
+        { choices: [{ index: 0, delta: { tool_calls: [toolCall] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+      ];
+  res.setHeader("content-type", "text/event-stream");
+  for (const frame of frames) res.write(`data: ${JSON.stringify(frame)}\n\n`);
+  res.end("data: [DONE]\n\n");
+}
+
+const api = async (method: string, path: string, body?: object): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
@@ -68,7 +110,12 @@ const decision = (pred: (row: DecisionRow) => boolean, ms?: number) =>
     return rows.filter(pred).at(-1);
   }, ms);
 
-type Card = { id: string; kind: string; card?: { requestId?: string; answered?: string; held?: string } };
+interface Card {
+  id: string;
+  kind: string;
+  card?: { requestId?: string; answered?: string; held?: string };
+  tool?: { name?: string };
+}
 
 const threadMessages = async (threadId: string): Promise<Card[]> =>
   (await api("GET", `/api/threads/${threadId}/messages`)).body.messages ?? [];
@@ -86,7 +133,8 @@ async function makeBot(instanceId: string, patch: Record<string, unknown>, model
     modelSelection: { instanceId, model },
   });
   expect(patched.status, JSON.stringify(patched.body)).toBe(200);
-  return patched.body.bot as { id: string; threadId: string };
+  const bot: { id: string; threadId: string } = patched.body.bot;
+  return bot;
 }
 
 async function send(bot: { id: string }) {
@@ -104,24 +152,27 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
       let raw = "";
       req.on("data", (chunk) => (raw += chunk));
       req.on("end", () => {
-        res.setHeader("content-type", "application/json");
         if (req.method === "GET" && req.url?.endsWith("/models")) {
+          res.setHeader("content-type", "application/json");
           res.end(JSON.stringify({ data: [{ id: "stub-reviewer" }] }));
           return;
         }
-        const body = JSON.parse(raw || "{}") as { messages?: Array<{ content?: string }>; tools?: unknown };
-        // a review request is tool-free by contract
+        // SAFETY: only the harness posts here, and only chat-completions bodies; ChatRequest's fields are all optional.
+        const body = JSON.parse(raw || "{}") as ChatRequest;
+        // A request with tools is a bot's turn on this engine.  A review is
+        // tool-free by contract, so a request without tools is a review.
         if (body.tools) {
-          res.statusCode = 400;
-          res.end(JSON.stringify({ error: "a review must not carry tools" }));
+          answerTurn(res, body);
           return;
         }
         reviewPrompts.push(String(body.messages?.[0]?.content ?? ""));
+        res.setHeader("content-type", "application/json");
         res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(verdict) } }] }));
       });
     });
     await new Promise<void>((resolve) => reviewer.listen(0, "127.0.0.1", resolve));
-    const reviewerUrl = `http://127.0.0.1:${(reviewer.address() as AddressInfo).port}/v1`;
+    const address = reviewer.address();
+    const reviewerUrl = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/v1`;
 
     chmodSync(FAKE_CLI, 0o755);
     chmodSync(FAKE_PI_CLI, 0o755);
@@ -152,15 +203,11 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
         },
       }),
     );
+    // posix only (see `posixOnly`), so no SystemRoot to carry
+    const env = { HOME: home, USERPROFILE: home, OMB_PORT: String(PORT), PATH: process.env.PATH ?? "" };
     child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
-      env: {
-        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-        HOME: home,
-        USERPROFILE: home,
-        OMB_PORT: String(PORT),
-      },
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr!.on("data", (c) => (stderr += c));
@@ -185,10 +232,8 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
   it("ships the hook and the fallback reviewer the Bot Profile reads", async () => {
     const config = (await api("GET", "/api/config")).body;
     expect(config.autoReview).toEqual({ fallbackReviewer: "reviewer" });
-    const instances = (await api("GET", "/api/instances")).body.instances as Array<{
-      instanceId: string;
-      capabilities: Record<string, unknown>;
-    }>;
+    const instances: Array<{ instanceId: string; capabilities: Record<string, unknown> }> =
+      (await api("GET", "/api/instances")).body.instances;
     const caps = (id: string) => instances.find((instance) => instance.instanceId === id)?.capabilities;
     expect(caps("acp")).toMatchObject({ reviewHook: "before", approvalReview: false });
     expect(caps("acpAuto")).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
@@ -306,16 +351,51 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
     });
     const chip = await waitFor(async () =>
       (await threadMessages(bot.threadId)).find(
-        (m) => (m as { tool?: { name?: string } }).tool?.name?.startsWith("review stopped the turn after bash (Stub Reviewer)"),
+        (m) => m.tool?.name?.startsWith("review stopped the turn after bash (Stub Reviewer)"),
       ),
     );
     expect(chip).toBeTruthy();
     // and the turn really ended: the bot is no longer busy, well before the
     // step's own 60 seconds were up
     const idle = await waitFor(async () => {
-      const bots = (await api("GET", "/api/bots")).body.bots as Array<{ id: string; busy?: boolean }>;
+      const bots: Array<{ id: string; busy?: boolean }> = (await api("GET", "/api/bots")).body.bots;
       return bots.find((candidate) => candidate.id === bot.id && !candidate.busy);
     }, 20_000);
     expect(idle).toBeTruthy();
   }, 120_000);
+
+  // The HTTP lanes (MiniMax, Grok on the xAI API, OpenAI-compatible) used to
+  // be greyed out too.  Their tool calls go through the in-process broker
+  // into the same fold, and they now review their own asks with a tool-free
+  // call to the same endpoint.
+  it("HTTP lane, On: the engine reviews its own ask, and a refusal keeps the card open", async () => {
+    verdict = { allow: false, reason: "not a file the owner wants" };
+    const before = reviewPrompts.length;
+    const bot = await makeBot("reviewer", { name: "Compat Refused", autoReview: "enforce" }, "stub-reviewer");
+    await send(bot);
+    const row = await decision((r) => r.botId === bot.id && r.decision === "card-shown" && r.source === "auto-review");
+    if (!row) {
+      throw new Error(`no reviewed card.  offered tools: ${offeredTools.join(", ")}\nstderr:\n${stderr.slice(-2000)}`);
+    }
+    // the bot's own engine reviewed it: no fallback was needed
+    expect(row).toMatchObject({ rule: "not a file the owner wants", reviewer: "reviewer" });
+    expect(reviewPrompts.length).toBeGreaterThan(before);
+    const open = await card(bot.threadId);
+    expect(open?.card?.answered).toBeUndefined();
+    expect(open?.card?.held).toBe("The reviewer (Stub Reviewer) did not approve this: not a file the owner wants");
+    const rows: DecisionRow[] = (await api("GET", "/api/decisions")).body.decisions;
+    expect(rows.some((r) => r.botId === bot.id && r.decision === "auto-approved")).toBe(false);
+    await release(bot, open!.card!.requestId!);
+  }, 90_000);
+
+  it("HTTP lane, Watch: the engine records its own review and the card stays with the person", async () => {
+    verdict = { allow: true, reason: "a scratch note" };
+    const bot = await makeBot("reviewer", { name: "Compat Watched", autoReview: "shadow" }, "stub-reviewer");
+    await send(bot);
+    const row = await decision((r) => r.botId === bot.id && r.decision === "review-would-approve");
+    expect(row).toMatchObject({ source: "auto-review-shadow", reviewer: "reviewer" });
+    const open = await card(bot.threadId);
+    expect(open?.card?.answered).toBeUndefined();
+    await release(bot, open!.card!.requestId!);
+  }, 90_000);
 });

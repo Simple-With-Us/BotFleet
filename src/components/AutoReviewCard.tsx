@@ -78,7 +78,7 @@ export function AutoReviewCardView({
         <label className="mt-3 block">
           <span className="text-[13px] font-medium text-ink">Fallback Reviewer</span>
           <span className="mt-0.5 block text-[12px] text-ink-secondary">
-            {"Reviews for every bot whose engine cannot review on its own.  It sees the actions those bots ask to run."}
+            {"Reviews for every bot whose engine cannot review on its own, and stands in when an engine's own review fails.  It sees the actions those bots ask to run."}
           </span>
           <select
             aria-label="Fallback Reviewer"

@@ -796,8 +796,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // otherwise starts a fresh one.  The cost is one lost codex-side
         // continuation per instance restart, for full-auto bots that also
         // hold this computer; the alternative is an unbrokered host turn.
+        //
+        // The same rule runs the other way for an UNATTENDED full-auto turn.
+        // A thread started brokered (a host turn, or a turn held for
+        // auto-review) keeps asking when resumed, and an unattended turn's
+        // ask waits on a card nobody is there to answer.  Such a turn starts
+        // fresh instead, so a webhook on a full-auto bot runs the way its
+        // instance is configured.
+        const unattendedFullAuto = turnFullAuto && turn.unattended === true;
         const cursor =
           (brokered && !(resumeCursor && brokeredThreads.has(resumeCursor))) ||
+          (unattendedFullAuto && resumeCursor !== null && brokeredThreads.has(resumeCursor)) ||
           (resumeCursor !== null && modelRejectedThreads.has(resumeCursor))
             ? null
             : resumeCursor;

@@ -113,22 +113,21 @@ describe("who reviews", () => {
     answer: string | Error | null,
     patch: Partial<ReviewerCandidate> = {},
   ): ReviewerCandidate & { calls: number } => {
-    const record = {
+    const record: ReviewerCandidate & { calls: number } = {
       instanceId,
       displayName: instanceId.toUpperCase(),
       driverKind: "test",
       enabled: true,
       calls: 0,
-      ...(answer === null
-        ? {}
-        : {
-            reviewPermission(this: { calls: number }) {
-              this.calls++;
-              return answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer);
-            },
-          }),
       ...patch,
     };
+    // null: an engine with no isolated reviewer of its own
+    if (answer !== null) {
+      record.reviewPermission = () => {
+        record.calls++;
+        return answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer);
+      };
+    }
     return record;
   };
   const request = { tool: "shell", summary: "echo hi", persona: "Scout" };

@@ -1223,10 +1223,10 @@ describe("ACP turns (fake CLI)", () => {
     const opened = await recorder.until((e) => e.type === "request.opened");
     // an ordinary ask, not host control: the reviewer may answer it
     expect(opened).toMatchObject({ requestType: "permission", tool: "shell", summary: "echo hi" });
-    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    expect(opened.type === "request.opened" && opened.approvalScope).toBeUndefined();
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv.slice(0, 2)).toEqual(["--permission-mode", "default"]);
-    await instance.adapter.respondToRequest("t-full-auto-held", (opened as any).requestId, { behavior: "deny" });
+    await instance.adapter.respondToRequest("t-full-auto-held", opened.requestId!, { behavior: "deny" });
     await recorder.until((e) => e.type === "turn.completed");
   });
 

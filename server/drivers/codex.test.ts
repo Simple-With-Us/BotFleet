@@ -890,13 +890,44 @@ describe("CodexDriver turns (fake app-server)", () => {
     await instance.adapter.sendTurn({ threadId: "t-held", text: "clean up", holdForReview: true });
     const opened = await recorder.until((e) => e.type === "request.opened");
     // an ordinary ask, which auto-review may answer: no host scope on it
-    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    expect(opened.type === "request.opened" && opened.approvalScope).toBeUndefined();
     await instance.adapter.respondToRequest("t-held", opened.requestId!, { behavior: "deny" });
     await recorder.until((e) => e.type === "turn.completed");
+    // SAFETY: FAKE_CODEX_DUMP is written by server/testing/fake-codex-app-server.ts in the FakeDump shape.
     expect(startParams(JSON.parse(readFileSync(dump, "utf8")) as FakeDump)).toMatchObject({
       sandbox: "workspace-write",
       approvalPolicy: "on-request",
     });
+  });
+
+  it("never resumes a held thread on an unattended turn, which would ask with nobody there", async () => {
+    // A thread started brokered keeps on-request when resumed.  A webhook
+    // turn on a full-auto bot is never held, so it must start fresh in the
+    // instance's own full-auto mode instead of inheriting the held thread's
+    // asks and waiting on a card nobody can answer.
+    await create({ mode: "approval", fullAuto: true });
+    process.env.FAKE_CODEX_DUMP = join(scratch, "held-first.json");
+    await instance.adapter.sendTurn({ threadId: "t-held-then-webhook", text: "first", holdForReview: true });
+    const started = await recorder.until((e) => e.type === "session.started" && e.threadId === "t-held-then-webhook");
+    const heldThread = started.type === "session.started" ? started.sessionId : null;
+    expect(heldThread).toBeTruthy();
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    await instance.adapter.respondToRequest("t-held-then-webhook", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-held-then-webhook");
+
+    const dump = join(scratch, "webhook-after-held.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-held-then-webhook",
+      text: "webhook",
+      resumeCursor: heldThread,
+      unattended: true,
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-held-then-webhook" && e.turnId !== opened.turnId);
+    // SAFETY: FAKE_CODEX_DUMP is written by server/testing/fake-codex-app-server.ts in the FakeDump shape.
+    const written = JSON.parse(readFileSync(dump, "utf8")) as FakeDump;
+    expect(written.calls.some((c) => c.method === "thread/resume")).toBe(false);
+    expect(startParams(written)).toMatchObject({ sandbox: "danger-full-access", approvalPolicy: "never" });
   });
 
   it("asks before every approval when not full-auto, which is where review holds it", async () => {

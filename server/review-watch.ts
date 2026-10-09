@@ -161,7 +161,7 @@ export class ReviewWatch {
       botName: plan.botName,
       tool: step.tool,
       summary: step.target ?? step.tool,
-      ...(plan.unattended ? { unattended: true } : {}),
+      unattended: plan.unattended || undefined,
     };
   }
 

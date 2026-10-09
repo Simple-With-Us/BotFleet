@@ -10,13 +10,18 @@ import { AutoReviewCardView } from "./AutoReviewCard";
 import { autoReviewGate } from "@/lib/bot-settings-gates";
 import type { InstanceInfo } from "@/state/store";
 
-const engine = (instanceId: string, displayName: string, capabilities: Record<string, unknown>): InstanceInfo =>
-  ({
-    instanceId,
-    driverKind: instanceId,
-    displayName,
-    capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false, toolLoop: false, ...capabilities },
-  }) as InstanceInfo;
+const engine = (
+  instanceId: string,
+  displayName: string,
+  capabilities: NonNullable<InstanceInfo["capabilities"]>,
+): InstanceInfo => ({
+  instanceId,
+  driverKind: instanceId,
+  displayName,
+  snapshot: { state: "available" },
+  models: { default: "m", options: [] },
+  capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false, toolLoop: false, ...capabilities },
+});
 
 const CLAUDE = engine("claude", "Claude Code", { approvalReview: true, reviewHook: "before", asksWhenHeld: true });
 const CURSOR = engine("cursor", "Cursor", { reviewHook: "before", asksWhenHeld: true });

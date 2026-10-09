@@ -3792,10 +3792,10 @@ bus.subscribe((event: RuntimeEvent) => {
         reviewWatch.observe(
           {
             threadId: event.threadId,
-            ...(event.turnId ? { turnId: event.turnId } : {}),
+            turnId: event.turnId,
             tool: name,
-            ...(event.target ? { target: event.target } : {}),
-            ...(event.toolKind ? { toolKind: event.toolKind } : {}),
+            target: event.target,
+            toolKind: event.toolKind,
           },
           (() => {
             const owner = group ? activeTurnOwners.forEvent(event.threadId, event.providerInstanceId) : undefined;
@@ -3920,7 +3920,7 @@ bus.subscribe((event: RuntimeEvent) => {
             decision: "card-shown",
             source: row.source,
             rule: row.rule,
-            ...(row.reviewer ? { reviewer: row.reviewer } : {}),
+            reviewer: row.reviewer,
             unattended: unattended || undefined,
           });
           if (buzz) {
@@ -3972,7 +3972,7 @@ bus.subscribe((event: RuntimeEvent) => {
                 decision: "auto-approved",
                 source: row.source,
                 rule: row.rule,
-                ...(row.reviewer ? { reviewer: row.reviewer } : {}),
+                reviewer: row.reviewer,
               });
             } catch {
               // couldn't answer it for them — hand it back to the human
@@ -4012,7 +4012,7 @@ bus.subscribe((event: RuntimeEvent) => {
               {
                 source: "auto-review",
                 rule: reviewed?.verdict.reason ?? "no reviewer answered",
-                ...(reviewed ? { reviewer: reviewed.reviewer.instanceId } : {}),
+                reviewer: reviewed?.reviewer.instanceId,
               },
               true,
             );

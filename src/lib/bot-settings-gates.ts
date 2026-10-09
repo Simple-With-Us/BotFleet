@@ -227,10 +227,19 @@ export interface AutoReviewGate {
   bypassNote: string | null;
 }
 
-/** Engines that can review for any bot: an isolated reviewer, switched on. */
+/** Whether an engine can actually answer a review right now: it has an
+ *  isolated reviewer, it is switched on, and its last probe found it usable
+ *  (a keyless API engine or a missing CLI would fail every review).  A probe
+ *  that is still answering counts, so a slow engine is not dropped. */
+function canReview(instance: InstanceInfo | undefined): boolean {
+  if (!instance || instance.capabilities?.approvalReview !== true || instance.enabled === false) return false;
+  return instance.snapshot?.state === "available" || instance.snapshot?.transient === true;
+}
+
+/** Engines that can review for any bot. */
 export function reviewerOptions(instances: InstanceInfo[]): ReviewerOption[] {
   return instances
-    .filter((instance) => instance.capabilities?.approvalReview === true && instance.enabled !== false)
+    .filter((instance) => canReview(instance))
     .map((instance) => ({ instanceId: instance.instanceId, name: instance.displayName }));
 }
 
@@ -251,7 +260,7 @@ export function autoReviewGate(
   const enforceHook: ReviewHook | "unknown" =
     nativeHook === "unknown" ? "unknown" : effectiveReviewHook(nativeHook, asksWhenHeld, true);
   const fallbackOptions = reviewerOptions(instances);
-  const reviewsItself = capabilities?.approvalReview === true && engine?.enabled !== false;
+  const reviewsItself = canReview(engine);
   const fallback = fallbackReviewerId
     ? fallbackOptions.find((option) => option.instanceId === fallbackReviewerId)
     : undefined;
@@ -262,7 +271,7 @@ export function autoReviewGate(
       : null;
   const needsFallback = engine !== undefined && !reviewsItself;
 
-  const hints: Record<AutoReviewMode, string> = {
+  const hints = {
     off: "Every undecided approval waits for you.",
     shadow:
       nativeHook === "after"
@@ -272,7 +281,7 @@ export function autoReviewGate(
       enforceHook === "after"
         ? "Stop the turn when the reviewer refuses a step."
         : "Answer only reviews that return a strict approval.",
-  };
+  } satisfies Record<AutoReviewMode, string>;
 
   // Unknown engine: say so and keep every mode open.  A saved choice must
   // never look deleted because the instance list has not answered yet.
@@ -303,9 +312,15 @@ export function autoReviewGate(
   const available = disabledReason === null;
 
   const reviewerName = reviewer?.name ?? "the reviewer";
+  // The server falls through to the fallback reviewer when an engine's own
+  // review fails (no key, a dead CLI, a timeout), so say so: that reviewer
+  // then sees this bot's action too.
+  const standIn = fallback && fallback.instanceId !== engine?.instanceId ? fallback : undefined;
   const who = reviewer?.role === "fallback"
     ? `${name} cannot review on its own, so ${reviewerName} reviews for it.${GAP}${reviewerName} sees each action this bot asks to run.`
-    : `${name} reviews its own approvals.`;
+    : standIn
+      ? `${name} reviews its own approvals, and ${standIn.name} stands in if that review fails.`
+      : `${name} reviews its own approvals.`;
   let summary: string;
   if (!available) {
     summary = disabledReason!;
