@@ -118,6 +118,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "update-drain") {
+  // Visual-spec harness (tests/e2e/update-drain.visual.spec.ts): the line a
+  // chat shows while an update holds new work.  Dynamically imported so the
+  // real app boot path never pays for it.
+  void import("./components/UpdateDrainVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "routine-hold") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
   // for in the real app boot path. The App render below is unchanged for any

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   appendHeldWork,
   clampDrainTimeout,
+  drainViewOf,
   HELD_SENDS_FILE,
   HELD_SENDS_MAX_AGE_MS,
   inFlightCounts,
@@ -112,6 +113,51 @@ describe("UpdateDrain", () => {
     advance(24 * 60 * 60_000);
     expect(releases).toEqual([]);
     expect(drain.stop()).toBe(false);
+  });
+
+  it("tells a listener when the hold starts, renews, and ends, however it ends", () => {
+    let now = 10_000;
+    const timers: Array<() => void> = [];
+    const heard: boolean[] = [];
+    const drain: UpdateDrain = new UpdateDrain({
+      now: () => now,
+      setTimer: (fn) => {
+        timers.push(fn);
+        return { cancel: () => {} };
+      },
+      onRelease: () => {},
+      onChange: () => heard.push(drain.active),
+    });
+    drain.begin(60_000);
+    drain.begin(60_000);
+    drain.stop();
+    drain.begin(60_000);
+    drain.release("updater");
+    drain.begin(60_000);
+    timers.at(-1)?.();
+    // Started, renewed, stopped, started, released, started, lease ran out.
+    expect(heard).toEqual([true, true, false, true, false, true, false]);
+    // Nothing held, nothing to hear about.
+    drain.stop();
+    drain.release("updater");
+    expect(heard).toHaveLength(7);
+  });
+
+  it("a listener that throws never breaks the hold", () => {
+    const lines: string[] = [];
+    const drain = new UpdateDrain({
+      now: () => 10_000,
+      setTimer: () => ({ cancel: () => {} }),
+      onRelease: () => {},
+      onChange: () => {
+        throw new Error("broadcast failed");
+      },
+      log: (line) => lines.push(line),
+    });
+    expect(drain.begin(60_000).startedAt).toBe(10_000);
+    expect(drain.active).toBe(true);
+    expect(drain.stop()).toBe(true);
+    expect(lines.join("\n")).toContain("broadcast failed");
   });
 
   it("clamps a requested window", () => {
@@ -240,5 +286,37 @@ describe("the held-work carrier", () => {
     expect(partitionByAge([fresh, old], 2_000)).toEqual({ run: [fresh], stale: [old] });
     const staleQueue = queued({ heldAt: 1_000 - HELD_SENDS_MAX_AGE_MS - 1 });
     expect(partitionByAge([staleQueue], 2_000)).toEqual({ run: [], stale: [staleQueue] });
+  });
+});
+
+describe("drainViewOf", () => {
+  const status = { startedAt: 10_000, timeoutMs: 6 * 60_000, deadline: 10_000 + 6 * 60_000 + UPDATE_DRAIN_LEASE_GRACE_MS };
+
+  it("is nothing when nothing is held", () => {
+    expect(drainViewOf(null, { bots: 3 })).toBeNull();
+  });
+
+  it("ends the window where the updater's own does, not where the lease does", () => {
+    const view = drainViewOf(status, { bots: 3, rooms: 1, held: { sends: 2, rooms: 1, routineRuns: 4 } });
+    expect(view).toEqual({
+      startedAt: 10_000,
+      // The lease slack is for an updater that never comes back: nobody waits it out.
+      windowEndsAt: 10_000 + 6 * 60_000,
+      deadline: status.deadline,
+      bots: 3,
+      rooms: 1,
+      held: { sends: 2, rooms: 1, routineRuns: 4 },
+    });
+    expect(view?.deadline).toBe(view!.windowEndsAt + UPDATE_DRAIN_LEASE_GRACE_MS);
+  });
+
+  it("reads missing, negative and fractional counts as whole numbers, and carries no text", () => {
+    const view = drainViewOf(status, { bots: -2, rooms: 1.9, held: { sends: Number.NaN, routineRuns: 2 } });
+    expect(view).toMatchObject({ bots: 0, rooms: 1, held: { sends: 0, rooms: 0, routineRuns: 2 } });
+    expect(Object.keys(view!).sort()).toEqual(["bots", "deadline", "held", "rooms", "startedAt", "windowEndsAt"]);
+  });
+
+  it("never ends the window before it began, whatever the lease slack", () => {
+    expect(drainViewOf(status, {}, 24 * 60 * 60_000)?.windowEndsAt).toBe(10_000);
   });
 });
