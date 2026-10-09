@@ -38,4 +38,20 @@ describe("LocalVmRuntimeCard copy", () => {
     const offenders = codeLines.filter((line) => /[.?!] {2}\S/.test(line));
     expect(offenders).toEqual([]);
   });
+
+  // JSX text collapses runs of ASCII spaces, so two spaces render as one.  The
+  // gap is a real U+00A0 plus a space, written as the visible escape so a
+  // reviewer (or a linter) can see it is not a bare space.
+  it("separates the slow-runtime sentences with a non-breaking gap, written as the escape", () => {
+    const lines = codeLines.filter((line) => line.includes("did not answer in time"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('busy.{"\\u00a0 "}BotFleet keeps checking.');
+  });
+
+  it("never glues two sentences with a single JSX space or a literal U+00A0", () => {
+    const bareSpace = codeLines.filter((line) => /[.?!]\{" "\}[A-Z]/.test(line));
+    expect(bareSpace).toEqual([]);
+    const literalNbsp = source.split("\n").filter((line) => line.includes("\u00a0"));
+    expect(literalNbsp).toEqual([]);
+  });
 });

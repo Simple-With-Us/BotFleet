@@ -199,6 +199,9 @@ describe("LocalVmRuntimeCard header for the other setup states", () => {
     expect(card.text).toContain("Waiting for docker to respond");
     expect(card.text).toContain("The container runtime (docker) is installed but did not answer in time");
     expect(card.text).toContain("because this Mac is busy");
+    // The two sentences are joined by a real U+00A0 plus a space, which HTML
+    // keeps; two ASCII spaces would collapse to one.
+    expect(card.text).toContain("is busy.\u00a0 BotFleet keeps checking.");
     expect(card.text).toContain("Waiting for the container runtime to respond.");
     expect(card.text).not.toMatch(/start docker first/i);
     expect(card.text).not.toMatch(/Open and start/i);
