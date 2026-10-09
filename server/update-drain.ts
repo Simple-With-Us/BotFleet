@@ -36,6 +36,7 @@
 // Mac holding work: the lease runs out and the drain releases itself.
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 
 /** The hold an updater gets when it does not say how long it needs. */
 export const UPDATE_DRAIN_DEFAULT_TIMEOUT_MS = 20 * 60_000;
@@ -60,9 +61,11 @@ export const HELD_SENDS_MAX_AGE_MS = 60 * 60_000;
 
 /** A requested drain window in milliseconds, clamped.  Anything unreadable is
  * the default rather than an error: the drain is the safe choice either way. */
-export function clampDrainTimeout(value: unknown): number {
-  const parsed = typeof value === "string" && value.trim() ? Number(value) : value;
-  if (typeof parsed !== "number" || !Number.isFinite(parsed) || parsed <= 0) return UPDATE_DRAIN_DEFAULT_TIMEOUT_MS;
+export type DrainWindowInput = number | string | null | undefined;
+
+export function clampDrainTimeout(value: DrainWindowInput): number {
+  const parsed = typeof value === "string" ? (value.trim() ? Number(value) : Number.NaN) : value ?? Number.NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return UPDATE_DRAIN_DEFAULT_TIMEOUT_MS;
   return Math.min(UPDATE_DRAIN_MAX_TIMEOUT_MS, Math.max(UPDATE_DRAIN_MIN_TIMEOUT_MS, Math.round(parsed)));
 }
 
@@ -73,8 +76,8 @@ export function clampDrainTimeout(value: unknown): number {
 export function inFlightCounts(
   counts: Readonly<Record<string, number>>,
   held: { queuedRoutineRuns: number },
-): Record<string, number> {
-  const result: Record<string, number> = { ...counts };
+) {
+  const result = { ...counts };
   if ("queuedSends" in result) result.queuedSends = 0;
   if ("routineRuns" in result) result.routineRuns = Math.max(0, result.routineRuns - Math.max(0, held.queuedRoutineRuns));
   return result;
@@ -134,7 +137,7 @@ export class UpdateDrain {
   /** Start holding new work, or renew the lease on a drain already running.
    *  A renewal keeps the original start, so "how long has this waited" stays
    *  true across an updater that asks twice. */
-  begin(timeoutMs: unknown): UpdateDrainStatus {
+  begin(timeoutMs: DrainWindowInput): UpdateDrainStatus {
     const now = this.now();
     const timeout = clampDrainTimeout(timeoutMs);
     const grace = this.options.graceMs ?? UPDATE_DRAIN_LEASE_GRACE_MS;
@@ -177,90 +180,76 @@ export class UpdateDrain {
   }
 }
 
+const nonEmpty = z.string().min(1);
+
 /** One held send, committed to its transcript and waiting to run.  The same
  *  arguments `drainQueuedSends` hands `startTurn`, so a send run after the
  *  restart is the turn it would have been without the update. */
-export interface HeldSend {
-  botId: string;
-  threadId: string;
-  prompt: string;
+const HeldSendSchema = z.object({
+  botId: nonEmpty,
+  threadId: nonEmpty,
+  prompt: z.string(),
   /** The last line committed for this batch; `startTurn` must not append it again. */
-  userMessageId: string;
+  userMessageId: nonEmpty,
   /** Every line of the batch, kept out of transcript replay because they are in `prompt`. */
-  excludeIds: string[];
-  linqChatId?: string;
+  excludeIds: z.array(z.string()),
+  linqChatId: z.string().optional(),
   /** Any line came over a relay, so the turn runs unattended (S8). */
-  relayed: boolean;
-  heldAt: number;
-}
+  relayed: z.boolean(),
+  heldAt: z.number().finite(),
+});
+export type HeldSend = z.infer<typeof HeldSendSchema>;
 
 /** Sends that waited behind a bot the update interrupted, carried exactly as
  *  the steer queue held them: NOT committed to the transcript.  That bot's own
  *  turn resumes after the restart, and boot recovery finds what to resume by
  *  reading the thread, so a committed line would be resumed in its place.
  *  These go back in the queue once recovery has run, and wait their turn. */
-export interface HeldQueueEntry {
-  botId: string;
-  threadId: string;
-  heldAt: number;
-  items: Array<{
-    messageId: string;
-    text: string;
-    prompt: string;
-    replyToId?: string;
-    linqChatId?: string;
-    automationSource?: string;
-    relayed: boolean;
-  }>;
-}
+const HeldQueueEntrySchema = z.object({
+  botId: nonEmpty,
+  threadId: nonEmpty,
+  heldAt: z.number().finite(),
+  items: z.array(z.object({
+    messageId: nonEmpty,
+    text: z.string(),
+    prompt: z.string(),
+    replyToId: z.string().optional(),
+    linqChatId: z.string().optional(),
+    automationSource: z.string().optional(),
+    relayed: z.boolean(),
+  })).min(1),
+});
+export type HeldQueueEntry = z.infer<typeof HeldQueueEntrySchema>;
 
 export interface HeldWork {
   sends: HeldSend[];
   queued: HeldQueueEntry[];
 }
 
-interface HeldSendsFile {
-  version: 1;
-  sends: HeldSend[];
-  queued?: HeldQueueEntry[];
-}
+/** The file as written.  Entries are checked one at a time, so one bad entry
+ *  costs only itself; a file from before `queued` existed reads as sends only. */
+const HeldSendsFileSchema = z.object({
+  version: z.literal(1),
+  sends: z.array(z.unknown()),
+  queued: z.array(z.unknown()).optional(),
+});
 
-const optionalString = (value: unknown) => value === undefined || typeof value === "string";
-const nonEmpty = (value: unknown) => typeof value === "string" && value.length > 0;
-
-function isHeldSend(value: unknown): value is HeldSend {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const raw = value as Record<string, unknown>;
-  return nonEmpty(raw.botId) && nonEmpty(raw.threadId) &&
-    typeof raw.prompt === "string" &&
-    nonEmpty(raw.userMessageId) &&
-    Array.isArray(raw.excludeIds) && raw.excludeIds.every((id) => typeof id === "string") &&
-    optionalString(raw.linqChatId) &&
-    typeof raw.relayed === "boolean" &&
-    typeof raw.heldAt === "number" && Number.isFinite(raw.heldAt);
-}
-
-function isHeldQueueEntry(value: unknown): value is HeldQueueEntry {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const raw = value as Record<string, unknown>;
-  return nonEmpty(raw.botId) && nonEmpty(raw.threadId) &&
-    typeof raw.heldAt === "number" && Number.isFinite(raw.heldAt) &&
-    Array.isArray(raw.items) && raw.items.length > 0 && raw.items.every((item: unknown) => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
-      const one = item as Record<string, unknown>;
-      return nonEmpty(one.messageId) && typeof one.text === "string" && typeof one.prompt === "string" &&
-        optionalString(one.replyToId) && optionalString(one.linqChatId) && optionalString(one.automationSource) &&
-        typeof one.relayed === "boolean";
-    });
+function keepValid<T>(entries: readonly unknown[], schema: z.ZodType<T>): T[] {
+  const kept: T[] = [];
+  for (const entry of entries) {
+    const parsed = schema.safeParse(entry);
+    if (parsed.success) kept.push(parsed.data);
+  }
+  return kept;
 }
 
 function readHeldWorkFile(path: string): HeldWork {
   if (!existsSync(path)) return { sends: [], queued: [] };
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<HeldSendsFile>;
-  if (parsed?.version !== 1 || !Array.isArray(parsed.sends)) throw new Error("held sends file has an unknown shape");
+  const parsed = HeldSendsFileSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
+  if (!parsed.success) throw new Error("held sends file has an unknown shape");
   return {
-    sends: parsed.sends.filter(isHeldSend),
-    queued: Array.isArray(parsed.queued) ? parsed.queued.filter(isHeldQueueEntry) : [],
+    sends: keepValid(parsed.data.sends, HeldSendSchema),
+    queued: keepValid(parsed.data.queued ?? [], HeldQueueEntrySchema),
   };
 }
 
@@ -278,7 +267,7 @@ export function appendHeldWork(dataDir: string, work: Partial<HeldWork>): void {
   } catch {
     // An unreadable leftover is not a reason to lose the work in hand.
   }
-  const file: HeldSendsFile = {
+  const file = {
     version: 1,
     sends: [...existing.sends, ...sends],
     queued: [...existing.queued, ...queued],
@@ -312,7 +301,7 @@ export function partitionByAge<T extends { heldAt: number }>(
   items: readonly T[],
   now: number,
   maxAgeMs = HELD_SENDS_MAX_AGE_MS,
-): { run: T[]; stale: T[] } {
+) {
   const run: T[] = [];
   const stale: T[] = [];
   for (const item of items) (now - item.heldAt > maxAgeMs ? stale : run).push(item);

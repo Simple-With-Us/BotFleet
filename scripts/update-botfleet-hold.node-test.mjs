@@ -60,15 +60,18 @@ function scriptedHarness({
     rooms: rooms(clock),
     held: { routineRuns: 0, sends: 0 },
   });
-  const body = (extra = {}) => ({
-    ...IDENTITY,
-    safeToRestart: inFlight(clock) === 0,
-    activeWorkCount: inFlight(clock),
-    quiescing: state.quiescing,
-    fencing: fencingUntil !== null && clock < fencingUntil,
-    ...(drains ? { draining: state.draining, drain: state.draining ? drain() : null } : {}),
-    ...extra,
-  });
+  const body = (extra = {}) => {
+    const answer = {
+      ...IDENTITY,
+      safeToRestart: inFlight(clock) === 0,
+      activeWorkCount: inFlight(clock),
+      quiescing: state.quiescing,
+      fencing: fencingUntil !== null && clock < fencingUntil,
+    };
+    // An older harness has never heard of a hold, so says nothing about one.
+    if (drains) Object.assign(answer, { draining: state.draining, drain: state.draining ? drain() : null });
+    return { ...answer, ...extra };
+  };
   let refusalsLeft = forceRefusals;
   const requestJson = async (url, options = {}) => {
     const method = options.method ?? "GET";

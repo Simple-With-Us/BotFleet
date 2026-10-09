@@ -753,8 +753,8 @@ async function probeHealthWithRetry(port, { attempts = 3, backoffMs = 250 } = {}
   return { ...result, port };
 }
 
-async function probeHealth(port, { timeoutMs } = {}) {
-  const result = await requestJson(`http://127.0.0.1:${port}/api/health`, { accept: [200], ...(timeoutMs ? { timeoutMs } : {}) });
+async function probeHealth(port, { timeoutMs = 3_000 } = {}) {
+  const result = await requestJson(`http://127.0.0.1:${port}/api/health`, { accept: [200], timeoutMs });
   if (result.kind !== "ok") return result;
   if (result.body?.app !== "botfleet" || !Number.isInteger(result.body?.pid) || result.body.pid <= 0) {
     return { kind: "foreign" };
@@ -796,7 +796,7 @@ export function healthTopologyResult(results, { allowMultiple = false } = {}) {
 }
 
 async function healthTopology(ports, options = {}) {
-  const probe = (port) => probeHealth(port, { timeoutMs: options.timeoutMs });
+  const probe = (port) => probeHealth(port, options.timeoutMs ? { timeoutMs: options.timeoutMs } : undefined);
   return healthTopologyResult(await Promise.all(ports.map(probe)), options);
 }
 

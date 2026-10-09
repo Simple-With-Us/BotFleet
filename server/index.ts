@@ -77,6 +77,7 @@ import {
   type HeldQueueEntry,
   type HeldSend,
   type HeldWork,
+  type DrainWindowInput,
 } from "./update-drain.ts";
 import { botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import { createUpdateControl, packagedInstalledAt } from "./update-control.ts";
@@ -311,6 +312,7 @@ import {
   restoreJobNotices,
   restoreSteeredEntries,
   takeSteeredEntries,
+  type SteerQueueSnapshot,
   type JobNoticeItem,
 } from "./steer-queue.ts";
 import { jobsPrompt, noticeWithoutJobTools } from "./jobs/prompt.ts";
@@ -4774,16 +4776,17 @@ function commitHeldSends(): HeldSend[] {
   for (let pass = 0; pass < 100 && queuedMessageCount() > 0; pass += 1) {
     const before = queuedMessageCount();
     drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId) => {
-      held.push({
+      const send: HeldSend = {
         botId,
         threadId,
         prompt,
         userMessageId: userMessage.id,
         excludeIds,
-        ...(linqChatId ? { linqChatId } : {}),
         relayed: takeRelayMark(threadId, excludeIds),
         heldAt,
-      });
+      };
+      if (linqChatId) send.linqChatId = linqChatId;
+      held.push(send);
     });
     if (queuedMessageCount() === before) break;
   }
@@ -4845,10 +4848,15 @@ function restoreHeldQueue(entries: readonly HeldQueueEntry[], context: string) {
   restoreSteeredEntries(live.map((entry) => ({
     threadId: entry.threadId,
     botId: entry.botId,
-    items: entry.items.map(({ relayed: _relayed, automationSource, ...item }) => ({
-      ...item,
-      ...(automationSource ? { automationSource: automationSource as Message["automationSource"] } : {}),
-    })),
+    items: entry.items.map((item) => {
+      const restored: SteerQueueSnapshot["items"][number] = { messageId: item.messageId, text: item.text, prompt: item.prompt };
+      if (item.replyToId) restored.replyToId = item.replyToId;
+      if (item.linqChatId) restored.linqChatId = item.linqChatId;
+      // SAFETY: the carrier only ever holds what `persistHeldWork` copied out
+      // of a steer-queue item, whose automationSource is already this type.
+      if (item.automationSource) restored.automationSource = item.automationSource as Message["automationSource"];
+      return restored;
+    }),
   })));
   if (entries.length > 0) console.log(`[${context}] requeued ${live.length} held thread(s), ${stale.length} too old to run`);
 }
@@ -9621,7 +9629,12 @@ function drainSnapshot() {
   };
 }
 
-function runtimeWorkCounts(ownAdmissionActive = false, allowCredentialQueues = false): Record<string, number> {
+/** Work in flight, by kind: what `runtimeReadiness` sums and a drain filters. */
+interface RuntimeWorkCounts {
+  readonly [kind: string]: number;
+}
+
+function runtimeWorkCounts(ownAdmissionActive = false, allowCredentialQueues = false): RuntimeWorkCounts {
   // Status timer / capabilities can run before module init finishes. Other
   // readiness counters still live below the top-level awaits; refuse Install
   // until bootComplete rather than throwing on a half-built harness.
@@ -9817,7 +9830,7 @@ async function drainAfterInterrupt(): Promise<void> {
 
 /** Start holding new work for an update, or renew the hold (server/update-drain.ts).
  *  Already fenced is reported as fenced: there is nothing left to drain. */
-function beginRuntimeDrain(timeoutMs: unknown) {
+function beginRuntimeDrain(timeoutMs: DrainWindowInput) {
   if (!runtimeQuiescing) updateDrain.begin(timeoutMs);
   return { ...currentRuntimeReadiness(), quiescing: runtimeQuiescing };
 }
@@ -13645,13 +13658,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // A harness that predates it treats the request as a plain quiesce,
       // which is exactly what a drain-capable updater falls back to.
       let drain = flag(url.searchParams.get("drain"));
-      let drainTimeoutMs: unknown = url.searchParams.get("timeoutMs");
+      let drainTimeoutMs: DrainWindowInput = url.searchParams.get("timeoutMs");
       if (method === "POST" && req.headers["content-type"]?.includes("application/json")) {
         try {
           const body = await readBody(req);
           if (body?.force === true) force = true;
           if (body?.drain === true) drain = true;
-          if (body?.timeoutMs !== undefined) drainTimeoutMs = body.timeoutMs;
+          if (typeof body?.timeoutMs === "number" || typeof body?.timeoutMs === "string") drainTimeoutMs = body.timeoutMs;
         } catch {}
       }
       const draining = method === "POST" && path === "/api/runtime/quiesce" && drain && !force;
@@ -16167,7 +16180,7 @@ setTimeout(() => {
   // once recovery has decided about that bot's own turn: resumed, it is busy
   // and they wait for it to settle; not resumed, they run now.
   void runBootRecovery()
-    .catch((error: unknown) => console.error("[boot-recovery] failed:", error))
+    .catch((error) => console.error("[boot-recovery] failed:", error))
     .finally(() => {
       restoreHeldQueue(carriedAcrossUpdate.queued, "update-held");
       drainQueuedSends();
