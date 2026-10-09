@@ -4412,6 +4412,10 @@ bus.subscribe((event: RuntimeEvent) => {
           mode: reviewMode,
           approvalScope: event.approvalScope,
           ownJobStart,
+          // On a turn held for review the step watch leaves every ask to its
+          // card (`markAsked`, above), so a person's always-allow has to be
+          // screened here or On would review less than Watch does
+          heldTurn: instance ? holdTurnForReview(asker, instance) : false,
         });
         const reviewers = grantReviewed ? reviewersForInstance(instance) : [];
         const reviewRequest = { tool, summary, persona: reviewPersona(asker) };
@@ -4430,7 +4434,7 @@ bus.subscribe((event: RuntimeEvent) => {
             // A refusal, no answer, or a spent review limit: never run it
             // unchecked, hand it to the person as an ordinary card.
             showHeldCard(
-              heldGrantText(grantLabel(verdict.rule), result),
+              heldGrantText(grantLabel(verdict.rule, verdict.source), result),
               {
                 source: "auto-review",
                 rule: result.kind === "verdict" ? result.verdict.reason : noVerdictRule(result),

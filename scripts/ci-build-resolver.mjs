@@ -341,6 +341,47 @@ function assertArtifact(value) {
 }
 /* oxlint-enable anti-slop/no-runtime-typeof */
 
+/**
+ * The two hand-written schemas the trust boundary parses GitHub's list
+ * responses through.  A 200 whose body lacks the list (`{}`, `null`,
+ * `{"workflow_runs": "x"}`) or whose entries are not the shape the resolver
+ * reads from is a malformed response, not "no build".  `no-build` is
+ * recoverable, so `auto` would quietly package locally and hide an API change
+ * or a proxy fault; `bad-response` is not.  An honestly empty list still comes
+ * back as `[]` and stays `no-build`.
+ *
+ * The schema is strict on the required fields the resolver reads (matching
+ * what `selectCommitRun` and `findCommitArtifact` already demand of each
+ * item), so a 200 that mixes a valid run with a partial one is no longer
+ * silently filtered — the boundary rejects it.  Extra fields GitHub may add
+ * later are still passed through.
+ */
+function parseWorkflowRunsResponse(body, url) {
+  if (!body || typeof body !== "object" || Array.isArray(body) ||
+      !Array.isArray(body.workflow_runs)) {
+    throw new ResolutionError(`GitHub returned HTTP 200 for ${url} without a "workflow_runs" list`, "bad-response");
+  }
+  for (const item of body.workflow_runs) {
+    if (!assertWorkflowRun(item)) {
+      throw new ResolutionError(`GitHub returned HTTP 200 for ${url} with a malformed workflow run entry`, "bad-response");
+    }
+  }
+  return body.workflow_runs;
+}
+
+function parseArtifactsResponse(body, url) {
+  if (!body || typeof body !== "object" || Array.isArray(body) ||
+      !Array.isArray(body.artifacts)) {
+    throw new ResolutionError(`GitHub returned HTTP 200 for ${url} without an "artifacts" list`, "bad-response");
+  }
+  for (const item of body.artifacts) {
+    if (!assertArtifact(item)) {
+      throw new ResolutionError(`GitHub returned HTTP 200 for ${url} with a malformed artifact entry`, "bad-response");
+    }
+  }
+  return body.artifacts;
+}
+
 /** The newest attempt at this commit, for diagnosis when none succeeded. */
 function anyRunForCommit(runs, commit) {
   return Array.isArray(runs) ? runs.find((item) => item?.head_sha === commit) || null : null;
@@ -949,7 +990,7 @@ export async function downloadBuiltBundle({
   }
   const headers = authHeaders(env, { execFileSyncImpl });
   const runsUrl = `${apiBase(repository)}/actions/workflows/${WORKFLOW_FILE}/runs?head_sha=${commit}&per_page=20`;
-  const runs = (await requestJson(runsUrl, { headers, fetchImpl }))?.workflow_runs;
+  const runs = parseWorkflowRunsResponse(await requestJson(runsUrl, { headers, fetchImpl }), runsUrl);
   const run_ = selectCommitRun(runs, commit);
   if (!run_) {
     // A run that exists for this commit but failed, was cancelled, or is still
@@ -985,7 +1026,8 @@ export async function downloadBuiltBundle({
       "no-build",
     );
   }
-  const artifacts = (await requestJson(`${apiBase(repository)}/actions/runs/${run_.id}/artifacts?per_page=100`, { headers, fetchImpl }))?.artifacts;
+  const artifactsUrl = `${apiBase(repository)}/actions/runs/${run_.id}/artifacts?per_page=100`;
+  const artifacts = parseArtifactsResponse(await requestJson(artifactsUrl, { headers, fetchImpl }), artifactsUrl);
   const artifact = findCommitArtifact(artifacts, commit);
   if (!artifact) {
     throw new ResolutionError(
