@@ -75,25 +75,39 @@ export function fleetSharedPreambleBytes(): number {
   return Buffer.byteLength(fleetSharedPreambleText(), "utf8");
 }
 
-export function fleetSharedPreambleText(): string {
+/** The loaders below read each asset once per process and cache it.  A missing
+ *  or empty file returns null and is never cached, so a later call retries. */
+function loadSharedPreamble(): string | null {
   if (cachedShared === undefined) {
     const text = readBotsFile("_shared.md");
-    if (!text) {
-      throw new Error(`Fleet seat shared preamble missing under ${fleetBotsDirectory()}`);
-    }
+    if (!text) return null;
     cachedShared = text;
   }
   return cachedShared;
 }
 
-function fleetSeatSpecificText(seatId: FleetSeatId): string {
+export function fleetSharedPreambleText(): string {
+  const text = loadSharedPreamble();
+  if (text === null) {
+    throw new Error(`Fleet seat shared preamble missing under ${fleetBotsDirectory()}`);
+  }
+  return text;
+}
+
+function loadSeatSpecific(seatId: FleetSeatId): string | null {
   const hit = cachedSeat.get(seatId);
   if (hit !== undefined) return hit;
   const text = readBotsFile(`${seatId}.md`);
-  if (!text) {
+  if (!text) return null;
+  cachedSeat.set(seatId, text);
+  return text;
+}
+
+function fleetSeatSpecificText(seatId: FleetSeatId): string {
+  const text = loadSeatSpecific(seatId);
+  if (text === null) {
     throw new Error(`Fleet seat file missing: ${seatId}.md under ${fleetBotsDirectory()}`);
   }
-  cachedSeat.set(seatId, text);
   return text;
 }
 
@@ -106,15 +120,21 @@ export function resolveFleetSeatId(bot: {
   return resolveBotfleetRole(bot)?.id ?? null;
 }
 
-function fleetSeatTemplate(): string {
+function loadSeatTemplate(): string | null {
   if (cachedSeatTemplate === undefined) {
     const text = readBotsFile("_seat.md");
-    if (!text) {
-      throw new Error(`Fleet seat template missing under ${fleetBotsDirectory()}`);
-    }
+    if (!text) return null;
     cachedSeatTemplate = text;
   }
   return cachedSeatTemplate;
+}
+
+function fleetSeatTemplate(): string {
+  const text = loadSeatTemplate();
+  if (text === null) {
+    throw new Error(`Fleet seat template missing under ${fleetBotsDirectory()}`);
+  }
+  return text;
 }
 
 /** The seat sentence for one role: the template with the role's name and seat. */
@@ -131,12 +151,13 @@ export function composeFleetSeatPrompt(seatId: FleetSeatId): string {
   return `${seat}\n\n${shared}\n\n${specific}`;
 }
 
-/** Like `composeFleetSeatPrompt`, but returns null when assets are missing (no throw). */
+/** Like `composeFleetSeatPrompt`, but returns null when assets are missing (no
+ *  throw).  It shares the module caches, so a turn costs Map lookups, not reads. */
 export function tryComposeFleetSeatPrompt(seatId: FleetSeatId): string | null {
-  const template = readBotsFile("_seat.md");
-  const shared = readBotsFile("_shared.md");
-  const specific = readBotsFile(`${seatId}.md`);
-  if (!template || !shared || !specific) return null;
+  const template = loadSeatTemplate();
+  const shared = loadSharedPreamble();
+  const specific = loadSeatSpecific(seatId);
+  if (template === null || shared === null || specific === null) return null;
   return `${renderSeatSection(template, seatId)}\n\n${shared}\n\n${specific}`;
 }
 

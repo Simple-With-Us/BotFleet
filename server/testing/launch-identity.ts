@@ -65,7 +65,12 @@ export function expectLaunchedAs(
 }
 
 const envSchema = z.record(z.string(), z.string().optional());
-const dumpSchema = z.object({ pid: z.number().optional(), argv: z.array(z.string()).default([]), env: envSchema });
+// Not `.strict()`:  each fake writes more than `{pid, argv, env}` at the top level
+// (`prompt` and `mcpConfig` from the Claude fake, `mcpServers` from the ACP fake,
+// `calls` and `decision` from the Codex fake), so `.strict()` would reject those dumps.
+const dumpSchema = z
+  .object({ pid: z.number().optional(), argv: z.array(z.string()).default([]), env: envSchema })
+  .passthrough();
 
 /** An environment printed as JSON by a test child. */
 export const parseEnv = (text: string) => envSchema.parse(JSON.parse(text));
