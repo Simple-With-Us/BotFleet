@@ -388,7 +388,9 @@ function findRisk(args: string[]): CommandRisk | null {
     const arg = args[i] ?? "";
     if (arg === "-delete") return destructive("find-delete");
     if (FIND_EXEC.has(arg)) {
-      const target = programName(peel(args.slice(i + 1)).words[0] ?? "");
+      const peeled = peel(args.slice(i + 1));
+      if (peeled.exhausted) return OPAQUE_WRAPPER;
+      const target = programName(peeled.words[0] ?? "");
       if (REMOVERS.has(target)) return destructive("find-exec-rm");
     }
   }
