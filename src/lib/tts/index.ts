@@ -4,7 +4,7 @@ import { estimatedClips } from "../../../shared/karaoke-align";
 // The harness's own projection rules (pure, no Node APIs), so a reply this
 // Mac speaks without the harness drops code, links, and markdown the same way,
 // and carries the same source spans for karaoke.
-import { karaokeScriptFromWire, localKaraokeScript, type KaraokeScript } from "../../../shared/spoken-script";
+import { karaokeScriptFromWire, localKaraokeScript, stripPauseTags, type KaraokeScript } from "../../../shared/spoken-script";
 import { z } from "zod";
 import { ClipsKaraoke, LiveKaraoke, type KaraokeEndReason, type KaraokeFeed } from "./karaoke-feed";
 import { TtsAudioBodySchema, type TtsAudioBody } from "./schema";
@@ -31,12 +31,15 @@ import { TtsAudioBodySchema, type TtsAudioBody } from "./schema";
 // - a hosted voice: the clips ready so far plus `total` (`progressive`), so
 //   the first sentence plays while the rest are still being made.
 //
-// Karaoke: the request asks for `spans`.  When the harness says the script
-// is the reply as written (`script: "written"`), the speaker publishes a
-// karaoke feed for that message (src/lib/tts/karaoke-feed.ts): clip windows
-// and an audio clock for a hosted voice, word ranges from the helper for a
-// Personal Voice.  The message's bubble follows it (src/lib/karaoke-session.ts).
-// A summary has no feed, so nothing is highlighted.
+// Karaoke: the speaker publishes a karaoke feed for every saved reply it
+// reads (src/lib/tts/karaoke-feed.ts): clip windows and an audio clock for a
+// hosted voice, word ranges from the helper for a Personal Voice.  The
+// message's bubble follows it over its own rendered words
+// (src/lib/karaoke-session.ts).  The request asks for `spans`: a distilled
+// script (`script: "summary"`, the default) has none and is aligned to the
+// message without them; the deterministic script (`script: "written"`)
+// carries spans that guide the alignment.  The bubble shows no highlight
+// when the two do not line up (karaokeFollowable in shared/karaoke-align.ts).
 
 /** The desktop app is the "mac" device in a bot's per-device voices. */
 export const THIS_DEVICE: SpeechDevice = "mac";
@@ -64,8 +67,8 @@ interface SpeakOptions {
   messageId?: string;
   threadId?: string;
   /** What the bot's voice reads, voiceScriptKind(bot).  Only the local
-   * Personal Voice fallback uses it (the harness decides for itself);
-   * unset means "written", the default. */
+   * Personal Voice fallback uses it (the harness decides for itself), to
+   * pick the reply's voice half for a distilled bot; unset means "written". */
   scriptKind?: VoiceScriptKind;
 }
 
@@ -343,22 +346,22 @@ export class Speaker {
       // its own rules and the same length bound, rather than leave the owner
       // with silence.  A refusal (413, 4xx) is shown instead.
       if (isPersonalVoiceId(opts.voiceId) && personalVoiceBridge() && harnessUnavailable(error)) {
-        // The harness's own rules, with their spans.  Written (the default):
-        // the reply as written, the text the harness would read and the
-        // bubble's spans index, so karaoke follows it.  A summary mode has
-        // no model here, so it reads the reply's own voice half (or the
-        // reply) and, like any summary, publishes no karaoke.
+        // The harness's own rules, with their spans: what its distiller
+        // falls back to when it cannot rewrite.  There is no distiller here,
+        // so a distilled bot reads the reply's own voice half (or the
+        // reply), and "off" reads the written reply.  Karaoke follows
+        // either; the spans guide it when they index the bubble's text.
         const written = (opts.scriptKind ?? "written") === "written";
         const { utterances, script } = localKaraokeScript(written ? writtenReply(text) : spokenReply(text));
         if (!utterances.length) throw error;
         if (script.spokenText.length > MAX_LOCAL_SPEECH_CHARS) throw new Error(REPLY_TOO_LONG);
-        await this.speakOnDevice(utterances, opts.voiceId ?? "", opts, live, script.spokenText, written ? script : null);
+        await this.speakOnDevice(utterances, opts.voiceId ?? "", opts, live, script.spokenText, script);
         return;
       }
       throw error;
     }
     if (!live()) return;
-    const script = writtenScript(body);
+    const script = karaokeScript(body);
     if (body.onDevice) {
       // The harness's own resolution of this Mac's voice wins over the
       // renderer's copy of the bot, which can be a moment stale.
@@ -398,7 +401,8 @@ export class Speaker {
   ): Promise<void> {
     const total = first.total ?? first.audio.length;
     const utterances = first.utterances ?? [];
-    const voiceText = first.voiceText;
+    // The call caption shows these; MiniMax pause tags are for the voice.
+    const voiceText = first.voiceText === undefined ? undefined : stripPauseTags(first.voiceText);
     // One window per clip on a single audio timeline.  Durations start as
     // estimates and become real as each clip's metadata arrives.
     const feed = script && opts.messageId && script.utterances.length === total
@@ -426,7 +430,7 @@ export class Speaker {
       if (!live()) return;
       if ("error" in loaded) throw loaded.error;
       next = index + 1 < total ? load(index + 1) : null;
-      const caption = utterances[index] ?? voiceText;
+      const caption = utterances[index] === undefined ? voiceText : stripPauseTags(utterances[index]);
       this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption, voiceText });
       const clip = index;
       const finished = await this.play(loaded.blob, live, feed
@@ -604,11 +608,12 @@ export class Speaker {
   }
 }
 
-/** The written-mode script the harness answered with, or null for a
- * summary (no karaoke) or a harness too old to say. */
-function writtenScript(body: TtsAudioBody): KaraokeScript | null {
-  if (body.script !== "written" || !body.utterances?.length) return null;
-  return karaokeScriptFromWire(body.utterances, body.spans ?? null);
+/** The script the harness answered with, for karaoke over the message: with
+ * its spans when it is the written script, without them for a distilled one
+ * (or a harness too old to say).  Null only without utterances. */
+function karaokeScript(body: TtsAudioBody): KaraokeScript | null {
+  if (!body.utterances?.length) return null;
+  return karaokeScriptFromWire(body.utterances, body.script === "written" ? body.spans ?? null : null);
 }
 
 export const speaker = new Speaker();

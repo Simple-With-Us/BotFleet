@@ -33,8 +33,9 @@ export const TtsAudioBodySchema = z.object({
   voice: z.string().optional(),
   onDevice: z.boolean().optional(),
   personalVoice: z.boolean().optional(),
-  /** Asked for with `spans: true`: "written" when the voice reads the reply
-   * as written (karaoke applies), "summary" otherwise. */
+  /** Asked for with `spans: true`: "written" when the utterances are the
+   * deterministic script (spans attached), "summary" for the distilled
+   * rewrite (the default, no spans).  Karaoke follows the message for both. */
   script: z.enum(["written", "summary"]).optional().catch(undefined),
   /** shared/spoken-script.ts SpokenSpansWire.  Shape-checked here; the
    * offsets are checked against the utterances by karaokeScriptFromWire.  A

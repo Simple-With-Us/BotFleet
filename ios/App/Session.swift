@@ -2031,11 +2031,12 @@ final class Session: ObservableObject {
     }
 
     /// What a Personal Voice reads for `message`, and the karaoke script
-    /// that follows it.  The harness's utterances when it answered; a reply
-    /// it reads as written comes with spans (`script: "written"`), and a
-    /// summary has no karaoke.  Without an answer this phone projects the
-    /// reply itself, and the highlight follows that projection without
-    /// spans, anchored on words that occur once on each side.
+    /// that follows it.  The harness's utterances when it answered: the
+    /// distilled rewrite by default (aligned to the message without spans),
+    /// or the written script with its spans (`script: "written"`).  Without
+    /// an answer this phone projects the reply itself, and the highlight
+    /// follows that projection without spans, anchored on words that occur
+    /// once on each side.
     private func personalReading(_ answer: MessageVoice?, message: Message) -> (segments: [SpeechSegment], script: KaraokeScript?) {
         if let answer, let utterances = answer.utterances {
             return (SpeechProjection.segments(fromUtterances: utterances), answer.karaokeScript)
@@ -2101,9 +2102,10 @@ final class Session: ObservableObject {
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.playback, mode: .spokenAudio)
         try audioSession.setActive(true)
-        // Karaoke for a reply read as written, one clip per utterance: each
-        // word's time is proportional to its place in its clip, and a
-        // clip's real length replaces the estimate once it plays.
+        // Karaoke over the message, one clip per utterance, for the
+        // distilled script and the written one alike: each word's time is
+        // proportional to its place in its clip, and a clip's real length
+        // replaces the estimate once it plays.
         var karaoke: MessageKaraoke?
         if let script = answer.karaokeScript, script.utterances.count == total {
             karaoke = KaraokeCenter.shared.begin(messageId: messageId, messageText: message.text ?? "", script: script, mode: .clips)

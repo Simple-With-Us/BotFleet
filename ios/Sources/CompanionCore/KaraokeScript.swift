@@ -5,11 +5,14 @@
 //  The spoken script a reply's voice reads, as the harness hands it over for
 //  karaoke.  A mirror of shared/spoken-script.ts.
 //
-//  POST /audio with `spans: true` answers `script: "written"` when the voice
-//  reads the reply as written (the default), plus `spans`: for every
-//  utterance, the source span of each stretch of spoken text in
-//  writtenReply(message.text).  A summary (an explicit Voice Summary mode)
-//  answers `script: "summary"` and carries no spans, and gets no karaoke.
+//  POST /audio with `spans: true` answers `script: "summary"` for the
+//  distilled rewrite the voice reads by default (numbers, codes, acronyms and
+//  links spelled out, code skipped), with no spans; the highlight still
+//  follows the message, aligned without them.  It answers `script:
+//  "written"` when the utterances are the deterministic script (the "off"
+//  mode, or the distiller's fallback), plus `spans`: for every utterance,
+//  the source span of each stretch of spoken text in
+//  writtenReply(message.text), which guide the alignment.
 //
 //  Wire format, version `SpokenSpansWire.currentFormat`:
 //    { format: 1, source: "written", sourceLength, utterances: [[Int]] }
@@ -21,6 +24,26 @@
 //
 
 import Foundation
+
+/// MiniMax pause tags (`<#0.3#>`), which the distiller writes between
+/// thoughts.  A mirror of shared/spoken-script.ts PAUSE_TAG.
+public enum SpokenPause {
+    // A constant pattern; a failure is a programming error the tests catch.
+    // swiftlint:disable:next force_try
+    static let tag = try! NSRegularExpression(pattern: #"<#[0-9]+(?:\.[0-9]+)?#>"#)
+
+    /// `text` with every pause tag blanked to spaces of the same UTF-16
+    /// length, so offsets into the text the voice received still apply.
+    public static func mask(_ text: String) -> String {
+        guard text.contains("<#") else { return text }
+        let ns = NSMutableString(string: text)
+        let matches = tag.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            ns.replaceCharacters(in: m.range, with: String(repeating: " ", count: m.range.length))
+        }
+        return ns as String
+    }
+}
 
 /// The `spans` member of the /audio answer.
 public struct SpokenSpansWire: Codable, Equatable, Sendable {
@@ -192,10 +215,14 @@ public struct KaraokeScript: Equatable, Sendable {
 }
 
 extension MessageVoice {
-    /// The written-mode script the harness answered with, or nil for a
-    /// summary (no karaoke) or a harness too old to say.
+    /// The script the harness answered with, for karaoke over the message.
+    /// A written script carries spans that guide the alignment; a distilled
+    /// one ("summary", the default) is aligned without them, and so is an
+    /// answer from a harness too old to say.  Nil only without utterances.
+    /// Whether the highlight is shown at all is the alignment's call
+    /// (KaraokeAlignment.followable).
     public var karaokeScript: KaraokeScript? {
-        guard script == "written", let utterances, !utterances.isEmpty else { return nil }
-        return KaraokeScript.fromWire(utterances: utterances, wire: spans)
+        guard let utterances, !utterances.isEmpty else { return nil }
+        return KaraokeScript.fromWire(utterances: utterances, wire: script == "written" ? spans : nil)
     }
 }
