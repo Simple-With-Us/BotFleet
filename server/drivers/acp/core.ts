@@ -31,6 +31,7 @@ import {
   LastKnownAnswer,
   logProbeFailure,
   spawnCli,
+  trackCliGroup,
 } from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
@@ -41,6 +42,12 @@ import {
   resolveInitDeadline,
   SLOW_INIT_LOG_MS,
 } from "./init-deadline.ts";
+import { annotatePromptBudget } from "../../sentry-ai.ts";
+import {
+  applyAcpPromptBudget,
+  decodeAcpPromptBudgetBytes,
+  resolveAcpPromptBudgetBytes,
+} from "./prompt-budget.ts";
 
 /**
  * A `host::model` pick talks to a loopback server with its own key.
@@ -64,6 +71,7 @@ import type {
   ProviderErrorCode,
 } from "../../contracts.ts";
 import { newEventId, newId } from "../../contracts.ts";
+import { applyLaunchIdentity } from "../../launch-identity.ts";
 import { computerProxyEnv } from "../../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../../computer-grants.ts";
 import { augmentedPath } from "../../env-path.ts";
@@ -105,8 +113,8 @@ export function acpMcpServers(turn: Pick<SendTurnInput, "integrations">): AcpStd
     });
   }
   // The bot's computers, mounted exactly like the Claude driver does.
-  // Cloud boxes use the REST adapter; host, sandbox, and VPS Cua
-  // connections expose Cua Driver's official MCP server directly. Every
+  // Cloud boxes use the REST adapter; host, sandbox, and VPS CUA
+  // connections expose CUA Driver's official MCP server directly. Every
   // grant gets its own server — this was an if/else if that dropped the
   // second computer a bot had been given.
   for (const mount of turnComputerMounts(turn.integrations)) {
@@ -173,6 +181,11 @@ export interface AcpConfig {
    * never cut off; only a fully wedged one is.  `promptTimeoutMs` still
    * applies underneath this as the absolute backstop. */
   promptIdleMs?: number;
+  /** UTF-8 byte ceiling for the composed `session/prompt` text.  Omitted
+   * uses the default.  `0` disables the budget and sends the prompt whole.
+   * The stable system block and the current user message are never cut to
+   * meet it. */
+  promptBudgetBytes?: number;
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -467,6 +480,7 @@ function decodeAcpConfig(defaultCli: string) {
       o.promptIdleMs <= MAX_PROMPT_IDLE_MS
         ? o.promptIdleMs
         : undefined;
+    const promptBudgetBytes = decodeAcpPromptBudgetBytes(o.promptBudgetBytes);
     return {
       cli: typeof o.cli === "string" ? o.cli : defaultCli,
       fullAuto: o.fullAuto === true,
@@ -474,6 +488,7 @@ function decodeAcpConfig(defaultCli: string) {
       ...(initTimeoutMs === undefined ? {} : { initTimeoutMs }),
       ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
       ...(promptIdleMs === undefined ? {} : { promptIdleMs }),
+      ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }),
     };
   };
 }
@@ -523,6 +538,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
   const decodeConfig = decodeAcpConfig(support.defaultCli);
+  /** Resolved ONCE, at registration, because the capability matrix reads it
+   *  statically.  Both answers are a pure function of `support`, so deriving
+   *  them here and reading them from `metadata.channelWiring` cannot disagree
+   *  with the per-instance block below, which reads these same two values. */
+  const mountsMcpServers = support.mcpServers !== false;
+  const acceptsImages = support.images !== false;
   // Experimental V2 driver rollout gate — when this flips to `true` the V2
   // session runtime in `acp/core.v2.ts` will be wired in here.  Today the
   // flag is `false` and the branch is a single boot-time log line so the
@@ -539,6 +560,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       displayName: support.displayName,
       supportsMultipleInstances: true,
       access: support.access ?? "subscription",
+      // Static mirror of the flags below that the runtime resolves
+      // mechanically, published so a consumer that cannot afford to create an
+      // instance (the capability-matrix test) can check a claim against the
+      // driver instead of against a comment.  The ACP core answers every MCP
+      // flag from one question, so these four are all the same boolean.
+      channelWiring: {
+        agentsMcp: mountsMcpServers,
+        computerMcp: mountsMcpServers,
+        composioMcp: mountsMcpServers,
+        localComputerMcp: mountsMcpServers,
+        images: acceptsImages,
+      },
     },
     install: support.install,
     models: withModelCapabilities(support.models, support),
@@ -663,7 +696,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // full-auto bot mount the local computer at all.
         const computerMounts = turnComputerMounts(turn.integrations);
         const controlsHost = hostToolPrefix(computerMounts) !== null;
-        const turnConfig: AcpConfig = controlsHost && config.fullAuto ? { ...config, fullAuto: false } : config;
+        // A turn the harness holds for auto-review is spawned in the same
+        // asking mode, so each `session/request_permission` reaches the
+        // reviewer instead of being answered here.
+        const turnConfig: AcpConfig =
+          (controlsHost || turn.holdForReview === true) && config.fullAuto ? { ...config, fullAuto: false } : config;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         // Carried across a relaunch (see maybeRetry): `attempt` is how many
@@ -771,7 +808,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           };
           child = spawnCli(spawned.cli, spawned.args, {
             cwd,
-            env: spawned.env ? { ...env, ...spawned.env } : env,
+            // Last, over the instance's env and a wrapper's additions alike:
+            // the launch identity is this bot's and this turn's.
+            env: applyLaunchIdentity(spawned.env ? { ...env, ...spawned.env } : env, turn.launchIdentity),
             stdio: ["pipe", "pipe", "pipe"],
           });
         } catch (error) {
@@ -781,6 +820,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             ...(failure.setup ? { setup: true } : {}),
           });
         }
+
+        // Armed at spawn so the group is probed in the same tick its leader
+        // is reaped: that is what lets stop() keep reaping a lingering MCP
+        // descendant after the leader has gone, without ever signalling a
+        // process-group id the OS may have handed to someone else.
+        const group = trackCliGroup(child);
 
         // `sawOutput` is the replay-safety gate, and it is PROTOCOL state, not
         // a reading of the error text: it flips the moment this child put
@@ -901,17 +946,63 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             send({ jsonrpc: "2.0", id, method, params });
           });
 
-        const stop = () => killCliTree(child);
+        // One force-kill per child, however many paths call stop().
+        let forceKillArmed = false;
+        const stop = () => {
+          // SIGTERM the whole group while the leader is alive.  A no-op once
+          // the leader has exited: killCliTree early-returns then.
+          killCliTree(child);
+          const leaderAlive = child.exitCode === null && child.signalCode === null;
+          if (process.platform === "win32") {
+            // No process groups here; taskkill /T /F already forced the
+            // tree.  Keep a direct kill for a leader taskkill missed.
+            if (!leaderAlive || forceKillArmed) return;
+            forceKillArmed = true;
+            const forceTimer = setTimeout(() => {
+              if (child.exitCode !== null || child.signalCode !== null) return;
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+            }, FORCE_EXIT_AFTER_MS);
+            forceTimer.unref?.();
+            return;
+          }
+          // The leader already exited before anyone asked it to stop, so
+          // killCliTree sent nothing, but an MCP descendant may still be
+          // alive in the group holding the session lock.  Ask it to go
+          // first.  `group.signal` only sends while the group id is still
+          // provably this child's (see trackCliGroup), never to a pgid the OS
+          // may have recycled.
+          if (!leaderAlive) group.signal("SIGTERM");
+          // Group already empty: a clean teardown, nothing left to force.
+          if (!group.owned || forceKillArmed) return;
+          forceKillArmed = true;
+          // Then force it.  This must NOT be gated on the leader still being
+          // alive: on a normal completion the leader dies on the SIGTERM
+          // above within milliseconds, while a SIGTERM-ignoring descendant
+          // lives on, and settle() has already dropped this turn from
+          // `active`, so stopAll/dispose can no longer reach it.  It is gated
+          // on the group instead: if the group empties first, trackCliGroup
+          // disowns it and this send is a no-op.
+          const forceTimer = setTimeout(() => group.signal("SIGKILL"), FORCE_EXIT_AFTER_MS);
+          forceTimer.unref?.();
+        };
         const stopAndWaitForExit = async () => {
           state.deadlineTerminating = true;
-          const pid = child.pid;
           const forceExit = () => {
-            try {
-              if (process.platform !== "win32" && pid) process.kill(-pid, "SIGKILL");
-              else child.kill("SIGKILL");
-            } catch {
-              // already gone
+            if (process.platform === "win32") {
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+              return;
             }
+            // Same ownership rule as stop(): reap a lingering descendant, but
+            // never signal a group id that has emptied and may be recycled.
+            group.signal("SIGKILL");
           };
           if (child.exitCode !== null || child.signalCode !== null) {
             forceExit();
@@ -1163,6 +1254,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             ...base(threadId, turnId),
             type: "request.opened",
             requestId,
+            // the tool call this ask is about, the same id its item.started
+            // carried, so the auto-review step watch leaves it to the card
+            itemId: z.string().min(1).safeParse(toolCall.toolCallId).data,
             requestType: "permission",
             tool,
             summary,
@@ -1571,11 +1665,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             emitSessionStarted();
             state.promptSent = true;
-            const text = support.buildPromptText
+            // Budget the prompt about to be sent.  This does not decide
+            // whether the system prompt is inlined on resume.  Under the
+            // ceiling the composed text is unchanged.
+            const composed = support.buildPromptText
               ? support.buildPromptText(turn)
               : turn.system
                 ? `${turn.system}\n\n${turn.text}`
                 : turn.text;
+            const budgeted = applyAcpPromptBudget({
+              composed,
+              sections: turn.systemSections,
+              userText: turn.text,
+              budgetBytes: resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes),
+            });
+            annotatePromptBudget(threadId, turnId, budgeted);
+            const text = budgeted.text;
             const result = await request(
               "session/prompt",
               {
@@ -1744,8 +1849,6 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         return { state: "available", version, authenticated: await support.isAuthenticated(env, config) };
       };
 
-      const mountsMcpServers = support.mcpServers !== false;
-
       return {
         instanceId,
         driverKind: DRIVER_KIND,
@@ -1767,7 +1870,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             composioMcp: mountsMcpServers,
             phoneMcp: mountsMcpServers,
             qdrantMcp: mountsMcpServers,
-            images: support.images !== false,
+            images: acceptsImages,
             effortLevels: support.effortLevels,
             localComputerMcp: mountsMcpServers,
             // Jobs matrix: native jobs die when the turn settles, and BotFleet
@@ -1777,6 +1880,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // says so.  Named helper rows come in P3.
             backgroundJobs: mountsMcpServers ? "emulated" : "none",
             helpers: "none",
+            // `session/request_permission` becomes request.opened; a
+            // full-auto instance answers it itself unless the turn is held
+            reviewHook: config.fullAuto ? "after" : "before",
+            asksWhenHeld: true,
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

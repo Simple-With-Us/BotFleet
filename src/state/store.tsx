@@ -24,6 +24,7 @@ import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
+import type { ReviewHook } from "../../shared/auto-review";
 import type { ContextInjectionRef } from "../../shared/context-injection";
 import { taskWorkspaceContextsMatch, type TaskAppRef, type TaskWorkspaceContext } from "../../shared/task-workspace-context";
 import { eligibleTaskApps } from "@/lib/task-app-context";
@@ -44,8 +45,10 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
-import { spokenReply } from "../../shared/voice-summary";
-import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
+import type { Pronunciation } from "../../shared/pronunciations";
+import { voiceScriptKind } from "../../shared/voice-summary";
+import { applyBotPatch, createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
+import { voiceForDevice, type BotVoices } from "../../shared/bot-voice";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 
 export type { BotColor, MausColor } from "@/lib/mascot";
@@ -101,7 +104,7 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   /** A "Job Finished" row: a background job of the bot's ended. */
   job?: import("../../shared/jobs").JobRowData;
@@ -110,6 +113,7 @@ export interface Message {
   modelSelection?: { instanceId: string; model: string };
   audio?: Array<{ path: string; mime: string }>;
   voiceText?: string;
+  voiceTextKind?: "written" | "summary";
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   recordingReview?: { correction?: string; comment?: string; updatedAt: number };
   translation?: { language: string; text: string; provider: string };
@@ -351,12 +355,19 @@ export interface Bot {
   computers?: Array<"cloud" | "vm" | "local" | "off">;
   /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
   cloudBackend?: CloudBackend;
+  /** The backend this bot really uses once the workspace default fills in for
+   * an unpinned one.  Read-only on the wire: the phone uses it to decide
+   * whether a live desktop exists; the settings UI keeps reading the raw
+   * `cloudBackend` so "inherited" and "pinned" stay distinguishable. */
+  effectiveCloudBackend?: CloudBackend;
   /** Allow Auto to prepare/start the managed VPS container. Off by default. */
   autoStartVps?: boolean;
   /** where new tasks run their shell tools; absent = the private bot workspace */
   cwd?: string;
   /** auto mode: the bot approves its own tool permissions */
   autoApprove?: boolean;
+  /** permission bypass mode: automatically approve all tools, commands, and routines without halting */
+  bypassPermissions?: boolean;
   /** optional model review for otherwise undecided, attended approvals */
   autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
@@ -370,11 +381,18 @@ export interface Bot {
   speechDevices?: Array<"mac" | "iphone">;
   /** this bot's own voice id (falls back to the app-wide one) */
   voice?: string;
+  /** Per-device overrides of `voice`.  The wire sends null when neither
+   * device has one.  Resolve with voiceForDevice (shared/bot-voice.ts). */
+  voices?: BotVoices | null;
   /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
    * "on_demand" runs only on manual speak; "always" runs on every turn; "off" uses raw answer. */
   voiceSummaryMode?: "off" | "on_demand" | "always";
   pinned?: boolean;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  True = Off: nothing new
+   *  starts for it from any source, but its chat stays visible and a turn
+   *  already running finishes.  Absent or false = on. */
+  off?: boolean;
   /** Sidebar section this bot renders under; absent = unsectioned. */
   section?: string;
   /** the one message pinned to the top of this bot's active thread */
@@ -512,13 +530,24 @@ export interface ConfigStatus {
     mode: "shared" | "per-bot";
     maxInstances: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
   };
   opencodeGo?: { configured: boolean };
   /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "system"; optimizedSummary?: boolean };
+  /** `voice` is the workspace default voice (every bot without its own
+   * speaks with it).  `pronunciations` is the list in force, the seeded
+   * defaults included; absent only from a harness older than the list. */
+  tts?: {
+    configured: boolean;
+    ready: boolean;
+    voice: string;
+    provider?: "minimax" | "system";
+    optimizedSummary?: boolean;
+    pronunciations?: Pronunciation[];
+  };
   /** Call-mode STT preference + global vocabulary, mirrored from AppConfig.
    * `provider` is undefined when the picker has no explicit preference and
    * chooses the platform default. `keyterms` is the global voice vocabulary
@@ -571,6 +600,13 @@ export interface ConfigStatus {
     projects: Array<{ slug: string; match: string[] }>;
     enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
   };
+  /** Auto-review's fleet settings.  `fallbackReviewer` is the stored choice
+   * of the engine that reviews a bot's approvals when its own engine cannot:
+   * null for Automatic, "none" for off, or an instance id.
+   * `automaticReviewer` is the engine Automatic picks right now (the card
+   * works it out live from the engine list by the same rule), and
+   * `maxReviewsPerTurn` is the per-turn reviewer-call cap. */
+  autoReview?: { fallbackReviewer: string | null; automaticReviewer?: string | null; maxReviewsPerTurn?: number };
   /** Opt-in flags. Absent means off. */
   features?: { skillRecorder: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
   /** Sentry diagnostics.  `configured` mirrors `hasDsn` — a key is on file,
@@ -647,7 +683,7 @@ export function getConversationMode(config?: ConfigStatus | null): ConversationM
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq"
+  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq" | "autoReview"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -682,6 +718,9 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     // Without this every SSE `config` frame wipes Linq status and resets
     // LinqSettings back to its empty defaults.
     imessageLinq: frame.imessageLinq,
+    // Without this every SSE `config` frame forgets the fallback reviewer,
+    // and the Bot Profile tells the owner auto-review is unavailable again.
+    autoReview: frame.autoReview,
   };
 }
 
@@ -768,6 +807,7 @@ export interface InstanceInfo {
       supportsEffort?: boolean;
       /** Absent inherits the instance-wide image capability. */
       images?: boolean;
+      contextWindow?: number;
     }>;
   };
   capabilities?: {
@@ -782,6 +822,15 @@ export interface InstanceInfo {
     /** This engine can answer a bounded review prompt without changing the
      * bot's active conversation. */
     approvalReview?: boolean;
+    /** Where auto-review can see this engine's tool calls (shared/auto-review.ts).
+     * Absent means the engine has not reported it yet, never "none". */
+    reviewHook?: ReviewHook;
+    /** A full-auto instance can run a held turn in its asking mode. */
+    asksWhenHeld?: boolean;
+    /** What a bot's Bypass Permissions switch does on this engine
+     * (shared/bypass-coverage.ts).  Absent from an older server, which reads
+     * as "asks": the switch works as described. */
+    bypassCoverage?: "asks" | "native" | "none";
     /** The harness runs this engine's tool loop, so Maximum Tool Rounds applies. */
     toolLoop?: boolean;
   };
@@ -849,6 +898,9 @@ export interface AppState {
   resourceTriggers: ResourceTrigger[];
   settingsOpen: boolean;
   pluginsOpen: boolean;
+  /** The Plugins manager view (drop-in extensions).  Distinct from
+   *  `pluginsOpen`, which is the Composio connectors surface. */
+  pluginsManagerOpen: boolean;
   computerOpen: boolean;
   /** the per-thread event inspector (runtime stream + native protocol tee) */
   inspectorOpen: boolean;
@@ -1042,6 +1094,11 @@ export type Action =
       /** Local UI recovery hook for voice flows. Never sent to the server. */
       onError?: (message: string) => void;
     }
+  | {
+      type: "approveAllRequests";
+      threadId: string;
+      onError?: (message: string) => void;
+    }
   | { type: "requestNewTask"; botId: string }
   | { type: "cancelNewTask" }
   | { type: "newTask"; botId: string; appRef?: TaskAppRef }
@@ -1075,6 +1132,7 @@ export type Action =
   | { type: "error"; message: string | null }
   | { type: "toggleSettings"; open?: boolean }
   | { type: "togglePlugins"; open?: boolean }
+  | { type: "togglePluginsManager"; open?: boolean }
   | { type: "toggleComputer"; open?: boolean }
   | { type: "toggleInspector"; open?: boolean }
   | { type: "focusMessage"; threadId: string; messageId: string }
@@ -1140,8 +1198,8 @@ export function mergeHydrateBots(
     const local = localById.get(serverBot.id);
     const started = epochAtFetch[serverBot.id] ?? 0;
     const now = localEpoch[serverBot.id] ?? 0;
-    if (local && now > started) return { ...local, ...overlay };
-    return { ...serverBot, ...overlay };
+    if (local && now > started) return applyBotPatch(local, overlay);
+    return applyBotPatch(serverBot, overlay);
   });
 }
 
@@ -1475,6 +1533,7 @@ export function reducer(state: AppState, action: Action): AppState {
     case "dismissCard":
       return patchCard(state, action.botId, action.messageId, { dismissed: true });
     case "decideRequest":
+    case "approveAllRequests":
       return state; // the server's request.resolved patch settles the card
     case "botAdded": {
       // An HTTP create/import response and a second fold of the same bot can
@@ -1688,6 +1747,18 @@ export function reducer(state: AppState, action: Action): AppState {
     }
     case "togglePlugins":
       return { ...state, pluginsOpen: action.open ?? !state.pluginsOpen };
+    case "togglePluginsManager": {
+      const open = action.open ?? !state.pluginsManagerOpen;
+      return {
+        ...state,
+        pluginsManagerOpen: open,
+        pluginsOpen: open ? false : state.pluginsOpen,
+        settingsOpen: open ? false : state.settingsOpen,
+        appSettingsOpen: open ? false : state.appSettingsOpen,
+        computerOpen: open ? false : state.computerOpen,
+        inspectorOpen: open ? false : state.inspectorOpen,
+      };
+    }
     case "focusMessage":
       return {
         ...state,
@@ -1752,8 +1823,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ),
           }
         : animated;
-      const { acknowledgeLocalAuto: _ack, ...botPatch } = action.patch;
-      const patched = updateBot(next, action.botId, (b) => ({ ...b, ...botPatch }));
+      const patched = updateBot(next, action.botId, (b) => applyBotPatch(b, action.patch));
       return { ...patched, botEpoch: bumpEpoch(patched.botEpoch, action.botId) };
     }
     case "threadActive": {
@@ -2090,6 +2160,7 @@ export const initialState: AppState = {
   resourceTriggers: [],
   settingsOpen: false,
   pluginsOpen: false,
+  pluginsManagerOpen: false,
   computerOpen: false,
   inspectorOpen: false,
   appSettingsOpen: false,
@@ -2391,7 +2462,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return result.bots.find((candidate) => candidate.id === botId) ?? null;
         },
         onAuthoritative: (bot, optimisticOverlay) => {
-          rawDispatch({ type: "botPatched", bot: { ...bot, ...optimisticOverlay } });
+          rawDispatch({ type: "botPatched", bot: applyBotPatch(bot, optimisticOverlay) });
         },
         onError: (error) => {
           rawDispatch({ type: "error", message: error.message });
@@ -2616,6 +2687,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             break;
           }
           void respond();
+          break;
+        }
+        case "approveAllRequests": {
+          api(`/api/threads/${action.threadId}/approve-all`, {
+            method: "POST",
+          }).catch((error) => {
+            showError(error);
+            action.onError?.(error instanceof Error ? error.message : String(error));
+          });
           break;
         }
         case "answerCard": {
@@ -3067,11 +3147,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // singleton speaker and microphone ordering for its whole lifetime.
             const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId || b.tasks?.some((t) => t.threadId === frame.threadId));
             if (owner && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
-              void speaker.speak(spokenReply(frame.message.text), {
+              // The reply as stored: the harness owns what is read, and the
+              // speaker's local fallback picks the written or voice half
+              // by the bot's mode.
+              void speaker.speak(frame.message.text, {
                 botId: owner.id,
                 messageId: frame.message.id,
                 threadId: frame.threadId,
-                voiceId: owner.voice,
+                // This Mac's own voice: its override, else the shared one.
+                voiceId: voiceForDevice(owner, "mac"),
+                scriptKind: voiceScriptKind(owner),
               });
             }
           }
@@ -3102,7 +3187,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           rawDispatch({
             type: "botPatched",
-            bot: { ...bot, ...botPatchQueue.overlayFor(bot.id) },
+            bot: applyBotPatch(bot, botPatchQueue.overlayFor(bot.id)),
           });
           break;
         }

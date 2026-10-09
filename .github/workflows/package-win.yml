@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -114,8 +114,14 @@ jobs:
           fi
           [ -f "$res/app-update.yml" ] || { echo "::error::missing $res/app-update.yml"; fail=1; }
           if [ -f "$res/app-update.yml" ]; then
+            # `owner` and `repo` are separate keys in the generated file, and
+            # only the repo was being checked — so a build that fell back to the
+            # former owner would have passed this gate while the error message
+            # claimed the owner was verified. Check both.
+            grep -q "^owner: Simple-With-Us$" "$res/app-update.yml" || {
+              echo "::error::app-update.yml does not point at Simple-With-Us/BotFleet releases"; fail=1; }
             grep -q "^repo: BotFleet$" "$res/app-update.yml" || {
-              echo "::error::app-update.yml does not point at jaywedgeworth22/BotFleet releases"; fail=1; }
+              echo "::error::app-update.yml does not point at Simple-With-Us/BotFleet releases"; fail=1; }
             # while the build is unsigned, a publisherName makes
             # electron-updater reject every update as untrusted
             if grep -q "publisherName" "$res/app-update.yml"; then
@@ -170,7 +176,7 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24

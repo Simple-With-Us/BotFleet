@@ -61,6 +61,10 @@ export const ENGINE_FIXTURES: readonly EngineFixture[] = [
   { displayName: "Qwen", driverKind: "qwenAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Hermes", driverKind: "hermesAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "MiniMax Code", driverKind: "mcodeAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
+  // Muse Code mounts MCP for the same reason every other ACP coding CLI does:
+  // the core answers every MCP flag from `mcpServers !== false`, and this
+  // driver does not opt out.
+  { displayName: "Muse Code", driverKind: "museAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
 
   // The remote agent.  Its driver declares no computer flag at all: the turn
   // runs on the box, so there is nothing to mount.

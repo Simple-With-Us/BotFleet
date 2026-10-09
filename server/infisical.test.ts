@@ -376,6 +376,55 @@ describe("probe", () => {
   });
 });
 
+describe("readPath", () => {
+  it("returns one folder's values to the caller and nowhere else", async () => {
+    withSettings({});
+    const fetchMock = loginThenList([{ secretKey: "ZULIP_BF_PLUMBER_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const values = await infisical.readPath("/zulip");
+
+    expect(values.get("ZULIP_BF_PLUMBER_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+    // the folder asked for, not the configured snapshot path
+    expect(String(fetchMock.mock.calls.at(-1)?.[0])).toContain("secretPath=%2Fzulip");
+    // never the snapshot, never the environment, never the status view
+    expect(infisicalSnapshot()).toBeNull();
+    expect(Object.values(process.env)).not.toContain(SENTINEL_VAULT_VALUE);
+    expect(JSON.stringify(infisical.getStatus())).not.toContain(SENTINEL_VAULT_VALUE);
+  });
+
+  it("reads another project's environment when the caller names one, with the same identity", async () => {
+    const settings = withSettings({});
+    const fetchMock = loginThenList([{ secretKey: "ZULIP_BF_PLUMBER_API_KEY", secretValue: SENTINEL_VAULT_VALUE }]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const values = await infisical.readPath("/zulip", { projectId: "afc-project-id", environment: "staging" });
+
+    expect(values.get("ZULIP_BF_PLUMBER_API_KEY")).toBe(SENTINEL_VAULT_VALUE);
+    const listUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
+    expect(listUrl.searchParams.get("workspaceId")).toBe("afc-project-id");
+    expect(listUrl.searchParams.get("environment")).toBe("staging");
+    expect(listUrl.searchParams.get("secretPath")).toBe("/zulip");
+    // one login, with the harness's own identity
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/login"))).toHaveLength(1);
+
+    // blank overrides fall back to the configured project and environment
+    await infisical.readPath("/zulip", { projectId: " ", environment: "" });
+    const ownUrl = new URL(String(fetchMock.mock.calls.at(-1)?.[0]));
+    expect(ownUrl.searchParams.get("workspaceId")).toBe(settings.projectId);
+    expect(ownUrl.searchParams.get("environment")).toBe(settings.environment);
+  });
+
+  it("refuses with no request when Infisical is turned off", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    withSettings({ enabled: false });
+
+    await expect(infisical.readPath("/zulip")).rejects.toThrow(/not configured and turned on/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("writeSecret", () => {
   it("refuses with 409 when write-through is off, without a request", async () => {
     const fetchMock = vi.fn();

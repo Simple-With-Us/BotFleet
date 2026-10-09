@@ -22,6 +22,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
 import { splitChatPrompt } from "./prompt-split.ts";
 import { toolFields } from "../tool-fields.ts";
@@ -343,7 +344,16 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
   // ~/.mmx/config.json (loadLocalMiniMaxConfig above), and only as one of
   // three key sources. "MiniMax CLI" told users to install and debug a
   // binary that has no bearing on whether a turn works.
-  metadata: { displayName: "MiniMax", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "MiniMax",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below, including what it
+    // does NOT declare: this driver mounts agents + local-computer tools and
+    // no Composio bridge, no screen channel, and no image input.  That
+    // absence is the reason the matrix shows connected apps as unavailable
+    // here while MiniMax Code shows them as available.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
+  },
   models: MODELS,
   install: {
     docsUrl: "https://platform.minimax.io/docs/token-plan/minimax-cli",
@@ -996,6 +1006,9 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           // server/tools/jobs.ts); helpers stay `delegate_bot`.
           backgroundJobs: "emulated",
           helpers: "none",
+          // Every tool with an `ask` policy opens a card on the in-process
+          // permission broker (server/tools/approvals.ts) before it runs.
+          reviewHook: "before",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
@@ -1029,6 +1042,21 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           stream: false,
         });
         return text.trim() ? text : reasoning;
+      },
+      // Auto-review on this same account: the utility model, no `tools`, the
+      // brief as the system message and the action as the user message,
+      // cancelled by the reviewer's deadline.
+      // Only the answer text counts as a verdict, never the reasoning.
+      reviewPermission: async (prompt: ReviewPrompt, signal?: AbortSignal) => {
+        const { text } = await complete(
+          [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.data },
+          ],
+          UTILITY_MODEL,
+          { stream: false, signal },
+        );
+        return text;
       },
       dispose: async () => {
         for (const { abort } of active.values()) abort.abort();

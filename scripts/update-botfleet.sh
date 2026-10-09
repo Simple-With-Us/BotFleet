@@ -14,12 +14,14 @@
 # short circuit; the skip happens here so a second `ubf` an hour later is
 # sub-second instead of a 2-minute interruption.
 #
-# WARNING:  force is not only "reinstall anyway".  The updater also treats it as
-# permission to update while work is active: it skips the idle requirement and
-# POSTs /api/runtime/quiesce?force=true, which interrupts busy bots and running
-# or queued routines.  Their work is saved to pending-update-resume.json and
-# resumed after the update, and a live room turn still refuses the forced
-# update.  Do not use it casually while bots are working.
+# Busy bots never block an update.  The updater asks BotFleet to hold new work,
+# gives the work already running a 60-second grace (--grace SECONDS), then
+# interrupts what is left, saves it to pending-update-resume.json and resumes it
+# after the update.  A live room turn is never interrupted; the updater waits a
+# few more minutes for rooms to go quiet, then stops without updating.
+# --wait-for-idle [MINUTES] never interrupts: it waits (20 minutes by default)
+# and stops without updating if bots are still busy.  --force skips the grace
+# and interrupts at once, and reinstalls even when already current.
 set -euo pipefail
 
 # Extend PATH with every place node is commonly found on macOS (Homebrew Apple
@@ -124,7 +126,9 @@ fi
 #     writes and settles a run that never writes one as "never started", so
 #     that run must not end here without a record.
 # Anything not on this allowlist (including --help, --source, --stage) goes to
-# the updater unchanged.
+# the updater unchanged.  --grace SECONDS and --wait-for-idle [MINUTES] are on
+# it: how busy bots are treated says nothing about whether there is anything
+# new to install.
 UP_TO_DATE_SHORTCUT=1
 case "${BOTFLEET_UPDATE_TARGET:-origin/main}" in
   origin/main) ;;
@@ -132,6 +136,7 @@ case "${BOTFLEET_UPDATE_TARGET:-origin/main}" in
 esac
 SHORTCUT_ARG_INDEX=0
 EXPECT_SHORTCUT_TARGET=0
+EXPECT_SHORTCUT_VALUE=0
 for arg in "$@"; do
   SHORTCUT_ARG_INDEX=$((SHORTCUT_ARG_INDEX + 1))
   if [[ "$EXPECT_SHORTCUT_TARGET" == "1" ]]; then
@@ -139,24 +144,78 @@ for arg in "$@"; do
     [[ "$arg" == "origin/main" ]] || UP_TO_DATE_SHORTCUT=0
     continue
   fi
+  # How busy work is treated changes nothing about whether there is anything
+  # to install, so these keep the up-to-date shortcut.
+  if [[ "$EXPECT_SHORTCUT_VALUE" == "1" ]]; then
+    EXPECT_SHORTCUT_VALUE=0
+    [[ "$arg" =~ ^[0-9]+(\.[0-9]+)?$ ]] && continue
+  fi
   case "$arg" in
     update) [[ "$SHORTCUT_ARG_INDEX" == "1" ]] || UP_TO_DATE_SHORTCUT=0 ;;
-    --force|-f|--no-open|--target=origin/main) ;;
+    --force|-f|--no-open|--target=origin/main|--grace=*|--wait-for-idle=*) ;;
+    --grace|--wait-for-idle) EXPECT_SHORTCUT_VALUE=1 ;;
     --target) EXPECT_SHORTCUT_TARGET=1 ;;
     *) UP_TO_DATE_SHORTCUT=0 ;;
   esac
 done
 [[ "$EXPECT_SHORTCUT_TARGET" == "0" ]] || UP_TO_DATE_SHORTCUT=0
 if [[ "${BOTFLEET_FORCE:-}" == "1" ]]; then
-  echo "WARNING:  BOTFLEET_FORCE=1 - running updater even if $BOTFLEET_CHECKOUT is already at origin/main.  This also interrupts busy bots and routines (they resume after the update)."
+  echo "WARNING:  BOTFLEET_FORCE=1 - running updater even if $BOTFLEET_CHECKOUT is already at origin/main.  This also interrupts busy bots and routines at once, with no grace (they resume after the update)."
 elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
   if git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin main 2>/dev/null; then
     LOCAL_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse HEAD)
     REMOTE_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse origin/main)
     if [[ "$LOCAL_HEAD" == "$REMOTE_HEAD" ]]; then
-      CURRENT=$(git -C "$BOTFLEET_CHECKOUT" log --oneline -1)
-      echo "OK: Already at $CURRENT.  Nothing to update.  (Set BOTFLEET_FORCE=1 or pass --force to reinstall anyway; that also interrupts busy bots and routines.)"
-      exit 0
+      IS_UP_TO_DATE=1
+
+      # 1. Compare against the installed Mac app's build identity.  Absence of
+      # the manifest is "we cannot tell what is installed", not "out of date":
+      # a developer checkout, a fixture, or an uninstalled app must not block
+      # the shortcut on its own.  Only a manifest that names a different commit
+      # counts as positive evidence of a mismatch.
+      APP_MANIFEST="${BOTFLEET_APP_PATH:-/Applications/BotFleet.app}/Contents/Resources/server/build-identity.json"
+      if [[ -f "$APP_MANIFEST" ]]; then
+        INSTALLED_COMMIT=$(APP_MANIFEST_PATH="$APP_MANIFEST" "$NODE_BIN" -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.env.APP_MANIFEST_PATH, "utf8")).sourceCommit) } catch { console.log("") }' 2>/dev/null) || INSTALLED_COMMIT=""
+        if [[ "$INSTALLED_COMMIT" =~ ^[0-9a-f]{40}$ && "$INSTALLED_COMMIT" != "$LOCAL_HEAD" ]]; then
+          IS_UP_TO_DATE=0
+        fi
+      fi
+
+      # 2. Compare against the running server's runtime commit.  Absence of
+      # the owner file or an unreachable runtime is also "no live harness to
+      # ask", not "out of date": only a runtime we could authenticate against
+      # and that answered with a different commit turns the shortcut off.
+      if [[ "$IS_UP_TO_DATE" == "1" ]]; then
+        OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/harness-owner.json"
+        if [[ -f "$OWNER_FILE" ]]; then
+          # The bearer credential is never read from harness-owner.json in this
+          # wrapper: it must arrive via BOTFLEET_OWNER_NONCE.  A live owner
+          # record means the harness was adopted, so a missing or rejected
+          # credential must fail fast instead of pretending the runtime check
+          # passed.  The helper reads only the port from the owner file and
+          # writes just a commit SHA to stdout.
+          : "${BOTFLEET_OWNER_NONCE:?BotFleet updater: BOTFLEET_OWNER_NONCE is required when a harness owner record exists.}"
+          RUNTIME_PROBE_ERR="$(mktemp "${TMPDIR:-/tmp}/botfleet-runtime-probe.XXXXXX")"
+          if ! RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" BOTFLEET_OWNER_NONCE="$BOTFLEET_OWNER_NONCE" "$NODE_BIN" "$SCRIPT_DIR/update-botfleet-runtime-commit.mjs" 2>"$RUNTIME_PROBE_ERR"); then
+            if [[ -s "$RUNTIME_PROBE_ERR" ]]; then
+              cat "$RUNTIME_PROBE_ERR" >&2
+            fi
+            rm -f "$RUNTIME_PROBE_ERR"
+            echo "BotFleet updater: could not verify the running harness commit (credential BOTFLEET_OWNER_NONCE)." >&2
+            exit 1
+          fi
+          rm -f "$RUNTIME_PROBE_ERR"
+          if [[ "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
+            IS_UP_TO_DATE=0
+          fi
+        fi
+      fi
+
+      if [[ "$IS_UP_TO_DATE" == "1" ]]; then
+        CURRENT=$(git -C "$BOTFLEET_CHECKOUT" log --oneline -1)
+        echo "OK: Already at $CURRENT.  Nothing to update.  (Set BOTFLEET_FORCE=1 or pass --force to reinstall anyway; that also interrupts busy bots and routines.)"
+        exit 0
+      fi
     fi
   else
     echo "WARNING:  Could not fetch origin/main from $BOTFLEET_CHECKOUT; running updater anyway."
@@ -297,6 +356,8 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
           scripts/update-botfleet-mac.mjs \
           scripts/mac-update-transaction.mjs \
           scripts/update-progress.mjs \
+          scripts/ci-build-resolver.mjs \
+          scripts/stage-entries.mjs \
           electron/update-credential-preparation.mjs | tar -x -C "$BOOTSTRAP_DIR"; then
         PINNED_ARGS=()
         if [[ "${1:-update}" != "apply" && "${1:-update}" != "unquiesce" ]]; then

@@ -40,6 +40,7 @@ export const JOB_ENGINE_FIXTURES: readonly JobEngineFixture[] = [
   { displayName: "Grok CLI", driverKind: "grokAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
   { displayName: "Kimi", driverKind: "kimiAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
   { displayName: "mcode", driverKind: "mcodeAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
+  { displayName: "Muse Code", driverKind: "museAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server, forwarded through the muse-code-acp adapter" },
   { displayName: "Cursor", driverKind: "cursorAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
   { displayName: "Droid", driverKind: "droidAgent", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },
   { displayName: "opencode", driverKind: "opencodeGo", capabilities: { agentsMcp: true, backgroundJobs: "emulated" }, lane: "mcp", because: "agents MCP server" },

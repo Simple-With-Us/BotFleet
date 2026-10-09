@@ -44,7 +44,11 @@ test("--json with no synced target exits 0 and prints an empty targets list", { 
       stdout = execFileSync("bash", [SCRIPT, "--target", "local", "--home", home, "--json"], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
-        env: { ...process.env, HOME: home, PATH: "/usr/bin:/bin" },
+        env: {
+          ...process.env,
+          HOME: home,
+          PATH: `${process.execPath.replace(/\/node$/, "")}:/usr/bin:/bin`,
+        },
       });
     } catch (err) {
       assert.fail(`script crashed on the no-targets path (bash 3.2 empty-array regression?): ${err.message}`);

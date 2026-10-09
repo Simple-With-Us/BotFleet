@@ -20,12 +20,9 @@ import {
   MAX_COMPANION_ENDPOINTS,
   type CompanionEndpoint,
 } from "./endpoints.ts";
-import {
-  companionProfilePatchDenial,
-  denyReason,
-  isCloudDesktopJoin,
-  isCompanionProfilePatch,
-} from "./routes.ts";
+import { companionBodyCheck, denyReason, isCloudDesktopJoin } from "./routes.ts";
+import { cleanDeviceName, parsePairRequestId } from "./devices.ts";
+import { isJsonObject, type JsonObject, type JsonValue } from "./json.ts";
 import { createSseScrubber, isJson, scrub } from "./wire.ts";
 
 /** What the forwarding handler needs from the process around it. */
@@ -39,8 +36,8 @@ export interface ProxyOptions {
    * own concern, and the one thing a device does before it has a token. */
   redeem: (
     code: string,
-    deviceName: unknown,
-    pairRequestId?: unknown,
+    deviceName: string,
+    pairRequestId?: string | null,
   ) => { token: string; device: unknown } | { error: string };
   /** What the phone should call this computer in its connection list. */
   serverName: () => string;
@@ -86,7 +83,7 @@ const MAX_JSON_BODY_BYTES = 32 * 1024 * 1024;
 
 /** Read a JSON body, bounded. An unbounded read on an unauthenticated route
  * is a way to be memory-exhausted by anyone who can reach the port. */
-const readJson = (req: IncomingMessage, limit = 64 * 1024): Promise<Record<string, unknown>> =>
+const readJson = (req: IncomingMessage, limit = 64 * 1024): Promise<JsonObject> =>
   new Promise((resolve, reject) => {
     let size = 0;
     const chunks: Buffer[] = [];
@@ -104,12 +101,13 @@ const readJson = (req: IncomingMessage, limit = 64 * 1024): Promise<Record<strin
       const text = Buffer.concat(chunks).toString("utf8").trim();
       if (!text) return resolve({});
       try {
-        const parsed: unknown = JSON.parse(text);
-        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        // SAFETY: JSON.parse without a reviver only produces JsonValue-shaped data.
+        const parsed = JSON.parse(text) as JsonValue;
+        if (!isJsonObject(parsed)) {
           reject(new Error("body must be a JSON object"));
           return;
         }
-        resolve(parsed as Record<string, unknown>);
+        resolve(parsed);
       } catch {
         reject(new Error("invalid JSON body"));
       }
@@ -169,7 +167,7 @@ const endpointSnapshot = (options: ProxyOptions): CompanionEndpointSnapshot => {
     if (
       !candidate ||
       !COMPANION_ENDPOINT_KINDS.includes(candidate.kind) ||
-      typeof candidate.url !== "string" ||
+      Object.prototype.toString.call(candidate.url) !== "[object String]" ||
       !Number.isSafeInteger(candidate.priority) ||
       candidate.priority < 0 ||
       candidate.priority > 10_000 ||
@@ -275,8 +273,8 @@ export function createProxyHandler(options: ProxyOptions) {
           // `code` remains accepted for manual entry and older mobile builds.
           const result = options.redeem(
             String(body.credential ?? body.code ?? ""),
-            body.deviceName,
-            body.pairRequestId,
+            cleanDeviceName(body.deviceName),
+            parsePairRequestId(body.pairRequestId),
           );
           if ("error" in result) return sendJson(res, 401, { error: result.error });
           // `hosts` rides along whichever way the phone paired — QR, typed
@@ -336,18 +334,23 @@ export function createProxyHandler(options: ProxyOptions) {
       return;
     }
 
+    // Routes that reach a broader harness handler (the bot profile and the
+    // bot organize PATCHes) have their body checked against a field
+    // allowlist first.  What is forwarded is the re-serialized, validated
+    // object, never the bytes the phone sent.
     let forwardedBody: Buffer | undefined;
-    if (isCompanionProfilePatch(method, path)) {
-      let body: Record<string, unknown>;
+    const bodyCheck = companionBodyCheck(method, path);
+    if (bodyCheck) {
+      let body: JsonObject;
       try {
         body = await readJson(req);
       } catch (error) {
         sendJson(res, 400, { error: error instanceof Error ? error.message : "invalid JSON body" });
         return;
       }
-      const profileDenial = companionProfilePatchDenial(body);
-      if (profileDenial) {
-        sendJson(res, profileDenial.status, { error: profileDenial.error });
+      const bodyDenial = bodyCheck(body);
+      if (bodyDenial) {
+        sendJson(res, bodyDenial.status, { error: bodyDenial.error });
         return;
       }
       forwardedBody = Buffer.from(JSON.stringify(body));

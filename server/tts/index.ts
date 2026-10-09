@@ -3,6 +3,8 @@
 // (system-voices.ts, no key).  This file is only the part that reads
 // ~/.botfleet/config.json, picks the engine, and decides whether there
 // is a voice at all.
+import { isPersonalVoiceId, readableVoiceId } from "../../shared/bot-voice.ts";
+import { applyPronunciations, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
 import type { AppConfig } from "../config.ts";
 import * as minimax from "./minimax.ts";
 import * as systemVoices from "./system-voices.ts";
@@ -49,9 +51,10 @@ export function voiceConfigured(cfg: AppConfig): boolean {
   return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
 
+/** The prefix rule lives in shared/bot-voice.ts so the clients and the
+ * iOS mirror cannot drift from what the harness refuses to synthesize. */
 export function isPersonalVoice(voiceId?: string): boolean {
-  if (!voiceId) return false;
-  return voiceId.startsWith("personal:") || voiceId.startsWith("apple-personal:");
+  return isPersonalVoiceId(voiceId);
 }
 
 /** A per-bot voice is a complete choice too; it should not be blocked just
@@ -67,8 +70,17 @@ export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
   return Boolean(cfg.tts?.key && (voiceId || cfg.tts?.voice));
 }
 
+/** The pronunciation list in force: the saved one, or the seeded defaults
+ * when it has never been saved (shared/pronunciations.ts). */
+export function pronunciations(cfg: AppConfig): readonly Pronunciation[] {
+  return effectivePronunciations(cfg.tts?.pronunciations);
+}
+
 /** What the settings panel needs. Never includes the key — same write-only
- * rule as every other credential. */
+ * rule as every other credential.  `voice` is the workspace default voice
+ * (every bot without a voice of its own speaks with it); it is a setting,
+ * not a secret, so both clients show it by name.  `pronunciations` is the
+ * list in force, defaults included, so a client never has to know them. */
 export function describeVoice(cfg: AppConfig) {
   return {
     configured: providerConfigured(cfg),
@@ -76,6 +88,7 @@ export function describeVoice(cfg: AppConfig) {
     voice: cfg.tts?.voice || "",
     provider: voiceProvider(cfg),
     optimizedSummary: cfg.tts?.optimizedSummary === true,
+    pronunciations: pronunciations(cfg).map((entry) => ({ term: entry.term, say: entry.say })),
   };
 }
 
@@ -98,7 +111,7 @@ export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Pro
   }
   if (cfg.tts?.voice && !voices.some((v) => v.id === cfg.tts?.voice)) {
     const defaultVoiceId = cfg.tts.voice;
-    voices.unshift({ id: defaultVoiceId, label: defaultVoiceId, description: "Workspace default" });
+    voices.unshift({ id: defaultVoiceId, label: readableVoiceId(defaultVoiceId), description: "Workspace default" });
   }
   return voices;
 }
@@ -116,9 +129,19 @@ export function listCustomVoices() {
 }
 
 /** Synthesize one utterance. Throws NoVoiceConfigured when there is nothing
- * to speak with, which the route turns into a 409 the client can explain. */
-export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: systemVoices.Runner) {
-  if (isPersonalVoice(voiceId)) {
+ * to speak with, which the route turns into a 409 the client can explain.
+ *
+ * The pronunciation list is applied here, the one layer every hosted and
+ * built-in synthesis goes through (message clips, Try, call mode), and only
+ * to the text sent to the engine: scripts and clip caches never see it, so a
+ * list edit re-bills nothing and applies to new synthesis only.  The list is
+ * idempotent (shared/pronunciations.ts), so text that already says "sequel"
+ * is left as it is. */
+export function speak(cfg: AppConfig, rawText: string, voiceId?: string, run?: systemVoices.Runner) {
+  const text = applyPronunciations(rawText, pronunciations(cfg));
+  // The workspace default can be a Personal Voice too; it must never reach
+  // a hosted engine as if it were one of that engine's ids.
+  if (isPersonalVoice(voiceId || cfg.tts?.voice)) {
     throw new Error("Apple Personal Voices speak on-device on authorized Apple devices (macOS and iOS) and cannot be synthesized on the server.");
   }
   if (voiceProvider(cfg) === "system") {

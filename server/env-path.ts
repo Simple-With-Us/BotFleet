@@ -31,10 +31,17 @@ function nvmBinDirs(): string[] {
 function knownDirs(): string[] {
   const home = homedir();
   return [
+    // Canonical installer dirs FIRST, before the ~/.local/bin symlink farm.
+    // The MiniMax Code installer drops a `~/.local/bin/mcode` symlink, but the
+    // launcher it points at resolves its own data dir from the parent of its
+    // own path — so invoked through the symlink it looks for `~/.local/current`
+    // and exits non-zero.  The canonical copy under `~/.minimax-code/bin` is
+    // the one that runs, and a GUI launch inherits a PATH with no mcode in it,
+    // so knownDirs order is the only thing that decides which one gets picked.
+    join(home, ".minimax-code", "bin"), // MiniMax Code CLI installer (mcode)
+    join(home, ".kimi-code", "bin"), // kimi-code installer
     join(home, ".local", "bin"), // claude installer default
     join(home, ".npm-global", "bin"), // npm prefix ~/.npm-global (claude, opencode)
-    join(home, ".kimi-code", "bin"), // kimi-code installer
-    join(home, ".minimax-code", "bin"), // MiniMax Code CLI installer (mcode)
     join(home, ".grok", "bin"), // x.ai installer
     join(home, ".opencode", "bin"), // opencode installer
     join(home, ".claude", "local"), // claude "local install"
@@ -118,8 +125,84 @@ export function augmentedPath(): string {
   return cached;
 }
 
+/** Installer dirs that must stay ahead of the `~/.local/bin` symlink farm,
+ * keyed by dir name and mapped to the CLI shim that installer drops into the
+ * farm.  The MiniMax Code installer drops a `~/.local/bin/mcode` symlink at
+ * a launcher that is not symlink-safe (it resolves its data dir from the
+ * parent of its own path, so through the symlink it reads
+ * `~/.local/current` and exits non-zero), and kimi-code symlinks `kimi` the
+ * same way.  Whichever copy comes first in PATH is the one that runs, so the
+ * canonical dir has to win when, and only when, the farm carries the shim. */
+const CANONICAL_INSTALLER_DIRS = {
+  ".minimax-code": "mcode",
+  ".kimi-code": "kimi",
+} as const satisfies Readonly<Record<string, string>>;
+
+/** Move a canonical installer dir ahead of `~/.local/bin` in a finished
+ * PATH, when the farm actually shadows that installer's CLI.  Ordering
+ * knownDirs() alone does not hold that precedence: `augmentedPath()` merges
+ * OMB_EXTRA_PATH, the inherited PATH and the login-shell probe AHEAD of
+ * knownDirs(), and any of those can carry `~/.local/bin`.  A GUI launch hits
+ * exactly that case, and every `resetPathCache()` (a rescan,
+ * `/api/cli-candidates`) rebuilds the merge with those sources first, so the
+ * symlink farm won again on the very next rebuild.  This runs on every
+ * merge, so the invariant holds whichever source supplied each dir.
+ *
+ * What the move does and does not change: a hoisted dir is inserted
+ * immediately ahead of the farm, so it jumps every entry that sat between
+ * the farm and its original slot.  When the farm leads PATH (the GUI-launch
+ * shape) that includes `/usr/bin`, `/usr/local/bin`, Homebrew and nvm bins,
+ * so any binary the canonical dir shares with one of those entries resolves
+ * differently afterwards.  That is why the move is gated rather than
+ * unconditional: it happens only when the farm carries the installer's shim
+ * (`~/.local/bin/mcode`, `~/.local/bin/kimi`) and the canonical dir carries
+ * the real CLI it shadows.  A machine whose farm has no such shim keeps its
+ * merged PATH order exactly, and a canonical dir that is absent from the
+ * merged list (uninstalled, or filtered out by knownDirs' existsSync) is
+ * never injected.
+ *
+ * The hoisted dir is dropped from its ORIGINAL position rather than left to
+ * appear twice: `mergePaths` dedupes before calling this, so a dir inserted
+ * ahead of the farm would otherwise also still be emitted when the walk
+ * reaches its old slot, and PATH would carry it twice.  `seen` is what makes
+ * each dir appear exactly once, hoisted position winning. */
+function promoteCanonicalDirs(parts: string[]): string[] {
+  const symlinkFarm = join(homedir(), ".local", "bin");
+  const farmIndex = parts.indexOf(symlinkFarm);
+  if (farmIndex === -1) return parts;
+  const toHoist = Object.entries(CANONICAL_INSTALLER_DIRS)
+    .map(([name, shim]) => ({ dir: join(homedir(), name, "bin"), shim }))
+    .filter(
+      ({ dir, shim }) =>
+        // Only a dir the farm currently outranks needs moving.  A dir
+        // already ahead of the farm keeps its inherited place, and a dir the
+        // merged list does not carry (indexOf -1) is never injected.
+        parts.indexOf(dir) > farmIndex &&
+        // Only when the farm really shadows this CLI, and the canonical dir
+        // really has the copy that should win.
+        existsSync(join(symlinkFarm, shim)) &&
+        existsSync(join(dir, shim)),
+    )
+    .map(({ dir }) => dir);
+  if (toHoist.length === 0) return parts;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const part of parts) {
+    if (part === symlinkFarm) {
+      for (const dir of toHoist) {
+        out.push(dir);
+        seen.add(dir);
+      }
+    }
+    if (seen.has(part)) continue;
+    out.push(part);
+    seen.add(part);
+  }
+  return out;
+}
+
 function mergePaths(parts: string[]): string {
-  return [...new Set(parts.filter(Boolean))].join(delimiter);
+  return promoteCanonicalDirs([...new Set(parts.filter(Boolean))]).join(delimiter);
 }
 
 function probeLoginShellPath(): void {

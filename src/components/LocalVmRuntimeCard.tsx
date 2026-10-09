@@ -3,7 +3,7 @@
 // for provider toggles + matrix without silently dropping the one-click
 // container install that operators rely on.  Behavior is unchanged from
 // the prior file: a status poll against `/api/local-computer`, four
-// numbered setup steps (install runtime / open runtime / prepare Cua
+// numbered setup steps (install runtime / open runtime / prepare BotFleet
 // desktop / create VM), a per-bot-vs-shared switch that hits
 // `/api/local-computer/mode`, and a Safety / Storage card with stop /
 // delete controls.
@@ -18,7 +18,16 @@ import { api, useStore, type ConfigStatus } from "@/state/store";
 import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { productErrorHeadline } from "@/lib/product-error";
+import { redactCommandSecrets } from "@/lib/redact-command-secrets";
+import { localVmSetupLine } from "@/lib/local-vm-setup-line";
+import { PersistentActionErrorCard } from "./PersistentActionErrorCard";
+
+// Must outlast the harness's worst case for one status read: a 4 s presence
+// check, then the runtime health probe, which retries once on a timeout (two
+// 12 s attempts).  A shorter wait aborts the request in exactly the case the
+// "slow to respond" message exists for, and each abandoned request keeps
+// running on the harness.
+const STATUS_TIMEOUT_MS = 40_000;
 
 type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
 
@@ -27,6 +36,8 @@ interface Status {
   runtime: string | null;
   available: string[];
   daemonUp: boolean;
+  /** Installed, but its health check timed out twice: unknown, not stopped. */
+  daemonSlow?: boolean;
   image: boolean;
   imageMatches: boolean;
   managed: boolean;
@@ -112,7 +123,8 @@ export function LocalVmRuntimeCard() {
   const [status, setStatus] = useState<Status | null>(null);
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<Action | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<null | { title: string; body: string; confirmLabel: string; action: Action }>(null);
   const [modePending, setModePending] = useState(false);
   const [modeError, setModeError] = useState<string | null>(null);
@@ -138,7 +150,7 @@ export function LocalVmRuntimeCard() {
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error ?? `Status request failed (${response.status})`);
     setStatus(body as Status);
-    setError(null);
+    setStatusError(null);
   }, []);
 
   useEffect(() => {
@@ -147,14 +159,26 @@ export function LocalVmRuntimeCard() {
     let controller: AbortController | undefined;
     const poll = async () => {
       controller = new AbortController();
+      let timedOut = false;
+      const timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller?.abort();
+      }, STATUS_TIMEOUT_MS);
       try {
         await refresh(controller.signal);
       } catch (e) {
-        if (active && !(e instanceof DOMException && e.name === "AbortError")) {
-          setStatus(null);
-          setError(e instanceof Error ? e.message : String(e));
-        }
+        if (!active) return;
+        if (e instanceof DOMException && e.name === "AbortError" && !timedOut) return;
+        const message = e instanceof Error ? e.message : String(e);
+        setStatusError(
+          redactCommandSecrets(
+            timedOut
+              ? `Status check timed out after ${Math.round(STATUS_TIMEOUT_MS / 1000)} seconds. The container runtime may be busy or not responding.`
+              : message,
+          ),
+        );
       } finally {
+        window.clearTimeout(timeoutId);
         if (active) {
           setLoading(false);
           timer = window.setTimeout(() => void poll(), 5000);
@@ -200,7 +224,7 @@ export function LocalVmRuntimeCard() {
       return;
     }
     setPending(action);
-    setError(null);
+    setActionError(null);
     try {
       if (action === "recreate") {
         await post("remove");
@@ -210,7 +234,7 @@ export function LocalVmRuntimeCard() {
       }
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setActionError(redactCommandSecrets(e instanceof Error ? e.message : String(e)));
     } finally {
       setPending(null);
     }
@@ -228,7 +252,7 @@ export function LocalVmRuntimeCard() {
         status?.security === "unsafe" ||
         status?.persistence === "unsafe"),
   );
-  const unavailable = !loading && !status;
+  const unavailable = !loading && !status && Boolean(statusError);
   const host = status?.platform === "darwin" ? "Mac" : "computer";
   const perBotRuntimeUnsupported = perBot && status?.runtime === "container";
   const headerReady = perBot ? Boolean(status?.daemonUp && status?.image && !perBotRuntimeUnsupported) : ready;
@@ -248,25 +272,14 @@ export function LocalVmRuntimeCard() {
       .finally(() => setModePending(false));
   };
 
-  const updateVmConfig = (patch: { shareCliCredentials?: boolean; allowHostTerminal?: boolean }) => {
-    api("/api/config", {
-      method: "PUT",
-      body: JSON.stringify({ localVm: patch }),
-    })
-      .then((config: ConfigStatus) => {
-        dispatch({ type: "configStatus", config });
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  };
-
   return (
     <>
       <Card
         id="setting-computers-local-vm"
         title="Local VM"
         subtitle={perBot
-          ? `Private Cua Linux desktops on this ${host}, with one container and durable workspace per bot.\u00a0 Distinct bots can work concurrently and idle desktops stop after 8 hours.`
-          : `A shared Cua Linux sandbox on this ${host} for bots to browse and work in, each on its own desktop, backed by one durable workspace and automatically recycled after 8 hours without activity.`}
+          ? `Private Linux desktops on this ${host}, with one container and durable workspace per bot.\u00a0 Distinct bots can work concurrently and idle desktops stop after 8 hours.`
+          : `A shared Linux sandbox on this ${host} for bots to browse and work in, each on its own desktop, backed by one durable workspace and automatically recycled after 8 hours without activity.`}
       >
         <div className="flex flex-wrap items-center gap-2">
           <span
@@ -286,7 +299,7 @@ export function LocalVmRuntimeCard() {
                     ? "Per-bot mode requires Docker or Podman"
                   : ready
                     ? "Ready"
-                    : (status?.problem ?? "Not ready")}
+                    : localVmSetupLine(status, perBot)}
           </span>
           <button
             onClick={() => {
@@ -305,11 +318,20 @@ export function LocalVmRuntimeCard() {
               rel="noreferrer"
               className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink hover:bg-control"
             >
-              <ExternalLink size={12} /> Watch screen
+              <ExternalLink size={12} /> Watch Screen
             </a>
           )}
         </div>
-        {error && <div className="mt-3 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger" title={error}>{productErrorHeadline(error)}</div>}
+        {statusError && (
+          <div className="mt-3">
+            <PersistentActionErrorCard message={statusError} onDismiss={() => setStatusError(null)} />
+          </div>
+        )}
+        {actionError && (
+          <div className="mt-3">
+            <PersistentActionErrorCard message={actionError} onDismiss={() => setActionError(null)} />
+          </div>
+        )}
       </Card>
 
       <Card
@@ -352,45 +374,7 @@ export function LocalVmRuntimeCard() {
         {modeError && <div className="mt-2 text-[11.5px] text-danger">{modeError}</div>}
       </Card>
 
-      <Card
-        id="setting-computers-cli-credentials"
-        title="Host & CLI Integration"
-        subtitle="Manage CLI authentication and terminal access for bots using the Local VM."
-      >
-        <div className="flex flex-col gap-3">
-          <label className="flex cursor-pointer items-start gap-3">
-            <input
-              type="checkbox"
-              checked={Boolean(state.config?.localVm?.shareCliCredentials)}
-              onChange={(e) => updateVmConfig({ shareCliCredentials: e.target.checked })}
-              className="mt-0.5 rounded border-hairline/40 accent-accent"
-            />
-            <div className="text-[13px]">
-              <div className="font-medium text-ink">Share Host CLI Credentials with Local VM</div>
-              <div className="text-[12px] text-ink-secondary">
-                Mounts read-only host CLI credentials (~/.infisical, ~/.ssh, ~/.docker, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) into the container so tools run inside the VM are signed into your accounts.
-              </div>
-            </div>
-          </label>
-
-          <label className="flex cursor-pointer items-start gap-3">
-            <input
-              type="checkbox"
-              checked={Boolean(state.config?.localVm?.allowHostTerminal)}
-              onChange={(e) => updateVmConfig({ allowHostTerminal: e.target.checked })}
-              className="mt-0.5 rounded border-hairline/40 accent-accent"
-            />
-            <div className="text-[13px]">
-              <div className="font-medium text-ink">Host Shell Execution with VM Screen (Hybrid Mode)</div>
-              <div className="text-[12px] text-ink-secondary">
-                Enables bots using the Local VM to execute shell commands and tests in your host Mac terminal environment, while keeping all mouse clicks, typing, and desktop viewing strictly inside the VM.
-              </div>
-            </div>
-          </label>
-        </div>
-      </Card>
-
-      <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares Cua and the VM for you.">
+      <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares the Linux desktop and the VM for you.">
         <div className="flex flex-col gap-4">
           <Step n={1} title="Install a Container Runtime" done={Boolean(status?.runtime)}>
             <div className="text-[13px] leading-relaxed text-ink-secondary">
@@ -407,26 +391,36 @@ export function LocalVmRuntimeCard() {
 
           <Step
             n={2}
-            title={status?.runtime && !status.daemonUp ? `Open and start ${status.runtime}` : "Start the container runtime"}
+            title={
+              status?.runtime && status.daemonSlow && !status.daemonUp
+                ? `Waiting for ${status.runtime} to respond`
+                : status?.runtime && !status.daemonUp
+                  ? `Open and start ${status.runtime}`
+                  : "Start the container runtime"
+            }
             done={Boolean(status?.daemonUp)}
           >
-            {!status?.runtime ? null : c?.runtimeStart ? (
+            {!status?.runtime ? null : status.daemonSlow && !status.daemonUp ? (
+              <div className="text-[13px] text-ink-secondary">
+                The container runtime ({status.runtime}) is installed but did not answer in time, usually because this {host} is busy.{"\u00a0 "}BotFleet keeps checking.
+              </div>
+            ) : c?.runtimeStart ? (
               <CommandLine command={c.runtimeStart} />
             ) : (
               <div className="text-[13px] text-ink-secondary">Open the installed runtime and start its engine, then re-check.</div>
             )}
           </Step>
 
-          <Step n={3} title="Prepare the Cua Desktop (one-time download and build)" done={Boolean(status?.image)}>
+          <Step n={3} title="Prepare the Linux Desktop (One-Time Download and Build)" done={Boolean(status?.image)}>
             {status?.daemonUp && (
-              <ActionButton action="pull" pending={pending} onClick={() => void act("pull")}>Prepare Cua Desktop</ActionButton>
+              <ActionButton action="pull" pending={pending} onClick={() => void act("pull")}>Prepare Linux Desktop</ActionButton>
             )}
             {c?.pull && <details className="text-[12px] text-ink-secondary"><summary className="cursor-pointer">Show Base-Image Download</summary><div className="mt-2"><CommandLine command={c.pull} /></div></details>}
           </Step>
 
           <Step
             n={4}
-            title={perBot ? "Create a private desktop from each bot's Computer panel" : needsRecreate ? "Replace the older or unsafe VM" : "Create and start the Local VM"}
+            title={perBot ? "Create a Private Desktop from Each Bot's Computer Panel" : needsRecreate ? "Replace the Older or Unsafe VM" : "Create and Start the Local VM"}
             done={!perBot && ready}
           >
             {perBot ? (
@@ -445,18 +439,39 @@ export function LocalVmRuntimeCard() {
                 </div>
                 {status?.image ? (
                   <ActionButton action="recreate" pending={pending} onClick={() => void act("recreate")} danger disabled={localVmOff}>
-                    <RotateCcw size={13} /> Delete and recreate
+                    <RotateCcw size={13} /> Delete and Recreate
                   </ActionButton>
                 ) : (
-                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Cua desktop above before replacing this VM.</div>
+                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Linux desktop above before replacing this VM.</div>
                 )}
               </>
             ) : status?.container === "stopped" ? (
-              <ActionButton action="start" pending={pending} onClick={() => void act("start")} disabled={localVmOff}>Start Local VM</ActionButton>
+              <>
+                <div className="flex gap-2 text-[13px] text-warning">
+                  <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+                  <span>{status?.problem ?? "This desktop cannot be resumed safely. Create a new Local VM instead."}</span>
+                </div>
+                {status?.image ? (
+                  <ActionButton action="recreate" pending={pending} onClick={() => void act("recreate")} danger disabled={localVmOff}>
+                    <RotateCcw size={13} /> Delete and recreate
+                  </ActionButton>
+                ) : (
+                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Linux desktop above before recreating this VM.</div>
+                )}
+              </>
             ) : status?.container === "running" ? (
               <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={13} className="animate-spin" /> Waiting for the desktop…</div>
             ) : status?.image ? (
               <ActionButton action="run" pending={pending} onClick={() => void act("run")} disabled={localVmOff}>Create Local VM</ActionButton>
+            ) : status ? (
+              // The VM comes last: say which step is still ahead of it.
+              <div className="text-[13px] text-ink-secondary">
+                {status.daemonUp
+                  ? "Prepare the Linux desktop above first.\u00a0 Then create the VM here."
+                  : status.daemonSlow
+                    ? "Waiting for the container runtime to respond."
+                    : "Start the container runtime above first."}
+              </div>
             ) : null}
             {localVmOff && !perBot && (
               <div className="text-[13px] text-ink-secondary">Local VM is turned off in Computer settings.{"\u00a0 "}Turn it on above to create or start it.</div>
@@ -478,8 +493,8 @@ export function LocalVmRuntimeCard() {
       <Card
         title="Safety and Storage"
         subtitle={perBot
-          ? `Cua Driver operates only this VM's desktop.\u00a0 Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement.\u00a0 Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container.\u00a0 Each VM keeps the existing 8 GB, 4 CPU, 512-process and dropped-capability limits.\u00a0 VMs can still reach the internet.`
-          : `Cua Driver operates only the VM's desktop.\u00a0 Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable.\u00a0 The password-protected viewer is available only on this machine.\u00a0 Docker and Podman runs are limited to 8 GB memory, 4 CPUs and 512 processes; all Linux capabilities are dropped except the two the desktop supervisor needs to switch to its unprivileged user.\u00a0 The VM can still reach the internet, and every bot sees the same files and sign-ins.`}
+          ? `Computer Driver operates only this VM's desktop.\u00a0 Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement.\u00a0 Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container.\u00a0 CPU and memory are sized to your container runtime (about 2 CPUs and 2–3 GiB by default), with a 512-process cap and dropped Linux capabilities.\u00a0 VMs can still reach the internet.`
+          : `Computer Driver operates only the VM's desktop.\u00a0 Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable.\u00a0 The password-protected viewer is available only on this machine.\u00a0 Docker and Podman runs are sized to your runtime (about 2 CPUs and 2–3 GiB by default), capped at 512 processes, with all Linux capabilities dropped except the two the desktop supervisor needs.\u00a0 The VM can still reach the internet, and every bot sees the same files and sign-ins.`}
       >
         {existing && (
           <div className="flex flex-wrap gap-2">
@@ -495,7 +510,7 @@ export function LocalVmRuntimeCard() {
         )}
         <div className="mt-3 break-all text-[11px] text-ink-secondary">
           Durable workspace: {status?.workspace_path ?? "not created"} ·{" "}
-          Cua Driver: {status?.driver_version ?? "0.20.0"} · Local image: {status?.image_ref ?? "not prepared"}
+          Computer Driver: {status?.driver_version ?? "0.20.0"} · Local image: {status?.image_ref ?? "not prepared"}
           {status?.base_image_ref ? <> · Base: {status.base_image_ref}</> : null}
         </div>
       </Card>

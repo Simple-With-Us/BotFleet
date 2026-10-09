@@ -16,7 +16,9 @@ import { clockReadingAt, elapsedSince, KNOWN_VERSION_MAX_AGE_MS, readClock, type
 import { applyMiniMaxBalanceToRegistry, getCachedLocalMiniMaxConfig, getMiniMaxBalance } from "../minimax-balance.ts";
 import { quotaCooldowns } from "../model-fallback.ts";
 import { computerReach, type ComputerReach } from "../computer-capability.ts";
+import type { ReviewHook } from "../../shared/auto-review.ts";
 import { quotaProviderForDriver } from "../quota-window-map.ts";
+import { bypassCoverage, type BypassCoverage } from "../../shared/bypass-coverage.ts";
 import type {
   AnyProviderDriver,
   InstanceConfig,
@@ -51,6 +53,7 @@ const RESERVED_INSTANCE_ID = new Map<string, InstanceId>([
   ["hermesAgent", "hermes"],
   ["piAgent", "pi"],
   ["mcodeAgent", "mcode"],
+  ["museAgent", "muse"],
 ]);
 
 export function isCustomInstance(driverKind: string, instanceId: InstanceId): boolean {
@@ -61,6 +64,8 @@ export function isCustomInstance(driverKind: string, instanceId: InstanceId): bo
  * be probed in parallel, and on a saturated Mac the pile-up is what pushed
  * each CLI past its own deadline. */
 const DEFAULT_PROBE_CONCURRENCY = 6;
+/** When the host is hot, cap parallel engine probes this low. */
+const DEFAULT_HOT_PROBE_CONCURRENCY = 2;
 /** How long one engine may take to describe before the sweep answers for it
  * from its last definitive snapshot.  The probe keeps running; its answer is
  * folded in (and pushed to clients) when it lands. */
@@ -80,11 +85,21 @@ const DEFINITIVE_MAX_AGE_MS = KNOWN_VERSION_MAX_AGE_MS;
 const DEFAULT_TRANSIENT_RECHECK_MS = 20_000;
 const TRANSIENT_RECHECK_MAX_MS = 5 * 60_000;
 
+export interface DescribeOptions {
+  maxAgeMs?: number;
+  staleWhileRevalidate?: boolean;
+  /** User-initiated refresh — probe even when the host is hot. */
+  force?: boolean;
+}
+
 export interface ProviderRegistryOptions {
   probeConcurrency?: number;
   entryDeadlineMs?: number;
   /** First re-check delay for "Checking" engines; 0 turns re-checks off. */
   transientRecheckMs?: number;
+  /** Same signal as webhook dispatch deferral (`webhookDispatchHot`). */
+  hostHot?: () => boolean;
+  hotProbeConcurrency?: number;
 }
 
 /** The sweep queued behind the running one for callers who must not be
@@ -218,7 +233,17 @@ export interface DescribedInstance {
     images?: boolean;
     effortLevels?: readonly string[];
     queueing?: boolean;
+    /** The engine can answer a review prompt on its own (`reviewPermission`). */
     approvalReview?: boolean;
+    /** Where auto-review sees this instance's tool calls.  Absent on a
+     *  shadow, which the client reads as "not reported yet", not as none. */
+    reviewHook?: ReviewHook;
+    /** A full-auto instance can run a held turn in its asking mode. */
+    asksWhenHeld?: boolean;
+    /** What a bot's Bypass Permissions switch does on this engine
+     *  (shared/bypass-coverage.ts): answers its approval requests, turns on
+     *  its own skip-approvals mode, or nothing because it never asks. */
+    bypassCoverage?: BypassCoverage;
     /** True when this engine runs the harness HTTP tool loop. */
     toolLoop: boolean;
   };
@@ -258,15 +283,35 @@ export class ProviderRegistry {
   private minimaxContextByInstance = new Map<InstanceId, { apiKey: string; apiUrl: string }>();
   private driversByKind: Map<string, AnyProviderDriver>;
   private readonly probeConcurrency: number;
+  private readonly hotProbeConcurrency: number;
   private readonly entryDeadlineMs: number;
   private readonly transientRecheckMs: number;
+  private readonly hostHot: () => boolean;
+  /** Set when the latest describe() answered from cache because the host was hot. */
+  private lastDescribeStale = false;
 
   constructor(drivers: readonly AnyProviderDriver[], options: ProviderRegistryOptions = {}) {
     this.driversByKind = new Map(drivers.map((d) => [d.driverKind, d]));
     this.probeConcurrency = Math.max(1, options.probeConcurrency ?? DEFAULT_PROBE_CONCURRENCY);
+    this.hotProbeConcurrency = Math.max(1, options.hotProbeConcurrency ?? DEFAULT_HOT_PROBE_CONCURRENCY);
     this.entryDeadlineMs = options.entryDeadlineMs ?? DEFAULT_ENTRY_DEADLINE_MS;
     this.transientRecheckMs = Math.max(0, options.transientRecheckMs ?? DEFAULT_TRANSIENT_RECHECK_MS);
+    this.hostHot = options.hostHot ?? (() => false);
     this.recheckDelayMs = this.transientRecheckMs;
+  }
+
+  private probeLimit(): number {
+    if (this.hostHot()) return Math.min(this.probeConcurrency, this.hotProbeConcurrency);
+    return this.probeConcurrency;
+  }
+
+  private markDescribeStale(): void {
+    this.lastDescribeStale = true;
+  }
+
+  /** Whether the most recent describe() was served from cache while the host was hot. */
+  describeWasStale(): boolean {
+    return this.lastDescribeStale;
   }
 
   private async loadEntry(instanceId: InstanceId, entry: InstanceConfig): Promise<ProviderInstance | null> {
@@ -511,6 +556,18 @@ export class ProviderRegistry {
     return () => this.describeListeners.delete(listener);
   }
 
+  /** The newest settled description of one engine, without probing it.
+   * Undefined before its first probe has settled.  For a synchronous health
+   * read on a hot path (auto-review's automatic fallback reviewer), where a
+   * describe per call would be far too slow. */
+  lastKnown(instanceId: InstanceId): DescribedInstance | undefined {
+    return (
+      this.latestSettled.get(instanceId)?.info ??
+      this.lastDefinitive.get(instanceId)?.info ??
+      this.lastDone?.result.find((info) => info.instanceId === instanceId)
+    );
+  }
+
   /** When a list this registry returned was produced (ms since epoch). */
   describedAtOf(result: DescribedInstance[]): number | undefined {
     return this.describedAtByResult.get(result);
@@ -583,8 +640,10 @@ export class ProviderRegistry {
     }
   }
 
-  async describe(opts?: { maxAgeMs?: number; staleWhileRevalidate?: boolean }): Promise<DescribedInstance[]> {
+  async describe(opts?: DescribeOptions): Promise<DescribedInstance[]> {
+    this.lastDescribeStale = false;
     const maxAge = opts?.maxAgeMs ?? 0;
+    const hot = this.hostHot();
     // Ages are read on both clocks (see procs.ts elapsedSince): a stamp can
     // run ahead of the wall clock after it is corrected backwards, and plain
     // subtraction would keep a stale answer inside maxAge for the size of the
@@ -608,7 +667,10 @@ export class ProviderRegistry {
         return running.promise;
       }
     }
-    if (maxAge > 0 && done && elapsedSince(done.born, clock) <= maxAge) return done.result;
+    if (maxAge > 0 && done && elapsedSince(done.born, clock) <= maxAge) {
+      if (hot && opts?.staleWhileRevalidate) this.markDescribeStale();
+      return done.result;
+    }
 
     // A caller that can live with a slightly old answer gets the last
     // completed one immediately while a new probe runs behind it.  Probing
@@ -617,7 +679,8 @@ export class ProviderRegistry {
     // making every caller block on it is what makes the model picker look
     // empty rather than slow.
     if (opts?.staleWhileRevalidate && done) {
-      void this.ensureSweep().catch(() => {});
+      if (hot) this.markDescribeStale();
+      else void this.ensureSweep().catch(() => {});
       return done.result;
     }
 
@@ -769,6 +832,10 @@ export class ProviderRegistry {
   /** Probe only the engines the last describe left as "Checking", one at a
    * time — a busy Mac is why they did not answer. */
   private async recheckTransient(): Promise<void> {
+    if (this.hostHot()) {
+      if (this.lastDone) this.scheduleRecheck(this.lastDone.result);
+      return;
+    }
     const done = this.lastDone;
     if (!done) return;
     for (const info of done.result) {
@@ -798,7 +865,7 @@ export class ProviderRegistry {
     // generation would let the old config's answer pass as the replacement's.
     const entries = this.entries();
     const gens = new Map(entries.map((entry) => [entry.instanceId, this.genOf(entry.instanceId)] as const));
-    const probed = await mapWithConcurrency(entries, this.probeConcurrency, (entry) => {
+    const probed = await mapWithConcurrency(entries, this.probeLimit(), (entry) => {
       const gen = gens.get(entry.instanceId)!;
       // The fleet changed since this sweep began: its answer is thrown away
       // (startSweep), so it starts no more probes beside its replacement's.
@@ -1059,7 +1126,13 @@ export class ProviderRegistry {
         enabled,
         snapshot,
         models: { default: "", options: [] },
-        capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false, toolLoop: false },
+        capabilities: {
+          computerMcp: false,
+          agentsMcp: false,
+          localComputerMcp: false,
+          toolLoop: false,
+          bypassCoverage: bypassCoverage(entry.shadow.driverKind),
+        },
         // A shadow has no adapter to ask, so the derivation is fed the same
         // all-false capabilities reported above.  That leaves the box-native
         // engine reaching its own box — which is what the client computed
@@ -1100,7 +1173,10 @@ export class ProviderRegistry {
         queueing: inst.adapter.capabilities.queueing === true,
         localComputerMcp: inst.adapter.capabilities.localComputerMcp === true,
         approvalReview: inst.reviewPermission !== undefined,
+        reviewHook: inst.adapter.capabilities.reviewHook ?? "none",
+        asksWhenHeld: inst.adapter.capabilities.asksWhenHeld === true,
         toolLoop: inst.adapter.capabilities.toolLoop === true,
+        bypassCoverage: bypassCoverage(inst.driverKind),
       },
       // Derived here, on the one wire where adapter capabilities already
       // become an InstanceInfo, so the client never recomputes it and can

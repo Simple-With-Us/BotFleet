@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import {
   CLAUDE_CONTAINMENT_DISALLOWED_TOOLS,
   CLAUDE_CONTAINMENT_ENV,
@@ -106,6 +107,19 @@ describe("ClaudeDriver.decodeConfig", () => {
 
   it("throws on an invalid permissionMode (registry downgrades this to a shadow)", () => {
     expect(() => ClaudeDriver.decodeConfig({ permissionMode: "yolo" })).toThrow(/permissionMode/);
+  });
+
+  it("maps the Engines page's autonomous-mode switch (fullAuto) to Claude's bypassPermissions", () => {
+    // Settings > Engines stores `fullAuto: true`; Claude spelled the same
+    // thing `permissionMode`, and the box ticked with no effect on the CLI.
+    expect(ClaudeDriver.decodeConfig({ fullAuto: true }).permissionMode).toBe("bypassPermissions");
+    expect(ClaudeDriver.decodeConfig({ fullAuto: false }).permissionMode).toBe("acceptEdits");
+    expect(ClaudeDriver.decodeConfig({}).permissionMode).toBe("acceptEdits");
+    // Only a real boolean true counts: a stray string is not a YOLO switch.
+    expect(ClaudeDriver.decodeConfig({ fullAuto: "yes" }).permissionMode).toBe("acceptEdits");
+    // An explicit permissionMode is never overridden by the switch.
+    expect(ClaudeDriver.decodeConfig({ fullAuto: true, permissionMode: "acceptEdits" }).permissionMode).toBe("acceptEdits");
+    expect(ClaudeDriver.decodeConfig({ fullAuto: true, permissionMode: "auto" }).permissionMode).toBe("auto");
   });
 
   it("normalizes and deduplicates built-in tool lists", () => {
@@ -544,6 +558,27 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(bypassed.mcpConfig?.mcpServers?.botfleet).toBeUndefined();
   });
 
+  it("starts the CLI in bypassPermissions when the Engines page's fullAuto switch is on", async () => {
+    // The end of the mapping decodeConfig does: the flag the CLI really gets.
+    // Built by hand, through decodeConfig the way the registry does it: the
+    // `create` helper above always supplies a permissionMode of its own.
+    instance = await ClaudeDriver.create({
+      instanceId: "claude-full-auto-test",
+      displayName: "Claude Full Auto Test",
+      environment: {},
+      enabled: true,
+      config: ClaudeDriver.decodeConfig({ cli: FAKE_CLI, fullAuto: true }),
+    });
+    recorder = recordEvents(instance.adapter);
+    const dump = join(scratch, "full-auto-switch.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-full-auto-switch", text: "hi" });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-full-auto-switch");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+    expect(seen.argv).not.toContain("--permission-prompt-tool");
+  });
+
   it("passes normalized available and denied built-in tool sets to Claude", async () => {
     await create(undefined, {}, {
       tools: ["Read", "WebFetch"],
@@ -730,6 +765,57 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(shell.mcpConfig.mcpServers.botfleet).toBeUndefined();
   });
 
+  it("runs a bypassPermissions turn held for auto-review through the broker, so each ask is reviewed first", async () => {
+    await create(undefined, {}, { permissionMode: "bypassPermissions" });
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "after", asksWhenHeld: true });
+    const dump = join(scratch, "bypass-held-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-bypass-held", text: "list the files", holdForReview: true });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-bypass-held");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--permission-mode") + 1]).not.toBe("bypassPermissions");
+    expect(seen.argv[seen.argv.indexOf("--permission-prompt-tool") + 1]).toBe("mcp__botfleet__approve");
+    expect(seen.mcpConfig.mcpServers.botfleet).toBeDefined();
+  });
+
+  it("routes connected apps and the phone through the prompt tool on a held turn, so the reviewer sees them first", async () => {
+    await create(undefined, {}, { permissionMode: "bypassPermissions" });
+    const integrations = {
+      composio: { command: process.execPath, args: ["/tmp/connector-proxy.js"], env: {} },
+      phone: { command: process.execPath, args: ["/tmp/phone-proxy.js"], env: {} },
+      agents: { command: process.execPath, args: ["/tmp/agents-proxy.js"], env: {} },
+    };
+    const heldDump = join(scratch, "held-mcp-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = heldDump;
+    await instance.adapter.sendTurn({ threadId: "t-held-mcp", text: "send it", holdForReview: true, integrations });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-held-mcp");
+    const held = JSON.parse(readFileSync(heldDump, "utf8"));
+    const heldAllowed = String(held.argv[held.argv.indexOf("--allowedTools") + 1]).split(",");
+    // still mounted, no longer pre-allowed: each call asks, and is reviewed
+    expect(held.mcpConfig.mcpServers.composio).toBeDefined();
+    expect(held.mcpConfig.mcpServers.phone).toBeDefined();
+    expect(heldAllowed).not.toContain("mcp__composio");
+    expect(heldAllowed).not.toContain("mcp__phone");
+    // the harness's own fleet comms stay pre-allowed (each tool is guarded by
+    // the endpoint it calls, and a full-auto bot's job_start must never become
+    // a card); the step watch reviews those calls as they start
+    expect(heldAllowed).toContain("mcp__agents");
+
+    // an unheld bypass turn keeps every pre-allow: nothing asks there
+    const freeDump = join(scratch, "free-mcp-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = freeDump;
+    await instance.adapter.sendTurn({ threadId: "t-free-mcp", text: "send it", integrations });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-free-mcp");
+    const free = JSON.parse(readFileSync(freeDump, "utf8"));
+    const freeAllowed = String(free.argv[free.argv.indexOf("--allowedTools") + 1]).split(",");
+    expect(freeAllowed).toEqual(expect.arrayContaining(["mcp__composio", "mcp__phone", "mcp__agents"]));
+  });
+
+  it("asks through the permission-prompt tool when not in bypass, which is where review holds each ask", async () => {
+    await create();
+    expect(instance.adapter.capabilities).toMatchObject({ reviewHook: "before", asksWhenHeld: true });
+  });
+
   it("resumes with --resume when a cursor exists and reports that session id", async () => {
     await create();
     const dump = join(scratch, "dump.json");
@@ -794,6 +880,71 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(readFileSync(dump, "utf8")).toBe(dumpBefore);
     expect(recorder.events.filter((e) => e.type === "turn.started")).toHaveLength(2);
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
+  });
+
+  describe("launch identity (the launcher contract)", () => {
+    let restore: () => void;
+    beforeEach(() => {
+      restore = inheritHarnessIdentity();
+    });
+    afterEach(() => {
+      restore();
+    });
+
+    const run = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+      const dump = join(scratch, `dump-${threadId}-${Date.now()}.json`);
+      process.env.FAKE_CLAUDE_DUMP = dump;
+      const started = await instance.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+      return readEngineDump(dump);
+    };
+
+    it("gives each bot on one engine instance its own seat and session, and none of the harness's identity", async () => {
+      // The instance's own environment tries to carry a credential too.
+      await create(undefined, { ZULIP_API_KEY: "instance-key", AGENT_SEAT: "CODEX" });
+
+      const plumber = await run("t-plumber", { seat: "BF-PLUMBER", session: "t-plumber" });
+      const fixer = await run("t-fixer", { seat: "BF-FIXER", session: "t-fixer" });
+
+      expectLaunchedAs(plumber.env, { seat: "BF-PLUMBER", session: "t-plumber" });
+      expectLaunchedAs(fixer.env, { seat: "BF-FIXER", session: "t-fixer" });
+      expect(JSON.stringify([plumber.env, fixer.env])).not.toContain("instance-key");
+    });
+
+    it("marks a bot with no role as launched and gives it no seat", async () => {
+      await create();
+      const seen = await run("t-no-role", { seat: null, session: "t-no-role" });
+      expectLaunchedAs(seen.env, { seat: null, session: "t-no-role" });
+    });
+
+    it("fails closed when a caller passes no identity at all", async () => {
+      await create();
+      const seen = await run("t-bare", undefined);
+      expectLaunchedAs(seen.env, { seat: null });
+    });
+
+    it("respawns rather than hand a second seat to the process the first one started", async () => {
+      await create();
+      // A room's members share one thread.
+      const first = await run("t-room", { seat: "BF-PLUMBER", session: "t-room" });
+      const firstDump = process.env.FAKE_CLAUDE_DUMP!;
+
+      // The same identity reuses the warm process: the fake writes its dump once per process.
+      const again = await instance.adapter.sendTurn({
+        threadId: "t-room",
+        text: "again",
+        launchIdentity: { seat: "BF-PLUMBER", session: "t-room" },
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === again.turnId);
+      expect(readEngineDump(firstDump).pid).toBe(first.pid);
+
+      // A different seat on the same thread is a new process with its own env.
+      const other = await run("t-room", { seat: "BF-FIXER", session: "t-room" });
+      expect(other.pid).not.toBe(first.pid);
+      expect(first.env.AGENT_LAUNCH_SEAT).toBe("BF-PLUMBER");
+      expect(other.env.AGENT_LAUNCH_SEAT).toBe("BF-FIXER");
+      expect(other.env.AGENT_SEAT).toBe("BF-FIXER");
+    });
   });
 
   it("relaunches the live turn, not the first turn, when a warm process crashes (E3)", async () => {
@@ -1274,7 +1425,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       conn.on("connect", resolve);
       conn.on("error", reject);
     });
-    conn.write(JSON.stringify({ t: "ask", id: "ask-1", tool: "Bash", input: { command: "rm -rf scratch" } }) + "\n");
+    conn.write(
+      JSON.stringify({ t: "ask", id: "ask-1", tool: "Bash", input: { command: "rm -rf scratch" }, toolUseId: "toolu_rm" }) + "\n",
+    );
 
     const opened = await recorder.until((e) => e.type === "request.opened");
     expect(opened).toMatchObject({
@@ -1282,6 +1435,9 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       tool: "Bash",
       summary: "rm -rf scratch",
       requestId: "ask-1",
+      // the tool_use the CLI asked about, the id its item.started carried,
+      // so the auto-review step watch leaves this step to the card
+      itemId: "toolu_rm",
     });
     // a plain CLI tool never carries the desktop-control approval scope,
     // so the UI can offer a remembered grant for it
@@ -1647,10 +1803,14 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await create();
     const dump = join(scratch, "review-isolation.json");
     process.env.FAKE_CLAUDE_DUMP = dump;
-    await expect(instance.reviewPermission?.("review this request")).resolves.toBe("fake generated text");
+    const prompt = { system: "You review one request.", data: "<action_to_review>\nreview this request\n</action_to_review>" };
+    await expect(instance.reviewPermission?.(prompt)).resolves.toBe("fake generated text");
     const seen = JSON.parse(readFileSync(dump, "utf8"));
-    expect(seen.prompt).toBe("review this request");
-    expect(seen.argv).not.toContain("review this request");
+    // the action under review goes on stdin only, never argv
+    expect(seen.prompt).toBe(prompt.data);
+    expect(seen.argv.some((arg: string) => arg.includes("review this request"))).toBe(false);
+    // the fixed brief rides as the system prompt
+    expect(seen.argv[seen.argv.indexOf("--append-system-prompt") + 1]).toBe(prompt.system);
     expect(seen.argv).toContain("--strict-mcp-config");
     expect(JSON.parse(seen.argv[seen.argv.indexOf("--mcp-config") + 1])).toEqual({ mcpServers: {} });
     expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("");
@@ -1675,7 +1835,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     ).toBe(true);
     expect(recorder.events).toContainEqual(expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "spawn_error" }));
     await expect(instance.generateText?.("title")).rejects.toThrow(/Update Claude Code/);
-    await expect(instance.reviewPermission?.("review")).rejects.toThrow(/Update Claude Code/);
+    await expect(instance.reviewPermission?.({ system: "brief", data: "review" })).rejects.toThrow(/Update Claude Code/);
     expect(existsSync(dump)).toBe(false);
     expect(readFileSync(probes, "utf8")).toBe("probe\n");
   });
@@ -1710,7 +1870,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-supported", text: "go" });
     await recorder.until((e) => e.type === "turn.completed");
     await instance.generateText?.("title");
-    await instance.reviewPermission?.("review");
+    await instance.reviewPermission?.({ system: "brief", data: "review" });
     expect(readFileSync(probes, "utf8")).toBe("probe\n");
   });
 
@@ -1733,7 +1893,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await create();
     const controller = new AbortController();
     controller.abort();
-    await expect(instance.reviewPermission?.("review this request", controller.signal)).rejects.toThrow(/aborted/);
+    await expect(instance.reviewPermission?.({ system: "brief", data: "review this request" }, controller.signal)).rejects.toThrow(/aborted/);
   });
 
   it("declares the effort levels the CLI accepts", async () => {

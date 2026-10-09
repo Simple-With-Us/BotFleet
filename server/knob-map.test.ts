@@ -78,6 +78,21 @@ describe("parseKnobValue", () => {
     expect(parseKnobValue(spec("observability.tracesSampleRate"), "0.5")).toBe(0.5);
   });
 
+  it("clamps the webhook hot-host deferral limit to its minute bounds", () => {
+    expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "20")).toBe(20);
+    expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "0")).toBe(1);
+    expect(parseKnobValue(spec("jobs.webhookHotDeferMinutes"), "9999")).toBe(720);
+  });
+
+  it("clamps the auto-review limit per turn and applies it from the vault", () => {
+    expect(parseKnobValue(spec("autoReview.maxReviewsPerTurn"), "50")).toBe(50);
+    expect(parseKnobValue(spec("autoReview.maxReviewsPerTurn"), "0")).toBe(1);
+    expect(parseKnobValue(spec("autoReview.maxReviewsPerTurn"), "100000")).toBe(500);
+    const cfg: AppConfig = { autoReview: { fallbackReviewer: "claude" } };
+    resolveKnobFields(cfg, new Map([["BOTFLEET_AUTO_REVIEW_MAX_PER_TURN", "12"]]));
+    expect(cfg.autoReview).toEqual({ fallbackReviewer: "claude", maxReviewsPerTurn: 12 });
+  });
+
   it("round-trips through the canonical string", () => {
     for (const entry of KNOB_FIELDS) {
       if (entry.kind === "bool") continue;

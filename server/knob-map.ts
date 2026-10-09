@@ -97,6 +97,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     min: 0,
   },
   {
+    id: "jobs.webhookHotDeferMinutes",
+    label: "Webhook hot-host deferral limit",
+    section: "jobs",
+    path: ["webhookHotDeferMinutes"],
+    infisicalName: "BOTFLEET_WEBHOOK_HOT_DEFER_MINUTES",
+    kind: "int",
+    min: 1,
+    max: 720,
+  },
+  {
     id: "observability.tracesSampleRate",
     label: "Sentry traces sample rate",
     section: "observability",
@@ -154,6 +164,18 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     kind: "float",
     min: 0,
     max: 1,
+  },
+  {
+    // Reviewer calls one turn may spend on auto-review (server/auto-review.ts
+    // `ReviewBudget`).  Bounds mirror shared/auto-review.ts.
+    id: "autoReview.maxReviewsPerTurn",
+    label: "Auto-review limit per turn",
+    section: "autoReview",
+    path: ["maxReviewsPerTurn"],
+    infisicalName: "BOTFLEET_AUTO_REVIEW_MAX_PER_TURN",
+    kind: "int",
+    min: 1,
+    max: 500,
   },
   {
     id: "infisical.refreshMinutes",

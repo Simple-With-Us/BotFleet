@@ -300,11 +300,20 @@ export function ProviderMark({
       return <LocalModelsMark size={size} className={className} />;
     case "piAgent":
       return <PiMark size={size} className={className} />;
-    default:
+    default: {
+      // Two letters once the name is long enough to collide.  This matters
+      // because a missing mark falls back to a monogram, and one letter made
+      // every unregistered driver an "M" — Muse Code, MiniMax, and MiniMax
+      // Code all read as the same tile in the same list, which is the exact
+      // confusion the engine names exist to prevent.  Two letters keeps them
+      // apart without inventing a brand mark we do not hold art for.
+      const base = driverKind.replace(/Agent$/i, "").trim();
+      const letters = (base.length > 4 ? base.slice(0, 2) : base.slice(0, 1)) || "?";
       return (
-        <span className="flex size-full items-center justify-center text-[10px] font-semibold tracking-tight text-ink-secondary">
-          {(driverKind.replace(/Agent$/i, "").slice(0, 1) || "?").toUpperCase()}
+        <span className="flex size-full items-center justify-center text-[9px] font-semibold tracking-tight text-ink-secondary">
+          {letters.toUpperCase()}
         </span>
       );
+    }
   }
 }

@@ -228,7 +228,7 @@ export function BotComputerDefaults() {
         </div>
         {!vpsConfigured && (
           <div className="mt-2 text-[11.5px] text-ink-secondary">
-            To use Self-hosted VPS, add an SSH host alias in App Settings → Connections.
+            To use Self-Hosted VPS, add an SSH host alias in App Settings → Connections.
           </div>
         )}
         <div className="mt-2 text-[11.5px] text-ink-secondary">

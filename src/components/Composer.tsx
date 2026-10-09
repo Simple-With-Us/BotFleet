@@ -4,7 +4,7 @@ import { acceptComposerTranscript } from "@/lib/composer-dictation";
 import { pickSTTProvider } from "@/lib/transcription-provider";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { currentCall, useOnCall } from "@/lib/call";
 import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
@@ -12,6 +12,7 @@ import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
 import { foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
+import { BotOffComposer } from "./BotOffComposer";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import {
@@ -31,6 +32,7 @@ import { PendingApprovalActions, PendingApprovalPanel, pendingApprovals } from "
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { ReplyQuote } from "./ReplyQuote";
 import { instanceSupportsLocalComputer } from "@/lib/local-computer";
+import { queuedChipLabel, useUpdateDrain } from "@/lib/update-control";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { resolveRoomLabels } from "../../shared/terminology";
 import { readCachedInventory } from "@/lib/connected-apps-cache";
@@ -136,8 +138,34 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
   );
 }
 
-/** Renders the editable message composer and its pending attachments. */
-export function Composer({
+/** Renders the editable message composer and its pending attachments.
+ *
+ *  A 1:1 bot that is switched Off (shared/bot-power.ts) gets the disabled
+ *  state instead: the harness refuses every new turn for it, so offering an
+ *  input would only collect a message that can never send.  The chat above
+ *  stays as it was, and the draft survives (it is keyed by bot, not by this
+ *  component).  Rooms keep their composer: a message there still lands in the
+ *  transcript, and an Off member is skipped with a notice. */
+export function Composer(props: ComponentProps<typeof ComposerInner>) {
+  const { state: store, dispatch: send } = useStore();
+  const bot = props.bot;
+  if (bot && !props.group && bot.off === true) {
+    // Read the live record, not the prop, so a Turn On from another window
+    // swaps the real composer back in without a remount of the whole chat.
+    const live = store.bots.find((candidate) => candidate.id === bot.id) ?? bot;
+    if (live.off === true) {
+      return (
+        <BotOffComposer
+          botName={live.name}
+          onTurnOn={() => send({ type: "updateBot", botId: live.id, patch: { off: false } })}
+        />
+      );
+    }
+  }
+  return <ComposerInner {...props} />;
+}
+
+function ComposerInner({
   bot,
   group,
   members,
@@ -303,6 +331,9 @@ export function Composer({
   const pendingChip = group
     ? queued?.text
     : (bot ? state.pendingQueued?.[bot.threadId]?.at(-1)?.text : undefined);
+  // While an update holds new work, a queued send waits for the restart and
+  // not for the bot, which may be idle.  The chip says so.
+  const updateHolding = useUpdateDrain() !== null;
   // a chip on its own is a message: the send control has to appear for it
   const fileInput = useRef<HTMLInputElement>(null);
   const [autoWarn, setAutoWarn] = useState(false);
@@ -610,8 +641,11 @@ export function Composer({
         {pendingChip && (
           <div className="mb-2 flex items-center gap-2 rounded-lg border border-hairline/40 bg-panel px-3 py-2 text-[12.5px] text-ink-secondary">
             <Clock size={13} className="shrink-0" />
-            <span className="min-w-0 flex-1 truncate" title={`Queued — sends when ${busyName} finishes: “${pendingChip}”`}>
-              Queued — sends when {busyName} finishes: “{pendingChip}”
+            <span
+              className="min-w-0 flex-1 truncate"
+              title={queuedChipLabel({ text: pendingChip, busyName, draining: updateHolding })}
+            >
+              {queuedChipLabel({ text: pendingChip, busyName, draining: updateHolding })}
             </span>
             <button
               type="button"
@@ -716,11 +750,17 @@ export function Composer({
             can type again, so a waiting bot is impossible to miss. */}
         {approval && (
           <div className="mb-2 overflow-hidden rounded-2xl border border-accent/40 bg-card">
-            <PendingApprovalPanel pending={approval} count={approvals.length} index={0} />
+            <PendingApprovalPanel
+              pending={approval}
+              count={approvals.length}
+              index={0}
+              bypassActive={Boolean(approvalBot?.bypassPermissions)}
+            />
             <PendingApprovalActions
               pending={approval}
               threadId={threadId}
               bot={approvalBot}
+              totalCount={approvals.length}
               onCancelTurn={() => {
                 if (group) dispatch({ type: "interruptGroup", groupId: group.id });
                 else if (bot) dispatch({ type: "interrupt", botId: bot.id });

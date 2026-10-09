@@ -53,6 +53,20 @@ public struct CompanionState: Sendable {
     /// event.  `nil` until the first of either arrives — not the same as "up
     /// to date", which is a real answer this has to wait for.
     public var macUpdateStatus: MacUpdateStatus?
+    /// Background jobs by conversation (thread id), from `jobs` frames and
+    /// `GET /api/jobs`.  A thread with none has no entry, so the header can ask
+    /// "does this have a pill" with one lookup.
+    public private(set) var jobsByThread: [String: [JobSnapshot]] = [:] {
+        didSet {
+            var index: [String: JobSnapshot] = [:]
+            for jobs in jobsByThread.values {
+                for job in jobs { index[job.id] = job }
+            }
+            jobIndex = index
+        }
+    }
+    /// Every job by id, rebuilt whenever `jobsByThread` changes (see `job(id:)`).
+    private var jobIndex: [String: JobSnapshot] = [:]
     /// Monotonic reducer position used to reject snapshots fetched before a
     /// newer stream frame was folded.
     private let hydrationStateID = UUID()
@@ -180,6 +194,16 @@ public struct CompanionState: Sendable {
         rooms.first { $0.threadId == threadId }
     }
 
+    /// Whether the harness would refuse to create, switch, rename or delete one
+    /// of this room's tasks right now (`channelTaskBlocked` in
+    /// server/index.ts): a turn is running, or a request is waiting on an
+    /// answer.  Only the open thread's transcript is loaded here, so a request
+    /// waiting in another task still answers 409 — and the harness's own
+    /// sentence reaches the person.
+    public func roomTaskChangesBlocked(_ room: Room) -> Bool {
+        room.isWorking || transcript(forThread: room.threadId).contains { $0.card?.isPending == true }
+    }
+
     /// Every unanswered approval or question, newest first. This is the
     /// screen the whole companion exists for.
     public var pendingApprovals: [(threadId: String, message: Message)] {
@@ -283,6 +307,36 @@ public struct CompanionState: Sendable {
         return true
     }
 
+    // MARK: - Background jobs
+
+    /// Replace one conversation's jobs.  An empty set removes the entry, so a
+    /// thread with nothing to show has no pill.
+    public mutating func setJobs(_ jobs: [JobSnapshot], forThread threadId: String) {
+        if jobs.isEmpty {
+            jobsByThread.removeValue(forKey: threadId)
+        } else {
+            jobsByThread[threadId] = jobs
+        }
+    }
+
+    /// One job by id, wherever it lives.  A single lookup in an index kept in
+    /// step with `jobsByThread`, so a screen that watches one job does not
+    /// scan every conversation on each redraw.
+    public func job(id: String) -> JobSnapshot? {
+        jobIndex[id]
+    }
+
+    /// Replace every conversation's jobs with what `GET /api/jobs` answered.
+    /// Separate from `hydrate(_:)`: jobs ride their own request, and a failed
+    /// jobs read must not make a good fleet snapshot look like it failed.
+    public mutating func hydrateJobs(_ jobs: [JobSnapshot]) {
+        var next: [String: [JobSnapshot]] = [:]
+        for job in jobs {
+            next[job.threadId, default: []].append(job)
+        }
+        jobsByThread = next
+    }
+
     /// Prepend an older page fetched for scrollback.
     public mutating func prepend(_ page: ThreadPage, toThread threadId: String) {
         hydrationRevision &+= 1
@@ -327,7 +381,7 @@ public struct CompanionState: Sendable {
         switch frame {
         case .message, .messagePatch, .thread, .bot, .botDeleted, .room, .roomDeleted:
             hydrationRevision &+= 1
-        case .hello, .notify, .screen, .computer, .config, .instances, .runtime, .updateStatus, .unknown:
+        case .hello, .notify, .screen, .computer, .config, .instances, .runtime, .updateStatus, .jobs, .unknown:
             break
         }
         switch frame {
@@ -417,13 +471,31 @@ public struct CompanionState: Sendable {
                 // was the last event that could ever mention this id.
                 clearStream(threadId)
                 clearScreen(botId)
+                jobsByThread.removeValue(forKey: threadId)
                 bots.remove(at: index)
             }
 
         case let .room(room):
             if let index = rooms.firstIndex(where: { $0.id == room.id }) {
                 var merged = room
-                merged.messages = rooms[index].messages
+                let previous = rooms[index]
+                if previous.threadId != room.threadId, let replacement = room.messages {
+                    // A channel task was created, switched to, or deleted down
+                    // to another one.  The room names a different thread now,
+                    // and the answer to that call carries its transcript, which
+                    // is authoritative — same as a bot's task switch above.
+                    // An ordinary frame keeps the transcript it already has.
+                    messages[room.threadId] = replacement
+                    hasMore[room.threadId] = room.hasMore ?? false
+                    merged.messages = replacement
+                    clearStream(previous.threadId)
+                    clearStream(room.threadId)
+                } else if previous.threadId == room.threadId {
+                    merged.messages = previous.messages
+                }
+                // A frame that moved the room to another thread without
+                // carrying its transcript leaves `merged.messages` empty
+                // rather than naming the old thread's messages as the new one's.
                 rooms[index] = merged
             } else {
                 rooms.append(room)
@@ -440,6 +512,7 @@ public struct CompanionState: Sendable {
                 // Same reasoning as a deleted bot: the thread is gone, so the
                 // half-written reply streaming into it has nowhere to land.
                 clearStream(threadId)
+                jobsByThread.removeValue(forKey: threadId)
                 rooms.remove(at: index)
             }
 
@@ -457,6 +530,9 @@ public struct CompanionState: Sendable {
 
         case let .updateStatus(status):
             macUpdateStatus = status
+
+        case let .jobs(threadId, jobs):
+            setJobs(jobs, forThread: threadId)
 
         // Nothing to fold: config and provisioning state are not part of
         // this client's job yet.

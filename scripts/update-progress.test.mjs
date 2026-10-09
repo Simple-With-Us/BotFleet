@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { applyPreparedUpdate, prepareUpdate, UpdateRefusedError } from "./mac-update-transaction.mjs";
+import { APPLY_STEPS, applyPreparedUpdate, PREPARE_STEPS, prepareUpdate, UpdateRefusedError } from "./mac-update-transaction.mjs";
 import {
   createUpdateProgress,
   instrumentOperations,
@@ -46,6 +46,8 @@ function fakeOperations(overrides = {}) {
     persistPrepared: async () => prepared,
     releaseSource: async () => {},
     validatePrepared: async () => {},
+    sweepLeftovers: async () => {},
+    ensureRunning: async () => ({ started: false }),
     preflight: async () => ({ safe: true }),
     capturePrevious: async () => ({ checkoutCommit: "a".repeat(40) }),
     materializeCandidate: async () => {},
@@ -62,7 +64,17 @@ function fakeOperations(overrides = {}) {
     finish: async () => {},
     rollback: async () => {},
     cleanupCandidate: async () => {},
+    smokeTestBundle: async () => {},
   };
+  // A fixture that quietly omits a step fails at runtime as
+  // "ops.<name> is not a function", which reads like a bug in the coordinator
+  // rather than an out-of-date fake.  Check it here instead, naming the step.
+  for (const step of [...PREPARE_STEPS, ...APPLY_STEPS]) {
+    if (step === "acquireLock") continue;
+    if (!Object.hasOwn(base, step) || base[step]?.call === undefined) {
+      throw new Error(`fakeOperations is missing ${step}; add it so this fixture keeps matching the transaction`);
+    }
+  }
   return { prepared, operations: { ...base, ...overrides } };
 }
 
@@ -92,6 +104,7 @@ describe("the progress file", () => {
       "installDependencies",
       "buildBundle",
       "validateBundle",
+      "smokeTestBundle",
       "persistPrepared",
       "releaseSource",
     ]);
@@ -114,6 +127,21 @@ describe("the progress file", () => {
     expect(seen[0].progress).toBeGreaterThan(0);
     expect(seen[0].progress).toBeLessThan(1);
     expect(seen[0].stepCount).toBe(UPDATE_STEPS.length);
+  });
+
+  it("carries what a step is waiting on, and clears it when the step moves on", () => {
+    const path = progressFile();
+    const progress = createUpdateProgress({ path, runId: "run_one" });
+    expect(read(path).detail).toBeNull();
+    progress.begin("fence");
+    progress.note({ detail: "Waiting for 3 bots to finish" });
+    expect(read(path)).toMatchObject({ step: "fence", detail: "Waiting for 3 bots to finish" });
+    progress.end("fence", true);
+    expect(read(path).detail).toBeNull();
+    progress.begin("quiesce");
+    progress.note({ detail: "stale" });
+    progress.finish("refused", "Bots were still busy after 20 minutes; nothing was interrupted.");
+    expect(read(path)).toMatchObject({ step: null, detail: null, outcome: "refused" });
   });
 
   it("marks the failing step and leaves the rest of the record intact", async () => {
@@ -190,7 +218,41 @@ describe("the reporting channel itself", () => {
   });
 });
 
+describe("the step list that drives the fraction", () => {
+  it("covers every step a successful run performs, and names nothing else", () => {
+    // `UPDATE_STEPS` is what the progress fraction is computed from, so a step
+    // missing from it freezes the Mac/phone fraction for the whole of that
+    // step and leaves every later fraction understated.  `rollback`,
+    // `cleanupCandidate` and `releaseSource` are deliberately absent: they run
+    // on the failure and teardown paths, which finish the record rather than
+    // advance it.
+    const teardownOnly = new Set(["rollback", "cleanupCandidate", "releaseSource"]);
+    const required = [...PREPARE_STEPS, ...APPLY_STEPS].filter((step) => !teardownOnly.has(step));
+    expect(required.filter((step) => !UPDATE_STEPS.includes(step))).toEqual([]);
+    const known = new Set([...PREPARE_STEPS, ...APPLY_STEPS, "acquireLock"]);
+    expect(UPDATE_STEPS.filter((step) => !known.has(step))).toEqual([]);
+  });
+
+  it("advances the fraction through the smoke test, which is the longest step", async () => {
+    const path = progressFile();
+    const progress = createUpdateProgress({ path, runId: "run_one" });
+    const seen = [];
+    const { operations } = fakeOperations({
+      smokeTestBundle: async () => {
+        seen.push(read(path));
+      },
+    });
+    await prepareUpdate({ target: "origin/main" }, instrumentOperations(operations, progress));
+    // The label alone used to keep rendering while `record.progress` stood
+    // still, because the recorder had no position for this step at all.
+    expect(seen).toHaveLength(1);
+    expect(seen[0].step).toBe("smokeTestBundle");
+    expect(seen[0].progress).toBeGreaterThan(0);
+  });
+});
+
 describe("which outcome a failure is", () => {
+
   it("calls a completed rollback rolled-back, whatever threw", () => {
     expect(outcomeForError(new Error("codesign failed"), { rolledBack: true })).toBe("rolled-back");
   });

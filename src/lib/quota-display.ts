@@ -405,7 +405,7 @@ export type LocalQuotaFreshnessView = {
  *  the file is the only thing that could say otherwise.
  *
  *  CodeCaps renamed on the wire from `agent-bar` to `codecaps` on 2026-09-20
- *  (PR #22 in jaywedgeworth22/codecaps).  Both values resolve to the new
+ *  (PR #22 in Simple-With-Us/codecaps).  Both values resolve to the new
  *  brand in the UI; anything else falls through to "CodeCaps" as the
  *  assumed writer of the local handoff path. */
 export function quotaProducerLabel(producer?: string | null): string {

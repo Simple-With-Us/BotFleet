@@ -24,6 +24,7 @@ import { effectiveDefaultResponder, groupResponseHint } from "@/lib/group-routin
 import { ChatMarkdown } from "./ChatMarkdown";
 import { MentionText } from "./MentionText";
 import { Composer } from "./Composer";
+import { UpdateDrainNotice } from "./UpdateDrainNotice";
 import { ErrorRow, TurnErrorAnnouncement, latestTurnErrorMessage } from "./ErrorRow";
 import { ChatFindBar } from "./ChatFindBar";
 import { GroupThreadTabs } from "./ThreadTabs";
@@ -979,6 +980,14 @@ function formatHoverTime(at: number) {
 
 export function GroupView({ group }: { group: Group }) {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const stream = useStreaming();
   const streaming = stream.streaming[group.threadId];
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1291,13 +1300,14 @@ export function GroupView({ group }: { group: Group }) {
       )}
       {/* Header: responsive container so chips fold gracefully */}
       <div
+        style={dragStyle}
         className={cn(
           "@container/chathead flex items-center justify-between gap-3 px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
+        <div style={noDragStyle} className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
           <button
             type="button"
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
@@ -1335,7 +1345,7 @@ export function GroupView({ group }: { group: Group }) {
             </div>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+        <div style={noDragStyle} className="flex shrink-0 items-center gap-1.5 md:gap-2">
           <button
             type="button"
             onClick={() => setFindOpen((open) => !open)}
@@ -1626,6 +1636,7 @@ export function GroupView({ group }: { group: Group }) {
         </button>
       )}
       <div className="w-full">
+      <UpdateDrainNotice />
       <Composer
         key={group.threadId}
         group={group}

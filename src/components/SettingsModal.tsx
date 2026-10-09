@@ -29,21 +29,26 @@ import { ApiKeyRow, EngineKeyRow, VpsConnection } from "./ApiKeys";
 import { LinqSettings } from "./LinqSettings";
 import { useUpdaterState } from "@/lib/updater";
 import {
+  activeDrain,
   availableLabel,
+  drainLabel,
   idleLabel,
-  installBlockedBusy,
+  installPausesWork,
+  PAUSES_WORK_COPY,
   installBlockedReason,
   installedLabel,
   lastRunDetail,
   lastRunLabel,
   runningLabel,
   updateSource,
+  useNow,
   useUpdateControl,
 } from "@/lib/update-control";
 import { EnginesSettings } from "./EnginesSettings";
 import { FleetModelsSection } from "./FleetModelsSection";
 import { BotComputerDefaults } from "./BotComputerDefaults";
 import { LocalComputerSection } from "./LocalComputerSection";
+import { HostCliIntegrationCard } from "./HostCliIntegrationCard";
 import { LocalVmRuntimeCard } from "./LocalVmRuntimeCard";
 import { SharedVpsRuntimeCard } from "./SharedVpsRuntimeCard";
 import { CompanionSection } from "./CompanionSection";
@@ -460,6 +465,9 @@ function UpdatesRow() {
   // only path that works there — and on a Mac that has both, it is the one
   // that can actually install without waiting for a published build.
   const local = useUpdateControl();
+  // A countdown while an update holds new work, so it ticks; a hook, so it
+  // comes before the early return below.
+  const holdNow = useNow(local.status?.drain ? 1_000 : null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const hasBridge = Boolean(window.ogb?.updater);
@@ -488,12 +496,13 @@ function UpdatesRow() {
   // Why Install Update is down.  The harness ships a reason with every
   // refusal it can see coming, and no surface rendered one — so a card with an
   const blockedReason = source === "harness" ? installBlockedReason(status) : null;
-  const isBusyBlocked = installBlockedBusy(status);
-  const isBlocked = blockedReason !== null && !isBusyBlocked;
-  const subtitleReason = isBusyBlocked ? "Work will pause and resume after update" : blockedReason;
+  const isBlocked = blockedReason !== null;
+  const subtitleReason = blockedReason ?? (source === "harness" && installPausesWork(status) ? PAUSES_WORK_COPY : null);
+  // How many messages are saved for after the restart, and when it begins.
+  const holdLine = source === "harness" ? drainLabel(activeDrain(status, holdNow), holdNow) : null;
   const subtitle =
     source === "harness" && status
-      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}`
+      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}${holdLine ? `${"\u00A0 "}${holdLine}` : ""}`
       : `${feedLabel}${"\u00A0 "}Auto-checks at most once per 6 hours;${"\u00A0 "}you can manually check any time if an update is available.`;
   const lastRun = source === "harness" ? lastRunLabel(status?.lastRun ?? null) : null;
   // The updater's own message for that run — a hover only, never inline.
@@ -566,7 +575,7 @@ function UpdatesRow() {
             </button>
             {hasUpdate && (
               <button
-                onClick={() => void local.install({ force: true })}
+                onClick={() => void local.install()}
                 disabled={local.busy !== null || isBlocked}
                 className="rounded-lg bg-accent px-3 py-1.5 text-[13px] font-medium text-white disabled:bg-control disabled:text-ink-secondary"
               >
@@ -1490,6 +1499,9 @@ export function SettingsModal() {
                 <>
                   <div id="setting-computers-providers" className={highlightClass("setting-computers-providers")}>
                     <LocalComputerSection />
+                  </div>
+                  <div className={highlightClass("setting-computers-cli-credentials")}>
+                    <HostCliIntegrationCard />
                   </div>
                   <div id="setting-computers-local-vm" className={highlightClass("setting-computers-local-vm")}>
                     <LocalVmRuntimeCard />

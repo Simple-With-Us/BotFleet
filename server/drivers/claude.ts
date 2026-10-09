@@ -50,6 +50,7 @@ export { STATIC_CLAUDE_MODELS };
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { applyLaunchIdentity } from "../launch-identity.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import {
   applyClaudeInject,
@@ -70,6 +71,7 @@ import {
   writePromptSplitReceipt,
   type PromptSplitReceipt,
 } from "./prompt-split.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 /** How the volatile half of the system prompt (memory, mentions) reaches a
@@ -525,6 +527,8 @@ interface Ask {
   tool: string;
   input: Record<string, unknown>;
   at: number;
+  /** The CLI's id for the tool_use being asked about, when it sent one. */
+  toolUseId?: string;
 }
 type AskBehavior = "allow" | "deny" | "answer";
 type AskResolutionSource = "user" | "timeout" | "system";
@@ -625,7 +629,14 @@ function createPermissionBroker(opts: {
       } catch {}
       return;
     }
-    const ask: Ask = { id: askId, kind, tool: msg.tool ?? "tool", input: msg.input ?? {}, at: Date.now() };
+    const ask: Ask = {
+      id: askId,
+      kind,
+      tool: msg.tool ?? "tool",
+      input: msg.input ?? {},
+      at: Date.now(),
+      toolUseId: String(msg.toolUseId ?? "") || undefined,
+    };
     const finish = (behavior: AskBehavior, message: string | undefined, source: AskResolutionSource) => {
       if (!pending.delete(askId)) return;
       clearTimeout(timer);
@@ -776,9 +787,17 @@ function decodeConfig(raw: unknown): ClaudeConfig {
   }
   const tools = decodeToolList(o.tools, "tools");
   const disallowedTools = decodeToolList(o.disallowedTools, "disallowedTools");
+  // Settings > Engines > "Bypass permissions (autonomous mode)" stores
+  // `fullAuto: true` on the instance (server/config.ts patchInstanceConfig),
+  // which is every other CLI engine's native YOLO switch.  Claude had its own
+  // spelling, `permissionMode`, and nothing read `fullAuto`: the box ticked and
+  // the CLI kept running in acceptEdits.  An explicit `permissionMode` still
+  // wins, so a hand-written one is never overridden.  The host-control
+  // downgrade in sendTurn applies to either spelling.
+  const fullAuto = o.fullAuto === true;
   return {
     cli: typeof o.cli === "string" ? o.cli : "claude",
-    permissionMode: (mode as ClaudeConfig["permissionMode"]) ?? "acceptEdits",
+    permissionMode: (mode as ClaudeConfig["permissionMode"]) ?? (fullAuto ? "bypassPermissions" : "acceptEdits"),
     ...(tools !== undefined ? { tools } : {}),
     ...(disallowedTools !== undefined ? { disallowedTools } : {}),
   };
@@ -830,7 +849,14 @@ function modelRejectionMessage(cliText: string, requested: string | null | undef
 
 export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Claude", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Claude",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block the instance publishes below, so the
+    // capability matrix can check its cell against the driver rather than
+    // against the comment above that block.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   // npm on all three: the one recipe that is genuinely cross-platform. The
   // native installers differ per OS and would need verifying separately.
   install: {
@@ -1084,9 +1110,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // but a turn that can click on the user's real desktop runs brokered:
       // the CLI gets acceptEdits plus the permission-prompt tool, so every
       // ask reaches the harness and the bot's Auto policy decides. Nothing
-      // else could make host control safe on a bypass instance.
+      // else could make host control safe on a bypass instance.  A turn the
+      // harness holds for auto-review (`holdForReview`) is brokered the same
+      // way, so the reviewer sees each ask before it runs.
       const permissionMode: ClaudeConfig["permissionMode"] =
-        controlsHost && config.permissionMode === "bypassPermissions" ? "auto" : config.permissionMode;
+        (controlsHost || turn.holdForReview === true) && config.permissionMode === "bypassPermissions"
+          ? "auto"
+          : config.permissionMode;
       const retryAbort = new AbortController();
       const retry = retryState.get(threadId) ?? { attempt: 0, cancelled: false };
       retry.cancelled = false;
@@ -1129,9 +1159,21 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const mcpServers: Record<string, unknown> = {};
 
       const allowed: string[] = [];
+      // A turn held for auto-review routes the servers that reach outside
+      // the bot through the permission-prompt tool instead of pre-allowing
+      // them: a connected-app call (an email, a message) and a phone call
+      // then reach the reviewer BEFORE they run, where a pre-allowed call
+      // could only be watched after it had already gone out.  The `agents`
+      // server stays pre-allowed on purpose: it is the harness's own fleet
+      // comms, jobs and Zulip, each guarded by the endpoint it calls (comms
+      // depth, peer approval), and the owner ruled that a full-auto bot's own
+      // `job_start` never becomes a card, which routing it through the broker
+      // would break.  The step watch reviews those calls as they start, a
+      // message to another bot (`ask_bot`) included.
+      const heldForReview = turn.holdForReview === true && permissionMode !== "bypassPermissions";
       if (turn.integrations?.composio) {
         mcpServers.composio = { ...turn.integrations.composio };
-        allowed.push("mcp__composio");
+        if (!heldForReview) allowed.push("mcp__composio");
       }
       // Every granted computer gets its own server, so the agent can choose
       // per task instead of the harness choosing once for it.
@@ -1165,7 +1207,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       }
       if (turn.integrations?.phone) {
         mcpServers.phone = { ...turn.integrations.phone };
-        allowed.push("mcp__phone");
+        if (!heldForReview) allowed.push("mcp__phone");
       }
       if (turn.integrations?.qdrant) {
         mcpServers.qdrant = { ...turn.integrations.qdrant };
@@ -1218,13 +1260,26 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       args.push("--mcp-config", mcpConfigPath, "--strict-mcp-config");
       args.push("--allowedTools", allowed.join(","));
 
-      const env = claudeEnvironment(turnModel, turnEnvironment);
+      // The launch identity is per bot and per turn (`turnEnvironment` is the
+      // instance's), and a retained process keeps the env it was spawned with,
+      // so it is part of the contract key below.
+      const env = applyLaunchIdentity(claudeEnvironment(turnModel, turnEnvironment), turn.launchIdentity);
       const cwd = turn.cwd ?? homedir();
       // everything that shapes the process, minus session/turn specifics
       // (the --mcp-config file is a fresh temp path each time; its CONTENT
       // is what matters and mcpServers carries that)
       const keyArgs = args.filter((a, i) => a !== "--mcp-config" && args[i - 1] !== "--mcp-config");
-      const argsKey = JSON.stringify({ args: keyArgs, mcpServers, cwd, model: injected.model ?? null, base: env.ANTHROPIC_BASE_URL ?? null });
+      const argsKey = JSON.stringify({
+        args: keyArgs,
+        mcpServers,
+        cwd,
+        model: injected.model ?? null,
+        base: env.ANTHROPIC_BASE_URL ?? null,
+        // A room's members share one thread: a second bot there must not
+        // write into the process spawned for the first one's seat.
+        seat: env.AGENT_LAUNCH_SEAT ?? null,
+        session: env.AGENT_SESSION ?? null,
+      });
 
       // What the user turn carries besides its text.  The volatile half rides
       // as a labelled block when this native session has not carried this
@@ -1314,6 +1369,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               ...base(threadId, eventTurnId),
               type: "request.opened",
               requestId: ask.id,
+              // the tool_use this ask is about, the same id its item.started
+              // carried, so the auto-review step watch leaves it to the card
+              itemId: ask.toolUseId,
               requestType: ask.kind,
               tool: ask.tool,
               summary: askSummary(ask),
@@ -2098,8 +2156,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     /** One-shot Claude call with the prompt on stdin, never argv. Approval
      * summaries can contain paths, commands, or secrets, so the generic
      * `claude -p "prompt"` shape is not safe for review. No tools or MCP
-     * servers are mounted in this isolated process. */
-    const generateReview = async (prompt: string, signal?: AbortSignal): Promise<string> => {
+     * servers are mounted in this isolated process.
+     *
+     * A review (`ReviewPrompt`) puts its brief in the system prompt, through
+     * the same `--append-system-prompt` flag every turn already uses, and
+     * only the action under review on stdin, so text inside the action reads
+     * as data rather than as part of the brief.  The brief is fixed text
+     * with nothing from the action in it, so argv is fine for it. */
+    const generateReview = async (stdin: string, system: string | undefined, signal?: AbortSignal): Promise<string> => {
       if (signal?.aborted) throw new Error("Claude review aborted");
       await requireStrictMcp();
       if (signal?.aborted) throw new Error("Claude review aborted");
@@ -2109,6 +2173,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           [
             "-p", "--model", "claude-haiku-4-5", "--output-format", "text",
             "--tools", "", "--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config",
+            ...(system === undefined ? [] : ["--append-system-prompt", system]),
           ],
           {
             stdio: ["pipe", "pipe", "pipe"],
@@ -2155,7 +2220,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (signal?.aborted) onAbort();
         else {
           signal?.addEventListener("abort", onAbort, { once: true });
-          child.stdin.end(prompt);
+          child.stdin.end(stdin);
         }
       });
     };
@@ -2193,6 +2258,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // under the Task/Agent row that started it.  One level deep; the
           // three-at-once cap is the CLI's and advisory (CLAUDE_CONTAINMENT_ENV).
           helpers: "typed",
+          // Every ask reaches the permission-prompt tool, except on a bypass
+          // instance, which asks nothing unless a turn is held for review.
+          reviewHook: config.permissionMode === "bypassPermissions" ? "after" : "before",
+          asksWhenHeld: true,
         },
         sendTurn,
         steer,
@@ -2216,8 +2285,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return () => listeners.delete(listener);
         },
       },
-      generateText: (prompt) => generateReview(prompt),
-      reviewPermission: generateReview,
+      generateText: (prompt) => generateReview(prompt, undefined),
+      reviewPermission: (prompt: ReviewPrompt, signal) => generateReview(prompt.data, prompt.system, signal),
       dispose: async () => {
         for (const { stop } of active.values()) stop();
         for (const threadId of [...sessions.keys()]) closeSession(threadId, "dispose");

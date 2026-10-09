@@ -16,7 +16,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyPreparedUpdate, prepareUpdate, runUpdate } from "./mac-update-transaction.mjs";
@@ -27,6 +27,12 @@ import {
   outcomeMessage,
 } from "./update-progress.mjs";
 import { validUpdateCredentialReceipt } from "../electron/update-credential-preparation.mjs";
+import { stageIsPrunable } from "./stage-entries.mjs";
+import {
+  downloadBuiltBundle,
+  ResolutionError,
+  updateSourcePolicy,
+} from "./ci-build-resolver.mjs";
 
 const EXPECTED_TEAM_ID = "CC8UTF7ATG";
 // Transition release: main still BUILDS com.botfleet.app (LEGACY_BUNDLE_ID).
@@ -88,14 +94,27 @@ export function parseArguments(argv) {
     else if (arg === "--progress") parsed.progress = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--run-id") parsed.runId = requiredValue(arg, args.shift());
     else if (arg === "--no-open") parsed.openApplication = false;
+    else if (arg === "--grace") parsed.graceMs = graceSeconds(requiredValue(arg, args.shift()));
+    else if (arg.startsWith("--grace=")) parsed.graceMs = graceSeconds(requiredValue("--grace", arg.slice("--grace=".length)));
+    else if (arg === "--wait-for-idle") {
+      // The minutes are optional: a bare flag waits the default window.
+      parsed.waitForIdleMs = /^\d+(\.\d+)?$/.test(args[0] ?? "") ? idleMinutes(args.shift()) : DEFAULT_WAIT_FOR_IDLE_MS;
+    }
+    else if (arg.startsWith("--wait-for-idle=")) {
+      parsed.waitForIdleMs = idleMinutes(requiredValue("--wait-for-idle", arg.slice("--wait-for-idle=".length)));
+    }
     else if (arg === "--force" || arg === "-f") parsed.force = true;
     else if (arg === "--help" || arg === "-h") parsed.help = true;
     else throw new Error(`Unknown option: ${arg}`);
   }
   if (command === "apply" && !parsed.stage) throw new Error("apply requires --stage <directory>");
   if (command === "unquiesce" && (parsed.target !== "origin/main" || parsed.source || parsed.stage || parsed.bundle ||
-      parsed.dependencies || parsed.openApplication === false || parsed.progress || parsed.runId)) {
+      parsed.dependencies || parsed.openApplication === false || parsed.progress || parsed.runId ||
+      parsed.graceMs !== undefined || parsed.waitForIdleMs !== undefined)) {
     throw new Error("unquiesce accepts no options");
+  }
+  if (parsed.force && parsed.waitForIdleMs !== undefined) {
+    throw new Error("--force and --wait-for-idle ask for opposite things; pass one");
   }
   if (command === "apply" && (parsed.bundle || parsed.dependencies || parsed.source)) {
     throw new Error("apply accepts only a prepared --stage");
@@ -118,12 +137,32 @@ function requiredValue(flag, value) {
   return value;
 }
 
+/** `--grace` is in seconds: how long work in flight gets before it is paused. */
+function graceSeconds(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0 || seconds > 600) {
+    throw new Error("--grace must be a number of seconds from 0 to 600");
+  }
+  return Math.round(seconds * 1_000);
+}
+
+/** `--wait-for-idle` is in minutes, because a person types it. */
+function idleMinutes(value) {
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 360) {
+    throw new Error("--wait-for-idle must be a number of minutes above 0 and at most 360");
+  }
+  return Math.round(minutes * 60_000);
+}
+
 function usage() {
   return `Usage:
   update-botfleet-mac.mjs update  [--target REF] [--source PATH] [--stage PATH] [--no-open]
+                              [--grace SECONDS | --wait-for-idle [MINUTES] | --force]
   update-botfleet-mac.mjs prepare [--target REF] [--source PATH] [--stage PATH]
                               [--bundle PATH --dependencies PATH]
   update-botfleet-mac.mjs apply   --stage PATH [--no-open]
+                              [--grace SECONDS | --wait-for-idle [MINUTES] | --force]
   update-botfleet-mac.mjs unquiesce
 
 Any of update/prepare/apply also accepts --progress PATH [--run-id ID], which records each
@@ -131,15 +170,30 @@ step and the final outcome to a JSON file a detached caller can read while the r
 
 prepare builds and validates without touching the live checkout, installed app, or processes.
 An existing exact-source build can be imported with --bundle and --dependencies.
-apply performs a fresh active-work check, installs one prepared stage, verifies exact runtime identity,
-and rolls the prior bundle and checkout back if any install or startup step fails.
+apply installs one prepared stage, verifies exact runtime identity, and rolls the prior bundle and
+checkout back if any install or startup step fails.
 unquiesce is the authenticated recovery action if the updater exits after fencing admission but before shutdown.
 
---force (-f, or BOTFLEET_FORCE=1) does more than reinstall when the checkout is already current.
-It drops the requirement that the harness be idle and asks it to quiesce with force=true, which
-interrupts busy bots and running or queued routines.  Their work is saved to
-pending-update-resume.json and resumed after the update.  A live room turn still refuses the
-forced update.  Use it only when interrupting that work is acceptable.`;
+Busy bots never block an update.  Before it stops anything, apply asks BotFleet to hold new work
+(new turns, routine and webhook runs, job wakes) and gives the work already running a short grace
+to finish on its own: 60 seconds, or --grace SECONDS (BOTFLEET_UPDATE_GRACE_MS).  Whatever is
+still running then is interrupted, saved to pending-update-resume.json and resumed after the
+update.  Held work is queued, never dropped: it runs after the restart.  The one thing that is
+never interrupted is a live room turn, because a room turn cannot be resumed without repeating
+it; apply waits up to 5 more minutes for rooms to go quiet (BOTFLEET_UPDATE_ROOM_WAIT_MS), and
+then lets everything go and stops without updating.
+
+A process that is not BotFleet but holds BotFleet's files or ports (a bot's own sqlite3, node or
+curl) is never signalled.  apply waits up to 90 seconds for it to let go
+(BOTFLEET_UNKNOWN_HOLDER_WAIT_MS), and names its executable if it is still there after that.
+
+--wait-for-idle [MINUTES] never interrupts anything.  It waits for the work already running to
+finish, 20 minutes unless MINUTES says otherwise, and if bots are still busy when the time runs
+out, everything held runs now and the update stops without changing anything.
+
+--force (-f, or BOTFLEET_FORCE=1) skips the grace and interrupts at once, and also reinstalls when
+the checkout is already current.  Interrupted work is saved to pending-update-resume.json and
+resumed after the update.  A live room turn still refuses it.`;
 }
 
 async function exists(path) {
@@ -278,7 +332,7 @@ export function prunablePath(path, roots) {
  * deleted.  Both kinds are swept — the bundle beside the installed app and
  * the dependency tree beside the live checkout.
  */
-export function staleCandidateNames(names, { prefix, suffix = "", keepNames = [], isAlive = processIsAlive } = {}) {
+export function staleCandidateNames(names, { prefix, suffix = "", keepNames = [], isAlive = processExists } = {}) {
   const stale = [];
   const unrecognised = [];
   for (const name of names) {
@@ -299,13 +353,10 @@ export const CANDIDATE_DEPENDENCY_PREFIX = ".botfleet-server.node_modules.update
 // every later update forever.  It carries the updater's pid so the ordinary
 // candidate rule sweeps it once that process is gone.
 export const FAILED_DEPENDENCY_PREFIX = ".botfleet-server.node_modules.failed-";
-// Entries a stage directory is allowed to contain and still be swept
-// unattended.  Anything else in there was put there by a person, and a person
-// gets to decide when it goes.
-const KNOWN_STAGE_ENTRIES = new Set([
-  "BotFleet.app", "node_modules", "prepared.json", "rollback", "source",
-  "pending-recovery.json", "credential-migration.json",
-]);
+// The allowlist lives in scripts/stage-entries.mjs because
+// server/update-control.ts sweeps with the same rules, and two copies of it
+// already drifted once — which leaked a full copy of the app and a
+// multi-gigabyte dependency tree on every update.
 export const ABANDONED_STAGE_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -375,7 +426,7 @@ export function abandonedStages(entries, { now = Date.now(), referenced = [], ag
     }
     const stamp = stageStamp(entry.name) ?? entry.mtimeMs;
     const stale = Number.isFinite(stamp) && now - stamp > ageMs;
-    if (stale && entry.names.every((name) => KNOWN_STAGE_ENTRIES.has(name))) prune.push(entry.path);
+    if (stale && stageIsPrunable(entry.names)) prune.push(entry.path);
     else report.push(entry.path);
   }
   return { prune, report };
@@ -569,7 +620,7 @@ async function acquireDirectoryLock(path, mode) {
       try { owner = JSON.parse(await readFile(join(path, "owner.json"), "utf8")); } catch {
         throw new Error(`Updater lock ${path} exists without a readable owner; inspect it before retrying`);
       }
-      if (Number.isInteger(owner?.pid) && processIsAlive(owner.pid)) {
+      if (Number.isInteger(owner?.pid) && await processIsAlive(owner.pid)) {
         throw new Error(`Another BotFleet update is running (pid ${owner.pid}, phase ${owner.mode || "unknown"})`);
       }
       if (attempt > 0) throw new Error(`Could not recover stale updater lock ${path}`);
@@ -579,13 +630,88 @@ async function acquireDirectoryLock(path, mode) {
   throw new Error(`Could not acquire updater lock ${path}`);
 }
 
-function processIsAlive(pid) {
+/**
+ * The raw signal-0 probe.  ESRCH is the only proof of absence: EPERM means the
+ * pid exists and belongs to someone else.  A zombie still has a pid, so this
+ * answers true for one; processIsAlive below is the check that knows better.
+ */
+function processExists(pid) {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
     return error?.code !== "ESRCH";
   }
+}
+
+/**
+ * A `ps` state column that begins with Z names a zombie: the process has
+ * exited and only its pid and exit status remain, waiting for a parent that
+ * never reaped it.  On 2026-10-08 a long-running grok CLI left two of
+ * BotFleet's bundled `cua-driver` processes in that state, `kill -0` kept
+ * answering success for them, and every apply refused to go on with "BotFleet
+ * did not exit after graceful quit and SIGTERM ... refusing SIGKILL".
+ */
+export function isZombieState(state) {
+  return String(state ?? "").trim().startsWith("Z");
+}
+
+/**
+ * The `ps` state column for every pid in one spawn, as a Map of pid to state.
+ * `ps` exits nonzero when some listed pid has gone but still prints the rest,
+ * so the rows are read whatever the exit code says.  A pid with no row is
+ * simply absent from the map.
+ */
+export async function processStates(pids) {
+  const states = new Map();
+  if (!pids.length) return states;
+  const result = await run("ps", ["-o", "pid=,stat=", "-p", pids.join(",")], { allowFailure: true });
+  for (const line of result.stdout.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(\S+)$/);
+    if (match) states.set(Number(match[1]), match[2]);
+  }
+  return states;
+}
+
+/**
+ * The pids in `pids` that are still running.  Every place the updater asks
+ * "does anything still hold BotFleet state" goes through this, so a zombie is
+ * never captured, waited on, signalled, or reported as a survivor.  A zombie
+ * holds no files, no ports and no database handle, so it can never hold
+ * BotFleet state, and no signal can make it exit sooner (only its parent
+ * reaping it can).
+ *
+ * `kill -0` runs first (ESRCH is the proof of absence), then ONE `ps` spawn
+ * reads the state of everything left, so a poll over N pids costs one spawn,
+ * not N.  This fails toward alive: a pid with no `ps` row, or a `ps` that
+ * fails, proves nothing, and reading that as "exited" would let the swap
+ * proceed under a live process.  Only a state beginning with Z says exited.
+ * (A `ps` that hangs blocks this check, as it blocks processCommand; run()
+ * has no timeout.)
+ *
+ * A caller may inject `isAlive`, synchronous or asynchronous.  The verdicts
+ * are awaited together because a Promise is always truthy and cannot be
+ * filtered on directly.
+ */
+export async function withoutExitedPids(pids, { isAlive, exists = processExists, statesOf = processStates } = {}) {
+  if (isAlive) {
+    const verdicts = await Promise.all(pids.map((pid) => isAlive(pid)));
+    return pids.filter((_, index) => verdicts[index]);
+  }
+  const present = pids.filter((pid) => exists(pid));
+  if (!present.length) return [];
+  let states;
+  try {
+    states = await statesOf(present);
+  } catch {
+    return present;
+  }
+  return present.filter((pid) => !isZombieState(states.get(pid)));
+}
+
+/** Is this one pid still running?  See withoutExitedPids; a zombie is not. */
+export async function processIsAlive(pid, options) {
+  return (await withoutExitedPids([pid], options)).length === 1;
 }
 
 async function parseJsonFile(path, label) {
@@ -631,8 +757,8 @@ async function probeHealthWithRetry(port, { attempts = 3, backoffMs = 250 } = {}
   return { ...result, port };
 }
 
-async function probeHealth(port) {
-  const result = await requestJson(`http://127.0.0.1:${port}/api/health`, { accept: [200] });
+async function probeHealth(port, { timeoutMs = 3_000 } = {}) {
+  const result = await requestJson(`http://127.0.0.1:${port}/api/health`, { accept: [200], timeoutMs });
   if (result.kind !== "ok") return result;
   if (result.body?.app !== "botfleet" || !Number.isInteger(result.body?.pid) || result.body.pid <= 0) {
     return { kind: "foreign" };
@@ -654,7 +780,10 @@ async function sqliteHolders(dataDirectory) {
   if (!present.length) return [];
   const result = await run("lsof", ["-t", "--", ...present], { allowFailure: true });
   if (![0, 1].includes(result.code)) throw new Error("Could not inspect BotFleet database ownership with lsof");
-  return [...new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger))];
+  // lsof lists open files, which a zombie no longer has, so this filter is
+  // belt and braces: a zombie reported here would hold the database "open"
+  // forever and no signal could ever close it.
+  return withoutExitedPids([...new Set(result.stdout.split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger))]);
 }
 
 export function healthTopologyResult(results, { allowMultiple = false } = {}) {
@@ -671,8 +800,13 @@ export function healthTopologyResult(results, { allowMultiple = false } = {}) {
 }
 
 async function healthTopology(ports, options = {}) {
-  return healthTopologyResult(await Promise.all(ports.map(probeHealth)), options);
+  const probe = (port) => probeHealth(port, options.timeoutMs ? { timeoutMs: options.timeoutMs } : undefined);
+  return healthTopologyResult(await Promise.all(ports.map(probe)), options);
 }
+
+/** A loaded Mac (load average in the hundreds) answers, just slowly: the
+ *  preflight reads wait this long for each answer instead of three seconds. */
+const PATIENT_REQUEST_MS = 10_000;
 
 const OWNER_KEYS = ["version", "pid", "port", "nonce"];
 
@@ -691,6 +825,25 @@ function validOwner(owner) {
   return owner.version === 1 && Number.isInteger(owner.pid) && owner.pid > 0 &&
     Number.isInteger(owner.port) && owner.port > 0 && owner.port <= 65535 &&
     typeof owner.nonce === "string" && /^[a-f0-9]{64}$/.test(owner.nonce);
+}
+
+/** Runtime calls authenticate with BOTFLEET_OWNER_NONCE only — never read the
+ *  bearer credential back out of harness-owner.json in this process. */
+/* oxlint-disable anti-slop/no-runtime-typeof -- env bearer credential boundary; zod is unavailable in the updater bootstrap graph. */
+export function requireHarnessBearerCredential() {
+  const credential = process.env.BOTFLEET_OWNER_NONCE;
+  if (typeof credential !== "string" || credential.length === 0) {
+    throw new Error("BOTFLEET_OWNER_NONCE is required when a harness owner record exists");
+  }
+  if (!/^[a-f0-9]{64}$/.test(credential)) {
+    throw new Error("BOTFLEET_OWNER_NONCE is not a valid harness bearer credential");
+  }
+  return credential;
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
+function harnessAuthorizationHeader() {
+  return { Authorization: `Bearer ${requireHarnessBearerCredential()}` };
 }
 
 /**
@@ -712,7 +865,7 @@ async function ownerRecordState(dataDirectory) {
     if (error?.code === "ENOENT") return { state: "absent" };
     throw error;
   }
-  if (!processIsAlive(owner.pid)) return { state: "stale", owner };
+  if (!(await processIsAlive(owner.pid))) return { state: "stale", owner };
   return { state: "live", owner };
 }
 
@@ -746,6 +899,10 @@ export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requi
   return null;
 }
 
+/** The topology reason a port that timed out produces: on a loaded Mac that
+ *  is a slow harness, not a wrong one, and worth asking again. */
+const TOPOLOGY_UNAVAILABLE = /unavailable or ambiguous/;
+
 async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   const { state, owner } = await ownerRecordState(config.dataDirectory);
   // A record naming a dead pid is a stopped or crashed harness, not an
@@ -764,28 +921,111 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   }
   if (state !== "live") return null;
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
-    headers: { Authorization: `Bearer ${owner.nonce}` },
+    headers: harnessAuthorizationHeader(),
     accept: [200],
+    timeoutMs: PATIENT_REQUEST_MS,
   });
   if (response.kind === "http" && response.status === 404) return null;
-  if (response.kind !== "ok") return { safe: false, reason: "Authenticated runtime readiness could not be verified" };
+  // `transient` marks the answers a slow harness gives: no answer at all, or
+  // a health port that timed out.  runtimePreflight asks again for those.
+  if (response.kind !== "ok") {
+    return { safe: false, transient: true, reason: "Authenticated runtime readiness could not be verified" };
+  }
   const runtime = response.body;
   const identityError = authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle });
   if (identityError) return { safe: false, reason: identityError };
-  const topology = await healthTopology(config.ports);
+  const topology = await healthTopology(config.ports, { timeoutMs: PATIENT_REQUEST_MS });
   if (!topology.safe || topology.pid !== owner.pid) {
-    return { safe: false, reason: topology.reason || "Health endpoints do not share the authenticated runtime owner" };
+    return {
+      safe: false,
+      transient: TOPOLOGY_UNAVAILABLE.test(topology.reason || ""),
+      reason: topology.reason || "Health endpoints do not share the authenticated runtime owner",
+    };
   }
-  const holders = await sqliteHolders(config.dataDirectory);
+  // A bot's own `sqlite3` or `node` holding the database for a moment is
+  // waited out, never signalled, and named if it stays (finding 5).
+  const settled = await settledDatabaseHolders(config, owner.pid, { report: config.reportDetail });
+  if (!settled.holders) return { safe: false, reason: settled.reason };
+  const holders = settled.holders;
   if (holders.length !== 1 || holders[0] !== owner.pid) {
     return { safe: false, reason: `Database ownership is ambiguous (${holders.length} live holders)` };
   }
   return { safe: true, mode: "authenticated", pid: owner.pid, port: owner.port, runtime, holders, health: topology.health };
 }
 
-export async function runtimePreflight(config, expectedBuild) {
-  const requireIdle = !config?.force && process.env.BOTFLEET_FORCE !== "1";
-  const strict = await strictRuntimePreflight(config, expectedBuild, { requireIdle });
+/** How long a preflight keeps asking a harness that does not answer. */
+export const DEFAULT_PREFLIGHT_RETRY_MS = 60_000;
+
+/**
+ * Ask again while the answer is only "too slow to tell", with backoff, inside
+ * a bounded window.  A loaded Mac (load average in the hundreds) can miss a
+ * three-second request now and then, and one missed request used to abort the
+ * whole apply.  A definitive answer — wrong identity, two database holders,
+ * no harness — returns at once, and so does the last attempt in the window.
+ */
+export async function retryTransient(attempt, {
+  windowMs = DEFAULT_PREFLIGHT_RETRY_MS,
+  now = Date.now,
+  wait = sleep,
+  firstDelayMs = 1_000,
+  maxDelayMs = 10_000,
+} = {}) {
+  const deadline = now() + Math.max(0, windowMs);
+  let delay = firstDelayMs;
+  for (;;) {
+    const result = await attempt();
+    const remaining = deadline - now();
+    if (!result?.transient || remaining <= 0) return result;
+    await wait(Math.min(delay, remaining));
+    delay = Math.min(maxDelayMs, delay * 2);
+  }
+}
+
+/** The non-interrupting mode: zero, or how long `--wait-for-idle` waits. */
+function waitForIdleFor(config) {
+  const value = config?.waitForIdleMs;
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function forcedRun(config) {
+  return Boolean(config?.force || process.env.BOTFLEET_FORCE === "1");
+}
+
+/** How the fence step treats work in flight.  See `usage()`.  `now` is one
+ *  plain ask with no hold and no grace (a rollback under --wait-for-idle). */
+export function fenceMode(config) {
+  if (config?.fenceNow === "force") return "force";
+  if (config?.fenceNow === "idle") return "now";
+  if (forcedRun(config)) return "force";
+  return waitForIdleFor(config) > 0 ? "wait-for-idle" : "grace";
+}
+
+/**
+ * The fence a rollback takes on the replacement: at once, never the hold,
+ * grace and pause cycle an update runs.  A replacement that failed its checks
+ * should not keep its work waiting 60 seconds before it is paused, and under
+ * --wait-for-idle it could otherwise wait hours.  So the forced quiesce runs
+ * straight away (the replacement's work is saved and the restored build
+ * resumes it) — except under --wait-for-idle, the opt-in that never
+ * interrupts: there it asks once, and a busy replacement defers the rollback
+ * with a recovery receipt rather than being interrupted.
+ */
+export function rollbackFenceConfig(config) {
+  return { ...config, fenceNow: waitForIdleFor(config) > 0 ? "idle" : "force" };
+}
+
+export async function runtimePreflight(config, expectedBuild, adapters = {}) {
+  // Work in flight is never a reason to stop here: the fence step decides
+  // what happens to it.  What this checks is that the harness is the one this
+  // Mac owns, and a harness too slow to say so is asked again.
+  const strict = await retryTransient(
+    () => (adapters.strictPreflight ?? strictRuntimePreflight)(config, expectedBuild, { requireIdle: false }),
+    {
+      windowMs: Number.isFinite(config?.preflightRetryMs) ? config.preflightRetryMs : DEFAULT_PREFLIGHT_RETRY_MS,
+      now: adapters.now,
+      wait: adapters.sleep,
+    },
+  );
   if (strict) return strict;
   return { safe: false, reason: "Runtime does not expose complete authenticated readiness; manual first adoption is required" };
 }
@@ -795,24 +1035,544 @@ async function runtimeIdentityPreflight(config, expectedBuild) {
   return strict || { safe: false, reason: "Expected build does not expose authenticated runtime identity" };
 }
 
+/** How long running work gets to finish on its own before it is paused. */
+export const DEFAULT_GRACE_MS = 60_000;
+/** How long `--wait-for-idle` waits when no minutes are given. */
+export const DEFAULT_WAIT_FOR_IDLE_MS = 20 * 60_000;
+/** After the grace, how long the updater keeps trying to pause work that the
+ *  harness will not interrupt — a live room turn — before it gives up. */
+export const DEFAULT_ROOM_WAIT_MS = 5 * 60_000;
+const DEFAULT_DRAIN_POLL_MS = 5_000;
+/** Between two forced attempts the harness refused for something other than
+ *  a room turn: each one interrupts and resumes, so they are spaced out. */
+const FORCE_RETRY_MS = 30_000;
+/** A forced quiesce interrupts every busy bot and waits up to 15 s for them
+ *  to settle, so its answer can take a while on a loaded Mac. */
+const FORCED_QUIESCE_TIMEOUT_MS = 90_000;
+const QUIESCE_TIMEOUT_MS = 20_000;
+/** How long the hold keeps polling a harness that has stopped answering. */
+const DRAIN_SILENCE_LIMIT_MS = 60_000;
+
+function plural(count, one, many = `${one}s`) {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+/** "20 minutes", "1 minute", "45 seconds": a window as a person says it. */
+export function describeWindow(ms) {
+  if (ms >= 60_000 && ms % 60_000 === 0) return plural(ms / 60_000, "minute");
+  if (ms >= 60_000) return plural(Math.round(ms / 6_000) / 10, "minute");
+  return plural(Math.max(1, Math.round(ms / 1_000)), "second");
+}
+
+/** The refusal `--wait-for-idle` ends with when bots stay busy. */
+export function waitForIdleTimeoutMessage(ms) {
+  return `Bots were still busy after ${describeWindow(ms)}; nothing was interrupted.  `
+    + "Try again later, or run without --wait-for-idle to pause and resume them.";
+}
+
+/** The refusal the default mode ends with when work would not pause.  The
+ *  one known cause is a room conversation, which is never interrupted. */
+export function pauseTimeoutMessage(ms, runtime) {
+  const rooms = Number.isInteger(runtime?.drain?.rooms) ? runtime.drain.rooms : 0;
+  if (rooms > 0) {
+    return `A room conversation was still running after ${describeWindow(ms)}, and a room turn cannot be paused `
+      + "without repeating it, so the update did not start.  Nothing was interrupted.  Try again when the room is quiet.";
+  }
+  return `BotFleet could not pause its work within ${describeWindow(ms)}, so the update did not start.  `
+    + "Anything it paused was resumed.  Try again in a few minutes.";
+}
+
+/** What the update is waiting for, for the progress record and the terminal.
+ *  `runtime` is a `/api/runtime` or quiesce answer: a drain-capable harness
+ *  reports `drain`, an older one only `activeWorkCount`. */
+export function drainProgressDetail(runtime, phase = "wait") {
+  const drain = runtime?.drain;
+  const bots = Number.isInteger(drain?.bots) ? drain.bots : 0;
+  const rooms = Number.isInteger(drain?.rooms) ? drain.rooms : 0;
+  const inFlight = Number.isInteger(drain?.inFlight) ? drain.inFlight
+    : Number.isInteger(runtime?.activeWorkCount) ? runtime.activeWorkCount : null;
+  if (phase === "pause") {
+    if (rooms > 0) return `Waiting for ${plural(rooms, "room conversation")} to finish`;
+    return bots > 0 ? `Pausing ${plural(bots, "bot")} to resume after the update` : "Pausing work to resume after the update";
+  }
+  if (bots > 0) return `Waiting for ${plural(bots, "bot")} to finish`;
+  if (inFlight !== null && inFlight > 0) return `Waiting for ${plural(inFlight, "operation")} to finish`;
+  return "Waiting for work in flight to finish";
+}
+
+/**
+ * Whether a runtime answer shows a fence this run may use: up, and settled.
+ *
+ * A forced quiesce still interrupting and saving work can still roll back, so
+ * a fence is only usable once the harness says it settled (`fencing: false`).
+ * The harness installed before this updater never reports `fencing`, and it
+ * raises `quiescing` BEFORE it starts interrupting, so for it the only proof
+ * of a settled fence is the work count itself: nothing in flight.  One rule
+ * for every path that can meet a fence — a forced answer, a second forced
+ * ask, and a fence discovered after an answer was lost.
+ */
+export function fenceUsable(body) {
+  if (body?.quiescing !== true) return false;
+  if (body.fencing === false) return true;
+  if (body.fencing === true) return false;
+  return body.safeToRestart === true && body.activeWorkCount === 0;
+}
+
+/** Whether a runtime answer shows a forced quiesce still interrupting and
+ *  saving work: the opposite of a settled fence, for a fence that is up. */
+export function fenceStillSettling(body) {
+  return body?.quiescing === true && !fenceUsable(body);
+}
+
+/** A fenced quiesce answer this run may use. */
+function runtimeQuiesced(response) {
+  return response?.kind === "ok" && response.status === 200 && fenceUsable(response.body);
+}
+
+const STOPPED_HOLDING = "BotFleet stopped holding new work before the update could start; nothing was interrupted.  Try again.";
+
+/** How long the harness keeps a fence this run took without hearing from it
+ *  (server/index.ts `armFenceLease`).  Long enough for a loaded Mac to miss a
+ *  few renewals; short enough that an updater killed between the fence and
+ *  the shutdown does not leave every bot refused for long. */
+export const FENCE_LEASE_MS = 3 * 60_000;
+/** How often this run renews it, from the fence until the harness is gone. */
+export const FENCE_LEASE_RENEW_MS = 20_000;
+const LEASE_QUERY = `leaseMs=${FENCE_LEASE_MS}`;
+
+/**
+ * SIGINT and SIGTERM, watched for the whole fence step: the hold, every
+ * request (one that fences after the signal arrived included), the pause,
+ * and the checks after the fence.  A signal anywhere in that window lifts
+ * what this run took — hold, fence, or a forced quiesce still settling — and
+ * ends the run with a refusal, instead of killing the updater with BotFleet
+ * fenced until someone runs `unquiesce`.  A listener replaces Node's default
+ * exit for these signals, which is why the run must end by returning: every
+ * path out of the step checks `stoppedBy`.
+ */
+export function watchStopSignals(signals) {
+  let stoppedBy = null;
+  const wakers = new Set();
+  const listeners = ["SIGINT", "SIGTERM"].map((signal) => {
+    const listener = () => {
+      stoppedBy ??= signal;
+      // Each wake removes itself; deleting the visited entry is safe in a Set.
+      for (const wake of wakers) wake();
+    };
+    signals?.on?.(signal, listener);
+    return [signal, listener];
+  });
+  return {
+    get stoppedBy() {
+      return stoppedBy;
+    },
+    /** `sleepFor`, cut short by a signal. */
+    sleeper(sleepFor) {
+      return (ms) => new Promise((resolve) => {
+        if (stoppedBy) return resolve();
+        const wake = () => {
+          wakers.delete(wake);
+          resolve();
+        };
+        wakers.add(wake);
+        sleepFor(ms).then(wake, wake);
+      });
+    },
+    dispose() {
+      for (const [signal, listener] of listeners) signals?.off?.(signal, listener);
+    },
+  };
+}
+
+/**
+ * Keep the fence's lease alive from the moment this run holds the fence until
+ * it lets go or the harness that holds it is gone: refused, restarted (a new
+ * nonce), or the fence down.  Renews at once, which also arms a lease the
+ * fence answer did not carry.  Runs past the fence step on purpose: the
+ * harness lives on through `quiesce` until bootout or SIGTERM reaches it, and
+ * an updater killed in between must not leave it fenced.  Only ever started
+ * on a harness that reports `lease`: one that predates it would read the
+ * renewal as a plain quiesce.  `stop()` waits for a renewal in flight, so a
+ * release that follows can never be overtaken by one.
+ */
+export function keepFenceLease(owner, {
+  request = requestJson,
+  leaseMs = FENCE_LEASE_MS,
+  everyMs = FENCE_LEASE_RENEW_MS,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+} = {}) {
+  const url = `http://127.0.0.1:${owner.port}/api/runtime/quiesce?renew=1&leaseMs=${leaseMs}`;
+  const headers = harnessAuthorizationHeader();
+  let stopped = false;
+  let timer = null;
+  let inFlight = Promise.resolve();
+  let renewals = 0;
+  const renew = () => {
+    timer = null;
+    if (stopped) return;
+    renewals += 1;
+    inFlight = Promise.resolve()
+      .then(() => request(url, { method: "POST", headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS }))
+      .then((answer) => {
+        const gone = answer.kind === "http" || answer.kind === "none" ||
+          (answer.kind === "ok" && (answer.body?.pid !== owner.pid || answer.body?.quiescing !== true));
+        if (gone) stopped = true;
+      }, () => {})
+      .finally(() => {
+        if (stopped) return;
+        timer = setTimer(renew, everyMs);
+        timer?.unref?.();
+      });
+  };
+  renew();
+  return {
+    get active() {
+      return !stopped;
+    },
+    get renewals() {
+      return renewals;
+    },
+    async stop() {
+      stopped = true;
+      if (timer) clearTimer(timer);
+      timer = null;
+      await inFlight;
+    },
+  };
+}
+
+/**
+ * Hold new work, give the work in flight its window, then take the fence.
+ *
+ * Resolves `{ ok: true, response, forced }` with the fenced quiesce answer,
+ * or `{ ok: false, reason }` having released whatever it held.  Every way
+ * out that is not a fence lifts the hold: the window closing, a signal, a
+ * harness that stops answering.  The harness's own lease is the backstop for
+ * an updater killed outright (server/update-drain.ts).
+ *
+ * `grace` (the default): work in flight gets `windowMs` to finish on its own;
+ * whatever is still running is then paused with the forced quiesce, saved to
+ * pending-update-resume.json and resumed after the restart.  The forced path
+ * still will not interrupt a live room turn, so for up to `roomWaitMs` more
+ * the updater waits for rooms to go quiet and asks again.
+ *
+ * `wait-for-idle`: the opt-in that never interrupts.  When `windowMs` runs
+ * out with bots still busy, it lets everything go and refuses.
+ *
+ * A harness that predates drains answers the first request as a plain
+ * quiesce, fenced when idle and refused when busy, with no `draining` field.
+ * That is the first update to carry this code, so it is not an error: the
+ * wait retries the plain fence, and the grace mode then forces as before.
+ */
+async function holdAndFence(config, owner, deps) {
+  const { request, now, pause: sleepFor, report, releaseAdmission, stop, mode, windowMs, roomWaitMs, pollMs } = deps;
+  const base = `http://127.0.0.1:${owner.port}`;
+  const headers = harnessAuthorizationHeader();
+  const quiesce = (query = "", timeoutMs = QUIESCE_TIMEOUT_MS) => request(`${base}/api/runtime/quiesce${query}`, {
+    method: "POST",
+    headers,
+    accept: [200, 409],
+    timeoutMs,
+  });
+  // Every request that can raise the fence asks for its lease.
+  const fenceQuiesce = () => quiesce(`?${LEASE_QUERY}`);
+  let forcedYet = false;
+  const forceQuiesce = () => {
+    forcedYet = true;
+    return quiesce(`?force=true&${LEASE_QUERY}`, FORCED_QUIESCE_TIMEOUT_MS);
+  };
+  const pause = stop.sleeper(sleepFor);
+  // A signal: lift whatever this run may hold — the hold, a fence an answer
+  // raised after the signal arrived, or a forced quiesce still settling
+  // (the release waits for it) — and end the run.
+  const stopped = async () => {
+    const reason = `Stopped by ${stop.stoppedBy} before the update started; `
+      + (forcedYet ? "anything paused was resumed." : "nothing was interrupted.");
+    try {
+      await releaseAdmission(config);
+      return { ok: false, reason };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `${reason}  Releasing BotFleet also failed; run update-botfleet.sh unquiesce: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  };
+  const waitDeadline = now() + windowMs;
+  const finalDeadline = mode === "grace" ? waitDeadline + roomWaitMs : waitDeadline;
+  // The harness holds a little past the updater's whole window, so its lease
+  // never runs out under a run that is still deciding.
+  const first = await retryTransient(async () => {
+    const answer = await quiesce(`?drain=1&timeoutMs=${Math.max(1_000, finalDeadline - now())}`);
+    return { ...answer, transient: answer.kind === "unavailable" && !stop.stoppedBy };
+  }, { windowMs: DRAIN_SILENCE_LIMIT_MS, now, wait: pause });
+  if (stop.stoppedBy) return stopped();
+  if (first.kind !== "ok") {
+    // The harness may have started holding and only the answer was lost:
+    // let go of whatever it holds rather than leave automations waiting on a
+    // lease nobody will collect.
+    const reason = "Runtime admission fence could not be established";
+    try {
+      await releaseAdmission(config);
+      return { ok: false, reason };
+    } catch {
+      return { ok: false, reason: `${reason}.  If BotFleet is holding new work, run update-botfleet.sh unquiesce.` };
+    }
+  }
+  if (runtimeQuiesced(first)) return { ok: true, response: first, forced: false };
+  const draining = first.body?.draining === true;
+  let holding = draining;
+  const release = async (reason) => {
+    if (!holding) return { ok: false, reason };
+    try {
+      await releaseAdmission(config);
+      holding = false;
+      return { ok: false, reason };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `${reason}  Releasing the held work also failed; run update-botfleet.sh unquiesce: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  };
+
+  {
+    let last = first.body;
+    let phase = "wait";
+    let silentSince = null;
+    let nextForceAt = 0;
+    let lastDetail = null;
+    for (;;) {
+      if (stop.stoppedBy) return stopped();
+      if (phase === "wait" && draining && last?.draining === true && last.drain?.inFlight === 0) {
+        // Nothing in flight: ask for the fence.  Work can land between the
+        // poll and this request; the harness then keeps holding and answers
+        // 409, and this simply goes round again.
+        const fenced = await fenceQuiesce();
+        // A signal that arrived while this was in flight wins over the fence.
+        if (stop.stoppedBy) return stopped();
+        if (runtimeQuiesced(fenced)) {
+          holding = false;
+          return { ok: true, response: fenced, forced: false };
+        }
+        if (fenced.kind === "ok") last = fenced.body;
+        if (fenced.kind === "ok" && fenced.body?.draining !== true) {
+          holding = false;
+          return { ok: false, reason: STOPPED_HOLDING };
+        }
+      }
+      if (phase === "wait" && now() >= waitDeadline) {
+        if (mode !== "grace") return release(waitForIdleTimeoutMessage(windowMs));
+        phase = "pause";
+      }
+      if (phase === "pause") {
+        const rooms = Number.isInteger(last?.drain?.rooms) ? last.drain.rooms : 0;
+        // A live room turn refuses the forced quiesce without touching
+        // anything, so asking while one runs only costs a request; an older
+        // harness cannot say, so it is simply asked.
+        // Never a second forced ask while the first is still fencing.
+        if (rooms === 0 && now() >= nextForceAt && last?.fencing !== true) {
+          const forced = await forceQuiesce();
+          if (stop.stoppedBy) return stopped();
+          if (runtimeQuiesced(forced)) {
+            holding = false;
+            return { ok: true, response: forced, forced: true };
+          }
+          if (forced.kind === "ok") {
+            last = forced.body;
+            // A refusal with no room turn interrupted and resumed work; do
+            // not churn through that again straight away.
+            if (!(Number.isInteger(last?.drain?.rooms) && last.drain.rooms > 0)) nextForceAt = now() + FORCE_RETRY_MS;
+          } else {
+            // No answer in time.  The harness may still be fencing; the next
+            // ask either collects the fence or is refused, so just go round.
+            nextForceAt = now() + pollMs;
+          }
+        }
+        if (now() >= finalDeadline) return release(pauseTimeoutMessage(windowMs + roomWaitMs, last));
+      }
+      const detail = drainProgressDetail(last, phase);
+      if (detail !== lastDetail) {
+        lastDetail = detail;
+        report(detail);
+      }
+      const deadline = phase === "wait" ? waitDeadline : finalDeadline;
+      await pause(Math.max(0, Math.min(pollMs, deadline - now())));
+      if (stop.stoppedBy) continue;
+      if (!draining) {
+        // An older harness: nothing is held, so there is nothing to poll.
+        // While waiting, retry the plain fence for an idle moment; the pause
+        // phase above asks for the forced one itself.
+        if (phase === "wait") {
+          const retried = await fenceQuiesce();
+          if (stop.stoppedBy) return stopped();
+          if (runtimeQuiesced(retried)) return { ok: true, response: retried, forced: false };
+          if (retried.kind === "ok") last = retried.body;
+        }
+        continue;
+      }
+      const polled = await request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
+      if (stop.stoppedBy) return stopped();
+      if (polled.kind !== "ok") {
+        silentSince ??= now();
+        if (now() - silentSince >= DRAIN_SILENCE_LIMIT_MS) {
+          return release("BotFleet stopped answering while the update waited for bots to finish; nothing was interrupted.");
+        }
+        continue;
+      }
+      silentSince = null;
+      if (polled.body?.pid !== owner.pid) {
+        holding = false;
+        return { ok: false, reason: STOPPED_HOLDING };
+      }
+      if (polled.body?.quiescing === true) {
+        // An ask whose answer timed out on this side landed on that one.  A
+        // forced fence still interrupting and saving work is not usable yet
+        // (it can still roll back), so wait for it to settle; a settled one
+        // is this run's fence (`fenceUsable`).  Only a harness that says it
+        // settled skips the idle check: it raises the fence idle, or having
+        // saved what it interrupted.
+        if (!fenceUsable(polled.body)) {
+          last = polled.body;
+          continue;
+        }
+        holding = false;
+        return { ok: true, response: { kind: "ok", status: 200, body: polled.body }, forced: polled.body.fencing === false };
+      }
+      if (polled.body?.draining !== true) {
+        // The lease ran out, something released it, or the harness restarted.
+        // Whatever it held is running again, so there is nothing to release.
+        holding = false;
+        return { ok: false, reason: STOPPED_HOLDING };
+      }
+      last = polled.body;
+    }
+  }
+}
+
+/**
+ * `--force`: one forced quiesce, watched to its end.  A forced quiesce can take
+ * a while (it interrupts every busy bot and waits for them to settle), and on a
+ * loaded Mac its answer can miss the timeout while the harness carries on.
+ * Asking again would only be told "already fencing", so the runtime is read
+ * until the fence settles one way or the other.  Resolves the settled answer,
+ * or `{ kind: "unavailable" }` when it never could tell.
+ */
+async function forceFence(owner, { request, now, wait, pollMs, stop }) {
+  const base = `http://127.0.0.1:${owner.port}`;
+  const headers = harnessAuthorizationHeader();
+  const answer = await request(`${base}/api/runtime/quiesce?force=true&${LEASE_QUERY}`, {
+    method: "POST",
+    headers,
+    accept: [200, 409],
+    timeoutMs: FORCED_QUIESCE_TIMEOUT_MS,
+  });
+  // A signal that arrived while the forced quiesce ran wins over its fence.
+  if (stop?.stoppedBy) return { kind: "stopped" };
+  if (runtimeQuiesced(answer)) return answer;
+  if (answer.kind === "ok" && answer.body?.quiescing !== true) return answer;
+  const deadline = now() + FORCED_QUIESCE_TIMEOUT_MS;
+  const interval = Number.isFinite(pollMs) && pollMs > 0 ? pollMs : DEFAULT_DRAIN_POLL_MS;
+  while (now() < deadline) {
+    await wait(Math.min(interval, Math.max(0, deadline - now())));
+    if (stop?.stoppedBy) return { kind: "stopped" };
+    const polled = await request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
+    if (stop?.stoppedBy) return { kind: "stopped" };
+    if (polled.kind !== "ok" || polled.body?.pid !== owner.pid) continue;
+    if (polled.body?.fencing === true) continue;
+    // No fence: the forced quiesce rolled itself back (or never started).
+    if (polled.body?.quiescing !== true) return { kind: "ok", status: 409, body: polled.body };
+    // A fence is only collected once it is settled: the harness says so, or
+    // (one that predates `fencing`) nothing is left in flight.  The installed
+    // harness raises its fence before it interrupts anything, so a fence seen
+    // with work still counted may yet roll back.
+    if (fenceUsable(polled.body)) return { kind: "ok", status: 200, body: polled.body };
+  }
+  return { kind: "unavailable", reason: "forced quiesce did not settle" };
+}
+
 export async function fenceRuntimeAdmission(config, adapters = {}) {
   const readRuntimeOwner = adapters.readOwner ?? readOwner;
   const request = adapters.requestJson ?? requestJson;
   const inspectTopology = adapters.healthTopology ?? healthTopology;
   const inspectHolders = adapters.sqliteHolders ?? sqliteHolders;
-  const releaseAdmission = adapters.releaseRuntimeAdmission ?? releaseRuntimeAdmission;
+  const now = adapters.now ?? Date.now;
+  const wait = adapters.sleep ?? sleep;
+  const releaseAdmission = adapters.releaseRuntimeAdmission ??
+    ((cfg) => releaseRuntimeAdmission(cfg, { readOwner: readRuntimeOwner, requestJson: request, now, sleep: wait }));
   const owner = await readRuntimeOwner(config.dataDirectory);
   if (!owner) return { safe: false, reason: "Authenticated runtime owner is unavailable for the admission fence" };
-  const forceQuery = (config?.force || process.env.BOTFLEET_FORCE === "1") ? "?force=true" : "";
-  const response = await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce${forceQuery}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${owner.nonce}` },
-    accept: [200, 409],
-  });
+  // One watcher for the whole fenced window (finding 6): from the first ask to
+  // the last check after the fence.  Handed back to Node's default the moment
+  // this step returns, by which time the run either holds a leased fence or
+  // has let go of everything.
+  const stop = watchStopSignals(adapters.signals === undefined ? process : adapters.signals);
+  try {
+    return await fenceWithin(config, owner, {
+      request, inspectTopology, inspectHolders, now, wait, releaseAdmission, stop, adapters,
+    });
+  } finally {
+    stop.dispose();
+  }
+}
+
+async function fenceWithin(config, owner, { request, inspectTopology, inspectHolders, now, wait, releaseAdmission, stop, adapters }) {
+  const pause = stop.sleeper(wait);
+  const mode = fenceMode(config);
+  const stopReason = (what) => `Stopped by ${stop.stoppedBy} before the update started; ${what}`;
+  let response;
+  let forced = mode === "force";
+  if (mode === "force" || mode === "now") {
+    response = mode === "force"
+      ? await forceFence(owner, { request, now, wait: pause, pollMs: config?.drainPollMs, stop })
+      : await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce?${LEASE_QUERY}`, {
+        method: "POST",
+        headers: harnessAuthorizationHeader(),
+        accept: [200, 409],
+        timeoutMs: QUIESCE_TIMEOUT_MS,
+      });
+    if (stop.stoppedBy || response.kind !== "ok") {
+      // A signal, or no answer and the harness may be fenced: never leave it
+      // that way.  The release waits for a forced quiesce still settling.
+      const reason = stop.stoppedBy
+        ? stopReason(mode === "force" ? "the fence was released and anything paused was resumed." : "nothing was interrupted.")
+        : "Runtime admission fence could not be established";
+      try {
+        await releaseAdmission(config);
+        return { safe: false, reason };
+      } catch {
+        return { safe: false, reason: `${reason}${stop.stoppedBy ? "" : "."}  If BotFleet is fenced, run update-botfleet.sh unquiesce.` };
+      }
+    }
+  } else {
+    const atLeastZero = (value, fallback) => (Number.isFinite(value) && value >= 0 ? value : fallback);
+    const held = await holdAndFence(config, owner, {
+      request,
+      releaseAdmission,
+      mode,
+      windowMs: mode === "grace" ? atLeastZero(config?.graceMs, DEFAULT_GRACE_MS) : waitForIdleFor(config),
+      roomWaitMs: atLeastZero(config?.roomWaitMs, DEFAULT_ROOM_WAIT_MS),
+      pollMs: Number.isFinite(config?.drainPollMs) && config.drainPollMs > 0 ? config.drainPollMs : DEFAULT_DRAIN_POLL_MS,
+      now,
+      pause: wait,
+      report: adapters.report ?? config?.reportDetail ?? (() => {}),
+      stop,
+    });
+    if (!held.ok) return { safe: false, reason: held.reason };
+    response = held.response;
+    forced = held.forced;
+  }
   if (response.kind !== "ok") return { safe: false, reason: "Runtime admission fence could not be established" };
   const runtime = response.body;
   const fenceHeld = response.status === 200 && runtime?.quiescing === true;
+  // The fence's lease, renewed from now until this run lets go or the harness
+  // is gone.  Only a harness that reports `lease` gets renewals.
+  const lease = fenceHeld && runtime && Object.hasOwn(runtime, "lease")
+    ? keepFenceLease(owner, { request, setTimer: adapters.setTimer, clearTimer: adapters.clearTimer })
+    : null;
   const refuseAfterFence = async (reason) => {
+    await lease?.stop();
     if (!fenceHeld) return { safe: false, reason };
     try {
       await releaseAdmission(config);
@@ -824,39 +1584,120 @@ export async function fenceRuntimeAdmission(config, adapters = {}) {
       };
     }
   };
-  const requireIdle = !config?.force && process.env.BOTFLEET_FORCE !== "1";
-  const identityError = authenticatedRuntimeError(runtime, owner, undefined, { requireIdle });
+  const stoppedAfterFence = () => refuseAfterFence(stopReason("the fence was released and anything paused was resumed."));
+  if (stop.stoppedBy) return stoppedAfterFence();
+  // A fence taken without forcing must be idle on the harness's own terms;
+  // a forced one has interrupted and saved whatever was running.
+  const identityError = authenticatedRuntimeError(runtime, owner, undefined, { requireIdle: !forced });
   if (identityError || !fenceHeld) {
     return refuseAfterFence(identityError || "Runtime refused the admission fence because work is active");
   }
   let topology;
-  let holders;
+  let settled;
   try {
-    [topology, holders] = await Promise.all([
-      inspectTopology(config.ports),
-      inspectHolders(config.dataDirectory),
+    [topology, settled] = await Promise.all([
+      retryTransient(async () => {
+        const result = await inspectTopology(config.ports);
+        return { ...result, transient: !stop.stoppedBy && !result.safe && TOPOLOGY_UNAVAILABLE.test(result.reason || "") };
+      }, { windowMs: 30_000, now, wait: pause }),
+      // A bot's own tool holding the database for a moment is waited out,
+      // never signalled, and named if it stays (finding 5).
+      settledDatabaseHolders(config, owner.pid, {
+        inspect: inspectHolders,
+        identify: adapters.processIdentity ?? {},
+        now,
+        wait: pause,
+        report: adapters.report ?? config?.reportDetail,
+        stopped: () => Boolean(stop.stoppedBy),
+      }),
     ]);
   } catch {
+    if (stop.stoppedBy) return stoppedAfterFence();
     return refuseAfterFence("Runtime ownership could not be verified after the admission fence");
   }
+  if (stop.stoppedBy) return stoppedAfterFence();
   if (!topology.safe || topology.pid !== owner.pid) {
     return refuseAfterFence(topology.reason || "Health endpoints do not share the fenced runtime owner");
   }
+  if (!settled.holders) return refuseAfterFence(settled.reason);
+  const holders = settled.holders;
   if (holders.length !== 1 || holders[0] !== owner.pid) {
     return refuseAfterFence(`Database ownership is ambiguous after admission fence (${holders.length} live holders)`);
   }
-  return { safe: true, mode: "authenticated", pid: owner.pid, port: owner.port, runtime, holders, health: topology.health };
+  return { safe: true, mode: "authenticated", pid: owner.pid, port: owner.port, runtime, holders, health: topology.health, lease };
 }
 
-export async function releaseRuntimeAdmission(config) {
-  const owner = await readOwner(config.dataDirectory);
+/** How long a release waits for a forced quiesce the harness says is settling. */
+const RELEASE_SETTLE_MS = FORCED_QUIESCE_TIMEOUT_MS;
+/** How long it waits on a harness that predates `fencing` and still counts
+ *  work under its fence: it may be interrupting, or rolling back. */
+const LEGACY_RELEASE_SETTLE_MS = 30_000;
+const RELEASE_POLL_MS = 1_000;
+
+/**
+ * Stand the fence down, or lift the hold, and confirm it.
+ *
+ * Never while a forced quiesce is still settling: a release that lands
+ * mid-settle used to stand the fence down under it, so its resume snapshot
+ * and held messages landed on an unfenced harness — bots latched stopped,
+ * cancelled routine runs left cancelled, held sends waiting for a restart
+ * that was not coming.  So this waits for the settle first (bounded), and a
+ * harness that still defers the release (`releasePending`) is watched until
+ * it has honoured it.  Every caller gets the wait: a hold given up on, a
+ * fence refused after its checks, the `--force` give-up, and `unquiesce`.
+ */
+export async function releaseRuntimeAdmission(config, adapters = {}) {
+  const readRuntimeOwner = adapters.readOwner ?? readOwner;
+  const request = adapters.requestJson ?? requestJson;
+  const now = adapters.now ?? Date.now;
+  const wait = adapters.sleep ?? sleep;
+  const owner = await readRuntimeOwner(config.dataDirectory);
   if (!owner) throw new Error("Authenticated runtime owner is unavailable for admission recovery");
-  const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime/quiesce`, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${owner.nonce}` },
-    accept: [200],
-  });
-  if (response.kind !== "ok" || response.body?.quiescing !== false) {
+  const base = `http://127.0.0.1:${owner.port}`;
+  const headers = harnessAuthorizationHeader();
+  const read = () => request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
+  /** Poll while `still` holds, up to a window chosen from the first answer.
+   *  Resolves the last answer read, or null when none came. */
+  const watch = async (still, windowFor) => {
+    let deadline = null;
+    let last = null;
+    for (;;) {
+      const answer = await read();
+      if (answer.kind !== "ok") {
+        // A harness too slow to say: the release itself retries, so go on.
+        if (deadline === null) return last;
+      } else {
+        last = answer.body;
+        if (!still(answer.body)) return answer.body;
+        deadline ??= now() + windowFor(answer.body);
+      }
+      if (now() >= deadline) return last;
+      await wait(Math.min(RELEASE_POLL_MS, Math.max(0, deadline - now())));
+    }
+  };
+  const settleWindow = (body) => (body?.fencing === true ? RELEASE_SETTLE_MS : LEGACY_RELEASE_SETTLE_MS);
+  await watch(fenceStillSettling, settleWindow);
+  // Releasing is the one request that must not be lost to a slow harness:
+  // a fence or a hold left behind keeps every bot on this Mac waiting.
+  const response = await retryTransient(async () => {
+    const answer = await request(`${base}/api/runtime/quiesce`, {
+      method: "DELETE",
+      headers,
+      accept: [200],
+      timeoutMs: QUIESCE_TIMEOUT_MS,
+    });
+    return { ...answer, transient: answer.kind === "unavailable" };
+  }, { windowMs: 30_000, now, wait });
+  let body = response.kind === "ok" ? response.body : null;
+  if (body && (body.releasePending === true || body.fencing === true)) {
+    // Still settling after all: the harness keeps the release and honours it
+    // the moment the forced quiesce settles.  Watch it land.
+    body = await watch(
+      (current) => current?.quiescing !== false || current?.draining === true || current?.fencing === true,
+      () => RELEASE_SETTLE_MS,
+    );
+  }
+  if (body?.quiescing !== false || body?.draining === true) {
     throw new Error("Runtime admission fence could not be released");
   }
 }
@@ -929,13 +1770,420 @@ export async function validateBuiltBundle(bundlePath, expectedCommit) {
   return { ...(await signatureIdentity(bundlePath, { allowLegacyBundleId: true })), version: build.version, apiVersion: build.apiVersion, uiHash: build.uiHash };
 }
 
-async function exactAppPids(appPath) {
-  const result = await run("ps", ["-axo", "pid=,command="], { allowFailure: true });
-  const executable = join(appPath, "Contents/MacOS/BotFleet");
-  return result.stdout.split("\n").flatMap((line) => {
-    const match = line.trim().match(/^(\d+)\s+(.+)$/);
-    return match && (match[2] === executable || match[2].startsWith(`${executable} `)) ? [Number(match[1])] : [];
+// ---------------------------------------------------------------------------
+// Pre-activation smoke test.
+//
+// validateBuiltBundle above reads files: it proves the bytes are signed, from
+// the expected team, and stamped with the expected commit.  None of that proves
+// the artifact runs.  0.1.24 shipped a server that passed every one of those
+// checks and died on every launch with ERR_MODULE_NOT_FOUND, because tsc
+// leaves bare imports verbatim and the packaged tree carries no node_modules.
+// The hosted release pipeline has caught that class of bug since
+// (scripts/smoke-packaged-server.mjs), but only for artifacts GitHub built.
+// A candidate downloaded from a CI build, imported from a stage, or produced
+// by a local fallback has had no equivalent gate on this Mac.
+//
+// So mirror MCode's validatePrefixPackage here: before the stage is published
+// or anything live is touched, actually run the candidate — boot the packaged
+// server with no node_modules in reach, wait for real readiness, and prove the
+// native SQLite binding initializes.  Three properties, deliberately, because
+// a busy Mac produces timeouts and a timeout must never be reported as a
+// corrupt artifact.  That mistake shipped twice on this machine already (see
+// scripts/native-version-probe.mjs); the classifier below exists so the same
+// mistake cannot ship a third time here.
+// ---------------------------------------------------------------------------
+
+// Generous on purpose.  prepare runs on the owner's Mac, often while five to
+// ten agent seats are compiling; the Sep 17 and Oct 1 outages were both a
+// healthy binary plus a starved CPU.  One retry on timeout only — a genuinely
+// bad artifact fails identically a second later, so retrying it would only
+// delay the real error, and a missing file cannot become present by waiting.
+// Not a lesson learned here: fleet recall ("busy host update timeout
+// classified as corrupt artifact not a failure", 2026-10-04) returns the Oct 1
+// cloudflared probe incident (PR #780, board fd1736f8) and an open board sweep
+// for six more short-timeout probes with the same failure.  This is the third
+// place that mistake has been paid for.
+const SMOKE_BOOT_TIMEOUT_MS = 180_000;
+const SMOKE_BOOT_ATTEMPTS = 2;
+const SMOKE_SQLITE_TIMEOUT_MS = 60_000;
+const SMOKE_HEALTH_REQUEST_TIMEOUT_MS = 3_000;
+const SMOKE_OUTPUT_EXCERPT = 2_000;
+// What we hold, versus what we show.  Generous enough to keep a full stack trace
+// and a boot log, small enough that two failed attempts cannot exhaust memory.
+const SMOKE_OUTPUT_CAPTURE = 256 * 1024;
+
+export function smokeTestEnabled(env = process.env) {
+  const value = (env.BOTFLEET_UPDATE_SMOKE ?? "").trim().toLowerCase();
+  return !(value === "0" || value === "off" || value === "false" || value === "no");
+}
+
+/**
+ * Turn a failed boot into a cause a human can act on.  The distinction that
+ * matters most is "this artifact is broken" versus "this Mac was too busy to
+ * finish the probe" — the two look identical to a naive boolean and call for
+ * opposite responses, so they must never collapse into one value.  A child
+ * still alive with no readiness and no exit is the busy case by elimination,
+ * so the default has to be the busy case rather than an unlabelled unknown.
+ */
+/**
+ * Decide readiness from an untrusted response body, strictly.
+ *
+ * `body?.ready !== false` treats a truncated body, an HTML error page, and a
+ * bare `{}` as ready, because every one of them is "not false".  This is a
+ * hand-written shape check rather than zod for a structural reason: the updater
+ * bootstraps itself by archiving a five-file graph into a temp directory with no
+ * node_modules beside it, so it cannot import a third-party validator at all.
+ * Every other module in that graph imports nothing but node: builtins.  The rule
+ * being satisfied is "never read a field off an untrusted response without
+ * checking its shape" — adding zod here would break updater bootstrap on every
+ * Mac, which is a far worse failure than a longer predicate.
+ */
+/* oxlint-disable anti-slop/no-runtime-typeof -- hand-written health body boundary parse; zod is unavailable in the updater bootstrap graph (see comment above). */
+export function parseHealthBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  // The health contract is an object with an explicit boolean `ready` and an app
+  // name.  Anything else is not a health response we recognise.
+  if (typeof body.ready !== "boolean" || typeof body.app !== "string") return false;
+  return body.ready;
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
+export function classifySmokeFailure({ exitCode, signal, spawnError, spawnTimedOut } = {}) {
+  if (spawnError) return "spawn-failed";
+  if (spawnTimedOut) return "sqlite-probe-timed-out";
+  if (exitCode !== null && exitCode !== undefined) return "server-exited";
+  if (signal) return `server-killed-${signal}`;
+  return "server-never-ready";
+}
+
+const SMOKE_CAUSES = {
+  "spawn-failed": "could not be started",
+  "server-exited": "exited during boot",
+  "server-never-ready": "never reported ready",
+  "sqlite-probe-timed-out": "timed out initializing its native SQLite binding",
+  "sqlite-unavailable": "could not initialize its native SQLite binding",
+  "owner-mismatch": "wrote an owner record naming a different process",
+};
+
+export function smokeFailureMessage({ cause, exitCode, signal, spawnError, targetCommit, output, bundlePath: _bundlePath }) {
+  const summary = SMOKE_CAUSES[cause] || cause;
+  const detail = [];
+  if (exitCode !== null && exitCode !== undefined) detail.push(`exit=${exitCode}`);
+  if (signal) detail.push(`signal=${signal}`);
+  if (spawnError) detail.push(`spawn=${spawnError}`);
+  detail.push(`commit=${targetCommit?.slice(0, 12) || "unknown"}`);
+  const excerpt = (output || "").trim().slice(-SMOKE_OUTPUT_EXCERPT);
+  const headline = `Staged BotFleet candidate ${summary} (${detail.join(", ")}); nothing was installed.`;
+  if (cause === "server-never-ready" || cause === "sqlite-probe-timed-out") {
+    return `${headline}  This Mac may simply have been too busy to finish the probe — re-run when it is quieter before treating the build as bad.${excerpt ? `\n--- candidate output ---\n${excerpt}` : ""}`;
+  }
+  return `${headline}${excerpt ? `\n--- candidate output ---\n${excerpt}` : ""}`;
+}
+
+/**
+ * `run` has no timeout, and a probe that can hang forever is worse than no
+ * probe at all — it would strand the updater lock.  Bound it explicitly and
+ * report a timeout as its own outcome rather than as a non-zero exit, for the
+ * same reason the boot classifier has a distinct "too busy" cause.
+ */
+function runBounded(command, args, { cwd, env, timeoutMs, maxBytes = 1024 * 1024 } = {}) {
+  return new Promise((resolveRun) => {
+    const child = spawn(command, args, {
+      cwd,
+      // A probe this runs must not inherit the updater's real environment.
+      // It writes a probe file and, in the SQLite case, touches HOME and the
+      // Sentry/OMB variables; a smoke test that can reach the owner's real
+      // state, or ship the owner's real telemetry under the updater's key, is
+      // not a smoke test.  PATH is carried because the probe needs node; the
+    // rest of the ambient environment is not.
+      env: env ? { PATH: process.env.PATH, ...env } : { PATH: process.env.PATH },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    // Capped, unlike the sibling helpers' absence of a cap elsewhere: a command
+    // that writes without bound would grow these strings until the updater
+    // itself ran out of memory, which is a worse outcome than a truncated
+    // diagnostic.  `overflow` is reported so the caller can tell a truncated
+    // capture from a short one.
+    let overflow = false;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    const append = (which, chunk) => {
+      if (overflow) return;
+      if (stdout.length + stderr.length + chunk.length > maxBytes) {
+        overflow = true;
+        stdout = stdout.slice(0, Math.max(0, maxBytes - stderr.length));
+        stderr = stderr.slice(0, Math.max(0, maxBytes - stdout.length));
+        child.kill("SIGKILL");
+        return;
+      }
+      if (which === "out") stdout += chunk;
+      else stderr += chunk;
+    };
+    child.stdout.on("data", (chunk) => append("out", chunk));
+    child.stderr.on("data", (chunk) => append("err", chunk));
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolveRun({ code: null, signal: "SIGKILL", stdout, stderr, timedOut: true, overflow });
+    }, timeoutMs);
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveRun(result);
+    };
+    child.once("error", (error) => settle({ code: null, signal: null, stdout, stderr, spawnError: error, timedOut: false, overflow }));
+    child.once("close", (code, signal) => settle({ code, signal, stdout, stderr, timedOut: false, overflow }));
   });
+}
+
+/**
+ * Prove `node:sqlite` initializes in the runtime that will actually serve the
+ * candidate.  The store opens its database through DatabaseSync from node:sqlite
+ * (server/message-db.ts), a native binding that has to load before the harness
+ * can run at all — the same reason MCode initializes better-sqlite3 in memory
+ * before it trusts a downloaded release.  In-memory keeps the probe from
+ * depending on the store's own file lifecycle: a lazy database is not a broken
+ * one, and this gate must never fail a healthy build for being lazy.
+ */
+async function smokeNativeSqlite({ serverDirectory, nodeBin, nodeEnv, runImpl = runBounded }) {
+  const script = [
+    'import { DatabaseSync } from "node:sqlite";',
+    'const db = new DatabaseSync(":memory:");',
+    'db.exec("CREATE TABLE smoke (id INTEGER PRIMARY KEY, value TEXT)");',
+    'db.prepare("INSERT INTO smoke (value) VALUES (?)").run("botfleet");',
+    'const row = db.prepare("SELECT value FROM smoke WHERE id = 1").get();',
+    'if (row?.value !== "botfleet") throw new Error(`unexpected row: ${JSON.stringify(row)}`);',
+    'db.close();',
+    'console.log("sqlite-ok");',
+  ].join("\n");
+  const probePath = join(serverDirectory, `smoke-sqlite-${process.pid}-${randomUUID()}.mjs`);
+  await writeFile(probePath, `${script}\n`, { mode: 0o600 });
+  try {
+    const result = await runImpl(nodeBin, [probePath], {
+      cwd: serverDirectory,
+      env: nodeEnv,
+      timeoutMs: SMOKE_SQLITE_TIMEOUT_MS,
+    });
+    if (result.timedOut) return { ok: false, timedOut: true, detail: "probe exceeded its time budget" };
+    if (result.spawnError) return { ok: false, timedOut: false, detail: `probe could not start: ${result.spawnError.message}` };
+    if (result.stdout.includes("sqlite-ok")) return { ok: true, timedOut: false, detail: null };
+    return {
+      ok: false,
+      timedOut: false,
+      detail: `node:sqlite did not initialize (exit=${result.code}, signal=${result.signal}): ${(result.stderr || result.stdout).trim().slice(0, 400)}`,
+    };
+  } finally {
+    await rm(probePath, { force: true });
+  }
+}
+
+async function freeLoopbackPort() {
+  const { createServer } = await import("node:net");
+  return new Promise((resolvePort, rejectPort) => {
+    const probe = createServer();
+    probe.unref();
+    probe.on("error", rejectPort);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const chosen = address?.port ?? 0;
+      probe.close(() => resolvePort(chosen));
+    });
+  });
+}
+
+/**
+ * The attempt policy, separated from the probe so it can be tested without a
+ * real candidate.  Retry exactly one readiness timeout and nothing else: a
+ * candidate that exited, or whose native SQLite binding will not load, fails
+ * identically a second later, so waiting again would only delay the real
+ * diagnosis.  A busy Mac and a broken build must not produce the same verdict.
+ */
+export async function runStagedSmokeTest({ builtBundle, targetCommit, smokeImpl, attempts = SMOKE_BOOT_ATTEMPTS, onRetry } = {}) {
+  const scratchRoot = join(tmpdir(), "botfleet-update-smoke");
+  await mkdir(scratchRoot, { recursive: true, mode: 0o700 });
+  let lastFailure = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // A structural problem (no entry point, ditto failed, no free port) is not
+    // a busy-host symptom, so it propagates without earning a retry.
+    const result = await smokeImpl({ bundlePath: builtBundle, targetCommit, attempt, scratchRoot });
+    if (result.ready && result.sqlite?.ok) return { ok: true, attempts: attempt };
+    if (result.ready && result.sqlite?.timedOut) {
+      lastFailure = { cause: "sqlite-probe-timed-out", output: result.output };
+    } else if (result.ready) {
+      // Booted, but the native binding would not initialize.  That is a real
+      // defect in the artifact, and the probe's own detail is the diagnosis.
+      lastFailure = { cause: "sqlite-unavailable", output: `${result.output}\n${result.sqlite?.detail || ""}` };
+    } else {
+      // The probe may know more than the process state does (an owner record
+      // that names the wrong pid looks exactly like a live, unready child).
+      // Its explicit cause wins; otherwise classify from what the process did.
+      lastFailure = {
+        cause: result.cause || classifySmokeFailure({
+          exitCode: result.exitCode,
+          signal: result.signal,
+          spawnError: result.spawnError,
+        }),
+        exitCode: result.exitCode,
+        signal: result.signal,
+        spawnError: result.spawnError,
+        output: result.output,
+      };
+    }
+    if (lastFailure.cause !== "server-never-ready" || attempt === attempts) break;
+    onRetry?.({ attempt, attempts });
+  }
+  throw new Error(smokeFailureMessage({ ...lastFailure, targetCommit, bundlePath: builtBundle }));
+}
+
+/**
+ * Boot the candidate's packaged server with no node_modules in reach and wait
+ * for genuine readiness.  Health answers as soon as the port binds, which is
+ * before boot work finishes, so `ready` — not the first 200 — is the signal.
+ * Readiness plus the owner record together are the same contract
+ * scripts/smoke-packaged-server.mjs asserts in CI; proving it locally is what
+ * makes a CI-built or imported candidate as trustworthy as a locally built one.
+ */
+export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scratchRoot }) {
+  const serverDirectory = join(bundlePath, "Contents/Resources/server");
+  if (!(await exists(join(serverDirectory, "index.js")))) {
+    throw new Error(`Staged BotFleet candidate has no packaged server entry point: ${serverDirectory}/index.js`);
+  }
+  // Checked BEFORE any scratch directory exists.  This used to sit after the
+  // ditto below, so a candidate with no packaged executable threw with a full
+  // copy of Contents/Resources/server already on disk, and the cleanup
+  // finally-block had not been entered yet — a structural throw is not retried,
+  // so every imported --bundle candidate without that binary leaked a /tmp
+  // directory for the life of the machine.
+  const packagedBinary = join(bundlePath, "Contents/MacOS/BotFleet");
+  if (!(await exists(packagedBinary))) {
+    throw new Error(`Staged BotFleet candidate has no packaged executable: ${packagedBinary}`);
+  }
+  const scratch = join(scratchRoot, `smoke-${targetCommit.slice(0, 12)}-${attempt}-${randomUUID()}`);
+  const staging = join(scratch, "server");
+  const home = join(scratch, "home");
+  await mkdir(home, { recursive: true, mode: 0o700 });
+  // Copy out of the bundle before running, exactly as the CI smoke test does.
+  // A bare import resolves differently depending on what sits above the tree,
+  // and the point of the probe is the layout the candidate will really ship.
+  await run("ditto", [serverDirectory, staging]);
+  const port = await freeLoopbackPort();
+  if (!port || DEFAULT_PORTS.includes(port)) {
+    throw new Error(`Could not reserve a loopback port for the staged smoke test (got ${port})`);
+  }
+
+  // Run the candidate on the runtime that will actually serve it: the packaged
+  // Electron binary under ELECTRON_RUN_AS_NODE=1, which is exactly how the
+  // harness launches it (server/index.ts's AGENTS_NODE_FLAG) and why
+  // electron-builder.yml keeps the runAsNode fuse on.  Using the updater's own
+  // Node would test a different runtime than the one under test — the
+  // Homebrew/nvm Node could have node:sqlite while Electron's bundled Node does
+  // not, or the reverse, and the probe would be answering a question nobody
+  // asked.  Dropping the flag would launch GUI Electron instead of the server.
+  const child = spawn(packagedBinary, [join(staging, "index.js")], {
+    cwd: staging,
+    env: {
+      PATH: process.env.PATH,
+      HOME: home,
+      ELECTRON_RUN_AS_NODE: "1",
+      OMB_PORT: String(port),
+      // No Sentry configuration at all, deliberately.  This child environment is
+      // built from scratch rather than inherited, so omitting the variable is
+      // what guarantees the probe cannot reach a real project.  A hard-coded
+      // loopback DSN would still be a DSN in source, and still one edit away
+      // from a real one.
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  // Bounded, because only the tail is ever rendered (SMOKE_OUTPUT_EXCERPT) and a
+  // candidate stuck in a crash loop — precisely the case this gate exists to
+  // diagnose — would otherwise append to this for two full boot windows and get
+  // the updater OOM-killed by the thing it was diagnosing.  Keep the tail: that
+  // is the part that names the failure.
+  let output = "";
+  const capture = (chunk) => {
+    output = (output + chunk).slice(-SMOKE_OUTPUT_CAPTURE);
+  };
+  child.stdout.on("data", capture);
+  child.stderr.on("data", capture);
+
+  try {
+    const deadline = Date.now() + SMOKE_BOOT_TIMEOUT_MS;
+    let ready = false;
+    let spawnError = null;
+    child.on("error", (error) => { spawnError = error; });
+    while (Date.now() < deadline) {
+      if (spawnError || child.exitCode !== null) break;
+      try {
+        // Bound each request, not just the loop: the deadline is only checked
+        // between iterations, so a candidate that accepts the connection and
+        // never answers would otherwise hold the updater lock for undici's
+        // default 300s headers timeout instead of returning at 180s.
+        const response = await fetch(`http://127.0.0.1:${port}/api/health`, {
+          signal: AbortSignal.timeout(SMOKE_HEALTH_REQUEST_TIMEOUT_MS),
+        });
+        if (response.ok && parseHealthBody(await response.json().catch(() => null))) {
+          ready = true;
+          break;
+        }
+      } catch {
+        /* not up yet */
+      }
+      await sleep(300);
+    }
+    if (!ready) {
+      return { ready: false, output, spawnError, exitCode: child.exitCode, signal: child.signalCode };
+    }
+    // The owner record is written at the end of a successful boot, so its
+    // presence and matching pid prove the candidate finished starting rather
+    // than merely binding a port.
+    const owner = await parseJsonFile(join(home, ".botfleet", "harness-owner.json"), "Staged runtime owner record");
+    if (owner?.pid !== child.pid) {
+      // A wrong owner record is a real defect, not a slow host, so it carries
+      // its own cause: without this it would classify as a readiness timeout,
+      // earn a retry, and be reported as "too busy".
+      return {
+        ready: false,
+        cause: "owner-mismatch",
+        output: `${output}\nowner record pid ${owner?.pid} does not match the staged server pid ${child.pid}`,
+        exitCode: child.exitCode,
+        signal: child.signalCode,
+      };
+    }
+    const sqlite = await smokeNativeSqlite({
+      serverDirectory: staging,
+      nodeBin: packagedBinary,
+      nodeEnv: { ELECTRON_RUN_AS_NODE: "1" },
+    });
+    return { ready: true, output, sqlite };
+  } finally {
+    child.kill("SIGKILL");
+    await rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+  }
+}
+
+
+/**
+ * The pids in `ps -axo pid=,stat=,command=` output whose arguments name
+ * `executable`.  Rows in a zombie state are skipped: the process is gone, and
+ * `ps` may keep printing its recorded command line until the parent reaps it.
+ */
+export function exactAppPidsFromPs(psOutput, executable) {
+  return psOutput.split("\n").flatMap((line) => {
+    const match = line.trim().match(/^(\d+)\s+(\S+)\s+(.+)$/);
+    if (!match || isZombieState(match[2])) return [];
+    return match[3] === executable || match[3].startsWith(`${executable} `) ? [Number(match[1])] : [];
+  });
+}
+
+async function exactAppPids(appPath) {
+  const result = await run("ps", ["-axo", "pid=,stat=,command="], { allowFailure: true });
+  return exactAppPidsFromPs(result.stdout, join(appPath, "Contents/MacOS/BotFleet"));
 }
 
 /**
@@ -957,7 +2205,7 @@ async function bundleHolderPids(bundlePath) {
   }
   const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
   if (![0, 1].includes(result.code)) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
-  return txtHolderPids(result.stdout, root);
+  return withoutExitedPids(txtHolderPids(result.stdout, root));
 }
 
 /**
@@ -984,12 +2232,50 @@ async function processCommand(pid) {
   return result.code === 0 ? result.stdout.trim() : "";
 }
 
+/** The executable a process runs, as a full path where `ps` knows it. */
+async function processExecutable(pid) {
+  const result = await run("ps", ["-p", String(pid), "-o", "comm="], { allowFailure: true });
+  return result.code === 0 ? result.stdout.trim() : "";
+}
+
 async function processCwd(pid) {
   const result = await run("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { allowFailure: true });
   return result.code === 0 ? result.stdout.split("\n").find((line) => line.startsWith("n"))?.slice(1) || "" : "";
 }
 
-export function isExpectedBotFleetProcess(command, cwd, config) {
+async function processTxtPaths(pid) {
+  const result = await run("lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"], { allowFailure: true });
+  return result.code === 0 ? result.stdout.split("\n").filter((line) => line.startsWith("n")).map(line => line.slice(1)) : [];
+}
+
+/**
+ * Which resolution failures justify quietly packaging on this Mac instead.
+ *
+ * Only "this commit was never built on CI" is a legitimate reason: the point of
+ * `auto` is to install a commit that predates the workflow.  A network failure,
+ * a rate limit, or a checksum mismatch must NOT fall back, because a silent
+ * 15-minute local build would turn a broken pipeline or a tampered artifact
+ * into "it worked, just slowly".
+ */
+export function isRecoverableResolutionFailure(error) {
+  if (!(error instanceof ResolutionError)) return false;
+  if (error.cause === "no-build") return true;
+  // Only a run the workflow was *expected* to cancel justifies a local
+  // fallback.  A genuinely failed build is a signal: its signature gate, its
+  // tests, or its packaging step rejected the commit, and quietly building the
+  // same commit locally for 15 minutes would turn a broken pipeline into a
+  // deceptively successful install.  `cancelled` is the expected outcome
+  // whenever a newer commit lands on main; `in_progress` is worth a moment.
+  if (error.cause === "build-failed") {
+    return ["cancelled", "in_progress"].includes(error.conclusion);
+  }
+  // Network, rate limit, checksum, and bad manifest must all surface: a silent
+  // local package would turn a broken pipeline or a tampered artifact into "it
+  // worked, just slowly".
+  return false;
+}
+
+export async function isExpectedBotFleetProcess(command, cwd, config, pid, { txtPathsOf = processTxtPaths } = {}) {
   const appExecutable = join(config.appPath, "Contents/MacOS/BotFleet");
   if (command === appExecutable || command.startsWith(`${appExecutable} `) || command.startsWith(`${config.appPath}/Contents/`)) {
     return true;
@@ -997,7 +2283,17 @@ export function isExpectedBotFleetProcess(command, cwd, config) {
   const executable = command.trim().split(/\s+/)[0] || "";
   const isNode = ["node", "nodejs"].includes(basename(executable));
   const serverArgument = command.split(/\s+/).some((argument) => argument === "server/index.ts" || argument === join(config.checkout, "server/index.ts"));
-  return isNode && serverArgument && cwd === config.checkout;
+  if (isNode && serverArgument && cwd === config.checkout) {
+    return true;
+  }
+  if (pid) {
+    const txtPaths = await txtPathsOf(pid);
+    const helperPrefix = join(config.appPath, "Contents/Frameworks/BotFleet Helper");
+    if (txtPaths.includes(appExecutable) || txtPaths.some((p) => p.startsWith(helperPrefix))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function stableApplicationProcessError(firstPids, secondPids, openApplication) {
@@ -1197,8 +2493,15 @@ export function applicationAttachmentError(snapshot, openApplication) {
   return "Updated BotFleet application stayed open but did not expose its bundled UI through the verified harness";
 }
 
-export function rollbackReadinessError(runningProcessCount, snapshot) {
+export function rollbackReadinessError(runningProcessCount, snapshot, { harnessAnswers = true } = {}) {
   if (runningProcessCount === 0 || snapshot?.safe === true) return null;
+  // No harness answers its port: nothing owns active work, only processes on
+  // their way out (2026-10-09: a replacement slow to quit at a load average
+  // in the hundreds).  Deferring then left BotFleet stopped until the owner
+  // relaunched it by hand.  The rollback waits those processes out instead
+  // (bounded, SIGTERM to verified BotFleet processes only, never SIGKILL);
+  // only a live harness that refuses the fence defers it.
+  if (!harnessAnswers) return null;
   return snapshot?.reason || "Current BotFleet work state is unavailable";
 }
 
@@ -1210,12 +2513,12 @@ export function credentialPreparationReceiptPath(prepared) {
   return join(prepared.stageDirectory, "credential-migration.json");
 }
 
-async function waitForExit(pids, timeoutMs, { isAlive = processIsAlive, wait = sleep, now = Date.now } = {}) {
+async function waitForExit(pids, timeoutMs, { isAlive, wait = sleep, now = Date.now } = {}) {
   const deadline = now() + timeoutMs;
-  let remaining = pids.filter((pid) => isAlive(pid));
+  let remaining = await withoutExitedPids(pids, { isAlive });
   while (remaining.length && now() < deadline) {
     await wait(250);
-    remaining = remaining.filter((pid) => isAlive(pid));
+    remaining = await withoutExitedPids(remaining, { isAlive });
   }
   return remaining;
 }
@@ -1241,6 +2544,250 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
 }
 
 /**
+ * A running process holds BotFleet state — the database, the bundle, a BotFleet
+ * port — and is not a BotFleet process.  The updater never signals one.  It is
+ * usually brief: a bot's own tool (`sqlite3`, `node`, `curl` against a BotFleet
+ * port) opening something for a second, which is why the callers wait it out
+ * (`waitOutUnrecognizedHolders`) before they refuse.
+ */
+export class UnrecognizedHolderError extends Error {
+  constructor(pid, executable, message) {
+    super(`${message}${executable ? ` (${executable})` : ""}`);
+    this.name = "UnrecognizedHolderError";
+    this.pid = pid;
+    this.executable = executable || "";
+  }
+}
+
+/** How long the updater waits for BotFleet's own processes to finish quitting
+ *  once they have been asked to, before it gives up (never with SIGKILL).
+ *  Fixed and generous rather than load-aware: on 2026-10-09 the app took
+ *  longer than the old one-shot check at load averages of 50 to 500 per core,
+ *  and a longer wait costs nothing on a quiet Mac, where it ends at once. */
+export const DEFAULT_EXIT_WAIT_MS = 180_000;
+const EXIT_WAIT_POLL_MS = 2_000;
+/** How long into that wait a BotFleet process still there gets one SIGTERM. */
+const EXIT_WAIT_NUDGE_MS = 20_000;
+
+/**
+ * Wait, bounded, for whatever `check` reports to clear: BotFleet processes
+ * still quitting, the database still held, a port still answering.  `check`
+ * re-resolves on every pass and returns null once clear, or `{ reason, pids }`.
+ * Progress is reported in a person's words.  `nudge` runs once, after
+ * `nudgeAfterMs`, with what is still there (a verified SIGTERM; never
+ * SIGKILL).  Throws the last reason when the window closes.
+ */
+export async function waitForBotFleetExit(check, {
+  windowMs = DEFAULT_EXIT_WAIT_MS,
+  pollMs = EXIT_WAIT_POLL_MS,
+  now = Date.now,
+  wait = sleep,
+  report = () => {},
+  nudge,
+  nudgeAfterMs = EXIT_WAIT_NUDGE_MS,
+} = {}) {
+  const started = now();
+  const deadline = started + Math.max(0, windowMs);
+  let nudged = false;
+  let lastLine = null;
+  for (;;) {
+    const blocker = await check();
+    if (!blocker) return;
+    if (now() >= deadline) {
+      throw new Error(`${blocker.reason} (waited ${describeWindow(windowMs)} for it to quit; never SIGKILL)`);
+    }
+    if (nudge && !nudged && now() - started >= nudgeAfterMs) {
+      nudged = true;
+      try {
+        await nudge(blocker);
+      } catch (error) {
+        console.error(`Could not ask BotFleet process ${blocker.pids?.join(", ") || "?"} to quit: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      continue;
+    }
+    const count = blocker.pids?.length ?? 0;
+    const line = `Waiting for BotFleet to finish quitting${count ? ` (${plural(count, "process", "processes")})` : ""}`;
+    if (line !== lastLine) {
+      lastLine = line;
+      (report ?? (() => {}))(line);
+    }
+    await wait(Math.min(pollMs, Math.max(0, deadline - now())));
+  }
+}
+
+/**
+ * Make sure a BotFleet harness answers, starting it when none does.
+ *
+ * The invariant every updater exit keeps (2026-10-09): BotFleet is left
+ * running, the new build or the prior one, never stopped.  A no-op when a
+ * harness already answers, so a genuine deferral (a live replacement that
+ * refused) never gets a second one.  An instance still quitting is waited
+ * out first (bounded), because `open` would only bring it forward and a
+ * harness started beside it would race it for the database.  A checkout and
+ * an app that do not match (a rollback that failed partway) are started
+ * anyway, and said: a running BotFleet is better than none, and the next
+ * update replaces both.
+ */
+export async function ensureBotFleetRunning({
+  answers,
+  bundleBusy = async () => [],
+  mismatch = async () => null,
+  start,
+  timeoutMs = 90_000,
+  exitWaitMs = DEFAULT_EXIT_WAIT_MS,
+  pollMs = 1_000,
+  now = Date.now,
+  wait = sleep,
+  report = () => {},
+} = {}) {
+  const say = report ?? (() => {});
+  if (await answers()) return { started: false };
+  let quitting = await bundleBusy();
+  const quitDeadline = now() + Math.max(0, exitWaitMs);
+  while (quitting.length && now() < quitDeadline) {
+    say("Waiting for BotFleet to finish quitting before starting it again");
+    await wait(Math.min(pollMs, Math.max(0, quitDeadline - now())));
+    if (await answers()) return { started: false };
+    quitting = await bundleBusy();
+  }
+  const mixed = await mismatch();
+  if (mixed) {
+    console.error(`Starting BotFleet although ${mixed}: a running BotFleet is better than none, and the next update replaces both.`);
+  }
+  say("Starting BotFleet again");
+  await start({ appStillQuitting: quitting.length > 0 });
+  const deadline = now() + Math.max(0, timeoutMs);
+  for (;;) {
+    if (await answers()) return { started: true, mixed };
+    if (now() >= deadline) break;
+    await wait(Math.min(pollMs, Math.max(0, deadline - now())));
+  }
+  throw new Error(`BotFleet was not running and did not answer within ${describeWindow(timeoutMs)} of being started${mixed ? ` (${mixed})` : ""}`);
+}
+
+/** How long apply waits for a non-BotFleet process to let go of BotFleet state. */
+export const DEFAULT_UNKNOWN_HOLDER_WAIT_MS = 90_000;
+const UNKNOWN_HOLDER_POLL_MS = 2_000;
+
+/**
+ * Run `attempt` again while it trips over an unrecognised holder, until the
+ * window closes.  `attempt` re-resolves what holds BotFleet state every time,
+ * so a holder that has gone simply is not there on the next pass.  One that is
+ * still there when the window closes is refused by name, and still never
+ * signalled: it is not ours to stop.
+ */
+export async function waitOutUnrecognizedHolders(attempt, {
+  windowMs = DEFAULT_UNKNOWN_HOLDER_WAIT_MS,
+  pollMs = UNKNOWN_HOLDER_POLL_MS,
+  now = Date.now,
+  wait = sleep,
+  report = () => {},
+  // A signal ends the wait at once; the caller says why it stopped.
+  stopped = () => false,
+} = {}) {
+  const deadline = now() + Math.max(0, windowMs);
+  let lastReport = null;
+  for (;;) {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!(error instanceof UnrecognizedHolderError)) throw error;
+      if (stopped()) throw error;
+      if (now() >= deadline) {
+        throw new UnrecognizedHolderError(
+          error.pid,
+          error.executable,
+          `Process ${error.pid} still holds BotFleet state after ${describeWindow(windowMs)} and is not a BotFleet process, `
+            + "so the updater will not stop it.  Quit it or let it finish, then update again",
+        );
+      }
+      const line = `Waiting for ${error.executable ? basename(error.executable) : `process ${error.pid}`} to let go of BotFleet's files`;
+      if (line !== lastReport) {
+        lastReport = line;
+        report(line);
+      }
+      await wait(Math.min(pollMs, Math.max(0, deadline - now())));
+    }
+  }
+}
+
+/**
+ * The processes holding the BotFleet database, once any that is not BotFleet
+ * has let go.
+ *
+ * The preflight and the check after the fence used to count every holder and
+ * refuse "Database ownership is ambiguous" at once — which is exactly where a
+ * bot's own `sqlite3` or `node` reading the database for a second trips an
+ * update.  An extra holder that is not a BotFleet process is now waited out
+ * the same bounded way capture and quiesce wait (`waitOutUnrecognizedHolders`),
+ * never signalled, and named when it stays.  A second holder that IS a
+ * BotFleet process is still a definitive ambiguity for the caller to refuse.
+ * Resolves `{ holders }`, or `{ holders: null, reason }` when a foreign holder
+ * outlasted the window.
+ */
+export async function settledDatabaseHolders(config, ownerPid, {
+  inspect = sqliteHolders,
+  identify = {},
+  windowMs = Number.isFinite(config?.unknownHolderWaitMs) ? config.unknownHolderWaitMs : DEFAULT_UNKNOWN_HOLDER_WAIT_MS,
+  now = Date.now,
+  wait = sleep,
+  report = () => {},
+  stopped = () => false,
+} = {}) {
+  try {
+    const holders = await waitOutUnrecognizedHolders(async () => {
+      const current = await inspect(config.dataDirectory);
+      const others = current.filter((pid) => pid !== ownerPid);
+      if (!others.length) return current;
+      // Throws for a live holder that is not BotFleet; drops one that exited.
+      const { pids } = await captureProcessIdentities(others, config, identify);
+      return current.filter((pid) => pid === ownerPid || pids.includes(pid));
+    }, { windowMs, now, wait, report: report ?? (() => {}), stopped });
+    return { holders };
+  } catch (error) {
+    if (error instanceof UnrecognizedHolderError) return { holders: null, reason: error.message };
+    throw error;
+  }
+}
+
+/**
+ * Record the identity of every running process that holds BotFleet state, so
+ * quiesce can tell the process it captured from a recycled pid.  Exited pids
+ * (a zombie above all) are dropped first: they hold nothing, and a zombie's
+ * command line and working directory are unreliable or empty, so verifying
+ * one would refuse a healthy machine with "owns BotFleet state but does not
+ * match an expected BotFleet executable".  Returns the surviving pids too, so
+ * the caller records only those.
+ */
+export async function captureProcessIdentities(pids, config, {
+  isAlive,
+  commandOf = processCommand,
+  cwdOf = processCwd,
+  executableOf = processExecutable,
+  txtPathsOf = processTxtPaths,
+} = {}) {
+  const live = await withoutExitedPids([...new Set(pids)], { isAlive });
+  const processCommands = {};
+  const processCwds = {};
+  for (const pid of live) {
+    const command = await commandOf(pid);
+    const cwd = await cwdOf(pid);
+    if (!(await isExpectedBotFleetProcess(command, cwd, config, pid, { txtPathsOf }))) {
+      // Gone while it was being described: it holds nothing any more.
+      if ((await withoutExitedPids([pid], { isAlive })).length === 0) continue;
+      throw new UnrecognizedHolderError(
+        pid,
+        (await executableOf(pid)) || command.trim().split(/\s+/)[0] || "",
+        `Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`,
+      );
+    }
+    processCommands[pid] = command;
+    processCwds[pid] = cwd;
+  }
+  return { pids: live.filter((pid) => processCommands[pid] !== undefined), processCommands, processCwds };
+}
+
+/**
  * Stop the BotFleet processes in `pids`: wait for a graceful exit, SIGTERM
  * whatever is left once its identity checks out, then wait again.  Never
  * SIGKILL.
@@ -1255,6 +2802,12 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
  * never signalled, and never waited on.  Without `current` every pid is
  * held to the strict rule.
  *
+ * A zombie counts as exited.  It has already died and holds nothing; only its
+ * parent can reap it, so it is neither waited on nor signalled, and its parent
+ * is never touched.  `kill -0` cannot tell the difference, which is how two
+ * defunct `cua-driver` processes left by a grok CLI that never reaped them
+ * blocked every apply on 2026-10-08 (processIsAlive reads the `ps` state).
+ *
  * A process exiting on its own is success at every point.  Under load `ps`
  * and `lsof` take seconds, so a process can pass the liveness check and be
  * gone by the time its identity comes back (empty), or by the time the
@@ -1265,9 +2818,11 @@ export function signalProcess(pid, signal, kill = (target, name) => process.kill
  */
 export async function terminateVerified(pids, previous, config, {
   current,
-  isAlive = processIsAlive,
+  isAlive,
   commandOf = processCommand,
   cwdOf = processCwd,
+  executableOf = processExecutable,
+  txtPathsOf = processTxtPaths,
   kill,
   wait = sleep,
   now = Date.now,
@@ -1275,21 +2830,31 @@ export async function terminateVerified(pids, previous, config, {
   const timing = { isAlive, wait, now };
   const resolvedNow = current ? new Set(current) : null;
   const survivors = await waitForExit([...new Set(pids)], config.gracefulExitMs, timing);
-  const signalled = [];
+  // Every survivor is identified before any is signalled, so an unrecognised
+  // holder stops the step with nothing half-stopped behind it.
+  const verified = [];
   for (const pid of survivors) {
     const command = await commandOf(pid);
     const cwd = await cwdOf(pid);
     const sameAsCaptured = Boolean(previous.processCommands?.[pid]) && previous.processCommands[pid] === command &&
       previous.processCwds?.[pid] === cwd;
-    if (!sameAsCaptured && !isExpectedBotFleetProcess(command, cwd, config)) {
+    if (!sameAsCaptured && !(await isExpectedBotFleetProcess(command, cwd, config, pid, { txtPathsOf }))) {
       // Exited while ps and lsof were still describing it: there was no
       // process left to describe, so its identity came back empty.
-      if (!isAlive(pid)) continue;
+      if ((await withoutExitedPids([pid], { isAlive })).length === 0) continue;
       // A captured pid that now names something else: the process the
       // capture saw is gone, and this one never held BotFleet state.
       if (resolvedNow && !resolvedNow.has(pid)) continue;
-      throw new Error(`Process ${pid} still holds BotFleet state but its executable is not an expected BotFleet path`);
+      throw new UnrecognizedHolderError(
+        pid,
+        (await executableOf(pid)) || command.trim().split(/\s+/)[0] || "",
+        `Process ${pid} still holds BotFleet state but its executable is not an expected BotFleet path`,
+      );
     }
+    verified.push(pid);
+  }
+  const signalled = [];
+  for (const pid of verified) {
     if (signalProcess(pid, "SIGTERM", kill)) signalled.push(pid);
   }
   const remaining = await waitForExit(signalled, config.termExitMs, timing);
@@ -1488,11 +3053,33 @@ function createConfig(parsed) {
     updatesDirectory: resolve(process.env.BOTFLEET_UPDATE_ROOT || join(home, "Library/Caches/BotFleet/updates")),
     ports: (process.env.BOTFLEET_UPDATE_PORTS || DEFAULT_PORTS.join(",")).split(",").map(Number),
     gracefulExitMs: Number(process.env.BOTFLEET_GRACEFUL_EXIT_MS || 20_000),
-    termExitMs: Number(process.env.BOTFLEET_TERM_EXIT_MS || 20_000),
+    termExitMs: Number(process.env.BOTFLEET_TERM_EXIT_MS || 60_000),
+    exitWaitMs: environmentMs("BOTFLEET_EXIT_WAIT_MS", DEFAULT_EXIT_WAIT_MS),
     startupTimeoutMs: Number(process.env.BOTFLEET_STARTUP_TIMEOUT_MS || 90_000),
+    // How long work in flight gets to finish before apply pauses it, and,
+    // only with --wait-for-idle, how long apply waits instead of pausing.
+    // A flag wins over the environment; an unreadable value is the default.
+    graceMs: parsed.graceMs ?? environmentMs("BOTFLEET_UPDATE_GRACE_MS", DEFAULT_GRACE_MS),
+    waitForIdleMs: parsed.waitForIdleMs,
+    roomWaitMs: environmentMs("BOTFLEET_UPDATE_ROOM_WAIT_MS", DEFAULT_ROOM_WAIT_MS),
+    preflightRetryMs: environmentMs("BOTFLEET_PREFLIGHT_RETRY_MS", DEFAULT_PREFLIGHT_RETRY_MS),
+    // How long a process that is not BotFleet may hold BotFleet state before
+    // apply refuses (it is never signalled either way).
+    unknownHolderWaitMs: environmentMs("BOTFLEET_UNKNOWN_HOLDER_WAIT_MS", DEFAULT_UNKNOWN_HOLDER_WAIT_MS),
+    drainPollMs: environmentMs("BOTFLEET_DRAIN_POLL_MS", 5_000),
     force: Boolean(parsed.force || process.env.BOTFLEET_FORCE === "1"),
+    // Set by main() once the progress record exists: what the drain is
+    // waiting for, for the terminal and for the Mac and the phone.
+    reportDetail: undefined,
     parsed,
   };
+}
+
+function environmentMs(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 function createOperations(config) {
@@ -1660,6 +3247,26 @@ function createOperations(config) {
 
     buildBundle: async (source, targetCommit) => {
       if (source.providedBundle) return source.providedBundle;
+      // Owner ruling 2026-10-01: GitHub's Mac runners do the building, always.
+      // `pnpm package:mac:local` below is the 10-15 minute electron-builder run
+      // that every recorded update failure was inside, so it is now the
+      // explicit bypass rather than the default.
+      const policy = updateSourcePolicy();
+      if (policy !== "local") {
+        try {
+          const hosted = await downloadBuiltBundle({
+            commit: targetCommit,
+            destination: join(source.stageDirectory, "hosted"),
+          });
+          console.log(`Using the hosted build of ${targetCommit.slice(0, 12)} instead of packaging on this Mac`);
+          return hosted.appPath;
+        } catch (error) {
+          // `ci` must fail loudly: silently falling back to a 15-minute local
+          // build would make the ruling a suggestion and hide a broken pipeline.
+          if (policy === "ci" || !isRecoverableResolutionFailure(error)) throw error;
+          console.error(`No usable hosted build, so packaging on this Mac instead: ${error.message}`);
+        }
+      }
       const identities = await output("security", ["find-identity", "-v", "-p", "codesigning"]);
       if (!identities.includes(EXPECTED_SIGN_IDENTITY)) {
         throw new Error(`Required stable signing identity is unavailable: ${EXPECTED_SIGN_IDENTITY}`);
@@ -1690,6 +3297,21 @@ function createOperations(config) {
 
     validateBundle: validateBuiltBundle,
 
+    smokeTestBundle: async (builtBundle, targetCommit) => {
+      if (!smokeTestEnabled()) {
+        console.log("Skipping the staged smoke test (BOTFLEET_UPDATE_SMOKE=0); the candidate is unproven.");
+        return;
+      }
+      const result = await runStagedSmokeTest({
+        builtBundle,
+        targetCommit,
+        smokeImpl: smokeStagedServer,
+        onRetry: ({ attempt, attempts }) =>
+          console.log(`Staged candidate did not report ready (attempt ${attempt}/${attempts}); retrying once for a busy host.`),
+      });
+      console.log(`Staged candidate ${targetCommit.slice(0, 12)} booted, reported ready, and initialized node:sqlite ✓ (attempt ${result.attempts})`);
+    },
+
     persistPrepared: async ({ source, targetCommit, builtBundle, identity }) => {
       const bundlePath = join(source.stageDirectory, "BotFleet.app");
       if (resolve(builtBundle) !== resolve(bundlePath)) {
@@ -1699,6 +3321,17 @@ function createOperations(config) {
       const copiedIdentity = await validateBuiltBundle(bundlePath, targetCommit);
       if (copiedIdentity.designatedRequirement !== identity.designatedRequirement) {
         throw new Error("Staged copy changed the BotFleet signing requirement");
+      }
+      // The download unpacked into <stage>/hosted and the app was just copied out
+      // of it, so that directory is now a second full copy of the bundle sitting
+      // in the stage.  A stage holding prepared.json is never prunable — it is a
+      // build a later `apply` can still install — so leaving it there means every
+      // prepared stage, which is the normal state between two updates, holds a
+      // duplicate of the app for as long as it exists.  Removed only after the
+      // copy has been validated, so a failure still leaves it for diagnosis.
+      const hostedScratch = join(source.stageDirectory, "hosted");
+      if (resolve(hostedScratch) !== resolve(bundlePath) && await exists(hostedScratch)) {
+        await rm(hostedScratch, { recursive: true, force: true });
       }
       const dependenciesPath = join(source.stageDirectory, "node_modules");
       const sourceDependencies = source.providedDependencies || join(source.path, "node_modules");
@@ -1756,6 +3389,65 @@ function createOperations(config) {
       return lastPreflight;
     },
 
+    // What an earlier run left behind: a candidate bundle or dependency tree,
+    // or a failed replacement's dependency tree, named after an updater that
+    // is gone.  Swept at the start of every apply, not only after a verified
+    // one, so a run of failures cannot pile them up (2026-10-09 left
+    // /Applications/.BotFleet.update-86863-… and its dependency tree).  A
+    // deferred rollback's pending-recovery.json is reported, not acted on:
+    // nothing reads it, so it never blocks this update.
+    sweepLeftovers: async () => {
+      const roots = [dirname(config.appPath), dirname(config.checkout), config.updatesDirectory];
+      await sweepCandidates(dirname(config.appPath), CANDIDATE_BUNDLE_PREFIX, ".app", [], roots);
+      await sweepCandidates(dirname(config.checkout), CANDIDATE_DEPENDENCY_PREFIX, "", [], roots);
+      await sweepCandidates(dirname(config.checkout), FAILED_DEPENDENCY_PREFIX, "", [], roots);
+      for (const name of await listDirectory(config.updatesDirectory)) {
+        const receipt = join(config.updatesDirectory, name, "pending-recovery.json");
+        if (await exists(receipt)) {
+          console.error(`An earlier update deferred its rollback (${receipt}); this update goes ahead and supersedes it.`);
+        }
+      }
+    },
+
+    // The invariant: BotFleet is left running.  Called before the first
+    // preflight (a harness an earlier failure left stopped is started, so a
+    // stale owner record does not refuse every later update) and after every
+    // failure.  A no-op when a harness answers.
+    ensureRunning: async () => ensureBotFleetRunning({
+      answers: async () => (await Promise.all(config.ports.map((port) => probeHealthWithRetry(port))))
+        .some((item) => item.kind === "botfleet"),
+      bundleBusy: () => bundleProcessPids(config.appPath),
+      mismatch: async () => {
+        const [head, appCommit] = await Promise.all([
+          gitOutput(config.checkout, ["rev-parse", "HEAD"]).catch(() => null),
+          installedBuildCommit(config.appPath),
+        ]);
+        return head && appCommit && head !== appCommit
+          ? `the checkout is at ${head.slice(0, 12)} but ${config.appPath} was built from ${appCommit.slice(0, 12)}`
+          : null;
+      },
+      start: async ({ appStillQuitting }) => {
+        const plist = harnessBootstrapPlist(config, {
+          plistExists: await exists(config.plist),
+          legacyPlistExists: await exists(config.legacyPlist),
+        });
+        if (await exists(plist)) {
+          const label = await startedHarnessLabel(config, plist);
+          const loaded = await run("launchctl", ["print", `${config.domain}/${label}`], { allowFailure: true });
+          // Loaded but not running: kickstart it.  Not loaded: bootstrap it.
+          await run("launchctl", loaded.code === 0
+            ? ["kickstart", `${config.domain}/${label}`]
+            : ["bootstrap", config.domain, plist], { allowFailure: true });
+        }
+        if (config.parsed.openApplication !== false && !appStillQuitting) {
+          await run("open", [config.appPath], { allowFailure: true });
+        }
+      },
+      timeoutMs: config.startupTimeoutMs,
+      exitWaitMs: config.exitWaitMs,
+      report: config.reportDetail,
+    }),
+
     fence: async () => fenceRuntimeAdmission(config),
 
     capturePrevious: async (prepared) => {
@@ -1782,21 +3474,22 @@ function createOperations(config) {
       ]);
       // Every process inside the bundle, not only its main binary: the swap
       // renames the whole directory, so an embedded driver or helper app has
-      // to be accounted for too.
-      const appPids = await bundleProcessPids(config.appPath);
-      const holders = await sqliteHolders(config.dataDirectory);
-      const runtimePids = [...new Set([...(lastPreflight?.pids || []), lastPreflight?.pid, ...holders].filter(Number.isInteger))];
-      const processCommands = {};
-      const processCwds = {};
-      for (const pid of new Set([...runtimePids, ...appPids])) {
-        const command = await processCommand(pid);
-        const cwd = await processCwd(pid);
-        if (!isExpectedBotFleetProcess(command, cwd, config)) {
-          throw new Error(`Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`);
-        }
-        processCommands[pid] = command;
-        processCwds[pid] = cwd;
-      }
+      // to be accounted for too.  Resolved afresh on every pass: a bot's own
+      // tool holding the database for a moment is waited out, not refused
+      // (`waitOutUnrecognizedHolders`), and the next pass no longer sees it.
+      const { bundlePids, runtimeCandidates, pids: livePids, processCommands, processCwds } =
+        await waitOutUnrecognizedHolders(async () => {
+          const bundle = await bundleProcessPids(config.appPath);
+          const holders = await sqliteHolders(config.dataDirectory);
+          const candidates = [...new Set([...(lastPreflight?.pids || []), lastPreflight?.pid, ...holders].filter(Number.isInteger))];
+          // Exited processes (zombies above all) are not captured: quiesce
+          // would wait on a pid that can never go away, and a defunct process
+          // fails the identity check below.
+          const captured = await captureProcessIdentities([...candidates, ...bundle], config);
+          return { ...captured, bundlePids: bundle, runtimeCandidates: candidates };
+        }, { windowMs: config.unknownHolderWaitMs, report: config.reportDetail });
+      const runtimePids = runtimeCandidates.filter((pid) => livePids.includes(pid));
+      const appPids = bundlePids.filter((pid) => livePids.includes(pid));
       const stamp = Date.now();
       const generation = `${stamp}-${checkoutCommit.slice(0, 12)}`;
       const rollback = await resolveRollbackPlacement({
@@ -1871,36 +3564,54 @@ function createOperations(config) {
       // gone or names someone else while the replacement owns the database
       // and port 8799.  The captured pids still go in, as hints that
       // terminateVerified drops once their identity no longer matches.
-      const [currentHolders, currentBundlePids, health] = await Promise.all([
-        sqliteHolders(config.dataDirectory),
-        bundleProcessPids(config.appPath),
-        Promise.all(config.ports.map(probeHealth)),
-      ]);
-      const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
-      await terminateVerified(
-        [...previous.runtimePids, ...previous.appPids, ...current],
-        previous,
-        config,
-        { current },
-      );
+      // Re-resolved on every pass, for the same reason as at capture: a
+      // non-BotFleet process holding BotFleet state is waited out and never
+      // signalled, and a refusal names it.
+      await waitOutUnrecognizedHolders(async () => {
+        const [currentHolders, currentBundlePids, health] = await Promise.all([
+          sqliteHolders(config.dataDirectory),
+          bundleProcessPids(config.appPath),
+          Promise.all(config.ports.map(probeHealth)),
+        ]);
+        const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
+        await terminateVerified(
+          [...previous.runtimePids, ...previous.appPids, ...current],
+          previous,
+          config,
+          { current },
+        );
+      }, { windowMs: config.unknownHolderWaitMs, report: config.reportDetail });
     },
 
-    assertQuiesced: async () => {
-      const holders = await sqliteHolders(config.dataDirectory);
-      if (holders.length) throw new Error(`BotFleet database still has ${holders.length} live holders after graceful shutdown`);
-      // A process can hold no database handle and answer no port while still
-      // running out of the installed bundle.  Renaming that bundle under it is
-      // exactly what leaves the owner looking at a rollback name, so the swap
-      // waits for the bundle to be empty of processes, not only for its state
-      // — and that means the whole bundle: the main binary, the embedded
-      // computer-use driver, and the speech and recorder helper apps.
-      const appPids = await bundleProcessPids(config.appPath);
-      if (appPids.length) {
-        throw new Error(`BotFleet process ${appPids.join(", ")} still runs from inside ${config.appPath} after graceful shutdown`);
-      }
-      const health = await Promise.all(config.ports.map((port) => probeHealthWithRetry(port)));
-      const portError = quiescedPortError(health);
-      if (portError) throw new Error(portError);
+    assertQuiesced: async (previous) => {
+      // Waited for, not checked once: on a loaded Mac the app's own verified
+      // processes can take minutes to quit (2026-10-09, "BotFleet process
+      // 11736 still runs from inside /Applications/BotFleet.app after
+      // graceful shutdown").  A process still there gets one verified SIGTERM;
+      // never SIGKILL.
+      await waitForBotFleetExit(async () => {
+        const holders = await sqliteHolders(config.dataDirectory);
+        if (holders.length) {
+          return { reason: `BotFleet database still has ${holders.length} live holders after graceful shutdown`, pids: holders };
+        }
+        // A process can hold no database handle and answer no port while still
+        // running out of the installed bundle.  Renaming that bundle under it is
+        // exactly what leaves the owner looking at a rollback name, so the swap
+        // waits for the bundle to be empty of processes, not only for its state
+        // — and that means the whole bundle: the main binary, the embedded
+        // computer-use driver, and the speech and recorder helper apps.
+        const appPids = await bundleProcessPids(config.appPath);
+        if (appPids.length) {
+          return { reason: `BotFleet process ${appPids.join(", ")} still runs from inside ${config.appPath} after graceful shutdown`, pids: appPids };
+        }
+        const health = await Promise.all(config.ports.map((port) => probeHealthWithRetry(port)));
+        const portError = quiescedPortError(health);
+        return portError ? { reason: portError, pids: [] } : null;
+      }, {
+        windowMs: config.exitWaitMs,
+        report: config.reportDetail,
+        nudge: ({ pids }) => (pids.length ? terminateVerified(pids, previous ?? {}, config, { current: pids }) : undefined),
+      });
     },
 
     advanceCheckout: async (targetCommit) => {
@@ -1997,26 +3708,34 @@ function createOperations(config) {
     },
 
     verifySingleOwner: async (prepared, previous) => {
-      let firstAppPids = [];
-      let secondAppPids = [];
       if (config.parsed.openApplication !== false) {
-        await sleep(2_000);
-        firstAppPids = await exactAppPids(config.appPath);
-        await sleep(1_000);
-        secondAppPids = await exactAppPids(config.appPath);
+        const deadline = Date.now() + config.startupTimeoutMs;
+        let appError = "Timeout waiting for application to stabilize";
+        let attachmentError = "Timeout waiting for UI attachment";
+        while (Date.now() < deadline) {
+          const firstAppPids = await exactAppPids(config.appPath);
+          await sleep(1_000);
+          const secondAppPids = await exactAppPids(config.appPath);
+          
+          appError = stableApplicationProcessError(firstAppPids, secondAppPids, true);
+          if (!appError) {
+            const snapshot = await runtimeIdentityPreflight(config, prepared);
+            if (!snapshot.safe || snapshot.mode !== "authenticated") {
+              attachmentError = snapshot.reason || "Updated application did not attach to the authenticated single data owner";
+            } else {
+              attachmentError = applicationAttachmentError(snapshot, true);
+            }
+            if (!attachmentError) break;
+          }
+        }
+        if (appError) throw new Error(appError);
+        if (attachmentError) throw new Error(attachmentError);
+      } else {
+        const snapshot = await runtimeIdentityPreflight(config, prepared);
+        if (!snapshot.safe || snapshot.mode !== "authenticated") {
+          throw new Error(snapshot.reason || "Updated application did not attach to the authenticated single data owner");
+        }
       }
-      const appError = stableApplicationProcessError(
-        firstAppPids,
-        secondAppPids,
-        config.parsed.openApplication !== false,
-      );
-      if (appError) throw new Error(appError);
-      const snapshot = await runtimeIdentityPreflight(config, prepared);
-      if (!snapshot.safe || snapshot.mode !== "authenticated") {
-        throw new Error(snapshot.reason || "Updated application did not attach to the authenticated single data owner");
-      }
-      const attachmentError = applicationAttachmentError(snapshot, config.parsed.openApplication !== false);
-      if (attachmentError) throw new Error(attachmentError);
       const survivors = await bundleProcessPids(previous.rollbackPath);
       const survivingError = survivingRollbackProcessError(survivors, previous.rollbackPath);
       if (survivingError) throw new Error(survivingError);
@@ -2053,15 +3772,19 @@ function createOperations(config) {
       ]);
       const runtimePids = health.filter((item) => item.kind === "botfleet").map((item) => item.pid);
       const runningPids = [...new Set([...holders, ...appPids, ...runtimePids])];
+      // Only a harness that answers can own active work.  Processes with no
+      // harness answering are on their way out, and are waited out below.
+      const harnessAnswers = runtimePids.length > 0;
       let readiness = { safe: true };
-      if (runningPids.length) {
+      if (runningPids.length && harnessAnswers) {
         try {
-          readiness = await fenceRuntimeAdmission(config);
+          // At once: no hold and no grace against the replacement.
+          readiness = await fenceRuntimeAdmission(rollbackFenceConfig(config));
         } catch (error) {
           readiness = { safe: false, reason: error instanceof Error ? error.message : String(error) };
         }
       }
-      const refusal = rollbackReadinessError(runningPids.length, readiness);
+      const refusal = rollbackReadinessError(runningPids.length, readiness, { harnessAnswers });
       if (refusal) {
         const receiptPath = pendingRecoveryReceiptPath(prepared);
         try {
@@ -2117,20 +3840,30 @@ function createOperations(config) {
         await terminateVerified([...holders, ...appPids], { ...previous, runtimePids: [...new Set([...previous.runtimePids, ...holders])] }, config);
       });
       await recordStop(async () => {
-        const [holders, bundlePids, health, owner] = await Promise.all([
-          sqliteHolders(config.dataDirectory),
-          bundleProcessPids(config.appPath),
-          Promise.all(config.ports.map((port) => probeHealthWithRetry(port))),
-          readOwner(config.dataDirectory).catch(() => null),
-        ]);
-        const stranger = health.filter((item) => item.kind === "foreign" || item.kind === "http");
-        if (stranger.length) {
-          console.error(`Something other than BotFleet answers port ${stranger.map((item) => item.port).join(", ")}; rollback is not waiting on it.`);
-        }
-        const owned = ownedRuntimePids({ holders, bundlePids, health, ownerPid: owner?.pid });
-        if (owned.length) {
-          throw new Error(`Rollback cannot mutate files while BotFleet process ${owned.join(", ")} still owns its bundle, database, or health endpoint`);
-        }
+        let strangerSaid = false;
+        // Waited for, bounded, like the install's own shutdown: a replacement
+        // slow to quit is not a reason to leave the Mac half-rolled-back.
+        await waitForBotFleetExit(async () => {
+          const [holders, bundlePids, health, owner] = await Promise.all([
+            sqliteHolders(config.dataDirectory),
+            bundleProcessPids(config.appPath),
+            Promise.all(config.ports.map((port) => probeHealthWithRetry(port))),
+            readOwner(config.dataDirectory).catch(() => null),
+          ]);
+          const stranger = health.filter((item) => item.kind === "foreign" || item.kind === "http");
+          if (stranger.length && !strangerSaid) {
+            strangerSaid = true;
+            console.error(`Something other than BotFleet answers port ${stranger.map((item) => item.port).join(", ")}; rollback is not waiting on it.`);
+          }
+          const owned = ownedRuntimePids({ holders, bundlePids, health, ownerPid: owner?.pid });
+          return owned.length
+            ? { reason: `Rollback cannot mutate files while BotFleet process ${owned.join(", ")} still owns its bundle, database, or health endpoint`, pids: owned }
+            : null;
+        }, {
+          windowMs: config.exitWaitMs,
+          report: config.reportDetail,
+          nudge: ({ pids }) => terminateVerified(pids, { ...previous, runtimePids: [...new Set([...previous.runtimePids, ...pids])] }, config, { current: pids }),
+        });
       });
       if (stopErrors.length) throw new AggregateError(stopErrors, "Could not quiesce the failed replacement for safe rollback");
 
@@ -2324,13 +4057,17 @@ export async function main(argv = process.argv.slice(2)) {
         target: parsed.target,
       })
     : null;
+  config.reportDetail = (detail) => {
+    console.log(`${detail}...`);
+    progress?.note({ detail });
+  };
   const operations = progress ? instrumentOperations(bare, progress) : bare;
   const perform = async () => {
     if (parsed.command === "prepare") return prepareUpdate(parsed, operations);
     if (parsed.command === "apply") {
-      return applyPreparedUpdate(await loadPrepared(parsed.stage), parsed, operations);
+      return applyPreparedUpdate(await loadPrepared(parsed.stage), { ...parsed, signals: process }, operations);
     }
-    return runUpdate(parsed, parsed, operations);
+    return runUpdate(parsed, { ...parsed, signals: process }, operations);
   };
   if (!progress) {
     await perform();

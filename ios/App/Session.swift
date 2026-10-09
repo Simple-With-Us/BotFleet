@@ -82,6 +82,12 @@ final class Session: ObservableObject {
     /// predates PR #383 and does not report the route.  Distinct from
     /// "have not fetched yet" so the row can render the right copy.
     @Published private(set) var pushSenderHealthNotReported = false
+    /// Shared memory (the recall corpus) status, read-only, for the Settings
+    /// row.  `nil` until the first fetch resolves; a failed fetch keeps the
+    /// last answer, and a 404 (a sidecar that predates the route) is
+    /// `sharedMemoryNotReported`.
+    @Published private(set) var sharedMemoryStatus: SharedMemoryStatus?
+    @Published private(set) var sharedMemoryNotReported = false
 
     /// instanceId -> driverKind, cached from the last `instances()` fetch so
     /// the chat header can resolve a bot's current-model provider mark
@@ -107,6 +113,20 @@ final class Session: ObservableObject {
     private var voiceTask: Task<Void, Never>?
     private var voiceGeneration = UUID()
     private var voicePlayer: AVAudioPlayer?
+    /// Completion of the hosted clip that is playing.  Held so stopVoice()
+    /// can end the wait: AVAudioPlayer.stop() sends no delegate callback.
+    private var voicePlayback: ClipPlayback?
+    /// The next hosted clip, fetched while the current one plays.
+    private var voicePrefetch: Task<Data, Error>?
+    /// Bots (and voices) already told this iPhone lacks their Personal Voice
+    /// this session.  Auto-play must not raise the same alert every reply.
+    private var personalVoiceMissingNoted: Set<String> = []
+    private var voiceAudioObservers: [NSObjectProtocol] = []
+    /// A read was playing when the current audio interruption began.
+    private var voiceInterrupted = false
+    /// DEBUG `-store-preview -preview-voice` only: voices for a profile
+    /// screenshot with no paired computer.  Nil everywhere else.
+    private var previewVoiceOptions: [Voice]?
     @Published private(set) var speakingMessageId: String?
 
     private var client: CompanionClient?
@@ -258,6 +278,7 @@ final class Session: ObservableObject {
 
     init() {
         _ = NotificationCoordinator.shared
+        observeVoiceAudioSession()
         NotificationCoordinator.shared.responseHandler = { [weak self] target in
             Task { @MainActor in await self?.openNotification(target) }
         }
@@ -275,14 +296,22 @@ final class Session: ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("-store-preview"),
            let url = Bundle.main.url(forResource: "StorePreview", withExtension: "json"),
            let data = try? Data(contentsOf: url),
-           let fleet = try? JSONDecoder().decode(Fleet.self, from: data) {
+           var fleet = try? JSONDecoder().decode(Fleet.self, from: data) {
             connection = Connection(name: "Preview Mac", host: "preview.tailnet.ts.net", port: 8810)
+            if ProcessInfo.processInfo.arguments.contains("-preview-voice") {
+                seedVoicePreview(&fleet)
+            }
+            if ProcessInfo.processInfo.arguments.contains("-preview-off") {
+                seedOffPreview(&fleet)
+            }
             state.hydrate(fleet)
             // StorePreview bots all select instanceId "preview"; seed the
             // driver map so the chat-header provider mark appears in the
             // screenshot harness (no live client to warm from).
             instanceDriverKinds = ["preview": "claude"]
             status = .live
+            TranscriptScrollDemo.startIfRequested(self)
+            KaraokeDemo.startIfRequested(self)
             return
         }
 #endif
@@ -293,6 +322,59 @@ final class Session: ObservableObject {
         restore()
         Task { await refreshNotificationAuthorization() }
     }
+
+#if DEBUG
+    /// Scroll harness only (`-scroll-demo`): change state as if the stream
+    /// had delivered a frame.  `state` is otherwise written only here.
+    func debugMutateState(_ body: (inout CompanionState) -> Void) {
+        body(&state)
+    }
+
+    /// Karaoke fixture only (`-karaoke-demo`): show a reply as being read
+    /// aloud, so its bubble wears Stop Voice.
+    func debugSetSpeaking(_ messageId: String?) {
+        speakingMessageId = messageId
+    }
+
+    /// `-preview-off`: Pixel is switched Off, so the chat list's dimmed row and
+    /// Off label, the disabled composer and the profile's Power section can be
+    /// screenshotted without a paired computer.  Pass `-open-first` as well to
+    /// land on Scout, then open Pixel from the list.
+    private func seedOffPreview(_ fleet: inout Fleet) {
+        for index in fleet.bots.indices where fleet.bots[index].id == "preview-pixel" {
+            fleet.bots[index].off = true
+        }
+    }
+
+    /// `-preview-voice`: every preview bot speaks a MiniMax voice on this
+    /// iPhone and a Mac Personal Voice on the Mac, with the voice engine
+    /// configured, so the profile's two voice pickers can be screenshotted.
+    private func seedVoicePreview(_ fleet: inout Fleet) {
+        for index in fleet.bots.indices {
+            fleet.bots[index].voice = "English_Graceful_Lady"
+            fleet.bots[index].voices = BotVoices(mac: "personal:com.apple.speech.personalvoice.preview-mac")
+            fleet.bots[index].speechDevices = ["mac", "iphone"]
+        }
+        // The owner's own setup: his MiniMax clone as the workspace default
+        // (listed with no friendly label, so it reads as the id made
+        // readable) and the seeded pronunciation list.
+        config = try? JSONDecoder().decode(
+            ConfigStatus.self,
+            from: Data(#"""
+            {"tts":{"configured":true,"voice":"jay-wedgeworth-001","provider":"minimax","pronunciations":[
+              {"term":"JSON","say":"Jason"},{"term":"SaaS","say":"sass"},{"term":"SQL","say":"sequel"},
+              {"term":"REGEX","say":"redge ex"},{"term":"GUI","say":"gooey"},{"term":"CAPTCHA","say":"cap cha"},
+              {"term":"sudo","say":"soo doo"},{"term":"cron","say":"kron"},{"term":"OAuth","say":"oh auth"}]}}
+            """#.utf8)
+        )
+        previewVoiceOptions = [
+            Voice(id: "jay-wedgeworth-001", label: "jay-wedgeworth-001", description: "Custom"),
+            Voice(id: "English_Graceful_Lady", label: "Graceful Lady"),
+            Voice(id: "English_Persuasive_Man", label: "Persuasive Man"),
+            Voice(id: "English_Wise_Woman", label: "Wise Woman"),
+        ]
+    }
+#endif
 
     /// Drop coalesced settings PATCHes when the paired computer changes so a
     /// queued mode, terminology, name, email, toggle, or timeout cannot land
@@ -525,6 +607,8 @@ final class Session: ObservableObject {
         state = CompanionState()
         pushSenderHealth = nil
         pushSenderHealthNotReported = false
+        sharedMemoryStatus = nil
+        sharedMemoryNotReported = false
         instanceDriverKinds = [:]
         cachedInstances = []
         instanceRoster.reset()
@@ -623,8 +707,11 @@ final class Session: ObservableObject {
     /// Called when the app leaves the screen. iOS will kill the connection
     /// anyway; dropping it deliberately means the cursor is written down at
     /// a known point instead of wherever the socket happened to die.
+    ///
+    /// A reply being read aloud is left alone: its clips come over their own
+    /// requests, not this stream, and the `audio` background mode keeps it
+    /// playing after the linger window closes.  Sign-out still stops it.
     func disconnect() {
-        stopVoice()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -733,6 +820,10 @@ final class Session: ObservableObject {
                         // Refresh provider marks after reconnect — instances
                         // may have changed while the phone was backgrounded.
                         Task { await self.warmInstanceDriverKinds() }
+                        // Jobs only ride the stream as they change, so a
+                        // connect, or a reconnect that missed frames, asks
+                        // for the whole set once.
+                        Task { await self.loadJobs() }
                         // The last frame this phone saw before the gap may
                         // have said a run was in progress — and the restart
                         // that gap likely IS took the connection down with
@@ -946,9 +1037,15 @@ final class Session: ObservableObject {
     // frame (or 202 queueId) lands. Everything else still waits on the
     // harness so the phone does not invent a second fold.
 
+    struct MessageSendOutcome: Sendable {
+        let ok: Bool
+        let clientNonce: String
+    }
+
     @discardableResult
-    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> Bool {
-        guard let client else { return false }
+    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> MessageSendOutcome {
+        guard let client else { return MessageSendOutcome(ok: false, clientNonce: "") }
+        var clientNonce = ""
         do {
             var prompt = text
             if !attachments.isEmpty {
@@ -964,7 +1061,7 @@ final class Session: ObservableObject {
                 }
                 prompt = ChatAttachments.composeMessage(text: text, attachments: uploaded)
             }
-            guard !prompt.isEmpty else { return false }
+            guard !prompt.isEmpty else { return MessageSendOutcome(ok: false, clientNonce: "") }
             let savedRecording: IncomingRecording?
             if let recording {
                 let path = try await client.uploadRecording(recording.data)
@@ -978,6 +1075,7 @@ final class Session: ObservableObject {
             case let .room(room): threadId = room.threadId
             }
             let localId = UUID().uuidString
+            clientNonce = localId
             state.rememberPendingSend(threadId: threadId, id: localId, text: prompt, queued: false)
             do {
                 switch chat {
@@ -1007,7 +1105,7 @@ final class Session: ObservableObject {
                         recording: savedRecording
                     )
                 }
-                return true
+                return MessageSendOutcome(ok: true, clientNonce: localId)
             } catch {
                 state.cancelPendingQueued(threadId: threadId, queueId: localId)
                 if let apiError = error as? APIError, apiError.isConflict {
@@ -1017,10 +1115,10 @@ final class Session: ObservableObject {
             }
         } catch let error as APIError where error.isUnauthorized {
             status = .unauthorized
-            return false
+            return MessageSendOutcome(ok: false, clientNonce: clientNonce)
         } catch {
             recordActionError(error)
-            return false
+            return MessageSendOutcome(ok: false, clientNonce: clientNonce)
         }
     }
 
@@ -1082,6 +1180,15 @@ final class Session: ObservableObject {
             choice: choice,
             isPermission: card.isPermission
         )
+    }
+
+    /// Allow every permission request waiting in this conversation (the
+    /// desktop's "Approve All").  The cards settle through the stream as the
+    /// harness answers each one, so nothing is folded in here.
+    @discardableResult
+    func approveAll(chat: Chat) async -> Bool {
+        let threadId = chat.threadId
+        return await perform { _ = try await $0.approveAll(threadId: threadId) }
     }
 
     /// The same answer, from something that only has the ids — the Live
@@ -1378,13 +1485,53 @@ final class Session: ObservableObject {
         }
     }
 
+    /// Duplicate a bot: make a new one, then copy onto it the profile fields a
+    /// paired phone is allowed to set (`BotDuplicate.profilePatch`).  The new
+    /// bot is folded in as soon as it exists, so if filling in its profile
+    /// fails the person still sees the bot that was made, with the reason.
+    @discardableResult
+    func duplicateBot(_ source: Bot) async -> Bot? {
+        guard let client else { return nil }
+        let patch = BotDuplicate.profilePatch(from: source)
+        let created: Bot
+        do {
+            created = try await client.createBot()
+            state.apply(.bot(created))
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+        do {
+            let patched = try await client.updateProfile(botId: created.id, patch: patch)
+            state.apply(.bot(patched))
+            return patched
+        } catch {
+            if !isCancellation(error) {
+                actionError = "The new bot was made, but its profile could not be copied.\u{00A0} \(error.localizedDescription)"
+            }
+            return created
+        }
+    }
+
     /// Make a room from the phone. Same shape as `createBot`: fold it in
     /// rather than wait for a broadcast, and hand it back so it can be opened.
     @discardableResult
-    func createRoom(name: String?, memberIds: [String]) async -> Room? {
+    func createRoom(
+        name: String?,
+        memberIds: [String],
+        cwd: String? = nil,
+        bulletin: String? = nil,
+        defaultResponder: GroupResponder? = nil
+    ) async -> Room? {
         guard let client else { return nil }
         do {
-            let room = try await client.createRoom(name: name, memberIds: memberIds)
+            let room = try await client.createRoom(
+                name: name,
+                memberIds: memberIds,
+                cwd: cwd,
+                bulletin: bulletin,
+                defaultResponder: defaultResponder
+            )
             state.apply(.room(room))
             return room
         } catch {
@@ -1647,6 +1794,139 @@ final class Session: ObservableObject {
         catch { recordActionError(error) }
     }
 
+    // MARK: - Roster organization
+    //
+    // Archive, Restore, Pin, Mark As Unread, Make Chief Of Staff, Move To
+    // Section, Pin Message, and Delete.  Each applies the harness's answer
+    // as soon as it arrives, the way `updateProfile` does, instead of waiting
+    // for the stream frame that follows.  The rules about what may be asked
+    // live in `BotOrganize`.
+
+    /// The bot PATCH, throwing the harness's refusal so a caller inside a
+    /// sheet can show it there.  No pairing reads as a cancelled tap: the
+    /// same silence every other action here gives it.
+    @MainActor
+    func applyOrganize(_ patch: BotOrganizePatch, to bot: Bot) async throws -> Bot {
+        guard let client, !patch.isEmpty else { throw CancellationError() }
+        let updated = try await client.organizeBot(id: bot.id, patch: patch)
+        // A new Chief of Staff demotes the old one in its section.  The
+        // harness sends that bot as its own frame too; folding it in now
+        // keeps the roster from showing two at once.  A bot deleted while the
+        // request was in flight is not put back (`botsToApply`).
+        for folded in BotOrganize.botsToApply(after: updated, in: state.bots) {
+            state.apply(.bot(folded))
+        }
+        return updated
+    }
+
+    /// `applyOrganize`, reporting a refusal through `actionError`.
+    @MainActor
+    @discardableResult
+    func organizeBot(_ bot: Bot, _ patch: BotOrganizePatch) async -> Bot? {
+        do {
+            return try await applyOrganize(patch, to: bot)
+        } catch {
+            recordActionError(error)
+            return nil
+        }
+    }
+
+    /// Delete a bot for good.  Throws the harness's refusal (a running Local
+    /// VM action is a 409 with a sentence) so the caller decides where to
+    /// show it.  On success the bot leaves `state` now rather than when the
+    /// `bot.deleted` frame lands, so no screen is left showing it.
+    @MainActor
+    func deleteBot(_ bot: Bot) async throws {
+        guard let client else { throw CancellationError() }
+        try await client.deleteBot(id: bot.id)
+        state.apply(.botDeleted(botId: bot.id))
+    }
+
+    /// Delete a room and its transcripts.  Same shape as `deleteBot`.
+    @MainActor
+    func deleteRoom(_ room: Room) async throws {
+        guard let client else { throw CancellationError() }
+        try await client.deleteRoom(id: room.id)
+        state.apply(.roomDeleted(groupId: room.id))
+    }
+
+    /// Move To Section for a room.  A blank or nil name takes it out.
+    @MainActor
+    @discardableResult
+    func moveRoom(_ room: Room, toSection section: String?) async -> Bool {
+        let value: BotProfilePatch.SectionString
+        if let name = BotOrganize.normalizedSection(section) {
+            value = .set(name)
+        } else {
+            value = .clear
+        }
+        return await patchRoom(room, RoomPatch(section: value))
+    }
+
+    /// Pin Message, or unpin with nil, in a bot chat or a room.
+    @MainActor
+    @discardableResult
+    func pinMessage(_ messageId: String?, in chat: Chat) async -> Bool {
+        switch chat {
+        case let .bot(bot):
+            return await organizeBot(bot, .pinMessage(messageId)) != nil
+        case let .room(room):
+            return await patchRoom(room, RoomPatch(pinnedMessageId: MessagePin(messageId)))
+        }
+    }
+
+    @MainActor
+    private func patchRoom(_ room: Room, _ patch: RoomPatch) async -> Bool {
+        guard let client else { return false }
+        do {
+            let updated = try await client.updateRoom(id: room.id, patch: patch)
+            if state.rooms.contains(where: { $0.id == updated.id }) {
+                state.apply(.room(updated))
+            }
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    /// Bring one message of the open chat into view, as a search hit does.
+    func focus(_ messageId: String) {
+        focusedMessageId = messageId
+    }
+
+    // MARK: - Room tasks
+    //
+    // A channel's separate conversations, mirrored from the bot task methods
+    // above.  Create, switch and delete answer with the room as it now stands,
+    // transcript included, so the answer is folded in directly.
+
+    func createRoomTask(for room: Room, title: String?) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.createRoomTask(roomId: room.id, title: title))) }
+        catch { recordActionError(error) }
+    }
+
+    func switchRoomTask(_ task: BotTask, for room: Room) async {
+        guard let client, task.threadId != room.threadId else { return }
+        do { state.apply(.room(try await client.switchRoomTask(roomId: room.id, threadId: task.threadId))) }
+        catch { recordActionError(error) }
+    }
+
+    func renameRoomTask(_ task: BotTask, for room: Room, title: String) async {
+        guard let client else { return }
+        do {
+            try await client.renameRoomTask(roomId: room.id, threadId: task.threadId, title: title)
+            await refresh()
+        } catch { recordActionError(error) }
+    }
+
+    func deleteRoomTask(_ task: BotTask, for room: Room) async {
+        guard let client else { return }
+        do { state.apply(.room(try await client.deleteRoomTask(roomId: room.id, threadId: task.threadId))) }
+        catch { recordActionError(error) }
+    }
+
     // MARK: - Agent profile
 
     @MainActor
@@ -1715,10 +1995,20 @@ final class Session: ObservableObject {
     }
 
     @MainActor
-    func updateProfile(_ patch: BotProfilePatch, for bot: Bot) async -> Bot? {
+    /// `withoutDeviceVoices` is the same save for a computer that predates
+    /// per-device voices.  Such a computer refuses the whole PATCH over the
+    /// `voices` key, so it is sent once more without it, rather than losing a
+    /// rename or a model change made in the same sheet.
+    func updateProfile(_ patch: BotProfilePatch, for bot: Bot, withoutDeviceVoices: BotProfilePatch? = nil) async -> Bot? {
         guard let client else { return nil }
         do {
-            let updated = try await client.updateProfile(botId: bot.id, patch: patch)
+            let updated: Bot
+            do {
+                updated = try await client.updateProfile(botId: bot.id, patch: patch)
+            } catch let refusal where withoutDeviceVoices != nil && BotVoiceEdit.isDeviceVoicesUnsupported(refusal) {
+                guard let fallback = withoutDeviceVoices, !Task.isCancelled else { return nil }
+                updated = try await client.updateProfile(botId: bot.id, patch: fallback)
+            }
             guard !Task.isCancelled else { return nil }
             state.apply(.bot(updated))
             return updated
@@ -1788,9 +2078,53 @@ final class Session: ObservableObject {
     }
 
     func voiceOptions() async -> [Voice] {
-        guard let client else { return [] }
+        guard let client else { return previewVoiceOptions ?? [] }
         do { return try await client.voices() }
         catch { recordActionError(error); return [] }
+    }
+
+    // MARK: - Workspace voice settings
+
+    /// Save the workspace default voice.  Returns the refusal in words, or
+    /// nil when it saved.
+    @MainActor
+    func updateDefaultVoice(_ voiceId: String) async -> String? {
+        guard let client else {
+            // The store preview has no computer; apply it here so the screen
+            // can be exercised.
+            guard previewVoiceOptions != nil else { return "Connect a computer first." }
+            config?.tts?.voice = voiceId
+            return nil
+        }
+        let pairing = pairingGeneration
+        do {
+            let status = try await client.updateDefaultVoice(voiceId)
+            guard pairingGeneration == pairing else { return nil }
+            config = status
+            return nil
+        } catch {
+            return isCancellation(error) ? nil : error.localizedDescription
+        }
+    }
+
+    /// Replace the workspace pronunciation list.  Returns the refusal in
+    /// words, or nil when it saved.
+    @MainActor
+    func updatePronunciations(_ list: [Pronunciation]) async -> String? {
+        guard let client else {
+            guard previewVoiceOptions != nil else { return "Connect a computer first." }
+            config?.tts?.pronunciations = list
+            return nil
+        }
+        let pairing = pairingGeneration
+        do {
+            let status = try await client.updatePronunciations(list)
+            guard pairingGeneration == pairing else { return nil }
+            config = status
+            return nil
+        } catch {
+            return isCancellation(error) ? nil : error.localizedDescription
+        }
     }
 
     func stopVoice() {
@@ -1798,60 +2132,359 @@ final class Session: ObservableObject {
         voiceGeneration = UUID()
         voiceTask?.cancel()
         voiceTask = nil
+        voicePrefetch?.cancel()
+        voicePrefetch = nil
         voicePlayer?.stop()
         voicePlayer = nil
+        voicePlayback?.finish(false)
+        voicePlayback = nil
         PersonalVoiceService.shared.stop()
+        // The highlight follows the voice: an early stop clears it at once.
+        // A reply read to the end keeps its short linger.
+        KaraokeCenter.shared.stop()
         speakingMessageId = nil
+        // The interruption belonged to the read that just ended.  Left set,
+        // its late end would stop the next read.
+        voiceInterrupted = false
         if wasPlaying { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
     }
 
+    /// Runs `work` with background execution time.  The `audio` background
+    /// mode keeps the app running only while something plays, so a locked
+    /// phone could be suspended in the silent waits of a read: the request
+    /// that plans it, and a clip that is not ready when the last one ends.
+    private func withVoiceBackgroundTime<T>(_ work: () async throws -> T) async rethrows -> T {
+        let time = VoiceBackgroundTime()
+        defer { time.end() }
+        return try await work()
+    }
+
+    /// Read a bot reply aloud with the voice this bot uses on the iPhone.
+    ///
+    /// The harness projects the reply for speech either way.  A Personal
+    /// Voice speaks those utterances here; a hosted (MiniMax) voice plays the
+    /// clips progressively, the first while the next is fetched, so a long
+    /// reply starts in seconds instead of waiting on every clip (which the
+    /// companion's 30-second header deadline used to turn into a 504).
     func playVoice(_ message: Message, threadId: String) {
         if speakingMessageId == message.id { stopVoice(); return }
         stopVoice()
-        let botVoice = state.bot(forThread: threadId)?.voice
-        if let botVoice, PersonalVoiceContract.isPersonalVoice(botVoice) {
-            guard let text = message.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                speakingMessageId = nil
-                return
-            }
-            speakingMessageId = message.id
-            let generation = voiceGeneration
-            voiceTask = Task { [weak self] in
-                do {
-                    try await PersonalVoiceService.shared.speak(text: text, voiceId: botVoice)
-                } catch {
-                    if !Task.isCancelled { self?.recordActionError(error) }
-                }
-                if self?.voiceGeneration == generation { self?.stopVoice() }
-            }
-            return
-        }
-        guard let client else { return }
+        let bot = state.bot(forThread: threadId)
+        let voiceId = bot?.voice(for: .iphone)
+        let personal = BotVoice.isPersonalVoiceId(voiceId)
+        // A Personal Voice can still read from the local projection without
+        // a client; a hosted voice cannot.
+        guard personal || client != nil else { return }
         speakingMessageId = message.id
         let generation = voiceGeneration
+        let client = self.client
         voiceTask = Task { [weak self] in
-            do {
-                let clips = try await client.messageVoice(threadId: threadId, messageId: message.id)
-                try Task.checkCancellation()
-                let audioSession = AVAudioSession.sharedInstance()
-                try audioSession.setCategory(.playback, mode: .spokenAudio)
-                try audioSession.setActive(true)
-                for index in clips.indices {
-                    let data = try await client.voiceClip(threadId: threadId, messageId: message.id, index: index)
-                    try Task.checkCancellation()
-                    let player = try AVAudioPlayer(data: data)
-                    guard player.prepareToPlay(), player.play() else { throw APIError.transport("Voice clip could not be played.") }
-                    self?.voicePlayer = player
-                    while player.isPlaying && !Task.isCancelled {
-                        try await Task.sleep(nanoseconds: 100_000_000)
-                    }
-                    try Task.checkCancellation()
-                }
-            } catch {
-                if !Task.isCancelled { self?.recordActionError(error) }
-            }
+            await self?.readAloud(message, threadId: threadId, botId: bot?.id, voiceId: voiceId, client: client)
             if self?.voiceGeneration == generation { self?.stopVoice() }
         }
+    }
+
+    private func readAloud(
+        _ message: Message,
+        threadId: String,
+        botId: String?,
+        voiceId: String?,
+        client: CompanionClient?
+    ) async {
+        let engine: VoiceTelemetry.Engine = BotVoice.isPersonalVoiceId(voiceId) ? .personal : .hosted
+        do {
+            if let voiceId, engine == .personal {
+                try await speakOnDevice(message, threadId: threadId, botId: botId, voiceId: voiceId, client: client)
+                return
+            }
+            guard let client else { return }
+            let answer: MessageVoice
+            do {
+                answer = try await withVoiceBackgroundTime {
+                    try await client.messageVoice(
+                        threadId: threadId, messageId: message.id, device: .iphone, progressive: true
+                    )
+                }
+            } catch {
+                if !isCancellation(error) { VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .hosted) }
+                throw error
+            }
+            try Task.checkCancellation()
+            if answer.speaksOnDevice {
+                // The harness resolved a Personal Voice this phone did not
+                // know about (a workspace default, or a newer choice).
+                let reading = personalReading(answer, message: message)
+                try await speakPersonal(
+                    reading.segments, voiceId: answer.voice ?? voiceId ?? "", botId: botId,
+                    karaoke: reading.script.map { (message, $0) }
+                )
+            } else {
+                try await playHostedClips(answer, threadId: threadId, message: message, client: client)
+            }
+        } catch {
+            guard !isCancellation(error), !Task.isCancelled else { return }
+            VoiceTelemetry.playbackFailed(error, engine: engine)
+            recordActionError(error)
+        }
+    }
+
+    /// A Personal Voice reads the harness's projection of the reply (no
+    /// markdown, URLs, or code), falling back to the same rules on this
+    /// phone only when the computer cannot answer.  Speaking on the device
+    /// never bills, so a reply over the hosted clip limit (413) is still
+    /// read in full from the local projection.
+    private func speakOnDevice(
+        _ message: Message,
+        threadId: String,
+        botId: String?,
+        voiceId: String,
+        client: CompanionClient?
+    ) async throws {
+        var answered: MessageVoice?
+        var speakWith = voiceId
+        if let client {
+            // Only the request may fall back to the local projection.  A
+            // failure while playing hosted clips below is a playback failure.
+            var answer: MessageVoice?
+            do {
+                answer = try await withVoiceBackgroundTime {
+                    try await client.messageVoice(
+                        threadId: threadId, messageId: message.id, device: .iphone, progressive: true
+                    )
+                }
+            } catch {
+                if isCancellation(error) || Task.isCancelled { throw error }
+                VoiceTelemetry.audioRequestFailed(error, stage: "post", engine: .personal)
+            }
+            try Task.checkCancellation()
+            if let answer {
+                guard answer.speaksOnDevice else {
+                    // The computer resolved a hosted voice for this iPhone;
+                    // this phone's copy of the bot is older.  Play its clips.
+                    try await playHostedClips(answer, threadId: threadId, message: message, client: client)
+                    return
+                }
+                answered = answer
+                if let resolved = answer.voice, BotVoice.isPersonalVoiceId(resolved) { speakWith = resolved }
+            }
+        }
+        let reading = personalReading(answered, message: message)
+        try await speakPersonal(
+            reading.segments,
+            voiceId: speakWith,
+            botId: botId,
+            karaoke: reading.script.map { (message, $0) }
+        )
+    }
+
+    /// What a Personal Voice reads for `message`, and the karaoke script
+    /// that follows it.  The harness's utterances when it answered: the
+    /// distilled rewrite by default (aligned to the message without spans),
+    /// or the written script with its spans (`script: "written"`).  Without
+    /// an answer this phone projects the reply itself, and the highlight
+    /// follows that projection without spans, anchored on words that occur
+    /// once on each side.
+    private func personalReading(_ answer: MessageVoice?, message: Message) -> (segments: [SpeechSegment], script: KaraokeScript?) {
+        if let answer, let utterances = answer.utterances {
+            return (SpeechProjection.segments(fromUtterances: utterances), answer.karaokeScript)
+        }
+        let segments = SpeechProjection.segments(fromReply: message.text ?? "")
+        return (segments, KaraokeScript.unguided(utterances: segments.map(\.text)))
+    }
+
+    private func speakPersonal(
+        _ segments: [SpeechSegment],
+        voiceId: String,
+        botId: String?,
+        karaoke follow: (message: Message, script: KaraokeScript)? = nil
+    ) async throws {
+        let service = PersonalVoiceService.shared
+        if service.authorizationStatus == .notDetermined {
+            _ = await service.requestAuthorization()
+            try Task.checkCancellation()
+        }
+        if !service.hasVoice(voiceId) { notePersonalVoiceMissing(botId: botId, voiceId: voiceId) }
+        // The bubble follows each word the synthesizer reports.
+        var karaoke: MessageKaraoke?
+        if let follow {
+            karaoke = KaraokeCenter.shared.begin(
+                messageId: follow.message.id,
+                messageText: follow.message.text ?? "",
+                script: follow.script,
+                mode: .live,
+                pronunciations: config?.pronunciations ?? []
+            )
+            karaoke?.setChunks(segments.map(\.text))
+        }
+        _ = try await service.speak(segments: segments, voiceId: voiceId) { [weak karaoke] progress in
+            karaoke?.liveWord(chunk: progress.segment, location: progress.location, at: progress.at)
+        }
+        // A stopped read already cleared it; finish only a read that ended.
+        KaraokeCenter.shared.finish(karaoke)
+    }
+
+    /// Say once per bot and voice why a different voice is reading, and
+    /// where to fix it.  Playback goes on with this iPhone's own voice.
+    private func notePersonalVoiceMissing(botId: String?, voiceId: String) {
+        guard personalVoiceMissingNoted.insert("\(botId ?? "")|\(voiceId)").inserted else { return }
+        VoiceTelemetry.personalVoiceMissing()
+        let service = PersonalVoiceService.shared
+        if service.authorizationStatus != .authorized {
+            actionError = "BotFleet cannot use Personal Voice on this iPhone, so the standard voice is reading instead.\u{00A0} Allow it in Settings > Accessibility > Personal Voice, or choose another voice for this iPhone in the bot's profile."
+        } else if service.personalVoices.isEmpty {
+            actionError = "This bot's iPhone voice is a Personal Voice from another device, so the standard voice is reading instead.\u{00A0} Choose a voice for this iPhone in the bot's profile."
+        } else {
+            actionError = "This bot's iPhone voice is a Personal Voice from another device, so your Personal Voice on this iPhone is reading instead.\u{00A0} Choose a voice for this iPhone in the bot's profile."
+        }
+    }
+
+    /// Plays every clip of a hosted reply in order, fetching the next clip
+    /// while the current one plays.  Walks `0..<total`, not the clips that
+    /// were ready when the harness answered.
+    private func playHostedClips(
+        _ answer: MessageVoice,
+        threadId: String,
+        message: Message,
+        client: CompanionClient
+    ) async throws {
+        let messageId = message.id
+        let total = answer.clipCount
+        guard total > 0 else { return }
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playback, mode: .spokenAudio)
+        try audioSession.setActive(true)
+        // Karaoke over the message, one clip per utterance, for the
+        // distilled script and the written one alike: each word's time is
+        // proportional to its place in its clip, and a clip's real length
+        // replaces the estimate once it plays.
+        var karaoke: MessageKaraoke?
+        if let script = answer.karaokeScript, script.utterances.count == total {
+            karaoke = KaraokeCenter.shared.begin(
+                messageId: messageId,
+                messageText: message.text ?? "",
+                script: script,
+                mode: .clips,
+                pronunciations: config?.pronunciations ?? []
+            )
+        }
+        var next = prefetchClip(0, threadId: threadId, messageId: messageId, client: client)
+        for index in 0..<total {
+            let data: Data
+            do {
+                // Usually already fetched while the last clip played.  When
+                // it is not, nothing plays during this wait.
+                let pending = next
+                data = try await withVoiceBackgroundTime { try await pending.value }
+            } catch {
+                if !isCancellation(error) { VoiceTelemetry.audioRequestFailed(error, stage: "clip", engine: .hosted) }
+                throw error
+            }
+            try Task.checkCancellation()
+            if index + 1 < total {
+                next = prefetchClip(index + 1, threadId: threadId, messageId: messageId, client: client)
+            }
+            try await playClip(data, karaoke: karaoke, index: index)
+        }
+        KaraokeCenter.shared.finish(karaoke)
+    }
+
+    private func prefetchClip(_ index: Int, threadId: String, messageId: String, client: CompanionClient) -> Task<Data, Error> {
+        let task = Task { [weak self] () async throws -> Data in
+            guard let self else { throw CancellationError() }
+            return try await self.fetchClip(index, threadId: threadId, messageId: messageId, client: client)
+        }
+        voicePrefetch = task
+        return task
+    }
+
+    /// One clip, with the bounded retries the harness asks for: a clip still
+    /// being made answers 425, and a job the harness forgot answers 404 and
+    /// is resumed with one more progressive POST.
+    private func fetchClip(_ index: Int, threadId: String, messageId: String, client: CompanionClient) async throws -> Data {
+        var policy = VoiceClipFetchPolicy()
+        while true {
+            do {
+                return try await client.voiceClip(threadId: threadId, messageId: messageId, index: index, device: .iphone)
+            } catch {
+                if isCancellation(error) { throw error }
+                switch policy.decide(statusCode: (error as? APIError)?.statusCode) {
+                case let .retry(after):
+                    try await Task.sleep(nanoseconds: UInt64(after * 1_000_000_000))
+                case .resume:
+                    _ = try await client.messageVoice(threadId: threadId, messageId: messageId, device: .iphone, progressive: true)
+                case .fail:
+                    throw error
+                }
+            }
+        }
+    }
+
+    /// Plays one clip to its end.  Waits on the player's delegate rather
+    /// than polling isPlaying, which an interruption also turns false.
+    private func playClip(_ data: Data, karaoke: MessageKaraoke? = nil, index: Int = 0) async throws {
+        let player = try AVAudioPlayer(data: data)
+        let playback = ClipPlayback()
+        player.delegate = playback
+        guard player.prepareToPlay(), player.play() else { throw APIError.transport("Voice clip could not be played.") }
+        voicePlayer = player
+        voicePlayback = playback
+        karaoke?.attachClip(index, player: player)
+        let finished = await withTaskCancellationHandler {
+            await playback.wait()
+        } onCancel: {
+            Task { @MainActor in playback.finish(false) }
+        }
+        karaoke?.detachClip(index, finished: finished)
+        if voicePlayback === playback {
+            voicePlayback = nil
+            voicePlayer = nil
+        }
+        try Task.checkCancellation()
+        guard finished else { throw APIError.transport("Voice clip could not be played.") }
+    }
+
+    /// Calls, Siri, and alarms pause playback; unplugged headphones stop it.
+    /// A Personal Voice read also handles these in PersonalVoiceService.
+    private func observeVoiceAudioSession() {
+        let center = NotificationCenter.default
+        voiceAudioObservers.append(center.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let optionsRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
+            MainActor.assumeIsolated { self?.handleVoiceInterruption(typeRaw: typeRaw, optionsRaw: optionsRaw) }
+        })
+        voiceAudioObservers.append(center.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let reasonRaw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            MainActor.assumeIsolated {
+                guard let self, self.speakingMessageId != nil,
+                      reasonRaw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:)) == .oldDeviceUnavailable
+                else { return }
+                self.stopVoice()
+            }
+        })
+    }
+
+    private func handleVoiceInterruption(typeRaw: UInt?, optionsRaw: UInt?) {
+        guard let type = typeRaw.flatMap(AVAudioSession.InterruptionType.init(rawValue:)) else { return }
+        if type == .began {
+            voiceInterrupted = speakingMessageId != nil
+            return
+        }
+        // Only an interruption a read saw begin; a stale end must not stop
+        // a read that started after it.
+        guard type == .ended, voiceInterrupted else { return }
+        voiceInterrupted = false
+        guard speakingMessageId != nil else { return }
+        // The system already paused the player when the interruption began.
+        guard AVAudioSession.InterruptionOptions(rawValue: optionsRaw ?? 0).contains(.shouldResume) else {
+            stopVoice()
+            return
+        }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        voicePlayer?.play()
     }
 
     func playRecording(_ message: Message, threadId: String) {
@@ -1909,7 +2542,7 @@ final class Session: ObservableObject {
                 break
             }
         }
-        guard let client else { return nil }
+        guard let client else { return previewVoiceOptions == nil ? nil : config }
         let status = try? await client.config()
         guard let status else { return nil }
         guard settingsUpdateGeneration == generation else { return nil }
@@ -1960,6 +2593,56 @@ final class Session: ObservableObject {
         let outcome = await enqueueSettingsUpdate()
         guard let outcome, outcome.timeoutOK == true else { return nil }
         return outcome.status
+    }
+
+    /// Enable Automatic Update Checks, through `PATCH /api/auto-update`.
+    /// One boolean, so it skips the coalescing queue the other settings
+    /// share; it only waits out a flush already in flight, the way
+    /// `configStatus()` does, so it never lands between that flush's write
+    /// and the status it reads back.  The Mac Update card says the outcome
+    /// in place, so nothing here raises the app-wide alert.
+    @MainActor
+    func setAutoUpdateEnabled(_ enabled: Bool) async -> PhoneWriteOutcome<ConfigStatus> {
+        while true {
+            let generationAtAwait = settingsUpdateGeneration
+            _ = await settingsUpdateTail?.value
+            if settingsUpdateGeneration == generationAtAwait { break }
+        }
+        guard let client else { return .failed(nil) }
+        let pairing = pairingGeneration
+        do {
+            let saved = try await client.setAutoUpdate(enabled: enabled)
+            guard pairingGeneration == pairing else { return .failed(nil) }
+            self.config = saved
+            return .saved(saved)
+        } catch let error as APIError where error.isUnauthorized {
+            self.status = .unauthorized
+            return .failed(nil)
+        } catch {
+            if isCancellation(error) { return .failed(nil) }
+            return PhoneWriteOutcome<ConfigStatus>.failure(error)
+        }
+    }
+
+    /// Set All Bots To Default on the Models screen.  Every bot the harness
+    /// changed also arrives on the event stream as a `bot` frame, which is
+    /// what updates the rows; the reply only says who was left alone.
+    @MainActor
+    func applyModelDefaults(
+        primary: DefaultModelSlot?,
+        fallbacks: [DefaultModelSlot?]
+    ) async -> PhoneWriteOutcome<ApplyModelDefaultsResult> {
+        guard let client else { return .failed(nil) }
+        do {
+            let result = try await client.applyModelDefaults(primary: primary, fallbacks: fallbacks)
+            return .saved(result)
+        } catch let error as APIError where error.isUnauthorized {
+            self.status = .unauthorized
+            return .failed(nil)
+        } catch {
+            if isCancellation(error) { return .failed(nil) }
+            return PhoneWriteOutcome<ApplyModelDefaultsResult>.failure(error)
+        }
     }
 
     @MainActor
@@ -2565,6 +3248,27 @@ final class Session: ObservableObject {
         catch { recordActionError(error); return false }
     }
 
+    /// Stop a routine run that is queued, running or waiting.
+    func cancelRoutineRun(_ run: RoutineRun) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.cancelRoutineRun(id: run.id); return true }
+        catch { recordActionError(error); return false }
+    }
+
+    /// Acknowledge one failed or missed run.  It keeps its status and error.
+    func markRoutineRunSeen(_ run: RoutineRun) async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.markRoutineRunSeen(id: run.id); return true }
+        catch { recordActionError(error); return false }
+    }
+
+    /// Acknowledge every unseen failure at once.
+    func markAllRoutineRunsSeen() async -> Bool {
+        guard let client else { return false }
+        do { _ = try await client.markAllRoutineRunsSeen(); return true }
+        catch { recordActionError(error); return false }
+    }
+
     // MARK: - Notification navigation
 
     func openNotification(_ target: NotificationTarget) async {
@@ -2650,6 +3354,112 @@ final class Session: ObservableObject {
             recordActionError(error)
             return nil
         }
+    }
+
+    // MARK: - Background jobs
+
+    /// Read every conversation's jobs and replace what the phone holds.
+    ///
+    /// Silent on failure: an older harness or sidecar has no jobs route, and
+    /// then the pill simply never appears.  A pairing that changed while the
+    /// request was out keeps the answer out of the new pairing's state.
+    func loadJobs() async {
+        guard let client else { return }
+        let generation = pairingGeneration
+        do {
+            let jobs = try await client.jobs()
+            guard pairingGeneration == generation else { return }
+            state.hydrateJobs(jobs)
+        } catch {
+            return
+        }
+    }
+
+    /// One job's newest output.  Throws, so the sheet can say what failed in
+    /// place rather than raising an alert over the screen.
+    func readJobOutput(_ jobId: String) async throws -> JobOutputResponse {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.jobOutput(id: jobId)
+    }
+
+    /// The owner's Stop for one job.  The next `jobs` frame shows it
+    /// stopping, then stopped; this only reports whether the request went in.
+    @discardableResult
+    func stopJob(_ jobId: String) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.stopJob(id: jobId)
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    /// Stop every running job of one conversation.
+    @discardableResult
+    func stopAllJobs(threadId: String) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.stopAllJobs(threadId: threadId)
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
+    }
+
+    // MARK: - Usage and cost
+
+    /// Quota windows, rolling spend and held engines.  `nil` on any failure,
+    /// and never an alert: the screen polls this, and a computer that is
+    /// asleep should not raise an alert every half minute.
+    func loadQuotas() async -> QuotasSnapshot? {
+        guard let client else { return nil }
+        return try? await client.quotas()
+    }
+
+    func loadSpeechUsage() async -> SpeechUsage? {
+        guard let client else { return nil }
+        return try? await client.speechUsage()
+    }
+
+    // MARK: - Shared memory
+
+    /// Refresh the shared-memory status.  Informational, like push health: a
+    /// failure keeps the last answer so a transient blip never blanks the row.
+    func refreshSharedMemoryStatus() async {
+        guard let client else { return }
+        let generation = pairingGeneration
+        do {
+            let fetched = try await client.sharedMemoryStatus()
+            guard pairingGeneration == generation else { return }
+            sharedMemoryStatus = fetched
+            sharedMemoryNotReported = false
+        } catch let error as APIError where error.isNotFound {
+            guard pairingGeneration == generation else { return }
+            sharedMemoryStatus = nil
+            sharedMemoryNotReported = true
+        } catch {
+            return
+        }
+    }
+
+    // MARK: - Skills
+
+    func loadBotSkills(botId: String) async throws -> SkillsResponse {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.botSkills(botId: botId)
+    }
+
+    func loadSkillText(botId: String, name: String) async throws -> String {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.skillText(botId: botId, name: name)
+    }
+
+    func setSkillEnabled(botId: String, name: String, enabled: Bool) async throws -> SkillListing {
+        guard let client else { throw APIError.transport("This iPhone is not connected to a computer.") }
+        return try await client.setSkillEnabled(botId: botId, name: name, enabled: enabled)
     }
 
     // MARK: - Connected apps
@@ -2987,6 +3797,15 @@ enum Chat: Identifiable, Hashable {
         }
     }
 
+    /// A bot switched Off.  Rooms are never Off themselves: an Off member is
+    /// skipped inside the room with a notice, and the room composer stays.
+    var isOff: Bool {
+        switch self {
+        case let .bot(bot): return bot.isOff
+        case .room: return false
+        }
+    }
+
     var color: String {
         switch self {
         case let .bot(bot): return bot.color
@@ -3021,7 +3840,7 @@ extension CompanionState {
     var chatSummaries: [ChatSummary] {
         let bots = self.bots.filter { $0.hidden != true }.map(Chat.bot)
         let rooms = self.rooms.map(Chat.room)
-        return (bots + rooms)
+        let summaries = (bots + rooms)
             .map { chat in
                 let last = newestLoadedMessage(for: chat)
                 return ChatSummary(
@@ -3031,14 +3850,11 @@ extension CompanionState {
                     pinned: Self.pinned(chat)
                 )
             }
-            .sorted { left, right in
-                ChatListOrder.orderedBefore(
-                    pinnedLeft: left.pinned,
-                    activityLeft: left.lastActivity,
-                    pinnedRight: right.pinned,
-                    activityRight: right.lastActivity
-                )
-            }
+        // Pinned first, then newest activity, then the order the harness sent:
+        // the same order the desktop sidebar draws (`ChatListOrder`).
+        return ChatListOrder.stableOrder(summaries) { summary in
+            (pinned: summary.pinned, activity: summary.lastActivity)
+        }
     }
 
     private static func pinned(_ chat: Chat) -> Bool {
@@ -3112,5 +3928,55 @@ extension CompanionState {
         case .screen: return "Screenshot"
         case .unknown: return last.text ?? ""
         }
+    }
+}
+
+/// One stretch of background execution time for a read.  Ends exactly once:
+/// when the work finishes, or when iOS says the time is up.  The expiration
+/// handler holds the object strongly so the task is always ended.
+@MainActor
+private final class VoiceBackgroundTime {
+    private var id: UIBackgroundTaskIdentifier = .invalid
+
+    init() {
+        id = UIApplication.shared.beginBackgroundTask(withName: "Read Aloud") {
+            MainActor.assumeIsolated { self.end() }
+        }
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
+    }
+}
+
+/// Turns AVAudioPlayer's completion callback into something a voice task can
+/// await.  `finish` is idempotent, so a stop and a late callback cannot both
+/// resume the waiter.
+@MainActor
+private final class ClipPlayback: NSObject, AVAudioPlayerDelegate {
+    private var result: Bool?
+    private var waiter: CheckedContinuation<Bool, Never>?
+
+    func wait() async -> Bool {
+        if let result { return result }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func finish(_ succeeded: Bool) {
+        guard result == nil else { return }
+        result = succeeded
+        let waiter = waiter
+        self.waiter = nil
+        waiter?.resume(returning: succeeded)
+    }
+
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor in self.finish(flag) }
+    }
+
+    nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        Task { @MainActor in self.finish(false) }
     }
 }

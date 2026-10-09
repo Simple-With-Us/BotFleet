@@ -314,7 +314,7 @@ export function VpsConnection() {
         SSH config alias for the Linux VPS. BotFleet uses your normal SSH config and agent; it does not store keys or passwords.{" "}
         See the{" "}
         <a
-          href="https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/byo-vps.md"
+          href="https://github.com/Simple-With-Us/BotFleet/blob/main/docs/byo-vps.md"
           target="_blank"
           rel="noopener noreferrer"
           className="text-accent hover:underline"

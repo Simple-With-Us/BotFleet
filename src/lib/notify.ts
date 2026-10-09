@@ -10,7 +10,7 @@ export type NotificationTarget = Pick<NotifyFrame, "botId" | "threadId">;
 /** Ask while handling the settings click. Browsers may reject permission
  * requests that are triggered later by an incoming SSE frame. */
 export function requestNotificationPermission(): Promise<NotificationPermission> | null {
-  if (typeof Notification === "undefined" || Notification.permission !== "default") return null;
+  if (!("Notification" in globalThis) || Notification.permission !== "default") return null;
   return Notification.requestPermission();
 }
 
@@ -37,7 +37,7 @@ export function showNotification(
   onOpen: (target: NotificationTarget) => void,
   avatarUrl?: string | null,
 ) {
-  if (typeof Notification === "undefined") return;
+  if (!("Notification" in globalThis)) return;
   if (document.hasFocus()) return;
 
   const open = () => {

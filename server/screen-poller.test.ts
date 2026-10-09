@@ -48,7 +48,14 @@ describe("screen capture demand", () => {
     pollers.start("bot-a", capture);
     pollers.poke("bot-a");
     expect(capture).not.toHaveBeenCalled();
-    expect(await pollers.final("bot-a")).toEqual({ png: "live", mime: "image/jpeg" });
+    expect(await pollers.final("bot-a")).toEqual({
+      png: "live",
+      mime: "image/jpeg",
+      // Stamped in the harness clock so the panel can age it against the
+      // polled screenshot's stamp; comparing the two across clocks would make
+      // the "which picture is newer" decision meaningless.
+      capturedAt: expect.any(Number),
+    });
     expect(capture).toHaveBeenCalledTimes(1);
 
     pollers.start("bot-a", capture);
@@ -67,7 +74,11 @@ describe("screen capture demand", () => {
     const final = pollers.final("bot-a");
     expect(capture).toHaveBeenCalledTimes(1);
     finishFirst?.({ png: "early", format: "png" });
-    await expect(final).resolves.toEqual({ png: "settled", mime: "image/png" });
+    await expect(final).resolves.toEqual({
+      png: "settled",
+      mime: "image/png",
+      capturedAt: expect.any(Number),
+    });
     expect(capture).toHaveBeenCalledTimes(2);
   });
 

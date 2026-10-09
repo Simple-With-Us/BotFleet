@@ -107,9 +107,36 @@ export function drainRoomRounds(
   }
 }
 
+/** Take every waiting round out of the queue, untouched: an update carries
+ *  them across its restart (server/update-drain.ts). */
+export function takeRoomRounds(): RoomRound[] {
+  const taken = [...queues.values()].map((round) => ({ ...round }));
+  queues.clear();
+  return taken;
+}
+
+/** Put rounds back to wait again, dated `now`: a round an update held waited
+ *  for the update, not for its bot, so the staleness cutoff starts over.  A
+ *  round already waiting for the same bot in the same thread keeps its place
+ *  (asking twice to speak is one request). */
+export function restoreRoomRounds(rounds: readonly Omit<RoomRound, "at">[], now: number): number {
+  let restored = 0;
+  for (const round of rounds) if (queueRoomRound(round, now)) restored += 1;
+  return restored;
+}
+
+/** Re-date every waiting round to `now`: the time a hold kept them waiting
+ *  does not count against them. */
+export function refreshRoomRounds(now: number): void {
+  for (const round of queues.values()) round.at = now;
+}
+
 /** Test seam: how many rounds are waiting. */
-export function _queuedRoomCount(): number {
-  return queues.size;
+export function _queuedRoomCount(ignoreBot?: (botId: string) => boolean): number {
+  if (!ignoreBot) return queues.size;
+  let count = 0;
+  for (const round of queues.values()) if (!ignoreBot(round.botId)) count += 1;
+  return count;
 }
 
 /** Whether the exact bot/thread round is still retained.  Runtime readiness

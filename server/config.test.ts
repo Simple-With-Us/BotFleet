@@ -86,6 +86,32 @@ describe("configuration boundaries", () => {
     expect(parseConfigPatch({ usage: { ingestUrl: "" } })).toEqual({ usage: { ingestUrl: "" } });
   });
 
+  it("accepts another Infisical project and environment for the Zulip keys, and refuses a malformed one", () => {
+    expect(
+      parseConfigPatch({
+        zulip: {
+          credentialSource: "infisical",
+          infisicalProjectId: " 9bf7417a-fbbb-42ca-870c-2b45207233f5 ",
+          infisicalEnv: "prod",
+          infisicalPath: "/zulip",
+        },
+      }),
+    ).toEqual({
+      zulip: {
+        credentialSource: "infisical",
+        infisicalProjectId: "9bf7417a-fbbb-42ca-870c-2b45207233f5",
+        infisicalEnv: "prod",
+        infisicalPath: "/zulip",
+      },
+    });
+    // empty clears it back to the harness's own project and environment
+    expect(parseConfigPatch({ zulip: { infisicalProjectId: "", infisicalEnv: "" } })).toEqual({
+      zulip: { infisicalProjectId: "", infisicalEnv: "" },
+    });
+    expect(() => parseConfigPatch({ zulip: { infisicalProjectId: "../other" } })).toThrow("zulip.infisicalProjectId");
+    expect(() => parseConfigPatch({ zulip: { infisicalEnv: "prod/zulip" } })).toThrow("zulip.infisicalEnv");
+  });
+
   it("accepts only a simple VPS SSH config alias and exposes no credentials", () => {
     expect(isValidSshAlias("production-vps")).toBe(true);
     expect(isValidSshAlias("prod; reboot")).toBe(false);
@@ -120,6 +146,14 @@ describe("configuration boundaries", () => {
       localVm: { maxInstances: 4 },
     });
     expect(localVmMaxInstances({ localVm: { maxInstances: 3 } })).toBe(3);
+  });
+
+  it("accepts localVm shareCliCredentials and allowHostTerminal patches", () => {
+    expect(
+      parseConfigPatch({ localVm: { shareCliCredentials: true, allowHostTerminal: true } }),
+    ).toEqual({
+      localVm: { shareCliCredentials: true, allowHostTerminal: true },
+    });
   });
 
   it("keeps experimental features off by default and accepts an explicit opt-in", () => {
@@ -1299,6 +1333,44 @@ describe("the secret-store section", () => {
       writeThrough: true,
     });
     expect(infisicalEnabled(loadConfig())).toBe(false);
+  });
+
+  it("persists the pronunciation list beside the voice, the way the STT vocabulary is kept", () => {
+    saveConfig({ tts: { key: "sentinel-tts-key", voice: "jay-wedgeworth-001" } });
+    const list = [{ term: "SQL", say: "sequel" }, { term: "C#", say: "C sharp" }];
+    saveConfig(parseConfigPatch({ tts: { pronunciations: list } }));
+    // A section merge: the list never drops the key or the default voice.
+    expect(loadConfig().tts).toMatchObject({ key: "sentinel-tts-key", voice: "jay-wedgeworth-001", pronunciations: list });
+    saveConfig(parseConfigPatch({ tts: { voice: "English_Graceful_Lady" } }));
+    expect(loadConfig().tts).toMatchObject({ voice: "English_Graceful_Lady", pronunciations: list });
+    // A saved empty list stays empty, so the defaults do not come back.
+    saveConfig(parseConfigPatch({ tts: { pronunciations: [] } }));
+    expect(loadConfig().tts?.pronunciations).toEqual([]);
+  });
+
+  it("validates the pronunciation list with the shared rules, and canonicalizes it", () => {
+    expect(parseConfigPatch({ tts: { pronunciations: [{ term: " SQL ", say: " se   quel " }] } }).tts?.pronunciations).toEqual([
+      { term: "SQL", say: "se quel" },
+    ]);
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "SQL", say: "a" }, { term: "sql", say: "b" }] } }))
+      .toThrow("sql is on the list twice.");
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "two words", say: "x" }] } })).toThrow();
+    expect(() => parseConfigPatch({ tts: { pronunciations: [{ term: "SQL", say: "my SQL" }] } })).toThrow();
+    expect(() => parseConfigPatch({ tts: { pronunciations: "SQL=sequel" } })).toThrow();
+  });
+
+  it("keeps every other setting when a hand-edited pronunciation list is bad", () => {
+    const stored = parseStoredConfig({
+      profile: { name: "Jay" },
+      tts: {
+        voice: "jay-wedgeworth-001",
+        pronunciations: [{ term: "SQL", say: "sequel" }, { term: "sql", say: "dup" }, { term: "", say: "x" }, 7],
+      },
+    });
+    expect(stored.profile?.name).toBe("Jay");
+    expect(stored.tts).toEqual({ voice: "jay-wedgeworth-001", pronunciations: [{ term: "SQL", say: "sequel" }] });
+    // Not a list at all reads as never saved, which means the defaults.
+    expect(parseStoredConfig({ tts: { voice: "v", pronunciations: "nope" } }).tts).toEqual({ voice: "v" });
   });
 
   it("persists call STT vocabulary and clears an explicit provider on Auto", () => {

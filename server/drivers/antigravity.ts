@@ -75,6 +75,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { applyLaunchIdentity } from "../launch-identity.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
@@ -356,7 +357,7 @@ const mcpConfigFileSchema = z.looseObject({
 /** The computer MCP server for this turn, or null when the turn has none.
  * Cloud boxes go through BotFleet's REST-to-MCP adapter (the same spec
  * claude.ts and codex.ts build); Local VM and VPS connections arrive as a
- * ready-made Cua Driver stdio command and pass through unchanged. */
+ * ready-made CUA Driver stdio command and pass through unchanged. */
 export function antigravityMcpServers(
   integrations: SendTurnInput["integrations"],
 ): Record<string, { command: string; args: string[]; env: Record<string, string> }> {
@@ -649,7 +650,12 @@ export function antigravityTurnErrorMessage(result: AntigravityTurnResult): stri
 
 export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Antigravity", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Antigravity",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
@@ -762,9 +768,18 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // bot-level autoApprove flag flip fullAuto for sandbox/cloud/VM turns
       // would silently promote an engine-level security gate the owner never
       // switched on.  Non-host turns keep exactly what config.fullAuto says.
+      //
+      // Bypass Permissions is the other per-bot switch, and the one the
+      // person turned on precisely to have nothing ask.  Print mode has no
+      // broker to carry it, so it is this driver's to apply, to the turns
+      // where it is safe to: never one that controls This Mac, the same line
+      // the broker draws (`autoVerdict` never answers a `local-computer`
+      // request in bypass), and, like the broker's bypass, even an unattended
+      // turn.  A host turn keeps exactly the rule above.
+      const isBypassed = turn.bypassPermissions === true && !controlsHost;
       const turnConfig: AntigravityConfig = {
         ...config,
-        fullAuto: controlsHost ? isAutoApproved : config.fullAuto,
+        fullAuto: controlsHost ? isAutoApproved : config.fullAuto || isBypassed,
       };
 
       // Default cwd to a per-thread workspace under DATA_DIR — deliberately
@@ -925,7 +940,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       try {
         child = spawnCli(config.cli, args, {
           cwd,
-          env,
+          // `env` is built once per instance and shared by every turn; the
+          // launch identity is this bot's and this turn's, applied to a copy.
+          env: applyLaunchIdentity(env, turn.launchIdentity),
           stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
         });
         if (useStdin && child.stdin) {
@@ -1578,6 +1595,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           // (P2b); `invoke_subagent` rows come with named helpers in P3.
           backgroundJobs: "none",
           helpers: "none",
+          // Print mode has no permission hook (see the header), but every
+          // step streams as a tool_use event, so review can watch it.
+          reviewHook: "after",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

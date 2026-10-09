@@ -75,7 +75,10 @@ jobs:
         # The harness and pure desktop capabilities stay portable across all
         # supported host platforms. POSIX-only process tests self-skip.
         os: [macos-latest, ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    # Docs-only fast path still reports the required check names
+    # (typecheck + test (macos-latest) / windows-latest) but must not consume
+    # scarce free-plan macOS/Windows concurrent slots (2026-10-05 backlog).
+    runs-on: ${{ needs.changes.outputs.docs_only == 'true' && 'ubuntu-latest' || matrix.os }}
     # The test chain alone takes 10.5 to 13.5 minutes per host, and a full
     # job ran 14m49s on Ubuntu, so 15 cancelled healthy runs.  Keep this at
     # or below the Sentry CI check-in margin minus 15 (scripts/sentry-ci-report.py).
@@ -86,7 +89,7 @@ jobs:
         run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.outputs.docs_only != 'true'
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: needs.changes.outputs.docs_only != 'true'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: needs.changes.outputs.docs_only != 'true'
@@ -125,7 +128,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
@@ -158,7 +161,7 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
@@ -232,8 +235,15 @@ jobs:
     name: Swift tests + iOS build
     needs: changes
     if: ${{ !cancelled() }}
-    runs-on: macos-latest
+    # Fast-path (docs-only or no ios/ changes) reports the required check on
+    # ubuntu-latest so we do not burn a macOS concurrent slot for an echo.
+    # iOS 27 deployment floor needs the iOS 27 SDK.  macos-latest ships Xcode
+    # 26.x only, so the full path runs on GitHub's hosted `xcode-27` image
+    # (actions/runner-images#14404) pinned to stable Xcode 27.0, never a beta.
+    runs-on: ${{ (needs.changes.outputs.docs_only == 'true' || needs.changes.outputs.ios_changed != 'true') && 'ubuntu-latest' || 'xcode-27' }}
     timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
       - name: Documentation-only fast path
         if: needs.changes.outputs.docs_only == 'true'
@@ -243,13 +253,16 @@ jobs:
         run: echo "No ios/, ios script, or CI workflow paths changed; the iOS build was skipped."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
+      - name: Assert stable Xcode 27.0
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
+        run: bash scripts/ios-assert-xcode.sh 27.0
       - name: Swift package tests
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: swift test --package-path ios
       - name: Generate the Xcode project
         if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: |
-          brew install xcodegen
+          bash scripts/ios-install-xcodegen.sh
           cd ios
           xcodegen generate
       - name: Build the iOS app (unsigned)

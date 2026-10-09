@@ -1,0 +1,43 @@
+# DEFAULT-DISABLED SETUP DRAFT.  This pin implements the initial DeepSeek route only.
+# MiniMax routing and budget integration remain pending in Usage-Monitor #1602:
+# https://github.com/Simple-With-Us/Usage-Monitor/issues/1602
+# Keep disabled until the reviewed replacement and secure activation setup are ready.
+# daily_attempt_limit is zero and budget_policy_id is pending.
+name: Kody DeepSeek Fix Proposals
+
+# Generated offline.  Missing SWU_KODY_AUTOFIX_ENABLED means disabled.
+# Budget approval and protected-environment setup are separate owner actions.
+# Daily attempt slots bound this repository only; they are not a dollar cap.
+on:
+  check_run:
+    types: [completed]
+
+permissions: {}
+concurrency:
+  group: kody-caller-${{ github.repository_id }}-${{ github.event.check_run.pull_requests[0].number || github.event.check_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    if: >-
+      vars.SWU_KODY_AUTOFIX_ENABLED == 'true' &&
+      github.event_name == 'check_run' && github.event.action == 'completed' &&
+      github.run_attempt == 1 &&
+      github.event.check_run.app.id == 413034 &&
+      github.event.sender.type == 'Bot' && github.event.sender.id == 148880201 &&
+      github.event.sender.login == 'kody-ai[bot]' &&
+      github.event.check_run.conclusion == 'success' &&
+      github.event.check_run.pull_requests[0].number != null &&
+      github.event.check_run.pull_requests[1] == null
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      actions: read
+    uses: Simple-With-Us/congress-trading-shared/.github/workflows/kody-autofix-reusable.yml@8ef33de1953158f26b2fd872b8d1bc045032844e
+    with:
+      repository_id: '1349857130'
+      profile: 'web'
+      source_prefixes: '["src/","server/"]'
+      daily_attempt_limit: 0
+      budget_policy_id: 'pending'

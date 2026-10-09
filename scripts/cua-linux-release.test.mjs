@@ -4,7 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  LINUX_CUA_RELEASE,
+  linuxCuaDriverManifestFailureMessage,
+  linuxCuaDriverVersionFailureMessage,
+  matchLinuxCuaDriverVersionLine,
   parseLinuxCuaArchive,
+  probeLinuxCuaDriverManifest,
+  probeLinuxCuaDriverVersion,
   readBoundedResponseBody,
   sha256,
   stageLinuxCua,
@@ -71,6 +77,56 @@ function contract(archive, members, overrides = {}) {
 function fileContract(bytes, staged = true) {
   return { kind: "file", size: bytes.length, sha256: sha256(bytes), staged };
 }
+
+function timedOutProbe(binary = "/staged/cua-driver") {
+  return {
+    status: null,
+    signal: "SIGTERM",
+    stdout: "",
+    stderr: "",
+    error: Object.assign(new Error(`spawnSync ${binary} ETIMEDOUT`), { code: "ETIMEDOUT" }),
+  };
+}
+
+describe("Linux CUA native probes", () => {
+  it("reads the pinned driver version line", () => {
+    expect(matchLinuxCuaDriverVersionLine(`cua-driver ${LINUX_CUA_RELEASE.version}\n`)).toBe(
+      LINUX_CUA_RELEASE.version,
+    );
+    expect(matchLinuxCuaDriverVersionLine("cua-driver 0.1.0\n")).toBeNull();
+  });
+
+  it("ignores stderr noise when matching the version line", () => {
+    const output = `warning: glibc locale\n\ncua-driver ${LINUX_CUA_RELEASE.version}\n`;
+    expect(matchLinuxCuaDriverVersionLine(output)).toBe(LINUX_CUA_RELEASE.version);
+  });
+
+  it("names a timeout instead of a version mismatch on a starved host", () => {
+    const spawn = vi.fn()
+      .mockReturnValueOnce(timedOutProbe())
+      .mockReturnValueOnce(timedOutProbe());
+    const probe = probeLinuxCuaDriverVersion("/staged/cua-driver", { spawn, log: () => {} });
+    expect(probe.ok).toBe(false);
+    expect(probe.reason).toBe("timeout");
+    const message = linuxCuaDriverVersionFailureMessage("/staged/cua-driver", probe);
+    expect(message).toMatch(/the version probe timed out/);
+    expect(message).not.toMatch(/did not report the expected version/);
+  });
+
+  it("names a timeout for manifest probes too", () => {
+    const spawn = vi.fn()
+      .mockReturnValueOnce(timedOutProbe())
+      .mockReturnValueOnce(timedOutProbe());
+    const probe = probeLinuxCuaDriverManifest("/staged/cua-driver", "/staged/cua-driver", {
+      spawn,
+      log: () => {},
+    });
+    expect(probe.reason).toBe("timeout");
+    expect(linuxCuaDriverManifestFailureMessage("/staged/cua-driver", probe)).toMatch(
+      /the version probe timed out/,
+    );
+  });
+});
 
 describe("Linux CUA release staging", () => {
   it("extracts only explicitly staged regular files from an exact reviewed archive", () => {

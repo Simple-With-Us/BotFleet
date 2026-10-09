@@ -1,4 +1,5 @@
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
+import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statfsSync } from "node:fs";
@@ -230,6 +231,30 @@ export function webhookDispatchHot(input: {
   return perCore !== null && perCore >= MAX_INIT_LOAD_FACTOR;
 }
 
+function formatLoadPerCore(value: number): string {
+  const rounded = Math.round(value * 10) / 10;
+  if (!Number.isFinite(rounded)) return "unknown";
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+/** Why a webhook wake is waiting, or null when the host can take it.
+ *
+ *  The string is the hold reason the automations receipt already renders.
+ *  A missing reading is named as unknown so the receipt still says the host
+ *  is what parked the wake.  A cool host returns null and must not invent
+ *  a reason. */
+export function webhookDispatchHoldReason(input: {
+  swapUsedPercent: number | null;
+  load: HostLoad | null;
+}): string | null {
+  if (!webhookDispatchHot(input)) return null;
+  const perCore = loadPerCore(input.load);
+  const loadText = perCore === null ? "unknown" : formatLoadPerCore(perCore);
+  const swap = input.swapUsedPercent;
+  const swapText = swap === null || !Number.isFinite(swap) ? "unknown" : `${Math.round(swap)}%`;
+  return `Host is busy (load ${loadText} per core, swap ${swapText})`;
+}
+
 export function sampleHost(now = Date.now()): HostSample {
   const total = totalmem();
   const free = freemem();
@@ -332,7 +357,7 @@ export interface ResourceTriggerManagerOptions {
   now?: () => number;
   sample?: () => HostSample;
   emit?: (event: ResourceTriggerManagerEvent) => void;
-  botState: (botId: string) => "ready" | "busy" | "missing";
+  botState: (botId: string) => BotDispatchState;
   /** Synchronous admission fence used during an update boundary. */
   admit?: () => boolean;
   enqueue: (input: {

@@ -913,6 +913,7 @@ async function startServerOn(port) {
     OMB_STATIC_DIR: path.join(process.resourcesPath, "ui"),
     OMB_RESOURCES_PATH: process.resourcesPath,
     OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
+    OMB_BOTS_DIR: path.join(process.resourcesPath, "bots"),
     OMB_PORT: String(port),
     OMB_USER_DATA: app.getPath("userData"),
     ...(secureCredentials.composioApiKey
@@ -1809,9 +1810,20 @@ ipcMain.handle("personal-voice:list", async () => {
   if (!nativeActions.appleSpeech) return [];
   return listPersonalVoices();
 });
-ipcMain.handle("personal-voice:speak", async (_event, text, voiceId) => {
+ipcMain.handle("personal-voice:speak", async (event, text, voiceId, options) => {
   if (!nativeActions.appleSpeech) throw new Error("Personal Voice requires macOS.");
-  return speakPersonalVoice(text, voiceId);
+  // Word ranges go back only to the window that asked, tagged with the id
+  // its preload chose, and carry numbers only: no text crosses back.
+  const progressId = Number(options?.progressId);
+  const sender = event.sender;
+  const onRange = Number.isSafeInteger(progressId) && progressId > 0
+    ? ({ location, length, elapsedMs }) => {
+      if (!sender.isDestroyed()) {
+        sender.send("personal-voice:range", { id: progressId, location, length, elapsedMs });
+      }
+    }
+    : undefined;
+  return speakPersonalVoice(text, voiceId, { onRange });
 });
 ipcMain.handle("personal-voice:stop", () => {
   if (nativeActions.appleSpeech) stopPersonalVoice();
@@ -2235,7 +2247,7 @@ function setupApplicationMenu() {
       submenu: [
         {
           label: "BotFleet Documentation",
-          click: () => shell.openExternal("https://github.com/jaywedgeworth22/BotFleet"),
+          click: () => shell.openExternal("https://github.com/Simple-With-Us/BotFleet"),
         },
         {
           label: "Open Logs & Data Folder",

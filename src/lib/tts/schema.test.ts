@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CustomVoiceResponseSchema,
   parsePersonalVoiceList,
   parseTtsVoicesResponse,
   TtsAudioBodySchema,
@@ -27,6 +28,38 @@ describe("TtsAudioBodySchema", () => {
     });
     expect(parsed.success).toBe(true);
     expect(parsed.success && parsed.data.audio).toHaveLength(1);
+  });
+
+  it("keeps the karaoke script and spans, and drops malformed ones without failing the answer", () => {
+    const spans = { format: 1, source: "written", sourceLength: 12, utterances: [[0, 6, 0, 6, 0]] };
+    const parsed = TtsAudioBodySchema.safeParse({ audio: [], utterances: ["Hello."], script: "written", spans });
+    expect(parsed.success && parsed.data).toMatchObject({ script: "written", spans });
+
+    const malformed = TtsAudioBodySchema.safeParse({
+      audio: [],
+      utterances: ["Hello."],
+      script: "poem",
+      spans: { format: 1, source: "written", sourceLength: -1, utterances: [["x"]] },
+    });
+    expect(malformed.success).toBe(true);
+    expect(malformed.success && malformed.data.script).toBeUndefined();
+    expect(malformed.success && malformed.data.spans).toBeUndefined();
+  });
+
+  it("keeps the progressive fields: total, complete, and the resolved voice", () => {
+    const parsed = TtsAudioBodySchema.safeParse({
+      audio: [],
+      voiceText: "One. Two.",
+      utterances: ["One.", "Two."],
+      total: 2,
+      complete: false,
+      voice: "minimax-warm",
+    });
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data).toMatchObject({ total: 2, complete: false, voice: "minimax-warm" });
+    expect(parsed.success && parsed.data.onDevice).toBeUndefined();
+    expect(TtsAudioBodySchema.safeParse({ audio: [], total: -1 }).success).toBe(false);
+    expect(TtsAudioBodySchema.safeParse({ audio: [], total: 1.5 }).success).toBe(false);
   });
 
   it("rejects a body whose fields are the wrong type", () => {
@@ -76,5 +109,73 @@ describe("parseTtsVoicesResponse", () => {
   it("rejects a malformed response by throwing a validation error", () => {
     expect(() => parseTtsVoicesResponse({ voices: "nope" })).toThrow();
     expect(() => parseTtsVoicesResponse(null)).toThrow();
+  });
+});
+
+describe("CustomVoiceResponseSchema", () => {
+  it("accepts the live success body with description", () => {
+    const parsed = CustomVoiceResponseSchema.safeParse({
+      ok: true,
+      voice: { id: "personal:com.apple.speech.voice.Jay", label: "Jay", description: "Custom" },
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success && "voice" in parsed.data) {
+      expect(parsed.data.voice.id).toBe("personal:com.apple.speech.voice.Jay");
+    }
+  });
+
+  it("accepts a success body without description (fixture and route mock shape)", () => {
+    const parsed = CustomVoiceResponseSchema.safeParse({
+      ok: true,
+      voice: { id: "v1", label: "Voice 1" },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("accepts an error body", () => {
+    const parsed = CustomVoiceResponseSchema.safeParse({ error: "Voice ID is required." });
+    expect(parsed.success).toBe(true);
+    if (parsed.success && "error" in parsed.data) {
+      expect(parsed.data.error).toBe("Voice ID is required.");
+    }
+  });
+
+  it("rejects a success body whose id is missing", () => {
+    expect(
+      CustomVoiceResponseSchema.safeParse({ ok: true, voice: { label: "x" } }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a success body whose id is empty", () => {
+    expect(
+      CustomVoiceResponseSchema.safeParse({ ok: true, voice: { id: "", label: "x" } }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a success body whose id is not a string", () => {
+    expect(
+      CustomVoiceResponseSchema.safeParse({ ok: true, voice: { id: 42, label: "x" } }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a success body that carries an unexpected extra field", () => {
+    expect(
+      CustomVoiceResponseSchema.safeParse({
+        ok: true,
+        voice: { id: "v1", label: "V1" },
+        extra: true,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a malformed response", () => {
+    expect(CustomVoiceResponseSchema.safeParse(null).success).toBe(false);
+    expect(CustomVoiceResponseSchema.safeParse({}).success).toBe(false);
+    expect(
+      CustomVoiceResponseSchema.safeParse({ voice: { id: "v1", label: "V1" } }).success,
+    ).toBe(false);
+    expect(
+      CustomVoiceResponseSchema.safeParse({ ok: true, voice: { id: "v1", label: "V1", extra: 1 } }).success,
+    ).toBe(false);
   });
 });
