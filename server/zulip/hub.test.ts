@@ -1043,3 +1043,30 @@ describe("review fixes: the decided-message indexes", () => {
     expect(session.state.handled).toHaveLength(HANDLED_RING_LIMIT);
   });
 });
+
+describe("a bot stopped in BotFleet", () => {
+  it("holds the unit and retries it, then drops it once it is six hours old (docs/zulip.md)", async () => {
+    let attempts = 0;
+    let skew = 0;
+    const hub = makeHub({
+      now: () => Date.now() + skew,
+      startTurn: async () => {
+        attempts += 1;
+        throw Object.assign(new Error("This bot is stopped."), { status: 409, code: "bot_stopped" });
+      },
+    });
+    await connected(hub);
+    fake.postStream(JAY, "agent-sync", "BF stopped", "@**BF-Plumber** are you there", "website");
+    // unlike an Off bot, a stop can lift (a person starts the bot again), so
+    // the work is held and retried rather than dropped on the first refusal
+    await waitFor(() => attempts >= 2, "a retry");
+    expect(botStatus(hub, "bot-plumber")?.pending).toBe(1);
+    expect(logs.some((line) => line.includes("the bot is off"))).toBe(false);
+    skew = 6 * 3600_000 + 60_000;
+    await waitFor(() => botStatus(hub, "bot-plumber")?.pending === 0, "the six-hour drop");
+    expect(logs.some((line) => line.includes("older than 6h"))).toBe(true);
+    const seen = attempts;
+    await settle(200);
+    expect(attempts).toBe(seen);
+  });
+});
