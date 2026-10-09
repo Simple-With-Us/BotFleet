@@ -33,6 +33,26 @@ describe("CliWrapperDriver.decodeConfig", () => {
     });
   });
 
+  it("accepts and drops the keys the harness writes into every instance's config", () => {
+    // The Engines page stores fullAuto and cli, and the credential flow stores key and
+    // credentialStorage, on any driver's instance.  A strict schema refused them and the
+    // registry turned the instance into a shadow entry.
+    expect(
+      CliWrapperDriver.decodeConfig({
+        command: "my-cli",
+        fullAuto: true,
+        cli: "/opt/bin/my-cli",
+        key: "placeholder",
+        credentialStorage: "external",
+      }),
+    ).toEqual({ command: "my-cli", args: [], passPromptAs: "arg" });
+  });
+
+  it("still rejects a key it does not own, so a typo cannot quietly run the default", () => {
+    expect(() => CliWrapperDriver.decodeConfig({ commmand: "my-cli" })).toThrow();
+    expect(() => CliWrapperDriver.decodeConfig({ command: "my-cli", fullAuto: "yes" })).toThrow();
+  });
+
   it("rejects a field saved with the wrong type instead of coercing it", () => {
     expect(() => CliWrapperDriver.decodeConfig({ command: 5 })).toThrow();
     expect(() => CliWrapperDriver.decodeConfig({ args: "not-a-list" })).toThrow();

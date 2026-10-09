@@ -497,7 +497,7 @@ import {
   shouldRolloverAutomationThread,
 } from "./automation-rollover.ts";
 import { formatEphemeralResultMessage } from "./ephemeral-dispatch.ts";
-import { RoutineRequestError, RoutineRequestService } from "./routine-requests.ts";
+import { RoutineRequestError, RoutineRequestService, routineApprovalApplied } from "./routine-requests.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
 import { scoutProject, suggestTeam } from "./project-scout.ts";
 import { fetchGithubTeam, fetchLibraryTeam, fetchTeamCatalog } from "./team-library.ts";
@@ -14277,7 +14277,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
                 source: "user",
               });
             }
-            approvedCount++;
+            // Count what settled.  A proposal whose subject changed since it was
+            // shown comes back `invalid` and stays pending with `held` set, so
+            // counting it told the operator the backlog was clear when a card
+            // still owned the composer.
+            if (routineApprovalApplied(result)) approvedCount++;
           }
           continue;
         }

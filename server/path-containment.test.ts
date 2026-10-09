@@ -12,6 +12,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { removeTempDir } from "./testing/cleanup.ts";
 import { checkWriteTargets, type WriteCheckOptions } from "./path-containment.ts";
 
+// Skipped on Windows: these suites create symbolic links, and an unelevated
+// Windows account (the hosted runner included) cannot create one without
+// Developer Mode, so the links fail before the containment check is reached.
 const posixOnly = describe.skipIf(process.platform === "win32");
 
 let base: string;

@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { BUILT_IN_DRIVERS } from "../builtIn.ts";
 import {
+  MUSE_ACP_ADAPTER_VERSION,
   MUSE_EFFORT_LEVELS,
   MUSE_LOGIN_NOTE,
   MuseAgentDriver,
@@ -72,6 +73,17 @@ describe("Muse Code driver", () => {
     // user would only find out on their first turn.
     expect(install?.command?.win32).toContain("npm install -g @bex-co/muse-code-acp");
     expect(install?.signInCommand).toBe("muse auth set --provider meta --api-key-stdin");
+  });
+
+  it("pins the community adapter to an exact version on every platform", () => {
+    // An unpinned npm install takes whatever was published last, and the adapter terminates every
+    // prompt, MCP handshake and permission request.  The pin names the release the driver was built on.
+    expect(MUSE_ACP_ADAPTER_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+    for (const platform of ["darwin", "linux", "win32"] as const) {
+      const command = MuseAgentDriver.install?.command?.[platform] ?? "";
+      expect(command, platform).toMatch(/npm install -g @bex-co\/muse-code-acp@\d+\.\d+\.\d+(\s|$)/);
+      expect(command, platform).toContain(`@bex-co/muse-code-acp@${MUSE_ACP_ADAPTER_VERSION}`);
+    }
   });
 
   it("offers the CLI's own default model, not the best model on the card", () => {
