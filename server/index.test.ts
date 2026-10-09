@@ -7739,6 +7739,48 @@ describe("PATCH /api/bots/:id roster organization fields", () => {
     }
   });
 
+  it("takes the six organize fields and nothing else when the sidecar's phone header is on the request", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Organize Phone" })).body.bot;
+    const stored = async () =>
+      (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id);
+    type PhoneBody = { cloudBackend?: string; pinned?: boolean; color?: string; autoApprove?: boolean; name?: string };
+    const fromPhone = (body: PhoneBody) =>
+      fetch(`${BASE}/api/bots/${bot.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", "x-botfleet-companion": "1" },
+        body: JSON.stringify(body),
+      });
+    try {
+      const before = await stored();
+      for (const body of [
+        { cloudBackend: "vps" },
+        { pinned: true, color: "crimson" },
+        { autoApprove: true },
+        { name: "Renamed From A Phone" },
+      ]) {
+        const res = await fromPhone(body);
+        expect(res.status, JSON.stringify(body)).toBe(403);
+        expect(z.object({ error: z.string() }).parse(await res.json()).error).toMatch(
+          /can only be changed in BotFleet on your computer/,
+        );
+      }
+      const unchanged = await stored();
+      expect(unchanged.color).toBe(before.color);
+      expect(unchanged.name).toBe(before.name);
+      expect(unchanged.autoApprove).toBe(before.autoApprove);
+      expect(unchanged.pinned).toBe(before.pinned);
+
+      // the six still go through, and the desktop (no header) keeps its other fields
+      expect((await fromPhone({ pinned: true })).status).toBe(200);
+      expect((await stored()).pinned).toBe(true);
+      const desktop = await api("PATCH", `/api/bots/${bot.id}`, { pinned: false, color: "crimson" });
+      expect(desktop.status).toBe(200);
+      expect(desktop.body.bot.color).toBe("crimson");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("archives, restores, pins and marks a bot unread, and moves it between sections", async () => {
     const bot = (await api("POST", "/api/bots", { name: "Organize Roundtrip" })).body.bot;
     try {

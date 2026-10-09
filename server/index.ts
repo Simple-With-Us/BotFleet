@@ -13336,8 +13336,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // phone's sidecar checks the types too (companion/src/routes.ts), but
       // this route has other callers, and a guard only one of them honors is
       // not a guard.  The six organize fields are parsed together.
-      const organize = checkBotOrganizeBody(body);
-      if (!organize.ok) return json(res, 400, { error: organize.error });
+      // From a paired phone (the sidecar stamps `x-botfleet-companion`) the
+      // body may carry the six organize fields and nothing else.
+      const organize = checkBotOrganizeBody(body, req.headers["x-botfleet-companion"] === "1");
+      if (!organize.ok) return json(res, organize.status, { error: organize.error });
       for (const key of ["unread", "cloudBackend", "color", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
       }

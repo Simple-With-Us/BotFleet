@@ -1799,11 +1799,11 @@ final class Session: ObservableObject {
         let updated = try await client.organizeBot(id: bot.id, patch: patch)
         // A new Chief of Staff demotes the old one in its section.  The
         // harness sends that bot as its own frame too; folding it in now
-        // keeps the roster from showing two at once.
-        for demoted in BotOrganize.demotedChiefs(after: updated, in: state.bots) {
-            state.apply(.bot(demoted))
+        // keeps the roster from showing two at once.  A bot deleted while the
+        // request was in flight is not put back (`botsToApply`).
+        for folded in BotOrganize.botsToApply(after: updated, in: state.bots) {
+            state.apply(.bot(folded))
         }
-        state.apply(.bot(updated))
         return updated
     }
 

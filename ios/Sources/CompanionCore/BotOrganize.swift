@@ -199,6 +199,16 @@ public enum BotOrganize {
         }
     }
 
+    /// What to fold into the roster once a bot PATCH has answered: the Chief
+    /// of Staff it demoted, then the bot itself.  Empty when the bot is no
+    /// longer in the roster.  A `bot.deleted` frame can land while the request
+    /// is in flight, and applying the answer would put a deleted bot back, the
+    /// same guard the room PATCH has before it applies its reply.
+    public static func botsToApply(after updated: Bot, in bots: [Bot]) -> [Bot] {
+        guard bots.contains(where: { $0.id == updated.id }) else { return [] }
+        return demotedChiefs(after: updated, in: bots) + [updated]
+    }
+
     // MARK: - Sections
 
     /// A stored section, trimmed; nil for none.

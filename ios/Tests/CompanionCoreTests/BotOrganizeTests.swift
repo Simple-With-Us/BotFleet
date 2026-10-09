@@ -127,6 +127,37 @@ final class BotOrganizeTests: XCTestCase {
         XCTAssertTrue(BotOrganize.demotedChiefs(after: notChief, in: [oldChief]).isEmpty)
     }
 
+    func testABotDeletedWhileItsPatchWasInFlightIsNotPutBack() throws {
+        var state = CompanionState()
+        let bot = try makeBot(id: "gone", name: "Gone", section: "Work")
+        state.apply(.bot(bot))
+        XCTAssertNotNil(state.bot("gone"))
+
+        // the PATCH was sent, then the delete frame landed, then the answer came
+        state.apply(.botDeleted(botId: "gone"))
+        var answer = bot
+        answer.pinned = true
+        let toApply = BotOrganize.botsToApply(after: answer, in: state.bots)
+        XCTAssertTrue(toApply.isEmpty)
+        for folded in toApply { state.apply(.bot(folded)) }
+
+        XCTAssertNil(state.bot("gone"))
+        XCTAssertTrue(state.bots.isEmpty)
+        // Applying the answer unguarded is what re-inserted it.
+        state.apply(.bot(answer))
+        XCTAssertNotNil(state.bot("gone"))
+    }
+
+    func testAPatchedBotThatIsStillThereIsAppliedAfterTheChiefItDemoted() throws {
+        let oldChief = try makeBot(id: "old", chief: true, section: "Work")
+        let newChief = try makeBot(id: "new", chief: true, section: "Work")
+        let roster = [oldChief, try makeBot(id: "new", section: "Work")]
+        let toApply = BotOrganize.botsToApply(after: newChief, in: roster)
+        XCTAssertEqual(toApply.map(\.id), ["old", "new"])
+        XCTAssertEqual(toApply.first?.chiefOfStaff, false)
+        XCTAssertEqual(toApply.last?.chiefOfStaff, true)
+    }
+
     func testSectionNameIsTrimmedAndCappedAtSixtyUTF16Units() {
         XCTAssertEqual(BotOrganize.sectionName(from: "  Work  "), "Work")
         XCTAssertNil(BotOrganize.sectionName(from: "   "))
