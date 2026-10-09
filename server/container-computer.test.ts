@@ -518,7 +518,7 @@ describe("containerComputerStatus", () => {
 
   it("reports the bounded desktop startup error instead of waiting forever", async () => {
     const errorProbe =
-      `docker exec ${CONTAINER} tail -n 4 /var/log/supervisor/cua-driver.error.log`;
+      `docker exec ${CONTAINER} tail -n 12 /var/log/supervisor/cua-driver.error.log`;
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -536,8 +536,71 @@ describe("containerComputerStatus", () => {
     expect(status.problem).toContain("desktop failed to start");
   });
 
+  describe("a failed desktop probe never blames the Driver's normal startup output", () => {
+    const ESC = "\u001b";
+    const errorProbe = `docker exec ${CONTAINER} tail -n 12 /var/log/supervisor/cua-driver.error.log`;
+    const healthyLog = [
+      "cua-driver v0.34.0 is available (you have v0.20.0)",
+      "   Update with: cua-driver update",
+      "   Release notes: https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.34.0",
+      `${ESC}[2m2026-10-07T13:54:42.869037Z${ESC}[0m ${ESC}[33m WARN${ESC}[0m ${ESC}[2mplatform_linux::overlay${ESC}[0m${ESC}[2m:${ESC}[0m X11 overlay: root reads cannot see this window's own pixels`,
+      "Cua Driver daemon listening on /opt/ogb/run/cua.sock",
+    ].join("\n");
+
+    function statusWith(probes: Record<string, string | Error>) {
+      const fake = runner({
+        "/usr/bin/which docker": "docker\n",
+        "/usr/bin/which podman": new Error("missing"),
+        "docker info --format {{.ServerVersion}}": "29\n",
+        [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+        [`docker inspect ${CONTAINER}`]: readyInspect(),
+        ...probes,
+      });
+      return containerComputerStatus(fake.run, "linux");
+    }
+
+    it("shows no banner, no WARN and no escape codes when the log is only startup noise", async () => {
+      const status = await statusWith({
+        [versionProbe]: `cua-driver ${CUA_DRIVER_VERSION}\n`,
+        [statusProbe]: "running\n",
+        [healthProbe]: JSON.stringify({ schema_version: "1", overall: "failed", checks: [] }),
+        [errorProbe]: healthyLog,
+      });
+      expect(status.desktopReady).toBe(false);
+      expect(status.problem).toBe("The Local VM desktop failed to start: CUA health report is failed");
+      for (const noise of ["Release notes", "WARN", "overlay", "listening", "[2m", "[0m", ESC]) {
+        expect(status.problem).not.toContain(noise);
+      }
+    });
+
+    it("reports a probe killed by its timeout as a transient check failure", async () => {
+      const killed = Object.assign(new Error(`Command failed: ${versionProbe}`), {
+        killed: true,
+        signal: "SIGTERM",
+        code: null,
+      });
+      const status = await statusWith({ [versionProbe]: killed, [errorProbe]: killed });
+      expect(status.container).toBe("running");
+      expect(status.desktopReady).toBe(false);
+      expect(status.desktop_error).toBeNull();
+      expect(status.desktopUnreachable).toBe(true);
+      expect(status.ready).toBe(false);
+      expect(status.problem).toBe("Couldn't reach the Local VM desktop just now; retrying");
+    });
+
+    it("still reports a real supervisor fault, with its colour stripped", async () => {
+      const status = await statusWith({
+        [versionProbe]: new Error("driver unavailable"),
+        [errorProbe]: `${healthyLog.split("\n")[0]}\n${ESC}[31m2026-10-07T13:56:00Z ERROR${ESC}[0m cua_driver: worker panicked`,
+      });
+      expect(status.problem).toBe(
+        "The Local VM desktop failed to start: 2026-10-07T13:56:00Z ERROR cua_driver: worker panicked",
+      );
+    });
+  });
+
   it("does not report ready when the driver's health contract fails", async () => {
-    const errorProbe = `docker exec ${CONTAINER} tail -n 4 /var/log/supervisor/cua-driver.error.log`;
+    const errorProbe = `docker exec ${CONTAINER} tail -n 12 /var/log/supervisor/cua-driver.error.log`;
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
