@@ -758,6 +758,7 @@ const updateControl = createUpdateControl({
   // while a turn is running.  Both `POST` routes pass their own reading
   // instead, excluding the admission the request itself holds.
   readiness: () => currentRuntimeReadiness(),
+  harnessOwnerNonce: () => harnessOwner.nonce,
   emit: (status) => broadcast({ kind: "update.status", status }),
 });
 // Bound the per-thread transcript logs before anything starts appending to
