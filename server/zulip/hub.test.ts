@@ -563,6 +563,35 @@ describe("posting", () => {
     expect(post.content).toBe("[BF-PLUMBER] All green on the tunnel.");
   });
 
+  it("sends every outbound text with the sentence gap: reply, channel post, owner DM and auto-reply", async () => {
+    const hub = makeHub();
+    await connected(hub);
+    fake.postStream(PEER, "agent-sync", "BF tunnel", "@**BF-Plumber** check", "ZulipPython");
+    await waitFor(() => turns.length === 1, "a turn");
+    const send = (tool: "reply" | "post", args: Record<string, string | number>) =>
+      hub.send({ botId: "bot-plumber", threadId: PLUMBER_THREAD, tool, args });
+    expect((await send("reply", { content: "Checked.  All green." })).ok).toBe(true);
+    expect((await send("post", { channel: "builds", topic: "BF deploy", content: "Shipped.  Watching it." })).ok).toBe(true);
+    expect((await send("post", { dm_user_id: JAY, content: "Claude asked.  I declined." })).ok).toBe(true);
+    // a code span keeps its spacing
+    expect((await send("reply", { content: "Ran `a.  b` once.  Fine." })).ok).toBe(true);
+    const G = "\u00a0 ";
+    expect(fake.postsBy(PLUMBER).map((post) => post.content)).toEqual([
+      `[BF-PLUMBER] Checked.${G}All green.`,
+      `[BF-PLUMBER] Shipped.${G}Watching it.`,
+      `[BF-PLUMBER] Claude asked.${G}I declined.`,
+      `[BF-PLUMBER] Ran \`a.  b\` once.${G}Fine.`,
+    ]);
+    await finishTurn(hub);
+
+    fake.postStream(JAY, "agent-sync", "BF other", "@**BF-Plumber** and this?", "website");
+    await waitFor(() => turns.length === 2, "a second turn");
+    replies.set(PLUMBER_THREAD, "Also fine.  Nothing to do.");
+    await finishTurn(hub);
+    await waitFor(() => fake.postsBy(PLUMBER).length === 5, "the auto-reply");
+    expect(fake.postsBy(PLUMBER)[4]!.content).toBe(`[BF-PLUMBER] Also fine.${G}Nothing to do.`);
+  });
+
   it("does not auto-reply after the bot replied, or after a failed turn", async () => {
     const hub = makeHub();
     await connected(hub);

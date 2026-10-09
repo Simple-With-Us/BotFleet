@@ -36,6 +36,30 @@ const CODE_BLOCK = /^(```|~~~)[\s\S]*?(^\1[ \t]*$|(?![\s\S]))/gm;
 const CODE_SPAN = /`[^`\n]*`/g;
 const QUOTE_LINE = /^\s*>.*$/gm;
 
+const MATH_BLOCK = /\$\$[\s\S]*?\$\$/g;
+/** An inline code span on one line: a run of backticks, then the same run. */
+const CODE_SPAN_RUN = /(`+)[^\n]*?\1/g;
+/** A sentence terminator, optional closing marks, then two or more ASCII
+ *  spaces before a non-space on the same line. */
+const SENTENCE_GAP = /([.!?]["'\u201d\u2019)\]*_]*) {2,}(?=\S)/g;
+
+/** The fleet's sentence gap, made to survive Zulip's renderer.  Zulip
+ *  collapses runs of ASCII spaces, so two spaces after a sentence become
+ *  U+00A0 plus one space, which renders as a visibly wider gap.  A safety
+ *  net applied to every outbound text, run before the secret scan so the
+ *  scan sees exactly what is sent.  Single spaces, spaces at a line end,
+ *  fenced code blocks, inline code spans and $$math$$ are left alone, and
+ *  running it twice changes nothing. */
+export function sentenceGap(text: string): string {
+  const kept: Array<readonly [number, number]> = [];
+  for (const pattern of [CODE_BLOCK, MATH_BLOCK, CODE_SPAN_RUN]) {
+    for (const match of text.matchAll(pattern)) kept.push([match.index, match.index + match[0].length]);
+  }
+  return text.replace(SENTENCE_GAP, (match: string, lead: string, offset: number) =>
+    kept.some(([start, end]) => offset < end && offset + match.length > start) ? match : `${lead}\u00a0 `,
+  );
+}
+
 /** Content without code blocks, code spans and quoted lines: a mention
  *  written inside any of them is an example or a quote, not a call. */
 export function outsideCode(content: string): string {

@@ -21,7 +21,7 @@
 import { z } from "zod";
 
 import { redactSecretsInText } from "../../shared/redact.ts";
-import { ZULIP_MAX_CONTENT_CHARS, sameOrigin, splitContent, topicRefusal } from "./format.ts";
+import { ZULIP_MAX_CONTENT_CHARS, sameOrigin, sentenceGap, splitContent, topicRefusal } from "./format.ts";
 import type { ZulipOrigin, ZulipUser } from "./types.ts";
 
 /** At most this many chunks per call; longer belongs in a file or a link. */
@@ -177,9 +177,12 @@ export function resolveTarget(
 
 export type ContentResult = { chunks: string[] } | { error: string };
 
-/** The text split for posting, or why it may not be posted. */
+/** The text split for posting, or why it may not be posted.  Every outbound
+ *  text passes here (zulip_reply, zulip_post to a channel or a DM, and the
+ *  auto-reply), and the sentence gap is applied first, so the secret scan
+ *  sees exactly what is sent. */
 export function checkContent(content: string | undefined, known: readonly string[]): ContentResult {
-  const body = content?.trim() ?? "";
+  const body = sentenceGap(content?.trim() ?? "");
   if (!body) return { error: "Nothing to post: content is empty." };
   const secret = secretRefusal(body, known);
   if (secret) {

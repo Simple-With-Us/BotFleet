@@ -6,6 +6,7 @@ import {
   directlyMentions,
   originKey,
   outsideCode,
+  sentenceGap,
   splitContent,
   topicRefusal,
   withTag,
@@ -194,5 +195,35 @@ describe("the peer screen", () => {
     // no channel id, no guessed link
     expect(zulipMessageLink("https://z.test", { kind: "stream", channel: "x", topic: "y" }, me, 8)).toBeNull();
     expect(buildInboundPrompt({ origin, items: [peerItem] }, { ...opts, realm: undefined })).not.toContain("#narrow");
+  });
+});
+
+describe("the sentence gap", () => {
+  const G = "  ";
+  it.each([
+    ["two spaces after a period", "Done.  Next.", `Done.${G}Next.`],
+    ["three or more spaces", "Done.    Next.", `Done.${G}Next.`],
+    ["after ! and ?", "Ready!  Go?  Yes.", `Ready!${G}Go?${G}Yes.`],
+    ["after a closing quote", 'He said "go."  Then left.', `He said "go."${G}Then left.`],
+    ["after curly quotes", "It is “done.”  Next ‘one.’  Last.", `It is “done.”${G}Next ‘one.’${G}Last.`],
+    ["after a parenthesis and a bracket", "(See above.)  Next [one.]  Last.", `(See above.)${G}Next [one.]${G}Last.`],
+    ["after bold and italic marks", "**Bold.**  Next _it._  Last.", `**Bold.**${G}Next _it._${G}Last.`],
+    ["before an inline code span", "Done.  `npm test` passes.", `Done.${G}\`npm test\` passes.`],
+    ["a single space", "Done. Next.", "Done. Next."],
+    ["spaces at a line end", "Done.  \nNext.", "Done.  \nNext."],
+    ["spaces at the end of the text", "Done.  ", "Done.  "],
+    ["no terminator", "word  word", "word  word"],
+    ["an existing gap", `Done.${G}Next.`, `Done.${G}Next.`],
+    ["inside an inline code span", "Run `a.  b` now.  Then stop.", `Run \`a.  b\` now.${G}Then stop.`],
+    ["inside a double-backtick span", "Use ``x.  `y` `` here.  Ok.", `Use \`\`x.  \`y\` \`\` here.${G}Ok.`],
+    ["inside a ``` block", "Intro.  Code:\n```\na.  b\n```\nAfter.  End.", `Intro.${G}Code:\n\`\`\`\na.  b\n\`\`\`\nAfter.${G}End.`],
+    ["inside a ~~~ block", "~~~ts\nx.  y\n~~~\nOk.  Done.", `~~~ts\nx.  y\n~~~\nOk.${G}Done.`],
+    ["inside an unclosed block", "Intro.  Code:\n```\na.  b", `Intro.${G}Code:\n\`\`\`\na.  b`],
+    ["inside $$math$$", "$$x.  y$$ holds.  Next.", `$$x.  y$$ holds.${G}Next.`],
+    ["inside multi-line $$math$$", "$$\na.  b\n$$\nOk.  Done.", `$$\na.  b\n$$\nOk.${G}Done.`],
+  ])("%s", (_name, input, expected) => {
+    expect(sentenceGap(input)).toBe(expected);
+    // idempotent: a second pass changes nothing
+    expect(sentenceGap(expected)).toBe(expected);
   });
 });
