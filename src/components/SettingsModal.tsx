@@ -13,6 +13,7 @@ import {
   ROOM_LABEL_MAX_LENGTH,
   ROOM_TERMINOLOGY_OPTIONS,
   ROOM_TERMINOLOGY_PRESETS,
+  lowerRoomLabels,
   suggestPlural,
   type RoomLabels,
   type RoomTerminology,
@@ -638,6 +639,8 @@ export function ConversationModeRow() {
   const { state, dispatch } = useStore();
   const current = parseConversationMode(state.config?.conversationMode);
   const labels = state.config?.roomLabels ?? { singular: "Channel", plural: "Channels" };
+  // Mid-sentence form:  keeps the capitals of a custom proper noun such as HUB.
+  const lower = lowerRoomLabels(labels);
   const [saving, setSaving] = useState(false);
   const [pendingSimple, setPendingSimple] = useState(false);
   const save = async (conversationMode: ConversationMode, mergeThreads = false) => {
@@ -671,14 +674,14 @@ export function ConversationModeRow() {
   return (
     <Card
       title="Workspace Arrangement"
-      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${labels.plural.toLowerCase()} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
+      subtitle={`Choose how your bots and ${lower.plural} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${lower.plural} mode treats each ${lower.singular} as a category for threads.`}
     >
       <div className="flex flex-col gap-2">
         {CONVERSATION_MODES.map((mode) => {
           const copy = CONVERSATION_MODE_COPY[mode];
           const selected = current === mode;
           const displayTitle = mode === "projects" ? labels.plural : copy.title;
-          const displaySubtitle = copy.subtitle(labels.singular.toLowerCase());
+          const displaySubtitle = copy.subtitle(lower.singular);
           return (
             <button
               key={mode}

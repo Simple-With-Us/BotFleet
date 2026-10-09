@@ -21,7 +21,7 @@ import { z } from "zod";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
 import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
-import { DEFAULT_ROOM_TERMINOLOGY, resolveRoomLabels } from "../shared/terminology.ts";
+import { DEFAULT_ROOM_TERMINOLOGY, lowerRoomLabels, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
 import {
@@ -12804,11 +12804,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 
     m = path.match(/^\/api\/groups\/([\w-]+)\/tasks$/);
     if (m && method === "POST") {
+      // The person's own word for a room, so every refusal here agrees with the
+      // Settings card.  lowerRoomLabels keeps the capitals of a proper noun.
+      const room = lowerRoomLabels(resolveRoomLabels(cfg.terminology, cfg.terminologyCustom));
       const group = store.group(m[1]);
-      if (!group) return json(res, 404, { error: "no such channel" });
-      if (group.dm) return json(res, 400, { error: "bot-to-bot channels keep one canonical conversation" });
+      if (!group) return json(res, 404, { error: `no such ${room.singular}` });
+      if (group.dm) return json(res, 400, { error: `bot-to-bot ${room.plural} keep one canonical conversation` });
       if (channelTaskBlocked(group)) {
-        return json(res, 409, { error: "this channel is working or waiting on you — finish that turn first" });
+        return json(res, 409, { error: `this ${room.singular} is working or waiting on you — finish that turn first` });
       }
       const body = await readBody(req);
       if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -12816,7 +12819,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (!allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode))) {
         return json(res, 409, {
-          error: `this workspace uses one conversation per ${resolveRoomLabels(cfg.terminology, cfg.terminologyCustom).singular.toLowerCase()} — switch Workspace Arrangement in Settings to allow extra threads`,
+          error: `this workspace uses one conversation per ${room.singular} — switch Workspace Arrangement in Settings to allow extra threads`,
         });
       }
       const task = store.createGroupTask(group.id, typeof body.title === "string" ? body.title : undefined);

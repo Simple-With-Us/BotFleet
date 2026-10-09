@@ -118,5 +118,34 @@ describe("SettingsModal", () => {
       "Any number of threads under each bot and app, nested in the sidebar.\u00a0 A thread can be tied to one app.",
     );
     expect(appsHtml).toContain("Apps");
+
+    // Case 3: a custom label that is an acronym keeps its capitals mid-sentence
+    const hubState: AppState = {
+      ...initialState,
+      config: {
+        ...initialState.config!,
+        roomLabels: { singular: "HUB", plural: "HUBS" },
+      },
+    };
+    const hubHtml = renderToStaticMarkup(
+      createElement(
+        StoreContext.Provider,
+        {
+          value: {
+            state: hubState,
+            dispatch: () => {},
+            flushBotPatches: async () => {},
+            refreshInstances: async () => {},
+          },
+        },
+        createElement(ConversationModeRow),
+      ),
+    );
+    expect(hubHtml).toContain(
+      "Choose how your bots and HUBS are structured.\u00a0 Simple is Grok-style with named bots, while HUBS mode treats each HUB as a category for threads.",
+    );
+    expect(hubHtml).toContain(
+      "Any number of threads under each bot and HUB, nested in the sidebar.\u00a0 A thread can be tied to one HUB.",
+    );
   });
 });
