@@ -2751,6 +2751,51 @@ export async function waitForStartup({
 }
 
 /**
+ * Wait for the updated application to be running as one exact process and to
+ * have attached to the single authenticated data owner.
+ *
+ * Two kinds of "not yet" are told apart.  An app that has not produced a
+ * process at all is only slow to launch (a loaded Mac can take minutes), so
+ * nothing about pid stability is said of it and the wait ends, if it must, with
+ * the plain timeout message.  An app that was running and is now gone has
+ * crashed, and that ends the wait at once.  Pid stability is judged only once
+ * there are pids to judge.
+ */
+export async function waitForStableApplication({
+  samplePids,
+  attachmentError: checkAttachment,
+  timeoutMs,
+  report,
+  now = Date.now,
+  wait = sleep,
+  sampleGapMs = 1_000,
+}) {
+  const deadline = now() + Math.max(0, timeoutMs);
+  let appError = "Timeout waiting for application to stabilize";
+  let attachmentError = "Timeout waiting for UI attachment";
+  const tick = startupProgress("the app", { report, now });
+  let appWasRunning = false;
+  while (now() < deadline) {
+    const firstPids = await samplePids();
+    await wait(sampleGapMs);
+    const secondPids = await samplePids();
+    if (firstPids.length || secondPids.length) {
+      appWasRunning = true;
+      appError = stableApplicationProcessError(firstPids, secondPids, true);
+      if (!appError) {
+        attachmentError = await checkAttachment();
+        if (!attachmentError) return;
+      }
+    } else if (appWasRunning) {
+      throw new Error("The updated application exited after it had started");
+    }
+    tick();
+  }
+  if (appError) throw new Error(appError);
+  throw new Error(attachmentError);
+}
+
+/**
  * The few fields of `launchctl print <domain>/<label>` that say whether the job
  * has exited since it was bootstrapped.  A job that is still booting is running
  * and has never exited; one that crashed has a last exit code or signal, and
@@ -3853,38 +3898,18 @@ function createOperations(config) {
 
     verifySingleOwner: async (prepared, previous) => {
       if (config.parsed.openApplication !== false) {
-        const deadline = Date.now() + config.startupTimeoutMs;
-        let appError = "Timeout waiting for application to stabilize";
-        let attachmentError = "Timeout waiting for UI attachment";
-        const tick = startupProgress("the app", { report: config.reportDetail });
-        // An app that was running and is now gone has crashed; one that has not
-        // shown up yet is only slow, which is waited out like a slow harness.
-        let appWasRunning = false;
-        while (Date.now() < deadline) {
-          const firstAppPids = await exactAppPids(config.appPath);
-          await sleep(1_000);
-          const secondAppPids = await exactAppPids(config.appPath);
-          if (firstAppPids.length || secondAppPids.length) appWasRunning = true;
-          else if (appWasRunning) {
-            appError = "The updated application exited after it had started";
-            attachmentError = null;
-            break;
-          }
-          tick();
-
-          appError = stableApplicationProcessError(firstAppPids, secondAppPids, true);
-          if (!appError) {
+        await waitForStableApplication({
+          samplePids: () => exactAppPids(config.appPath),
+          attachmentError: async () => {
             const snapshot = await runtimeIdentityPreflight(config, prepared);
             if (!snapshot.safe || snapshot.mode !== "authenticated") {
-              attachmentError = snapshot.reason || "Updated application did not attach to the authenticated single data owner";
-            } else {
-              attachmentError = applicationAttachmentError(snapshot, true);
+              return snapshot.reason || "Updated application did not attach to the authenticated single data owner";
             }
-            if (!attachmentError) break;
-          }
-        }
-        if (appError) throw new Error(appError);
-        if (attachmentError) throw new Error(attachmentError);
+            return applicationAttachmentError(snapshot, true);
+          },
+          timeoutMs: config.startupTimeoutMs,
+          report: config.reportDetail,
+        });
       } else {
         const snapshot = await runtimeIdentityPreflight(config, prepared);
         if (!snapshot.safe || snapshot.mode !== "authenticated") {
