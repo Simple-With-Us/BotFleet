@@ -678,7 +678,7 @@ export function ConversationModeRow() {
           const copy = CONVERSATION_MODE_COPY[mode];
           const selected = current === mode;
           const displayTitle = mode === "projects" ? labels.plural : copy.title;
-          const displaySubtitle = copy.subtitle;
+          const displaySubtitle = copy.subtitle(labels.singular.toLowerCase());
           return (
             <button
               key={mode}
@@ -700,7 +700,7 @@ export function ConversationModeRow() {
           <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5">
             <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
             <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved but hidden.
+              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved and out of the sidebar.
             </div>
             <div className="mt-2 flex flex-wrap gap-2">
               <button
@@ -717,7 +717,7 @@ export function ConversationModeRow() {
                 onClick={() => void save("simple")}
                 className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-raised/60"
               >
-                Keep Extra Threads Hidden
+                Keep Them Out of the Sidebar
               </button>
               <button
                 type="button"

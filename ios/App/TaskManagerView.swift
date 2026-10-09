@@ -167,7 +167,7 @@ struct RoomTaskManagerView: View {
     private var footerText: String {
         var text = "A task is one conversation in this \(roomWord).\u{00A0} Changes wait while a bot is working or needs an answer."
         if !canAddTask {
-            text += "\u{00A0} To add another, turn on Projects in Settings on your Mac."
+            text += "\u{00A0} To add another, switch Workspace Arrangement in Settings."
         }
         return text
     }

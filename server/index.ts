@@ -12812,7 +12812,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (!allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode))) {
         return json(res, 409, {
-          error: "this workspace uses one conversation per channel — turn on Fleet or Projects in Settings to add another",
+          error: "this workspace uses one conversation per channel — switch Workspace Arrangement in Settings to allow extra threads",
         });
       }
       const task = store.createGroupTask(group.id, typeof body.title === "string" ? body.title : undefined);
@@ -14495,7 +14495,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!bot) return json(res, 404, { error: "no such bot" });
       if (!allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode))) {
         return json(res, 409, {
-          error: "this workspace uses one conversation per bot — turn on Fleet or Projects in Settings to add another",
+          error: "this workspace uses one conversation per bot — switch Workspace Arrangement in Settings to allow extra threads",
         });
       }
       if (bot.busy) return json(res, 409, { error: "this bot is working — let it finish before starting a task" });
