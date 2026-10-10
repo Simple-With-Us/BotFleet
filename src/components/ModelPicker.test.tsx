@@ -261,6 +261,65 @@ describe("Local Models panel", () => {
   });
 });
 
+describe("the low-quota row hint names the real window", () => {
+  // `quota.models[id].windowsLabel` is optional in the contract
+  // (server/contracts.ts), so a per-model entry can arrive without one.  The
+  // row hint used to fall through to the generic "Current"/"Longer" names and
+  // say "Low longer quota" while the panel directly above it correctly said
+  // "Weekly" — two names for the same window in one menu.
+  type ModelQuota = {
+    capped: boolean;
+    remainingPercent?: number;
+    secondaryRemainingPercent?: number;
+    windowsLabel?: string;
+  };
+  const withQuota = (models: Record<string, ModelQuota>, windowsLabel?: string) =>
+    engine("antigravity", "antigravity", "Antigravity", [{ id: "gemini", label: "Gemini 3" }], {
+      snapshot: {
+        state: "available",
+        version: "1",
+        quota: { capped: false, windowsLabel, models },
+      },
+    } as Partial<InstanceInfo>);
+
+  it("uses the engine-level label when the model entry has none", () => {
+    const html = menu(
+      render(
+        [withQuota({ gemini: { capped: false, remainingPercent: 93, secondaryRemainingPercent: 3 } }, "5hr/Week")],
+        { selection: { instanceId: "antigravity", model: "gemini" } },
+      ),
+    );
+    const text = words(html);
+    expect(text).toContain("Low weekly quota");
+    expect(text).not.toContain("Low longer quota");
+  });
+
+  it("prefers the model entry's own label when it carries one", () => {
+    const html = menu(
+      render(
+        [
+          withQuota(
+            { gemini: { capped: false, remainingPercent: 93, secondaryRemainingPercent: 3, windowsLabel: "5hr/Week" } },
+            "ignored",
+          ),
+        ],
+        { selection: { instanceId: "antigravity", model: "gemini" } },
+      ),
+    );
+    expect(words(html)).toContain("Low weekly quota");
+  });
+
+  it("stays silent above the threshold either way", () => {
+    const html = menu(
+      render(
+        [withQuota({ gemini: { capped: false, remainingPercent: 80, secondaryRemainingPercent: 90 } }, "5hr/Week")],
+        { selection: { instanceId: "antigravity", model: "gemini" } },
+      ),
+    );
+    expect(words(html)).not.toContain("Low");
+  });
+});
+
 describe("engines keep the custom rows that are not local", () => {
   it("lists a configured cloud provider under Custom on its own engine", () => {
     const text = words(menu(render([codex([CLOUD_CUSTOM, QWEN])], { selection: { instanceId: "codex", model: "gpt-5.4" } })));

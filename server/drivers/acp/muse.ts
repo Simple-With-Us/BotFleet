@@ -33,6 +33,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ModelCatalog } from "../../contracts.ts";
+import { z } from "zod";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 /** Reasoning effort, narrowed to the rungs BotFleet's shared `EFFORT_LEVELS`
@@ -121,6 +122,34 @@ function museAuthIndexPath(env: Record<string, string | undefined>): string {
   return join(xdg && xdg.length > 0 ? xdg : join(home, ".config"), "muse", "auth.json");
 }
 
+/** Shape of `~/.config/muse/auth.json`, as far as this driver reads it.
+ *
+ *  Deliberately loose about everything except the one field that matters:
+ *  `storage` must be a non-empty string to count as a credential.  Only the
+ *  `meta` provider is modelled, and only that provider can satisfy
+ *  `museAuthenticated` — the index is a map of providers, and letting any one
+ *  of them satisfy the check put an instance with no Meta credential into the
+ *  failover chain at `server/safety/turn-safety.ts`, where it fails every turn.
+ *
+ *  `.passthrough()` because a provider we do not model must not invalidate the
+ *  whole index; `.catch(undefined)` per field so a `meta` entry carrying an
+ *  unexpected shape reads as "no credential" instead of failing the parse. */
+const authIndexSchema = z
+  .object({
+    providers: z
+      .object({
+        meta: z
+          .object({ storage: z.string().min(1) })
+          .passthrough()
+          .optional()
+          .catch(undefined),
+      })
+      .passthrough()
+      .optional()
+      .catch(undefined),
+  })
+  .passthrough();
+
 /** The credential backend the CLI recorded, or null when there is no index.
  *
  *  The value is no longer used to *reject* a session:  `keychain` means the
@@ -137,18 +166,16 @@ function museCredentialStorage(env: Record<string, string | undefined>): string 
     return null; // no index: not signed in, or not this CLI's index
   }
   try {
-    const parsed = JSON.parse(raw) as {
-      providers?: Record<string, { storage?: unknown } | undefined>;
-    };
-    // Scoped to `meta` on purpose.  The index is a map of *providers*, and any
-    // one of them carrying a storage field used to satisfy this check — so a
-    // user with some other provider configured, but no Meta one, was reported
-    // as signed in and pulled into the failover chain at
-    // `server/safety/turn-safety.ts`.  Only the provider this driver actually
-    // spends the credential on counts.
-    const meta = parsed.providers?.meta;
-    const storage = meta?.storage;
-    return typeof storage === "string" && storage.length > 0 ? storage : null;
+    // Parsed and validated rather than `as`-cast, matching the other drivers:
+    // a TypeScript cast only silences the compiler, it does not check anything
+    // at runtime, and this value decides whether the setup card clears and
+    // whether the instance joins the failover chain.  `.passthrough()` keeps
+    // unknown provider entries from failing the whole index — a future
+    // provider we do not model must not read as "signed out".
+    const parsed = authIndexSchema.safeParse(JSON.parse(raw));
+    if (!parsed.success) return null;
+    const storage = parsed.data.providers?.meta?.storage;
+    return storage ?? null;
   } catch {
     // A malformed index is not evidence of a credential, and must never throw
     // out of a snapshot path.

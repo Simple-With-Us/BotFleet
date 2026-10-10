@@ -223,6 +223,43 @@ describe("Muse Code driver", () => {
     expect(museAuthenticated({ HOME: otherHome })).toBe(false);
   });
 
+  it("survives an index whose shape is not what the schema expects", () => {
+    // The index is a file another program writes, so its shape is not ours to
+    // assume.  Every one of these is valid JSON that would have indexed into
+    // nonsense before the schema, and each must read as "not signed in"
+    // rather than throwing out of a snapshot path or, worse, reporting a
+    // credential that is not there.
+    const home = scratch();
+    const dir = join(home, ".config", "muse");
+    mkdirSync(dir, { recursive: true });
+    const cases = [
+      '"just a string"',
+      "42",
+      "null",
+      "[]",
+      JSON.stringify({ providers: "not-an-object" }),
+      JSON.stringify({ providers: { meta: "not-an-object" } }),
+      JSON.stringify({ providers: { meta: { storage: 42 } } }),
+      JSON.stringify({ providers: { meta: { storage: "" } } }),
+      JSON.stringify({ providers: { meta: { storage: null } } }),
+    ];
+    for (const body of cases) {
+      writeFileSync(join(dir, "auth.json"), body, "utf8");
+      expect(museAuthenticated({ HOME: home }), `index ${body.slice(0, 40)}`).toBe(false);
+    }
+
+    // An unmodelled provider alongside a good `meta` one still signs in —
+    // `.passthrough()` exists so a future provider cannot invalidate the file.
+    writeFileSync(
+      join(dir, "auth.json"),
+      JSON.stringify({
+        providers: { futureprovider: { storage: "file", somethingNew: 1 }, meta: { storage: "keychain" } },
+      }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: home })).toBe(true);
+  });
+
   it("names the same sign-in path the auth check can actually see", () => {
     // The bug this guards:  `loginNote` and `signInCommand` pointed at
     // `muse-code-acp --cli login`, which completes a device-code session into

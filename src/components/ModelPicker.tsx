@@ -285,6 +285,7 @@ function ModelRow({
   defaultId,
   onPick,
   quota,
+  engineWindowsLabel,
 }: {
   option: ModelOption;
   current: boolean;
@@ -296,6 +297,12 @@ function ModelRow({
     secondaryRemainingPercent?: number | null;
     windowsLabel?: string;
   };
+  /** Engine-level fallback label, used when a per-model quota entry carries
+   *  none.  `quota.models[id].windowsLabel` is optional in the contract
+   *  (server/contracts.ts), and without this the row hint falls back to the
+   *  generic "Current"/"Longer" names and says "Low longer quota" while the
+   *  panel above it correctly says "Weekly". */
+  engineWindowsLabel?: string;
 }) {
   return (
     <button
@@ -343,7 +350,9 @@ function ModelRow({
         {quota?.capped && (
           <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">Exhausted</span>
         )}
-        {!quota?.capped && <EngineQuotaHint quota={quota} />}
+        {!quota?.capped && (
+          <EngineQuotaHint quota={quota} fallbackWindowsLabel={engineWindowsLabel} />
+        )}
       </span>
       {current && <Check size={14} className="shrink-0 text-accent" />}
     </button>
@@ -357,15 +366,16 @@ function ModelRow({
  *  explained nothing.  A row now only speaks up when the engine is genuinely
  *  low, and then in words: "Low weekly quota".  Everything else is one click
  *  away in the panel under the header, where it can be labelled properly. */
-function EngineQuotaHint({ quota }: {
+function EngineQuotaHint({ quota, fallbackWindowsLabel }: {
   quota?: {
     remainingPercent?: number | null;
     secondaryRemainingPercent?: number | null;
     windowsLabel?: string;
   };
+  fallbackWindowsLabel?: string;
 }) {
   const windows = quotaWindows(quota?.remainingPercent, quota?.secondaryRemainingPercent, {
-    windowsLabel: quota?.windowsLabel,
+    windowsLabel: quota?.windowsLabel ?? fallbackWindowsLabel,
   });
   const binding = bindingQuotaWindow(windows);
   if (!binding) return null;
@@ -459,6 +469,10 @@ export function LocalModelsPanel({
                 defaultId=""
                 onPick={() => onPick(group.instance, option.id)}
                 quota={group.instance.snapshot.quota?.models?.[option.id]}
+                engineWindowsLabel={
+                  group.instance.snapshot.quota?.models?.[option.id]?.windowsLabel ??
+                  group.instance.snapshot.quota?.windowsLabel
+                }
               />
             ))}
           </div>
@@ -653,6 +667,7 @@ export function ModelPicker({
       defaultId={railInstance?.models.default ?? ""}
       onPick={() => railInstance && pick(railInstance, option.id)}
       quota={railInstance?.snapshot.quota?.models?.[option.id]}
+      engineWindowsLabel={railInstance?.snapshot.quota?.windowsLabel}
     />
   );
 
