@@ -1034,25 +1034,32 @@ export function vpsImageBuildState(alias: string | null, imagePresent: boolean, 
 
 /** "docker image inspect" payload, parsed at the SSH trust line.  Docker and
  *  Podman use different capitalisation (Id / id, Config / config / labels);
- *  the schema accepts both so a runner swap does not silently mis-parse. */
-const VpsDockerImageInspectSchema = z.array(
-  z.object({
-    Id: z.string().optional(),
-    id: z.string().optional(),
-    Config: z
-      .object({
-        // Docker prints `"Labels": null` for an image without labels.
-        Labels: z.record(z.string(), z.string()).nullish(),
-      })
-      .nullish(),
-    config: z
-      .object({
-        Labels: z.record(z.string(), z.string()).nullish(),
-        labels: z.record(z.string(), z.string()).nullish(),
-      })
-      .nullish(),
-  }),
+ *  the schema accepts both so a runner swap does not silently mis-parse.
+ *  `.passthrough()` keeps Docker/Podman field additions from silently changing
+ *  the runtime shape; we read only a fixed subset. */
+export const VpsDockerImageInspectSchema = z.array(
+  z
+    .object({
+      Id: z.string().optional(),
+      id: z.string().optional(),
+      Config: z
+        .object({
+          // Docker prints `"Labels": null` for an image without labels.
+          Labels: z.record(z.string(), z.string()).nullish(),
+        })
+        .passthrough()
+        .nullish(),
+      config: z
+        .object({
+          Labels: z.record(z.string(), z.string()).nullish(),
+          labels: z.record(z.string(), z.string()).nullish(),
+        })
+        .passthrough()
+        .nullish(),
+    })
+    .passthrough(),
 );
+export type VpsDockerImageInspect = z.infer<typeof VpsDockerImageInspectSchema>;
 
 /** True when the pinned tag is present on the VPS with BotFleet's labels.
  * Throws on a transport failure; a clean "no such image" is false. */
