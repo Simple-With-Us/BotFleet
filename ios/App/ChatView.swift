@@ -1066,9 +1066,18 @@ struct ChatView: View {
     }
 
     private func cancelQueuedMessage(_ queueId: String) {
-        session.dropPendingQueued(threadId: current.threadId, queueId: queueId)
-        if case let .bot(bot) = current {
+        switch current {
+        case let .bot(bot):
+            // A bot's queued send lives on the harness, so the chip comes down
+            // only once the server has taken it: Session.cancelQueued drops it
+            // on success and leaves it up, with the reason, when the call
+            // fails.  Dropping here first would strand a message that still
+            // sends behind a row the person already believes is gone.
             Task { await session.cancelQueued(botId: bot.id, queueId: queueId) }
+        case let .room(room):
+            // A room's queued send is held client-side only, so there is no
+            // server call to wait for and the chip is ours to remove.
+            session.dropPendingQueued(threadId: room.threadId, queueId: queueId)
         }
     }
 

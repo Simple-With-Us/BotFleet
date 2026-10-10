@@ -337,7 +337,16 @@ function ComposerInner({
   }, [group, queued, bot, state.pendingQueued]);
 
   const handleEditQueued = useCallback((entry: { queueId: string; text: string }) => {
-    if (group) {
+    if (group && queued) {
+      // The held message carries more than its text: the draft it took, which
+      // is where the attachment chips live, and the reply it was aimed at.
+      // Putting only entry.text back would leave the attachments stranded on
+      // a queued item that no longer exists and drop the reply target, so the
+      // restore path is the one a refused send already uses.
+      const { sent } = queued;
+      setQueued(null);
+      restoreFailedSend(sent);
+    } else if (group) {
       setText(entry.text);
       setQueued(null);
     } else if (bot) {
@@ -345,12 +354,16 @@ function ComposerInner({
       setText(entry.text);
     }
     requestAnimationFrame(() => {
-      inputRef.current?.focus();
-      if (inputRef.current) {
-        inputRef.current.setSelectionRange(entry.text.length, entry.text.length);
-      }
+      const input = inputRef.current;
+      if (!input) return;
+      input.focus();
+      // The caret goes to the end of whatever the box now holds, not to
+      // entry.text: on the restore path the box is the merged draft, which
+      // can be a different length from the composed text the pill was showing.
+      const end = input.value.length;
+      input.setSelectionRange(end, end);
     });
-  }, [group, bot, dispatch, setText]);
+  }, [group, bot, queued, dispatch, setText, restoreFailedSend]);
 
   const handleCancelQueued = useCallback((queueId: string) => {
     if (group) {
