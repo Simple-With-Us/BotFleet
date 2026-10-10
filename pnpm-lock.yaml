@@ -116,8 +116,8 @@ importers:
         specifier: ^4.1.11
         version: 4.3.3
       typebox:
-        specifier: 1.3.34
-        version: 1.3.34
+        specifier: 1.3.35
+        version: 1.3.35
       typescript:
         specifier: ^5.8.3
         version: 5.9.3
@@ -178,7 +178,7 @@ importers:
         version: 1.86.0
       postcss:
         specifier: ^8.5.26
-        version: 8.5.28
+        version: 8.5.29
       tailwindcss:
         specifier: ^4.3.3
         version: 4.3.3
@@ -4761,7 +4761,7 @@ packages:
     engines: {node: '>=6'}
 
   clutch@https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837:
-    resolution: {gitHosted: true, integrity: sha512-RvOViIrRaeDtbGje2h7urWva+rYX73abQKvg02S6p5DTDT5jgX5W19AUq+sET7rhp9KNJSBFkZRLu+ikbvNo8g==, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837}
+    resolution: {gitHosted: true, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837}
     version: 0.4.0
     engines: {node: '>=22.0.0'}
     hasBin: true
@@ -5615,7 +5615,7 @@ packages:
     engines: {node: '>=20.0.0'}
 
   harness@https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf:
-    resolution: {gitHosted: true, integrity: sha512-0EOxsZ5kEyLlC24heebCFIDr8ckwixQ6zTT2pxACcxbZ53yFEM/qK36fkhawQ94F5ZchfIRUbz+uIrbp7g3GoQ==, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf}
+    resolution: {gitHosted: true, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf}
     version: 0.1.0
     engines: {node: '>=22.0.0'}
     hasBin: true
@@ -6642,10 +6642,6 @@ packages:
     resolution: {integrity: sha512-g50586zr4bZmwFiTlflMu8E0bDTb5I5gertgwAKmsdUlTQIhZtunzUlD1WSzwcVWPoAVpsrA6vlfCD7oXvRwgg==}
     engines: {node: ^10 || ^12 || >=14}
 
-  postcss@8.5.28:
-    resolution: {integrity: sha512-RRuzqDtt5Y9h3quz5hWhK+TPnsmVs6WwSU6LkJMeY4HstUEDuYTG8UJSdawMRzmzAtV+KEoG8N3Qg2qLy5vM/A==}
-    engines: {node: ^10 || ^12 || >=14}
-
   postcss@8.5.29:
     resolution: {integrity: sha512-49cGhUbXj8Qenv0iTMxA1cFBzxXoctpC9Ujd77t1WcbJIr6nF/eI7g/8MgxrYldFRuAXvja7xQRwavoW7kgrxQ==}
     engines: {node: ^10 || ^12 || >=14}
@@ -7213,8 +7209,8 @@ packages:
     resolution: {integrity: sha512-faYHw0anBbc/kWF3zFTEnxSFOAGUX9GFbOBthvDdLsIlEoWOFOtS0zgCiQYwIskL9iGXZL3kAXD8OoZ4GmMATA==}
     engines: {node: '>= 18'}
 
-  typebox@1.3.34:
-    resolution: {integrity: sha512-wbnzrXXDW8xEFHDZZs2jo1MkhaYlKAY4FRhpBc1+2LF1fZVBGCXGdLEhA/Z/NBbgzJMFfeM8m7elKPa/+KxaUQ==}
+  typebox@1.3.35:
+    resolution: {integrity: sha512-gNcaAKuh/4JpDHHyo9AfXOtwlpVUMIHhhdJBEY+1x6rnRFB9usGGo6QfnwAadVbO7J6AptAZwGsi1ZMEObIS3g==}
 
   typebox@1.3.7:
     resolution: {integrity: sha512-meKuifc33Pccx0O6PdIzYMq3Og8zvP4TIi/a+Bw3AEMZMxOD0+RHGQvpglEe6Zdy3wZ8nqn/j95h8LUZLk/6Hg==}
@@ -11999,7 +11995,7 @@ snapshots:
       '@alloc/quick-lru': 5.2.0
       '@tailwindcss/node': 4.3.3
       '@tailwindcss/oxide': 4.3.3
-      postcss: 8.5.28
+      postcss: 8.5.29
       tailwindcss: 4.3.3
 
   '@tailwindcss/vite@4.3.3(vite@8.3.3(@types/node@26.6.4)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.16.9)(yaml@2.9.1))':
@@ -15226,12 +15222,6 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.2
 
-  postcss@8.5.28:
-    dependencies:
-      nanoid: 3.3.20
-      picocolors: 1.1.1
-      source-map-js: 1.2.2
-
   postcss@8.5.29:
     dependencies:
       nanoid: 3.3.20
@@ -15968,7 +15958,7 @@ snapshots:
       mime-types: 3.0.2
     optional: true
 
-  typebox@1.3.34: {}
+  typebox@1.3.35: {}
 
   typebox@1.3.7:
     optional: true
