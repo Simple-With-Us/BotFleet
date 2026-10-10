@@ -22,8 +22,11 @@ import {
 } from "@/lib/quota-display";
 import { cn } from "@/lib/cn";
 
-/** The subset of `InstanceInfo` this panel reads.  Kept structural so a test
- *  can hand it a plain object instead of a whole store instance. */
+/** The subset of `InstanceInfo` this panel reads.
+ *
+ *  A structural subset, not a cast:  `state.instances` is `InstanceInfo[]`, and
+ *  this interface is satisfied by it structurally, so the picker passes its
+ *  instances straight through with no assertion at all. */
 export interface QuotaEngineInfo {
   instanceId: string;
   displayName: string;
@@ -94,7 +97,13 @@ function WindowRow({ window }: { window: QuotaWindow }) {
  *  Models on an engine share the account's windows, so the union is the honest
  *  answer: take the *lowest* remaining percentage reported for each window
  *  across models, because that is the reading that reflects real headroom. */
-function engineWindows(engine: QuotaEngineInfo): { windows: QuotaWindow[]; label?: string } {
+/** The named windows and source label for one engine. */
+interface EngineWindows {
+  windows: QuotaWindow[];
+  label?: string;
+}
+
+function engineWindows(engine: QuotaEngineInfo): EngineWindows {
   const models = Object.values(engine.snapshot.quota?.models ?? {});
   if (models.length === 0) return { windows: [] };
   const label = models.find((m) => m.windowsLabel)?.windowsLabel ?? engine.snapshot.quota?.windowsLabel;

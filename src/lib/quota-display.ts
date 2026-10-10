@@ -615,7 +615,7 @@ export interface QuotaWindow {
 /** Title Case window names for the abbreviations the badge used to emit.
  *  Keys are the lowercased forms `windowsLabelFromHeadlines` produces
  *  ("5hr/week", "hour", "day", "month"), plus the bare primary forms. */
-const WINDOW_NAMES: Record<string, string> = {
+const WINDOW_NAMES = {
   "5h": "5-Hour",
   "5hr": "5-Hour",
   hour: "Hourly",
@@ -623,7 +623,18 @@ const WINDOW_NAMES: Record<string, string> = {
   week: "Weekly",
   monthly: "Monthly",
   month: "Monthly",
-};
+} as const;
+
+/** Look up a window name for an untrusted label, falling back when unknown.
+ *
+ *  The label arrives from the server, so it is a `string` rather than one of the
+ *  keys above; this narrows it in one place instead of asserting at each call
+ *  site. */
+function windowName(key: string | undefined, fallback: string): string {
+  if (!key) return fallback;
+  const found = Object.entries(WINDOW_NAMES).find(([name]) => name === key);
+  return found ? found[1] : fallback;
+}
 
 /** The windows a dual (or single) quota reading describes, named.
  *
@@ -643,14 +654,14 @@ export function quotaWindows(
   const windows: QuotaWindow[] = [];
   if (primary != null) {
     windows.push({
-      label: WINDOW_NAMES[primaryRaw] ?? (primaryRaw ? "Current" : "Quota"),
+      label: windowName(primaryRaw, primaryRaw ? "Current" : "Quota"),
       remainingPercent: primary,
       kind: "primary",
     });
   }
   if (secondary != null) {
     windows.push({
-      label: WINDOW_NAMES[secondaryRaw] ?? "Longer",
+      label: windowName(secondaryRaw, "Longer"),
       remainingPercent: secondary,
       kind: "secondary",
     });

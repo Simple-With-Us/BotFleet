@@ -849,7 +849,7 @@ export function ModelPicker({
                       labelled home under the header instead of a cryptic chip
                       repeated down every row. */}
                   <EngineQuotasPanel
-                    engines={state.instances as unknown as Parameters<typeof EngineQuotasPanel>[0]["engines"]}
+                    engines={state.instances}
                     activeInstanceId={railInstance.instanceId}
                   />
                   {railInstance.snapshot.quota?.capped && (
