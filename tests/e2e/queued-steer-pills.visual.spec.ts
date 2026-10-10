@@ -1,4 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
+import { z } from 'zod';
+
+const QueuedSendBodySchema = z.object({ text: z.string().optional() });
 
 // Visual coverage for the stacked queued steer pills (board b5146817).
 //
@@ -101,7 +104,7 @@ async function mockServer(page: Page) {
     if (pathname.startsWith(`/api/bots/${bot.id}/queue`)) return route.fulfill(json({ ok: true }));
     if (pathname.startsWith(`/api/bots/${bot.id}/interrupt`)) return route.fulfill(json({ ok: true }));
     if (post && method === 'POST') {
-      const body = route.request().postDataJSON() as { text?: string };
+      const body = QueuedSendBodySchema.parse(route.request().postDataJSON());
       sends.push({ text: body.text ?? '' });
       // No `replayed` key: MessagePostResponseSchema types it as
       // z.literal(true).optional() and is .strict(), so an explicit false is
@@ -170,7 +173,7 @@ async function mockServerWithRoom(page: Page) {
     if (pathname.startsWith(`/api/bots/${bot.id}/interrupt`)) return route.fulfill(json({ ok: true }));
     if (pathname.startsWith(`/api/groups/${room.id}/interrupt`)) return route.fulfill(json({ ok: true, stopped: true }));
     if (post && method === 'POST') {
-      const body = route.request().postDataJSON() as { text?: string };
+      const body = QueuedSendBodySchema.parse(route.request().postDataJSON());
       sends.push({ text: body.text ?? '' });
       return route.fulfill(
         json({ ok: true, queued: true, queueId: `q-${sends.length}`, threadId: QUEUE }, 202),
