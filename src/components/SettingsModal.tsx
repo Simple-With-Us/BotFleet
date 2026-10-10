@@ -13,6 +13,7 @@ import {
   ROOM_LABEL_MAX_LENGTH,
   ROOM_TERMINOLOGY_OPTIONS,
   ROOM_TERMINOLOGY_PRESETS,
+  lowerRoomLabels,
   suggestPlural,
   type RoomLabels,
   type RoomTerminology,
@@ -638,6 +639,8 @@ export function ConversationModeRow() {
   const { state, dispatch } = useStore();
   const current = parseConversationMode(state.config?.conversationMode);
   const labels = state.config?.roomLabels ?? { singular: "Channel", plural: "Channels" };
+  // Mid-sentence form:  keeps the capitals of a custom proper noun such as HUB.
+  const lower = lowerRoomLabels(labels);
   const [saving, setSaving] = useState(false);
   const [pendingSimple, setPendingSimple] = useState(false);
   const save = async (conversationMode: ConversationMode, mergeThreads = false) => {
@@ -671,14 +674,14 @@ export function ConversationModeRow() {
   return (
     <Card
       title="Workspace Arrangement"
-      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${labels.plural.toLowerCase()} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
+      subtitle={`Choose how your bots and ${lower.plural} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${lower.plural} mode treats each ${lower.singular} as a category for threads.`}
     >
       <div className="flex flex-col gap-2">
         {CONVERSATION_MODES.map((mode) => {
           const copy = CONVERSATION_MODE_COPY[mode];
           const selected = current === mode;
           const displayTitle = mode === "projects" ? labels.plural : copy.title;
-          const displaySubtitle = copy.subtitle;
+          const displaySubtitle = copy.subtitle(lower.singular);
           return (
             <button
               key={mode}
@@ -700,7 +703,7 @@ export function ConversationModeRow() {
           <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5">
             <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
             <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved but hidden.
+              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved and out of the sidebar.
             </div>
             <div className="mt-2 flex flex-wrap gap-2">
               <button
@@ -717,7 +720,7 @@ export function ConversationModeRow() {
                 onClick={() => void save("simple")}
                 className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-raised/60"
               >
-                Keep Extra Threads Hidden
+                Keep Them Out of the Sidebar
               </button>
               <button
                 type="button"

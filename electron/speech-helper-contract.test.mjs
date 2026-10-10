@@ -118,6 +118,7 @@ describe("Personal Voice helper contract", () => {
       speechSource.indexOf("export function stopPersonalVoice()"),
     );
     expect(speak).toContain("watchFile(outputPath, { interval: PERSONAL_VOICE_POLL_MS, persistent: false }, drain)");
+    expect(speak).toContain("setInterval(drain, PERSONAL_VOICE_POLL_MS)");
     expect(speak).toContain("personalVoiceChild === session");
     expect(speak).toContain("unwatchFile(outputPath, drain)");
   });
