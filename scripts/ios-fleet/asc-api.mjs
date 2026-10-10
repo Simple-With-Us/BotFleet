@@ -427,9 +427,8 @@ export async function countInternalTesters({ api, appId }) {
   const groups = ascRows(groupsRes).filter(
     (g) => g.attributes?.isInternalGroup === true && g.attributes?.hasAccessToAllBuilds === true
   );
-  let testers = 0;
+  const seen = new Set();
   for (const g of groups) {
-    const seen = new Set();
     let url = `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email`;
     for (let page = 0; page < 50 && url; page++) {
       const members = await api("GET", url);
@@ -437,9 +436,8 @@ export async function countInternalTesters({ api, appId }) {
       for (const t of ascRows(members)) seen.add(String(t.attributes?.email || "").toLowerCase());
       url = members.parsed?.links?.next || "";
     }
-    testers += seen.size;
   }
-  return { ok: true, groups: groups.length, testers };
+  return { ok: true, groups: groups.length, testers: seen.size };
 }
 
 // Make sure the app has an internal group with access to all builds, and that
