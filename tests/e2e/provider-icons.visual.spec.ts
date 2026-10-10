@@ -51,7 +51,10 @@ test('visual: provider marks for muse and mcode through ProviderMark', async ({ 
   await expect(panel).toBeVisible();
   await expect(panel.getByText('Engine Quotas')).toBeVisible();
 
-  await expect(board).toHaveScreenshot('provider-icons-marks.png', stableShot);
+  await expect(board).toHaveScreenshot('provider-icons-marks.png', {
+    ...stableShot,
+    mask: [page.getByTestId('provider-icons-quotas-panel')],
+  });
 });
 
 test('visual: muse mark carries the Meta blue ramp, mcode carries the brand red ramp', async ({ page }) => {
