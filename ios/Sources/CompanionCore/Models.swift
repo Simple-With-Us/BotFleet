@@ -911,6 +911,21 @@ public struct ConfigStatus: Codable, Sendable {
         roomLabels?.plural ?? Self.presetLabels(terminology).plural
     }
 
+    /// The singular room word for the middle of a sentence ("move to another
+    /// channel").  Mirrors `lowerRoomLabels` in shared/terminology.ts, which the
+    /// Mac uses:  a custom label that is an acronym, such as HUB, keeps its
+    /// capitals, and any other word loses only the capital of its first letter.
+    public var roomTerminologyLabelLowered: String {
+        Self.loweredRoomWord(roomTerminologyLabel)
+    }
+
+    static func loweredRoomWord(_ word: String) -> String {
+        let letters = word.filter { $0.isASCII && $0.isLetter }
+        if letters.count > 1, letters == letters.uppercased() { return word }
+        guard let first = word.first else { return word }
+        return first.lowercased() + word.dropFirst()
+    }
+
     /// The fallback for an older harness that sends only the key.  A word it
     /// has never heard of still renders as Channels rather than as nothing.
     static func presetLabels(_ terminology: String?) -> RoomLabels {

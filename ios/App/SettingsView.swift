@@ -185,7 +185,7 @@ struct SettingsView: View {
                         Text("Projects").tag("projects")
                     } label: {
                         Label {
-                            Text("Workspace Layout")
+                            Text("Workspace Arrangement")
                         } icon: {
                             SettingsIcon(symbol: "square.grid.2x2", color: .teal)
                         }
@@ -545,6 +545,7 @@ struct SettingsView: View {
 
     private var roomTerm: String { session.config?.roomTerminologyLabel ?? "Channel" }
     private var roomTermPlural: String { session.config?.roomTerminologyPlural ?? "Channels" }
+    private var roomTermLowered: String { session.config?.roomTerminologyLabelLowered ?? "channel" }
 
     private var normalizedProfileName: String {
         profileName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -603,10 +604,10 @@ struct SettingsView: View {
 
     private var workspaceFooter: String {
         guard settingsLoaded else {
-            return "Workspace layout, terminology, and tool toggles unlock after settings load from your computer."
+            return "Workspace arrangement, terminology, and tool toggles unlock after settings load from your computer."
         }
         return session.config?.isProjectsMode == true
-            ? "Projects hides named bots.  That word is a category that any number of threads can sit under."
+            ? "Any number of threads under each bot and \(roomTermLowered).\u{00A0} A thread can be tied to one \(roomTermLowered) on your computer."
             : "Simple is one conversation per bot.  That word is a group thread invited bots and you can all write in."
     }
 
