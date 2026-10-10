@@ -37,7 +37,9 @@ describe("botfleet external store adapter", () => {
     };
     expect(converted.id).toBe("m2");
     expect(converted.role).toBe("assistant");
-    expect(converted.content).toBe("Deployed to 127.0.0.1:8799.");
+    expect(converted.content).toEqual([
+      { type: "text", text: "Deployed to 127.0.0.1:8799." },
+    ]);
   });
 
   it("appends the live stream tail to the last assistant message", () => {
@@ -50,6 +52,23 @@ describe("botfleet external store adapter", () => {
     const last = adapter.messages![adapter.messages!.length - 1];
     expect(last.text).toBe("Deployed to 127.0.0.1:8799. Streaming tail…");
     expect(adapter.isRunning).toBe(true);
+  });
+
+  it("treats a reasoning-only stream as running and surfaces reasoning as its own part", () => {
+    const adapter = createBotFleetExternalStore({
+      threadId: "t1",
+      messages,
+      stream: { reasoning: "thinking…" },
+      send: async () => {},
+    });
+    expect(adapter.isRunning).toBe(true);
+    const last = adapter.messages![adapter.messages!.length - 1];
+    expect(last.reasoning).toBe("thinking…");
+    const converted = adapter.convertMessage!(last, 1) as { content: unknown };
+    expect(converted.content).toEqual([
+      { type: "text", text: "Deployed to 127.0.0.1:8799." },
+      { type: "reasoning", text: "thinking…" },
+    ]);
   });
 
   it("sends through the harness send path, not an AI SDK", async () => {

@@ -16,6 +16,7 @@ import {
   type AppendMessage,
   type ExternalStoreAdapter,
   type ThreadMessageLike,
+  type ThreadMessageLikePart,
 } from "@assistant-ui/react";
 
 /** Mirrors the shape ChatView.tsx consumes from `useStreaming()`. */
@@ -23,6 +24,8 @@ export type BotFleetThreadMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  /** Reasoning tail for the assistant's turn; surfaced as its own part. */
+  reasoning?: string;
   createdAt: Date;
   /** Stable branch key; BotFleet supports re-generating a turn. */
   branchKey?: string;
@@ -43,10 +46,12 @@ export type BotFleetReload = (params: { messageId: string }) => Promise<void>;
 function toThreadMessage(message: BotFleetThreadMessage): ThreadMessageLike {
   // `content` is `string | readonly ThreadMessageLikePart[]` — a plain string
   // is the supported text-only shape (verified in core's thread-message-like.d.ts).
+  const parts: ThreadMessageLikePart[] = [{ type: "text", text: message.text }];
+  if (message.reasoning) parts.push({ type: "reasoning", text: message.reasoning });
   return {
     id: message.id,
     role: message.role,
-    content: message.text,
+    content: parts,
     createdAt: message.createdAt,
     // Branch identity rides in `custom`; the `unstable_*` metadata keys are all
     // marked deprecated in 0.3.26.
@@ -75,7 +80,7 @@ export function createBotFleetExternalStore(params: {
   return {
     messages: withStream,
     convertMessage: toThreadMessage,
-    isRunning: Boolean(stream?.text),
+    isRunning: Boolean(stream?.text || stream?.reasoning),
     onNew: async (message: AppendMessage) => {
       const text = extractText(message);
       if (!text.trim()) return;
@@ -97,11 +102,16 @@ export function appendStreamTail(
   stream?: BotFleetStreamChunk,
 ): BotFleetThreadMessage[] {
   const tail = stream?.text ?? "";
-  if (!tail) return messages;
+  const reasoning = stream?.reasoning ?? "";
+  if (!tail && !reasoning) return messages;
   const next = messages.slice();
   const last = next[next.length - 1];
   if (!last || last.role !== "assistant") return messages;
-  next[next.length - 1] = { ...last, text: last.text + tail };
+  next[next.length - 1] = {
+    ...last,
+    text: last.text + tail,
+    reasoning: (last.reasoning ?? "") + reasoning,
+  };
   return next;
 }
 
