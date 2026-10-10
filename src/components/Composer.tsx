@@ -6,7 +6,7 @@ import { useTranscriptionAvailability } from "@/lib/use-transcription-availabili
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { currentCall, useOnCall } from "@/lib/call";
-import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
+import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, Zap, Hash, AppWindow, MessageSquare, Pencil, Trash2 } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
@@ -328,9 +328,45 @@ function ComposerInner({
   // queue), but stay off the transcript until drain — the chip here is the
   // pending row so they cannot become the active leaf mid-turn.
   const [queued, setQueued] = useState<{ text: string; replyToId?: string; sent: SentDraft<Message> } | null>(null);
-  const pendingChip = group
-    ? queued?.text
-    : (bot ? state.pendingQueued?.[bot.threadId]?.at(-1)?.text : undefined);
+  const pendingItems = useMemo(() => {
+    if (group) {
+      return queued ? [{ queueId: "group-queued", text: queued.text, at: Date.now() }] : [];
+    }
+    if (!bot) return [];
+    return state.pendingQueued?.[bot.threadId] ?? [];
+  }, [group, queued, bot, state.pendingQueued]);
+
+  const handleEditQueued = useCallback((entry: { queueId: string; text: string }) => {
+    if (group) {
+      setText(entry.text);
+      setQueued(null);
+    } else if (bot) {
+      dispatch({ type: "cancelQueued", botId: bot.id, queueId: entry.queueId });
+      setText(entry.text);
+    }
+    requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      if (inputRef.current) {
+        inputRef.current.setSelectionRange(entry.text.length, entry.text.length);
+      }
+    });
+  }, [group, bot, dispatch, setText]);
+
+  const handleCancelQueued = useCallback((queueId: string) => {
+    if (group) {
+      setQueued(null);
+    } else if (bot) {
+      dispatch({ type: "cancelQueued", botId: bot.id, queueId });
+    }
+  }, [group, bot, dispatch]);
+
+  const handleSteerQueued = useCallback(() => {
+    if (group) {
+      dispatch({ type: "interruptGroup", groupId: group.id });
+    } else if (bot) {
+      dispatch({ type: "interrupt", botId: bot.id });
+    }
+  }, [group, bot, dispatch]);
   // While an update holds new work, a queued send waits for the restart and
   // not for the bot, which may be idle.  The chip says so.
   const updateHolding = useUpdateDrain() !== null;
@@ -638,47 +674,51 @@ function ComposerInner({
           {speechError}
         </div>
       )}
-        {pendingChip && (
-          <div className="mb-2 flex items-center gap-2 rounded-lg border border-hairline/40 bg-panel px-3 py-2 text-[12.5px] text-ink-secondary">
-            <Clock size={13} className="shrink-0" />
-            <span
-              className="min-w-0 flex-1 truncate"
-              title={queuedChipLabel({ text: pendingChip, busyName, draining: updateHolding })}
-            >
-              {queuedChipLabel({ text: pendingChip, busyName, draining: updateHolding })}
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                if (group) {
-                  dispatch({ type: "interruptGroup", groupId: group.id });
-                } else if (bot) {
-                  dispatch({ type: "interrupt", botId: bot.id });
-                }
-              }}
-              className="rounded px-2 py-0.5 text-[11.5px] font-medium text-accent hover:bg-raised hover:underline"
-              title="Interrupt current turn and send queued messages immediately"
-            >
-              Steer Now
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                if (group) {
-                  setQueued(null);
-                  return;
-                }
-                if (!bot) return;
-                for (const entry of state.pendingQueued?.[bot.threadId] ?? []) {
-                  dispatch({ type: "cancelQueued", botId: bot.id, queueId: entry.queueId });
-                }
-              }}
-              aria-label="Cancel Queued Message"
-              title="Cancel Queued Message"
-              className="flex size-5 shrink-0 items-center justify-center rounded text-ink-secondary hover:bg-raised hover:text-ink"
-            >
-              <X size={13} strokeWidth={2.5} />
-            </button>
+        {pendingItems.length > 0 && (
+          <div className="mb-2 flex flex-col gap-1.5 max-h-36 overflow-y-auto pr-0.5">
+            {pendingItems.map((entry) => (
+              <div
+                key={entry.queueId}
+                className="flex items-center gap-2 rounded-xl border border-hairline/40 bg-panel px-3 py-1.5 text-[12.5px] text-ink shadow-xs transition-colors hover:border-hairline"
+              >
+                <MessageSquare size={13} className="shrink-0 text-ink-secondary" aria-hidden="true" />
+                <span
+                  className="min-w-0 flex-1 truncate font-normal"
+                  title={queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
+                >
+                  {queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
+                </span>
+                <div className="flex shrink-0 items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => handleEditQueued(entry)}
+                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink transition-colors"
+                    title="Edit queued message (puts back in composer)"
+                    aria-label="Edit queued message"
+                  >
+                    <Pencil size={12} strokeWidth={2} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleCancelQueued(entry.queueId)}
+                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-danger transition-colors"
+                    title="Cancel queued message"
+                    aria-label="Cancel queued message"
+                  >
+                    <Trash2 size={12} strokeWidth={2} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSteerQueued}
+                    className="flex size-6 items-center justify-center rounded-md text-accent hover:bg-accent/15 transition-colors"
+                    title="Steer Now — interrupt current turn and send immediately"
+                    aria-label="Steer Now"
+                  >
+                    <ArrowUp size={13} strokeWidth={2.5} />
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
         {pickerOpen && (
@@ -872,6 +912,12 @@ function ComposerInner({
               onEditLast();
               return;
             }
+            // When queued messages exist and input is empty, Cmd/Ctrl+Enter steers all queued messages
+            if (pendingItems.length > 0 && !hasContent && (e.metaKey || e.ctrlKey) && e.key === "Enter") {
+              e.preventDefault();
+              handleSteerQueued();
+              return;
+            }
             // Shift+Enter inserts a newline; plain Enter sends; Alt/Cmd+Enter steers immediately when busy
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
@@ -891,6 +937,8 @@ function ComposerInner({
               ? "Answer the approval above to continue"
               : recording
               ? "Listening…"
+              : pendingItems.length > 0
+              ? "Cmd/Ctrl+Enter steers all queued messages"
               : busy && canSteer
                 ? `${busyName} is working — Enter sends this into the running turn`
               : busy
