@@ -106,6 +106,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "call-button") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  The App render below is unchanged for any
+  // other URL.
+  void import("./components/CallButtonVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "karaoke") {
   // Visual-spec harness (tests/e2e/karaoke.visual.spec.ts): a reply being
   // read aloud, highlighted on the message itself.  Dynamically imported so
