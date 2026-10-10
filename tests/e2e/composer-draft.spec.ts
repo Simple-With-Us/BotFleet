@@ -330,3 +330,46 @@ test('two room messages held for a busy member come back together when the serve
   await expect.poll(() => sends.length).toBe(1);
   await expect(box).toHaveValue('first thought\n\nsecond thought');
 });
+
+test('editing a message held for a busy room brings its attachments back too', async ({ page }) => {
+  const sends = await mockServer(page, accept);
+  roomState.busy = true;
+  await openApp(page);
+  const box = await openRoom(page);
+  const chip = page.getByRole('button', { name: 'Remove pasted text' });
+
+  // a long paste becomes a chip rather than text in the box
+  await box.evaluate((field, long) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData('text/plain', long);
+    field.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
+  }, 'a pasted line of an enormous log\n'.repeat(60));
+  await expect(chip).toBeVisible();
+
+  // the room is mid-turn, so this is held client-side and nothing goes out
+  await box.fill('worth checking against the earlier answer');
+  await box.press('Enter');
+  await expect(box).toHaveValue('');
+  await expect(chip).toBeHidden();
+  expect(sends).toHaveLength(0);
+  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
+
+  // editing the held pill puts the message back where it can be changed.
+  // The paste it was carrying has to come back with it: the pill's text is
+  // the composed string, so restoring that string alone drops the attachment
+  // on the floor and the person loses an enormous log to a two-word edit.
+  await page.getByRole('button', { name: 'Edit queued message' }).first().click();
+  await expect(box).toHaveValue('worth checking against the earlier answer');
+  await expect(chip).toBeVisible();
+
+  // editing takes the message out of the hold: it is a draft again, waiting
+  // for the person to send it, so the pill is gone and nothing is in flight.
+  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(0);
+  expect(sends).toHaveLength(0);
+
+  roomState.busy = false;
+  await box.press('Enter');
+  await expect.poll(() => sends.length).toBe(1);
+  expect(sends[0].text).toContain('worth checking against the earlier answer');
+  await expect(chip).toBeHidden();
+});
