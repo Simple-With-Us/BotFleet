@@ -686,7 +686,7 @@ function ComposerInner({
                   className="min-w-0 flex-1 truncate font-normal"
                   title={queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
                 >
-                  {entry.text}
+                  {queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
                 </span>
                 <div className="flex shrink-0 items-center gap-1">
                   <button
