@@ -155,12 +155,15 @@ export function appendStreamTail(
   // Append a synthetic assistant message rather than dropping the tail, so the
   // running state and the visible text stay in sync.
   if (!last || last.role !== "assistant") {
+    const lastCreatedAt = messages[messages.length - 1]?.createdAt;
     next.push({
       id: STREAMING_MESSAGE_ID,
       role: "assistant",
       text: tail,
       reasoning: reasoning || undefined,
-      createdAt: messages[messages.length - 1]?.createdAt ?? new Date(),
+      createdAt: lastCreatedAt
+        ? new Date(Math.max(lastCreatedAt.getTime(), Date.now() - 1))
+        : new Date(),
       branchKey: last?.branchKey,
     });
     return next;
