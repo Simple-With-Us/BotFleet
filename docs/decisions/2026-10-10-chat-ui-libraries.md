@@ -52,14 +52,37 @@ Non-`ThreadMessage` types additionally require `convertMessage`.
 Verified in this lane (`src/components/assistant-ui/`):
 
 - `pnpm exec tsc --noEmit` — adapter typechecks clean against the real 0.15.27 types.
-- `BotFleetExternalStore.test.tsx` — 4/4 pass, including an SSR render of `ThreadPrimitive`
-  driven by harness-shaped data with no AI SDK present.
-- **A/B check:** breaking the streaming tail made the stream test fail (1 failed / 3 passed),
-  then restored to 4/4.  The test can fail, so it is a real check.
+- `BotFleetExternalStore.test.tsx` — 6/6 pass, including an SSR render of the harness
+  messages through `ThreadPrimitive.Messages` / `MessagePrimitive.Parts` with no AI SDK
+  present.
+- **A/B check on every behavioral test:** breaking the streaming tail fails the stream test;
+  dropping the text in `convertMessage` fails 3 tests including the render test; reverting the
+  synthetic-message path fails that test.  Each test can fail, so each is a real check.
 - Existing `ChatView.test.tsx` + `ChatMarkdown.test.tsx` still pass (23/23) — nothing regressed.
 
 Works outside Next.js: zero `next/*` imports in `dist`, `"use client"` is inert, React peer is
 `^18 || ^19` and BotFleet is on `^19.1.0`.  MIT throughout.
+
+### What the review round changed
+
+Three things the first pass got wrong, all caught by review and fixed:
+
+1. **Streaming before the settled message was dropped.**  The harness streams tokens *before* the
+   settled message lands — `ChatView.tsx:1774` renders exactly that window as a live bubble.
+   `appendStreamTail` used to early-return when the tail message was not an assistant message, so
+   those tokens vanished.  It now appends a synthetic assistant message
+   (`STREAMING_MESSAGE_ID`), keeping the running state and the visible text in sync.
+2. **A reasoning-only stream did not count as running.**  BotFleet streams `reasoning` and `text`
+   as separate frames; only `text` was consulted.
+3. **The render test asserted a literal.**  It passed regardless of whether the store reached the
+   DOM, because it asserted on a hardcoded child string.  It now routes the harness messages
+   through the primitives and asserts that *our* text appears — and it fails when the data does
+   not arrive.
+
+A note on the primitive API, since it is easy to get wrong: `ThreadPrimitive.Messages` takes a
+**render-function** child (it maps over the thread's message ids), and `MessagePrimitive.Root`
+renders its children verbatim — `MessagePrimitive.Parts` with a `components.Text` override is
+what actually renders message text.
 
 ### Blocker found: `@assistant-ui/react-ui` is broken upstream
 

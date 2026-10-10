@@ -42,6 +42,13 @@ export type BotFleetSend = (params: { threadId: string; text: string }) => Promi
 /** Our reload path is the harness' regenerate endpoint. */
 export type BotFleetReload = (params: { messageId: string }) => Promise<void>;
 
+/**
+ * Id for the synthetic assistant message that carries the live stream when the
+ * harness has not settled a real one yet.  Stable so re-renders replace it
+ * rather than append a new bubble per frame.
+ */
+export const STREAMING_MESSAGE_ID = "__botfleet_streaming__";
+
 function toThreadMessage(message: BotFleetThreadMessage): ThreadMessageLike {
   // `content` is `string | readonly ThreadMessageLikePart[]` — a plain string
   // is the supported text-only shape (verified in core's thread-message-like.d.ts).
@@ -108,7 +115,23 @@ export function appendStreamTail(
   if (!tail && !reasoning) return messages;
   const next = messages.slice();
   const last = next[next.length - 1];
-  if (!last || last.role !== "assistant") return messages;
+
+  // No assistant message yet — the harness streams tokens BEFORE the settled
+  // message lands (ChatView.tsx renders exactly this window as a live bubble).
+  // Append a synthetic assistant message rather than dropping the tail, so the
+  // running state and the visible text stay in sync.
+  if (!last || last.role !== "assistant") {
+    next.push({
+      id: STREAMING_MESSAGE_ID,
+      role: "assistant",
+      text: tail,
+      reasoning: reasoning || undefined,
+      createdAt: messages[messages.length - 1]?.createdAt ?? new Date(),
+      branchKey: last?.branchKey,
+    });
+    return next;
+  }
+
   next[next.length - 1] = {
     ...last,
     text: last.text + tail,

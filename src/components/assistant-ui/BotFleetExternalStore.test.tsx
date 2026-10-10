@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { AssistantRuntimeProvider, ThreadPrimitive } from "@assistant-ui/react";
+import { AssistantRuntimeProvider, MessagePrimitive, ThreadPrimitive } from "@assistant-ui/react";
 import { createElement, type ReactNode } from "react";
 import {
   createBotFleetExternalStore,
   useBotFleetRuntime,
+  STREAMING_MESSAGE_ID,
   type BotFleetThreadMessage,
 } from "./BotFleetExternalStore";
 
@@ -71,6 +72,25 @@ describe("botfleet external store adapter", () => {
     ]);
   });
 
+  it("appends a synthetic assistant message when streaming before any settled bot text", () => {
+    // The harness streams tokens before the settled message lands; ChatView.tsx
+    // renders that window as a live bubble rather than dropping it.
+    const userOnly: BotFleetThreadMessage[] = [
+      { id: "u1", role: "user", text: "deploy the harness", createdAt: new Date(0) },
+    ];
+    const adapter = createBotFleetExternalStore({
+      threadId: "t1",
+      messages: userOnly,
+      stream: { text: "Working…" },
+      send: async () => {},
+    });
+    const last = adapter.messages![adapter.messages!.length - 1];
+    expect(last.role).toBe("assistant");
+    expect(last.id).toBe(STREAMING_MESSAGE_ID);
+    expect(last.text).toBe("Working…");
+    expect(adapter.isRunning).toBe(true);
+  });
+
   it("sends through the harness send path, not an AI SDK", async () => {
     const send = vi.fn(async () => {});
     const adapter = createBotFleetExternalStore({ threadId: "t7", messages, send });
@@ -81,24 +101,60 @@ describe("botfleet external store adapter", () => {
     expect(send).toHaveBeenCalledWith({ threadId: "t7", text: "hello harness" });
   });
 
-  it("renders ThreadPrimitive markup from harness data with no AI SDK", () => {
-    function Harness() {
+  it("renders harness message text through ThreadPrimitive.Messages", () => {
+    function Harness({ stream }: { stream?: { text?: string } }) {
       const runtime = useBotFleetRuntime({
         threadId: "t1",
         messages,
-        stream: { text: " Streaming tail…" },
+        stream,
         send: async () => {},
       });
+      // Route the harness messages through the primitives so the assertions
+      // below can only pass if the runtime actually reaches the DOM with OUR
+      // text.  A literal child would render either way, which is exactly the
+      // gap Kody flagged on the first version of this test.
+      //
+      // `Messages` takes a RENDER-FUNCTION child (it maps over the thread's
+      // message ids); `MessagePrimitive.Content` renders the message part.
       const body: ReactNode = createElement(
         ThreadPrimitive.Viewport,
         null,
-        createElement(ThreadPrimitive.Viewport, null, "harness view"),
+        createElement(ThreadPrimitive.Messages, {
+          children: () =>
+            createElement(
+              MessagePrimitive.Root,
+              null,
+              // `Parts` maps message parts to components.  The `Text`
+              // override is the component that renders the harness text: if
+              // the store never reached the parts, this renders empty and the
+              // assertions below fail.  (No extra foil component — the real
+              // text itself is the evidence.)
+              createElement(MessagePrimitive.Parts, {
+                components: {
+                  Text: ({ text }: { text?: string }) => createElement("b", null, text),
+                },
+              }),
+            ),
+        }),
       );
       return createElement(AssistantRuntimeProvider, { runtime }, body);
     }
 
-    const html = renderToStaticMarkup(createElement(Harness));
-    expect(html.length).toBeGreaterThan(0);
-    expect(html).toContain("harness view");
+    // No live stream: assistant-ui renders the settled text for both roles.
+    const settled = renderToStaticMarkup(
+      createElement(Harness, { stream: undefined }),
+    );
+    expect(settled).toContain("deploy the harness");
+    expect(settled).toContain("Deployed to 127.0.0.1:8799.");
+
+    // With a live stream the trailing assistant message carries the appended
+    // tail, because our adapter folds the stream into the last assistant
+    // message before handing it over.  (Verified: this is a property of the
+    // adapter, not of the primitives — the settled and live paths both render.)
+    const live = renderToStaticMarkup(
+      createElement(Harness, { stream: { text: " Streaming tail…" } }),
+    );
+    expect(live).toContain("deploy the harness");
+    expect(live).toContain("Deployed to 127.0.0.1:8799. Streaming tail…");
   });
 });
