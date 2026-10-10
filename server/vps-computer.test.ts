@@ -1270,6 +1270,38 @@ describe("VPS image build-ahead and switch", () => {
     expect(fake.calls[run]!.args.at(-1)).toBe(IMAGE_ID);
   });
 
+  it("does not offer a swap for label drift on the pinned image, and still refuses to call it ready", async () => {
+    // A container on the pinned image id whose own labels drifted: bots
+    // refuse it, but replacing it would not be an image switch, so it is not
+    // "outdated" and the destructive swap is not offered.
+    const drifted = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+    const runner: VpsCommandRunner = async (args, options) => {
+      const out = await drifted.runner(args, options);
+      if (args[2] !== "inspect") return out;
+      const parsed = JSON.parse(out.stdout) as Array<{ Config: { Labels: Record<string, string> } }>;
+      parsed[0]!.Config.Labels[VPS_VIEWER_LABEL] = "0";
+      return { ...out, stdout: JSON.stringify(parsed) };
+    };
+    const status = await vpsComputerStatus(SHARED, "workspace", runner);
+    expect(status.imageMatches).toBe(false);
+    expect(status.imageOutdated).toBe(false);
+    expect(status.ready).toBe(false);
+    await expect(vpsSwitchToPreparedImage(SHARED, runner)).rejects.toThrow(/already runs the current image/);
+  });
+
+  it("reads an image with null labels as not the pinned image rather than a transport failure", async () => {
+    const fake = fixture();
+    const runner: VpsCommandRunner = async (args, options) => {
+      if (args[2] === "image") {
+        return { stdout: JSON.stringify([{ Id: IMAGE_ID, Config: { Labels: null } }]), stderr: "" };
+      }
+      return fake.runner(args, options);
+    };
+    const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+    expect(status.daemonUp).toBe(true);
+    expect(status.image).toBe(false);
+  });
+
   it("refuses a container BotFleet did not create", async () => {
     const fake = fixture({ managed: false, containerImageId: STALE_IMAGE_ID, containerName: SHARED_VPS_TARGET.containerName });
     await expect(vpsSwitchToPreparedImage(SHARED, fake.runner)).rejects.toThrow(/did not create/);

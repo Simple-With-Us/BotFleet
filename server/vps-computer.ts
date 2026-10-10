@@ -685,8 +685,8 @@ async function inspectVpsComputer(
     );
     status.daemonUp = true;
     const image = inspected[0];
-    const labels = image.Config?.Labels ?? image.config?.Labels ?? image.config?.labels;
-    const imageId = image.Id ?? image.id;
+    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels ?? undefined;
+    const imageId = image?.Id ?? image?.id;
     inspectedImageId = imageId && IMAGE_ID.test(imageId) ? imageId : null;
     status.image_id = inspectedImageId;
     status.image = Boolean(inspectedImageId) && imageLabelsMatch(labels);
@@ -1041,15 +1041,16 @@ const VpsDockerImageInspectSchema = z.array(
     id: z.string().optional(),
     Config: z
       .object({
-        Labels: z.record(z.string(), z.string()).optional(),
+        // Docker prints `"Labels": null` for an image without labels.
+        Labels: z.record(z.string(), z.string()).nullish(),
       })
-      .optional(),
+      .nullish(),
     config: z
       .object({
-        Labels: z.record(z.string(), z.string()).optional(),
-        labels: z.record(z.string(), z.string()).optional(),
+        Labels: z.record(z.string(), z.string()).nullish(),
+        labels: z.record(z.string(), z.string()).nullish(),
       })
-      .optional(),
+      .nullish(),
   }),
 );
 
@@ -1061,8 +1062,8 @@ async function pinnedVpsImagePresent(alias: string, runner: VpsCommandRunner): P
       JSON.parse((await runner(vpsDockerArgs(alias, ["image", "inspect", VPS_IMAGE]), { timeoutMs: 30_000 })).stdout),
     );
     const image = inspected[0];
-    const imageId = image.Id ?? image.id;
-    const labels = image.Config?.Labels ?? image.config?.Labels ?? image.config?.labels;
+    const imageId = image?.Id ?? image?.id;
+    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels ?? undefined;
     return Boolean(imageId && IMAGE_ID.test(imageId)) && imageLabelsMatch(labels);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1173,11 +1174,12 @@ export async function vpsSwitchToPreparedImage(
  * Label drift alone does NOT count — reconciling it would destroy the
  * container filesystem for a problem the swap cannot fix. */
 export function vpsContainerOutdated(status: VpsComputerStatus): boolean {
+  // With the pinned tag absent, no container can be on it.
   return (
     status.daemonUp &&
     status.container !== "missing" &&
     status.managed &&
-    status.container_image_id !== status.image_id
+    (!status.image || status.container_image_id !== status.image_id)
   );
 }
 
