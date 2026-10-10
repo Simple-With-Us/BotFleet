@@ -133,14 +133,19 @@ export interface EngineQuotasPanelProps {
   /** Which engine the picker is currently showing, marked in the list. */
   activeInstanceId?: string;
   className?: string;
+  /** Start with the detail panel open.  The picker leaves this collapsed;
+   *  the visual fixture sets it so a screenshot covers the bars and the
+   *  named windows rather than one collapsed line of text. */
+  defaultOpen?: boolean;
 }
 
 export function EngineQuotasPanel({
   engines,
   activeInstanceId,
   className,
+  defaultOpen = false,
 }: EngineQuotasPanelProps): React.ReactElement | null {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
 
   const rows = useMemo(
     () =>
@@ -195,7 +200,7 @@ export function EngineQuotasPanel({
             const binding = bindingQuotaWindow(windows);
             const isActive = engine.instanceId === activeInstanceId;
             return (
-              <div key={engine.instanceId} className={cn(isActive && "rounded bg-control/40 px-1.5 py-1 -mx-1.5")}>
+              <div key={engine.instanceId} data-testid={`engine-quota-${engine.instanceId}`} className={cn(isActive && "rounded bg-control/40 px-1.5 py-1 -mx-1.5")}>
                 <div className="mb-1 flex items-baseline justify-between gap-2">
                   <span className="truncate text-[12px] font-medium text-ink">
                     {engine.displayName}

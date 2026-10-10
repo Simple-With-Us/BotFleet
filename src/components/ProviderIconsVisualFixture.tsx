@@ -34,7 +34,9 @@ const MUSECODE: QuotaEngineInfo = {
           capped: false,
           remainingPercent: 93,
           secondaryRemainingPercent: 3,
-          resetsAt: Date.now() + 4 * 60 * 60 * 1000,
+          // Fixed, not relative:  the spec freezes the page clock to this
+          // instant, so the rendered countdown is stable across runs.
+          resetsAt: Date.parse('2026-10-10T19:00:00Z'),
           windowsLabel: "5hr/week",
         },
       },
@@ -84,8 +86,14 @@ export default function ProviderIconsVisualFixture() {
         </span>
       </div>
 
+      {/* The panel collapsed is one line of text, so a snapshot of it alone
+          pins almost none of what this fix actually changed.  Mounted with the
+          detail panel forced open so the named windows, the bars, and the
+          "nearly spent" callout are all in the image.  Only one copy: the
+          panel scrolls past its own max-height, so two of them would push the
+          interesting half out of frame. */}
       <div data-testid="provider-icons-quotas-panel">
-        <EngineQuotasPanel engines={[MUSECODE, MINIMAX]} activeInstanceId="muse" />
+        <EngineQuotasPanel engines={[MUSECODE, MINIMAX]} activeInstanceId="muse" defaultOpen />
       </div>
     </div>
   );

@@ -22,9 +22,16 @@ async function pinFonts(page: Page): Promise<void> {
   });
 }
 
-test.use({ viewport: { width: 640, height: 420 }, locale: 'en-US' });
+test.use({ viewport: { width: 640, height: 700 }, locale: 'en-US' });
 
 test('visual: provider marks for muse and mcode through ProviderMark', async ({ page }) => {
+  // Freeze the clock BEFORE the app loads.  The fixture builds its reset time
+  // from Date.now(), and the panel renders a live countdown ("resets in 3h
+  // 59m"), so without this the snapshot differs on every run and fails within
+  // the hour.  A mask over the panel would hide the very content this change
+  // added; freezing time keeps the countdown in the picture and makes it
+  // deterministic, which is the actual property worth pinning.
+  await page.clock.setFixedTime(new Date('2026-10-10T15:00:00Z'));
   await page.goto('/?fixture=provider-icons');
   await pinFonts(page);
 
@@ -51,13 +58,27 @@ test('visual: provider marks for muse and mcode through ProviderMark', async ({ 
   await expect(panel).toBeVisible();
   await expect(panel.getByText('Engine Quotas')).toBeVisible();
 
-  await expect(board).toHaveScreenshot('provider-icons-marks.png', {
-    ...stableShot,
-    mask: [page.getByTestId('provider-icons-quotas-panel')],
-  });
+
+  // The expanded panel is where the fix actually lives:  the old UI said
+  // "(93% / 3% for 5h / w)" and these are the words that replaced it.
+  const expanded = page.getByTestId('provider-icons-quotas-panel');
+  await expect(expanded.getByRole('button', { name: /Engine Quotas/ })).toBeVisible();
+  // Scope to the Muse Code block:  the MiniMax fixture below it has its own
+  // Weekly row, so an unscoped text match is ambiguous.
+  const museBlock = expanded.getByTestId('engine-quota-muse');
+  await expect(museBlock.getByText('5-Hour')).toBeVisible();
+  await expect(museBlock.getByText('Weekly').first()).toBeVisible();
+  await expect(museBlock.getByText('93% left', { exact: true })).toBeVisible();
+  await expect(museBlock.getByText('3% left', { exact: true })).toBeVisible();
+  // The one thing the packed chip could not say:  which window runs out first.
+  await expect(museBlock.getByText(/Weekly is nearly spent/)).toBeVisible();
+
+  await expect(board).toHaveScreenshot('provider-icons-marks.png', stableShot);
+>>>>>>> fad0153ae (Make the visual spec actually cover the quota panel)
 });
 
 test('visual: muse mark carries the Meta blue ramp, mcode carries the brand red ramp', async ({ page }) => {
+  await page.clock.setFixedTime(new Date('2026-10-10T15:00:00Z'));
   await page.goto('/?fixture=provider-icons');
   await pinFonts(page);
 
