@@ -1,4 +1,4 @@
-import { test, expect, type Page, type Route } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 
 // Visual coverage for the stacked queued steer pills (board b5146817).
 //
@@ -129,6 +129,72 @@ async function openBusyBot(page: Page) {
   return box;
 }
 
+const ROOM_THREAD = 'thread-room-steer';
+const ROOM_NAME = 'Writers Room';
+
+const room = {
+  id: 'room-steer',
+  threadId: ROOM_THREAD,
+  name: ROOM_NAME,
+  memberIds: [bot.id],
+  defaultResponder: { kind: 'member', botId: bot.id },
+  bulletin: '',
+  unread: false,
+  createdAt: 1_700_000_000_000,
+  busyBotId: bot.id,
+  setupCompletedAt: 1_700_000_000_000,
+  messages: [],
+};
+
+/** Answers the same startup surface as mockServer, but with a busy room on the
+ * sidebar too.  A room's queued send is held client-side and never hits the
+ * server while the room is busy, so this is allowed to answer 200 on /api/groups
+ * sends without ever receiving one. */
+async function mockServerWithRoom(page: Page) {
+  const sends: { text: string }[] = [];
+  await page.route('**/api/**', async (route) => {
+    const { pathname } = new URL(route.request().url());
+    const method = route.request().method();
+    const post = pathname.match(/^\/api\/bots\/([\w-]+)\/messages$/);
+    if (pathname === '/api/events') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: 'retry: 250\n\ndata: {"kind":"hello","resumed":false}\n\n',
+      });
+    }
+    if (pathname === '/api/bots' && method === 'GET') {
+      return route.fulfill(json({ bots: [bot], groups: [room], computerControl: {} }));
+    }
+    if (pathname.startsWith(`/api/bots/${bot.id}/queue`)) return route.fulfill(json({ ok: true }));
+    if (pathname.startsWith(`/api/bots/${bot.id}/interrupt`)) return route.fulfill(json({ ok: true }));
+    if (pathname.startsWith(`/api/groups/${room.id}/interrupt`)) return route.fulfill(json({ ok: true, stopped: true }));
+    if (post && method === 'POST') {
+      const body = route.request().postDataJSON() as { text?: string };
+      sends.push({ text: body.text ?? '' });
+      return route.fulfill(
+        json({ ok: true, queued: true, queueId: `q-${sends.length}`, threadId: QUEUE }, 202),
+      );
+    }
+    if (pathname === '/api/instances') return route.fulfill(json({ instances: [], describedAt: Date.now() }));
+    if (pathname === '/api/routines') return route.fulfill(json({ routines: [], runs: [] }));
+    if (pathname === '/api/webhooks') return route.fulfill(json({ webhooks: [], attempts: [], ingress: {} }));
+    if (pathname === '/api/resource-triggers') return route.fulfill(json({ triggers: [] }));
+    if (pathname === '/api/jobs') return route.fulfill(json({ jobs: [] }));
+    return route.fulfill(json({}));
+  });
+  return sends;
+}
+
+async function openBusyRoom(page: Page) {
+  await page.addInitScript(() => localStorage.setItem('omb-email-gate', 'skipped'));
+  await page.goto('/');
+  await page.getByText(ROOM_NAME, { exact: true }).first().click();
+  const box = page.getByRole('textbox', { name: `Message ${ROOM_NAME}` });
+  await expect(box).toBeVisible();
+  return box;
+}
+
 /** Sends `text` into the busy conversation and waits for its pill. */
 async function queueMessage(page: Page, box: ReturnType<typeof openBusyBot>, text: string, index: number) {
   await box.fill(text);
@@ -154,9 +220,10 @@ test('visual: one queued steer pill carries its label and three actions', async 
   await expect(page.getByRole('button', { name: 'Cancel queued message' })).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Steer Now' })).toHaveCount(1);
 
-  await expect(page.getByRole('button', { name: 'Edit queued message' }).first()).toHaveScreenshot(
-    'queued-steer-pill-single.png',
-    { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 },
+  const pillRow = page.getByRole('button', { name: 'Edit queued message' }).first().locator('xpath=..');
+  await expect(pillRow).toHaveScreenshot(
+    'composer-queued-pill.png',
+    { ...stableShot, maxDiffPixels: 0 },
   );
 });
 
@@ -184,9 +251,10 @@ test('visual: several queued pills stack without crowding out the composer', asy
   await expect(box).toBeVisible();
   await expect(box).toBeEditable();
 
-  await expect(page.getByRole('button', { name: 'Edit queued message' }).first()).toHaveScreenshot(
-    'queued-steer-pills-stacked.png',
-    { ...stableShot, maxDiffPixelRatio: 0.02, threshold: 0.2 },
+  const stack = page.getByRole('button', { name: 'Edit queued message' }).first().locator('xpath=ancestor::div[contains(@class, "flex flex-col")][1]');
+  await expect(stack).toHaveScreenshot(
+    'composer-queued-pills.png',
+    { ...stableShot, maxDiffPixels: 0 },
   );
 });
 
@@ -197,4 +265,24 @@ test('visual: an empty queue shows no queued row at all', async ({ page }) => {
 
   await expect(box).toBeVisible();
   await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(0);
+});
+
+test('visual: a queued message in a busy room shows the same pill row, with the group routing', async ({ page }) => {
+  const sends = await mockServerWithRoom(page);
+  const box = await openBusyRoom(page);
+  await pinFonts(page);
+
+  // The room is mid-turn; the message is held client-side and never POSTs.
+  await queueMessage(page, box, 'rerun the migration with the index dropped first', 1);
+  expect(sends).toHaveLength(0);
+
+  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Cancel queued message' })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Steer Now' })).toHaveCount(1);
+
+  const pillRow = page.getByRole('button', { name: 'Edit queued message' }).first().locator('xpath=..');
+  await expect(pillRow).toHaveScreenshot(
+    'composer-queued-pill-room.png',
+    { ...stableShot, maxDiffPixels: 0 },
+  );
 });
