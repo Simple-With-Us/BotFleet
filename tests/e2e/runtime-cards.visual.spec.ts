@@ -358,7 +358,9 @@ test('visual: SharedVpsRuntimeCard — new image ready, Switch to New Image with
     return route.fulfill({ status: 409, contentType: 'application/json', body: '{"error":"fixture"}' });
   });
   await button.click();
-  await expect(page.getByText('Switch to New Image?')).toBeVisible();
-  await expect(page.getByText(/Everything saved inside the container is reset/)).toBeVisible();
+  const dialog = page.getByRole('dialog', { name: 'Switch to New Image?' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText(/Everything saved inside the container is reset/)).toBeVisible();
+  await expect(dialog).toHaveScreenshot('runtime-cards-shared-vps-switch-confirm.png', stableShot);
   expect(posted).toBe(false);
 });
