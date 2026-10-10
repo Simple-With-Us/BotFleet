@@ -1104,6 +1104,10 @@ export async function vpsPrepareImageAhead(
 ): Promise<VpsImageBuildState> {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured — add an SSH config alias in App Settings → Connections"), { status: 409 });
+  // A present image makes the build a no-op; report "ready" instead of
+  // briefly advertising a build that will never run.
+  const alreadyPresent = await pinnedVpsImagePresent(alias, runner);
+  if (alreadyPresent) return vpsImageBuildState(alias, true);
   const flight = prepareVpsImage(alias, runner);
   // The HTTP request never waits on the build, so its failure must be
   // observed here or Node treats it as an unhandled rejection.  The error
