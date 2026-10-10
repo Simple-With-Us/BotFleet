@@ -124,7 +124,9 @@ function engineWindows(engine: QuotaEngineInfo): EngineWindows {
     }
   }
   const windows = quotaWindows(primary, secondary, { windowsLabel: label });
-  if (windows.length > 0 && resetsAt != null && windows[0]) windows[0].resetsAt = resetsAt;
+  if (windows.length > 0 && resetsAt != null) {
+    for (const w of windows) w.resetsAt = resetsAt;
+  }
   return { windows, label };
 }
 
