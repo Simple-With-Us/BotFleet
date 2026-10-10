@@ -130,6 +130,22 @@ function coerceUserAutoSide(side: keyof UserAutoPair, value: unknown): ConcreteS
   return DEFAULT_USER_AUTO_PAIR[side];
 }
 
+/** Platform and engine marks, for the Custom Palette only.  The preset skins
+ *  each restate `--color-mark` in styles.css; a palette has to supply one, and
+ *  the only two inputs here are the ground it paints and two fixed neutrals —
+ *  never `inkColor` and never `accentColor`.  That is the whole point: when a
+ *  palette puts main text on the accent colour, every logo that inherited ink
+ *  turned into an accent chip (owner 2026-10-10), and the rail of ten engines
+ *  stopped reading as engines. */
+const CUSTOM_PALETTE_MARK_ON_LIGHT_GROUND = "#2b3038";
+const CUSTOM_PALETTE_MARK_ON_DARK_GROUND = "#d8dbe0";
+
+function customPaletteMarkColor(appBg: string): string {
+  return relativeLightness(appBg) < 128
+    ? CUSTOM_PALETTE_MARK_ON_DARK_GROUND
+    : CUSTOM_PALETTE_MARK_ON_LIGHT_GROUND;
+}
+
 function relativeLightness(hex: string): number {
   const clean = hex.replace("#", "").trim();
   const full = clean.length === 3 ? [...clean].map((c) => c + c).join("") : clean;
@@ -290,6 +306,7 @@ export function applyCustomTheme(theme: CustomThemeConfig): void {
   root.style.setProperty("--color-hairline", theme.hairlineColor);
   root.style.setProperty("--color-ink", theme.inkColor);
   root.style.setProperty("--color-ink-secondary", theme.inkSecondaryColor);
+  root.style.setProperty("--color-mark", customPaletteMarkColor(theme.appBg));
   root.style.setProperty("--color-accent", theme.accentColor);
   root.style.setProperty("--color-accent-border", theme.accentColor);
   root.style.setProperty("--color-accent-text", theme.accentColor);
@@ -353,6 +370,7 @@ export function applySkin(id: SkinId): void {
     root.style.removeProperty("--color-hairline");
     root.style.removeProperty("--color-ink");
     root.style.removeProperty("--color-ink-secondary");
+    root.style.removeProperty("--color-mark");
     root.style.removeProperty("--color-bubble-user");
 
     const customAccent = readCustomAccent();

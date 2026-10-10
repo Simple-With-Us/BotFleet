@@ -145,6 +145,7 @@ import {
   enableQuotaCooldownPersist,
   inheritedUnattended,
   dshVisionSelection,
+  isDshVisionlessModel,
   lastTurnStartIndex,
   parseQuotaResetTime,
   providerErrorCodeFromStopReason,
@@ -301,6 +302,7 @@ import {
   routinePromptFor,
 } from "./tools/prompts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
+import { DSH_DEEPSEEK_FLASH_MODEL } from "./drivers/acp/dsh.ts";
 import {
   ActiveTurnOwners,
   ExactTurnLeases,
@@ -5850,10 +5852,12 @@ async function startTurn(
     }
   }
 
-  // DeepSeek-V4.1-Pro lacks vision; visual data sharing automatically routes
-  // to DeepSeek-V4.1-Flash and updates the stored selection so the switch persists.
-  if (instanceId === "dsh" && model === "DeepSeek-V4.1-Pro" && text.includes("<attached-image ")) {
-    model = "DeepSeek-V4.1-Flash";
+  // The DSH Pro row lacks vision; visual data sharing automatically routes to
+  // the Flash row and updates the stored selection so the switch persists.
+  // `isDshVisionlessModel` is the same answer the chain rewrite below gives, so
+  // this path and that one cannot disagree about which ids count as Pro.
+  if (instanceId === "dsh" && isDshVisionlessModel(model) && text.includes("<attached-image ")) {
+    model = DSH_DEEPSEEK_FLASH_MODEL;
     // Persist against the selection that owns this thread, and keep the
     // dispatch fallback policy aligned with the new primary and its chain.
     fallbackPolicy = dshVisionSelection(fallbackPolicy);

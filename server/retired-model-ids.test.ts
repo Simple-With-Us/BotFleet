@@ -18,6 +18,16 @@ describe("rewriteRetiredModelId", () => {
     expect(rewriteRetiredModelId("deepseek-v4-flash")).toBe("DeepSeek-V4.1-Flash");
   });
 
+  it("maps the misnamed DeepSeek-V4.1-Pro row onto DeepSeek-V4-Pro", () => {
+    // DeepSeek never published a 4.1 Pro (its catalog is DeepSeek-V4.1-Flash
+    // plus DeepSeek-V4-Pro-0813), so this is a rename, not a retirement with a
+    // successor.  Bots saved against the old id would otherwise send an id no
+    // engine accepts.
+    expect(rewriteRetiredModelId("DeepSeek-V4.1-Pro")).toBe("DeepSeek-V4-Pro");
+    expect(isRetiredModelId("DeepSeek-V4.1-Pro")).toBe(true);
+    expect(rewriteRetiredModelId("DeepSeek-V4-Pro")).toBe("DeepSeek-V4-Pro");
+  });
+
   it("leaves live catalog ids alone, including near-miss stems", () => {
     expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-Preview")).toBe("MiniMax-M3.1-Flash-Preview");
     expect(rewriteRetiredModelId("MiniMax-M2.7-highspeed")).toBe("MiniMax-M2.7-highspeed");
@@ -52,6 +62,26 @@ describe("rewriteModelSelection", () => {
       fallbacks: [
         { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
         { instanceId: "grok", model: "grok-4.6" },
+      ],
+    });
+  });
+
+  it("rewrites a saved Pro selection and its DSH fallback", () => {
+    const { selection, changed } = rewriteModelSelection({
+      instanceId: "dsh",
+      model: "DeepSeek-V4.1-Pro",
+      fallbacks: [
+        { instanceId: "dsh", model: "DeepSeek-V4.1-Pro" },
+        { instanceId: "dsh", model: "DeepSeek-V4.1-Flash" },
+      ],
+    });
+    expect(changed).toBe(true);
+    expect(selection).toEqual({
+      instanceId: "dsh",
+      model: "DeepSeek-V4-Pro",
+      fallbacks: [
+        { instanceId: "dsh", model: "DeepSeek-V4-Pro" },
+        { instanceId: "dsh", model: "DeepSeek-V4.1-Flash" },
       ],
     });
   });

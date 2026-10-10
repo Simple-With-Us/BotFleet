@@ -238,6 +238,19 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "engine-marks") {
+  // Visual-spec harness (tests/e2e/engine-marks.visual.spec.ts): the model
+  // picker's engine rail, in a preset skin or in the Custom Palette whose main
+  // text is its accent.  Dynamically imported so the fixture chunk is not paid
+  // for in the real app boot path.
+  void import("./components/EngineMarksVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "bypass-warning") {
   // Visual-spec harness (tests/e2e/bypass-warning.visual.spec.ts): the Permission
   // Bypass confirmation dialog, standard, high-risk model and busy.
