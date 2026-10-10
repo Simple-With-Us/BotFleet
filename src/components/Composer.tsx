@@ -336,7 +336,7 @@ function ComposerInner({
     return state.pendingQueued?.[bot.threadId] ?? [];
   }, [group, queued, bot, state.pendingQueued]);
 
-  const handleEditQueued = useCallback((entry: { queueId: string; text: string }) => {
+  const handleEditQueued = useCallback((entry: { queueId: string; text: string; reply?: Message }) => {
     if (group && queued) {
       // The held message carries more than its text: the draft it took, which
       // is where the attachment chips live, and the reply it was aimed at.
@@ -350,8 +350,19 @@ function ComposerInner({
       setText(entry.text);
       setQueued(null);
     } else if (bot) {
+      // The bot's queued entry carries reply (the Message, not just the id)
+      // because the server only knows replyToId: putting only entry.text back
+      // would drop the reply quote on the floor.  Restore through the same
+      // path a refused send uses so the quote comes back with the text.
+      const sent: SentDraft<Message> = {
+        draftId,
+        threadId,
+        text: entry.text,
+        attachments: [],
+        reply: entry.reply,
+      };
       dispatch({ type: "cancelQueued", botId: bot.id, queueId: entry.queueId });
-      setText(entry.text);
+      restoreFailedSend(sent);
     }
     requestAnimationFrame(() => {
       const input = inputRef.current;
@@ -363,7 +374,7 @@ function ComposerInner({
       const end = input.value.length;
       input.setSelectionRange(end, end);
     });
-  }, [group, bot, queued, dispatch, setText, restoreFailedSend]);
+  }, [group, bot, queued, draftId, threadId, dispatch, restoreFailedSend]);
 
   const handleCancelQueued = useCallback((queueId: string) => {
     if (group) {
@@ -458,7 +469,7 @@ function ComposerInner({
       dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, onError });
+      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, reply: replyTo ?? undefined, onError });
       if (busy && opts?.steerNow) {
         dispatch({ type: "interrupt", botId: bot.id });
       }

@@ -939,7 +939,7 @@ export interface AppState {
   } | null;
   /** 1:1 queue-fallback lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
-  pendingQueued: Record<string, Array<{ queueId: string; text: string; at: number }>>;
+  pendingQueued: Record<string, Array<{ queueId: string; text: string; at: number; reply?: Message }>>;
   /** queueIds whose drain frame beat the POST continuation. One-shot and
    * bounded to a short event window so other clients cannot grow it forever. */
   consumedQueueIds: Record<string, true>;
@@ -1076,12 +1076,16 @@ export type Action =
       botId: string;
       text: string;
       replyToId?: string;
+      /** The full reply Message, kept on the queue entry so an edit can
+       * restore it.  The server only sees replyToId; the client needs the
+       * Message to put the quote back through restoreFailedSend. */
+      reply?: Message;
       /** The server refused the send or could not be reached.  Called with the
        * reason, after the error banner is set, so a caller that cleared its
        * input can put it back. */
       onError?: (message: string) => void;
     }
-  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number }
+  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number; reply?: Message }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
   | { type: "cancelQueued"; botId: string; queueId: string }
   | { type: "editMessage"; botId: string; messageId: string; text: string }
@@ -1901,6 +1905,7 @@ export function reducer(state: AppState, action: Action): AppState {
             {
               queueId: action.queueId,
               text: action.text,
+              reply: action.reply,
               // Stamp once at remember-time; ChatView must not remint Date.now().
               at: action.at ?? Date.now(),
             },
@@ -2620,6 +2625,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                     threadId: parsed.data.threadId,
                     queueId: parsed.data.queueId,
                     text: action.text,
+                    reply: action.reply,
                     at: sentAt,
                   });
                 }
