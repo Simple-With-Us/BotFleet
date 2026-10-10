@@ -11,10 +11,12 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { BUILT_IN_DRIVERS } from "../builtIn.ts";
 import {
+  type AuthIndex,
   MUSE_EFFORT_LEVELS,
   MUSE_LOGIN_NOTE,
   MuseAgentDriver,
   STATIC_MUSE_MODELS,
+  authIndexSchema,
   museAuthenticated,
 } from "./muse.ts";
 
@@ -223,6 +225,29 @@ describe("Muse Code driver", () => {
     expect(museAuthenticated({ HOME: otherHome })).toBe(false);
   });
 
+  it("exposes the schema and a type derived from it, so they cannot drift", () => {
+    // The driver reads the index through `authIndexSchema`, and `AuthIndex` is
+    // derived from that same schema.  Asserting a good fixture against both is
+    // what makes "the type matches the runtime check" a checked fact rather
+    // than a claim -- if the schema changes shape without the type following,
+    // this stops compiling or stops passing.
+    const good = {
+      schema_version: 1,
+      providers: {
+        somefutureprovider: { storage: "file" },
+        meta: { storage: "keychain", mechanism: "browser_session" },
+      },
+    };
+    const parsed = authIndexSchema.safeParse(good);
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    const index: AuthIndex = parsed.data;
+    expect(index.providers?.meta?.storage).toBe("keychain");
+    // Unmodelled keys survive, because a provider we do not know about must
+    // not invalidate the whole file.
+    expect(index.providers?.somefutureprovider).toEqual({ storage: "file" });
+  });
+
   it("survives an index whose shape is not what the schema expects", () => {
     // The index is a file another program writes, so its shape is not ours to
     // assume.  Every one of these is valid JSON that would have indexed into
@@ -253,7 +278,10 @@ describe("Muse Code driver", () => {
     writeFileSync(
       join(dir, "auth.json"),
       JSON.stringify({
-        providers: { futureprovider: { storage: "file", somethingNew: 1 }, meta: { storage: "keychain" } },
+        providers: {
+          futureprovider: { storage: "file", somethingNew: 1 },
+          meta: { storage: "keychain" },
+        },
       }),
       "utf8",
     );

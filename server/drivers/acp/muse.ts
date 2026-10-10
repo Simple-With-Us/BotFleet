@@ -134,7 +134,7 @@ function museAuthIndexPath(env: Record<string, string | undefined>): string {
  *  `.passthrough()` because a provider we do not model must not invalidate the
  *  whole index; `.catch(undefined)` per field so a `meta` entry carrying an
  *  unexpected shape reads as "no credential" instead of failing the parse. */
-const authIndexSchema = z
+export const authIndexSchema = z
   .object({
     providers: z
       .object({
@@ -149,6 +149,11 @@ const authIndexSchema = z
       .catch(undefined),
   })
   .passthrough();
+
+/** The validated shape of the credential index, derived from the schema itself
+ *  so the type and the runtime check cannot drift apart.  Exported with it so
+ *  the auth tests can assert against the same contract the driver reads. */
+export type AuthIndex = z.infer<typeof authIndexSchema>;
 
 /** The credential backend the CLI recorded, or null when there is no index.
  *
@@ -174,8 +179,11 @@ function museCredentialStorage(env: Record<string, string | undefined>): string 
     // provider we do not model must not read as "signed out".
     const parsed = authIndexSchema.safeParse(JSON.parse(raw));
     if (!parsed.success) return null;
-    const storage = parsed.data.providers?.meta?.storage;
-    return storage ?? null;
+    // Annotating with the inferred type is the point of exporting the schema:
+    // if the runtime check and the declared shape ever disagree, this line
+    // stops compiling rather than the drift going unnoticed.
+    const index: AuthIndex = parsed.data;
+    return index.providers?.meta?.storage ?? null;
   } catch {
     // A malformed index is not evidence of a credential, and must never throw
     // out of a snapshot path.

@@ -6,6 +6,8 @@ import { test, expect, type Page } from '@playwright/test';
 // of the panel detail so a regression to the named windows, bars, or
 // "nearly spent" callout cannot hide behind a change to the rail.
 
+const stableShot = { animations: 'disabled' as const, caret: 'hide' as const };
+
 async function pinFonts(page: Page): Promise<void> {
   await page.addStyleTag({
     content: `
@@ -46,7 +48,12 @@ test('visual: engine quotas panel disclosure', async ({ page }) => {
   // first.
   await expect(museBlock.getByText(/Weekly is nearly spent/)).toBeVisible();
 
-  // Screenshot settings (maxDiffPixelRatio, threshold, animations, caret)
-  // come from playwright.config's expect.toHaveScreenshot.
-  await expect(detail).toHaveScreenshot('engine-quotas-panel.png');
+  // Tolerance is inline rather than inherited, matching the other visual specs:
+  // a later edit to playwright.config's defaults must not silently tighten or
+  // loosen this comparison.
+  await expect(detail).toHaveScreenshot('engine-quotas-panel.png', {
+    ...stableShot,
+    maxDiffPixelRatio: 0.02,
+    threshold: 0.2,
+  });
 });

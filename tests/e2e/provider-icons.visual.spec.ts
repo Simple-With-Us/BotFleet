@@ -8,6 +8,8 @@ import { test, expect, type Page } from '@playwright/test';
 //
 // There is no visual-tests/ directory; this follows tests/e2e/visual.spec.ts.
 
+const stableShot = { animations: 'disabled' as const, caret: 'hide' as const };
+
 async function pinFonts(page: Page): Promise<void> {
   await page.addStyleTag({
     content: `
@@ -56,9 +58,14 @@ test('visual: provider marks for muse and mcode through ProviderMark', async ({ 
   // engine-quotas-panel.visual.spec.ts, which screenshots the panel detail on
   // its own; this spec is about the marks, and only checks the panel mounts.
 
-  // Screenshot settings (maxDiffPixelRatio, threshold, animations, caret)
-  // come from playwright.config's expect.toHaveScreenshot.
-  await expect(board).toHaveScreenshot('provider-icons-marks.png');
+  // Tolerance is inline rather than inherited, matching the other visual specs:
+  // a later edit to playwright.config's defaults must not silently tighten or
+  // loosen this comparison.
+  await expect(board).toHaveScreenshot('provider-icons-marks.png', {
+    ...stableShot,
+    maxDiffPixelRatio: 0.02,
+    threshold: 0.2,
+  });
 });
 
 test('visual: muse mark carries the Meta blue ramp, mcode carries the brand red ramp', async ({ page }) => {
