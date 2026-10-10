@@ -22,6 +22,7 @@ import type { BotColor, BotMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
+import type { Attachment } from "@/lib/composer-attachments";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
 import type { ReviewHook } from "../../shared/auto-review";
@@ -939,7 +940,7 @@ export interface AppState {
   } | null;
   /** 1:1 queue-fallback lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
-  pendingQueued: Record<string, Array<{ queueId: string; text: string; at: number; reply?: Message }>>;
+  pendingQueued: Record<string, Array<{ queueId: string; text: string; at: number; reply?: Message; attachments: Attachment[] }>>;
   /** queueIds whose drain frame beat the POST continuation. One-shot and
    * bounded to a short event window so other clients cannot grow it forever. */
   consumedQueueIds: Record<string, true>;
@@ -1080,12 +1081,17 @@ export type Action =
        * restore it.  The server only sees replyToId; the client needs the
        * Message to put the quote back through restoreFailedSend. */
       reply?: Message;
+      /** The attachments the composer held, kept on the queue entry so an
+       * edit can put them back: the composed `text` carries <attached-image …>
+       * placeholders, and restoring only the text would leave those
+       * placeholders stranded on a chip that no longer exists. */
+      attachments?: Attachment[];
       /** The server refused the send or could not be reached.  Called with the
        * reason, after the error banner is set, so a caller that cleared its
        * input can put it back. */
       onError?: (message: string) => void;
     }
-  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number; reply?: Message }
+  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number; reply?: Message; attachments?: Attachment[] }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
   | { type: "cancelQueued"; botId: string; queueId: string }
   | { type: "editMessage"; botId: string; messageId: string; text: string }
@@ -1906,6 +1912,7 @@ export function reducer(state: AppState, action: Action): AppState {
               queueId: action.queueId,
               text: action.text,
               reply: action.reply,
+              attachments: action.attachments ?? [],
               // Stamp once at remember-time; ChatView must not remint Date.now().
               at: action.at ?? Date.now(),
             },
@@ -2626,6 +2633,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                     queueId: parsed.data.queueId,
                     text: action.text,
                     reply: action.reply,
+                    attachments: action.attachments ?? [],
                     at: sentAt,
                   });
                 }

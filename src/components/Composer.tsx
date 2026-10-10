@@ -336,7 +336,7 @@ function ComposerInner({
     return state.pendingQueued?.[bot.threadId] ?? [];
   }, [group, queued, bot, state.pendingQueued]);
 
-  const handleEditQueued = useCallback((entry: { queueId: string; text: string; reply?: Message }) => {
+  const handleEditQueued = useCallback((entry: { queueId: string; text: string; reply?: Message; attachments: Attachment[] }) => {
     if (group && queued) {
       // The held message carries more than its text: the draft it took, which
       // is where the attachment chips live, and the reply it was aimed at.
@@ -351,14 +351,15 @@ function ComposerInner({
       setQueued(null);
     } else if (bot) {
       // The bot's queued entry carries reply (the Message, not just the id)
-      // because the server only knows replyToId: putting only entry.text back
-      // would drop the reply quote on the floor.  Restore through the same
-      // path a refused send uses so the quote comes back with the text.
+      // and the attachments, because the server only sees replyToId: putting
+      // only entry.text back would drop the reply quote and the attachment
+      // chips on the floor.  Restore through the same path a refused send
+      // uses so the quote and the chips come back with the text.
       const sent: SentDraft<Message> = {
         draftId,
         threadId,
         text: entry.text,
-        attachments: [],
+        attachments: entry.attachments,
         reply: entry.reply,
       };
       dispatch({ type: "cancelQueued", botId: bot.id, queueId: entry.queueId });
@@ -469,7 +470,7 @@ function ComposerInner({
       dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, reply: replyTo ?? undefined, onError });
+      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, reply: replyTo ?? undefined, attachments, onError });
       if (busy && opts?.steerNow) {
         dispatch({ type: "interrupt", botId: bot.id });
       }
