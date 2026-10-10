@@ -398,8 +398,8 @@ test('editing a queued bot message waits for the harness before restoring the dr
 
   // While the DELETE is in flight the message is still queued, so the draft
   // must NOT be back in the box: a fast resend here would put the original and
-  // the copy on the wire together.
-  await page.waitForTimeout(300);
+  // the copy on the wire together.  The assertions below are the wait; no bare
+  // sleep, because a fixed 300ms is either too short or a lie on a slow run.
   await expect(box).toHaveValue('');
   await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
 
