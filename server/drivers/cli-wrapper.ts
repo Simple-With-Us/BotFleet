@@ -30,12 +30,28 @@ const MAX_PROMPT_ARG_BYTES = 32_000;
 /** Runtime config is a contract boundary, so it is parsed rather than
  * asserted.  Every field defaults, so an instance saved with no config still
  * decodes; a field saved with the wrong type is rejected, and registry.ts
- * turns that rejection into a shadow entry whose reason is this error. */
-export const CliWrapperConfigSchema = z.object({
-  command: z.string().min(1).default("echo"),
-  args: z.array(z.string()).default([]),
-  passPromptAs: z.enum(["stdin", "arg"]).default("arg"),
-}).strict();
+ * turns that rejection into a shadow entry whose reason is this error.
+ *
+ * Unknown keys are rejected too, because a typo (`commmand`) would otherwise
+ * decode to the default `echo` and quietly run the wrong program.  The
+ * exception is the keys the harness writes into EVERY instance's config,
+ * whatever its driver: the Engines page stores `fullAuto` (Bypass permissions)
+ * and `cli`, and the credential flow stores `key` and `credentialStorage`
+ * (`patchInstanceConfig` in server/config.ts).  The wrapper owns none of them,
+ * so it accepts and drops them; a strict schema that refused them turned a
+ * ticked checkbox into a shadow entry that took the engine offline. */
+export const CliWrapperConfigSchema = z
+  .object({
+    command: z.string().min(1).default("echo"),
+    args: z.array(z.string()).default([]),
+    passPromptAs: z.enum(["stdin", "arg"]).default("arg"),
+    fullAuto: z.boolean().optional(),
+    cli: z.string().optional(),
+    key: z.string().optional(),
+    credentialStorage: z.string().optional(),
+  })
+  .strict()
+  .transform(({ command, args, passPromptAs }) => ({ command, args, passPromptAs }));
 
 export type CliWrapperConfig = z.infer<typeof CliWrapperConfigSchema>;
 

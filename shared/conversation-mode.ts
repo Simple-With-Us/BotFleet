@@ -3,12 +3,19 @@
  *
  * - `simple` — Grok-style.  Named bots, one conversation each.  Rooms are
  *   group threads: one shared conversation per room that invited bots and
- *   the user write in.  Extra bot tasks stay saved but stay hidden.
- * - `projects` — Claude / Codex / Antigravity style.  No named bots.  The
- *   same custom room word is a category, and any number of threads can sit
- *   under it.  Each thread can carry its own model and fallbacks.
- *   Incoming webhooks, resource samples, and schedules each reuse one
- *   thread of that type per category.
+ *   the user write in.  Extra threads left over from Projects stay saved and
+ *   out of the sidebar, unless merging them was chosen when switching to
+ *   Simple.
+ * - `projects` — Claude / Codex / Antigravity style.  Bots stay in the
+ *   roster, which is headed Threads, and each bot and each room can hold
+ *   any number of threads, nested under it in the sidebar.  A bot thread
+ *   can be tied to one room (its App) and runs in that room's folder.
+ *   Incoming webhooks, resource samples, and schedules write into the bot's
+ *   open thread in both arrangements.  Projects also keeps sending a source
+ *   to a thread that already carries its key.
+ *
+ * Projects does not hide bots.  The server honors a per-thread model, but no
+ * shipped client can set one, so the Settings copy does not promise it.
  *
  * They are not the same feature with two labels.  The room-terminology
  * setting only names them (Channel, Group, Project, or a custom pair).
@@ -74,18 +81,23 @@ export function automationLaneTitle(
   return source === "webhook" || source === "resource" ? "Triggers" : "Routines";
 }
 
+/** What each arrangement says about itself in Settings.  A subtitle takes the
+ * person's own singular room word, already lowercased, so a workspace that
+ * calls rooms channels never reads "room".  Neither subtitle may promise
+ * hidden bots or a per-thread model:  Projects lists bots as Simple does, and
+ * no shipped client sets a thread's model. */
 export const CONVERSATION_MODE_COPY: Record<
   ConversationMode,
-  { title: string; subtitle: string }
+  { title: string; subtitle: (room: string) => string }
 > = {
   simple: {
     title: "Simple",
-    subtitle:
+    subtitle: () =>
       "Named bots with one conversation each, plus group threads that invited bots and you can all write in.",
   },
   projects: {
     title: "Projects",
-    subtitle:
-      "Categories with any number of threads under them.\u00a0 Each thread picks a model.\u00a0 Named bots stay hidden.",
+    subtitle: (room) =>
+      `Any number of threads under each bot and ${room}, nested in the sidebar.\u00a0 A thread can be tied to one ${room}.`,
   },
 };
