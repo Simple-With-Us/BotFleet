@@ -5,6 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { createConnection, createServer, type AddressInfo } from "node:net";
+import { z } from "zod";
 
 import {
   BASE_IMAGE,
@@ -267,6 +268,11 @@ export interface VpsComputerStatus {
   container_name: string;
   container_id: string | null;
   image_id: string | null;
+  /** The image the running container was actually started from.  Bots refuse
+   *  a container when this differs from `image_id`; label drift alone does
+   *  NOT trigger the refuse / swap because the swap destroys the container
+   *  filesystem. */
+  container_image_id: string | null;
   /** The host's pinned-image build: idle, building, failed, or ready. */
   imageBuild: VpsImageBuildState;
   /** A BotFleet container exists but is not on the pinned image, so bots
@@ -529,6 +535,7 @@ function emptyStatus(target: VpsTarget, alias: string | null): VpsComputerStatus
     container_name: target.containerName,
     container_id: null,
     image_id: null,
+    container_image_id: null,
     imageBuild: { phase: "idle", startedAt: null, elapsedMs: null, error: null },
     imageOutdated: false,
   };
@@ -673,16 +680,13 @@ async function inspectVpsComputer(
 
   let inspectedImageId: string | null = null;
   try {
-    const inspected = JSON.parse((await run(["image", "inspect", VPS_IMAGE])).stdout) as Array<{
-      Id?: string;
-      id?: string;
-      Config?: { Labels?: Record<string, string> };
-      config?: { Labels?: Record<string, string>; labels?: Record<string, string> };
-    }>;
+    const inspected = VpsDockerImageInspectSchema.parse(
+      JSON.parse((await run(["image", "inspect", VPS_IMAGE])).stdout),
+    );
     status.daemonUp = true;
     const image = inspected[0];
-    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels;
-    const imageId = image?.Id ?? image?.id;
+    const labels = image.Config?.Labels ?? image.config?.Labels ?? image.config?.labels;
+    const imageId = image.Id ?? image.id;
     inspectedImageId = imageId && IMAGE_ID.test(imageId) ? imageId : null;
     status.image_id = inspectedImageId;
     status.image = Boolean(inspectedImageId) && imageLabelsMatch(labels);
@@ -741,6 +745,8 @@ async function inspectVpsComputer(
       detail?.Image === inspectedImageId &&
       imageLabelsMatch(labels) &&
       labels?.[VPS_VIEWER_LABEL] === VIEWER_VERSION;
+    const containerImageRef = detail?.Image;
+    status.container_image_id = containerImageRef && IMAGE_ID.test(containerImageRef) ? containerImageRef : null;
     const managedFlag =
       labels?.[VPS_MANAGED_LABEL] === "1" ||
       LEGACY_VPS_MANAGED_LABELS.some((key) => labels?.[key] === "1");
@@ -1026,19 +1032,37 @@ export function vpsImageBuildState(alias: string | null, imagePresent: boolean, 
   return { phase: "idle", startedAt: null, elapsedMs: null, error: null };
 }
 
+/** "docker image inspect" payload, parsed at the SSH trust line.  Docker and
+ *  Podman use different capitalisation (Id / id, Config / config / labels);
+ *  the schema accepts both so a runner swap does not silently mis-parse. */
+const VpsDockerImageInspectSchema = z.array(
+  z.object({
+    Id: z.string().optional(),
+    id: z.string().optional(),
+    Config: z
+      .object({
+        Labels: z.record(z.string(), z.string()).optional(),
+      })
+      .optional(),
+    config: z
+      .object({
+        Labels: z.record(z.string(), z.string()).optional(),
+        labels: z.record(z.string(), z.string()).optional(),
+      })
+      .optional(),
+  }),
+);
+
 /** True when the pinned tag is present on the VPS with BotFleet's labels.
  * Throws on a transport failure; a clean "no such image" is false. */
 async function pinnedVpsImagePresent(alias: string, runner: VpsCommandRunner): Promise<boolean> {
   try {
-    const inspected = JSON.parse((await runner(vpsDockerArgs(alias, ["image", "inspect", VPS_IMAGE]), { timeoutMs: 30_000 })).stdout) as Array<{
-      Id?: string;
-      id?: string;
-      Config?: { Labels?: Record<string, string> };
-      config?: { Labels?: Record<string, string>; labels?: Record<string, string> };
-    }>;
+    const inspected = VpsDockerImageInspectSchema.parse(
+      JSON.parse((await runner(vpsDockerArgs(alias, ["image", "inspect", VPS_IMAGE]), { timeoutMs: 30_000 })).stdout),
+    );
     const image = inspected[0];
-    const imageId = image?.Id ?? image?.id;
-    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels;
+    const imageId = image.Id ?? image.id;
+    const labels = image.Config?.Labels ?? image.config?.Labels ?? image.config?.labels;
     return Boolean(imageId && IMAGE_ID.test(imageId)) && imageLabelsMatch(labels);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1145,9 +1169,16 @@ export async function vpsSwitchToPreparedImage(
 }
 
 /** A container BotFleet created that is not on the pinned image: bots
- * refuse it, and a swap onto the prepared image is how it is replaced. */
+ * refuse it, and a swap onto the prepared image is how it is replaced.
+ * Label drift alone does NOT count — reconciling it would destroy the
+ * container filesystem for a problem the swap cannot fix. */
 export function vpsContainerOutdated(status: VpsComputerStatus): boolean {
-  return status.daemonUp && status.container !== "missing" && status.managed && !status.imageMatches;
+  return (
+    status.daemonUp &&
+    status.container !== "missing" &&
+    status.managed &&
+    status.container_image_id !== status.image_id
+  );
 }
 
 function withImageBuildState(status: VpsComputerStatus, alias: string | null): VpsComputerStatus {

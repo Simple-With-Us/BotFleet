@@ -163,7 +163,7 @@ function fixture({
             },
           },
            Id: containerId,
-          Image: state.image ? state.containerImageId : "old-image-id",
+          Image: state.containerImageId,
           HostConfig: {
             Binds: mounts ? ["/host:/container"] : [],
             VolumesFrom: [],
