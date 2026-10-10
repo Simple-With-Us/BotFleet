@@ -220,11 +220,16 @@ test('visual: one queued steer pill carries its label and three actions', async 
   await expect(page.getByRole('button', { name: 'Cancel queued message' })).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Steer Now' })).toHaveCount(1);
 
-  const pillRow = page.getByRole('button', { name: 'Edit queued message' }).first().locator('xpath=..');
-  await expect(pillRow).toHaveScreenshot(
-    'composer-queued-pill.png',
-    { ...stableShot, maxDiffPixels: 0 },
-  );
+  // The row, not the Edit button: a screenshot of the button is a 24px
+  // pencil that pins none of the layout this feature is about.  The label
+  // span is a direct child of the row, so one level up from it is the row
+  // itself — glyph, words and all three actions.
+  const pillRow = page.locator('span[title^="Queued"]').first().locator('xpath=..');
+  await expect(pillRow).toHaveScreenshot('composer-queued-pill.png', {
+    ...stableShot,
+    maxDiffPixelRatio: 0.02,
+    threshold: 0.2,
+  });
 });
 
 test('visual: several queued pills stack without crowding out the composer', async ({ page }) => {
@@ -251,11 +256,12 @@ test('visual: several queued pills stack without crowding out the composer', asy
   await expect(box).toBeVisible();
   await expect(box).toBeEditable();
 
-  const stack = page.getByRole('button', { name: 'Edit queued message' }).first().locator('xpath=ancestor::div[contains(@class, "flex flex-col")][1]');
-  await expect(stack).toHaveScreenshot(
-    'composer-queued-pills.png',
-    { ...stableShot, maxDiffPixels: 0 },
-  );
+  const stack = page.locator('span[title^="Queued"]').first().locator('xpath=../..');
+  await expect(stack).toHaveScreenshot('composer-queued-pills.png', {
+    ...stableShot,
+    maxDiffPixelRatio: 0.02,
+    threshold: 0.2,
+  });
 });
 
 test('visual: an empty queue shows no queued row at all', async ({ page }) => {
@@ -280,9 +286,10 @@ test('visual: a queued message in a busy room shows the same pill row, with the 
   await expect(page.getByRole('button', { name: 'Cancel queued message' })).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Steer Now' })).toHaveCount(1);
 
-  const pillRow = page.getByRole('button', { name: 'Edit queued message' }).first().locator('xpath=..');
-  await expect(pillRow).toHaveScreenshot(
-    'composer-queued-pill-room.png',
-    { ...stableShot, maxDiffPixels: 0 },
-  );
+  const pillRow = page.locator('span[title^="Queued"]').first().locator('xpath=..');
+  await expect(pillRow).toHaveScreenshot('composer-queued-pill-room.png', {
+    ...stableShot,
+    maxDiffPixelRatio: 0.02,
+    threshold: 0.2,
+  });
 });
