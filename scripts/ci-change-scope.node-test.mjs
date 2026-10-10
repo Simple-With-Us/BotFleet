@@ -214,3 +214,30 @@ test("every host runs the canonical complete test chain without masking failures
   assert.equal(gates[0].if, "needs.changes.outputs.docs_only != 'true'");
   assert.notEqual(gates[0]["continue-on-error"], true);
 });
+
+test("the test job checks out full history so the effort ledger guard can find its merge base", () => {
+  // A depth-1 checkout has no remote main branch.  The guard (scripts/effort-log-integrity.node-test.mjs)
+  // then had no comparison point and skipped itself on every pull request.
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const checkout = workflow.jobs.test.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+  assert.ok(checkout, "the test job must check out the repository");
+  assert.equal(checkout.with?.["fetch-depth"], 0);
+});
+
+test("a documentation-only change still runs the effort ledger guard", () => {
+  // docs/EFFORT-LOG.md is documentation, so a ledger-only pull request skips the test job's
+  // full chain.  The classify job already has full history, so it carries the guard.
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const steps = workflow.jobs.changes.steps;
+  const checkout = steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+  assert.equal(checkout.with["fetch-depth"], 0);
+  const guard = steps.find((step) => /effort-log-integrity\.node-test\.mjs/.test(step.run ?? ""));
+  assert.ok(guard, "the changes job must run the effort ledger guard");
+  assert.equal(guard.if, checkout.if, "the guard runs exactly when the checkout does");
+  assert.notEqual(guard["continue-on-error"], true);
+  assert.ok(
+    steps.indexOf(guard) > steps.findIndex((step) => step.id === "scope"),
+    "the guard runs after the scope outputs are written",
+  );
+  assert.equal(classifyCIPaths(["docs/EFFORT-LOG.md"]).docsOnly, true);
+});

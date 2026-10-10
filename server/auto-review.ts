@@ -78,24 +78,37 @@ export function shouldReview(context: ReviewContext): boolean {
  *  - host control, which Bypass never covers and the reviewer never answers;
  *  - the harness's own `job_start` in full auto, which the owner ruled never
  *    becomes a card (server/auto-approve.ts `autoVerdict`), so a refusal
- *    would have nowhere honest to go. */
+ *    would have nowhere honest to go.
+ *
+ * A person's own "always allow" is a third grant, and it is reviewed in one
+ * case only: On, on a turn the harness holds for review (`heldTurn`).  Watch
+ * reviews every step such a turn takes, but a step whose ask reaches the card
+ * is handed to the card (`ReviewWatch.markAsked`), and an always-allow answers
+ * at the card with no review.  Without this, On reviewed less than Watch for
+ * exactly the actions a person had pre-approved.  Anywhere else an
+ * always-allow stays the person's decision, as it was. */
 export function reviewsGrant(context: {
   source: AutoVerdictSource | undefined;
   mode: AutoReviewMode;
   approvalScope: "local-computer" | "disposable-computer" | undefined;
   /** The ask is the harness's own `job_start` (`isOwnJobStartRequest`). */
   ownJobStart: boolean;
+  /** The turn is one the harness holds in its asking mode for review
+   *  (`shouldHoldForReview`), so the step watch hands its asks to the card. */
+  heldTurn?: boolean;
 }): boolean {
-  return (
-    context.mode !== "off" &&
-    context.source === "auto-mode" &&
-    context.approvalScope !== "local-computer" &&
-    !context.ownJobStart
-  );
+  if (context.mode === "off" || context.approvalScope === "local-computer" || context.ownJobStart) return false;
+  if (context.source === "auto-mode") return true;
+  return context.source === "always-allow" && context.mode === "enforce" && context.heldTurn === true;
 }
 
-/** Which switch produced a grant, in the words the held card uses. */
-export function grantLabel(rule: string | undefined): "Bypass" | "Auto mode" {
+/** Which grant let an ask through, in the words the held card uses. */
+export type GrantLabel = "Bypass" | "Auto mode" | "Always allow";
+
+/** Which switch produced a grant.  An always-allow carries its own key as the
+ *  rule, so it is told apart by its source, never by the rule. */
+export function grantLabel(rule: string | undefined, source?: AutoVerdictSource): GrantLabel {
+  if (source === "always-allow") return "Always allow";
   return rule === PERMISSION_BYPASS_RULE ? "Bypass" : "Auto mode";
 }
 
@@ -304,14 +317,15 @@ export async function reviewWithReviewers(
 
 /** The held card's line for an Auto or Bypass grant the reviewer did not
  * let through under On. */
-export function heldGrantText(label: "Bypass" | "Auto mode", result: ReviewResult): string {
+export function heldGrantText(label: GrantLabel, result: ReviewResult): string {
+  const lead = label === "Always allow" ? "You set this to always allow, but" : `${label} is on, but`;
   if (result.kind === "verdict") {
-    return `${label} is on, but the reviewer (${result.reviewer.name}) did not approve this: ${result.verdict.reason}`;
+    return `${lead} the reviewer (${result.reviewer.name}) did not approve this: ${result.verdict.reason}`;
   }
   if (result.kind === "capped") {
-    return `${label} is on, but auto-review reached its limit of ${result.limit} reviews for this turn, so this waits for you.`;
+    return `${lead} auto-review reached its limit of ${result.limit} reviews for this turn, so this waits for you.`;
   }
-  return `${label} is on, but no reviewer could check this one, so it waits for you.`;
+  return `${lead} no reviewer could check this one, so it waits for you.`;
 }
 
 /** The decision-log rule for a review that produced no verdict. */
@@ -360,6 +374,11 @@ export class ReviewBudget {
 
   exhausted(key: string): boolean {
     return (this.used.get(key) ?? 0) >= this.limit();
+  }
+
+  /** How many reviewer calls this turn may still take. */
+  remaining(key: string): number {
+    return Math.max(0, this.limit() - (this.used.get(key) ?? 0));
   }
 
   /** True the first time it is asked about a capped turn, so the cap is

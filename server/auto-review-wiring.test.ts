@@ -27,6 +27,8 @@
 //  15. An HTTP lane's own action is reviewed first by a different engine
 //  16. A held turn's asked step is judged once, at the card, not twice
 //  17. A message to another bot (ask_bot) is watched like any other step
+//  18. On, held turn: a person's always-allow is reviewed too, so On never
+//      reviews less than Watch
 import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type ServerResponse } from "node:http";
@@ -420,6 +422,76 @@ posixOnly("auto-review on an engine without a reviewer of its own", () => {
     } finally {
       actionVerdicts.clear();
     }
+  }, 90_000);
+
+  // Finding 1 of the follow-up review.  A held turn hands each ask to the card,
+  // and the step watch drops the step once it asks.  An always-allow answered
+  // at the card with no review, so On reviewed less than Watch did for the very
+  // actions a person had pre-approved.
+  it("On, held turn: a person's always-allow is reviewed, and a refusal hands the ask to them as a card", async () => {
+    verdict = { allow: false, reason: "not what the owner asked for" };
+    actionVerdicts.set("run", { allow: true, reason: "a harmless step" });
+    try {
+      const bot = await makeBot("acpAutoAsk", {
+        name: "Held Always",
+        autoReview: "enforce",
+        alwaysAllow: [approvalKey("shell", "echo hi")],
+      });
+      await send(bot);
+      const row = await decision((r) => r.botId === bot.id && r.decision === "card-shown" && r.source === "auto-review");
+      expect(row, `the always-allow ask was never reviewed. stderr:\n${stderr.slice(-2000)}`).toMatchObject({
+        rule: "not what the owner asked for",
+        reviewer: "reviewer",
+        tool: "shell",
+      });
+      const open = await card(bot.threadId);
+      expect(open?.card?.answered).toBeUndefined();
+      expect(open?.card?.held).toBe(
+        "You set this to always allow, but the reviewer (Stub Reviewer) did not approve this: not what the owner asked for",
+      );
+      // the grant did not answer it behind the reviewer's back
+      const rows: DecisionRow[] = (await api("GET", "/api/decisions")).body.decisions;
+      expect(rows.some((r) => r.botId === bot.id && r.decision === "auto-approved")).toBe(false);
+      await release(bot, open!.card!.requestId!);
+    } finally {
+      actionVerdicts.clear();
+    }
+  }, 90_000);
+
+  it("On, held turn: an always-allow the reviewer approves is answered, and the log says the reviewer approved it", async () => {
+    verdict = { allow: true, reason: "a harmless echo" };
+    const bot = await makeBot("acpAutoAsk", {
+      name: "Held Always Allowed",
+      autoReview: "enforce",
+      alwaysAllow: [approvalKey("shell", "echo hi")],
+    });
+    await send(bot);
+    const row = await decision((r) => r.botId === bot.id && r.decision === "auto-approved");
+    expect(row, `no review approval. stderr:\n${stderr.slice(-2000)}`).toMatchObject({
+      source: "auto-review",
+      rule: "a harmless echo",
+      reviewer: "reviewer",
+    });
+    const chip = await waitFor(async () =>
+      (await threadMessages(bot.threadId)).find((m) => m.tool?.name?.includes("review approved (Stub Reviewer)")),
+    );
+    expect(chip?.tool?.name).toContain("(always allowed), review approved (Stub Reviewer): echo hi");
+  }, 90_000);
+
+  it("On, a turn that is not held: an always-allow stays the person's own decision", async () => {
+    // `acp` asks natively and is not held (it is not a full-auto instance), so
+    // On changes nothing about an action the person already allowed
+    verdict = { allow: false, reason: "would refuse anything" };
+    const before = reviewPrompts.length;
+    const bot = await makeBot("acp", {
+      name: "Unheld Always",
+      autoReview: "enforce",
+      alwaysAllow: [approvalKey("shell", "echo hi")],
+    });
+    await send(bot);
+    const row = await decision((r) => r.botId === bot.id && r.decision === "auto-approved");
+    expect(row).toMatchObject({ source: "always-allow", rule: approvalKey("shell", "echo hi") });
+    expect(reviewPrompts.slice(before).filter((prompt) => prompt.includes("echo hi"))).toEqual([]);
   }, 90_000);
 
   it("On, held turn: a step the engine takes without asking is still watched, and a refusal stops the turn", async () => {

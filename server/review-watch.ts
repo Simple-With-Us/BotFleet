@@ -33,7 +33,13 @@
 //     answer broke the contract, too many steps were waiting, or the turn's
 //     review limit was reached) stops the turn the same way a refusal does.
 //
-// It never approves anything, so it is safe on an unattended turn too.
+// It never approves anything, so it is safe on an unattended turn too.  That
+// is also why it needs no `local-computer` exclusion, which the card paths do
+// (server/auto-review.ts `shouldReview`, `reviewsGrant`): there the reviewer
+// would ANSWER an ask for control of the owner's own machine, and it never
+// may.  Here `ReviewWatchDeps` has no way to answer anything.  A step on the
+// host computer is reviewed like any other, and the reviewer can only record
+// its opinion or, under On, stop the turn.
 //
 // Steps are reviewed one at a time per TURN, in the order they started, so a
 // chatty engine costs one reviewer call at a time rather than a burst, and a
@@ -41,6 +47,14 @@
 // after it.  The queue belongs to the turn, not the thread: in a room two
 // members run side by side, and one member's backlog must neither delay the
 // other's reviews nor push the other's next step into the queue limit.
+//
+// A turn can end with steps still queued: an engine that reports its work
+// afterwards (Box Agent) announces a burst of steps and completes at once.
+// Those steps are still reviewed, late.  Nothing is left to stop by then, so
+// a refusal is shown and recorded as a flag, a step nobody could check is
+// recorded as skipped, and neither ever stops a turn (see `turnEnded`).
+// Dropping them unreviewed would let a fast engine finish before its first
+// step was looked at, and turn On into Off for that engine.
 
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { AutoReviewMode } from "../shared/auto-review.ts";
@@ -54,6 +68,7 @@ import {
   type ReviewSpend,
 } from "./auto-review.ts";
 import type { DecisionRow } from "./decision-log.ts";
+import { HARNESS_TOOLS } from "./tools/registry.ts";
 
 /** The kinds of step worth a reviewer call: anything that changes something
  *  or reaches outside the bot (a command, an edit, a fetch, a connected-app
@@ -83,14 +98,44 @@ export function watchesKind(kind: ToolKind | undefined): boolean {
   return kind === undefined || WATCHED_KINDS.has(kind);
 }
 
-/** A message to another bot, however the engine spells the tool
- *  (`mcp__agents__ask_bot`, a bare `ask_bot`).  It is classed as a delegation
- *  (`task`), which is not watched, but a peer acts on it, so it is. */
-const PEER_MESSAGE_TOOL = /(?:^|__)(?:ask_bot|delegate_bot)$/;
+/** The harness's own tools that change something or reach someone, by the
+ *  names the registry gives them: a message to a peer (`ask_bot`,
+ *  `delegate_bot`), a new bot, a credential request, a routine, a Zulip post
+ *  or reply, a job start or kill.  They are what a bot calls on the `agents`
+ *  MCP server.  Their reads (`list_bots`, `job_output`) are not here, for the
+ *  same reason no other read is reviewed.  Derived from the registry, so a new
+ *  tool that writes is watched without anyone remembering to add it. */
+const WATCHED_HARNESS_TOOLS: readonly string[] = HARNESS_TOOLS.filter(
+  (tool) => tool.surfaces.mcp && tool.sideEffect === "write",
+).map((tool) => tool.name);
 
-/** Whether a step is worth a reviewer call: its kind, or a message to a peer. */
+/** Whether a step is one of the harness's own writing tools, however the
+ *  engine spells it.  The name is classed as a delegation (`task`) on every
+ *  engine that prefixes the server, because the server is called `agents` and
+ *  `classifyTool` reads "agent" anywhere in a name, so the kind cannot be
+ *  trusted to select these.
+ *
+ *  The name is cut at `__` and at anything that is not a letter, digit or
+ *  underscore, and a piece counts when it IS a tool name or ends in `_` and
+ *  one.  That covers `mcp__agents__job_start` (Claude), a bare `job_start`
+ *  (Codex reports an MCP tool by its tool name alone), `agents.job_start`,
+ *  `agents/job_start`, `mcp:agents/job_start`, `mcp_agents_job_start`,
+ *  `agents_job_start`, and an ACP title that wraps the name in words
+ *  (`Tool: agents/job_start`, `job_start (agents MCP Server)`).  An ACP agent
+ *  chooses its own `tool_call` title and this repository holds no captured
+ *  frame of an MCP call, so those last two are the spellings engines are
+ *  known to use rather than ones read out of a fixture.  A name that merely
+ *  begins with a tool name (`ask_bot_later`) is not one.  Matching more only
+ *  costs a reviewer call; matching less leaves a tool nobody reviews. */
+export function isWatchedHarnessTool(tool: string): boolean {
+  const pieces = tool.toLowerCase().split(/__|[^a-z0-9_]+/);
+  return pieces.some((piece) => WATCHED_HARNESS_TOOLS.some((name) => piece === name || piece.endsWith(`_${name}`)));
+}
+
+/** Whether a step is worth a reviewer call: its kind, or one of the
+ *  harness's own writing tools. */
 export function watchesStep(step: Pick<WatchedStep, "tool" | "toolKind">): boolean {
-  return watchesKind(step.toolKind) || PEER_MESSAGE_TOOL.test(step.tool);
+  return watchesKind(step.toolKind) || isWatchedHarnessTool(step.tool);
 }
 
 export interface WatchedStep {
@@ -159,6 +204,19 @@ interface Pending {
   /** Not reviewed before this time (ms on the watch's clock): a held turn's
    *  step gives its ask a moment to arrive. */
   readyAt: number;
+  /** Set when the step's turn ended while it waited: what was left of the
+   *  turn's review limit at that moment.  The turn's budget is released when
+   *  the turn settles, so a late review is charged to this instead and can
+   *  neither overspend the limit nor leave a stale entry behind. */
+  lateBudget?: ReviewSpend;
+}
+
+/** `left` reviewer calls, spent one at a time.  `limit` stays the turn's
+ *  configured limit, not `left`: a capped late review reports it as "review
+ *  limit of N reached for this turn", and N is that limit. */
+function snapshotSpend(left: number, limit: number): ReviewSpend {
+  let remaining = left;
+  return { limit, spend: () => (remaining > 0 ? (remaining--, true) : false) };
 }
 
 /** Why On stopped a turn without a refusal: the rule for the log and the
@@ -173,6 +231,14 @@ export class ReviewWatch {
   private readonly queues = new Map<string, Pending[]>();
   private readonly draining = new Map<string, { threadId: string; run: Promise<void> }>();
   private readonly stoppedTurns = new Set<string>();
+  // The steps whose turn ended while they waited.  By identity, not by turn
+  // key: an engine that reports no turn id shares one key across turns, and a
+  // late step must never be taken for part of the turn running now.
+  private readonly endedSteps = new WeakSet<WatchedStep>();
+  // The step each turn's drain has taken off the queue and not finished with,
+  // whether it is waiting out its grace or being reviewed: `turnEnded` cannot
+  // find it in the queue, and it is just as much a step of the turn that ended.
+  private readonly handling = new Map<string, Pending>();
   // The steps whose ask reached the card, by turn.  An id is only meaningful
   // inside its turn: an engine may number its steps again in the next one.
   private readonly asked = new Map<string, Set<string>>();
@@ -253,17 +319,40 @@ export class ReviewWatch {
     }
   }
 
-  /** A turn settled: forget what was latched, queued or asked for it.
-   *  Without a turn id nothing says which one, so everything on the thread
-   *  goes, as `RunningTurns.completed` does.  A stop is latched only for the
-   *  life of its turn, so the next turn on the thread is watched again. */
+  /** A turn settled: forget what was latched or asked for it, and hand what
+   *  it still had queued to a late review.  Without a turn id nothing says
+   *  which one, so everything on the thread goes, as `RunningTurns.completed`
+   *  does.  A stop is latched only for the life of its turn, so the next turn
+   *  on the thread is watched again.
+   *
+   *  The queue is NOT discarded.  Steps that started before the turn ended
+   *  are reviewed all the same, and since nothing is left to stop they can
+   *  only be flagged or recorded: a refusal becomes a flag, and a step nobody
+   *  could check is recorded as skipped.  Their grace to ask is over, so they
+   *  go straight to the reviewer, and they spend what the turn had left of its
+   *  review limit (`Pending.lateBudget`). */
   turnEnded(threadId: string, turnId: string | undefined): void {
     const prefix = `${threadId}:`;
     const onThread = (key: string) => (turnId === undefined ? key.startsWith(prefix) : key === this.key(threadId, turnId));
     // deleting the entry being visited is well defined for a Set or a Map
     for (const key of this.stoppedTurns) if (onThread(key)) this.stoppedTurns.delete(key);
     for (const key of this.asked.keys()) if (onThread(key)) this.asked.delete(key);
-    for (const key of this.queues.keys()) if (onThread(key)) this.queues.delete(key);
+    const keys = new Set([...this.handling.keys(), ...this.queues.keys()].filter(onThread));
+    for (const key of keys) {
+      // the queue key and the budget key are built the same way
+      const left = this.deps.budget?.remaining(key);
+      // `left` is what the late reviews may spend; the limit they report is
+      // still the turn's own, so "review limit of N reached" names N
+      const lateBudget = left === undefined ? undefined : snapshotSpend(left, this.deps.budget!.limit());
+      // the step the drain is waiting on or reviewing is no longer in the
+      // queue, and is as much a step of the turn that ended as the rest
+      const current = this.handling.get(key);
+      for (const pending of [...(current ? [current] : []), ...(this.queues.get(key) ?? [])]) {
+        this.endedSteps.add(pending.step);
+        pending.readyAt = 0;
+        pending.lateBudget = lateBudget;
+      }
+    }
   }
 
   /** Resolves once every step queued on the thread (or on every thread) has
@@ -290,8 +379,12 @@ export class ReviewWatch {
     return this.deps.sleep ? this.deps.sleep(ms) : new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  /** Whether the step's turn was stopped.  A step whose turn ended is never
+   *  covered by a stop: with no turn id every turn on the thread shares one
+   *  key, so the stop latched for the turn running now is not the end of a
+   *  review owed for an earlier one. */
   private isStopped(step: WatchedStep): boolean {
-    return this.stoppedTurns.has(this.key(step.threadId, step.turnId));
+    return !this.endedSteps.has(step) && this.stoppedTurns.has(this.key(step.threadId, step.turnId));
   }
 
   /** Whether this step's ask reached the card.  An ask that named no turn is
@@ -312,9 +405,22 @@ export class ReviewWatch {
     }
   }
 
-  /** Drop whatever else this turn queued. */
+  /** Drop whatever else this turn queued.  A step left over from an earlier
+   *  turn that shared this key is not this turn's to drop. */
   private dropTurn(step: WatchedStep): void {
-    this.queues.delete(this.key(step.threadId, step.turnId));
+    const key = this.key(step.threadId, step.turnId);
+    const leftOver = (this.queues.get(key) ?? []).filter((pending) => this.endedSteps.has(pending.step));
+    if (leftOver.length > 0) this.queues.set(key, leftOver);
+    else this.queues.delete(key);
+  }
+
+  /** Whether there is nothing left to stop for this step: its turn ended
+   *  while it waited, or ended while it was being reviewed.  A step that
+   *  waited is judged by that alone, never by `turnRunning`: an engine with no
+   *  turn id shares one key across turns, and a turn running NOW is not the
+   *  one this step belonged to. */
+  private turnOver(step: WatchedStep): boolean {
+    return this.endedSteps.has(step) || !this.deps.turnRunning(step.threadId, step.turnId);
   }
 
   private rowBase(step: WatchedStep, plan: WatchPlan): Omit<DecisionRow, "at" | "decision" | "source"> {
@@ -348,28 +454,38 @@ export class ReviewWatch {
         this.queues.delete(turnKey);
         return;
       }
-      if (this.isStopped(next.step) || this.wasAsked(next.step)) continue;
-      const wait = next.readyAt - this.now();
-      if (wait > 0) {
-        await this.sleep(wait);
-        // its ask may have reached the card, or the turn been stopped, while
-        // the step waited
-        if (this.isStopped(next.step) || this.wasAsked(next.step)) continue;
-      }
+      this.handling.set(turnKey, next);
       try {
-        await this.reviewStep(next);
-      } catch (error) {
-        // An audit that throws must never take the harness down with it, and
-        // under On a step nobody finished checking is not let through.
-        console.error("review-watch: a step review failed", error);
-        try {
-          this.failClosed(next.step, next.plan, {
-            rule: "the review failed",
-            chip: `review stopped the turn at ${next.step.tool}: the review failed`,
-          });
-        } catch (stopError) {
-          console.error("review-watch: could not stop the turn", stopError);
-        }
+        await this.handle(next);
+      } finally {
+        this.handling.delete(turnKey);
+      }
+    }
+  }
+
+  /** One step off the queue: wait out its grace, then review it. */
+  private async handle(next: Pending): Promise<void> {
+    if (this.isStopped(next.step) || this.wasAsked(next.step)) return;
+    const wait = next.readyAt - this.now();
+    if (wait > 0) {
+      await this.sleep(wait);
+      // its ask may have reached the card, or the turn been stopped, while
+      // the step waited
+      if (this.isStopped(next.step) || this.wasAsked(next.step)) return;
+    }
+    try {
+      await this.reviewStep(next);
+    } catch (error) {
+      // An audit that throws must never take the harness down with it, and
+      // under On a step nobody finished checking is not let through.
+      console.error("review-watch: a step review failed", error);
+      try {
+        this.failClosed(next.step, next.plan, {
+          rule: "the review failed",
+          chip: `review stopped the turn at ${next.step.tool}: the review failed`,
+        });
+      } catch (stopError) {
+        console.error("review-watch: could not stop the turn", stopError);
       }
     }
   }
@@ -387,11 +503,22 @@ export class ReviewWatch {
    *  that it stopped recording, and records nothing more for the turn. */
   private capped(step: WatchedStep, plan: WatchPlan, limit: number): void {
     const rule = noVerdictRule({ kind: "capped", limit });
-    if (plan.mode === "enforce") {
+    if (plan.mode === "enforce" && !this.endedSteps.has(step)) {
       this.stop(step, plan, {
         rule,
         chip: `review stopped the turn at ${step.tool}: it reached its limit of ${limit} reviews for this turn`,
       });
+      return;
+    }
+    if (plan.mode === "enforce") {
+      // Late step: stop() -> turnOver() produces its own note
+      this.stop(step, plan, { rule, chip: "" });
+      return;
+    }
+    if (this.endedSteps.has(step)) {
+      // The turn is over, so there is nothing to pause, and the steps behind
+      // this one are not ours to drop: each is a step nobody checked.
+      this.deps.log({ ...this.rowBase(step, plan), decision: "review-skipped", source: "auto-review-watch", rule });
       return;
     }
     this.dropTurn(step);
@@ -405,7 +532,10 @@ export class ReviewWatch {
   private stop(step: WatchedStep, plan: WatchPlan, why: FailClosed, reviewer?: Reviewer): void {
     if (this.isStopped(step)) return;
     const base = this.rowBase(step, plan);
-    if (!this.deps.turnRunning(step.threadId, step.turnId)) {
+    if (this.turnOver(step)) {
+      // Not a stop, so no claim of one; but On promised to check this step
+      // and could not, and a log row alone is easy to miss.
+      this.deps.note(step.threadId, `review could not check ${step.tool} before the turn ended: ${why.rule}`, false);
       this.deps.log({ ...base, decision: "review-skipped", source: "auto-review-watch", rule: why.rule });
       return;
     }
@@ -424,9 +554,9 @@ export class ReviewWatch {
     });
   }
 
-  private async reviewStep({ step, plan }: Pending): Promise<void> {
+  private async reviewStep({ step, plan, lateBudget }: Pending): Promise<void> {
     const review = this.deps.review ?? ((reviewers, request, options) => defaultReview(reviewers, request, options));
-    const budget = this.deps.budget?.forTurn(ReviewBudget.key(step.threadId, step.turnId));
+    const budget = lateBudget ?? this.deps.budget?.forTurn(ReviewBudget.key(step.threadId, step.turnId));
     const result = await review(
       plan.reviewers,
       {
@@ -475,9 +605,10 @@ export class ReviewWatch {
       return;
     }
     if (this.isStopped(step)) return;
-    if (!this.deps.turnRunning(step.threadId, step.turnId)) {
-      // The turn ended while the reviewer thought.  Nothing is left to stop,
-      // so the refusal is shown and recorded rather than claimed as a stop.
+    if (this.turnOver(step)) {
+      // The turn ended while the step waited or the reviewer thought.  Nothing
+      // is left to stop, so the refusal is shown and recorded rather than
+      // claimed as a stop.
       this.deps.note(step.threadId, `review flagged ${step.tool} after the turn ended (${reviewer.name}): ${verdict.reason}`, false);
       this.deps.log({
         ...base,

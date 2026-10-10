@@ -347,6 +347,53 @@ export async function listPersonalVoices(options) {
   return (await listPersonalVoicesResult(options)).voices;
 }
 
+/** The longest reply the renderer will read aloud (MAX_LOCAL_SPEECH_CHARS in
+ * src/lib/tts/index.ts).  The speaking deadline grows with the text, so an
+ * unbounded request would also be an unbounded wait. */
+export const MAX_PERSONAL_VOICE_TEXT_CHARS = 12_000;
+const MAX_PERSONAL_VOICE_ID_CHARS = 256;
+
+function hasControlCharacter(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
+/* oxlint-disable anti-slop/no-runtime-typeof */
+/**
+ * The renderer chooses the text and the voice id, so the main process checks
+ * them before it spawns anything: a string of text that is not blank and not
+ * longer than a reply can be, and a voice id that is a string, short, free of
+ * control characters, and either empty (the caller named no voice, so the
+ * helper picks the first Personal Voice) or a `personal:` or `apple-personal:`
+ * id.  A plain voice name such as `Samantha` is not a Personal Voice id and is
+ * refused here, as the helper also refuses to match an ordinary voice.
+ * Hand-written guards: the packaged app has no node_modules for a schema.
+ */
+export function validatePersonalVoiceRequest(text, voiceIdOrNone) {
+  if (typeof text !== "string" || !text.trim()) {
+    return { ok: false, error: "Personal Voice needs some text to speak." };
+  }
+  if (text.length > MAX_PERSONAL_VOICE_TEXT_CHARS) {
+    return { ok: false, error: "That text is too long to read aloud." };
+  }
+  // The bridge declares the id optional (`speak(text, voiceId?, options?)`), and a call
+  // without one has always meant "no voice named", so a missing id is the empty id.
+  const voiceId = voiceIdOrNone ?? "";
+  if (
+    typeof voiceId !== "string"
+    || voiceId.length > MAX_PERSONAL_VOICE_ID_CHARS
+    || hasControlCharacter(voiceId)
+    || (voiceId !== "" && !/^(?:apple-)?personal:/.test(voiceId))
+  ) {
+    return { ok: false, error: "That is not a Personal Voice id." };
+  }
+  return { ok: true, text, voiceId };
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
 /**
  * Speak `text` with a Personal Voice.  `options.onRange({ location, length,
  * elapsedMs })` is called as each word is about to be spoken: `location` and
@@ -356,6 +403,10 @@ export async function listPersonalVoices(options) {
  * batch.  Ranges from a stopped or replaced session are never delivered.
  */
 export function speakPersonalVoice(text, voiceId, options = {}) {
+  // Validate before anything else: a bad request must not cut off the speech
+  // already in progress, write files, or spawn a process.
+  const request = validatePersonalVoiceRequest(text, voiceId);
+  if (!request.ok) return Promise.reject(new Error(request.error));
   stopPersonalVoice();
   if (process.platform !== "darwin") {
     return Promise.reject(new Error("Personal Voice requires macOS."));
@@ -379,7 +430,7 @@ export function speakPersonalVoice(text, voiceId, options = {}) {
     const textPath = path.join(sessionDir, "text.txt");
     writeFileSync(outputPath, "");
     writeFileSync(errorPath, "");
-    writeFileSync(textPath, String(text ?? ""), { mode: 0o600 });
+    writeFileSync(textPath, request.text, { mode: 0o600 });
 
     const proc = spawn(
       "/usr/bin/open",
@@ -395,7 +446,7 @@ export function speakPersonalVoice(text, voiceId, options = {}) {
         "--args",
         "--speak-personal-voice",
         "--voice-id",
-        String(voiceId ?? ""),
+        request.voiceId,
         "--text-file",
         textPath,
         "--stop-file",

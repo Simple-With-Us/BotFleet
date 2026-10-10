@@ -165,6 +165,13 @@ function usage() {
                               [--grace SECONDS | --wait-for-idle [MINUTES] | --force]
   update-botfleet-mac.mjs unquiesce
 
+With no --target, update and prepare (run through scripts/update-botfleet.sh) install the newest
+commit on origin/main whose hosted Mac build succeeded and that is newer than the installed build,
+rather than main's tip, whose build is usually still running or was cancelled by the next push.
+They print which commit was chosen and how far behind the tip it is, and stop with an explanation
+when nothing newer has a successful build.  --target installs exactly the commit named, and
+BOTFLEET_UPDATE_SOURCE=local keeps main's tip.
+
 Any of update/prepare/apply also accepts --progress PATH [--run-id ID], which records each
 step and the final outcome to a JSON file a detached caller can read while the run is going.
 
@@ -193,7 +200,12 @@ out, everything held runs now and the update stops without changing anything.
 
 --force (-f, or BOTFLEET_FORCE=1) skips the grace and interrupts at once, and also reinstalls when
 the checkout is already current.  Interrupted work is saved to pending-update-resume.json and
-resumed after the update.  A live room turn still refuses it.`;
+resumed after the update.  A live room turn still refuses it.
+
+A slow boot is not a failure.  After the new build starts, apply waits up to 15 minutes for the
+harness (and then the app) to come up, saying once a minute how long it has waited
+(BOTFLEET_STARTUP_TIMEOUT_MS, in milliseconds, overrides).  Only a real crash ends the wait early:
+the harness's launchd job exiting or being killed, or the app disappearing after it started.`;
 }
 
 async function exists(path) {
@@ -2657,12 +2669,176 @@ export async function ensureBotFleetRunning({
   say("Starting BotFleet again");
   await start({ appStillQuitting: quitting.length > 0 });
   const deadline = now() + Math.max(0, timeoutMs);
+  const tick = startupProgress("BotFleet", { report: say, now });
   for (;;) {
     if (await answers()) return { started: true, mixed };
     if (now() >= deadline) break;
+    tick();
     await wait(Math.min(pollMs, Math.max(0, deadline - now())));
   }
   throw new Error(`BotFleet was not running and did not answer within ${describeWindow(timeoutMs)} of being started${mixed ? ` (${mixed})` : ""}`);
+}
+
+/**
+ * How long the updater waits for a freshly started harness (and the app) to
+ * come up before it calls the update failed and rolls back.
+ *
+ * It was 90 seconds, and on 2026-10-09 that was shorter than a healthy boot:
+ * at load averages of 150 to 900 the new harness logged "booting" and was still
+ * working through its start-up when the window closed, so a perfectly good
+ * build was rolled back, and the restored build then took about two minutes to
+ * become ready itself.  A slow boot is not a failure, so the wait is long and
+ * reports its progress; what ends it early is a real crash (see
+ * `launchdExitReason`), not the clock.  BOTFLEET_STARTUP_TIMEOUT_MS overrides.
+ */
+export const DEFAULT_STARTUP_TIMEOUT_MS = 15 * 60_000;
+const STARTUP_POLL_MS = 500;
+const STARTUP_REPORT_EVERY_MS = 60_000;
+
+/**
+ * A function to call on every pass of a start-up wait.  Once a minute it says
+ * how long the wait has run ("Waiting for the new version to start, 3 min so
+ * far"), so a slow boot is visibly a wait and not a hang.
+ */
+export function startupProgress(what, { report, now = Date.now, everyMs = STARTUP_REPORT_EVERY_MS } = {}) {
+  const startedAt = now();
+  let next = startedAt + everyMs;
+  return () => {
+    const current = now();
+    if (current < next) return;
+    next = current + everyMs;
+    const minutes = Math.max(1, Math.round((current - startedAt) / 60_000));
+    (report ?? (() => {}))(`Waiting for ${what} to start, ${minutes} min so far`);
+  };
+}
+
+/**
+ * Wait for `attempt` to report a safe snapshot, as long as `timeoutMs` allows,
+ * unless `crashed` says the thing being waited for has really died.
+ *
+ * `crashed` resolves to a reason string or null.  It is only asked after an
+ * attempt that was not safe, so a build that came up between two polls is never
+ * called crashed.  A crash ends the wait at once, with that reason: waiting
+ * longer for a process that has exited can only waste the owner's time.
+ */
+export async function waitForStartup({
+  attempt,
+  crashed = async () => null,
+  timeoutMs,
+  what,
+  fallback,
+  report,
+  now = Date.now,
+  wait = sleep,
+  pollMs = STARTUP_POLL_MS,
+  reportEveryMs = STARTUP_REPORT_EVERY_MS,
+}) {
+  const deadline = now() + Math.max(0, timeoutMs);
+  const tick = startupProgress(what, { report, now, everyMs: reportEveryMs });
+  let snapshot;
+  for (;;) {
+    snapshot = await attempt();
+    if (snapshot?.safe) return snapshot;
+    const crash = await crashed();
+    if (crash) {
+      throw new Error(`${what[0].toUpperCase()}${what.slice(1)} stopped before it was ready: ${crash}.${snapshot?.reason ? `  Last check: ${snapshot.reason}` : ""}`);
+    }
+    if (now() >= deadline) break;
+    tick();
+    await wait(Math.min(pollMs, Math.max(0, deadline - now())));
+  }
+  throw new Error(snapshot?.reason || fallback);
+}
+
+/**
+ * Wait for the updated application to be running as one exact process and to
+ * have attached to the single authenticated data owner.
+ *
+ * Two kinds of "not yet" are told apart.  An app that has not produced a
+ * process at all is only slow to launch (a loaded Mac can take minutes), so
+ * nothing about pid stability is said of it and the wait ends, if it must, with
+ * the plain timeout message.  An app that was running and is now gone has
+ * crashed, and that ends the wait at once.  Pid stability is judged only once
+ * there are pids to judge.
+ */
+export async function waitForStableApplication({
+  samplePids,
+  attachmentError: checkAttachment,
+  timeoutMs,
+  report,
+  now = Date.now,
+  wait = sleep,
+  sampleGapMs = 1_000,
+}) {
+  const deadline = now() + Math.max(0, timeoutMs);
+  let appError = "Timeout waiting for application to stabilize";
+  let attachmentError = "Timeout waiting for UI attachment";
+  const tick = startupProgress("the app", { report, now });
+  let appWasRunning = false;
+  while (now() < deadline) {
+    const firstPids = await samplePids();
+    await wait(sampleGapMs);
+    const secondPids = await samplePids();
+    if (firstPids.length || secondPids.length) {
+      appWasRunning = true;
+      appError = stableApplicationProcessError(firstPids, secondPids, true);
+      if (!appError) {
+        attachmentError = await checkAttachment();
+        if (!attachmentError) return;
+      }
+    } else if (appWasRunning) {
+      throw new Error("The updated application exited after it had started");
+    }
+    tick();
+  }
+  if (appError) throw new Error(appError);
+  throw new Error(attachmentError);
+}
+
+/**
+ * The few fields of `launchctl print <domain>/<label>` that say whether the job
+ * has exited since it was bootstrapped.  A job that is still booting is running
+ * and has never exited; one that crashed has a last exit code or signal, and
+ * KeepAlive may already have started it again (runs above one).
+ */
+export function parseLaunchdJob(text) {
+  const field = (name) => new RegExp(`^[ \\t]*${name} = (.+)$`, "m").exec(String(text))?.[1]?.trim();
+  const runs = Number(field("runs"));
+  return {
+    state: field("state"),
+    runs: Number.isInteger(runs) ? runs : null,
+    lastExit: field("last exit code") ?? field("last exit status"),
+    signal: field("last terminating signal"),
+  };
+}
+
+/** Why a launchd job counts as crashed, or null while it is merely running. */
+export function describeLaunchdExit(job) {
+  // "0" is launchd's no-signal sentinel, and a non-empty string is truthy, so
+  // `job?.signal` alone misreads a healthy job as one killed by signal 0.
+  const signal = job?.signal;
+  if (signal && signal !== "0" && signal !== 0) return `its process was killed by a signal (${signal})`;
+  if (job?.lastExit && !/never exited/i.test(job.lastExit)) {
+    return /^\d+$/.test(job.lastExit) ? `its process exited with code ${job.lastExit}` : `its process exited (${job.lastExit})`;
+  }
+  if (job?.runs !== null && job?.runs > 1) return `launchd has had to start it ${job.runs} times`;
+  return null;
+}
+
+/**
+ * The reason any of these launchd jobs has exited since it was bootstrapped,
+ * or null.  A label launchd does not know is not a crash (it may belong to the
+ * other plist name), and neither is a `print` that fails: the wait just keeps
+ * going and the timeout is the backstop.
+ */
+export async function launchdExitReason(labels, { print }) {
+  for (const label of labels) {
+    const result = await print(label);
+    if (result.code !== 0) continue;
+    const reason = describeLaunchdExit(parseLaunchdJob(result.stdout));
+    if (reason) return `launchd job ${label}: ${reason}`;
+  }
+  return null;
 }
 
 /** How long apply waits for a non-BotFleet process to let go of BotFleet state. */
@@ -3055,7 +3231,10 @@ function createConfig(parsed) {
     gracefulExitMs: Number(process.env.BOTFLEET_GRACEFUL_EXIT_MS || 20_000),
     termExitMs: Number(process.env.BOTFLEET_TERM_EXIT_MS || 60_000),
     exitWaitMs: environmentMs("BOTFLEET_EXIT_WAIT_MS", DEFAULT_EXIT_WAIT_MS),
-    startupTimeoutMs: Number(process.env.BOTFLEET_STARTUP_TIMEOUT_MS || 90_000),
+    // How long a freshly started harness (and the app) may take to come up
+    // before the update is called failed.  Long on purpose; see
+    // DEFAULT_STARTUP_TIMEOUT_MS.
+    startupTimeoutMs: environmentMs("BOTFLEET_STARTUP_TIMEOUT_MS", DEFAULT_STARTUP_TIMEOUT_MS),
     // How long work in flight gets to finish before apply pauses it, and,
     // only with --wait-for-idle, how long apply waits instead of pausing.
     // A flag wins over the environment; an unreadable value is the default.
@@ -3187,6 +3366,14 @@ function createOperations(config) {
     acquireLock: (mode) => acquireDirectoryLock(config.lockDirectory, mode),
 
     resolveTarget: async (plan) => {
+      // The wrapper (scripts/update-botfleet.sh) looked for the newest commit
+      // on main with a successful hosted build and found none newer than the
+      // installed one.  It hands that explanation here instead of ending the
+      // run itself, so it is recorded in the progress file like any other
+      // failure rather than being reported as an updater that never started.
+      // An explicit --target never carries it.
+      const nothingNewer = (process.env.BOTFLEET_UPDATE_SELECTION_FAILURE ?? "").trim();
+      if (nothingNewer) throw new ResolutionError(nothingNewer, "no-green-build");
       const repository = plan.source || config.checkout;
       await git(repository, ["fetch", "origin", "main"]);
       const commit = await gitOutput(repository, ["rev-parse", "--verify", `${plan.target}^{commit}`]);
@@ -3685,15 +3872,20 @@ function createOperations(config) {
       await run("launchctl", ["bootstrap", config.domain, plist]);
     },
 
-    verifyHarness: async (prepared) => {
-      const deadline = Date.now() + config.startupTimeoutMs;
-      let snapshot;
-      while (Date.now() < deadline) {
-        snapshot = await runtimeIdentityPreflight(config, prepared);
-        if (snapshot.safe) return;
-        await sleep(500);
-      }
-      throw new Error(snapshot?.reason || "Updated harness did not prove its expected build and ownership before timeout");
+    verifyHarness: async (prepared, previous) => {
+      // A slow boot is waited out, with progress; only a harness that has really
+      // died (its launchd job exited) ends the wait early.
+      await waitForStartup({
+        attempt: () => runtimeIdentityPreflight(config, prepared),
+        crashed: () => launchdExitReason(
+          [previous?.startedHarnessLabel ?? config.label],
+          { print: (label) => run("launchctl", ["print", `${config.domain}/${label}`], { allowFailure: true }) },
+        ),
+        timeoutMs: config.startupTimeoutMs,
+        what: "the new version",
+        fallback: "Updated harness did not prove its expected build and ownership before timeout",
+        report: config.reportDetail,
+      });
     },
 
     startApplication: async (_prepared, previous, options) => {
@@ -3709,27 +3901,18 @@ function createOperations(config) {
 
     verifySingleOwner: async (prepared, previous) => {
       if (config.parsed.openApplication !== false) {
-        const deadline = Date.now() + config.startupTimeoutMs;
-        let appError = "Timeout waiting for application to stabilize";
-        let attachmentError = "Timeout waiting for UI attachment";
-        while (Date.now() < deadline) {
-          const firstAppPids = await exactAppPids(config.appPath);
-          await sleep(1_000);
-          const secondAppPids = await exactAppPids(config.appPath);
-          
-          appError = stableApplicationProcessError(firstAppPids, secondAppPids, true);
-          if (!appError) {
+        await waitForStableApplication({
+          samplePids: () => exactAppPids(config.appPath),
+          attachmentError: async () => {
             const snapshot = await runtimeIdentityPreflight(config, prepared);
             if (!snapshot.safe || snapshot.mode !== "authenticated") {
-              attachmentError = snapshot.reason || "Updated application did not attach to the authenticated single data owner";
-            } else {
-              attachmentError = applicationAttachmentError(snapshot, true);
+              return snapshot.reason || "Updated application did not attach to the authenticated single data owner";
             }
-            if (!attachmentError) break;
-          }
-        }
-        if (appError) throw new Error(appError);
-        if (attachmentError) throw new Error(attachmentError);
+            return applicationAttachmentError(snapshot, true);
+          },
+          timeoutMs: config.startupTimeoutMs,
+          report: config.reportDetail,
+        });
       } else {
         const snapshot = await runtimeIdentityPreflight(config, prepared);
         if (!snapshot.safe || snapshot.mode !== "authenticated") {
@@ -3940,14 +4123,21 @@ function createOperations(config) {
       }
       if (previous.appWasRunning) await record(async () => { await run("open", [config.appPath]); });
       if (previous.launchdLoaded || previous.legacyLaunchdLoaded || previous.appWasRunning) await record(async () => {
-        const deadline = Date.now() + config.startupTimeoutMs;
-        let snapshot;
-        while (Date.now() < deadline) {
-          snapshot = await runtimePreflight(config);
-          if (snapshot.safe) return;
-          await sleep(500);
-        }
-        throw new Error(snapshot?.reason || "Restored BotFleet runtime did not regain safe single ownership");
+        // The restored build boots as slowly as the one it replaced did: on
+        // 2026-10-09 it took about two minutes at a load average near 900.  The
+        // same long wait, with progress, and the same early stop for a job that
+        // has really died.
+        await waitForStartup({
+          attempt: () => runtimePreflight(config),
+          crashed: () => launchdExitReason(
+            [config.label, config.legacyLabel],
+            { print: (label) => run("launchctl", ["print", `${config.domain}/${label}`], { allowFailure: true }) },
+          ),
+          timeoutMs: config.startupTimeoutMs,
+          what: "the restored version",
+          fallback: "Restored BotFleet runtime did not regain safe single ownership",
+          report: config.reportDetail,
+        });
       });
       if (errors.length) throw new AggregateError(errors, "One or more rollback restart operations failed");
       console.error(`Update failed; restored BotFleet bundle and checkout ${previous.checkoutCommit.slice(0, 12)}.`);

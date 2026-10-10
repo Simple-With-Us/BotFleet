@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,13 +17,18 @@ import {
   downloadBuiltBundle,
   findCommitArtifact,
   inspectArchive,
+  listUpdateCandidates,
   manifestArtifactName,
+  readInstalledSourceCommit,
   readSymlinkTargets,
   maskedKeyPreview,
   materializeBuild,
   resetGhAuthCacheForTests,
   ResolutionError,
   selectCommitRun,
+  selectNewestGreenCommit,
+  selectUpdateTarget,
+  SELECTION_WINDOW,
   updateSourcePolicy,
   verifyManifest,
 } from "./ci-build-resolver.mjs";
@@ -151,6 +156,97 @@ test("a commit with no hosted build says so, and says how to make one", async (t
       assert.match(error.message, new RegExp(COMMIT));
       return true;
     },
+  );
+});
+
+test("a JSON response without the list is a bad response, not a missing build", async (t) => {
+  // `no-build` is recoverable, so `auto` would quietly package locally and hide an
+  // API change or a proxy fault.  These bodies are valid JSON that is not the
+  // envelope the endpoint promises.
+  for (const body of [{}, null, 42, { workflow_runs: "nope" }, { workflow_runs: null }, { workflows: [] }]) {
+    await assert.rejects(
+      downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl: json(body) }),
+      (error) => {
+        assert.ok(error instanceof ResolutionError, JSON.stringify(body));
+        assert.equal(error.cause, "bad-response", JSON.stringify(body));
+        assert.match(error.message, /without a "workflow_runs" list/);
+        return true;
+      },
+      JSON.stringify(body),
+    );
+  }
+});
+
+test("a run whose artifact list is malformed is a bad response, not a missing build", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) return json({ artifacts: null })();
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "bad-response");
+      assert.match(error.message, /without an "artifacts" list/);
+      return true;
+    },
+  );
+});
+
+test("a run entry missing a required field is a bad response at the boundary, not a silent skip", async (t) => {
+  // The old shape only checked the envelope, so a partial entry was passed through
+  // and silently dropped by `selectCommitRun`.  The boundary now rejects it: a
+  // proxy or a 200-with-truncated-body would otherwise look like an empty build
+  // and `auto` would quietly package locally.
+  for (const partial of [
+    { head_sha: COMMIT, status: "completed", conclusion: "success", event: "push" }, // no id
+    { id: 1, status: "completed", conclusion: "success", event: "push" }, // no head_sha
+    { id: 1, head_sha: COMMIT, conclusion: "success", event: "push" }, // no status
+    { id: 1, head_sha: COMMIT, status: "completed", event: "push" }, // no conclusion (must be string|null)
+  ]) {
+    await assert.rejects(
+      downloadBuiltBundle({
+        commit: COMMIT,
+        destination: await fixture(t),
+        fetchImpl: json({ workflow_runs: [partial] }),
+      }),
+      (error) => {
+        assert.ok(error instanceof ResolutionError, JSON.stringify(partial));
+        assert.equal(error.cause, "bad-response", JSON.stringify(partial));
+        assert.match(error.message, /malformed workflow run entry/);
+        return true;
+      },
+      JSON.stringify(partial),
+    );
+  }
+});
+
+test("an artifact entry missing a required field is a bad response at the boundary, not a silent skip", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) {
+      return json({ artifacts: [{ name: artifactNameFor(COMMIT), expired: false, archive_download_url: "https://example.test/a.zip" }] })();
+    }
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "bad-response");
+      assert.match(error.message, /malformed artifact entry/);
+      return true;
+    },
+  );
+});
+
+test("an empty artifact list is still a missing build", async (t) => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes("/artifacts")) return json({ artifacts: [] })();
+    return json(successfulRuns)();
+  };
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl }),
+    (error) => error instanceof ResolutionError && error.cause === "no-build",
   );
 });
 
@@ -896,4 +992,438 @@ test("the unpacked tree is checked again on disk", { skip: posixOnly }, async (t
       },
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Choosing the newest commit with a green hosted build when no target is named
+// ---------------------------------------------------------------------------
+
+// Oldest to newest.  C0 is "installed" in most cases below; C4 is main's tip.
+const C = ["1", "2", "3", "4", "5"].map((digit) => digit.repeat(40));
+const SELECT_ENV = { GITHUB_TOKEN: "fixture-token" };
+
+/**
+ * A fetch that answers the three Actions endpoints the selection reads, and
+ * records every URL it was asked for.  `green` is the commits that have a
+ * successful run (newest-first as GitHub lists them); `tipRun` is what the
+ * per-commit lookup of main's tip returns.
+ */
+function actionsFetch({ green = [], tipRun = null, expired = [], urls = [], fail = null } = {}) {
+  const body = (value) => ({ ok: true, status: 200, json: async () => value });
+  return async (url) => {
+    const text = String(url);
+    urls.push(text);
+    if (fail) return fail(text);
+    if (text.includes("status=success")) {
+      return body({ workflow_runs: green.map((commit, index) => aRun({ id: 100 + index, head_sha: commit })) });
+    }
+    if (text.includes("head_sha=")) {
+      return body({ workflow_runs: tipRun ? [aRun({ id: 7, ...tipRun })] : [] });
+    }
+    const match = /runs\/(\d+)\/artifacts/.exec(text);
+    if (match) {
+      const commit = green[Number(match[1]) - 100];
+      return body({ artifacts: [anArtifact({ name: artifactNameFor(commit), expired: expired.includes(commit) })] });
+    }
+    throw new Error(`unexpected request ${text}`);
+  };
+}
+
+const select = (candidates, options = {}) =>
+  selectNewestGreenCommit({ candidates, tip: candidates[0], env: SELECT_ENV, ...options });
+
+test("main's tip is chosen when its build is green", async () => {
+  const urls = [];
+  const found = await select([C[4], C[3], C[2]], { fetchImpl: actionsFetch({ green: [C[4], C[3]], urls }) });
+  assert.equal(found.commit, C[4]);
+  assert.equal(found.behind, 0);
+  assert.equal(found.tipBuild, "succeeded");
+  // The listing is one request for all of main's successful runs, then the
+  // artifact of the commit chosen.  The tip's own state is not looked up
+  // because nothing needs describing.
+  assert.equal(urls.length, 2, urls.join("\n"));
+  assert.match(urls[0], /\/actions\/workflows\/mac-commit-build\.yml\/runs\?branch=main&status=success&per_page=100$/);
+  assert.match(urls[1], /\/actions\/runs\/100\/artifacts/);
+});
+
+test("a cancelled tip falls back to the newest earlier commit that is green", async () => {
+  // Exactly the 2026-10-09 failure: the tip's build was cancelled by the next
+  // push, and the commit before it had a green build.
+  const found = await select([C[4], C[3], C[2]], {
+    fetchImpl: actionsFetch({ green: [C[3], C[2]], tipRun: { head_sha: C[4], status: "completed", conclusion: "cancelled" } }),
+  });
+  assert.equal(found.commit, C[3]);
+  assert.equal(found.behind, 1);
+  assert.equal(found.tipBuild, "was cancelled");
+});
+
+test("the newest GREEN COMMIT wins, whatever order the runs finished in", async () => {
+  // A re-run of an old commit can finish after a newer one, so GitHub lists the
+  // older commit's run first.  Git order decides.
+  const found = await select([C[4], C[3], C[2]], {
+    fetchImpl: actionsFetch({ green: [C[2], C[3]], tipRun: { head_sha: C[4], status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(found.commit, C[3]);
+  assert.equal(found.behind, 1);
+  assert.equal(found.tipBuild, "is still running");
+});
+
+test("a tip that is still queued, failed or has no build at all is described as such", async () => {
+  for (const [tipRun, expected] of [
+    [{ head_sha: C[4], status: "queued", conclusion: null }, "is still running"],
+    [{ head_sha: C[4], status: "completed", conclusion: "failure" }, "failed"],
+    [{ head_sha: C[4], status: "completed", conclusion: "timed_out" }, "timed out"],
+    [null, "has no hosted build yet"],
+  ]) {
+    const found = await select([C[4], C[3]], { fetchImpl: actionsFetch({ green: [C[3]], tipRun }) });
+    assert.equal(found.commit, C[3]);
+    assert.equal(found.tipBuild, expected);
+  }
+});
+
+test("a green run whose artifact has expired is skipped for the next candidate", async () => {
+  const logs = [];
+  const found = await select([C[4], C[3], C[2]], {
+    fetchImpl: actionsFetch({ green: [C[4], C[3], C[2]], expired: [C[4]], tipRun: { head_sha: C[4], status: "completed", conclusion: "success" } }),
+    log: (line) => logs.push(line),
+  });
+  assert.equal(found.commit, C[3]);
+  assert.equal(found.behind, 1);
+  assert.match(logs.join("\n"), /artifact is missing or expired/);
+});
+
+test("only runs the install path itself would accept count as green", async () => {
+  const fetchImpl = async (url) => ({
+    ok: true,
+    status: 200,
+    json: async () => String(url).includes("status=success")
+      ? { workflow_runs: [aRun({ id: 1, head_sha: C[4], event: "pull_request" }), aRun({ id: 2, head_sha: C[3], event: "workflow_dispatch" })] }
+      : String(url).includes("head_sha=")
+        ? { workflow_runs: [] }
+        : { artifacts: [anArtifact({ name: artifactNameFor(C[3]) })] },
+  });
+  const found = await select([C[4], C[3]], { fetchImpl });
+  assert.equal(found.commit, C[3], "a pull_request run is not a build of main; a workflow_dispatch run is");
+});
+
+test("a malformed Actions response is no usable build, never a guess", async () => {
+  // Hand-checked (no zod: the updater is bootstrapped without node_modules), so
+  // the checks have to hold on their own: an array, then every item's shape.
+  const respond = ({ runs, artifacts }) => async (url) => {
+    const text = String(url);
+    const body = text.includes("/artifacts")
+      ? artifacts
+      : text.includes("head_sha=") ? { workflow_runs: [] } : runs;
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const goodRuns = { workflow_runs: [aRun({ id: 100, head_sha: C[4] })] };
+  const goodArtifact = anArtifact({ name: artifactNameFor(C[4]) });
+  // Control: the well-formed pair selects the commit.
+  assert.equal((await select([C[4]], { fetchImpl: respond({ runs: goodRuns, artifacts: { artifacts: [goodArtifact] } }) })).commit, C[4]);
+
+  for (const [label, artifacts] of [
+    ["a body that is not an object", "oops"],
+    ["a null body", null],
+    ["no artifacts key", {}],
+    ["artifacts that is not an array", { artifacts: { 0: goodArtifact } }],
+    ["artifacts that is null", { artifacts: null }],
+    ["an item that is not an object", { artifacts: ["x", 7, null] }],
+    ["an item without expired", { artifacts: [{ ...goodArtifact, expired: undefined }] }],
+    ["an item with a string expired", { artifacts: [{ ...goodArtifact, expired: "false" }] }],
+    ["an item with a string id", { artifacts: [{ ...goodArtifact, id: "1" }] }],
+    ["an item without a download url", { artifacts: [{ ...goodArtifact, archive_download_url: undefined }] }],
+    ["an item with a numeric name", { artifacts: [{ ...goodArtifact, name: 5 }] }],
+    ["an expired item", { artifacts: [{ ...goodArtifact, expired: true }] }],
+    ["an artifact for another commit", { artifacts: [{ ...goodArtifact, name: artifactNameFor(C[3]) }] }],
+  ]) {
+    const found = await select([C[4]], { fetchImpl: respond({ runs: goodRuns, artifacts }) });
+    assert.equal(found.commit, null, label);
+  }
+
+  for (const [label, runs] of [
+    ["a body that is not an object", "oops"],
+    ["workflow_runs that is not an array", { workflow_runs: { 0: aRun({ head_sha: C[4] }) } }],
+    ["a run without an id", { workflow_runs: [aRun({ id: undefined, head_sha: C[4] })] }],
+    ["a run with a numeric head_sha", { workflow_runs: [aRun({ head_sha: 4 })] }],
+    ["a run with a missing status", { workflow_runs: [aRun({ head_sha: C[4], status: undefined })] }],
+    ["a run that did not conclude success", { workflow_runs: [aRun({ head_sha: C[4], conclusion: "failure" })] }],
+    ["a run with no conclusion", { workflow_runs: [aRun({ id: 100, head_sha: C[4], conclusion: null })] }],
+  ]) {
+    const found = await select([C[4]], { fetchImpl: respond({ runs, artifacts: { artifacts: [goodArtifact] } }) });
+    assert.equal(found.commit, null, label);
+  }
+});
+
+test("nothing green among the candidates is an answer, not an error", async () => {
+  const found = await select([C[4], C[3]], {
+    fetchImpl: actionsFetch({ green: [], tipRun: { head_sha: C[4], status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(found.commit, null);
+  assert.equal(found.tipBuild, "is still running");
+});
+
+test("only a handful of artifact lookups are made before giving up", async () => {
+  const urls = [];
+  const many = Array.from({ length: 12 }, (_, index) => String(index + 1).padStart(2, "0").repeat(20));
+  const found = await select(many, { fetchImpl: actionsFetch({ green: many, expired: many, urls }) });
+  assert.equal(found.commit, null);
+  assert.equal(urls.filter((url) => url.includes("/artifacts")).length, 5);
+  assert.deepEqual([found.withoutArtifact, found.capped], [5, true]);
+});
+
+test("a GitHub failure surfaces as a classified error the wrapper can fail open on", async () => {
+  await assert.rejects(
+    select([C[4]], { fetchImpl: actionsFetch({ fail: () => ({ ok: false, status: 403, json: async () => ({}) }) }) }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "rate-limited");
+      // The message names the commit it was looking for, not a placeholder.
+      assert.match(error.message, new RegExp(C[4]));
+      return true;
+    },
+  );
+});
+
+// ---- Which commits are candidates: real git, because the floor is the point.
+
+async function mainHistory(t, count = 5) {
+  const dir = await fixture(t);
+  const git = async (...args) => (await run("git", ["-C", dir, ...args])).stdout.trim();
+  await run("git", ["init", "-q", "-b", "main", dir]);
+  const commits = [];
+  for (let index = 0; index < count; index += 1) {
+    await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", `c${index}`);
+    commits.push(await git("rev-parse", "HEAD"));
+  }
+  await git("update-ref", "refs/remotes/origin/main", commits.at(-1));
+  return { dir, commits, git, gitSync: (args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim() };
+}
+
+test("candidates run from main's tip down to, but not including, the installed build", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [c0, c1, c2, c3, c4] = commits;
+  const listed = listUpdateCandidates({ git: gitSync, installed: c1 });
+  assert.deepEqual(listed.candidates, [c4, c3, c2], "the installed build and everything older is excluded");
+  assert.equal(listed.tip, c4);
+  assert.notEqual(listed.truncated, true);
+  assert.deepEqual(listUpdateCandidates({ git: gitSync, installed: c3 }).candidates, [c4]);
+  assert.ok(!listUpdateCandidates({ git: gitSync, installed: c0 }).candidates.includes(c0));
+});
+
+test("when the floor cannot be proven the selection steps aside rather than guess", async (t) => {
+  const { commits, git, gitSync } = await mainHistory(t);
+  const tip = commits.at(-1);
+  assert.match(listUpdateCandidates({ git: gitSync, installed: null }).skip, /no source commit/);
+  assert.match(listUpdateCandidates({ git: gitSync, installed: tip }).skip, /already main's tip/);
+  assert.match(listUpdateCandidates({ git: gitSync, installed: "9".repeat(40) }).skip, /not an ancestor/);
+  // A build from a commit that never reached main is not on main's history.
+  await git("checkout", "-q", "-b", "side", commits[1]);
+  await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "side");
+  const sideCommit = await git("rev-parse", "HEAD");
+  assert.match(listUpdateCandidates({ git: gitSync, installed: sideCommit }).skip, /not an ancestor/);
+  await git("update-ref", "-d", "refs/remotes/origin/main");
+  assert.match(listUpdateCandidates({ git: gitSync, installed: commits[0] }).skip, /origin\/main cannot be read/);
+});
+
+test("the candidate window is bounded and says when it was cut", async (t) => {
+  const { commits, gitSync } = await mainHistory(t, 6);
+  const listed = listUpdateCandidates({ git: gitSync, installed: commits[0], windowSize: 3 });
+  assert.equal(listed.candidates.length, 3);
+  assert.equal(listed.truncated, true);
+  assert.equal(SELECTION_WINDOW, 100);
+});
+
+test("first-parent history is what is walked, so a merged side branch is never a candidate", async (t) => {
+  const { commits, git, gitSync } = await mainHistory(t, 3);
+  await git("checkout", "-q", "-b", "feature", commits[0]);
+  await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "feature work");
+  const feature = await git("rev-parse", "HEAD");
+  await git("checkout", "-q", "main");
+  await git("-c", "user.name=Test", "-c", "user.email=test@example.com", "merge", "-q", "--no-ff", "-m", "merge feature", "feature");
+  const merge = await git("rev-parse", "HEAD");
+  await git("update-ref", "refs/remotes/origin/main", merge);
+  const listed = listUpdateCandidates({ git: gitSync, installed: commits[0] });
+  assert.deepEqual(listed.candidates, [merge, commits[2], commits[1]]);
+  assert.ok(!listed.candidates.includes(feature), "a commit only reachable through a merge was never pushed to main, so it has no build");
+  // An installed build on the merged side branch: the mainline commits that do
+  // not contain it are not an upgrade from it, so only the merge itself is.
+  assert.deepEqual(listUpdateCandidates({ git: gitSync, installed: feature }).candidates, [merge]);
+});
+
+// ---- The whole decision.
+
+test("selectUpdateTarget picks the tip when it is green and the earlier commit when it is not", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [c0, , c2, c3, c4] = commits;
+  const common = { git: gitSync, installedCommit: c0, env: SELECT_ENV };
+
+  const tipGreen = await selectUpdateTarget({ ...common, fetchImpl: actionsFetch({ green: [c4, c3] }) });
+  assert.deepEqual([tipGreen.status, tipGreen.commit], ["selected", c4]);
+  assert.match(tipGreen.message, new RegExp(`^Updating to ${c4.slice(0, 12)} \\(main's tip; its build succeeded\\)$`));
+
+  const tipCancelled = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [c3, c2], tipRun: { head_sha: c4, status: "completed", conclusion: "cancelled" } }),
+  });
+  assert.deepEqual([tipCancelled.status, tipCancelled.commit], ["selected", c3]);
+  assert.equal(
+    tipCancelled.message,
+    `Updating to ${c3.slice(0, 12)} (main is 1 commit ahead; its build was cancelled)`,
+  );
+
+  const tipRunning = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [c2], tipRun: { head_sha: c4, status: "in_progress", conclusion: null } }),
+  });
+  assert.deepEqual([tipRunning.status, tipRunning.commit], ["selected", c2]);
+  assert.equal(
+    tipRunning.message,
+    `Updating to ${c2.slice(0, 12)} (main is 2 commits ahead; its build is still running)`,
+  );
+});
+
+test("nothing newer than the installed build is green: a clear refusal, never the installed build", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [, c1, , , c4] = commits;
+  // The installed commit (c1) and an older one are green; everything above is
+  // not.  Choosing either would be a reinstall or a downgrade.
+  const decision = await selectUpdateTarget({
+    git: gitSync,
+    installedCommit: c1,
+    env: SELECT_ENV,
+    fetchImpl: actionsFetch({ green: [c1, commits[0]], tipRun: { head_sha: c4, status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(decision.status, "none");
+  assert.match(decision.message, /^No newer hosted build to install\./);
+  assert.match(decision.message, new RegExp(`installed build is ${c1.slice(0, 12)}`));
+  assert.match(decision.message, new RegExp(`Main is at ${c4.slice(0, 12)}, 3 commits ahead`));
+  assert.match(decision.message, /its build is still running/);
+  assert.match(decision.message, /BOTFLEET_UPDATE_SOURCE=local/);
+  assert.ok(!decision.message.includes("\n"), "the explanation is one line, because the wrapper hands it over in a variable");
+});
+
+test("green builds whose artifacts expired ask for a re-run, not a wait", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const [, c1, c2, c3, c4] = commits;
+  const common = { git: gitSync, installedCommit: c1, env: SELECT_ENV };
+  const tipRun = { head_sha: c4, status: "completed", conclusion: "success" };
+
+  const all = await selectUpdateTarget({ ...common, fetchImpl: actionsFetch({ green: [c4, c3, c2], expired: [c4, c3, c2], tipRun }) });
+  assert.equal(all.status, "none");
+  assert.match(all.message, /3 commits in between have successful hosted builds, but their artifacts are missing or expired\./);
+  assert.match(all.message, /Re-run the Mac Commit Build workflow on main's tip/);
+  assert.doesNotMatch(all.message, /None of the commits in between has a successful hosted build/);
+  assert.ok(!all.message.includes("\n"));
+
+  const one = await selectUpdateTarget({ ...common, fetchImpl: actionsFetch({ green: [c4], expired: [c4], tipRun }) });
+  assert.match(one.message, /1 commit in between has a successful hosted build, but its artifact is missing or expired\./);
+});
+
+test("a truncated window changes what is said about the span searched, never the distance to the chosen commit", async (t) => {
+  // Six commits, a window of three: the installed build (c0) is further back
+  // than the search looked.
+  const { commits, gitSync } = await mainHistory(t, 6);
+  const [c0, , , c3, c4, c5] = commits;
+  const common = { git: gitSync, installedCommit: c0, env: SELECT_ENV, windowSize: 3 };
+
+  // The chosen commit is two below the tip, and that count is exact: it is the
+  // chosen commit's position counted down from the tip, so it is not "more
+  // than" anything even though the window was cut.
+  const selected = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [c3], tipRun: { head_sha: c5, status: "in_progress", conclusion: null } }),
+  });
+  assert.deepEqual([selected.status, selected.commit, selected.behind, selected.truncated], ["selected", c3, 2, true]);
+  assert.equal(selected.message, `Updating to ${c3.slice(0, 12)} (main is 2 commits ahead; its build is still running)`);
+
+  // Nothing green in the window: the span between the installed build and the
+  // tip is what is unsearched, so THAT count is a lower bound.
+  const none = await selectUpdateTarget({
+    ...common,
+    fetchImpl: actionsFetch({ green: [], tipRun: { head_sha: c5, status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(none.status, "none");
+  assert.match(none.message, new RegExp(`Main is at ${c5.slice(0, 12)}, more than 3 commits ahead`));
+
+  // A window that was not cut says nothing of the kind.
+  const whole = await selectUpdateTarget({
+    ...common,
+    windowSize: 100,
+    fetchImpl: actionsFetch({ green: [c4], tipRun: { head_sha: c5, status: "in_progress", conclusion: null } }),
+  });
+  assert.equal(whole.truncated, false);
+  assert.equal(whole.message, `Updating to ${c4.slice(0, 12)} (main is 1 commit ahead; its build is still running)`);
+});
+
+test("the policy decides what 'nothing newer' means: local keeps the tip, auto falls back to it", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const nothingGreen = actionsFetch({ green: [], tipRun: { head_sha: commits[4], status: "in_progress", conclusion: null } });
+  const base = { git: gitSync, installedCommit: commits[0], fetchImpl: nothingGreen };
+
+  const local = await selectUpdateTarget({ ...base, env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "local" } });
+  assert.equal(local.status, "skip");
+  assert.match(local.reason, /packages the commit on this Mac/);
+
+  const auto = await selectUpdateTarget({ ...base, env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "auto" } });
+  assert.equal(auto.status, "skip", "auto packages the tip locally when no hosted build is newer");
+
+  // auto still prefers a hosted build over packaging when one exists.
+  const autoGreen = await selectUpdateTarget({
+    ...base,
+    env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "auto" },
+    fetchImpl: actionsFetch({ green: [commits[3]], tipRun: { head_sha: commits[4], status: "in_progress", conclusion: null } }),
+  });
+  assert.deepEqual([autoGreen.status, autoGreen.commit], ["selected", commits[3]]);
+
+  // local never even asks GitHub.
+  const urls = [];
+  await selectUpdateTarget({ ...base, env: { ...SELECT_ENV, BOTFLEET_UPDATE_SOURCE: "local" }, fetchImpl: actionsFetch({ urls }) });
+  assert.deepEqual(urls, []);
+});
+
+test("an installed build that is already the tip leaves the plain update path alone", async (t) => {
+  const { commits, gitSync } = await mainHistory(t);
+  const urls = [];
+  const decision = await selectUpdateTarget({
+    git: gitSync,
+    installedCommit: commits[4],
+    env: SELECT_ENV,
+    fetchImpl: actionsFetch({ urls }),
+  });
+  assert.equal(decision.status, "skip");
+  assert.deepEqual(urls, [], "nothing is looked up when there is nothing to choose");
+});
+
+test("the installed build is read from the app's build identity", async (t) => {
+  const app = await fixture(t);
+  const identity = join(app, "Contents/Resources/server/build-identity.json");
+  await mkdir(dirname(identity), { recursive: true });
+  await writeFile(identity, JSON.stringify({ sourceCommit: C[1] }));
+  assert.equal(await readInstalledSourceCommit(app), C[1]);
+  await writeFile(identity, JSON.stringify({ sourceCommit: "not-a-commit" }));
+  assert.equal(await readInstalledSourceCommit(app), null);
+  // Strict: a string of exactly 40 lowercase hex digits, nothing that merely
+  // coerces to one.  `RegExp#test` stringifies its argument, so an array
+  // holding a valid sha used to pass.
+  for (const [label, sourceCommit] of [
+    ["an array holding a valid sha", [C[1]]],
+    ["a number", 1234567890],
+    ["null", null],
+    ["an object", { sha: C[1] }],
+    ["39 digits", "a".repeat(39)],
+    ["41 digits", "a".repeat(41)],
+    ["uppercase hex", "A".repeat(40)],
+    ["a sha with a trailing newline", `${C[1]}\n`],
+    ["a sha with surrounding space", ` ${C[1]}`],
+  ]) {
+    await writeFile(identity, JSON.stringify({ sourceCommit }));
+    assert.equal(await readInstalledSourceCommit(app), null, label);
+  }
+  await writeFile(identity, JSON.stringify(null));
+  assert.equal(await readInstalledSourceCommit(app), null, "a manifest that is not an object");
+  await writeFile(identity, JSON.stringify({ sourceCommit: C[1] }));
+  assert.equal(await readInstalledSourceCommit(app), C[1]);
+  await writeFile(identity, "{ torn");
+  assert.equal(await readInstalledSourceCommit(app), null);
+  assert.equal(await readInstalledSourceCommit(join(app, "missing")), null);
 });

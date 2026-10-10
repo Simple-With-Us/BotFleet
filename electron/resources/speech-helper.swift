@@ -432,8 +432,12 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
   let speaker = PersonalVoiceSpeaker()
 
   let doSpeak = {
-    let allVoices = AVSpeechSynthesisVoice.speechVoices()
-    let matched = allVoices.first(where: {
+    // Match only Personal Voices.  Matching by identifier or name over every
+    // installed voice let `personal:Samantha` select an ordinary system voice
+    // and speak the user's words with it.
+    let personalVoices = AVSpeechSynthesisVoice.speechVoices()
+      .filter { $0.voiceTraits.contains(.isPersonalVoice) }
+    let matched = personalVoices.first(where: {
       $0.identifier == rawId || $0.name == rawId ||
       "personal:\($0.identifier)" == requestedVoiceId ||
       "apple-personal:\($0.identifier)" == requestedVoiceId
@@ -441,9 +445,7 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
     // Guess only when the caller named no voice at all. A named-but-absent
     // voice — one not synced to this Mac — must fail loudly rather than be
     // replaced by a different Personal Voice speaking the user's words.
-    let voice = matched ?? (rawId.isEmpty
-      ? allVoices.first(where: { $0.voiceTraits.contains(.isPersonalVoice) })
-      : nil)
+    let voice = matched ?? (rawId.isEmpty ? personalVoices.first : nil)
 
     guard let selectedVoice = voice else {
       fail("voice-not-found")

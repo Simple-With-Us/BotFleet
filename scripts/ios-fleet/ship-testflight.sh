@@ -262,9 +262,14 @@ sentry_redact() {
 # After a successful archive: upload dSYMs and Size Analysis.  Never fail the
 # TestFlight ship if Sentry is missing or the upload errors.
 upload_sentry_artifacts() {
-  local project archive
+  local project archive sentry_org
   project="$(sentry_project_for_app)"
   archive="${ARCHIVE_PATH:-}"
+  # Org that owns the botfleet project (verified 2026-10-09: only org
+  # simple-with-us lists project botfleet; a token scoped to the retired
+  # slug jays-services fails with "organization not found").  Overridable
+  # via the environment so a rotation can be tried without editing this file.
+  sentry_org="${SENTRY_ORG:-simple-with-us}"
   if [[ -z "$project" ]]; then
     log "sentry: no project mapping for app=${APP_KEY}; skipping artifact upload"
     return 0
@@ -294,14 +299,14 @@ upload_sentry_artifacts() {
   # temp dir).  Print what sentry-cli says about auth/org first, and on any
   # failure print the tail of its log, with every token shape redacted, so
   # the hosted ship log carries the real error.
-  log "sentry: sentry-cli $(sentry-cli --version 2>/dev/null | awk '{print $NF}'); org=simple-with-us project=${project}"
+  log "sentry: sentry-cli $(sentry-cli --version 2>/dev/null | awk '{print $NF}'); org=${sentry_org} project=${project}"
   set +e
-  SENTRY_ORG=simple-with-us SENTRY_PROJECT="$project" sentry-cli info 2>&1 \
+  SENTRY_ORG="$sentry_org" SENTRY_PROJECT="$project" sentry-cli info 2>&1 \
     | sentry_redact | sed 's/^/[ios-ship] sentry-info: /'
   set -e
   log "sentry: uploading debug files for project=${project} (token length ${#SENTRY_AUTH_TOKEN})"
   set +e
-  SENTRY_ORG=simple-with-us SENTRY_PROJECT="$project" \
+  SENTRY_ORG="$sentry_org" SENTRY_PROJECT="$project" \
     sentry-cli debug-files upload --include-sources "$archive" \
     >"${LOG_DIR}/sentry-debug-files.log" 2>&1
   local dif_rc=$?
@@ -311,10 +316,11 @@ upload_sentry_artifacts() {
   else
     log "warning: sentry debug-files upload rc=${dif_rc}; tail of ${LOG_DIR}/sentry-debug-files.log:"
     tail -n 25 "${LOG_DIR}/sentry-debug-files.log" | sentry_redact | sed 's/^/[ios-ship]   sentry-dif: /'
+    sentry_org_mismatch_hint "${LOG_DIR}/sentry-debug-files.log" "$sentry_org"
   fi
   log "sentry: Size Analysis build upload for project=${project}"
   set +e
-  SENTRY_ORG=simple-with-us SENTRY_PROJECT="$project" \
+  SENTRY_ORG="$sentry_org" SENTRY_PROJECT="$project" \
     sentry-cli build upload "$archive" \
     >"${LOG_DIR}/sentry-build-upload.log" 2>&1
   local build_rc=$?
@@ -324,8 +330,21 @@ upload_sentry_artifacts() {
   else
     log "warning: sentry build upload rc=${build_rc}; tail of ${LOG_DIR}/sentry-build-upload.log:"
     tail -n 25 "${LOG_DIR}/sentry-build-upload.log" | sentry_redact | sed 's/^/[ios-ship]   sentry-build: /'
+    sentry_org_mismatch_hint "${LOG_DIR}/sentry-build-upload.log" "$sentry_org"
   fi
   return 0
+}
+
+# When an upload log shows the token's embedded org disagreeing with the
+# configured org (2026-10-09: token scoped to retired slug jays-services vs
+# org simple-with-us), say exactly what to rotate.  Reads the already-written
+# log file and prints only fixed guidance -- never any secret value -- and
+# never fails the ship.
+sentry_org_mismatch_hint() {
+  local sentry_log="$1" hint_org="$2"
+  if grep -q -E "organization not found|embedded in token" "$sentry_log" 2>/dev/null; then
+    log "sentry: token/org mismatch -- SENTRY_AUTH_TOKEN is scoped to a different or retired org; mint an org token for ${hint_org} and update Infisical prod SENTRY_AUTH_TOKEN (owner approval required). TestFlight ship continues."
+  fi
 }
 
 link_private_key() {
