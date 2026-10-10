@@ -43,8 +43,27 @@ export type BotFleetSend = (params: { threadId: string; text: string }) => Promi
 export type BotFleetReload = (params: {
   messageId: string;
   sourceId: string | null;
-  runConfig: unknown;
+  runConfig: RunConfigLike;
 }) => Promise<void>;
+
+/**
+ * `RunConfig` in @assistant-ui/core is `{ custom?: Record<string, unknown> }`.
+ * Neither `RunConfig` nor `StartRunConfig` is re-exported by
+ * @assistant-ui/react, so the shapes are spelled out structurally here.
+ */
+type RunConfigLike = { readonly custom?: Record<string, unknown> };
+
+/**
+ * `onReload(parentId, config)` — `config` is a `StartRunConfig`.  `sourceId` is
+ * the edited message and `runConfig` is caller-supplied run options; both are
+ * forwarded so a regenerate can carry the harness' own branch semantics
+ * instead of dropping them.
+ */
+type StartRunConfigLike = {
+  parentId: string | null;
+  sourceId: string | null;
+  runConfig: RunConfigLike;
+};
 
 /**
  * Id for the synthetic assistant message that carries the live stream when the
@@ -108,10 +127,7 @@ export function createBotFleetExternalStore(params: {
     },
     // Signature is (parentId, config) — parentId is `string | null`, not an object.
     onReload: reload
-      ? async (
-          parentId: string | null,
-          config: { parentId: string | null; sourceId: string | null; runConfig: unknown },
-        ) => {
+      ? async (parentId: string | null, config: StartRunConfigLike) => {
           if (!parentId) return;
           await reload({
             messageId: parentId,

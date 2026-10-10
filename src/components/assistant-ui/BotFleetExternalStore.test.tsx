@@ -111,6 +111,42 @@ describe("botfleet external store adapter", () => {
     expect(adapter.messages![1].role).toBe("assistant");
   });
 
+it("forwards sourceId and runConfig on regenerate", async () => {
+    const reload = vi.fn(async () => {});
+    const adapter = createBotFleetExternalStore({
+      threadId: "t1",
+      messages,
+      send: async () => {},
+      reload,
+    });
+    await adapter.onReload!("m1", {
+      parentId: "m1",
+      sourceId: "m0",
+      runConfig: { custom: { model: "test" } },
+    });
+    expect(reload).toHaveBeenCalledWith({
+      messageId: "m1",
+      sourceId: "m0",
+      runConfig: { custom: { model: "test" } },
+    });
+  });
+
+  it("skips regenerate when there is no parent id", async () => {
+    const reload = vi.fn(async () => {});
+    const adapter = createBotFleetExternalStore({
+      threadId: "t1",
+      messages,
+      send: async () => {},
+      reload,
+    });
+    await adapter.onReload!(null, {
+      parentId: null,
+      sourceId: null,
+      runConfig: {},
+    });
+    expect(reload).not.toHaveBeenCalled();
+  });
+
 it("sends through the harness send path, not an AI SDK", async () => {
     const send = vi.fn(async () => {});
     const adapter = createBotFleetExternalStore({ threadId: "t7", messages, send });

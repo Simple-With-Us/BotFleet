@@ -101,6 +101,19 @@ This is the general hazard with this library: a "keep these two in sync" suggest
 correct in isolation and wrong once another fix changes the invariant it was reasoning about.
 Re-derive against the current code rather than applying it to the version it was written for.
 
+Not every suggestion was wrong, though, and the distinction is worth drawing.  A later pass
+correctly noted that `onReload(parentId, config)` receives a `StartRunConfig` carrying
+`sourceId` and `runConfig`, which the adapter was dropping — regenerate should forward the
+harness' own branch semantics rather than discard them.  That one was kept and given tests.
+
+So the test applied was: *does this suggestion describe reality that is still true in the current
+code?*  The sync guard described a real inconsistency, but its premise had been removed by an
+earlier fix.  The reload forwarding described a real gap with no competing fix.
+
+One typing consequence: neither `RunConfig` nor `StartRunConfig` is re-exported by
+`@assistant-ui/react` (only `CreateStartRunConfig` is), so those shapes are written structurally
+and documented where they are declared.
+
 ### Blocker found: `@assistant-ui/react-ui` is broken upstream
 
 Do **not** plan around the pre-styled package.  Every published `@assistant-ui/react-ui`
