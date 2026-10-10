@@ -618,6 +618,105 @@ test("countInternalTesters follows pagination and reports an unreadable later pa
   assert.equal(broken.ok, false);
 });
 
+test("countInternalTesters counts a tester once when two all-builds groups both hold them", async () => {
+  const { countInternalTesters } = await import("./ios-fleet/asc-api.mjs");
+  const { api } = fakeAsc({
+    groups: [
+      { id: "int1", name: "Internal Testers", isInternalGroup: true, hasAccessToAllBuilds: true, members: ["a@example.com", "b@example.com"] },
+      { id: "int2", name: "Also Internal", isInternalGroup: true, hasAccessToAllBuilds: true, members: ["B@Example.com", "c@example.com"] }
+    ]
+  });
+  // b@ is in both groups (and differs only by case): three people, not four.
+  assert.deepEqual(await countInternalTesters({ api, appId: "1" }), { ok: true, groups: 2, testers: 3 });
+});
+
+test("ascAllRows follows links.next, refuses a next link that leaves App Store Connect, and never returns a partial list as whole", async () => {
+  const { ascAllRows } = await import("./ios-fleet/asc-api.mjs");
+  const row = (id) => ({ type: "betaTesters", id, attributes: { email: `${id}@example.com` } });
+  const pages = {
+    "/v1/x?limit=2": { data: [row("a"), row("b")], links: { next: "https://api.appstoreconnect.apple.com/v1/x?cursor=2" } },
+    "https://api.appstoreconnect.apple.com/v1/x?cursor=2": { data: [row("c")] }
+  };
+  const apiOk = async (_m, path) => ({ status: 200, ok: true, parsed: pages[path], text: "" });
+  const all = await ascAllRows({ api: apiOk, url: "/v1/x?limit=2" });
+  assert.equal(all.ok, true);
+  assert.deepEqual(all.rows.map((r) => r.id), ["a", "b", "c"]);
+
+  // The bearer token must not be sent to a host the API named in a link.
+  const calls = [];
+  const apiEvil = async (_m, path) => {
+    calls.push(path);
+    return { status: 200, ok: true, parsed: { data: [row("a")], links: { next: "https://evil.example.com/steal" } }, text: "" };
+  };
+  const evil = await ascAllRows({ api: apiEvil, url: "/v1/x" });
+  assert.equal(evil.ok, false);
+  assert.deepEqual(calls, ["/v1/x"], "the off-host link was never requested");
+
+  // A page that never ends is capped, and a capped read is "unreadable", not a short list.
+  const apiLoop = async () => ({ status: 200, ok: true, parsed: { data: [row("a")], links: { next: "https://api.appstoreconnect.apple.com/v1/x?cursor=n" } }, text: "" });
+  const looped = await ascAllRows({ api: apiLoop, url: "/v1/x" });
+  assert.equal(looped.ok, false);
+  assert.match(looped.error, /more than \d+ pages/);
+});
+
+test("rows without a string id and an attributes object are dropped by hand-written checks, not by zod", async () => {
+  const { ascAllRows, countInternalTesters } = await import("./ios-fleet/asc-api.mjs");
+  const good = { type: "betaTesters", id: "ok", attributes: { email: "ok@example.com" } };
+  const bad = [null, "text", 7, {}, { id: 7, attributes: {} }, { id: "no-attrs" }, { id: "arr", attributes: [] }, { id: "nul", attributes: null }];
+  const api = async () => ({ status: 200, ok: true, parsed: { data: [...bad, good] }, text: "" });
+  const out = await ascAllRows({ api, url: "/v1/x" });
+  assert.deepEqual(out.rows.map((r) => r.id), ["ok"]);
+  // A malformed group row neither throws nor counts as an internal group.
+  const apiGroups = async (_m, path) => {
+    if (path.startsWith("/v1/apps/")) return { status: 200, ok: true, parsed: { data: [{ id: "g", attributes: null }, null, { id: 1 }] }, text: "" };
+    return { status: 500, ok: false, parsed: {}, text: "" };
+  };
+  assert.deepEqual(await countInternalTesters({ api: apiGroups, appId: "1" }), { ok: true, groups: 0, testers: 0 });
+  // Pin the by-hand check so nobody swaps it for a package import.
+  assert.match(read("scripts/ios-fleet/asc-api.mjs"), /const isAscRow = \(row\) =>/);
+});
+
+test("ensureInternalTesterGroup reads every page of the group's members, so a member on page 2 is not re-added", async () => {
+  const { ensureInternalTesterGroup } = await import("./ios-fleet/asc-api.mjs");
+  const member = (e) => ({ type: "betaTesters", id: `t-${e}`, attributes: { email: e } });
+  const posts = [];
+  const api = async (method, path, body) => {
+    if (method === "GET" && path.startsWith("/v1/apps/1/betaGroups")) {
+      return { status: 200, ok: true, parsed: { data: [{ id: "int1", type: "betaGroups", attributes: { name: "Internal Testers", isInternalGroup: true, hasAccessToAllBuilds: true } }] }, text: "" };
+    }
+    if (method === "GET" && path.startsWith("/v1/users")) {
+      return { status: 200, ok: true, parsed: { data: [{ id: "u1", attributes: { username: "alice@example.com" } }] }, text: "" };
+    }
+    if (method === "GET" && path === "/v1/betaGroups/int1/betaTesters?limit=200&fields[betaTesters]=email") {
+      return { status: 200, ok: true, parsed: { data: [member("zed@example.com")], links: { next: "https://api.appstoreconnect.apple.com/v1/betaGroups/int1/betaTesters?cursor=2" } }, text: "" };
+    }
+    if (method === "GET" && path.includes("betaGroups/int1/betaTesters?cursor=2")) {
+      return { status: 200, ok: true, parsed: { data: [member("alice@example.com")] }, text: "" };
+    }
+    if (method !== "GET") posts.push(`${method} ${path} ${body || ""}`);
+    return { status: 500, ok: false, parsed: {}, text: "" };
+  };
+  const out = await ensureInternalTesterGroup({ api, appId: "1", emails: ["alice@example.com"], log: () => {}, warn: () => {} });
+  assert.equal(out.alreadyIn, 1, "alice sits on page 2 of the members and is already in the group");
+  assert.equal(out.added, 0);
+  assert.deepEqual(posts, [], "nothing is written for a member the second page already shows");
+});
+
+test("every ship submits the newest build for Beta App Review to the external group, in code", () => {
+  // AC: the newest build is submitted to Beta App Review for the external
+  // "Public Beta" group.  ensure-standing-testers runs after every ship (the
+  // "Sync standing TestFlight testers" step), assigns the build to the external
+  // group, and POSTs the submission whenever externalBuildState is
+  // READY_FOR_BETA_SUBMISSION.
+  const yml = read(".github/workflows/ios-ship.yml");
+  const mjs = read("scripts/ios-fleet/asc-api.mjs");
+  assert.match(yml, /name: Sync standing TestFlight testers[\s\S]*ensure-standing-testers "\$appleid"/);
+  const branch = mjs.slice(mjs.indexOf('method === "ensure-standing-testers"'), mjs.indexOf('method === "ensure-tf-ready"'));
+  assert.match(branch, /relationships\/builds/, "the build is assigned to the external group");
+  assert.match(branch, /ext === "READY_FOR_BETA_SUBMISSION"[\s\S]*\/v1\/betaAppReviewSubmissions/);
+  assert.match(branch, /submitted \$\{buildLabel\} for Beta App Review/);
+});
+
 test("the ship no longer claims internal testers can install when none exist", () => {
   const sh = read("scripts/ios-fleet/ship-testflight.sh");
   const mjs = read("scripts/ios-fleet/asc-api.mjs");

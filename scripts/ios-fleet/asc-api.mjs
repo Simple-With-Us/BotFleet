@@ -346,7 +346,40 @@ function buildReleaseNotes({ marketing, displayName, title, subjects, iosPathPre
 // drive them with a fake and so main() keeps one authenticated client.
 export const INTERNAL_GROUP_NAME = "Internal Testers";
 
-const ascRows = (res) => (res && res.ok && Array.isArray(res.parsed?.data) ? res.parsed.data : []);
+// A resource row is { id: <string>, attributes: <object>, ... }.  This client is
+// dependency-free on purpose (the hosted ios-ship workflow runs it with plain
+// `node` before any `pnpm install`, so `import "zod"` fails with
+// ERR_MODULE_NOT_FOUND and breaks every ship; a test pins that), so the shape is
+// checked by hand.  `String(x) === x` is true only for a string primitive, and the
+// toString tag is "[object Object]" only for a plain object, so a malformed row is
+// dropped here instead of crashing a caller that reads row.id or row.attributes.
+const isAscRow = (row) =>
+  Boolean(row) && String(row.id) === row.id && Object.prototype.toString.call(row.attributes) === "[object Object]";
+
+const ascRows = (res) => (res && res.ok && Array.isArray(res.parsed?.data) ? res.parsed.data.filter(isAscRow) : []);
+
+const ASC_ORIGIN = "https://api.appstoreconnect.apple.com/";
+const ASC_MAX_PAGES = 50;
+
+// Every row of a collection, following links.next.  Never returns a partial list
+// as if it were whole: a failed page, a next link that leaves App Store Connect
+// (the bearer token must not follow it), or more than ASC_MAX_PAGES pages all
+// answer { ok: false }, and callers treat that as "unreadable".
+export async function ascAllRows({ api, url }) {
+  const rows = [];
+  let next = url;
+  for (let page = 0; page < ASC_MAX_PAGES && next; page++) {
+    const res = await api("GET", next);
+    if (!res.ok) return { ok: false, error: ascErrorText(res), rows: [] };
+    rows.push(...ascRows(res));
+    next = res.parsed?.links?.next || "";
+    if (next && !next.startsWith(ASC_ORIGIN) && !next.startsWith("/")) {
+      return { ok: false, error: "next link leaves App Store Connect", rows: [] };
+    }
+  }
+  if (next) return { ok: false, error: `more than ${ASC_MAX_PAGES} pages`, rows: [] };
+  return { ok: true, rows };
+}
 
 export function ascErrorText(res) {
   const e = (res?.parsed?.errors || [])[0] || {};
@@ -393,8 +426,8 @@ export async function addTesterToGroup({ api, appId, groupId, email, createFirst
   const addExisting = (tester) => api("POST", `/v1/betaGroups/${groupId}/relationships/betaTesters`,
     JSON.stringify({ data: [{ type: "betaTesters", id: tester.id }] }));
   const recoverFromCrossApp = async () => {
-    const appTesters = await api("GET", `/v1/betaTesters?filter[apps]=${appId}&limit=200&fields[betaTesters]=email`);
-    const appScoped = ascRows(appTesters).find(sameEmail);
+    const appTesters = await ascAllRows({ api, url: `/v1/betaTesters?filter[apps]=${appId}&limit=200&fields[betaTesters]=email` });
+    const appScoped = appTesters.rows.find(sameEmail);
     if (!appScoped) return null;
     existing = appScoped;
     return addExisting(appScoped);
@@ -427,15 +460,12 @@ export async function countInternalTesters({ api, appId }) {
   const groups = ascRows(groupsRes).filter(
     (g) => g.attributes?.isInternalGroup === true && g.attributes?.hasAccessToAllBuilds === true
   );
+  // One Set across ALL groups: a tester in two all-builds groups is one person.
   const seen = new Set();
   for (const g of groups) {
-    let url = `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email`;
-    for (let page = 0; page < 50 && url; page++) {
-      const members = await api("GET", url);
-      if (!members.ok) return { ok: false, error: ascErrorText(members), groups: groups.length, testers: seen.size };
-      for (const t of ascRows(members)) seen.add(String(t.attributes?.email || "").toLowerCase());
-      url = members.parsed?.links?.next || "";
-    }
+    const members = await ascAllRows({ api, url: `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email` });
+    if (!members.ok) return { ok: false, error: members.error, groups: groups.length, testers: seen.size };
+    for (const t of members.rows) seen.add(String(t.attributes?.email || "").toLowerCase());
   }
   return { ok: true, groups: groups.length, testers: seen.size };
 }
@@ -478,29 +508,17 @@ export async function ensureInternalTesterGroup({ api, appId, emails, log, warn 
   // know which standing emails qualify; when the list is unreadable, try them
   // all and let Apple answer.  Paginate so teams with >200 users are not silently
   // truncated (GH #1018: the internal group must hold every ASC standing email).
-  const ascUsers = new Set();
-  let usersUrl = "/v1/users?limit=200&fields[users]=username";
-  let usersReadable = false;
-  for (let page = 0; page < 50 && usersUrl; page++) {
-    const usersRes = await api("GET", usersUrl);
-    if (!usersRes.ok) {
-      // A failure on ANY page makes the list incomplete.  Treat it as unreadable
-      // (try every standing email) rather than as "everyone else is not a user".
-      ascUsers.clear();
-      usersReadable = false;
-      break;
-    }
-    usersReadable = true;
-    for (const u of ascRows(usersRes)) {
-      ascUsers.add(String(u.attributes?.username || "").toLowerCase());
-    }
-    usersUrl = usersRes.parsed?.links?.next || "";
-  }
+  // A failure on ANY page (or an oversized list) makes the list incomplete, so it
+  // reads as unreadable (try every standing email), never as "everyone else is
+  // not a user".
+  const users = await ascAllRows({ api, url: "/v1/users?limit=200&fields[users]=username" });
+  const usersReadable = users.ok;
+  const ascUsers = new Set(users.rows.map((u) => String(u.attributes?.username || "").toLowerCase()));
   if (!usersReadable) log(`could not read App Store Connect users; trying every standing email`);
 
-  const inGroupRes = await api("GET", `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email`);
-  if (!inGroupRes.ok) return fail(`could not list testers in internal group (${ascErrorText(inGroupRes)}); not re-adding anyone`);
-  const inGroup = new Set(ascRows(inGroupRes).map((t) => String(t.attributes?.email || "").toLowerCase()));
+  const members = await ascAllRows({ api, url: `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email` });
+  if (!members.ok) return fail(`could not list testers in internal group (${members.error}); not re-adding anyone`);
+  const inGroup = new Set(members.rows.map((t) => String(t.attributes?.email || "").toLowerCase()));
 
   for (const email of emails) {
     const key = email.toLowerCase();
