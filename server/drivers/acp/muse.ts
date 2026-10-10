@@ -140,11 +140,15 @@ function museCredentialStorage(env: Record<string, string | undefined>): string 
     const parsed = JSON.parse(raw) as {
       providers?: Record<string, { storage?: unknown } | undefined>;
     };
-    for (const provider of Object.values(parsed.providers ?? {})) {
-      const storage = provider?.storage;
-      if (typeof storage === "string" && storage.length > 0) return storage;
-    }
-    return null;
+    // Scoped to `meta` on purpose.  The index is a map of *providers*, and any
+    // one of them carrying a storage field used to satisfy this check — so a
+    // user with some other provider configured, but no Meta one, was reported
+    // as signed in and pulled into the failover chain at
+    // `server/safety/turn-safety.ts`.  Only the provider this driver actually
+    // spends the credential on counts.
+    const meta = parsed.providers?.meta;
+    const storage = meta?.storage;
+    return typeof storage === "string" && storage.length > 0 ? storage : null;
   } catch {
     // A malformed index is not evidence of a credential, and must never throw
     // out of a snapshot path.
@@ -154,24 +158,25 @@ function museCredentialStorage(env: Record<string, string | undefined>): string 
 
 /** Is Muse Code signed in *for this driver*?
  *
- *  Two tiers, and the distinction is the whole point.
+ *  Three tiers, and the distinction is the whole point.
  *
  *  **An API key, or a file-backed stored credential, is signed in.**  Muse Code
  *  resolves credentials as `META_API_KEY` first, then a stored key, and only
- *  then a stored browser session — so `META_API_KEY` and a `storage` of
- *  anything other than `keychain` are both credentials a client can read.  On
- *  Linux and Windows there is no macOS Keychain, so a file-backed credential is
- *  the normal case there and treating it as "not signed in" would strand every
- *  user on those platforms.
+ *  then a stored browser session — so `META_API_KEY` and a file-backed
+ *  `storage` are both credentials a client can read.  On Linux and Windows
+ *  there is no macOS Keychain, so a file-backed credential is the normal case
+ *  there and treating it as "not signed in" would strand every user on those
+ *  platforms.
  *
- *  **A keychain-backed session is reported as unproven, not signed in.**  This
- *  is the case that produced the original bug.  The credential is real and the
- *  CLI uses it happily — `muse exec` works on that account — but the community
- *  adapter we spawn bundles `@muse-code/sdk@1.3.0`, which predates the
- *  Keychain move and answers "not logged in".  Counting it would put a
- *  setup-complete badge over an engine that fails every turn.
+ *  **A keychain-backed session is signed in too, and this used to be wrong.**
+ *  That was the case that produced the original bug:  the old check reported
+ *  "unproven" for keychain storage, on the theory that the community adapter
+ *  we spawn bundles `@muse-code/sdk@1.3.0`, which predates the Keychain move
+ *  and would answer "not logged in".  **That theory was measured and refuted** —
+ *  see below.  It is recorded here because the refutation is the load-bearing
+ *  part:  anyone tempted to reintroduce that tier needs to know it was tested.
  *
- *  Why "unproven" has to be a real answer rather than an aside:  the live
+ *  Why this distinction has to be a real answer rather than an aside:  the live
  *  consumers of this value are the setup card and the failover chain at
  *  `server/safety/turn-safety.ts`, which skips an instance whose
  *  `authenticated` is `false`.  `muse` sets neither

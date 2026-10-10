@@ -223,9 +223,8 @@ export function MiniMaxMark({ size = 16, className }: IconProps) {
  *  Muse Code had no case in `ProviderMark` at all, so it fell through to the
  *  two-letter monogram and rendered as a bare "M" in the engine rail — the one
  *  tile that read as a placeholder rather than a product, next to real marks.
- *  Geometry and the blue ramp are the ones CodeCaps ships in
- *  `Sources/CodeCaps/Resources/ProviderMarks/muse-code.svg`, so the same engine
- *  wears the same mark in both apps.
+ *  Geometry and the blue ramp are lifted from the Muse Code provider mark that
+ *  ships with CodeCaps, so the same engine wears the same mark in both apps.
  *
  *  The three paths keep the source's own layering: a flat base, a gradient
  *  body, and a lighter leading edge.  The source shipped a padded

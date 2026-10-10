@@ -180,6 +180,49 @@ describe("Muse Code driver", () => {
     expect(museAuthenticated({ HOME: brokenHome })).toBe(false);
   });
 
+  it("only counts a credential under the provider this driver actually spends", () => {
+    // The index is a map of *providers*.  The check used to return the first
+    // provider carrying any `storage`, so an index holding only some other
+    // provider reported the engine as signed in — and `turn-safety.ts` then
+    // put that unauthenticated instance into the failover chain, where it
+    // would fail every turn before the chain ever got a real shot.
+    const otherHome = scratch();
+    const otherDir = join(otherHome, ".config", "muse");
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(
+      join(otherDir, "auth.json"),
+      JSON.stringify({
+        schema_version: 1,
+        providers: { someotherprovider: { mechanism: "api_key", storage: "keychain" } },
+      }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: otherHome })).toBe(false);
+
+    // Both present: `meta` is the one that counts, and it satisfies the check
+    // on its own.  `meta` must win even when the other provider sorts first.
+    writeFileSync(
+      join(otherDir, "auth.json"),
+      JSON.stringify({
+        schema_version: 1,
+        providers: {
+          aaaother: { mechanism: "api_key", storage: "keychain" },
+          meta: { mechanism: "browser_session", storage: "keychain" },
+        },
+      }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: otherHome })).toBe(true);
+
+    // A `meta` entry with no storage is not a credential either.
+    writeFileSync(
+      join(otherDir, "auth.json"),
+      JSON.stringify({ schema_version: 1, providers: { meta: { mechanism: "none" } } }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: otherHome })).toBe(false);
+  });
+
   it("names the same sign-in path the auth check can actually see", () => {
     // The bug this guards:  `loginNote` and `signInCommand` pointed at
     // `muse-code-acp --cli login`, which completes a device-code session into
