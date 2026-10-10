@@ -1,7 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { z } from 'zod';
 
-const QueuedSendBodySchema = z.object({ text: z.string().optional() });
+const QueuedSendBodySchema = z.object({ text: z.string().optional() }).strict();
 
 // Visual coverage for the stacked queued steer pills (board b5146817).
 //
