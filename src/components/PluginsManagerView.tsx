@@ -73,8 +73,8 @@ async function readApiError(response: Response): Promise<ApiError | null> {
 // The schemas are the single definition of what the plugins route returns, and
 // they live in server/plugin-types so the server and the view cannot drift
 // apart.  The view's types are derived from them (`z.infer`), and the boundary
-// strips unknown keys by default: a server-added field is dropped from
-// `parsed.data` instead of failing the parse and blanking the list.
+// is strict: a server-added field fails the parse instead of being silently
+// dropped from `parsed.data`.
 
 async function readPluginsResponse(response: Response): Promise<PluginsResponse | null> {
   let body: unknown;

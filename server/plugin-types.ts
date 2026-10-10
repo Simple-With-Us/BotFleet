@@ -82,26 +82,26 @@ export const PluginExportsSchema = z.object({
 }).strict();
 export type PluginExports = z.infer<typeof PluginExportsSchema>;
 
-/** Permissive source shape for the API listing.  Distinct from the
- *  strict `PluginSourceSchema` used by the on-disk registry: the API
- *  layer must accept a server-added field without blanking the list. */
+/** API listing source shape.  Distinct field surface from the
+ *  on-disk `PluginSourceSchema` (folder/git extras are optional on the
+ *  wire), but still strict at the wire boundary so a server-added
+ *  field cannot drift in unnoticed. */
 export const PluginListingSourceSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("folder"), path: z.string().min(1) }),
+  z.object({ kind: z.literal("folder"), path: z.string().min(1) }).strict(),
   z.object({
     kind: z.literal("git"),
     url: z.string().min(1),
     ref: z.string().nullable().optional(),
     path: z.string().optional(),
-  }),
+  }).strict(),
 ]);
 export type PluginListingSource = z.infer<typeof PluginListingSourceSchema>;
 
 /** The shape returned by the plugins listing API.  The view reads the
  *  `/api/plugins` response through this schema so the wire format and the
- *  consumer type cannot drift apart.  The schema strips unknown keys: a
- *  server-added field is dropped from `parsed.data` instead of failing
- *  the parse and blanking the list.  The stricter on-disk registry
- *  schema above is a separate trust boundary. */
+ *  consumer type cannot drift apart.  Strict at the wire boundary: a
+ *  server-added field fails the parse instead of being silently dropped,
+ *  matching the on-disk registry schema above. */
 export const PluginListingSchema = z.object({
   name: z.string().min(1),
   version: z.string().min(1),
@@ -132,7 +132,7 @@ export const PluginListingSchema = z.object({
       args: z.array(z.string()).optional(),
     }).strict()).optional(),
   }).strict().optional(),
-});
+}).strict();
 
 /** The full response body of `GET /api/plugins`. */
 export const PluginsResponseSchema = z.object({

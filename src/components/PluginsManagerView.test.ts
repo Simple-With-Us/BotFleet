@@ -11,9 +11,8 @@ import {
 } from "../../server/plugin-types";
 
 // The view's types are derived from the schemas that read the plugins route, so
-// they cannot drift apart.  These checks pin that, and the one runtime behaviour
-// the derivation chose: unknown fields are stripped at the boundary, so a field
-// the server adds cannot blank the list.
+// they cannot drift apart.  These checks pin that, and the runtime behaviour
+// the schemas declare: unknown fields are rejected at the wire boundary.
 
 const listing = {
   name: "weather",
@@ -40,15 +39,13 @@ describe("plugins manager schemas", () => {
     expectTypeOf<Extract<PluginListingSource, { kind: "git" }>["url"]>().toEqualTypeOf<string>();
   });
 
-  it("silently drops a field the server adds instead of rejecting it", () => {
+  it("rejects a field the server adds so the wire format cannot drift silently", () => {
     const parsed = PluginsResponseSchema.safeParse({
       plugins: [{ ...listing, addedLater: true, source: { ...listing.source, extra: 1 } }],
     });
-    expect(parsed.success).toBe(true);
-    if (!parsed.success) return;
-    const parsedListing = parsed.data.plugins[0]!;
-    expect("addedLater" in parsedListing).toBe(false);
-    expect("extra" in parsedListing.source).toBe(false);
+    expect(parsed.success).toBe(false);
+    expect(PluginListingSourceSchema.safeParse({ ...listing.source, extra: 1 }).success).toBe(false);
+    expect(PluginListingSchema.safeParse({ ...listing, addedLater: true }).success).toBe(false);
   });
 
   it("rejects a listing whose source cannot be shown", () => {
