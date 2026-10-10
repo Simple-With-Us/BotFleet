@@ -330,7 +330,19 @@ function ComposerInner({
   const [queued, setQueued] = useState<{ text: string; replyToId?: string; sent: SentDraft<Message> } | null>(null);
   const pendingItems = useMemo(() => {
     if (group) {
-      return queued ? [{ queueId: "group-queued", text: queued.text, at: Date.now() }] : [];
+      // The room's held message is one client-side entry, so the pill's entry
+      // is built here rather than read from pendingQueued.  It carries the
+      // same shape the bot branch gets, attachments included, so handleEditQueued
+      // has one contract instead of two.
+      return queued
+        ? [{
+            queueId: "group-queued",
+            text: queued.text,
+            at: Date.now(),
+            reply: queued.sent.reply,
+            attachments: queued.sent.attachments,
+          }]
+        : [];
     }
     if (!bot) return [];
     return state.pendingQueued?.[bot.threadId] ?? [];
@@ -362,8 +374,17 @@ function ComposerInner({
         attachments: entry.attachments,
         reply: entry.reply,
       };
-      dispatch({ type: "cancelQueued", botId: bot.id, queueId: entry.queueId });
-      restoreFailedSend(sent);
+      dispatch({
+        type: "cancelQueued",
+        botId: bot.id,
+        queueId: entry.queueId,
+        // Restore only once the harness has taken the queued message.  Doing
+        // it here instead would put the draft back while the DELETE is still
+        // in flight, and a fast resend in that window sends both the original
+        // and the copy.  If the DELETE fails the pill stays, the queued send
+        // survives, and the person can try again.
+        onSettled: () => restoreFailedSend(sent),
+      });
     }
     requestAnimationFrame(() => {
       const input = inputRef.current;
