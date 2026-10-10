@@ -25,23 +25,45 @@ name: Sentry Deploy
 # SENTRY_AUTH_TOKEN comes from Infisical prod through the shared composite
 # action (.github/actions/infisical-secrets), with the synced GitHub secret
 # as a fallback during the cutover.
+#
+# Second trigger (PR #899): ios-ship.yml calls this workflow with an
+# archive-verified, exact-build TestFlight readiness receipt, and the
+# record-testflight-availability job below records the Cocoa release and
+# confirmed TestFlight availability.  Green CI, an uploaded archive, and a
+# skipped ship are NOT deployment evidence.  Reporting failure is a separate
+# red job; it must not cause another app upload.  Each job below is gated to
+# its own event, so neither trigger can run the other job.
 
 on:
   workflow_run:
     workflows:
       - CI
     types: [completed]
+  workflow_call:
+    inputs:
+      receipt:
+        description: Verified TestFlight distribution receipt from ios-ship
+        required: false
+        default: ""
+        type: string
+      receipt_error:
+        description: The ship succeeded but its deployment receipt could not be verified
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
   pull-requests: read
 
-concurrency:
-  group: sentry-deploy-${{ github.event.workflow_run.head_sha }}
-  cancel-in-progress: false
+# No top-level concurrency group: the two jobs carry their own (one per
+# trigger shape) so neither trigger starves the other.
 
 jobs:
   record-production-deploy:
+    concurrency:
+      group: sentry-deploy-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
     if: >
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
@@ -150,3 +172,46 @@ jobs:
             echo "::warning::sentry-cli releases deploys failed after retries; leaving workflow green"
           fi
           exit 0
+
+  record-testflight-availability:
+    # workflow_call only: without this guard the job would also run on every
+    # CI completion (where github.ref is main) with an empty receipt and fail
+    # red on JSON.parse.  The production job above is likewise scoped to its
+    # own workflow_run payload fields.
+    if: >-
+      github.event_name == 'workflow_call' &&
+      github.repository == 'Simple-With-Us/BotFleet' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: sentry-testflight-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Validate the distribution receipt before loading credentials
+        env:
+          SENTRY_DEPLOY_RECEIPT: ${{ inputs.receipt }}
+          SENTRY_RECEIPT_ERROR: ${{ inputs.receipt_error }}
+        run: |
+          node --input-type=module -e '
+            import { validateReceipt } from "./scripts/sentry-testflight-receipt.mjs";
+            if (process.env.SENTRY_RECEIPT_ERROR === "true") throw new Error("The upload succeeded but receipt verification failed; deployment reporting is blocked");
+            const receipt = validateReceipt(JSON.parse(process.env.SENTRY_DEPLOY_RECEIPT));
+            if (receipt.sourceCommit !== process.env.GITHUB_SHA) throw new Error("Receipt source does not match the ship workflow");
+          '
+      - name: Load the required Sentry auth token
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: SENTRY_AUTH_TOKEN
+          required: SENTRY_AUTH_TOKEN
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+        env:
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      - name: Record the Cocoa release and confirmed TestFlight availability
+        env:
+          SENTRY_DEPLOY_RECEIPT: ${{ inputs.receipt }}
+        run: node scripts/sentry-report-testflight.mjs
