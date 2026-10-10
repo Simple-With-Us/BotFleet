@@ -7,7 +7,6 @@ import { test, expect, type Page } from '@playwright/test';
 // of context.
 //
 // There is no visual-tests/ directory; this follows tests/e2e/visual.spec.ts.
-const stableShot = {} as const; // maxDiffPixelRatio/threshold (and animations/caret) live in playwright.config under expect.toHaveScreenshot; spec only adds mask
 
 async function pinFonts(page: Page): Promise<void> {
   await page.addStyleTag({
@@ -73,7 +72,9 @@ test('visual: provider marks for muse and mcode through ProviderMark', async ({ 
   // The one thing the packed chip could not say:  which window runs out first.
   await expect(museBlock.getByText(/Weekly is nearly spent/)).toBeVisible();
 
-  await expect(board).toHaveScreenshot('provider-icons-marks.png', stableShot);
+  // Screenshot settings (maxDiffPixelRatio, threshold, animations, caret)
+  // come from playwright.config's expect.toHaveScreenshot.
+  await expect(board).toHaveScreenshot('provider-icons-marks.png');
 });
 
 test('visual: muse mark carries the Meta blue ramp, mcode carries the brand red ramp', async ({ page }) => {
