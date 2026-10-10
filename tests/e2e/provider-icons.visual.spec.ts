@@ -52,25 +52,9 @@ test('visual: provider marks for muse and mcode through ProviderMark', async ({ 
   const monogram = page.getByTestId('provider-mark-monogram');
   await expect(monogram.locator('svg')).toHaveCount(0);
 
-  // EngineQuotasPanel renders in the picker header (ModelPicker.tsx:851-854).
-  const panel = page.getByTestId('provider-icons-quotas-panel');
-  await expect(panel).toBeVisible();
-  await expect(panel.getByText('Engine Quotas')).toBeVisible();
-
-
-  // The expanded panel is where the fix actually lives:  the old UI said
-  // "(93% / 3% for 5h / w)" and these are the words that replaced it.
-  const expanded = page.getByTestId('provider-icons-quotas-panel');
-  await expect(expanded.getByRole('button', { name: /Engine Quotas/ })).toBeVisible();
-  // Scope to the Muse Code block:  the MiniMax fixture below it has its own
-  // Weekly row, so an unscoped text match is ambiguous.
-  const museBlock = expanded.getByTestId('engine-quota-muse');
-  await expect(museBlock.getByText('5-Hour')).toBeVisible();
-  await expect(museBlock.getByText('Weekly').first()).toBeVisible();
-  await expect(museBlock.getByText('93% left', { exact: true })).toBeVisible();
-  await expect(museBlock.getByText('3% left', { exact: true })).toBeVisible();
-  // The one thing the packed chip could not say:  which window runs out first.
-  await expect(museBlock.getByText(/Weekly is nearly spent/)).toBeVisible();
+  // The quota panel's own contents are covered by
+  // engine-quotas-panel.visual.spec.ts, which screenshots the panel detail on
+  // its own; this spec is about the marks, and only checks the panel mounts.
 
   // Screenshot settings (maxDiffPixelRatio, threshold, animations, caret)
   // come from playwright.config's expect.toHaveScreenshot.
