@@ -40,7 +40,11 @@ export type BotFleetStreamChunk = {
 export type BotFleetSend = (params: { threadId: string; text: string }) => Promise<void>;
 
 /** Our reload path is the harness' regenerate endpoint. */
-export type BotFleetReload = (params: { messageId: string }) => Promise<void>;
+export type BotFleetReload = (params: {
+  messageId: string;
+  sourceId: string | null;
+  runConfig: unknown;
+}) => Promise<void>;
 
 /**
  * Id for the synthetic assistant message that carries the live stream when the
@@ -104,9 +108,16 @@ export function createBotFleetExternalStore(params: {
     },
     // Signature is (parentId, config) — parentId is `string | null`, not an object.
     onReload: reload
-      ? async (parentId: string | null) => {
+      ? async (
+          parentId: string | null,
+          config: { parentId: string | null; sourceId: string | null; runConfig: unknown },
+        ) => {
           if (!parentId) return;
-          await reload({ messageId: parentId });
+          await reload({
+            messageId: parentId,
+            sourceId: config.sourceId,
+            runConfig: config.runConfig,
+          });
         }
       : undefined,
   };
