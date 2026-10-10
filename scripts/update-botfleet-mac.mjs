@@ -854,8 +854,32 @@ export function requireHarnessBearerCredential() {
 }
 /* oxlint-enable anti-slop/no-runtime-typeof */
 
-function harnessAuthorizationHeader() {
-  return { Authorization: `Bearer ${requireHarnessBearerCredential()}` };
+/** Transition fallback for launchers that predate the credential handoff: an
+ *  installed harness or app older than that change, or a terminal run with no
+ *  launcher at all, never sets BOTFLEET_OWNER_NONCE.  The live owner record is
+ *  already in memory at every call site, so use its value rather than
+ *  refusing an update the old launcher started.  A present-but-malformed
+ *  variable still fails: that is a real misconfiguration, not an old
+ *  launcher.  Remove this fallback once the installed base carries the
+ *  handoff. */
+/* oxlint-disable anti-slop/no-runtime-typeof -- env credential boundary; zod is unavailable in the updater bootstrap graph. */
+export function resolveHarnessBearerCredential(owner) {
+  const credential = process.env.BOTFLEET_OWNER_NONCE;
+  if (typeof credential === "string" && credential.length > 0) {
+    if (!/^[a-f0-9]{64}$/.test(credential)) {
+      throw new Error("BOTFLEET_OWNER_NONCE is not a valid harness bearer credential");
+    }
+    return credential;
+  }
+  if (owner && typeof owner.nonce === "string" && /^[a-f0-9]{64}$/.test(owner.nonce)) {
+    return owner.nonce;
+  }
+  throw new Error("BOTFLEET_OWNER_NONCE is required when a harness owner record exists");
+}
+/* oxlint-enable anti-slop/no-runtime-typeof */
+
+function harnessAuthorizationHeader(owner) {
+  return { Authorization: `Bearer ${resolveHarnessBearerCredential(owner)}` };
 }
 
 /**
@@ -933,7 +957,7 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   }
   if (state !== "live") return null;
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
-    headers: harnessAuthorizationHeader(),
+    headers: harnessAuthorizationHeader(owner),
     accept: [200],
     timeoutMs: PATIENT_REQUEST_MS,
   });
@@ -1215,7 +1239,7 @@ export function keepFenceLease(owner, {
   clearTimer = clearTimeout,
 } = {}) {
   const url = `http://127.0.0.1:${owner.port}/api/runtime/quiesce?renew=1&leaseMs=${leaseMs}`;
-  const headers = harnessAuthorizationHeader();
+  const headers = harnessAuthorizationHeader(owner);
   let stopped = false;
   let timer = null;
   let inFlight = Promise.resolve();
@@ -1280,7 +1304,7 @@ export function keepFenceLease(owner, {
 async function holdAndFence(config, owner, deps) {
   const { request, now, pause: sleepFor, report, releaseAdmission, stop, mode, windowMs, roomWaitMs, pollMs } = deps;
   const base = `http://127.0.0.1:${owner.port}`;
-  const headers = harnessAuthorizationHeader();
+  const headers = harnessAuthorizationHeader(owner);
   const quiesce = (query = "", timeoutMs = QUIESCE_TIMEOUT_MS) => request(`${base}/api/runtime/quiesce${query}`, {
     method: "POST",
     headers,
@@ -1473,7 +1497,7 @@ async function holdAndFence(config, owner, deps) {
  */
 async function forceFence(owner, { request, now, wait, pollMs, stop }) {
   const base = `http://127.0.0.1:${owner.port}`;
-  const headers = harnessAuthorizationHeader();
+  const headers = harnessAuthorizationHeader(owner);
   const answer = await request(`${base}/api/runtime/quiesce?force=true&${LEASE_QUERY}`, {
     method: "POST",
     headers,
@@ -1540,7 +1564,7 @@ async function fenceWithin(config, owner, { request, inspectTopology, inspectHol
       ? await forceFence(owner, { request, now, wait: pause, pollMs: config?.drainPollMs, stop })
       : await request(`http://127.0.0.1:${owner.port}/api/runtime/quiesce?${LEASE_QUERY}`, {
         method: "POST",
-        headers: harnessAuthorizationHeader(),
+        headers: harnessAuthorizationHeader(owner),
         accept: [200, 409],
         timeoutMs: QUIESCE_TIMEOUT_MS,
       });
@@ -1666,7 +1690,7 @@ export async function releaseRuntimeAdmission(config, adapters = {}) {
   const owner = await readRuntimeOwner(config.dataDirectory);
   if (!owner) throw new Error("Authenticated runtime owner is unavailable for admission recovery");
   const base = `http://127.0.0.1:${owner.port}`;
-  const headers = harnessAuthorizationHeader();
+  const headers = harnessAuthorizationHeader(owner);
   const read = () => request(`${base}/api/runtime`, { headers, accept: [200], timeoutMs: QUIESCE_TIMEOUT_MS });
   /** Poll while `still` holds, up to a window chosen from the first answer.
    *  Resolves the last answer read, or null when none came. */

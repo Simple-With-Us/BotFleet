@@ -46,6 +46,7 @@ import {
   rollbackHarnessBootoutLabels,
   rollbackHarnessBootstrapPlists,
   rollbackReadinessError,
+  resolveHarnessBearerCredential,
   run,
   runStagedSmokeTest,
   runtimePreflight,
@@ -850,11 +851,29 @@ test("the up-to-date runtime probe reads the bearer credential from BOTFLEET_OWN
   assert.match(helper, /maskedCredentialEnvRef/);
 });
 
-test("the mac updater authenticates runtime calls with BOTFLEET_OWNER_NONCE only", async () => {
+test("the mac updater prefers BOTFLEET_OWNER_NONCE and falls back to the live owner record", async () => {
   const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
   assert.match(source, /requireHarnessBearerCredential/);
+  assert.match(source, /resolveHarnessBearerCredential/);
   assert.match(source, /process\.env\.BOTFLEET_OWNER_NONCE/);
   assert.doesNotMatch(source, /Authorization: `Bearer \$\{owner\.nonce\}`/);
+});
+
+test("resolveHarnessBearerCredential falls back to the live owner record for old launchers", () => {
+  const owner = { version: 1, pid: 42, port: 8799, nonce: "c".repeat(64) };
+  const previous = process.env.BOTFLEET_OWNER_NONCE;
+  try {
+    delete process.env.BOTFLEET_OWNER_NONCE;
+    assert.equal(resolveHarnessBearerCredential(owner), owner.nonce);
+    assert.throws(() => resolveHarnessBearerCredential(null), /BOTFLEET_OWNER_NONCE is required/);
+    process.env.BOTFLEET_OWNER_NONCE = "d".repeat(64);
+    assert.equal(resolveHarnessBearerCredential(owner), "d".repeat(64));
+    process.env.BOTFLEET_OWNER_NONCE = "short";
+    assert.throws(() => resolveHarnessBearerCredential(owner), /not a valid/);
+  } finally {
+    if (previous === undefined) delete process.env.BOTFLEET_OWNER_NONCE;
+    else process.env.BOTFLEET_OWNER_NONCE = previous;
+  }
 });
 
 test("apply bootstraps the updater recorded in the stage manifest, not a newer origin/main", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
