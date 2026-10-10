@@ -123,10 +123,11 @@ function museAuthIndexPath(env: Record<string, string | undefined>): string {
 
 /** The credential backend the CLI recorded, or null when there is no index.
  *
- *  `file` and friends mean the credential is in this very file and any client
- *  can read it.  `keychain` means the token was handed to the OS keychain
- *  instead, which is the one case this engine cannot use — see
- *  `museAuthenticated`. */
+ *  The value is no longer used to *reject* a session:  `keychain` means the
+ *  token was handed to the OS keychain, and the installed CLI resolves it for
+ *  the adapter, so it counts as signed in — see `museAuthenticated`.  It is
+ *  still the right thing to read, because a present file with a recorded
+ *  `storage` is exactly what distinguishes signed in from signed out. */
 function museCredentialStorage(env: Record<string, string | undefined>): string | null {
   const path = museAuthIndexPath(env);
   let raw: string;
@@ -180,25 +181,49 @@ function museCredentialStorage(env: Record<string, string | undefined>): string 
  *  so `loginNote` and `signInCommand` name the API key as the path, and a test
  *  holds them to this function so the two cannot drift apart again.
  */
+/** Is Muse Code signed in *for this driver*?
+ *
+ *  This used to answer `false` for a keychain-backed session, on the theory
+ *  that the community adapter's bundled `@muse-code/sdk@1.3.0` predates the
+ *  keychain move and would answer "not logged in" while the credential was in
+ *  fact fine.  **That theory is wrong, and it is now measured rather than
+ *  assumed.**
+ *
+ *  On a keychain-device-code account, the real `muse-code-acp` adapter
+ *  completes `initialize` → `session/new` → `session/prompt` and returns
+ *  `stopReason: end_turn`.  The adapter does not read the credential itself:
+ *  it spawns `muse serve`, and the installed CLI resolves the keychain token.
+ *  The SDK version is irrelevant to the question, because the SDK is not the
+ *  component holding the session.
+ *
+ *  So keychain storage is a real credential and is treated as signed in.  The
+ *  old `false` was not cosmetic: it stranded the setup card forever and kept
+ *  the instance out of the failover chain at `server/safety/turn-safety.ts`
+ *  for a user who had signed in correctly and could run a turn by hand — the
+ *  exact "does not work" report this fixes.
+ *
+ *  `storage` is still read at all, because it is the only thing in the index
+ *  that distinguishes "signed in" from "signed out" — the file itself carries
+ *  no secret and exists either way. */
 export function museAuthenticated(env: Record<string, string | undefined>): boolean {
   if (env.META_API_KEY?.trim()) return true;
-  const storage = museCredentialStorage(env);
-  return storage !== null && storage !== "keychain";
+  return museCredentialStorage(env) !== null;
 }
 
 /** The sign-in sentence the harness shows when this engine is not authenticated.
  *  Exported so a test can hold it to `museAuthenticated` — the bug this encodes
  *  was the two drifting apart.
  *
- *  The trailing instruction is not decoration.  `muse auth set --api-key-stdin`
- *  reads the key from stdin, which is what keeps it out of shell history, and
- *  it therefore **blocks until it gets one**.  The setup surfaces say "paste
- *  the command and press Enter" and nothing more, so a user who followed them
+ *  The API key is offered as one valid route, not the only one: a browser
+ *  session stored in the macOS keychain is honoured like any other credential,
+ *  because the installed CLI resolves it for the adapter.  The key path is
+ *  named here because it is the route that also works on a machine with no
+ *  keychain, and because the command reads the key from stdin — so it must
+ *  name both the prompt and the Ctrl-D, or a user who followed the card
  *  exactly sat in a terminal that looked hung:  no key, no EOF, no stored
- *  credential, and a card that never cleared.  Naming the key and the Ctrl-D
- *  is the difference between a command that works and one that appears frozen. */
+ *  credential, and a card that never cleared. */
 export const MUSE_LOGIN_NOTE =
-  "Muse Code needs an API key for BotFleet — a browser session signed into the Mac keychain works in the terminal but this engine cannot read it.  To sign in, run `muse auth set --provider meta --api-key-stdin`, paste the key when it prompts, then press Ctrl-D and Enter";
+  "Muse Code needs an API key for BotFleet.  A browser session signed into the Mac keychain also works.  To sign in, run `muse auth set --provider meta --api-key-stdin`, paste the key when it prompts, then press Ctrl-D and Enter";
 
 const support: AcpSupport = {
   driverKind: "museAgent",

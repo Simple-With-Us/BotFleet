@@ -594,3 +594,80 @@ export function formatDualQuotaBadge(
   return null;
 }
 
+/** One named quota window, ready to render as its own labelled row.
+ *
+ *  `formatDualQuotaBadge` collapses a two-window engine into one string —
+ *  `(93% / 3% for 5h / w)` — which packs two numbers, an unexplained
+ *  abbreviation and an implied ordering into a chip the width of a word.  The
+ *  owner read it as noise that hid the one number worth knowing, which is
+ *  usually the *binding* window: the one closest to 0%.  Splitting the pair
+ *  into named windows lets each one carry its own label, its own bar, and — for
+ *  the binding one — a sentence that says so. */
+export interface QuotaWindow {
+  /** Title Case name for the row: "5-Hour", "Weekly", "Monthly". */
+  label: string;
+  remainingPercent: number;
+  /** Which end of the pair is this: the short window or the long one. */
+  kind: "primary" | "secondary";
+  resetsAt?: number | null;
+}
+
+/** Title Case window names for the abbreviations the badge used to emit.
+ *  Keys are the lowercased forms `windowsLabelFromHeadlines` produces
+ *  ("5hr/week", "hour", "day", "month"), plus the bare primary forms. */
+const WINDOW_NAMES: Record<string, string> = {
+  "5h": "5-Hour",
+  "5hr": "5-Hour",
+  hour: "Hourly",
+  day: "Daily",
+  week: "Weekly",
+  monthly: "Monthly",
+  month: "Monthly",
+};
+
+/** The windows a dual (or single) quota reading describes, named.
+ *
+ *  Returns an empty array when neither percentage is present, so a caller can
+ *  treat "nothing to show" and "everything exhausted" as different things. */
+export function quotaWindows(
+  remainingPercent?: number | null,
+  secondaryRemainingPercent?: number | null,
+  options?: { windowsLabel?: string },
+): QuotaWindow[] {
+  const raw = (options?.windowsLabel ?? "").toLowerCase();
+  const [primaryRaw, secondaryRaw] = raw.split("/").map((part) => part.trim());
+  const primary = remainingPercent != null ? Math.round(remainingPercent) : null;
+  const secondary = secondaryRemainingPercent != null ? Math.round(secondaryRemainingPercent) : null;
+  if (primary == null && secondary == null) return [];
+
+  const windows: QuotaWindow[] = [];
+  if (primary != null) {
+    windows.push({
+      label: WINDOW_NAMES[primaryRaw] ?? (primaryRaw ? "Current" : "Quota"),
+      remainingPercent: primary,
+      kind: "primary",
+    });
+  }
+  if (secondary != null) {
+    windows.push({
+      label: WINDOW_NAMES[secondaryRaw] ?? "Longer",
+      remainingPercent: secondary,
+      kind: "secondary",
+    });
+  }
+  return windows;
+}
+
+/** The window a caller should lead with: the lowest remaining percentage.
+ *
+ *  Two windows both at 93% are unremarkable; one at 3% beside one at 93% means
+ *  the engine is effectively spent.  Picking the minimum is what lets the panel
+ *  answer "can this bot run right now?" without the reader doing arithmetic on
+ *  a pair of numbers. */
+export function bindingQuotaWindow(windows: QuotaWindow[]): QuotaWindow | null {
+  if (windows.length === 0) return null;
+  return windows.reduce((lowest, window) =>
+    window.remainingPercent < lowest.remainingPercent ? window : lowest,
+  );
+}
+

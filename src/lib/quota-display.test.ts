@@ -4,6 +4,7 @@ import {
   absoluteQuotaLabel,
   antigravityGroupSummary,
   antigravityQuotaLines,
+  bindingQuotaWindow,
   formatDualQuotaBadge,
   formatResetCountdown,
   headlinesExhausted,
@@ -15,6 +16,7 @@ import {
   providerIssueLine,
   quotaLinesSummary,
   quotaProducerLabel,
+  quotaWindows,
   remainingPercentLabel,
   windowHeadlines,
   windowsLabelFromHeadlines,
@@ -573,5 +575,49 @@ describe("absolute allowances and handoff health", () => {
     // resolves to the same rendered string.
     expect(providerIssueLine("Claude", "Sign in again to refresh quota", "agent-bar"))
       .toBe("Claude: Sign in again to refresh quota (from CodeCaps)");
+  });
+});
+
+describe("quotaWindows", () => {
+  it("names each window instead of emitting one packed abbreviation", () => {
+    // The chip this replaces read "(93% / 3% for 5h / w)":  two numbers, two
+    // unexplained abbreviations, and no way to tell which window was the one
+    // about to stop a turn.
+    const windows = quotaWindows(93, 3, { windowsLabel: "5hr/week" });
+    expect(windows.map((w) => w.label)).toEqual(["5-Hour", "Weekly"]);
+    expect(windows.map((w) => w.remainingPercent)).toEqual([93, 3]);
+    expect(windows.map((w) => w.kind)).toEqual(["primary", "secondary"]);
+  });
+
+  it("names a single window, and handles an unlabelled reading", () => {
+    expect(quotaWindows(42, null, { windowsLabel: "hour" })[0]?.label).toBe("Hourly");
+    expect(quotaWindows(80, null)[0]?.label).toBe("Quota");
+    expect(quotaWindows(null, 10, { windowsLabel: "5hr/month" })[0]?.label).toBe("Monthly");
+  });
+
+  it("returns nothing when there is no reading at all", () => {
+    // Distinct from "everything spent": an absent reading must not render as
+    // a 0% window, which would read as an exhausted engine.
+    expect(quotaWindows(null, null, { windowsLabel: "5hr/week" })).toEqual([]);
+  });
+});
+
+describe("bindingQuotaWindow", () => {
+  it("picks the lowest window, which is the one that stops a turn first", () => {
+    // 93% beside 3% is an engine that is effectively spent, and the weekly
+    // number is the one to say so — not the flattering 93%.
+    const binding = bindingQuotaWindow(quotaWindows(93, 3, { windowsLabel: "5hr/week" }));
+    expect(binding?.label).toBe("Weekly");
+    expect(binding?.remainingPercent).toBe(3);
+  });
+
+  it("is not fooled by ordering", () => {
+    expect(bindingQuotaWindow(quotaWindows(5, 90, { windowsLabel: "5hr/week" }))?.label).toBe("5-Hour");
+    expect(bindingQuotaWindow(quotaWindows(50, 50, { windowsLabel: "5hr/week" }))?.label).toBe("5-Hour");
+  });
+
+  it("handles a single window and an empty list", () => {
+    expect(bindingQuotaWindow(quotaWindows(12, null, { windowsLabel: "week" }))?.remainingPercent).toBe(12);
+    expect(bindingQuotaWindow([])).toBeNull();
   });
 });

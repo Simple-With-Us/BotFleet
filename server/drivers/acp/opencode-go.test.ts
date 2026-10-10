@@ -53,6 +53,30 @@ describe("OpenCode catalog", () => {
     ]);
   });
 
+  it("defaults to a first-party Zen model rather than the first listed", () => {
+    // The catalog used to resolve its default through a hardcoded id that the
+    // CLI has since deprecated, so a bot with no saved model inherited a model
+    // that failed every turn.  The default is now chosen by rule: prefer a
+    // first-party Zen model (the route that needs no stored credential), and
+    // only then the first live entry.
+    const models = parseOpenCodeModelsOutput([
+      "openrouter/vendor/model-v2",
+      JSON.stringify({ name: "Vendor Model", status: "active" }, null, 2),
+      "opencode/some-live-free",
+      JSON.stringify({ name: "Live Free", status: "active" }, null, 2),
+    ].join("\n"));
+    expect(models?.default).toBe("opencode/some-live-free");
+
+    // With no first-party model at all, still hand back something the CLI
+    // listed rather than a blank or a stale id.
+    const thirdPartyOnly = parseOpenCodeModelsOutput([
+      "openrouter/vendor/model-v2",
+      JSON.stringify({ name: "Vendor Model", status: "active" }, null, 2),
+    ].join("\n"));
+    expect(thirdPartyOnly?.default).toBe("openrouter/vendor/model-v2");
+  });
+
+
   it("caches the anonymous model probe across authentication checks", async () => {
     const runModels = vi.fn(async () => "opencode/x-preview-f-free\n");
 

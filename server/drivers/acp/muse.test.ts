@@ -109,7 +109,7 @@ describe("Muse Code driver", () => {
     expect(museAuthenticated({ META_API_KEY: "   " })).toBe(false);
   });
 
-  it("separates a keychain session from a file-backed credential", () => {
+  it("accepts a keychain session, because the CLI resolves it for the adapter", () => {
     // Every fixture goes where the REAL index lives — `$HOME/.config/muse/`,
     // not `dir/auth.json` — so these are genuine regression guards.  The first
     // version of this test wrote elsewhere and passed for the wrong reason:  an
@@ -135,14 +135,19 @@ describe("Muse Code driver", () => {
       "utf8",
     );
 
-    // A browser session signed into the keychain is real, and the CLI uses it —
-    // `muse exec` works on that account — but this engine's adapter cannot
-    // read it, so counting it would put a setup-complete badge over an engine
-    // that fails every turn.  Unproven, not signed in.
-    expect(museAuthenticated({ HOME: keychainHome })).toBe(false);
+    // A keychain-backed browser session is a real credential.  This used to
+    // assert `false`, on the theory that the adapter's bundled
+    // `@muse-code/sdk@1.3.0` predates the keychain move.  Measured against the
+    // real `muse-code-acp` on this exact account shape:  initialize, session/new
+    // and session/prompt all succeed and the prompt returns `end_turn`.  The
+    // adapter spawns `muse serve`; the installed CLI is what reads the token,
+    // so the SDK version never mattered.  Answering `false` here stranded the
+    // setup card and the failover chain for a user who was signed in and could
+    // run a turn by hand.
+    expect(museAuthenticated({ HOME: keychainHome })).toBe(true);
     expect(
       museAuthenticated({ HOME: keychainHome, MUSE_AUTH_PATH: join(keychainDir, "auth.json") }),
-    ).toBe(false);
+    ).toBe(true);
 
     // A file-backed credential is the NORMAL case on Linux and Windows, where
     // there is no macOS Keychain to put it in.  Treating that as "not signed
