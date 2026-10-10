@@ -16,7 +16,6 @@ import {
   type AppendMessage,
   type ExternalStoreAdapter,
   type ThreadMessageLike,
-  type ThreadMessageLikePart,
 } from "@assistant-ui/react";
 
 /** Mirrors the shape ChatView.tsx consumes from `useStreaming()`. */
@@ -46,8 +45,11 @@ export type BotFleetReload = (params: { messageId: string }) => Promise<void>;
 function toThreadMessage(message: BotFleetThreadMessage): ThreadMessageLike {
   // `content` is `string | readonly ThreadMessageLikePart[]` — a plain string
   // is the supported text-only shape (verified in core's thread-message-like.d.ts).
-  const parts: ThreadMessageLikePart[] = [{ type: "text", text: message.text }];
-  if (message.reasoning) parts.push({ type: "reasoning", text: message.reasoning });
+  // `ThreadMessageLikePart` itself is NOT re-exported from @assistant-ui/react
+  // or @assistant-ui/core, so derive the element type from `ThreadMessageLike`.
+  type Part = Extract<ThreadMessageLike["content"], readonly unknown[]>[number];
+  const parts: Part[] = [{ type: "text", text: message.text }];
+  if (message.reasoning) parts.push({ type: "reasoning", text: message.reasoning } as Part);
   return {
     id: message.id,
     role: message.role,
