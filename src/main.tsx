@@ -61,6 +61,19 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "provider-icons") {
+  // Visual-spec harness (tests/e2e/provider-icons.visual.spec.ts): the
+  // changed `ProviderMark` cases (muse, mcode) and the EngineQuotasPanel that
+  // ships in the picker header.  Dynamically imported so the real app boot
+  // path never pays for it.
+  void import("./components/ProviderIconsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "team-map-context") {
   void import("./components/TeamMapPage").then((mod) => {
     const Fixture = mod.TeamMapSharedContextVisualFixture;
