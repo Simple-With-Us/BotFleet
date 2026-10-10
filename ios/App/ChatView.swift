@@ -524,13 +524,26 @@ struct ChatView: View {
                     withAnimation(reduceMotion ? nil : .default) { proxy.scrollTo(row, anchor: .center) }
                     session.consumeFocus(messageId)
                 }
-                .task {
-                    guard let messageId = session.focusedMessageId,
-                          let row = transcriptRowId(containing: messageId, in: items)
-                    else { return }
-                    follow.leaveBottom(newestSettledId: newestSettled)
-                    proxy.scrollTo(row, anchor: .center)
-                    session.consumeFocus(messageId)
+                .task(id: threadId) {
+                    if let messageId = session.focusedMessageId,
+                       let row = transcriptRowId(containing: messageId, in: items) {
+                        follow.leaveBottom(newestSettledId: newestSettled)
+                        proxy.scrollTo(row, anchor: .center)
+                        session.consumeFocus(messageId)
+                        return
+                    }
+                    follow.resume()
+                    scrollToBottom(proxy)
+                    try? await Task.sleep(nanoseconds: 60_000_000)
+                    if follow.isFollowing {
+                        scrollToBottom(proxy)
+                    }
+                }
+                .onAppear {
+                    if session.focusedMessageId == nil {
+                        follow.resume()
+                        scrollToBottom(proxy)
+                    }
                 }
             }
             .id(threadId)
@@ -835,8 +848,6 @@ struct ChatView: View {
         let run: () -> Void
     }
 
-    private static let steerPrompt = "Pause and explain your current plan"
-
     private var plusActions: [PlusAction] {
         var out: [PlusAction] = []
         out.append(PlusAction(
@@ -857,7 +868,7 @@ struct ChatView: View {
         })
         out.append(PlusAction(
             id: "commands", systemImage: "command", title: "Slash commands",
-            subtitle: "Computer, tasks, steer, and more"
+            subtitle: "Computer, tasks, and more"
         ) {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
                 showCommandHUD = true
@@ -865,14 +876,6 @@ struct ChatView: View {
             draft = ComposerSendRecovery.slashCommandDraft(from: draft)
             composerFocusAfterPlusDismiss = true
         })
-        if current.busy, case .bot = current {
-            out.append(PlusAction(
-                id: "steer", systemImage: "steeringwheel", title: "Steer",
-                subtitle: canSend
-                    ? "Send this into the running turn"
-                    : "Redirect what this bot is doing now"
-            ) { steer() })
-        }
         if clipboardHasAttachment {
             out.append(PlusAction(
                 id: "paste", systemImage: "doc.on.clipboard", title: "Paste from clipboard",
@@ -988,10 +991,6 @@ struct ChatView: View {
         ])
     }
 
-    private func steer() {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        submit(text.isEmpty ? Self.steerPrompt : nil)
-    }
 
     private func submit(_ explicitText: String? = nil) {
         // This also cancels an in-flight permission prompt before it can
@@ -1042,6 +1041,41 @@ struct ChatView: View {
                 dictation.restoreRecording(recording.data, transcript: recording.transcript)
             }
         }
+    }
+
+    private func steerSend() {
+        submit()
+        if current.busy {
+            Task {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                switch current {
+                case let .bot(bot): await session.interrupt(bot: bot)
+                case let .room(room): await session.interrupt(room: room)
+                }
+            }
+        }
+    }
+
+    private func steerNow() {
+        Task {
+            switch current {
+            case let .bot(bot): await session.interrupt(bot: bot)
+            case let .room(room): await session.interrupt(room: room)
+            }
+        }
+    }
+
+    private func cancelQueuedMessage(_ queueId: String) {
+        session.dropPendingQueued(threadId: current.threadId, queueId: queueId)
+        if case let .bot(bot) = current {
+            Task { await session.cancelQueued(botId: bot.id, queueId: queueId) }
+        }
+    }
+
+    private func editQueuedMessage(_ item: QueuedSend) {
+        cancelQueuedMessage(item.queueId)
+        draft = item.text
+        composerFocused = true
     }
 
     // MARK: - Composer
@@ -1098,31 +1132,95 @@ struct ChatView: View {
                     draft = "\(prefix)\(mention.trigger)\(selected.name) "
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else if current.busy, case .bot = current {
+            } else if composerFocused {
                 HStack(spacing: 8) {
-                    Button(action: steer) {
-                        HStack(spacing: 5) {
-                            Image(systemName: "steeringwheel")
-                                .font(.system(size: 12, weight: .semibold))
-                            Text("Steer")
-                                .font(.caption.weight(.semibold))
+                    Button {
+                        composerFocused = false
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("⌄")
+                                .font(.system(size: 14, weight: .bold))
+                            Text("⌨️")
+                                .font(.system(size: 13))
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
                         .background(Capsule().fill(Color.secondary.opacity(0.14)))
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Steer the running turn")
+                    .accessibilityLabel("Hide keyboard")
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 4)
                 .transition(.opacity)
-            } else if draft.isEmpty && !hasPendingApproval {
+            } else if draft.isEmpty && !hasPendingApproval && !current.busy {
                 PredictiveActionChipsView(accentColor: BotPalette.color(current.color)) { chip in
                     draft = chip.prompt
                     composerFocused = true
                 }
                 .transition(.opacity)
+            }
+
+            let queuedSends = session.state.pendingQueued[current.threadId] ?? []
+            if !queuedSends.isEmpty {
+                VStack(spacing: 6) {
+                    ForEach(queuedSends, id: \.queueId) { item in
+                        HStack(spacing: 8) {
+                            Image(systemName: "bubble.left")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(Color.secondary)
+                            Text(item.text)
+                                .font(.system(size: 13))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .foregroundStyle(Color.primary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Button {
+                                editQueuedMessage(item)
+                            } label: {
+                                Image(systemName: "pencil")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(Color.secondary)
+                                    .frame(width: 28, height: 28)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Edit message")
+
+                            Button {
+                                steerNow()
+                            } label: {
+                                Image(systemName: "arrow.up")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .foregroundStyle(BubbleColor.mine)
+                                    .frame(width: 28, height: 28)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Steer now")
+
+                            Button {
+                                cancelQueuedMessage(item.queueId)
+                            } label: {
+                                Image(systemName: "trash")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(Color.red.opacity(0.85))
+                                    .frame(width: 28, height: 28)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Cancel queued message")
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(Color.secondary.opacity(0.12))
+                        )
+                    }
+                }
+                .padding(.horizontal, 4)
             }
 
             if !pendingAttachments.isEmpty {
@@ -1230,6 +1328,20 @@ struct ChatView: View {
                         .padding(.trailing, 6)
                         .padding(.bottom, 6)
                         .animation(.easeOut(duration: 0.15), value: canSend)
+                        .contextMenu {
+                            if canSend {
+                                Button {
+                                    steerSend()
+                                } label: {
+                                    Label("Steer Now", systemImage: "bolt.fill")
+                                }
+                                Button {
+                                    submit()
+                                } label: {
+                                    Label("Queue Message", systemImage: "clock")
+                                }
+                            }
+                        }
                     }
                     .frame(minHeight: 44)
                     .glassRounded(cornerRadius: 18, interactive: false)
@@ -1566,21 +1678,10 @@ struct MessageRow: View {
             // Stay up while `message.queued` is true, even after `bot.busy`
             // flips false.  Gating on busy made the chip vanish in the gap
             // between turn-end and the drain frame (Sentry on #224).
-            if message.queued == true, case let .bot(bot) = chat {
+            if message.queued == true {
                 HStack(spacing: 4) {
                     Image(systemName: "clock")
                     Text("Queued — sends when this turn finishes")
-                    Button("Steer Now") {
-                        Task { await session.interrupt(bot: bot) }
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Color.accentColor)
-                    Button {
-                        Task { await session.cancelQueued(botId: bot.id, queueId: message.queueId ?? message.id) }
-                    } label: {
-                        Image(systemName: "xmark")
-                    }
-                    .accessibilityLabel("Cancel queued message")
                 }
                 .font(.system(size: 11))
                 .foregroundStyle(Color.secondary)

@@ -1141,6 +1141,10 @@ final class Session: ObservableObject {
         UserDefaults.standard.set(data, forKey: Self.postedPushTokenKey)
     }
 
+    func dropPendingQueued(threadId: String, queueId: String) {
+        state.cancelPendingQueued(threadId: threadId, queueId: queueId)
+    }
+
     func cancelQueued(botId: String, queueId: String) async {
         guard let client else { return }
         func dropLocalChip() {
