@@ -78,11 +78,16 @@ export function createBotFleetExternalStore(params: {
   // Streaming is "mutate the assistant message in place" — the same thing
   // BotFleet already does with its per-frame rAF delta buffer.
   const withStream = appendStreamTail(messages, stream);
+  const last = messages[messages.length - 1];
 
   return {
     messages: withStream,
     convertMessage: toThreadMessage,
-    isRunning: Boolean(stream?.text || stream?.reasoning),
+    isRunning: Boolean(
+      (stream?.text || stream?.reasoning) &&
+        last &&
+        last.role === "assistant",
+    ),
     onNew: async (message: AppendMessage) => {
       const text = extractText(message);
       if (!text.trim()) return;
