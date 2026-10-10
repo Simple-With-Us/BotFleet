@@ -91,7 +91,27 @@ describe("botfleet external store adapter", () => {
     expect(adapter.isRunning).toBe(true);
   });
 
-  it("sends through the harness send path, not an AI SDK", async () => {
+  it("stays running when tokens stream before any settled bot message", () => {
+    // This is the disagreement between two review suggestions.  A guard like
+    // `last.role === "assistant"` was proposed to keep isRunning in sync with
+    // the rendered tail — but once appendStreamTail appends a synthetic
+    // assistant message, that guard would suppress the working state during
+    // the exact window where the user needs it.  Pinned here deliberately.
+    const userOnly: BotFleetThreadMessage[] = [
+      { id: "u1", role: "user", text: "deploy the harness", createdAt: new Date(0) },
+    ];
+    const adapter = createBotFleetExternalStore({
+      threadId: "t1",
+      messages: userOnly,
+      stream: { text: "Working…" },
+      send: async () => {},
+    });
+    expect(adapter.isRunning).toBe(true);
+    expect(adapter.messages).toHaveLength(2);
+    expect(adapter.messages![1].role).toBe("assistant");
+  });
+
+it("sends through the harness send path, not an AI SDK", async () => {
     const send = vi.fn(async () => {});
     const adapter = createBotFleetExternalStore({ threadId: "t7", messages, send });
     await adapter.onNew!({

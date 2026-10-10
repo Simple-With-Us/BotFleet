@@ -85,16 +85,18 @@ export function createBotFleetExternalStore(params: {
   // Streaming is "mutate the assistant message in place" — the same thing
   // BotFleet already does with its per-frame rAF delta buffer.
   const withStream = appendStreamTail(messages, stream);
-  const last = messages[messages.length - 1];
 
   return {
     messages: withStream,
     convertMessage: toThreadMessage,
-    isRunning: Boolean(
-      (stream?.text || stream?.reasoning) &&
-        last &&
-        last.role === "assistant",
-    ),
+    // True whenever the harness is mid-turn.  appendStreamTail guarantees a
+    // rendered tail for every streaming frame: it folds the delta into the
+    // trailing assistant message, or appends a synthetic one when the settled
+    // message has not landed yet.  So isRunning and the visible text stay in
+    // sync WITHOUT also requiring the last message to be an assistant one —
+    // that guard would hide the "working" state during exactly the window
+    // (tokens streaming before the settled reply) where the user needs it.
+    isRunning: Boolean(stream?.text || stream?.reasoning),
     onNew: async (message: AppendMessage) => {
       const text = extractText(message);
       if (!text.trim()) return;

@@ -84,6 +84,23 @@ A note on the primitive API, since it is easy to get wrong: `ThreadPrimitive.Mes
 renders its children verbatim — `MessagePrimitive.Parts` with a `components.Text` override is
 what actually renders message text.
 
+### Where review and this doc disagreed
+
+Review proposed guarding `isRunning` with `last.role === "assistant"`, so it could not report
+"running" while no streamed tail was rendered.  That was right *before* fix (1) and wrong after
+it: once `appendStreamTail` appends a synthetic assistant message, a rendered tail exists in
+every streaming frame, and the guard would hide the working state during exactly the window where
+the user needs it — tokens streaming before the settled reply lands.
+
+The contract is now "isRunning ⇔ a streamed tail is rendered", maintained by the single rule in
+`appendStreamTail` rather than by two conditions kept in sync by hand.  A test
+("stays running when tokens stream before any settled bot message") pins it so the disagreement
+cannot resurface silently.
+
+This is the general hazard with this library: a "keep these two in sync" suggestion can be
+correct in isolation and wrong once another fix changes the invariant it was reasoning about.
+Re-derive against the current code rather than applying it to the version it was written for.
+
 ### Blocker found: `@assistant-ui/react-ui` is broken upstream
 
 Do **not** plan around the pre-styled package.  Every published `@assistant-ui/react-ui`
