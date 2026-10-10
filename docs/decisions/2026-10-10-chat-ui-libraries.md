@@ -52,13 +52,16 @@ Non-`ThreadMessage` types additionally require `convertMessage`.
 Verified in this lane (`src/components/assistant-ui/`):
 
 - `pnpm exec tsc --noEmit` — adapter typechecks clean against the real 0.15.27 types.
-- `BotFleetExternalStore.test.tsx` — 6/6 pass, including an SSR render of the harness
+- `BotFleetExternalStore.test.tsx` — 9/9 pass, including an SSR render of the harness
   messages through `ThreadPrimitive.Messages` / `MessagePrimitive.Parts` with no AI SDK
   present.
 - **A/B check on every behavioral test:** breaking the streaming tail fails the stream test;
   dropping the text in `convertMessage` fails 3 tests including the render test; reverting the
-  synthetic-message path fails that test.  Each test can fail, so each is a real check.
+  synthetic-message path fails that test; stubbing the reload forwarding fails that test.  Each
+  test can fail, so each is a real check.
 - Existing `ChatView.test.tsx` + `ChatMarkdown.test.tsx` still pass (23/23) — nothing regressed.
+- Full `src` suite: 191 files / 2,423 tests pass.  Lint ratchet passes at 4,872 warnings against
+  a 4,890 baseline.  Zero type assertions in the adapter.
 
 Works outside Next.js: zero `next/*` imports in `dist`, `"use client"` is inert, React peer is
 `^18 || ^19` and BotFleet is on `^19.1.0`.  MIT throughout.
