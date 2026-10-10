@@ -92,17 +92,17 @@ function WindowRow({ window }: { window: QuotaWindow }) {
   );
 }
 
-/** The windows for one engine, collapsed to the best reading available.
- *
- *  Models on an engine share the account's windows, so the union is the honest
- *  answer: take the *lowest* remaining percentage reported for each window
- *  across models, because that is the reading that reflects real headroom. */
 /** The named windows and source label for one engine. */
 interface EngineWindows {
   windows: QuotaWindow[];
   label?: string;
 }
 
+/** The windows for one engine, collapsed to the best reading available.
+ *
+ *  Models on an engine share the account's windows, so the union is the honest
+ *  answer: take the *lowest* remaining percentage reported for each window
+ *  across models, because that is the reading that reflects real headroom. */
 function engineWindows(engine: QuotaEngineInfo): EngineWindows {
   const models = Object.values(engine.snapshot.quota?.models ?? {});
   if (models.length === 0) return { windows: [] };
@@ -124,9 +124,12 @@ function engineWindows(engine: QuotaEngineInfo): EngineWindows {
     }
   }
   const windows = quotaWindows(primary, secondary, { windowsLabel: label });
-  if (windows.length > 0 && resetsAt != null) {
-    for (const w of windows) w.resetsAt = resetsAt;
-  }
+
+  // `resetsAt` is the PRIMARY window's reset (the 5-hour one), so it belongs on
+  // the primary row only.  Assigning it to every window would print "resets in
+  // 4h" under a Weekly row whose reset is days away -- a confident wrong answer
+  // rather than a missing one.
+  if (windows.length > 0 && resetsAt != null && windows[0]) windows[0].resetsAt = resetsAt;
   return { windows, label };
 }
 
