@@ -21,11 +21,12 @@
  * echoing anything secret-shaped from the response (ASC responses don't
  * carry credentials, only app metadata, so this is safe to print as-is).
  */
-import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash, createSign } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 function loadEnvFile(path) {
   const text = readFileSync(path, "utf8");
@@ -327,6 +328,226 @@ function buildReleaseNotes({ marketing, displayName, title, subjects, iosPathPre
   return `${header}${lines.join("\n")}`;
 }
 
+// ---------------------------------------------------------------------------
+// TestFlight tester groups (shared by ensure-standing-testers and ensure-tf-ready)
+// ---------------------------------------------------------------------------
+// WHY THIS EXISTS (found 2026-10-09, GH #1018): moving a fleet iOS app to a new
+// bundle ID means a NEW App Store Connect app record, and a new record starts
+// with no TestFlight groups at all.  The ship uploaded 14 VALID builds to
+// app.botfleet.ios and every run was green, while the owner saw nothing: the
+// legacy record had an internal group ("BotFleet Testers", all builds) and the
+// new one had none, so no internal tester existed, and the external group's
+// testers were never invited because no build had cleared Beta App Review.
+// Internal testers are App Store Connect users; they need no review and get
+// every build the moment it finishes processing, so the internal group is the
+// path that must always exist.
+//
+// These helpers take the caller's `api(method, path, jsonBody)` so a test can
+// drive them with a fake and so main() keeps one authenticated client.
+export const INTERNAL_GROUP_NAME = "Internal Testers";
+
+// A resource row is { id: <string>, attributes: <object>, ... }.  This client is
+// dependency-free on purpose (the hosted ios-ship workflow runs it with plain
+// `node` before any `pnpm install`, so `import "zod"` fails with
+// ERR_MODULE_NOT_FOUND and breaks every ship; a test pins that), so the shape is
+// checked by hand.  `String(x) === x` is true only for a string primitive, and the
+// toString tag is "[object Object]" only for a plain object, so a malformed row is
+// dropped here instead of crashing a caller that reads row.id or row.attributes.
+const isAscRow = (row) =>
+  Boolean(row) && String(row.id) === row.id && Object.prototype.toString.call(row.attributes) === "[object Object]";
+
+const ascRows = (res) => (res && res.ok && Array.isArray(res.parsed?.data) ? res.parsed.data.filter(isAscRow) : []);
+
+const ASC_ORIGIN = "https://api.appstoreconnect.apple.com/";
+const ASC_MAX_PAGES = 50;
+
+// Every row of a collection, following links.next.  Never returns a partial list
+// as if it were whole: a failed page, a next link that leaves App Store Connect
+// (the bearer token must not follow it), or more than ASC_MAX_PAGES pages all
+// answer { ok: false }, and callers treat that as "unreadable".
+export async function ascAllRows({ api, url }) {
+  const rows = [];
+  let next = url;
+  for (let page = 0; page < ASC_MAX_PAGES && next; page++) {
+    const res = await api("GET", next);
+    if (!res.ok) return { ok: false, error: ascErrorText(res), rows: [] };
+    rows.push(...ascRows(res));
+    next = res.parsed?.links?.next || "";
+    if (next && !next.startsWith(ASC_ORIGIN) && !next.startsWith("/")) {
+      return { ok: false, error: "next link leaves App Store Connect", rows: [] };
+    }
+  }
+  if (next) return { ok: false, error: `more than ${ASC_MAX_PAGES} pages`, rows: [] };
+  return { ok: true, rows };
+}
+
+export function ascErrorText(res) {
+  const e = (res?.parsed?.errors || [])[0] || {};
+  return `HTTP ${res?.status} ${e.code || ""} ${e.detail || e.title || ""}`.trim();
+}
+
+export function maskEmail(email) {
+  const [user, domain] = String(email).split("@");
+  return `${String(user).slice(0, 1)}***@${domain}`;
+}
+
+// Put one email into one beta group.  Returns { ok, existing, res }.
+//
+// Tester records are PER APP on Apple's side: filter[email] on its own returns
+// every record that email has across the team's apps, and adding another app's
+// record to this app's group answers 409 STATE_ERROR "Tester(s) cannot be
+// assigned" (seen live on 2026-10-09 for the owner's own address).  So:
+//   - createFirst (the internal group path): POST /v1/betaTesters with the group
+//     relationship.  For an existing address on THIS app Apple answers with that
+//     app's own record, and for an App Store Connect user it makes an internal
+//     tester.  Falls back to the lookup below if the create is refused.
+//   - lookup: prefer a record already tied to this app (filter[apps]), then any
+//     record with the address, then create.  filter[email] is an exact match, so
+//     a tester stored with different letter case is missed and the create
+//     answers 409; the case-insensitive search over the app's testers recovers it.
+export async function addTesterToGroup({ api, appId, groupId, email, createFirst = false }) {
+  const wanted = String(email).toLowerCase();
+  const create = () => api("POST", "/v1/betaTesters", JSON.stringify({
+    data: {
+      type: "betaTesters",
+      attributes: { email },
+      relationships: { betaGroups: { data: [{ type: "betaGroups", id: groupId }] } }
+    }
+  }));
+  if (createFirst) {
+    const made = await create();
+    if (made.ok) return { ok: true, existing: false, res: made };
+  }
+  const sameEmail = (t) => String(t.attributes?.email || "").toLowerCase() === wanted;
+  let existing = ascRows(await api("GET", `/v1/betaTesters?filter[email]=${encodeURIComponent(email)}&filter[apps]=${appId}&limit=5`)).find(sameEmail);
+  if (!existing) {
+    existing = ascRows(await api("GET", `/v1/betaTesters?filter[email]=${encodeURIComponent(email)}&limit=5`)).find(sameEmail);
+  }
+  const addExisting = (tester) => api("POST", `/v1/betaGroups/${groupId}/relationships/betaTesters`,
+    JSON.stringify({ data: [{ type: "betaTesters", id: tester.id }] }));
+  const recoverFromCrossApp = async () => {
+    const appTesters = await ascAllRows({ api, url: `/v1/betaTesters?filter[apps]=${appId}&limit=200&fields[betaTesters]=email` });
+    const appScoped = appTesters.rows.find(sameEmail);
+    if (!appScoped) return null;
+    existing = appScoped;
+    return addExisting(appScoped);
+  };
+  let res;
+  if (existing) {
+    res = await addExisting(existing);
+    if (res.status === 409) {
+      // The record we found is for another app; Apple refused to assign it.
+      // Try the app-scoped lookup before giving up.
+      const recovered = await recoverFromCrossApp();
+      if (recovered) res = recovered;
+    }
+  } else {
+    res = await create();
+    if (res.status === 409) {
+      const recovered = await recoverFromCrossApp();
+      if (recovered) res = recovered;
+    }
+  }
+  return { ok: Boolean(res.ok || res.status === 204), existing: Boolean(existing), res };
+}
+
+// How many testers can install every build of the app without Beta App Review:
+// the members of internal groups that have access to all builds.  Never throws;
+// { ok:false } means the count could not be read, which is not the same as zero.
+export async function countInternalTesters({ api, appId }) {
+  const groupsRes = await api("GET", `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,hasAccessToAllBuilds`);
+  if (!groupsRes.ok) return { ok: false, error: ascErrorText(groupsRes), groups: 0, testers: 0 };
+  const groups = ascRows(groupsRes).filter(
+    (g) => g.attributes?.isInternalGroup === true && g.attributes?.hasAccessToAllBuilds === true
+  );
+  // One Set across ALL groups: a tester in two all-builds groups is one person.
+  const seen = new Set();
+  for (const g of groups) {
+    const members = await ascAllRows({ api, url: `/v1/betaGroups/${g.id}/betaTesters?limit=200&fields[betaTesters]=email` });
+    if (!members.ok) return { ok: false, error: members.error, groups: groups.length, testers: seen.size };
+    for (const t of members.rows) seen.add(String(t.attributes?.email || "").toLowerCase());
+  }
+  return { ok: true, groups: groups.length, testers: seen.size };
+}
+
+// Make sure the app has an internal group with access to all builds, and that
+// every standing email that is an App Store Connect user is in it.  Idempotent,
+// ADD-ONLY (never removes a tester or a group), prints emails masked.  An
+// existing all-builds internal group is reused whatever its name.  Emails that
+// are not ASC users stay external-only: Apple refuses them in an internal group.
+// Returns { groupId, created, added, alreadyIn, external, testers, warnings }.
+export async function ensureInternalTesterGroup({ api, appId, emails, log, warn }) {
+  const out = { groupId: null, created: false, added: 0, alreadyIn: 0, external: 0, testers: 0, warnings: 0 };
+  const fail = (msg) => { out.warnings += 1; warn(msg); return out; };
+
+  const groupsRes = await api("GET", `/v1/apps/${appId}/betaGroups?limit=200&fields[betaGroups]=name,isInternalGroup,hasAccessToAllBuilds`);
+  if (!groupsRes.ok) return fail(`internal group list failed (${ascErrorText(groupsRes)})`);
+  let group = ascRows(groupsRes).find(
+    (g) => g.attributes?.isInternalGroup === true && g.attributes?.hasAccessToAllBuilds === true
+  );
+  if (group) {
+    log(`reusing internal group "${group.attributes?.name}" id=${group.id}`);
+  } else {
+    const created = await api("POST", "/v1/betaGroups", JSON.stringify({
+      data: {
+        type: "betaGroups",
+        attributes: { name: INTERNAL_GROUP_NAME, isInternalGroup: true, hasAccessToAllBuilds: true, feedbackEnabled: true },
+        relationships: { app: { data: { type: "apps", id: appId } } }
+      }
+    }));
+    if (!created.ok) {
+      return fail(`could not create internal group "${INTERNAL_GROUP_NAME}" (${ascErrorText(created)}); create it by hand in App Store Connect > TestFlight > Internal Testing`);
+    }
+    group = created.parsed.data;
+    out.created = true;
+    log(`created internal group "${INTERNAL_GROUP_NAME}" id=${group.id} (all builds)`);
+  }
+  out.groupId = group.id;
+
+  // Internal testers must be App Store Connect users.  Read the team's users to
+  // know which standing emails qualify; when the list is unreadable, try them
+  // all and let Apple answer.  Paginate so teams with >200 users are not silently
+  // truncated (GH #1018: the internal group must hold every ASC standing email).
+  // A failure on ANY page (or an oversized list) makes the list incomplete, so it
+  // reads as unreadable (try every standing email), never as "everyone else is
+  // not a user".
+  const users = await ascAllRows({ api, url: "/v1/users?limit=200&fields[users]=username" });
+  const usersReadable = users.ok;
+  const ascUsers = new Set(users.rows.map((u) => String(u.attributes?.username || "").toLowerCase()));
+  if (!usersReadable) log(`could not read App Store Connect users; trying every standing email`);
+
+  const members = await ascAllRows({ api, url: `/v1/betaGroups/${group.id}/betaTesters?limit=200&fields[betaTesters]=email` });
+  if (!members.ok) return fail(`could not list testers in internal group (${members.error}); not re-adding anyone`);
+  const inGroup = new Set(members.rows.map((t) => String(t.attributes?.email || "").toLowerCase()));
+
+  for (const email of emails) {
+    const key = email.toLowerCase();
+    if (inGroup.has(key)) {
+      out.alreadyIn += 1;
+      log(`${maskEmail(email)} already in internal group`);
+      continue;
+    }
+    if (usersReadable && !ascUsers.has(key)) {
+      out.external += 1;
+      log(`${maskEmail(email)} is not an App Store Connect user; external group only`);
+      continue;
+    }
+    const added = await addTesterToGroup({ api, appId, groupId: group.id, email, createFirst: true });
+    if (added.ok) {
+      out.added += 1;
+      inGroup.add(key);
+      log(`added ${maskEmail(email)} to internal group`);
+    } else {
+      fail(`could not add ${maskEmail(email)} to internal group (${ascErrorText(added.res)})`);
+    }
+  }
+  out.testers = inGroup.size;
+  if (out.testers === 0) {
+    fail("the internal group has no tester: none of the standing emails is an App Store Connect user, so nobody can install builds without Beta App Review.  Add an App Store Connect user to ASC_STANDING_TESTERS or to TestFlight > Internal Testing by hand");
+  }
+  return out;
+}
+
 async function setWhatToTest({ api, buildId, appId, marketing }) {
   const mode = process.env.IOS_TF_RELEASE_NOTES;
   if (mode === "0") {
@@ -624,7 +845,10 @@ async function main() {
   //
   // Exit codes: 0 ready | 2 usage/API error | 3 readiness timeout (build found,
   // still processing) | 4 the uploaded build never appeared within the discovery
-  // budget, so compliance was NOT declared on it.
+  // budget, so compliance was NOT declared on it | 5 the build is ready but the
+  // app has no internal tester who could install it (see countInternalTesters) |
+  // 6 the build is ready but the internal-tester count could not be read, so
+  // whether anyone can install it is unverified.
   if (method === "ensure-appstore-profiles") {
     const mapPath = path;
     if (!mapPath) {
@@ -811,10 +1035,7 @@ async function main() {
     const EMAIL_RE = /^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/;
     const raw = String(process.env.ASC_STANDING_TESTERS || "");
     const emails = [...new Set(raw.split(/[\s,;]+/).map((e) => e.trim().toLowerCase()).filter(Boolean))];
-    const mask = (e) => {
-      const [user, domain] = e.split("@");
-      return `${user.slice(0, 1)}***@${domain}`;
-    };
+    const mask = maskEmail;
     if (!/^\d+$/.test(appId)) {
       console.error(`${prefix}: usage: node asc-api.mjs ensure-standing-testers <appleId> [buildVersion]`);
       process.exit(2);
@@ -832,11 +1053,8 @@ async function main() {
       console.error(`${prefix}: ASC_STANDING_TESTERS lists ${emails.length} emails; the standing list is three.  Refusing to invite`);
       process.exit(2);
     }
-    const rows = (res) => (res && res.ok && Array.isArray(res.parsed?.data) ? res.parsed.data : []);
-    const errText = (res) => {
-      const e = (res?.parsed?.errors || [])[0] || {};
-      return `HTTP ${res?.status} ${e.code || ""} ${e.detail || e.title || ""}`.trim();
-    };
+    const rows = ascRows;
+    const errText = ascErrorText;
     let warnings = 0;
     const warn = (msg) => { warnings += 1; console.error(`${prefix}: WARNING ${msg}`); };
 
@@ -879,36 +1097,25 @@ async function main() {
         console.error(`${prefix}: ${mask(email)} already in group`);
         continue;
       }
-      const found = await api("GET", `/v1/betaTesters?filter[email]=${encodeURIComponent(email)}&limit=5`);
-      let existing = rows(found).find((t) => String(t.attributes?.email || "").toLowerCase() === email);
-      const addExisting = (tester) => api("POST", `/v1/betaGroups/${group.id}/relationships/betaTesters`,
-        JSON.stringify({ data: [{ type: "betaTesters", id: tester.id }] }));
-      let res;
-      if (existing) {
-        res = await addExisting(existing);
-      } else {
-        res = await api("POST", "/v1/betaTesters", JSON.stringify({
-          data: {
-            type: "betaTesters",
-            attributes: { email },
-            relationships: { betaGroups: { data: [{ type: "betaGroups", id: group.id }] } }
-          }
-        }));
-        // filter[email] is an exact match, so a tester stored with different
-        // letter case is missed and the create answers 409.  Find the record
-        // among this app's testers case-insensitively and reuse it.
-        if (res.status === 409) {
-          const appTesters = await api("GET", `/v1/betaTesters?filter[apps]=${appId}&limit=200&fields[betaTesters]=email`);
-          existing = rows(appTesters).find((t) => String(t.attributes?.email || "").toLowerCase() === email);
-          if (existing) res = await addExisting(existing);
-        }
-      }
+      const added = await addTesterToGroup({ api, appId, groupId: group.id, email });
+      const res = added.res;
+      const existing = added.existing;
       if (res.ok || res.status === 204) {
         console.error(`${prefix}: added ${mask(email)} to group (${existing ? "existing tester" : "new tester"})`);
       } else {
         warn(`could not add ${mask(email)} to group (${errText(res)})`);
       }
     }
+
+    // 2b) Internal group: App Store Connect users install every build with no
+    //     Beta App Review.  This is the path that reaches the owner's phone; a
+    //     new app record has none until this creates it (GH #1018).
+    // Its warnings go through warn(), so they count toward the exit code.
+    await ensureInternalTesterGroup({
+      api, appId, emails,
+      log: (m) => console.error(`${prefix}: ${m}`),
+      warn
+    });
 
     // 3) Build: the given CFBundleVersion, else the newest upload.
     const buildQuery = wantBuild
@@ -1088,14 +1295,26 @@ async function main() {
       const state = detail.internalBuildState || "";
       console.error(`ensure-tf-ready: poll ${pollNo} enc=${attrs.usesNonExemptEncryption} internal=${state}`);
       if (state === "IN_BETA_TESTING" || state === "READY_FOR_BETA_TESTING") {
+        // READY_FOR_BETA_TESTING only says Apple finished processing.  It does
+        // not say anyone can install the build: a new app record has no internal
+        // group, and that is how 14 green ships reached nobody (GH #1018).
+        const internalTesters = await countInternalTesters({ api, appId });
+        if (internalTesters.ok) {
+          console.error(`ensure-tf-ready: internal testers with access to all builds=${internalTesters.testers} (groups=${internalTesters.groups})`);
+        } else {
+          console.error(`ensure-tf-ready: could not count internal testers (${internalTesters.error})`);
+        }
+        const nobody = internalTesters.ok && internalTesters.testers === 0;
         console.log(JSON.stringify({
           ok: true,
           buildId,
           version,
           internalBuildState: state,
-          usesNonExemptEncryption: attrs.usesNonExemptEncryption
+          usesNonExemptEncryption: attrs.usesNonExemptEncryption,
+          internalTesterCount: internalTesters.ok ? internalTesters.testers : null
         }));
-        process.exit(0);
+        // 5 = read and zero; 6 = could not be read, so installability is unverified.
+        process.exit(nobody ? 5 : internalTesters.ok ? 0 : 6);
       }
       await sleep(POLL_MS);
     }
@@ -1119,7 +1338,10 @@ async function main() {
   if (!res.ok) process.exit(2);
 }
 
-main().catch((err) => {
-  console.error(String(err && err.stack ? err.stack : err));
-  process.exit(1);
-});
+// Run only when invoked as a script, so a test can import the helpers above.
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+  main().catch((err) => {
+    console.error(String(err && err.stack ? err.stack : err));
+    process.exit(1);
+  });
+}
