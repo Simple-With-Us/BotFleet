@@ -74,7 +74,6 @@ test('visual: provider marks for muse and mcode through ProviderMark', async ({ 
   await expect(museBlock.getByText(/Weekly is nearly spent/)).toBeVisible();
 
   await expect(board).toHaveScreenshot('provider-icons-marks.png', stableShot);
->>>>>>> fad0153ae (Make the visual spec actually cover the quota panel)
 });
 
 test('visual: muse mark carries the Meta blue ramp, mcode carries the brand red ramp', async ({ page }) => {
