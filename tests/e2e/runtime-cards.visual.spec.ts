@@ -100,29 +100,36 @@ const SHARED_VPS_STALE = {
   ready: false,
   imageOutdated: true,
 };
-const SHARED_VPS_OUTDATED_BODIES: Record<string, Record<string, unknown>> = {
-  'vps-outdated': {
-    ...SHARED_VPS_STALE,
-    image: false,
-    imageMatches: false,
-    imageBuild: { phase: 'idle', startedAt: null, elapsedMs: null, error: null },
-    problem: 'Prepare the pinned BotFleet CUA image on the VPS (Driver 0.20.0)',
-  },
-  'vps-building': {
-    ...SHARED_VPS_STALE,
-    image: false,
-    imageMatches: false,
-    imageBuild: { phase: 'building', startedAt: 1, elapsedMs: 754_000, error: null },
-    problem: 'Prepare the pinned BotFleet CUA image on the VPS (Driver 0.20.0)',
-  },
-  'vps-switch': {
-    ...SHARED_VPS_STALE,
-    image: true,
-    imageMatches: false,
-    imageBuild: { phase: 'ready', startedAt: null, elapsedMs: null, error: null },
-    problem: 'The VPS container uses an incompatible or untrusted BotFleet image',
-  },
-};
+function sharedVpsOutdatedBody(pageState: string) {
+  switch (pageState) {
+    case 'vps-outdated':
+      return {
+        ...SHARED_VPS_STALE,
+        image: false,
+        imageMatches: false,
+        imageBuild: { phase: 'idle', startedAt: null, elapsedMs: null, error: null },
+        problem: 'Prepare the pinned BotFleet CUA image on the VPS (Driver 0.20.0)',
+      };
+    case 'vps-building':
+      return {
+        ...SHARED_VPS_STALE,
+        image: false,
+        imageMatches: false,
+        imageBuild: { phase: 'building', startedAt: 1, elapsedMs: 754_000, error: null },
+        problem: 'Prepare the pinned BotFleet CUA image on the VPS (Driver 0.20.0)',
+      };
+    case 'vps-switch':
+      return {
+        ...SHARED_VPS_STALE,
+        image: true,
+        imageMatches: false,
+        imageBuild: { phase: 'ready', startedAt: null, elapsedMs: null, error: null },
+        problem: 'The VPS container uses an incompatible or untrusted BotFleet image',
+      };
+    default:
+      return null;
+  }
+}
 
 test.use({
   viewport: { width: 1280, height: 1000 },
@@ -170,7 +177,7 @@ test.beforeEach(async ({ page }) => {
       pendingVpsRoutes.push(route);
       return;
     }
-    const outdated = SHARED_VPS_OUTDATED_BODIES[pageState];
+    const outdated = sharedVpsOutdatedBody(pageState);
     if (outdated) {
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(outdated) });
     }

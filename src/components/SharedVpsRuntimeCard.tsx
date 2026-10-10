@@ -32,10 +32,12 @@ export interface VpsStatus {
 
 /** The header line and its dot.  A container on an older image is never a
  * clean "Running": bots refuse it until it is switched. */
-export function sharedVpsStatusLabel(status: Pick<VpsStatus, "container" | "imageOutdated">): {
+export interface SharedVpsHeader {
   label: string;
   tone: "ok" | "warn" | "idle";
-} {
+}
+
+export function sharedVpsStatusLabel(status: Pick<VpsStatus, "container" | "imageOutdated">): SharedVpsHeader {
   const outdated = status.imageOutdated === true;
   if (status.container === "running") {
     return outdated ? { label: "Running (outdated image)", tone: "warn" } : { label: "Running", tone: "ok" };
