@@ -111,7 +111,13 @@ harness' own branch semantics rather than discard them.  That one was kept and g
 
 So the test applied was: *does this suggestion describe reality that is still true in the current
 code?*  The sync guard described a real inconsistency, but its premise had been removed by an
-earlier fix.  The reload forwarding described a real gap with no competing fix.
+earlier fix.  The reload forwarding described a real gap with no competing fix.  The final pass
+(a synthetic bubble that reused the triggering message's timestamp) described a real ordering
+bug: an equal `createdAt` leaves the bubble's position up to the renderer's tie-break.
+
+A caution about writing the test for that last one: the obvious assertion is `>=`, and that is
+vacuously satisfied by the tie that *is* the bug.  The A/B check caught it — the test passed
+against sabotaged code.  The property is strictly greater.
 
 One typing consequence: neither `RunConfig` nor `StartRunConfig` is re-exported by
 `@assistant-ui/react` (only `CreateStartRunConfig` is), so those shapes are written structurally

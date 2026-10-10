@@ -5,6 +5,7 @@ import { createElement, type ReactNode } from "react";
 import {
   createBotFleetExternalStore,
   useBotFleetRuntime,
+  appendStreamTail,
   STREAMING_MESSAGE_ID,
   type BotFleetThreadMessage,
 } from "./BotFleetExternalStore";
@@ -89,6 +90,26 @@ describe("botfleet external store adapter", () => {
     expect(last.id).toBe(STREAMING_MESSAGE_ID);
     expect(last.text).toBe("Working…");
     expect(adapter.isRunning).toBe(true);
+  });
+
+  it("stamps the synthetic message so it sorts strictly after the triggering message", () => {
+    // The synthetic bubble must never tie or sort ABOVE the settled message
+    // that triggered it, or the live tail renders in the wrong place in the
+    // transcript.  A TIE is the failure mode a `>=` assertion would miss:
+    // inheriting the trigger's timestamp verbatim leaves the two equal, so
+    // the bubble's position is then decided by whatever the renderer does
+    // with equal keys.  Hence strictly greater.
+    const seeded: BotFleetThreadMessage[] = [
+      { id: "a1", role: "assistant", text: "earlier answer", createdAt: new Date(1000) },
+      { id: "u1", role: "user", text: "follow-up", createdAt: new Date(2000) },
+    ];
+    const out = appendStreamTail(seeded, { text: "live tail" });
+    const synthetic = out[out.length - 1];
+    expect(synthetic.id).toBe(STREAMING_MESSAGE_ID);
+    expect(synthetic.createdAt.getTime()).toBeGreaterThan(
+      seeded[seeded.length - 1].createdAt.getTime(),
+    );
+    expect(out.slice().sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())).toEqual(out);
   });
 
   it("stays running when tokens stream before any settled bot message", () => {
