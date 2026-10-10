@@ -867,7 +867,7 @@ export function resolveHarnessBearerCredential(owner) {
   const credential = process.env.BOTFLEET_OWNER_NONCE;
   if (typeof credential === "string" && credential.length > 0) {
     if (!/^[a-f0-9]{64}$/.test(credential)) {
-      throw new Error("BOTFLEET_OWNER_NONCE is not a valid harness Bearer [REDACTED]");
+      throw new Error("BOTFLEET_OWNER_NONCE is not a valid harness bearer credential");
     }
     return credential;
   }
