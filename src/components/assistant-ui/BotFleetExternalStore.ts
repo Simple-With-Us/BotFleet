@@ -56,7 +56,7 @@ function toThreadMessage(message: BotFleetThreadMessage): ThreadMessageLike {
   // or @assistant-ui/core, so derive the element type from `ThreadMessageLike`.
   type Part = Extract<ThreadMessageLike["content"], readonly unknown[]>[number];
   const parts: Part[] = [{ type: "text", text: message.text }];
-  if (message.reasoning) parts.push({ type: "reasoning", text: message.reasoning } as Part);
+  if (message.reasoning) parts.push({ type: "reasoning", text: message.reasoning });
   return {
     id: message.id,
     role: message.role,

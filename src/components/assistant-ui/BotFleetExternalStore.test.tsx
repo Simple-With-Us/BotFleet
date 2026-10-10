@@ -114,10 +114,19 @@ describe("botfleet external store adapter", () => {
 it("sends through the harness send path, not an AI SDK", async () => {
     const send = vi.fn(async () => {});
     const adapter = createBotFleetExternalStore({ threadId: "t7", messages, send });
-    await adapter.onNew!({
+    const onNew = adapter.onNew!;
+    // `AppendMessage` is `Omit<ThreadMessage, "id">` plus the run-plumbing
+    // fields (parentId / sourceId / runConfig); build a complete one rather
+    // than asserting the literal.
+    await onNew({
       content: [{ type: "text", text: "hello harness" }],
       role: "user",
-    } as never);
+      createdAt: new Date(0),
+      metadata: { custom: {} },
+      parentId: null,
+      sourceId: null,
+      runConfig: undefined,
+    });
     expect(send).toHaveBeenCalledWith({ threadId: "t7", text: "hello harness" });
   });
 
