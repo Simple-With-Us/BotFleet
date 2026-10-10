@@ -50,6 +50,15 @@ async function pinFonts(page: Page): Promise<void> {
   });
 }
 
+/** The queued label carries whatever the person typed, so it is masked: the
+ * baseline is here to pin the row's chrome — bubble glyph, three actions, the
+ * border, the padding, the stack gap — not one specific sentence.  Left
+ * unmasked, rewording a fixture would rewrite most of the diff pixels and the
+ * assertion would fail on content instead of on layout. */
+function queuedMask(page: Page) {
+  return [page.locator('span[title^="Queued"]')];
+}
+
 test.use({
   viewport: { width: 900, height: 720 },
   locale: 'en-US',
@@ -232,6 +241,7 @@ test('visual: one queued steer pill carries its label and three actions', async 
     ...stableShot,
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
+    mask: queuedMask(page),
   });
 });
 
@@ -264,6 +274,7 @@ test('visual: several queued pills stack without crowding out the composer', asy
     ...stableShot,
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
+    mask: queuedMask(page),
   });
 });
 
@@ -294,5 +305,6 @@ test('visual: a queued message in a busy room shows the same pill row, with the 
     ...stableShot,
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
+    mask: queuedMask(page),
   });
 });
