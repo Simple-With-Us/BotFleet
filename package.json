@@ -95,7 +95,8 @@
     "test:board-audit": "node --test scripts/audit-effort-board.node-test.mjs",
     "test:server-start": "node --test scripts/botfleet-server-start.node-test.mjs",
     "postinstall": "node scripts/compile-clutch-dep.mjs",
-    "test:cred-sync": "node --test scripts/sync-cli-credentials.node-test.mjs"
+    "test:cred-sync": "node --test scripts/sync-cli-credentials.node-test.mjs",
+    "test:kody-autofix": "node --test .github/autofix/kody-pilot.node-test.mjs"
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",
