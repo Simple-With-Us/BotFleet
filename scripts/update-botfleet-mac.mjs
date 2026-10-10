@@ -490,12 +490,56 @@ export function txtHolderPids(lsofOutput, bundleRealPath) {
  */
 /**
  * A failed install leaves the replacement behind as `<name>.failed-<stamp>`
- * so it can be examined.  Nothing ever removes them, and nothing mentioned
- * them either.  They are evidence of a failed update, so they are reported
- * rather than deleted.
+ * so it can be examined.  They are evidence of a failed update, so they are
+ * reported rather than deleted.
+ *
+ * Evidence is worth keeping for a while and worthless forever, though, and
+ * this used to have no end: every failed update left a whole second copy of
+ * the app in /Applications forever.  Four of them held 2.5 GB on a disk that
+ * was 99% full.  So they are now capped -- see `FAILED_INSTALL_KEEP`.  The
+ * newest few stay as evidence; the rest go.
  */
 export function failedInstallBundles(names, bundleName) {
   return names.filter((name) => name.startsWith(`${bundleName}.failed-`));
+}
+
+/**
+ * How many failed-install bundles to keep.
+ *
+ * Three is enough to diagnose a bad update (the one you just hit, plus the
+ * couple before it that might share a cause) without letting a flapping
+ * updater fill the disk.  Each one is a full copy of the app, so on a 600 MB
+ * bundle the difference between three and unlimited is the whole disk.
+ */
+export const FAILED_INSTALL_KEEP = 3;
+
+/**
+ * The millisecond stamp a failed-install bundle carries, or null when the name
+ * is not one.  The stamp is written by the failed install itself, so it is the
+ * only age signal available without stat'ing every bundle.
+ */
+export function failedInstallStamp(name, bundleName) {
+  const prefix = `${bundleName}.failed-`;
+  if (!name.startsWith(prefix)) return null;
+  const stamp = Number(name.slice(prefix.length));
+  return Number.isSafeInteger(stamp) && stamp > 0 ? stamp : null;
+}
+
+/**
+ * Which failed-install bundles are past the retention cap: the oldest ones,
+ * keeping the `keep` newest.  Pure, so the policy is testable without a disk.
+ *
+ * A bundle whose stamp does not parse is never pruned.  It is not ours to age
+ * out, and guessing could delete the wrong thing.
+ */
+export function failedInstallBundlesToPrune(names, bundleName, keep = FAILED_INSTALL_KEEP) {
+  const stamped = [];
+  for (const name of names) {
+    const stamp = failedInstallStamp(name, bundleName);
+    if (stamp !== null) stamped.push({ name, stamp });
+  }
+  stamped.sort((a, b) => b.stamp - a.stamp);
+  return stamped.slice(Math.max(0, keep)).map((entry) => entry.name);
 }
 
 export function survivingRollbackProcessError(pids, rollbackPath) {
@@ -3357,8 +3401,28 @@ function createOperations(config) {
     for (const item of unclaimedGenerations(generations)) {
       console.error(`Rollback receipt ${item.receiptPath} names no installed application; it was left in place for manual review.`);
     }
-    for (const name of failedInstallBundles(await listDirectory(dirname(config.appPath)), basename(config.appPath))) {
-      console.error(`A previous update left ${join(dirname(config.appPath), name)} behind; it is evidence of that failure and was left in place for manual review.`);
+    const appDir = dirname(config.appPath);
+    const bundleName = basename(config.appPath);
+    const present = await listDirectory(appDir);
+    const kept = present.filter(
+      (name) => failedInstallBundles([name], bundleName).length === 1 && !failedInstallBundlesToPrune(present, bundleName).includes(name),
+    );
+    for (const name of kept) {
+      console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
+    }
+    // Past the retention cap these are not evidence any more, just disk.  Each
+    // one is a whole second copy of the app.
+    for (const name of failedInstallBundlesToPrune(present, bundleName)) {
+      const path = join(appDir, name);
+      // Only ever something this updater itself named, sitting beside the app
+      // it manages.  A same-named bundle anywhere else is not ours to remove.
+      if (dirname(path) !== appDir) continue;
+      try {
+        await rm(path, { recursive: true, force: true });
+        console.log(`Removed ${name}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
+      } catch (error) {
+        console.error(`Could not remove the expired failed-install bundle ${path}: ${error.message}`);
+      }
     }
   };
 
