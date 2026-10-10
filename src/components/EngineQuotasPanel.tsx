@@ -196,6 +196,7 @@ export function EngineQuotasPanel({
       {open && (
         <div
           id={detailId}
+          data-testid="engine-quotas-detail"
           className="mt-1.5 max-h-56 space-y-3 overflow-y-auto rounded-lg border border-hairline/40 bg-inset/30 px-3 py-2.5"
         >
           {rows.map(({ engine, windows }) => {
