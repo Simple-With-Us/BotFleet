@@ -1093,7 +1093,7 @@ export type Action =
     }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number; reply?: Message; attachments?: Attachment[] }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
-  | { type: "cancelQueued"; botId: string; queueId: string }
+  | { type: "cancelQueued"; botId: string; queueId: string; onSettled?: () => void }
   | { type: "editMessage"; botId: string; messageId: string; text: string }
   | { type: "switchBranch"; botId: string; messageId: string }
   | { type: "threadActive"; threadId: string; activeLeafId: string }
@@ -2588,7 +2588,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "cancelQueued":
           void api(`/api/bots/${action.botId}/queue/${action.queueId}`, { method: "DELETE" })
             .then(() => rawDispatch(action))
-            .catch(showError);
+            // The caller restores a draft from the entry it is removing, and
+            // that has to wait for the server: until the DELETE lands the
+            // queued message is still live, so a draft put back now can be
+            // sent twice.  Either way the entry's owner hears how it ended.
+            .catch(showError)
+            .finally(() => action.onSettled?.());
           break;
         case "send": {
           // persist through the existing card route so an older server that

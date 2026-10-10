@@ -373,3 +373,37 @@ test('editing a message held for a busy room brings its attachments back too', a
   expect(sends[0].text).toContain('worth checking against the earlier answer');
   await expect(chip).toBeHidden();
 });
+
+test('editing a queued bot message waits for the harness before restoring the draft', async ({ page }) => {
+  const cancel = held();
+  // The server, not the client, decides a send is queued: the pill only
+  // exists once the POST answers queued: true with a queueId.
+  await mockServer(page, (route) =>
+    route.fulfill(json({ ok: true, queued: true, queueId: 'q-1', threadId: `thread-${DRAFTSMAN.id}` }, 202)),
+  );
+  // Hold the DELETE that retires a queued message, so the window Kody named is
+  // wide open: the queued send is still live on the server the whole time.
+  await page.route('**/api/bots/*/queue/*', async (route) => {
+    await cancel.released;
+    return route.fulfill(json({ ok: true }));
+  });
+  await openApp(page);
+  const box = await openBot(page, DRAFTSMAN.name);
+
+  await box.fill('worth a second look');
+  await box.press('Enter');
+  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
+
+  await page.getByRole('button', { name: 'Edit queued message' }).first().click();
+
+  // While the DELETE is in flight the message is still queued, so the draft
+  // must NOT be back in the box: a fast resend here would put the original and
+  // the copy on the wire together.
+  await page.waitForTimeout(300);
+  await expect(box).toHaveValue('');
+  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
+
+  cancel.release();
+  await expect(box).toHaveValue('worth a second look');
+  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(0);
+});
