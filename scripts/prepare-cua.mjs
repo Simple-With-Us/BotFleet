@@ -183,7 +183,7 @@ export async function prepareCua({ root = join(dirname(fileURLToPath(import.meta
     const nativePackage = join(dependencyRoot, "@trycua", `cua-driver-darwin-${arch}`);
     if (!existsSync(nativePackage)) {
       throw new Error(
-        `required CUA darwin-${arch} native package is missing — is pnpm.supportedArchitectures.cpu set in package.json?`,
+        `required CUA darwin-${arch} native package is missing — is pnpm supportedArchitectures.cpu set in pnpm-workspace.yaml?`,
       );
     }
     await mkdir(nativeDir, { recursive: true });
