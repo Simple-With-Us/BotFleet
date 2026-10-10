@@ -18,6 +18,8 @@ export default defineConfig({
     toHaveScreenshot: {
       maxDiffPixelRatio: 0.02,
       threshold: 0.2,
+      animations: 'disabled',
+      caret: 'hide',
     },
   },
   projects: [{ name: 'chromium', use: { browserName: 'chromium' } }],

@@ -7,7 +7,7 @@ import { test, expect, type Page } from '@playwright/test';
 // of context.
 //
 // There is no visual-tests/ directory; this follows tests/e2e/visual.spec.ts.
-const stableShot = { animations: 'disabled', caret: 'hide', maxDiffPixelRatio: 0.02, threshold: 0.2 } as const;
+const stableShot = {} as const; // maxDiffPixelRatio/threshold (and animations/caret) live in playwright.config under expect.toHaveScreenshot; spec only adds mask
 
 async function pinFonts(page: Page): Promise<void> {
   await page.addStyleTag({
