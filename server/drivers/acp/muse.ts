@@ -33,6 +33,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ModelCatalog } from "../../contracts.ts";
+import { z } from "zod";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 /** Reasoning effort, narrowed to the rungs BotFleet's shared `EFFORT_LEVELS`
@@ -121,12 +122,46 @@ function museAuthIndexPath(env: Record<string, string | undefined>): string {
   return join(xdg && xdg.length > 0 ? xdg : join(home, ".config"), "muse", "auth.json");
 }
 
+/** Shape of `~/.config/muse/auth.json`, as far as this driver reads it.
+ *
+ *  Deliberately loose about everything except the one field that matters:
+ *  `storage` must be a non-empty string to count as a credential.  Only the
+ *  `meta` provider is modelled, and only that provider can satisfy
+ *  `museAuthenticated` — the index is a map of providers, and letting any one
+ *  of them satisfy the check put an instance with no Meta credential into the
+ *  failover chain at `server/safety/turn-safety.ts`, where it fails every turn.
+ *
+ *  `.passthrough()` because a provider we do not model must not invalidate the
+ *  whole index; `.catch(undefined)` per field so a `meta` entry carrying an
+ *  unexpected shape reads as "no credential" instead of failing the parse. */
+export const authIndexSchema = z
+  .object({
+    providers: z
+      .object({
+        meta: z
+          .object({ storage: z.string().min(1) })
+          .passthrough()
+          .optional()
+          .catch(undefined),
+      })
+      .passthrough()
+      .optional()
+      .catch(undefined),
+  })
+  .passthrough();
+
+/** The validated shape of the credential index, derived from the schema itself
+ *  so the type and the runtime check cannot drift apart.  Exported with it so
+ *  the auth tests can assert against the same contract the driver reads. */
+export type AuthIndex = z.infer<typeof authIndexSchema>;
+
 /** The credential backend the CLI recorded, or null when there is no index.
  *
- *  `file` and friends mean the credential is in this very file and any client
- *  can read it.  `keychain` means the token was handed to the OS keychain
- *  instead, which is the one case this engine cannot use — see
- *  `museAuthenticated`. */
+ *  The value is no longer used to *reject* a session:  `keychain` means the
+ *  token was handed to the OS keychain, and the installed CLI resolves it for
+ *  the adapter, so it counts as signed in — see `museAuthenticated`.  It is
+ *  still the right thing to read, because a present file with a recorded
+ *  `storage` is exactly what distinguishes signed in from signed out. */
 function museCredentialStorage(env: Record<string, string | undefined>): string | null {
   const path = museAuthIndexPath(env);
   let raw: string;
@@ -136,14 +171,19 @@ function museCredentialStorage(env: Record<string, string | undefined>): string 
     return null; // no index: not signed in, or not this CLI's index
   }
   try {
-    const parsed = JSON.parse(raw) as {
-      providers?: Record<string, { storage?: unknown } | undefined>;
-    };
-    for (const provider of Object.values(parsed.providers ?? {})) {
-      const storage = provider?.storage;
-      if (typeof storage === "string" && storage.length > 0) return storage;
-    }
-    return null;
+    // Parsed and validated rather than `as`-cast, matching the other drivers:
+    // a TypeScript cast only silences the compiler, it does not check anything
+    // at runtime, and this value decides whether the setup card clears and
+    // whether the instance joins the failover chain.  `.passthrough()` keeps
+    // unknown provider entries from failing the whole index — a future
+    // provider we do not model must not read as "signed out".
+    const parsed = authIndexSchema.safeParse(JSON.parse(raw));
+    if (!parsed.success) return null;
+    // Annotating with the inferred type is the point of exporting the schema:
+    // if the runtime check and the declared shape ever disagree, this line
+    // stops compiling rather than the drift going unnoticed.
+    const index: AuthIndex = parsed.data;
+    return index.providers?.meta?.storage ?? null;
   } catch {
     // A malformed index is not evidence of a credential, and must never throw
     // out of a snapshot path.
@@ -153,24 +193,25 @@ function museCredentialStorage(env: Record<string, string | undefined>): string 
 
 /** Is Muse Code signed in *for this driver*?
  *
- *  Two tiers, and the distinction is the whole point.
+ *  Three tiers, and the distinction is the whole point.
  *
  *  **An API key, or a file-backed stored credential, is signed in.**  Muse Code
  *  resolves credentials as `META_API_KEY` first, then a stored key, and only
- *  then a stored browser session — so `META_API_KEY` and a `storage` of
- *  anything other than `keychain` are both credentials a client can read.  On
- *  Linux and Windows there is no macOS Keychain, so a file-backed credential is
- *  the normal case there and treating it as "not signed in" would strand every
- *  user on those platforms.
+ *  then a stored browser session — so `META_API_KEY` and a file-backed
+ *  `storage` are both credentials a client can read.  On Linux and Windows
+ *  there is no macOS Keychain, so a file-backed credential is the normal case
+ *  there and treating it as "not signed in" would strand every user on those
+ *  platforms.
  *
- *  **A keychain-backed session is reported as unproven, not signed in.**  This
- *  is the case that produced the original bug.  The credential is real and the
- *  CLI uses it happily — `muse exec` works on that account — but the community
- *  adapter we spawn bundles `@muse-code/sdk@1.3.0`, which predates the
- *  Keychain move and answers "not logged in".  Counting it would put a
- *  setup-complete badge over an engine that fails every turn.
+ *  **A keychain-backed session is signed in too, and this used to be wrong.**
+ *  That was the case that produced the original bug:  the old check reported
+ *  "unproven" for keychain storage, on the theory that the community adapter
+ *  we spawn bundles `@muse-code/sdk@1.3.0`, which predates the Keychain move
+ *  and would answer "not logged in".  **That theory was measured and refuted** —
+ *  see below.  It is recorded here because the refutation is the load-bearing
+ *  part:  anyone tempted to reintroduce that tier needs to know it was tested.
  *
- *  Why "unproven" has to be a real answer rather than an aside:  the live
+ *  Why this distinction has to be a real answer rather than an aside:  the live
  *  consumers of this value are the setup card and the failover chain at
  *  `server/safety/turn-safety.ts`, which skips an instance whose
  *  `authenticated` is `false`.  `muse` sets neither
@@ -180,25 +221,49 @@ function museCredentialStorage(env: Record<string, string | undefined>): string 
  *  so `loginNote` and `signInCommand` name the API key as the path, and a test
  *  holds them to this function so the two cannot drift apart again.
  */
+/** Is Muse Code signed in *for this driver*?
+ *
+ *  This used to answer `false` for a keychain-backed session, on the theory
+ *  that the community adapter's bundled `@muse-code/sdk@1.3.0` predates the
+ *  keychain move and would answer "not logged in" while the credential was in
+ *  fact fine.  **That theory is wrong, and it is now measured rather than
+ *  assumed.**
+ *
+ *  On a keychain-device-code account, the real `muse-code-acp` adapter
+ *  completes `initialize` → `session/new` → `session/prompt` and returns
+ *  `stopReason: end_turn`.  The adapter does not read the credential itself:
+ *  it spawns `muse serve`, and the installed CLI resolves the keychain token.
+ *  The SDK version is irrelevant to the question, because the SDK is not the
+ *  component holding the session.
+ *
+ *  So keychain storage is a real credential and is treated as signed in.  The
+ *  old `false` was not cosmetic: it stranded the setup card forever and kept
+ *  the instance out of the failover chain at `server/safety/turn-safety.ts`
+ *  for a user who had signed in correctly and could run a turn by hand — the
+ *  exact "does not work" report this fixes.
+ *
+ *  `storage` is still read at all, because it is the only thing in the index
+ *  that distinguishes "signed in" from "signed out" — the file itself carries
+ *  no secret and exists either way. */
 export function museAuthenticated(env: Record<string, string | undefined>): boolean {
   if (env.META_API_KEY?.trim()) return true;
-  const storage = museCredentialStorage(env);
-  return storage !== null && storage !== "keychain";
+  return museCredentialStorage(env) !== null;
 }
 
 /** The sign-in sentence the harness shows when this engine is not authenticated.
  *  Exported so a test can hold it to `museAuthenticated` — the bug this encodes
  *  was the two drifting apart.
  *
- *  The trailing instruction is not decoration.  `muse auth set --api-key-stdin`
- *  reads the key from stdin, which is what keeps it out of shell history, and
- *  it therefore **blocks until it gets one**.  The setup surfaces say "paste
- *  the command and press Enter" and nothing more, so a user who followed them
+ *  The API key is offered as one valid route, not the only one: a browser
+ *  session stored in the macOS keychain is honoured like any other credential,
+ *  because the installed CLI resolves it for the adapter.  The key path is
+ *  named here because it is the route that also works on a machine with no
+ *  keychain, and because the command reads the key from stdin — so it must
+ *  name both the prompt and the Ctrl-D, or a user who followed the card
  *  exactly sat in a terminal that looked hung:  no key, no EOF, no stored
- *  credential, and a card that never cleared.  Naming the key and the Ctrl-D
- *  is the difference between a command that works and one that appears frozen. */
+ *  credential, and a card that never cleared. */
 export const MUSE_LOGIN_NOTE =
-  "Muse Code needs an API key for BotFleet — a browser session signed into the Mac keychain works in the terminal but this engine cannot read it.  To sign in, run `muse auth set --provider meta --api-key-stdin`, paste the key when it prompts, then press Ctrl-D and Enter";
+  "Muse Code needs an API key for BotFleet.  A browser session signed into the Mac keychain also works.  To sign in, run `muse auth set --provider meta --api-key-stdin`, paste the key when it prompts, then press Ctrl-D and Enter";
 
 const support: AcpSupport = {
   driverKind: "museAgent",

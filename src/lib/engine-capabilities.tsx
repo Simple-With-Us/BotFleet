@@ -929,7 +929,14 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         "Pricing for this engine is not recorded in this build.",
       ],
     },
-    defaultModels: [{ id: "opencode/x-preview-f-free", display: "OpenCode Preview" }],
+    // No hardcoded id: the free catalog rotates and the previous entry
+    // (`opencode/x-preview-f-free`) has been deprecated upstream, so listing it
+    // offered a model that failed every turn.  The driver resolves the default
+    // from whatever the installed CLI actually serves, which is the definition
+    // of a host-driven catalog: the models are whatever local host the user has
+    // configured, so there is no fleet-wide id to name here.
+    catalogIsHostDriven: true,
+    defaultModels: [],
   },
 
   qwen: {

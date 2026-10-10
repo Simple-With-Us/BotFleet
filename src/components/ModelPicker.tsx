@@ -24,11 +24,12 @@ import { pickedSelection, selectionEffortLevels, selectionWithEffort } from "@/l
 import { effortLabel } from "@/lib/model-effort";
 import type { EffortLevel } from "../../server/contracts.ts";
 import { ProviderMark } from "./ProviderIcons";
+import { EngineQuotasPanel } from "./EngineQuotasPanel";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
 import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
-import { formatDualQuotaBadge } from "@/lib/quota-display";
+import { quotaWindows, bindingQuotaWindow } from "@/lib/quota-display";
 import { cn } from "@/lib/cn";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
 import {
@@ -284,7 +285,7 @@ function ModelRow({
   defaultId,
   onPick,
   quota,
-  windowsLabel,
+  engineWindowsLabel,
 }: {
   option: ModelOption;
   current: boolean;
@@ -296,13 +297,13 @@ function ModelRow({
     secondaryRemainingPercent?: number | null;
     windowsLabel?: string;
   };
-  windowsLabel?: string;
+  /** Engine-level fallback label, used when a per-model quota entry carries
+   *  none.  `quota.models[id].windowsLabel` is optional in the contract
+   *  (server/contracts.ts), and without this the row hint falls back to the
+   *  generic "Current"/"Longer" names and says "Low longer quota" while the
+   *  panel above it correctly says "Weekly". */
+  engineWindowsLabel?: string;
 }) {
-  const badge = formatDualQuotaBadge(
-    quota?.remainingPercent,
-    quota?.secondaryRemainingPercent,
-    { windowsLabel: quota?.windowsLabel ?? windowsLabel },
-  );
   return (
     <button
       type="button"
@@ -314,7 +315,13 @@ function ModelRow({
       )}
     >
       <span className="flex min-w-0 flex-1 items-center gap-1.5">
-        <span className="min-w-0 flex-1 break-words" title={option.label}>{option.label}</span>
+        {/* `truncate`, not `break-words`.  This span is `flex-1` (basis 0), so
+            when the Default/ctx/quota chips beside it claim the row, the label
+            shrinks to nothing — and `break-words` then breaks it one character
+            per line, which is how "MiniMax M2.7" rendered as a vertical column
+            of letters.  Truncating keeps the name on one line and hands the
+            overflow to the title attribute instead. */}
+        <span className="min-w-0 flex-1 truncate" title={option.label}>{option.label}</span>
         {option.id === defaultId && (
           <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
         )}
@@ -343,12 +350,44 @@ function ModelRow({
         {quota?.capped && (
           <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">Exhausted</span>
         )}
-        {!quota?.capped && badge && (
-          <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">{badge}</span>
+        {!quota?.capped && (
+          <EngineQuotaHint quota={quota} fallbackWindowsLabel={engineWindowsLabel} />
         )}
       </span>
       {current && <Check size={14} className="shrink-0 text-accent" />}
     </button>
+  );
+}
+
+/** A short per-row nudge, now that the full numbers live in Engine Quotas.
+ *
+ *  The old chip printed every engine's whole quota state on every model —
+ *  `(93% / 3% for 5h / w)` — which said the same thing down the whole list and
+ *  explained nothing.  A row now only speaks up when the engine is genuinely
+ *  low, and then in words: "Low weekly quota".  Everything else is one click
+ *  away in the panel under the header, where it can be labelled properly. */
+function EngineQuotaHint({ quota, fallbackWindowsLabel }: {
+  quota?: {
+    remainingPercent?: number | null;
+    secondaryRemainingPercent?: number | null;
+    windowsLabel?: string;
+  };
+  fallbackWindowsLabel?: string;
+}) {
+  const windows = quotaWindows(quota?.remainingPercent, quota?.secondaryRemainingPercent, {
+    windowsLabel: quota?.windowsLabel ?? fallbackWindowsLabel,
+  });
+  const binding = bindingQuotaWindow(windows);
+  if (!binding) return null;
+  if (binding.remainingPercent > 10) return null;
+  const tone =
+    binding.remainingPercent <= 0
+      ? "bg-danger/10 text-danger"
+      : "bg-amber-500/15 text-amber-700 dark:text-amber-300";
+  return (
+    <span className={cn("shrink-0 rounded px-1.5 py-px text-[10px]", tone)}>
+      {binding.remainingPercent <= 0 ? `${binding.label} spent` : `Low ${binding.label.toLowerCase()} quota`}
+    </span>
   );
 }
 
@@ -430,7 +469,10 @@ export function LocalModelsPanel({
                 defaultId=""
                 onPick={() => onPick(group.instance, option.id)}
                 quota={group.instance.snapshot.quota?.models?.[option.id]}
-                windowsLabel={group.instance.snapshot.quota?.windowsLabel}
+                engineWindowsLabel={
+                  group.instance.snapshot.quota?.models?.[option.id]?.windowsLabel ??
+                  group.instance.snapshot.quota?.windowsLabel
+                }
               />
             ))}
           </div>
@@ -625,7 +667,7 @@ export function ModelPicker({
       defaultId={railInstance?.models.default ?? ""}
       onPick={() => railInstance && pick(railInstance, option.id)}
       quota={railInstance?.snapshot.quota?.models?.[option.id]}
-      windowsLabel={windowsLabel}
+      engineWindowsLabel={railInstance?.snapshot.quota?.windowsLabel}
     />
   );
 
@@ -818,6 +860,13 @@ export function ModelPicker({
                       ? "Run this bot with a model already on your machine."
                       : "Choose a model for this bot."}
                   </div>
+                  {/* Quotas live on the engine, not the model, so they get one
+                      labelled home under the header instead of a cryptic chip
+                      repeated down every row. */}
+                  <EngineQuotasPanel
+                    engines={state.instances}
+                    activeInstanceId={railInstance.instanceId}
+                  />
                   {railInstance.snapshot.quota?.capped && (
                     <div className="mt-2 rounded bg-amber-500/10 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300 border border-amber-500/20">
                       <strong>Usage cap in effect:</strong> {railInstance.snapshot.quota?.error ?? "Session limit or quota reached."} Turns automatically fail over to configured fallbacks until reset.

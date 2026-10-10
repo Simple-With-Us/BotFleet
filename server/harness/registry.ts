@@ -54,6 +54,11 @@ const RESERVED_INSTANCE_ID = new Map<string, InstanceId>([
   ["piAgent", "pi"],
   ["mcodeAgent", "mcode"],
   ["museAgent", "muse"],
+  // OpenCode kept its historical `opencodeGo` driver kind when the product
+  // expanded past Go.  Without a row here the engine reads as operator-added
+  // (see `isCustomInstance`), which offers a delete button for the one engine
+  // a user cannot meaningfully replace.
+  ["opencodeGo", "opencode"],
 ]);
 
 export function isCustomInstance(driverKind: string, instanceId: InstanceId): boolean {

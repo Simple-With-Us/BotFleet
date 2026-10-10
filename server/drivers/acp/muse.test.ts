@@ -11,10 +11,12 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { BUILT_IN_DRIVERS } from "../builtIn.ts";
 import {
+  type AuthIndex,
   MUSE_EFFORT_LEVELS,
   MUSE_LOGIN_NOTE,
   MuseAgentDriver,
   STATIC_MUSE_MODELS,
+  authIndexSchema,
   museAuthenticated,
 } from "./muse.ts";
 
@@ -109,7 +111,7 @@ describe("Muse Code driver", () => {
     expect(museAuthenticated({ META_API_KEY: "   " })).toBe(false);
   });
 
-  it("separates a keychain session from a file-backed credential", () => {
+  it("accepts a keychain session, because the CLI resolves it for the adapter", () => {
     // Every fixture goes where the REAL index lives — `$HOME/.config/muse/`,
     // not `dir/auth.json` — so these are genuine regression guards.  The first
     // version of this test wrote elsewhere and passed for the wrong reason:  an
@@ -135,14 +137,19 @@ describe("Muse Code driver", () => {
       "utf8",
     );
 
-    // A browser session signed into the keychain is real, and the CLI uses it —
-    // `muse exec` works on that account — but this engine's adapter cannot
-    // read it, so counting it would put a setup-complete badge over an engine
-    // that fails every turn.  Unproven, not signed in.
-    expect(museAuthenticated({ HOME: keychainHome })).toBe(false);
+    // A keychain-backed browser session is a real credential.  This used to
+    // assert `false`, on the theory that the adapter's bundled
+    // `@muse-code/sdk@1.3.0` predates the keychain move.  Measured against the
+    // real `muse-code-acp` on this exact account shape:  initialize, session/new
+    // and session/prompt all succeed and the prompt returns `end_turn`.  The
+    // adapter spawns `muse serve`; the installed CLI is what reads the token,
+    // so the SDK version never mattered.  Answering `false` here stranded the
+    // setup card and the failover chain for a user who was signed in and could
+    // run a turn by hand.
+    expect(museAuthenticated({ HOME: keychainHome })).toBe(true);
     expect(
       museAuthenticated({ HOME: keychainHome, MUSE_AUTH_PATH: join(keychainDir, "auth.json") }),
-    ).toBe(false);
+    ).toBe(true);
 
     // A file-backed credential is the NORMAL case on Linux and Windows, where
     // there is no macOS Keychain to put it in.  Treating that as "not signed
@@ -173,6 +180,112 @@ describe("Muse Code driver", () => {
     mkdirSync(brokenDir, { recursive: true });
     writeFileSync(join(brokenDir, "auth.json"), "{ not json", "utf8");
     expect(museAuthenticated({ HOME: brokenHome })).toBe(false);
+  });
+
+  it("only counts a credential under the provider this driver actually spends", () => {
+    // The index is a map of *providers*.  The check used to return the first
+    // provider carrying any `storage`, so an index holding only some other
+    // provider reported the engine as signed in — and `turn-safety.ts` then
+    // put that unauthenticated instance into the failover chain, where it
+    // would fail every turn before the chain ever got a real shot.
+    const otherHome = scratch();
+    const otherDir = join(otherHome, ".config", "muse");
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(
+      join(otherDir, "auth.json"),
+      JSON.stringify({
+        schema_version: 1,
+        providers: { someotherprovider: { mechanism: "api_key", storage: "keychain" } },
+      }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: otherHome })).toBe(false);
+
+    // Both present: `meta` is the one that counts, and it satisfies the check
+    // on its own.  `meta` must win even when the other provider sorts first.
+    writeFileSync(
+      join(otherDir, "auth.json"),
+      JSON.stringify({
+        schema_version: 1,
+        providers: {
+          aaaother: { mechanism: "api_key", storage: "keychain" },
+          meta: { mechanism: "browser_session", storage: "keychain" },
+        },
+      }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: otherHome })).toBe(true);
+
+    // A `meta` entry with no storage is not a credential either.
+    writeFileSync(
+      join(otherDir, "auth.json"),
+      JSON.stringify({ schema_version: 1, providers: { meta: { mechanism: "none" } } }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: otherHome })).toBe(false);
+  });
+
+  it("exposes the schema and a type derived from it, so they cannot drift", () => {
+    // The driver reads the index through `authIndexSchema`, and `AuthIndex` is
+    // derived from that same schema.  Asserting a good fixture against both is
+    // what makes "the type matches the runtime check" a checked fact rather
+    // than a claim -- if the schema changes shape without the type following,
+    // this stops compiling or stops passing.
+    const good = {
+      schema_version: 1,
+      providers: {
+        somefutureprovider: { storage: "file" },
+        meta: { storage: "keychain", mechanism: "browser_session" },
+      },
+    };
+    const parsed = authIndexSchema.safeParse(good);
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    const index: AuthIndex = parsed.data;
+    expect(index.providers?.meta?.storage).toBe("keychain");
+    // Unmodelled keys survive, because a provider we do not know about must
+    // not invalidate the whole file.
+    expect(index.providers?.somefutureprovider).toEqual({ storage: "file" });
+  });
+
+  it("survives an index whose shape is not what the schema expects", () => {
+    // The index is a file another program writes, so its shape is not ours to
+    // assume.  Every one of these is valid JSON that would have indexed into
+    // nonsense before the schema, and each must read as "not signed in"
+    // rather than throwing out of a snapshot path or, worse, reporting a
+    // credential that is not there.
+    const home = scratch();
+    const dir = join(home, ".config", "muse");
+    mkdirSync(dir, { recursive: true });
+    const cases = [
+      '"just a string"',
+      "42",
+      "null",
+      "[]",
+      JSON.stringify({ providers: "not-an-object" }),
+      JSON.stringify({ providers: { meta: "not-an-object" } }),
+      JSON.stringify({ providers: { meta: { storage: 42 } } }),
+      JSON.stringify({ providers: { meta: { storage: "" } } }),
+      JSON.stringify({ providers: { meta: { storage: null } } }),
+    ];
+    for (const body of cases) {
+      writeFileSync(join(dir, "auth.json"), body, "utf8");
+      expect(museAuthenticated({ HOME: home }), `index ${body.slice(0, 40)}`).toBe(false);
+    }
+
+    // An unmodelled provider alongside a good `meta` one still signs in —
+    // `.passthrough()` exists so a future provider cannot invalidate the file.
+    writeFileSync(
+      join(dir, "auth.json"),
+      JSON.stringify({
+        providers: {
+          futureprovider: { storage: "file", somethingNew: 1 },
+          meta: { storage: "keychain" },
+        },
+      }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: home })).toBe(true);
   });
 
   it("names the same sign-in path the auth check can actually see", () => {

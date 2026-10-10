@@ -10,16 +10,51 @@ import { createAcpDriver, type AcpSupport } from "./core.ts";
 import type { ModelCatalog, ProviderErrorCode } from "../../contracts.ts";
 import { execCli } from "../../procs.ts";
 
+/** Fallback catalog for a bot that has no saved model yet.
+ *
+ *  The id here used to be a hardcoded `opencode/x-preview-f-free`, and that
+ *  model is gone:  OpenCode answers `Model exo-free has been deprecated` for
+ *  it, so a new bot inherited a default that failed every turn.  Worse, the
+ *  CLI's own default was the equally-dead `exo-free`, so an unset model hit
+ *  the same wall from the other side.
+ *
+ *  A hardcoded id cannot be right for long — the free catalog rotates.  So the
+ *  fallback is deliberately the *first model the installed CLI lists*, resolved
+ *  per instance, with this entry only used when the probe yields nothing (a
+ *  CLI too old to answer, or one mid-upgrade).  `resolveModels` merges the
+ *  live catalog over this, and `resolveTurnModel` follows the bot's saved id
+ *  when it has one. */
 const STATIC_MODELS: ModelCatalog = {
-  default: "opencode/x-preview-f-free",
-  options: [
-    {
-      id: "opencode/x-preview-f-free",
-      label: "Zen · Ox Alpha Free",
-      contextWindow: 1_000_000,
-    },
-  ],
+  // Left empty on purpose: an empty `options` list cannot present a
+  // deprecated id to a user as if it were a choice.  A bot with no saved
+  // model and no live catalog surfaces as "no models available" rather than
+  // as one broken entry.
+  default: "",
+  options: [],
 };
+
+/** The first model the installed CLI will actually run, or null.
+ *
+ *  Read from the CLI's own `models` output — the same source of truth
+ *  `canListOpenCodeModels` trusts — so the default is whatever the user's
+ *  installed version currently serves rather than a string this file froze
+ *  when it was written. */
+async function firstLiveModel(
+  cli: string,
+  env: Record<string, string | undefined>,
+): Promise<string | null> {
+  try {
+    const stdout = await runOpenCodeModels(cli, env, false);
+    for (const line of stdout.split(/\r?\n/u)) {
+      const candidate = line.trim();
+      if (validModelSlug(candidate)) return candidate;
+    }
+  } catch {
+    // An unreadable catalog is not an error here: the caller falls back to
+    // reporting no models rather than inventing one.
+  }
+  return null;
+}
 
 let lastSuccessfulCatalog: ModelCatalog | null = null;
 const MODEL_PROBE_TTL_MS = 30_000;
@@ -125,8 +160,16 @@ export function parseOpenCodeModelsOutput(stdout: string): ModelCatalog | null {
   flush();
 
   if (!options.length) return null;
-  const preferred = options.find((option) => option.id === STATIC_MODELS.default);
-  return { default: (preferred ?? options[0]!).id, options };
+  // Prefer a first-party Zen model when the CLI offers one, because Zen is the
+  // route that works with no stored credential at all — a new bot should land
+  // on a model it can actually run rather than on whatever happens to be
+  // listed first (a third-party provider's model, for instance, which needs a
+  // key the user may never have configured).  Falls back to the first live
+  // entry, which is always a model this CLI just listed.
+  const preferred = options.find((option) => option.id.startsWith("opencode/"))
+    ?? options.find((option) => option.id.startsWith("opencode-go/"))
+    ?? options[0]!;
+  return { default: preferred.id, options };
 }
 
 function runOpenCodeModels(
@@ -378,10 +421,25 @@ const support = (loadCatalog: OpenCodeCatalogLoader): AcpSupport => ({
   ),
   requireAuthenticationBeforeSpawn: true,
   classifyError: classifyOpenCodeError,
-  resolveModels: async (environment, config) => mergeLocalInject(
-    await loadCatalog(environment, config.cli),
-    environment,
-  ),
+  resolveModels: async (environment, config) => {
+    const catalog = await loadCatalog(environment, config.cli);
+    // Prefer the catalog's own default; if it is empty or points at a model the
+    // CLI no longer serves, fall back to whatever the CLI lists first.  This is
+    // what keeps a bot from being handed a deprecated id it cannot run.
+    const live = catalog.options.length > 0 ? catalog : null;
+    const fallback = live ? null : await firstLiveModel(config.cli, environment);
+    const merged = await mergeLocalInject(
+      live ?? {
+        default: fallback ?? "",
+        options: fallback ? [{ id: fallback, label: providerLabel(fallback.split("/")[0]!) }] : [],
+      },
+      environment,
+    );
+    if (merged.options.length > 0 && !merged.default) {
+      merged.default = merged.options[0]!.id;
+    }
+    return merged;
+  },
   buildPromptText: (turn) => turn.system ? `${turn.system}\n\n${turn.text}` : turn.text,
 });
 
