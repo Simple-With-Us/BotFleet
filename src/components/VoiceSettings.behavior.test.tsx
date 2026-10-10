@@ -120,13 +120,38 @@ vi.mock("./DesktopCapabilities", () => {
   };
 });
 
-import { VoiceSettings } from "./VoiceSettings";
+import {
+  DEVICE_VOICES_NEED_UPDATE,
+  PERSONAL_VOICE_LIST_TIMEOUT_MS,
+  PERSONAL_VOICE_NOT_ON_MAC,
+  VoiceSettings,
+  type VoiceSettingsPatch,
+} from "./VoiceSettings";
+import { applyBotPatch } from "@/state/bot-patch-queue";
 import type { Bot } from "@/state/store";
 
 const MACOS_14 = "Personal Voices need macOS 14 or later, or an iPhone";
 const OTHER_COMPUTER = "Personal Voice is not available on this computer";
 
-function sampleBot(voice?: string): Bot {
+/** `voices` defaults to null, as a current harness sends it.  Pass
+ * LEGACY_HARNESS for a harness that predates per-device voices. */
+const LEGACY_HARNESS = Symbol("legacy harness");
+function sampleBot(voice?: string, voices: Bot["voices"] | typeof LEGACY_HARNESS = null): Bot {
+  if (voices === LEGACY_HARNESS) {
+    return {
+      id: "bot-1",
+      name: "Assistant",
+      threadId: "t1",
+      title: "",
+      description: "",
+      notifications: false,
+      color: "blue",
+      unread: false,
+      modelSelection: { instanceId: "fixture", model: "default" },
+      messages: [],
+      voice,
+    };
+  }
   return {
     id: "bot-1",
     name: "Assistant",
@@ -139,6 +164,7 @@ function sampleBot(voice?: string): Bot {
     modelSelection: { instanceId: "fixture", model: "default" },
     messages: [],
     voice,
+    voices,
   };
 }
 
@@ -165,18 +191,22 @@ async function flush() {
 describe("VoiceSettings rendered voice commit", () => {
   let root: Root;
   let container: HTMLDivElement;
-  const patches: Array<{ voice?: string }> = [];
+  const patches: VoiceSettingsPatch[] = [];
+  // The bot the next mount starts from.  Patches fold in exactly as the
+  // store folds them (applyBotPatch), so a device the patch does not name
+  // keeps its value.
+  let startingBot: Bot = sampleBot("");
 
   function Harness() {
-    const [voice, setVoice] = useState("");
+    const [bot, setBot] = useState<Bot>(startingBot);
     useEffect(() => {
       patches.splice(0, patches.length);
     }, []);
     return createElement(VoiceSettings, {
-      bot: sampleBot(voice),
+      bot,
       onPatch: (patch) => {
         patches.push(patch);
-        if (typeof patch.voice === "string") setVoice(patch.voice);
+        setBot((current) => applyBotPatch(current, patch));
       },
     });
   }
@@ -192,6 +222,8 @@ describe("VoiceSettings rendered voice commit", () => {
     capState.listeners.clear();
     apiMock.mockReset();
     patches.splice(0, patches.length);
+    startingBot = sampleBot("");
+    Reflect.deleteProperty(window, "ogb");
   });
 
   async function mount() {
@@ -224,11 +256,21 @@ describe("VoiceSettings rendered voice commit", () => {
     await flush();
   }
 
+  /** The Mac picker.  (The first select on the card is the workspace
+   * Default Voice.) */
   function select() {
-    const found = container.querySelector("select");
+    const found = container.querySelector<HTMLSelectElement>('select[aria-label="Assistant\'s voice on this Mac"]');
     if (!found) throw new Error("missing voice select");
     return found;
   }
+
+  function iphoneSelect() {
+    const found = container.querySelector<HTMLSelectElement>('select[aria-label="Assistant\'s voice on iPhone"]');
+    if (!found) throw new Error("missing iPhone voice select");
+    return found;
+  }
+
+  const macPatch = (patch: VoiceSettingsPatch) => patch.voices?.mac;
 
   function alerts() {
     return [...container.querySelectorAll("[role=alert]")].map((node) => node.textContent ?? "");
@@ -257,7 +299,7 @@ describe("VoiceSettings rendered voice commit", () => {
     await flush();
 
     expect(select().value).toBe("");
-    expect(patches.some((patch) => patch.voice === "personal:fixture-voice")).toBe(false);
+    expect(patches.some((patch) => macPatch(patch) === "personal:fixture-voice")).toBe(false);
     expect(alerts().some((text) => text.includes(MACOS_14))).toBe(true);
     expect(container.textContent).not.toContain("Apple Personal Voice: fixture-voice");
     expect(id.value).toBe("personal:fixture-voice");
@@ -302,7 +344,7 @@ describe("VoiceSettings rendered voice commit", () => {
     await flush();
     await flush();
 
-    expect(patches.some((patch) => patch.voice === "personal:late-voice")).toBe(true);
+    expect(patches.some((patch) => macPatch(patch) === "personal:late-voice")).toBe(true);
     expect(select().value).toBe("personal:late-voice");
     expect(alerts().some((text) => text.includes(MACOS_14))).toBe(false);
   });
@@ -333,7 +375,7 @@ describe("VoiceSettings rendered voice commit", () => {
     });
     expect(select().value).toBe("custom-1");
     expect(alerts().some((text) => text.includes(OTHER_COMPUTER) || text.includes(MACOS_14))).toBe(false);
-    expect(patches.some((patch) => patch.voice === "custom-1")).toBe(true);
+    expect(patches.some((patch) => macPatch(patch) === "custom-1")).toBe(true);
   });
 
   it("clears the denial when the custom voice is deleted", async () => {
@@ -374,7 +416,7 @@ describe("VoiceSettings rendered voice commit", () => {
     await flush();
 
     expect(select().value).toBe("");
-    expect(patches.some((patch) => patch.voice === "personal:early-voice")).toBe(false);
+    expect(patches.some((patch) => macPatch(patch) === "personal:early-voice")).toBe(false);
     expect(alerts().some((text) => text.includes("Checking Personal Voice availability"))).toBe(true);
     expect(id.value).toBe("personal:early-voice");
     expect(container.textContent).toContain("Add Voice Identifier");
@@ -510,7 +552,7 @@ describe("VoiceSettings rendered voice commit", () => {
     const deleted = apiMock.mock.calls.filter((call) => call[1]?.method === "DELETE");
     expect(deleted).toHaveLength(0);
     expect(select().value).toBe("");
-    expect(patches.some((patch) => patch.voice === preExistingId)).toBe(false);
+    expect(patches.some((patch) => macPatch(patch) === preExistingId)).toBe(false);
     expect(alerts().some((text) => text.includes(MACOS_14))).toBe(true);
     // The pre-existing row stays listed; the user can still pick it later
     // when the gate opens.
@@ -620,5 +662,181 @@ describe("VoiceSettings rendered voice commit", () => {
     // And the still-open form explains the failure.
     expect(alerts().some((text) => text.includes("Failed to add voice identifier."))).toBe(true);
     expect(id.value).toBe("personal:malformed-response");
+  });
+
+  function installPersonalVoices(list: () => Promise<Array<{ id: string; name: string; locale?: string }>>) {
+    capState.state.personalVoice = true;
+    capState.state.reasonCode = undefined;
+    Reflect.set(window, "ogb", {
+      personalVoice: {
+        isAvailable: async () => true,
+        list,
+        speak: async () => {},
+        stop: async () => {},
+      },
+    });
+  }
+
+  const optionValues = (node: HTMLSelectElement) => [...node.options].map((option) => option.value);
+
+  it("shows the MiniMax voices while the Personal Voice list is still waiting", async () => {
+    installPersonalVoices(() => new Promise(() => {}));
+    await mount();
+
+    expect(optionValues(select())).toContain("custom-1");
+    expect(optionValues(iphoneSelect())).toContain("custom-1");
+    expect(container.textContent).not.toContain("Loading voices…");
+    expect(container.textContent).toContain("Loading Personal Voices on this Mac…");
+  });
+
+  it("stops waiting for a Personal Voice list that never answers", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      installPersonalVoices(() => new Promise(() => {}));
+      await act(async () => {
+        container = document.createElement("div");
+        document.body.appendChild(container);
+        root = createRoot(container);
+        apiMock.mockResolvedValue({ voices: [] });
+        root.render(createElement(Harness));
+      });
+      expect(container.textContent).toContain("Loading Personal Voices on this Mac…");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(PERSONAL_VOICE_LIST_TIMEOUT_MS);
+      });
+      expect(container.textContent).not.toContain("Loading Personal Voices on this Mac…");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still offers a Personal Voice list that arrives after the spinner gave up", async () => {
+    // The helper can park on the authorization prompt while the owner reads
+    // it.  The answer that follows must still reach the Mac picker.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let answer: (voices: Array<{ id: string; name: string }>) => void = () => {};
+    try {
+      installPersonalVoices(() => new Promise((resolve) => {
+        answer = resolve;
+      }));
+      await act(async () => {
+        container = document.createElement("div");
+        document.body.appendChild(container);
+        root = createRoot(container);
+        apiMock.mockResolvedValue({ voices: [] });
+        root.render(createElement(Harness));
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(PERSONAL_VOICE_LIST_TIMEOUT_MS + 1);
+      });
+      expect(container.textContent).not.toContain("Loading Personal Voices on this Mac…");
+      expect(optionValues(select())).not.toContain("personal:late-1");
+
+      await act(async () => {
+        answer([{ id: "personal:late-1", name: "Jay, Answered Late" }]);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(optionValues(select())).toContain("personal:late-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("writes the shared voice and offers no iPhone picker against a harness without per-device voices", async () => {
+    // Its non-strict PATCH would strip `voices` and answer 200 with the bot
+    // unchanged, so the picker would snap back with no error.
+    startingBot = sampleBot("", LEGACY_HARNESS);
+    await mount();
+
+    expect(container.querySelector('select[aria-label="Assistant\'s voice on iPhone"]')).toBeNull();
+    expect(container.textContent).toContain(DEVICE_VOICES_NEED_UPDATE);
+    await act(async () => {
+      setSelectValue(select(), "custom-1");
+    });
+    expect(patches).toEqual([{ voice: "custom-1" }]);
+    expect(select().value).toBe("custom-1");
+  });
+
+  it("offers this Mac's Personal Voices for the Mac only", async () => {
+    installPersonalVoices(async () => [{ id: "personal:mac-1", name: "Jay on Mac", locale: "en-US" }]);
+    await mount();
+
+    expect(optionValues(select())).toContain("personal:mac-1");
+    expect(optionValues(iphoneSelect()).some((id) => id.startsWith("personal:"))).toBe(false);
+
+    await act(async () => {
+      setSelectValue(select(), "personal:mac-1");
+    });
+    expect(patches.at(-1)).toEqual({ voices: { mac: "personal:mac-1" } });
+    expect(select().value).toBe("personal:mac-1");
+    expect(container.textContent).toContain("It plays on-device on this Mac.");
+  });
+
+  it("sets the iPhone's MiniMax voice from here without touching the Mac's", async () => {
+    startingBot = sampleBot("", { mac: "custom-1" });
+    await mount();
+
+    // The harness lists personal:jay, but a Personal Voice is never offered
+    // for the iPhone from this Mac.
+    expect(optionValues(iphoneSelect())).not.toContain("personal:jay");
+
+    await act(async () => {
+      setSelectValue(iphoneSelect(), "custom-1");
+    });
+    expect(patches).toEqual([{ voices: { iphone: "custom-1" } }]);
+    expect(iphoneSelect().value).toBe("custom-1");
+    expect(select().value).toBe("custom-1");
+  });
+
+  it("clears only the Mac's own choice when the Mac goes back to the shared voice", async () => {
+    startingBot = sampleBot("custom-1", { mac: "custom-1", iphone: "custom-1" });
+    await mount();
+
+    await act(async () => {
+      setSelectValue(select(), "");
+    });
+    expect(patches).toEqual([{ voices: { mac: null } }]);
+    expect(select().value).toBe("");
+    expect(iphoneSelect().value).toBe("custom-1");
+  });
+
+  it("asks for a Mac voice when the Mac's Personal Voice is not on this Mac", async () => {
+    installPersonalVoices(async () => [{ id: "personal:mac-1", name: "Jay on Mac" }]);
+    startingBot = sampleBot("", { mac: "personal:iphone-only" });
+    await mount();
+
+    expect(container.textContent).toContain(PERSONAL_VOICE_NOT_ON_MAC);
+    expect([...select().options].find((option) => option.value === "personal:iphone-only")?.textContent).toBe(
+      "Personal Voice not on this Mac",
+    );
+    // Try stays on: if the voice really is missing, the helper says so.
+    const tryButton = container.querySelector<HTMLButtonElement>('button[title="Hear this Apple Personal Voice"]');
+    expect(tryButton?.disabled).toBe(false);
+  });
+
+  it("does not call a Personal Voice missing when the helper's list is empty", async () => {
+    // The helper answers [] for a failure or a timeout, not only for a Mac
+    // with no Personal Voices, so an empty list is no evidence.
+    installPersonalVoices(async () => []);
+    startingBot = sampleBot("", { mac: "personal:mac-voice" });
+    await mount();
+
+    expect(container.textContent).not.toContain(PERSONAL_VOICE_NOT_ON_MAC);
+    expect(container.textContent).toContain("It plays on-device on this Mac.");
+    const tryButton = container.querySelector<HTMLButtonElement>('button[title="Hear this Apple Personal Voice"]');
+    expect(tryButton?.disabled).toBe(false);
+  });
+
+  it("clears every device that named a deleted voice", async () => {
+    startingBot = sampleBot("custom-1", { mac: "custom-1", iphone: "custom-1" });
+    await mount();
+    const remove = container.querySelector<HTMLButtonElement>('button[title="Remove Mine from list"]');
+    if (!remove) throw new Error("missing delete");
+    await act(async () => {
+      remove.click();
+    });
+    await flush();
+
+    expect(patches).toEqual([{ voice: "", voices: { mac: null, iphone: null } }]);
   });
 });

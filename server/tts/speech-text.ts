@@ -14,6 +14,8 @@
 // Pure and synchronous on purpose: it is the piece most likely to need
 // tuning against real transcripts, so it stays trivially testable.
 
+import { SPOKEN_ENTITY, spokenEntity } from "../../shared/speech-spans.ts";
+
 /** A fenced block becomes a mention of itself, with its language if known. */
 function describeCodeBlock(fence: string): string {
   const lang = fence.trim().split(/\s+/)[0]?.replace(/[^a-z0-9+#]/gi, "") ?? "";
@@ -110,6 +112,12 @@ export function speakable(input: string): string {
     /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/gu,
     "",
   );
+
+  // HTML entities read as the character the screen shows.  After the
+  // markdown rules (an entity is text, never syntax), before the whitespace
+  // tidy and the sentence split, which both need the no-break space as a
+  // space.
+  text = text.replace(SPOKEN_ENTITY, (_m, name: string) => spokenEntity(name));
 
   // a blank line is a paragraph break — make it an audible one
   text = text.replace(/\n{2,}/g, ". ");

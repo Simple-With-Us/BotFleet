@@ -24,6 +24,7 @@ import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
 import { CONTROL_REFUSAL_PLAIN, createControlClient } from "./control-client.ts";
+import { ContainerRuntimeDisabledError, resolveRuntimeCommand } from "./container-runtime-guard.ts";
 import { augmentedPath } from "./env-path.ts";
 
 // 45s of TOTAL silence before the bridge even probes. An MCP session is
@@ -44,7 +45,15 @@ export interface BridgeLiveness {
  * connection it is diagnosing. */
 export function runLivenessProbe(probe: BridgeLiveness, timeoutMs = PROBE_TIMEOUT_MS): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn(probe.command, probe.args, {
+    let command: string;
+    try {
+      command = resolveRuntimeCommand(probe.command);
+    } catch {
+      // Container runtimes are switched off: the transport counts as dead.
+      resolve(false);
+      return;
+    }
+    const child = spawn(command, probe.args, {
       shell: false,
       env: { ...process.env, PATH: augmentedPath() },
       stdio: ["ignore", "ignore", "ignore"],
@@ -206,7 +215,16 @@ export function createGateInterceptor(options: {
 }
 
 export function runMcpBridge(options: BridgeOptions): void {
-  const child = spawn(options.command, options.args, {
+  let command: string;
+  try {
+    command = resolveRuntimeCommand(options.command);
+  } catch (error) {
+    // The container-runtime kill switch is on and no fixture stands in for the
+    // runtime: refuse before anything spawns, the way an invalid connection does.
+    process.stderr.write(`${error instanceof ContainerRuntimeDisabledError ? error.message : String(error)}\n`);
+    process.exit(2);
+  }
+  const child = spawn(command, options.args, {
     shell: false,
     env: { ...process.env, PATH: augmentedPath() },
     stdio: ["pipe", "pipe", "pipe"],

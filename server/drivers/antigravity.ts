@@ -75,6 +75,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { applyLaunchIdentity } from "../launch-identity.ts";
 import { appendNative } from "./native.ts";
 
 const DRIVER_KIND = "antigravityAgent";
@@ -767,9 +768,18 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // bot-level autoApprove flag flip fullAuto for sandbox/cloud/VM turns
       // would silently promote an engine-level security gate the owner never
       // switched on.  Non-host turns keep exactly what config.fullAuto says.
+      //
+      // Bypass Permissions is the other per-bot switch, and the one the
+      // person turned on precisely to have nothing ask.  Print mode has no
+      // broker to carry it, so it is this driver's to apply, to the turns
+      // where it is safe to: never one that controls This Mac, the same line
+      // the broker draws (`autoVerdict` never answers a `local-computer`
+      // request in bypass), and, like the broker's bypass, even an unattended
+      // turn.  A host turn keeps exactly the rule above.
+      const isBypassed = turn.bypassPermissions === true && !controlsHost;
       const turnConfig: AntigravityConfig = {
         ...config,
-        fullAuto: controlsHost ? isAutoApproved : config.fullAuto,
+        fullAuto: controlsHost ? isAutoApproved : config.fullAuto || isBypassed,
       };
 
       // Default cwd to a per-thread workspace under DATA_DIR — deliberately
@@ -930,7 +940,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       try {
         child = spawnCli(config.cli, args, {
           cwd,
-          env,
+          // `env` is built once per instance and shared by every turn; the
+          // launch identity is this bot's and this turn's, applied to a copy.
+          env: applyLaunchIdentity(env, turn.launchIdentity),
           stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
         });
         if (useStdin && child.stdin) {
@@ -1583,6 +1595,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           // (P2b); `invoke_subagent` rows come with named helpers in P3.
           backgroundJobs: "none",
           helpers: "none",
+          // Print mode has no permission hook (see the header), but every
+          // step streams as a tool_use event, so review can watch it.
+          reviewHook: "after",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

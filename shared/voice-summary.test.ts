@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   resolveVoiceSummaryMode,
+  voiceScriptKind,
   splitVoiceSummary,
   spokenReply,
   stripVoiceSummaryTags,
@@ -41,17 +42,21 @@ describe("voice summary", () => {
   });
 
   describe("resolveVoiceSummaryMode", () => {
+    // Owner correction, 2026-10-08: the distilled spoken rewrite is the
+    // default again, as it was before #952.
     it("defaults to always for bots with speakReplies enabled", () => {
       expect(resolveVoiceSummaryMode({ speakReplies: true })).toBe("always");
     });
 
     it("defaults to always for bots with speechDevices configured", () => {
       expect(resolveVoiceSummaryMode({ speechDevices: ["mac"] })).toBe("always");
+      expect(resolveVoiceSummaryMode({ speechDevices: ["iphone"] })).toBe("always");
     });
 
     it("defaults to on_demand for text-only bots", () => {
       expect(resolveVoiceSummaryMode({})).toBe("on_demand");
       expect(resolveVoiceSummaryMode(null)).toBe("on_demand");
+      expect(resolveVoiceSummaryMode(undefined)).toBe("on_demand");
       expect(resolveVoiceSummaryMode({ speakReplies: false, speechDevices: [] })).toBe("on_demand");
     });
 
@@ -59,6 +64,15 @@ describe("voice summary", () => {
       expect(resolveVoiceSummaryMode({ voiceSummaryMode: "off", speakReplies: true })).toBe("off");
       expect(resolveVoiceSummaryMode({ voiceSummaryMode: "on_demand", speakReplies: true })).toBe("on_demand");
       expect(resolveVoiceSummaryMode({ voiceSummaryMode: "always", speakReplies: false })).toBe("always");
+    });
+
+    it("reads the reply as written only in an explicit off mode", () => {
+      expect(voiceScriptKind({})).toBe("summary");
+      expect(voiceScriptKind(null)).toBe("summary");
+      expect(voiceScriptKind({ speakReplies: true, speechDevices: ["mac"] })).toBe("summary");
+      expect(voiceScriptKind({ voiceSummaryMode: "off" })).toBe("written");
+      expect(voiceScriptKind({ voiceSummaryMode: "on_demand" })).toBe("summary");
+      expect(voiceScriptKind({ voiceSummaryMode: "always" })).toBe("summary");
     });
   });
 });

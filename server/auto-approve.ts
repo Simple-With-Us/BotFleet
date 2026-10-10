@@ -76,6 +76,11 @@ const SENSITIVE = [
   // The desktop's OS-encrypted credential document (safeStorage), which is
   // where every packaged-app key actually lands.
   /\bcredentials\.bin\b/i,
+  // The fleet's secrets folder and every Zulip key file in it.  Each BF role
+  // bot's `<Role>-zuliprc` is a live bot key (docs/zulip.md): a bot that can
+  // read another role's file can post as that role, so a read is carded too.
+  /(^|[\s/"'=:~])\.secrets([/\\]|$|["'\s])/i,
+  /zuliprc\b/i,
   ...(process.env.OMB_DATA_DIR
     ? [new RegExp(`(^|[\\s/"'])${process.env.OMB_DATA_DIR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([/\\\\]|$|["'\\s])`, "i")]
     : []),
@@ -362,6 +367,11 @@ export function offerableApprovalKey(
   return key;
 }
 
+/** The rule a permission-bypass grant carries.  Auto-review keys on it:
+ *  On screens a bypass approval before it is delivered, and Watch audits it
+ *  afterwards (server/auto-review.ts `reviewsBypass`). */
+export const PERMISSION_BYPASS_RULE = "permission-bypass";
+
 export interface AutoApprover {
   autoApprove?: boolean;
   bypassPermissions?: boolean;
@@ -424,7 +434,7 @@ export function autoVerdict(
   // acknowledgeLocalAuto before this combination is created.
   if (bot.bypassPermissions && context?.scope !== "local-computer") {
     const key = approvalKey(tool, summary, context?.scope);
-    return { approve: `auto-approved ${key} (permission bypass)`, source: "auto-mode", rule: "permission-bypass" };
+    return { approve: `auto-approved ${key} (permission bypass)`, source: "auto-mode", rule: PERMISSION_BYPASS_RULE };
   }
   // Owner ruling, 2026-10-01 and applied literally 2026-10-02: a bot in full
   // auto never gets an approval card for the harness's own `job_start`.  It
@@ -439,7 +449,12 @@ export function autoVerdict(
   // guard.  Bash and every other tool keep all of theirs, and a bot that is
   // not in full auto falls through to the checks below, where a job start is
   // never granted and a card is the only way in.
-  if (bot.autoApprove && context?.ownJobStart === true && isOwnJobStart(tool)) {
+  // A bot in Bypass Permissions has asked for strictly more than full auto, so
+  // it gets the same treatment here.  The bypass branch above skips any
+  // `local-computer` request, and the MCP lane tags every job start that way
+  // because a job runs on this computer, so without this a bypass-only bot was
+  // carded on every job it started.
+  if ((bot.autoApprove || bot.bypassPermissions) && context?.ownJobStart === true && isOwnJobStart(tool)) {
     const key = approvalKey(tool, summary, context.scope);
     return { approve: `auto-approved ${key}`, source: "auto-mode", rule: key };
   }

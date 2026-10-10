@@ -124,7 +124,7 @@ In-app **Check for updates** reads `latest-mac.yml` from the GitHub release.
 | | Value |
 |---|---|
 | Published release / tag | **v0.1.38** (the only tag) |
-| Update feed | **shipped** — that release carries `latest-mac.yml` alongside four DMGs.  The feed lists the two versioned ones (`BotFleet-0.1.38-arm64.dmg`, `BotFleet-0.1.38-x64.dmg`); the stable `BotFleet.dmg` and `BotFleet-intel.dmg` the download links above point at are there too.  No zip payload is published, so in-app updates install the DMG. |
+| Update feed | **shipped** — that release carries `latest-mac.yml` alongside four DMGs.  The feed lists the two versioned ones (`BotFleet-0.1.38-arm64.dmg`, `BotFleet-0.1.38-x64.dmg`); the stable `BotFleet.dmg` and `BotFleet-intel.dmg` the download links above point at are there too.  No ZIP payload is published, and the macOS updater needs one, so **Check for updates** cannot install from this feed ([`docs/releasing.md`](docs/releasing.md)).  Until a release ships both macOS zips, update by downloading the DMG. |
 | `package.json` version on `main` | `1.0.31` |
 | iOS companion `MARKETING_VERSION` | `1.0.30` |
 
@@ -219,6 +219,8 @@ Early but real — the loop works end to end: message → bot → streamed reply
 Every BotFleet-layer add-on listed above is in testing.
 
 Contributions welcome — the driver SPI in [`server/contracts.ts`](server/contracts.ts) is deliberately small; adding a provider is one file in [`server/drivers/`](server/drivers/) plus a one-line registration.
+
+Fleet Kody review rules are maintained in [`Simple-With-Us/Kodus-Config`](https://github.com/Simple-With-Us/Kodus-Config), not in this tree.  See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how that relates to the repo-local `kodus-config.yml`.
 
 ## License
 

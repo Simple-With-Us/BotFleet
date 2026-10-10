@@ -26,6 +26,8 @@ Verification uses these isolated fixtures:
 - [Mac updater transaction](mac-updater.md) — signed update delivery and application
 - [Staged candidate smoke test](staged-candidate-smoke.md) — the pre-activation probe that runs a candidate before anything live is touched
 - [Connector grants](connector-grants.md) — per-bot third-party tool authorization
+- [Saved data faults](saved-data.md) — unreadable bots, rooms, routines and settings files are set aside, never deleted
+- [Bot On/Off switch](bot-off.md) — an Off bot starts nothing new and finishes a running turn
 
 ### Test Fixtures
 
@@ -40,6 +42,7 @@ Many recipes are codified as unit tests or integration tests:
 - **Mac updater:** `scripts/mac-update-transaction.node-test.mjs` simulates signed update delivery.
 - **Staged candidate smoke:** `smokeStagedServer` boots a real signed bundle; see [staged-candidate-smoke.md](staged-candidate-smoke.md) for the recipe that runs it against the installed app.
 - **Connector grants:** `server/mcp-server.test.ts` and integration fixtures verify tool authorization per bot.
+- **Saved data faults:** `server/store-quarantine.test.ts`, `server/routines-quarantine.test.ts`, `server/config-salvage.test.ts` and `server/data-faults-boot.test.ts` cover each store and the real server; `tests/e2e/data-fault-banner.spec.ts` covers the bar.
 
 ## Evidence
 
@@ -55,6 +58,12 @@ Keep all evidence with the test run so a reviewer can spot-check any claim.
 ## Cleanup
 
 After a test completes, temporary data directories are removed. Server logs remain at the printed path.  Interrupt long-running fixtures with Ctrl-C; the launcher stops its child before cleanup.
+
+## Container Runtimes Are Off In Fixtures
+
+A throwaway HOME does not isolate docker, podman, Apple `container` or OrbStack.  They talk to one machine-wide daemon, and the Local VM container name follows the OS username, so a fixture that turns the Local VM on can create, replace or remove the owner's real `botfleet-computer-<user>` container.
+
+Every fixture therefore runs with `BOTFLEET_DISABLE_CONTAINER_RUNTIME=1` (`server/container-runtime-guard.ts`).  The default Local VM runner, the BYO-VPS Docker-over-SSH runner and the MCP stdio bridge refuse any runtime command before they spawn it, and runtime detection reports no runtime with a clear problem string.  `spawnDetached`, `server/testing/setup.ts` and the smoke scripts apply it for you.  A suite that must exercise a fake `docker` puts the script in a directory of its own and names that directory in `BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR`; with the switch on, a runtime then runs only from that directory, by absolute path, so a PATH lookup can never reach the real binary.  `server/local-vm-runtime-guard.test.ts` boots a harness with trap runtimes on PATH and fails if one ever runs.
 
 ## What This Proves And What It Does Not
 

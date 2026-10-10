@@ -32,6 +32,9 @@ export function automationSourceLabel(source: string | undefined, body: string):
     // a background job ended and woke its bot (jobs P1)
     case "job":
       return "Background Job";
+    // a Zulip @-mention or DM woke the bot (docs/zulip.md)
+    case "zulip":
+      return "Zulip";
     default:
       if (isDelegationMessage({ role: "system", text: body })) {
         return "Delegated Task";

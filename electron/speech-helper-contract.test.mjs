@@ -22,11 +22,27 @@ describe("Personal Voice helper contract", () => {
     // argv is world-readable through `ps` on macOS, and this text is a voice
     // summary of the user's own private messages.
     expect(speechSource).toMatch(/const textPath = path\.join\(sessionDir, "text\.txt"\);/);
-    expect(speechSource).toMatch(/writeFileSync\(textPath, String\(text \?\? ""\), \{ mode: 0o600 \}\);/);
+    expect(speechSource).toMatch(/writeFileSync\(textPath, request\.text, \{ mode: 0o600 \}\);/);
     expect(speechSource).toContain('"--text-file"');
     // The old shape put the reply itself in argv.
     expect(speechSource).not.toMatch(/^\s*"--text",$/m);
+    expect(speechSource).not.toMatch(/^\s*request\.text,\s*$/m);
     expect(speechSource).not.toMatch(/^\s*String\(text \?\? ""\),\s*$/m);
+  });
+
+  it("matches only Personal Voices, never an ordinary voice of the same name", () => {
+    // `personal:Samantha` used to select the system voice Samantha, because the match ran over
+    // every installed voice by identifier or name.  The lookup narrows to the Personal Voice
+    // trait first, for the named voice and for the no-voice-named guess alike.
+    const start = helperSource.indexOf("let doSpeak = {");
+    const end = helperSource.indexOf("let status = AVSpeechSynthesizer.personalVoiceAuthorizationStatus", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const lookup = helperSource.slice(start, end);
+    expect(lookup).toMatch(/let personalVoices = AVSpeechSynthesisVoice\.speechVoices\(\)\s*\.filter \{ \$0\.voiceTraits\.contains\(\.isPersonalVoice\) \}/);
+    expect(lookup).toMatch(/let matched = personalVoices\.first\(where:/);
+    expect(lookup).toMatch(/\?\? \(rawId\.isEmpty \? personalVoices\.first : nil\)/);
+    expect(lookup).not.toContain("allVoices");
   });
 
   it("reads the text from the file the main process writes", () => {
@@ -75,5 +91,61 @@ describe("Personal Voice helper contract", () => {
     const cancel = helperSource.slice(cancelStart, cancelEnd);
     expect(cancel).toContain("remainderAfterCancel(");
     expect(cancel).not.toMatch(/attempts < 2 \{\s*speakCurrentChunk\(\)/);
+  });
+
+  it("streams word ranges against the caller's text, not the chunk", () => {
+    // Karaoke maps these offsets onto the spoken script, so they must index
+    // the text file as written: chunks are ranges into it, each range is
+    // offset by its chunk's base, and a retried remainder moves the base.
+    expect(helperSource).toContain("static func chunkRanges(_ text: String, maxCharacters: Int = 750) -> [NSRange]");
+    expect(helperSource).toContain("self.chunkBases = ranges.map { $0.location }");
+    const will = helperSource.slice(
+      helperSource.indexOf("willSpeakRangeOfSpeechString characterRange: NSRange"),
+      helperSource.indexOf("func advanceAfterChunk()"),
+    );
+    expect(will).toContain('"range": [chunkBases[currentChunkIndex] + characterRange.location, characterRange.length]');
+    expect(will).toContain('"elapsedMs"');
+    const cancelStart = helperSource.indexOf("func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel");
+    const cancel = helperSource.slice(cancelStart, helperSource.indexOf("let speaker = PersonalVoiceSpeaker()"));
+    expect(cancel).toContain("chunkBases[currentChunkIndex] += cut");
+    // emit() flushes, which is what makes a line visible while speaking
+    expect(helperSource).toMatch(/print\(line\)\s*\n\s*fflush\(stdout\)/);
+  });
+
+  it("tails the helper's output while it speaks and guards stale sessions", () => {
+    const speak = speechSource.slice(
+      speechSource.indexOf("export function speakPersonalVoice("),
+      speechSource.indexOf("export function stopPersonalVoice()"),
+    );
+    expect(speak).toContain("watchFile(outputPath, { interval: PERSONAL_VOICE_POLL_MS, persistent: false }, drain)");
+    expect(speak).toContain("personalVoiceChild === session");
+    expect(speak).toContain("unwatchFile(outputPath, drain)");
+  });
+
+  it("bounds Personal Voice listing and stops the helper through its marker", () => {
+    expect(speechSource).toContain("const PERSONAL_VOICE_LIST_TIMEOUT_MS = 8_000;");
+    const list = speechSource.slice(
+      speechSource.indexOf("export function listPersonalVoicesResult("),
+      speechSource.indexOf("export async function listPersonalVoices("),
+    );
+    // \s+, not a literal newline and indent: a Windows checkout has CRLF here.
+    expect(list).toMatch(/"--list-personal-voices",\s+"--stop-file",/);
+    expect(list).toContain('settle({ voices: [], status: "timeout", timedOut: true });');
+    // The helper's stop timer is installed before the list branch runs.
+    expect(helperSource.indexOf("if let stopFile {")).toBeLessThan(helperSource.indexOf('contains("--list-personal-voices")'));
+  });
+
+  it("sends ranges only to the asking window, as numbers, and unsubscribes", () => {
+    const mainSource = readFileSync(join(HERE, "main.mjs"), "utf8");
+    const preloadSource = readFileSync(join(HERE, "preload.cjs"), "utf8");
+    const handler = mainSource.slice(
+      mainSource.indexOf('ipcMain.handle("personal-voice:speak"'),
+      mainSource.indexOf('ipcMain.handle("personal-voice:stop"'),
+    );
+    expect(handler).toContain('sender.send("personal-voice:range", { id: progressId, location, length, elapsedMs })');
+    expect(handler).not.toContain("webContents.send");
+    expect(handler).not.toMatch(/send\([^)]*text/);
+    expect(preloadSource).toContain('ipcRenderer.on("personal-voice:range", handler);');
+    expect(preloadSource).toContain('.finally(() => ipcRenderer.removeListener("personal-voice:range", handler))');
   });
 });

@@ -110,7 +110,16 @@ test('ship receipt follows recorded success only after exact ASC readiness; skip
   assert.equal((source.match(/record_successful_ship\n\s*emit_sentry_deployment_receipt/g)||[]).length,2);
   assert.equal((source.match(/TF_READY_CONFIRMED=1/g)||[]).length,1);
   const workflow=read('.github/workflows/sentry-deploy.yml');
-  assert.match(workflow,/workflow_call:/); assert.doesNotMatch(workflow,/workflow_run:|workflow_dispatch:|continue-on-error|exit 0/);
+  assert.match(workflow,/workflow_call:/);
+  // Merge resolution with main: the workflow keeps production-deploy reporting
+  // on workflow_run AND receipt reporting on workflow_call.  Each job is gated
+  // to its own event so neither trigger can run the other job red on an empty
+  // payload.  The production job stays soft-fail by design (warnings + exit 0).
+  assert.match(workflow,/workflow_run:/);
+  assert.doesNotMatch(workflow,/workflow_dispatch:/);
+  assert.match(workflow,/record-production-deploy:/);
+  assert.match(workflow,/record-testflight-availability:/);
+  assert.match(workflow,/github.event_name == 'workflow_call'/);
   assert.match(workflow,/required: SENTRY_AUTH_TOKEN/);
   assert.match(workflow,/receipt.sourceCommit !== process.env.GITHUB_SHA/);
   assert.match(workflow,/SENTRY_RECEIPT_ERROR === "true"\) throw new Error/);

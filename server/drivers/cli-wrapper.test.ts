@@ -12,7 +12,8 @@ import { z } from "zod";
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance, SendTurnInput } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { CliWrapperDriver, type CliWrapperConfig } from "./cli-wrapper.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, parseEnv } from "../testing/launch-identity.ts";
+import { CliWrapperDriver, wrapperBaseEnvironment, type CliWrapperConfig } from "./cli-wrapper.ts";
 
 const NODE = process.execPath;
 
@@ -31,6 +32,26 @@ describe("CliWrapperDriver.decodeConfig", () => {
       args: ["--json"],
       passPromptAs: "stdin",
     });
+  });
+
+  it("accepts and drops the keys the harness writes into every instance's config", () => {
+    // The Engines page stores fullAuto and cli, and the credential flow stores key and
+    // credentialStorage, on any driver's instance.  A strict schema refused them and the
+    // registry turned the instance into a shadow entry.
+    expect(
+      CliWrapperDriver.decodeConfig({
+        command: "my-cli",
+        fullAuto: true,
+        cli: "/opt/bin/my-cli",
+        key: "placeholder",
+        credentialStorage: "external",
+      }),
+    ).toEqual({ command: "my-cli", args: [], passPromptAs: "arg" });
+  });
+
+  it("still rejects a key it does not own, so a typo cannot quietly run the default", () => {
+    expect(() => CliWrapperDriver.decodeConfig({ commmand: "my-cli" })).toThrow();
+    expect(() => CliWrapperDriver.decodeConfig({ command: "my-cli", fullAuto: "yes" })).toThrow();
   });
 
   it("rejects a field saved with the wrong type instead of coercing it", () => {
@@ -63,6 +84,11 @@ describe("CliWrapperDriver turns (real child process)", () => {
   afterEach(async () => {
     recorder?.stop();
     await instance?.dispose();
+  });
+
+  it("tells auto-review there is nothing to see: a wrapped command reports no actions", async () => {
+    await create({ command: NODE, args: ["-e", ""], passPromptAs: "arg" });
+    expect(instance.adapter.capabilities.reviewHook).toBe("none");
   });
 
   it("opens the turn before any delta and settles it exactly once", async () => {
@@ -113,6 +139,7 @@ describe("CliWrapperDriver turns (real child process)", () => {
       const { turnId } = await instance.adapter.sendTurn(turn("hi"));
       await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
 
+      // SAFETY: the filter keeps only content.delta events, which carry a string delta.
       const out = recorder.events
         .filter((e) => e.type === "content.delta")
         .map((e) => (e as { delta: string }).delta)
@@ -128,6 +155,108 @@ describe("CliWrapperDriver turns (real child process)", () => {
       delete process.env.LINQ_WEBHOOK_SECRET;
       delete process.env.ANTHROPIC_API_KEY;
     }
+  });
+
+  it("launches each bot's child with its own seat and none of the harness's identity", async () => {
+    const restore = inheritHarnessIdentity();
+    try {
+      // an instance-level identity must not survive either
+      await create(
+        {
+          command: NODE,
+          args: [
+            "-e",
+            "const keep = Object.entries(process.env).filter(([k]) => /^(AGENT_|ZULIP_|CLAUDE_CODE_SESSION_ID$)/.test(k));" +
+              "process.stdout.write(JSON.stringify(Object.fromEntries(keep)))",
+          ],
+          passPromptAs: "arg",
+        },
+        { AGENT_SEAT: "CODEX", ZULIP_SITE: "https://instance.example.invalid" },
+      );
+      const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+        const before = recorder.events.length;
+        const { turnId } = await instance.adapter.sendTurn(turn("hi", { threadId, launchIdentity }));
+        await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+        const out = recorder.events
+          .slice(before)
+          .flatMap((e) => (e.type === "content.delta" ? [e.delta] : []))
+          .join("");
+        return parseEnv(out);
+      };
+      const plumber = await seenFor("t-w-plumber", { seat: "BF-PLUMBER", session: "t-w-plumber" });
+      const fixer = await seenFor("t-w-fixer", { seat: "BF-FIXER", session: "t-w-fixer" });
+      const none = await seenFor("t-w-none", { seat: null, session: "t-w-none" });
+      const bare = await seenFor("t-w-bare", undefined);
+      expectLaunchedAs(plumber, { seat: "BF-PLUMBER", session: "t-w-plumber" });
+      expectLaunchedAs(fixer, { seat: "BF-FIXER", session: "t-w-fixer" });
+      expectLaunchedAs(none, { seat: null, session: "t-w-none" });
+      expectLaunchedAs(bare, { seat: null });
+      expect(JSON.stringify([plumber, fixer, none, bare])).not.toContain("instance.example");
+    } finally {
+      restore();
+    }
+  });
+
+  it("hands the child only an allowlist of the harness environment, so an unlisted secret never rides along", async () => {
+    // None of these names is on the workspace or provider scrub lists: a
+    // denylist cannot withhold what nobody has named yet.
+    const canary = `canary-${Date.now()}`;
+    const unlisted = ["GH_TOKEN", "SENTRY_AUTH_TOKEN", "BOTFLEET_MCP_TOKEN", "CLI_WRAPPER_UNLISTED_SECRET"];
+    for (const name of unlisted) process.env[name] = canary;
+    try {
+      await create(
+        {
+          command: NODE,
+          args: [
+            "-e",
+            `const names = ${JSON.stringify(unlisted)};
+             process.stdout.write(JSON.stringify({
+               leaked: names.filter((n) => process.env[n] !== undefined),
+               home: (process.env.HOME || process.env.USERPROFILE) ? "present" : null,
+               path: process.env.PATH ? "present" : null,
+               ok: process.env.CLI_WRAPPER_OK ?? null,
+             }))`,
+          ],
+          passPromptAs: "arg",
+        },
+        { CLI_WRAPPER_OK: "approved" },
+      );
+      const { turnId } = await instance.adapter.sendTurn(turn("hi"));
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+
+      // SAFETY: the filter keeps only content.delta events, which carry a string delta.
+      const out = recorder.events
+        .filter((e) => e.type === "content.delta")
+        .map((e) => (e as { delta: string }).delta)
+        .join("");
+      const seen = z
+        .object({ leaked: z.array(z.string()), home: z.string().nullable(), path: z.string().nullable(), ok: z.string().nullable() })
+        .strict()
+        .parse(JSON.parse(out));
+      expect(seen.leaked).toEqual([]);
+      // the basics a program needs still arrive, and the instance's own variable too
+      expect(seen.home).toBe("present");
+      expect(seen.path).toBe("present");
+      expect(seen.ok).toBe("approved");
+      expect(out).not.toContain(canary);
+    } finally {
+      for (const name of unlisted) delete process.env[name];
+    }
+  });
+
+  it("builds the base environment from names, case-insensitively, and drops the PATH and unlisted names", () => {
+    const base = wrapperBaseEnvironment({
+      HOME: "/home/x",
+      Path: "/should/not/ride",
+      SystemRoot: "C:\\Windows",
+      LC_ALL: "C",
+      XDG_CONFIG_HOME: "/cfg",
+      GH_TOKEN: "t",
+      OPENAI_API_KEY: "k",
+      HTTPS_PROXY: "http://proxy:3128",
+      UNSET: undefined,
+    });
+    expect(Object.keys(base).sort()).toEqual(["HOME", "HTTPS_PROXY", "LC_ALL", "SystemRoot", "XDG_CONFIG_HOME"]);
   });
 
   it("does not mark subsequent turns as interrupted when an idle thread is interrupted", async () => {

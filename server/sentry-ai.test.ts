@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  annotatePromptBudget,
   classifyMessage,
   configureTurnIdentity,
   genAiProvider,
@@ -157,6 +158,27 @@ describe("Sentry AI observability", () => {
     observeRuntimeEvent(base({ type: "turn.started" }), sink);
     expect(spans[0].name).toBe("invoke_agent Scout");
     expect(spans[0].attributes["gen_ai.agent.name"]).toBe("Scout");
+  });
+
+  it("attaches prompt bytes before and after, and the trimmed flag, to the invoke_agent span", () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    annotatePromptBudget("thread-1", "turn-1", {
+      before: { stable: 4000, volatile: 9000 },
+      after: { stable: 4000, volatile: 120 },
+      trimmed: true,
+    });
+    expect(spans[0].op).toBe("gen_ai.invoke_agent");
+    expect(spans[0].attributes["botfleet.prompt.stable_bytes_before"]).toBe(4000);
+    expect(spans[0].attributes["botfleet.prompt.volatile_bytes_before"]).toBe(9000);
+    expect(spans[0].attributes["botfleet.prompt.stable_bytes_after"]).toBe(4000);
+    expect(spans[0].attributes["botfleet.prompt.volatile_bytes_after"]).toBe(120);
+    expect(spans[0].attributes["botfleet.prompt.trimmed"]).toBe(true);
+    expect(() => annotatePromptBudget("missing", "turn", {
+      before: { stable: 1, volatile: 1 },
+      after: { stable: 1, volatile: 1 },
+      trimmed: false,
+    })).not.toThrow();
   });
 
   it("opens an invoke_agent span, tags the conversation, model, tokens, and tools", () => {

@@ -202,6 +202,9 @@ posixOnly("VPS turn routing e2e (fake ACP fleet + fake docker over SSH)", () => 
       USERPROFILE: home,
       OMB_PORT: String(PORT),
       OMB_EXTRA_PATH: fakeBin,
+      // spawnDetached switches container runtimes off; this fake `docker` is
+      // the one runtime the harness may run, by absolute path.
+      BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: fakeBin,
       FAKE_DOCKER_DIR: fakeBin,
       FAKE_DOCKER_LOG: dockerLog,
     };

@@ -2,6 +2,10 @@
 //   {"partial":true,"text":"…"}   while recognizing
 //   {"partial":false,"text":"…"}  final result, then exit 0
 //   {"error":"…"}                 then exit 1
+// With --speak-personal-voice it speaks instead, and streams:
+//   {"range":[location,length],"elapsedMs":n}  as each word is about to be
+//                                 spoken (UTF-16 offsets into --text-file)
+//   {"finished":true}             then exit 0
 // Runs until the final result or a per-session stop marker. Launched by
 // electron/speech.mjs as this background app bundle so macOS can resolve the
 // microphone and speech purpose strings in its Info.plist.
@@ -194,6 +198,9 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
   final class PersonalVoiceSpeaker: NSObject, @unchecked Sendable, AVSpeechSynthesizerDelegate {
     let synth = AVSpeechSynthesizer()
     var chunks: [String] = []
+    /// UTF-16 offset of each chunk's first unit in the original text, so a
+    /// range inside a chunk becomes a range inside the text the caller sent.
+    var chunkBases: [Int] = []
     var currentChunkIndex = 0
     var attempts = 0
     var voice: AVSpeechSynthesisVoice?
@@ -202,84 +209,113 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
     /// Ranges before this have already been spoken.  A cancel retries from
     /// here instead of from the start of the chunk.
     var nextRangeUTF16 = 0
+    var startedAt: DispatchTime?
+
+    /// Chunk boundaries as UTF-16 ranges into the ORIGINAL text, so word
+    /// ranges can be reported against it.  Sentences first, then clauses at
+    /// punctuation, then words; atoms are packed greedily up to the limit and
+    /// each chunk is the original text between its first and last atom.
+    static func chunkRanges(_ text: String, maxCharacters: Int = 750) -> [NSRange] {
+      let ns = text as NSString
+      let blank = CharacterSet.whitespacesAndNewlines
+      func isBlank(_ index: Int) -> Bool {
+        let unit = ns.character(at: index)
+        guard let scalar = Unicode.Scalar(unit) else { return false }
+        return blank.contains(scalar)
+      }
+      func trimmed(_ range: NSRange) -> NSRange {
+        var start = range.location
+        var end = range.location + range.length
+        while start < end && isBlank(start) { start += 1 }
+        while end > start && isBlank(end - 1) { end -= 1 }
+        return NSRange(location: start, length: end - start)
+      }
+      let whole = trimmed(NSRange(location: 0, length: ns.length))
+      guard whole.length > 0 else { return [] }
+      guard whole.length > maxCharacters else { return [whole] }
+
+      var sentences: [NSRange] = []
+      ns.enumerateSubstrings(in: whole, options: [.bySentences, .localized]) { _, range, _, _ in
+        let sentence = trimmed(range)
+        if sentence.length > 0 { sentences.append(sentence) }
+      }
+      if sentences.isEmpty { sentences = [whole] }
+
+      let delimiters: Set<unichar> = [59, 58, 10, 0x2014, 0x2013, 44] // ; : \n — – ,
+      let clauseMinimum = min(200, maxCharacters / 3)
+      var atoms: [NSRange] = []
+      for sentence in sentences {
+        if sentence.length <= maxCharacters {
+          atoms.append(sentence)
+          continue
+        }
+        var clauses: [NSRange] = []
+        var clauseStart = sentence.location
+        let sentenceEnd = sentence.location + sentence.length
+        var i = sentence.location
+        while i < sentenceEnd {
+          if delimiters.contains(ns.character(at: i)) && i + 1 - clauseStart >= clauseMinimum {
+            let clause = trimmed(NSRange(location: clauseStart, length: i + 1 - clauseStart))
+            if clause.length > 0 { clauses.append(clause) }
+            clauseStart = i + 1
+          }
+          i += 1
+        }
+        let rest = trimmed(NSRange(location: clauseStart, length: sentenceEnd - clauseStart))
+        if rest.length > 0 { clauses.append(rest) }
+
+        for clause in clauses {
+          if clause.length <= maxCharacters {
+            atoms.append(clause)
+            continue
+          }
+          // Words: runs between spaces.  A word longer than the limit is cut
+          // at composed-character boundaries.
+          let clauseEnd = clause.location + clause.length
+          var wordStart = clause.location
+          var j = clause.location
+          while j <= clauseEnd {
+            if j == clauseEnd || ns.character(at: j) == 32 {
+              if j > wordStart {
+                var piece = wordStart
+                while j - piece > maxCharacters {
+                  var cut = piece + maxCharacters
+                  cut = ns.rangeOfComposedCharacterSequence(at: cut).location
+                  if cut <= piece { cut = piece + maxCharacters }
+                  atoms.append(NSRange(location: piece, length: cut - piece))
+                  piece = cut
+                }
+                atoms.append(NSRange(location: piece, length: j - piece))
+              }
+              wordStart = j + 1
+            }
+            j += 1
+          }
+        }
+      }
+
+      var result: [NSRange] = []
+      var current: NSRange?
+      for atom in atoms {
+        guard let open = current else {
+          current = atom
+          continue
+        }
+        let merged = NSRange(location: open.location, length: atom.location + atom.length - open.location)
+        if merged.length <= maxCharacters {
+          current = merged
+        } else {
+          result.append(open)
+          current = atom
+        }
+      }
+      if let open = current { result.append(open) }
+      return result
+    }
 
     static func chunkText(_ text: String, maxCharacters: Int = 750) -> [String] {
-      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !trimmed.isEmpty else { return [] }
-      guard trimmed.count > maxCharacters else { return [trimmed] }
-
-      var rawSentences: [String] = []
-      trimmed.enumerateSubstrings(in: trimmed.startIndex..<trimmed.endIndex, options: [.bySentences, .localized]) { substring, _, _, _ in
-        if let s = substring?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
-          rawSentences.append(s)
-        }
-      }
-      if rawSentences.isEmpty { rawSentences = [trimmed] }
-
-      let delimiters: [Character] = [";", ":", "\n", "—", "–", ","]
-      var atoms: [String] = []
-      for sentence in rawSentences {
-        if sentence.count <= maxCharacters {
-          atoms.append(sentence)
-        } else {
-          var clauseParts: [String] = []
-          var cur = ""
-          for char in sentence {
-            cur.append(char)
-            if delimiters.contains(char) && cur.count >= min(200, maxCharacters / 3) {
-              let cl = cur.trimmingCharacters(in: .whitespacesAndNewlines)
-              if !cl.isEmpty { clauseParts.append(cl) }
-              cur = ""
-            }
-          }
-          let rem = cur.trimmingCharacters(in: .whitespacesAndNewlines)
-          if !rem.isEmpty { clauseParts.append(rem) }
-
-          for part in clauseParts {
-            if part.count <= maxCharacters {
-              atoms.append(part)
-            } else {
-              let words = part.split(separator: " ").map(String.init)
-              var wChunk = ""
-              for word in words {
-                if word.count > maxCharacters {
-                  if !wChunk.isEmpty { atoms.append(wChunk); wChunk = "" }
-                  var sub = word
-                  while sub.count > maxCharacters {
-                    let idx = sub.index(sub.startIndex, offsetBy: maxCharacters)
-                    atoms.append(String(sub[..<idx]))
-                    sub = String(sub[idx...])
-                  }
-                  if !sub.isEmpty { wChunk = sub }
-                } else if wChunk.isEmpty {
-                  wChunk = word
-                } else if wChunk.count + 1 + word.count <= maxCharacters {
-                  wChunk += " " + word
-                } else {
-                  atoms.append(wChunk)
-                  wChunk = word
-                }
-              }
-              if !wChunk.isEmpty { atoms.append(wChunk) }
-            }
-          }
-        }
-      }
-
-      var result: [String] = []
-      var current = ""
-      for atom in atoms {
-        if current.isEmpty {
-          current = atom
-        } else if current.count + 1 + atom.count <= maxCharacters {
-          current += " " + atom
-        } else {
-          result.append(current)
-          current = atom
-        }
-      }
-      if !current.isEmpty { result.append(current) }
-      return result
+      let ns = text as NSString
+      return chunkRanges(text, maxCharacters: maxCharacters).map { ns.substring(with: $0) }
     }
 
     /// Retry text after didCancel.  `nextRangeLocation` is the UTF-16 start
@@ -296,7 +332,11 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
     func speak(voice: AVSpeechSynthesisVoice, text: String) {
       synth.delegate = self
       self.voice = voice
-      self.chunks = Self.chunkText(text)
+      let ns = text as NSString
+      let ranges = Self.chunkRanges(text)
+      self.chunks = ranges.map { ns.substring(with: $0) }
+      self.chunkBases = ranges.map { $0.location }
+      self.startedAt = DispatchTime.now()
       guard !chunks.isEmpty else {
         emit(["finished": true])
         exit(0)
@@ -327,6 +367,15 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
       utterance: AVSpeechUtterance
     ) {
       nextRangeUTF16 = characterRange.location
+      // One line per word, flushed by emit(): UTF-16 offsets into the text
+      // the caller sent (the chunk's base plus the range inside the chunk),
+      // and the helper's own clock so a reader can undo polling batches.
+      guard currentChunkIndex < chunkBases.count else { return }
+      let elapsedNs = DispatchTime.now().uptimeNanoseconds - (startedAt ?? DispatchTime.now()).uptimeNanoseconds
+      emit([
+        "range": [chunkBases[currentChunkIndex] + characterRange.location, characterRange.length],
+        "elapsedMs": Int(elapsedNs / 1_000_000),
+      ])
     }
 
     func advanceAfterChunk() {
@@ -358,15 +407,20 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
       // when part of this chunk was already spoken.
       attempts += 1
       if attempts < 2 {
+        let chunk = chunks[currentChunkIndex]
         let remainder = Self.remainderAfterCancel(
-          chunk: chunks[currentChunkIndex],
+          chunk: chunk,
           nextRangeLocation: nextRangeUTF16
         )
+        // The retried utterance starts where the remainder starts, so its
+        // ranges are offset by what was cut off the front.
+        let cut = (chunk as NSString).length - (remainder as NSString).length
         nextRangeUTF16 = 0
         if remainder.isEmpty {
           advanceAfterChunk()
         } else {
           chunks[currentChunkIndex] = remainder
+          chunkBases[currentChunkIndex] += cut
           speakCurrentChunk()
         }
       } else {
@@ -378,8 +432,12 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
   let speaker = PersonalVoiceSpeaker()
 
   let doSpeak = {
-    let allVoices = AVSpeechSynthesisVoice.speechVoices()
-    let matched = allVoices.first(where: {
+    // Match only Personal Voices.  Matching by identifier or name over every
+    // installed voice let `personal:Samantha` select an ordinary system voice
+    // and speak the user's words with it.
+    let personalVoices = AVSpeechSynthesisVoice.speechVoices()
+      .filter { $0.voiceTraits.contains(.isPersonalVoice) }
+    let matched = personalVoices.first(where: {
       $0.identifier == rawId || $0.name == rawId ||
       "personal:\($0.identifier)" == requestedVoiceId ||
       "apple-personal:\($0.identifier)" == requestedVoiceId
@@ -387,9 +445,7 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
     // Guess only when the caller named no voice at all. A named-but-absent
     // voice — one not synced to this Mac — must fail loudly rather than be
     // replaced by a different Personal Voice speaking the user's words.
-    let voice = matched ?? (rawId.isEmpty
-      ? allVoices.first(where: { $0.voiceTraits.contains(.isPersonalVoice) })
-      : nil)
+    let voice = matched ?? (rawId.isEmpty ? personalVoices.first : nil)
 
     guard let selectedVoice = voice else {
       fail("voice-not-found")

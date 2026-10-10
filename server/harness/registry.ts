@@ -16,7 +16,9 @@ import { clockReadingAt, elapsedSince, KNOWN_VERSION_MAX_AGE_MS, readClock, type
 import { applyMiniMaxBalanceToRegistry, getCachedLocalMiniMaxConfig, getMiniMaxBalance } from "../minimax-balance.ts";
 import { quotaCooldowns } from "../model-fallback.ts";
 import { computerReach, type ComputerReach } from "../computer-capability.ts";
+import type { ReviewHook } from "../../shared/auto-review.ts";
 import { quotaProviderForDriver } from "../quota-window-map.ts";
+import { bypassCoverage, type BypassCoverage } from "../../shared/bypass-coverage.ts";
 import type {
   AnyProviderDriver,
   InstanceConfig,
@@ -231,7 +233,17 @@ export interface DescribedInstance {
     images?: boolean;
     effortLevels?: readonly string[];
     queueing?: boolean;
+    /** The engine can answer a review prompt on its own (`reviewPermission`). */
     approvalReview?: boolean;
+    /** Where auto-review sees this instance's tool calls.  Absent on a
+     *  shadow, which the client reads as "not reported yet", not as none. */
+    reviewHook?: ReviewHook;
+    /** A full-auto instance can run a held turn in its asking mode. */
+    asksWhenHeld?: boolean;
+    /** What a bot's Bypass Permissions switch does on this engine
+     *  (shared/bypass-coverage.ts): answers its approval requests, turns on
+     *  its own skip-approvals mode, or nothing because it never asks. */
+    bypassCoverage?: BypassCoverage;
     /** True when this engine runs the harness HTTP tool loop. */
     toolLoop: boolean;
   };
@@ -542,6 +554,18 @@ export class ProviderRegistry {
   onDescribed(listener: DescribeListener): () => void {
     this.describeListeners.add(listener);
     return () => this.describeListeners.delete(listener);
+  }
+
+  /** The newest settled description of one engine, without probing it.
+   * Undefined before its first probe has settled.  For a synchronous health
+   * read on a hot path (auto-review's automatic fallback reviewer), where a
+   * describe per call would be far too slow. */
+  lastKnown(instanceId: InstanceId): DescribedInstance | undefined {
+    return (
+      this.latestSettled.get(instanceId)?.info ??
+      this.lastDefinitive.get(instanceId)?.info ??
+      this.lastDone?.result.find((info) => info.instanceId === instanceId)
+    );
   }
 
   /** When a list this registry returned was produced (ms since epoch). */
@@ -1102,7 +1126,13 @@ export class ProviderRegistry {
         enabled,
         snapshot,
         models: { default: "", options: [] },
-        capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false, toolLoop: false },
+        capabilities: {
+          computerMcp: false,
+          agentsMcp: false,
+          localComputerMcp: false,
+          toolLoop: false,
+          bypassCoverage: bypassCoverage(entry.shadow.driverKind),
+        },
         // A shadow has no adapter to ask, so the derivation is fed the same
         // all-false capabilities reported above.  That leaves the box-native
         // engine reaching its own box — which is what the client computed
@@ -1143,7 +1173,10 @@ export class ProviderRegistry {
         queueing: inst.adapter.capabilities.queueing === true,
         localComputerMcp: inst.adapter.capabilities.localComputerMcp === true,
         approvalReview: inst.reviewPermission !== undefined,
+        reviewHook: inst.adapter.capabilities.reviewHook ?? "none",
+        asksWhenHeld: inst.adapter.capabilities.asksWhenHeld === true,
         toolLoop: inst.adapter.capabilities.toolLoop === true,
+        bypassCoverage: bypassCoverage(inst.driverKind),
       },
       // Derived here, on the one wire where adapter capabilities already
       // become an InstanceInfo, so the client never recomputes it and can

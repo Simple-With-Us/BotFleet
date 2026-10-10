@@ -14,12 +14,15 @@ import { shortPath } from "@/lib/short-path";
 import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@/lib/cloud-backend";
 import { computerDestinationDisabledReason, instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
+import { BotPowerToggle } from "./BotPowerToggle";
 import { BotSkillsPanel } from "./BotSkillsPanel";
 import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
 import { BypassPermissionsWarning } from "./BypassPermissionsWarning";
 import { evaluateModelRiskForBypass } from "../../shared/model-safety";
+import { bypassCoverageNote } from "../../shared/bypass-coverage";
 import { VoiceSettings } from "./VoiceSettings";
+import { AutoReviewCard } from "./AutoReviewCard";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
 import { botCapabilityGates, toolRoundsGate } from "@/lib/bot-settings-gates";
 import { MaxToolRoundsField } from "./MaxToolRoundsField";
@@ -383,6 +386,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "composio"
         | "modelSelection"
         | "maxToolRounds"
+        | "off"
       >
     > & { acknowledgeLocalAuto?: boolean; connectorTools?: Bot["connectorTools"] },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
@@ -395,8 +399,10 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   // lib/bot-settings-gates.ts.
   const gates = botCapabilityGates(state.instances, bot);
   const engine = gates.engine;
-  const { canAutoReview, canCoordinate, canUseConnectedApps, canUseVps } = gates;
+  const { canCoordinate, canUseConnectedApps, canUseVps } = gates;
   const roundsGate = toolRoundsGate(state.instances, bot);
+  // Null when the engine asks and the broker answers, which is the common case.
+  const bypassNote = bypassCoverageNote(engine?.capabilities?.bypassCoverage ?? "asks");
   const connectedAppsConfigured = state.config?.composio?.configured === true;
   const connectedAppsEnabled = bot.composio !== false;
   const sectionName = bot.section?.trim() || "General";
@@ -465,6 +471,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               onChange={(e) => patch({ description: e.target.value })}
             />
           </Field>
+
+          <BotPowerToggle off={bot.off === true} onChange={(off) => patch({ off })} />
 
           <div className={cn(
             "rounded-xl border p-4",
@@ -838,8 +846,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 </div>
                 <div className="mt-0.5 text-[13px] text-ink-secondary">
                   {bot.bypassPermissions
-                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards."
-                    : "Automatically approve all tool, command, and routine requests without stopping for manual approval cards."}
+                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards.  Requests that control This Mac still ask."
+                    : "Automatically approve all tool, command, and routine requests without stopping for manual approval cards.  Requests that control This Mac still ask."}
                 </div>
               </div>
               <button
@@ -866,6 +874,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 />
               </button>
             </div>
+            {bypassNote && (
+              <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{bypassNote}</div>
+            )}
             {modelRisk.isDangerous && (
               <div className="mt-3 flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-2.5 text-[12px] text-warning">
                 <AlertTriangle size={15} className="mt-0.5 shrink-0" />
@@ -877,42 +888,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             )}
           </div>
 
-          <div className="rounded-xl bg-card p-4">
-            <div className="text-[15px] font-medium text-ink">Review Routine Approvals</div>
-            <div className="mt-0.5 text-[13px] text-ink-secondary">
-              {bot.bypassPermissions
-                ? "Permission Bypass is active: routine operations and tool calls are automatically permitted without waiting for isolated reviews or approval cards."
-                : canAutoReview
-                ? "The same engine reviews ordinary approval cards. Existing safety rules, unattended turns, local-computer access, and questions still wait for you."
-                : "This engine cannot run an isolated review safely. Approvals will wait for you, or you can enable Permission Bypass above for unattended routine execution."}
-            </div>
-            <div className="mt-3 flex gap-1 rounded-lg bg-inset p-0.5">
-              {(
-                [
-                  ["off", "Off", "Every undecided approval waits for you."],
-                  ["shadow", "Watch", "Record the review without answering the card."],
-                  ["enforce", "On", "Answer only reviews that return a strict approval."],
-                ] as const
-              ).map(([value, label, hint]) => {
-                const current = bot.autoReview === "shadow" || bot.autoReview === "enforce" ? bot.autoReview : "off";
-                const disabled = value !== "off" && !canAutoReview;
-                return (
-                  <button
-                    key={value}
-                    title={disabled ? "Not supported by this engine" : hint}
-                    disabled={disabled}
-                    onClick={() => patch({ autoReview: value })}
-                    className={cn(
-                      "flex-1 rounded-md px-2.5 py-1.5 text-[13px] font-medium disabled:cursor-not-allowed disabled:opacity-40",
-                      current === value ? "bg-raised text-ink" : "text-ink-secondary hover:text-ink",
-                    )}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+          <AutoReviewCard bot={bot} onMode={(autoReview) => patch({ autoReview })} />
 
           <VoiceSettings bot={bot} onPatch={patch} />
 

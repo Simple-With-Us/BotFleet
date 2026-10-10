@@ -14,8 +14,28 @@ import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 
+import {
+  CONTAINER_RUNTIME_IDS,
+  daemonSlowProblem,
+  runtimeProductName,
+  type ContainerRuntimeId,
+} from "../shared/container-runtime-name.ts";
 import { augmentedPath } from "./env-path.ts";
+import { isTransientProbeFailure, judgeDesktopProbeFailure, problemText } from "./desktop-probe.ts";
+import {
+  CONTAINER_RUNTIME_DISABLED_MESSAGE,
+  containerRuntimeDisabled,
+  fixtureRuntimeCommand,
+  resolveRuntimeCommand,
+} from "./container-runtime-guard.ts";
 import { renderDockerfileCliInstallRun, renderDockerfileVerifyArtifacts } from "./vm-cli-install.ts";
+import {
+  forgetLocalVmGhToken,
+  localVmGhContainerEnv,
+  syncLocalVmGhToken,
+  syncLocalVmGhTokenWithin,
+  type GhSyncOutcome,
+} from "./local-vm-gh-credentials.ts";
 import {
   allowedCliGuestDestinations,
   cliCredentialCandidates,
@@ -31,11 +51,26 @@ import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 
 const run = promisify(execFile);
 const SCREENSHOT_STATUS_TTL_MS = 10_000;
+/** How long create waits for the gh login before leaving it to finish behind. */
+const CREATE_GH_SYNC_MAX_WAIT_MS = 20_000;
+
+/** Extras a caller can hand a command.  Both are optional and ignored by
+ *  runners that predate them, so existing fakes keep working unchanged. */
+export interface CommandRunOptions {
+  /** Written to the command's stdin, then stdin is closed.  This is the only
+   *  way a secret reaches a command: argv shows up in `ps` and `docker inspect`
+   *  echoes `-e` values, stdin does neither. */
+  input?: string;
+  /** Overlaid on the harness environment for this call.  An `undefined` value
+   *  removes that variable. */
+  env?: Record<string, string | undefined>;
+}
 
 export type CommandRunner = (
   command: string,
   args: string[],
   timeout?: number,
+  options?: CommandRunOptions,
 ) => Promise<{ stdout: string }>;
 
 export const CUA_DRIVER_VERSION = "0.20.0";
@@ -49,7 +84,34 @@ export const BASE_IMAGE = `${BASE_IMAGE_REPOSITORY}@${BASE_IMAGE_DIGEST}`;
 // Image and container labels below remain the authoritative compatibility
 // check, not the mutable tag.
 export const IMAGE_REPOSITORY = "localhost/botfleet/cua-local-vm";
-export const IMAGE_LAYER_VERSION = "6";
+// BUMP THIS WHENEVER THE MANAGED IMAGE CONTENTS CHANGE.  `imageLabelsMatch`
+// decides whether an existing container still matches, so a content change
+// without a bump is invisible: an already-provisioned image is accepted and
+// never rebuilt, and the fix only ever reaches newly created Dockerfiles.
+//
+// v7 (2026-10-06): the VM CLI layer now bakes `ENV RUSTUP_HOME` so the rustup
+// shims survive past the RUN that installed them.  Kody review on #911 caught
+// that v6 alone would leave every pre-existing container with shims that
+// cannot resolve a toolchain.  Safe to bump here because no v6 image has ever
+// built — the CLI layer's first three builds all failed at verify — so there
+// are no running containers to replace.  Note the contrast with CUA_PATH_SHIMS
+// below, which heals in place precisely because bumping there *would* replace
+// live containers.
+//
+// v8 (2026-10-07): the VM CLI layer now carries Homebrew, zsh as the login
+// shell, an `open` shim, ripgrep and the gap-list CLIs, and git.  Bumped
+// because a v7 image has none of it and `imageLabelsMatch` would otherwise
+// keep accepting it.  Any container built from v7 or earlier is replaced on the
+// next provision.
+//
+// Deliberately NOT bumped for a verify-only change (2026-10-08): the baked
+// `botfleet-vm-cli-verify` now checks `ping` by presence instead of running
+// `ping -V`, which fails as the desktop user in a live VM (no NET_RAW).  A bump
+// would block every Local VM bot until Prepare and a recreate, and invalidate
+// Self-Hosted VPS containers (they share this label), to fix a script that only
+// matters when someone runs it by hand.  The new check ships with the next image
+// whose contents change for a real reason.
+export const IMAGE_LAYER_VERSION = "8";
 export const IMAGE_LAYER_LABEL = "com.botfleet.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export function sanitizeContainerSuffix(name: string): string {
@@ -89,8 +151,8 @@ export const DISPLAY = ":1";
 export const CUA_SOCKET = "/run/user/1000/botfleet-cua.sock";
 export const CUA_EXECUTABLE = "/usr/local/libexec/botfleet/cua-driver";
 
-const RUNTIMES = ["docker", "podman", "container"] as const;
-export type Runtime = (typeof RUNTIMES)[number];
+const RUNTIMES = CONTAINER_RUNTIME_IDS;
+export type Runtime = ContainerRuntimeId;
 export type LifecycleAction = "pull" | "run" | "start" | "stop" | "remove";
 
 const INTERNAL_VIEWER_PORT = 6901;
@@ -174,21 +236,6 @@ export function adaptContainerLimits(
   const memoryGib =
     hostGib === null ? ceiling.memoryGib : Math.min(ceiling.memoryGib, hostGib < MIN_CONTAINER_MEMORY_GIB ? Math.max(1, hostGib) : hostGib);
   return { cpus: Math.max(1, cpus), memoryGib };
-}
-
-function runtimeProductName(runtime: Runtime): string {
-  switch (runtime) {
-    case "docker":
-      return "Docker";
-    case "podman":
-      return "Podman";
-    case "container":
-      return "Apple Container";
-    default: {
-      const never: never = runtime;
-      return never;
-    }
-  }
 }
 
 /** Parsed capacity from `docker info` / `podman info` format templates — trust boundary. */
@@ -479,14 +526,30 @@ function redactCommandError(error: unknown): unknown {
   return scrubbed;
 }
 
-async function sh(cmd: string, args: string[], timeout = 8000): Promise<{ stdout: string }> {
+async function sh(
+  cmd: string,
+  args: string[],
+  timeout = 8000,
+  options?: CommandRunOptions,
+): Promise<{ stdout: string }> {
+  // The one door every default-runner call walks through (`defaultCommandRunner`
+  // is this function).  Kept inline, not wrapped: callers compare
+  // `runner === sh` to recognise the real runner.
+  const command = resolveRuntimeCommand(cmd);
   try {
-    const { stdout } = await run(cmd, args, {
+    const pending = run(command, args, {
       timeout,
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
-      env: { ...process.env, PATH: augmentedPath() },
+      env: { ...process.env, PATH: augmentedPath(), ...options?.env },
     });
+    if (options?.input !== undefined) {
+      // A command that exits before it reads stdin closes the pipe on us; that
+      // is the command's failure to report, not an unhandled stream error.
+      pending.child.stdin?.on("error", () => undefined);
+      pending.child.stdin?.end(options.input);
+    }
+    const { stdout } = await pending;
     return { stdout };
   } catch (error) {
     throw redactCommandError(error);
@@ -510,6 +573,53 @@ export interface ContainerRuntimeStatus {
   runtime: Runtime | null;
   available: Runtime[];
   daemonUp: boolean;
+  /** Set (to true) only when the runtime is installed but its health probe ran
+   * out of time on every attempt, so nobody knows whether the daemon is up.
+   * Absent otherwise, so a healthy or plainly-stopped runtime keeps its old
+   * shape.  Distinct from `daemonUp: false` on its own, which means the daemon
+   * answered "not running". */
+  daemonSlow?: true;
+  /** Set only when the kill switch (container-runtime-guard.ts) removed every
+   * runtime: the operator-facing reason no runtime is reported. */
+  disabled?: string;
+}
+
+/** Budget for one health probe of the daemon (`docker info` and friends).
+ *
+ *  Ten seconds was too tight on a Mac whose load average sat in the hundreds:
+ *  OrbStack was up the whole time and `docker info` took 1.2 s from a shell,
+ *  yet the probe timed out and the Local VM card told the owner to start a
+ *  runtime that was running.  Two attempts of this length keep the worst case
+ *  around 24 s.  A healthy daemon answers the first attempt, so the common case
+ *  costs exactly one call, as before. */
+export const RUNTIME_PROBE_TIMEOUT_MS = 12_000;
+export const RUNTIME_PROBE_ATTEMPTS = 2;
+
+type DaemonProbe = "up" | "down" | "slow";
+
+function daemonProbeArgs(candidate: Runtime): string[] {
+  return candidate === "container"
+    ? ["system", "status"]
+    : candidate === "podman"
+      ? ["info", "--format", "json"]
+      : ["info", "--format", "{{.ServerVersion}}"];
+}
+
+/** Is the runtime's daemon answering?  Only a probe that RAN OUT OF TIME is
+ *  asked again, and then once: a fast "Cannot connect to the Docker daemon" is
+ *  an answer (the daemon is down, and asking again changes nothing), while a
+ *  timeout says nothing about the daemon and often succeeds on a second look.
+ *  Two timeouts are reported as "slow", never as "down". */
+async function probeDaemon(candidate: Runtime, runner: CommandRunner): Promise<DaemonProbe> {
+  for (let attempt = 1; attempt <= RUNTIME_PROBE_ATTEMPTS; attempt += 1) {
+    try {
+      await runner(candidate, daemonProbeArgs(candidate), RUNTIME_PROBE_TIMEOUT_MS);
+      return "up";
+    } catch (error) {
+      if (!(error instanceof Error) || !isTransientProbeFailure(error)) return "down";
+    }
+  }
+  return "slow";
 }
 
 /** Inspect only the host runtime. Unlike a full Local VM status check, this
@@ -524,33 +634,32 @@ export async function containerRuntimeStatus(
   const candidates: Runtime[] = platform === "win32"
     ? ["podman", "docker"]
     : RUNTIMES.filter((runtime) => runtime !== "container" || platform === "darwin");
-  const present = await Promise.all(candidates.map((runtime) => installed(runtime, runner, platform)));
+  // Kill switch: with it on, the real runner may run only fixture runtimes, so
+  // presence is "is there a fixture file", never a PATH lookup that could find
+  // the machine's real docker.  An injected runner is a test double and is left
+  // alone.
+  const guarded = runner === sh && containerRuntimeDisabled();
+  const present = guarded
+    ? candidates.map((runtime) => fixtureRuntimeCommand(runtime) !== null)
+    : await Promise.all(candidates.map((runtime) => installed(runtime, runner, platform)));
+  if (guarded && !present.includes(true)) {
+    return { runtime: null, available: [], daemonUp: false, disabled: CONTAINER_RUNTIME_DISABLED_MESSAGE };
+  }
   const available = candidates.filter((_, index) => present[index]);
-  const healthy = await Promise.all(
-    available.map(async (candidate) => {
-      try {
-        const infoArgs = candidate === "container"
-          ? ["system", "status"]
-          : candidate === "podman"
-            ? ["info", "--format", "json"]
-            : ["info", "--format", "{{.ServerVersion}}"];
-        await runner(
-          candidate,
-          infoArgs,
-          10_000,
-        );
-        return true;
-      } catch {
-        return false;
-      }
-    }),
-  );
-  const healthyIndex = healthy.indexOf(true);
-  return {
-    runtime: healthyIndex >= 0 ? available[healthyIndex] : (available[0] ?? null),
+  const verdicts = await Promise.all(available.map((candidate) => probeDaemon(candidate, runner)));
+  const healthyIndex = verdicts.indexOf("up");
+  // With nothing healthy, a runtime that timed out is the one to name: it may
+  // be perfectly fine, whereas the first-listed one that refused is stopped.
+  const slowIndex = healthyIndex >= 0 ? -1 : verdicts.indexOf("slow");
+  const pickedIndex = healthyIndex >= 0 ? healthyIndex : slowIndex >= 0 ? slowIndex : 0;
+  const status: ContainerRuntimeStatus = {
+    runtime: available[pickedIndex] ?? null,
     available,
     daemonUp: healthyIndex >= 0,
   };
+  // Set only when true, so a healthy or plainly-stopped runtime keeps its shape.
+  if (slowIndex >= 0) status.daemonSlow = true;
+  return status;
 }
 
 export interface ContainerComputerStatus {
@@ -558,6 +667,11 @@ export interface ContainerComputerStatus {
   runtime: Runtime | null;
   available: Runtime[];
   daemonUp: boolean;
+  /** The runtime is installed but its health probe timed out twice, so whether
+   * the daemon is up is unknown right now.  Never "start the runtime": the
+   * daemon is probably fine and merely slow (a loaded host), and the next poll
+   * re-checks.  Only ever true alongside `daemonUp: false`. */
+  daemonSlow: boolean;
   image: boolean;
   imageMatches: boolean;
   managed: boolean;
@@ -567,6 +681,10 @@ export interface ContainerComputerStatus {
   persistence: "durable" | "unsafe" | "unknown";
   desktopReady: boolean;
   desktop_error: string | null;
+  /** One desktop check timed out, so the desktop's state is unknown right
+   * now.  Never a "failed to start": the container is known to be running, and
+   * the next poll re-checks. */
+  desktopUnreachable: boolean;
   create_supported: boolean;
   ready: boolean;
   problem: string | null;
@@ -588,6 +706,7 @@ function emptyStatus(platform: NodeJS.Platform, target: LocalVmTarget): Containe
     runtime: null,
     available: [],
     daemonUp: false,
+    daemonSlow: false,
     image: false,
     imageMatches: false,
     managed: false,
@@ -597,6 +716,7 @@ function emptyStatus(platform: NodeJS.Platform, target: LocalVmTarget): Containe
     persistence: "unknown",
     desktopReady: false,
     desktop_error: null,
+    desktopUnreachable: false,
     create_supported: true,
     ready: false,
     problem: "Install a supported container runtime first",
@@ -615,7 +735,7 @@ function emptyStatus(platform: NodeJS.Platform, target: LocalVmTarget): Containe
 
 function statusProblem(status: ContainerComputerStatus): string | null {
   if (!status.runtime) return "Install a supported container runtime first";
-  if (!status.daemonUp) return `Start ${status.runtime} first`;
+  if (!status.daemonUp) return status.daemonSlow ? daemonSlowProblem(status.runtime) : `Start ${status.runtime} first`;
   if (!status.image) return `Prepare the CUA desktop image with Driver ${CUA_DRIVER_VERSION}`;
   if (status.container === "missing" && !status.create_supported) {
     return "Per-bot Local VMs require Docker or Podman because Apple container requires a fixed host port";
@@ -627,6 +747,7 @@ function statusProblem(status: ContainerComputerStatus): string | null {
   if (status.security === "unsafe") return "The existing Local VM is missing safety limits; recreate it";
   if (status.persistence === "unsafe") return "The existing Local VM is missing its durable workspace; recreate it";
   if (status.container === "stopped") return "This desktop image cannot safely resume; recreate the Local VM";
+  if (status.desktopUnreachable) return "Couldn't reach the Local VM desktop just now; retrying";
   if (status.desktop_error) return `The Local VM desktop failed to start: ${status.desktop_error}`;
   if (!status.desktopReady) return "The Local VM started, but CUA Driver is not ready yet";
   return null;
@@ -772,6 +893,11 @@ export async function containerComputerStatus(
   status.available = runtimeStatus.available;
   status.runtime = runtimeStatus.runtime;
   status.daemonUp = runtimeStatus.daemonUp;
+  status.daemonSlow = runtimeStatus.daemonSlow === true;
+  if (runtimeStatus.disabled) {
+    status.problem = runtimeStatus.disabled;
+    return status;
+  }
   status.create_supported = target.key === SHARED_LOCAL_VM_TARGET.key || status.runtime !== "container";
   if (!status.runtime || !status.daemonUp) {
     status.problem = statusProblem(status);
@@ -908,7 +1034,9 @@ export async function containerComputerStatus(
     try {
       const expected = `cua-driver ${CUA_DRIVER_VERSION}`;
       const version = await runner(status.runtime, cuaExecArgs(["--version"], { container: target.containerName }), 8000);
-      if (version.stdout.trim() !== expected) throw new Error(`expected ${expected}`);
+      if (version.stdout.trim() !== expected) {
+        throw new Error(`expected ${expected}, found "${problemText(version.stdout, 60) || "none"}"`);
+      }
       await runner(status.runtime, cuaExecArgs(["status", "--socket", CUA_SOCKET], { container: target.containerName }), 8000);
       const health = await runner(
         status.runtime,
@@ -947,26 +1075,32 @@ export async function containerComputerStatus(
       }
       status.desktopReady = true;
     } catch (error) {
-      // An empty log means XFCE and the supervisor-owned CUA daemon are
-      // probably still starting. A real startup failure should be actionable
-      // in the panel instead of looking like an endless readiness wait.
-      status.desktop_error = error instanceof Error ? error.message.slice(0, 320) : null;
+      // A real startup failure should be actionable in the panel instead of
+      // looking like an endless readiness wait, so the supervisor's error log
+      // is read for the reason.  It is judged, not pasted: a healthy Driver
+      // writes its update notice and WARN lines to that same file, and a probe
+      // that merely timed out says nothing about the desktop (see
+      // desktop-probe.ts).
+      let supervisorLog: string | null = null;
       try {
         const errorLog = await runner(
           status.runtime,
-          ["exec", target.containerName, "tail", "-n", "4", "/var/log/supervisor/cua-driver.error.log"],
+          ["exec", target.containerName, "tail", "-n", "12", "/var/log/supervisor/cua-driver.error.log"],
           4000,
         );
-        status.desktop_error =
-          errorLog.stdout.replace(/\s+/g, " ").trim().slice(0, 320) ||
-          status.desktop_error;
+        supervisorLog = errorLog.stdout;
       } catch {
         // The log may not exist during the first seconds of container boot.
       }
+      const verdict = judgeDesktopProbeFailure(error instanceof Error ? error : new Error(String(error)), supervisorLog);
+      status.desktop_error = verdict.desktopError;
+      status.desktopUnreachable = verdict.unreachable;
     }
   }
 
   status.problem = statusProblem(status);
+  // Strip terminal colour codes from whatever reached the problem text.
+  if (status.problem) status.problem = problemText(status.problem, 600);
   status.ready = status.problem === null;
   return status;
 }
@@ -1358,6 +1492,10 @@ export function containerRunArgs(
         materializeCredentials: options?.materializeCredentials,
       }),
     );
+    // The gh mount is read-only and, on macOS, holds no token (it lives in the
+    // Keychain).  These point gh at a writable directory the token sync logs
+    // into, and git's github.com helper at gh.  All non-secret.
+    for (const entry of localVmGhContainerEnv()) common.push("-e", entry);
   }
   common.push(
     "--mount",
@@ -1416,7 +1554,11 @@ async function ensureVmWorkspace(platform: NodeJS.Platform, target: LocalVmTarge
   if (platform !== "win32") await chmod(target.workspaceDir, 0o700);
 }
 
-const MANAGED_IMAGE_BUILD_TIMEOUT_MS = 45 * 60_000;
+/** How long an image build may run.  The CLI layer downloads and installs
+ * dozens of tools, so a cold build takes well over the 10 minutes the VPS path
+ * used to allow: it measured 21 to 22 minutes on a loaded arm64 Mac.  Shared
+ * with the VPS backend so the two cannot drift apart again. */
+export const MANAGED_IMAGE_BUILD_TIMEOUT_MS = 45 * 60_000;
 
 async function prepareManagedImage(runtime: Runtime, runner: CommandRunner): Promise<void> {
   await runner(runtime, ["pull", BASE_IMAGE], 10 * 60_000);
@@ -1534,8 +1676,50 @@ export async function containerComputerAction(
           ? ["rm", runtime === "container" ? "--force" : "-f", target.containerName]
           : [action, target.containerName];
     await runner(runtime, args, 2 * 60_000);
+    if (action === "run" || action === "stop" || action === "remove") {
+      // Whatever login the old container held is gone with it; a remembered
+      // token hash would make the next sync skip the one login a new
+      // container needs.
+      forgetLocalVmGhToken(target.containerName);
+    }
+    if (action === "run" && shareCliCredentials && !(runner === sh && containerRuntimeDisabled())) {
+      // Right after create, so a human opening the viewer finds gh signed in
+      // before any bot turn.  Best-effort: the sync never throws, and the wake
+      // path runs inside a bot's turn, so a slow login finishes behind it.  Not
+      // under the container-runtime kill switch: the real runner refuses docker.
+      await syncLocalVmGhTokenWithin({ runtime, containerName: target.containerName, runner }, CREATE_GH_SYNC_MAX_WAIT_MS);
+    }
   }
   return containerComputerStatus(runner, platform, target);
+}
+
+/** Bring the Local VM's gh login in line with the host's, when the existing
+ *  "Share Host CLI Credentials" option is on.  Called for each Local VM turn
+ *  once the container is ready, so a host re-login reaches the VM without a
+ *  recreate.  Never throws, and touches the container only when the host token
+ *  changed (see `syncLocalVmGhToken`).
+ *
+ *  In shared mode every bot's desktop runs as the same cua user in one
+ *  container, so one login covers all of them; a per-bot container is its own
+ *  cache entry and gets its own login.
+ *
+ *  `maxWaitMs` bounds how long a caller waits.  A login that is slower than
+ *  that (GitHub unreachable, a loaded host) keeps running and is recorded when
+ *  it finishes; the caller just stops waiting for it and gets "pending", so a
+ *  nice-to-have credential sync cannot hold up a bot's turn. */
+export async function refreshLocalVmGhCredentials(
+  runtime: Runtime,
+  target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+  runner: CommandRunner = sh,
+  options: { maxWaitMs?: number } = {},
+): Promise<GhSyncOutcome | "disabled" | "pending"> {
+  if (!shareCliCredentialsConfigured()) return "disabled";
+  // The container-runtime kill switch (#948) makes the real runner refuse every
+  // docker exec, so there is nothing to deliver a token to: skip before reading
+  // the host token at all.  An injected runner is a test double and is left alone.
+  if (runner === sh && containerRuntimeDisabled()) return "runtime-disabled";
+  const deps = { runtime, containerName: target.containerName, runner };
+  return options.maxWaitMs === undefined ? syncLocalVmGhToken(deps) : syncLocalVmGhTokenWithin(deps, options.maxWaitMs);
 }
 
 /** Recreate a stopped Local VM container (the auto-wake), or fail truthfully.
@@ -1743,7 +1927,14 @@ export function setupCommands(
       view: target.viewerPort ? `http://127.0.0.1:${target.viewerPort}/vnc.html` : "",
     };
   }
-  const command = (args: string[]) => [runtime, ...args].join(" ");
+  // Display text a person may paste into a shell, so an argument with whitespace
+  // or a shell metacharacter (the git credential helper, `!gh auth git-credential`)
+  // is single-quoted rather than left to be split or history-expanded.  A
+  // backslash or `~` alone is left bare: those are ordinary in a Windows path,
+  // which has always been printed as-is here.
+  const shellWord = (word: string) =>
+    /[\s!"'`$&;|<>()*?{}#]/.test(word) ? `'${word.replace(/'/g, `'\\''`)}'` : word;
+  const command = (args: string[]) => [runtime, ...args].map(shellWord).join(" ");
   return {
     install,
     runtimeStart,

@@ -16,6 +16,7 @@ import { z } from "zod";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
+import { CONTAINER_RUNTIME_DISABLED_MESSAGE } from "./container-runtime-guard.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 import { DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
@@ -733,6 +734,488 @@ describe("harness HTTP API", () => {
     }
     expect((await fetch(`${BASE}/api/config`)).status).toBe(200);
   });
+
+  it("refuses a malformed quiesce request with 400 and changes nothing", async () => {
+    // Kody 4226532374: force, drain and the windows were read loosely.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const post = (query: string, body?: string) => fetch(`${BASE}/api/runtime/quiesce${query}`, {
+      method: "POST",
+      headers: body === undefined ? authorization : { ...authorization, "content-type": "application/json" },
+      body,
+    });
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      quiescing: boolean;
+      draining: boolean;
+    };
+    try {
+      for (const [query, body] of [
+        ["?drain=maybe", undefined],
+        ["?force=yes", undefined],
+        ["?drain=1&timeoutMs=soon", undefined],
+        ["?leaseMs=-5", undefined],
+        ["", JSON.stringify({ force: "yes" })],
+        ["", JSON.stringify({ drain: true, timeoutMs: -1 })],
+        ["", JSON.stringify({ drain: true, extra: 1 })],
+        ["", "{ not json"],
+      ] as const) {
+        const refused = await post(query, body);
+        expect(refused.status, `${query} ${body ?? ""}`).toBe(400);
+        expect(await refused.json()).toMatchObject({ error: expect.stringMatching(/^invalid quiesce request/) });
+      }
+      expect(await runtime()).toMatchObject({ quiescing: false, draining: false });
+
+      // A well-formed body still works.
+      const held = await post("", JSON.stringify({ drain: true, timeoutMs: 60_000 }));
+      expect(held.status).toBe(200);
+      expect(await held.json()).toMatchObject({ draining: true, quiescing: false });
+    } finally {
+      await fetch(`${BASE}/api/runtime/quiesce`, { method: "DELETE", headers: authorization });
+    }
+    expect(await runtime()).toMatchObject({ quiescing: false, draining: false });
+  });
+
+  it("holds new work for an update without closing routes, and never drops a held message", async () => {
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json() as Promise<{
+      draining: boolean;
+      quiescing: boolean;
+      drain: { inFlight: number | null; bots: number; rooms: number; held: { sends: number; routineRuns: number } } | null;
+    }>;
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const busy = async () =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy);
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const said = async (text: string) => ((await api("GET", `/api/threads/${bot.threadId}/messages?limit=50`)).body.messages as Array<{
+      role: string;
+      text?: string;
+    }>).filter((message) => message.role === "user" && message.text === text).length;
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+
+      // Start holding.  Nothing is fenced: every route still answers.
+      const began = await quiesce("POST", "?drain=1&timeoutMs=60000");
+      expect(began.status).toBe(200);
+      expect(await began.json()).toMatchObject({ draining: true, quiescing: false });
+      expect((await fetch(`${BASE}/api/config`)).status).toBe(200);
+
+      // A person's new message to an idle bot is held, not started and not refused.
+      const held = await api("POST", `/api/bots/${bot.id}/messages`, { text: "held until released" });
+      expect(held.status).toBe(202);
+      expect(held.body).toMatchObject({ ok: true, queued: true, threadId: bot.threadId });
+      expect(await busy()).toBe(false);
+      await expect.poll(async () => (await runtime()).drain?.held.sends, SLOW).toBe(1);
+      await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(0);
+
+      // The app and a paired phone cannot read /api/runtime (loopback plus the
+      // owner's token), so the same hold rides on the update status they do
+      // read, with no token: what is waiting, and when the window ends.
+      const shown = await api("GET", "/api/update/status");
+      expect(shown.status).toBe(200);
+      expect(shown.body.drain).toMatchObject({ held: { sends: 1, rooms: 0 }, bots: 0, rooms: 0 });
+      expect(shown.body.drain.windowEndsAt).toBeGreaterThan(Date.now());
+      expect(shown.body.drain.windowEndsAt).toBeLessThan(shown.body.drain.deadline);
+      // Counts and times only: nothing of the person's words, and none of the
+      // runtime route's own bookkeeping.
+      expect(JSON.stringify(shown.body.drain)).not.toContain("held until released");
+      expect(shown.body.drain).not.toHaveProperty("inFlight");
+
+      // Giving up on the update lets it run now, once.
+      const released = await quiesce("DELETE");
+      expect(released.status).toBe(200);
+      expect(await released.json()).toMatchObject({ draining: false, quiescing: false });
+      expect((await api("GET", "/api/update/status")).body).not.toHaveProperty("drain");
+      await expect.poll(busy, SLOW).toBe(true);
+      expect(await said("held until released")).toBe(1);
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await expect.poll(busy, SLOW).toBe(false);
+
+      // Work in flight keeps the drain from becoming the fence: the plain
+      // quiesce answers 409 and the hold stays up.
+      await quiesce("POST", "?drain=1&timeoutMs=60000");
+      const heldMutation = request({
+        hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
+        headers: { "content-type": "application/json", "content-length": "2" },
+      });
+      heldMutation.on("error", () => {});
+      heldMutation.write("{");
+      await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(1);
+      const early = await quiesce("POST");
+      expect(early.status).toBe(409);
+      expect(await early.json()).toMatchObject({ draining: true, quiescing: false });
+      heldMutation.destroy();
+      await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(0);
+
+      // Once nothing is in flight the drain becomes the fence, and the held
+      // message is committed to its thread and the carrier for the restart.
+      const carried = await api("POST", `/api/bots/${bot.id}/messages`, { text: "carried across the restart" });
+      expect(carried.body).toMatchObject({ queued: true });
+      const fenced = await quiesce("POST");
+      expect(fenced.status).toBe(200);
+      expect(await fenced.json()).toMatchObject({ quiescing: true, draining: false, safeToRestart: true, activeWorkCount: 0 });
+      const saved: { sends: Array<{ botId: string; prompt: string }> } = JSON.parse(readFileSync(carrier, "utf8"));
+      expect(saved.sends).toEqual([expect.objectContaining({ botId: bot.id, prompt: "carried across the restart" })]);
+
+      // The restart did not come: standing the fence down runs it now.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+      await expect.poll(busy, SLOW).toBe(true);
+      expect(await said("carried across the restart")).toBe(1);
+    } finally {
+      await quiesce("DELETE");
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await expect.poll(busy, SLOW).toBe(false);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+    }
+  }, 180_000);
+
+  it("pauses a busy bot after the grace and carries held messages across a forced fence", async () => {
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    const resumePath = join(home, ".botfleet", "pending-update-resume.json");
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const working = (await api("POST", "/api/bots")).body.bot;
+    const idle = (await api("POST", "/api/bots")).body.bot;
+    const busy = async (id: string) =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      for (const bot of [working, idle]) {
+        await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      }
+      expect((await api("POST", `/api/bots/${working.id}/messages`, { text: "a long job in flight" })).status).toBe(202);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+
+      // The hold goes up first; the grace passes with the bot still working.
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      expect((await api("POST", `/api/bots/${idle.id}/messages`, { text: "held behind the update" })).body)
+        .toMatchObject({ queued: true });
+
+      // Then the forced fence: the working bot is interrupted and saved, and
+      // the held message is carried rather than dropped.
+      // Under load an interrupted bot can take longer than the harness's own
+      // 15-second settle, and the forced quiesce then rolls back and keeps the
+      // hold, exactly as the updater expects; it asks again, so this does too.
+      let forced = await quiesce("POST", "?force=true");
+      for (let attempt = 0; attempt < 5 && forced.status !== 200; attempt += 1) {
+        await forced.arrayBuffer();
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        forced = await quiesce("POST", "?force=true");
+      }
+      expect(forced.status).toBe(200);
+      expect(await forced.json()).toMatchObject({ quiescing: true, draining: false, safeToRestart: true });
+      const resume: { interruptedBots: Array<{ botId: string }> } = JSON.parse(readFileSync(resumePath, "utf8"));
+      expect(resume.interruptedBots.map((entry) => entry.botId)).toContain(working.id);
+      // SAFETY: the carrier this harness just wrote, read back by its test; the assertions below check it.
+      const saved = JSON.parse(readFileSync(carrier, "utf8")) as {
+        sends: Array<{ botId: string }>;
+        queued: Array<{ botId: string; items: Array<{ text: string }> }>;
+      };
+      // The idle bot's message is committed to its thread and runs first
+      // thing.  (A send queued behind the interrupted bot would be carried
+      // uncommitted instead — server/steer-queue.test.ts and
+      // server/update-drain.test.ts cover that half, because the fixture CLI
+      // steers every mid-turn message into the live turn.)
+      expect(saved.sends.map((entry) => entry.botId)).toEqual([idle.id]);
+      expect(saved.queued).toEqual([]);
+
+      // No restart came: standing down resumes the interrupted bot and runs
+      // the held message, and leaves nothing behind on disk.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      await expect.poll(() => busy(idle.id), SLOW).toBe(true);
+      expect(existsSync(resumePath)).toBe(false);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+    } finally {
+      await quiesce("DELETE");
+      for (const bot of [working, idle]) {
+        await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      }
+      for (const bot of [working, idle]) await expect.poll(() => busy(bot.id), SLOW).toBe(false);
+      for (const bot of [working, idle]) await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+      rmSync(resumePath, { force: true });
+    }
+  }, 240_000);
+
+  it("defers a release that arrives while a forced quiesce is still settling, then honours it", async () => {
+    // Finding 1: the DELETE the updater sends at its deadline, on Ctrl-C and
+    // in the --force give-up used to stand the fence down mid-settle, so the
+    // resume snapshot and the held messages landed on an unfenced harness.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      quiescing: boolean;
+      fencing: boolean;
+      draining: boolean;
+    };
+    const resumePath = join(home, ".botfleet", "pending-update-resume.json");
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const working = (await api("POST", "/api/bots")).body.bot;
+    const idle = (await api("POST", "/api/bots")).body.bot;
+    const busy = async (id: string) =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
+    const said = async (threadId: string, text: string) => {
+      const messages: Array<{ role: string; text?: string }> = (await api("GET", `/api/threads/${threadId}/messages?limit=50`)).body.messages;
+      return messages.filter((message) => message.role === "user" && message.text === text).length;
+    };
+    let heldMutation: ReturnType<typeof request> | null = null;
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      for (const bot of [working, idle]) {
+        await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      }
+      expect((await api("POST", `/api/bots/${working.id}/messages`, { text: "keep working through the release" })).status).toBe(202);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      expect((await api("POST", `/api/bots/${idle.id}/messages`, { text: "held through a deferred release" })).body)
+        .toMatchObject({ queued: true });
+
+      // A request still reading its body keeps the forced quiesce settling
+      // (it waits up to 15 seconds for work in flight to clear).
+      heldMutation = request({
+        hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
+        headers: { "content-type": "application/json", "content-length": "2" },
+      });
+      heldMutation.on("error", () => {});
+      heldMutation.write("{");
+      const forced = quiesce("POST", "?force=true");
+      await expect.poll(async () => (await runtime()).fencing, SLOW).toBe(true);
+
+      // The release lands mid-settle: kept, not acted on yet.
+      const early = await quiesce("DELETE");
+      expect(early.status).toBe(200);
+      expect(await early.json()).toMatchObject({ releasePending: true, fencing: true, quiescing: true });
+      expect((await runtime()).quiescing).toBe(true);
+
+      // The settle completes, and the release is honoured the moment it does:
+      // the forced request answers unfenced, the snapshot it wrote is consumed
+      // (the interrupted bot resumes), and the held message runs.
+      heldMutation.destroy();
+      heldMutation = null;
+      // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+      const answer = (await (await forced).json()) as { quiescing: boolean; fencing: boolean };
+      expect(answer).toMatchObject({ quiescing: false, fencing: false });
+      expect(await runtime()).toMatchObject({ quiescing: false, fencing: false, draining: false });
+      await expect.poll(() => existsSync(resumePath), SLOW).toBe(false);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+      await expect.poll(() => busy(idle.id), SLOW).toBe(true);
+      expect(await said(idle.threadId, "held through a deferred release")).toBe(1);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+    } finally {
+      heldMutation?.destroy();
+      await quiesce("DELETE");
+      for (const bot of [working, idle]) {
+        await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      }
+      for (const bot of [working, idle]) await expect.poll(() => busy(bot.id), SLOW).toBe(false);
+      for (const bot of [working, idle]) await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+      rmSync(resumePath, { force: true });
+    }
+  }, 240_000);
+
+  it("keeps work a rolled-back forced attempt paused under the hold, and never interrupts it twice", async () => {
+    // Finding 10: every forced attempt that rolled back resumed what it had
+    // interrupted, so the next attempt interrupted it again and its tool calls
+    // repeated, up to ten times an update.  Under a hold, paused work now stays
+    // paused and saved; later attempts add to the same snapshot; letting go
+    // of the hold resumes it once.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    const resumePath = join(home, ".botfleet", "pending-update-resume.json");
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const paused = () => {
+      if (!existsSync(resumePath)) return [];
+      const snapshot: { interruptedBots: Array<{ botId: string }> } = JSON.parse(readFileSync(resumePath, "utf8"));
+      return snapshot.interruptedBots.map((entry) => entry.botId);
+    };
+    const working = (await api("POST", "/api/bots")).body.bot;
+    const busy = async (id: string) =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.busy);
+    const holdAMutation = () => {
+      const held = request({
+        hostname: "127.0.0.1", port: PORT, path: "/api/config", method: "PUT",
+        headers: { "content-type": "application/json", "content-length": "2" },
+      });
+      held.on("error", () => {});
+      held.write("{");
+      return held;
+    };
+    let heldMutation: ReturnType<typeof request> | null = null;
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      await api("PATCH", `/api/bots/${working.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      expect((await api("POST", `/api/bots/${working.id}/messages`, { text: "paused once, resumed once" })).status).toBe(202);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      expect((await quiesce("POST", "?drain=1&timeoutMs=120000")).status).toBe(200);
+
+      // First forced attempt: interrupts the bot, saves it, then cannot finish
+      // (a request still reading its body) and rolls back.  The hold is up,
+      // so the bot stays paused and saved instead of being re-sent its prompt.
+      heldMutation = holdAMutation();
+      const inFlight = async () => {
+        // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+        const answer = (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as { drain: { inFlight: number } | null };
+        return answer.drain?.inFlight ?? 0;
+      };
+      await expect.poll(inFlight, SLOW).toBeGreaterThanOrEqual(2);
+      const first = await quiesce("POST", "?force=true");
+      expect(first.status).toBe(409);
+      expect(await first.json()).toMatchObject({ quiescing: false, draining: true });
+      expect(paused()).toEqual([working.id]);
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      expect(await busy(working.id)).toBe(false);
+
+      // Second forced attempt: nothing to interrupt; the snapshot is the same.
+      const second = await quiesce("POST", "?force=true");
+      expect(second.status).toBe(409);
+      expect(paused()).toEqual([working.id]);
+      expect(await busy(working.id)).toBe(false);
+
+      // The hold converts to the fence once nothing is in flight, keeping the
+      // snapshot for the restart.
+      heldMutation.destroy();
+      heldMutation = null;
+      await expect.poll(async () => (await quiesce("POST")).status, SLOW).toBe(200);
+      expect(paused()).toEqual([working.id]);
+
+      // No restart came: standing down resumes the paused turn, once.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => busy(working.id), SLOW).toBe(true);
+      expect(existsSync(resumePath)).toBe(false);
+    } finally {
+      heldMutation?.destroy();
+      await quiesce("DELETE");
+      await api("POST", `/api/bots/${working.id}/interrupt`, { threadId: working.threadId });
+      await expect.poll(() => busy(working.id), SLOW).toBe(false);
+      await api("DELETE", `/api/bots/${working.id}`);
+      rmSync(carrier, { force: true });
+      rmSync(resumePath, { force: true });
+    }
+  }, 240_000);
+
+  it("releases a fence whose updater stopped renewing its lease, and never fences on a renewal", async () => {
+    // Finding 6: an updater killed between the fence and the shutdown left
+    // every bot refused until someone ran `unquiesce`.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      quiescing: boolean;
+      lease: { expiresAt: number } | null;
+    };
+    try {
+      // A renewal never raises a fence.
+      const stray = await quiesce("POST", "?renew=1&leaseMs=60000");
+      expect(stray.status).toBe(200);
+      expect(await stray.json()).toMatchObject({ renewed: false, quiescing: false, lease: null });
+
+      // Margins sized for a loaded Mac: a renewal every 3 seconds against a
+      // 10-second lease, over 12 seconds, so only a renewed lease survives.
+      const fenced = await quiesce("POST", "?leaseMs=10000");
+      expect(fenced.status).toBe(200);
+      // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+      const first = (await fenced.json()) as { quiescing: boolean; lease: { expiresAt: number } | null };
+      expect(first.quiescing).toBe(true);
+      expect(first.lease?.expiresAt).toBeGreaterThan(Date.now());
+
+      // Renewed, it holds past its first deadline.
+      for (let renewal = 0; renewal < 4; renewal += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+        const renewed = await quiesce("POST", "?renew=1&leaseMs=10000");
+        expect(await renewed.json()).toMatchObject({ renewed: true, quiescing: true });
+      }
+      expect((await runtime()).quiescing).toBe(true);
+
+      // Left alone, it lets go.
+      await expect.poll(async () => (await runtime()).quiescing, { timeout: 45_000, interval: 250 }).toBe(false);
+      expect((await runtime()).lease).toBeNull();
+      expect((await api("GET", "/api/config")).status).toBe(200);
+    } finally {
+      await quiesce("DELETE");
+    }
+  }, 120_000);
+
+  it("holds a room round for an update like other work, and carries it across the fence", async () => {
+    // Finding 7: room messages and rounds were not held, so a room whose bots
+    // kept answering each other kept an update waiting for about six minutes.
+    const owner: { nonce: string } = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const authorization = { Authorization: `Bearer ${owner.nonce}` };
+    const quiesce = (method: "POST" | "DELETE", query = "") =>
+      fetch(`${BASE}/api/runtime/quiesce${query}`, { method, headers: authorization });
+    const SLOW = { timeout: 30_000, interval: 250 };
+    // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+    const runtime = async () => (await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as {
+      drain: { inFlight: number; rooms: number; held: { rooms: number } } | null;
+    };
+    const carrier = join(home, ".botfleet", "update-held-sends.json");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const room = (await api("POST", "/api/groups", { name: "Held room", memberIds: [bot.id] })).body.group;
+    const busy = async () =>
+      Boolean((await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy);
+    try {
+      const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+      await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      await api("PATCH", `/api/groups/${room.id}/setup`, { action: "skip" });
+      await api("PATCH", `/api/groups/${room.id}`, { defaultResponder: { kind: "member", botId: bot.id } });
+
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      // A person's room message lands in the room; the member's reply waits.
+      expect((await api("POST", `/api/groups/${room.id}/messages`, { text: "Held until the update" })).status).toBe(202);
+      await expect.poll(async () => (await runtime()).drain?.held.rooms, SLOW).toBe(1);
+      expect(await busy()).toBe(false);
+      // Held is not in flight, and is not a live room turn to wait for.
+      await expect.poll(async () => (await runtime()).drain?.inFlight, SLOW).toBe(0);
+      expect((await runtime()).drain?.rooms).toBe(0);
+
+      // The fence carries the round for the restart.
+      const fenced = await quiesce("POST");
+      expect(fenced.status).toBe(200);
+      const saved: { rooms: Array<{ groupId: string; botId: string }> } = JSON.parse(readFileSync(carrier, "utf8"));
+      expect(saved.rooms).toEqual([expect.objectContaining({ groupId: room.id, botId: bot.id })]);
+
+      // No restart came: standing down puts the round back and the member answers.
+      expect((await quiesce("DELETE")).status).toBe(200);
+      await expect.poll(() => existsSync(carrier), SLOW).toBe(false);
+      await expect.poll(busy, SLOW).toBe(true);
+
+      // That answer is a live room turn: the one thing the updater still
+      // waits for before it forces (read off the room's speaker).
+      expect((await quiesce("POST", "?drain=1&timeoutMs=60000")).status).toBe(200);
+      await expect.poll(async () => (await runtime()).drain?.rooms, SLOW).toBe(1);
+      expect((await quiesce("DELETE")).status).toBe(200);
+    } finally {
+      await quiesce("DELETE");
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await api("POST", `/api/groups/${room.id}/interrupt`, {});
+      await expect.poll(busy, SLOW).toBe(false);
+      await api("DELETE", `/api/groups/${room.id}`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      rmSync(carrier, { force: true });
+    }
+  }, 120_000);
 
   it("serves packaged UI assets and preserves API 404s", async () => {
     const root = await fetch(`${BASE}/`);
@@ -3024,6 +3507,27 @@ describe("harness HTTP API", () => {
         }, { timeout: 5_000 }).toBe(true);
 
         if (reloadInstanceId === "gatedQuota") {
+          // Assistant text precedes the result frame.  Reloading after text alone
+          // can interrupt a still-active turn instead of its deferred terminal
+          // fold, correctly clearing busy before the successor is posted.
+          // Wait for the terminal event, then prove the held health probe still
+          // owns busy before exercising the targeted reload.
+          await expect.poll(() => {
+            const file = join(home, ".botfleet", "events", `${bot.threadId}.ndjson`);
+            if (!existsSync(file)) return false;
+            return readFileSync(file, "utf8").split("\n").some((line) => {
+              if (!line.trim()) return false;
+              try {
+                return JSON.parse(line).type === "turn.completed";
+              } catch {
+                return false; // The asynchronous log writer may be mid-append.
+              }
+            });
+          }, { timeout: 5_000 }).toBe(true);
+          expect((await api("GET", "/api/bots?messages=0")).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          )?.busy).toBe(true);
+
           reload = api("PATCH", `/api/instances/${reloadInstanceId}`, { fullAuto: true });
           await expect.poll(async () => {
             const transcript = await api("GET", `/api/threads/${bot.threadId}/messages?limit=200`);
@@ -4602,6 +5106,48 @@ describe("harness HTTP API", () => {
     expect((await api("PATCH", `/api/bots/${bot.id}`, { autoStartVps: "yes" })).status).toBe(400);
     const invalid = await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "daytona" });
     expect(invalid.status).toBe(400);
+  });
+
+  it("sends the backend a bot really uses without disturbing the raw value", async () => {
+    // The workspace default fills in for a bot that was never pinned, and the
+    // join route resolves it that way.  A phone deciding whether to offer the
+    // live cloud desktop must see that answer, while the desktop keeps the
+    // stored value to tell an inherited backend from a pinned one.
+    const originalDefault = (await api("GET", "/api/config")).body.botDefaults.cloudBackend ?? "box";
+    const unpinned = (await api("POST", "/api/bots", { name: "Unpinned Backend" })).body.bot;
+    const pinned = (await api("POST", "/api/bots", { name: "Pinned Backend" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${pinned.id}`, { cloudBackend: "box" })).status).toBe(200);
+      const find = async (id: string) =>
+        (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === id);
+
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      let unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("box");
+
+      // The workspace now sends unpinned bots to the VPS: the stored value is
+      // still unset, the effective one follows the default, and a bot pinned
+      // to Box stays on Box.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "vps" } })).status).toBe(200);
+      unpinnedWire = await find(unpinned.id);
+      expect(unpinnedWire.cloudBackend).toBeUndefined();
+      expect(unpinnedWire.effectiveCloudBackend).toBe("vps");
+      const pinnedWire = await find(pinned.id);
+      expect(pinnedWire.cloudBackend).toBe("box");
+      expect(pinnedWire.effectiveCloudBackend).toBe("box");
+
+      // A pin to the VPS wins over a Box default.
+      expect((await api("PUT", "/api/config", { botDefaults: { cloudBackend: "box" } })).status).toBe(200);
+      const repinned = await api("PATCH", `/api/bots/${unpinned.id}`, { cloudBackend: "vps" });
+      expect(repinned.status).toBe(200);
+      expect(repinned.body.bot.cloudBackend).toBe("vps");
+      expect(repinned.body.bot.effectiveCloudBackend).toBe("vps");
+    } finally {
+      await api("DELETE", `/api/bots/${unpinned.id}`);
+      await api("DELETE", `/api/bots/${pinned.id}`);
+      await api("PUT", "/api/config", { botDefaults: { cloudBackend: originalDefault } });
+    }
   });
 
   it("validates a Composio project key, creates a Session, and keeps externally stored secrets off disk", async () => {
@@ -7114,6 +7660,251 @@ describe("PATCH /api/terminology", () => {
   });
 });
 
+describe("PATCH /api/auto-update", () => {
+  const configPath = () => join(home, ".botfleet", "config.json");
+  const readDisk = () => JSON.parse(readFileSync(configPath(), "utf8"));
+
+  it("stores the flag, reports it, and hands clients the same status as every config route", async () => {
+    try {
+      const on = await api("PATCH", "/api/auto-update", { enabled: true });
+      expect(on.status).toBe(200);
+      expect(on.body.autoUpdate).toMatchObject({ enabled: true });
+      expect(readDisk().autoUpdate.enabled).toBe(true);
+      // the phone reads it back from the route it already had
+      expect((await api("GET", "/api/config")).body.autoUpdate.enabled).toBe(true);
+
+      const off = await api("PATCH", "/api/auto-update", { enabled: false });
+      expect(off.status).toBe(200);
+      expect(off.body.autoUpdate).toMatchObject({ enabled: false });
+      expect(readDisk().autoUpdate.enabled).toBe(false);
+    } finally {
+      await api("PATCH", "/api/auto-update", { enabled: false });
+    }
+  });
+
+  it("leaves the updater's own check record alone, so a toggle cannot reset the throttle", async () => {
+    try {
+      expect((await api("PATCH", "/api/auto-update", { enabled: true })).status).toBe(200);
+      // The desktop updater writes these to the same file from another process.
+      const disk = readDisk();
+      disk.autoUpdate = { ...disk.autoUpdate, lastCheckMs: 1_700_000_000_000, lastAppFingerprint: "fp-123" };
+      writeFileSync(configPath(), JSON.stringify(disk, null, 2));
+
+      const off = await api("PATCH", "/api/auto-update", { enabled: false });
+      expect(off.status).toBe(200);
+      expect(readDisk().autoUpdate).toEqual({
+        enabled: false,
+        lastCheckMs: 1_700_000_000_000,
+        lastAppFingerprint: "fp-123",
+      });
+      // and the status reports what is stored, not a stale in-memory copy
+      expect(off.body.autoUpdate).toMatchObject({ enabled: false, lastCheckMs: 1_700_000_000_000 });
+    } finally {
+      const disk = readDisk();
+      delete disk.autoUpdate;
+      writeFileSync(configPath(), JSON.stringify(disk, null, 2));
+      await api("PATCH", "/api/auto-update", { enabled: false });
+    }
+  });
+
+  it("accepts only a boolean `enabled`", async () => {
+    for (const body of [{}, { enabled: "true" }, { enabled: 1 }, { enabled: null }, { autoUpdate: { enabled: true } }]) {
+      expect((await api("PATCH", "/api/auto-update", body)).status, JSON.stringify(body)).toBe(400);
+    }
+  });
+
+  it("is not a side door into the rest of the config file", async () => {
+    const before = await api("GET", "/api/config");
+    const res = await api("PATCH", "/api/auto-update", {
+      enabled: false,
+      profile: { name: "Someone Else" },
+      ingress: { publicUrl: "https://evil.example.com" },
+    });
+    expect(res.status).toBe(200);
+    const after = await api("GET", "/api/config");
+    expect(after.body.profile?.name).toBe(before.body.profile?.name);
+    expect(readDisk().ingress?.publicUrl).not.toBe("https://evil.example.com");
+  });
+});
+
+describe("PATCH /api/bots/:id roster organization fields", () => {
+  const SECTION = "organize-test";
+
+  it("refuses a pinned, hidden or unread value that is not a boolean", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Organize Types" })).body.bot;
+    try {
+      for (const body of [{ pinned: "yes" }, { hidden: 1 }, { unread: null }, { pinned: {} }, { hidden: [] }]) {
+        const res = await api("PATCH", `/api/bots/${bot.id}`, body);
+        expect(res.status, JSON.stringify(body)).toBe(400);
+        expect(res.body.error).toMatch(/must be true or false/);
+      }
+      // the section and the pinned message are typed by the same parse
+      const badSection = await api("PATCH", `/api/bots/${bot.id}`, { section: 4 });
+      expect(badSection.status).toBe(400);
+      expect(badSection.body.error).toMatch(/section must be a string/);
+      const badPin = await api("PATCH", `/api/bots/${bot.id}`, { pinnedMessageId: ["m"] });
+      expect(badPin.status).toBe(400);
+      expect(badPin.body.error).toMatch(/pinnedMessageId must be a message id/);
+      const stored = (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id);
+      expect(stored.pinned).not.toBe("yes");
+      expect(stored.hidden).not.toBe(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("takes the six organize fields and nothing else when the sidecar's phone header is on the request", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Organize Phone" })).body.bot;
+    const stored = async () =>
+      (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id);
+    type PhoneBody = { cloudBackend?: string; pinned?: boolean; color?: string; autoApprove?: boolean; name?: string };
+    const fromPhone = (body: PhoneBody) =>
+      fetch(`${BASE}/api/bots/${bot.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", "x-botfleet-companion": "1" },
+        body: JSON.stringify(body),
+      });
+    try {
+      const before = await stored();
+      for (const body of [
+        { cloudBackend: "vps" },
+        { pinned: true, color: "crimson" },
+        { autoApprove: true },
+        { name: "Renamed From A Phone" },
+      ]) {
+        const res = await fromPhone(body);
+        expect(res.status, JSON.stringify(body)).toBe(403);
+        expect(z.object({ error: z.string() }).parse(await res.json()).error).toMatch(
+          /can only be changed in BotFleet on your computer/,
+        );
+      }
+      const unchanged = await stored();
+      expect(unchanged.color).toBe(before.color);
+      expect(unchanged.name).toBe(before.name);
+      expect(unchanged.autoApprove).toBe(before.autoApprove);
+      expect(unchanged.pinned).toBe(before.pinned);
+
+      // the six still go through, and the desktop (no header) keeps its other fields
+      expect((await fromPhone({ pinned: true })).status).toBe(200);
+      expect((await stored()).pinned).toBe(true);
+      const desktop = await api("PATCH", `/api/bots/${bot.id}`, { pinned: false, color: "crimson" });
+      expect(desktop.status).toBe(200);
+      expect(desktop.body.bot.color).toBe("crimson");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("archives, restores, pins and marks a bot unread, and moves it between sections", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Organize Roundtrip" })).body.bot;
+    try {
+      const archived = await api("PATCH", `/api/bots/${bot.id}`, { hidden: true });
+      expect(archived.status).toBe(200);
+      expect(archived.body.bot).toMatchObject({ id: bot.id, hidden: true });
+      const restored = await api("PATCH", `/api/bots/${bot.id}`, { hidden: false });
+      expect(restored.body.bot).toMatchObject({ hidden: false });
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { pinned: true })).body.bot).toMatchObject({ pinned: true });
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { pinned: false })).body.bot).toMatchObject({ pinned: false });
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { unread: true })).body.bot).toMatchObject({ unread: true });
+
+      const moved = await api("PATCH", `/api/bots/${bot.id}`, { section: `  ${SECTION}  ` });
+      expect(moved.body.bot.section).toBe(SECTION);
+      const tooLong = await api("PATCH", `/api/bots/${bot.id}`, { section: "x".repeat(61) });
+      expect(tooLong.status).toBe(400);
+      const cleared = await api("PATCH", `/api/bots/${bot.id}`, { section: null });
+      expect(cleared.body.bot.section).toBeUndefined();
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("hands the Chief of Staff role over inside a section, and will not archive the chief", async () => {
+    const first = (await api("POST", "/api/bots", { name: "Chief One" })).body.bot;
+    const second = (await api("POST", "/api/bots", { name: "Chief Two" })).body.bot;
+    try {
+      await api("PATCH", `/api/bots/${first.id}`, { section: SECTION });
+      await api("PATCH", `/api/bots/${second.id}`, { section: SECTION });
+      const fleet = async () => (await api("GET", "/api/bots")).body.bots as Array<{ id: string; chiefOfStaff?: boolean }>;
+
+      expect((await api("PATCH", `/api/bots/${first.id}`, { chiefOfStaff: true })).body.bot).toMatchObject({
+        chiefOfStaff: true,
+      });
+      // electing the second demotes the first, in the stored roster
+      expect((await api("PATCH", `/api/bots/${second.id}`, { chiefOfStaff: true })).status).toBe(200);
+      const after = await fleet();
+      expect(after.find((entry) => entry.id === second.id)?.chiefOfStaff).toBe(true);
+      expect(after.find((entry) => entry.id === first.id)?.chiefOfStaff).toBeFalsy();
+
+      // the harness refuses to archive the chief; the demote-then-archive
+      // pair the desktop sends is how a chief is archived
+      const refused = await api("PATCH", `/api/bots/${second.id}`, { hidden: true });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/choose another Chief of Staff/i);
+      const demoted = await api("PATCH", `/api/bots/${second.id}`, { hidden: true, chiefOfStaff: false });
+      expect(demoted.status).toBe(200);
+      expect(demoted.body.bot).toMatchObject({ hidden: true });
+    } finally {
+      await api("DELETE", `/api/bots/${first.id}`);
+      await api("DELETE", `/api/bots/${second.id}`);
+    }
+  });
+});
+
+describe("workspace voice settings", () => {
+  it("hands every client the default voice by id and the pronunciation list in force", async () => {
+    const saved = await api("PUT", "/api/config", { tts: { voice: "jay-wedgeworth-001" } });
+    expect(saved.status).toBe(200);
+    expect(saved.body.tts.voice).toBe("jay-wedgeworth-001");
+    const status = await api("GET", "/api/config");
+    expect(status.body.tts.voice).toBe("jay-wedgeworth-001");
+    // Never saved yet: the seeded list, so a client never has to know it.
+    expect(status.body.tts.pronunciations).toEqual(expect.arrayContaining([
+      { term: "SQL", say: "sequel" },
+      { term: "OAuth", say: "oh auth" },
+    ]));
+  });
+
+  it("saves the list through PUT /api/config with the shared validation", async () => {
+    const ok = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "SQL", say: "S Q L" }] } });
+    expect(ok.status).toBe(200);
+    expect(ok.body.tts.pronunciations).toEqual([{ term: "SQL", say: "S Q L" }]);
+    const dup = await api("PUT", "/api/config", { tts: { pronunciations: [{ term: "a", say: "x" }, { term: "A", say: "y" }] } });
+    expect(dup.status).toBe(400);
+  });
+
+  it("lets the phone's narrow route change the default voice, and nothing else", async () => {
+    const res = await api("PATCH", "/api/tts/default-voice", { voice: "English_Graceful_Lady", profile: { name: "Side Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.voice).toBe("English_Graceful_Lady");
+    expect((await api("GET", "/api/config")).body.profile?.name).not.toBe("Side Door");
+    // A Personal Voice belongs to one device; blank and junk are refused.
+    const personal = await api("PATCH", "/api/tts/default-voice", { voice: "personal:Jay" });
+    expect(personal.status).toBe(400);
+    expect(personal.body.error).toContain("Personal Voices stay on the device");
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "  " })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: "a\u0000b" })).status).toBe(400);
+    expect((await api("PATCH", "/api/tts/default-voice", { voice: 7 })).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.voice).toBe("English_Graceful_Lady");
+    // The MiniMax id is kept exactly; MiniMax ids are case-sensitive.
+    const exact = await api("PATCH", "/api/tts/default-voice", { voice: "jay-wedgeworth-001" });
+    expect(exact.body.tts.voice).toBe("jay-wedgeworth-001");
+  });
+
+  it("lets the phone's narrow route replace the pronunciation list, with a plain-language refusal", async () => {
+    const list = [{ term: "JSON", say: "Jason" }, { term: "kubectl", say: "cube control" }];
+    const res = await api("PATCH", "/api/tts/pronunciations", { pronunciations: list, tts: { voice: "Side_Door" } });
+    expect(res.status).toBe(200);
+    expect(res.body.tts.pronunciations).toEqual(list);
+    expect(res.body.tts.voice).not.toBe("Side_Door");
+    const bad = await api("PATCH", "/api/tts/pronunciations", { pronunciations: [{ term: "JSON", say: "my JSON" }] });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toContain("which is also on the list");
+    expect((await api("PATCH", "/api/tts/pronunciations", {})).status).toBe(400);
+    expect((await api("GET", "/api/config")).body.tts.pronunciations).toEqual(list);
+  });
+});
+
 describe("local Auto consent for inherited and discovered computers", () => {
   it("guards config defaults and per-bot Auto while preserving explicit Off", async () => {
     expect((await api("PUT", "/api/config", {
@@ -7319,9 +8110,14 @@ describe("Local VM lifecycle routes honor the provider toggle", () => {
       expect(on.status).toBe(200);
       // Shared mode allows the bot endpoint to run or create the shared container;
       // it is not blocked by the provider gate or by a legacy App Settings referral.
+      // This harness runs with container runtimes switched off (spawnDetached),
+      // so the request must reach the runtime layer and be refused THERE, with
+      // exactly that message — nothing is created on the machine running the
+      // suite.  An unqualified "no gate text" assertion once let a real
+      // `docker run` through and orphaned the owner's real Local VM container.
       const perBot = await api("POST", `/api/bots/${bot.id}/local-computer/run`, {});
-      expect(String(perBot.body.error ?? "")).not.toContain("turned off in Computer settings");
-      expect(String(perBot.body.error ?? "")).not.toContain("Shared mode manages this desktop in App Settings");
+      expect(perBot.status).toBe(409);
+      expect(perBot.body.error).toBe(CONTAINER_RUNTIME_DISABLED_MESSAGE);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }

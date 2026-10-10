@@ -269,7 +269,7 @@ process.stdin.on("data", (chunk) => {
           });
         } else if (mode === "approval" || mode === "windows-command") {
           const approvalCommand = mode === "windows-command" ? command : "rm -rf scratch";
-          out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: approvalCommand } });
+          out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: approvalCommand, callId: "call-approve" } });
           // turn continues from the approval response handler above
         } else {
           finishTurn();

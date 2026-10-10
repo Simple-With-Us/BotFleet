@@ -1,0 +1,229 @@
+name: PR Autofix
+
+# When a review bot comments on an open pull request, ask Claude Code (through the MiniMax
+# Anthropic endpoint) to make the smallest change that answers it, and push that change to the
+# PR branch.
+#
+# This used to be urcades/pr-autofix.  That action is pinned at its newest commit and could never
+# get past its guard step:  it counts earlier autofix commits with `grep -c ... || echo "0"`, and
+# when there are none `grep -c` prints 0 and exits 1, so the fallback prints a second 0.  The value
+# became "0\n0", the second 0 landed on a line of $GITHUB_OUTPUT that is not name=value, and the
+# runner stopped with "Invalid format '0'" on every run.  The same action also checked out the
+# PR branch without asking whether the PR was still open, so a late bot comment on a merged PR
+# (whose branch is gone) failed at `git checkout`.  Forking it is not allowed here, so its steps
+# live in this file, written so a comment can never reach $GITHUB_OUTPUT or an environment
+# variable.
+#
+# The steps are inline on purpose.  A script in the repository would be read from whichever PR
+# branch is checked out, and an older branch does not have it.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+
+concurrency:
+  group: autofix-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  autofix:
+    if: >
+      (github.event.issue.pull_request || github.event.pull_request) &&
+      (github.event.issue.state || github.event.pull_request.state) == 'open' &&
+      contains(fromJSON('["bot", "Bot"]'), github.event.comment.user.type || github.event.review.user.type || '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    env:
+      ANTHROPIC_BASE_URL: https://api.minimax.io/anthropic
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.MINIMAX_API_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      DEFAULT_MAX_ITERATIONS: "5"
+    steps:
+      - name: Resolve The Pull Request
+        id: pr
+        run: |
+          set -euo pipefail
+          # An issue_comment event carries no head ref, and the PR can have merged or closed since
+          # the event fired, so ask for its current state.
+          info=$(gh pr view "$PR_NUMBER" --json state,headRefName,isCrossRepository)
+          state=$(jq -r '.state' <<< "$info")
+          cross=$(jq -r '.isCrossRepository' <<< "$info")
+          branch=$(jq -r '.headRefName' <<< "$info")
+          if [ "$state" != "OPEN" ] || [ "$cross" = "true" ]; then
+            echo "::notice::PR #$PR_NUMBER is $state (from a fork: $cross), so there is nothing to push to"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "proceed=true"
+            echo "branch=$branch"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check Out The PR Branch
+        if: steps.pr.outputs.proceed == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.pr.outputs.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check The Comment And Build The Prompt
+        id: guard
+        if: steps.pr.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/autofix"
+          mkdir -p "$dir"
+
+          skip() {
+            echo "::notice::$1"
+            echo "should_fix=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # A pull_request_review carries .review, the two comment events carry .comment.  The text
+          # goes to a file, never to a step output or an environment variable:  an output line that
+          # is not name=value is the error this step used to die with, a body that repeated the
+          # heredoc delimiter could write outputs of its own, and one environment string tops out
+          # near 128 KB.
+          author=$(jq -r '(.review // .comment).user.login // empty' "$GITHUB_EVENT_PATH")
+          jq -r '(.review // .comment).body // empty' "$GITHUB_EVENT_PATH" > "$dir/comment.txt"
+          path=$(jq -r '.comment.path // empty' "$GITHUB_EVENT_PATH")
+          line=$(jq -r '.comment.line // .comment.original_line // empty' "$GITHUB_EVENT_PATH")
+
+          # jq prints an empty string as a blank line, so test for any non-blank character.
+          grep -q '[^[:space:]]' "$dir/comment.txt" || skip "Empty comment body, skipping"
+
+          # Settings come from .autofix.yml (allowed_bots list, max_iterations), read with awk
+          # because the file is small and flat.
+          allowed=""
+          max="$DEFAULT_MAX_ITERATIONS"
+          if [ -f .autofix.yml ]; then
+            echo "::notice::Loading config from .autofix.yml"
+            allowed=$(awk '
+              /^allowed_bots:/ { in_list = 1; next }
+              in_list && /^[[:space:]]*-/ {
+                sub(/^[[:space:]]*-[[:space:]]*/, "")
+                sub(/[[:space:]]*#.*$/, "")
+                sub(/[[:space:]]+$/, "")
+                print
+                next
+              }
+              in_list && /^[^[:space:]#-]/ { in_list = 0 }
+            ' .autofix.yml | tr -d "\"'" | paste -sd, -)
+            configured=$(awk '/^max_iterations:/ { print $2; exit }' .autofix.yml)
+            case "$configured" in
+              '' | *[!0-9]*) ;;
+              *) max="$configured" ;;
+            esac
+          fi
+
+          # Lint-style comments are always allowed, anything else must come from a listed bot.
+          # An empty list allows every bot.
+          if grep -qiE '(eslint|prettier|flake8|pylint|rubocop|stylelint|shellcheck|warning:|error:|⚠|❌|\[lint\]|\[style\])' "$dir/comment.txt"; then
+            echo "::notice::Comment matches a lint pattern, allowed regardless of the bot list"
+          elif [ -n "$allowed" ]; then
+            match=0
+            IFS=',' read -r -a bots <<< "$allowed"
+            for bot in "${bots[@]}"; do
+              if [ "$bot" = "$author" ]; then match=1; break; fi
+            done
+            if [ "$match" -ne 1 ]; then
+              skip "Author '$author' is not in the allowed bot list, skipping"
+            fi
+          fi
+
+          # The cap is per PR:  count the autofix commits this branch has that the default branch
+          # does not.  grep -c prints the count and exits 1 when it is 0, so `|| true` and nothing
+          # else keeps the output a single number.  The subject test matches what the Commit step
+          # writes.
+          subjects=$(git log --format=%s "origin/$DEFAULT_BRANCH..HEAD")
+          prior=$(printf '%s\n' "$subjects" | grep -c '^autofix:' || true)
+          iteration=$((prior + 1))
+          if [ "$iteration" -gt "$max" ]; then
+            skip "Iteration limit reached ($iteration > $max), skipping"
+          fi
+
+          # The diff is context only, so cap it.
+          gh pr diff "$PR_NUMBER" 2> /dev/null | head -c 100000 > "$dir/pr.diff" || true
+          if [ "$(wc -c < "$dir/pr.diff")" -ge 100000 ]; then
+            echo "(diff truncated)" >> "$dir/pr.diff"
+          fi
+
+          {
+            echo "You are fixing a code review comment on a pull request.  Make minimal, targeted changes to address the comment."
+            echo
+            echo "## Review Comment"
+            cat "$dir/comment.txt"
+            if [ -n "$path" ]; then
+              echo
+              echo "## Location"
+              echo "File: $path"
+              if [ -n "$line" ]; then
+                echo "Line: $line"
+              fi
+            fi
+            if [ -s "$dir/pr.diff" ]; then
+              echo
+              echo "## PR Diff (for context)"
+              echo '```diff'
+              cat "$dir/pr.diff"
+              echo '```'
+            fi
+            echo
+            echo "## Instructions"
+            echo "- Read the relevant file(s) and understand the context"
+            echo "- Make the minimum change needed to address the review comment"
+            echo "- Do not refactor unrelated code"
+            echo "- Do not add comments explaining the fix unless the review asked for comments"
+            echo "- If the comment is unclear or you cannot determine a fix, make no changes"
+          } > "$dir/prompt.md"
+
+          {
+            echo "should_fix=true"
+            echo "iteration=$iteration"
+            echo "max_iterations=$max"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Autofix iteration $iteration / $max for a comment by $author"
+
+      - name: Install Claude Code
+        if: steps.guard.outputs.should_fix == 'true'
+        run: npm install -g @anthropic-ai/claude-code@2.1.295
+
+      - name: Run The Fix
+        if: steps.guard.outputs.should_fix == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+        run: |
+          echo "::group::Claude Code output"
+          claude --print --dangerously-skip-permissions < "$RUNNER_TEMP/autofix/prompt.md" || true
+          echo "::endgroup::"
+
+      - name: Commit And Push
+        if: steps.guard.outputs.should_fix == 'true'
+        env:
+          BRANCH: ${{ steps.pr.outputs.branch }}
+          ITERATION: ${{ steps.guard.outputs.iteration }}
+          MAX_ITERATIONS: ${{ steps.guard.outputs.max_iterations }}
+        run: |
+          set -euo pipefail
+          # GITHUB_TOKEN may not create or change files under .github/workflows, and GitHub rejects
+          # the whole push when one does.  Leave them out so the rest of the fix still lands.
+          git add -A -- . ':(exclude).github/workflows'
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "autofix: address review comment [$ITERATION/$MAX_ITERATIONS]"
+          git push origin "HEAD:refs/heads/$BRANCH"

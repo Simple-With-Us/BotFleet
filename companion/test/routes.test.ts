@@ -8,7 +8,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  COMPANION_BOT_ORGANIZE_FIELDS,
   COMPANION_PROFILE_PATCH_FIELDS,
+  companionBodyCheck,
+  companionBotOrganizeDenial,
   companionProfilePatchDenial,
   denyReason,
 } from "../src/routes.ts";
@@ -58,8 +61,14 @@ describe("what the app may do", () => {
     ["PATCH", "/api/bots/bot_123/tasks/th_1"],
     ["DELETE", "/api/bots/bot_123/tasks/th_1"],
     ["PATCH", "/api/bots/bot_123/profile"],
+    ["PATCH", "/api/bots/bot_123"],
+    ["DELETE", "/api/bots/bot_123"],
+    ["POST", "/api/bots/apply-model-defaults"],
     ["POST", "/api/bots/bot_123/avatar/generate"],
     ["POST", "/api/bots/bot_123/computer/join"],
+    ["PATCH", "/api/groups/room-1"],
+    ["DELETE", "/api/groups/room-1"],
+    ["PATCH", "/api/auto-update"],
     ["POST", "/api/groups/room-1/messages"],
     ["POST", "/api/groups/room-1/interrupt"],
     ["POST", "/api/groups/room-1/read"],
@@ -77,6 +86,8 @@ describe("what the app may do", () => {
     ["GET", "/api/attachments/avatar-123.webp"],
     ["GET", "/api/tts/voices"],
     ["POST", "/api/tts/speak"],
+    ["PATCH", "/api/tts/default-voice"],
+    ["PATCH", "/api/tts/pronunciations"],
     ["POST", "/api/threads/th_1/messages/msg_2/audio"],
     ["GET", "/api/threads/th_1/messages/msg_2/audio/0"],
     ["GET", "/api/routines"],
@@ -84,11 +95,24 @@ describe("what the app may do", () => {
     ["PATCH", "/api/routines/routine_1"],
     ["DELETE", "/api/routines/routine_1"],
     ["POST", "/api/routines/routine_1/run"],
+    ["POST", "/api/routine-runs/run_1/cancel"],
+    ["POST", "/api/routine-runs/run_1/seen"],
+    ["POST", "/api/routine-runs/seen"],
     ["GET", "/api/connectors/catalog"],
     ["GET", "/api/connectors/connected"],
     ["GET", "/api/connectors"],
     ["POST", "/api/connectors/slack/authorize"],
     ["DELETE", "/api/connectors/slack/accounts/ca_123"],
+    ["GET", "/api/quotas"],
+    ["GET", "/api/tts/usage"],
+    ["GET", "/api/qdrant/status"],
+    ["GET", "/api/jobs"],
+    ["GET", "/api/jobs/job_01JABCDEFGHJKMNPQRSTVWXYZ0/output"],
+    ["POST", "/api/jobs/job_01JABCDEFGHJKMNPQRSTVWXYZ0/stop"],
+    ["POST", "/api/jobs/stop"],
+    ["GET", "/api/bots/bot_123/skills"],
+    ["GET", "/api/bots/bot_123/skills/pdf-tools"],
+    ["PATCH", "/api/bots/bot_123/skills/pdf-tools"],
   ];
 
   for (const [method, path] of calls) {
@@ -120,6 +144,97 @@ describe("what the app may do", () => {
     expect(ask("POST", "/api/update/status")?.status).toBe(404);
     expect(ask("GET", "/api/update/status", false)?.status).toBe(401);
   });
+
+  it("shows the phone the hold an update has on new work through the update status, not the runtime route", () => {
+    // `GET /api/runtime` reports the hold (draining, what is held, when it
+    // ends), but it is loopback plus the harness owner's token and stays
+    // closed to a paired phone.  The same numbers ride on `update.status`,
+    // which the phone already reads and is pushed, so no new route was
+    // needed and a lost phone reaches nothing more.
+    expect(allowed("GET", "/api/update/status")).toBe(true);
+    expect(ask("GET", "/api/runtime")).toEqual({ status: 404, error: "no route: GET /api/runtime" });
+    expect(ask("POST", "/api/runtime/quiesce")?.status).toBe(404);
+    expect(ask("DELETE", "/api/runtime/quiesce")?.status).toBe(404);
+    expect(ask("GET", "/api/update/drain")?.status).toBe(404);
+  });
+});
+
+describe("usage, memory status, jobs and skills", () => {
+  const JOB = "job_01JABCDEFGHJKMNPQRSTVWXYZ0";
+
+  it("reads usage and memory status, and nothing writes to them", () => {
+    for (const path of ["/api/quotas", "/api/tts/usage", "/api/qdrant/status"]) {
+      expect(allowed("GET", path), path).toBe(true);
+      for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+        expect(allowed(method, path), `${method} ${path}`).toBe(false);
+      }
+      expect(ask("GET", path, false)?.status, path).toBe(401);
+    }
+    // the alias for the same handler is not a second door
+    expect(allowed("GET", "/api/recall/status")).toBe(false);
+    // nor is the speech provider's other usage-adjacent surface
+    expect(allowed("GET", "/api/quotas/extra")).toBe(false);
+    expect(allowed("GET", "/api/tts/usage/reset")).toBe(false);
+    expect(allowed("GET", "/api/qdrant/collections")).toBe(false);
+  });
+
+  it("lets the phone list jobs, read one's output and Stop it, with only those verbs", () => {
+    expect(allowed("GET", "/api/jobs")).toBe(true);
+    expect(allowed("GET", `/api/jobs/${JOB}/output`)).toBe(true);
+    expect(allowed("POST", `/api/jobs/${JOB}/stop`)).toBe(true);
+    expect(allowed("POST", "/api/jobs/stop")).toBe(true);
+    // each is exact-method: reading a stop route or posting to an output route is nothing
+    expect(allowed("POST", `/api/jobs/${JOB}/output`)).toBe(false);
+    expect(allowed("GET", `/api/jobs/${JOB}/stop`)).toBe(false);
+    expect(allowed("GET", "/api/jobs/stop")).toBe(false);
+    expect(allowed("DELETE", "/api/jobs")).toBe(false);
+    expect(allowed("POST", "/api/jobs")).toBe(false);
+    expect(allowed("PUT", `/api/jobs/${JOB}/stop`)).toBe(false);
+    expect(ask("GET", "/api/jobs", false)?.status).toBe(401);
+    expect(ask("POST", `/api/jobs/${JOB}/stop`, false)?.status).toBe(401);
+  });
+
+  it("keeps the reads no screen uses closed, and lets no path be smuggled in as a job id", () => {
+    // one job's metadata and the wake-turn cost totals are on the harness but not on the phone
+    expect(allowed("GET", `/api/jobs/${JOB}`)).toBe(false);
+    expect(allowed("GET", "/api/jobs/wake-usage")).toBe(false);
+    // ids are the harness's own `[\w-]+` route pattern;  the `job_<ulid>` shape
+    // is the harness's to judge (it answers 400), so a plain wrong id is forwarded
+    expect(allowed("GET", "/api/jobs/not-a-job/output")).toBe(true);
+    expect(allowed("POST", "/api/jobs/job_short/stop")).toBe(true);
+    for (const id of ["job_../../config", "job_01JABCDEFGHJKMNPQRSTVWXYZ0%2f..", "job.1", "job 1", "..", "a/b"]) {
+      expect(allowed("GET", `/api/jobs/${id}/output`), id).toBe(false);
+      expect(allowed("POST", `/api/jobs/${id}/stop`), id).toBe(false);
+    }
+    expect(allowed("GET", `/api/jobs/${JOB}/output/extra`)).toBe(false);
+    expect(allowed("POST", `/api/jobs/${JOB}/stop/extra`)).toBe(false);
+    // the harness's internal job endpoints are bot-tool plumbing and do not exist off the Mac
+    expect(ask("POST", "/api/internal/jobs/start")?.status).toBe(404);
+    expect(ask("POST", "/api/internal/jobs/kill")?.status).toBe(404);
+  });
+
+  it("lets the phone read skills and switch one on or off, and never import or remove one", () => {
+    expect(allowed("GET", "/api/bots/bot_123/skills")).toBe(true);
+    expect(allowed("GET", "/api/bots/bot_123/skills/pdf-tools")).toBe(true);
+    expect(allowed("PATCH", "/api/bots/bot_123/skills/pdf-tools")).toBe(true);
+    // Import can read a folder off the Mac's disk and is gated only on the
+    // connection being loopback, which the sidecar's is.  Closed, with both
+    // body shapes it takes (`{ folder }` and `{ source }`).
+    expect(allowed("POST", "/api/bots/bot_123/skills")).toBe(false);
+    expect(ask("POST", "/api/bots/bot_123/skills")?.status).toBe(404);
+    // the desktop panel has no remove button, so there is no remove route
+    expect(allowed("DELETE", "/api/bots/bot_123/skills/pdf-tools")).toBe(false);
+    expect(allowed("PUT", "/api/bots/bot_123/skills/pdf-tools")).toBe(false);
+    expect(allowed("PATCH", "/api/bots/bot_123/skills")).toBe(false);
+    expect(allowed("POST", "/api/bots/bot_123/skills/pdf-tools")).toBe(false);
+    // the harness's skill-name charset is lowercase letters, digits and hyphen
+    for (const name of ["PDF-Tools", "pdf_tools", "pdf.tools", "..", "pdf-tools/extra", "pdf%2ftools", "pdf tools"]) {
+      expect(allowed("GET", `/api/bots/bot_123/skills/${name}`), name).toBe(false);
+      expect(allowed("PATCH", `/api/bots/bot_123/skills/${name}`), name).toBe(false);
+    }
+    expect(ask("GET", "/api/bots/bot_123/skills", false)?.status).toBe(401);
+    expect(ask("PATCH", "/api/bots/bot_123/skills/pdf-tools", false)?.status).toBe(401);
+  });
 });
 
 describe("what it may not", () => {
@@ -132,8 +247,8 @@ describe("what it may not", () => {
     // option failed at the tap.  Owner's call: parity (see routes.ts).
     expect(ask("POST", "/api/connectors/slack/authorize")).toBeNull();
     expect(ask("DELETE", "/api/connectors/slack/accounts/ca_123")).toBeNull();
-    // Profile subset and approval answers stay on the phone.  Privilege
-    // fields on profile are still refused by the harness, not widened here.
+    // Profile subset and approval answers stay on the phone.  Connected apps
+    // and host paths on profile are still refused by the allowlist.
     expect(ask("PATCH", "/api/bots/bot_123/profile")).toBeNull();
     expect(ask("POST", "/api/threads/th_1/respond")).toBeNull();
     expect(ask("POST", "/api/threads/th_1/approve-all")).toBeNull();
@@ -144,19 +259,13 @@ describe("what it may not", () => {
       expect(companionProfilePatchDenial({ [field]: "value" }), field).toBeNull();
     }
     for (const field of [
-      "autoApprove",
-      "autoReview",
-      "bypassPermissions",
       "composio",
       "connectorTools",
-      "computers",
       "cloudBackend",
       "autoStartVps",
-      "cwd",
       "extraCwds",
       "userNotes",
       "chiefOfStaff",
-      "approvePeerComms",
       "futurePrivilege",
     ]) {
       expect(companionProfilePatchDenial({ name: "Scout", [field]: true }), field).toEqual({
@@ -164,6 +273,114 @@ describe("what it may not", () => {
         error: `${field} can only be changed in BotFleet on your computer`,
       });
     }
+  });
+
+  it("lets the phone switch computers, the tool-round budget and a bot's folder", () => {
+    // The Computers, round-budget and folder controls of the native bot sheet
+    // shipped (#709, #649) without anyone extending this list, so every save
+    // of any of them came back "can only be changed in BotFleet on your
+    // computer".  What the harness does with each is tested end to end in
+    // companion/test/proxy.test.ts: it checks This Mac against the stored bot
+    // and confines the folder, neither of which the sidecar can see.
+    for (const field of ["computers", "maxToolRounds", "cwd"]) {
+      expect(COMPANION_PROFILE_PATCH_FIELDS, field).toContain(field);
+    }
+    expect(companionProfilePatchDenial({ computers: ["cloud", "vm"] })).toBeNull();
+    expect(companionProfilePatchDenial({ maxToolRounds: null, name: "Scout" })).toBeNull();
+    expect(companionProfilePatchDenial({ cwd: "/Users/jay/Code/BotFleet", name: "Scout" })).toBeNull();
+    expect(companionProfilePatchDenial({ cwd: null })).toBeNull();
+  });
+
+  it("lets the phone set the execution policy, by the 2026-10-09 owner ruling", () => {
+    // #323 (audit BF-IOS-001) kept these on the computer and the native sheet
+    // showed them read-only.  The owner then ruled that bots get bypass
+    // permissions and the rest from the phone too.  What a bot may do on This
+    // Mac is not moved by this list: the harness refuses to turn Auto Mode on
+    // for a bot that can use it, and bypass never answers a host-control
+    // request.  Both are tested against a real harness in
+    // companion/test/proxy.test.ts.
+    for (const field of ["autoApprove", "autoReview", "approvePeerComms", "bypassPermissions"]) {
+      expect(COMPANION_PROFILE_PATCH_FIELDS, field).toContain(field);
+      expect(companionProfilePatchDenial({ [field]: true }), field).toBeNull();
+      expect(companionProfilePatchDenial({ name: "Scout", computers: ["vm"], [field]: true }), field).toBeNull();
+    }
+    expect(companionProfilePatchDenial({ autoReview: "enforce", bypassPermissions: false })).toBeNull();
+    // The neighbours stay refused, and one refused field still refuses the
+    // whole request, including the edits that would have been fine alone.
+    expect(companionProfilePatchDenial({ bypassPermissions: true, composio: true })).toEqual({
+      status: 403,
+      error: "composio can only be changed in BotFleet on your computer",
+    });
+  });
+
+  it("lets the phone play back and annotate its own recordings, and nothing nearby", () => {
+    // The native chat view calls both; they answered "no route".
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording")).toBeNull();
+    expect(ask("PATCH", "/api/threads/th_1/messages/msg_1/recording-review")).toBeNull();
+    // Exactly those two verbs on exactly those two paths, and a device that
+    // has not paired gets neither.
+    expect(ask("PUT", "/api/threads/th_1/messages/msg_1/recording")?.status).toBe(404);
+    expect(ask("DELETE", "/api/threads/th_1/messages/msg_1/recording")?.status).toBe(404);
+    expect(ask("POST", "/api/threads/th_1/messages/msg_1/recording-review")?.status).toBe(404);
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording-review")?.status).toBe(404);
+    expect(allowed("GET", "/api/threads/th_1/messages/msg_1/recording/extra")).toBe(false);
+    expect(allowed("GET", "/api/threads/th_1/messages/msg_1/recording/../../config")).toBe(false);
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/recording", false)?.status).toBe(401);
+    expect(ask("PATCH", "/api/threads/th_1/messages/msg_1/recording-review", false)?.status).toBe(401);
+  });
+
+  it("lets the phone turn a bot Off and back On, and only through the profile route", () => {
+    // The phone's disabled composer has one button, Turn On, so a refusal here
+    // would strand an Off bot on the phone.
+    expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("off");
+    expect(companionProfilePatchDenial({ off: true })).toBeNull();
+    expect(companionProfilePatchDenial({ off: false })).toBeNull();
+    // Switching it is not a way to smuggle a host-control field along.
+    expect(companionProfilePatchDenial({ off: false, composio: true })).toEqual({
+      status: 403,
+      error: "composio can only be changed in BotFleet on your computer",
+    });
+    // The general bot PATCH is on the route list only for roster
+    // organization, behind a field allowlist (see the organize tests below).
+    // Turning a bot Off is still a profile field and nothing else.
+    expect(allowed("PATCH", "/api/bots/b_1")).toBe(true);
+    expect(companionBotOrganizeDenial({ off: true })).toEqual({
+      status: 403,
+      error: "off can only be changed in BotFleet on your computer",
+    });
+    expect(allowed("PATCH", "/api/bots/b_1/profile")).toBe(true);
+  });
+
+  it("lets the phone write per-device voices", () => {
+    expect(COMPANION_PROFILE_PATCH_FIELDS).toContain("voices");
+    expect(companionProfilePatchDenial({ voices: { iphone: "English_Graceful_Lady" } })).toBeNull();
+    expect(companionProfilePatchDenial({ voices: null, speechDevices: ["mac", "iphone"] })).toBeNull();
+  });
+
+  it("accepts the profile body the phone's Duplicate Bot sends", () => {
+    // `POST /api/bots` then `PATCH /api/bots/:id/profile` with the fields the
+    // phone owns.  The iOS client (BotDuplicate.profilePatch) keeps to exactly
+    // these keys; the sidecar refuses a body with any other, so if this list
+    // ever narrows, Duplicate Bot would start failing at the second request.
+    expect(allowed("POST", "/api/bots")).toBe(true);
+    expect(allowed("PATCH", "/api/bots/bot_new/profile")).toBe(true);
+    const body = {
+      name: "Scout copy",
+      title: "Researcher",
+      description: "Reads things",
+      notifications: false,
+      avatarUrl: "/api/attachments/face.png",
+      avatarCrop: "circle",
+      voice: "English_Graceful_Lady",
+      modelSelection: { instanceId: "claude", model: "sonnet", fallbacks: [] },
+    };
+    expect(companionProfilePatchDenial(body)).toBeNull();
+  });
+
+  it("permits a device-qualified clip GET", () => {
+    // The sidecar matches the path with the query removed and forwards the
+    // query untouched, so `?device=` needs no allowlist entry of its own.
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/audio/0")).toBeNull();
   });
 
   it("permits message-linked audio but not arbitrary attachment audio", () => {
@@ -239,6 +456,32 @@ describe("what it may not", () => {
     expect(ask("POST", "/api/routines/routine_1/run")).toBeNull();
   });
 
+  it("lets the phone cancel a routine run and mark runs seen, and nothing else about them", () => {
+    expect(ask("POST", "/api/routine-runs/run_1/cancel")).toBeNull();
+    expect(ask("POST", "/api/routine-runs/run_1/seen")).toBeNull();
+    // The sweep that marks every failure seen.
+    expect(ask("POST", "/api/routine-runs/seen")).toBeNull();
+    // Method is part of the allowance.
+    for (const method of ["GET", "PUT", "PATCH", "DELETE"]) {
+      expect(ask(method, "/api/routine-runs/run_1/cancel")?.status, method).toBe(404);
+      expect(ask(method, "/api/routine-runs/run_1/seen")?.status, method).toBe(404);
+      expect(ask(method, "/api/routine-runs/seen")?.status, method).toBe(404);
+    }
+    // Only those two action words, and the runs listing is not a route.
+    expect(ask("POST", "/api/routine-runs/run_1/retry")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/run_1")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs")?.status).toBe(404);
+    expect(ask("GET", "/api/routine-runs")?.status).toBe(404);
+    // Anchored at both ends: no traversal, no trailing segment, no encoded dot.
+    expect(ask("POST", "/api/routine-runs/../config/cancel")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/run_1/cancel/extra")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/run%2E1/cancel")?.status).toBe(404);
+    expect(ask("POST", "/api/routine-runs/seen/extra")?.status).toBe(404);
+    // And it is still a paired-device route rather than an open one.
+    expect(ask("POST", "/api/routine-runs/run_1/cancel", false)?.status).toBe(401);
+    expect(ask("POST", "/api/routine-runs/seen", false)?.status).toBe(401);
+  });
+
   it("denies the peer-agent endpoints exist at all", () => {
     expect(ask("GET", "/api/internal/peers")?.status).toBe(404);
     expect(ask("POST", "/api/internal/ask-bot")?.status).toBe(404);
@@ -262,14 +505,22 @@ describe("what it may not", () => {
   // and deleting a bot are the same path.
   it("allows a path only for the methods it was allowed for", () => {
     expect(allowed("GET", "/api/bots")).toBe(true);
-    expect(allowed("DELETE", "/api/bots/bot_123")).toBe(false);
+    // a bot id is one path segment: the bare resource takes exactly the
+    // verbs listed, and nothing nested under it by accident
+    expect(allowed("DELETE", "/api/bots/bot_123")).toBe(true);
+    expect(allowed("PUT", "/api/bots/bot_123")).toBe(false);
+    expect(allowed("GET", "/api/bots/bot_123")).toBe(false);
+    expect(allowed("DELETE", "/api/bots/bot_123/profile")).toBe(false);
+    expect(allowed("DELETE", "/api/bots/bot_123/messages")).toBe(false);
     expect(allowed("POST", "/api/threads/th_1/messages")).toBe(false);
     expect(allowed("GET", "/api/groups/room-1")).toBe(false);
-    expect(allowed("PATCH", "/api/bots/bot_123")).toBe(false);
+    expect(allowed("PUT", "/api/groups/room-1")).toBe(false);
     expect(allowed("PATCH", "/api/bots/bot_123/profile/execution-policy")).toBe(false);
     expect(allowed("PUT", "/api/config")).toBe(false);
     expect(allowed("GET", "/api/attachments/../config.json")).toBe(false);
-    expect(allowed("POST", "/api/routine-runs/run_1/cancel")).toBe(false);
+    // Cancelling and marking a run seen are allowed (see the routine-runs
+    // test below); every other way to reach a run still is not.
+    expect(allowed("GET", "/api/routine-runs/run_1/cancel")).toBe(false);
     expect(allowed("DELETE", "/api/connectors/slack")).toBe(false);
     expect(allowed("GET", "/api/connectors/connected/all")).toBe(false);
     // listing, authorizing and detaching ONE account are allowed; an account
@@ -278,7 +529,9 @@ describe("what it may not", () => {
     expect(allowed("DELETE", "/api/connectors/slack/accounts/ca_123")).toBe(true);
     expect(allowed("DELETE", "/api/connectors/slack/accounts/../../config")).toBe(false);
     expect(allowed("POST", "/api/connectors/slack/authorize/extra")).toBe(false);
-    expect(allowed("DELETE", "/api/groups/room-1")).toBe(false);
+    expect(allowed("DELETE", "/api/groups/room-1")).toBe(true);
+    expect(allowed("DELETE", "/api/groups/room-1/messages")).toBe(false);
+    expect(allowed("DELETE", "/api/groups/room-1/extra")).toBe(false);
   });
 
   // Patterns are anchored, so a path that merely starts right is still a
@@ -353,5 +606,153 @@ describe("settings display preferences", () => {
     expect(ask("PATCH", "/api/features", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/room-turn-timeout", false)?.status).toBe(401);
     expect(ask("PATCH", "/api/profile", false)?.status).toBe(401);
+  });
+});
+
+describe("roster organization", () => {
+  it("opens the bot PATCH for the six organize fields and no others", () => {
+    expect([...COMPANION_BOT_ORGANIZE_FIELDS].sort()).toEqual(
+      ["chiefOfStaff", "hidden", "pinned", "pinnedMessageId", "section", "unread"].sort(),
+    );
+    expect(companionBotOrganizeDenial({ hidden: true })).toBeNull();
+    expect(companionBotOrganizeDenial({ hidden: false })).toBeNull();
+    expect(companionBotOrganizeDenial({ pinned: true })).toBeNull();
+    expect(companionBotOrganizeDenial({ unread: true })).toBeNull();
+    expect(companionBotOrganizeDenial({ chiefOfStaff: false })).toBeNull();
+    expect(companionBotOrganizeDenial({ section: "Work" })).toBeNull();
+    expect(companionBotOrganizeDenial({ section: null })).toBeNull();
+    expect(companionBotOrganizeDenial({ pinnedMessageId: "msg_1-a" })).toBeNull();
+    expect(companionBotOrganizeDenial({ pinnedMessageId: null })).toBeNull();
+    expect(companionBotOrganizeDenial({ pinnedMessageId: "" })).toBeNull();
+    // several at once is fine: the desktop archives and demotes in one save
+    expect(companionBotOrganizeDenial({ hidden: true, chiefOfStaff: false })).toBeNull();
+  });
+
+  it("refuses every field the bot PATCH reads that is not an organize field", () => {
+    // The keys the harness handler reads, plus a name nobody has invented
+    // yet.  Each one alone, and each one riding along with a legitimate
+    // organize field: the whole request fails either way.
+    for (const field of [
+      "autoApprove",
+      "bypassPermissions",
+      "alwaysAllow",
+      "autoReview",
+      "approvePeerComms",
+      "acknowledgeLocalAuto",
+      "computers",
+      "computer",
+      "composio",
+      "cloudBackend",
+      "autoStartVps",
+      "gitWorktreeLeases",
+      "cwd",
+      "color",
+      "mascotExpression",
+      "name",
+      "title",
+      "modelSelection",
+      "requireAvailableModel",
+      "off",
+      "playbooks",
+      "futurePrivilege",
+    ]) {
+      const expected = {
+        status: 403,
+        error: `${field} can only be changed in BotFleet on your computer`,
+      };
+      expect(companionBotOrganizeDenial({ [field]: true }), field).toEqual(expected);
+      expect(companionBotOrganizeDenial({ pinned: true, [field]: true }), `${field} beside pinned`).toEqual(expected);
+    }
+  });
+
+  it("checks value types the harness would store as sent", () => {
+    for (const field of ["hidden", "pinned", "unread", "chiefOfStaff"]) {
+      for (const bad of ["true", 1, 0, null, {}, [], "false"]) {
+        expect(companionBotOrganizeDenial({ [field]: bad }), `${field}=${JSON.stringify(bad)}`).toEqual({
+          status: 400,
+          error: `${field} must be true or false`,
+        });
+      }
+    }
+    for (const bad of [1, true, {}, []]) {
+      expect(companionBotOrganizeDenial({ section: bad })?.status).toBe(400);
+    }
+    for (const bad of [1, true, {}, [], "../etc/passwd", "a b", "x/y"]) {
+      expect(companionBotOrganizeDenial({ pinnedMessageId: bad })?.status, JSON.stringify(bad)).toBe(400);
+    }
+    expect(companionBotOrganizeDenial({})).toEqual({ status: 400, error: "nothing to save" });
+  });
+
+  it("picks the right body check for each filtered route, and none for the rest", () => {
+    expect(companionBodyCheck("PATCH", "/api/bots/b_1/profile")).not.toBeNull();
+    expect(companionBodyCheck("PATCH", "/api/bots/b_1")).toBe(companionBotOrganizeDenial);
+    expect(companionBodyCheck("DELETE", "/api/bots/b_1")).toBeNull();
+    expect(companionBodyCheck("PATCH", "/api/bots/b_1/tasks/t_1")).toBeNull();
+    expect(companionBodyCheck("PATCH", "/api/groups/room-1")).toBeNull();
+  });
+
+  it("deletes a bot or a room only with the DELETE verb, on the bare resource", () => {
+    expect(allowed("DELETE", "/api/bots/bot_123")).toBe(true);
+    expect(allowed("DELETE", "/api/groups/room-1")).toBe(true);
+    expect(ask("DELETE", "/api/bots/bot_123", false)?.status).toBe(401);
+    expect(ask("DELETE", "/api/groups/room-1", false)?.status).toBe(401);
+    // an encoded traversal fails to match and is denied
+    expect(allowed("DELETE", "/api/bots/..%2Fgroups%2Froom-1")).toBe(false);
+    expect(allowed("DELETE", "/api/bots/")).toBe(false);
+    expect(allowed("DELETE", "/api/bots")).toBe(false);
+    expect(allowed("DELETE", "/api/groups")).toBe(false);
+  });
+
+  it("covers Pin Message on a room through the room PATCH it already had", () => {
+    expect(allowed("PATCH", "/api/groups/room-1")).toBe(true);
+    expect(ask("PATCH", "/api/groups/room-1", false)?.status).toBe(401);
+  });
+});
+
+describe("model defaults and automatic updates", () => {
+  it("lets the phone apply model defaults, and keeps the computer defaults on the Mac", () => {
+    expect(allowed("POST", "/api/bots/apply-model-defaults")).toBe(true);
+    expect(allowed("GET", "/api/bots/apply-model-defaults")).toBe(false);
+    expect(allowed("POST", "/api/bots/apply-model-defaults/extra")).toBe(false);
+    expect(ask("POST", "/api/bots/apply-model-defaults", false)?.status).toBe(401);
+    // Computer grants for every bot are not a phone decision, and the
+    // refusal says so rather than reading as a bug in the companion.
+    expect(ask("POST", "/api/bots/apply-defaults")).toEqual({
+      status: 403,
+      error: "computer defaults for every bot are set on your computer",
+    });
+  });
+
+  it("opens one narrow route for the automatic update preference, not the config", () => {
+    expect(allowed("PATCH", "/api/auto-update")).toBe(true);
+    expect(allowed("PUT", "/api/auto-update")).toBe(false);
+    expect(allowed("POST", "/api/auto-update")).toBe(false);
+    expect(allowed("GET", "/api/auto-update")).toBe(false);
+    expect(allowed("PATCH", "/api/auto-update/extra")).toBe(false);
+    expect(ask("PATCH", "/api/auto-update", false)?.status).toBe(401);
+    // the preference is still readable where it always was, as a boolean
+    expect(allowed("GET", "/api/config")).toBe(true);
+    expect(allowed("PATCH", "/api/config")).toBe(false);
+    expect(allowed("PUT", "/api/config")).toBe(false);
+  });
+});
+
+describe("workspace voice settings", () => {
+  it("lets the phone change the default voice and the pronunciation list, and nothing else under tts", () => {
+    expect(allowed("PATCH", "/api/tts/default-voice")).toBe(true);
+    expect(allowed("PATCH", "/api/tts/pronunciations")).toBe(true);
+    expect(allowed("PUT", "/api/tts/default-voice")).toBe(false);
+    expect(allowed("POST", "/api/tts/pronunciations")).toBe(false);
+    expect(allowed("GET", "/api/tts/pronunciations")).toBe(false);
+    expect(allowed("PATCH", "/api/tts/default-voice/extra")).toBe(false);
+    expect(allowed("PATCH", "/api/tts/key")).toBe(false);
+    expect(allowed("POST", "/api/tts/voice-clone")).toBe(false);
+    expect(allowed("PATCH", "/api/config")).toBe(false);
+    expect(allowed("PUT", "/api/config")).toBe(false);
+  });
+
+  it("still refuses an unpaired device", () => {
+    expect(ask("PATCH", "/api/tts/default-voice", false)?.status).toBe(401);
+    expect(ask("PATCH", "/api/tts/pronunciations", false)?.status).toBe(401);
   });
 });
