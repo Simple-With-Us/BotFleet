@@ -41,6 +41,10 @@ import {
   vpsSyncCliCredentials,
   resetVpsCliSyncThrottle,
   reuseVps,
+  resetVpsImageBuildState,
+  vpsImageBuildState,
+  vpsPrepareImageAhead,
+  vpsSwitchToPreparedImage,
   type VpsCommandRunner,
 } from "./vps-computer.ts";
 import { computerReach, type ComputerCapabilityFlags } from "./computer-capability.ts";
@@ -159,7 +163,7 @@ function fixture({
             },
           },
            Id: containerId,
-          Image: state.image ? state.containerImageId : "old-image-id",
+          Image: state.containerImageId,
           HostConfig: {
             Binds: mounts ? ["/host:/container"] : [],
             VolumesFrom: [],
@@ -1102,5 +1106,205 @@ describe("runnerFailureDetail", () => {
     expect(runnerFailureDetail("docker: failed with VNC_PW=hunter2 in the command line", 1)).toContain(
       "VNC_PW=<redacted>",
     );
+  });
+});
+
+describe("VPS image build-ahead and switch", () => {
+  const SHARED: AppConfig = { vps: { sshAlias: "production-vps" }, botDefaults: { vpsMode: "shared" } };
+  const STALE_IMAGE_ID = `sha256:${"c".repeat(64)}`;
+  // A shared container still running on the previous IMAGE_LAYER_VERSION:
+  // the new pinned tag is absent until the build, and once it exists the
+  // container is still on the old image id.
+  const staleShared = () =>
+    fixture({ image: false, containerImageId: STALE_IMAGE_ID, containerName: SHARED_VPS_TARGET.containerName });
+  const gated = (runner: VpsCommandRunner) => {
+    let release!: () => void;
+    let fail: ((error: Error) => void) | undefined;
+    const gate = new Promise<void>((resolve, reject) => {
+      release = resolve;
+      fail = reject;
+    });
+    const wrapped: VpsCommandRunner = async (args, options) => {
+      if (args[2] === "build") await gate;
+      return runner(args, options);
+    };
+    return { runner: wrapped, release: () => release(), fail: (error: Error) => fail?.(error) };
+  };
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const builds = (calls: Array<{ args: string[] }>) => calls.filter(({ args }) => args[2] === "build").length;
+
+  beforeEach(() => resetVpsImageBuildState());
+  afterEach(() => resetVpsImageBuildState());
+
+  it("reports a running container on a stale image as outdated, never as clean and ready", async () => {
+    const fake = staleShared();
+    const status = await vpsComputerStatus(SHARED, "workspace", fake.runner);
+    expect(status.container).toBe("running");
+    expect(status.image).toBe(false);
+    expect(status.imageOutdated).toBe(true);
+    expect(status.ready).toBe(false);
+    expect(status.imageBuild.phase).toBe("idle");
+    expect(status.problem).toMatch(/Prepare the pinned BotFleet CUA image/);
+  });
+
+  it("builds once for concurrent presses while the old container keeps running", async () => {
+    const fake = staleShared();
+    const gate = gated(fake.runner);
+    const first = await vpsPrepareImageAhead(SHARED, gate.runner);
+    const second = await vpsPrepareImageAhead(SHARED, gate.runner);
+    expect(first.phase).toBe("building");
+    expect(second.phase).toBe("building");
+    expect(second.startedAt).toBe(first.startedAt);
+    await settle();
+
+    const during = await vpsComputerStatus(SHARED, "workspace", gate.runner);
+    expect(during.imageBuild.phase).toBe("building");
+    expect(during.imageBuild.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(during.container).toBe("running");
+
+    gate.release();
+    await settle();
+    await settle();
+    expect(builds(fake.calls)).toBe(1);
+    // nothing touched the running container while the image built
+    expect(fake.calls.some(({ args }) => ["rm", "stop", "run"].includes(args[2]!))).toBe(false);
+
+    const after = await vpsComputerStatus(SHARED, "workspace", fake.runner);
+    expect(after.image).toBe(true);
+    expect(after.imageBuild.phase).toBe("ready");
+    expect(after.imageOutdated).toBe(true);
+    expect(after.ready).toBe(false);
+  });
+
+  it("lets a provision that needs the image join the build already running", async () => {
+    const fake = fixture({ image: false, container: false });
+    const gate = gated(fake.runner);
+    await vpsPrepareImageAhead(CONFIG, gate.runner);
+    await settle();
+    const provision = vpsComputerAction("provision", CONFIG, BOT_ID, gate.runner);
+    await settle();
+    gate.release();
+    const status = await provision;
+    expect(status.ready).toBe(true);
+    expect(builds(fake.calls)).toBe(1);
+  });
+
+  it("skips the build when the pinned image is already on the VPS", async () => {
+    const fake = fixture();
+    await vpsPrepareImageAhead(CONFIG, fake.runner);
+    await settle();
+    await settle();
+    expect(builds(fake.calls)).toBe(0);
+    expect(vpsImageBuildState("production-vps", true).phase).toBe("ready");
+  });
+
+  it("records a failed build for the panel without an unhandled rejection, and a retry can succeed", async () => {
+    const fake = staleShared();
+    const gate = gated(fake.runner);
+    await vpsPrepareImageAhead(SHARED, gate.runner);
+    await settle();
+    gate.fail(new Error("docker build exited 1: \u001b[31mno space left on device\u001b[0m"));
+    await settle();
+    await settle();
+    const failed = await vpsComputerStatus(SHARED, "workspace", fake.runner);
+    expect(failed.imageBuild.phase).toBe("failed");
+    expect(failed.imageBuild.error).toContain("no space left on device");
+    expect(failed.imageBuild.error).not.toContain("\u001b");
+
+    await vpsPrepareImageAhead(SHARED, fake.runner);
+    await settle();
+    await settle();
+    const retried = await vpsComputerStatus(SHARED, "workspace", fake.runner);
+    expect(retried.imageBuild.phase).toBe("ready");
+    expect(retried.image).toBe(true);
+  });
+
+  it("refuses to switch before the new image is ready", async () => {
+    const fake = staleShared();
+    await expect(vpsSwitchToPreparedImage(SHARED, fake.runner)).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringMatching(/isn't ready yet/),
+    });
+    expect(fake.calls.some(({ args }) => ["rm", "run"].includes(args[2]!))).toBe(false);
+  });
+
+  it("refuses to switch while the image is still building", async () => {
+    const fake = staleShared();
+    const gate = gated(fake.runner);
+    await vpsPrepareImageAhead(SHARED, gate.runner);
+    await settle();
+    await expect(vpsSwitchToPreparedImage(SHARED, gate.runner)).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringMatching(/still building/),
+    });
+    expect(fake.calls.some(({ args }) => ["rm", "run"].includes(args[2]!))).toBe(false);
+    gate.release();
+    await settle();
+  });
+
+  it("refuses outside shared mode, with no container, or when already current", async () => {
+    await expect(vpsSwitchToPreparedImage(CONFIG, fixture().runner)).rejects.toMatchObject({ status: 409 });
+    const missing = fixture({ container: false, containerName: SHARED_VPS_TARGET.containerName });
+    await expect(vpsSwitchToPreparedImage(SHARED, missing.runner)).rejects.toThrow(/No shared VPS container/);
+    const current = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+    await expect(vpsSwitchToPreparedImage(SHARED, current.runner)).rejects.toThrow(/already runs the current image/);
+    expect(current.calls.some(({ args }) => args[2] === "rm")).toBe(false);
+  });
+
+  it("switches a stale container onto the prepared image without rebuilding it", async () => {
+    const fake = staleShared();
+    await vpsPrepareImageAhead(SHARED, fake.runner);
+    await settle();
+    await settle();
+    const buildsBefore = builds(fake.calls);
+    expect(buildsBefore).toBe(1);
+
+    const status = await vpsSwitchToPreparedImage(SHARED, fake.runner);
+    expect(status.ready).toBe(true);
+    expect(status.imageOutdated).toBe(false);
+    expect(builds(fake.calls)).toBe(buildsBefore);
+    const rm = fake.calls.findIndex(({ args }) => args[2] === "rm" && args[3] === "-f" && args[4] === CONTAINER_ID);
+    const run = fake.calls.findIndex(({ args }) => args[2] === "run");
+    expect(rm).toBeGreaterThanOrEqual(0);
+    expect(run).toBeGreaterThan(rm);
+    expect(fake.calls[run]!.args.at(-1)).toBe(IMAGE_ID);
+  });
+
+  it("does not offer a swap for label drift on the pinned image, and still refuses to call it ready", async () => {
+    // A container on the pinned image id whose own labels drifted: bots
+    // refuse it, but replacing it would not be an image switch, so it is not
+    // "outdated" and the destructive swap is not offered.
+    const drifted = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+    const runner: VpsCommandRunner = async (args, options) => {
+      const out = await drifted.runner(args, options);
+      if (args[2] !== "inspect") return out;
+      const parsed = JSON.parse(out.stdout) as Array<{ Config: { Labels: Record<string, string> } }>;
+      parsed[0]!.Config.Labels[VPS_VIEWER_LABEL] = "0";
+      return { ...out, stdout: JSON.stringify(parsed) };
+    };
+    const status = await vpsComputerStatus(SHARED, "workspace", runner);
+    expect(status.imageMatches).toBe(false);
+    expect(status.imageOutdated).toBe(false);
+    expect(status.ready).toBe(false);
+    await expect(vpsSwitchToPreparedImage(SHARED, runner)).rejects.toThrow(/already runs the current image/);
+  });
+
+  it("reads an image with null labels as not the pinned image rather than a transport failure", async () => {
+    const fake = fixture();
+    const runner: VpsCommandRunner = async (args, options) => {
+      if (args[2] === "image") {
+        return { stdout: JSON.stringify([{ Id: IMAGE_ID, Config: { Labels: null } }]), stderr: "" };
+      }
+      return fake.runner(args, options);
+    };
+    const status = await vpsComputerStatus(CONFIG, BOT_ID, runner);
+    expect(status.daemonUp).toBe(true);
+    expect(status.image).toBe(false);
+  });
+
+  it("refuses a container BotFleet did not create", async () => {
+    const fake = fixture({ managed: false, containerImageId: STALE_IMAGE_ID, containerName: SHARED_VPS_TARGET.containerName });
+    await expect(vpsSwitchToPreparedImage(SHARED, fake.runner)).rejects.toThrow(/did not create/);
+    expect(fake.calls.some(({ args }) => args[2] === "rm")).toBe(false);
   });
 });

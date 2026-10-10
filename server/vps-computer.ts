@@ -5,6 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { createConnection, createServer, type AddressInfo } from "node:net";
+import { z } from "zod";
 
 import {
   BASE_IMAGE,
@@ -267,6 +268,16 @@ export interface VpsComputerStatus {
   container_name: string;
   container_id: string | null;
   image_id: string | null;
+  /** The image the running container was actually started from.  Bots refuse
+   *  a container when this differs from `image_id`; label drift alone does
+   *  NOT trigger the refuse / swap because the swap destroys the container
+   *  filesystem. */
+  container_image_id: string | null;
+  /** The host's pinned-image build: idle, building, failed, or ready. */
+  imageBuild: VpsImageBuildState;
+  /** A BotFleet container exists but is not on the pinned image, so bots
+   *  refuse it until it is switched (see vpsContainerOutdated). */
+  imageOutdated: boolean;
 }
 
 function containerNamePart(botId: string): string {
@@ -524,6 +535,9 @@ function emptyStatus(target: VpsTarget, alias: string | null): VpsComputerStatus
     container_name: target.containerName,
     container_id: null,
     image_id: null,
+    container_image_id: null,
+    imageBuild: { phase: "idle", startedAt: null, elapsedMs: null, error: null },
+    imageOutdated: false,
   };
 }
 
@@ -648,6 +662,14 @@ async function computeVpsComputerStatus(
   botId: string,
   runner: VpsCommandRunner,
 ): Promise<VpsComputerStatus> {
+  return withImageBuildState(await inspectVpsComputer(cfg, botId, runner), vpsSshAlias(cfg));
+}
+
+async function inspectVpsComputer(
+  cfg: AppConfig,
+  botId: string,
+  runner: VpsCommandRunner,
+): Promise<VpsComputerStatus> {
   const alias = vpsSshAlias(cfg);
   const target = vpsTargetFor(cfg, botId);
   const status = emptyStatus(target, alias);
@@ -658,15 +680,12 @@ async function computeVpsComputerStatus(
 
   let inspectedImageId: string | null = null;
   try {
-    const inspected = JSON.parse((await run(["image", "inspect", VPS_IMAGE])).stdout) as Array<{
-      Id?: string;
-      id?: string;
-      Config?: { Labels?: Record<string, string> };
-      config?: { Labels?: Record<string, string>; labels?: Record<string, string> };
-    }>;
+    const inspected = VpsDockerImageInspectSchema.parse(
+      JSON.parse((await run(["image", "inspect", VPS_IMAGE])).stdout),
+    );
     status.daemonUp = true;
     const image = inspected[0];
-    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels;
+    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels ?? undefined;
     const imageId = image?.Id ?? image?.id;
     inspectedImageId = imageId && IMAGE_ID.test(imageId) ? imageId : null;
     status.image_id = inspectedImageId;
@@ -726,6 +745,8 @@ async function computeVpsComputerStatus(
       detail?.Image === inspectedImageId &&
       imageLabelsMatch(labels) &&
       labels?.[VPS_VIEWER_LABEL] === VIEWER_VERSION;
+    const containerImageRef = detail?.Image;
+    status.container_image_id = containerImageRef && IMAGE_ID.test(containerImageRef) ? containerImageRef : null;
     const managedFlag =
       labels?.[VPS_MANAGED_LABEL] === "1" ||
       LEGACY_VPS_MANAGED_LABELS.some((key) => labels?.[key] === "1");
@@ -857,7 +878,9 @@ export async function vpsComputerStatus(
   const cacheable = runner === defaultRunner && key !== null;
   if (cacheable) {
     const cached = statusCache.get(key);
-    if (cached && cached.expiresAt > Date.now()) return cached.status;
+    // The build phase and its elapsed time are re-derived on every poll; only
+    // the SSH inspection is served from the cache.
+    if (cached && cached.expiresAt > Date.now()) return withImageBuildState(cached.status, vpsSshAlias(cfg));
   }
   const status = await computeVpsComputerStatus(cfg, botId, runner);
   if (cacheable) statusCache.set(key, { status, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
@@ -947,12 +970,236 @@ function assertUsableContainer(status: VpsComputerStatus) {
   }
 }
 
-async function prepareVpsImage(alias: string, runner: VpsCommandRunner) {
+async function buildVpsImage(alias: string, runner: VpsCommandRunner) {
   await runner(vpsDockerArgs(alias, ["pull", BASE_IMAGE]), { timeoutMs: 10 * 60_000 });
   await runner(vpsDockerArgs(alias, ["build", "-t", VPS_IMAGE, "-"]), {
     input: managedImageDockerfile(),
     timeoutMs: MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   });
+}
+
+// ── Image build-ahead ─────────────────────────────────────────────────────
+// The pinned image belongs to the VPS host, not to a container, so its build
+// is single-flight per SSH alias.  A provision that finds no container and a
+// "Prepare Image" press from Settings share one `docker build`, and neither
+// ever runs two builds of the same tag at once.  The build deliberately does
+// NOT hold the lifecycle lock: that lock gives up after 5 seconds, and a
+// 20 to 45 minute build under it would 409 every bot's turn-start provision.
+
+export type VpsImageBuildPhase = "idle" | "building" | "failed" | "ready";
+
+export interface VpsImageBuildState {
+  phase: VpsImageBuildPhase;
+  /** Epoch ms the running (or last) build started; null when none has run. */
+  startedAt: number | null;
+  /** Milliseconds since startedAt, measured on the harness clock so the
+   *  panel's elapsed time never depends on the viewer's clock. */
+  elapsedMs: number | null;
+  /** Why the last build failed; set only in the "failed" phase. */
+  error: string | null;
+}
+
+interface VpsImageBuildRecord {
+  flight: Promise<void> | null;
+  startedAt: number;
+  error: string | null;
+}
+
+const imageBuilds = new Map<string, VpsImageBuildRecord>();
+
+/** Test hook: forget every build record (a real harness starts empty). */
+export function resetVpsImageBuildState(): void {
+  imageBuilds.clear();
+}
+
+function forgetStatusCacheForAlias(alias: string) {
+  for (const key of statusCache.keys()) {
+    if (key.startsWith(`${alias}:`)) statusCache.delete(key);
+  }
+}
+
+/** The phase is derived from the inspected image where it can be: "ready"
+ * means the pinned image is present with matching labels, whatever this
+ * process remembers, so a harness restart mid-build recovers the truth on
+ * the next poll.  Only "building" and "failed" come from memory. */
+export function vpsImageBuildState(alias: string | null, imagePresent: boolean, now = Date.now()): VpsImageBuildState {
+  const record = alias ? imageBuilds.get(alias) : undefined;
+  if (record?.flight) {
+    return { phase: "building", startedAt: record.startedAt, elapsedMs: Math.max(0, now - record.startedAt), error: null };
+  }
+  if (imagePresent) return { phase: "ready", startedAt: null, elapsedMs: null, error: null };
+  if (record?.error) return { phase: "failed", startedAt: record.startedAt, elapsedMs: null, error: record.error };
+  return { phase: "idle", startedAt: null, elapsedMs: null, error: null };
+}
+
+/** "docker image inspect" payload, parsed at the SSH trust line.  Docker and
+ *  Podman use different capitalisation (Id / id, Config / config / labels);
+ *  the schema accepts both so a runner swap does not silently mis-parse.
+ *  `.passthrough()` keeps Docker/Podman field additions from silently changing
+ *  the runtime shape; we read only a fixed subset. */
+export const VpsDockerImageInspectSchema = z.array(
+  z
+    .object({
+      Id: z.string().optional(),
+      id: z.string().optional(),
+      Config: z
+        .object({
+          // Docker prints `"Labels": null` for an image without labels.
+          Labels: z.record(z.string(), z.string()).nullish(),
+        })
+        .passthrough()
+        .nullish(),
+      config: z
+        .object({
+          Labels: z.record(z.string(), z.string()).nullish(),
+          labels: z.record(z.string(), z.string()).nullish(),
+        })
+        .passthrough()
+        .nullish(),
+    })
+    .passthrough(),
+);
+export type VpsDockerImageInspect = z.infer<typeof VpsDockerImageInspectSchema>;
+
+/** True when the pinned tag is present on the VPS with BotFleet's labels.
+ * Throws on a transport failure; a clean "no such image" is false. */
+async function pinnedVpsImagePresent(alias: string, runner: VpsCommandRunner): Promise<boolean> {
+  try {
+    const inspected = VpsDockerImageInspectSchema.parse(
+      JSON.parse((await runner(vpsDockerArgs(alias, ["image", "inspect", VPS_IMAGE]), { timeoutMs: 30_000 })).stdout),
+    );
+    const image = inspected[0];
+    const imageId = image?.Id ?? image?.id;
+    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels ?? undefined;
+    return Boolean(imageId && IMAGE_ID.test(imageId)) && imageLabelsMatch(labels);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isMissingObjectMessage(message)) return false;
+    throw error;
+  }
+}
+
+/** Join the host's in-progress build, or start one.  The returned promise
+ * settles when the build does; a failure is remembered for the panel and
+ * rethrown to the caller. */
+function prepareVpsImage(alias: string, runner: VpsCommandRunner): Promise<void> {
+  const existing = imageBuilds.get(alias);
+  if (existing?.flight) return existing.flight;
+  const record: VpsImageBuildRecord = { flight: null, startedAt: Date.now(), error: null };
+  record.flight = (async () => {
+    try {
+      // A finished build from another flight (or by hand on the VPS) is
+      // reused; the 20-minute build runs only when the tag is truly absent.
+      if (!(await pinnedVpsImagePresent(alias, runner))) await buildVpsImage(alias, runner);
+    } catch (error) {
+      record.error = problemText(error instanceof Error ? error.message : String(error), 600) || "the image build failed";
+      throw error;
+    } finally {
+      record.flight = null;
+      forgetStatusCacheForAlias(alias);
+    }
+  })();
+  imageBuilds.set(alias, record);
+  return record.flight;
+}
+
+/** Settings → "Prepare Image": start (or join) the build in the background
+ * and answer at once with its state.  The current container keeps running;
+ * nothing here touches it. */
+export async function vpsPrepareImageAhead(
+  cfg: AppConfig,
+  runner: VpsCommandRunner = defaultRunner,
+): Promise<VpsImageBuildState> {
+  const alias = vpsSshAlias(cfg);
+  if (!alias) throw Object.assign(new Error("VPS is not configured — add an SSH config alias in App Settings → Connections"), { status: 409 });
+  // A present image makes the build a no-op; report "ready" instead of
+  // briefly advertising a build that will never run.
+  const alreadyPresent = await pinnedVpsImagePresent(alias, runner);
+  if (alreadyPresent) return vpsImageBuildState(alias, true);
+  const flight = prepareVpsImage(alias, runner);
+  // The HTTP request never waits on the build, so its failure must be
+  // observed here or Node treats it as an unhandled rejection.  The error
+  // is already recorded for the panel.
+  flight.catch(() => undefined);
+  return vpsImageBuildState(alias, false);
+}
+
+/** Settings → "Switch to New Image": replace the shared container with one
+ * created from the already-built pinned image.  Downtime is a container
+ * restart, not a rebuild, and the container filesystem is reset exactly as
+ * a remove would reset it.  Refuses unless the new image is ready. */
+export async function vpsSwitchToPreparedImage(
+  cfg: AppConfig,
+  runner: VpsCommandRunner = defaultRunner,
+): Promise<VpsComputerStatus> {
+  const alias = vpsSshAlias(cfg);
+  if (!alias) throw Object.assign(new Error("VPS is not configured — add an SSH config alias in App Settings → Connections"), { status: 409 });
+  if (!isSharedVpsMode(cfg)) {
+    throw Object.assign(new Error("Switching images from Settings is only for the shared VPS — use each bot's Computer panel in per-bot mode"), { status: 409 });
+  }
+  const target = SHARED_VPS_TARGET;
+  const botId = "workspace";
+  const key = `${alias}:${target.containerName}`;
+  const after = await withVpsLifecycleLock(key, async () => {
+    statusCache.delete(key);
+    try {
+      if (imageBuilds.get(alias)?.flight) {
+        throw Object.assign(new Error("The new image is still building — switch once it is ready"), { status: 409 });
+      }
+      const before = await computeVpsComputerStatus(cfg, botId, runner);
+      if (!before.daemonUp) throw Object.assign(new Error(before.problem ?? "Docker over SSH is not reachable"), { status: 409 });
+      if (!before.image || !before.image_id) {
+        throw Object.assign(new Error("The new image isn't ready yet — prepare it first"), { status: 409 });
+      }
+      if (before.container === "missing") {
+        throw Object.assign(new Error("No shared VPS container exists — a bot's next turn creates one from the new image"), { status: 409 });
+      }
+      if (!before.managed) {
+        throw Object.assign(
+          new Error("The VPS container name is occupied by a container BotFleet did not create — remove it on the VPS yourself"),
+          { status: 409 },
+        );
+      }
+      if (!vpsContainerOutdated(before)) {
+        throw Object.assign(new Error("The shared VPS container already runs the current image"), { status: 409 });
+      }
+      closeAllVpsDesktopTunnels();
+      const run = (args: string[]) => runner(vpsDockerArgs(alias, args), { timeoutMs: 2 * 60_000 });
+      await run(["rm", "-f", before.container_id ?? before.container_name]);
+      await run(vpsContainerRunArgs(before.container_name, before.image_id, undefined, vpsDesktopSize(cfg)));
+      return await waitForVpsReady(cfg, botId, runner);
+    } finally {
+      statusCache.delete(key);
+    }
+  });
+  // Each bot's own desktop session is started by its next turn's provision,
+  // as after any fresh container; only the shared CLI logins are restored here.
+  if (cfg.localVm?.shareCliCredentials && after.ready) {
+    await autoSyncCliCredentials(cfg, target, after.container_id ?? after.container_name, runner);
+  }
+  return withImageBuildState(after, alias);
+}
+
+/** A container BotFleet created that is not on the pinned image: bots
+ * refuse it, and a swap onto the prepared image is how it is replaced.
+ * Label drift alone does NOT count — reconciling it would destroy the
+ * container filesystem for a problem the swap cannot fix. */
+export function vpsContainerOutdated(status: VpsComputerStatus): boolean {
+  // With the pinned tag absent, no container can be on it.
+  return (
+    status.daemonUp &&
+    status.container !== "missing" &&
+    status.managed &&
+    (!status.image || status.container_image_id !== status.image_id)
+  );
+}
+
+function withImageBuildState(status: VpsComputerStatus, alias: string | null): VpsComputerStatus {
+  return {
+    ...status,
+    imageBuild: vpsImageBuildState(alias, status.image),
+    imageOutdated: vpsContainerOutdated(status),
+  };
 }
 
 /** Waits for the driver inside a verified, running container to come up.
@@ -1503,7 +1750,9 @@ export async function vpsComputerScreenshot(
   const cacheable = runner === defaultRunner;
   const loadStatus = async () => {
     const cached = cacheable ? statusCache.get(key) : undefined;
-    if (cached && cached.expiresAt > Date.now()) return cached.status;
+    // The build phase and its elapsed time are re-derived on every poll; only
+    // the SSH inspection is served from the cache.
+    if (cached && cached.expiresAt > Date.now()) return withImageBuildState(cached.status, vpsSshAlias(cfg));
     return computeVpsComputerStatus(cfg, botId, runner);
   };
   const status = cacheable

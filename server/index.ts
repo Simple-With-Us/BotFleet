@@ -14715,6 +14715,34 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       return json(res, 200, await vps.vpsSyncCliCredentials(cfg, vps.SHARED_VPS_TARGET));
     }
+    // Build the pinned image on the VPS ahead of a swap.  Answers at once
+    // with the build state; the 20 to 45 minute build runs in the background
+    // and the current container keeps running.  Concurrent presses, and a
+    // provision that needs the image, join the same build.
+    if (method === "POST" && path === "/api/vps-computer/prepare-image") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
+      }
+      if (computerProviderOff(cfg, "selfHostedVps")) {
+        return json(res, 409, { error: `${COMPUTER_PROVIDER_LABEL.selfHostedVps} is turned off in Computer settings` });
+      }
+      return json(res, 202, { imageBuild: await vps.vpsPrepareImageAhead(cfg) });
+    }
+    // Replace the shared container with one created from the prepared image:
+    // a restart's downtime instead of a rebuild's.  It resets the container
+    // filesystem, so it is refused while any bot is using the shared VPS.
+    if (method === "POST" && path === "/api/vps-computer/switch-image") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
+      }
+      if (computerProviderOff(cfg, "selfHostedVps")) {
+        return json(res, 409, { error: `${COMPUTER_PROVIDER_LABEL.selfHostedVps} is turned off in Computer settings` });
+      }
+      if (vps.sharedVpsContainerLifecycleBlocked(cfg, "workspace", activeVpsThreads.size, false, false)) {
+        return json(res, 409, { error: "the shared VPS is in use by a bot — wait for its turn to finish, then switch" });
+      }
+      return json(res, 200, await vps.vpsSwitchToPreparedImage(cfg));
+    }
     m = path.match(/^\/api\/local-computer\/(pull|run|start|stop|remove)$/);
     if (m && method === "POST") {
       // Requiring JSON makes these localhost lifecycle mutations non-simple
