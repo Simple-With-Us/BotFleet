@@ -748,8 +748,8 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; re
                     type="button"
                     onClick={() => handleEditQueued(entry)}
                     className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink transition-colors"
-                    title="Edit queued message (puts back in composer)"
-                    aria-label="Edit queued message"
+                    title="Puts the message back in the composer to edit."
+                    aria-label="Edit Queued Message"
                   >
                     <Pencil size={12} strokeWidth={2} />
                   </button>
@@ -757,8 +757,8 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; re
                     type="button"
                     onClick={() => handleCancelQueued(entry.queueId)}
                     className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-danger transition-colors"
-                    title="Cancel queued message"
-                    aria-label="Cancel queued message"
+                    title="Cancel Queued Message"
+                    aria-label="Cancel Queued Message"
                   >
                     <Trash2 size={12} strokeWidth={2} />
                   </button>
@@ -766,7 +766,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; re
                     type="button"
                     onClick={handleSteerQueued}
                     className="flex size-6 items-center justify-center rounded-md text-accent hover:bg-accent/15 transition-colors"
-                    title="Steer Now — interrupt current turn and send immediately"
+                    title="Stops the current turn and sends this now."
                     aria-label="Steer Now"
                   >
                     <ArrowUp size={13} strokeWidth={2.5} />

@@ -352,19 +352,19 @@ test('editing a message held for a busy room brings its attachments back too', a
   await expect(box).toHaveValue('');
   await expect(chip).toBeHidden();
   expect(sends).toHaveLength(0);
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
 
   // editing the held pill puts the message back where it can be changed.
   // The paste it was carrying has to come back with it: the pill's text is
   // the composed string, so restoring that string alone drops the attachment
   // on the floor and the person loses an enormous log to a two-word edit.
-  await page.getByRole('button', { name: 'Edit queued message' }).first().click();
+  await page.getByRole('button', { name: 'Edit Queued Message' }).first().click();
   await expect(box).toHaveValue('worth checking against the earlier answer');
   await expect(chip).toBeVisible();
 
   // editing takes the message out of the hold: it is a draft again, waiting
   // for the person to send it, so the pill is gone and nothing is in flight.
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(0);
   expect(sends).toHaveLength(0);
 
   roomState.busy = false;
@@ -392,20 +392,20 @@ test('editing a queued bot message waits for the harness before restoring the dr
 
   await box.fill('worth a second look');
   await box.press('Enter');
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
 
-  await page.getByRole('button', { name: 'Edit queued message' }).first().click();
+  await page.getByRole('button', { name: 'Edit Queued Message' }).first().click();
 
   // While the DELETE is in flight the message is still queued, so the draft
   // must NOT be back in the box: a fast resend here would put the original and
   // the copy on the wire together.  The assertions below are the wait; no bare
   // sleep, because a fixed 300ms is either too short or a lie on a slow run.
   await expect(box).toHaveValue('');
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
 
   cancel.release();
   await expect(box).toHaveValue('worth a second look');
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(0);
   // The restore fills the box after the DELETE answers, so the caret has to
   // move with it.  Asserting the value alone would not notice a caret left at
   // position 0, which is what reading the value before the restore produced.

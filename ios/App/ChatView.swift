@@ -1155,18 +1155,15 @@ struct ChatView: View {
                     Button {
                         composerFocused = false
                     } label: {
-                        HStack(spacing: 4) {
-                            Text("⌄")
-                                .font(.system(size: 14, weight: .bold))
-                            Text("⌨️")
-                                .font(.system(size: 13))
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Capsule().fill(Color.secondary.opacity(0.14)))
+                        Image(systemName: "keyboard.chevron.compact.down")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(Color.secondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Capsule().fill(Color.secondary.opacity(0.14)))
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Hide keyboard")
+                    .accessibilityLabel("Hide Keyboard")
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 4)
@@ -1204,7 +1201,7 @@ struct ChatView: View {
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel("Edit message")
+                            .accessibilityLabel("Edit Queued Message")
 
                             Button {
                                 steerNow()
@@ -1216,19 +1213,19 @@ struct ChatView: View {
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel("Steer now")
+                            .accessibilityLabel("Steer Now")
 
                             Button {
                                 cancelQueuedMessage(item.queueId)
                             } label: {
-                                Image(systemName: "trash")
+                                Image(systemName: "xmark")
                                     .font(.system(size: 13, weight: .medium))
                                     .foregroundStyle(Color.red.opacity(0.85))
                                     .frame(width: 28, height: 28)
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel("Cancel queued message")
+                            .accessibilityLabel("Cancel Queued Message")
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)

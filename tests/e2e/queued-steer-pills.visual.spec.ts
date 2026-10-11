@@ -224,7 +224,7 @@ async function openBusyRoom(page: Page) {
 async function queueMessage(page: Page, box: ReturnType<typeof openBusyBot>, text: string, index: number) {
   await box.fill(text);
   await box.press('Enter');
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(index);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(index);
 }
 
 test('visual: one queued steer pill carries its label and three actions', async ({ page }) => {
@@ -241,8 +241,8 @@ test('visual: one queued steer pill carries its label and three actions', async 
   ).toBeVisible();
 
   // Three actions ride the row: undo the queue, drop it, or send it now.
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
-  await expect(page.getByRole('button', { name: 'Cancel queued message' })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Cancel Queued Message' })).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Steer Now' })).toHaveCount(1);
 
   // The row, not the Edit button: a screenshot of the button is a 24px
@@ -271,7 +271,7 @@ test('visual: several queued pills stack without crowding out the composer', asy
   // Each held message keeps its own row, carrying its own words.  The row
   // truncates long text with CSS, so the words are asserted through the
   // label's title attribute, which holds the full string either way.
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(3);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(3);
   const labels = page.locator('span[title^="Queued"]');
   await expect(labels).toHaveCount(3);
   await expect(labels.nth(0)).toHaveAttribute('title', /index dropped first/);
@@ -297,7 +297,7 @@ test('visual: an empty queue shows no queued row at all', async ({ page }) => {
   await pinFonts(page);
 
   await expect(box).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(0);
 });
 
 test('visual: a queued message in a busy room shows the same pill row, with the group routing', async ({ page }) => {
@@ -309,8 +309,8 @@ test('visual: a queued message in a busy room shows the same pill row, with the 
   await queueMessage(page, box, 'rerun the migration with the index dropped first', 1);
   expect(sends).toHaveLength(0);
 
-  await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(1);
-  await expect(page.getByRole('button', { name: 'Cancel queued message' })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Cancel Queued Message' })).toHaveCount(1);
   await expect(page.getByRole('button', { name: 'Steer Now' })).toHaveCount(1);
 
   const pillRow = page.locator('span[title^="Queued"]').first().locator('xpath=..');
