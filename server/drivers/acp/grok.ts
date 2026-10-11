@@ -374,8 +374,20 @@ const support: AcpSupport = {
   buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
 };
 
-/** Grok's client-hook capability, as `initialize` describes it.  Lenient:  a
- *  field of an unexpected shape reads as absent, which refuses the turn. */
+/** Grok's client-hook capability, as `initialize` describes it.
+ *
+ *  Deliberately `.looseObject` (Zod's `.passthrough()`), not `.strict()`.  The
+ *  one thing that decides anything is `grokAllowlistProblem` below:  it accepts
+ *  only when `blockingEvents` includes `pre_tool_use` AND `decisions` includes
+ *  `deny`.  No unknown key can satisfy that pair, so passing extra keys through
+ *  cannot turn "this CLI offers no hooks" into "it does" -- there is nothing to
+ *  smuggle through an ignored field.
+ *
+ *  Strict buys no safety here and costs real robustness:  one new field anywhere
+ *  in `initialize` would fail `safeParse`, `hooks` would read as absent, and
+ *  every routine carrying an allowlist would be refused until someone edits this
+ *  file.  Leniency degrades to "the new field is ignored";  strictness degrades
+ *  to "the feature is off fleet-wide". */
 const hookCapabilitySchema = z.looseObject({
   blockingEvents: z.array(z.string()).optional().catch(undefined),
   decisions: z.array(z.string()).optional().catch(undefined),
