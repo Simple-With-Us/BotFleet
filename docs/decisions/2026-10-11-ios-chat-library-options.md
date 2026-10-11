@@ -23,12 +23,18 @@ A candidate must be:
 6. **Maintained** — activity within roughly the last year.
 7. **CI-safe** — builds with Swift tools 6.0+ / Xcode 16+ without dependency pins that break the build.
 
-## Result: no candidate passes all seven
+## Result: the first survey was wrong — see the correction below
 
-The landscape splits, and the two halves never meet.
+My first pass concluded "no candidate passes all seven; the landscape splits cleanly and the halves
+never meet."  That was **falsified** by an independent pass asked to break it.  Two libraries exist
+that the first survey missed.  The correction is in the next section; the candidate-by-candidate
+findings from the first pass are kept below because they are still accurate.
+
+### First-pass candidates (all three genuinely ruled out)
 
 **Agent-oriented libraries are proprietary and backend-locked.  Open SwiftUI libraries are generic
-messengers.**  There is no third option.
+messengers.**  As a description of *those three*, that holds.  It is not a description of the whole
+field.
 
 ### Stream Chat `StreamChatAI` — near-perfect match, ruled out on licence
 
@@ -110,36 +116,93 @@ concrete gap we identified.
 translation layer, and it pulls Kingfisher `from: 8.5.0` — where ≥8.13 needs Swift 6.2 and breaks CI
 (lesson 2026-09-28), so it needs a pin and a guard.
 
-## Recommendation
+## Correction: the falsification pass found two libraries the first survey missed
 
-**Build the missing pieces natively.  Do not take a dependency.**
+A second pass was commissioned specifically to **break** the conclusion above, on the grounds that a
+conclusion reached by one search is worth very little.  It succeeded.  Two candidates exist:
 
-The one concrete gap this survey confirmed is **message grouping** — consecutive messages from the
-same speaker do not cluster (`grep` for `grouped|isGrouped|consecutive|sameSender` in `ChatView.swift`
-returns nothing).  It is roughly 40 lines of SwiftUI against a `ChatView.swift` already at 2,644.
+### `unlocalhosted/beautiful-ui-swift` — passes all seven criteria
 
-The 2026-09-30 audit framed this as "borrow vs polish," which implied borrowing was broadly available.
-For the agent-specific parts it is not.  That is a correction worth recording, and it is the reason the
-original audit's premise had to be corrected in the first place.
+MIT licence (full text, GitHub reports `licenseInfo.key = mit`).  Verified:
 
-### One design worth stealing — the schema, not the code
+- **Pure SwiftUI container** — `ChatPanel.swift` is `ScrollView { LazyVStack { ForEach } }`, no
+  `UIViewRepresentable` anywhere.  So it can host Liquid Glass.
+- **Backend-agnostic** — `Package.swift` declares **zero dependencies** and there is no networking
+  code.  Pure UI.
+- **Agent-oriented** — this is what the first survey missed entirely.  It ships `ApprovalCard` +
+  `ApprovalOptionList`, `ToolCallGroup` + `ToolCallRow`, `ThinkingTraceView` + `ThinkingStepRow`,
+  and `StreamingResponseView`.  `ApprovalCard` was read and is a real implementation (bound
+  selection, custom response, `ApprovalDecision` callback), not a stub.
+- **Custom content** — unrestricted composition; ships `RecordTable`, `ChangeTable`, `CodeBlock`.  No
+  closed enum.
+- **Maintained** — last push 2026-08-12.
+- **CI-safe** — `swift build` exits 0 in 136s on Swift 6.4 / Xcode 27.  Its manifest floor is
+  `swift-tools-version: 6.3` and `.iOS(.v26)`, both *below* BotFleet's own (iOS 27.0, Swift 6.4), so
+  it does not break our CI.
 
-Stream's `ai_reasoning` / `ai_tool_call` attachment schema is a clean, consistent wire shape for tool
-cards: a typed part with a payload, which `AIMessagePart.parts(from: [(type: String, payload: Data)])`
-decodes from plain tuples.  BotFleet's tool cards could adopt that shape **without the dependency** —
-it is a data convention, not code.  Worth considering if the harness's card payloads need a consistent
-form.
+**The caveat that limits adoption** is adoption, not fitness: 10 commits, 0 forks, 2 stars, activity
+confined to 2026-08-11/12.  Depending on it as a package means depending on a single author with no
+track record.  *Reading it* costs nothing and is worth doing.
 
-## Residual uncertainty
+### `NerdSnipe-Inc/AIChatKit` — MIT, real SwiftUI, but fails two criteria
 
-- **No visual side-by-side.**  Everything above is from source and licences.  Whether Exyte's or
-  Stream's bubbles actually *look* better than ours on a simulator is unverified, and if that is the
-  real appeal, code reading will not settle it.
-- **Pricing tier numbers are unverified** beyond Stream's stated Maker eligibility — the pricing tables
-  are JS-rendered.  Moot given the licence blocker.
-- **An independent falsification pass was commissioned** to try to break the "nobody is agent-oriented
-  and open" conclusion, since a conclusion reached by one search is worth little.  Its result is
-  recorded in the board row `3c30a404`.
+- **Passes** container (real `ScrollView` / `LazyVStack`), licence (MIT), and is agent-oriented
+  enough to ship `ToolCallView` and `ThinkingTileView`.  `ChatProvider` is a public protocol, so a
+  harness provider is implementable.  `swift-tools-version:5.10`, iOS 17+.
+- **Fails approvals** — grep for `approval|approve|permission|human-in-the-loop` across `Sources/`
+  returns **zero hits**.
+- **Fails custom content** — `ChatMessage.ContentBlock` is a *closed* enum (text / image / toolCall /
+  toolResult / thinking / redactedThinking).  That is the same defect that disqualified Exyte: our
+  tool cards could not be expressed.
+
+### Also checked and rejected
+
+- `euforicio/streamdown-swift` — **FSL-1.1, source-available**, not open source; requires iOS/macOS 26.
+- `unionst/swift-chat` — the LICENSE says "free to use and **closed source**"; `binaryTarget`
+  xcframework, no-redistribute and no-compete clauses.
+- `BBC6BAE9/a2ui-swift` — MIT and agent-oriented (A2UI renderer), but no chat list / tool / approval
+  model; it generates forms and UI.
+- `FluidGroup/swiftui-messaging-ui` — Apache-2.0, pure SwiftUI, but scroll primitives only, zero agent
+  concepts.
+- `CherryHQ/hanlin-ai` — agent-oriented and MIT, but a whole application, not a reusable library.
+- `sozercan/ayna` — `products: [.executable]`; an app.
+
+## Revised recommendation
+
+**Still build native — but for a different reason than the first pass gave.**
+
+The first pass said borrowing was unavailable.  That is wrong; it is available and one library
+(`beautiful-ui-swift`) even clears every criterion.  The real reason to stay native is that
+**BotFleet already owns these components.**  We have `ApprovalCard` and `AgentThoughtChamberView`
+on iOS, exactly what that library ships.  Taking a dependency on a 2-star package to obtain things we
+already have, in order to gain message grouping (roughly 40 lines), is a bad trade.
+
+So the action changes, not the destination:
+
+- **Vendor the shapes, not the package.**  `beautiful-ui-swift`'s `ApprovalCard` and `ThinkingTraceView`
+  are worth reading closely — a second opinion on components we wrote ourselves, from an author who
+  approached them fresh.  Reading is free and carries no dependency risk.
+- **Still build grouping natively.**  Unchanged.
+- **Do not depend on either library.**  Single-author, sub-3★, no adoption history.  A production
+  dependency on that is a supply-chain risk, and MIT grants from a sole author can be relicensed.
+
+### Honest accounting of the error
+
+The first survey concluded "no candidate passes" from three candidates.  It searched for messengers
+and an agent SDK, and did not search component libraries, GitHub topic pages, or Swift Package Index
+systematically.  It also did not notice that "open + agent-oriented" was an unfalsifiable-sounding
+claim until something was found.  The lesson is procedural: **for a "nothing exists" claim, the
+search has to be as adversarial as the claim**, and a second pass should be commissioned *before*
+the conclusion is recorded, not after.
+
+### Residual uncertainty
+
+- **No visual side-by-side.**  Everything here is source and licences.  Whether anyone's bubbles
+  actually *look* better on a simulator is unverified.
+- `beautiful-ui-swift` was compiled for **macOS**; the iOS/simulator build is unverified.  Its
+  maintainer identity and whether the MIT grant would survive relicensing are unverified.
+- "No *major* project provides an agent-oriented SwiftUI chat UI" still appears to hold — both
+  counter-examples are single-author and sub-3★.  That weaker claim is the one I would defend.
 
 ## Sources
 
@@ -150,3 +213,7 @@ form.
 - `EnesKaraosman/SwiftyChat` (cloned, `08661b8`) — Package.swift, LICENSE, `ChatMessage.swift`, `ChatMessageKind.swift`, `ChatView.swift`
 - `exyte/Chat` @ `49bf1f3` (cloned) — `UIList.swift`, `Message.swift`, `ChatView.swift`
 - `CherryHQ/hanlin-ai` — README (agent-oriented but a whole application, not a library)
+- `unlocalhosted/beautiful-ui-swift` — LICENSE, Package.swift, `ChatPanel.swift`, `ApprovalCard.swift`, models; `swift build` exit 0
+- `NerdSnipe-Inc/AIChatKit` — LICENSE, Package.swift, `ChatMessage.swift`, `ChatProvider.swift`, `ConversationView.swift`
+- `euforicio/streamdown-swift`, `unionst/swift-chat`, `BBC6BAE9/a2ui-swift`, `FluidGroup/swiftui-messaging-ui` — LICENSE / Package.swift
+- <https://swiftpackageindex.com/packages?q=chat> (its search API now returns HTML, not JSON — a gap that contributed to the first pass missing these)
