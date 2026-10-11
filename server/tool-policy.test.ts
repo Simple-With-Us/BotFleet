@@ -255,6 +255,7 @@ describe("evaluateCommand: attacks", () => {
     denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --to CODEX`);
     denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --to-owner`);
     denied(`${AGENT_SYNC} whoami --json --as CLAUDE`);
+    denied(`${AGENT_SYNC.replace("agent-sync", "AGENT-SYNC")} whoami --json --as CLAUDE`);
     denied(`${AGENT_SYNC} whoami --json --a CLAUDE`);
     denied(`${AGENT_SYNC} whoami --json --rc /tmp/other-zuliprc`);
     denied(`${AGENT_SYNC} whoami --json --default-seat MM`);
@@ -400,6 +401,16 @@ describe("files", () => {
     expect(evaluateRead(policy(), "/Users/jay/.secrets/global-api-keys").ok).toBe(false);
     expect(evaluateRead(policy(), "/etc/hosts").ok).toBe(false);
   });
+
+  it("refuses a folded LaunchAgents spelling at save time", () => {
+    expect(() =>
+      sanitizeToolPolicy({
+        mode: "allowlist",
+        commands: [],
+        writePaths: ["/Users/me/library/launchagents/persist.plist"],
+      }),
+    ).toThrow(/Command allowlist/);
+  });
 });
 
 describe("sanitizeToolPolicy", () => {
@@ -433,6 +444,8 @@ describe("sanitizeToolPolicy", () => {
     ["a write path in a dot directory", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/.local/state/x.md"] }],
     ["a credential directory write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/.secrets/zulip"] }],
     ["a LaunchAgents write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/Library/LaunchAgents/x.plist"] }],
+    ["a LaunchAgents write path with folded case", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/library/launchagents/x.plist"] }],
+    ["agent-sync --as through a case-folded argv0", { mode: "allowlist", commands: [{ argv0: "/Users/jay/.local/bin/AGENT-SYNC", sub: ["whoami"], flags: { "--as": { value: "text" } } }] }],
     ["too many positionals", { mode: "allowlist", commands: [{ argv0: "/bin/x", positionals: 99 }] }],
     ["a positional switch", { mode: "allowlist", commands: [{ argv0: "/bin/x", args: [{ value: "none" }] }] }],
     ["a relative positional path", { mode: "allowlist", commands: [{ argv0: "/bin/x", args: [{ value: "path", paths: ["log.txt"] }] }] }],

@@ -108,11 +108,16 @@ export function isCleanAbsolutePath(path: string): boolean {
  *  an allowed name into `~/.ssh`. */
 export function isProtectedPath(path: string): boolean {
   if (path.split("/").some((part) => part.startsWith("."))) return true;
-  return PROTECTED_WRITE_PARTS.some((part) => `${path}/`.includes(part));
+  // macOS default volumes are case-insensitive, so `/library/launchagents`
+  // is the same directory as `/Library/LaunchAgents`.  Compare folded.
+  const haystack = `${path}/`.toLowerCase();
+  return PROTECTED_WRITE_PARTS.some((part) => haystack.includes(part.toLowerCase()));
 }
 
 function isAgentSync(argv0: string): boolean {
-  return posix.basename(argv0) === "agent-sync";
+  // Same fold: an `AGENT-SYNC` spelling on a case-insensitive volume is the
+  // same binary, and the forbidden-flag checks must still apply.
+  return posix.basename(argv0).toLowerCase() === "agent-sync";
 }
 
 /** The agent-sync flag a word spells or abbreviates, if it is a forbidden one. */
