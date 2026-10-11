@@ -90,19 +90,68 @@ try {
 const nativeActions = nativeDesktopActions(process.platform);
 const require = createRequire(import.meta.url);
 
+// Match server/sentry.ts: all-zeros is an unknown checkout, never a release.
+const UNKNOWN_COMMIT = "0".repeat(40);
+const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
+
+function resolvedDesktopReleaseSha() {
+  const candidates = [];
+  for (const raw of [process.env.SENTRY_RELEASE, process.env.GITHUB_SHA]) {
+    const value = typeof raw === "string" ? raw.trim() : "";
+    if (value) candidates.push(value);
+  }
+  // Packaged Electron builds stamp a real SHA in build-identity.json; env
+  // overrides still win when set.
+  if (process.resourcesPath) {
+    try {
+      const build = readPackagedBuildIdentity(path.join(process.resourcesPath, "server"));
+      if (build?.sourceCommit) candidates.push(build.sourceCommit);
+    } catch {
+      /* dev runs and unpackaged CI have no identity; release stays env-only */
+    }
+  }
+  for (const candidate of candidates) {
+    if (candidate && candidate !== UNKNOWN_COMMIT && RELEASE_SHA.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function redactQueryStringTokens(url) {
+  return typeof url === "string"
+    ? url.replace(/([?&])(token|key|secret|authorization)=[^&]*/gi, "$1$2=[redacted]")
+    : url;
+}
+
+function scrubDesktopSentryRequest(event) {
+  if (!event) return event;
+  if (event.request) {
+    if (event.request.headers) event.request.headers = {};
+    if (typeof event.request.query_string === "string") {
+      event.request.query_string = "[redacted]";
+    }
+  }
+  return event;
+}
+
 function initDesktopSentry() {
   if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") return;
   const dsn = String(process.env.SENTRY_DSN || process.env.VITE_SENTRY_DSN || "").trim();
   if (!dsn) return;
   try {
     const Sentry = require("@sentry/electron/main");
-    const releaseRaw = String(process.env.SENTRY_RELEASE || process.env.GITHUB_SHA || "").trim();
-    const release = /^[0-9a-f]{7,40}$/i.test(releaseRaw) ? releaseRaw : undefined;
+    const release = resolvedDesktopReleaseSha();
     Sentry.init({
       dsn,
       sendDefaultPii: false,
       environment: String(process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() || "production",
       release,
+      beforeSend(event) {
+        return scrubDesktopSentryRequest(event);
+      },
+      beforeBreadcrumb(breadcrumb) {
+        if (breadcrumb?.data?.url) breadcrumb.data.url = redactQueryStringTokens(breadcrumb.data.url);
+        return breadcrumb;
+      },
     });
   } catch {
     /* @sentry/electron is optional in a source checkout */
