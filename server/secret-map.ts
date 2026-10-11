@@ -65,6 +65,16 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
     reloadProviders: true,
   },
   {
+    id: "gemini.key",
+    label: "Google Gemini API key",
+    section: "gemini",
+    path: ["key"],
+    env: ["GEMINI_API_KEY"],
+    infisicalName: "GEMINI_API_KEY",
+    secret: true,
+    reloadProviders: true,
+  },
+  {
     id: "openaiCompat.key",
     label: "OpenAI-compatible API key",
     section: "openaiCompat",
