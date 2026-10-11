@@ -1249,6 +1249,49 @@ final class Session: ObservableObject {
         }
     }
 
+    /// Answer from a Live Activity's own buttons — the Lock Screen card or the
+    /// Dynamic Island — which is the one place an approval can be given
+    /// without the app ever being opened.
+    ///
+    /// Two things differ from an in-app card.  The system may have cold-launched
+    /// this process to run the intent, so the client is rebuilt on demand
+    /// first, on the same bounded round trip a notification action uses.  And
+    /// the answer is quiet: there is no screen to put an error on, and the
+    /// person tapping is looking at the Lock Screen, not at this thread.
+    ///
+    /// `requestId` and `isPermission` come from the card that drew the buttons,
+    /// so nothing is re-resolved here.  Picking "whatever is pending on this
+    /// thread" instead is the bug PR #383's review caught — it answers a
+    /// different card than the one the person was looking at.
+    @discardableResult
+    func answerFromLiveActivity(
+        threadId: String,
+        requestId: String,
+        choice: String,
+        isPermission: Bool
+    ) async -> Bool {
+        let attempt: @MainActor @Sendable () async throws -> Bool = {
+            while self.client == nil {
+                try await Task.sleep(nanoseconds: 100_000_000)
+                self.connect()
+            }
+            return await self.answer(
+                threadId: threadId,
+                requestId: requestId,
+                choice: choice,
+                isPermission: isPermission,
+                quietly: true
+            )
+        }
+        let bounded = await BackgroundRefreshCoordinator.run(
+            timeoutNanoseconds: Self.liveActivityActionTimeoutNanoseconds
+        ) { try await attempt() }
+        switch bounded {
+        case .newData: return true
+        case .noData, .failed: return false
+        }
+    }
+
     /// A bare notification-action background launch gets a much smaller
     /// execution budget than the 15 s full background-fetch grant in
     /// `CompanionAppDelegate` — long enough for one hydrate-and-respond
@@ -1256,6 +1299,13 @@ final class Session: ObservableObject {
     /// enough to stay well inside what iOS is likely to allow before
     /// reclaiming the process.
     private static let approvalActionTimeoutNanoseconds: UInt64 = 8_000_000_000
+
+    /// A Live Activity intent is not a notification action.  Nothing is
+    /// holding a completion handler that has to be released, and the system
+    /// keeps the app alive for its own background window, so this gets the
+    /// longer budget — still bounded, because a process left waiting on a
+    /// harness that never answers is reclaimed either way.
+    private static let liveActivityActionTimeoutNanoseconds: UInt64 = 20_000_000_000
 
     /// Signals "this attempt could not even be made" (no client within the
     /// timeout, or the answer itself failed) to `BackgroundRefreshCoordinator`,

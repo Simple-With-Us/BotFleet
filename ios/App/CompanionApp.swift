@@ -22,6 +22,12 @@ struct CompanionApp: App {
         SentryTelemetry.start()
         let session = Session()
         _session = StateObject(wrappedValue: session)
+        // Answer from the island or the Lock Screen.  Installed here rather
+        // than in `onAppear` because a `LiveActivityIntent` launches this
+        // process in the background without ever showing the scene, so a route
+        // wired on appearance would be nil at exactly the moment a Lock Screen
+        // tap needs it.
+        LiveActivityApprovalRoute.install(session: session)
         appDelegate.onDeviceToken = { hex in
             Task { await session.registerPushToken(hex) }
         }
