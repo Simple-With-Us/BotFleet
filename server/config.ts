@@ -1684,6 +1684,7 @@ export function saveConfig(
   // does not get baked into `~/.botfleet/config.json` either, or the file
   // starts shadowing the store it is supposed to defer to.  Knob values are
   // not sensitive, so this is about authority, not cleartext.
+  // SAFETY: same partial-config invariant as `stripVaultManagedValues` above.
   const strippedKnobsFromDisk = stripVaultManagedKnobs(checkedPatch as Partial<AppConfig>);
   if (strippedKnobsFromDisk.length > 0) {
     console.warn(`[secrets] not persisting vault-managed knobs: ${strippedKnobsFromDisk.join(", ")}`);
