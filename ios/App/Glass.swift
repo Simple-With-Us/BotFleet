@@ -7,15 +7,26 @@
 // beneath it; before that, a thin material with a hairline does the same
 // job in the same shape, just without the light.
 import SwiftUI
+import UIKit
 
 /// Something floating over content: a tile, a pill, a sheet.
 struct GlassSurface<S: InsettableShape>: ViewModifier {
     let shape: S
     var interactive: Bool = true
     var tint: Color? = nil
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) {
+        if reduceTransparency {
+            // Reduce Transparency is a legibility setting, and a material
+            // floating over scrolling text is exactly what the reader is
+            // asking not to see.  An opaque fill keeps the shape and the
+            // accent, and drops the see-through.
+            content
+                .background(opaqueFill, in: shape)
+                .background(tint?.opacity(0.18) ?? .clear, in: shape)
+                .overlay(shape.strokeBorder(Color.primary.opacity(0.25), lineWidth: 0.5))
+        } else if #available(iOS 26.0, *) {
             let base: Glass = interactive ? .regular.interactive() : .regular
             content.glassEffect(tint.map { base.tint($0) } ?? base, in: shape)
         } else {
@@ -24,6 +35,12 @@ struct GlassSurface<S: InsettableShape>: ViewModifier {
                 .background(tint?.opacity(0.18) ?? .clear, in: shape)
                 .overlay(shape.strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5))
         }
+    }
+
+    /// A system surface rather than a literal colour, so the card still
+    /// matches the rest of the app's chrome in dark mode.
+    private var opaqueFill: Color {
+        Color(uiColor: .secondarySystemBackground)
     }
 }
 

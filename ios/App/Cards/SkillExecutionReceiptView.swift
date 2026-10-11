@@ -8,6 +8,7 @@ public struct SkillExecutionReceiptView: View {
     public let output: String
     
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded: Bool = false
     
     public init(
@@ -31,14 +32,14 @@ public struct SkillExecutionReceiptView: View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
                 guard hasDetails else { return }
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.75)) {
                     isExpanded.toggle()
                 }
                 Haptics.selection()
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "wrench.and.screwdriver.fill")
-                        .font(.system(size: 11))
+                        .font(.scaled(11, relativeTo: .caption2))
                         .foregroundColor(Color(hex: "#8B5CF6"))
                     
                     VStack(alignment: .leading, spacing: 1) {
@@ -47,7 +48,7 @@ public struct SkillExecutionReceiptView: View {
                             .foregroundColor(isDark ? Color(hex: "#F8FAFC") : Color(hex: "#0F172A"))
                         if !parameters.isEmpty {
                             Text(parameters)
-                                .font(.system(size: 9.5, design: .monospaced))
+                                .font(.scaled(9.5, design: .monospaced, relativeTo: .caption2))
                                 .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
@@ -56,7 +57,7 @@ public struct SkillExecutionReceiptView: View {
                     
                     if durationMs > 0 {
                         Text("• \(durationMs)ms")
-                            .font(.system(size: 9.5, design: .monospaced))
+                            .font(.scaled(9.5, design: .monospaced, relativeTo: .caption2))
                             .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
                     }
                     
@@ -66,7 +67,7 @@ public struct SkillExecutionReceiptView: View {
                     
                     if hasDetails {
                         Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.scaled(9, weight: .bold, relativeTo: .caption2))
                             .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
                     }
                 }
@@ -77,16 +78,20 @@ public struct SkillExecutionReceiptView: View {
             }
             .buttonStyle(.plain)
             .disabled(!hasDetails)
+            // Nothing but the chevron said whether the receipt was open, and a
+            // chevron is a picture. No value when there is nothing to open:
+            // the button is disabled, so the state would only be noise.
+            .accessibilityValue(hasDetails ? (isExpanded ? "Expanded" : "Collapsed") : "")
             
             if isExpanded && hasDetails {
                 VStack(alignment: .leading, spacing: 6) {
                     if !parameters.isEmpty {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("COMMAND / INPUT")
-                                .font(.system(size: 8.5, weight: .heavy, design: .monospaced))
+                                .font(.scaled(8.5, weight: .heavy, design: .monospaced, relativeTo: .caption2))
                                 .foregroundColor(Color(hex: "#8B5CF6"))
                             Text(parameters)
-                                .font(.system(size: 10, design: .monospaced))
+                                .font(.scaled(10, design: .monospaced, relativeTo: .caption2))
                                 .foregroundColor(isDark ? Color(hex: "#E2E8F0") : Color(hex: "#1E293B"))
                                 .textSelection(.enabled)
                         }
@@ -95,10 +100,10 @@ public struct SkillExecutionReceiptView: View {
                     if !output.isEmpty {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(status == "error" ? "ERROR" : "OUTPUT")
-                                .font(.system(size: 8.5, weight: .heavy, design: .monospaced))
+                                .font(.scaled(8.5, weight: .heavy, design: .monospaced, relativeTo: .caption2))
                                 .foregroundColor(status == "error" ? Color.red : Color(hex: "#10B981"))
                             Text(output)
-                                .font(.system(size: 10, design: .monospaced))
+                                .font(.scaled(10, design: .monospaced, relativeTo: .caption2))
                                 .foregroundColor(isDark ? Color(hex: "#E2E8F0") : Color(hex: "#1E293B"))
                                 .lineLimit(16)
                                 .textSelection(.enabled)
@@ -112,21 +117,10 @@ public struct SkillExecutionReceiptView: View {
             }
         }
         .padding(6)
-        .background(
-            LinearGradient(
-                colors: isDark ? [
-                    Color(hex: "#18181B").opacity(0.92),
-                    Color(hex: "#0F172A").opacity(0.88)
-                ] : [
-                    Color.white.opacity(0.94),
-                    Color(hex: "#F8FAFC").opacity(0.88)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        // The one material the chrome is made of (Glass.swift), replacing a
+        // gradient stacked under a second material. The purple stroke and the
+        // shadow stay — they are the receipt's identity.
+        .glassRounded(cornerRadius: 12, interactive: false)
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color(hex: "#8B5CF6").opacity(0.25), lineWidth: 0.65)
@@ -141,7 +135,7 @@ public struct SkillExecutionReceiptView: View {
                 .fill(status == "success" ? Color.green : (status == "running" ? Color.orange : Color.red))
                 .frame(width: 5, height: 5)
             Text(status.capitalized)
-                .font(.system(size: 9, weight: .bold))
+                .font(.scaled(9, weight: .bold, relativeTo: .caption2))
                 .foregroundColor(status == "success" ? Color.green : (status == "running" ? Color.orange : Color.red))
         }
         .padding(.horizontal, 6)

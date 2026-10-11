@@ -8,6 +8,7 @@ public struct AgentThoughtChamberView: View {
     public let isStreaming: Bool
     
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded: Bool = false
     
     public init(
@@ -37,21 +38,12 @@ public struct AgentThoughtChamberView: View {
             }
         }
         .padding(6)
-        .background(
-            LinearGradient(
-                colors: isDark ? [
-                    Color(hex: "#18181B").opacity(0.92),
-                    Color(hex: "#0F172A").opacity(0.88)
-                ] : [
-                    Color.white.opacity(0.94),
-                    Color(hex: "#F8FAFC").opacity(0.88)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        // The one material the chrome is made of (Glass.swift). The card used
+        // to stack a gradient under a second material, and two translucent
+        // layers over each other read as mud. The accent stroke and the
+        // shadow stay — they are what make this a thought card rather than a
+        // pane of glass.
+        .glassRounded(cornerRadius: 12, interactive: false)
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(isDark ? mascotColor.opacity(0.3) : Color.black.opacity(0.08), lineWidth: 0.65)
@@ -62,35 +54,38 @@ public struct AgentThoughtChamberView: View {
     @ViewBuilder
     private func headerButton(isDark: Bool) -> some View {
         Button {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.72)) {
+            withAnimation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.72)) {
                 isExpanded.toggle()
             }
             Haptics.selection()
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "brain.head.profile")
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.scaled(11, weight: .bold, relativeTo: .caption2))
                     .foregroundColor(mascotColor)
-                
+
                 Text(isStreaming ? "Thinking…" : "Thought Process")
                     .font(.caption2.weight(.bold))
                     .foregroundColor(isDark ? Color(hex: "#F8FAFC") : Color(hex: "#334155"))
-                
+
                 if isStreaming {
                     Circle()
                         .fill(mascotColor)
                         .frame(width: 6, height: 6)
-                        .symbolEffect(.pulse, options: .repeating, isActive: isStreaming)
+                        // The pulse repeats forever while a thought streams,
+                        // and never stopping is exactly what Reduce Motion is
+                        // for. The dot still appears; it just holds still.
+                        .symbolEffect(.pulse, options: .repeating, isActive: isStreaming && !reduceMotion)
                 }
-                
+
                 Spacer()
-                
+
                 Text("\(steps.count) \(steps.count == 1 ? "step" : "steps")")
-                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                    .font(.scaled(9.5, weight: .medium, design: .monospaced, relativeTo: .caption2))
                     .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
-                
+
                 Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.scaled(9, weight: .bold, relativeTo: .caption2))
                     .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
             }
             .padding(.horizontal, 10)
@@ -99,6 +94,9 @@ public struct AgentThoughtChamberView: View {
             .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+        // The chevron is the only thing that says whether the steps are
+        // showing, and a picture of a chevron is not an announcement.
+        .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
     }
     
     @ViewBuilder
@@ -127,7 +125,7 @@ public struct AgentThoughtChamberView: View {
     private func stepRow(index: Int, step: String, isDark: Bool) -> some View {
         HStack(alignment: .top, spacing: 6) {
             Text(String(index + 1) + ".")
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .font(.scaled(10, weight: .bold, design: .monospaced, relativeTo: .caption2))
                 .foregroundColor(mascotColor)
             
             Text(step)
