@@ -73,6 +73,7 @@ function recordingSink() {
         attributes: { ...opts.attributes },
         ended: false,
         status: emptyStatus,
+        // SAFETY: recording sink stub — root spans have no parent handle in tests.
         handle: undefined as SpanLike | undefined,
         parent: opts.parentSpan,
       };
