@@ -120,20 +120,48 @@ public struct CompanionState: Sendable {
         return branch + queued
     }
 
-    public mutating func rememberPendingQueued(threadId: String, queueId: String, text: String) {
-        rememberPendingSend(threadId: threadId, id: queueId, text: text, queued: true)
+    public mutating func rememberPendingQueued(
+        threadId: String,
+        queueId: String,
+        text: String,
+        rawText: String? = nil,
+        attachments: [PendingChatAttachment] = []
+    ) {
+        rememberPendingSend(
+            threadId: threadId,
+            id: queueId,
+            text: text,
+            queued: true,
+            rawText: rawText,
+            attachments: attachments
+        )
     }
 
     /// Show the user's own line immediately.  Idle sends stay until the
     /// matching user `message` frame lands; busy 202s stay until drain.
-    public mutating func rememberPendingSend(threadId: String, id: String, text: String, queued: Bool) {
+    public mutating func rememberPendingSend(
+        threadId: String,
+        id: String,
+        text: String,
+        queued: Bool,
+        rawText: String? = nil,
+        attachments: [PendingChatAttachment] = []
+    ) {
         if queued, consumedQueueIds.contains(id) {
             consumedQueueIds.remove(id)
             return
         }
         var list = pendingQueued[threadId] ?? []
         if list.contains(where: { $0.queueId == id }) { return }
-        list.append(QueuedSend(queueId: id, text: text, queued: queued))
+        list.append(
+            QueuedSend(
+                queueId: id,
+                text: text,
+                rawText: rawText,
+                attachments: attachments,
+                queued: queued
+            )
+        )
         pendingQueued[threadId] = list
     }
 
