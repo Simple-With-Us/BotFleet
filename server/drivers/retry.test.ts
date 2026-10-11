@@ -82,8 +82,14 @@ describe("classifyError", () => {
     expect(classifyError({ exitCode: null })).toEqual({ transient: false, reason: "unknown" });
   });
 
-  it("never retries a signal kill or interrupt", () => {
+  it("never retries a signal kill (negative exit code)", () => {
     expect(classifyError({ exitCode: -1 })).toEqual({ transient: false, reason: "interrupted" });
+  });
+
+  it("never auto-retries a turn the user stopped (\"interrupted by user\" / \"cancelled by user\")", () => {
+    // Main used to assert a bare `new Error("interrupted")` here.  The bare
+    // word no longer means "the user stopped this turn" (see the next test),
+    // so the user-stop case is pinned on the drivers' own stop-path phrases.
     expect(classifyError(new Error("interrupted by user"))).toEqual({ transient: false, reason: "interrupted" });
     expect(classifyError(new Error("turn cancelled by user"))).toEqual({ transient: false, reason: "interrupted" });
   });
@@ -107,6 +113,32 @@ describe("classifyError", () => {
       transient: false,
       reason: "interrupted",
     });
+  });
+
+  it("keeps a per-minute TPM 429 transient and retryable, not quota", () => {
+    // OpenAI's token-per-minute throttle opens with "Rate limit reached" but
+    // clears in seconds ("Please try again in 6s").  Only a monthly, billing
+    // cycle, plan or hard cap with that opening is quota.
+    const tpm =
+      "429 Rate limit reached for gpt-4.1 in organization org-example on tokens per min (TPM): Limit 30000, Used 29500, Requested 1200. Please try again in 6s. Visit https://platform.openai.com/account/rate-limits to learn more.";
+    const expected = { transient: true, reason: "rate_limited" };
+    expect(classifyError(new Error(tpm))).toEqual(expected);
+    expect(classifyError({ text: tpm })).toEqual(expected);
+    expect(classifyError({ exitCode: 1, stderr: tpm })).toEqual(expected);
+    // the same opening without a status code or a retry hint
+    expect(classifyError(new Error("Rate limit reached for requests per min (RPM). Please try again in 250ms."))).toEqual(
+      expected,
+    );
+    expect(classifyError(new Error("Rate limit reached. Please try again in 6s."))).toEqual(expected);
+  });
+
+  it("still calls a monthly or plan-level rate limit quota", () => {
+    const quota = { transient: false, reason: "quota" };
+    expect(classifyError(new Error("Rate limit reached for this month"))).toEqual(quota);
+    expect(classifyError(new Error("Rate limit reached for your plan"))).toEqual(quota);
+    expect(classifyError(new Error("Rate limit reached: monthly cap hit for this billing cycle"))).toEqual(quota);
+    expect(classifyError(new Error("monthly rate limit reached"))).toEqual(quota);
+    expect(classifyError({ exitCode: 1, stderr: "Rate limit reached for your plan" })).toEqual(quota);
   });
 
   it("prefers the transient reading when stderr carries both shapes", () => {
@@ -165,11 +197,15 @@ describe("classifyError", () => {
   // driver happened to wrap it in.  Every string below must now land on the
   // identical verdict whether it arrives as a thrown Error, a bare
   // `{ text }`, or a CLI exit report (`{ exitCode, stderr }`).
-  const SHAPE_INVARIANT_CASES: Array<[string, ErrorClassification]> = [
+  const MESSAGE_VERDICT_CASES: Array<[string, ErrorClassification]> = [
     ["unexpected status 503", { transient: true, reason: "server_error" }],
     ["unexpected status 429", { transient: true, reason: "rate_limited" }],
     ["unexpected status 401", { transient: false, reason: "auth" }],
     ["rate limit reached for this month", { transient: false, reason: "quota" }],
+    [
+      "Rate limit reached for gpt-4.1 on tokens per min (TPM). Please try again in 6s.",
+      { transient: true, reason: "rate_limited" },
+    ],
     ["RESOURCE_EXHAUSTED capacity", { transient: false, reason: "quota" }],
     ["overloaded", { transient: true, reason: "overloaded" }],
     ["stream interrupted", { transient: false, reason: "unknown" }],
@@ -180,7 +216,7 @@ describe("classifyError", () => {
     ["Invalid params", { transient: false, reason: "unknown" }],
   ];
 
-  it.each(SHAPE_INVARIANT_CASES)("classifies %j identically as Error / {text} / CliExit", (text, expected) => {
+  it.each(MESSAGE_VERDICT_CASES)("classifies %j identically as Error / {text} / CliExit", (text, expected) => {
     expect(classifyError(new Error(text))).toEqual(expected);
     expect(classifyError({ text })).toEqual(expected);
     expect(classifyError({ exitCode: 1, stderr: text })).toEqual(expected);

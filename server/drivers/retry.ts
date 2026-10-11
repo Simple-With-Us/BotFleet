@@ -118,8 +118,15 @@ const PRIORITY_TERMINAL_PATTERNS: Array<{ pattern: RegExp; reason: TerminalReaso
     // expired" / "out of credits".  Bare "billing", "subscription",
     // "402", and "quota" no longer match — those substrings appear
     // in too many benign contexts (an audit finding).
+    // "rate limit reached" is quota ONLY when the same clause names a
+    // monthly, billing-cycle, plan or hard cap ("rate limit reached for this
+    // month", "Rate limit reached for your plan").  A bare "Rate limit
+    // reached ..." is the per-minute throttle every provider sends (OpenAI's
+    // "Rate limit reached for gpt-4.1 ... on tokens per min (TPM) ... Please
+    // try again in 6s" is the canonical one) and must stay a transient,
+    // retryable rate_limited.
     pattern:
-      /\bsession limit\b|\busage cap\b|\busage limit\b|\bquota exceeded\b|\brate limit reached\b|\bplan limit\b|(?<!-)\btier limit\b|\bmonthly limit\b|\bfree\s*tier\s+limit\b|\bspend limit\b|\bbudget exceeded\b|\bcredits?\b[^.\n]{0,30}\b(?:exhausted|depleted|empty|insufficient|zero)\b|\bout of (?:usage|credits)\b|\binsufficient.?balance\b|\binsufficient.?funds\b|\bzero balance\b|\bresource.?exhausted\b|\bresource_exhausted\b|\bexhausted your.*quota\b|\bdaily quota\b|\bslow pool\b|\bpayment required\b|\bsubscription\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due)\b|\bbilling\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due|not active|failed)\b/i,
+      /\bsession limit\b|\busage cap\b|\busage limit\b|\bquota exceeded\b|\brate limit reached\b[^.\n]{0,60}\b(?:this month|per month|monthly|billing (?:cycle|period)|your plan|hard limit)\b|\b(?:monthly|hard) rate limit reached\b|\bplan limit\b|(?<!-)\btier limit\b|\bmonthly limit\b|\bfree\s*tier\s+limit\b|\bspend limit\b|\bbudget exceeded\b|\bcredits?\b[^.\n]{0,30}\b(?:exhausted|depleted|empty|insufficient|zero)\b|\bout of (?:usage|credits)\b|\binsufficient.?balance\b|\binsufficient.?funds\b|\bzero balance\b|\bresource.?exhausted\b|\bresource_exhausted\b|\bexhausted your.*quota\b|\bdaily quota\b|\bslow pool\b|\bpayment required\b|\bsubscription\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due)\b|\bbilling\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due|not active|failed)\b/i,
     reason: "quota",
   },
   {
@@ -225,7 +232,7 @@ function classifyByStatusCode(text: string): ErrorClassification | undefined {
  */
 export function classifyError(err: FailureInput): ErrorClassification {
   const text = messageOf(err);
-  const exit = err && typeof err === "object" && "exitCode" in err ? err : null;
+  const exit = err && "exitCode" in err ? err : null;
   if (exit && exit.exitCode !== null && exit.exitCode < 0) return { transient: false, reason: "interrupted" };
 
   for (const { pattern, reason } of PRIORITY_TERMINAL_PATTERNS) {
