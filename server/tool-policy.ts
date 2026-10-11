@@ -22,7 +22,9 @@
 // shell would still expand them there.  Then argv[0] must equal an entry's
 // absolute path exactly, the entry's fixed sub-words must follow, and every
 // remaining word must be an allowed flag (with a value of the declared shape)
-// or one of the entry's few free positionals.
+// or a positional word of its declared shape.  A word that names a file must be
+// declared as a `path`:  a `text` word naming a file would let the model point
+// the program at any file it can reach.
 
 import { posix } from "node:path";
 
@@ -127,6 +129,17 @@ const flagSpecSchema = z.discriminatedUnion("value", [
  *  takes exactly one following word. */
 export type ToolPolicyFlagSpec = z.output<typeof flagSpecSchema>;
 
+/** One positional word, matched by its place among the entry's positional
+ *  words.  The same value kinds as a flag, minus the switch. */
+const argSpecSchema = z.discriminatedUnion("value", [
+  z.strictObject({ value: z.literal("text"), maxLength: z.number().int().min(1).max(MAX_TEXT_MAX).optional() }),
+  z.strictObject({ value: z.literal("int"), min: z.number().int().optional(), max: z.number().int().optional() }),
+  z.strictObject({ value: z.literal("oneOf"), values: z.array(configWord.max(256)).min(1).max(MAX_ENUM) }),
+  z.strictObject({ value: z.literal("path"), paths: z.array(cleanAbsolutePath).min(1).max(MAX_PATHS) }),
+]);
+
+export type ToolPolicyArgSpec = z.output<typeof argSpecSchema>;
+
 const commandSchema = z
   .strictObject({
     /** Absolute path of the program, compared as a string:  no PATH lookup,
@@ -136,8 +149,11 @@ const commandSchema = z
     sub: z.array(configWord).max(MAX_SUB).default([]),
     /** Allowed flags, by exact spelling (`--json`, `-n`). */
     flags: z.record(z.string().regex(FLAG_NAME, "is not a flag name"), flagSpecSchema).default({}),
-    /** How many free words (not starting with `-`) may follow, anywhere among
-     *  the flags. */
+    /** Positional words (not starting with `-`), anywhere among the flags,
+     *  each of its declared shape, in order.  All of them must be present. */
+    args: z.array(argSpecSchema).max(MAX_POSITIONALS).default([]),
+    /** How many more positional words may follow the declared `args`, as
+     *  free text.  Never use one for a word that names a file. */
     positionals: z.number().int().min(0).max(MAX_POSITIONALS).default(0),
   })
   .superRefine((command, ctx) => {
@@ -262,7 +278,7 @@ function programName(argv0: string): string {
   return base && SAFE_CONFIG_WORD.test(base) && base.length <= 64 ? base : "command";
 }
 
-function valueProblem(spec: ToolPolicyFlagSpec, value: string): string | null {
+function valueProblem(spec: ToolPolicyFlagSpec | ToolPolicyArgSpec, value: string): string | null {
   if (value.startsWith("-")) return "a flag value may not start with -";
   if (value.startsWith("@")) return "a flag value may not start with @";
   switch (spec.value) {
@@ -312,10 +328,17 @@ function matchEntry(entry: ToolPolicyCommand, argv: string[]): string | null {
       continue;
     }
     if (word.startsWith("@")) return "a free word starting with @";
+    const declared = entry.args[positionals];
     positionals++;
-    if (positionals > entry.positionals) return "an extra free word";
+    if (declared) {
+      const problem = valueProblem(declared, word);
+      if (problem) return problem.replace("flag value", "positional word").replace("path flag", "path word");
+      continue;
+    }
+    if (positionals > entry.args.length + entry.positionals) return "an extra free word";
     if (word.length > DEFAULT_TEXT_MAX) return "a free word that is too long";
   }
+  if (positionals < entry.args.length) return "a positional word is missing";
   for (const [name, spec] of Object.entries(entry.flags)) {
     if (spec.required === true && !seen.has(name)) return "a required flag is missing";
   }

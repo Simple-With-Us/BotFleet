@@ -172,6 +172,9 @@ posixOnly("a routine with a command allowlist", () => {
     expect((await api("POST", `/api/routines/${routine.id}/run`)).status).toBe(201);
     const run = await runOf(routine.id);
     if (!run) throw new Error(`no settled run. stderr:\n${stderr.slice(-2000)}`);
+    // Denials are recorded, but a turn that finished is a completed run:  a
+    // refused habit (search_tool, todo_write) must not fail the routine.
+    expect(run.status).toBe("completed");
     const seen = JSON.parse(readFileSync(join(home, "grok.json"), "utf8"));
     expect(seen.argv).not.toContain("bypassPermissions");
     expect(seen.argv).toContain("--no-leader");

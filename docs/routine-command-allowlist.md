@@ -20,7 +20,12 @@ Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a
       }
     },
     { "argv0": "/opt/homebrew/bin/python3", "sub": ["/Users/jay/apps/fleet-work-backup/fleet_work_backup.py", "health"], "flags": { "--json": { "value": "none" } } },
-    { "argv0": "/usr/bin/tail", "sub": [], "flags": { "-n": { "value": "int", "min": 1, "max": 200 } }, "positionals": 1 }
+    {
+      "argv0": "/usr/bin/tail",
+      "sub": [],
+      "flags": { "-n": { "value": "int", "min": 1, "max": 200 } },
+      "args": [{ "value": "path", "paths": ["/Users/jay/Library/Logs/fleet-work-backup.log"] }]
+    }
   ],
   "writePaths": ["/Users/jay/apps/state/plumber/line.md"],
   "readPaths": []
@@ -30,7 +35,8 @@ Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a
 - `argv0` is an absolute path, compared as a string:  no PATH lookup, no `..`, no link resolution.
 - `sub` is the fixed words that must follow, in order (a verb, or a script path then a verb).
 - `flags` maps each allowed flag, spelled exactly, to its value:  `none` (a switch), `text`, `int` (with `min` and `max`), `oneOf` (with `values`), or `path` (with exact absolute `paths`).  `repeat` lets a flag appear more than once;  `required` makes it mandatory.
-- `positionals` is how many free words may follow (default 0).
+- `args` declares the positional words, in order, each with the same value kinds as a flag (minus the switch), and all of them required.  `positionals` is how many more free text words may follow (default 0).
+- **Any word that names a file, a flag value or a positional, must be a `path`.**  A `text` word that names a file lets the model point the program at any file it can reach:  `tail` with a free positional reads `~/.secrets`.
 - `writePaths` and `readPaths` are exact absolute files.  No directories, no globs, no dotfiles, and nothing under a credential or login directory (`.ssh`, `.secrets`, `.gnupg`, `.aws`, `.config/gh`, `Library/LaunchAgents`, `Library/LaunchDaemons`).  A write path's parent is created owner-only on first use, and the file is written owner-only (0600), as `agent-sync --body-file` requires.
 
 `POST /api/routines` and `PATCH /api/routines/:id` take it as `toolPolicy`.  A PATCH that omits it keeps the stored one;  `null` removes it.  A routine with an allowlist must run on the bot (`runOn: "bot"`).  Bot-requested routine changes (routine cards) cannot set or clear it.

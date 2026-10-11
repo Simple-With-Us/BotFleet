@@ -42,7 +42,13 @@ function policy(): ToolPolicy {
       },
       { argv0: OPEN_LOOPS, sub: ["send"], flags: { "--dm-file": { value: "path", paths: [DM_FILE] } } },
       { argv0: PYTHON, sub: [BACKUP, "health"], flags: { "--json": { value: "none" } } },
-      { argv0: "/usr/bin/tail", sub: [], flags: { "-n": { value: "int", min: 1, max: 200 } }, positionals: 1 },
+      {
+        argv0: "/usr/bin/tail",
+        sub: [],
+        flags: { "-n": { value: "int", min: 1, max: 200 } },
+        args: [{ value: "path", paths: ["/Users/jay/Library/Logs/fleet-work-backup.log"] }],
+      },
+      { argv0: "/Users/jay/.local/bin/echo-note", sub: [], flags: {}, positionals: 1 },
       {
         argv0: "/Users/jay/.local/bin/needs-owner",
         sub: ["file"],
@@ -230,11 +236,23 @@ describe("evaluateCommand: attacks", () => {
     denied(`${AGENT_SYNC} read --topic t --limit -1`);
     denied(`${AGENT_SYNC} read --topic t --limit 1e3`);
     denied(`${AGENT_SYNC} whoami --json extra`);
-    denied("/usr/bin/tail -n 50 /tmp/a /tmp/b");
+    denied("/usr/bin/tail -n 50 /Users/jay/Library/Logs/fleet-work-backup.log /tmp/b");
+    denied("/usr/bin/tail -n 50");
+    denied(`/Users/jay/.local/bin/echo-note "one" "two"`);
     denied(`/Users/jay/.local/bin/needs-owner file --by BF-DEPLOYER --question q`);
     // an argparse fromfile word
     denied("/usr/bin/tail -n 50 @/Users/jay/.secrets/global-api-keys");
+    denied(`/Users/jay/.local/bin/echo-note @/etc/passwd`);
     denied(`/Users/jay/.local/bin/needs-owner file --question @/etc/passwd`);
+  });
+
+  it("refuses a positional word naming any file but the declared one", () => {
+    // the hole a bare positional count leaves:  tail would read any file
+    denied("/usr/bin/tail -n 50 /Users/jay/.secrets/global-api-keys");
+    denied("/usr/bin/tail -n 200 /etc/passwd");
+    denied("/usr/bin/tail -n 50 /Users/jay/Library/Logs/../../.secrets/global-api-keys");
+    expect(evaluateCommand(p, "/usr/bin/tail -n 50 /Users/jay/Library/Logs/fleet-work-backup.log")).toMatchObject({ ok: true });
+    expect(evaluateCommand(p, `/Users/jay/.local/bin/echo-note "a note"`)).toMatchObject({ ok: true });
   });
 
   it("refuses the wrong fixed words for an interpreter", () => {
@@ -336,6 +354,8 @@ describe("sanitizeToolPolicy", () => {
     ["a credential directory write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/.secrets/zulip"] }],
     ["a LaunchAgents write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/Library/LaunchAgents/x.plist"] }],
     ["too many positionals", { mode: "allowlist", commands: [{ argv0: "/bin/x", positionals: 99 }] }],
+    ["a positional switch", { mode: "allowlist", commands: [{ argv0: "/bin/x", args: [{ value: "none" }] }] }],
+    ["a relative positional path", { mode: "allowlist", commands: [{ argv0: "/bin/x", args: [{ value: "path", paths: ["log.txt"] }] }] }],
   ])("refuses %s", (_label, raw) => {
     expect(() => sanitizeToolPolicy(raw)).toThrow(/Command allowlist/);
   });

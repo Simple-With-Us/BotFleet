@@ -59,7 +59,7 @@ describe("routine toolPolicy", () => {
   it("round-trips through sanitizeInput and the routines file", () => {
     const h = harness();
     const created = h.manager.create({ name: "Backup Health", prompt: "Check", botId: "bot", schedule: daily, toolPolicy: POLICY });
-    expect(created.toolPolicy).toEqual({ ...POLICY, readPaths: [], commands: [{ ...POLICY.commands[0], positionals: 0 }] });
+    expect(created.toolPolicy).toEqual({ ...POLICY, readPaths: [], commands: [{ ...POLICY.commands[0], args: [], positionals: 0 }] });
     h.manager.flushNow();
     const reloaded = new RoutineManager(h.options);
     expect(reloaded.listRoutines()[0]!.toolPolicy).toEqual(created.toolPolicy);
