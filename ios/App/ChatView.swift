@@ -1091,8 +1091,21 @@ struct ChatView: View {
     }
 
     private func editQueuedMessage(_ item: QueuedSend) {
-        cancelQueuedMessage(item.queueId)
-        draft = item.text
+        switch current {
+        case let .bot(bot):
+            Task {
+                guard await session.cancelQueued(botId: bot.id, queueId: item.queueId) else { return }
+                restoreQueuedDraft(from: item)
+            }
+        case let .room(room):
+            session.dropPendingQueued(threadId: room.threadId, queueId: item.queueId)
+            restoreQueuedDraft(from: item)
+        }
+    }
+
+    private func restoreQueuedDraft(from item: QueuedSend) {
+        draft = item.rawText ?? item.text
+        pendingAttachments = item.attachments
         composerFocused = true
     }
 
