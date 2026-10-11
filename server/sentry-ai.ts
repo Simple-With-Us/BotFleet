@@ -467,9 +467,8 @@ function applyConversation(
     const resolved = identity === undefined ? identityFor(threadId) : identity;
     const id = clean(resolved?.botId) ?? clean(resolved?.roomId) ?? threadId;
     const username = clean(resolved?.botName) ?? clean(resolved?.roomName);
-    const user: { id: string; username?: string } = { id };
-    if (username) user.username = username;
-    sink.setUser(user);
+    if (username) sink.setUser({ id, username });
+    else sink.setUser({ id });
   } catch {
     /* conversation tagging must never take down a turn */
   }
