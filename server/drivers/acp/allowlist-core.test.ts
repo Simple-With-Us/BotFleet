@@ -399,6 +399,33 @@ posix("an allowlist turn on Grok", () => {
     expect(readFileSync(other, "utf8")).toBe("OTHER-FILE\n");
   });
 
+  it("keeps agent-sync's rules when it runs under another name through a link", async () => {
+    await grok();
+    // The policy names `poster`, so nothing at save time says agent-sync;  the gate resolves the link.
+    const realDir = join(scratch, "fleet");
+    mkdirSync(realDir);
+    const real = join(realDir, "agent-sync");
+    writeFileSync(real, readFileSync(tool, "utf8"));
+    chmodSync(real, 0o755);
+    const alias = join(scratch, "poster");
+    symlinkSync(real, alias);
+    const aliased = sanitizeToolPolicy({
+      mode: "allowlist",
+      commands: [{ argv0: alias, sub: ["post"], flags: { "--topic": { value: "text" }, "--to": { value: "text" } } }],
+    })!;
+    const { dump: seen } = await runTurn(
+      [
+        { type: "shell", command: `${alias} post --topic t --to CODEX` },
+        { type: "raw-terminal", command: `/bin/bash -lc '${alias} post --topic t --to CODEX'` },
+      ],
+      { policy: aliased },
+    );
+    expect(seen.results.map((r: any) => r.terminal ?? r.hook)).toEqual(["deny", "refused"]);
+    expect(existsSync(join(scratch, "TOOL-RAN"))).toBe(false);
+    const { dump: allowed } = await runTurn([{ type: "shell", command: `${alias} post --topic t` }], { policy: aliased, dumpName: "allowed.json" });
+    expect(allowed.results[0]).toMatchObject({ hook: "allow", exit: { exitCode: 0 } });
+  });
+
   it("answers a permission ask from the policy with a once option only, never an always option", async () => {
     await grok();
     const { dump: seen } = await runTurn([

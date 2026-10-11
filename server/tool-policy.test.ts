@@ -276,6 +276,22 @@ describe("evaluateCommand: attacks", () => {
     denied("/usr/bin/tail -fn 50 /tmp/x");
   });
 
+  it("keeps agent-sync's rules for agent-sync in another letter case or run by an interpreter", () => {
+    // Built by hand:  sanitizeToolPolicy refuses these entries, and the run-time check must hold alone.
+    const unchecked: ToolPolicy = {
+      mode: "allowlist",
+      commands: [
+        { argv0: "/Users/jay/.local/bin/Agent-Sync", sub: ["post"], flags: { "--as": { value: "text" }, "--topic": { value: "text" } }, args: [], positionals: 0 },
+        { argv0: PYTHON, sub: ["/Users/jay/apps/fleet/agent-sync", "dm"], flags: { "--to": { value: "text" } }, args: [], positionals: 0 },
+      ],
+      writePaths: [],
+      readPaths: [],
+    };
+    expect(evaluateCommand(unchecked, "/Users/jay/.local/bin/Agent-Sync post --topic t --as CLAUDE").ok).toBe(false);
+    expect(evaluateCommand(unchecked, "/Users/jay/.local/bin/Agent-Sync post --topic t")).toMatchObject({ ok: true });
+    expect(evaluateCommand(unchecked, `${PYTHON} /Users/jay/apps/fleet/agent-sync dm --to CODEX`).ok).toBe(false);
+  });
+
   it("refuses a direct message to anyone but the owner", () => {
     denied(`${AGENT_SYNC} dm --body-file ${DM_FILE}`);
     denied(`${AGENT_SYNC} dm --owner --to CODEX --body-file ${DM_FILE}`);
@@ -455,6 +471,11 @@ describe("sanitizeToolPolicy", () => {
     ["a positional path under LaunchAgents", { mode: "allowlist", commands: [{ argv0: "/bin/cat", args: [{ value: "path", paths: ["/Users/jay/Library/LaunchAgents/x.plist"] }] }] }],
     ["a read path in a dot directory", { mode: "allowlist", commands: [], readPaths: ["/Users/jay/.grok/auth.json"] }],
     ["a read path under a credential directory", { mode: "allowlist", commands: [], readPaths: ["/Users/jay/.config/gh/hosts.yml"] }],
+    ["a write path under LaunchAgents in another letter case", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/library/launchagents/x.plist"] }],
+    ["a positional path under LaunchDaemons in another letter case", { mode: "allowlist", commands: [{ argv0: "/bin/cat", args: [{ value: "path", paths: ["/LIBRARY/LAUNCHDAEMONS/x.plist"] }] }] }],
+    ["agent-sync named in another letter case, with --as", { mode: "allowlist", commands: [{ argv0: "/Users/jay/.local/bin/Agent-Sync", sub: ["whoami"], flags: { "--as": { value: "text" } } }] }],
+    ["agent-sync run by an interpreter, with --to", { mode: "allowlist", commands: [{ argv0: PYTHON, sub: ["/Users/jay/apps/fleet/agent-sync", "post"], flags: { "--to": { value: "text" } } }] }],
+    ["agent-sync dm run by an interpreter without a required --owner", { mode: "allowlist", commands: [{ argv0: PYTHON, sub: ["/Users/jay/apps/fleet/agent-sync", "dm"], flags: { "--owner": { value: "none" } } }] }],
   ])("refuses %s", (_label, raw) => {
     expect(() => sanitizeToolPolicy(raw)).toThrow(/Command allowlist/);
   });

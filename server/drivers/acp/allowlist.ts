@@ -33,12 +33,14 @@ import { z } from "zod";
 import { killCliTree } from "../../procs.ts";
 import type { JsonValue } from "../../schema.ts";
 import {
+  agentSyncProblem,
   evaluateArgv,
   evaluateCommand,
   evaluateRead,
   evaluateWrite,
   isCleanAbsolutePath,
   isProtectedPath,
+  namesAgentSync,
   unwrapShellCommand,
   type PolicyDecision,
   type ToolPolicy,
@@ -280,6 +282,28 @@ function namesOrReachesProtected(path: string): boolean {
   return real === null || isProtectedPath(real);
 }
 
+/** agent-sync's rules for a command that runs it under another name:  a
+ *  link of any name (`~/bin/poster -> agent-sync`) as the program, or as the
+ *  script an interpreter runs.  The policy check catches the name in any
+ *  letter case;  this resolves the program and each fixed word that is an
+ *  absolute path, and applies the same rules from the word that turns out to
+ *  be agent-sync.  Null when there is nothing to refuse. */
+function agentSyncAliasProblem(argv: readonly string[]): string | null {
+  for (let i = 0; i < argv.length; i++) {
+    const word = argv[i]!;
+    if (word.startsWith("-")) break;
+    if (!word.startsWith("/") || namesAgentSync(word)) continue;
+    let real: string;
+    try {
+      real = realpathSync(word);
+    } catch {
+      continue;
+    }
+    if (namesAgentSync(real)) return agentSyncProblem(argv.slice(i));
+  }
+  return null;
+}
+
 /** Whether an opened file is the regular, singly linked file that
  *  `configured` resolves to now, through root-owned links only.  A link or a
  *  directory swapped in anywhere on the path between the checks and the open
@@ -360,10 +384,13 @@ export class AllowlistGate {
   }
 
   /** Refuse an allowed command whose path words name a protected place or
-   *  run through a link BotFleet does not follow (`resolvedLocation`). */
+   *  run through a link BotFleet does not follow (`resolvedLocation`), or
+   *  that runs agent-sync under another name and breaks its rules. */
   private checkPaths(decision: PolicyDecision): PolicyDecision {
     if (!decision.ok) return decision;
     const program = basename(decision.argv[0] ?? "") || "command";
+    const aliasProblem = agentSyncAliasProblem(decision.argv);
+    if (aliasProblem) return denied(aliasProblem, program);
     for (const path of decision.paths ?? []) {
       if (namesOrReachesProtected(path)) return denied("a path names a protected place or runs through a link or hard link BotFleet does not follow", program);
     }

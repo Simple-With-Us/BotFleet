@@ -108,16 +108,19 @@ export function isCleanAbsolutePath(path: string): boolean {
  *  an allowed name into `~/.ssh`. */
 export function isProtectedPath(path: string): boolean {
   if (path.split("/").some((part) => part.startsWith("."))) return true;
-  // macOS default volumes are case-insensitive, so `/library/launchagents`
+// macOS default volumes are case-insensitive, so `/library/launchagents`
   // is the same directory as `/Library/LaunchAgents`.  Compare folded.
-  const haystack = `${path}/`.toLowerCase();
-  return PROTECTED_WRITE_PARTS.some((part) => haystack.includes(part.toLowerCase()));
+  const folded = `${path}/`.toLowerCase();
+  return PROTECTED_WRITE_PARTS.some((part) => folded.includes(part.toLowerCase()));
 }
 
-function isAgentSync(argv0: string): boolean {
-  // Same fold: an `AGENT-SYNC` spelling on a case-insensitive volume is the
-  // same binary, and the forbidden-flag checks must still apply.
-  return posix.basename(argv0).toLowerCase() === "agent-sync";
+/** Whether a program or script path names agent-sync, in any letter case:  an
+ *  `AGENT-SYNC` spelling on a case-insensitive volume is the same binary, and
+ *  the forbidden-flag checks must still apply.  This is a basename, so the ACP
+ *  gate also resolves links — an alias of another name is caught at run time
+ *  from the word that turns out to be agent-sync. */
+export function namesAgentSync(word: string): boolean {
+  return posix.basename(word).toLowerCase() === "agent-sync";
 }
 
 /** The agent-sync flag a word spells or abbreviates, if it is a forbidden one. */
@@ -188,15 +191,18 @@ const commandSchema = z
   .superRefine((command, ctx) => {
     const names = Object.keys(command.flags);
     if (names.length > MAX_FLAGS) ctx.addIssue({ code: "custom", message: `has more than ${MAX_FLAGS} flags` });
+    // agent-sync as the program, or as the script an interpreter runs
+    const fixed = [command.argv0, ...command.sub];
+    const agentSyncAt = fixed.findIndex(namesAgentSync);
     for (const [name, spec] of Object.entries(command.flags)) {
       if (spec.value === "int" && spec.min !== undefined && spec.max !== undefined && spec.min > spec.max) {
         ctx.addIssue({ code: "custom", message: `flag ${name} has min above max` });
       }
-      if (isAgentSync(command.argv0) && forbiddenAgentSyncFlag(name)) {
+      if (agentSyncAt >= 0 && forbiddenAgentSyncFlag(name)) {
         ctx.addIssue({ code: "custom", message: `agent-sync may never take ${name}` });
       }
     }
-    if (isAgentSync(command.argv0) && command.sub[0] === "dm" && command.flags["--owner"]?.required !== true) {
+    if (agentSyncAt >= 0 && fixed[agentSyncAt + 1] === "dm" && command.flags["--owner"]?.required !== true) {
       ctx.addIssue({ code: "custom", message: "agent-sync dm is allowed only with a required --owner flag" });
     }
   });
@@ -372,8 +378,10 @@ function matchEntry(entry: ToolPolicyCommand, argv: string[], paths: string[]): 
   return null;
 }
 
-/** The rules every agent-sync call keeps whatever the policy says. */
-function agentSyncProblem(argv: string[]): string | null {
+/** The rules every agent-sync call keeps whatever the policy says.  `argv`
+ *  starts at the word that runs agent-sync (the program, or the script an
+ *  interpreter runs). */
+export function agentSyncProblem(argv: string[]): string | null {
   for (const word of argv.slice(1)) {
     const forbidden = forbiddenAgentSyncFlag(word);
     if (forbidden) return `agent-sync may never take ${forbidden}`;
@@ -391,8 +399,12 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
   if (ENV_ASSIGNMENT.test(argv0)) return { ok: false, reason: "an environment-variable prefix", name: "env-prefix" };
   if (!argv0.startsWith("/")) return { ok: false, reason: "the program is not an absolute path", name };
   if (argv.some((word) => controlChar(word))) return { ok: false, reason: "a control character", name };
-  if (isAgentSync(argv0)) {
-    const problem = agentSyncProblem(argv);
+  // agent-sync as the program or as a script among the fixed words:  only
+  // ever more refusals, so a free word that happens to say agent-sync costs
+  // nothing.
+  const agentSyncAt = argv.slice(0, 1 + MAX_SUB).findIndex(namesAgentSync);
+  if (agentSyncAt >= 0) {
+    const problem = agentSyncProblem(argv.slice(agentSyncAt));
     if (problem) return { ok: false, reason: problem, name };
   }
   const candidates = policy.commands.filter((entry) => entry.argv0 === argv0);
