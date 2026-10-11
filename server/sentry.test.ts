@@ -261,6 +261,7 @@ describe("Sentry AI data collection kill-switch", () => {
 
   it("stamps a git SHA release on the Node client", async () => {
     let initOpts: Record<string, unknown> | null = null;
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
     const sdk = Object.assign({} as FakeSentrySdk, {
       init(opts: Record<string, unknown>) {
         initOpts = opts;
