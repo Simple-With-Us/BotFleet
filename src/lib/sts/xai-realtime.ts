@@ -77,11 +77,19 @@ const buildFrameSchema = () => z.looseObject({ type: z.string() });
  * both land on null rather than on an exception in the message handler.
  */
 function parseJson<S extends z.ZodType>(schema: S, raw: string): z.output<S> | null {
+  let parsedJson: unknown;
   try {
-    return schema.parse(JSON.parse(raw));
-  } catch {
+    parsedJson = JSON.parse(raw);
+  } catch (error) {
+    console.warn("parseJson: vendor frame was not JSON", { error });
     return null;
   }
+  const result = schema.safeParse(parsedJson);
+  if (!result.success) {
+    console.warn("parseJson: vendor frame failed schema", { issues: result.error.issues });
+    return null;
+  }
+  return result.data;
 }
 
 type XaiStsBridge = {

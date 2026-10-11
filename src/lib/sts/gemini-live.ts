@@ -460,12 +460,14 @@ export function createGeminiLiveSession(): StsSession {
     let decoded: unknown;
     try {
       decoded = JSON.parse(String(raw));
-    } catch {
+    } catch (error) {
+      console.warn("gemini-live: vendor frame was not JSON", { error });
       emitError("Gemini live sent a frame this build could not read.");
       return;
     }
     const parsed = serverMessageSchema.safeParse(decoded);
     if (!parsed.success) {
+      console.warn("gemini-live: vendor frame failed schema", { issues: parsed.error.issues });
       emitError("Gemini live sent a message this build does not understand.");
       return;
     }
@@ -545,7 +547,8 @@ export function createGeminiLiveSession(): StsSession {
       if (!mint) {
         throw new Error("Gemini live bridge is unavailable in this build.");
       }
-      startPromise = (async () => {
+      const pending = (async () => {
+        try {
         const attempt = ++generation;
         stopping = false;
         ended = false;
@@ -650,8 +653,15 @@ export function createGeminiLiveSession(): StsSession {
           }
           throw error;
         }
+        } catch (error) {
+          // Only in-flight starts are deduped.  A rejected promise must not
+          // pin retries to the first network blip, expired token, or goAway.
+          if (startPromise === pending) startPromise = null;
+          throw error;
+        }
       })();
-      return startPromise;
+      startPromise = pending;
+      return pending;
     },
 
     sendAudio(pcm) {
