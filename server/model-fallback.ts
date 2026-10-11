@@ -8,6 +8,10 @@ import { dirname } from "node:path";
 
 import { STATIC_ANTIGRAVITY_MODELS } from "./antigravity-models.ts";
 import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
+import {
+  DSH_DEEPSEEK_FLASH_MODEL,
+  DSH_DEEPSEEK_PRO_MODEL,
+} from "./drivers/acp/dsh.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
 import { modelRejections, type ModelRejectionGate } from "./model-rejections.ts";
@@ -50,11 +54,28 @@ function isBuiltInClaudeSonnetOrOpus(model: string): boolean {
 
 /** A DSH Pro route cannot read images. Replace it throughout the saved chain
  * when switching an image turn to Flash so no stale Pro fallback can retry
- * the same image prompt. Other engines and models remain untouched. */
+ * the same image prompt. Other engines and models remain untouched.
+ *
+ *  The retired `DeepSeek-V4.1-Pro` spelling is accepted here too: a send path
+ *  can still carry it before the store rewrite reaches the saved chain (see
+ *  `retired-model-ids.ts`), and a Pro turn that quietly stopped switching to
+ *  Flash would fail on the image instead of routing away from it. */
+const DSH_PRO_MODEL_IDS: ReadonlySet<string> = new Set([
+  DSH_DEEPSEEK_PRO_MODEL,
+  "DeepSeek-V4.1-Pro",
+]);
+
+/** True when a route names the DSH Pro row, in either spelling.  The send
+ *  path in `index.ts` asks this instead of comparing ids itself, so the two
+ *  places that decide a Pro turn cannot drift apart. */
+export function isDshVisionlessModel(model: string): boolean {
+  return DSH_PRO_MODEL_IDS.has(model);
+}
+
 export function dshVisionSelection(chain: ModelSelection): ModelSelection {
   const switchPro = (entry: ModelSelection): ModelSelection =>
-    entry.instanceId === "dsh" && entry.model === "DeepSeek-V4.1-Pro"
-      ? { ...entry, model: "DeepSeek-V4.1-Flash" }
+    entry.instanceId === "dsh" && DSH_PRO_MODEL_IDS.has(entry.model)
+      ? { ...entry, model: DSH_DEEPSEEK_FLASH_MODEL }
       : entry;
   return {
     ...switchPro(chain),

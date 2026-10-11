@@ -45,9 +45,17 @@ export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
  *  The V4.1 rename retired the `deepseek-v4-flash` id, which sits in
  *  `DSH_EXCLUDED_MODEL_IDS` so a profile written against the old catalog
  *  cannot re-add it.  `deepseek-v4-pro` is NOT retired: it is still the
- *  declared Pro id on stock dsh 0.1.5-rc.2 and in an owner override (only its
- *  display name gained ".1"), so it folds onto the `DeepSeek-V4.1-Pro` row via
- *  `dshSameModel` rather than being excluded.
+ *  declared Pro id on stock dsh and in an owner override, so it folds onto the
+ *  `DeepSeek-V4-Pro` row via `dshSameModel` rather than being excluded.
+ *
+ *  The two DeepSeek display names are not a matched pair, and DeepSeek's own
+ *  catalog is the reason (verified 2026-10-10 against
+ *  https://api-docs.deepseek.com/quick_start/pricing/): the Flash row is
+ *  model version `DeepSeek-V4.1-Flash` on wire id `deepseek-flash`, while the
+ *  Pro row is `DeepSeek-V4-Pro-0813` on wire id `deepseek-v4-pro`.  Pro never
+ *  gained a ".1", so the picker used to name a `DeepSeek-V4.1-Pro` that DeepSeek
+ *  does not publish.  It reads `DeepSeek-V4-Pro`, and the old picker id folds
+ *  onto it through `RETIRED_MODEL_REPLACEMENTS` so saved bots keep working.
  *
  *  `MiniMax-M2.7` and `MiniMax-M3` are dropped per the product decision (M3.1
  *  Flash Preview dominates on context and is the canonical DSH-hosted MiniMax
@@ -56,12 +64,24 @@ export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
  *
  *  Badges are price/speed facts the picker renders as chips, so the cost
  *  tradeoff is visible before a model is picked. */
+
+/** The two DeepSeek ids the vision route keys off, named once.
+ *
+ *  Spelled as constants rather than repeated literals because the Pro id is
+ *  exactly the kind of value that goes stale quietly: the picker used to say
+ *  `DeepSeek-V4.1-Pro`, which DeepSeek never published, and three files each
+ *  carried their own copy of the string — the catalog row, `dshVisionSelection`
+ *  in `model-fallback.ts`, and the send path in `index.ts`.  One wrong rename
+ *  there silently stops an image from routing off Pro, with nothing failing. */
+export const DSH_DEEPSEEK_PRO_MODEL = "DeepSeek-V4-Pro";
+export const DSH_DEEPSEEK_FLASH_MODEL = "DeepSeek-V4.1-Flash";
+
 export const STATIC_DSH_MODELS: ModelCatalog = {
-  default: "DeepSeek-V4.1-Flash",
+  default: DSH_DEEPSEEK_FLASH_MODEL,
   options: [
     {
-      id: "DeepSeek-V4.1-Flash",
-      label: "DeepSeek-V4.1-Flash",
+      id: DSH_DEEPSEEK_FLASH_MODEL,
+      label: DSH_DEEPSEEK_FLASH_MODEL,
       images: true,
       contextWindow: 1_000_000,
       badge: "Multimodal",
@@ -69,13 +89,13 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
         "Accepts image and video input at the same token rate as text — each image is capped at 1,024 tokens.",
     },
     {
-      id: "DeepSeek-V4.1-Pro",
-      label: "DeepSeek-V4.1-Pro",
+      id: DSH_DEEPSEEK_PRO_MODEL,
+      label: DSH_DEEPSEEK_PRO_MODEL,
       images: false,
       contextWindow: 1_000_000,
       badge: "No Vision",
       badgeTitle:
-        "Text and reasoning only — lacks vision. Switch to DeepSeek-V4.1-Flash to attach an image.",
+        `Text and reasoning only — lacks vision. Switch to ${DSH_DEEPSEEK_FLASH_MODEL} to attach an image.`,
     },
     {
       id: "MiniMax-M3.1-Flash-Preview",
@@ -111,7 +131,7 @@ const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   // file written against the old catalog still does, and the union below
   // would otherwise re-add it as a stale duplicate of the V4.1 Flash row.
   // `deepseek-v4-pro` is deliberately absent: it is still declared, and
-  // `dshSameModel` folds it onto `DeepSeek-V4.1-Pro` without a duplicate.
+  // `dshSameModel` folds it onto `DeepSeek-V4-Pro` row without a duplicate.
   "deepseek-v4-flash",
 ];
 
@@ -235,7 +255,7 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
  *  `readClaudeModelCatalog` makes.  The reason is concrete: a DSH profile that
  *  configures only the `minimax` provider still serves the DeepSeek rows, so
  *  treating the file as authoritative would silently drop
- *  `DeepSeek-V4.1-Flash` / `DeepSeek-V4.1-Pro` from the picker — and
+ *  `DeepSeek-V4.1-Flash` / `DeepSeek-V4-Pro` from the picker — and
  *  `DeepSeek-V4.1-Flash` is the static default.  A partial source can add
  *  models; it cannot retire them.  Removals need an explicit exclusion in
  *  `DSH_EXCLUDED_MODEL_IDS`, which is how `MiniMax-M2.7` and the retired

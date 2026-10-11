@@ -72,10 +72,23 @@ describe("DshAgentDriver config", () => {
     expect(STATIC_DSH_MODELS.default).toBe("DeepSeek-V4.1-Flash");
     expect(STATIC_DSH_MODELS.options.map((option) => option.id)).toEqual([
       "DeepSeek-V4.1-Flash",
-      "DeepSeek-V4.1-Pro",
+      "DeepSeek-V4-Pro",
       "MiniMax-M3.1-Flash-Preview",
       "MiniMax-M2.7-highspeed",
     ]);
+  });
+
+  it("names the two DeepSeek rows the way DeepSeek's own catalog does", () => {
+    // Owner 2026-10-10: the picker used to offer `DeepSeek-V4.1-Pro`.  DeepSeek
+    // never published that.  Its catalog (api-docs.deepseek.com, verified
+    // 2026-10-10) is wire id `deepseek-flash` / model version
+    // `DeepSeek-V4.1-Flash`, plus wire id `deepseek-v4-pro` / model version
+    // `DeepSeek-V4-Pro-0813`.  Only the Flash row carries a ".1".
+    const ids = STATIC_DSH_MODELS.options.map((option) => option.id);
+    expect(ids).toContain("DeepSeek-V4-Pro");
+    expect(ids).not.toContain("DeepSeek-V4.1-Pro");
+    // Flash keeps its own version name; renaming it would be the same mistake.
+    expect(ids).toContain("DeepSeek-V4.1-Flash");
   });
 
   it("badges rows where the choice has a capability, cost, or availability consequence", () => {
@@ -83,12 +96,12 @@ describe("DshAgentDriver config", () => {
     // Image + Video: same token rate as text, so the capability is the point,
     // not a price.
     expect(byId.get("DeepSeek-V4.1-Flash")?.badge).toBe("Multimodal");
-    // DeepSeek-V4.1-Pro lacks vision and warns of auto-switch to Flash on visual input.
-    expect(byId.get("DeepSeek-V4.1-Pro")?.badge).toBe("No Vision");
-    expect(byId.get("DeepSeek-V4.1-Pro")?.badgeTitle).toContain("lacks vision");
-    expect(byId.get("DeepSeek-V4.1-Pro")?.badgeTitle).toContain("Switch to DeepSeek-V4.1-Flash to attach an image");
+    // DeepSeek-V4-Pro lacks vision and warns of auto-switch to Flash on visual input.
+    expect(byId.get("DeepSeek-V4-Pro")?.badge).toBe("No Vision");
+    expect(byId.get("DeepSeek-V4-Pro")?.badgeTitle).toContain("lacks vision");
+    expect(byId.get("DeepSeek-V4-Pro")?.badgeTitle).toContain("Switch to DeepSeek-V4.1-Flash to attach an image");
     expect(byId.get("DeepSeek-V4.1-Flash")?.images).toBe(true);
-    expect(byId.get("DeepSeek-V4.1-Pro")?.images).toBe(false);
+    expect(byId.get("DeepSeek-V4-Pro")?.images).toBe(false);
     // Preview: Token Plan / MiniMax Code only, so it needs a Token Plan key.
     expect(byId.get("MiniMax-M3.1-Flash-Preview")?.badge).toBe("Preview");
     // 2x Cost: $0.60/$2.40 against M3's $0.30/$1.20.
@@ -115,13 +128,13 @@ describe("DshAgentDriver config", () => {
   it("encodes DeepSeek picker ids onto preferred stock wire ids; MiniMax stays identity", () => {
     // Clutch empty-advertisement fallback maps picker display ids onto the
     // stock wire ids dsh actually declares.  MiniMax has no alias fold.
-    expect(dshModelOptionValue("DeepSeek-V4.1-Pro")).toBe('["deepseek-official","deepseek-v4-pro"]');
+    expect(dshModelOptionValue("DeepSeek-V4-Pro")).toBe('["deepseek-official","deepseek-v4-pro"]');
     expect(dshModelOptionValue("DeepSeek-V4.1-Flash")).toBe('["deepseek-official","deepseek-flash"]');
     expect(dshModelIdFromOptionValue('["deepseek-official","deepseek-v4-pro"]')).toBe("deepseek-v4-pro");
     expect(dshModelOptionValue("MiniMax-M3.1-Flash-Preview")).toBe('["minimax","MiniMax-M3.1-Flash-Preview"]');
     expect(dshModelIdFromOptionValue('["minimax","MiniMax-M3.1-Flash-Preview"]')).toBe("MiniMax-M3.1-Flash-Preview");
-    expect(dshModelIdFromOptionValue('["other-provider","DeepSeek-V4.1-Pro"]')).toBeNull();
-    expect(dshModelIdFromOptionValue("DeepSeek-V4.1-Pro")).toBeNull();
+    expect(dshModelIdFromOptionValue('["other-provider","DeepSeek-V4-Pro"]')).toBeNull();
+    expect(dshModelIdFromOptionValue("DeepSeek-V4-Pro")).toBeNull();
   });
 
   it("round-trips every catalog row through the ACP model option encoding", () => {
@@ -135,7 +148,7 @@ describe("DshAgentDriver config", () => {
     // (wire-only; picker ids stay stable).  MiniMax stays an identity round trip.
     const expectedWire: Record<string, string> = {
       "DeepSeek-V4.1-Flash": "deepseek-flash",
-      "DeepSeek-V4.1-Pro": "deepseek-v4-pro",
+      "DeepSeek-V4-Pro": "deepseek-v4-pro",
     };
     for (const option of STATIC_DSH_MODELS.options) {
       const encoded = dshModelOptionValue(option.id);
@@ -221,7 +234,7 @@ describe("native DSH ACP turns", () => {
   it("mounts standard MCP servers and applies confirmed model and reasoning options", async () => {
     const dump = join(scratch, "dsh.json");
     const flash = dshModelOptionValue("DeepSeek-V4.1-Flash");
-    const pro = dshModelOptionValue("DeepSeek-V4.1-Pro");
+    const pro = dshModelOptionValue("DeepSeek-V4-Pro");
     process.env.FAKE_ACP_DUMP = dump;
     process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([flash, pro]);
     process.env.FAKE_ACP_REASONING_EFFORTS = "off,high,max";
@@ -230,7 +243,7 @@ describe("native DSH ACP turns", () => {
     await instance!.adapter.sendTurn({
       threadId: "dsh-native-turn",
       text: "test the native ACP path",
-      model: "DeepSeek-V4.1-Pro",
+      model: "DeepSeek-V4-Pro",
       effort: "max",
       integrations: {
         agents: { command: "/usr/bin/node", args: ["/tmp/agents-proxy.mjs"], env: {} },
@@ -240,7 +253,7 @@ describe("native DSH ACP turns", () => {
 
     expect(done).toMatchObject({ ok: true });
     expect(recorder!.events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4.1-Pro" }),
+      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4-Pro" }),
     ]));
     expect(JSON.parse(readFileSync(dump, "utf8")).argv).toEqual(["--profile", "acp"]);
     expect(JSON.parse(readFileSync(`${dump}.mcp.json`, "utf8"))).toEqual([
@@ -269,7 +282,7 @@ describe("native DSH ACP turns", () => {
     await instance!.adapter.sendTurn({
       threadId: "dsh-resolved-turn",
       text: "resolve the picker id against the advertised catalog",
-      model: "DeepSeek-V4.1-Pro",
+      model: "DeepSeek-V4-Pro",
     });
     const done = await recorder!.until((event) => event.type === "turn.completed");
 
@@ -278,7 +291,7 @@ describe("native DSH ACP turns", () => {
       { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: advertisedPro } },
     ]);
     expect(recorder!.events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4.1-Pro" }),
+      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4-Pro" }),
     ]));
   });
 
@@ -373,7 +386,7 @@ describe("native DSH ACP turns", () => {
 
   it("accepts a bare set_config_option acknowledgement instead of failing the turn", async () => {
     const flash = dshModelOptionValue("DeepSeek-V4.1-Flash");
-    const pro = dshModelOptionValue("DeepSeek-V4.1-Pro");
+    const pro = dshModelOptionValue("DeepSeek-V4-Pro");
     process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([flash, pro]);
     process.env.FAKE_ACP_REASONING_EFFORTS = "off,high,max";
     process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
@@ -382,14 +395,14 @@ describe("native DSH ACP turns", () => {
     await instance!.adapter.sendTurn({
       threadId: "dsh-native-bare-config-reply",
       text: "run on the pinned model and effort",
-      model: "DeepSeek-V4.1-Pro",
+      model: "DeepSeek-V4-Pro",
       effort: "max",
     });
     const done = await recorder!.until((event) => event.type === "turn.completed");
 
     expect(done).toMatchObject({ ok: true });
     expect(recorder!.events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4.1-Pro" }),
+      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4-Pro" }),
     ]));
   });
 });
@@ -684,12 +697,12 @@ describe("readDshModelCatalog", () => {
       "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n",
     ));
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
-    expect(ids).toContain("DeepSeek-V4.1-Pro");
+    expect(ids).toContain("DeepSeek-V4-Pro");
     expect(ids).toContain("MiniMax-M3.1-Flash-Preview");
     // `deepseek-v4-pro` is the id dsh still declares for Pro: it folds onto
     // the V4.1 row and never survives the union as its own stale row.
     expect(ids).not.toContain("deepseek-v4-pro");
-    expect(ids.filter((id) => id === "DeepSeek-V4.1-Pro")).toHaveLength(1);
+    expect(ids.filter((id) => id === "DeepSeek-V4-Pro")).toHaveLength(1);
     expect(ids).not.toContain("MiniMax-M3");
   });
 
@@ -700,25 +713,39 @@ describe("readDshModelCatalog", () => {
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
     expect(ids).not.toContain("deepseek-v4-flash");
     expect(ids).toContain("DeepSeek-V4.1-Flash");
-    expect(ids).toContain("DeepSeek-V4.1-Pro");
+    expect(ids).toContain("DeepSeek-V4-Pro");
   });
 
-  it("does not exclude deepseek-v4-pro, which dsh still declares: it folds onto the V4.1-Pro row", () => {
-    // dsh 0.1.5-rc.2 declares `deepseek-v4-pro` (display name DeepSeek-V4.1-Pro)
+  it("does not exclude deepseek-v4-pro, which dsh still declares: it folds onto the V4-Pro row", () => {
+    // dsh 0.1.5-rc.2 declares `deepseek-v4-pro` (display name DeepSeek-V4-Pro)
     // and the owner's override keeps it.  It is live, not retired, so its live
     // contextWindow must merge into the Pro row instead of being discarded by
     // an exclusion, and the model must still be listed exactly once.
     writeSettings(llmPiAi(
-      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n          name: DeepSeek-V4.1-Pro\n          contextWindow: 777000\n",
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n          name: DeepSeek-V4-Pro\n          contextWindow: 777000\n",
     ));
     const catalog = readDshModelCatalog({ HOME: home });
     const ids = catalog.options.map((o) => o.id);
     expect(ids).not.toContain("deepseek-v4-pro");
-    expect(ids.filter((id) => id === "DeepSeek-V4.1-Pro")).toHaveLength(1);
-    const pro = catalog.options.find((o) => o.id === "DeepSeek-V4.1-Pro");
+    expect(ids.filter((id) => id === "DeepSeek-V4-Pro")).toHaveLength(1);
+    const pro = catalog.options.find((o) => o.id === "DeepSeek-V4-Pro");
     expect(pro?.contextWindow).toBe(777000);
-    expect(pro?.label).toBe("DeepSeek-V4.1-Pro");
+    expect(pro?.label).toBe("DeepSeek-V4-Pro");
     expect(pro?.images).toBe(false);
+  });
+
+  it("folds a stale DeepSeek-V4.1-Pro display name onto the V4-Pro row", () => {
+    // A profile written while the picker misnamed Pro still declares the old
+    // display name.  Without the fold it would appear as a second, duplicate
+    // Pro row next to the live one.
+    writeSettings(llmPiAi(
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n          name: DeepSeek-V4.1-Pro\n          contextWindow: 888000\n",
+    ));
+    const catalog = readDshModelCatalog({ HOME: home });
+    const ids = catalog.options.map((o) => o.id);
+    expect(ids).not.toContain("DeepSeek-V4.1-Pro");
+    expect(ids.filter((id) => id === "DeepSeek-V4-Pro")).toHaveLength(1);
+    expect(catalog.options.find((o) => o.id === "DeepSeek-V4-Pro")?.contextWindow).toBe(888000);
   });
 
   it("folds a stock-spelling settings row onto its static row instead of duplicating the model", () => {
@@ -807,7 +834,7 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
           group: "deepseek-official",
           options: [
             { value: '["deepseek-official","deepseek-flash"]', name: "DeepSeek-V4.1-Flash" },
-            { value: '["deepseek-official","deepseek-v4-pro"]', name: "DeepSeek-V4.1-Pro" },
+            { value: '["deepseek-official","deepseek-v4-pro"]', name: "DeepSeek-V4-Pro" },
           ],
         },
         {
@@ -838,9 +865,9 @@ describe("dsh model option resolution (Clutch #54 consumer)", () => {
   it("maps DeepSeek picker ids onto preferred stock wire ids when nothing is advertised", () => {
     // Clutch fix: empty-advertisement fallback used to send the picker display
     // id and produce unknown model option on stock dsh.  Preferred wire ids now.
-    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", undefined)).toBe('["deepseek-official","deepseek-v4-pro"]');
-    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", [])).toBe('["deepseek-official","deepseek-v4-pro"]');
-    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", [{ id: "model", options: [] }])).toBe(
+    expect(dshModelOptionValue("DeepSeek-V4-Pro", undefined)).toBe('["deepseek-official","deepseek-v4-pro"]');
+    expect(dshModelOptionValue("DeepSeek-V4-Pro", [])).toBe('["deepseek-official","deepseek-v4-pro"]');
+    expect(dshModelOptionValue("DeepSeek-V4-Pro", [{ id: "model", options: [] }])).toBe(
       '["deepseek-official","deepseek-v4-pro"]',
     );
     expect(dshModelOptionValue("DeepSeek-V4.1-Flash", undefined)).toBe('["deepseek-official","deepseek-flash"]');
@@ -938,7 +965,7 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
       expect(levelsOf(catalog, M31)).toEqual(M31_LEVELS);
       // Every other row keeps no levels of its own: DeepSeek takes the
       // engine-wide list, and the client's DSH MiniMax rule hides M2.7.
-      for (const id of ["DeepSeek-V4.1-Flash", "DeepSeek-V4.1-Pro", "MiniMax-M2.7-highspeed"]) {
+      for (const id of ["DeepSeek-V4.1-Flash", "DeepSeek-V4-Pro", "MiniMax-M2.7-highspeed"]) {
         expect(levelsOf(catalog, id)).toBeUndefined();
       }
     });
@@ -1042,7 +1069,7 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
     });
 
     it("still sends nothing for Default on DeepSeek and on DSH MiniMax rows without levels", async () => {
-      await configure({ model: "DeepSeek-V4.1-Pro" });
+      await configure({ model: "DeepSeek-V4-Pro" });
       await configure({ model: "MiniMax-M2.7-highspeed" });
       expect(calls).toEqual([]);
     });

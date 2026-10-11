@@ -66,23 +66,36 @@ function decide(messagesAfterUser: FallbackScanMessage[], opts: {
 describe("DSH vision route migration", () => {
   it("updates the Pro primary and matching fallback without changing unrelated routes", () => {
     const original: ModelSelection = {
-      instanceId: "dsh", model: "DeepSeek-V4.1-Pro", effort: "high",
+      instanceId: "dsh", model: "DeepSeek-V4-Pro", effort: "high",
       fallbacks: [
-        { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
-        { instanceId: "dsh", model: "DeepSeek-V4.1-Pro", effort: "none" },
+        { instanceId: "claude", model: "DeepSeek-V4-Pro" },
+        { instanceId: "dsh", model: "DeepSeek-V4-Pro", effort: "none" },
         { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
       ],
     };
     expect(dshVisionSelection(original)).toEqual({
       instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "high",
       fallbacks: [
-        { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
+        { instanceId: "claude", model: "DeepSeek-V4-Pro" },
         { instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "none" },
         { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
       ],
     });
-    expect(original.model).toBe("DeepSeek-V4.1-Pro");
-    expect(original.fallbacks?.[1]?.model).toBe("DeepSeek-V4.1-Pro");
+    expect(original.model).toBe("DeepSeek-V4-Pro");
+    expect(original.fallbacks?.[1]?.model).toBe("DeepSeek-V4-Pro");
+  });
+
+  it("still routes the retired DeepSeek-V4.1-Pro spelling off Pro", () => {
+    // A send path can carry the old id before the store rewrite reaches it, and
+    // a Pro turn that stayed on Pro would fail on the image instead of routing.
+    expect(
+      dshVisionSelection({ instanceId: "dsh", model: "DeepSeek-V4.1-Pro" }),
+    ).toEqual({ instanceId: "dsh", model: "DeepSeek-V4.1-Flash" });
+  });
+
+  it("leaves a non-dsh entry named DeepSeek-V4-Pro alone", () => {
+    const chain: ModelSelection = { instanceId: "claude", model: "DeepSeek-V4-Pro" };
+    expect(dshVisionSelection(chain)).toEqual(chain);
   });
 });
 
