@@ -820,14 +820,32 @@ describe("ACP turns (fake CLI)", () => {
   });
 
   it("still reports a null cost when the agent reports none", async () => {
-    // A blank is honest. Inventing a price from a table here would be a worse
-    // lie, because these are subscription logins: an API-equivalent figure is
-    // an estimate, and `billingMode` exists to mark one as such.
+    // Grok has no catalog row.  Inventing a price from a table here would be
+    // a worse lie, because these are subscription logins: an API-equivalent
+    // figure is an estimate, and `billingMode` exists to mark one as such.
     process.env.FAKE_ACP_USAGE_ROOT = "1";
     await create();
     await instance.adapter.sendTurn({ threadId: "t-no-cost", text: "go" });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: null });
+  });
+
+  it("estimates MiniMax Code catalog cost when the agent reports tokens but no charge", async () => {
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({
+      threadId: "t-mcode-cost",
+      text: "go",
+      model: "MiniMax-M3.1-Flash-Preview-thinking",
+    });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({
+      type: "turn.completed",
+      ok: true,
+      billingMode: "estimated",
+    });
+    expect(typeof done.cost).toBe("number");
+    expect(done.cost).toBeGreaterThan(0);
   });
 
   it("folds cache reads into input rather than reporting them beside it", async () => {

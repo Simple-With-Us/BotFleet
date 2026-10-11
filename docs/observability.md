@@ -70,8 +70,10 @@ so you can confirm delivery.  Leaving the DSN field blank on Save keeps the
 value already stored — there is no accidental-wipe path.  Clearing the DSN
 is a separate, explicit "Remove Diagnostics Key" action.
 
-Prompts, transcripts, and tool arguments are never sent to Sentry from any
-surface.
+Prompts, transcripts, and tool arguments stay off the wire by default.
+Set `SENTRY_AI_PROMPT_CAPTURE=1` on the harness to stamp redacted, clipped
+`gen_ai.input.messages` / `gen_ai.output.messages` on chat and turn spans.
+Jay approved that opt-in.  Tool arguments are still never attached.
 
 ## The two HTTP routes
 

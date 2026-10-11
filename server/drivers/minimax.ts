@@ -30,7 +30,7 @@ import { classifyHttpError, httpErrorFor, type HttpErrorClassification } from ".
 import { runTurnLoop, DEFAULT_TURN_LOOP_BUDGET, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
 import { costUsd, type ChatCompletionsPriceTable } from "./chat-completions/pricing.ts";
 import { capReplayedTranscript } from "./chat-completions/replay-cap.ts";
-import { genAiProvider, withChatSpan } from "../sentry-ai.ts";
+import { formatGenAiMessages, genAiProvider, withChatSpan } from "../sentry-ai.ts";
 
 const DRIVER_KIND = "minimax";
 const API_KEY_ENV = "MINIMAX_API_KEY";
@@ -722,7 +722,13 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // item.started at all; calling it here would double every tool
         // span.
         const { text, reasoning, usage, tool_calls } = await withChatSpan(
-          { model, conversationId: threadId, taskId: turnId, provider: genAiProvider(DRIVER_KIND) },
+          {
+            model,
+            conversationId: threadId,
+            taskId: turnId,
+            provider: genAiProvider(DRIVER_KIND),
+            input: formatGenAiMessages(roundMessages),
+          },
           ({ recordUsage }) =>
             complete(roundMessages, model, {
               stream: true,
