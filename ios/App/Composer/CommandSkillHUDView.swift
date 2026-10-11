@@ -43,30 +43,6 @@ public struct CommandSkillHUDView: View {
             iconName: "square.stack.fill",
             brandColor: Color(hex: "#A855F7"),
             command: "/tasks"
-        ),
-        CommandSkillItem(
-            id: "diff",
-            title: "/diff",
-            description: "Inspect latest git changes and patches",
-            iconName: "arrow.triangle.pull",
-            brandColor: Color(hex: "#22C55E"),
-            command: "Show git diff and list modified files"
-        ),
-        CommandSkillItem(
-            id: "retry",
-            title: "/retry",
-            description: "Retry the last turn with fresh context",
-            iconName: "arrow.clockwise",
-            brandColor: Color(hex: "#EAB308"),
-            command: "Please retry the last turn"
-        ),
-        CommandSkillItem(
-            id: "steer",
-            title: "/steer",
-            description: "Steer and redirect active execution",
-            iconName: "steeringwheel",
-            brandColor: Color(hex: "#F97316"),
-            command: "Pause and explain your current plan"
         )
     ]
     
