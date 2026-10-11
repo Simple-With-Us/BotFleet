@@ -160,13 +160,64 @@ describe("evaluateCommand: attacks", () => {
     return decision;
   };
 
-  it("refuses chaining an allowed command with another", () => {
+  it("refuses chaining an allowed command with another:  ; && || | & |&", () => {
     denied(`${AGENT_SYNC} whoami --json; touch PWNED`);
+    denied(`${AGENT_SYNC} whoami --json;touch PWNED`);
     denied(`${AGENT_SYNC} whoami --json && touch PWNED`);
+    denied(`${AGENT_SYNC} whoami --json || touch PWNED`);
     denied(`${AGENT_SYNC} whoami --json | /bin/sh`);
+    denied(`${AGENT_SYNC} whoami --json |& /bin/sh`);
+    denied(`${AGENT_SYNC} whoami --json & touch PWNED`);
+    denied(`${AGENT_SYNC} whoami --json\ntouch PWNED`);
+  });
+
+  it("refuses command substitution:  $() and backticks, bare or inside double quotes", () => {
     denied(`${AGENT_SYNC} whoami --json $(touch PWNED)`);
     denied(`${AGENT_SYNC} whoami --json \`touch PWNED\``);
+    denied(`${AGENT_SYNC} read --topic "$(touch PWNED)"`);
+    denied(`${AGENT_SYNC} read --topic "\`touch PWNED\`"`);
+    denied(`${AGENT_SYNC} read --topic $((1+1))`);
+    denied(`${AGENT_SYNC} read --topic \${HOME}`);
+    denied(`${AGENT_SYNC} read --topic "\${HOME}"`);
+    denied(`/usr/bin/tail -n 50 <(touch PWNED)`);
+  });
+
+  it("refuses redirects", () => {
     denied(`${AGENT_SYNC} whoami --json > /tmp/PWNED`);
+    denied(`${AGENT_SYNC} whoami --json >/tmp/PWNED`);
+    denied(`${AGENT_SYNC} whoami --json >> /tmp/PWNED`);
+    denied(`${AGENT_SYNC} whoami --json 1>/tmp/PWNED`);
+    denied(`${AGENT_SYNC} whoami --json 2>&1`);
+    denied(`${AGENT_SYNC} whoami --json &>/tmp/PWNED`);
+    denied(`${AGENT_SYNC} whoami --json >| /tmp/PWNED`);
+    denied(`/usr/bin/tail -n 50 < /Users/jay/.secrets/global-api-keys`);
+    denied(`/usr/bin/tail -n 50 <<< x`);
+  });
+
+  it("refuses quoting tricks:  quotes group a word, they never smuggle one", () => {
+    // a forbidden flag quoted whole, or split across quoted pieces, is still that flag
+    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} '--fleet'`);
+    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --fl''eet`);
+    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} --"to" CODEX`);
+    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} "--to=CODEX"`);
+    // ANSI-C quoting starts with an unquoted $
+    denied(`${AGENT_SYNC} whoami --json $'\\x3b' touch PWNED`);
+    // a quoted space glues words into one, so the program or verb no longer matches
+    denied(`"${AGENT_SYNC} whoami" --json`);
+    denied(`${AGENT_SYNC} "whoami --json"`);
+    // a quoted ; is text, never a separator:  here it is an extra word, refused
+    denied(`${AGENT_SYNC} whoami --json "; touch PWNED"`);
+    denied(`${AGENT_SYNC} whoami "--json;touch" PWNED`);
+    // a quote-concatenated ../ is still a different path
+    denied(`${AGENT_SYNC} dm --owner --body-file "/Users/jay/apps/state/open-loops/"'..'"/../../.secrets/x"`);
+    // typographic quotes and a no-break space are not quotes or spaces at all
+    denied(`${AGENT_SYNC} post --topic t --body-file ${LINE_FILE} “--fleet”`);
+    denied(`${AGENT_SYNC} whoami --json`);
+    // a backslash or ! inside double quotes, which a shell would still act on
+    denied(`${AGENT_SYNC} read --topic "a\\"b"`);
+    denied(`${AGENT_SYNC} read --topic "a!b"`);
+    // quoting the listed program itself changes nothing:  the same argv is allowed
+    expect(evaluateCommand(p, `'${AGENT_SYNC}' whoami "--json"`)).toEqual({ ok: true, argv: [AGENT_SYNC, "whoami", "--json"], paths: [] });
   });
 
   it("refuses a bare command with no path, the shape an engine's own allow rules auto-run", () => {
@@ -302,6 +353,29 @@ describe("unwrapShellCommand", () => {
   it("passes a plain command through for the strict check", () => {
     expect(unwrapShellCommand(`${AGENT_SYNC} whoami --json`)).toEqual({ command: `${AGENT_SYNC} whoami --json` });
   });
+
+  it("reads a double-quoted wrapper the way bash does, and the strict check still refuses what it carries", () => {
+    // An engine escapes inner quotes with \" in a double-quoted wrapper, so the
+    // wrapper accepts that escape (and a literal !, which bash -c never expands).
+    // The inner command then meets tokenizeCommand, which refuses \ and ! inside
+    // double quotes, and nothing is ever handed to a shell.
+    const inner = (wrapper: string): string => {
+      const unwrapped = unwrapShellCommand(wrapper);
+      if (!unwrapped || !("command" in unwrapped)) throw new Error(`not unwrapped: ${wrapper}`);
+      return unwrapped.command;
+    };
+    const quoted = inner(`/bin/bash -lc "${AGENT_SYNC} read --topic \\"a b\\""`);
+    expect(quoted).toBe(`${AGENT_SYNC} read --topic "a b"`);
+    expect(evaluateCommand(policy(), quoted)).toMatchObject({ ok: true });
+    for (const wrapper of [
+      `/bin/bash -lc "${AGENT_SYNC} read --topic \\"a!b\\""`,
+      `/bin/bash -lc "${AGENT_SYNC} read --topic \\"a\\\\\\"b\\""`,
+      `/bin/bash -lc "${AGENT_SYNC} read --topic \\"\\$(touch PWNED)\\""`,
+      `/bin/bash -lc "${AGENT_SYNC} whoami --json \\\`touch PWNED\\\`"`,
+    ]) {
+      expect(evaluateCommand(policy(), inner(wrapper)).ok, wrapper).toBe(false);
+    }
+  });
 });
 
 describe("files", () => {
@@ -362,6 +436,12 @@ describe("sanitizeToolPolicy", () => {
     ["too many positionals", { mode: "allowlist", commands: [{ argv0: "/bin/x", positionals: 99 }] }],
     ["a positional switch", { mode: "allowlist", commands: [{ argv0: "/bin/x", args: [{ value: "none" }] }] }],
     ["a relative positional path", { mode: "allowlist", commands: [{ argv0: "/bin/x", args: [{ value: "path", paths: ["log.txt"] }] }] }],
+    ["a path flag naming a credential file", { mode: "allowlist", commands: [{ argv0: "/bin/x", flags: { "--a": { value: "path", paths: ["/Users/jay/.ssh/id_ed25519"] } } }] }],
+    ["a path flag naming a dotfile", { mode: "allowlist", commands: [{ argv0: "/bin/x", flags: { "--a": { value: "path", paths: ["/Users/jay/.zshrc"] } } }] }],
+    ["a positional path under a credential directory", { mode: "allowlist", commands: [{ argv0: "/usr/bin/tail", args: [{ value: "path", paths: ["/Users/jay/.secrets/global-api-keys"] }] }] }],
+    ["a positional path under LaunchAgents", { mode: "allowlist", commands: [{ argv0: "/bin/cat", args: [{ value: "path", paths: ["/Users/jay/Library/LaunchAgents/x.plist"] }] }] }],
+    ["a read path in a dot directory", { mode: "allowlist", commands: [], readPaths: ["/Users/jay/.grok/auth.json"] }],
+    ["a read path under a credential directory", { mode: "allowlist", commands: [], readPaths: ["/Users/jay/.config/gh/hosts.yml"] }],
   ])("refuses %s", (_label, raw) => {
     expect(() => sanitizeToolPolicy(raw)).toThrow(/Command allowlist/);
   });

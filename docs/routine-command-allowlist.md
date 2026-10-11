@@ -10,24 +10,24 @@ Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a
 {
   "mode": "allowlist",
   "commands": [
-    { "argv0": "/Users/jay/.local/bin/agent-sync", "sub": ["whoami"], "flags": { "--json": { "value": "none" } } },
+    { "argv0": "/Users/you/.local/bin/agent-sync", "sub": ["whoami"], "flags": { "--json": { "value": "none" } } },
     {
-      "argv0": "/Users/jay/.local/bin/agent-sync",
+      "argv0": "/Users/you/.local/bin/agent-sync",
       "sub": ["post"],
       "flags": {
         "--topic": { "value": "text", "required": true },
-        "--body-file": { "value": "path", "paths": ["/Users/jay/apps/state/plumber/line.md"], "required": true }
+        "--body-file": { "value": "path", "paths": ["/Users/you/apps/state/plumber/line.md"], "required": true }
       }
     },
-    { "argv0": "/opt/homebrew/bin/python3", "sub": ["/Users/jay/apps/fleet-work-backup/fleet_work_backup.py", "health"], "flags": { "--json": { "value": "none" } } },
+    { "argv0": "/opt/homebrew/bin/python3", "sub": ["/Users/you/apps/fleet-work-backup/fleet_work_backup.py", "health"], "flags": { "--json": { "value": "none" } } },
     {
       "argv0": "/usr/bin/tail",
       "sub": [],
       "flags": { "-n": { "value": "int", "min": 1, "max": 200 } },
-      "args": [{ "value": "path", "paths": ["/Users/jay/Library/Logs/fleet-work-backup.log"] }]
+      "args": [{ "value": "path", "paths": ["/Users/you/Library/Logs/fleet-work-backup.log"] }]
     }
   ],
-  "writePaths": ["/Users/jay/apps/state/plumber/line.md"],
+  "writePaths": ["/Users/you/apps/state/plumber/line.md"],
   "readPaths": []
 }
 ```
@@ -37,7 +37,8 @@ Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a
 - `flags` maps each allowed flag, spelled exactly, to its value:  `none` (a switch), `text`, `int` (with `min` and `max`), `oneOf` (with `values`), or `path` (with exact absolute `paths`).  `repeat` lets a flag appear more than once;  `required` makes it mandatory.
 - `args` declares the positional words, in order, each with the same value kinds as a flag (minus the switch), and all of them required.  `positionals` is how many more free text words may follow (default 0).
 - **Any word that names a file, a flag value or a positional, must be a `path`.**  A `text` word that names a file lets the model point the program at any file it can reach:  `tail` with a free positional reads `~/.secrets`.
-- `writePaths` and `readPaths` are exact absolute files.  No directories, no globs, no dotfiles, and nothing under a credential or login directory (`.ssh`, `.secrets`, `.gnupg`, `.aws`, `.config/gh`, `Library/LaunchAgents`, `Library/LaunchDaemons`).  A write path's parent is created owner-only on first use, and the file is written owner-only (0600), as `agent-sync --body-file` requires.
+- `writePaths` and `readPaths` are exact absolute files.  No directories, no globs, no dotfiles, and nothing under a credential or login directory (`.ssh`, `.secrets`, `.gnupg`, `.aws`, `.config/gh`, `Library/LaunchAgents`, `Library/LaunchDaemons`).  The same rule holds for every `path` value of a flag or positional, and a policy that breaks it is refused when it is saved.  A write path's parent is created owner-only on first use, and the file is written owner-only (0600), as `agent-sync --body-file` requires.
+- At run time every path a command, a read or a write names is checked again, on its own spelling and on where it really lands:  a path that names a protected place, that a link carries into one (`logs -> ~/.secrets`), or that runs through a dangling link is refused before anything is created, read, written or run.
 
 `POST /api/routines` and `PATCH /api/routines/:id` take it as `toolPolicy`.  A PATCH that omits it keeps the stored one;  `null` removes it.  A routine with an allowlist must run on the bot (`runOn: "bot"`).  Bot-requested routine changes (routine cards) cannot set or clear it.
 
@@ -74,7 +75,7 @@ Every other engine is refused:  the ACP core refuses an allowlist turn on an eng
 
 ## Tests
 
-- `server/tool-policy.test.ts`:  the tokeniser and matcher, including the attack cases (chaining, substitution, redirects, globs, path tricks, environment prefixes, long-option smuggling, `@file` words, a non-owner `dm`).
-- `server/drivers/acp/allowlist-core.test.ts`:  the driver core against a scripted Grok-shaped engine, real child processes and a real file system.
+- `server/tool-policy.test.ts`:  the tokeniser and matcher, with one test for each attack class (shell metacharacters, quoting tricks, `$()` and backticks, `;` `&&` and `|`, redirects, `../` path tricks, environment prefixes, long-option smuggling), plus globs, `@file` words, a non-owner `dm`, the engine's shell wrapper, and the save-time refusals.
+- `server/drivers/acp/allowlist-core.test.ts`:  the driver core against a scripted Grok-shaped engine, real child processes and a real file system, including symlink paths (a link into a credential directory, a dangling link, a link planted at the listed file) and a policy that skipped validation.
 - `server/routines-tool-policy.test.ts` and `server/routine-allowlist-wiring.test.ts`:  the routine API, the run snapshot, and the harness refusing MiniMax Code.
 - `server/drivers/acp/allowlist-live.test.ts`:  the real `grok` CLI under the owner's own config.  Opt-in with `BOTFLEET_ALLOWLIST_LIVE=1`;  it spends real model turns and never runs in CI.

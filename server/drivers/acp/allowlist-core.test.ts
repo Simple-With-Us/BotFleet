@@ -279,6 +279,76 @@ posix("an allowlist turn on Grok", () => {
     expect(readFileSync(target, "utf8")).toBe("original");
   });
 
+  it("refuses a path that names a protected place, even in a policy that skipped validation", async () => {
+    await grok();
+    const secretsDir = join(scratch, ".secrets");
+    mkdirSync(secretsDir);
+    const secret = join(secretsDir, "token");
+    writeFileSync(secret, "SECRET-VALUE\n");
+    // sanitizeToolPolicy refuses every one of these paths, so build the policy by hand:  the run-time
+    // checks must hold on their own for a policy that reached the driver some other way.
+    const unchecked: ToolPolicy = {
+      mode: "allowlist",
+      commands: [{ argv0: "/bin/cat", sub: [], flags: {}, args: [{ value: "path", paths: [secret] }], positionals: 0 }],
+      writePaths: [join(secretsDir, "planted")],
+      readPaths: [secret],
+    };
+    expect(() => sanitizeToolPolicy(unchecked)).toThrow(/Command allowlist/);
+    const { dump: seen } = await runTurn(
+      [
+        { type: "shell", command: `/bin/cat ${secret}` },
+        { type: "raw-terminal", command: `/bin/bash -lc '/bin/cat ${secret}'` },
+        { type: "read", path: secret },
+        { type: "raw-read", path: secret },
+        { type: "write", path: join(secretsDir, "planted"), content: "x" },
+        { type: "raw-write", path: join(secretsDir, "planted"), content: "x" },
+      ],
+      { policy: unchecked },
+    );
+    expect(seen.results.map((r: any) => r.terminal ?? r.write ?? r.read ?? r.hook)).toEqual([
+      "deny",
+      "refused",
+      "deny",
+      "refused",
+      "deny",
+      "refused",
+    ]);
+    expect(JSON.stringify(seen.results)).not.toContain("SECRET-VALUE");
+    expect(existsSync(join(secretsDir, "planted"))).toBe(false);
+  });
+
+  it("refuses a read whose parent directory is a link into a credential directory", async () => {
+    await grok();
+    const secretsDir = join(scratch, ".secrets");
+    mkdirSync(secretsDir);
+    writeFileSync(join(secretsDir, "dm.md"), "SECRET-VALUE\n");
+    symlinkSync(secretsDir, join(scratch, "state"));
+    const { dump: seen } = await runTurn([
+      { type: "read", path: dmFile },
+      { type: "raw-read", path: dmFile },
+    ]);
+    expect(seen.results.map((r: any) => r.read ?? r.hook)).toEqual(["deny", "refused"]);
+    expect(JSON.stringify(seen.results)).not.toContain("SECRET-VALUE");
+  });
+
+  it("refuses a path that runs through a dangling link, and creates nothing", async () => {
+    await grok();
+    // Both links point at protected places that do not exist yet:  where the path lands is unknown,
+    // so it is refused rather than treated as an ordinary missing directory.
+    symlinkSync(join(scratch, ".ssh"), join(scratch, "state"));
+    symlinkSync(join(scratch, ".secrets"), join(scratch, "logs"));
+    const { dump: seen } = await runTurn([
+      { type: "write", path: join(scratch, "state", "nested", "deep.md"), content: "x" },
+      { type: "raw-write", path: join(scratch, "state", "nested", "deep.md"), content: "x" },
+      { type: "raw-write", path: dmFile, content: "x" },
+      { type: "shell", command: `/bin/cat ${join(scratch, "logs", "app.log")}` },
+      { type: "raw-terminal", command: `/bin/bash -lc '/bin/cat ${join(scratch, "logs", "app.log")}'` },
+    ]);
+    expect(seen.results.map((r: any) => r.terminal ?? r.write ?? r.hook)).toEqual(["deny", "refused", "refused", "deny", "refused"]);
+    expect(existsSync(join(scratch, ".ssh"))).toBe(false);
+    expect(existsSync(join(scratch, ".secrets"))).toBe(false);
+  });
+
   it("answers a permission ask from the policy with a once option only, never an always option", async () => {
     await grok();
     const { dump: seen } = await runTurn([

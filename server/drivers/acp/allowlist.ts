@@ -223,7 +223,9 @@ function canonicalPath(configured: string): string | null {
 }
 
 /** Where `path` really lands:  its nearest existing ancestor resolved through
- *  every link, with the missing rest appended.  Null when nothing resolves. */
+ *  every link, with the missing rest appended.  Null when nothing resolves, or
+ *  when an entry on the way exists but cannot be resolved (a dangling link, a
+ *  link loop, an unreadable directory):  where that lands is unknown. */
 function resolvedLocation(path: string): string | null {
   const rest: string[] = [];
   let dir = path;
@@ -231,6 +233,7 @@ function resolvedLocation(path: string): string | null {
     try {
       return posix.join(realpathSync(dir), ...rest.reverse());
     } catch {
+      if (entryExists(dir)) return null;
       const parent = dirname(dir);
       if (parent === dir) return null;
       rest.push(basename(dir));
@@ -239,11 +242,23 @@ function resolvedLocation(path: string): string | null {
   }
 }
 
-/** A link carries `path`, which names no protected place itself, into one
- *  (`logs -> ~/.secrets`, `state -> ~/.ssh`).  Checked before anything is
- *  created, read, written or run. */
-function redirectedIntoProtected(path: string): boolean {
-  if (isProtectedPath(path)) return false;
+/** Whether anything, a dangling link included, sits at `path`. */
+function entryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `path` names a protected place itself, or a link carries it into
+ *  one (`logs -> ~/.secrets`, `state -> ~/.ssh`), or where it lands cannot be
+ *  known.  A saved policy never names a protected path (tool-policy.ts refuses
+ *  it), so the first check guards a policy that skipped validation.  Checked
+ *  before anything is created, read, written or run. */
+function namesOrReachesProtected(path: string): boolean {
+  if (isProtectedPath(path)) return true;
   const real = resolvedLocation(path);
   return real === null || isProtectedPath(real);
 }
@@ -294,22 +309,29 @@ export class AllowlistGate {
     }
     if (WRITE_TOOLS.has(toolName)) {
       const path = input.file_path ?? input.path;
-      return path === undefined ? denied("the file is missing", name) : evaluateWrite(this.policy, path, canonicalPath);
+      return path === undefined ? denied("the file is missing", name) : this.checkFile(evaluateWrite(this.policy, path, canonicalPath), "write");
     }
     if (READ_TOOLS.has(toolName)) {
       const path = input.target_file ?? input.file_path ?? input.path;
-      return path === undefined ? denied("the file is missing", name) : evaluateRead(this.policy, path, canonicalPath);
+      return path === undefined ? denied("the file is missing", name) : this.checkFile(evaluateRead(this.policy, path, canonicalPath), "read");
     }
     return denied(ONLY_THESE_TOOLS, name);
   }
 
-  /** Refuse an allowed command whose path words a link carries into a
-   *  protected place. */
+  /** Refuse an allowed read or write whose file names a protected place, or
+   *  that a link carries into one.  The client file call checks it again. */
+  private checkFile(decision: PolicyDecision, label: "read" | "write"): PolicyDecision {
+    if (!decision.ok) return decision;
+    return namesOrReachesProtected(decision.argv[0]!) ? denied("the file names or resolves into a protected directory", label) : decision;
+  }
+
+  /** Refuse an allowed command whose path words name a protected place, or
+   *  that a link carries into one. */
   private checkPaths(decision: PolicyDecision): PolicyDecision {
     if (!decision.ok) return decision;
     const program = basename(decision.argv[0] ?? "") || "command";
     for (const path of decision.paths ?? []) {
-      if (redirectedIntoProtected(path)) return denied("a path resolves through a link into a protected directory", program);
+      if (namesOrReachesProtected(path)) return denied("a path names or resolves into a protected directory", program);
     }
     return decision;
   }
@@ -359,9 +381,13 @@ export class AllowlistGate {
     return false;
   }
 
-  /** A tool that started or finished without the hook allowing it:  the
-   *  engine ran something BotFleet never saw.  Returns the tool label when
-   *  that happened. */
+  /** A tool that started (`in_progress`) or completed without the hook
+   *  allowing it:  the engine ran something BotFleet never saw.  Returns the
+   *  tool label when that happened.  `failed` is not counted:  it is how a
+   *  call the hook denied ends (Grok reports each refusal that way), so
+   *  counting it would stop every routine at its first refusal.  The tripwire
+   *  is the last of four guards:  the hook, the permission answers and the
+   *  client terminal and file checks stand in front of it. */
   bypassed(update: JsonValue | undefined): string | null {
     const parsed = toolUpdateSchema.safeParse(update);
     if (!parsed.success) return null;
@@ -517,7 +543,7 @@ export class AllowlistGate {
     const p = parsed.data;
     const decision = evaluateRead(this.policy, p.path, canonicalPath);
     if (!decision.ok) return rpcRefusal(this.deny(decision));
-    if (redirectedIntoProtected(decision.argv[0]!)) return rpcRefusal(this.deny(denied("the file resolves through a link into a protected directory", "read")));
+    if (namesOrReachesProtected(decision.argv[0]!)) return rpcRefusal(this.deny(denied("the file names or resolves into a protected directory", "read")));
     const target = canonicalPath(decision.argv[0]!);
     if (!target) return rpcRefusal("the file is not readable");
     let stat;
@@ -547,8 +573,8 @@ export class AllowlistGate {
     const configured = decision.argv[0]!;
     // Before anything is created:  a link anywhere above the file must not
     // carry it into a protected place.
-    if (redirectedIntoProtected(configured)) {
-      return rpcRefusal(this.deny(denied("the file resolves through a link into a protected directory", "write")));
+    if (namesOrReachesProtected(configured)) {
+      return rpcRefusal(this.deny(denied("the file names or resolves into a protected directory", "write")));
     }
     const parent = dirname(configured);
     // A routine's state directory may not exist on its first run.  Create it

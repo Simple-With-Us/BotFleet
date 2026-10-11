@@ -101,9 +101,11 @@ export function isCleanAbsolutePath(path: string): boolean {
 }
 
 /** True for a dotfile, a file in a dot directory, or anything under a
- *  credential or login directory.  Checked on the configured path when a
- *  policy is saved, and again on the file a write or read resolves to, so a
- *  symlinked parent cannot carry an allowed name into `~/.ssh`. */
+ *  credential or login directory.  Checked on every configured path (write,
+ *  read, and `path` flag and positional values) when a policy is saved, and
+ *  again at run time on the path itself and on where it resolves to, so
+ *  neither a policy that skipped validation nor a symlinked parent can carry
+ *  an allowed name into `~/.ssh`. */
 export function isProtectedPath(path: string): boolean {
   if (path.split("/").some((part) => part.startsWith("."))) return true;
   return PROTECTED_WRITE_PARTS.some((part) => `${path}/`.includes(part));
@@ -125,6 +127,13 @@ function forbiddenAgentSyncFlag(word: string): string | null {
 
 const flagCommon = { repeat: z.boolean().optional(), required: z.boolean().optional() };
 const cleanAbsolutePath = z.string().refine(isCleanAbsolutePath, "must be a clean absolute path");
+/** A file a routine may name:  a write or read path, or the value of a `path`
+ *  flag or positional.  Never a dotfile or anything under a credential or login
+ *  directory, whatever the policy says. */
+const routinePath = cleanAbsolutePath.refine(
+  (path) => !isProtectedPath(path),
+  "may not name a dotfile or a credential or login directory",
+);
 const configWord = z
   .string()
   .min(1)
@@ -137,7 +146,7 @@ const flagSpecSchema = z.discriminatedUnion("value", [
   z.strictObject({ value: z.literal("text"), maxLength: z.number().int().min(1).max(MAX_TEXT_MAX).optional(), ...flagCommon }),
   z.strictObject({ value: z.literal("int"), min: z.number().int().optional(), max: z.number().int().optional(), ...flagCommon }),
   z.strictObject({ value: z.literal("oneOf"), values: z.array(configWord.max(256)).min(1).max(MAX_ENUM), ...flagCommon }),
-  z.strictObject({ value: z.literal("path"), paths: z.array(cleanAbsolutePath).min(1).max(MAX_PATHS), ...flagCommon }),
+  z.strictObject({ value: z.literal("path"), paths: z.array(routinePath).min(1).max(MAX_PATHS), ...flagCommon }),
 ]);
 
 /** One flag a command entry allows.  `none` is a switch; every other kind
@@ -150,7 +159,7 @@ const argSpecSchema = z.discriminatedUnion("value", [
   z.strictObject({ value: z.literal("text"), maxLength: z.number().int().min(1).max(MAX_TEXT_MAX).optional() }),
   z.strictObject({ value: z.literal("int"), min: z.number().int().optional(), max: z.number().int().optional() }),
   z.strictObject({ value: z.literal("oneOf"), values: z.array(configWord.max(256)).min(1).max(MAX_ENUM) }),
-  z.strictObject({ value: z.literal("path"), paths: z.array(cleanAbsolutePath).min(1).max(MAX_PATHS) }),
+  z.strictObject({ value: z.literal("path"), paths: z.array(routinePath).min(1).max(MAX_PATHS) }),
 ]);
 
 export type ToolPolicyArgSpec = z.output<typeof argSpecSchema>;
@@ -189,19 +198,15 @@ const commandSchema = z
 
 export type ToolPolicyCommand = z.output<typeof commandSchema>;
 
-const writePath = cleanAbsolutePath.refine(
-  (path) => !isProtectedPath(path),
-  "may not name a dotfile or a credential or login directory",
-);
 const unique = (paths: string[]) => [...new Set(paths)];
 
 const toolPolicySchema = z.strictObject({
   mode: z.literal("allowlist"),
   commands: z.array(commandSchema).max(MAX_COMMANDS).default([]),
   /** Exact absolute files the turn may write.  No directories, no globs. */
-  writePaths: z.array(writePath).max(MAX_PATHS).default([]).transform(unique),
+  writePaths: z.array(routinePath).max(MAX_PATHS).default([]).transform(unique),
   /** Exact absolute files the turn may read, beyond `writePaths`. */
-  readPaths: z.array(cleanAbsolutePath).max(MAX_PATHS).default([]).transform(unique),
+  readPaths: z.array(routinePath).max(MAX_PATHS).default([]).transform(unique),
 });
 
 export type ToolPolicy = z.output<typeof toolPolicySchema>;

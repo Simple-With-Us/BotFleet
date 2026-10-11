@@ -12,7 +12,8 @@
 //                     | {type:"read", path} | {type:"mcp", name}
 //                     | {type:"permission", kind, rawInput, options}
 //                     | {type:"raw-terminal", command, args?, cwd?}
-//                     | {type:"raw-write", path, content} | {type:"hook-foreign"}
+//                     | {type:"raw-write", path, content} | {type:"raw-read", path}
+//                     | {type:"hook-foreign"}
 //                     | {type:"bypass", name}
 //   FAKE_AL_DUMP      path:  written with what the client sent and answered
 //   FAKE_AL_NO_HOOKS  "1":  initialize advertises no client hooks
@@ -152,6 +153,10 @@ async function runStep(step: Json): Promise<Json> {
     case "raw-write": {
       const written = await call("fs/write_text_file", { sessionId: "fake-al", path: step.path, content: step.content });
       return { step: step.type, write: written.error ? "refused" : "ok" };
+    }
+    case "raw-read": {
+      const read = await call("fs/read_text_file", { sessionId: "fake-al", path: step.path });
+      return { step: step.type, read: read.error ? "refused" : read.result?.content };
     }
     case "bypass": {
       // The engine ran a tool on its own:  no hook, straight to completed.
