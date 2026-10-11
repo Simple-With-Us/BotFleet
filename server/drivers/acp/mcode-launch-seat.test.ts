@@ -100,7 +100,8 @@ function whoamiAnswer(results: readonly string[]): { seat: string; email: string
 }
 
 describe("findExecutable", () => {
-  it("finds an executable file on PATH and passes over a directory or a plain file of the name", () => {
+  // File modes mean nothing on Windows, where every file passes an X_OK check.
+  it.skipIf(process.platform === "win32")("finds an executable file on PATH and passes over a directory or a plain file of the name", () => {
     const bin = mkdtempSync(join(tmpdir(), "botfleet-mcode-seat-bin-"));
     try {
       mkdirSync(join(bin, "a-directory"));
