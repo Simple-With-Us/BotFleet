@@ -244,7 +244,12 @@ async function ensureLiveClient(dsn: string): Promise<FleetNodeClient | null> {
     });
     liveClient = {
       captureEvent(event) {
-        client.captureEvent(event);
+        client.captureEvent({
+          message: event.message,
+          level: "info",
+          tags: event.tags,
+          extra: event.extra,
+        });
       },
       close(timeout) {
         return client.close(timeout);
