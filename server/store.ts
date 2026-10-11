@@ -1886,6 +1886,8 @@ export class Store {
       parentId: source.parentId ?? null,
       replyToId: source.replyToId,
       automationSource: source.automationSource,
+      // an edit or retry of a routine's prompt is still that routine's turn
+      toolPolicy: source.toolPolicy,
       from: source.from ? { ...source.from } : undefined,
       comm: source.comm && source.automationSource !== "delegation" &&
         !isDelegationMessage({ role: source.role, text: source.text, automationSource: source.automationSource })

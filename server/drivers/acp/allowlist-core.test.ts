@@ -2,7 +2,7 @@
 // scripted engine (server/testing/fake-acp-allowlist-cli.ts) that behaves the
 // way Grok Build was observed to, against the real AllowlistGate, real child
 // processes and a real file system in a throwaway directory.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -347,6 +347,54 @@ posix("an allowlist turn on Grok", () => {
     expect(seen.results.map((r: any) => r.terminal ?? r.write ?? r.hook)).toEqual(["deny", "refused", "refused", "deny", "refused"]);
     expect(existsSync(join(scratch, ".ssh"))).toBe(false);
     expect(existsSync(join(scratch, ".secrets"))).toBe(false);
+  });
+
+  it("follows no link it does not own, even one into an ordinary directory", async () => {
+    await grok();
+    // A link any user-level process could plant (a routine's own command, a checked-out repository)
+    // turns the exact file the policy names into some other file.  Only links root owns are followed,
+    // which the throwaway directory itself shows on macOS:  tmpdir() is under /var, root's link to
+    // /private/var, and every allowed path below still works.
+    const elsewhere = join(scratch, "documents");
+    mkdirSync(elsewhere);
+    writeFileSync(join(elsewhere, "app.log"), "OTHER-FILE\n");
+    symlinkSync(elsewhere, join(scratch, "state"));
+    symlinkSync(elsewhere, join(scratch, "logs"));
+    const { dump: seen } = await runTurn([
+      { type: "write", path: dmFile, content: "overwritten" },
+      { type: "raw-write", path: dmFile, content: "overwritten" },
+      { type: "read", path: dmFile },
+      { type: "raw-read", path: dmFile },
+      { type: "shell", command: `/bin/cat ${join(scratch, "logs", "app.log")}` },
+      { type: "raw-terminal", command: `/bin/bash -lc '/bin/cat ${join(scratch, "logs", "app.log")}'` },
+    ]);
+    expect(seen.results.map((r: any) => r.terminal ?? r.write ?? r.read ?? r.hook)).toEqual([
+      "deny",
+      "refused",
+      "deny",
+      "refused",
+      "deny",
+      "refused",
+    ]);
+    expect(existsSync(join(elsewhere, "dm.md"))).toBe(false);
+    expect(JSON.stringify(seen.results)).not.toContain("OTHER-FILE");
+  });
+
+  it("refuses a listed file that is a hard link to another file", async () => {
+    await grok();
+    const other = join(scratch, "other.txt");
+    writeFileSync(other, "OTHER-FILE\n");
+    mkdirSync(join(scratch, "logs"));
+    linkSync(other, join(scratch, "logs", "app.log"));
+    mkdirSync(dirname(dmFile), { recursive: true });
+    linkSync(other, dmFile);
+    const { dump: seen } = await runTurn([
+      { type: "raw-write", path: dmFile, content: "overwritten" },
+      { type: "raw-read", path: dmFile },
+      { type: "shell", command: `/bin/cat ${join(scratch, "logs", "app.log")}` },
+    ]);
+    expect(seen.results.map((r: any) => r.write ?? r.read ?? r.hook)).toEqual(["refused", "refused", "deny"]);
+    expect(readFileSync(other, "utf8")).toBe("OTHER-FILE\n");
   });
 
   it("answers a permission ask from the policy with a once option only, never an always option", async () => {

@@ -154,6 +154,7 @@ import {
   selectionForFallbackPick,
   shouldReplayPersistedStarter,
   bootRecoveryTurnOpts,
+  continuedTurnToolPolicy,
   sliceIsShortProviderError,
   turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
@@ -9137,6 +9138,8 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
   void startTurn(entry.botId, prompt, {
     threadId: entry.threadId,
     cardContinuation: true,
+    // the rest of the turn the card paused, held to that turn's allowlist
+    toolPolicy: continuedTurnToolPolicy(store.activePath(entry.threadId)),
     onDispatchError: (message) => markConnectorResumeFailed(entry.threadId, entry.resumeKey, message),
   }).catch((error) => {
     // A stopped bot is a decision, not a fault: settle the card quietly rather
@@ -9249,6 +9252,8 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
   void startTurn(entry.botId, prompt, {
     threadId: entry.threadId,
     cardContinuation: true,
+    // the rest of the turn the card paused, held to that turn's allowlist
+    toolPolicy: continuedTurnToolPolicy(store.activePath(entry.threadId)),
     onDispatchError: (message) => markSecretResumeFailed(entry.threadId, entry.messageId, message),
   }).catch((error) => {
     // See the connector resume above: a stopped bot settles the card instead

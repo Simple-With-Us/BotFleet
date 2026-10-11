@@ -12,6 +12,7 @@ import { writeFileAtomic } from "./atomic.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
 import { modelRejections, type ModelRejectionGate } from "./model-rejections.ts";
 import type { ModelSelection, ProviderErrorCode } from "./contracts.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 import { rewriteModelSelection, rewriteRetiredModelId } from "./retired-model-ids.ts";
 
 /** Antigravity offers no 3.1 Flash, so a naive -pro -> -flash rewrite of
@@ -190,6 +191,8 @@ export interface FallbackScanMessage {
   kind: string;
   text?: string;
   tool?: { name?: string; ok?: boolean; kind?: string };
+  /** On a routine's prompt message:  its command allowlist. */
+  toolPolicy?: ToolPolicy;
 }
 
 export interface TurnFallbackPick extends ModelSelection {
@@ -314,6 +317,16 @@ export function lastTurnStartIndex(messages: FallbackScanMessage[]): number {
   return -1;
 }
 
+/** The command allowlist of the turn a continuation resumes (a connector or
+ *  secret card answered, a boot resume):  the one on the active path's latest
+ *  turn starter, which is that turn's own prompt.  A continuation carries no
+ *  persisted starter of its own, so without this it would run the rest of an
+ *  allowlisted routine with everything the bot can do. */
+export function continuedTurnToolPolicy(messages: FallbackScanMessage[]): ToolPolicy | undefined {
+  const index = lastTurnStartIndex(messages);
+  return index >= 0 ? messages[index]?.toolPolicy : undefined;
+}
+
 /** Boot-recovery prompt when the in-flight turn has no persisted starter
  * (connector/secret cardContinuation is ephemeral). */
 export const BOOT_RECOVERY_NOTICE =
@@ -429,11 +442,15 @@ export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "
 export interface BootRecoveryResumeUser {
   role?: string;
   automationSource?: BootRecoveryAutomationSource;
+  toolPolicy?: ToolPolicy;
 }
 
 export interface BootRecoveryTurnOpts {
   automationSource?: BootRecoveryAutomationSource;
   unattended?: boolean;
+  /** The routine's command allowlist, on the replay and the continuation
+   *  path alike:  a resumed routine turn is held to it as the first was. */
+  toolPolicy?: ToolPolicy;
 }
 
 /**
@@ -459,7 +476,10 @@ export function bootRecoveryTurnOpts(
   // clear the guard and let always-allow authorize a request nobody is
   // watching.  A system row with no source gets the same treatment.
   const unattended = webhookOrResource || resumeUser?.role === "system" ? true : undefined;
-  return { automationSource, unattended };
+  // The allowlist rides on the starter, so neither path may drop it:  the
+  // continuation sends BOOT_RECOVERY_NOTICE instead of the starter, and the
+  // notice is stored with this policy for the next resume.
+  return resumeUser?.toolPolicy ? { automationSource, unattended, toolPolicy: resumeUser.toolPolicy } : { automationSource, unattended };
 }
 
 function sameEngine(a: { instanceId: string; model: string }, b: { instanceId: string; model: string }): boolean {

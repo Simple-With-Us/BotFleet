@@ -24,7 +24,7 @@
 // Every engine message is decoded with a schema first:  a message of an
 // unexpected shape is a refusal, never a guess.
 import { spawn, type ChildProcess } from "node:child_process";
-import { constants as fsConstants, existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { constants as fsConstants, existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, type Stats } from "node:fs";
 import { chmod, open, readFile } from "node:fs/promises";
 import { basename, dirname, posix } from "node:path";
 
@@ -222,41 +222,58 @@ function canonicalPath(configured: string): string | null {
   return isCleanAbsolutePath(resolved) && !isProtectedPath(resolved) ? resolved : null;
 }
 
-/** Where `path` really lands:  its nearest existing ancestor resolved through
- *  every link, with the missing rest appended.  Null when nothing resolves, or
- *  when an entry on the way exists but cannot be resolved (a dangling link, a
- *  link loop, an unreadable directory):  where that lands is unknown. */
+/** How many links one path may pass through before it counts as a loop. */
+const MAX_LINK_HOPS = 40;
+
+/** Where `path` really lands, walked one component at a time from the root.
+ *  Only links the operating system owns (owner root:  macOS's `/tmp`, `/var`
+ *  and `/etc`) are followed.  Once a component does not exist yet, the rest is
+ *  appended as it is:  nothing below a missing directory can redirect.  Null
+ *  when the path runs through any other link (a user-level process, one of a
+ *  routine's own commands or a checked-out repository could have planted it,
+ *  so it may point anywhere, protected or not), through a link loop, or
+ *  through something it cannot read, and when it names an existing file that
+ *  has another hard link (another name for the same file, possibly in a
+ *  protected place). */
 function resolvedLocation(path: string): string | null {
-  const rest: string[] = [];
-  let dir = path;
-  for (;;) {
+  const pending = path.split("/").filter(Boolean);
+  let current = "/";
+  let hops = 0;
+  let last: Stats | null = null;
+  while (pending.length > 0) {
+    const next = posix.join(current, pending.shift()!);
     try {
-      return posix.join(realpathSync(dir), ...rest.reverse());
-    } catch {
-      if (entryExists(dir)) return null;
-      const parent = dirname(dir);
-      if (parent === dir) return null;
-      rest.push(basename(dir));
-      dir = parent;
+      last = lstatSync(next);
+    } catch (error) {
+      const missing = error instanceof Error && "code" in error && error.code === "ENOENT";
+      return missing ? posix.join(next, ...pending) : null;
     }
+    if (last.isSymbolicLink()) {
+      if (last.uid !== 0 || ++hops > MAX_LINK_HOPS) return null;
+      let target: string;
+      try {
+        target = readlinkSync(next);
+      } catch {
+        return null;
+      }
+      // `current` is a real directory (every link above it was followed), so
+      // resolving the target against it lexically is resolving it physically.
+      pending.unshift(...posix.resolve(current, target).split("/").filter(Boolean));
+      current = "/";
+      continue;
+    }
+    current = next;
   }
+  if (last?.isFile() && last.nlink > 1) return null;
+  return current;
 }
 
-/** Whether anything, a dangling link included, sits at `path`. */
-function entryExists(path: string): boolean {
-  try {
-    lstatSync(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Whether `path` names a protected place itself, or a link carries it into
- *  one (`logs -> ~/.secrets`, `state -> ~/.ssh`), or where it lands cannot be
- *  known.  A saved policy never names a protected path (tool-policy.ts refuses
- *  it), so the first check guards a policy that skipped validation.  Checked
- *  before anything is created, read, written or run. */
+/** Whether `path` may not be used:  it names a protected place itself, it
+ *  lands in one, or where it lands cannot be trusted (`resolvedLocation`
+ *  returned null:  a link BotFleet does not follow, a loop, a hard-linked
+ *  file).  A saved policy never names a protected path (tool-policy.ts
+ *  refuses it), so the first check guards a policy that skipped validation.
+ *  Checked before anything is created, read, written or run. */
 function namesOrReachesProtected(path: string): boolean {
   if (isProtectedPath(path)) return true;
   const real = resolvedLocation(path);
@@ -318,20 +335,21 @@ export class AllowlistGate {
     return denied(ONLY_THESE_TOOLS, name);
   }
 
-  /** Refuse an allowed read or write whose file names a protected place, or
-   *  that a link carries into one.  The client file call checks it again. */
+  /** Refuse an allowed read or write whose file names a protected place or
+   *  runs through a link BotFleet does not follow.  The client file call
+   *  checks it again. */
   private checkFile(decision: PolicyDecision, label: "read" | "write"): PolicyDecision {
     if (!decision.ok) return decision;
-    return namesOrReachesProtected(decision.argv[0]!) ? denied("the file names or resolves into a protected directory", label) : decision;
+    return namesOrReachesProtected(decision.argv[0]!) ? denied("the file names a protected place or runs through a link or hard link BotFleet does not follow", label) : decision;
   }
 
-  /** Refuse an allowed command whose path words name a protected place, or
-   *  that a link carries into one. */
+  /** Refuse an allowed command whose path words name a protected place or
+   *  run through a link BotFleet does not follow (`resolvedLocation`). */
   private checkPaths(decision: PolicyDecision): PolicyDecision {
     if (!decision.ok) return decision;
     const program = basename(decision.argv[0] ?? "") || "command";
     for (const path of decision.paths ?? []) {
-      if (namesOrReachesProtected(path)) return denied("a path names or resolves into a protected directory", program);
+      if (namesOrReachesProtected(path)) return denied("a path names a protected place or runs through a link or hard link BotFleet does not follow", program);
     }
     return decision;
   }
@@ -543,7 +561,7 @@ export class AllowlistGate {
     const p = parsed.data;
     const decision = evaluateRead(this.policy, p.path, canonicalPath);
     if (!decision.ok) return rpcRefusal(this.deny(decision));
-    if (namesOrReachesProtected(decision.argv[0]!)) return rpcRefusal(this.deny(denied("the file names or resolves into a protected directory", "read")));
+    if (namesOrReachesProtected(decision.argv[0]!)) return rpcRefusal(this.deny(denied("the file names a protected place or runs through a link or hard link BotFleet does not follow", "read")));
     const target = canonicalPath(decision.argv[0]!);
     if (!target) return rpcRefusal("the file is not readable");
     let stat;
@@ -574,7 +592,7 @@ export class AllowlistGate {
     // Before anything is created:  a link anywhere above the file must not
     // carry it into a protected place.
     if (namesOrReachesProtected(configured)) {
-      return rpcRefusal(this.deny(denied("the file names or resolves into a protected directory", "write")));
+      return rpcRefusal(this.deny(denied("the file names a protected place or runs through a link or hard link BotFleet does not follow", "write")));
     }
     const parent = dirname(configured);
     // A routine's state directory may not exist on its first run.  Create it
