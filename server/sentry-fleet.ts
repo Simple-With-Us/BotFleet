@@ -228,15 +228,31 @@ async function ensureLiveClient(dsn: string): Promise<FleetNodeClient | null> {
   await closeLiveClient();
   try {
     const Sentry = await import("@sentry/node");
-    liveClient = new Sentry.NodeClient({
+    const client = new Sentry.NodeClient({
       dsn,
       environment: (process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() || "production",
-      sendDefaultPii: false,
       tracesSampleRate: 0,
       stackParser: Sentry.defaultStackParser,
       transport: Sentry.makeNodeTransport,
       integrations: [],
+      dataCollection: {
+        httpBodies: [],
+        httpHeaders: { request: false, response: false },
+        cookies: false,
+        urlQueryParams: false,
+      },
     });
+    liveClient = {
+      captureEvent(event) {
+        client.captureEvent(event);
+      },
+      close(timeout) {
+        return client.close(timeout);
+      },
+      flush(timeout) {
+        return client.flush(timeout);
+      },
+    };
     liveClientDsn = dsn;
     return liveClient;
   } catch {
