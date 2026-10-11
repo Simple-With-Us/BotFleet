@@ -94,6 +94,15 @@ export function isCleanAbsolutePath(path: string): boolean {
   return posix.normalize(path) === path && !path.split("/").some((part) => part === "." || part === "..");
 }
 
+/** True for a dotfile, a file in a dot directory, or anything under a
+ *  credential or login directory.  Checked on the configured path when a
+ *  policy is saved, and again on the file a write or read resolves to, so a
+ *  symlinked parent cannot carry an allowed name into `~/.ssh`. */
+export function isProtectedPath(path: string): boolean {
+  if (path.split("/").some((part) => part.startsWith("."))) return true;
+  return PROTECTED_WRITE_PARTS.some((part) => `${path}/`.includes(part));
+}
+
 function isAgentSync(argv0: string): boolean {
   return posix.basename(argv0) === "agent-sync";
 }
@@ -175,7 +184,7 @@ const commandSchema = z
 export type ToolPolicyCommand = z.output<typeof commandSchema>;
 
 const writePath = cleanAbsolutePath.refine(
-  (path) => !posix.basename(path).startsWith(".") && !PROTECTED_WRITE_PARTS.some((part) => `${path}/`.includes(part)),
+  (path) => !isProtectedPath(path),
   "may not name a dotfile or a credential or login directory",
 );
 const unique = (paths: string[]) => [...new Set(paths)];

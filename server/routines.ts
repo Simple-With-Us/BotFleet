@@ -1537,12 +1537,24 @@ export class RoutineManager {
         }
         // Combined deliveries stay pending until this owning turn settles.
         // A dispatch is not evidence that any delivery completed successfully.
+        //
+        // Only runs held to the same allowlist fold together:  a delivery
+        // queued after the owner narrowed a routine's allowlist must never
+        // ride on an older, broader one.  The rest stay queued and dispatch
+        // on a later tick under their own.
+        const routinePolicy = this.routines.find((r) => r.id === run.routineId)?.toolPolicy;
+        const policyKey = (candidate: RoutineRun) => {
+          const policy = candidate.toolPolicy ?? routinePolicy;
+          return policy ? JSON.stringify(policy) : "";
+        };
+        const ownPolicyKey = policyKey(run);
         const waiting = this.runs.filter(
           (candidate) =>
             candidate.status === "queued" &&
             candidate.id !== run.id &&
             candidate.botId === run.botId &&
-            automationThreadKey(candidate) === key,
+            automationThreadKey(candidate) === key &&
+            policyKey(candidate) === ownPolicyKey,
         );
         for (const folded of waiting) {
           folded.status = "running";
@@ -1585,11 +1597,7 @@ export class RoutineManager {
           // allowlist must fail the run, never reach the driver half-formed.
           const toolPolicy = run.triggerSource === "webhook" || run.triggerSource === "resource"
             ? undefined
-            : sanitizeToolPolicy(
-                run.toolPolicy
-                  ?? waiting.find((candidate) => candidate.toolPolicy)?.toolPolicy
-                  ?? this.routines.find((r) => r.id === run.routineId)?.toolPolicy,
-              );
+            : sanitizeToolPolicy(run.toolPolicy ?? routinePolicy);
           await this.options.startTurn(
             run.botId,
             threadId,

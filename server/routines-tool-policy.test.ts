@@ -107,6 +107,24 @@ describe("routine toolPolicy", () => {
     expect(h.turns[0]!.toolPolicy).toEqual(routine.toolPolicy);
   });
 
+  it("never folds a run into one held to a different allowlist", async () => {
+    const h = harness();
+    h.gate.admitting = false;
+    const routine = h.manager.create({ name: "Held", prompt: "Held prompt", botId: "bot", schedule: daily, toolPolicy: POLICY });
+    h.manager.runNow(routine.id);
+    await h.manager.tick();
+    // the owner narrows the allowlist, then a second delivery queues
+    h.manager.update(routine.id, { toolPolicy: { ...POLICY, writePaths: [] } });
+    const newer = h.manager.runNow(routine.id)!;
+    expect(newer.toolPolicy?.writePaths).toEqual([]);
+    h.gate.admitting = true;
+    await h.manager.tick();
+    // Two turns, each under its own allowlist (this harness never reports the
+    // bot busy, so both dispatch in one tick), and neither folded into the other.
+    expect(h.turns.map((t) => t.toolPolicy?.writePaths).sort()).toEqual([[], POLICY.writePaths]);
+    expect(h.manager.listRuns().every((r) => r.coalescedInto === undefined)).toBe(true);
+  });
+
   it("keeps the allowlist when an update omits it and removes it on an explicit null", () => {
     const h = harness();
     const routine = h.manager.create({ name: "Held", prompt: "Held prompt", botId: "bot", schedule: daily, toolPolicy: POLICY });

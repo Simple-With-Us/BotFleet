@@ -11,7 +11,7 @@
 //                     {type:"shell", command} | {type:"write", path, content}
 //                     | {type:"read", path} | {type:"mcp", name}
 //                     | {type:"permission", kind, rawInput, options}
-//                     | {type:"raw-terminal", command, args?}
+//                     | {type:"raw-terminal", command, args?, cwd?}
 //                     | {type:"raw-write", path, content} | {type:"hook-foreign"}
 //                     | {type:"bypass", name}
 //   FAKE_AL_DUMP      path:  written with what the client sent and answered
@@ -137,10 +137,12 @@ async function runStep(step: Json): Promise<Json> {
     case "raw-terminal": {
       const params: Json = { sessionId: "fake-al", command: step.command };
       if (step.args) params.args = step.args;
+      if (step.cwd) params.cwd = step.cwd;
       const created = await call("terminal/create", params);
       if (created.error) return { step: step.type, terminal: "refused" };
       const exit = await call("terminal/wait_for_exit", { sessionId: "fake-al", terminalId: created.result.terminalId });
-      return { step: step.type, terminal: "ran", exit: exit.result };
+      const output = await call("terminal/output", { sessionId: "fake-al", terminalId: created.result.terminalId });
+      return { step: step.type, terminal: "ran", exit: exit.result, output: output.result?.output };
     }
     case "raw-write": {
       const written = await call("fs/write_text_file", { sessionId: "fake-al", path: step.path, content: step.content });

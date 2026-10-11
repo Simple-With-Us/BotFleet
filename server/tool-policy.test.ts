@@ -351,6 +351,7 @@ describe("sanitizeToolPolicy", () => {
     ["a relative write path", { mode: "allowlist", commands: [], writePaths: ["state/dm.md"] }],
     ["a glob write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/apps/state/*.md"] }],
     ["a dotfile write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/.zshrc"] }],
+    ["a write path in a dot directory", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/.local/state/x.md"] }],
     ["a credential directory write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/.secrets/zulip"] }],
     ["a LaunchAgents write path", { mode: "allowlist", commands: [], writePaths: ["/Users/jay/Library/LaunchAgents/x.plist"] }],
     ["too many positionals", { mode: "allowlist", commands: [{ argv0: "/bin/x", positionals: 99 }] }],

@@ -2,7 +2,7 @@
 // scripted engine (server/testing/fake-acp-allowlist-cli.ts) that behaves the
 // way Grok Build was observed to, against the real AllowlistGate, real child
 // processes and a real file system in a throwaway directory.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +37,7 @@ function allowlist(): ToolPolicy {
     commands: [
       { argv0: tool, sub: ["whoami"], flags: { "--json": { value: "none" } } },
       { argv0: tool, sub: ["post"], flags: { "--topic": { value: "text", required: true } } },
+      { argv0: "/bin/pwd", sub: [] },
     ],
     writePaths: [dmFile],
   })!;
@@ -62,6 +63,7 @@ interface FakeStep {
   type: string;
   command?: string;
   args?: string[];
+  cwd?: string;
   path?: string;
   content?: string;
   name?: string;
@@ -206,6 +208,23 @@ describe("an allowlist turn on Grok", () => {
     expect(statSync(dmFile).mode & 0o777).toBe(0o600);
     expect(existsSync(elsewhere)).toBe(false);
     expect(existsSync(join(scratch, ".zshrc"))).toBe(false);
+  });
+
+  it("runs every allowed command in the turn's own directory, whatever cwd the engine asks for", async () => {
+    await grok();
+    const { dump: seen } = await runTurn([{ type: "raw-terminal", command: "/bin/bash -lc '/bin/pwd'", cwd: "/" }]);
+    expect(seen.results[0].terminal).toBe("ran");
+    expect(realpathSync(seen.results[0].output.trim())).toBe(realpathSync(scratch));
+  });
+
+  it("refuses a write whose parent directory is a link into a credential or dot directory", async () => {
+    await grok();
+    const hidden = join(scratch, ".ssh");
+    mkdirSync(hidden);
+    symlinkSync(hidden, join(scratch, "state"));
+    const { dump: seen } = await runTurn([{ type: "raw-write", path: dmFile, content: "ssh-ed25519 AAAA attacker" }]);
+    expect(seen.results[0].write).toBe("refused");
+    expect(existsSync(join(hidden, "dm.md"))).toBe(false);
   });
 
   it("refuses to write through a link planted at the listed path", async () => {

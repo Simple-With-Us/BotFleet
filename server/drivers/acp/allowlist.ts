@@ -24,9 +24,9 @@
 // Every engine message is decoded with a schema first:  a message of an
 // unexpected shape is a refusal, never a guess.
 import { spawn, type ChildProcess } from "node:child_process";
-import { constants as fsConstants, existsSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { constants as fsConstants, existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { chmod, open, readFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, posix } from "node:path";
+import { basename, dirname, posix } from "node:path";
 
 import { z } from "zod";
 
@@ -37,6 +37,8 @@ import {
   evaluateCommand,
   evaluateRead,
   evaluateWrite,
+  isCleanAbsolutePath,
+  isProtectedPath,
   unwrapShellCommand,
   type PolicyDecision,
   type ToolPolicy,
@@ -194,8 +196,8 @@ export interface AllowlistGateOptions {
   /** The environment an allowed command runs with:  the engine child's own,
    *  launch identity included, never the variables the engine passes. */
   env: Record<string, string | undefined>;
-  /** Working directory when the engine names none (or one that is not a
-   *  directory). */
+  /** The working directory every allowed command runs in:  the turn's own,
+   *  whatever directory the engine asks for. */
   cwd: string;
   /** Called once per denial with a line that names the program or tool only. */
   log?: (line: string) => void;
@@ -207,13 +209,17 @@ function toolLabel(raw: string | null | undefined): string {
 }
 
 /** The configured path's spelling through its resolved parent directory, or
- *  null when the parent does not exist yet. */
+ *  null when the parent does not exist yet, or when that resolution lands
+ *  somewhere a routine may never touch (a symlinked parent pointing into
+ *  `~/.ssh`, a dot directory, a login directory). */
 function canonicalPath(configured: string): string | null {
+  let resolved: string;
   try {
-    return posix.join(realpathSync(dirname(configured)), basename(configured));
+    resolved = posix.join(realpathSync(dirname(configured)), basename(configured));
   } catch {
     return null;
   }
+  return isCleanAbsolutePath(resolved) && !isProtectedPath(resolved) ? resolved : null;
 }
 
 function rpcRefusal(message: string): ClientRefusal {
@@ -371,7 +377,9 @@ export class AllowlistGate {
     const decision = "argv" in unwrapped ? evaluateArgv(this.policy, unwrapped.argv) : evaluateCommand(this.policy, unwrapped.command);
     if (!decision.ok) return rpcRefusal(this.deny(decision));
     const [program, ...rest] = decision.argv;
-    const cwd = p.cwd !== undefined && isAbsolute(p.cwd) && isDirectory(p.cwd) ? p.cwd : this.cwd;
+    // Always the turn's own directory, never one the engine names:  a
+    // program can read configuration or act on relative files in its cwd.
+    const cwd = this.cwd;
     const requested = p.outputByteLimit;
     const limit = requested !== undefined && Number.isFinite(requested) && requested > 0
       ? Math.min(Math.floor(requested), MAX_OUTPUT_LIMIT)
@@ -533,10 +541,3 @@ export class AllowlistGate {
   }
 }
 
-function isDirectory(path: string): boolean {
-  try {
-    return statSync(path).isDirectory();
-  } catch {
-    return false;
-  }
-}
