@@ -67,11 +67,13 @@ describe("server Sentry init", () => {
     );
   });
 
-  it("prefers SENTRY_RELEASE then GITHUB_SHA and skips an all-zero fallback", () => {
+  it("prefers SENTRY_RELEASE, then GITHUB_SHA, then VERCEL_GIT_COMMIT_SHA, and skips an all-zero fallback", () => {
     expect(sentryReleaseName({})).toBeUndefined();
     expect(sentryReleaseName({}, "0".repeat(40))).toBeUndefined();
     expect(sentryReleaseName({ GITHUB_SHA: "abc1234" })).toBe("abc1234");
     expect(sentryReleaseName({ SENTRY_RELEASE: "deadbeef", GITHUB_SHA: "abc1234" })).toBe("deadbeef");
+    expect(sentryReleaseName({ VERCEL_GIT_COMMIT_SHA: "vercel12" })).toBe("vercel12");
+    expect(sentryReleaseName({ GITHUB_SHA: "abc1234", VERCEL_GIT_COMMIT_SHA: "vercel12" })).toBe("abc1234");
     expect(sentryReleaseName({}, "c".repeat(40))).toBe("c".repeat(40));
   });
 

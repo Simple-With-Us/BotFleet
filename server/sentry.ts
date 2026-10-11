@@ -192,7 +192,8 @@ const UNKNOWN_COMMIT = "0".repeat(40);
 const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
 
 /** A git SHA Sentry can use as `release`.  All-zeros (unknown checkout) is
- *  not a release.  `SENTRY_RELEASE` wins, then `GITHUB_SHA`. */
+ *  not a release.  `SENTRY_RELEASE` wins, then `GITHUB_SHA`, then
+ *  `VERCEL_GIT_COMMIT_SHA`. */
 export function sentryReleaseName(
   env: NodeJS.ProcessEnv = process.env,
   fallback?: string | null,
