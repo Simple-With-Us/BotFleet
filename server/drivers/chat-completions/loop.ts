@@ -314,17 +314,6 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
   handle.unref?.();
 }
 
-/** Push a pending timer's deadline out by its full delay, in place.  Node's
- *  `Timeout.refresh()` does that without allocating, which matters on a
- *  path that runs once per streamed chunk; where it is missing the caller
- *  re-arms instead. */
-function refreshTimer(timer: ReturnType<typeof setTimeout>): boolean {
-  const handle: { refresh?: () => unknown } = timer;
-  if (typeof handle.refresh !== "function") return false;
-  handle.refresh();
-  return true;
-}
-
 /** Rejects when `signal` aborts, and detaches its listener either way so a
  *  long turn does not accumulate one per race. */
 function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose: () => void } {
@@ -684,9 +673,12 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
       // Progress from the driver.  A no-op once the attempt is over or the
       // clock has fired, so a straggling chunk can never re-arm a timer for
       // a request that already ended.
+      // Re-arm rather than Timeout.refresh(): Vitest 5 fake timers expose
+      // refresh() but do not move the deadline, so an idle clock that only
+      // refreshed would fire from the first arm instead of the last chunk.
       const noteProgress = () => {
         if (idleTimer === null || request.signal.aborted) return;
-        if (!refreshTimer(idleTimer)) armIdle();
+        armIdle();
       };
       // The round's hard deadline, shared by EVERY attempt at it rather
       // than re-armed per try: `requestTimeoutMs` is the most a person will
