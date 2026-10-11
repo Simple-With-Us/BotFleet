@@ -73,13 +73,103 @@ its headline WER suggests.
 
 Treat all of it as marketing until a candidate has been run over BotFleet audio.
 
+## What It Actually Costs Per Hour (Jay's Correction, 2026-10-11)
+
+Every number above is a **list pay-as-you-go price**, including MiniMax's $60.  That is
+not what any of us pay.  MiniMax sells speech on a subscription with bundled credits,
+and Jay buys that, so comparing his subscription against a competitor's price list is
+comparing two different things.  It also inflated the apparent saving: "4x cheaper than
+MiniMax" was measured against a rate Jay does not actually pay.
+
+**Characters are the wrong common unit anyway** — providers count them differently, and
+MiniMax bills a Chinese character as two.  Hours of generated audio is the honest shared
+denominator.  At roughly 150 words per minute and six characters per word, one hour of
+speech is about **54,000 characters**.
+
+| TTS option | List rate | Per hour of audio |
+|---|---|---|
+| Azure Neural | $16/1M chars | **$0.86/hr** |
+| xAI `/v1/tts` | $15/1M chars | **$0.81/hr** |
+| Azure Neural HD | $22/1M chars | $1.19/hr |
+| Deepgram Aura-2 | $30/1M chars | $1.62/hr |
+| Cartesia Sonic 3.6 (Scale) | $37.40/1M chars | $2.02/hr |
+| MiniMax `speech-2.8-turbo`, paygo | $60/1M chars | $3.24/hr |
+| MiniMax `speech-2.8-hd`, paygo | $100/1M chars | $5.40/hr |
+
+### The MiniMax Subscription, Expressed The Same Way
+
+Using ~45,000 credits to one hour of audio:
+
+| Plan | Monthly | Credits | Audio included | Effective $/hr at full use |
+|---|---|---|---|---|
+| Starter | $5 | 100,000 | 2.2 hr | $2.25 |
+| Standard | $30 | 300,000 | 6.7 hr | $4.50 |
+| Pro | $99 | 1,100,000 | 24.4 hr | $4.05 |
+| Scale | $249 | 3,300,000 | 73.3 hr | $3.40 |
+| Business | $999 | 20,000,000 | 444.4 hr | $2.25 |
+
+So the subscription is **not** as cheap as the $60/1M list figure suggested — it is
+roughly $2.25–$4.50 per hour at full utilisation, against $0.81/hr paygo at xAI.
+
+### The Break-Even That Actually Decides It
+
+A subscription is a fixed cost.  Within the allowance the marginal character is free, so
+the plan only pays for itself if the allowance is actually being consumed.  Against
+xAI's $0.81/hr, the plan costs more than pay-as-you-go once monthly usage passes:
+
+| Plan | Allowance | Break-even vs xAI | Break-even vs Azure |
+|---|---|---|---|
+| Starter | 2.2 hr | **6.2 hr/mo** | 5.8 hr/mo |
+| Standard | 6.7 hr | **37.0 hr/mo** | 34.7 hr/mo |
+| Pro | 24.4 hr | **122.2 hr/mo** | 114.6 hr/mo |
+| Scale | 73.3 hr | 307.4 hr/mo | 288.2 hr/mo |
+| Business | 444.4 hr | 1,233 hr/mo | 1,156 hr/mo |
+
+Read plainly: **unless usage is running somewhere near the top of the allowance, a plan
+tier is charging several times what the same audio costs on pay-as-you-go.**  That is the
+opposite of the conclusion the list-price table implied.
+
+### Free Tiers Change The Arithmetic Again
+
+| Free tier | Included | In hours of audio |
+|---|---|---|
+| **Azure Neural** | 500,000 chars/month | **~9.3 hr** |
+| Cartesia Free | 20,000 credits | ~0.4 hr |
+| MiniMax Audio Free | 10,000 credits | ~0.2 hr |
+
+Below roughly nine hours of TTS a month, Azure Neural costs nothing and the whole
+comparison is moot.
+
+### Three Reasons Not To Act On This Table Alone
+
+1. **Credits are shared.**  The MiniMax Audio Subscription covers speech, voice cloning
+   and music on one pool.  BotFleet uses MiniMax for **voice cloning**, which the
+   MiniMax Token Plan explicitly excludes — so TTS is not the only thing drawing on those
+   credits, and you cannot rip the TTS share out and leave the rest.
+2. **The conversion is not published.**  MiniMax does not publish an official
+   points-to-characters conversion; the 45,000-credits-per-hour figure used here is
+   third-party, and MiniMax's own consumer page implies ~50,000.  The break-evens move
+   by roughly 10% depending on which is right.
+3. **Nobody has stated the actual volume.**  Every figure above is conditional on it, and
+   it is the one input that decides the answer.
+
+**Before choosing on cost, get the real monthly hours of TTS out of BotFleet's own usage
+records.**  That number either confirms MiniMax is overpaying by several times or shows
+the allowance is genuinely exhausted.  Guessing it from the price list is what produced
+the wrong answer in the first place.
+
 ## What Would Actually Decide It
 
-Not more reading of price pages.  One fixture of real call audio and voice-prompt audio,
-run through each finalist, scoring word error rate, entity error rate on the terms we
-care about, and time-to-first-audio.  Until that exists, any ranking here is a
-hypothesis, and the honest position on the TTS and call-STT choices is that they are
-open.
+Two numbers, both obtainable rather than guessable:
+
+1. **Monthly hours of TTS actually generated**, from BotFleet's own usage records.  It
+   decides the cost question above outright.
+2. **A fixture of real call audio and voice-prompt audio**, run through each finalist,
+   scoring word error rate, entity error rate on the terms we care about, and
+   time-to-first-audio.  This decides the quality question, which no price page answers.
+
+Until both exist, any ranking here is a hypothesis, and the honest position on the TTS
+and call-STT choices is that they are open.
 
 ## Current State
 
