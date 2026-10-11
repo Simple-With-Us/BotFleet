@@ -992,7 +992,11 @@ struct ChatView: View {
     }
 
 
-    private func submit(_ explicitText: String? = nil) {
+    /// Returns the task carrying the send, so a caller that has to act on
+    /// the server's answer (Steer Now) can wait for it instead of guessing
+    /// with a sleep.  Callers that do not care discard it.
+    @discardableResult
+    private func submit(_ explicitText: String? = nil) -> Task<Void, Never>? {
         // This also cancels an in-flight permission prompt before it can
         // open the microphone after the message has already been sent.
         dictation.stop()
@@ -1001,10 +1005,10 @@ struct ChatView: View {
         let recording: (data: Data, transcript: String)? = dictation.recordedWAV.flatMap { data in
             dictation.recordedTranscript.map { (data: data, transcript: $0) }
         }
-        guard !text.isEmpty || !outgoing.isEmpty, !sending else { return }
+        guard !text.isEmpty || !outgoing.isEmpty, !sending else { return nil }
         // The server intentionally refuses recorded sends while a bot is
         // steering; keep the capture locally rather than upload an orphan.
-        guard recording == nil || !current.busy else { return }
+        guard recording == nil || !current.busy else { return nil }
         draft = ""
         pendingAttachments = []
         dictation.discardRecording()
@@ -1024,7 +1028,7 @@ struct ChatView: View {
         )
         let sentText = text
         sending = true
-        Task {
+        let task = Task {
             let outcome = await session.send(sentText, to: current, attachments: outgoing, recording: recording)
             sending = false
             let transcript = session.state.transcript(forThread: threadId)
@@ -1041,17 +1045,22 @@ struct ChatView: View {
                 dictation.restoreRecording(recording.data, transcript: recording.transcript)
             }
         }
+        return task
     }
 
     private func steerSend() {
-        submit()
-        if current.busy {
-            Task {
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                switch current {
-                case let .bot(bot): await session.interrupt(bot: bot)
-                case let .room(room): await session.interrupt(room: room)
-                }
+        // Interrupt only once the harness has accepted the send.  A fixed
+        // 300ms sleep was a guess at how long the POST takes: on a slower run
+        // it elapsed first, the interrupt landed on the running turn, and the
+        // message was interrupted into nothing.  Waiting for the send means
+        // the queued message exists before anything cancels it.
+        guard let sent = submit() else { return }
+        Task {
+            await sent.value
+            guard current.busy else { return }
+            switch current {
+            case let .bot(bot): await session.interrupt(bot: bot)
+            case let .room(room): await session.interrupt(room: room)
             }
         }
     }
