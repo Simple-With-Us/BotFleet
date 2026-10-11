@@ -14,27 +14,36 @@ public enum TVFaceAssetSource: Sendable {
     var baseURL: URL {
         switch self {
         case .fleetLink:
-            return URL(string: "https://fleetlink.online/TV-Face/botfleet")!
+            return URL(string: "https://fleetlink.online/TV-Face/botfleet-skins")!
         case .custom(let url):
             return url
         }
     }
 
-    func url(color: String, expression: TVFaceExpression, kind: TVFaceFrameKind) -> URL {
+    /// Where a color's pack lives, most current first. FleetLink publishes
+    /// every color under `botfleet-skins/{color}/` (the "app-ready" layout)
+    /// and still serves the older `botfleet/{color}/` tree, so the legacy
+    /// shape is kept as a retry rather than the primary: the phone resolved
+    /// the two the other way round from the web demo, and a color whose pack
+    /// has not been mirrored into `botfleet-skins/` was unreachable.
+    func roots(color: String) -> [URL] {
         let skin = TVFaceManifest.skinDir(color)
-        // FleetLink layout: orange at pack root; other colors under /{color}/.
-        // Local/app layout would use /skins/{skin}/ — we support both:
-        // FleetLink uses color name (or root for orange/default).
-        let root: URL
-        if case .fleetLink = self {
-            if skin == "default" {
-                root = baseURL
-            } else {
-                root = baseURL.appendingPathComponent(skin)
-            }
-        } else {
-            root = baseURL.appendingPathComponent(skin)
+        switch self {
+        case .custom(let url):
+            return [url.appendingPathComponent(skin)]
+        case .fleetLink:
+            if skin == "default" { return [baseURL] }
+            return [
+                baseURL.appendingPathComponent(skin),
+                URL(string: "https://fleetlink.online/TV-Face/botfleet")!.appendingPathComponent(skin),
+            ]
         }
+    }
+
+    /// One asset inside a pack root. `TVFaceExpression.rawValue` is a closed
+    /// `[a-z_]` vocabulary and `TVFaceManifest.skinDir` a closed color set,
+    /// so nothing interpolated here can escape the pack directory.
+    func url(root: URL, expression: TVFaceExpression, kind: TVFaceFrameKind) -> URL {
         switch kind {
         case .still:
             return root.appendingPathComponent("stills/\(expression.rawValue).png")
@@ -53,20 +62,44 @@ final class TVFacePlayer: ObservableObject {
     private var color: String
     private var source: TVFaceAssetSource
     private var task: Task<Void, Never>?
-    private var cache: [URL: Data] = [:]
+
+    /// Pack bytes, shared by every avatar on screen and bounded by a byte
+    /// ceiling. `TVFacePlayer` is created per `TVFaceAvatar` through
+    /// `@StateObject`, so a per-player cache pinned one copy of every pack per
+    /// visible row and re-fetched each pack once per row. Oldest insertion is
+    /// evicted first, so a long session cannot pin everything it has seen.
+    private static var sharedCache: [URL: Data] = [:]
+    private static var sharedCacheOrder: [URL] = []
+    private static var sharedCacheBytes = 0
+    private static let sharedCacheByteCeiling = 16 * 1024 * 1024
+
+    private static func cache(_ url: URL, _ data: Data) {
+        guard sharedCache[url] == nil else { return }
+        sharedCache[url] = data
+        sharedCacheOrder.append(url)
+        sharedCacheBytes += data.count
+        while sharedCacheBytes > sharedCacheByteCeiling, let oldest = sharedCacheOrder.first {
+            sharedCacheOrder.removeFirst()
+            if let dropped = sharedCache.removeValue(forKey: oldest) {
+                sharedCacheBytes -= dropped.count
+            }
+        }
+    }
 
     init(color: String, source: TVFaceAssetSource = .fleetLink) {
         self.color = color
         self.source = source
     }
 
-    func setColor(_ color: String) {
+    /// Swap the skin and replay the current expression under it. `previous` is
+    /// reset so the planner emits the enter step again — the caller used to
+    /// follow this with a second `play`, whose `task?.cancel()` killed the
+    /// enter this had just scheduled and cut straight to the hold.
+    func setColor(_ color: String, replaying expression: TVFaceExpression, animated: Bool) {
         guard color != self.color else { return }
         self.color = color
-        // Force replay of current expression under the new skin.
-        let expr = previous
         previous = .resting
-        play(expression: expr, animated: true)
+        play(expression: expression, animated: animated)
     }
 
     func play(state: BotState, animated: Bool) {
@@ -97,27 +130,32 @@ final class TVFacePlayer: ObservableObject {
     }
 
     private func show(expression: TVFaceExpression, kind: TVFaceFrameKind) async {
-        let url = source.url(color: color, expression: expression, kind: kind == .still ? .still : kind)
-        if let cached = cache[url] {
-            imageData = cached
-            return
+        // Same order as the web demo: the requested frame, then the same
+        // expression's still, then resting — each across every pack root,
+        // most current first.
+        var frames: [(TVFaceExpression, TVFaceFrameKind)] = [(expression, kind)]
+        if kind != .still { frames.append((expression, .still)) }
+        frames.append((.resting, .still))
+        let urls = frames.flatMap { frame in
+            source.roots(color: color).map { source.url(root: $0, expression: frame.0, kind: frame.1) }
         }
-        // Fallback chain: requested → still of same expression → resting still.
-        if let data = await fetch(url) {
-            cache[url] = data
+        for (index, url) in urls.enumerated() {
+            let data: Data
+            if let cached = Self.sharedCache[url] {
+                data = cached
+            } else if let fetched = await fetch(url) {
+                Self.cache(url, fetched)
+                data = fetched
+            } else {
+                continue
+            }
+            // Every earlier candidate missed, so it resolves to these bytes
+            // too.  The packs ship a hold GIF for only a dozen faces, and a
+            // still-only face used to re-issue its guaranteed 404 on every
+            // state change for the life of the player.
+            for missed in urls[..<index] { Self.cache(missed, data) }
             imageData = data
             return
-        }
-        let still = source.url(color: color, expression: expression, kind: .still)
-        if let data = await fetch(still) {
-            cache[still] = data
-            imageData = data
-            return
-        }
-        let rest = source.url(color: color, expression: .resting, kind: .still)
-        if let data = await fetch(rest) {
-            cache[rest] = data
-            imageData = data
         }
     }
 
@@ -181,7 +219,9 @@ struct TVFaceAvatar: View {
         .accessibilityHidden(true)
         .onAppear { player.play(state: state, animated: animated) }
         .onChange(of: state) { _, new in player.play(state: new, animated: animated) }
-        .onChange(of: color) { _, new in player.setColor(new); player.play(state: state, animated: animated) }
+        .onChange(of: color) { _, new in
+            player.setColor(new, replaying: TVFaceManifest.expression(for: state), animated: animated)
+        }
         .onChange(of: animated) { _, new in player.play(state: state, animated: new) }
     }
 }

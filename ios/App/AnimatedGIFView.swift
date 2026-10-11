@@ -13,6 +13,17 @@ struct AnimatedGIFView: UIViewRepresentable {
         self.contentMode = contentMode
     }
 
+    /// Decoded bytes of the frame currently on screen. `UIImage.animatedImage`
+    /// walks every frame of a 480×480 pack through ImageIO, and `TVFaceAvatar`
+    /// reads `player.imageData` in `body`, so an unguarded `updateUIView`
+    /// re-decoded the whole frame set on every parent re-render and restarted
+    /// the animation at frame 0.
+    final class Coordinator {
+        var lastData: Data?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeUIView(context: Context) -> UIImageView {
         let view = UIImageView()
         view.contentMode = contentMode
@@ -24,16 +35,29 @@ struct AnimatedGIFView: UIViewRepresentable {
     func updateUIView(_ view: UIImageView, context: Context) {
         view.contentMode = contentMode
         guard let data else {
+            view.stopAnimating()
             view.image = nil
             view.animationImages = nil
+            context.coordinator.lastData = nil
             return
         }
+        guard context.coordinator.lastData != data else { return }
+        context.coordinator.lastData = data
         if let animated = UIImage.animatedImage(withAnimatedGIFData: data) {
             view.image = animated
             view.startAnimating()
         } else {
             view.image = UIImage(data: data)
         }
+    }
+
+    /// A row scrolled off screen must not keep a decoded frame set — and its
+    /// display link — alive.
+    static func dismantleUIView(_ view: UIImageView, coordinator: Coordinator) {
+        view.stopAnimating()
+        view.animationImages = nil
+        view.image = nil
+        coordinator.lastData = nil
     }
 }
 

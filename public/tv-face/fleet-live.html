@@ -249,14 +249,20 @@ class FacePlayer {
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = 0;
   }
-  async show(url, kind) {
+  async show(url, kind, isCurrent = () => true) {
+    // isCurrent() lets the caller abandon a step a newer one has already
+    // replaced.  Tearing the running loop down before the await was what let a
+    // slow, stale step destroy a newer step's loop and then paint itself: it
+    // had just bumped the token, so the `my !== this.token` check passed and
+    // the card sat on a finished enter transition until the next script step.
+    // The loop is only cancelled once the new asset is actually in hand.
     const my = ++this.token;
-    if (this.raf) cancelAnimationFrame(this.raf);
-    this.raf = 0;
     try {
       if (kind === "still" || url.endsWith(".png")) {
         const img = await loadStill(url);
-        if (my !== this.token) return;
+        if (my !== this.token || !isCurrent()) return;
+        if (this.raf) cancelAnimationFrame(this.raf);
+        this.raf = 0;
         this.canvas.width = img.naturalWidth || 480;
         this.canvas.height = img.naturalHeight || 480;
         this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
@@ -264,7 +270,9 @@ class FacePlayer {
         return;
       }
       const gif = await loadGif(url);
-      if (my !== this.token) return;
+      if (my !== this.token || !isCurrent()) return;
+      if (this.raf) cancelAnimationFrame(this.raf);
+      this.raf = 0;
       this.canvas.width = gif.width;
       this.canvas.height = gif.height;
       const full = this.ctx.createImageData(gif.width, gif.height);
@@ -318,13 +326,18 @@ const cards = bots.map((b) => {
     <div class="role">${b.role} · ${b.color}</div>
     <div class="state">resting</div>`;
   grid.appendChild(el);
-  return { bot: b, el, player: new FacePlayer(el.querySelector("canvas")), stateEl: el.querySelector(".state"), cur: null };
+  return { bot: b, el, player: new FacePlayer(el.querySelector("canvas")), stateEl: el.querySelector(".state"), cur: null, gen: 0 };
 });
 
 async function apply(card, step) {
   const key = step.state + ":" + step.kind;
   if (card.cur === key) return;
   card.cur = key;
+  const gen = ++card.gen;
+  // The probe and the decode below are two network hops with nothing
+  // serializing them, so a step that has already been superseded must not
+  // disturb the winner — every enter step is only 1s ahead of its hold.
+  const isCurrent = () => card.cur === key && card.gen === gen;
   const resolved = resolveAsset(card.bot.color, step.state, step.kind);
   card.stateEl.textContent =
     resolved.state + (resolved.kind === "hold" ? " · loop" : resolved.kind === "still" ? "" : " · " + resolved.kind);
@@ -342,11 +355,15 @@ async function apply(card, step) {
 
   for (const candidate of tryUrls) {
     try {
-      if (candidate.kind !== "still") {
-        const head = await fetch(candidate.url, { method: "GET", mode: "cors" });
-        if (!head.ok) continue;
+      if (candidate.kind !== "still" && isCurrent()) {
+        // HEAD, not GET: a GET here transferred the whole GIF body only for
+        // loadGif() to fetch the identical URL a second time.  Only a
+        // definitive absence skips the candidate, so a server that refuses
+        // HEAD still falls through to show(), which fetches for real.
+        const head = await fetch(candidate.url, { method: "HEAD", mode: "cors" }).catch(() => null);
+        if (head && (head.status === 404 || head.status === 410)) continue;
       }
-      await card.player.show(candidate.url, candidate.kind);
+      await card.player.show(candidate.url, candidate.kind, isCurrent);
       return;
     } catch (_) {}
   }
