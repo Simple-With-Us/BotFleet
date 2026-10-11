@@ -101,8 +101,8 @@ describe("browser Sentry", () => {
     expect(src).toMatch(/blockAllMedia:\s*true/);
     expect(src).toMatch(/feedbackIntegration\(/);
     expect(src).toMatch(/autoInject:\s*false/);
-    expect(src).toMatch(/enableLogs:\s*true/);
-    expect(src).toMatch(/sendDefaultPii:\s*false/);
+    expect(src).toMatch(/urlQueryParams:\s*false/);
+    expect(src).not.toMatch(/sendDefaultPii/);
     expect(src).toMatch(/genAI:\s*\{\s*inputs:\s*false,\s*outputs:\s*false/);
   });
 

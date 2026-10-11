@@ -197,7 +197,7 @@ describe("Sentry AI data collection kill-switch", () => {
     });
   });
 
-  it("passes streamGenAiSpans and dataCollection into Sentry.init", async () => {
+  it("passes dataCollection and a static trace lifecycle into Sentry.init", async () => {
     let initOpts: Record<string, unknown> | null = null;
     const sdk = Object.assign({} as FakeSentrySdk, {
       init(opts: Record<string, unknown>) {
@@ -222,9 +222,12 @@ describe("Sentry AI data collection kill-switch", () => {
       source: "config",
     });
     expect(initOpts).toMatchObject({
-      streamGenAiSpans: true,
+      traceLifecycle: "static",
       dataCollection: { genAI: { inputs: true, outputs: true }, httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, urlQueryParams: false },
     });
+    expect(initOpts).not.toHaveProperty("sendDefaultPii");
+    expect(initOpts).not.toHaveProperty("streamGenAiSpans");
+    expect(initOpts).not.toHaveProperty("enableLogs");
 
     resetSentryForTests();
     setSentryLoaderForTests(sentryTestLoader(sdk));
@@ -239,7 +242,7 @@ describe("Sentry AI data collection kill-switch", () => {
       source: "config",
     });
     expect(initOpts).toMatchObject({
-      streamGenAiSpans: true,
+      traceLifecycle: "static",
       dataCollection: { genAI: { inputs: false, outputs: false } },
     });
     delete process.env.SENTRY_AI_DATA_COLLECTION;
@@ -406,7 +409,7 @@ describe("webhook secrets never reach Sentry", () => {
     const http = hooks.integrations.find((integration) => integration.name === "Http");
     expect(http?.options?.ignoreIncomingRequests?.(`/hooks/${endpoint}/${secret}`)).toBe(true);
     expect(http?.options?.ignoreIncomingRequests?.("/api/bots")).toBe(false);
-    expect((http?.options as Record<string, unknown>)?.maxIncomingRequestBodySize).toBe("none");
+    expect((http?.options as Record<string, unknown>)?.maxRequestBodySize).toBe("none");
     expect(hooks.integrations.some((integration) => integration.name === "ConsoleLogs")).toBe(true);
     expect(isWebhookIngressPath("/health")).toBe(false);
   });

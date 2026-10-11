@@ -494,11 +494,11 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   if (sdk.httpIntegration) {
     integrations.push(sdk.httpIntegration({
       ignoreIncomingRequests: (urlPath) => isWebhookIngressPath(urlPath),
-      maxIncomingRequestBodySize: "none",
+      maxRequestBodySize: "none",
     }));
   }
-  // enableLogs alone only produces breadcrumbs; the console integration
-  // is what turns a warn or an error into a Sentry log.
+  // v11 dropped enableLogs; the console integration is what turns a
+  // warn or an error into a Sentry log.
   if (input.logsEnabled) integrations.push(sdk.consoleLoggingIntegration({ levels: ["warn", "error"] }));
   try {
     sdk.init({
@@ -544,8 +544,11 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
 
         return input.tracesSampleRate;
       },
-      enableLogs: true,
       integrations,
+      // v11 streams spans by default, which makes beforeSendTransaction a
+      // no-op.  Static lifecycle keeps one transaction event so the webhook
+      // secret scrub still walks names, URLs, and child spans.
+      traceLifecycle: "static",
       // Every payload kind the client sends passes the webhook-secret scrub:
       // errors and messages, transactions with all their child spans, and
       // console-derived logs.  No beforeSendSpan: in this SDK the gen_ai
@@ -555,11 +558,9 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
       beforeSend: (event) => safeScrubHook(event),
       beforeSendTransaction: (event) => safeScrubHook(event),
       beforeSendLog: (log) => safeScrubHook(log),
-      sendDefaultPii: false,
-      // Sentry Agents (SaaS): standalone gen_ai envelopes for Conversations.
-      // Opt-out only for self-hosted that cannot ingest them.
-      streamGenAiSpans: true,
       // GenAI I/O collection ON by default; kill with SENTRY_AI_DATA_COLLECTION=0.
+      // v11 dropped sendDefaultPii and streamGenAiSpans; dataCollection is the
+      // remaining privacy knob, and gen_ai spans always stream.
       dataCollection: {
         ...genAiDataCollectionOptions(),
         httpBodies: [],

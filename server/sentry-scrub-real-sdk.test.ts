@@ -17,7 +17,6 @@ beforeAll(() => {
   Sentry.init({
     dsn: "https://public@example.invalid/1",
     tracesSampleRate: 1,
-    enableLogs: true,
     transport: () => ({
       send: async (envelope) => {
         envelopes.push(JSON.stringify(envelope));
@@ -26,10 +25,11 @@ beforeAll(() => {
       flush: async () => true,
     }),
     integrations: [Sentry.httpIntegration({ ignoreIncomingRequests: (urlPath) => isWebhookIngressPath(urlPath) })],
+    traceLifecycle: "static",
     beforeSend: (event) => safeScrubHook(event),
     beforeSendTransaction: (event) => safeScrubHook(event),
     beforeSendLog: (log) => safeScrubHook(log),
-    dataCollection: { httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, queryParams: false },
+    dataCollection: { httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, urlQueryParams: false },
   });
 });
 
