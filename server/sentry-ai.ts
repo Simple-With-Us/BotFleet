@@ -467,10 +467,9 @@ function applyConversation(
     const resolved = identity === undefined ? identityFor(threadId) : identity;
     const id = clean(resolved?.botId) ?? clean(resolved?.roomId) ?? threadId;
     const username = clean(resolved?.botName) ?? clean(resolved?.roomName);
-    sink.setUser({
-      id,
-      ...(username ? { username } : {}),
-    });
+    const user: { id: string; username?: string } = { id };
+    if (username) user.username = username;
+    sink.setUser(user);
   } catch {
     /* conversation tagging must never take down a turn */
   }
@@ -746,24 +745,17 @@ export function captureTurnPrompt(
 /** Flatten chat-completions messages for a span attribute.  Tool rows are
  *  dropped: they can carry paths, payloads, and credentials. */
 export function formatGenAiMessages(
-  messages: ReadonlyArray<{ role?: string; content?: unknown }>,
+  messages: ReadonlyArray<{ role?: string; content?: string }>,
 ): string {
   const parts: string[] = [];
   for (const message of messages) {
-    const role = typeof message.role === "string" ? message.role : "unknown";
+    const role = message.role || "unknown";
     if (role === "tool") continue;
-    const raw = message.content;
-    const content = typeof raw === "string" ? raw : raw == null ? "" : JSON.stringify(raw);
+    const content = message.content;
     if (!content) continue;
     parts.push(`${role}: ${content}`);
   }
   return parts.join("\n\n");
-}
-
-function chatResultText(result: unknown): string | undefined {
-  if (!result || typeof result !== "object" || !("text" in result)) return undefined;
-  const text = Reflect.get(result, "text");
-  return typeof text === "string" && text ? text : undefined;
 }
 
 /** Map a harness runtime event onto gen_ai spans.  No-op without a sink. */
@@ -858,12 +850,12 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
           "gen_ai.conversation.id": conversationId,
           "gen_ai.provider.name": turn.provider,
           "gen_ai.system": turn.provider,
-          ...(toolModel ? { "gen_ai.request.model": toolModel } : {}),
           "botfleet.room_id": event.threadId,
           "gen_ai.agent.name": agentName(turn.identity, event.provider),
           ...identityAttributes(turn.identity),
         },
       });
+      if (toolModel) toolSpan.setAttribute("gen_ai.request.model", toolModel);
       turn.tools.set(toolId, toolSpan);
       turn.toolNames.push(toolName);
       break;
@@ -927,12 +919,12 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
           "gen_ai.conversation.id": conversationId,
           "gen_ai.provider.name": turn.provider,
           "gen_ai.system": turn.provider,
-          ...(approvalModel ? { "gen_ai.request.model": approvalModel } : {}),
           "botfleet.room_id": event.threadId,
           "gen_ai.agent.name": agentName(turn.identity, event.provider),
           ...identityAttributes(turn.identity),
         },
       });
+      if (approvalModel) toolSpan.setAttribute("gen_ai.request.model", approvalModel);
       turn.tools.set(toolId, toolSpan);
       turn.toolNames.push(toolName);
       break;
@@ -1129,13 +1121,14 @@ export function recordExecutedTools(
         "gen_ai.tool.name": toolName,
         "gen_ai.conversation.id": taskId,
         "botfleet.room_id": conversationId,
-        ...(provider && provider !== "custom"
-          ? { "gen_ai.provider.name": provider, "gen_ai.system": provider }
-          : {}),
-        ...(model ? { "gen_ai.request.model": model } : {}),
         ...identityAttrs,
       },
     });
+    if (provider && provider !== "custom") {
+      span.setAttribute("gen_ai.provider.name", provider);
+      span.setAttribute("gen_ai.system", provider);
+    }
+    if (model) span.setAttribute("gen_ai.request.model", model);
     span.end();
   }
 }
@@ -1163,7 +1156,7 @@ export interface ChatSpanContext {
  *  and is what actually becomes `gen_ai.conversation.id`; a caller that
  *  omits it falls back to `conversationId`, so this stays per-room instead
  *  of reporting nothing. */
-export async function withChatSpan<T extends { usage?: ChatSpanUsage | null }>(
+export async function withChatSpan<T extends { usage?: ChatSpanUsage | null; text?: string }>(
   opts: { model: string; conversationId: string; taskId?: string; provider?: string; input?: string },
   fn: (context: ChatSpanContext) => Promise<T>,
   sink: SentryAiSink | null = liveSink(),
@@ -1222,7 +1215,7 @@ export async function withChatSpan<T extends { usage?: ChatSpanUsage | null }>(
       applyUsageToSpan(span, result.usage);
     }
     if (isPromptCaptureEnabled()) {
-      const text = chatResultText(result);
+      const text = result.text;
       if (text) span.setAttribute("gen_ai.output.messages", clipSpanText(text));
     }
     return result;

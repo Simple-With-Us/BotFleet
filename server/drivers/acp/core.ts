@@ -1080,7 +1080,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             ok,
             stopReason,
             cost: turnCost ?? null,
-            ...(turnBillingMode ? { billingMode: turnBillingMode } : {}),
+            billingMode: turnBillingMode,
             ...(turnUsage ? { usage: turnUsage } : {}),
           });
           stop(); // the agent process does not exit on its own

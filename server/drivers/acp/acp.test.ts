@@ -844,8 +844,7 @@ describe("ACP turns (fake CLI)", () => {
       ok: true,
       billingMode: "estimated",
     });
-    expect(typeof done.cost).toBe("number");
-    expect(done.cost).toBeGreaterThan(0);
+    expect((done as { cost?: number | null }).cost).toBeGreaterThan(0);
   });
 
   it("folds cache reads into input rather than reporting them beside it", async () => {

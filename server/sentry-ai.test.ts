@@ -1300,12 +1300,15 @@ describe("catalog cost fallback", () => {
         type: "turn.completed",
         provider: "mcodeAgent",
         ok: true,
-        usage: { input: 1_000_000, output: 500_000 },
+        usage: { input: 100_000, output: 50_000 },
         cost: null,
       }),
       sink,
     );
-    expect(spans[0].attributes["gen_ai.usage.cost"]).toBeCloseTo(0.9, 10);
+    expect(spans[0].attributes["gen_ai.usage.cost"]).toBeCloseTo(
+      (100_000 * 0.3 + 50_000 * 1.2) / 1_000_000,
+      10,
+    );
     expect(spans[0].attributes["botfleet.cost.source"]).toBe("catalog");
     expect(spans[0].attributes["gen_ai.provider.name"]).toBe("minimax");
     expect(spans[0].attributes["gen_ai.system"]).toBe("minimax");

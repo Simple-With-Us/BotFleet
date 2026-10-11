@@ -44,8 +44,8 @@ describe("catalog DeepSeek family", () => {
 describe("estimateCatalogCost", () => {
   it("prices MiniMax M3.1 at the published ≤512K rate", () => {
     expect(
-      estimateCatalogCost("MiniMax-M3.1-Flash-Preview", { input: 1_000_000, output: 500_000 }),
-    ).toBeCloseTo(0.3 + 0.6, 10);
+      estimateCatalogCost("MiniMax-M3.1-Flash-Preview", { input: 100_000, output: 50_000 }),
+    ).toBeCloseTo((100_000 * 0.3 + 50_000 * 1.2) / 1_000_000, 10);
   });
 
   it("prices mcode thinking ids the same as the base model", () => {
