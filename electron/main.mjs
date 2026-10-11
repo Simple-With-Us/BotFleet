@@ -96,8 +96,8 @@ const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
 
 function resolvedDesktopReleaseSha() {
   const candidates = [];
-  for (const raw of [process.env.SENTRY_RELEASE, process.env.GITHUB_SHA]) {
-    const value = typeof raw === "string" ? raw.trim() : "";
+  for (const key of ["SENTRY_RELEASE", "GITHUB_SHA", "VERCEL_GIT_COMMIT_SHA"]) {
+    const value = process.env[key]?.trim();
     if (value) candidates.push(value);
   }
   // Packaged Electron builds stamp a real SHA in build-identity.json; env
@@ -117,16 +117,15 @@ function resolvedDesktopReleaseSha() {
 }
 
 function redactQueryStringTokens(url) {
-  return typeof url === "string"
-    ? url.replace(/([?&])(token|key|secret|authorization)=[^&]*/gi, "$1$2=[redacted]")
-    : url;
+  if (url == null || url === "") return url;
+  return String(url).replace(/([?&])(token|key|secret|authorization)=[^&]*/gi, "$1$2=[redacted]");
 }
 
 function scrubDesktopSentryRequest(event) {
   if (!event) return event;
   if (event.request) {
     if (event.request.headers) event.request.headers = {};
-    if (typeof event.request.query_string === "string") {
+    if (event.request.query_string) {
       event.request.query_string = "[redacted]";
     }
   }
