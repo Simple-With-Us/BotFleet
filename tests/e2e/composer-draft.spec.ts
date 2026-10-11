@@ -406,4 +406,10 @@ test('editing a queued bot message waits for the harness before restoring the dr
   cancel.release();
   await expect(box).toHaveValue('worth a second look');
   await expect(page.getByRole('button', { name: 'Edit queued message' })).toHaveCount(0);
+  // The restore fills the box after the DELETE answers, so the caret has to
+  // move with it.  Asserting the value alone would not notice a caret left at
+  // position 0, which is what reading the value before the restore produced.
+  await expect
+    .poll(() => box.evaluate((field) => field.selectionStart))
+    .toBe('worth a second look'.length);
 });
