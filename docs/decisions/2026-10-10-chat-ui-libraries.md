@@ -2,7 +2,7 @@
 
 **Date:** Sat, Oct 10, 2026
 **Seat:** MM
-**Board:** `2b6d247c` · Lane `~/apps/lanes/BotFleet/minimax-chat-ui-libraries` @ `minimax/chat-ui-libraries`
+**Board:** `2b6d247c`
 
 Owner decision (Sat, Oct 10, 2026): use [assistant-ui](https://www.assistant-ui.com) for the macOS
 chat surface and Exyte Chat for the iOS chat surface.
