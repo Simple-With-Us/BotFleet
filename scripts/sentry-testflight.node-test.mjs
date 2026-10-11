@@ -8,9 +8,9 @@ import test from 'node:test';
 import { createReceipt, validateReceipt } from './sentry-testflight-receipt.mjs';
 import { reportTestFlight } from './sentry-report-testflight.mjs';
 const sha = 'a'.repeat(40);
-const fixture = () => ({ archive: { bundleId:'app.botfleet', marketingVersion:'1.0.79', buildNumber:'202610060212' },
+const fixture = () => ({ archive: { bundleId:'app.botfleet.ios', marketingVersion:'1.0.79', buildNumber:'202610060212' },
   readiness:{ok:true,version:'202610060212',buildId:'asc-build-123',internalBuildState:'IN_BETA_TESTING'},
-  sourceCommit:sha,expectedCommit:sha,bundleId:'app.botfleet',marketingVersion:'1.0.79',buildNumber:'202610060212',now:new Date('2026-10-06T02:30:00.000Z') });
+  sourceCommit:sha,expectedCommit:sha,bundleId:'app.botfleet.ios',marketingVersion:'1.0.79',buildNumber:'202610060212',now:new Date('2026-10-06T02:30:00.000Z') });
 const receipt = () => createReceipt(fixture());
 const root = new URL('../', import.meta.url);
 // Git checks shell sources out with CRLF on Windows.  Extract the same shell
@@ -19,7 +19,7 @@ const read = path => readFileSync(new URL(path,root),'utf8').replace(/\r\n/g,'\n
 const shellPath = path => path.replaceAll('\\', '/');
 
 test('receipt matches Cocoa SDK identity and exact archive, source, ASC build', () => {
-  assert.equal(receipt().release, 'app.botfleet@1.0.79+202610060212');
+  assert.equal(receipt().release, 'app.botfleet.ios@1.0.79+202610060212');
   assert.equal(receipt().milestone, 'testflight-ready');
   for (const field of ['bundleId','marketingVersion','buildNumber']) {
     const f = fixture(); f.archive[field] = 'different'; assert.throws(() => createReceipt(f));
@@ -33,7 +33,7 @@ test('receipt matches Cocoa SDK identity and exact archive, source, ASC build', 
 });
 
 test('receipt rejects wrong app, forged release, SHA and output injection', () => {
-  for (const change of [{bundleId:'app.botfleet.ios'},{release:sha},{sourceCommit:'main'},
+  for (const change of [{bundleId:'app.botfleet'},{release:sha},{sourceCommit:'main'},
     {ascBuildId:'x\nsentry_receipt=oops'}, {buildNumber:'1\n'}, {confirmedAt:'not-a-date'}, {schema:2}]) {
     assert.throws(() => validateReceipt({...receipt(),...change}));
   }
@@ -61,7 +61,7 @@ test('report uses exact Cocoa release, source refs, scoped project and honest di
   assert.equal(result.deployId,'123'); assert.equal(api.calls.length,4);
   assert.deepEqual(api.calls[1].body.refs,[{repository:'jaywedgeworth22/BotFleet',commit:sha}]);
   assert.equal(api.calls[1].body.version,receipt().release);
-  assert.match(api.calls[0].url,/app.botfleet%401.0.79%2B202610060212/);
+  assert.match(api.calls[0].url,/app.botfleet.ios%401.0.79%2B202610060212/);
   assert.deepEqual(api.calls[3].body.projects,['botfleet']);
   assert.equal(api.calls[3].body.name,'ios-testflight:202610060212');
   assert.equal(api.calls[3].body.dateFinished,receipt().confirmedAt);
@@ -102,7 +102,7 @@ test('ship receipt follows recorded success only after exact ASC readiness; skip
       const out=join(dir,`out-${status}-${receiptStatus}`); writeFileSync(out,'');
       const script=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; return ${status}; elif [[ ${receiptStatus} == 1 ]]; then return 1; else echo emitted >> "$GITHUB_OUTPUT"; fi; }\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
       const scriptFile=join(dir,'fixture.sh'); writeFileSync(scriptFile,script);
-      const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),BUNDLE_ID:'app.botfleet',BUILD_NUM:'202610060212',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
+      const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'202610060212',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
       assert.equal(result.status,0,result.stderr);
       assert.equal(readFileSync(out,'utf8'),status!==0?'':receiptStatus===0?'emitted\n':'sentry_receipt_error=true\n');
     }
@@ -151,7 +151,7 @@ test('a confirmed upload survives receipt failure and the same source is not upl
     const script=`set -euo pipefail\nlog(){ :; }\njson_get(){ :; }\ndate(){ echo 1791280000; }\nmkdir(){ :; }\nchmod(){ :; }\nbash(){ return 1; }\n${stateFunctions}\nrepo_head_sha(){ echo ${sha}; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; else return 1; fi; }\n${ensure}\n${emit}\nprintf uploaded > "$STATE_DIR/uploaded"\nensure_tf_ready\nrecord_successful_ship\nemit_sentry_deployment_receipt\nevaluate_ship_gate\nprintf '%s' "$SHIP_GATE_DECISION"\n`;
     // A file avoids Windows/Git Bash inline-command length and quoting limits.
     const scriptFile=join(dir,'fixture.sh'); writeFileSync(scriptFile,script);
-    const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),STATE_DIR:shellPath(dir),FORCE_SHIP:'0',EXPORT_ONLY:'0',DEFAULT_MIN_INTERVAL_SEC:'3600',BUNDLE_ID:'app.botfleet',BUILD_NUM:'202610060212',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:'',DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
+    const result=spawnSync('bash',[shellPath(scriptFile)],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),STATE_DIR:shellPath(dir),FORCE_SHIP:'0',EXPORT_ONLY:'0',DEFAULT_MIN_INTERVAL_SEC:'3600',BUNDLE_ID:'app.botfleet.ios',BUILD_NUM:'202610060212',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:'',DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
     assert.equal(result.status,0,result.stderr);
     assert.equal(result.stdout,'skip');
     assert.equal(readFileSync(join(dir,'uploaded'),'utf8'),'uploaded');
