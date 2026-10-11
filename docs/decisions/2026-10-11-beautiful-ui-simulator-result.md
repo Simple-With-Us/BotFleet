@@ -88,7 +88,7 @@ xcodebuild -scheme BeautifulUI -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' build      # BUILD SUCCEEDED
 ```
 
-The comparison app is throwaway and lives outside the repo (`~/.cache/fleet-probe/CompareSimApp`);
+The comparison app is throwaway and lives outside the repo in a local cache directory;
 nothing from the library is vendored into BotFleet, per the owner's ruling to read and never copy.
 
 ## Sources

@@ -1671,6 +1671,16 @@ struct MessageRow: View {
     /// nothing at all about who had spoken.
     private var accessibilitySender: String {
         if message.role == .user { return "You" }
+        // A `system` row is auto-delivered, not spoken by the bot. Falling
+        // through to "Bot" below misattributed every webhook, iMessage and
+        // delegation row to it, and contradicted the inner channel card's own
+        // "Webhook" label.
+        if message.role == .system {
+            if let source = message.automationSource, !source.isEmpty {
+                return source.capitalized
+            }
+            return "System"
+        }
         if let from = message.from?.name, !from.isEmpty { return from }
         if let name = senderBot?.name { return name }
         if case let .room(room) = chat { return room.name }
