@@ -4,10 +4,12 @@
 **Supersedes:** the iOS next-step in [2026-10-10-chat-ui-libraries.md](2026-10-10-chat-ui-libraries.md)
 **Corrected:** Sun, Oct 11, 2026, after the design review on PR #1068 (issue comment `6110970373`).  Docs only.  The simulator comparison and the grouping spike listed under Open Follow-Ups were not done.
 
+## Description
+
 The main decision doc answered "should we adopt Exyte Chat for iOS?" with "borrow its patterns."
 The owner's follow-up was sharper: *what other options would be an actual upgrade and well suited?*
 
-This records a survey against explicit acceptance criteria rather than by impression.
+This records a survey against explicit acceptance criteria rather than by impression.  It corrects the merged superseding note in [2026-10-10-chat-ui-libraries.md](2026-10-10-chat-ui-libraries.md), which said the survey found no candidate that passes; the corrected position is that the survey found one candidate that does and the reason to stay native is that BotFleet already owns the components.  Edge cases and constraints considered: licence compatibility (Stream's customer-and-API grant excludes our own-backend use, MIT carries a copyright-notice clause for any copy), CI toolchain (Xcode 27.0 with Swift 6.4 tools and Swift 5 language mode — the 2026-09-28 Kingfisher lesson describes an older runner), single-author supply-chain risk, and the assumption that only a SwiftUI stack can host Liquid Glass materials, which is untested.
 
 **Expected behavior after this correction:** the answer to "should BotFleet adopt a third-party iOS chat UI library?" remains *build native, do not depend on one*.  Any candidate must clear the nine criteria below, no surveyed library does, and adopting a sub-3★ single-author package to obtain components BotFleet already owns (`ApprovalCard`, `AgentThoughtChamberView`) is a bad trade.  Action: read `beautiful-ui-swift` and the Stream Chat `StreamChatAI` docs as a second opinion, never copy their source; spike message grouping natively; do not depend on either.  Out of scope: the simulator visual comparison and the grouping spike, both deferred to Open Follow-Ups.
 
