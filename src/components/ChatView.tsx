@@ -651,23 +651,6 @@ function Bubble({
         <div className="mt-1 flex items-center gap-1.5 pr-1 text-[11px] text-ink-secondary/70">
           <Clock size={11} aria-hidden="true" />
           <span>Queued — sends when this turn finishes</span>
-          <button
-            type="button"
-            onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
-            className="ml-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent hover:bg-raised hover:underline"
-            title="Interrupt current turn and send this message immediately"
-          >
-            Steer Now
-          </button>
-          <button
-            type="button"
-            onClick={() => dispatch({ type: "cancelQueued", botId: bot.id, queueId: message.queueId ?? message.id })}
-            aria-label="Cancel Queued Message"
-            title="Cancel Queued Message"
-            className="ml-0.5 flex size-4 shrink-0 items-center justify-center rounded text-ink-secondary hover:bg-raised hover:text-ink"
-          >
-            <X size={11} strokeWidth={2.5} />
-          </button>
         </div>
       )}
       <ReactionChips threadId={bot.threadId} message={message} align={alignRight ? "right" : "left"} />
