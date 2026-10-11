@@ -6,7 +6,7 @@ settings:
 
 overrides:
   '@xmldom/xmldom@0.8.13': 0.8.15
-  js-yaml@4.3.1: 5.4.2
+  js-yaml@4.3.1: 5.4.3
   lodash-es: 4.18.1
   sharp@0.35.2: 0.35.5
   sharp@0.35.3: 0.35.5
@@ -5579,7 +5579,7 @@ packages:
     engines: {node: '>=6'}
 
   clutch@https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837:
-    resolution: {gitHosted: true, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837}
+    resolution: {gitHosted: true, integrity: sha512-RvOViIrRaeDtbGje2h7urWva+rYX73abQKvg02S6p5DTDT5jgX5W19AUq+sET7rhp9KNJSBFkZRLu+ikbvNo8g==, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837}
     version: 0.4.0
     engines: {node: '>=22.0.0'}
     hasBin: true
@@ -6433,7 +6433,7 @@ packages:
     engines: {node: '>=20.0.0'}
 
   harness@https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf:
-    resolution: {gitHosted: true, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf}
+    resolution: {gitHosted: true, integrity: sha512-0EOxsZ5kEyLlC24heebCFIDr8ckwixQ6zTT2pxACcxbZ53yFEM/qK36fkhawQ94F5ZchfIRUbz+uIrbp7g3GoQ==, tarball: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf}
     version: 0.1.0
     engines: {node: '>=22.0.0'}
     hasBin: true
@@ -6639,8 +6639,8 @@ packages:
   js-tokens@4.0.0:
     resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==}
 
-  js-yaml@5.4.2:
-    resolution: {integrity: sha512-m+aqu+LwO1O6sIopafj8HUVl5aawITwZQe/yHpMCKjaWBaA/d07B/QdMb3529REftiU+RMMHL3Vlsw3hON7vWg==}
+  js-yaml@5.4.3:
+    resolution: {integrity: sha512-yzzNtgczwgoVHNigCyKTXcQJU4Y8t/ikU4UxXW0BvrLfHTGWZhsNcOT2s/a7vn81/4KqVnNmHjaUEPlvWnNwVw==}
     hasBin: true
 
   json-bigint@1.0.0:
@@ -8910,7 +8910,7 @@ snapshots:
       '@deepseek-ai/cordis': 4.0.2(@deepseek-ai/cordis-plugin-include@1.0.7)(@deepseek-ai/cordis-plugin-loader@1.0.3)
       '@deepseek-ai/cordis-plugin-loader': 1.0.3(@deepseek-ai/cordis@4.0.2)(node-addon-require-builtin@0.1.6)
       '@deepseek-ai/cosmokit': 1.8.3
-      js-yaml: 5.4.2
+      js-yaml: 5.4.3
     optional: true
 
   '@deepseek-ai/cordis-plugin-loader@1.0.3(@deepseek-ai/cordis@4.0.2)(node-addon-require-builtin@0.1.6)':
@@ -9039,7 +9039,7 @@ snapshots:
       '@deepseek-ai/dsh-tools': 0.1.5-rc.2(7f9e302786cf21e030eafe960666842c)
       '@deepseek-ai/dsh-typert-protocol': 0.1.5-rc.2(@deepseek-ai/cordis@4.0.2)
       '@deepseek-ai/schemastery': 3.18.2
-      js-yaml: 5.4.2
+      js-yaml: 5.4.3
       zod: 4.6.5
     optional: true
 
@@ -9178,7 +9178,7 @@ snapshots:
       '@deepseek-ai/dsh-launch-environment': 0.1.5-rc.2(@deepseek-ai/cordis@4.0.2)
       '@deepseek-ai/dsh-package-manifest': 0.1.5-rc.2(@deepseek-ai/cordis@4.0.2)
       '@deepseek-ai/dsh-system-prompt': 0.1.5-rc.2(@deepseek-ai/cordis@4.0.2)(@deepseek-ai/dsh-invariants@0.1.5-rc.2(@deepseek-ai/cordis@4.0.2))(@deepseek-ai/dsh-llm@0.1.5-rc.2(@deepseek-ai/cordis@4.0.2))(@deepseek-ai/dsh-scope@0.1.5-rc.2(@deepseek-ai/cordis@4.0.2)(@deepseek-ai/dsh-invariants@0.1.5-rc.2(@deepseek-ai/cordis@4.0.2)))
-      js-yaml: 5.4.2
+      js-yaml: 5.4.3
       resolve.exports: 2.0.3
     optionalDependencies:
       '@deepseek-ai/cordis-plugin-hmr': 1.0.17(@deepseek-ai/cordis-plugin-timer@1.1.4(@deepseek-ai/cordis@4.0.2))(@deepseek-ai/cordis@4.0.2)
@@ -11506,7 +11506,7 @@ snapshots:
       '@deepseek-ai/dsh-workflow-worker-thread': 0.1.5-rc.2(a6dd593c2d666646082c08410aedfdc9)
       '@deepseek-ai/schemastery': 3.18.2
       commander: 15.0.0
-      js-yaml: 5.4.2
+      js-yaml: 5.4.3
       node-addon-require-builtin: 0.1.6
     transitivePeerDependencies:
       - '@cfworker/json-schema'
@@ -14229,7 +14229,7 @@ snapshots:
       hosted-git-info: 4.1.0
       isbinaryfile: 5.0.7
       jiti: 2.7.0
-      js-yaml: 5.4.2
+      js-yaml: 5.4.3
       json5: 2.2.3
       lazy-val: 1.0.5
       minimatch: 10.2.6
@@ -14366,7 +14366,7 @@ snapshots:
       fs-extra: 10.1.0
       http-proxy-agent: 7.0.2
       https-proxy-agent: 7.0.6
-      js-yaml: 5.4.2
+      js-yaml: 5.4.3
       sanitize-filename: 1.6.4
       source-map-support: 0.5.21
       stat-mode: 1.0.0
@@ -14928,7 +14928,7 @@ snapshots:
       app-builder-lib: 26.17.0(dmg-builder@26.17.0)(electron-builder-squirrel-windows@26.17.0)
       builder-util: 26.16.0
       fs-extra: 10.1.0
-      js-yaml: 5.4.2
+      js-yaml: 5.4.3
     transitivePeerDependencies:
       - electron-builder-squirrel-windows
       - supports-color
@@ -15008,7 +15008,7 @@ snapshots:
     dependencies:
       builder-util-runtime: 9.7.0
       fs-extra: 10.1.0
-      js-yaml: 5.4.2
+      js-yaml: 5.4.3
       lazy-val: 1.0.5
       lodash.escaperegexp: 4.1.2
       lodash.isequal: 4.5.0
@@ -15906,7 +15906,7 @@ snapshots:
   js-tokens@4.0.0:
     optional: true
 
-  js-yaml@5.4.2:
+  js-yaml@5.4.3:
     dependencies:
       argparse: 2.0.1
 
