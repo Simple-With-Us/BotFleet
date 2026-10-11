@@ -503,6 +503,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
         type: "send",
         botId: bot.id,
         text: t,
+        // Composer text before compose.  Queued edit restores this, not the wire prompt.
         rawText: text,
         replyToId: replyTo?.id,
         reply: replyTo ?? undefined,

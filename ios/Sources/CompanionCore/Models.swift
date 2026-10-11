@@ -218,18 +218,37 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
 /// screen the moment they tap send, without claiming the steer-queue.
 public struct QueuedSend: Hashable, Sendable {
     public var queueId: String
+    /// Wire prompt (`composeMessage`), shown on the pill and sent to the harness.
     public var text: String
+    /// Composer text before attachment tags were folded in; used when editing
+    /// a queued line so markers are not duplicated on resend.
+    public var rawText: String?
+    /// Attachment chips the composer held at send time, restored on edit.
+    public var attachments: [PendingChatAttachment]
     public var queued: Bool
     /// Epoch milliseconds when the phone first showed this line.  Stamped
     /// once at remember-time so `visibleTranscript` never remints "now" on
     /// every re-render (which made stuck or slow-drain chips look newly sent).
     public var at: Double
 
-    public init(queueId: String, text: String, queued: Bool = true, at: Double = Date().timeIntervalSince1970 * 1000) {
+    public init(
+        queueId: String,
+        text: String,
+        rawText: String? = nil,
+        attachments: [PendingChatAttachment] = [],
+        queued: Bool = true,
+        at: Double = Date().timeIntervalSince1970 * 1000
+    ) {
         self.queueId = queueId
         self.text = text
+        self.rawText = rawText
+        self.attachments = attachments
         self.queued = queued
         self.at = at
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(queueId)
     }
 }
 
