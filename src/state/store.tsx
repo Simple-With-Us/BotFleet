@@ -2263,10 +2263,15 @@ export const MessagePostResponseSchema = z.union([
  * have to re-fetch or duplicate this function's request/parse logic. */
 export class ApiError extends Error {
   readonly body: any;
-  constructor(message: string, body: any) {
+  /** The HTTP status, so callers can tell a 404 from a 500 without matching
+   * the message: the message prefers body.error when the server sent one, so
+   * the status code is often not in it at all. */
+  readonly status: number;
+  constructor(message: string, body: any, status: number) {
     super(message);
     this.name = "ApiError";
     this.body = body;
+    this.status = status;
   }
 }
 
@@ -2282,7 +2287,7 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
     });
     const body = await res.json().catch(() => ({}));
     if (res.ok) return body;
-    lastError = new ApiError(body.error ?? `${res.status} ${res.statusText}`, body);
+    lastError = new ApiError(body.error ?? `${res.status} ${res.statusText}`, body, res.status);
     if (res.status !== 502) break;
   }
   throw lastError ?? new Error("request failed");
@@ -2596,7 +2601,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // leaves the queued message live, and putting the draft back
             // beside it is exactly the duplicate this ordering avoids.
             .then(() => action.onSettled?.())
-            .catch(showError);
+            .catch((error) => {
+              // A 404 means the harness has already drained the entry (or
+              // never had it), which is the outcome the person asked for.
+              // Treating it as a failure leaves the chip on screen with an
+              // error for an operation that in fact completed, and the iOS
+              // twin in Session.cancelQueued already drops it here.
+              if (error instanceof ApiError && error.status === 404) {
+                rawDispatch(action);
+                action.onSettled?.();
+                return;
+              }
+              showError(error);
+            });
           break;
         case "send": {
           // persist through the existing card route so an older server that
