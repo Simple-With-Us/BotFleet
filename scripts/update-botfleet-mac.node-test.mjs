@@ -869,7 +869,7 @@ test("resolveHarnessBearerCredential falls back to the live owner record for old
     process.env.BOTFLEET_OWNER_NONCE = "d".repeat(64);
     assert.equal(resolveHarnessBearerCredential(owner), "d".repeat(64));
     process.env.BOTFLEET_OWNER_NONCE = "short";
-    assert.throws(() => resolveHarnessBearerCredential(owner), /not a valid/);
+    assert.throws(() => resolveHarnessBearerCredential(owner), /not a valid harness bearer credential/);
   } finally {
     if (previous === undefined) delete process.env.BOTFLEET_OWNER_NONCE;
     else process.env.BOTFLEET_OWNER_NONCE = previous;
