@@ -1104,8 +1104,15 @@ struct ChatView: View {
     }
 
     private func restoreQueuedDraft(from item: QueuedSend) {
-        draft = item.rawText ?? item.text
-        pendingAttachments = item.attachments
+        if let rawText = item.rawText {
+            draft = rawText
+            pendingAttachments = item.attachments
+        } else {
+            // Legacy rows only stored composed wire text; re-applying chips would
+            // duplicate markers already embedded in `text`.
+            draft = item.text
+            pendingAttachments = []
+        }
         composerFocused = true
     }
 

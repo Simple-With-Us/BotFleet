@@ -246,10 +246,6 @@ public struct QueuedSend: Hashable, Sendable {
         self.queued = queued
         self.at = at
     }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(queueId)
-    }
 }
 
 /// Body of `POST /api/bots/:id/messages`. A live send is `{ok:true}`; a
