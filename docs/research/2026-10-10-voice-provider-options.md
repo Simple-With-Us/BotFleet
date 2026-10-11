@@ -140,23 +140,46 @@ opposite of the conclusion the list-price table implied.
 Below roughly nine hours of TTS a month, Azure Neural costs nothing and the whole
 comparison is moot.
 
-### Three Reasons Not To Act On This Table Alone
+### The Actual Volume, Measured
 
-1. **Credits are shared.**  The MiniMax Audio Subscription covers speech, voice cloning
-   and music on one pool.  BotFleet uses MiniMax for **voice cloning**, which the
-   MiniMax Token Plan explicitly excludes — so TTS is not the only thing drawing on those
-   credits, and you cannot rip the TTS share out and leave the rest.
-2. **The conversion is not published.**  MiniMax does not publish an official
-   points-to-characters conversion; the 45,000-credits-per-hour figure used here is
-   third-party, and MiniMax's own consumer page implies ~50,000.  The break-evens move
-   by roughly 10% depending on which is right.
-3. **Nobody has stated the actual volume.**  Every figure above is conditional on it, and
-   it is the one input that decides the answer.
+This does not have to be guessed.  `server/tts/usage.ts` appends every successful
+synthesis to `~/.botfleet/tts-usage.jsonl`, and it records `source: "provider"` for
+provider-confirmed character counts.  Measured on Jay's Mac:
 
-**Before choosing on cost, get the real monthly hours of TTS out of BotFleet's own usage
-records.**  That number either confirms MiniMax is overpaying by several times or shows
-the allowance is genuinely exhausted.  Guessing it from the price list is what produced
-the wrong answer in the first place.
+| Month | Billed characters | ≈ Hours of audio |
+|---|---|---|
+| 2026-09 | 3,501 | 0.06 hr |
+| 2026-10 | 163,577 | **3.03 hr** |
+
+October's 2,226 requests were **all** `source: "provider"`, so 163,577 characters is
+confirmed billable volume, not an estimate from submitted text.
+
+**At 163,577 characters a month, the cost question resolves without any contest:**
+
+| Option | Monthly cost at 163,577 chars |
+|---|---|
+| **Azure Neural** (500,000 chars free) | **$0.00** — uses 33% of the free allowance |
+| xAI `/v1/tts` paygo | $2.45 |
+| Cartesia Sonic 3.6 paygo | $8.02 |
+| MiniMax `speech-2.8-turbo` paygo | $9.81 |
+
+So the correct statement is not "xAI is 4x cheaper than MiniMax."  At the volume we
+actually generate, **TTS fits entirely inside Azure's free tier and costs nothing**, and
+the cheapest paid option is $2.45/month.  The saving is measured in dollars per month
+against a plan that costs more than that by itself, not in multiples of a list price
+nobody pays.
+
+### What This Measurement Does Not Cover
+
+- **The iOS app's synthesis.**  This file is written by the macOS harness only.
+- **Voice cloning and music.**  MiniMax draws those from the same credit pool, so the
+  TTS share above understates the total audio spend on that plan.
+- **Speech-to-text.**  Recorded elsewhere; this table is TTS only.
+- **Depth.**  Two months of history, and September predates real use of the feature.
+
+Any one of those could move the number.  None of them is likely to push 3 hours a month
+past Azure's 9.3-hour free allowance, but that should be confirmed rather than assumed
+before switching a paying subscription off.
 
 ## What Would Actually Decide It
 
