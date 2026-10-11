@@ -531,7 +531,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
         parentSampled?: boolean;
         name?: string;
         op?: string;
-        attributes?: Record<string, unknown>;
+        attributes?: { "sentry.op"?: string };
       }) => {
         if (samplingContext.parentSampled !== undefined) {
           return samplingContext.parentSampled;

@@ -211,10 +211,10 @@ describe("Sentry AI data collection kill-switch", () => {
   });
 
   it("passes dataCollection and a static trace lifecycle into Sentry.init", async () => {
-    let initOpts: Record<string, unknown> | null = null;
+    let initOpts: SentryInitOptions | null = null;
     const sdk = Object.assign({} as FakeSentrySdk, {
-      init(opts: Record<string, unknown>) {
-        initOpts = opts;
+      init(opts?: SentryInitOptions) {
+        initOpts = opts ?? null;
       },
       close() {
         return Promise.resolve(true);
@@ -262,11 +262,11 @@ describe("Sentry AI data collection kill-switch", () => {
   });
 
   it("stamps a git SHA release on the Node client", async () => {
-    let initOpts: Record<string, unknown> | null = null;
+    let initOpts: SentryInitOptions | null = null;
     // SAFETY: empty object shell — runtime only calls the members stamped below.
     const sdk = Object.assign({} as FakeSentrySdk, {
-      init(opts: Record<string, unknown>) {
-        initOpts = opts;
+      init(opts?: SentryInitOptions) {
+        initOpts = opts ?? null;
       },
       close() {
         return Promise.resolve(true);
@@ -292,10 +292,10 @@ describe("Sentry AI data collection kill-switch", () => {
 
 describe("Sentry tracesSampler dynamic rates", () => {
   it("samples AI spans with aiRate and routine HTTP spans with httpRate", async () => {
-    let initOpts: Record<string, unknown> | null = null;
+    let initOpts: SentryInitOptions | null = null;
     const sdk = Object.assign({} as FakeSentrySdk, {
-      init(opts: Record<string, unknown>) {
-        initOpts = opts;
+      init(opts?: SentryInitOptions) {
+        initOpts = opts ?? null;
       },
       close() {
         return Promise.resolve(true);
@@ -318,7 +318,7 @@ describe("Sentry tracesSampler dynamic rates", () => {
       source: "config",
     });
     expect(initOpts).toBeTruthy();
-    const sampler = (initOpts as unknown as { tracesSampler: (ctx: Record<string, unknown>) => number | boolean }).tracesSampler;
+    const sampler = initOpts?.tracesSampler;
     expect(typeof sampler).toBe("function");
 
     // Parent sampled decision inherited
