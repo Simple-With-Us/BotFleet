@@ -92,10 +92,26 @@ describe("fleet export", () => {
     expect(event.tags["gen_ai.system"]).toBe("minimax");
     expect(event.tags["gen_ai.request.model"]).toBe("MiniMax-M3.1-Flash-Preview");
     expect(event.extra["gen_ai.usage.cost"]).toBe(0.09);
+    expect(event.extra["botfleet.cost.estimated_usd"]).toBeUndefined();
     expect(event.extra["botfleet.tool.names"]).toBe("bash,read");
     expect(event.extra["gen_ai.input.messages"]).toBeUndefined();
     expect(event.extra["gen_ai.output.messages"]).toBeUndefined();
     expect(event.tags).not.toHaveProperty("prompt");
+  });
+
+  it("routes subscription estimates away from gen_ai.usage.cost", () => {
+    const event = buildFleetCapture({
+      conversationId: "task-est",
+      threadId: "thread-est",
+      provider: "openai",
+      ok: true,
+      durationMs: 1,
+      cost: 0.02,
+      costSource: "estimated",
+      toolNames: [],
+    });
+    expect(event.extra["botfleet.cost.estimated_usd"]).toBe(0.02);
+    expect(event.extra["gen_ai.usage.cost"]).toBeUndefined();
   });
 
   it("sends through the installed sink", () => {

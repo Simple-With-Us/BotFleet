@@ -49,6 +49,7 @@ export type FleetExtra = {
   "gen_ai.usage.output_tokens"?: number;
   "gen_ai.usage.input_tokens.cached"?: number;
   "gen_ai.usage.cost"?: number;
+  "botfleet.cost.estimated_usd"?: number;
   "botfleet.tool.names"?: string;
   "gen_ai.input.messages"?: string;
   "gen_ai.output.messages"?: string;
@@ -81,6 +82,18 @@ const DORMANT: FleetRuntimeState = {
 let sink: FleetSink | null = null;
 let sinkFromTests = false;
 let runtime: FleetRuntimeState = { ...DORMANT };
+type FleetNodeClient = {
+  captureEvent(event: {
+    message: string;
+    level: string;
+    tags: FleetTags;
+    extra: FleetExtra;
+  }): void;
+  close(timeout?: number): Promise<boolean>;
+  flush(timeout?: number): Promise<boolean>;
+};
+let liveClient: FleetNodeClient | null = null;
+let liveClientDsn: string | null = null;
 
 export function sentryFleetDsnFromEnv(env: NodeJS.ProcessEnv = process.env): string | undefined {
   const raw = (env.SENTRY_FLEET_DSN || "").trim();
@@ -129,7 +142,11 @@ function extraFor(turn: FleetTurnExport): FleetExtra {
   if (turn.inputTokens != null) extra["gen_ai.usage.input_tokens"] = turn.inputTokens;
   if (turn.outputTokens != null) extra["gen_ai.usage.output_tokens"] = turn.outputTokens;
   if (turn.cachedInputTokens != null) extra["gen_ai.usage.input_tokens.cached"] = turn.cachedInputTokens;
-  if (turn.cost != null) extra["gen_ai.usage.cost"] = turn.cost;
+  if (turn.costSource === "estimated") {
+    if (turn.cost != null) extra["botfleet.cost.estimated_usd"] = turn.cost;
+  } else if (turn.cost != null) {
+    extra["gen_ai.usage.cost"] = turn.cost;
+  }
   if (turn.toolNames.length > 0) extra["botfleet.tool.names"] = turn.toolNames.join(",");
   return extra;
 }
@@ -166,6 +183,7 @@ export function applySentryFleetConfig(dsn: string | null): FleetRuntimeState {
   const parsed = dsn ? describeDsn(dsn) : null;
   if (!dsn || !parsed) {
     sink = null;
+    void closeLiveClient();
     runtime = { ...DORMANT, configured: Boolean(dsn) };
     return { ...runtime };
   }
@@ -188,16 +206,29 @@ function liveFleetSink(dsn: string): FleetSink {
   // pays the Node SDK tax.  A test replaces the sink outright.
   return {
     capture(event) {
-      void sendWithNodeSdk(dsn, event);
+      void captureWithLiveClient(dsn, event);
     },
   };
 }
 
-async function sendWithNodeSdk(dsn: string, event: FleetCapture): Promise<void> {
-  if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") return;
+async function closeLiveClient(): Promise<void> {
+  if (!liveClient) return;
+  try {
+    await liveClient.close(500);
+  } catch {
+    // Rotation or shutdown must not take the harness down.
+  }
+  liveClient = null;
+  liveClientDsn = null;
+}
+
+async function ensureLiveClient(dsn: string): Promise<FleetNodeClient | null> {
+  if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") return null;
+  if (liveClient && liveClientDsn === dsn) return liveClient;
+  await closeLiveClient();
   try {
     const Sentry = await import("@sentry/node");
-    const client = new Sentry.NodeClient({
+    liveClient = new Sentry.NodeClient({
       dsn,
       environment: (process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() || "production",
       sendDefaultPii: false,
@@ -206,14 +237,23 @@ async function sendWithNodeSdk(dsn: string, event: FleetCapture): Promise<void> 
       transport: Sentry.makeNodeTransport,
       integrations: [],
     });
+    liveClientDsn = dsn;
+    return liveClient;
+  } catch {
+    return null;
+  }
+}
+
+async function captureWithLiveClient(dsn: string, event: FleetCapture): Promise<void> {
+  try {
+    const client = await ensureLiveClient(dsn);
+    if (!client) return;
     client.captureEvent({
       message: event.message,
       level: "info",
       tags: event.tags,
       extra: event.extra,
     });
-    await client.flush(1500);
-    await client.close(500);
   } catch {
     // A missing SDK or a refused DSN must not take the harness down.
   }
@@ -230,5 +270,7 @@ export function setFleetSinkForTests(next: FleetSink | null): void {
 export function resetSentryFleetForTests(): void {
   sink = null;
   sinkFromTests = false;
+  liveClient = null;
+  liveClientDsn = null;
   runtime = { ...DORMANT };
 }

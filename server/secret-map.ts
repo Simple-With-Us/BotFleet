@@ -296,6 +296,8 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
   },
   {
     id: "observability.sentryFleetDsn",
+    // Second Sentry project (fleet-infra).  `SENTRY_FLEET_DSN` is harness-only
+    // (see secret-map.test HARNESS_ONLY) — not an engine spawn alias.
     label: "Sentry fleet-infra DSN",
     section: "observability",
     path: ["sentryFleetDsn"],
