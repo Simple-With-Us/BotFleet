@@ -1,5 +1,7 @@
 # Routine Command Allowlist
 
+> Implements **BF-2409** (BFS-1 of the open-loops plan):  the routine command allowlist on the real engines, plus the `BF-DIRECTOR` role seat.  This document is not the place for the GitHub fallback `SENTRY_AUTH_TOKEN` rotation (issue #1042);  that work is its own follow-up.
+
 A routine can carry a `toolPolicy`:  the fixed commands its turns may run and the exact files they may write.  Every BotFleet bot runs with auto-approve, and a routine reads untrusted text (public pull requests, Linear issues, Zulip) while holding the owner's credentials.  A routine that only needs `agent-sync whoami` and one report command must not be talked into anything else.
 
 Chat turns, webhook turns, resource turns and Zulip wakes are unchanged.  Only a routine's own scheduled or Run Now turns carry the allowlist, and every re-dispatch of that turn keeps it (a model fail-over, a credential card, a boot resume), because the allowlist is stored on the turn's prompt message.
