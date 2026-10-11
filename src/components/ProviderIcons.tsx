@@ -164,6 +164,8 @@ export function QwenMark({ size = 16, className }: IconProps) {
  *  translucent copy is kept so the mark still reads on both light and dark
  *  surfaces without shipping a second asset. */
 export function MiniMaxMark({ size = 16, className }: IconProps) {
+  const base = "bf-minimax-grad-1";
+  const highlight = "bf-minimax-grad-1h";
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" className={className} aria-hidden>
       <path

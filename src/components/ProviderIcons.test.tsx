@@ -64,6 +64,8 @@ describe("ProviderMark monogram fallback", () => {
     // this guards the Muse fix against being "solved" by deleting it.
     const svg = markup(<ProviderMark driverKind="totallyUnknownEngine" size={18} />);
     expect(svg).not.toContain("<svg");
+  });
+});
 
 import { createElement } from "react";
 
