@@ -25,7 +25,7 @@
 // unexpected shape is a refusal, never a guess.
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants, existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, type Stats } from "node:fs";
-import { chmod, open, readFile } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { basename, dirname, posix } from "node:path";
 
 import { z } from "zod";
@@ -278,6 +278,22 @@ function namesOrReachesProtected(path: string): boolean {
   if (isProtectedPath(path)) return true;
   const real = resolvedLocation(path);
   return real === null || isProtectedPath(real);
+}
+
+/** Whether an opened file is the regular, singly linked file that
+ *  `configured` resolves to now, through root-owned links only.  A link or a
+ *  directory swapped in anywhere on the path between the checks and the open
+ *  makes the device and inode differ, and the handle is refused. */
+export function openedFileIsListed(opened: Stats, configured: string): boolean {
+  if (!opened.isFile() || opened.nlink !== 1) return false;
+  const real = resolvedLocation(configured);
+  if (real === null || isProtectedPath(real)) return false;
+  try {
+    const now = lstatSync(real);
+    return now.dev === opened.dev && now.ino === opened.ino;
+  } catch {
+    return false;
+  }
 }
 
 function rpcRefusal(message: string): ClientRefusal {
@@ -562,16 +578,29 @@ export class AllowlistGate {
     const decision = evaluateRead(this.policy, p.path, canonicalPath);
     if (!decision.ok) return rpcRefusal(this.deny(decision));
     if (namesOrReachesProtected(decision.argv[0]!)) return rpcRefusal(this.deny(denied("the file names a protected place or runs through a link or hard link BotFleet does not follow", "read")));
-    const target = canonicalPath(decision.argv[0]!);
+    const configured = decision.argv[0]!;
+    const target = canonicalPath(configured);
     if (!target) return rpcRefusal("the file is not readable");
-    let stat;
+    // One open, then every check on that handle and the read through it:
+    // a link or another file swapped in after a check is never what is read.
+    // O_NOFOLLOW makes the kernel refuse a link at the file itself.
+    let handle;
     try {
-      stat = lstatSync(target);
-    } catch {
-      return { error: { code: -32002, message: "file not found" } };
+      handle = await open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    } catch (error) {
+      const missing = error instanceof Error && "code" in error && error.code === "ENOENT";
+      return missing ? { error: { code: -32002, message: "file not found" } } : rpcRefusal("the file is not readable");
     }
-    if (!stat.isFile() || stat.size > MAX_READ_BYTES) return rpcRefusal("the file is not a regular file of a readable size");
-    let content = await readFile(target, "utf8");
+    let content: string;
+    try {
+      const stat = await handle.stat();
+      if (!openedFileIsListed(stat, configured) || stat.size > MAX_READ_BYTES) {
+        return rpcRefusal("the file is not a regular file of a readable size");
+      }
+      content = await handle.readFile("utf8");
+    } finally {
+      await handle.close();
+    }
     const fromLine = p.line !== undefined && p.line > 1 ? p.line - 1 : 0;
     const limit = p.limit !== undefined && p.limit > 0 ? p.limit : undefined;
     if (fromLine > 0 || limit !== undefined) {
@@ -600,22 +629,22 @@ export class AllowlistGate {
     if (!existsSync(parent)) mkdirSync(parent, { recursive: true, mode: 0o700 });
     const target = canonicalPath(configured);
     if (!target) return rpcRefusal("the file is not writable");
+    // O_NOFOLLOW:  the kernel refuses a link at the file itself.  No O_TRUNC:
+    // the handle is checked first, so a file swapped in after the checks
+    // above is refused before a byte of it changes.
+    const handle = await open(target, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW, 0o600);
     try {
-      const existing = lstatSync(target);
-      if (!existing.isFile()) return rpcRefusal(this.deny(denied("the path is a link or not a regular file", "write")));
-    } catch {
-      // absent: created below
-    }
-    // O_NOFOLLOW: a link planted between the check and the open is refused
-    // by the kernel instead of followed.
-    const handle = await open(target, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW, 0o600);
-    try {
+      if (!openedFileIsListed(await handle.stat(), configured)) {
+        return rpcRefusal(this.deny(denied("the path is a link or not a regular file", "write")));
+      }
+      await handle.truncate(0);
       await handle.writeFile(p.content, "utf8");
+      // agent-sync --body-file accepts only an owner-only file.  Through the
+      // handle, never the path, which could have been swapped since.
+      await handle.chmod(0o600);
     } finally {
       await handle.close();
     }
-    // agent-sync --body-file accepts only an owner-only file.
-    await chmod(target, 0o600);
     return { result: null };
   }
 

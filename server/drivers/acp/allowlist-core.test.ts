@@ -2,7 +2,8 @@
 // scripted engine (server/testing/fake-acp-allowlist-cli.ts) that behaves the
 // way Grok Build was observed to, against the real AllowlistGate, real child
 // processes and a real file system in a throwaway directory.
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +13,7 @@ import type { ProviderInstance, RuntimeEvent } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import { sanitizeToolPolicy, type ToolPolicy } from "../../tool-policy.ts";
+import { openedFileIsListed } from "./allowlist.ts";
 import { GrokAgentDriver, grokAllowlistProblem } from "./grok.ts";
 import { McodeAgentDriver } from "./mcode.ts";
 
@@ -473,6 +475,33 @@ posix("an engine that cannot be held", () => {
   it("says so in its capabilities, while Grok says it can", async () => {
     await grok();
     expect(instance!.adapter.capabilities.toolPolicy).toBe(true);
+  });
+});
+
+posix("openedFileIsListed", () => {
+  it("refuses a handle whose path was swapped for another file or a link after it was opened", async () => {
+    // The race a read or write closes:  the checks pass, then something replaces the file before or
+    // after the open.  Reading and writing go through the one handle, and the handle must still be
+    // the file the listed path resolves to.
+    const dir = mkdtempSync(join(tmpdir(), "omb-allowlist-race-"));
+    try {
+      const listed = join(dir, "line.md");
+      writeFileSync(listed, "mine");
+      const handle = await open(listed, "r");
+      try {
+        expect(openedFileIsListed(await handle.stat(), listed)).toBe(true);
+        writeFileSync(join(dir, "other"), "theirs");
+        renameSync(join(dir, "other"), listed);
+        expect(openedFileIsListed(await handle.stat(), listed)).toBe(false);
+        rmSync(listed);
+        symlinkSync(join(dir, "elsewhere"), listed);
+        expect(openedFileIsListed(await handle.stat(), listed)).toBe(false);
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      removeTempDir(dir);
+    }
   });
 });
 
