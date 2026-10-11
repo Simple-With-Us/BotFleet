@@ -119,8 +119,11 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
-    "@playwright/test": "^1.62.0",
+    "@assistant-ui/react": "^0.15.27",
+    "@assistant-ui/react-markdown": "^0.14.20",
+    "@assistant-ui/react-ui": "^0.2.1",
     "@oxlint/plugins": "1.87.0",
+    "@playwright/test": "^1.62.0",
     "@tailwindcss/vite": "^4.1.11",
     "@types/node": "^26.2.0",
     "@types/react": "^19.1.9",
