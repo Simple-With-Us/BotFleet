@@ -89,8 +89,8 @@ type FleetNodeClient = {
     tags: FleetTags;
     extra: FleetExtra;
   }): void;
-  close(timeout?: number): Promise<boolean>;
-  flush(timeout?: number): Promise<boolean>;
+  close(timeout?: number): PromiseLike<boolean>;
+  flush(timeout?: number): PromiseLike<boolean>;
 };
 let liveClient: FleetNodeClient | null = null;
 let liveClientDsn: string | null = null;
