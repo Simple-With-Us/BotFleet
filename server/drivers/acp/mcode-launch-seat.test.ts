@@ -6,12 +6,15 @@
 // with a cut-down environment, so the `agent-sync mcp --default-seat MM` entry
 // in ~/.minimax/mcp.json would never see AGENT_LAUNCHER and AGENT_LAUNCH_SEAT
 // and would fall back to its default seat.  Run against mcode 0.6.2 that is
-// not what happens:  mcode hands its whole environment to an MCP server it
-// starts, whether the server is listed in mcp.json or comes in over ACP, and
-// to the shell tool as well.  agent-sync then reads the launcher's seat and
-// ignores `--default-seat`.  These tests pin that, so an mcode update that
-// stops forwarding the environment fails here before it signs a bot's post
-// with the wrong seat.
+// not what happens:  mcode hands the five launch variables (AGENT_LAUNCHER,
+// AGENT_LAUNCH_SEAT, AGENT_SEAT, AGENT_SESSION, AGENT_SYNC_ATTACH) to an MCP
+// server it starts, whether the server is listed in mcp.json or comes in over
+// ACP, and to the shell tool as well.  (The probe reports only AGENT_ and
+// X_FIXTURE_ names, so these tests do not claim anything about the rest of the
+// environment.)  agent-sync then reads the launcher's seat and ignores
+// `--default-seat`.  These tests pin that, so an mcode update that stops
+// forwarding those variables fails here before it signs a bot's post with the
+// wrong seat.
 //
 // They run the REAL mcode (and, for the second group, the real agent-sync)
 // against a scripted fake model and a fake Zulip, in a throwaway data
@@ -345,6 +348,7 @@ withMcodeAndAgentSync("the agent-sync MCP entry the owner registered (`--default
       expect(answer.email).toBe(MINIMAX.email);
       expect(answer.tag_prefix).toBe("[MM]");
       expect(answer.session_source).toBe("none");
+      expect(zulip!.requests.length).toBeGreaterThan(0);
       expect(zulip!.requests.every((request) => request.userId === MINIMAX.user_id)).toBe(true);
     },
     TURN_TIMEOUT_MS,
