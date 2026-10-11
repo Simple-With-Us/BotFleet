@@ -57,9 +57,16 @@ const roomState = { busy: false };
  * bot or room send to `onSend`.  Returns the sends the server received, in
  * order.  The event stream says hello and ends, which makes the page read
  * the roster again each time it reconnects. */
-async function mockServer(page: Page, onSend: (route: Route, attempt: number) => Promise<void> | void) {
+async function mockServer(
+  page: Page,
+  onSend: (route: Route, attempt: number) => Promise<void> | void,
+  opts?: { busyBotIds?: string[] },
+) {
   const sends: Sent[] = [];
   roomState.busy = false;
+  const bots = [DRAFTSMAN, SECOND].map((candidate) =>
+    opts?.busyBotIds?.includes(candidate.id) ? { ...candidate, busy: true } : candidate,
+  );
   await page.route('**/api/**', async (route) => {
     const { pathname } = new URL(route.request().url());
     const method = route.request().method();
@@ -72,7 +79,7 @@ async function mockServer(page: Page, onSend: (route: Route, attempt: number) =>
       });
     }
     if (pathname === '/api/bots' && method === 'GET') {
-      return route.fulfill(json({ bots: [DRAFTSMAN, SECOND], groups: [room(roomState.busy)], computerControl: {} }));
+      return route.fulfill(json({ bots, groups: [room(roomState.busy)], computerControl: {} }));
     }
     if (pathname === `/api/groups/${room(false).id}/interrupt`) return route.fulfill(json({ ok: true, stopped: true }));
     if (send && method === 'POST') {
@@ -412,4 +419,47 @@ test('editing a queued bot message waits for the harness before restoring the dr
   await expect
     .poll(() => box.evaluate((field) => field.selectionStart))
     .toBe('worth a second look'.length);
+});
+
+test('editing a queued bot message restores attachments without duplicating wire markers', async ({ page }) => {
+  let sendAttempt = 0;
+  const sends = await mockServer(
+    page,
+    (route) => {
+      sendAttempt += 1;
+      if (sendAttempt === 1) {
+        return route.fulfill(
+          json({ ok: true, queued: true, queueId: 'q-attach', threadId: `thread-${DRAFTSMAN.id}` }, 202),
+        );
+      }
+      return route.fulfill(json({ ok: true }, 202));
+    },
+    { busyBotIds: [DRAFTSMAN.id] },
+  );
+  await page.route('**/api/bots/*/queue/*', (route) => route.fulfill(json({ ok: true })));
+  await openApp(page);
+  const box = await openBot(page, DRAFTSMAN.name);
+  const chip = page.getByRole('button', { name: 'Remove pasted text' });
+
+  await box.evaluate((field, long) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData('text/plain', long);
+    field.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
+  }, 'a pasted line of an enormous log\n'.repeat(60));
+  await expect(chip).toBeVisible();
+
+  await box.fill('worth checking against the earlier answer');
+  await box.press('Enter');
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
+
+  await page.getByRole('button', { name: 'Edit Queued Message' }).first().click();
+  await expect(box).toHaveValue('worth checking against the earlier answer');
+  await expect(chip).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(0);
+
+  await box.press('Enter');
+  await expect.poll(() => sends.length).toBe(2);
+  const wire = sends[1]!.text;
+  expect((wire.match(/<pasted-text/g) ?? []).length).toBe(1);
+  expect(wire).toContain('worth checking against the earlier answer');
 });

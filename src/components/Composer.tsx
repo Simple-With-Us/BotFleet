@@ -361,7 +361,7 @@ const focusCaretToEnd = useCallback(() => {
   });
 }, []);
 
-const handleEditQueued = useCallback((entry: { queueId: string; text: string; reply?: Message; attachments: Attachment[] }) => {
+const handleEditQueued = useCallback((entry: { queueId: string; text: string; rawText?: string; reply?: Message; attachments: Attachment[] }) => {
     if (group && queued) {
       // The held message carries more than its text: the draft it took, which
       // is where the attachment chips live, and the reply it was aimed at.
@@ -382,7 +382,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; re
       const sent: SentDraft<Message> = {
         draftId,
         threadId,
-        text: entry.text,
+        text: entry.rawText ?? entry.text,
         attachments: entry.attachments,
         reply: entry.reply,
       };
@@ -499,7 +499,16 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; re
       dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, reply: replyTo ?? undefined, attachments, onError });
+      dispatch({
+        type: "send",
+        botId: bot.id,
+        text: t,
+        rawText: text,
+        replyToId: replyTo?.id,
+        reply: replyTo ?? undefined,
+        attachments,
+        onError,
+      });
       if (busy && opts?.steerNow) {
         dispatch({ type: "interrupt", botId: bot.id });
       }

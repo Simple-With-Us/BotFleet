@@ -940,7 +940,7 @@ export interface AppState {
   } | null;
   /** 1:1 queue-fallback lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
-  pendingQueued: Record<string, Array<{ queueId: string; text: string; at: number; reply?: Message; attachments: Attachment[] }>>;
+  pendingQueued: Record<string, Array<{ queueId: string; text: string; rawText?: string; at: number; reply?: Message; attachments: Attachment[] }>>;
   /** queueIds whose drain frame beat the POST continuation. One-shot and
    * bounded to a short event window so other clients cannot grow it forever. */
   consumedQueueIds: Record<string, true>;
@@ -1076,6 +1076,9 @@ export type Action =
       type: "send";
       botId: string;
       text: string;
+      /** Composer text before `composeMessage`; kept on queued entries so edit
+       * restore does not double-expand attachment markers. */
+      rawText?: string;
       replyToId?: string;
       /** The full reply Message, kept on the queue entry so an edit can
        * restore it.  The server only sees replyToId; the client needs the
@@ -1091,7 +1094,7 @@ export type Action =
        * input can put it back. */
       onError?: (message: string) => void;
     }
-  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number; reply?: Message; attachments?: Attachment[] }
+  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; rawText?: string; at?: number; reply?: Message; attachments?: Attachment[] }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
   | { type: "cancelQueued"; botId: string; queueId: string; onSettled?: () => void }
   | { type: "editMessage"; botId: string; messageId: string; text: string }
@@ -1911,6 +1914,7 @@ export function reducer(state: AppState, action: Action): AppState {
             {
               queueId: action.queueId,
               text: action.text,
+              rawText: action.rawText,
               reply: action.reply,
               attachments: action.attachments ?? [],
               // Stamp once at remember-time; ChatView must not remint Date.now().
@@ -2607,8 +2611,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 // is too old to expose DELETE /queue/ (body carries "no route").
                 // iOS keeps the chip in the latter case; mirror that here so a
                 // local drop does not hide a message that is still going to send.
-                const routeError = error.body?.error;
-                if (typeof routeError === "string" && routeError.includes("no route")) {
+                if (String(error.body?.error ?? "").includes("no route")) {
                   showError(error);
                   return;
                 }
@@ -2661,6 +2664,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                     threadId: parsed.data.threadId,
                     queueId: parsed.data.queueId,
                     text: action.text,
+                    rawText: action.rawText,
                     reply: action.reply,
                     attachments: action.attachments ?? [],
                     at: sentAt,
