@@ -371,10 +371,9 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; re
       const { sent } = queued;
       setQueued(null);
       restoreFailedSend(sent);
-    } else if (group) {
-      setText(entry.text);
-      setQueued(null);
-    } else if (bot) {
+      return;
+    }
+    if (bot) {
       // The bot's queued entry carries reply (the Message, not just the id)
       // and the attachments, because the server only sees replyToId: putting
       // only entry.text back would drop the reply quote and the attachment
