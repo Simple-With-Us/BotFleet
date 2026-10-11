@@ -47,12 +47,13 @@ jobs:
       - name: Resolve the Sentry DSN
         uses: ./.github/actions/infisical-secrets
         with:
-          names: SENTRY_DSN VITE_SENTRY_DSN
+          names: SENTRY_DSN VITE_SENTRY_DSN SENTRY_AUTH_TOKEN
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
           client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
         env:
           GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
 
       # Vite inlines VITE_SENTRY_DSN at build time, so it must be in the
       # environment before the package step runs.  Infisical/GitHub hold no

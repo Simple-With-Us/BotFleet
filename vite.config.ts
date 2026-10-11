@@ -2,9 +2,35 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { sentryVitePlugin } from "@sentry/vite-plugin";
+
+const sentryRelease = (process.env.SENTRY_RELEASE || process.env.GITHUB_SHA || "").trim();
+const sentryAuthToken = (process.env.SENTRY_AUTH_TOKEN || "").trim();
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  define: {
+    "import.meta.env.VITE_SENTRY_RELEASE": JSON.stringify(sentryRelease),
+  },
+  build: {
+    sourcemap: Boolean(sentryAuthToken),
+  },
+  plugins: [
+    react(),
+    tailwindcss(),
+    sentryVitePlugin({
+      org: "simple-with-us",
+      project: "botfleet",
+      authToken: sentryAuthToken || undefined,
+      disable: !sentryAuthToken,
+      telemetry: false,
+      sourcemaps: {
+        filesToDeleteAfterUpload: ["./dist/**/*.map"],
+      },
+      release: {
+        name: sentryRelease || undefined,
+      },
+    }),
+  ],
   test: {
     environment: "node",
     include: [

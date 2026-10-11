@@ -10,6 +10,7 @@
 // DSN never reaches a log line, a status field, or a broadcast frame; only
 // the ingest host and the project id do.
 import { observabilitySettings, type ObservabilitySettings } from "./config.ts";
+import { runtimeBuildIdentity } from "./runtime-identity.ts";
 import { secretSource } from "./secret-map.ts";
 import {
   applySentryConfig,
@@ -115,6 +116,7 @@ class ObservabilityManager {
       uiTracesSampleRate: settings.uiTracesSampleRate,
       logsEnabled: settings.logsEnabled,
       source,
+      release: runtimeBuildIdentity.sourceCommit,
     };
   }
 

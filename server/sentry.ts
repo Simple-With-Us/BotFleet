@@ -25,6 +25,8 @@ export interface SentryRuntimeInput {
   uiTracesSampleRate?: number;
   logsEnabled: boolean;
   source: SentrySource;
+  /** Git SHA so `sentry-deploy.yml` markers line up with events. */
+  release?: string | null;
 }
 
 export interface SentryRuntimeState {
@@ -184,6 +186,23 @@ export function sentryDsnFromEnv(
 ): string | undefined {
   const raw = (env.SENTRY_DSN || env.BOTFLEET_SENTRY_DSN || "").trim();
   return raw || undefined;
+}
+
+const UNKNOWN_COMMIT = "0".repeat(40);
+const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
+
+/** A git SHA Sentry can use as `release`.  All-zeros (unknown checkout) is
+ *  not a release.  `SENTRY_RELEASE` wins, then `GITHUB_SHA`. */
+export function sentryReleaseName(
+  env: NodeJS.ProcessEnv = process.env,
+  fallback?: string | null,
+): string | undefined {
+  const candidates = [env.SENTRY_RELEASE, env.GITHUB_SHA, env.VERCEL_GIT_COMMIT_SHA, fallback];
+  for (const raw of candidates) {
+    const value = raw?.trim();
+    if (value && value !== UNKNOWN_COMMIT && RELEASE_SHA.test(value)) return value;
+  }
+  return undefined;
 }
 
 interface SentrySdkLoad {
@@ -474,6 +493,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
     input.logsEnabled ? "logs" : "nologs",
     genAiCollection ? "ai-data-on" : "ai-data-off",
     "stream-genai",
+    sentryReleaseName(process.env, input.release) || "norelease",
   ].join("|");
   if (initialized && activeFingerprint === fingerprint) {
     runtimeState = { ...base, active: true, profilingAvailable: runtimeState.profilingAvailable };
@@ -504,6 +524,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
     sdk.init({
       dsn: input.dsn,
       environment: input.environment,
+      release: sentryReleaseName(process.env, input.release),
       tracesSampleRate: input.tracesSampleRate,
       tracesSampler: (samplingContext: {
         parentSampled?: boolean;
@@ -655,6 +676,7 @@ export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<
       : 0.1,
     logsEnabled: true,
     source: dsn ? "env" : "none",
+    release: sentryReleaseName(env),
   })).active;
 }
 

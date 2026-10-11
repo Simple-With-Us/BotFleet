@@ -89,6 +89,27 @@ try {
 }
 const nativeActions = nativeDesktopActions(process.platform);
 const require = createRequire(import.meta.url);
+
+function initDesktopSentry() {
+  if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") return;
+  const dsn = String(process.env.SENTRY_DSN || process.env.VITE_SENTRY_DSN || "").trim();
+  if (!dsn) return;
+  try {
+    const Sentry = require("@sentry/electron/main");
+    const releaseRaw = String(process.env.SENTRY_RELEASE || process.env.GITHUB_SHA || "").trim();
+    const release = /^[0-9a-f]{7,40}$/i.test(releaseRaw) ? releaseRaw : undefined;
+    Sentry.init({
+      dsn,
+      sendDefaultPii: false,
+      environment: String(process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() || "production",
+      release,
+    });
+  } catch {
+    /* @sentry/electron is optional in a source checkout */
+  }
+}
+initDesktopSentry();
+
 const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource } = require(
   "./screen-preview.cjs",
 );

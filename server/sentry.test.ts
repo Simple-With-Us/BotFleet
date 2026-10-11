@@ -10,6 +10,7 @@ import {
   scrubSentryPayload,
   scrubWebhookSecrets,
   sentryDsnFromEnv,
+  sentryReleaseName,
   asSentryNodeTestStandIn,
   sentryTestLoader,
   setSentryLoaderForTests,
@@ -43,6 +44,8 @@ afterEach(() => {
   delete process.env.SENTRY_DSN;
   delete process.env.BOTFLEET_SENTRY_DSN;
   delete process.env.SENTRY_AI_DATA_COLLECTION;
+  delete process.env.SENTRY_RELEASE;
+  delete process.env.GITHUB_SHA;
 });
 
 describe("server Sentry init", () => {
@@ -62,6 +65,14 @@ describe("server Sentry init", () => {
     expect(sentryDsnFromEnv({ BOTFLEET_SENTRY_DSN: "https://example.invalid/2" })).toBe(
       "https://example.invalid/2",
     );
+  });
+
+  it("prefers SENTRY_RELEASE then GITHUB_SHA and skips an all-zero fallback", () => {
+    expect(sentryReleaseName({})).toBeUndefined();
+    expect(sentryReleaseName({}, "0".repeat(40))).toBeUndefined();
+    expect(sentryReleaseName({ GITHUB_SHA: "abc1234" })).toBe("abc1234");
+    expect(sentryReleaseName({ SENTRY_RELEASE: "deadbeef", GITHUB_SHA: "abc1234" })).toBe("deadbeef");
+    expect(sentryReleaseName({}, "c".repeat(40))).toBe("c".repeat(40));
   });
 
   it("survives a synchronous throw from sdk.close during re-init", async () => {
@@ -246,6 +257,33 @@ describe("Sentry AI data collection kill-switch", () => {
       dataCollection: { genAI: { inputs: false, outputs: false } },
     });
     delete process.env.SENTRY_AI_DATA_COLLECTION;
+  });
+
+  it("stamps a git SHA release on the Node client", async () => {
+    let initOpts: Record<string, unknown> | null = null;
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init(opts: Record<string, unknown>) {
+        initOpts = opts;
+      },
+      close() {
+        return Promise.resolve(true);
+      },
+      addIntegration() {},
+      consoleLoggingIntegration() {
+        return { name: "ConsoleLogs" };
+      },
+    });
+    setSentryLoaderForTests(sentryTestLoader(sdk));
+    await applySentryConfig({
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 0.2,
+      logsEnabled: false,
+      source: "config",
+      release: "d".repeat(40),
+    });
+    expect(initOpts).toMatchObject({ release: "d".repeat(40) });
   });
 });
 
