@@ -74,6 +74,14 @@ describe("classifyError", () => {
     expect(classifyError({ exitCode: 3 })).toEqual({ transient: false, reason: "terminal_exit" });
   });
 
+  it("pins a signal close (null exit code) with no text to unknown, not terminal_exit", () => {
+    // exitCode: null means the process was closed by a signal rather than
+    // exiting on its own — the terminal_exit fallback only covers a
+    // nonzero *exit*, so this falls through to the generic "unknown" reason
+    // (still transient: false either way).
+    expect(classifyError({ exitCode: null })).toEqual({ transient: false, reason: "unknown" });
+  });
+
   it("never retries a signal kill or interrupt", () => {
     expect(classifyError({ exitCode: -1 })).toEqual({ transient: false, reason: "interrupted" });
     expect(classifyError(new Error("interrupted by user"))).toEqual({ transient: false, reason: "interrupted" });
@@ -85,7 +93,20 @@ describe("classifyError", () => {
     // user"/"cancelled by user") so a transient reconnect message that
     // merely contains the word "interrupted" isn't swallowed into a
     // permanent give-up before the transient vocabulary gets a look at it.
-    expect(classifyError(new Error("stream interrupted"))).not.toEqual({ transient: false, reason: "interrupted" });
+    // "stream interrupted" alone matches nothing else in this file either,
+    // so it lands on "unknown" — asserted exactly, not just "not interrupted".
+    expect(classifyError(new Error("stream interrupted"))).toEqual({ transient: false, reason: "unknown" });
+  });
+
+  it("a user-stop phrase wins even when the same text also carries transient vocabulary", () => {
+    // The narrowed "interrupted" arm now sits in PRIORITY_TERMINAL_PATTERNS,
+    // ahead of TRANSIENT_PATTERNS, so a stop phrase that also happens to
+    // carry a transient word (a socket reset while the cancel was landing)
+    // still reads as interrupted, not as a retryable connection reset.
+    expect(classifyError(new Error("turn cancelled by user: socket hang up"))).toEqual({
+      transient: false,
+      reason: "interrupted",
+    });
   });
 
   it("prefers the transient reading when stderr carries both shapes", () => {
@@ -153,6 +174,7 @@ describe("classifyError", () => {
     ["overloaded", { transient: true, reason: "overloaded" }],
     ["stream interrupted", { transient: false, reason: "unknown" }],
     ["interrupted by user", { transient: false, reason: "interrupted" }],
+    ["turn cancelled by user: socket hang up", { transient: false, reason: "interrupted" }],
     ["ECONNRESET", { transient: true, reason: "connection_reset" }],
     ["timeout waiting for response", { transient: true, reason: "timeout" }],
     ["Invalid params", { transient: false, reason: "unknown" }],

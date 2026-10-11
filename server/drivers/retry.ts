@@ -56,11 +56,7 @@ export interface ErrorClassification {
 // explicit disjunction arms — every test case in retry.test.ts still
 // matches one of them.
 //
-// "status" is already one of the cue words below, so "unexpected status 503"
-// / "unexpected status 429" / "unexpected status 401" already read as
-// status-code cues on their own (verified: hasHttpStatusCode matches all
-// three against their respective codes without any change here) — no
-// separate "unexpected status" cue needs adding for the Unit 2 fix.
+// "status" is already one of the cue words below, so "unexpected status 503/429/401" already reads as a status-code cue on its own — no separate "unexpected status" cue needed for the Unit 2 fix.
 const HTTP_STATUS_CONTEXT = "\\b(?:https?://|status|http|code|error)\\b[^\\s\\n]{0,4}(?:[:=\\s]\\s*[(\\[]?|[(\\[])";
 
 function hasHttpStatusCode(text: string, code: RegExp): boolean {
@@ -95,12 +91,17 @@ const TRANSIENT_PATTERNS: Array<{ pattern: RegExp; reason: TransientReason }> = 
 
 // Terminal arms that must win over everything else — including a
 // transient-looking phrase elsewhere in the same text — because they are
-// unrecoverable by definition: no retry count fixes a bad key or an empty
-// wallet.  Checked first, in both the CliExit and Error/text shapes, so a
-// message that is both quota-shaped and mentions "capacity" (RESOURCE_EXHAUSTED
-// bodies do) always classifies as quota, never as the transient "overloaded"
-// reading.  See classifyError's single ordered pass below (2026-09-25 fix for
-// "classifyError verdict depends on input shape").
+// unrecoverable by definition: no retry count fixes a bad key, an empty
+// wallet, or a turn the user already stopped.  Checked first, in both the
+// CliExit and Error/text shapes, so a message that is both quota-shaped and
+// mentions "capacity" (RESOURCE_EXHAUSTED bodies do) always classifies as
+// quota, never as the transient "overloaded" reading — and a stop phrase
+// that happens to also carry transient vocabulary (a socket reset while the
+// user's cancel was landing) always classifies as interrupted, never as a
+// retryable connection reset.  See classifyError's single ordered pass below
+// (2026-09-25 fix for "classifyError verdict depends on input shape"; the
+// interrupted arm moved here from the general terminal group on the FIX
+// round because it lost to TRANSIENT_PATTERNS there).
 const PRIORITY_TERMINAL_PATTERNS: Array<{ pattern: RegExp; reason: TerminalReason }> = [
   {
     // Auth-shaped words OR a status-code-driven 401/403.  "free range
@@ -121,6 +122,20 @@ const PRIORITY_TERMINAL_PATTERNS: Array<{ pattern: RegExp; reason: TerminalReaso
       /\bsession limit\b|\busage cap\b|\busage limit\b|\bquota exceeded\b|\brate limit reached\b|\bplan limit\b|(?<!-)\btier limit\b|\bmonthly limit\b|\bfree\s*tier\s+limit\b|\bspend limit\b|\bbudget exceeded\b|\bcredits?\b[^.\n]{0,30}\b(?:exhausted|depleted|empty|insufficient|zero)\b|\bout of (?:usage|credits)\b|\binsufficient.?balance\b|\binsufficient.?funds\b|\bzero balance\b|\bresource.?exhausted\b|\bresource_exhausted\b|\bexhausted your.*quota\b|\bdaily quota\b|\bslow pool\b|\bpayment required\b|\bsubscription\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due)\b|\bbilling\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due|not active|failed)\b/i,
     reason: "quota",
   },
+  {
+    // Narrowed to the drivers' own stop-path phrases (interrupted BY USER,
+    // cancelled by user) — a turn the user stopped must never come back as
+    // an auto-retry, even when the same text also carries transient
+    // vocabulary ("turn cancelled by user: socket hang up" must not read as
+    // a retryable connection reset).  That is why this arm has to outrank
+    // TRANSIENT_PATTERNS, exactly like auth and quota above.  Bare
+    // "interrupted" does NOT match here, so a transient reconnect message
+    // like "stream interrupted" still falls through to the transient
+    // vocabulary (or "unknown" when nothing else matches) instead of being
+    // swallowed into a permanent give-up.
+    pattern: /\b(?:interrupted by user|cancelled by user)\b/i,
+    reason: "interrupted",
+  },
 ];
 
 // Remaining terminal arms — checked AFTER the transient vocabulary, so a
@@ -134,13 +149,6 @@ const TERMINAL_PATTERNS: Array<{ pattern: RegExp; reason: TerminalReason }> = [
   { pattern: /\bmodel not found\b|\bunknown model\b|\bdoes not exist for model\b|\bunsupported model\b/i, reason: "unknown_model" },
   { pattern: /\b(?:invalid request|malformed)\b/i, reason: "invalid_request" },
   { pattern: /\b(?:no such thread|thread gone)\b/i, reason: "not_found" },
-  // Narrowed to the drivers' own stop-path phrases (interrupted BY USER,
-  // cancelled by user) — a turn the user stopped must never come back as an
-  // auto-retry.  Bare "interrupted" used to match here too, which meant a
-  // transient reconnect message like "stream interrupted: connection lost"
-  // was swallowed into a permanent give-up before the transient vocabulary
-  // ever got a look at it.
-  { pattern: /\b(?:interrupted by user|cancelled by user)\b/i, reason: "interrupted" },
 ];
 
 /** A CLI exit report, as drivers assemble it from a child process's close
@@ -193,11 +201,13 @@ function classifyByStatusCode(text: string): ErrorClassification | undefined {
  *
  * One order, for every input shape (Error, `{text}`, or a CLI exit report):
  *   1. a signal kill (negative exit code) is never retried;
- *   2. the priority terminal arms (auth, quota) — unrecoverable, so they
- *      outrank a transient-looking word elsewhere in the same text;
+ *   2. the priority terminal arms (auth, quota, interrupted) — unrecoverable
+ *      or already stopped by the user, so they outrank a transient-looking
+ *      word elsewhere in the same text (a stop that also carries a socket
+ *      error must still read as interrupted, never as a retryable reset);
  *   3. the transient vocabulary;
  *   4. the remaining terminal arms (unknown_model, invalid_request,
- *      not_found, interrupted);
+ *      not_found);
  *   5. the numeric HTTP status code, when the text carries one with a
  *      recognizable cue nearby.
  * Before this fix, a CliExit checked transient before terminal while an
