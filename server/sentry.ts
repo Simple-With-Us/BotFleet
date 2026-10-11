@@ -494,7 +494,9 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   if (sdk.httpIntegration) {
     integrations.push(sdk.httpIntegration({
       ignoreIncomingRequests: (urlPath) => isWebhookIngressPath(urlPath),
-      maxRequestBodySize: "none",
+      // v11 renamed this option and narrowed it to incoming bodies.  "none" still means
+      // never capture one, so the privacy intent of the old line is unchanged.
+      maxIncomingRequestBodySize: "none",
     }));
   }
   // v11 dropped enableLogs; the console integration is what turns a
