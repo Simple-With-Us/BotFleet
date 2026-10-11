@@ -217,7 +217,10 @@ No user-visible surface changed.  This lane is the proof, not the migration.
 1. **macOS** — port `ChatView` incrementally onto `ThreadPrimitive`, one region at a time behind
    the existing surface, keeping `ChatMarkdown`, themes, mascot and tool cards.  Start with the
    message list and viewport; leave composer, find bar and thread tabs as-is.
-2. **iOS** — extract Exyte's composer and bubble patterns by reading them; no dependency yet.  Revisit the full swap only if the owner wants it.
+2. **iOS** — ~~extract Exyte's composer and bubble patterns by reading them; no dependency yet~~
+   **Superseded 2026-10-11** by [2026-10-11-ios-chat-library-options.md](2026-10-11-ios-chat-library-options.md):
+   a survey of every credible option found none that passes all acceptance criteria, so the answer is
+   build-native.  The concrete gap is message grouping.
 3. Re-check `@assistant-ui/react-ui` on a later version before ever adopting it.
 
 ## Sources
