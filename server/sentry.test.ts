@@ -409,7 +409,9 @@ describe("webhook secrets never reach Sentry", () => {
     const http = hooks.integrations.find((integration) => integration.name === "Http");
     expect(http?.options?.ignoreIncomingRequests?.(`/hooks/${endpoint}/${secret}`)).toBe(true);
     expect(http?.options?.ignoreIncomingRequests?.("/api/bots")).toBe(false);
-    expect((http?.options as Record<string, unknown>)?.maxRequestBodySize).toBe("none");
+    // v11 renamed this option;  "none" is still the value that keeps an incoming
+    // request body out of the envelope.
+    expect((http?.options as Record<string, unknown>)?.maxIncomingRequestBodySize).toBe("none");
     expect(hooks.integrations.some((integration) => integration.name === "ConsoleLogs")).toBe(true);
     expect(isWebhookIngressPath("/health")).toBe(false);
   });
