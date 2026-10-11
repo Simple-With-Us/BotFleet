@@ -223,7 +223,8 @@ No user-visible surface changed.  This lane is the proof, not the migration.
 2. **iOS** — ~~extract Exyte's composer and bubble patterns by reading them; no dependency yet~~
    **Superseded 2026-10-11** by [2026-10-11-ios-chat-library-options.md](2026-10-11-ios-chat-library-options.md).
    `beautiful-ui-swift` passes the seven criteria as that survey wrote them.  The reason to stay native is
-   that BotFleet already owns these components (`ApprovalCard`, `AgentThoughtChamberView`).  The
+   that BotFleet already owns `AgentThoughtChamberView` (ios/App/Cards/AgentThoughtChamberView.swift) and
+   the approval card UI in `CardView` inside `ios/App/ChatView.swift`.  The
    concrete gap is message grouping.
 3. Re-check `@assistant-ui/react-ui` on a later version before ever adopting it.
 
