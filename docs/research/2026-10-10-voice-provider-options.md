@@ -163,23 +163,70 @@ confirmed billable volume, not an estimate from submitted text.
 | Cartesia Sonic 3.6 paygo | $8.02 |
 | MiniMax `speech-2.8-turbo` paygo | $9.81 |
 
-So the correct statement is not "xAI is 4x cheaper than MiniMax."  At the volume we
-actually generate, **TTS fits entirely inside Azure's free tier and costs nothing**, and
-the cheapest paid option is $2.45/month.  The saving is measured in dollars per month
-against a plan that costs more than that by itself, not in multiples of a list price
-nobody pays.
+### Correction (2026-10-11, later the same day): The Plan Already Covers This
+
+An earlier revision of this section inferred that because MiniMax carves voice
+*cloning* out of the Token Plan, TTS must also be billed separately.  **That inference
+was wrong, and the conclusion above draws the wrong conclusion.**  The published wording
+is the opposite:
+
+> Supported text, image, and **speech** resources share one quota.  Model coverage
+> includes the full MiniMax lineup (M3 / M2.7 / image / **speech**).  A small number of
+> special models (MiniMax H3, voice design, rapid voice cloning, etc.) are not currently
+> supported.
+
+Only **voice design** and **rapid voice cloning** are excluded.  TTS and ASR are both
+inside the plan's shared quota.  Jay's $132/month M Plan (Build tier) therefore already
+covers MiniMax speech at **$0 marginal**, and at 3.03 hours a month that usage sits
+comfortably inside it.
+
+**So the table above compares two zeroes.**  Moving TTS from MiniMax to Azure's free tier
+saves nothing, because MiniMax was already free at this volume.  The honest conclusion is
+stronger than the cost table: **there is no TTS cost problem to solve at current usage,
+and provider choice on cost grounds is not a live question.**
+
+The one thing that could change this is the shared pool.  Speech draws from the same
+quota as text, which is the actual driver of consumption, and non-video usage is subject
+to 5-hour and weekly windows — so a long call competes with coding sessions rather than
+sitting in a separate budget.  That is a quota-contention question, not a price question,
+and it is the only reason to revisit TTS provider choice on cost.
 
 ### What This Measurement Does Not Cover
 
 - **The iOS app's synthesis.**  This file is written by the macOS harness only.
-- **Voice cloning and music.**  MiniMax draws those from the same credit pool, so the
-  TTS share above understates the total audio spend on that plan.
 - **Speech-to-text.**  Recorded elsewhere; this table is TTS only.
 - **Depth.**  Two months of history, and September predates real use of the feature.
 
-Any one of those could move the number.  None of them is likely to push 3 hours a month
-past Azure's 9.3-hour free allowance, but that should be confirmed rather than assumed
-before switching a paying subscription off.
+None of those is likely to push 3 hours a month past either MiniMax's plan quota or
+Azure's 9.3-hour free allowance — which is precisely why neither is worth switching for
+cost.
+
+### No MiniMax Speech-To-Speech Model Exists
+
+Worth stating plainly, because it was asked: **MiniMax has no duplex speech-to-speech
+model.**  It ships TTS (`speech-2.8-hd`, `speech-2.8-turbo`) over HTTP and WebSocket, and
+Speech Recognition at $0.38/hour with diarization and subtitle export.  Its
+"bidirectional streaming" endpoint is bidirectional *text* to audio, not audio-in
+audio-out.  There is no `/v1/realtime` equivalent, so the plan buys the strongest chained
+stack rather than an STS.
+
+### Speech-To-Speech Is Not Sold On Any Subscription
+
+| Provider | How it is sold |
+|---|---|
+| xAI `/v1/realtime` | Metered only — $0.08/min audio plus $0.004 per text input |
+| OpenAI Realtime | Metered only; ChatGPT subscriptions do not cover API usage |
+| Google AI Pro / Ultra | Quota applies **inside AI Studio only**; direct API use is billed separately |
+| Hume EVI | Subscription, but a hosted voice product rather than a raw STS model |
+
+`gemini-3.8-live` is the one duplex model with a usable free tier.  It documents
+interruption as first-class — the server emits `server_content` with `interrupted: true`
+when the user speaks over the reply — and supports VAD, tool use and audio
+transcriptions, so the "front-end that calls the bot's engine as a function" design works
+there too.  Three caveats: audio-only sessions cap at **15 minutes** without context
+compression, the API **re-bills accumulated context on every turn** so long sessions
+compound, and proactive audio is permanently enabled in 3.8, billing input tokens for the
+whole time the session is listening.
 
 ## What Would Actually Decide It
 
