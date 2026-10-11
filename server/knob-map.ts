@@ -48,6 +48,28 @@ export interface KnobFieldSpec {
  * deliberately-out-of-scope list. */
 export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
   {
+    // How long a voice call waits for the bot's own engine before the model
+    // answers that turn alone.  A coding engine regularly takes 10-30s, and the
+    // vendor preamble only covers the first couple of seconds, so this is the
+    // knob that decides when a call degrades instead of going quiet.
+    id: "sts.engineTimeoutMs",
+    label: "Voice call engine timeout",
+    section: "sts",
+    path: ["engineTimeoutMs"],
+    infisicalName: "BOTFLEET_STS_ENGINE_TIMEOUT_MS",
+    kind: "int",
+    min: 1000,
+    max: 120000,
+  },
+  {
+    id: "sts.frontEngine",
+    label: "Voice calls use the bot's engine",
+    section: "sts",
+    path: ["frontEngine"],
+    infisicalName: "BOTFLEET_STS_FRONT_ENGINE",
+    kind: "bool",
+  },
+  {
     id: "jobs.defaultMinutes",
     label: "Default job run limit",
     section: "jobs",

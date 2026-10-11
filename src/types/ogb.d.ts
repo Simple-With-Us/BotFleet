@@ -175,6 +175,16 @@ type SkillRecordingPayload = {
         setKey(value: string): Promise<{ configured: boolean }>;
         streamingToken(): Promise<{ token: string; expiresInSeconds: number }>;
       };
+      // Speech-to-speech session tokens.  The permanent provider key stays in
+      // the encrypted main-process store; the renderer only ever receives one
+      // of these short-lived, single-session tokens, exactly like
+      // transcription.streamingToken above.
+      sts?: {
+        /** Which STS providers have a credential configured. */
+        status(): Promise<{ xai: boolean; gemini: boolean }>;
+        xaiToken(): Promise<{ token: string; expiresInSeconds: number }>;
+        geminiToken(): Promise<{ token: string; expiresInSeconds: number }>;
+      };
       /** Absolute path of a dropped File ("" when the drag carried no
        * file on disk). Absent in older builds of the shell. */
       getPathForFile?(file: File): string;

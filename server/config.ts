@@ -300,6 +300,7 @@ const instanceConfigMapSchema = z.record(z.string(), instanceConfigSchema);
 const appConfigSchema = z.object({
   deleteInstance: optionalText,
   xai: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  gemini: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   openaiCompat: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   /** MiniMax API key and base URL.  Same shape as `openaiCompat` above and
    * for the same reason: the driver speaks the OpenAI wire protocol against
@@ -329,6 +330,18 @@ const appConfigSchema = z.object({
    * "system" (the Mac's built-in voices, no key). */
   tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), pronunciations: pronunciationListSchema.optional(), credentialStorage: externalCredentialStorage }).optional(),
   callStt: z.object({ provider: z.enum(["apple", "assemblyai"]).nullable().optional(), keyterms: z.array(z.string().trim().min(1)).max(100).optional() }).optional(),
+  // Call-mode speech-to-speech.  Opt-in per workspace and deliberately separate
+  // from callStt: an STS provider replaces the whole chained loop rather than
+  // swapping one link of it.  `provider: null` means Auto — use whichever
+  // provider has a key, preferring the configured default.
+  sts: z.object({
+    provider: z.enum(["xai", "gemini"]).nullable().optional(),
+    // Hand real work to the bot's own engine through a function tool.  When
+    // false the model answers alone; when true a slow or failed engine falls
+    // back to the model for that turn and marks the line engineBypassed.
+    frontEngine: z.boolean().optional(),
+    engineTimeoutMs: z.number().int().min(1000).max(120000).optional(),
+  }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   autoUpdate: z
@@ -537,6 +550,7 @@ const jsonObjectSchema = z.record(z.string(), z.json());
 export interface AppConfig {
   deleteInstance?: string;
   xai?: { key?: string; url?: string; credentialStorage?: "external" };
+  gemini?: { key?: string; credentialStorage?: "external" };
   openaiCompat?: { key?: string; url?: string; credentialStorage?: "external" };
   minimax?: { key?: string; url?: string; credentialStorage?: "external" };
   composio?: { apiKey?: string; userId?: string; sessionId?: string; brokerUrl?: string; credentialStorage?: "external" };
@@ -558,6 +572,11 @@ export interface AppConfig {
   callStt?: {
     provider?: "apple" | "assemblyai" | null;
     keyterms?: string[];
+  };
+  sts?: {
+    provider?: "xai" | "gemini" | null;
+    frontEngine?: boolean;
+    engineTimeoutMs?: number;
   };
   imageGen?: { key?: string; credentialStorage?: "external" };
   autoUpdate?: {
@@ -771,7 +790,7 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
 
 export function parseConfigPatch(value: JsonValue): ConfigPatch {
   if (value && typeof value === "object" && !Array.isArray(value)) {
-    for (const section of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "infisical"]) {
+    for (const section of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "infisical"]) {
       const candidate = value[section];
       if (candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
           Object.hasOwn(candidate, "credentialStorage")) {
@@ -1717,7 +1736,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip", "autoReview"] as const) {
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
