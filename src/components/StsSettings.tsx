@@ -1,0 +1,296 @@
+// Settings panel for speech-to-speech (STS) calls.
+//
+// Mirrors TranscriptionSettings: it hydrates from GET /api/config, writes the
+// `sts` slice back with PUT /api/config, and reads per-provider key state from
+// the Electron bridge rather than from config.json, because the keys live in
+// the credential store and only their presence crosses the bridge.
+//
+// Two things are deliberately honest here rather than convenient:
+//
+//  * A provider with no key is still selectable.  pickStsProvider degrades a
+//    preference pinned to a keyless provider to Auto, so the panel says which
+//    key is missing and what will actually happen instead of implying the call
+//    will fail.
+//  * `frontEngine` defaults to on.  prepareStsSession reads
+//    `config.frontEngine !== false`, so an absent value is on, and an absent
+//    value must render as on.
+
+import { Loader2 } from "lucide-react";
+import { useEffect, useState } from "react";
+
+import { cn } from "@/lib/cn";
+import { STS_PROVIDERS, type StsProvider } from "@/lib/sts";
+
+/** What the radios offer: Auto plus one entry per STS provider. */
+export type StsOption = "auto" | StsProvider;
+
+/** The `sts` slice of AppConfig, as it arrives from GET /api/config. */
+export interface StsConfigSlice {
+  provider?: "xai" | "gemini" | null;
+  frontEngine?: boolean;
+}
+
+const PROVIDER_TITLES = {
+  xai: "xAI",
+  gemini: "Google Gemini",
+} satisfies Record<StsProvider, string>;
+
+const PROVIDER_BLURBS = {
+  xai: "Realtime duplex speech on one connection.",
+  gemini: "Gemini Live duplex speech on one connection.",
+} satisfies Record<StsProvider, string>;
+
+/** The credential each provider needs, named so a missing one is actionable. */
+const PROVIDER_CREDENTIALS = {
+  xai: "XAI_API_KEY",
+  gemini: "GEMINI_API_KEY",
+} satisfies Record<StsProvider, string>;
+
+/** Narrow a config or radio value without a cast, off the list the picker uses. */
+function isStsProvider(value: string | null | undefined): value is StsProvider {
+  return STS_PROVIDERS.some((provider) => provider === value);
+}
+
+/**
+ * The provider choice actually in force.  Absent and `null` both mean Auto,
+ * which is what the config schema stores when the picker has no preference.
+ */
+export function stsEffectiveProvider(slice?: StsConfigSlice | null): StsOption {
+  const provider = slice?.provider;
+  return isStsProvider(provider) ? provider : "auto";
+}
+
+/**
+ * Whether real work is handed to the bot's own engine.  Only an explicit
+ * `false` turns it off, matching prepareStsSession's `frontEngine !== false`,
+ * so an unset config renders as on rather than as an off toggle.
+ */
+export function stsEffectiveFrontEngine(slice?: StsConfigSlice | null): boolean {
+  return slice?.frontEngine !== false;
+}
+
+/** Per-provider key state; null means "not known", never "no key". */
+export type StsKeyState = Partial<Record<StsProvider, boolean>> | null;
+
+/**
+ * What the panel says under a provider about its credential.
+ *
+ * A missing key is named rather than swallowed: pickStsProvider degrades a
+ * preference pinned to a keyless provider to Auto, so the honest line says
+ * which key is absent and that Auto will take the call until it is added.
+ * `null` means the state is still unknown, which must not read as "no key".
+ */
+export function stsKeyNotice(provider: StsProvider, keys: StsKeyState): string | null {
+  if (!keys) return null;
+  return keys[provider]
+    ? "Key configured."
+    : `No ${PROVIDER_CREDENTIALS[provider]} — calls use Auto until one is added.`;
+}
+
+export function StsSettings() {
+  const bridge = window.ogb?.sts;
+  const [keys, setKeys] = useState<StsKeyState>(null);
+  const [keysFailed, setKeysFailed] = useState(false);
+  const [provider, setProvider] = useState<StsOption>("auto");
+  const [frontEngine, setFrontEngine] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    if (!bridge) {
+      setKeysFailed(true);
+      return;
+    }
+    bridge
+      .status()
+      .then((status) => {
+        if (!alive) return;
+        setKeys({ xai: status.xai, gemini: status.gemini });
+      })
+      .catch(() => {
+        if (!alive) return;
+        setKeysFailed(true);
+      });
+    return () => { alive = false; };
+  }, [bridge]);
+
+  // Hydrate the STS section from AppConfig once on mount; later edits go back
+  // through PUT /api/config rather than the bridge.
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/config")
+      .then((res) => {
+        if (!res.ok) throw new Error(`GET /api/config → ${res.status}`);
+        return res.json();
+      })
+      .then((cfg: { sts?: StsConfigSlice }) => {
+        if (!alive) return;
+        setProvider(stsEffectiveProvider(cfg?.sts));
+        setFrontEngine(stsEffectiveFrontEngine(cfg?.sts));
+        setLoaded(true);
+      })
+      .catch((failure) => {
+        if (!alive) return;
+        setError(failure instanceof Error ? failure.message : String(failure));
+        setLoaded(true);
+      });
+    return () => { alive = false; };
+  }, []);
+
+  // One writer for the whole slice, so a second click mid-save is dropped
+  // rather than racing the first PUT.  Reports whether the write landed, so
+  // a failed save leaves the shown choice where it was.
+  const save = async (patch: StsConfigSlice): Promise<boolean> => {
+    if (saving) return false;
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sts: patch }),
+      });
+      if (!res.ok) throw new Error(`PUT /api/config → ${res.status}`);
+      return true;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveProvider = async (next: StsOption) => {
+    // Only a confirmed write advances the shown choice.
+    if (await save({ provider: next === "auto" ? null : next })) setProvider(next);
+  };
+
+  const saveFrontEngine = async (next: boolean) => {
+    if (await save({ frontEngine: next })) setFrontEngine(next);
+  };
+
+  const configured = STS_PROVIDERS.filter((p) => keys?.[p]);
+
+  return (
+    <div className="space-y-6">
+      <section>
+        <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
+          <span className={cn("size-1.5 rounded-full", configured.length > 0 ? "bg-success" : "bg-raised-hover")} />
+          <span className="text-ink">Speech-to-Speech Calls</span>
+          {configured.length > 0 && <span className="text-[11px] text-success">Key Ready</span>}
+        </div>
+        <p className="mb-2 text-[12px] leading-relaxed text-ink-secondary">
+          The model hears the caller and speaks back on one connection, instead of transcribing
+          and re-synthesizing each turn.{"\u00A0 "}Add a provider key to turn it on.
+        </p>
+
+        <fieldset className="space-y-1.5">
+          <legend className="sr-only">Speech-to-speech provider</legend>
+
+          <label
+            className={cn(
+              "flex cursor-pointer items-start gap-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2 hover:border-hairline",
+              provider === "auto" && "border-accent",
+              (saving || !loaded) && "cursor-not-allowed opacity-60",
+            )}
+          >
+            <input
+              type="radio"
+              name="sts-provider"
+              value="auto"
+              checked={provider === "auto"}
+              onChange={() => void saveProvider("auto")}
+              disabled={!loaded || saving}
+              className="mt-1 size-3 accent-accent"
+            />
+            <div>
+              <div className="text-[13px] text-ink">Auto</div>
+              <div className="text-[11px] text-ink-secondary">
+                Use whichever provider has a key, preferring {PROVIDER_TITLES[STS_PROVIDERS[0]]}.
+                {keys && configured.length === 0 && " No provider key is configured yet."}
+              </div>
+            </div>
+          </label>
+
+          {STS_PROVIDERS.map((option) => {
+            const notice = stsKeyNotice(option, keys);
+            return (
+              <label
+                key={option}
+                className={cn(
+                  "flex cursor-pointer items-start gap-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2 hover:border-hairline",
+                  provider === option && "border-accent",
+                  (saving || !loaded) && "cursor-not-allowed opacity-60",
+                )}
+              >
+                <input
+                  type="radio"
+                  name="sts-provider"
+                  value={option}
+                  checked={provider === option}
+                  onChange={() => void saveProvider(option)}
+                  disabled={!loaded || saving}
+                  className="mt-1 size-3 accent-accent"
+                />
+                <div>
+                  <div className="text-[13px] text-ink">{PROVIDER_TITLES[option]}</div>
+                  <div className="text-[11px] text-ink-secondary">
+                    {notice ? `${PROVIDER_BLURBS[option]} ${notice}` : PROVIDER_BLURBS[option]}
+                  </div>
+                </div>
+              </label>
+            );
+          })}
+        </fieldset>
+
+        {!bridge && (
+          <div className="mt-2 text-[12px] text-warning">Available in the installed desktop app.</div>
+        )}
+        {bridge && keysFailed && (
+          <div className="mt-2 text-[12px] text-warning">
+            Key status unavailable — provider keys are stored by the desktop app.
+          </div>
+        )}
+      </section>
+
+      <section>
+        <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
+          <span className="text-ink">Hand Real Work To The Bot's Engine</span>
+        </div>
+        <p className="mb-2 text-[12px] leading-relaxed text-ink-secondary">
+          The model hands real work to the bot's own coding engine.{"\u00A0 "}When that engine is
+          slow or unavailable, the model answers that turn alone instead.
+        </p>
+        <label
+          className={cn(
+            "flex items-center gap-3 rounded-lg border border-hairline/40 bg-inset px-3 py-2",
+            (saving || !loaded) ? "cursor-not-allowed opacity-60" : "cursor-pointer hover:border-hairline",
+          )}
+        >
+          <input
+            type="checkbox"
+            checked={frontEngine}
+            onChange={(event) => void saveFrontEngine(event.target.checked)}
+            disabled={!loaded || saving}
+            className="size-3 accent-accent"
+            aria-label="Hand real work to the bot's engine"
+          />
+          <div className="text-[13px] text-ink">Use The Bot's Coding Engine</div>
+          <div className="ml-auto flex items-center gap-1.5 text-[11px] text-ink-secondary">
+            {saving && <Loader2 size={12} className="animate-spin" />}
+            {frontEngine ? "On" : "Off"}
+          </div>
+        </label>
+        <div className="mt-1 text-[11px] text-ink-secondary">On by default.</div>
+      </section>
+
+      {error && (
+        <div role="alert" className="text-[12px] text-danger">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}

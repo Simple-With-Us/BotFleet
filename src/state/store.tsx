@@ -554,6 +554,11 @@ export interface ConfigStatus {
    * chooses the platform default. `keyterms` is the global voice vocabulary
    * the user has set up; per-bot terms are layered on top in call-stt.ts. */
   callStt?: { provider?: "apple" | "assemblyai"; keyterms?: string[] };
+  /** Speech-to-speech call preference, mirrored from AppConfig.  `provider`
+   * is undefined when the picker has no explicit preference and Auto picks
+   * whichever provider has a key; `frontEngine` defaults to true, so an
+   * absent value reads as on, matching prepareStsSession. */
+  sts?: { provider?: "xai" | "gemini"; frontEngine?: boolean };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: { configured: boolean };
   /** who's using the app — collected in onboarding, shown in the sidebar */
@@ -684,7 +689,7 @@ export function getConversationMode(config?: ConfigStatus | null): ConversationM
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq" | "autoReview"
+  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "callStt" | "sts" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq" | "autoReview"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -705,6 +710,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     opencodeGo: frame.opencodeGo,
     tts: frame.tts,
     callStt: frame.callStt,
+    sts: frame.sts,
     imageGen: frame.imageGen,
     profile: frame.profile,
     autoUpdate: frame.autoUpdate,

@@ -61,6 +61,7 @@ import { SecretsSection } from "./SecretsSection";
 import { SkinPicker } from "./SkinPicker";
 import { RoomTurnTimeoutSettings } from "./RoomTurnTimeoutSettings";
 import { TranscriptionSettings } from "./TranscriptionSettings";
+import { StsSettings } from "./StsSettings";
 import { QdrantRagConnection } from "./QdrantRagConnection";
 import { cn } from "@/lib/cn";
 import { putAutomaticUpdateSetting } from "@/lib/automatic-update-setting";
@@ -1430,6 +1431,9 @@ export function SettingsModal() {
                     ) : null}
                     <div id="setting-connections-transcription" className={highlightClass("setting-connections-transcription")}>
                       <TranscriptionSettings />
+                    </div>
+                    <div id="setting-connections-sts" className={highlightClass("setting-connections-sts")}>
+                      <StsSettings />
                     </div>
                     <div id="setting-connections-api-keys" className={cn("flex flex-col gap-4", highlightClass("setting-connections-api-keys"))}>
                       <ApiKeyRow section="box" />

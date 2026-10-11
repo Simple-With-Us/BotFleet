@@ -254,6 +254,10 @@ class LivePlayback {
  *  exist yet: ogb.d.ts gains the sts namespace with the sibling bridge work. */
 function readTokenMint(): (() => Promise<{ token: string }>) | undefined {
   const bridge = typeof window !== "undefined" ? window.ogb : undefined;
+  // SAFETY: `sts` is optional on the bridge and `geminiToken` is optional
+  // inside it, so this assertion widens to exactly the shape we read one
+  // optional level down.  The result is immediately narrowed back by the
+  // `typeof mint === "function"` guard below, so nothing unsafe escapes.
   const mint = (bridge as { sts?: { geminiToken?: () => Promise<{ token: string }> } } | undefined)?.sts
     ?.geminiToken;
   return typeof mint === "function" ? mint : undefined;
@@ -707,6 +711,9 @@ export function createGeminiLiveSession(): StsSession {
 
   // The resumption token is vendor state with no home on StsSession, so it is
   // reached the same way call-stt.ts reaches its raw IPC teardown.
+  // SAFETY: attaching the handle reader to the session object is the same
+  // escape hatch call-stt.ts uses for its raw IPC teardown, and the property
+  // is optional so no caller can be tricked into expecting it.
   (session as StsSession & { __resume?: () => GeminiResumeHandle | null }).__resume = () => resume;
   return session;
 }
