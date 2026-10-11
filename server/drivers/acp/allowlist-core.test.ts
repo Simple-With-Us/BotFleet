@@ -38,8 +38,9 @@ function allowlist(): ToolPolicy {
       { argv0: tool, sub: ["whoami"], flags: { "--json": { value: "none" } } },
       { argv0: tool, sub: ["post"], flags: { "--topic": { value: "text", required: true } } },
       { argv0: "/bin/pwd", sub: [] },
+      { argv0: "/bin/cat", sub: [], args: [{ value: "path", paths: [join(scratch, "logs", "app.log")] }] },
     ],
-    writePaths: [dmFile],
+    writePaths: [dmFile, join(scratch, "state", "nested", "deep.md")],
   })!;
 }
 
@@ -115,7 +116,13 @@ afterEach(async () => {
   removeTempDir(scratch);
 });
 
-describe("an allowlist turn on Grok", () => {
+// The turns below run a real fake agent-sync CLI:  a `#!/bin/sh` script, POSIX argv0 paths, and
+// `/bin/cat` and `/bin/pwd`, which `isCleanAbsolutePath` rightly refuses on Windows, where mkdtemp
+// hands back `C:\Users\...\fake-agent-sync`.  The suite is POSIX-only;  `grokAllowlistProblem` below
+// is pure logic and runs everywhere.
+const posix = describe.skipIf(process.platform === "win32");
+
+posix("an allowlist turn on Grok", () => {
   it("spawns in an asking mode, offers a terminal and files, registers the hook, and mounts no MCP", async () => {
     await grok(true);
     const { done, dump: seen } = await runTurn([]);
@@ -227,6 +234,40 @@ describe("an allowlist turn on Grok", () => {
     expect(existsSync(join(hidden, "dm.md"))).toBe(false);
   });
 
+  it("refuses a command whose path word a link carries into a credential directory", async () => {
+    await grok();
+    const secrets = join(scratch, ".secrets");
+    mkdirSync(secrets);
+    writeFileSync(join(secrets, "app.log"), "SECRET-VALUE\n");
+    symlinkSync(secrets, join(scratch, "logs"));
+    const log = join(scratch, "logs", "app.log");
+    const { dump: seen } = await runTurn([
+      { type: "shell", command: `/bin/cat ${log}` },
+      { type: "raw-terminal", command: `/bin/bash -lc '/bin/cat ${log}'` },
+    ]);
+    expect(seen.results[0].hook).toBe("deny");
+    expect(seen.results[1].terminal).toBe("refused");
+    expect(JSON.stringify(seen.results)).not.toContain("SECRET-VALUE");
+  });
+
+  it("runs the same command when the path word is a real file", async () => {
+    await grok();
+    mkdirSync(join(scratch, "logs"));
+    writeFileSync(join(scratch, "logs", "app.log"), "backup ok\n");
+    const { dump: seen } = await runTurn([{ type: "shell", command: `/bin/cat ${join(scratch, "logs", "app.log")}` }]);
+    expect(seen.results[0]).toMatchObject({ hook: "allow", output: "backup ok\n" });
+  });
+
+  it("creates no directory under a link into a protected place before refusing the write", async () => {
+    await grok();
+    const hidden = join(scratch, ".ssh");
+    mkdirSync(hidden);
+    symlinkSync(hidden, join(scratch, "state"));
+    const { dump: seen } = await runTurn([{ type: "raw-write", path: join(scratch, "state", "nested", "deep.md"), content: "x" }]);
+    expect(seen.results[0].write).toBe("refused");
+    expect(existsSync(join(hidden, "nested"))).toBe(false);
+  });
+
   it("refuses to write through a link planted at the listed path", async () => {
     await grok();
     mkdirSync(dirname(dmFile), { recursive: true });
@@ -280,7 +321,7 @@ describe("an allowlist turn on Grok", () => {
   });
 });
 
-describe("turns without an allowlist", () => {
+posix("turns without an allowlist", () => {
   it("are unchanged:  full-auto Grok keeps bypassPermissions, no client terminal, no hook", async () => {
     await grok(true);
     const { done, dump: seen } = await runTurn([], { policy: null });
@@ -292,7 +333,7 @@ describe("turns without an allowlist", () => {
   });
 });
 
-describe("an engine that cannot be held", () => {
+posix("an engine that cannot be held", () => {
   it("refuses an allowlist turn on MiniMax Code before anything spawns", async () => {
     instance = await McodeAgentDriver.create({
       instanceId: "mcode-allowlist",

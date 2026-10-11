@@ -222,6 +222,32 @@ function canonicalPath(configured: string): string | null {
   return isCleanAbsolutePath(resolved) && !isProtectedPath(resolved) ? resolved : null;
 }
 
+/** Where `path` really lands:  its nearest existing ancestor resolved through
+ *  every link, with the missing rest appended.  Null when nothing resolves. */
+function resolvedLocation(path: string): string | null {
+  const rest: string[] = [];
+  let dir = path;
+  for (;;) {
+    try {
+      return posix.join(realpathSync(dir), ...rest.reverse());
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) return null;
+      rest.push(basename(dir));
+      dir = parent;
+    }
+  }
+}
+
+/** A link carries `path`, which names no protected place itself, into one
+ *  (`logs -> ~/.secrets`, `state -> ~/.ssh`).  Checked before anything is
+ *  created, read, written or run. */
+function redirectedIntoProtected(path: string): boolean {
+  if (isProtectedPath(path)) return false;
+  const real = resolvedLocation(path);
+  return real === null || isProtectedPath(real);
+}
+
 function rpcRefusal(message: string): ClientRefusal {
   // -32000 is a server-defined error: the engine reports the tool as failed
   // and the model reads the message.
@@ -264,7 +290,7 @@ export class AllowlistGate {
     if (!toolName || !input) return denied(ONLY_THESE_TOOLS, name);
     if (SHELL_TOOLS.has(toolName)) {
       if (input.is_background === true) return denied("background commands are not allowed", name);
-      return input.command === undefined ? denied("the command is missing", name) : evaluateCommand(this.policy, input.command);
+      return input.command === undefined ? denied("the command is missing", name) : this.checkPaths(evaluateCommand(this.policy, input.command));
     }
     if (WRITE_TOOLS.has(toolName)) {
       const path = input.file_path ?? input.path;
@@ -275,6 +301,17 @@ export class AllowlistGate {
       return path === undefined ? denied("the file is missing", name) : evaluateRead(this.policy, path, canonicalPath);
     }
     return denied(ONLY_THESE_TOOLS, name);
+  }
+
+  /** Refuse an allowed command whose path words a link carries into a
+   *  protected place. */
+  private checkPaths(decision: PolicyDecision): PolicyDecision {
+    if (!decision.ok) return decision;
+    const program = basename(decision.argv[0] ?? "") || "command";
+    for (const path of decision.paths ?? []) {
+      if (redirectedIntoProtected(path)) return denied("a path resolves through a link into a protected directory", program);
+    }
+    return decision;
   }
 
   /** Answer a `pre_tool_use` hook:  `{}` lets the tool run, a `deny`
@@ -374,7 +411,9 @@ export class AllowlistGate {
     const p = parsed.data;
     const unwrapped = unwrapShellCommand(p.command, p.args);
     if (!unwrapped) return rpcRefusal(this.deny(denied("a shell wrapper of an unexpected shape", "command")));
-    const decision = "argv" in unwrapped ? evaluateArgv(this.policy, unwrapped.argv) : evaluateCommand(this.policy, unwrapped.command);
+    const decision = this.checkPaths(
+      "argv" in unwrapped ? evaluateArgv(this.policy, unwrapped.argv) : evaluateCommand(this.policy, unwrapped.command),
+    );
     if (!decision.ok) return rpcRefusal(this.deny(decision));
     const [program, ...rest] = decision.argv;
     // Always the turn's own directory, never one the engine names:  a
@@ -478,6 +517,7 @@ export class AllowlistGate {
     const p = parsed.data;
     const decision = evaluateRead(this.policy, p.path, canonicalPath);
     if (!decision.ok) return rpcRefusal(this.deny(decision));
+    if (redirectedIntoProtected(decision.argv[0]!)) return rpcRefusal(this.deny(denied("the file resolves through a link into a protected directory", "read")));
     const target = canonicalPath(decision.argv[0]!);
     if (!target) return rpcRefusal("the file is not readable");
     let stat;
@@ -505,6 +545,11 @@ export class AllowlistGate {
     if (!decision.ok) return rpcRefusal(this.deny(decision));
     if (Buffer.byteLength(p.content, "utf8") > MAX_WRITE_BYTES) return rpcRefusal("the content is too large");
     const configured = decision.argv[0]!;
+    // Before anything is created:  a link anywhere above the file must not
+    // carry it into a protected place.
+    if (redirectedIntoProtected(configured)) {
+      return rpcRefusal(this.deny(denied("the file resolves through a link into a protected directory", "write")));
+    }
     const parent = dirname(configured);
     // A routine's state directory may not exist on its first run.  Create it
     // owner-only;  the resolved parent is then the only directory written in.

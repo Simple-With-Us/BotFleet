@@ -33,7 +33,13 @@ import { z } from "zod";
 import { schemaIssue, type JsonValue } from "./schema.ts";
 
 export type PolicyDecision =
-  | { ok: true; argv: string[] }
+  | {
+      ok: true;
+      argv: string[];
+      /** The words a `path` spec matched (flag values and positionals), so
+       *  the caller can check where each really lands before running. */
+      paths?: string[];
+    }
   | { ok: false; reason: string; /** safe to log:  a program name or tool name, never an argument */ name: string };
 
 const MAX_COMMANDS = 32;
@@ -310,7 +316,7 @@ function valueProblem(spec: ToolPolicyFlagSpec | ToolPolicyArgSpec, value: strin
 }
 
 /** Match argv (already split) against one entry. */
-function matchEntry(entry: ToolPolicyCommand, argv: string[]): string | null {
+function matchEntry(entry: ToolPolicyCommand, argv: string[], paths: string[]): string | null {
   if (argv.length < 1 + entry.sub.length) return "missing its fixed words";
   for (let k = 0; k < entry.sub.length; k++) {
     if (argv[1 + k] !== entry.sub[k]) return "its fixed words differ";
@@ -332,6 +338,7 @@ function matchEntry(entry: ToolPolicyCommand, argv: string[]): string | null {
         if (value === undefined) return "a flag missing its value";
         const problem = valueProblem(spec, value);
         if (problem) return problem;
+        if (spec.value === "path") paths.push(value);
         k++;
       }
       continue;
@@ -342,6 +349,7 @@ function matchEntry(entry: ToolPolicyCommand, argv: string[]): string | null {
     if (declared) {
       const problem = valueProblem(declared, word);
       if (problem) return problem.replace("flag value", "positional word").replace("path flag", "path word");
+      if (declared.value === "path") paths.push(word);
       continue;
     }
     if (positionals > entry.args.length + entry.positionals) return "an extra free word";
@@ -381,8 +389,9 @@ export function evaluateArgv(policy: ToolPolicy, argv: string[]): PolicyDecision
   if (candidates.length === 0) return { ok: false, reason: "the program is not on the allowlist", name };
   let lastProblem = "it matches no allowlist entry";
   for (const entry of candidates) {
-    const problem = matchEntry(entry, argv);
-    if (problem === null) return { ok: true, argv: [...argv] };
+    const paths: string[] = [];
+    const problem = matchEntry(entry, argv, paths);
+    if (problem === null) return { ok: true, argv: [...argv], paths };
     lastProblem = problem;
   }
   return { ok: false, reason: `the arguments do not match the allowlist (${lastProblem})`, name };

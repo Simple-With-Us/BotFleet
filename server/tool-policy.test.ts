@@ -138,10 +138,15 @@ describe("evaluateCommand: the allowed shapes", () => {
     }
   });
 
-  it("returns the exact argv it allowed", () => {
+  it("returns the exact argv it allowed, and the words it matched as paths", () => {
     expect(evaluateCommand(policy(), `${AGENT_SYNC} read --topic "a b" --json`)).toEqual({
       ok: true,
       argv: [AGENT_SYNC, "read", "--topic", "a b", "--json"],
+      paths: [],
+    });
+    expect(evaluateCommand(policy(), `${AGENT_SYNC} dm --owner --body-file ${DM_FILE}`)).toMatchObject({ paths: [DM_FILE] });
+    expect(evaluateCommand(policy(), "/usr/bin/tail -n 5 /Users/jay/Library/Logs/fleet-work-backup.log")).toMatchObject({
+      paths: ["/Users/jay/Library/Logs/fleet-work-backup.log"],
     });
   });
 });
