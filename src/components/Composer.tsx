@@ -404,7 +404,6 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; re
       });
       return;
     }
-    focusCaretToEnd();
   }, [group, bot, queued, draftId, threadId, dispatch, restoreFailedSend, focusCaretToEnd]);
 
   const handleCancelQueued = useCallback((queueId: string) => {

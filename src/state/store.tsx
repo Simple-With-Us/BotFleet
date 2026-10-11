@@ -2602,12 +2602,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // beside it is exactly the duplicate this ordering avoids.
             .then(() => action.onSettled?.())
             .catch((error) => {
-              // A 404 means the harness has already drained the entry (or
-              // never had it), which is the outcome the person asked for.
-              // Treating it as a failure leaves the chip on screen with an
-              // error for an operation that in fact completed, and the iOS
-              // twin in Session.cancelQueued already drops it here.
               if (error instanceof ApiError && error.status === 404) {
+                // A 404 can mean the entry is already gone or that this harness
+                // is too old to expose DELETE /queue/ (body carries "no route").
+                // iOS keeps the chip in the latter case; mirror that here so a
+                // local drop does not hide a message that is still going to send.
+                const routeError = error.body?.error;
+                if (typeof routeError === "string" && routeError.includes("no route")) {
+                  showError(error);
+                  return;
+                }
                 rawDispatch(action);
                 action.onSettled?.();
                 return;
