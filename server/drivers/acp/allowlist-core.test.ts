@@ -185,8 +185,10 @@ describe("an allowlist turn on Grok", () => {
       { type: "mcp", name: "recall_stats" },
       { type: "mcp", name: "spawn_subagent" },
       { type: "hook-foreign" },
+      // reading back a backgrounded allowed command's output stays allowed
+      { type: "mcp", name: "get_command_or_subagent_output" },
     ]);
-    expect(seen.results.map((r: any) => r.hook)).toEqual(["deny", "deny", "deny", "deny"]);
+    expect(seen.results.map((r: any) => r.hook)).toEqual(["deny", "deny", "deny", "deny", "allow"]);
   });
 
   it("writes exactly the listed file, owner-only, and refuses any other", async () => {

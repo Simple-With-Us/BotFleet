@@ -71,6 +71,11 @@ export const HOOK_METHODS = new Set(["_x.ai/hooks/run", "x.ai/hooks/run"]);
 const SHELL_TOOLS = new Set(["run_terminal_command"]);
 const WRITE_TOOLS = new Set(["write", "search_replace"]);
 const READ_TOOLS = new Set(["read_file"]);
+/** Reads the output of a command this turn already ran.  Grok moves a
+ *  command that runs past about 30 seconds to the background and reads its
+ *  output back with this;  subagents are off, so the only tasks it can reach
+ *  are the allowed commands' own. */
+const OUTPUT_TOOLS = new Set(["get_command_or_subagent_output"]);
 
 const DEFAULT_OUTPUT_LIMIT = 1024 * 1024;
 const MAX_OUTPUT_LIMIT = 8 * 1024 * 1024;
@@ -249,6 +254,7 @@ export class AllowlistGate {
    *  permission paths share this). */
   private decideTool(toolName: string | undefined, input: ToolInput | undefined): PolicyDecision {
     const name = toolLabel(toolName);
+    if (toolName && OUTPUT_TOOLS.has(toolName)) return { ok: true, argv: [toolName] };
     if (!toolName || !input) return denied(ONLY_THESE_TOOLS, name);
     if (SHELL_TOOLS.has(toolName)) {
       if (input.is_background === true) return denied("background commands are not allowed", name);
