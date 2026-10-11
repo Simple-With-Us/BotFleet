@@ -16,7 +16,7 @@
 //                     | {type:"bypass", name}
 //   FAKE_AL_DUMP      path:  written with what the client sent and answered
 //   FAKE_AL_NO_HOOKS  "1":  initialize advertises no client hooks
-import { writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 /** One JSON-RPC message or step:  this fake reads whatever the client sends,
@@ -37,7 +37,12 @@ const steps: Json[] = JSON.parse(process.env.FAKE_AL_STEPS ?? "[]");
 const dumpPath = process.env.FAKE_AL_DUMP;
 const dump: Dump = { argv: process.argv.slice(2), env: { AGENT_LAUNCH_SEAT: process.env.AGENT_LAUNCH_SEAT ?? null }, results: [] };
 const save = () => {
-  if (dumpPath) writeFileSync(dumpPath, JSON.stringify(dump, null, 2));
+  if (!dumpPath) return;
+  // Write beside the target and rename, so a reader never sees the file mid-write:  writeFileSync truncates
+  // first, and a test reading on the next line could otherwise catch an empty file and fail on the JSON.
+  const tmp = `${dumpPath}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(dump, null, 2));
+  renameSync(tmp, dumpPath);
 };
 save();
 
