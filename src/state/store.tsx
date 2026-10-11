@@ -2592,8 +2592,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // that has to wait for the server: until the DELETE lands the
             // queued message is still live, so a draft put back now can be
             // sent twice.  Either way the entry's owner hears how it ended.
-            .catch(showError)
-            .finally(() => action.onSettled?.());
+            // onSettled runs on success only, not from finally: a refusal
+            // leaves the queued message live, and putting the draft back
+            // beside it is exactly the duplicate this ordering avoids.
+            .then(() => action.onSettled?.())
+            .catch(showError);
           break;
         case "send": {
           // persist through the existing card route so an older server that

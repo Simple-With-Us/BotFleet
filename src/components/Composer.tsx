@@ -348,7 +348,20 @@ function ComposerInner({
     return state.pendingQueued?.[bot.threadId] ?? [];
   }, [group, queued, bot, state.pendingQueued]);
 
-  const handleEditQueued = useCallback((entry: { queueId: string; text: string; reply?: Message; attachments: Attachment[] }) => {
+  /** Focus the composer and put the caret at the end of whatever it now holds.
+ * Not entry.text: on a restore the box is the merged draft, which can be a
+ * different length from the composed text the pill was showing. */
+const focusCaretToEnd = useCallback(() => {
+  requestAnimationFrame(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    input.focus();
+    const end = input.value.length;
+    input.setSelectionRange(end, end);
+  });
+}, []);
+
+const handleEditQueued = useCallback((entry: { queueId: string; text: string; reply?: Message; attachments: Attachment[] }) => {
     if (group && queued) {
       // The held message carries more than its text: the draft it took, which
       // is where the attachment chips live, and the reply it was aimed at.
@@ -378,25 +391,22 @@ function ComposerInner({
         type: "cancelQueued",
         botId: bot.id,
         queueId: entry.queueId,
-        // Restore only once the harness has taken the queued message.  Doing
-        // it here instead would put the draft back while the DELETE is still
-        // in flight, and a fast resend in that window sends both the original
-        // and the copy.  If the DELETE fails the pill stays, the queued send
-        // survives, and the person can try again.
-        onSettled: () => restoreFailedSend(sent),
+        // Restore only once the harness has taken the queued message, and
+        // only when it did: a fast resend while the DELETE is in flight sends
+        // the original and the copy together, and restoring on failure leaves
+        // the draft sitting beside a message that is still going to be sent.
+        // A refusal keeps the pill and the error, and the person can edit
+        // again.  The caret moves with the restore, because on this path the
+        // box is still empty until the DELETE answers.
+        onSettled: () => {
+          restoreFailedSend(sent);
+          focusCaretToEnd();
+        },
       });
+      return;
     }
-    requestAnimationFrame(() => {
-      const input = inputRef.current;
-      if (!input) return;
-      input.focus();
-      // The caret goes to the end of whatever the box now holds, not to
-      // entry.text: on the restore path the box is the merged draft, which
-      // can be a different length from the composed text the pill was showing.
-      const end = input.value.length;
-      input.setSelectionRange(end, end);
-    });
-  }, [group, bot, queued, draftId, threadId, dispatch, restoreFailedSend]);
+    focusCaretToEnd();
+  }, [group, bot, queued, draftId, threadId, dispatch, restoreFailedSend, focusCaretToEnd]);
 
   const handleCancelQueued = useCallback((queueId: string) => {
     if (group) {

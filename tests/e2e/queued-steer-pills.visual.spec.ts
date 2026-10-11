@@ -1,7 +1,10 @@
 import { test, expect, type Page } from '@playwright/test';
 import { z } from 'zod';
 
-const QueuedSendBodySchema = z.object({ text: z.string().optional() }).strict();
+export const QueuedSendBodySchema = z.object({ text: z.string().optional() }).strict();
+// Inferred from the schema so the runtime check and the static type cannot
+// drift apart (Kody rule 24).
+export type QueuedSendBody = z.infer<typeof QueuedSendBodySchema>;
 
 // Visual coverage for the stacked queued steer pills (board b5146817).
 //
