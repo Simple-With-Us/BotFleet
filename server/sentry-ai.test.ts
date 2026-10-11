@@ -19,6 +19,11 @@ import {
 } from "./sentry-ai.ts";
 import { describeResult } from "../shared/tool-activity.ts";
 import type { RuntimeEvent } from "./contracts.ts";
+import {
+  resetSentryFleetForTests,
+  setFleetSinkForTests,
+  type FleetCapture,
+} from "./sentry-fleet.ts";
 
 function base(over: Partial<RuntimeEvent> & Pick<RuntimeEvent, "type">): RuntimeEvent {
   const event = {
@@ -100,6 +105,7 @@ function recordingSink() {
 
 afterEach(() => {
   resetSentryAiForTests();
+  resetSentryFleetForTests();
 });
 
 describe("Sentry AI observability", () => {
@@ -1312,6 +1318,41 @@ describe("catalog cost fallback", () => {
     expect(spans[0].attributes["botfleet.cost.source"]).toBe("catalog");
     expect(spans[0].attributes["gen_ai.provider.name"]).toBe("minimax");
     expect(spans[0].attributes["gen_ai.system"]).toBe("minimax");
+  });
+
+  it("mirrors a completed catalog-priced turn to the fleet sink", () => {
+    const captured: FleetCapture[] = [];
+    setFleetSinkForTests({ capture: (event) => captured.push(event) });
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash-Preview", botName: "Coder" }));
+    const { sink } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "mcodeAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "item.started",
+        itemType: "tool",
+        itemId: "t1",
+        title: "bash",
+      }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "turn.completed",
+        provider: "mcodeAgent",
+        ok: true,
+        usage: { input: 100_000, output: 50_000 },
+        cost: null,
+      }),
+      sink,
+    );
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.tags.platform).toBe("botfleet");
+    expect(captured[0]?.tags["gen_ai.system"]).toBe("minimax");
+    expect(captured[0]?.extra["botfleet.tool.names"]).toBe("bash");
+    expect(captured[0]?.extra["gen_ai.usage.cost"]).toBeCloseTo(
+      (100_000 * 0.3 + 50_000 * 1.2) / 1_000_000,
+      10,
+    );
   });
 
   it("puts a catalog-priced estimated cost on gen_ai.usage.cost as well", () => {

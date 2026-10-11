@@ -46,6 +46,7 @@ const HARNESS_ONLY = new Set([
   "CF_ACCESS_CLIENT_SECRET",
   "SENTRY_DSN",
   "BOTFLEET_SENTRY_DSN",
+  "SENTRY_FLEET_DSN",
 ]);
 
 const spec = (id: string) => {

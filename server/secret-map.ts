@@ -294,6 +294,16 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
     secret: true,
     reloadProviders: false,
   },
+  {
+    id: "observability.sentryFleetDsn",
+    label: "Sentry fleet-infra DSN",
+    section: "observability",
+    path: ["sentryFleetDsn"],
+    env: ["SENTRY_FLEET_DSN"],
+    infisicalName: "SENTRY_FLEET_DSN",
+    secret: true,
+    reloadProviders: false,
+  },
 ] as const;
 
 /** Every Infisical name this process will accept, built once from the table.

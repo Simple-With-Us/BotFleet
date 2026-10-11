@@ -51,6 +51,7 @@ BotFleet is a single-user local harness: the server binds loopback-only (`127.0.
 | `LINQ_API_TOKEN` | imessageLinq.apiToken | secret |
 | `LINQ_WEBHOOK_SECRET` | imessageLinq.webhookSecret | secret |
 | `SENTRY_DSN` | observability.sentryDsn | secret |
+| `SENTRY_FLEET_DSN` | observability.sentryFleetDsn | secret |
 
 "config" rows are non-secret values (URLs, collection names) that travel the same vault path; the Secrets card shows them the way `GET /api/config` already does.
 

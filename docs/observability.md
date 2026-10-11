@@ -257,9 +257,18 @@ email address is the one value on this list that identifies a person.  The
 iOS app is a different product with no analytics SDK at all — see
 [iOS privacy](ios-privacy.md).
 
+## Fleet-infra export
+
+Completed bot turns can also send one summary event to the shared
+`fleet-infra` Sentry project.  That DSN is `SENTRY_FLEET_DSN` in Infisical
+prod (or the same name in the process environment).  It is never hardcoded,
+and it is never the product `SENTRY_DSN`.  The summary carries provider,
+model, tokens, catalog or reported cost, duration, and tool names — not
+prompts.  Missing `SENTRY_FLEET_DSN` leaves the export inert.
+
 ## What is intentionally out of scope
 
-- A second Sentry project — everything lands in `simple-with-us/botfleet`.
+- Shipping a default DSN — every surface stays off until a DSN is configured.
 - `@sentry/profiling-node` — not installed; `profilingAvailable` reports
   `false` and the harness warns once rather than silently no-oping.
 - `ios/App/SentryTelemetry.swift` and `ios/project.yml` already handle an
