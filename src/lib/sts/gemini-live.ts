@@ -548,7 +548,6 @@ export function createGeminiLiveSession(): StsSession {
         throw new Error("Gemini live bridge is unavailable in this build.");
       }
       const pending = (async () => {
-        try {
         const attempt = ++generation;
         stopping = false;
         ended = false;
@@ -653,14 +652,14 @@ export function createGeminiLiveSession(): StsSession {
           }
           throw error;
         }
-        } catch (error) {
-          // Only in-flight starts are deduped.  A rejected promise must not
-          // pin retries to the first network blip, expired token, or goAway.
-          if (startPromise === pending) startPromise = null;
-          throw error;
-        }
       })();
       startPromise = pending;
+      // Only in-flight starts are deduped.  A rejected promise must not pin
+      // retries to the first network blip, expired token, or goAway.  Attach
+      // after assignment so TypeScript can see `pending` is initialized.
+      void pending.catch(() => {
+        if (startPromise === pending) startPromise = null;
+      });
       return pending;
     },
 

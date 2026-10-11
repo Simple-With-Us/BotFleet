@@ -192,12 +192,18 @@ describe("gemini live handshake", () => {
     await session.stop();
   });
 
-it("rejects a start whose socket never opens", async () => {
+  it("rejects a start whose socket never opens", async () => {
     const session = createGeminiLiveSession();
     const opening = session.start({ instructions: "You are Skippy." });
     await vi.waitFor(() => expect(sockets).toHaveLength(1));
     sockets[0]!.emit("error", {});
     await expect(opening).rejects.toThrow(/could not open/i);
+    const retry = session.start({ instructions: "You are Skippy." });
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    sockets[1]!.open();
+    sockets[1]!.receive({ setupComplete: {} });
+    await retry;
+    await session.stop();
   });
 
   it("shares one session across overlapping starts", async () => {
