@@ -22,6 +22,22 @@ BotFleet first removes everything that could carry a different identity or a Zul
 
 Where it applies:  the Claude, Codex, ACP (every ACP engine), Antigravity, pi and CLI-wrapper drivers, the shell of the HTTP-lane `bash` tool, and a background job's shell.  The Claude driver also keys its warm process on the seat and session, so a second bot on the same thread starts its own process.  The Codex driver additionally passes `-c shell_environment_policy.set.<NAME>=...` for the five variables, because Codex runs the model's shell commands under its own environment policy.
 
+## MCP Servers And Shell Commands On mcode
+
+An mcode turn starts more processes of its own:  the MCP servers it knows, and the commands of its shell tool.  mcode 0.6.2 starts all of them with the environment of the `mcode acp` process BotFleet launched, so each one sees the five variables above.  That holds for a server listed in the data directory's `mcp.json` (the owner's `~/.minimax/mcp.json`) and for one BotFleet sends in `session/new`.  A server's own `env` block is added on top.  Nothing here is BotFleet code:  it is how mcode starts them, which is why `server/drivers/acp/mcode-launch-seat.test.ts` pins it.
+
+That is what lets the owner's `agent-sync mcp --default-seat MM` entry sign a launched bot's posts as the bot.  agent-sync takes the launcher's seat first and reads `--default-seat` only when no launcher started the session:
+
+| Process | Seat agent-sync serves |
+| --- | --- |
+| Launched by BotFleet, seat assigned | The bot's role seat (`BF-MONITOR`), with the credential file `~/.secrets/Zulip/BF-Monitor-zuliprc`.  Posts are tagged `[BF-MONITOR·<session>]`. |
+| Launched by BotFleet, no seat (the switch below is off, or the name names no role) | None.  agent-sync exits 3 and the bot is offered no agent-sync tools. |
+| Not launched (the owner's own MiniMax Code) | `MM`, from `--default-seat MM`.  Posts are tagged `[MM]`. |
+
+So a bot's post signed `[MM]`, with no session part, did not come from a launched turn of this code:  its process had neither `AGENT_LAUNCHER` nor `AGENT_SESSION`, and every launched turn has both.  The tests show mcode is not what dropped them.  Check in this order:  restart the harness after an update, because a process started before the launcher contract landed keeps running the old code, then look for a spawn path that skips `applyLaunchIdentity`.
+
+Two consequences of the switch.  With `BOTFLEET_FLEET_SEAT_PROMPTS` off, a launched mcode bot cannot post through agent-sync at all, which is the safe failure.  With it on, the bot's credential file must exist (mode 600) in the home mcode runs with, or agent-sync exits 3 for the same reason.
+
 ## Which Bots Get a Seat
 
 The ten role seats are `BF-BUILDER`, `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER` and `BF-PUBLISHER`.  A bot's role comes from, in order:
@@ -48,3 +64,4 @@ A user's Codex config can narrow the environment of the model's shell commands w
 - `server/drivers/*.test.ts` (claude, codex, acp, antigravity, pi, cli-wrapper):  the real fake engine process sees each bot's own seat, none of the inherited identity, and no Zulip variable.
 - `server/launch-identity-wiring.test.ts`:  the real harness, a 1:1 chat and a room turn, from an environment that holds a seat and a Zulip login.
 - `server/tools/computer.test.ts`, `server/tools/host.test.ts`, `server/jobs/registry.test.ts`:  the `bash` tool and job shells.
+- `server/drivers/acp/mcode-launch-seat.test.ts`:  the real `mcode` CLI against a scripted fake model and a fake Zulip, in a throwaway data directory.  A launched turn's MCP server (from `mcp.json` and from `session/new`) and shell see exactly the five variables;  the real `agent-sync mcp --default-seat MM` answers `whoami` as `BF-MONITOR` for a launched turn, refuses with no seat, and still answers `MM` for an ordinary MiniMax Code session.  Needs `mcode` (and `agent-sync` for the last group) on the machine;  skips with a message when they are absent, as in CI, or with `BOTFLEET_REAL_MCODE_TESTS=0`.
