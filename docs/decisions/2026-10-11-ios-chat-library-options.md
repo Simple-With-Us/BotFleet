@@ -9,6 +9,8 @@ The owner's follow-up was sharper: *what other options would be an actual upgrad
 
 This records a survey against explicit acceptance criteria rather than by impression.
 
+**Expected behavior after this correction:** the answer to "should BotFleet adopt a third-party iOS chat UI library?" remains *build native, do not depend on one*.  Any candidate must clear the nine criteria below, no surveyed library does, and adopting a sub-3★ single-author package to obtain components BotFleet already owns (`ApprovalCard`, `AgentThoughtChamberView`) is a bad trade.  Action: read `beautiful-ui-swift` and the Stream Chat `StreamChatAI` docs as a second opinion, never copy their source; spike message grouping natively; do not depend on either.  Out of scope: the simulator visual comparison and the grouping spike, both deferred to Open Follow-Ups.
+
 ## Acceptance criteria
 
 A candidate must be:
