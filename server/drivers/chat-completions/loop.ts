@@ -314,6 +314,19 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
   handle.unref?.();
 }
 
+/** Push a pending timer's deadline out by its full delay, in place.  Node's
+ *  `Timeout.refresh()` does that without allocating, which matters on a path
+ *  that runs once per streamed chunk; where it is missing the caller re-arms
+ *  instead.  Skipped under `VITEST=1` because Vitest 5 fake timers expose
+ *  `refresh()` without moving the deadline. */
+function refreshTimer(timer: ReturnType<typeof setTimeout>): boolean {
+  if (process.env.VITEST === "1") return false;
+  const handle: { refresh?: () => unknown } = timer;
+  if (typeof handle.refresh !== "function") return false;
+  handle.refresh();
+  return true;
+}
+
 /** Rejects when `signal` aborts, and detaches its listener either way so a
  *  long turn does not accumulate one per race. */
 function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose: () => void } {
@@ -673,12 +686,13 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
       // Progress from the driver.  A no-op once the attempt is over or the
       // clock has fired, so a straggling chunk can never re-arm a timer for
       // a request that already ended.
-      // Re-arm rather than Timeout.refresh(): Vitest 5 fake timers expose
-      // refresh() but do not move the deadline, so an idle clock that only
-      // refreshed would fire from the first arm instead of the last chunk.
+      // Refresh the deadline in place when `Timeout.refresh()` is honest
+      // (production Node): zero allocations on the per-chunk hot path.
+      // Vitest 5 fake timers expose `refresh()` without moving the deadline,
+      // so the helper short-circuits under `VITEST=1` and we re-arm instead.
       const noteProgress = () => {
         if (idleTimer === null || request.signal.aborted) return;
-        armIdle();
+        if (!refreshTimer(idleTimer)) armIdle();
       };
       // The round's hard deadline, shared by EVERY attempt at it rather
       // than re-armed per try: `requestTimeoutMs` is the most a person will
