@@ -1,0 +1,311 @@
+// The routine command allowlist, end to end through the ACP driver core:  a
+// scripted engine (server/testing/fake-acp-allowlist-cli.ts) that behaves the
+// way Grok Build was observed to, against the real AllowlistGate, real child
+// processes and a real file system in a throwaway directory.
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+
+import type { ProviderInstance, RuntimeEvent } from "../../contracts.ts";
+import { recordEvents, type EventRecorder } from "../../testing/events.ts";
+import { removeTempDir } from "../../testing/cleanup.ts";
+import { sanitizeToolPolicy, type ToolPolicy } from "../../tool-policy.ts";
+import { GrokAgentDriver, grokAllowlistProblem } from "./grok.ts";
+import { McodeAgentDriver } from "./mcode.ts";
+
+/** The event, narrowed to turn.completed by its discriminant. */
+function asCompleted(event: RuntimeEvent): Extract<RuntimeEvent, { type: "turn.completed" }> {
+  if (event.type !== "turn.completed") throw new Error(`expected turn.completed, saw ${event.type}`);
+  return event;
+}
+
+const FAKE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-allowlist-cli.ts");
+
+let scratch: string;
+let instance: ProviderInstance | undefined;
+let recorder: EventRecorder | undefined;
+/** A stand-in for agent-sync:  prints its argv and the seat it was launched as,
+ *  and leaves a marker so a test can prove it ran. */
+let tool: string;
+let dmFile: string;
+
+function allowlist(): ToolPolicy {
+  return sanitizeToolPolicy({
+    mode: "allowlist",
+    commands: [
+      { argv0: tool, sub: ["whoami"], flags: { "--json": { value: "none" } } },
+      { argv0: tool, sub: ["post"], flags: { "--topic": { value: "text", required: true } } },
+    ],
+    writePaths: [dmFile],
+  })!;
+}
+
+async function grok(fullAuto = true): Promise<ProviderInstance> {
+  instance = await GrokAgentDriver.create({
+    instanceId: "grok-allowlist",
+    displayName: "Grok",
+    environment: { HOME: scratch, GROK_HOME: join(scratch, ".grok") },
+    enabled: true,
+    config: { cli: FAKE, fullAuto },
+  });
+  recorder = recordEvents(instance.adapter);
+  return instance;
+}
+
+function dump(name: string): any {
+  return JSON.parse(readFileSync(join(scratch, name), "utf8"));
+}
+
+interface FakeStep {
+  type: string;
+  command?: string;
+  args?: string[];
+  path?: string;
+  content?: string;
+  name?: string;
+  kind?: string;
+  rawInput?: Record<string, string>;
+  options?: Array<{ optionId: string; kind: string }>;
+}
+
+/** `policy`: omitted runs the test allowlist;  null runs an ordinary turn. */
+async function runTurn(steps: FakeStep[], opts: { policy?: ToolPolicy | null; dumpName?: string; threadId?: string } = {}) {
+  const dumpName = opts.dumpName ?? "dump.json";
+  process.env.FAKE_AL_STEPS = JSON.stringify(steps);
+  process.env.FAKE_AL_DUMP = join(scratch, dumpName);
+  const threadId = opts.threadId ?? `t-${Math.random().toString(36).slice(2)}`;
+  await instance!.adapter.sendTurn({
+    threadId,
+    text: "run the routine",
+    cwd: scratch,
+    launchIdentity: { seat: "BF-HOUSEKEEPER", session: threadId },
+    integrations: { composio: { command: "/composio", args: [], env: {} } },
+    toolPolicy: opts.policy === undefined ? allowlist() : (opts.policy ?? undefined),
+  });
+  const done = asCompleted(await recorder!.until((e) => e.type === "turn.completed" && e.threadId === threadId, 20_000));
+  return { done, dump: existsSync(join(scratch, dumpName)) ? dump(dumpName) : null, threadId };
+}
+
+beforeAll(() => {
+  chmodSync(FAKE, 0o755);
+});
+
+beforeEach(() => {
+  scratch = mkdtempSync(join(tmpdir(), "omb-allowlist-"));
+  mkdirSync(join(scratch, ".grok"), { recursive: true });
+  writeFileSync(join(scratch, ".grok", "auth.json"), "{}");
+  tool = join(scratch, "fake-agent-sync");
+  writeFileSync(tool, `#!/bin/sh\necho "ran:$*:seat=$AGENT_LAUNCH_SEAT"\ntouch "${join(scratch, "TOOL-RAN")}"\n`);
+  chmodSync(tool, 0o755);
+  dmFile = join(scratch, "state", "dm.md");
+});
+
+afterEach(async () => {
+  recorder?.stop();
+  await instance?.adapter.stopAll();
+  instance = undefined;
+  recorder = undefined;
+  delete process.env.FAKE_AL_STEPS;
+  delete process.env.FAKE_AL_DUMP;
+  delete process.env.FAKE_AL_NO_HOOKS;
+  removeTempDir(scratch);
+});
+
+describe("an allowlist turn on Grok", () => {
+  it("spawns in an asking mode, offers a terminal and files, registers the hook, and mounts no MCP", async () => {
+    await grok(true);
+    const { done, dump: seen } = await runTurn([]);
+    expect(done.ok).toBe(true);
+    expect(seen.argv).not.toContain("bypassPermissions");
+    expect(seen.argv.slice(0, 2)).toEqual(["--permission-mode", "default"]);
+    expect(seen.argv).toEqual(expect.arrayContaining(["--disable-web-search", "--no-subagents", "--no-leader"]));
+    expect(seen.clientCapabilities).toEqual({ fs: { readTextFile: true, writeTextFile: true }, terminal: true });
+    expect(seen.sessionMeta).toEqual({ "x.ai/hooks": { pre_tool_use: [{ hookCallbackIds: ["botfleet-allowlist"] }] } });
+    expect(seen.mcpServers).toEqual([]);
+  });
+
+  it("runs an allowed command itself, with no shell, as the bot's seat", async () => {
+    await grok();
+    const { done, dump: seen } = await runTurn([{ type: "shell", command: `${tool} whoami --json` }]);
+    expect(done.ok).toBe(true);
+    expect(seen.results[0]).toMatchObject({ hook: "allow", exit: { exitCode: 0 } });
+    expect(seen.results[0].output).toBe("ran:whoami --json:seat=BF-HOUSEKEEPER\n");
+    expect(done.denials).toBeUndefined();
+  });
+
+  it("keeps a quoted topic with spaces as one argument", async () => {
+    await grok();
+    const { dump: seen } = await runTurn([{ type: "shell", command: `${tool} post --topic "AFC 29c02bcb fleet-work-backup"` }]);
+    expect(seen.results[0].output).toBe("ran:post --topic AFC 29c02bcb fleet-work-backup:seat=BF-HOUSEKEEPER\n");
+  });
+
+  it("denies `whoami; touch PWNED`, a bare touch, gh, and an unlisted program, and nothing runs", async () => {
+    await grok();
+    const pwned = join(scratch, "PWNED");
+    const { done, dump: seen } = await runTurn([
+      { type: "shell", command: `${tool} whoami --json; touch ${pwned}` },
+      { type: "shell", command: "touch PWNED" },
+      { type: "shell", command: "gh --version" },
+      { type: "shell", command: `/usr/bin/touch ${pwned}` },
+      { type: "shell", command: `${tool} whoami --json $(touch ${pwned})` },
+    ]);
+    expect(seen.results.map((r: any) => r.hook)).toEqual(["deny", "deny", "deny", "deny", "deny"]);
+    expect(existsSync(pwned)).toBe(false);
+    expect(existsSync(join(scratch, "PWNED"))).toBe(false);
+    expect(existsSync(join(scratch, "TOOL-RAN"))).toBe(false);
+    expect(done.denials).toEqual([
+      "allowlist: fake-agent-sync",
+      "allowlist: touch",
+      "allowlist: gh",
+      "allowlist: touch",
+      "allowlist: fake-agent-sync",
+    ]);
+  });
+
+  it("checks the terminal call itself, so a hook that let something through still runs nothing", async () => {
+    await grok();
+    const pwned = join(scratch, "PWNED");
+    const { dump: seen } = await runTurn([
+      { type: "raw-terminal", command: `/bin/bash -lc '${tool} whoami --json; touch ${pwned}'` },
+      { type: "raw-terminal", command: "/bin/sh", args: ["-c", `touch ${pwned}`] },
+      { type: "raw-terminal", command: `/bin/bash -lc "$(touch ${pwned})"` },
+      { type: "raw-terminal", command: `/bin/bash -i -c '${tool} whoami --json'` },
+      { type: "raw-terminal", command: `/bin/bash -lc '${tool} whoami --json'` },
+    ]);
+    expect(seen.results.map((r: any) => r.terminal)).toEqual(["refused", "refused", "refused", "refused", "ran"]);
+    expect(existsSync(pwned)).toBe(false);
+  });
+
+  it("denies every MCP tool, Composio included, and a hook call it did not register", async () => {
+    await grok();
+    const { dump: seen } = await runTurn([
+      { type: "mcp", name: "COMPOSIO_SEARCH_TOOLS" },
+      { type: "mcp", name: "recall_stats" },
+      { type: "mcp", name: "spawn_subagent" },
+      { type: "hook-foreign" },
+    ]);
+    expect(seen.results.map((r: any) => r.hook)).toEqual(["deny", "deny", "deny", "deny"]);
+  });
+
+  it("writes exactly the listed file, owner-only, and refuses any other", async () => {
+    await grok();
+    const elsewhere = join(scratch, "state", "other.md");
+    const { dump: seen } = await runTurn([
+      { type: "write", path: dmFile, content: "hello owner" },
+      { type: "write", path: elsewhere, content: "nope" },
+      { type: "raw-write", path: join(scratch, ".zshrc"), content: "nope" },
+      { type: "read", path: dmFile },
+      { type: "read", path: join(scratch, ".grok", "auth.json") },
+    ]);
+    expect(seen.results.map((r: any) => r.write ?? r.read ?? r.hook)).toEqual(["ok", "deny", "refused", "hello owner", "deny"]);
+    expect(readFileSync(dmFile, "utf8")).toBe("hello owner");
+    expect(statSync(dmFile).mode & 0o777).toBe(0o600);
+    expect(existsSync(elsewhere)).toBe(false);
+    expect(existsSync(join(scratch, ".zshrc"))).toBe(false);
+  });
+
+  it("refuses to write through a link planted at the listed path", async () => {
+    await grok();
+    mkdirSync(dirname(dmFile), { recursive: true });
+    const target = join(scratch, "victim.txt");
+    writeFileSync(target, "original");
+    symlinkSync(target, dmFile);
+    const { dump: seen } = await runTurn([{ type: "raw-write", path: dmFile, content: "overwritten" }]);
+    expect(seen.results[0].write).toBe("refused");
+    expect(readFileSync(target, "utf8")).toBe("original");
+  });
+
+  it("answers a permission ask from the policy with a once option only, never an always option", async () => {
+    await grok();
+    const { dump: seen } = await runTurn([
+      { type: "permission", kind: "execute", rawInput: { command: `${tool} whoami --json` } },
+      { type: "permission", kind: "execute", rawInput: { command: "touch PWNED" } },
+      { type: "permission", kind: "edit", rawInput: { file_path: dmFile } },
+      { type: "permission", kind: "other", rawInput: { tool_name: "COMPOSIO_SEARCH_TOOLS" } },
+      {
+        type: "permission",
+        kind: "execute",
+        rawInput: { command: `${tool} whoami --json` },
+        options: [{ optionId: "allow-always", kind: "allow_always" }, { optionId: "reject-once", kind: "reject_once" }],
+      },
+    ]);
+    expect(seen.results.map((r: any) => r.outcome?.optionId ?? r.outcome?.outcome)).toEqual([
+      "allow-once",
+      "reject-once",
+      "allow-once",
+      "reject-once",
+      "reject-once",
+    ]);
+  });
+
+  it("stops the turn when the engine runs a tool the hook never allowed", async () => {
+    await grok();
+    const { done } = await runTurn([{ type: "bypass", name: "use_tool" }, { type: "shell", command: `${tool} whoami --json` }]);
+    expect(done).toMatchObject({ ok: false, stopReason: "capability_denied" });
+    const error = recorder!.events.find((e) => e.type === "runtime.error");
+    expect(error?.type === "runtime.error" ? error.message : "").toMatch(/use_tool/);
+    expect(existsSync(join(scratch, "TOOL-RAN"))).toBe(false);
+  });
+
+  it("refuses to run when the engine offers no blocking pre-tool hook", async () => {
+    await grok();
+    process.env.FAKE_AL_NO_HOOKS = "1";
+    const { done, dump: seen } = await runTurn([{ type: "shell", command: `${tool} whoami --json` }]);
+    expect(done).toMatchObject({ ok: false, stopReason: "setup_required" });
+    expect(seen.sessionMeta).toBeUndefined();
+    expect(existsSync(join(scratch, "TOOL-RAN"))).toBe(false);
+  });
+});
+
+describe("turns without an allowlist", () => {
+  it("are unchanged:  full-auto Grok keeps bypassPermissions, no client terminal, no hook", async () => {
+    await grok(true);
+    const { done, dump: seen } = await runTurn([], { policy: null });
+    expect(done.ok).toBe(true);
+    expect(seen.argv.slice(0, 2)).toEqual(["--permission-mode", "bypassPermissions"]);
+    expect(seen.argv).not.toContain("--no-leader");
+    expect(seen.clientCapabilities).toEqual({ fs: { readTextFile: false, writeTextFile: false } });
+    expect(seen.sessionMeta).toBeNull();
+  });
+});
+
+describe("an engine that cannot be held", () => {
+  it("refuses an allowlist turn on MiniMax Code before anything spawns", async () => {
+    instance = await McodeAgentDriver.create({
+      instanceId: "mcode-allowlist",
+      displayName: "MiniMax Code",
+      environment: { HOME: scratch },
+      enabled: true,
+      config: { cli: FAKE, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+    expect(instance.adapter.capabilities.toolPolicy).toBe(false);
+    const { done, dump: seen } = await runTurn([{ type: "shell", command: `${tool} whoami --json` }], { dumpName: "mcode.json" });
+    expect(done).toMatchObject({ ok: false, stopReason: "setup_required" });
+    expect(seen).toBeNull();
+    const error = recorder.events.find((e) => e.type === "runtime.error");
+    expect(error).toMatchObject({ setup: true });
+    expect(error?.type === "runtime.error" ? error.message : "").toMatch(/cannot be held/);
+  });
+
+  it("says so in its capabilities, while Grok says it can", async () => {
+    await grok();
+    expect(instance!.adapter.capabilities.toolPolicy).toBe(true);
+  });
+});
+
+describe("grokAllowlistProblem", () => {
+  it("accepts an initialize answer with a blocking pre-tool hook that can deny, and nothing less", () => {
+    expect(
+      grokAllowlistProblem({ agentCapabilities: { _meta: { "x.ai/hooks": { blockingEvents: ["pre_tool_use"], decisions: ["deny", "block"] } } } }),
+    ).toBeNull();
+    expect(grokAllowlistProblem({ _meta: { "x.ai/hooks": { blockingEvents: ["pre_tool_use"], decisions: ["deny", "block"] } } })).toBeNull();
+    expect(grokAllowlistProblem({ agentCapabilities: { _meta: {} } })).toMatch(/pre-tool hook/);
+    expect(grokAllowlistProblem({ _meta: { "x.ai/hooks": { blockingEvents: ["stop"], decisions: ["deny"] } } })).toMatch(/pre-tool hook/);
+    expect(grokAllowlistProblem({ _meta: { "x.ai/hooks": { blockingEvents: ["pre_tool_use"], decisions: ["block"] } } })).toMatch(/pre-tool hook/);
+    expect(grokAllowlistProblem({})).toMatch(/pre-tool hook/);
+    expect(grokAllowlistProblem(null)).toMatch(/pre-tool hook/);
+  });
+});

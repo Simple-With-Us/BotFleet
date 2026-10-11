@@ -491,6 +491,7 @@ import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
 import { fleetSeatPromptPart } from "./seat-prompt.ts";
 import { launchEnvironment, launchIdentityFor } from "./launch-identity.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
@@ -5642,6 +5643,10 @@ async function startTurn(
      * `server/bot-stop-policy.ts`.
      */
     personInitiated?: boolean;
+    /** A routine's command allowlist (server/tool-policy.ts).  Stored on the
+     *  turn's prompt message, so every re-dispatch of that message (a model
+     *  fail-over, a credential card, a boot resume) keeps it. */
+    toolPolicy?: ToolPolicy;
   },
 ) {
   if (runtimeQuiescing) {
@@ -5796,6 +5801,19 @@ async function startTurn(
       { status: 409, pickUnusable: true },
     );
   }
+  // A routine's command allowlist, fresh from the routine or carried on the
+  // prompt message a re-dispatch replays.  Only a driver that holds a turn to
+  // it (or refuses it) may receive the turn;  any other engine would run the
+  // routine with everything the bot can do.
+  const turnToolPolicy = opts?.toolPolicy ?? opts?.userMessage?.toolPolicy;
+  if (turnToolPolicy && instance.adapter.capabilities.toolPolicy !== true) {
+    throw Object.assign(
+      new Error(
+        `This routine runs under a command allowlist, and the ${instance.displayName || instance.driverKind} engine cannot be held to one.  Run it on a bot whose engine is Grok Build.`,
+      ),
+      { status: 409, pickUnusable: true },
+    );
+  }
   const workspaceError = taskWorkspaceExecutionError(task.workspaceContext, instance.driverKind, opts?.runOn, task.cwd);
   if (workspaceError) throw Object.assign(new Error(workspaceError), { status: 409 });
   const instanceId = instance.instanceId;
@@ -5880,6 +5898,7 @@ async function startTurn(
           automationSource: opts?.automationSource,
           from: opts?.from,
           comm: opts?.comm,
+          toolPolicy: turnToolPolicy,
         });
   }
 
@@ -6610,6 +6629,7 @@ async function startTurn(
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
         launchIdentity: launchIdentityFor(bot, threadId),
+        toolPolicy: turnToolPolicy,
       };
       // What the harness put in front of the model that the person did not
       // type: the bot's memory, the skills and playbooks this message
@@ -6879,6 +6899,7 @@ routines = new RoutineManager({
       automationSource: triggerSource,
       onDispatchError,
       ephemeralDispatch: turnOpts?.ephemeralDispatch,
+      toolPolicy: turnOpts?.toolPolicy,
     }),
   interruptTurn: async (botId, threadId, runOn) => {
     const bot = store.bot(botId);

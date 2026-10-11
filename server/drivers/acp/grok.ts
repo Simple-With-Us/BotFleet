@@ -7,7 +7,10 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { z } from "zod";
+
 import type { ModelCatalog } from "../../contracts.ts";
+import type { JsonValue } from "../../schema.ts";
 import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
 import { classifyError } from "../retry.ts";
 import { AcpModelRejectedError, createAcpDriver, type AcpSupport } from "./core.ts";
@@ -306,6 +309,30 @@ const support: AcpSupport = {
     return args;
   },
 
+  // A routine with a command allowlist (server/drivers/acp/allowlist.ts).
+  // Never bypassPermissions.  The owner's own ~/.grok/config.toml allow
+  // rules (`Bash(*)`, `MCPTool(*)`) still auto-approve in `default` mode, and
+  // agent mode ignores --deny, --tools and --disallowed-tools, so the mode is
+  // not the guard:  the client-registered pre_tool_use hook is, with the
+  // client terminal and file calls behind it.  Web search and fetch and
+  // subagents are switched off because nothing in a routine needs them.
+  // --no-leader keeps this turn in its own process, where the hook and the
+  // client capabilities this connection registered apply.
+  allowlist: {
+    spawnArgs: (_config, turn) => [
+      "--permission-mode",
+      "default",
+      "--disable-web-search",
+      "--no-subagents",
+      "agent",
+      ...(turn.model ? ["-m", turn.model] : []),
+      ...(turn.effort ? ["--reasoning-effort", turn.effort] : []),
+      "--no-leader",
+      "stdio",
+    ],
+    verifyInitialize: (init) => grokAllowlistProblem(init),
+  },
+
   // -m on argv is necessary but not sufficient: session/new still starts on
   // [models].default. Pin the slug over the wire, same as Hermes/Droid.
   async configureSession({ request, sessionId, turn, sessionModels }) {
@@ -346,5 +373,28 @@ const support: AcpSupport = {
   // persona is prepended codex-style.
   buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
 };
+
+/** Grok's client-hook capability, as `initialize` describes it.  Lenient:  a
+ *  field of an unexpected shape reads as absent, which refuses the turn. */
+const hookCapabilitySchema = z.looseObject({
+  blockingEvents: z.array(z.string()).optional().catch(undefined),
+  decisions: z.array(z.string()).optional().catch(undefined),
+});
+const hookMetaSchema = z.looseObject({ "x.ai/hooks": hookCapabilitySchema.optional().catch(undefined) }).optional().catch(undefined);
+const initializeHooksSchema = z.looseObject({
+  _meta: hookMetaSchema,
+  agentCapabilities: z.looseObject({ _meta: hookMetaSchema }).optional().catch(undefined),
+});
+
+/** Why this Grok CLI cannot be held to a routine's allowlist, from its
+ *  `initialize` answer:  it must offer a blocking `pre_tool_use` client hook
+ *  that can deny.  Grok 1.0.50 says so in `agentCapabilities._meta`.  Null
+ *  when it can be held. */
+export function grokAllowlistProblem(init: JsonValue | undefined): string | null {
+  const parsed = initializeHooksSchema.safeParse(init);
+  const hooks = parsed.success ? (parsed.data.agentCapabilities?._meta?.["x.ai/hooks"] ?? parsed.data._meta?.["x.ai/hooks"]) : undefined;
+  if (hooks?.blockingEvents?.includes("pre_tool_use") && hooks.decisions?.includes("deny")) return null;
+  return "This Grok CLI offers no blocking pre-tool hook, so BotFleet cannot hold a routine to its command allowlist.  Update Grok Build.";
+}
 
 export const GrokAgentDriver = createAcpDriver(support);

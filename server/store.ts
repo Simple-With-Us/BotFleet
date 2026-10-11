@@ -40,6 +40,7 @@ import {
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
 import { rewriteModelSelection } from "./retired-model-ids.ts";
 import { automationRolloverSeedText } from "./automation-rollover.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 
 export type BotColor =
   | "green"
@@ -127,6 +128,9 @@ export interface Message {
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
   automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
+  /** On a routine's prompt message:  the routine's command allowlist
+   *  (server/tool-policy.ts), so a re-dispatch of this message is held to it. */
+  toolPolicy?: ToolPolicy;
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */

@@ -83,6 +83,14 @@ const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
 import { getBool } from "../../feature-flags.ts";
+import type { JsonValue } from "../../schema.ts";
+import {
+  ALLOWLIST_CLIENT_CAPABILITIES,
+  AllowlistGate,
+  allowlistHookMeta,
+  HOOK_METHODS,
+  type HookAnswer,
+} from "./allowlist.ts";
 
 const acpNonemptyString = z.string().min(1);
 
@@ -247,6 +255,18 @@ export interface AcpSupport {
   /** Optional rewrite of the spawned CLI.  DSH sits a stdio bridge in front
    * of stock `dsh` so session/new mcpServers are accepted and delivered. */
   wrapSpawn?(cli: string, args: string[], turn: SendTurnInput): AcpSpawnRewrite;
+  /** How this engine is held to a routine's command allowlist
+   *  (`SendTurnInput.toolPolicy`, server/drivers/acp/allowlist.ts).  Absent
+   *  means the engine cannot be held:  it runs tools without asking BotFleet
+   *  first (mcode's Ask mode does, and ignores the client terminal), so an
+   *  allowlist turn is refused before anything spawns. */
+  allowlist?: {
+    /** Spawn argv for an allowlist turn.  Never a bypass permission mode. */
+    spawnArgs(config: AcpConfig, turn: SendTurnInput): string[];
+    /** Why the engine, as its `initialize` answer describes it, cannot be held
+     *  (for example, no blocking pre-tool hook);  null when it can. */
+    verifyInitialize(init: JsonValue | undefined): string | null;
+  };
   /** Resume RPC used by this ACP server.  Most older harnesses implement
    * `session/load`; current ACP v1 servers may expose `session/resume`. */
   resumeMethod?: "session/load" | "session/resume";
@@ -411,6 +431,15 @@ export class AcpModelRejectedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "AcpModelRejectedError";
+  }
+}
+
+/** An allowlist turn on an engine that cannot be held to it.  Refused, not
+ *  retried:  the next launch would be the same engine. */
+class AcpAllowlistRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AcpAllowlistRefusedError";
   }
 }
 
@@ -699,8 +728,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // A turn the harness holds for auto-review is spawned in the same
         // asking mode, so each `session/request_permission` reaches the
         // reviewer instead of being answered here.
+        //
+        // A routine with a command allowlist is never full-auto either:  the
+        // allowlist gate answers every ask, and the engine is spawned in a
+        // mode that asks (never a bypass mode).
+        const toolPolicy = turn.toolPolicy;
         const turnConfig: AcpConfig =
-          (controlsHost || turn.holdForReview === true) && config.fullAuto ? { ...config, fullAuto: false } : config;
+          (controlsHost || turn.holdForReview === true || toolPolicy) && config.fullAuto ? { ...config, fullAuto: false } : config;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         // Carried across a relaunch (see maybeRetry): `attempt` is how many
@@ -784,6 +818,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         }
         const cancelled = cancelledBeforeDispatch();
         if (cancelled) return cancelled;
+        // Fail closed:  an engine that cannot be held to the allowlist never
+        // runs an allowlist turn.  The run says why, and setup marks it as the
+        // engine's limit rather than this run's fault.
+        if (toolPolicy && !support.allowlist) {
+          return finishBeforeDispatch(false, "setup_required", {
+            message: `This routine runs under a command allowlist, and ${support.displayName} cannot be held to one:  it runs tools without asking BotFleet first.  Run the routine on a bot whose engine is Grok Build.`,
+            setup: true,
+          });
+        }
         let resolvedModel: string | undefined;
         try {
           resolvedModel = support.resolveTurnModel?.(turn.model, env);
@@ -797,20 +840,29 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           resolvedModel !== undefined && resolvedModel !== turn.model
             ? { ...turn, model: resolvedModel }
             : turn;
-        const mcpServers = acpMcpServers(turn);
+        // An allowlist turn mounts nothing:  every tool it may use is the
+        // engine's own shell or file tool, routed back through BotFleet.
+        const mcpServers = toolPolicy ? [] : acpMcpServers(turn);
 
         let child;
+        // What the engine child runs with.  An allowlisted command BotFleet
+        // runs on the engine's behalf gets the same environment, launch
+        // identity included, and never the variables the engine passes.
+        let launchEnv: Record<string, string | undefined> = env;
         try {
-          const requestedArgs = support.spawnArgs(turnConfig, cliTurn);
+          const requestedArgs = toolPolicy && support.allowlist
+            ? support.allowlist.spawnArgs(turnConfig, cliTurn)
+            : support.spawnArgs(turnConfig, cliTurn);
           const spawned = support.wrapSpawn?.(config.cli, requestedArgs, cliTurn) ?? {
             cli: config.cli,
             args: requestedArgs,
           };
+          // Last, over the instance's env and a wrapper's additions alike:
+          // the launch identity is this bot's and this turn's.
+          launchEnv = applyLaunchIdentity(spawned.env ? { ...env, ...spawned.env } : env, turn.launchIdentity);
           child = spawnCli(spawned.cli, spawned.args, {
             cwd,
-            // Last, over the instance's env and a wrapper's additions alike:
-            // the launch identity is this bot's and this turn's.
-            env: applyLaunchIdentity(spawned.env ? { ...env, ...spawned.env } : env, turn.launchIdentity),
+            env: launchEnv,
             stdio: ["pipe", "pipe", "pipe"],
           });
         } catch (error) {
@@ -826,6 +878,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // descendant after the leader has gone, without ever signalling a
         // process-group id the OS may have handed to someone else.
         const group = trackCliGroup(child);
+
+        // The allowlist gate for this attempt (null on every other turn).
+        const gate = toolPolicy
+          ? new AllowlistGate({
+              policy: toolPolicy,
+              env: launchEnv,
+              cwd,
+              log: (line) => console.warn(`[acp:${DRIVER_KIND}] ${line}`),
+            })
+          : null;
+        /** session/new and session/load params, with the allowlist's hook
+         *  registered on an allowlist turn. */
+        const withAllowlistMeta = <T extends object>(params: T) => (gate ? { ...params, _meta: allowlistHookMeta() } : params);
 
         // `sawOutput` is the replay-safety gate, and it is PROTOCOL state, not
         // a reading of the error text: it flips the moment this child put
@@ -1071,8 +1136,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
           rpcPending.clear();
           active.delete(threadId);
+          gate?.dispose();
           flushAssistantText();
-          emit({
+          const completed: Extract<RuntimeEvent, { type: "turn.completed" }> = {
             ...base(threadId, turnId),
             type: "turn.completed",
             ok,
@@ -1082,7 +1148,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // `billingMode`, which defaults to "actual".
             cost: turnCost ?? null,
             ...(turnUsage ? { usage: turnUsage } : {}),
-          });
+          };
+          // What a routine's allowlist refused, by program or tool name.
+          if (gate && gate.denials.length > 0) completed.denials = [...gate.denials];
+          emit(completed);
           stop(); // the agent process does not exit on its own
         };
 
@@ -1128,6 +1197,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             p.reject(new Error("turn retrying"));
           }
           rpcPending.clear();
+          gate?.dispose();
           stop();
           // The thread STAYS claimed through the backoff — that entry is what
           // makes a stop during the wait reach this turn instead of racing a
@@ -1178,8 +1248,51 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           return true;
         };
 
+        // An allowlist turn's own client calls:  the engine's pre-tool hook,
+        // and the terminal and file calls BotFleet runs on its behalf.
+        const handleAllowlistRequest = (msg: any): boolean => {
+          if (!gate) return false;
+          if (HOOK_METHODS.has(msg.method)) {
+            state.sawOutput = true;
+            let answer: HookAnswer;
+            try {
+              answer = gate.hook(msg.params);
+            } catch {
+              // A gate that cannot decide denies:  an error answer would make
+              // the engine fail OPEN.
+              answer = { decision: "deny", reason: "BotFleet's routine allowlist could not decide this tool." };
+            }
+            send({ jsonrpc: "2.0", id: msg.id, result: answer });
+            return true;
+          }
+          if (gate.handles(msg.method)) {
+            state.sawOutput = true;
+            void gate
+              .client(msg.method, msg.params)
+              .catch(() => ({ error: { code: -32000, message: `${msg.method} failed` } }))
+              .then((answer) => {
+                if (!state.settled) send({ jsonrpc: "2.0", id: msg.id, ...answer });
+              });
+            return true;
+          }
+          return false;
+        };
+
+        /** The engine ran a tool the gate never allowed:  stop the turn now. */
+        const tripAllowlist = (tool: string) => {
+          if (state.settled) return;
+          console.warn(`[acp:${DRIVER_KIND}] allowlist bypassed by ${tool}; stopping the turn`);
+          emit({
+            ...base(threadId, turnId),
+            type: "runtime.error",
+            message: `BotFleet stopped this routine:  the engine ran a tool (${tool}) that the command allowlist had not approved.`,
+          });
+          settle(false, "capability_denied");
+        };
+
         // server→client permission request → canonical request.opened
         const handleServerRequest = (msg: any) => {
+          if (handleAllowlistRequest(msg)) return;
           if (msg.method !== "session/request_permission") {
             // never leave an unknown server request hanging — the agent blocks
             return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
@@ -1201,6 +1314,27 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             });
 
           const toolCall = params.toolCall ?? {};
+          if (gate) {
+            // The allowlist answers, never a person, and never with an
+            // "always" option:  that would write a standing allow rule into
+            // the engine's own config.
+            const allowOnce = options.find((o) => o.kind === "allow_once")?.optionId;
+            // reject_once only, for the same reason:  reject_always is a
+            // standing rule too.  No such option means a plain cancel.
+            const rejectOnce = options.find((o) => o.kind === "reject_once")?.optionId;
+            let allowed = false;
+            try {
+              allowed = gate.permission(params) && Boolean(allowOnce);
+            } catch {
+              allowed = false;
+            }
+            const optionId = allowed ? allowOnce : rejectOnce;
+            return send({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: optionId ? { outcome: { outcome: "selected", optionId } } : cancelled,
+            });
+          }
           if (turnConfig.fullAuto) {
             const allow = optionFor("allow");
             if (!allow) missing("allow");
@@ -1293,6 +1427,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             case "tool_call": {
               state.sawOutput = true;
+              const bypassedBy = gate?.bypassed(u);
+              if (bypassedBy) return tripAllowlist(bypassedBy);
               // prepared once: the same text is filed with the event and
               // fingerprinted for the update that may follow
               const announced = u.rawInput === undefined ? undefined : prepareInput(u.rawInput);
@@ -1321,6 +1457,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               break;
             }
             case "tool_call_update": {
+              const bypassedBy = gate?.bypassed(u);
+              if (bypassedBy) return tripAllowlist(bypassedBy);
               // The schema lets a call's input arrive or settle on an update,
               // at any status: take it when it is new text for this call.
               const settled = typeof u.toolCallId === "string" && u.rawInput !== undefined ? prepareInput(u.rawInput) : undefined;
@@ -1509,7 +1647,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             try {
               init = await request(
                 "initialize",
-                { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } },
+                {
+                  protocolVersion: 1,
+                  clientCapabilities: gate
+                    ? ALLOWLIST_CLIENT_CAPABILITIES
+                    : { fs: { readTextFile: false, writeTextFile: false } },
+                },
                 initDeadline.timeoutMs,
               );
             } catch (error) {
@@ -1522,6 +1665,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             const initElapsedMs = Date.now() - initStartedAt;
             if (initElapsedMs >= SLOW_INIT_LOG_MS) {
               console.warn(`[acp] ${DRIVER_KIND} ${describeSlowInit(initElapsedMs, initDeadline)}`);
+            }
+            if (gate && support.allowlist) {
+              const problem = support.allowlist.verifyInitialize(init);
+              if (problem) throw new AcpAllowlistRefusedError(problem);
             }
             const methods: Array<{ id?: string }> = Array.isArray(init?.authMethods) ? init.authMethods : [];
             const methodId = support.pickAuthMethod(methods);
@@ -1552,7 +1699,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               try {
                 sessionResult = await request(
                   support.resumeMethod ?? "session/load",
-                  { sessionId: cursor, cwd, mcpServers },
+                  withAllowlistMeta({ sessionId: cursor, cwd, mcpServers }),
                   LOAD_SESSION_TIMEOUT,
                 );
                 sessionId = cursor;
@@ -1564,7 +1711,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               }
             }
             if (!sessionId) {
-              sessionResult = await request("session/new", { cwd, mcpServers }, NEW_SESSION_TIMEOUT);
+              sessionResult = await request(
+                "session/new",
+                withAllowlistMeta({ cwd, mcpServers }),
+                NEW_SESSION_TIMEOUT,
+              );
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
             }
@@ -1734,6 +1885,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             else if (reason === "cancelled") settle(true, "cancelled");
             else settle(false, reason ?? "failed");
           } catch (e) {
+            if (!state.settled && !state.retrying && e instanceof AcpAllowlistRefusedError) {
+              emit({ ...base(threadId, turnId), type: "runtime.error", message: e.message, setup: true });
+              settle(false, "setup_required");
+              return;
+            }
             if (!state.settled && !state.retrying) {
               const resumeFailure = e instanceof AcpResumeError;
               const classifiedFailure = resumeFailure && e.cause !== undefined ? e.cause : e;
@@ -1884,6 +2040,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // full-auto instance answers it itself unless the turn is held
             reviewHook: config.fullAuto ? "after" : "before",
             asksWhenHeld: true,
+            // Holds a routine's command allowlist (allowlist.ts), or refuses it.
+            toolPolicy: Boolean(support.allowlist),
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),
