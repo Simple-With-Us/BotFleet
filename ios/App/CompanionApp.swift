@@ -56,6 +56,11 @@ struct CompanionApp: App {
                     liveActivities.attach(to: session)
                     liveActivities.transition(to: liveActivityPhase(scenePhase))
                     Task { await testFlightUpdate.checkIfDue() }
+                    #if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains("-live-activity-preview") {
+                        LiveActivityCoordinator.startPreviewActivity()
+                    }
+                    #endif
                 }
                 .onOpenURL { session.receiveOpenURL($0) }
                 .onChange(of: scenePhase) { _, phase in

@@ -316,3 +316,35 @@ enum LiveActivityApprovalRoute {
         await answered?.end(nil, dismissalPolicy: .immediate)
     }
 }
+
+#if DEBUG
+extension LiveActivityCoordinator {
+    /// A real ActivityKit request with fixture content, so the Lock Screen card
+    /// and its buttons can be seen on a simulator that has no paired harness.
+    /// DEBUG only, and only from the `-live-activity-preview` launch argument.
+    static func startPreviewActivity() {
+        let content = BotActivityAttributes.ContentState(
+            face: BotState.thinking.rawValue,
+            kind: "needsYou",
+            headline: "Forge needs you",
+            line: "Run `rm -rf build/cache` in the BotFleet repo?",
+            requestId: "preview-request",
+            options: ["Allow", "Deny"],
+            isPermission: true,
+            since: Date()
+        )
+        Task.detached(priority: .userInitiated) {
+            try? Activity.request(
+                attributes: BotActivityAttributes(
+                    botId: "preview-bot",
+                    threadId: "preview-thread",
+                    name: "Forge",
+                    color: "coral"
+                ),
+                content: .init(state: content, staleDate: nil),
+                pushType: nil
+            )
+        }
+    }
+}
+#endif
