@@ -24,6 +24,7 @@ import { classifyError } from "./drivers/retry.ts";
 import { estimateCatalogCost, isCatalogPricedModel } from "./gen-ai-cost.ts";
 import { redactSecrets, redactSecretsInText } from "./redact.ts";
 import { getSentry, isSentryActive, scrubWebhookSecrets } from "./sentry.ts";
+import { exportFleetTurn } from "./sentry-fleet.ts";
 
 export type SpanLike = {
   setAttribute(key: string, value: string | number | boolean): void;
@@ -572,11 +573,16 @@ export function genAiProvider(driverKind: string, model?: string | null): string
   return GEN_AI_PROVIDERS.get(kind) ?? (driverKind || "custom");
 }
 
+type StampedTurnCost = {
+  cost?: number;
+  source?: string;
+};
+
 function applyTurnCost(
   turn: AgentTurn,
   usage: { input?: number; output?: number; cachedInput?: number; cost?: number | null } | undefined,
   billingMode?: "actual" | "estimated",
-): void {
+): StampedTurnCost {
   const model = turn.model ?? turn.identity?.model;
   const reported = usage?.cost;
   const validReported = reported != null && Number.isFinite(reported) && reported >= 0;
@@ -592,20 +598,23 @@ function applyTurnCost(
     if (isCatalogPricedModel(model)) {
       turn.span.setAttribute("gen_ai.usage.cost", reported);
       turn.span.setAttribute("botfleet.cost.source", "catalog");
+      return { cost: reported, source: "catalog" };
     }
-    return;
+    return { cost: reported, source: "estimated" };
   }
 
   if (validReported) {
     turn.span.setAttribute("gen_ai.usage.cost", reported);
-    return;
+    return { cost: reported };
   }
 
   const catalog = estimateCatalogCost(model, usage);
   if (catalog != null) {
     turn.span.setAttribute("gen_ai.usage.cost", catalog);
     turn.span.setAttribute("botfleet.cost.source", "catalog");
+    return { cost: catalog, source: "catalog" };
   }
+  return {};
 }
 
 /** Stop reasons that are never a crash on their own.  `host_control_policy`
@@ -658,11 +667,12 @@ function endTurn(
   if (!turn) return;
   for (const tool of turn.tools.values()) tool.end();
   turn.tools.clear();
-  turn.span.setAttribute("botfleet.turn.duration_ms", Math.max(0, Date.now() - turn.startedAt));
+  const durationMs = Math.max(0, Date.now() - turn.startedAt);
+  turn.span.setAttribute("botfleet.turn.duration_ms", durationMs);
   if (usage?.input != null) turn.span.setAttribute("gen_ai.usage.input_tokens", usage.input);
   if (usage?.output != null) turn.span.setAttribute("gen_ai.usage.output_tokens", usage.output);
   if (usage?.cachedInput != null) turn.span.setAttribute("gen_ai.usage.input_tokens.cached", usage.cachedInput);
-  applyTurnCost(turn, usage, billingMode);
+  const stamped = applyTurnCost(turn, usage, billingMode);
   if (isPromptCaptureEnabled()) {
     if (turn.inputText) turn.span.setAttribute("gen_ai.input.messages", clipSpanText(turn.inputText));
     if (turn.outputChunks.length > 0) {
@@ -671,6 +681,24 @@ function endTurn(
   }
   if (!ok && !expectedStop) turn.span.setStatus?.({ code: 2, message: "internal_error" });
   turn.span.end();
+  const colon = key.lastIndexOf(":");
+  const threadId = colon >= 0 ? key.slice(0, colon) : key;
+  exportFleetTurn({
+    conversationId: turn.conversationId,
+    threadId,
+    provider: turn.provider,
+    model: turn.model,
+    ok,
+    durationMs,
+    inputTokens: usage?.input,
+    outputTokens: usage?.output,
+    cachedInputTokens: usage?.cachedInput,
+    cost: stamped.cost,
+    costSource: stamped.source,
+    toolNames: turn.toolNames,
+    botId: turn.identity?.botId,
+    botName: turn.identity?.botName,
+  });
   turns.delete(key);
 }
 
