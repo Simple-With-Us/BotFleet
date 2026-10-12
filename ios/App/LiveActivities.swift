@@ -208,6 +208,11 @@ final class LiveActivityCoordinator {
 
         // bots that went quiet or whose unread was opened: let the island go
         for activity in Activity<BotActivityAttributes>.activities where !wantedIds.contains(activity.attributes.botId) {
+            #if DEBUG
+            // The `-live-activity-preview` fixture has no bot behind it, so
+            // reconciliation would end the very card it exists to show.
+            if Self.isPreviewFixture(activity) { continue }
+            #endif
             guard lifecycle.permitsUpdates(from: generation) else { return }
             lastSent.removeValue(forKey: activity.attributes.botId)
             since.removeValue(forKey: activity.attributes.botId)
@@ -322,6 +327,12 @@ extension LiveActivityCoordinator {
     /// A real ActivityKit request with fixture content, so the Lock Screen card
     /// and its buttons can be seen on a simulator that has no paired harness.
     /// DEBUG only, and only from the `-live-activity-preview` launch argument.
+    static let previewBotId = "preview-bot"
+
+    static func isPreviewFixture(_ activity: Activity<BotActivityAttributes>) -> Bool {
+        activity.attributes.botId == previewBotId
+    }
+
     static func startPreviewActivity() {
         let content = BotActivityAttributes.ContentState(
             face: BotState.thinking.rawValue,
@@ -336,7 +347,7 @@ extension LiveActivityCoordinator {
         Task.detached(priority: .userInitiated) {
             try? Activity.request(
                 attributes: BotActivityAttributes(
-                    botId: "preview-bot",
+                    botId: previewBotId,
                     threadId: "preview-thread",
                     name: "Forge",
                     color: "coral"
