@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonValue } from "./json.ts";
+import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
 import { DATA_DIR, writeFileAtomic } from "./state.ts";
 
 export interface ApnsConfig {
