@@ -640,12 +640,37 @@ export async function dependencyFingerprint(nodeModulesPath) {
   return digest.digest("hex");
 }
 
+/** The one lockfile document pnpm actually wrote, from a project lockfile
+ *  that may be a YAML STREAM.
+ *
+ *  pnpm 12 records `packageManagerDependencies` — the self-hosted pnpm it
+ *  installs for `packageManager: "pnpm@12.x"` — as a SEPARATE leading document,
+ *  with the real lockfile after a second `---`.  Its internal copy at
+ *  `node_modules/.pnpm/lock.yaml` is that second document alone: verified
+ *  byte-for-byte on this repo, in both directions.
+ *
+ *  This matters because comparing the two whole files compares a stream against
+ *  one of its own documents, which can never match — so the dependency gate
+ *  below rejected EVERY install on every Mac.  That is silent in the common
+ *  case (`pnpm install --frozen-lockfile` still succeeds, because pnpm reads
+ *  what it needs), so it only surfaces as "update failed" at the one moment
+ *  someone tries to update, fleet-wide.
+ *
+ *  Split on a line that is exactly `---`, after an optional leading one, and
+ *  take the last chunk.  A single-document lockfile (pnpm < 12) is returned
+ *  unchanged apart from that leading marker, which is what it was. */
+export function effectiveLockDocument(text) {
+  const body = text.startsWith("---\n") ? text.slice(4) : text;
+  const chunks = body.split("\n---\n");
+  return chunks[chunks.length - 1];
+}
+
 async function assertDependenciesMatchSource(nodeModulesPath, sourcePath) {
   const [sourceLock, installedLock] = await Promise.all([
     readFile(join(sourcePath, "pnpm-lock.yaml")),
     readFile(join(nodeModulesPath, ".pnpm/lock.yaml")),
   ]);
-  if (!sourceLock.equals(installedLock)) {
+  if (!effectiveLockDocument(sourceLock.toString("utf8")).equals(installedLock)) {
     throw new Error("Staged dependency tree does not match the exact source lockfile");
   }
 }

@@ -26,6 +26,7 @@ import {
   DEFAULT_PORTS,
   DEFAULT_STARTUP_TIMEOUT_MS,
   dependencyFingerprint,
+  effectiveLockDocument,
   describeLaunchdExit,
   isRecoverableResolutionFailure,
   parseLaunchdJob,
@@ -217,6 +218,29 @@ test("dependency fingerprints cover package contents and symlink targets", async
   await rm(join(dependencies, "package-link"));
   await symlink("other-package", join(dependencies, "package-link"));
   assert.notEqual(await dependencyFingerprint(dependencies), contentChanged);
+});
+
+// The dependency gate compared the whole project lockfile against pnpm's
+// internal copy.  Since pnpm 12 those are different BYTE LENGTHS by design —
+// the project file is a two-document stream carrying `packageManagerDependencies`
+// and pnpm writes only the real lockfile — so the gate rejected every install
+// on every Mac while `pnpm install --frozen-lockfile` kept working, and the
+// only symptom was "update failed" at the moment someone tried to update.
+test("the dependency gate compares the document pnpm wrote, not the whole stream", () => {
+  const lock = "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n";
+  // pnpm 12: a leading document for the self-hosted package manager, then the
+  // real lockfile after a second `---`.
+  const stream = `---\nlockfileVersion: '9.0'\n\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.10.1\n        version: 12.10.1\n---\n${lock}`;
+  assert.equal(effectiveLockDocument(stream), lock);
+  assert.notEqual(stream, lock);
+
+  // pnpm < 12: one document, no separator.  A leading marker alone is not a
+  // document boundary, so the content comes back unchanged.
+  assert.equal(effectiveLockDocument(lock), lock);
+  assert.equal(effectiveLockDocument(`---\n${lock}`), lock);
+
+  // A real drift still fails: different dependency content is not equal.
+  assert.notEqual(effectiveLockDocument(stream), `${lock}\n# drift\n`);
 });
 
 test("command results wait for output pipes to close", async () => {
