@@ -170,6 +170,6 @@ describe("writeThroughKnobs", () => {
     expect(calls.get("BOTFLEET_SPEND_CEILING_USD")).toBe("25.5");
     expect(calls.get("BOTFLEET_INFISICAL_REFRESH_MINUTES")).toBe("10");
     expect(calls.get("BOTFLEET_AUTO_REVIEW_MAX_PER_TURN")).toBe("80");
-    expect(KNOB_FIELDS.length).toBe(14);
+    expect(KNOB_FIELDS.length).toBe(16);
   });
 });

@@ -42,7 +42,8 @@ import {
   resolveInitDeadline,
   SLOW_INIT_LOG_MS,
 } from "./init-deadline.ts";
-import { annotatePromptBudget } from "../../sentry-ai.ts";
+import { estimateCatalogCost } from "../../gen-ai-cost.ts";
+import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
 import {
   applyAcpPromptBudget,
   decodeAcpPromptBudgetBytes,
@@ -1115,13 +1116,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
          *  while grok and minimax did.  The fleet spend view was therefore
          *  a confident fraction of the truth with nothing marking the gap.
          *
-         *  Only a number the agent itself reported counts.  Inventing one
-         *  from a price table here would be a worse lie than a blank:
-         *  these are subscription logins, so an API-equivalent figure is an
-         *  estimate, not a charge, and `billingMode` exists to say so.
-         *  An agent that reports nothing keeps `null` and is counted as
-         *  UNPRICED by rolling-spend rather than as free. */
+         *  A number the agent itself reported is provider truth and is
+         *  billed as actual.  When the agent reports none, MiniMax Code,
+         *  DSH, and DeepSeek fall back to the published catalog (marked
+         *  `estimated`) so Usage Monitor and Sentry show dollars instead
+         *  of a blank.  Grok and the rest stay null — they have no catalog
+         *  row, and inventing one would be a worse lie than a blank. */
         let turnCost: number | null | undefined;
+        let turnBillingMode: "actual" | "estimated" | undefined;
 
         const settle = (ok: boolean, stopReason: string | null) => {
           if (state.settled || state.retrying) return;
@@ -1143,10 +1145,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             type: "turn.completed",
             ok,
             stopReason,
-            // `turnCost` is only ever a figure the agent itself reported, so
-            // it is a provider number and not an estimate — hence no
-            // `billingMode`, which defaults to "actual".
             cost: turnCost ?? null,
+            billingMode: turnBillingMode,
             ...(turnUsage ? { usage: turnUsage } : {}),
           };
           // What a routine's allowlist refused, by program or tool name.
@@ -1831,6 +1831,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               budgetBytes: resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes),
             });
             annotatePromptBudget(threadId, turnId, budgeted);
+            captureTurnPrompt(threadId, turnId, budgeted.text);
             const text = budgeted.text;
             const result = await request(
               "session/prompt",
@@ -1877,9 +1878,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 ...turnUsage,
               });
             }
-            // Only a figure the agent itself reported.  See `turnCost`.
             const reportedCost = acpNumber(usage, "cost", "costUsd", "cost_usd", "totalCostUsd");
-            if (reportedCost != null && reportedCost > 0) turnCost = reportedCost;
+            if (reportedCost != null && reportedCost > 0) {
+              turnCost = reportedCost;
+            } else {
+              const catalog = estimateCatalogCost(selectedModel, turnUsage);
+              if (catalog != null) {
+                turnCost = catalog;
+                turnBillingMode = "estimated";
+              }
+            }
             const reason = normalizeStopReason(result?.stopReason);
             if (reason === "end_turn" || reason === "max_tokens") settle(true, null);
             else if (reason === "cancelled") settle(true, "cancelled");

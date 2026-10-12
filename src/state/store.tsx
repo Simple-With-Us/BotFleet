@@ -22,6 +22,7 @@ import type { BotColor, BotMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
+import type { Attachment } from "@/lib/composer-attachments";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
 import type { ReviewHook } from "../../shared/auto-review";
@@ -939,7 +940,7 @@ export interface AppState {
   } | null;
   /** 1:1 queue-fallback lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
-  pendingQueued: Record<string, Array<{ queueId: string; text: string; at: number }>>;
+  pendingQueued: Record<string, Array<{ queueId: string; text: string; rawText?: string; at: number; reply?: Message; attachments: Attachment[] }>>;
   /** queueIds whose drain frame beat the POST continuation. One-shot and
    * bounded to a short event window so other clients cannot grow it forever. */
   consumedQueueIds: Record<string, true>;
@@ -1075,15 +1076,27 @@ export type Action =
       type: "send";
       botId: string;
       text: string;
+      /** Composer text before `composeMessage`; kept on queued entries so edit
+       * restore does not double-expand attachment markers. */
+      rawText?: string;
       replyToId?: string;
+      /** The full reply Message, kept on the queue entry so an edit can
+       * restore it.  The server only sees replyToId; the client needs the
+       * Message to put the quote back through restoreFailedSend. */
+      reply?: Message;
+      /** The attachments the composer held, kept on the queue entry so an
+       * edit can put them back: the composed `text` carries <attached-image …>
+       * placeholders, and restoring only the text would leave those
+       * placeholders stranded on a chip that no longer exists. */
+      attachments?: Attachment[];
       /** The server refused the send or could not be reached.  Called with the
        * reason, after the error banner is set, so a caller that cleared its
        * input can put it back. */
       onError?: (message: string) => void;
     }
-  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number }
+  | { type: "pendingQueued"; threadId: string; queueId: string; text: string; rawText?: string; at?: number; reply?: Message; attachments?: Attachment[] }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
-  | { type: "cancelQueued"; botId: string; queueId: string }
+  | { type: "cancelQueued"; botId: string; queueId: string; onSettled?: () => void }
   | { type: "editMessage"; botId: string; messageId: string; text: string }
   | { type: "switchBranch"; botId: string; messageId: string }
   | { type: "threadActive"; threadId: string; activeLeafId: string }
@@ -1901,6 +1914,9 @@ export function reducer(state: AppState, action: Action): AppState {
             {
               queueId: action.queueId,
               text: action.text,
+              rawText: action.rawText,
+              reply: action.reply,
+              attachments: action.attachments ?? [],
               // Stamp once at remember-time; ChatView must not remint Date.now().
               at: action.at ?? Date.now(),
             },
@@ -2251,10 +2267,15 @@ export const MessagePostResponseSchema = z.union([
  * have to re-fetch or duplicate this function's request/parse logic. */
 export class ApiError extends Error {
   readonly body: any;
-  constructor(message: string, body: any) {
+  /** The HTTP status, so callers can tell a 404 from a 500 without matching
+   * the message: the message prefers body.error when the server sent one, so
+   * the status code is often not in it at all. */
+  readonly status: number;
+  constructor(message: string, body: any, status: number) {
     super(message);
     this.name = "ApiError";
     this.body = body;
+    this.status = status;
   }
 }
 
@@ -2270,7 +2291,7 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
     });
     const body = await res.json().catch(() => ({}));
     if (res.ok) return body;
-    lastError = new ApiError(body.error ?? `${res.status} ${res.statusText}`, body);
+    lastError = new ApiError(body.error ?? `${res.status} ${res.statusText}`, body, res.status);
     if (res.status !== 502) break;
   }
   throw lastError ?? new Error("request failed");
@@ -2576,7 +2597,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "cancelQueued":
           void api(`/api/bots/${action.botId}/queue/${action.queueId}`, { method: "DELETE" })
             .then(() => rawDispatch(action))
-            .catch(showError);
+            // The caller restores a draft from the entry it is removing, and
+            // that has to wait for the server: until the DELETE lands the
+            // queued message is still live, so a draft put back now can be
+            // sent twice.  Either way the entry's owner hears how it ended.
+            // onSettled runs on success only, not from finally: a refusal
+            // leaves the queued message live, and putting the draft back
+            // beside it is exactly the duplicate this ordering avoids.
+            .then(() => action.onSettled?.())
+            .catch((error) => {
+              if (error instanceof ApiError && error.status === 404) {
+                // A 404 can mean the entry is already gone or that this harness
+                // is too old to expose DELETE /queue/ (body carries "no route").
+                // iOS keeps the chip in the latter case; mirror that here so a
+                // local drop does not hide a message that is still going to send.
+                if (String(error.body?.error ?? "").includes("no route")) {
+                  showError(error);
+                  return;
+                }
+                rawDispatch(action);
+                action.onSettled?.();
+                return;
+              }
+              showError(error);
+            });
           break;
         case "send": {
           // persist through the existing card route so an older server that
@@ -2620,6 +2664,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                     threadId: parsed.data.threadId,
                     queueId: parsed.data.queueId,
                     text: action.text,
+                    rawText: action.rawText,
+                    reply: action.reply,
+                    attachments: action.attachments ?? [],
                     at: sentAt,
                   });
                 }

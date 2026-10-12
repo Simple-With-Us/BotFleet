@@ -21,7 +21,7 @@ import { newEventId, newId } from "../contracts.ts";
 import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
 import { splitChatPrompt } from "./prompt-split.ts";
-import { withChatSpan } from "../sentry-ai.ts";
+import { formatGenAiMessages, withChatSpan } from "../sentry-ai.ts";
 import { runTurnLoop, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
 
 import { httpErrorFor } from "./chat-completions/errors.ts";
@@ -465,7 +465,13 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           msg: { model, messageCount: roundMessages.length, round: opts.round },
         });
         const { text, reasoning, tool_calls, usage } = await withChatSpan(
-          { model, conversationId: threadId, taskId: turnId, provider: sentryProviderForUrl(config.url) },
+          {
+            model,
+            conversationId: threadId,
+            taskId: turnId,
+            provider: sentryProviderForUrl(config.url),
+            input: formatGenAiMessages(roundMessages),
+          },
           ({ recordUsage }) =>
             complete(roundMessages, model, {
               stream: true,

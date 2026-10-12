@@ -1076,7 +1076,14 @@ final class Session: ObservableObject {
             }
             let localId = UUID().uuidString
             clientNonce = localId
-            state.rememberPendingSend(threadId: threadId, id: localId, text: prompt, queued: false)
+            state.rememberPendingSend(
+                threadId: threadId,
+                id: localId,
+                text: prompt,
+                queued: false,
+                rawText: text,
+                attachments: attachments
+            )
             do {
                 switch chat {
                 case let .bot(bot):
@@ -1091,7 +1098,13 @@ final class Session: ObservableObject {
                         let dest = result.threadId ?? bot.threadId
                         if dest != threadId {
                             state.cancelPendingQueued(threadId: threadId, queueId: localId)
-                            state.rememberPendingQueued(threadId: dest, queueId: queueId, text: prompt)
+                            state.rememberPendingQueued(
+                                threadId: dest,
+                                queueId: queueId,
+                                text: prompt,
+                                rawText: text,
+                                attachments: attachments
+                            )
                         } else {
                             state.promotePendingSend(threadId: dest, from: localId, to: queueId)
                         }
@@ -1141,8 +1154,14 @@ final class Session: ObservableObject {
         UserDefaults.standard.set(data, forKey: Self.postedPushTokenKey)
     }
 
-    func cancelQueued(botId: String, queueId: String) async {
-        guard let client else { return }
+    func dropPendingQueued(threadId: String, queueId: String) {
+        state.cancelPendingQueued(threadId: threadId, queueId: queueId)
+    }
+
+    /// Returns whether the harness took the queued entry (local chip removed).
+    @discardableResult
+    func cancelQueued(botId: String, queueId: String) async -> Bool {
+        guard let client else { return false }
         func dropLocalChip() {
             if let threadId = state.bot(botId)?.threadId {
                 state.cancelPendingQueued(threadId: threadId, queueId: queueId)
@@ -1156,19 +1175,23 @@ final class Session: ObservableObject {
         do {
             try await client.cancelQueued(botId: botId, queueId: queueId)
             dropLocalChip()
+            return true
         } catch let error as APIError where error.isUnauthorized {
             status = .unauthorized
+            return false
         } catch let error as APIError where error.isNotFound {
             let message = error.errorDescription ?? ""
             if message.contains("no route") {
                 // Packaged companion older than #224 deny-lists DELETE /queue/.
                 // Dropping the chip locally would hide a message that still sends.
                 actionError = "This Mac is running an older BotFleet.  Update BotFleet on your computer, then you can cancel a queued message."
-            } else {
-                dropLocalChip()
+                return false
             }
+            dropLocalChip()
+            return true
         } catch {
             recordActionError(error)
+            return false
         }
     }
 

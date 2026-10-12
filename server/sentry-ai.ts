@@ -8,9 +8,11 @@
 // the bot title (`gen_ai.agent.name`) so Agents Dashboard rows are identifiable.
 // `setUser` fills the Conversations User column from bot/room identity.
 //
-// Manual spans still omit raw prompts, transcripts, and tool arguments (they
-// can carry credentials).  SDK `dataCollection.genAI` is ON by default for
-// any future/auto integration path; kill with `SENTRY_AI_DATA_COLLECTION=0`.
+// Manual spans omit raw prompts, transcripts, and tool arguments by default
+// (they can carry credentials).  Opt in with `SENTRY_AI_PROMPT_CAPTURE=1` —
+// Jay approved prompts; values are redacted, then clipped, before they
+// reach a span.  SDK `dataCollection.genAI` is ON by default for any
+// future/auto integration path; kill with `SENTRY_AI_DATA_COLLECTION=0`.
 //
 // The gen_ai.* vocabulary here is SENTRY's, not Usage Monitor's.  `x_ai`,
 // `gcp.gemini`, and `moonshot` are Sentry provider names; the Usage Monitor
@@ -19,6 +21,7 @@
 import type { RuntimeEvent } from "./contracts.ts";
 import { observability } from "./observability.ts";
 import { classifyError } from "./drivers/retry.ts";
+import { estimateCatalogCost, isCatalogPricedModel } from "./gen-ai-cost.ts";
 import { redactSecrets, redactSecretsInText } from "./redact.ts";
 import { getSentry, isSentryActive, scrubWebhookSecrets } from "./sentry.ts";
 
@@ -96,6 +99,16 @@ type AgentTurn = {
   provider: string;
   identity: TurnIdentity | null;
   tools: Map<string, SpanLike>;
+  /** `Date.now()` at turn.started, for the turn-duration attribute. */
+  startedAt: number;
+  /** The per-task conversation id stamped on every span of this turn. */
+  conversationId: string;
+  /** Tool names opened this turn, in order, for the fleet summary export. */
+  toolNames: string[];
+  /** Opt-in prompt text (ACP composed prompt or HTTP last-user). */
+  inputText?: string;
+  /** Opt-in assistant output chunks accumulated from content.delta. */
+  outputChunks: string[];
 };
 
 const turns = new Map<string, AgentTurn>();
@@ -454,10 +467,8 @@ function applyConversation(
     const resolved = identity === undefined ? identityFor(threadId) : identity;
     const id = clean(resolved?.botId) ?? clean(resolved?.roomId) ?? threadId;
     const username = clean(resolved?.botName) ?? clean(resolved?.roomName);
-    sink.setUser({
-      id,
-      ...(username ? { username } : {}),
-    });
+    if (username) sink.setUser({ id, username });
+    else sink.setUser({ id });
   } catch {
     /* conversation tagging must never take down a turn */
   }
@@ -521,21 +532,80 @@ const GEN_AI_PROVIDERS = new Map<string, string>([
   ["cursor", "cursor"],
   ["cursoragent", "cursor"],
   ["minimax", "minimax"],
+  ["minimaxagent", "minimax"],
+  ["mcode", "minimax"],
+  ["mcodeagent", "minimax"],
   ["boxagent", "box"],
 ]);
 
+/** Opt-in prompt/response capture for gen_ai spans.  Off by default:
+ * `SENTRY_AI_PROMPT_CAPTURE=1` (also `true` / `yes` / `on`) stamps
+ * `gen_ai.input.messages` / `gen_ai.output.messages` on chat and turn
+ * spans.  Jay approved prompts; the flag keeps the default exactly as the
+ * exclusion tests pin it until he turns it on.  Values are redacted, then
+ * clipped, before they reach a span. */
+export function isPromptCaptureEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.SENTRY_AI_PROMPT_CAPTURE ?? "0").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+/** Clip an input/output message payload for a span attribute.  Sentry caps
+ * span attribute strings well below what a full transcript costs, so this
+ * stays a bounded prefix, never the whole turn. */
+function clipSpanText(value: string, maxChars = 4000): string {
+  return redactSecretsInText(value).slice(0, maxChars);
+}
+
 /** Map a BotFleet driver kind onto Sentry's provider vocabulary.  An engine
  * Sentry has no name for keeps its own kind rather than being folded into a
- * neighbour it does not belong to. */
-export function genAiProvider(driverKind: string): string {
+ * neighbour it does not belong to.
+ *
+ * `model` is the turn's model id when it is already known.  A multi-provider
+ * engine (DSH serves both DeepSeek and MiniMax rows) reports its own driver
+ * kind at turn.started, before any model is picked — the model wins once it
+ * arrives, so a DSH turn running MiniMax-M3.1 reads `minimax`, not `deepseek`. */
+export function genAiProvider(driverKind: string, model?: string | null): string {
+  const fromModel = (model ?? "").trim().toLowerCase();
+  if (fromModel.includes("minimax")) return "minimax";
+  if (fromModel.includes("deepseek")) return "deepseek";
   const kind = (driverKind || "").trim().toLowerCase();
   return GEN_AI_PROVIDERS.get(kind) ?? (driverKind || "custom");
 }
 
-function applyCost(span: SpanLike, cost: number | null | undefined, billingMode?: "actual" | "estimated"): void {
-  if (billingMode === "estimated") return;
-  if (cost == null || !Number.isFinite(cost) || cost < 0) return;
-  span.setAttribute("gen_ai.usage.cost", cost);
+function applyTurnCost(
+  turn: AgentTurn,
+  usage: { input?: number; output?: number; cachedInput?: number; cost?: number | null } | undefined,
+  billingMode?: "actual" | "estimated",
+): void {
+  const model = turn.model ?? turn.identity?.model;
+  const reported = usage?.cost;
+  const validReported = reported != null && Number.isFinite(reported) && reported >= 0;
+
+  if (billingMode === "estimated" && validReported) {
+    // A subscription-equivalent figure is an estimate, not a charge, so it
+    // stays out of `gen_ai.usage.cost` for Claude / Codex / the rest of the
+    // subscription fleet (Usage Monitor sums that attribute as spend) and
+    // rides `botfleet.cost.estimated_usd`.  Catalog-priced MiniMax / mcode /
+    // DeepSeek still need dollars on the Sentry facet — that is the gap
+    // this fallback exists to close.
+    turn.span.setAttribute("botfleet.cost.estimated_usd", reported);
+    if (isCatalogPricedModel(model)) {
+      turn.span.setAttribute("gen_ai.usage.cost", reported);
+      turn.span.setAttribute("botfleet.cost.source", "catalog");
+    }
+    return;
+  }
+
+  if (validReported) {
+    turn.span.setAttribute("gen_ai.usage.cost", reported);
+    return;
+  }
+
+  const catalog = estimateCatalogCost(model, usage);
+  if (catalog != null) {
+    turn.span.setAttribute("gen_ai.usage.cost", catalog);
+    turn.span.setAttribute("botfleet.cost.source", "catalog");
+  }
 }
 
 /** Stop reasons that are never a crash on their own.  `host_control_policy`
@@ -588,10 +658,17 @@ function endTurn(
   if (!turn) return;
   for (const tool of turn.tools.values()) tool.end();
   turn.tools.clear();
+  turn.span.setAttribute("botfleet.turn.duration_ms", Math.max(0, Date.now() - turn.startedAt));
   if (usage?.input != null) turn.span.setAttribute("gen_ai.usage.input_tokens", usage.input);
   if (usage?.output != null) turn.span.setAttribute("gen_ai.usage.output_tokens", usage.output);
   if (usage?.cachedInput != null) turn.span.setAttribute("gen_ai.usage.input_tokens.cached", usage.cachedInput);
-  applyCost(turn.span, usage?.cost, billingMode);
+  applyTurnCost(turn, usage, billingMode);
+  if (isPromptCaptureEnabled()) {
+    if (turn.inputText) turn.span.setAttribute("gen_ai.input.messages", clipSpanText(turn.inputText));
+    if (turn.outputChunks.length > 0) {
+      turn.span.setAttribute("gen_ai.output.messages", clipSpanText(turn.outputChunks.join("")));
+    }
+  }
   if (!ok && !expectedStop) turn.span.setStatus?.({ code: 2, message: "internal_error" });
   turn.span.end();
   turns.delete(key);
@@ -646,14 +723,49 @@ export function annotatePromptBudget(
   }
 }
 
+/** Remember the prompt that was actually sent, for opt-in capture.
+ *  No-op when the flag is off or the turn span was never opened. */
+export function captureTurnPrompt(
+  threadId: string,
+  turnId: string | undefined,
+  text: string | null | undefined,
+): void {
+  try {
+    if (!isPromptCaptureEnabled()) return;
+    const turn = turns.get(turnKey(threadId, turnId));
+    if (!turn) return;
+    const prompt = clean(text);
+    if (prompt) turn.inputText = prompt;
+  } catch {
+    // Telemetry must never take down a turn.
+  }
+}
+
+/** Flatten chat-completions messages for a span attribute.  Tool rows are
+ *  dropped: they can carry paths, payloads, and credentials. */
+export function formatGenAiMessages(
+  messages: ReadonlyArray<{ role?: string; content?: string }>,
+): string {
+  const parts: string[] = [];
+  for (const message of messages) {
+    const role = message.role || "unknown";
+    if (role === "tool") continue;
+    const content = message.content;
+    if (!content) continue;
+    parts.push(`${role}: ${content}`);
+  }
+  return parts.join("\n\n");
+}
+
 /** Map a harness runtime event onto gen_ai spans.  No-op without a sink. */
 export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | null = liveSink()): void {
   if (!sink) return;
   const key = turnKey(event.threadId, event.turnId);
-  const provider = genAiProvider(event.provider);
-  // Resolve once per event so setUser and span attributes share the same snapshot.
   const eventIdentity = identityFor(event.threadId);
   const conversationId = taskConversationId(event);
+  // The model hint comes from identity at turn.started (often unknown yet)
+  // and from the event once a session names one — see session.started below.
+  const provider = genAiProvider(event.provider, eventIdentity?.model);
   applyConversation(sink, conversationId, event.threadId, eventIdentity);
 
   switch (event.type) {
@@ -681,7 +793,17 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       });
       const model = clean(identity?.model);
       if (model) span.setAttribute("gen_ai.request.model", model);
-      turns.set(key, { span, provider, identity, model, tools: new Map() });
+      turns.set(key, {
+        span,
+        provider,
+        identity,
+        model,
+        tools: new Map(),
+        startedAt: Date.now(),
+        conversationId,
+        toolNames: [],
+        outputChunks: [],
+      });
       break;
     }
     case "session.started": {
@@ -689,6 +811,16 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       if (turn && event.model) {
         turn.model = event.model;
         turn.span.setAttribute("gen_ai.request.model", event.model);
+        // A multi-provider engine names its driver kind at turn.started and
+        // its model only now: correct the provider while the span is open.
+        const corrected = genAiProvider(event.provider, event.model);
+        if (corrected !== turn.provider) {
+          turn.provider = corrected;
+          turn.span.setAttribute("gen_ai.provider.name", corrected);
+          turn.span.setAttribute("gen_ai.system", corrected);
+          for (const tool of turn.tools.values()) tool.setAttribute("gen_ai.system", corrected);
+        }
+        for (const tool of turn.tools.values()) tool.setAttribute("gen_ai.request.model", event.model);
       }
       break;
     }
@@ -707,6 +839,7 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       if (!turn) break;
       const toolName = (event.title ?? "tool").split(/\s/)[0] || "tool";
       const toolId = event.itemId ?? toolName;
+      const toolModel = clean(turn.model) ?? clean(turn.identity?.model);
       const toolSpan = sink.startInactiveSpan({
         op: "gen_ai.execute_tool",
         name: `execute_tool ${toolName}`,
@@ -714,15 +847,27 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
           "gen_ai.operation.name": "execute_tool",
           "gen_ai.tool.name": toolName,
           "gen_ai.conversation.id": conversationId,
+          "gen_ai.provider.name": turn.provider,
+          "gen_ai.system": turn.provider,
           "botfleet.room_id": event.threadId,
           "gen_ai.agent.name": agentName(turn.identity, event.provider),
           ...identityAttributes(turn.identity),
         },
       });
+      if (toolModel) toolSpan.setAttribute("gen_ai.request.model", toolModel);
       turn.tools.set(toolId, toolSpan);
+      turn.toolNames.push(toolName);
       break;
     }
     case "item.completed": {
+      if (event.itemType === "assistant_text") {
+        if (isPromptCaptureEnabled()) {
+          const turn = turns.get(key);
+          const text = clean(event.text);
+          if (turn && text) turn.outputChunks.push(text);
+        }
+        break;
+      }
       if (event.itemType !== "tool") break;
       const turn = turns.get(key);
       if (!turn || !event.itemId) break;
@@ -748,12 +893,22 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       turn.tools.delete(event.itemId);
       break;
     }
+    case "content.delta": {
+      if (event.streamKind !== "assistant_text") break;
+      if (!isPromptCaptureEnabled()) break;
+      const turn = turns.get(key);
+      if (!turn) break;
+      const delta = event.delta;
+      if (delta) turn.outputChunks.push(delta);
+      break;
+    }
     case "request.opened": {
       const turn = turns.get(key);
       if (!turn) break;
       const toolName = event.tool || "tool";
       const toolId = event.requestId ?? toolName;
       if (turn.tools.has(toolId)) break;
+      const approvalModel = clean(turn.model) ?? clean(turn.identity?.model);
       const toolSpan = sink.startInactiveSpan({
         op: "gen_ai.execute_tool",
         name: `execute_tool ${toolName}`,
@@ -761,12 +916,16 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
           "gen_ai.operation.name": "execute_tool",
           "gen_ai.tool.name": toolName,
           "gen_ai.conversation.id": conversationId,
+          "gen_ai.provider.name": turn.provider,
+          "gen_ai.system": turn.provider,
           "botfleet.room_id": event.threadId,
           "gen_ai.agent.name": agentName(turn.identity, event.provider),
           ...identityAttributes(turn.identity),
         },
       });
+      if (approvalModel) toolSpan.setAttribute("gen_ai.request.model", approvalModel);
       turn.tools.set(toolId, toolSpan);
+      turn.toolNames.push(toolName);
       break;
     }
     case "request.resolved": {
@@ -947,7 +1106,10 @@ export function recordExecutedTools(
 ): void {
   if (!sink || toolNames.length === 0) return;
   applyConversation(sink, taskId, conversationId);
-  const identityAttrs = identityWithAgentName(identityFor(conversationId));
+  const identity = identityFor(conversationId);
+  const identityAttrs = identityWithAgentName(identity);
+  const model = clean(identity?.model);
+  const provider = model ? genAiProvider("custom", model) : undefined;
   for (const raw of toolNames) {
     const toolName = raw.trim() || "tool";
     const span = sink.startInactiveSpan({
@@ -961,6 +1123,11 @@ export function recordExecutedTools(
         ...identityAttrs,
       },
     });
+    if (provider && provider !== "custom") {
+      span.setAttribute("gen_ai.provider.name", provider);
+      span.setAttribute("gen_ai.system", provider);
+    }
+    if (model) span.setAttribute("gen_ai.request.model", model);
     span.end();
   }
 }
@@ -976,7 +1143,10 @@ export interface ChatSpanContext {
   span: SpanLike;
 }
 
-/** Wrap one OpenAI-compatible chat completion.  Never attach messages.
+/** Wrap one OpenAI-compatible chat completion.
+ *
+ *  Messages stay off the span unless `SENTRY_AI_PROMPT_CAPTURE` is on and
+ *  the caller passed `input` (and/or the result carries `text`).
  *
  *  `conversationId` stays the THREAD id — `openTurnSpan` and `identityFor`
  *  both key off it, since that is what the harness's identity resolver and
@@ -985,8 +1155,8 @@ export interface ChatSpanContext {
  *  and is what actually becomes `gen_ai.conversation.id`; a caller that
  *  omits it falls back to `conversationId`, so this stays per-room instead
  *  of reporting nothing. */
-export async function withChatSpan<T extends { usage?: ChatSpanUsage | null }>(
-  opts: { model: string; conversationId: string; taskId?: string; provider?: string },
+export async function withChatSpan<T extends { usage?: ChatSpanUsage | null; text?: string }>(
+  opts: { model: string; conversationId: string; taskId?: string; provider?: string; input?: string },
   fn: (context: ChatSpanContext) => Promise<T>,
   sink: SentryAiSink | null = liveSink(),
 ): Promise<T> {
@@ -1032,6 +1202,9 @@ export async function withChatSpan<T extends { usage?: ChatSpanUsage | null }>(
       ...identityAttrs,
     },
   });
+  if (isPromptCaptureEnabled() && opts.input) {
+    span.setAttribute("gen_ai.input.messages", clipSpanText(opts.input));
+  }
   try {
     const result = await fn({
       recordUsage: (u) => applyUsageToSpan(span, u),
@@ -1039,6 +1212,10 @@ export async function withChatSpan<T extends { usage?: ChatSpanUsage | null }>(
     });
     if (result?.usage) {
       applyUsageToSpan(span, result.usage);
+    }
+    if (isPromptCaptureEnabled()) {
+      const text = result.text;
+      if (text) span.setAttribute("gen_ai.output.messages", clipSpanText(text));
     }
     return result;
   } catch (error) {

@@ -172,13 +172,15 @@ Reasons not to swap wholesale:
    (`id`, `user`, `status`, `createdAt`, `attributedText`, `attachments`, `reactions`,
    `customData`, …).  That is a standing translation layer, not a drop-in.
 2. **The message list is a wrapped `UITableView`.**  `UIList` is a `UIViewRepresentable`.  It is
-   not SwiftUI `List`/`ScrollView`, so it cannot host BotFleet's `Glass.swift` Liquid Glass
-   surfaces the way native SwiftUI can, and our 615 lines of custom cards (SQL result table, PR
-   diff, thought chamber, skill receipt) would have to live inside UIKit cells.
+   not SwiftUI `List`/`ScrollView`.  Whether a UIKit cell can host BotFleet's `Glass.swift` Liquid
+   Glass is unverified: UIKit can host glass, and the addendum marks that assumption to check
+   before it disqualifies a candidate.  Our 615 lines of custom cards (SQL result table, PR
+   diff, thought chamber, skill receipt) would still have to live inside UIKit cells.
 3. **Dependency risk against our CI.**  It pulls Kingfisher `from: 8.5.0`, `giphy-ios-sdk`
    (exact `2.2.16`), `exyte/MediaPicker`, `exyte/AnchoredPopup`.  Kingfisher ≥ 8.13 requires
-   Swift 6.2 and breaks CI on Xcode 16.4 (lesson 2026-09-28), so a resolver bump silently
-   re-breaks the build.  That needs a pin and a guard.
+   Swift 6.2.  The 2026-09-28 lesson records that this broke CI when CI was Xcode 16.4.  Current
+   CI is Xcode 27.0 with Swift 6.4, as stated in the addendum, so that lesson does not describe
+   today's runner.  A pin is still the right guard against a resolver bump.
 4. **The message menu is a closed generic** (`MessageMenuAction` with `static menuItems(for:)`),
    so our long-press actions need a conformed enum — fine, but more surface.
 
@@ -197,8 +199,9 @@ incremental win against a large rewrite.
 Exyte's `inputViewBuilder` shape (composer, mention autocomplete, predictive action chips,
 command-skill HUD already exist under `ios/App/Composer/`) and its bubble styling as reference
 for `ChatView.swift`, but keep the native SwiftUI scroll container so Glass and the custom cards
-keep working.  A full `ChatView`-replacing swap trades a working Liquid Glass surface for a
-UIKit-backed one — that is a downgrade, not an upgrade.
+keep working.  A full `ChatView`-replacing swap moves that SwiftUI surface onto a UIKit-backed
+list.  Glass alone is not the reason to refuse it, because a UIKit cell hosting Liquid Glass
+is unverified.  The translation layer and the custom cards inside UIKit cells still are.
 
 If the owner wants the full swap anyway, the blockers above are the checklist: model mapping,
 Kingfisher pin + CI guard, Glass re-skin, and a card-rendering plan for the four custom cards.
@@ -217,7 +220,12 @@ No user-visible surface changed.  This lane is the proof, not the migration.
 1. **macOS** — port `ChatView` incrementally onto `ThreadPrimitive`, one region at a time behind
    the existing surface, keeping `ChatMarkdown`, themes, mascot and tool cards.  Start with the
    message list and viewport; leave composer, find bar and thread tabs as-is.
-2. **iOS** — extract Exyte's composer and bubble patterns by reading them; no dependency yet.  Revisit the full swap only if the owner wants it.
+2. **iOS** — ~~extract Exyte's composer and bubble patterns by reading them; no dependency yet~~
+   **Superseded 2026-10-11** by [2026-10-11-ios-chat-library-options.md](2026-10-11-ios-chat-library-options.md).
+   `beautiful-ui-swift` passes the seven criteria as that survey wrote them.  The reason to stay native is
+   that BotFleet already owns `AgentThoughtChamberView` (ios/App/Cards/AgentThoughtChamberView.swift) and
+   the approval card UI in `CardView` inside `ios/App/ChatView.swift`.  The
+   concrete gap is message grouping.
 3. Re-check `@assistant-ui/react-ui` on a later version before ever adopting it.
 
 ## Sources
