@@ -2,10 +2,12 @@
 //
 // One Live Activity per bot that is doing something — needs you, working,
 // or has an unread message — started, updated and ended from the same
-// `updates` the pill reads. Tapping the lock-screen card opens that bot's
-// thread. The stream is foreground-only and there is no push path yet, so
-// the background lifecycle transition requests immediate teardown.  Activities
-// are rebuilt from current state when the app becomes active again.
+// `updates` the pill reads.  Tapping the lock-screen card opens that bot's
+// thread.  The stream is foreground-only and there is no push path yet, so the
+// background lifecycle transition ends the ambient activities.  An activity
+// still waiting on an answer is the exception and stays, because it is the one
+// card that has to be readable and tappable with the phone locked; it is
+// reconciled against current state on the next foreground activation.
 import ActivityKit
 import Combine
 import Foundation
@@ -27,10 +29,6 @@ final class LiveActivityCoordinator {
 
     func attach(to session: Session) {
         self.session = session
-        // Answer from the island: the intent runs in this process.
-        AnswerApprovalIntent.handler = { [weak session] threadId, requestId, choice, isPermission in
-            await session?.answer(threadId: threadId, requestId: requestId, choice: choice, isPermission: isPermission)
-        }
         cancellable = session.$state
             .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
             .sink { [weak self] state in self?.scheduleSync(state) }
@@ -57,6 +55,8 @@ final class LiveActivityCoordinator {
             awaitFreshState()
         case .endAll:
             endAll()
+        case .endAmbient:
+            endAmbientActivities()
         case .resetAndAwaitFreshState:
             endAll()
             awaitFreshState()
@@ -85,6 +85,27 @@ final class LiveActivityCoordinator {
         since.removeAll()
         enqueueActivityWork {
             for activity in Activity<BotActivityAttributes>.activities {
+                await activity.end(nil, dismissalPolicy: .immediate)
+            }
+        }
+    }
+
+    /// Backgrounding ends decoration, not a decision.  An activity still
+    /// waiting on an answer stays on the Lock Screen, because that is the one
+    /// card worth reading with the phone in a pocket; a working bot or an
+    /// unread thread goes, since a local-only stream cannot keep either honest.
+    /// The retained card is reconciled by the first foreground `sync`.
+    private func endAmbientActivities() {
+        resumeRefresh?.cancel()
+        resumeRefresh = nil
+        enqueueActivityWork {
+            for activity in Activity<BotActivityAttributes>.activities {
+                let state = activity.content.state
+                guard !LiveActivityRetention.shouldRetain(
+                    kind: state.kind, requestId: state.requestId, options: state.options
+                ) else { continue }
+                self.lastSent.removeValue(forKey: activity.attributes.botId)
+                self.since.removeValue(forKey: activity.attributes.botId)
                 await activity.end(nil, dismissalPolicy: .immediate)
             }
         }
@@ -141,7 +162,7 @@ final class LiveActivityCoordinator {
             }
 
             // A bot stopping for you is worth an alert: the island pops open
-            // on its own and the lock screen lights up. Working and unread
+            // on its own and the lock screen lights up.  Working and unread
             // are not — unread dismisses itself once the thread is read.
             let alert: AlertConfiguration? = update.kind == .needsYou
                 ? AlertConfiguration(
@@ -187,6 +208,11 @@ final class LiveActivityCoordinator {
 
         // bots that went quiet or whose unread was opened: let the island go
         for activity in Activity<BotActivityAttributes>.activities where !wantedIds.contains(activity.attributes.botId) {
+            #if DEBUG
+            // The `-live-activity-preview` fixture has no bot behind it, so
+            // reconciliation would end the very card it exists to show.
+            if Self.isPreviewFixture(activity) { continue }
+            #endif
             guard lifecycle.permitsUpdates(from: generation) else { return }
             lastSent.removeValue(forKey: activity.attributes.botId)
             since.removeValue(forKey: activity.attributes.botId)
@@ -254,3 +280,82 @@ func liveActivityHeadline(_ name: String, kind: ChatUpdate.Kind) -> String {
     case .toReview: return "\(name) has an update"
     }
 }
+
+/// Answering from the island or the Lock Screen, in a process that may have
+/// no UI at all.
+///
+/// A `LiveActivityIntent` runs in the **app's** process: the system launches
+/// it in the background and performs the intent there.  The SwiftUI scene never
+/// comes on screen for that launch, so anything wired from `onAppear` — which
+/// is where this used to be installed — is `nil` at exactly the moment the
+/// Lock Screen button is tapped, and the tap silently did nothing.
+///
+/// So the route is installed from `CompanionApp.init`, the first code this
+/// process runs, and the session is rebuilt on demand inside the intent
+/// rather than assumed.  The card is dismissed here too: with the app
+/// backgrounded there is no `sync` to redraw it, so the buttons would sit on
+/// the Lock Screen claiming an approval that already landed.
+@MainActor
+enum LiveActivityApprovalRoute {
+    static func install(session: Session) {
+        AnswerApprovalIntent.handler = { [weak session] threadId, requestId, choice, isPermission in
+            guard let session else { return }
+            let sent = await session.answerFromLiveActivity(
+                threadId: threadId,
+                requestId: requestId,
+                choice: choice,
+                isPermission: isPermission
+            )
+            guard sent else { return }
+            await dismissCard(threadId: threadId, requestId: requestId)
+        }
+    }
+
+    /// End only the card that was just answered, never every activity: the
+    /// Lock Screen can be showing several bots at once and the others are
+    /// still true.
+    static func dismissCard(threadId: String, requestId: String) async {
+        let answered = Activity<BotActivityAttributes>.activities.first {
+            $0.attributes.threadId == threadId && $0.content.state.requestId == requestId
+        }
+        await answered?.end(nil, dismissalPolicy: .immediate)
+    }
+}
+
+#if DEBUG
+extension LiveActivityCoordinator {
+    /// A real ActivityKit request with fixture content, so the Lock Screen card
+    /// and its buttons can be seen on a simulator that has no paired harness.
+    /// DEBUG only, and only from the `-live-activity-preview` launch argument.
+    static let previewBotId = "preview-bot"
+
+    static func isPreviewFixture(_ activity: Activity<BotActivityAttributes>) -> Bool {
+        activity.attributes.botId == previewBotId
+    }
+
+    static func startPreviewActivity() {
+        let content = BotActivityAttributes.ContentState(
+            face: BotState.thinking.rawValue,
+            kind: "needsYou",
+            headline: "Forge needs you",
+            line: "Run `rm -rf build/cache` in the BotFleet repo?",
+            requestId: "preview-request",
+            options: ["Allow", "Deny"],
+            isPermission: true,
+            since: Date()
+        )
+        Task.detached(priority: .userInitiated) {
+            try? Activity.request(
+                attributes: BotActivityAttributes(
+                    botId: previewBotId,
+                    threadId: "preview-thread",
+                    name: "Forge",
+                    color: "coral"
+                ),
+                content: .init(state: content, staleDate: nil),
+                pushType: nil
+            )
+        }
+    }
+}
+#endif

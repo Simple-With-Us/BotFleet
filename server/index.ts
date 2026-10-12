@@ -155,6 +155,7 @@ import {
   selectionForFallbackPick,
   shouldReplayPersistedStarter,
   bootRecoveryTurnOpts,
+  continuedTurnToolPolicy,
   sliceIsShortProviderError,
   turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
@@ -493,6 +494,7 @@ import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
 import { fleetSeatPromptPart } from "./seat-prompt.ts";
 import { launchEnvironment, launchIdentityFor } from "./launch-identity.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
@@ -5339,6 +5341,8 @@ function drainRoomQueue() {
         undefined,
         undefined,
         round.turnSelection,
+        // A queued card continuation comes back to the routine's allowlist.
+        continuedTurnToolPolicy(store.activePath(round.threadId)),
       ).catch((error) => {
         store.appendMessage(round.threadId, {
           role: "bot",
@@ -5644,6 +5648,10 @@ async function startTurn(
      * `server/bot-stop-policy.ts`.
      */
     personInitiated?: boolean;
+    /** A routine's command allowlist (server/tool-policy.ts).  Stored on the
+     *  turn's prompt message, so every re-dispatch of that message (a model
+     *  fail-over, a credential card, a boot resume) keeps it. */
+    toolPolicy?: ToolPolicy;
   },
 ) {
   if (runtimeQuiescing) {
@@ -5798,6 +5806,19 @@ async function startTurn(
       { status: 409, pickUnusable: true },
     );
   }
+  // A routine's command allowlist, fresh from the routine or carried on the
+  // prompt message a re-dispatch replays.  Only a driver that holds a turn to
+  // it (or refuses it) may receive the turn;  any other engine would run the
+  // routine with everything the bot can do.
+  const turnToolPolicy = opts?.toolPolicy ?? opts?.userMessage?.toolPolicy;
+  if (turnToolPolicy && instance.adapter.capabilities.toolPolicy !== true) {
+    throw Object.assign(
+      new Error(
+        `This routine runs under a command allowlist, and the ${instance.displayName || instance.driverKind} engine cannot be held to one.  Run it on a bot whose engine is Grok Build.`,
+      ),
+      { status: 409, pickUnusable: true },
+    );
+  }
   const workspaceError = taskWorkspaceExecutionError(task.workspaceContext, instance.driverKind, opts?.runOn, task.cwd);
   if (workspaceError) throw Object.assign(new Error(workspaceError), { status: 409 });
   const instanceId = instance.instanceId;
@@ -5884,6 +5905,7 @@ async function startTurn(
           automationSource: opts?.automationSource,
           from: opts?.from,
           comm: opts?.comm,
+          toolPolicy: turnToolPolicy,
         });
   }
 
@@ -6614,6 +6636,7 @@ async function startTurn(
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
         launchIdentity: launchIdentityFor(bot, threadId),
+        toolPolicy: turnToolPolicy,
       };
       // What the harness put in front of the model that the person did not
       // type: the bot's memory, the skills and playbooks this message
@@ -6883,6 +6906,7 @@ routines = new RoutineManager({
       automationSource: triggerSource,
       onDispatchError,
       ephemeralDispatch: turnOpts?.ephemeralDispatch,
+      toolPolicy: turnOpts?.toolPolicy,
     }),
   interruptTurn: async (botId, threadId, runOn) => {
     const bot = store.bot(botId);
@@ -8112,6 +8136,11 @@ async function runGroupMemberTurn(
   onDispatchError?: (message: string) => void,
   isCancelled?: () => boolean,
   turnSelection?: ModelSelection,
+  // A routine's command allowlist, threaded through so a connector/secret
+  // card resumption in a group keeps it (the prompt message in the active
+  // path carries it, but `runGroupMemberTurn` does not call `startTurn` —
+  // it has its own dispatch path and its own `sendTurn` call).
+  toolPolicy?: ToolPolicy,
 ): Promise<boolean> {
   if (isCancelled?.()) return false;
   const group = store.group(groupId);
@@ -8182,6 +8211,20 @@ async function runGroupMemberTurn(
   const userName = cfg.profile?.name?.trim() || "User";
   if (!instance) {
     const message = `${bot.name}'s model is unavailable`;
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: `error: ${message}`, ok: false },
+    });
+    onDispatchError?.(message);
+    return true;
+  }
+  // A routine's command allowlist must hold the turn, the same fail-closed
+  // check the 1:1 dispatch makes.  An engine whose capabilities lack
+  // `toolPolicy` would run the routine with everything the bot can do.
+  if (toolPolicy && instance.adapter.capabilities.toolPolicy !== true) {
+    const message = `This routine runs under a command allowlist, and the ${instance.displayName || instance.driverKind} engine cannot be held to one.  Run it on a bot whose engine is Grok Build.`;
     store.appendMessage(threadId, {
       role: "bot",
       kind: "activity",
@@ -8764,6 +8807,8 @@ async function runGroupMemberTurn(
         holdForReview: holdTurnForReview(bot, instance) || undefined,
         launchIdentity: launchIdentityFor(bot, threadId),
         ...memberTurnSelection(selection),
+        // the rest of the turn the card paused, held to that turn's allowlist
+        toolPolicy,
       });
     })
       .then((started) => {
@@ -8851,6 +8896,7 @@ async function runGroupMemberTurn(
         onDispatchError,
         isCancelled,
         pendingFallback.selection,
+        toolPolicy,
       );
     }
   }
@@ -8863,7 +8909,7 @@ async function runGroupMemberTurn(
     for (const next of roomResponders(replyText, members, { kind: "mentions" })) {
       if (isCancelled?.()) return false;
       if (spoken.has(next.id)) continue;
-      if (!(await runGroupMemberTurn(groupId, threadId, next.id, hop + 1, spoken, undefined, undefined, isCancelled))) {
+      if (!(await runGroupMemberTurn(groupId, threadId, next.id, hop + 1, spoken, undefined, undefined, isCancelled, undefined, toolPolicy))) {
         return false;
       }
     }
@@ -9087,6 +9133,9 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
   }
   if (owner.group) {
     const groupId = owner.group.id;
+    // The continuation is held to the routine's allowlist, the same way the
+    // 1:1 dispatcher does (lines below).  Compute it once before any await.
+    const toolPolicy = continuedTurnToolPolicy(store.activePath(entry.threadId));
     const operation = beginGroupTurnOperation(groupId, entry.threadId);
     const previous = groupQueues.get(groupId) ?? Promise.resolve();
     const next = previous.then(async () => {
@@ -9106,6 +9155,8 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
         prompt,
         (message) => markConnectorResumeFailed(entry.threadId, entry.resumeKey, message),
         () => operation.cancelled,
+        undefined,
+        toolPolicy,
       );
     });
     const tracked = next.finally(() => finishGroupTurnOperation(groupId, operation));
@@ -9120,6 +9171,8 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
   void startTurn(entry.botId, prompt, {
     threadId: entry.threadId,
     cardContinuation: true,
+    // the rest of the turn the card paused, held to that turn's allowlist
+    toolPolicy: continuedTurnToolPolicy(store.activePath(entry.threadId)),
     onDispatchError: (message) => markConnectorResumeFailed(entry.threadId, entry.resumeKey, message),
   }).catch((error) => {
     // A stopped bot is a decision, not a fault: settle the card quietly rather
@@ -9195,6 +9248,9 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
   }
   if (owner.group) {
     const groupId = owner.group.id;
+    // The continuation is held to the routine's allowlist, the same way the
+    // 1:1 dispatcher does (lines below).  Compute it once before any await.
+    const toolPolicy = continuedTurnToolPolicy(store.activePath(entry.threadId));
     const operation = beginGroupTurnOperation(groupId, entry.threadId);
     const previous = groupQueues.get(groupId) ?? Promise.resolve();
     const next = previous.then(async () => {
@@ -9214,6 +9270,8 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
         prompt,
         (message) => markSecretResumeFailed(entry.threadId, entry.messageId, message),
         () => operation.cancelled,
+        undefined,
+        toolPolicy,
       );
     });
     const tracked = next.finally(() => finishGroupTurnOperation(groupId, operation));
@@ -9232,6 +9290,8 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
   void startTurn(entry.botId, prompt, {
     threadId: entry.threadId,
     cardContinuation: true,
+    // the rest of the turn the card paused, held to that turn's allowlist
+    toolPolicy: continuedTurnToolPolicy(store.activePath(entry.threadId)),
     onDispatchError: (message) => markSecretResumeFailed(entry.threadId, entry.messageId, message),
   }).catch((error) => {
     // See the connector resume above: a stopped bot settles the card instead

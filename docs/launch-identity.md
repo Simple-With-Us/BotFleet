@@ -40,13 +40,13 @@ Two consequences of the switch.  With `BOTFLEET_FLEET_SEAT_PROMPTS` off, a launc
 
 ## Which Bots Get a Seat
 
-The ten role seats are `BF-BUILDER`, `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER` and `BF-PUBLISHER`.  A bot's role comes from, in order:
+The eleven role seats are `BF-BUILDER`, `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-DIRECTOR`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER` and `BF-PUBLISHER`.  A bot's role comes from, in order:
 
 1. An `@fleet-seat: <role>` line in the bot's description.
 2. A name with a `BF-` or `BF ` prefix (`BF-Plumber`).
 3. A name that is exactly a role, any case (`Plumber`).
 
-A name that only contains a role word (`Plumber 2`), and `BF-Director`, name no role.  This is by name, as the seat prompt has always resolved it.  The Zulip binding (`zulip.bots`, by bot id) is a separate setting:  keep the two in agreement, because the seat in the environment and the bot a native post is sent as come from different places.
+A name that only contains a role word (`Plumber 2`) names no role.  Director has been a role since 2026-10-11 (owner):  it has its own Zulip bot, `bf-director-bot@`, so `BF-Director` and `Director` resolve to `BF-DIRECTOR` like any other role.  This is by name, as the seat prompt has always resolved it.  The Zulip binding (`zulip.bots`, by bot id) is a separate setting:  keep the two in agreement, because the seat in the environment and the bot a native post is sent as come from different places.
 
 ## The Switch
 

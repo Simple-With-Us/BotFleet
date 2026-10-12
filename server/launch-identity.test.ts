@@ -13,13 +13,14 @@ import {
 } from "./launch-identity.ts";
 import { zulipTag } from "./zulip/format.ts";
 
-describe("the ten role seats", () => {
-  it("names exactly the ten BotFleet roles, each with an upper-case BF seat", () => {
+describe("the eleven role seats", () => {
+  it("names exactly the eleven BotFleet roles, each with an upper-case BF seat", () => {
     expect(BOTFLEET_ROLES.map((role) => role.seat)).toEqual([
       "BF-BUILDER",
       "BF-COMPILER",
       "BF-DEPLOYER",
       "BF-DESIGNER",
+      "BF-DIRECTOR",
       "BF-FIXER",
       "BF-HOUSEKEEPER",
       "BF-MONITOR",
@@ -56,14 +57,14 @@ describe("resolveBotfleetRole", () => {
     expect(resolveBotfleetRole({ name: "Builder", description: "@fleet-seat: fixer" })?.seat).toBe("BF-FIXER");
   });
 
-  it("resolves all ten roles by their bare names", () => {
+  it("resolves all eleven roles by their bare names", () => {
     for (const role of BOTFLEET_ROLES) {
       expect(resolveBotfleetRole({ name: role.name })?.seat, role.name).toBe(role.seat);
     }
   });
 
   it("gives a bot that names no role no seat", () => {
-    for (const name of ["Kiwi", "Plumber 2", "The Plumber", "BF-Director", "Director", "BF-Claude", "Claude", "Codex", "", "BF-"]) {
+    for (const name of ["Kiwi", "Plumber 2", "The Plumber", "Director 2", "BF-Claude", "Claude", "Codex", "", "BF-"]) {
       expect(resolveBotfleetRole({ name }), name).toBeNull();
     }
     expect(resolveBotfleetRole({ name: "Kiwi", description: "@fleet-seat: claude" })).toBeNull();
