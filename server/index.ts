@@ -4572,11 +4572,15 @@ bus.subscribe((event: RuntimeEvent) => {
         // The request id travels with the frame so a phone can answer THIS
         // card from a lock screen rather than looking for whatever is
         // pending on the thread — which is the wrong card as soon as two
-        // are open at once.
+        // are open at once.  The card's own choices travel with it for the
+        // same reason: a phone that shows this as a Live Activity has no
+        // transcript to re-read, so it can only offer the verbs it is given.
         notify(
           buildNotification(permission ? "approval" : "question", asker, event.threadId, event.summary, {
             requestId: event.requestId,
             tool: event.tool,
+            options: card.options,
+            isPermission: permission,
             snoozed: threadAlertsSnoozed(asker.id, event.threadId),
           }),
         );
