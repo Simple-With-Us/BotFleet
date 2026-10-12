@@ -337,8 +337,20 @@ export function ProviderMark({
       // apart without inventing a brand mark we do not hold art for.
       const base = driverKind.replace(/Agent$/i, "").trim();
       const letters = (base.length > 4 ? base.slice(0, 2) : base.slice(0, 1)) || "?";
+      // An explicit square, NOT `size-full`.  Every other mark is an SVG with
+      // a real width and height, so the monogram is the only one whose box
+      // comes from CSS — and a percentage width resolves against the nearest
+      // sized ancestor.  In a wide flex row (the Engines settings list) that
+      // ancestor is the whole row, so the monogram stretched across it and
+      // pushed the engine name to the far right:  Muse Code's row rendered as
+      // a floating "M" with its name three hundred pixels away, because its
+      // driver kind had no registered mark.  Any future unregistered driver
+      // would have hit the same floor.
       return (
-        <span className="flex size-full items-center justify-center text-[9px] font-semibold tracking-tight text-mark">
+        <span
+          className="flex items-center justify-center text-[9px] font-semibold tracking-tight text-mark"
+          style={{ width: size, height: size }}
+        >
           {letters.toUpperCase()}
         </span>
       );

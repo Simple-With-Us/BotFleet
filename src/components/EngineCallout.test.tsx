@@ -38,8 +38,21 @@ describe("EngineCallout", () => {
     for (const id of ENGINE_DISPLAY_ORDER) {
       const entry = ENGINE_CAPABILITIES[id];
       const html = renderToStaticMarkup(createElement(EngineCallout, { engineId: id }));
-      expect(html).toContain("Why This Engine?");
+      // The trigger names its engine.  It used to read "Why This Engine?" in a
+      // full-width bold bar, which is the shape of a section heading — and it
+      // sits directly under an engine name, so it read as the title of the
+      // block of engines below it rather than a question about this one.
       const decoded = decodeHtmlEntities(html);
+      // And it is sized to its label, not stretched across the row.  Checked as an
+      // exact class prefix: a bare `not.toContain("w-full")` would also match
+      // inside `max-w-full` and pass for the wrong reason.
+      expect(html).toContain("inline-flex w-auto max-w-full");
+      // The label is split across a <strong>, so compare the text, not markup.
+      const label = decodeHtmlEntities(html.replace(/<[^>]+>/g, " "))
+        .replace(/\s+/g, " ")
+        .trim();
+      expect(label).toContain(`Why ${entry.displayName} ?`);
+      expect(label).not.toContain("Why This Engine?");
       expect(decoded).not.toContain(entry.whyThisEngine.headline);
       // Collapsed: one-line summary — no prose paragraphs, no pricing line.
       // Avoid /<p/ — Lucide's <path> would falsely match.

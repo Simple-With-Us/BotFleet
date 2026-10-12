@@ -73,7 +73,11 @@ function EngineCalloutDisclosure(props: {
     <div
       className={
         className ??
-        "mt-2 rounded-xl border border-hairline/30 bg-inset/30 px-3 py-2 text-[12.5px] leading-relaxed text-ink-secondary"
+        // No card, no border, no background while collapsed:  a full-width
+        // bordered bar under an engine name is a section heading, which is
+        // what this was mistaken for.  When it opens, the detail below it
+        // carries its own panel, so the trigger does not need one.
+        "mt-1.5 text-[12.5px] leading-relaxed text-ink-secondary"
       }
     >
       <button
@@ -83,19 +87,28 @@ function EngineCalloutDisclosure(props: {
         // Only point at the detail region while it is rendered; a collapsed
         // callout has no element with this id.
         aria-controls={open ? detailId : undefined}
-        className="flex w-full items-center gap-1.5 rounded text-left text-ink hover:text-ink"
+        // A control, not a heading.  This bar spans the whole row width with a
+        // bold label and a chevron, which is exactly the shape of a section
+        // heading — and it sits directly under an engine name, so it read as
+        // the title of the block of engines below it.  Naming the engine turns
+        // it back into a question about that engine ("Why Clutch?"), and
+        // shrinking it to an inline pill stops it stretching across the row.
+        className="inline-flex w-auto max-w-full items-center gap-1 rounded-md px-1.5 py-0.5 text-left text-[11.5px] text-ink-secondary transition-colors hover:bg-raised/50 hover:text-ink"
       >
-        <span className="min-w-0 flex-1 truncate">
-          <strong>Why This Engine?</strong>
+        <span className="min-w-0 truncate">
+          Why <strong className="font-medium text-ink">{entry.displayName}</strong>?
         </span>
         <ChevronDown
-          size={13}
-          className={cn("shrink-0 text-ink-secondary transition-transform", open && "rotate-180")}
+          size={12}
+          className={cn("shrink-0 transition-transform", open && "rotate-180")}
           aria-hidden
         />
       </button>
       {open && (
-        <div id={detailId} className="mt-1.5 max-h-40 overflow-y-auto">
+        <div
+          id={detailId}
+          className="mt-1.5 max-h-40 overflow-y-auto rounded-lg border border-hairline/30 bg-inset/30 px-3 py-2"
+        >
           <p className="mb-1.5 text-ink">{entry.whyThisEngine.headline}</p>
           {entry.whyThisEngine.prose.map((line, index) => (
             <p key={index} className="mb-1 last:mb-0">
