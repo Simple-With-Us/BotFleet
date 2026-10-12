@@ -11,7 +11,9 @@ import { join } from "node:path";
  * the desktop-capabilities and speech stacks; the guard itself is a single unconditional branch,
  * so pinning its shape and its position relative to the hooks is what actually protects it.
  */
-const SRC = readFileSync(join(__dirname, "CallView.tsx"), "utf8");
+// Normalised to LF: a Windows checkout has CRLF, and these source-shape
+// assertions embed `\n`, which would never match `,\r\n` in the raw file.
+const SRC = readFileSync(join(__dirname, "CallView.tsx"), "utf8").replace(/\r\n/g, "\n");
 
 describe("CallTargetButton visibility", () => {
   it("returns null when no voice provider is configured", () => {
