@@ -55,6 +55,10 @@ export interface ProxyOptions {
   connected?: (deviceId: string, disconnect: () => void) => () => void;
   /** Store an APNs device token for closed-app wake. */
   setPushToken?: (deviceId: string, token: string) => boolean;
+  /** Store the push-to-start Live Activity token.  Separate from the one
+   * above because the phone registers them separately and either can be
+   * reissued without the other. */
+  setLiveActivityToken?: (deviceId: string, token: string) => boolean;
   /** How the closed-app wake sender is doing.  Counts, timestamps, and the
    * last status Apple returned — nothing derived from the signing key. */
   pushHealth?: () => PushSenderHealth;
@@ -326,6 +330,25 @@ export function createProxyHandler(options: ProxyOptions) {
           const push = String(body.token ?? "");
           if (!options.setPushToken?.(deviceId, push)) {
             return sendJson(res, 400, { error: "that push token is not usable" });
+          }
+          return sendJson(res, 200, { ok: true });
+        },
+        (error: Error) => sendJson(res, 400, { error: error.message }),
+      );
+      return;
+    }
+
+    if (method === "POST" && path === "/api/companion/live-activity-token") {
+      const device = options.authenticate(token);
+      const deviceId = device?.id;
+      if (!deviceId) {
+        return sendJson(res, 401, { error: "pair this device from Phone settings in BotFleet on your computer" });
+      }
+      readJson(req).then(
+        (body) => {
+          const live = String(body.token ?? "");
+          if (!options.setLiveActivityToken?.(deviceId, live)) {
+            return sendJson(res, 400, { error: "that Live Activity token is not usable" });
           }
           return sendJson(res, 200, { ok: true });
         },

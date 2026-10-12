@@ -48,6 +48,7 @@ describe("what the app may do", () => {
     ["GET", "/api/instances"],
     ["GET", "/api/companion/endpoints"],
     ["POST", "/api/companion/push-token"],
+    ["POST", "/api/companion/live-activity-token"],
     ["GET", "/api/bots"],
     ["POST", "/api/bots"],
     ["POST", "/api/bots/bot_123/messages"],
@@ -438,6 +439,14 @@ describe("what it may not", () => {
     expect(ask("POST", "/api/companion/push-token", false)?.status).toBe(401);
     expect(ask("POST", "/api/companion/push-token")).toBeNull();
     expect(ask("GET", "/api/companion/push-token")?.status).toBe(403);
+  });
+
+  it("lets a paired phone register its Live Activity token, and only paired", () => {
+    expect(ask("POST", "/api/companion/live-activity-token", false)?.status).toBe(401);
+    expect(ask("POST", "/api/companion/live-activity-token")).toBeNull();
+    expect(ask("GET", "/api/companion/live-activity-token")?.status).toBe(403);
+    // Not a family: no sibling door opens beside it.
+    expect(ask("POST", "/api/companion/live-activity-token/extra")?.status).toBe(403);
   });
 
   it("describes only refused routine operations as computer-only", () => {

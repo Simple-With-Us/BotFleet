@@ -249,6 +249,10 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // locally; it never becomes a newly exposed harness route.
   { method: "GET", path: /^\/api\/companion\/endpoints$/ },
   { method: "POST", path: /^\/api\/companion\/push-token$/ },
+  // The push-to-start token for the Live Activity: a second APNs token the
+  // phone registers on its own channel, so it gets its own door rather than
+  // a second field on an existing one.
+  { method: "POST", path: /^\/api\/companion\/live-activity-token$/ },
   // Whether closed-app wake is actually working, so the phone can say so in
   // Settings instead of leaving a silent push path looking healthy.  Counts
   // and Apple's own status strings only — never anything about the key.

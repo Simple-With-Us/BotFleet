@@ -1252,6 +1252,55 @@ describe("APNs token registration", () => {
       await new Promise<void>((resolve) => pushServer.close(() => resolve()));
     }
   });
+
+  it("stores a Live Activity token locally, beside the alert token", async () => {
+    const stored: string[] = [];
+    const liveServer = createServer(
+      createProxyHandler({
+        harnessPort: 1,
+        authenticate: (token) => (token === TOKEN ? { id: "d1", cloudDesktopAccess: false } : null),
+        redeem: () => ({ error: "not used" }),
+        serverName: () => "Test computer",
+        setLiveActivityToken: (id, token) => {
+          if (!/^[0-9a-f]{64,}$/.test(token)) return false;
+          stored.push(`${id}:${token}`);
+          return true;
+        },
+      }),
+    );
+    await new Promise<void>((resolve) => liveServer.listen(0, "127.0.0.1", resolve));
+    const port = (liveServer.address() as { port: number }).port;
+    const hex = "cd".repeat(32);
+    try {
+      const denied = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: hex }),
+      });
+      expect(denied.status).toBe(401);
+
+      const unusable = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ token: "not-hex" }),
+      });
+      expect(unusable.status).toBe(400);
+
+      const ok = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ token: hex }),
+      });
+      expect(ok.status).toBe(200);
+      expect(await ok.json()).toEqual({ ok: true });
+      expect(stored).toEqual([`d1:${hex}`]);
+    } finally {
+      await new Promise<void>((resolve) => liveServer.close(() => resolve()));
+    }
+  });
 });
 
 // The whole loop, with the real registry rather than a stub: open a pairing
