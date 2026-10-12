@@ -16,7 +16,7 @@
 //
 // `main.tsx` stamps the skin before the first paint, exactly as the app does,
 // so a screenshot cannot catch a frame of the wrong palette.
-import { applyCustomTheme, applySkin, type CustomThemeConfig, type SkinId } from "@/lib/skins";
+import { applyCustomTheme, applySkin, SKIN_IDS, type CustomThemeConfig, type SkinId } from "@/lib/skins";
 import { LOCAL_MODELS_DRIVER_KIND } from "@/lib/local-models";
 import { ProviderMark } from "./ProviderIcons";
 
@@ -57,7 +57,10 @@ function applyRequestedSkin(): string {
     applyCustomTheme(HOSTILE_PALETTE);
     return "custom";
   }
-  const skin = (query.get("skin") ?? "atelier") as SkinId;
+  // The fixture is driven by a URL somebody types by hand, so `skin` arrives unvalidated.
+  // Look it up in the real list rather than asserting it is one:  a typo then paints the
+  // default skin instead of reaching `applySkin` as a value that is not a skin.
+  const skin: SkinId = SKIN_IDS.find((id) => id === query.get("skin")) ?? "atelier";
   applySkin(skin);
   return skin;
 }
