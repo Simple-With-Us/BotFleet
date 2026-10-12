@@ -89,7 +89,12 @@ describe("OpenCode catalog", () => {
     expect(runModels).toHaveBeenCalledOnce();
   });
 
-  it("asks a CLI that refuses --verbose anyway, instead of reporting nothing", async () => {
+  // A `#!/bin/sh` fixture with a mode bit:  Windows cannot execute one at
+  // all, so the probe's flag handling is asserted on the platforms that run
+  // this driver's real CLIs.  Same guard as the sibling ACP suites.
+  it.skipIf(process.platform === "win32")(
+    "asks a CLI that refuses --verbose anyway, instead of reporting nothing",
+    async () => {
     // opencode v2.0.26 answers `Unrecognized flag: --verbose` and exits.  The
     // probe used to send only that form, so the rejection fell through to the
     // empty fallback catalog and the engine read as having no models at all —
@@ -120,7 +125,9 @@ describe("OpenCode catalog", () => {
     }
   });
 
-  it("records why the catalog is empty when the CLI lists nothing", async () => {
+  it.skipIf(process.platform === "win32")(
+    "records why the catalog is empty when the CLI lists nothing",
+    async () => {
     // An engine with no models and no reason reads as broken.  It is not: the
     // CLI answered and had nothing to list, and the person needs that sentence.
     const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-emptymodels-"));
