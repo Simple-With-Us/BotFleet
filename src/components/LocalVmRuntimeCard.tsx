@@ -13,7 +13,7 @@
 // available".  Keeping them split lets a future ops change to the
 // runtime not drag the settings UX with it, and vice versa.
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Check, Circle, ExternalLink, Loader2, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
+import { AlertTriangle, Check, Circle, Loader2, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
 import { api, useStore, type ConfigStatus } from "@/state/store";
 import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
@@ -54,7 +54,6 @@ interface Status {
   container_name: string;
   workspace_path: string;
   workspace_guest_path: string;
-  viewer_url: string;
   idle_timeout_ms: number;
   max_instances: number;
   commands: {
@@ -65,7 +64,6 @@ interface Status {
     start: string | null;
     stop: string | null;
     remove: string | null;
-    view: string;
   };
 }
 
@@ -311,16 +309,6 @@ export function LocalVmRuntimeCard() {
           >
             <RefreshCw size={12} /> Re-check
           </button>
-          {ready && !perBot && (
-            <a
-              href={status?.viewer_url ?? c?.view}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink hover:bg-control"
-            >
-              <ExternalLink size={12} /> Watch Screen
-            </a>
-          )}
         </div>
         {statusError && (
           <div className="mt-3">
