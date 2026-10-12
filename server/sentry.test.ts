@@ -77,8 +77,8 @@ describe("server Sentry init", () => {
     expect(sentryReleaseName({}, "0".repeat(40))).toBeUndefined();
     expect(sentryReleaseName({ GITHUB_SHA: "abc1234" })).toBe("abc1234");
     expect(sentryReleaseName({ SENTRY_RELEASE: "deadbeef", GITHUB_SHA: "abc1234" })).toBe("deadbeef");
-    expect(sentryReleaseName({ VERCEL_GIT_COMMIT_SHA: "vercel12abcdef" })).toBe("vercel12abcdef");
-    expect(sentryReleaseName({ GITHUB_SHA: "abc1234", VERCEL_GIT_COMMIT_SHA: "vercel12abcdef" })).toBe("abc1234");
+    expect(sentryReleaseName({ VERCEL_GIT_COMMIT_SHA: "abcdef1234567" })).toBe("abcdef1234567");
+    expect(sentryReleaseName({ GITHUB_SHA: "abc1234", VERCEL_GIT_COMMIT_SHA: "abcdef1234567" })).toBe("abc1234");
     expect(sentryReleaseName({}, "c".repeat(40))).toBe("c".repeat(40));
   });
 
