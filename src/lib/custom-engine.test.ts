@@ -232,7 +232,14 @@ describe("the Add Engine form's driver choice", () => {
 
     const base = { name: "Second MiniMax", endpoint: "https://api.minimaxi.com/v1", key: SENTINEL_ADD_KEY };
     expect(validateAddEngine({ ...base, driver: "minimax", models: [] })).toBeNull();
-    expect(validateAddEngine({ ...base, driver: "openai-compat", models: [] })).toContain("model ID is required");
+    // An OpenAI-compatible vendor publishes its own list at `{url}/models`, and
+    // the driver already asks for it — naming models by hand is how that probe
+    // used to be switched off.  Blank is allowed, and resolved by discovery.
+    expect(validateAddEngine({ ...base, driver: "openai-compat", models: [] })).toBeNull();
+    // Too many is still refused: the route stores at most 15 per connection.
+    expect(validateAddEngine({ ...base, driver: "openai-compat", models: Array.from({ length: 16 }, (_, i) => `m${i}`) })).toBe(
+      "At most 15 model IDs can be configured",
+    );
     expect(validateAddEngine({ ...base, driver: "minimax", models: [] , name: "" })).toBe("Engine name is required");
     expect(validateAddEngine({ ...base, driver: "minimax", models: [], endpoint: " " })).toBe("Endpoint URL is required");
     // A paid hosted API is given no workspace credential for a connection the
