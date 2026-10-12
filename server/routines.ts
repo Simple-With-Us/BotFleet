@@ -24,6 +24,7 @@ import { botAutomationsPausedMessage } from "./bot-stop-policy.ts";
 import { BOT_OFF_SKIPPED } from "../shared/bot-power.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
+import { sanitizeToolPolicy, type ToolPolicy } from "./tool-policy.ts";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
@@ -116,6 +117,9 @@ export interface Routine {
   /** When true, each wake runs on a fresh thread with no transcript replay;
    *  the owner automation thread receives one summary message. */
   oneShotWake?: boolean;
+  /** The commands and files this routine's turns may touch
+   *  (server/tool-policy.ts).  Absent: an ordinary routine turn. */
+  toolPolicy?: ToolPolicy;
   nextRunAt: number | null;
   createdAt: number;
   updatedAt: number;
@@ -132,6 +136,10 @@ export interface RoutineRun {
    * routines.json. */
   prompt?: string;
   durationMinutes?: number;
+  /** Snapshot of the routine's command allowlist as queued, kept beside the
+   *  prompt snapshot so a run whose routine was deleted or edited meanwhile
+   *  can never dispatch its prompt without the allowlist it was queued with. */
+  toolPolicy?: ToolPolicy;
   botId: string;
   runOn: RoutineRunOn;
   scheduledFor: number;
@@ -216,6 +224,8 @@ export interface RoutineInput {
   scheduleTimeZoneSource?: "stored" | "host";
   durationMinutes?: number;
   oneShotWake?: boolean;
+  /** A command allowlist, or null to remove one (update only). */
+  toolPolicy?: JsonValue | ToolPolicy | null;
 }
 
 interface RoutineFile {
@@ -347,7 +357,7 @@ export interface RoutineManagerOptions {
     runOn: RoutineRunOn,
     triggerSource: RoutineRunTrigger,
     onDispatchError: (message: string) => void,
-    turnOpts?: { ephemeralDispatch?: boolean },
+    turnOpts?: { ephemeralDispatch?: boolean; toolPolicy?: ToolPolicy },
   ) => Promise<void>;
   interruptTurn?: (botId: string, threadId: string, runOn: RoutineRunOn) => Promise<void>;
   onRunFailed?: (run: RoutineRun) => void;
@@ -461,6 +471,10 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
   const schedule = input.schedule.type === "daily" && input.scheduleTimeZoneSource === "host"
     ? { type: "daily" as const, time: input.schedule.time, weekdays: input.schedule.weekdays }
     : input.schedule;
+  const toolPolicy = sanitizeToolPolicy(input.toolPolicy);
+  // Only a run on the bot's own engine can be held to an allowlist:  a cloud
+  // or Maus run executes somewhere BotFleet does not answer the engine's asks.
+  if (toolPolicy && runOn !== "bot") throw new Error("A routine with a command allowlist must run on the bot");
   return {
     name,
     prompt,
@@ -470,6 +484,8 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
     schedule: cleanSchedule(schedule),
     durationMinutes: Math.min(240, Math.max(15, Math.round(Number(input.durationMinutes) || 30))),
     ...(input.oneShotWake === true ? { oneShotWake: true } : {}),
+    // undefined when there is none:  update() deletes the key then
+    toolPolicy,
   };
 }
 
@@ -805,6 +821,8 @@ export class RoutineManager {
       schedule: nextSchedule,
       durationMinutes: patch.durationMinutes ?? routine.durationMinutes,
       oneShotWake: patch.oneShotWake ?? routine.oneShotWake,
+      // Omitted keeps the stored allowlist;  an explicit null removes it.
+      toolPolicy: patch.toolPolicy === undefined ? routine.toolPolicy : patch.toolPolicy,
     });
     if (this.options.botState(clean.botId) === "missing") throw new Error("That Bot no longer exists");
     const cancelledRuns: RoutineRun[] = [];
@@ -816,6 +834,7 @@ export class RoutineManager {
         updatedAt: Math.max(now, routine.updatedAt + 1),
       });
       if (patch.oneShotWake === false) delete routine.oneShotWake;
+      if (!clean.toolPolicy) delete routine.toolPolicy;
       if (patch.enabled === false) {
         for (const run of this.runs) {
           if (run.routineId !== routine.id || run.status !== "queued") continue;
@@ -1518,12 +1537,24 @@ export class RoutineManager {
         }
         // Combined deliveries stay pending until this owning turn settles.
         // A dispatch is not evidence that any delivery completed successfully.
+        //
+        // Only runs held to the same allowlist fold together:  a delivery
+        // queued after the owner narrowed a routine's allowlist must never
+        // ride on an older, broader one.  The rest stay queued and dispatch
+        // on a later tick under their own.
+        const routinePolicy = this.routines.find((r) => r.id === run.routineId)?.toolPolicy;
+        const policyKey = (candidate: RoutineRun) => {
+          const policy = candidate.toolPolicy ?? routinePolicy;
+          return policy ? JSON.stringify(policy) : "";
+        };
+        const ownPolicyKey = policyKey(run);
         const waiting = this.runs.filter(
           (candidate) =>
             candidate.status === "queued" &&
             candidate.id !== run.id &&
             candidate.botId === run.botId &&
-            automationThreadKey(candidate) === key,
+            automationThreadKey(candidate) === key &&
+            policyKey(candidate) === ownPolicyKey,
         );
         for (const folded of waiting) {
           folded.status = "running";
@@ -1560,6 +1591,13 @@ export class RoutineManager {
                 })),
               })
             : own;
+          // The allowlist the run was queued with, else the routine's own.  A
+          // webhook or resource run has no routine and never carries one.
+          // Re-checked here:  routines.json is a file, and a hand-edited
+          // allowlist must fail the run, never reach the driver half-formed.
+          const toolPolicy = run.triggerSource === "webhook" || run.triggerSource === "resource"
+            ? undefined
+            : sanitizeToolPolicy(run.toolPolicy ?? routinePolicy);
           await this.options.startTurn(
             run.botId,
             threadId,
@@ -1567,7 +1605,7 @@ export class RoutineManager {
             normalizeRunOn(run.runOn),
             scheduledTriggerSource,
             (message) => this.failThread(threadId, message, "dispatch_failed"),
-            { ephemeralDispatch: Boolean(run.ownerThreadId) },
+            { ephemeralDispatch: Boolean(run.ownerThreadId), toolPolicy },
           );
         } catch (error) {
           this.failThread(threadId, error instanceof Error ? error.message : String(error), "dispatch_failed");
@@ -1832,6 +1870,7 @@ export class RoutineManager {
       routineName: routine.name,
       prompt: routine.prompt,
       durationMinutes: routine.durationMinutes,
+      toolPolicy: routine.toolPolicy,
       botId: routine.botId,
       runOn: normalizeRunOn(routine.runOn),
       scheduledFor,

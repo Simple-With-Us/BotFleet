@@ -6,6 +6,7 @@
 // readable.
 
 import type { ComputerMount } from "./computer-grants.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
@@ -439,6 +440,11 @@ export interface SendTurnInput {
    *  driver that spawns a child for the turn applies it to that child's
    *  environment; absent means a launched child with no seat. */
   launchIdentity?: LaunchIdentity;
+  /** A routine's command allowlist (server/tool-policy.ts).  Present only on
+   *  a routine turn whose routine set one, and on every re-dispatch of that
+   *  turn.  A driver whose capabilities say `toolPolicy: true` holds the turn
+   *  to it;  the harness refuses to send such a turn to any other driver. */
+  toolPolicy?: ToolPolicy;
 }
 
 /** The decoded `arguments` object of one tool call.
@@ -623,6 +629,10 @@ export interface ProviderAdapter {
      * a host-control turn already gets, so every ask reaches the reviewer
      * before it runs.  Meaningful only beside `reviewHook: "after"`. */
     asksWhenHeld?: boolean;
+    /** True when the driver holds a turn to `SendTurnInput.toolPolicy` (or
+     *  refuses it when the engine instance cannot be held).  Absent: the
+     *  harness never sends this driver an allowlist turn. */
+    toolPolicy?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;

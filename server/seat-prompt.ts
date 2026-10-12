@@ -21,7 +21,7 @@ export const FLEET_SHARED_RULE_MARKERS = [
   "Extra-ship: NO",
 ] as const;
 
-/** Seat ids with a `bots/<id>.md` file (lowercase): the ten BotFleet roles. */
+/** Seat ids with a `bots/<id>.md` file (lowercase): the eleven BotFleet roles. */
 export const FLEET_SEAT_IDS = BOTFLEET_ROLES.map((role) => role.id);
 
 export type FleetSeatId = KnownBotfleetRole["id"];
