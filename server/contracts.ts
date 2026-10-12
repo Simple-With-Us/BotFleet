@@ -758,8 +758,9 @@ export interface ModelCatalog {
     /** Short tag rendered next to the label in the model picker (e.g. a
      * price/speed tradeoff the user should see before picking).  Drivers
      * set it on static catalog rows; the picker renders it as a chip with
-     * `badgeTitle` (full sentence) on hover.  Keep the chip under ~10 chars
-     * so it does not push the label to a second line on narrow chat heads. */
+     * `badgeTitle` (full sentence) on hover.  Keep the chip short: in a
+     * narrow picker the row's tags wrap onto their own line rather than
+     * squeezing the name, so a long chip costs the list a row of height. */
     badge?: string;
     /** Hover explanation for `badge`.  Without this the chip renders
      * without a tooltip and a screen-reader hint. */
