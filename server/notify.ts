@@ -31,6 +31,19 @@ export interface Notification {
   /** The tool that asked, for display and telemetry.  Nothing may depend
    * on it: an older harness sends neither field. */
   tool?: string;
+  /** The card's own choices, so a consumer can offer the same buttons the
+   * card would have.  A phone that started this ask as a Live Activity has no
+   * transcript to re-read, so without this it would have to guess the verbs
+   * and could offer "Deny" where the card said "Reject". */
+  options?: string[];
+  /** Whether this is a permission decision rather than a free-text question.
+   * The two are answered differently — allow/deny against a granted scope, or
+   * text — and a Live Activity answering the wrong one is worse than not
+   * answering at all. */
+  isPermission?: boolean;
+  /** The bot's palette colour, so a consumer can render this bot's own face
+   * rather than a generic one. */
+  color?: string;
 }
 
 /** The two kinds where a request is actually waiting on a person. */
@@ -62,6 +75,7 @@ export interface NotifyBot {
   name: string;
   threadId: string;
   notifications?: boolean;
+  color?: string;
 }
 
 /** Build the frame for one event, or null when it should stay quiet.
@@ -73,7 +87,14 @@ export function buildNotification(
   bot: NotifyBot,
   threadId: string,
   detail: string,
-  extra?: { avatarUrl?: string; requestId?: string; tool?: string; snoozed?: boolean },
+  extra?: {
+    avatarUrl?: string;
+    requestId?: string;
+    tool?: string;
+    snoozed?: boolean;
+    options?: string[];
+    isPermission?: boolean;
+  },
 ): Notification | null {
   // The toggle means what it says: off is off, including for approvals.
   // A bot whose notifications you turned off can still block waiting for
@@ -106,12 +127,15 @@ export function buildNotification(
 
   const frame: Notification = { kind, botId: bot.id, botName: bot.name, threadId, title, body };
   if (extra?.avatarUrl !== undefined) frame.avatarUrl = extra.avatarUrl;
+  if (bot.color !== undefined) frame.color = bot.color;
   // Request identity belongs only to a frame where a request is waiting.
   // Enforced here rather than trusted to every call site, because a `done`
   // frame carrying a request id would invite a client to answer it.
   if (isBlockingKind(kind)) {
     if (extra?.requestId !== undefined) frame.requestId = extra.requestId;
     if (extra?.tool !== undefined) frame.tool = extra.tool;
+    if (extra?.options !== undefined) frame.options = extra.options;
+    if (extra?.isPermission !== undefined) frame.isPermission = extra.isPermission;
   }
   return frame;
 }

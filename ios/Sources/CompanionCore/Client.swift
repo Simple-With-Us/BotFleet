@@ -1065,6 +1065,32 @@ public struct CompanionClient: Sendable {
         )
     }
 
+    /// Hand the sidecar a Live Activity push token.
+    ///
+    /// Two kinds exist and they are not interchangeable.  A push-to-start
+    /// token is per-device and survives every activity, and it is the only one
+    /// that can start an activity while the app is dead; an update token is
+    /// minted per activity and rotates, and can only update or end that one.
+    /// The sidecar stores them separately for that reason, so the kind has to
+    /// travel with the token rather than be inferred.
+    public func registerLiveActivityToken(_ hex: String, kind: LiveActivityTokenKind) async throws {
+        let token = hex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard token.utf8.count >= 64,
+              token.utf8.allSatisfy({
+                  (48...57).contains($0) || (97...102).contains($0)
+              })
+        else {
+            throw APIError.transport("That Live Activity token is not usable.")
+        }
+        try await send(
+            try makeRequest(
+                "POST",
+                "/api/companion/live-activity-token",
+                body: ["token": token, "kind": kind.rawValue]
+            )
+        )
+    }
+
     /// What the sidecar knows about the APNs sender right now.
     ///
     /// Mirrors `PushSenderHealth` in `companion/src/apns.ts` — counts,

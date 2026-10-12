@@ -67,3 +67,11 @@ __pycache__/
 # playwright run sweeps error-context.md and .last-run.json into the diff.
 test-results/
 playwright-report/
+
+# The DSH/Clutch engine's own skill root for whatever checkout it runs in.
+# Per AGENT-SYNC it outranks the shared `~/.agents/skills` and "no installer
+# writes" it — the engine materializes it at runtime.  Left untracked-and-
+# unignored it reads as local work, so the updater refused every run with
+# "the always-on checkout has uncommitted changes" on a directory that was
+# simply the engine doing its job.
+.agents/
