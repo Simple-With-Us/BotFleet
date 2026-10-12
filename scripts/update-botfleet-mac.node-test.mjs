@@ -27,6 +27,7 @@ import {
   DEFAULT_STARTUP_TIMEOUT_MS,
   dependencyFingerprint,
   effectiveLockDocument,
+  reportCheckoutDrift,
   describeLaunchdExit,
   isRecoverableResolutionFailure,
   parseLaunchdJob,
@@ -218,6 +219,50 @@ test("dependency fingerprints cover package contents and symlink targets", async
   await rm(join(dependencies, "package-link"));
   await symlink("other-package", join(dependencies, "package-link"));
   assert.notEqual(await dependencyFingerprint(dependencies), contentChanged);
+});
+
+// The always-on checkout is supposed to be a detached origin/main checkout and
+// the updater leaves it there on apply.  When a seat switched it to a working
+// branch instead, the harness served that branch for days with nothing on
+// screen saying so.  Advisory only: it must never fail an update.
+test("checkout drift is reported, and only when it is real", async () => {
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  const root = await mkdtemp(join(tmpdir(), "omb-checkout-drift-"));
+  const repo = join(root, "repo");
+  await run("git", ["init", "-q", repo]);
+  await run("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+  await run("git", ["-C", repo, "config", "user.name", "T"]);
+  await writeFile(join(repo, "f"), "1");
+  await run("git", ["-C", repo, "add", "f"]);
+  await run("git", ["-C", repo, "commit", "-qm", "one"]);
+  // A real origin/main ref, because that is what the drift check compares
+  // against — without one, "not origin/main" is indistinguishable from "no
+  // origin", and the check stays quiet on every checkout.
+  await run("git", ["-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+  // At origin/main: silent, because there is nothing to say.
+  assert.equal(await reportCheckoutDrift(repo), null);
+
+  // A branch at the SAME commit is not drift: the harness would be serving
+  // identical code, so there is nothing worth a warning.
+  await run("git", ["-C", repo, "checkout", "-q", "-b", "seat-work"]);
+  assert.equal(await reportCheckoutDrift(repo), null);
+
+  // A branch with its own commit IS drift, and it names itself — this is the
+  // shape that let a seat's working branch serve the harness for days.
+  await writeFile(join(repo, "f"), "2");
+  await run("git", ["-C", repo, "commit", "-qam", "two"]);
+  const drifted = await reportCheckoutDrift(repo);
+  assert.ok(drifted, "drift on a branch should be reported");
+  assert.match(drifted, /seat-work/);
+
+  // A path that is not a checkout reports nothing rather than failing an update.
+  assert.equal(await reportCheckoutDrift(join(root, "not-a-repo")), null);
 });
 
 // The first version of this fix tested only the document helper and left the

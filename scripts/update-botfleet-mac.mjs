@@ -665,6 +665,36 @@ export function effectiveLockDocument(text) {
   return chunks[chunks.length - 1];
 }
 
+/** Say out loud when the always-on checkout is not serving origin/main.
+ *
+ *  The updater leaves that checkout detached at the commit it applied, so the
+ *  normal state is origin/main and nothing is printed.  Anything else — a seat
+ *  having switched it to a working branch, a merge left unpulled — is drift
+ *  the owner cannot see from inside the app, and it is the whole answer to
+ *  "why is this running old code".  Advisory only: the update proceeds and
+ *  repairs the checkout on apply, which is where the fix belongs.
+ *
+ *  Never throws.  A checkout in a state git cannot describe here is reported
+ *  as unknown rather than failing an update that would otherwise succeed. */
+export async function reportCheckoutDrift(checkout) {
+  try {
+    // Module-level `output`, not the `gitOutput` closure inside createConfig —
+    // that one is not in scope here, and reaching for it fails at runtime in a
+    // way this function's own catch would quietly turn back into silence.
+    const readGit = (args) => output("git", ["-C", checkout, ...args]);
+    const head = (await readGit(["rev-parse", "--short", "HEAD"])).trim();
+    const remote = (await readGit(["rev-parse", "--short", "origin/main"])).trim();
+    const branch = await readGit(["symbolic-ref", "--short", "HEAD"]).catch(() => null);
+    if (head === remote) return null;
+    const where = branch ? `branch ${branch.trim()}` : "a detached HEAD";
+    const message = `Always-on checkout is on ${where} at ${head}, not origin/main ${remote}; this update moves it to ${remote}.`;
+    console.error(`WARNING:  ${message}`);
+    return message;
+  } catch {
+    return null;
+  }
+}
+
 async function assertDependenciesMatchSource(nodeModulesPath, sourcePath) {
   const [sourceLock, installedLock] = await Promise.all([
     readFile(join(sourcePath, "pnpm-lock.yaml")),
@@ -3689,6 +3719,14 @@ function createOperations(config) {
     },
 
     preflight: async (_prepared) => {
+      // The always-on checkout is supposed to be a detached origin/main
+      // checkout; this update moves it there when it applies.  If something
+      // else moved it — a seat switching the checkout to a working branch is
+      // the way this happens — the harness keeps serving that branch until the
+      // next successful update, which is a long time to run code nobody
+      // deployed on purpose.  Naming it costs one line and answers "why is my
+      // app weeks behind main" without anyone having to remember to ask.
+      await reportCheckoutDrift(config.checkout);
       lastPreflight = await runtimePreflight(config);
       return lastPreflight;
     },
