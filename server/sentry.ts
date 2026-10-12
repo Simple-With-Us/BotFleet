@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { resetSentryCronsForTests } from "./sentry-crons.ts";
+import { runtimeBuildIdentity } from "./runtime-identity.ts";
 
 export type SentryNode = typeof import("@sentry/node");
 type SentryIntegration = Parameters<SentryNode["addIntegration"]>[0];
@@ -677,7 +678,7 @@ export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<
       : 0.1,
     logsEnabled: true,
     source: dsn ? "env" : "none",
-    release: sentryReleaseName(env),
+    release: sentryReleaseName(env, runtimeBuildIdentity.sourceCommit),
   })).active;
 }
 

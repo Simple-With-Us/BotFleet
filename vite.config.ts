@@ -3,8 +3,9 @@ import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { sentryVitePlugin } from "@sentry/vite-plugin";
+import { sentryReleaseName } from "./server/sentry.ts";
 
-const sentryRelease = (process.env.SENTRY_RELEASE || process.env.GITHUB_SHA || "").trim();
+const sentryRelease = sentryReleaseName(process.env) ?? "";
 const sentryAuthToken = (process.env.SENTRY_AUTH_TOKEN || "").trim();
 
 export default defineConfig({

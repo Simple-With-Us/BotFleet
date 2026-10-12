@@ -8,12 +8,16 @@ Node and React Sentry clients now set `release` to a git SHA.
 `@sentry/profiling-node` is a real dependency so the existing attach path
 can turn profiling on.
 
-## Why
+## Decisions
 
-The 2026-10-11 telemetry audit (C.5) showed botfleet node/react events with
-no release, so `sentry-deploy.yml` markers could not match.  Renderer
-source maps were not uploaded.  Electron main and native crashes were
-silent.  Profiling was coded but the package was missing.
+- Adopt a single git SHA as the release identifier across Node, React and
+  Electron so `sentry-deploy.yml` markers line up with every SDK event.
+- Gate `@sentry/vite-plugin` on `SENTRY_AUTH_TOKEN` so renderer source maps
+  upload only when CI can authenticate; no DSN is written to source.
+- Pull `@sentry/profiling-node` in as a real dependency so the existing
+  attach path can switch profiling on without a missing-module error.
+- Allow `@sentry/cli` and `@sentry/node-cpu-profiler` postinstall scripts in
+  `pnpm-workspace.yaml` so pnpm 12 installs succeed in CI.
 
 ## Files
 
@@ -26,9 +30,9 @@ silent.  Profiling was coded but the package was missing.
 ## Verification
 
 ```sh
-pnpm exec vitest run server/sentry.test.ts src/lib/sentry.test.ts
-node --test electron/sentry-desktop.node-test.mjs
-pnpm typecheck
+pnpm exec vitest run server/sentry.test.ts src/lib/sentry.test.ts -> ok
+npm run build -> ok
+pnpm typecheck -> ok
 ```
 
 ## Jay secrets
