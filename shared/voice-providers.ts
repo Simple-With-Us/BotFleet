@@ -1,6 +1,7 @@
 // Voice TTS/STT provider ids, credential checks, and fallback ladder order.
 // Keys are resolved from the workspace config object after loadConfig() /
 // Infisical — never read process.env here.
+import { z } from "zod";
 
 /** Slim config slice the ladder helpers need — keeps this module usable from
  *  the renderer without importing `server/config.ts`. */
@@ -38,7 +39,40 @@ export const DEFAULT_CLOUD_STT_LADDER: readonly CloudSttProvider[] = [
   "groq",
 ];
 
-export type CloudSttCapabilities = Record<CloudSttProvider, boolean>;
+export interface CloudSttCapabilities {
+  meta: boolean;
+  xai: boolean;
+  assemblyai: boolean;
+  azure: boolean;
+  groq: boolean;
+}
+
+function foldProviderId(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function isMember<T extends string>(allowed: readonly T[], value: string): value is T {
+  for (const id of allowed) {
+    if (id === value) return true;
+  }
+  return false;
+}
+
+export function isHostedTtsProvider(value: string): value is HostedTtsProvider {
+  return isMember(HOSTED_TTS_PROVIDERS, value);
+}
+
+export function isCloudSttProvider(value: string): value is CloudSttProvider {
+  return isMember(CLOUD_STT_PROVIDERS, value);
+}
+
+export function isCallSttProvider(value: string): value is CallSttProvider {
+  return isMember(CALL_STT_PROVIDERS, value);
+}
+
+export function isTtsProvider(value: string): value is TtsProvider {
+  return isMember(TTS_PROVIDERS, value);
+}
 
 export function emptyCloudSttCapabilities(): CloudSttCapabilities {
   return {
@@ -98,17 +132,33 @@ export function cloudSttCapabilitiesFromConfig(cfg: VoiceProviderConfig): CloudS
   return cap;
 }
 
-function normalizeLadder<T extends string>(allowed: readonly T[], ladder: readonly string[] | undefined): T[] {
-  if (!ladder?.length) return [...allowed];
-  const seen = new Set<T>();
-  const out: T[] = [];
+function normalizeHostedLadder(ladder: readonly string[] | undefined): HostedTtsProvider[] {
+  if (!ladder?.length) return [...HOSTED_TTS_PROVIDERS];
+  const seen = new Set<HostedTtsProvider>();
+  const out: HostedTtsProvider[] = [];
   for (const entry of ladder) {
-    const id = entry.trim().toLowerCase() as T;
-    if (!allowed.includes(id) || seen.has(id)) continue;
+    const id = foldProviderId(entry);
+    if (!isHostedTtsProvider(id) || seen.has(id)) continue;
     seen.add(id);
     out.push(id);
   }
-  for (const id of allowed) {
+  for (const id of HOSTED_TTS_PROVIDERS) {
+    if (!seen.has(id)) out.push(id);
+  }
+  return out;
+}
+
+function normalizeCloudLadder(ladder: readonly string[] | undefined): CloudSttProvider[] {
+  if (!ladder?.length) return [...CLOUD_STT_PROVIDERS];
+  const seen = new Set<CloudSttProvider>();
+  const out: CloudSttProvider[] = [];
+  for (const entry of ladder) {
+    const id = foldProviderId(entry);
+    if (!isCloudSttProvider(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  for (const id of CLOUD_STT_PROVIDERS) {
     if (!seen.has(id)) out.push(id);
   }
   return out;
@@ -116,12 +166,11 @@ function normalizeLadder<T extends string>(allowed: readonly T[], ladder: readon
 
 /** Ordered hosted TTS providers to try for synthesis, including fallbacks. */
 export function resolveHostedTtsLadder(cfg: VoiceProviderConfig): HostedTtsProvider[] {
-  const ladder = normalizeLadder(HOSTED_TTS_PROVIDERS, cfg.tts?.ladder);
+  const ladder = normalizeHostedLadder(cfg.tts?.ladder);
   const explicit = cfg.tts?.provider;
   if (explicit === "system") return [];
-  const pinned = explicit && HOSTED_TTS_PROVIDERS.includes(explicit as HostedTtsProvider)
-    ? (explicit as HostedTtsProvider)
-    : undefined;
+  const foldedExplicit = explicit ? foldProviderId(explicit) : "";
+  const pinned = isHostedTtsProvider(foldedExplicit) ? foldedExplicit : undefined;
   const ordered: HostedTtsProvider[] = [];
   const seen = new Set<HostedTtsProvider>();
   if (pinned) {
@@ -138,11 +187,10 @@ export function resolveHostedTtsLadder(cfg: VoiceProviderConfig): HostedTtsProvi
 
 /** Ordered cloud STT providers with credentials on file. */
 export function resolveCloudSttLadder(cfg: VoiceProviderConfig): CloudSttProvider[] {
-  const ladder = normalizeLadder(CLOUD_STT_PROVIDERS, cfg.callStt?.ladder);
+  const ladder = normalizeCloudLadder(cfg.callStt?.ladder);
   const explicit = cfg.callStt?.provider;
-  const pinned = explicit && CLOUD_STT_PROVIDERS.includes(explicit as CloudSttProvider)
-    ? (explicit as CloudSttProvider)
-    : undefined;
+  const foldedExplicit = explicit ? foldProviderId(explicit) : "";
+  const pinned = isCloudSttProvider(foldedExplicit) ? foldedExplicit : undefined;
   const ordered: CloudSttProvider[] = [];
   const seen = new Set<CloudSttProvider>();
   if (pinned) {
@@ -157,14 +205,18 @@ export function resolveCloudSttLadder(cfg: VoiceProviderConfig): CloudSttProvide
   return ordered.filter((id) => cloudSttProviderHasCredential(cfg, id));
 }
 
-export function parseTtsProvider(value: unknown): TtsProvider | undefined {
-  if (typeof value !== "string") return undefined;
-  const folded = value.trim().toLowerCase();
-  return (TTS_PROVIDERS as readonly string[]).includes(folded) ? (folded as TtsProvider) : undefined;
+const stringInput = z.string();
+
+export function parseTtsProvider(value: string | null | undefined): TtsProvider | undefined {
+  const parsed = stringInput.safeParse(value ?? "");
+  if (!parsed.success) return undefined;
+  const folded = foldProviderId(parsed.data);
+  return isTtsProvider(folded) ? folded : undefined;
 }
 
-export function parseCallSttProvider(value: unknown): CallSttProvider | undefined {
-  if (typeof value !== "string") return undefined;
-  const folded = value.trim().toLowerCase();
-  return (CALL_STT_PROVIDERS as readonly string[]).includes(folded) ? (folded as CallSttProvider) : undefined;
+export function parseCallSttProvider(value: string | null | undefined): CallSttProvider | undefined {
+  const parsed = stringInput.safeParse(value ?? "");
+  if (!parsed.success) return undefined;
+  const folded = foldProviderId(parsed.data);
+  return isCallSttProvider(folded) ? folded : undefined;
 }

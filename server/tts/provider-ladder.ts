@@ -53,10 +53,8 @@ async function synthesizeWithProvider(
       if (!voice) throw new NoVoiceConfigured("voice");
       return azure.synthesize(text, voice, key, region);
     }
-    default: {
-      const _never: never = provider;
-      throw new Error(`Unknown TTS provider: ${String(_never)}`);
-    }
+    default:
+      throw new Error(`Unknown TTS provider: ${provider satisfies never}`);
   }
 }
 

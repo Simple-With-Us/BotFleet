@@ -3,9 +3,59 @@ import { useEffect, useMemo, useState } from "react";
 
 import { cn } from "@/lib/cn";
 import { announceTranscriptionStatus } from "@/lib/transcription-status";
+import { parseCallSttProvider } from "../../shared/voice-providers.ts";
 import { KEYTERMS_MAX, formatKeyterms, keytermsDirty, parseKeyterms, persistKeyterms } from "@/lib/stt-keyterms";
 
 type Provider = "auto" | "apple" | "assemblyai" | "xai" | "meta" | "azure" | "groq";
+
+type ProviderOption = { value: Provider; title: string; description: string };
+
+function providerFromRadio(value: string): Provider {
+  if (value === "auto") return "auto";
+  return parseCallSttProvider(value) ?? "auto";
+}
+
+const CALL_STT_PROVIDER_OPTIONS: readonly ProviderOption[] = [
+  {
+    value: "auto",
+    title: "Automatic",
+    description:
+      "Use the best provider for this device — Apple on macOS, AssemblyAI on every other platform.",
+  },
+  {
+    value: "apple",
+    title: "Apple Speech Recognition",
+    description:
+      "macOS only.\u00A0 Audio never leaves the device.\u00A0 Lower accuracy on technical jargon.",
+  },
+  {
+    value: "assemblyai",
+    title: "AssemblyAI Cloud Recognition",
+    description:
+      "Cross-platform.\u00A0 Requires an API key above.\u00A0 Better accuracy and custom vocabulary.",
+  },
+  {
+    value: "xai",
+    title: "xAI Cloud Recognition",
+    description: "Uses the xAI API key from Connections.\u00A0 Streaming bridge ships in a follow-up.",
+  },
+  {
+    value: "meta",
+    title: "Meta Muse Voice Transcribe",
+    description: "Uses the Meta speech key from Connections.\u00A0 Streaming bridge ships in a follow-up.",
+  },
+  {
+    value: "azure",
+    title: "Azure Speech",
+    description:
+      "Uses the Azure Speech key and region from Connections.\u00A0 Streaming bridge ships in a follow-up.",
+  },
+  {
+    value: "groq",
+    title: "Groq Whisper",
+    description: "Batch transcription path.\u00A0 Uses the Groq key from Connections.",
+  },
+];
 
 const MAX_INPUT_HEIGHT_PX = 220;
 
@@ -41,8 +91,8 @@ export function TranscriptionSettings() {
       .then((cfg) => {
         if (!alive) return;
         const explicit = cfg?.callStt?.provider;
-        const known: Provider[] = ["apple", "assemblyai", "xai", "meta", "azure", "groq"];
-        setProvider(known.includes(explicit) ? explicit : "auto");
+        const parsed = typeof explicit === "string" ? parseCallSttProvider(explicit) : undefined;
+        setProvider(parsed ?? "auto");
         const saved = parseKeyterms(formatKeyterms(Array.isArray(cfg?.callStt?.keyterms) ? cfg.callStt.keyterms : []));
         setGlobalKeyterms(formatKeyterms(saved));
         setLastSavedKeyterms(saved);
@@ -174,48 +224,7 @@ export function TranscriptionSettings() {
         </p>
         <fieldset className="space-y-1.5">
           <legend className="sr-only">Voice call dictation provider</legend>
-          {(
-            [
-              {
-                value: "auto" as Provider,
-                title: "Automatic",
-                description:
-                  "Use the best provider for this device — Apple on macOS, AssemblyAI on every other platform.",
-              },
-              {
-                value: "apple" as Provider,
-                title: "Apple Speech Recognition",
-                description:
-                  "macOS only.\u00A0 Audio never leaves the device.\u00A0 Lower accuracy on technical jargon.",
-              },
-              {
-                value: "assemblyai" as Provider,
-                title: "AssemblyAI Cloud Recognition",
-                description:
-                  "Cross-platform.\u00A0 Requires an API key above.\u00A0 Better accuracy and custom vocabulary.",
-              },
-              {
-                value: "xai" as Provider,
-                title: "xAI Cloud Recognition",
-                description: "Uses the xAI API key from Connections.\u00A0 Streaming bridge ships in a follow-up.",
-              },
-              {
-                value: "meta" as Provider,
-                title: "Meta Muse Voice Transcribe",
-                description: "Uses the Meta speech key from Connections.\u00A0 Streaming bridge ships in a follow-up.",
-              },
-              {
-                value: "azure" as Provider,
-                title: "Azure Speech",
-                description: "Uses the Azure Speech key and region from Connections.\u00A0 Streaming bridge ships in a follow-up.",
-              },
-              {
-                value: "groq" as Provider,
-                title: "Groq Whisper",
-                description: "Batch transcription path.\u00A0 Uses the Groq key from Connections.",
-              },
-            ]
-          ).map((option) => (
+          {CALL_STT_PROVIDER_OPTIONS.map((option) => (
             <label
               key={option.value}
               className={cn(
@@ -228,7 +237,7 @@ export function TranscriptionSettings() {
                 name="call-stt-provider"
                 value={option.value}
                 checked={provider === option.value}
-                onChange={(event) => void saveProvider(event.target.value as Provider)}
+                onChange={(event) => void saveProvider(providerFromRadio(event.target.value))}
                 disabled={!callSttLoaded || savingProvider}
                 className="mt-1 size-3 accent-accent"
               />

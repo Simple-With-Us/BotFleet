@@ -8,6 +8,7 @@ import {
   type CloudSttProvider,
   anyCloudSttConfigured,
   emptyCloudSttCapabilities,
+  isCloudSttProvider,
 } from "../../shared/voice-providers.ts";
 import type { STTProvider } from "./call-stt";
 
@@ -67,9 +68,8 @@ export function pickSTTProvider(input: ProviderPickerInput): ProviderChoice {
   const appleUsable = isMacOS && appleSpeechAvailable;
   const cloudUsable = anyCloudSttConfigured(cloudStt);
 
-  if (explicitPreference && explicitPreference !== "apple") {
-    const cloud = explicitPreference as CloudSttProvider;
-    if (cloudStt[cloud]) return { provider: cloud, reason: "user-preference" };
+  if (explicitPreference && explicitPreference !== "apple" && isCloudSttProvider(explicitPreference)) {
+    if (cloudStt[explicitPreference]) return { provider: explicitPreference, reason: "user-preference" };
   }
   if (explicitPreference === "apple" && appleUsable) {
     return { provider: "apple" };
