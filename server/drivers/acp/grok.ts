@@ -388,12 +388,12 @@ const support: AcpSupport = {
  *  every routine carrying an allowlist would be refused until someone edits this
  *  file.  Leniency degrades to "the new field is ignored";  strictness degrades
  *  to "the feature is off fleet-wide". */
-const hookCapabilitySchema = z.looseObject({
+export const hookCapabilitySchema = z.looseObject({
   blockingEvents: z.array(z.string()).optional().catch(undefined),
   decisions: z.array(z.string()).optional().catch(undefined),
 });
-const hookMetaSchema = z.looseObject({ "x.ai/hooks": hookCapabilitySchema.optional().catch(undefined) }).optional().catch(undefined);
-const initializeHooksSchema = z.looseObject({
+export const hookMetaSchema = z.looseObject({ "x.ai/hooks": hookCapabilitySchema.optional().catch(undefined) }).optional().catch(undefined);
+export const initializeHooksSchema = z.looseObject({
   _meta: hookMetaSchema,
   agentCapabilities: z.looseObject({ _meta: hookMetaSchema }).optional().catch(undefined),
 });
