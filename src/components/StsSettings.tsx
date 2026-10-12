@@ -68,10 +68,10 @@ export const StsConfigResponseSchema = z.object({
  */
 export function describeStsConfigFailure(failure: z.ZodError): string {
   const first = failure.issues[0];
-  if (!first) return "These settings did not load.  Try again.";
+  if (!first) return "These settings did not load.  Try again.";
   const where = first.path.join(".");
   const complaint = first.message.toLowerCase();
-  return `These settings did not load.  ${where ? `${where}: ` : ""}${complaint}.`;
+  return `These settings did not load.  ${where ? `${where}: ` : ""}${complaint}.`;
 }
 
 const PROVIDER_TITLES = {
@@ -128,7 +128,7 @@ export function stsKeyNotice(provider: StsProvider, keys: StsKeyState): string |
   if (!keys) return null;
   return keys[provider]
     ? "Key configured."
-    : `No ${PROVIDER_KEY_NAMES[provider]}.  Calls stay on Auto until you add one.`;
+    : `No ${PROVIDER_KEY_NAMES[provider]}.  Calls stay on Auto until you add one.`;
 }
 
 export function StsSettings() {
@@ -170,7 +170,7 @@ export function StsSettings() {
     let alive = true;
     fetch("/api/config")
       .then((res) => {
-        if (!res.ok) throw new Error("These settings did not load.  Try again.");
+        if (!res.ok) throw new Error("These settings did not load.  Try again.");
         return res.json();
       })
       .then((body) => StsConfigResponseSchema.parse(body))
@@ -205,7 +205,7 @@ export function StsSettings() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sts: patch }),
       });
-      if (!res.ok) throw new Error("These settings did not save.  Try again.");
+      if (!res.ok) throw new Error("These settings did not save.  Try again.");
       return true;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -309,7 +309,7 @@ export function StsSettings() {
         )}
         {bridge && keysFailed && (
           <div className="mt-2 text-[12px] text-warning">
-            Could not read the key status.  The desktop app stores provider keys.
+            Could not read the key status.{"  "}The desktop app stores provider keys.
           </div>
         )}
       </section>

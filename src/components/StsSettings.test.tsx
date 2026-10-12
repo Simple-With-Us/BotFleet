@@ -94,10 +94,10 @@ describe("stsKeyNotice", () => {
 
   it("names the missing credential and says what actually happens", () => {
     expect(stsKeyNotice("xai", { xai: false })).toBe(
-      "No xAI API key.  Calls stay on Auto until you add one.",
+      "No xAI API key.  Calls stay on Auto until you add one.",
     );
     expect(stsKeyNotice("gemini", { xai: true, gemini: false })).toBe(
-      "No Gemini API key.  Calls stay on Auto until you add one.",
+      "No Gemini API key.  Calls stay on Auto until you add one.",
     );
   });
 });
@@ -241,7 +241,7 @@ describe("describeStsConfigFailure", () => {
 
   it("still says something when the failure carries no issue", () => {
     expect(describeStsConfigFailure(new z.ZodError([])))
-      .toBe("These settings did not load.  Try again.");
+      .toBe("These settings did not load.  Try again.");
   });
 });
 
