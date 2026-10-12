@@ -670,7 +670,11 @@ async function assertDependenciesMatchSource(nodeModulesPath, sourcePath) {
     readFile(join(sourcePath, "pnpm-lock.yaml")),
     readFile(join(nodeModulesPath, ".pnpm/lock.yaml")),
   ]);
-  if (!effectiveLockDocument(sourceLock.toString("utf8")).equals(installedLock)) {
+  // A Buffer comparison, because `effectiveLockDocument` returns a string and
+  // String has no `.equals` — calling one throws a TypeError that surfaces as
+  // an unexplained updater crash instead of the message below.
+  const effective = Buffer.from(effectiveLockDocument(sourceLock.toString("utf8")), "utf8");
+  if (!effective.equals(installedLock)) {
     throw new Error("Staged dependency tree does not match the exact source lockfile");
   }
 }

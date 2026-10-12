@@ -220,6 +220,23 @@ test("dependency fingerprints cover package contents and symlink targets", async
   assert.notEqual(await dependencyFingerprint(dependencies), contentChanged);
 });
 
+// The first version of this fix tested only the document helper and left the
+// gate calling `.equals()` on a STRING, which throws a TypeError and surfaces
+// as an unexplained updater crash.  These cases drive the comparison the gate
+// actually performs, so a type slip cannot pass again.
+test("the gate comparison is byte-wise and type-correct", async () => {
+  const lock = "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n";
+  const stream = `---\nlockfileVersion: '9.0'\n\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.10.1\n---\n${lock}`;
+  // Exactly the expression assertDependenciesMatchSource runs.
+  const gate = (sourceLock, installedLock) =>
+    Buffer.from(effectiveLockDocument(sourceLock.toString("utf8")), "utf8").equals(installedLock);
+
+  assert.equal(gate(Buffer.from(stream), Buffer.from(lock)), true);
+  assert.equal(gate(Buffer.from(lock), Buffer.from(lock)), true);
+  assert.equal(gate(Buffer.from(stream), Buffer.from(`${lock}\n# drift\n`)), false);
+  assert.equal(gate(Buffer.from(lock), Buffer.from(stream)), false);
+});
+
 // The dependency gate compared the whole project lockfile against pnpm's
 // internal copy.  Since pnpm 12 those are different BYTE LENGTHS by design —
 // the project file is a two-document stream carrying `packageManagerDependencies`
