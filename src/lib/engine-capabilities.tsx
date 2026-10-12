@@ -30,6 +30,8 @@ const PROVIDER_MARK_LABELS: Readonly<Record<string, string>> = {
   minimaxAgent: "MiniMax",
   mcode: "MiniMax",
   mcodeAgent: "MiniMax",
+  muse: "Meta Muse",
+  museAgent: "Meta Muse",
 };
 
 function providerMarkLabel(driverKind: string): string {
@@ -75,13 +77,12 @@ export type CapabilityKey =
  *  "not available" colour while printing a dash — cannot come back.
  *  `engine-capabilities.test.ts` fails the build when a registered engine
  *  omits a key, so the honest answer becomes explicit `"unknown"`. */
-export type CapabilityState = "yes" | "no" | "limited" | "yes-pro-only" | "unknown";
+export type CapabilityState = "yes" | "no" | "limited" | "unknown";
 
 /** The full state vocabulary, in the order the matrix legend lists it. */
 export const CAPABILITY_STATES: readonly CapabilityState[] = [
   "yes",
   "limited",
-  "yes-pro-only",
   "no",
   "unknown",
 ] as const;
@@ -153,9 +154,9 @@ export interface EngineCapabilityEntry {
    *  gap in the wiring, not a claim that the model cannot do it. */
   capabilityNotes?: Partial<Record<CapabilityKey, string>>;
   /** Provider brands this engine actually serves, rendered as marks beside
-   *  the "Why This Engine" headline.  More than one is normal and says
-   *  something real: Clutch carries both DeepSeek and MiniMax because the
-   *  bridge hosts models from both providers, which a single "Clutch" name
+   *  the expanded More Info headline.  More than one is normal and says
+   *  something real: Clutch carries DeepSeek, Muse, and MiniMax because the
+   *  bridge hosts models from those providers, which a single "Clutch" name
    *  hides completely.  Leave absent when the engine is one brand, because the
    *  row's own badge already names it. */
   providerKinds?: readonly string[];
@@ -539,11 +540,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     id: "deepseek-harness",
     displayName: "Clutch",
     capabilityBadgeColor: "bg-rose-600 text-white",
-    // The one row where the engine name hides something: the Clutch bridge
-    // hosts models from BOTH providers, and "Clutch" says neither.  Its model
-    // catalog is two DeepSeek tiers, two MiniMax tiers, and nothing else, so
-    // both marks belong in the Why This Engine block.
-    providerKinds: ["deepseekAgent", "minimax"],
+    // Clutch is the app; these are the provider/model families it serves.
+    // The row renders Clutch's own mark first, then these marks in this order.
+    providerKinds: ["deepseekAgent", "muse", "minimax"],
     group: "Cloud",
     pricing: {
       kind: "api",
@@ -585,10 +584,10 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
     },
     whyThisEngine: {
-      headline: "DeepSeek models over the Clutch ACP bridge, billed pay-as-you-go.",
+      headline: "DeepSeek, Muse, and MiniMax models through the Clutch bridge.",
       prose: [
-        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments are per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4-Pro carries a No Vision badge.",
-        "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
+        "Clutch runs DeepSeek, Meta Muse, and MiniMax models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments remain per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4-Pro carries a No Vision badge.",
+        "Muse and MiniMax use subscription-backed API-key access.  DeepSeek remains pay-as-you-go; the rates below are its public API catalog, not a subscription invoice.",
       ],
     },
     defaultModels: [
@@ -644,13 +643,12 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       // stops claiming a channel the driver does not wire.
       connectedApps: "no",
       longContext: "yes",
-      // The direct driver exposes neither a web tool nor image input, and
-      // neither has been audited on a real turn.  Marked "unknown" so the
-      // matrix does not claim a gap nobody measured.
-      webAccess: "unknown",
-      imageAttachments: "unknown",
-      computerUse: "unknown",
-      liveResearch: "unknown",
+      // The direct HTTP driver exposes none of these channels.  These are
+      // wiring facts, not guesses about what the underlying model can do.
+      webAccess: "no",
+      imageAttachments: "no",
+      computerUse: "no",
+      liveResearch: "no",
     },
     capabilityNotes: {
       connectedApps:
@@ -1309,6 +1307,34 @@ export const ENGINE_DISPLAY_ORDER: string[] = [
   "cli-wrapper",
 ];
 
+/** Access surface shown in the matrix.  Billing stays in `pricing`; it cannot
+ *  be inferred from access because MiniMax API uses a subscription-backed API
+ *  key while Muse Code is a CLI with the same kind of account billing. */
+const ENGINE_ACCESS_LABELS: Readonly<Record<string, string>> = {
+  grok: "CLI + API",
+  cursor: "CLI",
+  claude: "CLI",
+  codex: "CLI",
+  antigravity: "CLI",
+  "deepseek-harness": "API",
+  minimax: "API",
+  mcode: "CLI",
+  muse: "CLI",
+  kimi: "CLI",
+  droid: "CLI",
+  opencode: "CLI",
+  qwen: "CLI",
+  hermes: "CLI",
+  pi: "CLI",
+  "openai-compat": "API",
+  box: "API",
+  "cli-wrapper": "CLI",
+};
+
+export function engineAccessLabel(entry: EngineCapabilityEntry): string {
+  return ENGINE_ACCESS_LABELS[entry.id] ?? "Access unknown";
+}
+
 /** Resolve the engine id from a driver-kind string when the registry and
  *  the runtime disagree.  Examples:
  *    "grokAgent"  → "grok"
@@ -1408,8 +1434,6 @@ export function capabilityCellGlyph(state: CapabilityState | undefined): string 
       return "✗";
     case "limited":
       return "~";
-    case "yes-pro-only":
-      return "★";
     default:
       // "unknown" and a missing key share this glyph on purpose: both mean
       // nobody has looked, and neither is a claim that the engine can't.
@@ -1428,8 +1452,6 @@ export function capabilityCellLabel(state: CapabilityState | undefined): string 
       return "Not available";
     case "limited":
       return "Limited";
-    case "yes-pro-only":
-      return "Pro plan only";
     default:
       return "Not audited";
   }
@@ -1470,7 +1492,7 @@ export function EngineCalloutBody(props: {
          *  used to be, and `flex-wrap` could drop the headline onto its own
          *  line away from the label that introduces it. */}
         <span>
-          <strong>Why This Engine?</strong> {entry.whyThisEngine.headline}
+          <strong>More Info.</strong> {entry.whyThisEngine.headline}
         </span>
       </p>
       {entry.whyThisEngine.prose.map((line, index) => (

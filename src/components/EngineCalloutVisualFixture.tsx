@@ -1,12 +1,12 @@
 // Test harness for tests/e2e/engine-callout.visual.spec.ts.
 //
-// Mounts the real Why This Engine block in the two shapes it can take, side
+// Mounts the real More Info block in the two shapes it can take, side
 // by side.  The block grew a provider-mark row, and both shapes are load
-// bearing:  Clutch is the only engine that lists brands (it hosts DeepSeek and
-// MiniMax models, which the single "Clutch" name says nothing about), while
+// bearing:  Clutch is the only engine that lists brands (it hosts DeepSeek,
+// Muse, and MiniMax models, which the single "Clutch" name says nothing about), while
 // every other engine lists none and its label and headline must sit in normal
 // inline flow.  A layout that reads well with marks present can easily push a
-// 6px flex gap into the space between "Why This Engine?" and the headline when
+// 6px flex gap into the space between "More Info" and the headline when
 // there are none, so both are pinned.
 import { EngineCalloutBody } from "@/lib/engine-capabilities";
 
@@ -28,13 +28,13 @@ export default function EngineCalloutVisualFixture() {
             id: CLUTCH,
             displayName: "Clutch",
             capabilityBadgeColor: "bg-rose-600 text-white",
-            providerKinds: ["deepseekAgent", "minimax"],
+            providerKinds: ["deepseekAgent", "muse", "minimax"],
             group: "Cloud",
             pricing: { kind: "unknown" },
             capabilities: {},
             whyThisEngine: {
-              headline: "DeepSeek models over the Clutch ACP bridge, billed pay-as-you-go.",
-              prose: ["Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge."],
+              headline: "DeepSeek, Muse, and MiniMax models through the Clutch bridge.",
+              prose: ["Clutch runs DeepSeek, Meta Muse, and MiniMax models through BotFleet's Clutch ACP bridge."],
             },
             defaultModels: [],
           }}

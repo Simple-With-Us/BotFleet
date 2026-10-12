@@ -1,5 +1,5 @@
 // EngineCallout shape tests — every known engine renders a collapsed
-// "Why This Engine?" disclosure by default, and the headline, prose, and
+// "More Info" disclosure by default, and the headline, prose, and
 // registry pricing pill when expanded.  Replaces the legacy
 // MiniMaxCallout.test.ts; the new copy is shared across all engines so
 // the matrix and the callout cannot drift.
@@ -38,10 +38,7 @@ describe("EngineCallout", () => {
     for (const id of ENGINE_DISPLAY_ORDER) {
       const entry = ENGINE_CAPABILITIES[id];
       const html = renderToStaticMarkup(createElement(EngineCallout, { engineId: id }));
-      // The trigger names its engine.  It used to read "Why This Engine?" in a
-      // full-width bold bar, which is the shape of a section heading — and it
-      // sits directly under an engine name, so it read as the title of the
-      // block of engines below it rather than a question about this one.
+      // The trigger is a neutral disclosure, not a repeated engine pitch.
       const decoded = decodeHtmlEntities(html);
       // And it is sized to its label, not stretched across the row.  Checked as an
       // exact class prefix: a bare `not.toContain("w-full")` would also match
@@ -51,13 +48,14 @@ describe("EngineCallout", () => {
       const label = decodeHtmlEntities(html.replace(/<[^>]+>/g, " "))
         .replace(/\s+/g, " ")
         .trim();
-      expect(label).toContain(`Why ${entry.displayName} ?`);
+      expect(label).toContain("More Info");
       expect(label).not.toContain("Why This Engine?");
+      expect(html).toContain(`aria-label="More Info about ${entry.displayName}"`);
       expect(decoded).not.toContain(entry.whyThisEngine.headline);
       // Collapsed: one-line summary — no prose paragraphs, no pricing line.
       // Avoid /<p/ — Lucide's <path> would falsely match.
       expect(html).not.toMatch(/<p[\s>]/);
-      expect(html).not.toContain("Pricing:");
+      expect(html).not.toContain("Billing:");
       expect(html).toContain('aria-expanded="false"');
       expect(html).toContain("aria-hidden");
       // No dangling reference: the detail region is not rendered collapsed.
@@ -72,8 +70,8 @@ describe("EngineCallout", () => {
     );
     expect(html).toContain('aria-expanded="true"');
     expect(html).toMatch(/<p[\s>]/);
-    expect(html).toContain("Pricing:");
-    expect(html).toContain("Subscription + API");
+    expect(html).toContain("Access: API");
+    expect(html).toContain("Billing: Subscription + API");
     const decoded = decodeHtmlEntities(html);
     expect(decoded).toContain(entry.whyThisEngine.headline);
     expect(decoded).toContain(entry.whyThisEngine.prose[0]);

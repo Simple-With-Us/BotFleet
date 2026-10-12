@@ -239,6 +239,19 @@ export function MuseCodeMark({ size = 16, className }: IconProps) {
   );
 }
 
+/** Clutch's app identity: the neutral C monogram from Clutch's full-bleed
+ *  app icon.  Provider marks follow it separately, so the engine no longer
+ *  borrows DeepSeek's whale as its own product mark. */
+export function ClutchMark({ size = 16, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 256 256" className={className} aria-hidden>
+      <rect width="256" height="256" fill="#151820" />
+      <rect y="253" width="256" height="3" fill="#1E293B" />
+      <path fill="#F8FAFC" d="M176.6 64.6A55 55 0 1 0 176.6 135.4L155.2 117.4A27 27 0 1 1 155.2 82.6z" />
+    </svg>
+  );
+}
+
 /** Official pi (pi.dev) mark — geometric "Pi" wordmark from pi.dev/logo.svg. */
 export function PiMark({ size = 16, className }: IconProps) {
   return (
@@ -279,10 +292,11 @@ export function ProviderMark({
     case "grok":
     case "grokAgent":
       return <GrokMark size={size} className={className} />;
-    case "deepseek":
-    case "deepseekAgent":
     case "dsh":
     case "dshAgent":
+      return <ClutchMark size={size} className={className} />;
+    case "deepseek":
+    case "deepseekAgent":
       return <DeepSeekMark size={size} className={className} />;
     case "claude":
     case "claudeAgent":

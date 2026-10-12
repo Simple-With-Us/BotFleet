@@ -382,11 +382,9 @@ function EngineRow({
           {isThisBusy && <Loader2 size={12} className="animate-spin text-accent" />}
         </span>
         {/* Which platform(s) this engine actually serves, on the row.  It was
-            already in the capability data, but only ever rendered INSIDE the
-            "Why This Engine?" disclosure — so a row reading "Clutch" hid the
-            fact that the bridge hosts both DeepSeek and MiniMax, behind a bar
-            that looks like a section heading.  Only multi-brand engines get
-            marks; a single-brand engine's own name and mark already say it. */}
+            already in the capability data, but only ever rendered inside the
+            details disclosure.  The app mark stays first; provider/model
+            marks follow it.  Only multi-brand engines get the extra marks. */}
         {providerKinds.length > 1 && (
           <span className="flex shrink-0 items-center gap-1" aria-label={`Runs ${providerLabels.join(" and ")} models`}>
             {providerKinds.map((kind) => (
@@ -474,7 +472,7 @@ function EngineRow({
           permission guards do not apply.
         </div>
       )}
-      {["minimax", "claude", "grok", "codex", "antigravity", "cursorAgent", "deepseekAgent", "dshAgent", "antigravityAgent", "grokAgent", "claudeAgent", "mcodeAgent"].includes(instance.driverKind) && (
+      {["minimax", "claude", "grok", "codex", "antigravity", "cursorAgent", "deepseekAgent", "dshAgent", "antigravityAgent", "grokAgent", "claudeAgent", "mcodeAgent", "museAgent"].includes(instance.driverKind) && (
         <EngineCallout driverKind={instance.driverKind} instanceId={instance.instanceId} />
       )}
       {instance.driverKind === "boxAgent" && (
