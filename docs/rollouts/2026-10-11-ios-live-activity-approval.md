@@ -4,6 +4,18 @@ Issue BF-2410.  Branch `minimax/ios-live-activity-approval`.  Supersedes the
 background half of [2026-09-12-ios-live-activity-suspension.md](2026-09-12-ios-live-activity-suspension.md);
 its race handling, generation guards and refresh backoff are unchanged.
 
+## Changes
+
+One bullet per edited path.
+
+- `ios/Sources/CompanionCore/LiveActivityLifecycle.swift` — `transition(to: .background)` now returns the new `.endAmbient` instead of `.endAll`; `.endAll` is kept for sign-out and cold resets.
+- `ios/Sources/CompanionCore/LiveActivityRetention.swift` (new) — `shouldRetain(kind:requestId:options:)`, the pure rule that decides what survives backgrounding:  it drops a working bot, an unread `toReview` and a `needsYou` card with no request or no choices, and keeps a pending ask with real choices.
+- `ios/App/LiveActivities.swift` — `handle(.endAmbient)` calls the new `endAmbientActivities()`, which ends exactly the activities `LiveActivityRetention` rejects and leaves the rest (and their `lastSent`/`since` bookkeeping) alone; the `AnswerApprovalIntent.handler` assignment moved out of `attach(to:)` into the new `LiveActivityApprovalRoute`; the DEBUG `-live-activity-preview` fixture and its reconciliation guard live here too.
+- `ios/App/CompanionApp.swift` — `init()` calls `LiveActivityApprovalRoute.install(session:)` before any view exists.
+- `ios/App/Session.swift` — `answerFromLiveActivity(threadId:requestId:choice:isPermission:)` polls for and rebuilds the client under a 20 s bound, then answers quietly; it never re-resolves which request is pending.
+- `ios/App/LiveActivities.swift` — `LiveActivityApprovalRoute.dismissCard(threadId:requestId:)` ends the one answered activity.
+- `ios/Tests/CompanionCoreTests/LiveActivityLifecycleTests.swift` — background expectations moved from `.endAll` to `.endAmbient`, plus a case asserting background is not sign-out; four new `LiveActivityRetentionTests` cover the retention rule.
+
 ## What Was Broken
 
 The Lock Screen card already rendered `Allow` / `Deny` pills through
@@ -27,27 +39,10 @@ process.  Two things stopped it being a feature:
 
 ## Behavior
 
-- **Backgrounding ends ambient activities and keeps decisions.**
-  `LiveActivityLifecycle.transition(to: .background)` returns the new
-  `.endAmbient` instead of `.endAll`.  The coordinator ends every activity for
-  which `LiveActivityRetention.shouldRetain` is false: a `working` bot, an
-  unread `toReview`, and a `needsYou` card with no request behind it.  A card
-  with a pending request and real choices stays.  Sign-out still returns
-  `.endAll` and still ends everything.
-- **The answer route exists before any UI.**  `LiveActivityApprovalRoute.install`
-  runs from `CompanionApp.init`, the first code the process executes, so the
-  handler exists on a background launch.  It calls
-  `Session.answerFromLiveActivity`, which polls for — and rebuilds — the client
-  on the same bounded pattern a notification action uses, then answers
-  *quietly*: there is no screen to put an error on.
-- **The answer is exact.**  `requestId` and `isPermission` come from the card
-  that drew the buttons, so nothing is re-resolved.  Re-deriving the request
-  from "whatever is pending on this thread" is the bug PR #383's review caught.
-- **The card clears itself.**  After the answer lands,
-  `LiveActivityApprovalRoute.dismissCard` ends the one activity whose thread and
-  `requestId` match.  With the app backgrounded there is no `sync` to redraw the
-  card, so without this the buttons would sit on the Lock Screen claiming an
-  approval that already went through.
+- **Backgrounding ends ambient work and keeps decisions.**  The lifecycle now asks for `.endAmbient`, and the coordinator ends only what `LiveActivityRetention` rejects (see the two `LiveActivityRetention.swift` / `LiveActivities.swift` bullets above).  Sign-out still ends everything.
+- **The answer route exists before any UI.**  `CompanionApp.init` installs it, and `Session.answerFromLiveActivity` rebuilds the client on demand inside a bounded wait, then answers quietly — there is no screen to put an error on.
+- **The answer is exact.**  `requestId` and `isPermission` come from the card that drew the buttons, so nothing is re-resolved.  Re-deriving the request from "whatever is pending on this thread" is the bug PR #383's review caught.
+- **The card clears itself.**  After the answer lands, `dismissCard` ends the one activity whose thread and `requestId` match.  With the app backgrounded there is no `sync` to redraw the card, so without this the buttons would sit on the Lock Screen claiming an approval that already went through.
 
 ## Trade-off
 
