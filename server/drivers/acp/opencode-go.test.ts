@@ -126,6 +126,54 @@ describe("OpenCode catalog", () => {
   });
 
   it.skipIf(process.platform === "win32")(
+    "keeps the two empty-list failures apart rather than collapsing them",
+    async () => {
+      // "Your CLI is broken" and "your CLI has no models" are the two things a
+      // person here is trying to tell apart, so a plain command that ERRORED
+      // must never be reported as a plain command that printed nothing — and a
+      // verbose failure that is only about the flag must not be reported as the
+      // cause of an empty catalog.
+      const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-twofailures-"));
+      const broken = join(scratch, "opencode-broken");
+      // Exits non-zero for BOTH shapes: the CLI itself is unusable.
+      writeFileSync(broken, ["#!/bin/sh", 'echo "ENOENT: no such binary" >&2', "exit 127", ""].join("\n"));
+      const flagOnly = join(scratch, "opencode-flagonly");
+      // Exits 0 with no output for plain, and refuses only the verbose form.
+      writeFileSync(
+        flagOnly,
+        [
+          "#!/bin/sh",
+          'for arg in "$@"; do',
+          '  if [ "$arg" = "--verbose" ]; then',
+          '    echo "Unrecognized flag: --verbose in command opencode models" >&2',
+          "    exit 1",
+          "  fi",
+          "done",
+          "exit 0",
+          "",
+        ].join("\n"),
+      );
+      chmodSync(broken, 0o755);
+      chmodSync(flagOnly, 0o755);
+      resetOpenCodeModelCache();
+      try {
+        await discoverOpenCodeModels({}, broken);
+        expect(openCodeModelProbeProblem()).toContain("no such binary");
+        expect(openCodeModelProbeProblem()).not.toContain("listed nothing");
+
+        await discoverOpenCodeModels({}, flagOnly);
+        // The CLI answered correctly and had nothing to list; the flag refusal
+        // is context, not the cause.
+        expect(openCodeModelProbeProblem()).toContain("listed nothing");
+        expect(openCodeModelProbeProblem()).toContain("Unrecognized flag");
+      } finally {
+        resetOpenCodeModelCache();
+        await removeTempDir(scratch);
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
     "records why the catalog is empty when the CLI lists nothing",
     async () => {
     // An engine with no models and no reason reads as broken.  It is not: the

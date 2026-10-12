@@ -220,13 +220,24 @@ async function probeOpenCodeModels(
     return "";
   });
   if (plain.trim()) return plain;
-  try {
-    return await runOpenCodeModels(cli, environment, true);
-  } catch {
-    // Both shapes failed.  Report the plain command's reason: that is the one
-    // this CLI version supports, so its message is the useful one.
-  }
-  throw new Error(plainProblem ?? "opencode models answered nothing");
+  let verboseProblem: string | null = null;
+  const verbose = await runOpenCodeModels(cli, environment, true).catch((error: Error) => {
+    verboseProblem = error?.message ?? String(error);
+    return "";
+  });
+  if (verbose.trim()) return verbose;
+
+  // Neither shape produced a list, and the two failures mean different things.
+  // A plain command that ERRORED means the CLI itself is unusable, so its
+  // message is the answer.  A plain command that RAN and printed nothing means
+  // the CLI answered correctly and simply has nothing to list — and the verbose
+  // failure beside it is only ever about the flag, so it is reported as context
+  // rather than as the cause.  Collapsing both into one fallback string loses
+  // the difference between "your CLI is broken" and "your CLI has no models",
+  // which are the two things a person here is trying to tell apart.
+  if (plainProblem) throw new Error(plainProblem);
+  if (verboseProblem) throw new Error(`opencode models listed nothing (${verboseProblem})`);
+  throw new Error("opencode models answered nothing");
 }
 
 /** Ask the same OpenCode binary that will run ACP for its effective catalog.
