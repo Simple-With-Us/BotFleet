@@ -135,7 +135,7 @@ jobs:
           echo "commit:  $(git rev-parse HEAD)"
           cat release/SHA256SUMS-ubuntu-x64.txt
       - name: Upload smoke diagnostics on failure
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: botfleet-ubuntu-smoke-diagnostics
@@ -145,7 +145,7 @@ jobs:
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 7
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.release.outputs.artifact-name }}
           path: |
