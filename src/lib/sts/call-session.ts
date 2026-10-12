@@ -15,6 +15,13 @@
 //    not a persona, so the model is handed a `bot_engine` function that runs a
 //    real turn and resolves with its reply.  The deadline and the bypass belong
 //    to the frozen provider layer; this file only supplies the tool.
+//  * How a permission is answered out loud.  On a speech-to-speech call the
+//    user's speech reaches the model, not the app, so there is no second
+//    dictation channel to route "yes" through: the chained path's spoken answer
+//    cannot exist here.  The same tool therefore carries the approval — the
+//    model learns one is waiting, reads the request out loud, and hands the
+//    user's own words back for the app to map.  The app decides, never the
+//    model, and it decides with the same anchored rules the chained path uses.
 //
 // The capture half mirrors `assemblyai-transcription.ts` exactly — the same
 // `getUserMedia` constraints, the same ScriptProcessor into a zeroed gain node,
@@ -455,8 +462,37 @@ export const BOT_ENGINE_PARAMETERS = {
       type: "string",
       description: "Optional extra detail: paths, names, errors, constraints.",
     },
+    approval: {
+      type: "object",
+      description:
+        "A permission the caller has to give, instead of engine work. Use " +
+        '"check" to see what is waiting, "ask" to get the exact sentence to read ' +
+        'aloud, and "decide" to hand back the caller\'s own answer.',
+      properties: {
+        action: {
+          type: "string",
+          enum: ["check", "ask", "decide"],
+          description: "Which half of the exchange this call is.",
+        },
+        requestId: {
+          type: "string",
+          description: "Which request. Left out, it means the oldest waiting one.",
+        },
+        answer: {
+          type: "string",
+          description:
+            'For "decide" only: the words the caller actually said. You do not ' +
+            "interpret them; the app decides what they mean.",
+        },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
   },
-  required: ["task"],
+  // Deliberately nothing required. An approval call carries no task, and
+  // requiring one would hand the engine a sentence the model invented only to
+  // satisfy the schema.
+  required: [],
   additionalProperties: false,
 } as const;
 
@@ -464,6 +500,7 @@ export const BOT_ENGINE_PARAMETERS = {
 export interface EngineToolCall {
   task?: string;
   context?: string;
+  approval?: StsApprovalCall;
 }
 
 /** A turn runner, in the tool's own vocabulary rather than the wire's. */
@@ -477,9 +514,16 @@ export type EngineToolRunner = (call: EngineToolCall, signal: AbortSignal) => Pr
  */
 const engineToolArguments = z.looseObject({});
 
+const approvalCallSchema = z.object({
+  action: z.enum(["check", "ask", "decide"]).optional(),
+  requestId: z.string().optional(),
+  answer: z.string().optional(),
+});
+
 const engineToolCallSchema = z.object({
   task: z.string().optional(),
   context: z.string().optional(),
+  approval: approvalCallSchema.optional(),
 });
 
 /**
@@ -518,6 +562,216 @@ export function enginePrompt(call: EngineToolCall): string {
   return context ? `${head}\n\nContext from the caller: ${context}` : head;
 }
 
+// ── a permission, answered out loud ──────────────────────────────────────
+//
+// The rule this encodes, unchanged from the chained path: an approval is the
+// user's decision, not the model's.  The model may carry the user's words back
+// and nothing else.  It never chooses an outcome, never paraphrases an answer
+// into one, and an answer that cannot be read unambiguously approves nothing.
+// The word "always allow" is deliberately unreachable from here: that grant is
+// durable, and a voice decision must not be able to create one.
+
+/** Spoken answers to a permission card. Anything else is read as a reply to
+ * the bot, not as consent — an approval must never be granted by a sentence
+ * that merely contained the word "sure". */
+const YES = /^(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|allow|approve|approved|fine|please do)\b/i;
+const NO = /^(no|nope|don'?t|do not|stop|deny|denied|cancel|never|skip it)\b/i;
+
+/** How a spoken answer was understood. "unclear" is the safe default: the
+ * request stays open and nothing was decided. */
+export type SpokenApproval = "allow" | "deny" | "unclear";
+
+/**
+ * Read a spoken answer as a decision.
+ *
+ * Anchored at the start of the utterance, so only an answer that *is* a yes or
+ * a no counts.  "I'm not sure" contains "sure" and is not consent; "no" wins
+ * over nothing because the two patterns cannot both match.
+ */
+export function spokenApprovalDecision(answer: string | undefined): SpokenApproval {
+  const said = answer?.trim() ?? "";
+  if (YES.test(said)) return "allow";
+  if (NO.test(said)) return "deny";
+  return "unclear";
+}
+
+/** The denial note a spoken "no" records. Shared with the chained path so a
+ * voice denial and a clicked denial leave the same audit record. */
+export const VOICE_DENIAL_MESSAGE = "Denied by the user, on a call.";
+
+/**
+ * A permission the app is holding, in the shape this file reasons about.
+ *
+ * Built by the call view from the same pending list the card renders, so the
+ * thing the model is told out loud and the thing on screen are one request.
+ * `prompt` is the sentence the shared prompt builder already produces for the
+ * chained path: the model reads it rather than inventing its own summary of
+ * what is being asked.
+ */
+export interface StsApprovalView {
+  requestId: string;
+  /** The provider-authored tool name, for the model's own bookkeeping. */
+  tool: string;
+  /** A routine confirmation rather than a tool approval. */
+  routine: boolean;
+  /** The card's message id, so a voice decision can name what it answered. */
+  messageId: string;
+  prompt: string;
+}
+
+/** Which half of the exchange the model is calling for. */
+export type StsApprovalAction = "check" | "ask" | "decide";
+
+export interface StsApprovalCall {
+  action?: StsApprovalAction;
+  requestId?: string;
+  answer?: string;
+}
+
+interface StsApprovalText {
+  /** What the model is told, and may read aloud. */
+  text: string;
+}
+
+export type StsApprovalOutcome =
+  | (StsApprovalText & { kind: "status" })
+  | (StsApprovalText & { kind: "ask"; requestId: string })
+  | (StsApprovalText & { kind: "unclear"; requestId: string })
+  | (StsApprovalText & { kind: "stale" })
+  | { kind: "decided"; requestId: string; decision: "allow" | "deny" };
+
+/** Requests this call has already submitted, however they were answered. */
+export type StsDecided = ReadonlySet<string>;
+
+/**
+ * What the model is told when it names a request that is no longer waiting.
+ *
+ * Reachable and harmless: the model can be a turn behind, the card can be
+ * clicked on another device, or the call can outlive the request.  Nothing is
+ * submitted, because a decision for a request that is gone cannot be undone.
+ */
+export function staleApprovalText(): string {
+  return (
+    "That request is no longer waiting for permission, so nothing was submitted.  " +
+    "Do not answer it again.  If the work is still needed, call the engine for it."
+  );
+}
+
+/** Requests still open, oldest first — the one the card is showing is first. */
+function waitingApprovals(pending: readonly StsApprovalView[], decided: StsDecided): StsApprovalView[] {
+  return pending.filter((approval) => !decided.has(approval.requestId));
+}
+
+/**
+ * The request an action names.
+ *
+ * A named request that is not waiting resolves to nothing rather than to the
+ * oldest one: falling back would let the model answer a different permission
+ * than the one it read out.  No name at all means the oldest, which is what the
+ * chained path asks about and what the card is showing.
+ */
+function targetApproval(
+  waiting: readonly StsApprovalView[],
+  requestId: string | undefined,
+): StsApprovalView | undefined {
+  if (!requestId) return waiting[0];
+  return waiting.find((approval) => approval.requestId === requestId);
+}
+
+function statusText(waiting: readonly StsApprovalView[]): string {
+  if (!waiting.length) {
+    return "Nothing is waiting for permission right now.  Carry on with the call.";
+  }
+  const lines = waiting.map(
+    (approval, index) => `${index + 1}. ${approval.prompt}  Request id: ${approval.requestId}.`,
+  );
+  return [
+    waiting.length === 1
+      ? "One request is waiting for permission."
+      : `${waiting.length} requests are waiting for permission, oldest first.`,
+    ...lines,
+    `Ask for them one at a time, oldest first, and call \`${BOT_ENGINE_TOOL}\` again with the answer.`,
+  ].join("\n");
+}
+
+function askText(approval: StsApprovalView): string {
+  return (
+    `Read this to the caller word for word, then wait for their answer:\n${approval.prompt}\n` +
+    `When they answer, call \`${BOT_ENGINE_TOOL}\` again with approval action "decide", ` +
+    `request id ${approval.requestId}, and their exact words as the answer.  Never answer it for them.`
+  );
+}
+
+function unclearText(approval: StsApprovalView): string {
+  return (
+    "That was not a clear yes or no, so nothing was submitted and this request is still waiting.  " +
+    `Ask the caller again, and tell them the approval for ${approval.tool} is also on screen if they ` +
+    "would rather press the buttons."
+  );
+}
+
+/**
+ * Decide what an approval action means.
+ *
+ * Pure, and the whole of the policy: it is the only place that can answer a
+ * request, so a decision the app cannot read unambiguously comes back as
+ * "unclear" with nothing to submit.  Anything unrecognised — a missing action, a
+ * request that is gone — degrades to the read-only status rather than guessing.
+ */
+export function resolveStsApproval(
+  request: StsApprovalCall,
+  pending: readonly StsApprovalView[],
+  decided: StsDecided,
+): StsApprovalOutcome {
+  const waiting = waitingApprovals(pending, decided);
+  const action = request.action;
+
+  if (action === "decide") {
+    const target = targetApproval(waiting, request.requestId);
+    if (!target) return { kind: "stale", text: staleApprovalText() };
+    const decision = spokenApprovalDecision(request.answer);
+    if (decision === "unclear") return { kind: "unclear", requestId: target.requestId, text: unclearText(target) };
+    return { kind: "decided", requestId: target.requestId, decision };
+  }
+
+  if (action === "ask") {
+    const target = targetApproval(waiting, request.requestId);
+    if (!target) return { kind: "stale", text: staleApprovalText() };
+    return { kind: "ask", requestId: target.requestId, text: askText(target) };
+  }
+
+  // "check", and anything the model made up: reading what is waiting can
+  // never submit anything, so an unrecognised action is safe to answer.
+  return { kind: "status", text: statusText(waiting) };
+}
+
+/**
+ * The clause that tells the model how to ask out loud and carry the answer
+ * back.
+ *
+ * Appended to the composed instructions by the caller rather than written into
+ * `composeStsInstructions`, which is frozen and has no place for it: the persona
+ * it composes is the first section, so a clause added there would sit above the
+ * tool it talks about.  Last in the instructions is where the model reads a
+ * rule best, and appending leaves that function untouched.
+ */
+export function stsApprovalInstructions(): string {
+  return [
+    "Permissions can stop you mid-turn.  When the engine asks for one, the tool result says what " +
+      "is being asked and gives you its request id.",
+    "Ask for it out loud: read the request to the caller word for word, wait for their answer, then " +
+      `call \`${BOT_ENGINE_TOOL}\` again with approval action "decide", that request id, and their ` +
+      "exact words as the answer.",
+    "The caller decides, not you.  Pass on what they actually said and let the app read it.  Never " +
+      "approve anything yourself, never invent an answer, and never treat silence, a guess, or an " +
+      "unclear reply as a yes: anything you cannot pass on verbatim approves nothing.",
+    "The approval also stays on screen as a card, so answering out loud and pressing the card are " +
+      "the same decision, recorded the same way.",
+    `If a turn did not tell you one is waiting, or the caller asks why you stopped, call ` +
+      `\`${BOT_ENGINE_TOOL}\` with approval action "check" before you answer.`,
+  ].join("\n\n");
+}
+
 // ── waiting for the engine's reply ───────────────────────────────────────
 
 export interface EngineTurnMessage {
@@ -525,34 +779,66 @@ export interface EngineTurnMessage {
   role?: string;
   kind?: string;
   text?: string | null;
+  /** Just enough of a permission card to tell a waiting request from a
+   *  resolved or dismissed one. */
+  card?: {
+    requestId?: string;
+    tool?: string;
+    answered?: string;
+    dismissed?: boolean;
+  };
 }
+
+/**
+ * How an engine turn ended.
+ *
+ * `approval` is not a failure: the engine is waiting on the user, which is the
+ * one thing this call cannot answer for itself.  It is reported as its own
+ * outcome so the model can ask out loud, rather than as silence the deadline
+ * would eventually turn into a bypass.
+ */
+export type EngineTurnResult =
+  | { kind: "reply"; text: string }
+  | { kind: "approval"; requestId: string }
+  | { kind: "failed"; text: string };
 
 export interface EngineTurnWaiter {
   /**
    * Start waiting for the reply to a turn that is about to be dispatched.
    * `before` is the set of message ids already on screen.
    */
-  arm(before: ReadonlySet<string>, signal: AbortSignal): Promise<string>;
+  arm(before: ReadonlySet<string>, signal: AbortSignal): Promise<EngineTurnResult>;
   /** Feed the current messages; settles the wait when the reply lands. */
   observe(messages: readonly EngineTurnMessage[]): void;
+  /**
+   * Settle an armed wait with something the caller already knows — a decision
+   * that could not be saved, say.  Resolves rather than rejects because the
+   * engine did run: the model should hear what happened, not be handed a
+   * bypass it cannot explain.
+   */
+  note(text: string): void;
   /** Give up on the wait and reject it. */
   cancel(): void;
 }
 
 /**
- * Resolve a bot turn's reply text.
+ * Resolve a bot turn's outcome.
  *
  * A tool call has to answer inside the deadline, so it cannot watch React state
  * itself: it arms, dispatches, and this — driven from the call view's existing
- * message effect — settles when the first new bot text message appears.  A turn
- * that ends without one leaves the promise unsettled, which is deliberate: the
- * provider's own deadline then fires, `callBotEngine` records the bypass, and
- * the model answers that turn instead.
+ * message effect — settles when a permission card or the first new bot text
+ * message appears.  A turn that ends without either leaves the promise
+ * unsettled, which is deliberate: the provider's own deadline then fires,
+ * `callBotEngine` records the bypass, and the model answers that turn instead.
+ *
+ * A permission card wins over a reply in the same batch, because an open
+ * request is the state that holds the turn up: reporting the reply instead
+ * would send the model off believing the engine finished.
  */
 export function createEngineTurnWaiter(): EngineTurnWaiter {
   interface Token {
     before: ReadonlySet<string>;
-    resolve: (text: string) => void;
+    resolve: (result: EngineTurnResult) => void;
     reject: (error: Error) => void;
     detach: () => void;
   }
@@ -564,10 +850,17 @@ export function createEngineTurnWaiter(): EngineTurnWaiter {
     live?.detach();
   };
 
+  /** A request still waiting for an answer, or nothing. */
+  const waitingApproval = (message: EngineTurnMessage): string | undefined => {
+    if (!message.card?.requestId || !message.card.tool) return undefined;
+    if (message.card.answered || message.card.dismissed) return undefined;
+    return message.card.requestId;
+  };
+
   return {
     arm(before, signal) {
       clear();
-      return new Promise<string>((resolve, reject) => {
+      return new Promise<EngineTurnResult>((resolve, reject) => {
         if (signal.aborted) {
           reject(new Error("The call ended before the engine turn started."));
           return;
@@ -585,15 +878,30 @@ export function createEngineTurnWaiter(): EngineTurnWaiter {
     observe(messages) {
       const live = pending;
       if (!live) return;
-      for (const message of messages) {
-        if (live.before.has(message.id)) continue;
+      const fresh = messages.filter((message) => !live.before.has(message.id));
+
+      for (const message of fresh) {
+        const requestId = waitingApproval(message);
+        if (!requestId) continue;
+        clear();
+        live.resolve({ kind: "approval", requestId });
+        return;
+      }
+
+      for (const message of fresh) {
         if (message.role !== "bot" || message.kind !== "text") continue;
         const text = message.text?.trim();
         if (!text) continue;
         clear();
-        live.resolve(text);
+        live.resolve({ kind: "reply", text });
         return;
       }
+    },
+    note(text) {
+      const live = pending;
+      if (!live) return;
+      clear();
+      live.resolve({ kind: "failed", text });
     },
     cancel() {
       const live = pending;

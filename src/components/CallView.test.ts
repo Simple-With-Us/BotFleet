@@ -93,3 +93,80 @@ describe("Personal Voice desktop call support", () => {
     expect(SRC).toMatch(/Apple Personal Voice speaks on Apple devices \(Mac and iPhone\)/);
   });
 });
+
+/**
+ * Approvals by voice, on a speech-to-speech call.
+ *
+ * Source-level for the same reason as the rest of this file: the decision logic
+ * is a pure function and is unit-tested in `call-session.test.ts`, while what is
+ * worth protecting here is the wiring — that a spoken answer reaches the same
+ * action the card's own buttons dispatch, and that the call view never settles
+ * a card itself.
+ */
+describe("approvals by voice", () => {
+  it("reads a spoken answer with the shared anchored rules", () => {
+    // The chained path and the speech-to-speech path must judge an answer by
+    // the same standard, so the rules live with the policy rather than here.
+    expect(SRC).not.toMatch(/\bYES\s*=\s*\/\^/);
+    expect(SRC).not.toMatch(/\bNO\s*=\s*\/\^/);
+    expect(SRC).toMatch(/const spoken = spokenApprovalDecision\(said\);/);
+    expect(SRC).toMatch(/if \(spoken !== "unclear"\)/);
+  });
+
+  it("records the same denial note whichever path heard it", () => {
+    expect(SRC).toMatch(/message: allow \? undefined : VOICE_DENIAL_MESSAGE/);
+  });
+
+  it("submits a voice decision through the card's own action", () => {
+    // `decideRequest` is what PendingApprovalActions dispatches, so a spoken
+    // "yes" and a clicked "Allow Once" are one decision with one record.
+    const decisions = SRC.match(/type: "decideRequest"/g) ?? [];
+    expect(decisions.length).toBe(2);
+    expect(SRC).toMatch(/type: "decideRequest",\n\s*threadId: bot\.threadId,\n\s*requestId,\n\s*behavior: decision,/);
+  });
+
+  it("never lets the call itself answer or hide a card", () => {
+    // The card stays in the chat whatever the voice decided; the call only
+    // submits, and the server's patch is what settles it.
+    expect(SRC).not.toMatch(/dismissCard/);
+    expect(SRC).not.toMatch(/answered:/);
+    expect(SRC).not.toMatch(/alwaysAllow/);
+  });
+
+  it("answers nothing until the policy has read the user's words", () => {
+    expect(SRC).toMatch(/const outcome = resolveStsApproval\(request, approvalsRef\.current, decidedRef\.current\);/);
+    expect(SRC).toMatch(/if \(outcome\.kind !== "decided"\) return outcome\.text;/);
+  });
+
+  it("claims a request before submitting it, and hands the claim back on failure", () => {
+    expect(SRC).toMatch(/decidedRef\.current\.add\(requestId\);/);
+    expect(SRC).toMatch(/decidedRef\.current\.delete\(requestId\);/);
+    expect(SRC).toMatch(/waiter\?\.note\(/);
+  });
+
+  it("turns a turn blocked on a permission into the question to ask out loud", () => {
+    // The stall this replaces: the engine was waiting on the user and the wait
+    // used to time out into a bypass instead of reaching the model.
+    expect(SRC).toMatch(/if \(result\.kind !== "approval"\) return result\.text;/);
+    expect(SRC).toMatch(/\{ action: "ask", requestId: result\.requestId \}/);
+    expect(SRC).toMatch(/if \(call\.approval\) return runVoiceApproval\(call\.approval, signal\);/);
+  });
+
+  it("reads the prompt the card already renders rather than inventing one", () => {
+    expect(SRC).toMatch(/prompt: spokenApprovalPrompt\(pending, botName\),/);
+    expect(SRC).toMatch(/approvalsRef\.current = pendingApprovals\(messages\)\.map/);
+  });
+
+  it("teaches the model the rule only when the tool is offered", () => {
+    expect(SRC).toMatch(
+      /const instructions = frontEngine\s*\? `\$\{prepared\.instructions\}\\n\\n\$\{stsApprovalInstructions\(\)\}`\s*: prepared\.instructions;/,
+    );
+  });
+
+  it("leaves the chained narration early-return alone", () => {
+    // An STS call still speaks for itself; the chained path still reads
+    // approvals aloud, and neither is changed by this.
+    expect(SRC).toMatch(/if \(stsModeRef\.current\) \{\s*for \(const m of messages\) spokenIds\.current\.add\(m\.id\);\s*return;/);
+    expect(SRC).toMatch(/void sayThenListen\(spokenApprovalPrompt\(approval, bot\.name\)\);/);
+  });
+});

@@ -40,12 +40,20 @@ import {
   enginePrompt,
   microphoneAvailable,
   readStsKeys,
+  resolveStsApproval,
+  spokenApprovalDecision,
+  staleApprovalText,
+  stsApprovalInstructions,
   stsBridgeAvailable,
   stsCapability,
   stsLineText,
+  VOICE_DENIAL_MESSAGE,
   type CallModeDecision,
   type EngineToolRunner,
+  type EngineTurnResult,
   type EngineTurnWaiter,
+  type StsApprovalCall,
+  type StsApprovalView,
   type StsCallDriver,
   type StsLineView,
   type StsProvider,
@@ -56,16 +64,29 @@ import { prepareStsSession } from "@/lib/sts";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { BotMascot } from "./Avatar";
-import { isRoutineApproval, pendingApprovals, spokenApprovalPrompt } from "./PendingApproval";
+import { isRoutineApproval, pendingApprovals, spokenApprovalPrompt, type Pending } from "./PendingApproval";
 import { cn } from "@/lib/cn";
 import { track } from "@/lib/analytics";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 
-/** Spoken answers to a permission card. Anything else is read as a reply
- * to the bot, not as consent — an approval must never be granted by a
- * sentence that merely contained the word "sure". */
-const YES = /^(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|allow|approve|approved|fine|please do)\b/i;
-const NO = /^(no|nope|don'?t|do not|stop|deny|denied|cancel|never|skip it)\b/i;
+/** The card the chat is already rendering, as the permission the engine tool
+ *  reasons about.  One request, two views: the model is handed the same words
+ *  the chained path would have spoken, so what is on screen and what is said
+ *  out loud cannot disagree. */
+function toStsApproval(pending: Pending, botName: string): StsApprovalView {
+  return {
+    requestId: pending.requestId,
+    tool: pending.tool,
+    routine: isRoutineApproval(pending),
+    messageId: pending.message.id,
+    prompt: spokenApprovalPrompt(pending, botName),
+  };
+}
+
+// The anchored yes/no rules that read a spoken answer live in `call-session`
+// rather than here: a speech-to-speech call learns what the user said from what
+// the model hands back, and both call paths must judge that answer by exactly
+// the same standard.
 
 type Phase = "listening" | "sending" | "working" | "speaking";
 const CALL_ENDPOINT_MS = 850;
@@ -368,6 +389,12 @@ function Call({ bot }: { bot: Bot }) {
   // tell a new reply from one that was already on screen.
   const botRef = useRef(bot);
   botRef.current = bot;
+  // The permissions this call is holding, and the ones it has already answered.
+  // Both are refs because the engine tool runs from a provider callback rather
+  // than from a render, and a tool call must never close over a stale list.
+  const approvalsRef = useRef<StsApprovalView[]>([]);
+  approvalsRef.current = pendingApprovals(messages).map((pending) => toStsApproval(pending, bot.name));
+  const decidedRef = useRef<Set<string>>(new Set());
   // The STT provider session is chosen once per call and reused across every
   // listen cycle. The provider picker decides apple (macOS, no cloud key) vs
   // assemblyai (cross-platform, or macOS-with-key per the picker default).
@@ -431,27 +458,95 @@ function Call({ bot }: { bot: Bot }) {
     [listen, say],
   );
 
+  /** Turn one settled engine turn into the text the model reads.  A turn that
+   * stopped for permission becomes the sentence to ask out loud, so the model
+   * hears the request while the turn it already dispatched is still waiting. */
+  const engineTurnText = useCallback((result: EngineTurnResult): string => {
+    if (result.kind !== "approval") return result.text;
+    const outcome = resolveStsApproval(
+      { action: "ask", requestId: result.requestId },
+      approvalsRef.current,
+      decidedRef.current,
+    );
+    return outcome.kind === "ask" ? outcome.text : staleApprovalText();
+  }, []);
+
+  /**
+   * Answer a permission the model asked about.
+   *
+   * The user's speech reaches the model on this call, never the app, so the
+   * answer arrives as text the model hands back and the app reads it.  The
+   * decision then goes out through `decideRequest` — the same action the
+   * permission card's own buttons dispatch — so a spoken "yes" and a clicked
+   * "Allow Once" are one decision with one record.  The card is never told to
+   * disappear: it settles the way it settles for a click.
+   */
+  const runVoiceApproval = useCallback(
+    async (request: StsApprovalCall, signal: AbortSignal): Promise<string> => {
+      const outcome = resolveStsApproval(request, approvalsRef.current, decidedRef.current);
+      // Anything but a decision — including an answer that could not be read
+      // unambiguously — goes back to the model as text, having submitted
+      // nothing.
+      if (outcome.kind !== "decided") return outcome.text;
+
+      const { requestId, decision } = outcome;
+      const waiter = engineWaiterRef.current;
+      // Claimed before the request goes out, exactly as the chained path does:
+      // until the server's durable card patch lands this request is still on
+      // screen and must not be answered a second time.
+      decidedRef.current.add(requestId);
+      dispatch({
+        type: "decideRequest",
+        threadId: bot.threadId,
+        requestId,
+        behavior: decision,
+        message: decision === "deny" ? VOICE_DENIAL_MESSAGE : undefined,
+        onError: (error: string) => {
+          // A decision the server refused is no decision at all: hand the claim
+          // back so the request can be answered again, and say so rather than
+          // leaving the model to wait out the deadline in silence.
+          decidedRef.current.delete(requestId);
+          const detail = error.trim().slice(0, 240);
+          waiter?.note(
+            `That approval could not be saved${detail ? `: ${detail}` : "."}  Ask the caller to answer it again.`,
+          );
+        },
+      });
+      // Armed after the dispatch, so the card's own settle patch counts as
+      // already on screen and only the engine's reply can satisfy this wait.
+      const before = new Set(visibleMessages(botRef.current).map((message) => message.id));
+      const answer = waiter?.arm(before, signal);
+      if (!answer) throw new Error("The bot's engine is not available on this call.");
+      // The engine was mid-turn and is running again: this waits for what it
+      // has to say about the decision, under the same deadline as any turn.
+      return engineTurnText(await answer);
+    },
+    [bot.threadId, dispatch, engineTurnText],
+  );
+
   /**
    * The bot's own engine, as the `bot_engine` function tool.
    *
    * This is the same turn the chained path runs when it dispatches a send: the
    * voice model decides to call the tool, the call dispatches a real turn, and
    * the reply that lands resolves the tool.  Nothing here waits on a rendering
-   * effect or a second HTTP endpoint.
+   * effect or a second HTTP endpoint.  The same tool also carries a permission
+   * the user has to answer, because on this call there is no other way to ask.
    *
    * The deadline is the provider's, not this function's: it aborts `signal`, the
    * waiter rejects, `callBotEngine` records a bypass, and the model answers that
    * turn itself with the transcript marked.
    */
-  const runEngineTurn = useCallback<EngineToolRunner>(
+  const runEngineTool = useCallback<EngineToolRunner>(
     async (call, signal) => {
+      if (call.approval) return runVoiceApproval(call.approval, signal);
       const before = new Set(visibleMessages(botRef.current).map((message) => message.id));
       const answer = engineWaiterRef.current?.arm(before, signal);
       dispatch({ type: "send", botId: bot.id, text: enginePrompt(call) });
       if (!answer) throw new Error("The bot's engine is not available on this call.");
-      return answer;
+      return engineTurnText(await answer);
     },
-    [bot.id, dispatch],
+    [bot.id, dispatch, engineTurnText, runVoiceApproval],
   );
 
   // Navigating away from this bot hangs up. Without ownership checking, the
@@ -516,8 +611,9 @@ function Call({ bot }: { bot: Bot }) {
           hush();
           return;
         }
-        if (YES.test(said) || NO.test(said)) {
-          const allow = YES.test(said);
+        const spoken = spokenApprovalDecision(said);
+        if (spoken !== "unclear") {
+          const allow = spoken === "allow";
           // Keep this request claimed until the server's durable card patch
           // arrives. Clearing it here lets a render in that network gap read
           // and submit the same approval again.
@@ -530,7 +626,7 @@ function Call({ bot }: { bot: Bot }) {
             threadId: bot.threadId,
             requestId: open.requestId,
             behavior: allow ? "allow" : "deny",
-            message: allow ? undefined : "Denied by the user, on a call.",
+            message: allow ? undefined : VOICE_DENIAL_MESSAGE,
             onError: (error: string) => {
               const pending = askedApproval.current;
               if (
@@ -618,13 +714,20 @@ function Call({ bot }: { bot: Bot }) {
         const frontEngine = state.config?.sts?.frontEngine !== false;
         // Built even when the front engine is off, so the preference stays one
         // setting read; prepareStsSession decides whether it is offered.
-        const botEngine = createStsBotEngine(runEngineTurn);
+        const botEngine = createStsBotEngine(runEngineTool);
         const prepared = prepareStsSession(provider, {
           persona: composeCallPersona(bot),
           engineTimeoutMs: state.config?.sts?.engineTimeoutMs,
           frontEngine,
           botEngine,
         });
+        // The approval clause rides last, so the model reads the rule after it
+        // has met the tool the rule is about.  It is only added when the tool
+        // is actually offered: told about a tool it does not have, a model
+        // would invent calls that cannot succeed.
+        const instructions = frontEngine
+          ? `${prepared.instructions}\n\n${stsApprovalInstructions()}`
+          : prepared.instructions;
         const engine = frontEngine ? botEngine : undefined;
         const driver = createStsCallDriver(prepared.session, {
           onLine: (line) => {
@@ -658,7 +761,7 @@ function Call({ bot }: { bot: Bot }) {
           // until their handshake lands, so nothing said in between is lost.
           await driver.start();
           await prepared.session.start({
-            instructions: prepared.instructions,
+            instructions,
             botEngine: engine,
             engineTimeoutMs: prepared.timeoutMs,
           });
@@ -724,7 +827,7 @@ function Call({ bot }: { bot: Bot }) {
     // busy/approval are intentionally initial snapshots. Their live changes
     // are handled below without tearing down native event listeners.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bot.id, bot.threadId, dispatch, hush, listen, move, runEngineTurn, sayThenListen]);
+  }, [bot.id, bot.threadId, dispatch, hush, listen, move, runEngineTool, sayThenListen]);
 
   // ── the engine's reply, when the model called the tool ────────────────
   useEffect(() => {

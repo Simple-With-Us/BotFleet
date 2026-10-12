@@ -21,14 +21,21 @@ import {
   enginePrompt,
   MIC_CONSTRAINTS,
   parseEngineToolCall,
+  resolveStsApproval,
+  spokenApprovalDecision,
+  staleApprovalText,
+  stsApprovalInstructions,
   stsBridgeAvailable,
   stsBypassMarker,
   stsCapability,
   stsLineText,
   STS_INPUT_SAMPLE_RATE,
+  VOICE_DENIAL_MESSAGE,
   type MicAudioGraph,
   type MicPlatform,
   type MicStream,
+  type StsApprovalOutcome,
+  type StsApprovalView,
   type StsSession,
   type StsTranscriptLine,
 } from "./call-session";
@@ -408,8 +415,16 @@ describe("createStsBotEngine", () => {
   it("advertises the tool the providers expect, with the task it needs", () => {
     const engine = createStsBotEngine(async () => "done");
     expect(engine.name).toBe("bot_engine");
-    expect(engine.parameters).toMatchObject({ required: ["task"] });
+    expect(engine.parameters).toMatchObject({
+      properties: { task: { type: "string" }, approval: { type: "object" } },
+    });
     expect(engine.description).toMatch(/engine/);
+  });
+
+  it("requires nothing, because an approval call carries no task", () => {
+    // Requiring `task` would make the model invent a sentence of engine work
+    // purely to satisfy the schema on a call that is only answering a prompt.
+    expect(BOT_ENGINE_PARAMETERS.required).toEqual([]);
   });
 });
 
@@ -436,6 +451,17 @@ describe("parseEngineToolCall", () => {
     expect(parseEngineToolCall({ task: { nested: true } })).toEqual({});
   });
 
+  it("carries a permission the model asked about", () => {
+    expect(parseEngineToolCall({ approval: { action: "decide", requestId: "req-1", answer: "yes" } }))
+      .toEqual({ approval: { action: "decide", requestId: "req-1", answer: "yes" } });
+  });
+
+  it("drops an approval whose action is not one it offers", () => {
+    // An action the schema does not declare must not reach the policy as a
+    // half-parsed decision; the whole call is dropped instead.
+    expect(parseEngineToolCall({ approval: { action: "approve", answer: "yes" } })).toEqual({});
+  });
+
   it("is what the advertised tool declares", () => {
     const engine = createStsBotEngine(async () => "done");
     expect(engine.parameters).toBe(BOT_ENGINE_PARAMETERS);
@@ -444,13 +470,20 @@ describe("parseEngineToolCall", () => {
 
 describe("createEngineTurnWaiter", () => {
   const turn = (id: string, role: string, kind: string, text?: string) => ({ id, role, kind, text });
+  /** A permission card, with only the two ways one stops being pending. */
+  const card = (id: string, requestId: string, tool: string, settle?: { answered?: string; dismissed?: boolean }) => ({
+    id,
+    role: "bot",
+    kind: "options",
+    card: { requestId, tool, ...settle },
+  });
 
   it("resolves with the first new bot text message", async () => {
     const waiter = createEngineTurnWaiter();
     const controller = new AbortController();
     const answer = waiter.arm(new Set(["m0"]), controller.signal);
     waiter.observe([turn("m0", "user", "text", "hi"), turn("m1", "bot", "activity"), turn("m2", "bot", "text", "  the build passed ")]);
-    await expect(answer).resolves.toBe("the build passed");
+    await expect(answer).resolves.toEqual({ kind: "reply", text: "the build passed" });
   });
 
   it("ignores a bot message that is not a final text reply", async () => {
@@ -459,7 +492,64 @@ describe("createEngineTurnWaiter", () => {
     const answer = waiter.arm(new Set<string>(), controller.signal);
     waiter.observe([turn("m1", "bot", "text", "   ")]);
     waiter.observe([turn("m2", "bot", "text", "a real answer")]);
-    await expect(answer).resolves.toBe("a real answer");
+    await expect(answer).resolves.toEqual({ kind: "reply", text: "a real answer" });
+  });
+
+  it("reports a permission that opened mid-turn instead of waiting out the deadline", async () => {
+    // The stall this exists to end: the engine is blocked on the user, so the
+    // wait has to come back with the request rather than time out.
+    const waiter = createEngineTurnWaiter();
+    const answer = waiter.arm(new Set(["m0"]), new AbortController().signal);
+    waiter.observe([turn("m0", "user", "text", "fix the tests"), card("m1", "req-1", "Bash")]);
+    await expect(answer).resolves.toEqual({ kind: "approval", requestId: "req-1" });
+  });
+
+  it("prefers a waiting permission over a reply in the same batch", async () => {
+    // An open request is what holds the turn up; reporting the reply instead
+    // would send the model off believing the engine had finished.
+    const waiter = createEngineTurnWaiter();
+    const answer = waiter.arm(new Set<string>(), new AbortController().signal);
+    waiter.observe([turn("m2", "bot", "text", "all done"), card("m1", "req-1", "Bash")]);
+    await expect(answer).resolves.toEqual({ kind: "approval", requestId: "req-1" });
+  });
+
+  it("does not mistake an answered, dismissed, or tool-less card for a permission", async () => {
+    const waiter = createEngineTurnWaiter();
+    const answer = waiter.arm(new Set<string>(), new AbortController().signal);
+    waiter.observe([
+      card("m1", "req-1", "Bash", { answered: "Allow" }),
+      card("m2", "req-2", "Write", { dismissed: true }),
+      // A question card carries a request id but no tool: it is not a
+      // permission, and answering it aloud is a different exchange entirely.
+      { id: "m3", role: "bot", kind: "options", card: { requestId: "req-3" } },
+    ]);
+    waiter.observe([turn("m4", "bot", "text", "never mind")]);
+    await expect(answer).resolves.toEqual({ kind: "reply", text: "never mind" });
+  });
+
+  it("does not re-report a permission card that was already on screen", async () => {
+    // The card this call just decided is still on screen until the server's
+    // patch lands; re-arming for the engine's reply must not see it again.
+    const waiter = createEngineTurnWaiter();
+    const answer = waiter.arm(new Set(["m1"]), new AbortController().signal);
+    waiter.observe([card("m1", "req-1", "Bash"), turn("m2", "bot", "text", "done")]);
+    await expect(answer).resolves.toEqual({ kind: "reply", text: "done" });
+  });
+
+  it("settles with what the caller already knows, rather than rejecting", async () => {
+    // A decision the server refused is not an engine failure: rejecting here
+    // would be recorded as a bypass the model cannot explain.
+    const waiter = createEngineTurnWaiter();
+    const answer = waiter.arm(new Set<string>(), new AbortController().signal);
+    waiter.note("That approval could not be saved.  Ask the caller again.");
+    await expect(answer).resolves.toEqual({
+      kind: "failed",
+      text: "That approval could not be saved.  Ask the caller again.",
+    });
+  });
+
+  it("ignores a note that arrives with nothing armed", () => {
+    expect(() => createEngineTurnWaiter().note("nobody is listening")).not.toThrow();
   });
 
   it("rejects when the call ends mid-turn, so the provider can bypass", async () => {
@@ -483,7 +573,7 @@ describe("createEngineTurnWaiter", () => {
     // A second turn is unaffected by the first one's cancellation.
     const second = waiter.arm(new Set<string>(), new AbortController().signal);
     waiter.observe([turn("m9", "bot", "text", "recovered")]);
-    await expect(second).resolves.toBe("recovered");
+    await expect(second).resolves.toEqual({ kind: "reply", text: "recovered" });
   });
 });
 
@@ -497,6 +587,180 @@ describe("composeCallPersona", () => {
 
   it("leaves out a profile the bot never set", () => {
     expect(composeCallPersona({ name: "Skippy" })).not.toContain("undefined");
+  });
+});
+
+// ── a permission, answered out loud ──────────────────────────────────────
+
+const PENDING: StsApprovalView[] = [
+  {
+    requestId: "req-1",
+    tool: "Bash",
+    routine: false,
+    messageId: "m1",
+    prompt: "Skippy wants to run ls. Should I allow it?",
+  },
+  {
+    requestId: "req-2",
+    tool: "Write",
+    routine: false,
+    messageId: "m2",
+    prompt: "Skippy wants to edit main.ts. Should I allow it?",
+  },
+];
+
+const NOTHING_DECIDED = new Set<string>();
+
+/** What the model would be handed for any outcome that submits nothing.  A
+ *  decision has no text by construction: it goes out as an action instead. */
+function outcomeText(outcome: StsApprovalOutcome): string {
+  if (outcome.kind === "decided") {
+    throw new Error("A decision is an action, not something the model is told.");
+  }
+  return outcome.text;
+}
+
+describe("spokenApprovalDecision", () => {
+  it("reads an answer that opens with a decision", () => {
+    // The anchor is at the start of the utterance, exactly as the chained path
+    // has always read it: what matters is that the answer *is* a yes or a no,
+    // not that it is exactly one word.
+    expect(spokenApprovalDecision("yes")).toBe("allow");
+    expect(spokenApprovalDecision("  Yeah, go ahead  ")).toBe("allow");
+    expect(spokenApprovalDecision("yes, but read it to me first")).toBe("allow");
+    expect(spokenApprovalDecision("no")).toBe("deny");
+    expect(spokenApprovalDecision("don't")).toBe("deny");
+  });
+
+  it("refuses to read consent out of a sentence that only contains it", () => {
+    // The rule the chained path has always held: an approval is never granted
+    // by a word that happened to appear somewhere in the utterance.
+    expect(spokenApprovalDecision("I'm not sure about that")).toBe("unclear");
+    expect(spokenApprovalDecision("can you approve the deploy?")).toBe("unclear");
+    expect(spokenApprovalDecision("I would approve it if you asked")).toBe("unclear");
+    expect(spokenApprovalDecision(undefined)).toBe("unclear");
+    expect(spokenApprovalDecision("   ")).toBe("unclear");
+  });
+});
+
+describe("resolveStsApproval — checking what is waiting", () => {
+  it("says so plainly when nothing is pending", () => {
+    const outcome = resolveStsApproval({ action: "check" }, [], NOTHING_DECIDED);
+    expect(outcome.kind).toBe("status");
+    expect(outcomeText(outcome)).toMatch(/Nothing is waiting/);
+  });
+
+  it("lists every waiting request, oldest first, with the id to answer it by", () => {
+    const outcome = resolveStsApproval({ action: "check" }, PENDING, NOTHING_DECIDED);
+    expect(outcome.kind).toBe("status");
+    const text = outcomeText(outcome);
+    expect(text).toContain("2 requests are waiting for permission, oldest first.");
+    expect(text.indexOf("req-1")).toBeLessThan(text.indexOf("req-2"));
+    expect(text).toContain("Skippy wants to run ls. Should I allow it?");
+  });
+
+  it("leaves out a request this call has already answered", () => {
+    // The card stays on screen until the server's patch lands; without this a
+    // second look would offer to answer the same permission twice.
+    const outcome = resolveStsApproval({ action: "check" }, PENDING, new Set(["req-1"]));
+    expect(outcomeText(outcome)).toContain("One request is waiting for permission.");
+    expect(outcomeText(outcome)).not.toContain("req-1");
+  });
+
+  it("treats an action it does not recognise as a read, never as consent", () => {
+    const outcome = resolveStsApproval({ answer: "yes" }, PENDING, NOTHING_DECIDED);
+    expect(outcome.kind).toBe("status");
+  });
+});
+
+describe("resolveStsApproval — asking out loud", () => {
+  it("hands back the sentence to read, word for word, and how to answer it", () => {
+    const outcome = resolveStsApproval({ action: "ask" }, PENDING, NOTHING_DECIDED);
+    expect(outcome.kind).toBe("ask");
+    // The oldest request is the one on screen, so it is the one asked about.
+    expect(outcome.kind === "ask" && outcome.requestId).toBe("req-1");
+    expect(outcomeText(outcome)).toContain("Skippy wants to run ls. Should I allow it?");
+    expect(outcomeText(outcome)).toContain('action "decide"');
+    expect(outcomeText(outcome)).toContain("Never answer it for them");
+  });
+
+  it("asks about a named request rather than the oldest one", () => {
+    const outcome = resolveStsApproval({ action: "ask", requestId: "req-2" }, PENDING, NOTHING_DECIDED);
+    expect(outcome.kind === "ask" && outcome.requestId).toBe("req-2");
+    expect(outcomeText(outcome)).toContain("edit main.ts");
+  });
+
+  it("never falls back to the oldest request for a name it cannot match", () => {
+    // Falling back would let the model read one permission aloud and answer a
+    // different one.
+    const outcome = resolveStsApproval({ action: "ask", requestId: "req-9" }, PENDING, NOTHING_DECIDED);
+    expect(outcome.kind).toBe("stale");
+    expect(outcomeText(outcome)).toBe(staleApprovalText());
+  });
+});
+
+describe("resolveStsApproval — carrying the answer back", () => {
+  it("decides only what the user actually said", () => {
+    const allow = resolveStsApproval({ action: "decide", requestId: "req-1", answer: "yes" }, PENDING, NOTHING_DECIDED);
+    expect(allow).toEqual({ kind: "decided", requestId: "req-1", decision: "allow" });
+    const deny = resolveStsApproval({ action: "decide", requestId: "req-1", answer: "no" }, PENDING, NOTHING_DECIDED);
+    expect(deny).toEqual({ kind: "decided", requestId: "req-1", decision: "deny" });
+  });
+
+  it("approves nothing when the answer cannot be read unambiguously", () => {
+    // A misheard turn is not a yes, and it is not a no either: the request
+    // stays open, and the model is told to ask again.
+    for (const answer of ["I'm not sure", "why do you need that?", "", undefined]) {
+      const outcome = resolveStsApproval({ action: "decide", requestId: "req-1", answer }, PENDING, NOTHING_DECIDED);
+      expect(outcome.kind).toBe("unclear");
+      expect(outcomeText(outcome)).toContain("still waiting");
+    }
+  });
+
+  it("submits nothing for a request that is no longer waiting", () => {
+    for (const decided of [new Set(["req-1"]), new Set<string>()]) {
+      const outcome = resolveStsApproval(
+        { action: "decide", requestId: decided.has("req-1") ? "req-1" : "req-9", answer: "yes" },
+        PENDING,
+        decided,
+      );
+      expect(outcome.kind).toBe("stale");
+    }
+  });
+
+  it("records one denial note for a voice answer and a click alike", () => {
+    expect(VOICE_DENIAL_MESSAGE).toBe("Denied by the user, on a call.");
+  });
+});
+
+describe("stsApprovalInstructions", () => {
+  const clause = stsApprovalInstructions();
+
+  it("tells the model the caller decides, and that it passes words on verbatim", () => {
+    expect(clause).toContain("The caller decides, not you.");
+    expect(clause).toContain("exact words as the answer");
+    expect(clause).toContain("anything you cannot pass on verbatim approves nothing");
+  });
+
+  it("never offers the model a way to approve on its own", () => {
+    expect(clause).not.toMatch(/always allow/i);
+  });
+
+  it("says the card stays, so answering aloud and clicking are the same decision", () => {
+    expect(clause).toContain("stays on screen as a card");
+  });
+});
+
+describe("the engine tool carries the permission", () => {
+  it("gives the runner the parsed approval rather than the wire shape", async () => {
+    const seen: unknown[] = [];
+    const engine = createStsBotEngine(async (call) => {
+      seen.push(call.approval);
+      return "asked";
+    });
+    const reply = await engine.run({ approval: { action: "ask", requestId: "req-1" }, model: "x" }, AbortSignal.abort());
+    expect(seen).toEqual([{ action: "ask", requestId: "req-1" }]);
+    expect(reply).toBe("asked");
   });
 });
 
