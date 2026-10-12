@@ -14,6 +14,7 @@ import { EngineCallout } from "./EngineCallout";
 import { EngineCapabilitiesMatrix } from "./EngineCapabilitiesMatrix";
 import { ProviderMark } from "./ProviderIcons";
 import { splitEngineRail } from "@/lib/engine-rail";
+import { engineProviderKinds, engineProviderLabels } from "@/lib/engine-capabilities";
 import {
   INSTANCE_AUTONOMOUS_MODE_NO_OP_NOTE,
   instanceAutonomousModeApplies,
@@ -294,6 +295,8 @@ function EngineRow({
   const isThisBusy = busyInstanceId === instance.instanceId;
   const hasCli = instance.cli !== undefined || instance.cliDefault !== undefined;
   const isCustom = isCustomEngineInstance(instance);
+  const providerKinds = engineProviderKinds(instance.driverKind);
+  const providerLabels = engineProviderLabels(instance.driverKind);
 
   // Close the picker when this instance's override changes to anything else
   // — a save from this row, another tab, or the 5-min refresh. The picker
@@ -378,6 +381,25 @@ function EngineRow({
           {instance.displayName}
           {isThisBusy && <Loader2 size={12} className="animate-spin text-accent" />}
         </span>
+        {/* Which platform(s) this engine actually serves, on the row.  It was
+            already in the capability data, but only ever rendered INSIDE the
+            "Why This Engine?" disclosure — so a row reading "Clutch" hid the
+            fact that the bridge hosts both DeepSeek and MiniMax, behind a bar
+            that looks like a section heading.  Only multi-brand engines get
+            marks; a single-brand engine's own name and mark already say it. */}
+        {providerKinds.length > 1 && (
+          <span className="flex shrink-0 items-center gap-1" aria-label={`Runs ${providerLabels.join(" and ")} models`}>
+            {providerKinds.map((kind) => (
+              <span
+                key={kind}
+                className="inline-flex size-4 items-center justify-center rounded-[4px] border border-hairline/40 bg-surface"
+                title={`${providerLabels[providerKinds.indexOf(kind)]} models`}
+              >
+                <ProviderMark driverKind={kind} size={12} />
+              </span>
+            ))}
+          </span>
+        )}
         {instance.cli ? (
           <span className={cn("truncate font-mono text-[11.5px]", enabled ? "text-accent" : "text-ink-secondary/60")} title={instance.cli}>
             {instance.cli}

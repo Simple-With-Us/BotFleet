@@ -36,6 +36,23 @@ function providerMarkLabel(driverKind: string): string {
   return PROVIDER_MARK_LABELS[driverKind] ?? driverKind;
 }
 
+/** The provider brands an engine actually serves, as driver kinds.  Exported
+ *  because the platform an engine belongs to has to be readable on the row
+ *  itself, not only inside the capabilities matrix:  a row that says "Clutch"
+ *  and nothing else hides that the bridge hosts DeepSeek and MiniMax models,
+ *  which is the thing a person setting up an engine is actually deciding on.
+ *  Empty for single-brand engines, whose own name and mark already say it. */
+export function engineProviderKinds(driverKind: string | undefined | null): string[] {
+  const id = engineIdFromDriverKind(driverKind);
+  if (!id) return [];
+  return [...(engineCapability(id).providerKinds ?? [])];
+}
+
+/** The same brands, named for a tooltip or a screen reader. */
+export function engineProviderLabels(driverKind: string | undefined | null): string[] {
+  return engineProviderKinds(driverKind).map(providerMarkLabel);
+}
+
 export type CapabilityKey =
   | "files"
   | "terminal"
