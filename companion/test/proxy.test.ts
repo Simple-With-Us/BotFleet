@@ -15,6 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createProxyHandler } from "../src/proxy.ts";
 import { createConnectedDeviceTracker } from "../src/connected-devices.ts";
+import { isJsonObject, isJsonString } from "../src/json.ts";
 import type { CompanionEndpoint } from "../src/endpoints.ts";
 import { harnessReady } from "../../server/testing/harness-ready.ts";
 
@@ -1303,9 +1304,16 @@ describe("APNs token registration", () => {
           body: JSON.stringify(body),
         });
         expect(rejected.status, label).toBe(400);
-        const parsed = (await rejected.json()) as { error: string };
-        expect(typeof parsed.error, label).toBe("string");
-        expect(parsed.error.length, label).toBeGreaterThan(0);
+        // Narrowed at runtime rather than cast: a wire shape that stopped
+        // being `{ error: string }` should fail this assertion saying so,
+        // not throw on `parsed.error.length` of something else.  The
+        // companion declares no dependencies, so this is the package's own
+        // json.ts guard, not a schema library.
+        const payload: unknown = await rejected.json();
+        expect(isJsonObject(payload), `${label}: a JSON object`).toBe(true);
+        const error = isJsonObject(payload) ? payload.error : undefined;
+        expect(isJsonString(error), `${label}: a string error`).toBe(true);
+        expect(typeof error === "string" && error.length > 0, label).toBe(true);
       }
       // None of those reached the registry.
       expect(stored).toEqual([]);
