@@ -8802,9 +8802,9 @@ async function runGroupMemberTurn(
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
         launchIdentity: launchIdentityFor(bot, threadId),
+        ...memberTurnSelection(selection),
         // the rest of the turn the card paused, held to that turn's allowlist
         toolPolicy,
-        ...memberTurnSelection(selection),
       });
     })
       .then((started) => {
