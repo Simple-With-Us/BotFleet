@@ -2,7 +2,7 @@
 //
 // One Live Activity per bot that is doing something — needs you, working,
 // or has an unread message — started, updated and ended from the same
-// `updates` the pill reads. Tapping the lock-screen card opens that bot's
+// `updates` the pill reads.  Tapping the lock-screen card opens that bot's
 // thread.  The stream is foreground-only and there is no push path yet, so the
 // background lifecycle transition ends the ambient activities.  An activity
 // still waiting on an answer is the exception and stays, because it is the one
@@ -162,7 +162,7 @@ final class LiveActivityCoordinator {
             }
 
             // A bot stopping for you is worth an alert: the island pops open
-            // on its own and the lock screen lights up. Working and unread
+            // on its own and the lock screen lights up.  Working and unread
             // are not — unread dismisses itself once the thread is read.
             let alert: AlertConfiguration? = update.kind == .needsYou
                 ? AlertConfiguration(
