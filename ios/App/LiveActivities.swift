@@ -3,8 +3,8 @@
 // One Live Activity per bot that is doing something — needs you, working,
 // or has an unread message — started, updated and ended from the same
 // `updates` the pill reads. Tapping the lock-screen card opens that bot's
-// thread. The stream is foreground-only and there is no push path yet, so the
-// background lifecycle transition ends the ambient activities. An activity
+// thread.  The stream is foreground-only and there is no push path yet, so the
+// background lifecycle transition ends the ambient activities.  An activity
 // still waiting on an answer is the exception and stays, because it is the one
 // card that has to be readable and tappable with the phone locked; it is
 // reconciled against current state on the next foreground activation.
@@ -280,14 +280,14 @@ func liveActivityHeadline(_ name: String, kind: ChatUpdate.Kind) -> String {
 /// no UI at all.
 ///
 /// A `LiveActivityIntent` runs in the **app's** process: the system launches
-/// it in the background and performs the intent there. The SwiftUI scene never
+/// it in the background and performs the intent there.  The SwiftUI scene never
 /// comes on screen for that launch, so anything wired from `onAppear` — which
 /// is where this used to be installed — is `nil` at exactly the moment the
 /// Lock Screen button is tapped, and the tap silently did nothing.
 ///
 /// So the route is installed from `CompanionApp.init`, the first code this
 /// process runs, and the session is rebuilt on demand inside the intent
-/// rather than assumed. The card is dismissed here too: with the app
+/// rather than assumed.  The card is dismissed here too: with the app
 /// backgrounded there is no `sync` to redraw it, so the buttons would sit on
 /// the Lock Screen claiming an approval that already landed.
 @MainActor
