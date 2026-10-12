@@ -4,8 +4,10 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { sentryVitePlugin } from "@sentry/vite-plugin";
 import { sentryReleaseName } from "./server/sentry.ts";
+import { runtimeBuildIdentity } from "./server/runtime-identity.ts";
 
-const sentryRelease = sentryReleaseName(process.env) ?? "";
+const sentryRelease =
+  sentryReleaseName(process.env, runtimeBuildIdentity.sourceCommit) ?? "";
 const sentryAuthToken = (process.env.SENTRY_AUTH_TOKEN || "").trim();
 
 export default defineConfig({

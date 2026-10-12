@@ -19,6 +19,15 @@ can turn profiling on.
 - Allow `@sentry/cli` and `@sentry/node-cpu-profiler` postinstall scripts in
   `pnpm-workspace.yaml` so pnpm 12 installs succeed in CI.
 
+## Next steps
+
+- Add `SENTRY_AUTH_TOKEN` to BotFleet Infisical prod so desktop package
+  jobs can upload source maps.
+- Confirm the Vite plugin uploads renderer source maps in CI once the
+  token is wired up.
+- Spot-check a packaged build: Electron main and harness events share the
+  same `release` SHA in Sentry.
+
 ## Files
 
 - `server/sentry.ts` — `sentryReleaseName`, `release` on `Sentry.init`
