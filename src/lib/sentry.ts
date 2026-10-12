@@ -34,6 +34,7 @@ export interface SentryClientOptions {
   replayEnabled: boolean;
   replaysSessionSampleRate: number;
   replaysOnErrorSampleRate: number;
+  release?: string;
 }
 
 /** The three things this module does to the browser SDK.  Behind a port so
@@ -97,6 +98,7 @@ const browserPort: SentryBrowserPort = {
         Sentry.init({
           dsn: options.dsn,
           environment: options.environment,
+          release: options.release,
           tracesSampleRate: options.tracesSampleRate,
           dataCollection: {
             userInfo: false,
@@ -193,6 +195,7 @@ function packagedClientOptions(): SentryClientOptions | null {
   const replaysSessionSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_SESSION_SAMPLE_RATE) ?? "0.1");
   const replaysOnErrorSampleRate = Number(viteEnvText(import.meta.env.VITE_SENTRY_REPLAY_ERROR_SAMPLE_RATE) ?? "1.0");
 
+  const release = viteEnvText(import.meta.env.VITE_SENTRY_RELEASE);
   return {
     dsn,
     environment: env,
@@ -200,6 +203,7 @@ function packagedClientOptions(): SentryClientOptions | null {
     replayEnabled: !replayDisabled,
     replaysSessionSampleRate: !replayDisabled && Number.isFinite(replaysSessionSampleRate) ? replaysSessionSampleRate : 0,
     replaysOnErrorSampleRate: !replayDisabled && Number.isFinite(replaysOnErrorSampleRate) ? replaysOnErrorSampleRate : 0,
+    release,
   };
 }
 
@@ -710,6 +714,7 @@ function startRuntimeClient(dsn: string, environment: string, tracesSampleRate: 
     dsn,
     environment,
     tracesSampleRate,
+    release: buildTimeOptions?.release ?? viteEnvText(import.meta.env.VITE_SENTRY_RELEASE),
     replayEnabled,
     replaysSessionSampleRate: replayEnabled
       ? buildTimeOptions?.replaysSessionSampleRate ?? (Number.isFinite(replaysSessionSampleRate) ? replaysSessionSampleRate : 0)
