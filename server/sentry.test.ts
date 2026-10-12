@@ -19,6 +19,11 @@ import {
 
 type SentryInitOptions = Parameters<SentryNode["init"]>[0];
 type SentryHttpIntegrationOptions = Parameters<NonNullable<SentryNode["httpIntegration"]>>[0];
+type TracesSamplerFixture = {
+  parentSampled?: boolean;
+  name?: string;
+  attributes?: { "sentry.op"?: string };
+};
 
 interface FakeSentryClient {
   getDsn(): { host?: string } | undefined;
@@ -211,10 +216,10 @@ describe("Sentry AI data collection kill-switch", () => {
   });
 
   it("passes dataCollection and a static trace lifecycle into Sentry.init", async () => {
-    let initOpts: SentryInitOptions | null = null;
+    let initOpts: SentryInitOptions | undefined;
     const sdk = Object.assign({} as FakeSentrySdk, {
       init(opts?: SentryInitOptions) {
-        initOpts = opts ?? null;
+        initOpts = opts;
       },
       close() {
         return Promise.resolve(true);
@@ -245,7 +250,7 @@ describe("Sentry AI data collection kill-switch", () => {
     resetSentryForTests();
     setSentryLoaderForTests(sentryTestLoader(sdk));
     process.env.SENTRY_AI_DATA_COLLECTION = "0";
-    initOpts = null;
+    initOpts = undefined;
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -262,11 +267,11 @@ describe("Sentry AI data collection kill-switch", () => {
   });
 
   it("stamps a git SHA release on the Node client", async () => {
-    let initOpts: SentryInitOptions | null = null;
+    let initOpts: SentryInitOptions | undefined;
     // SAFETY: empty object shell — runtime only calls the members stamped below.
     const sdk = Object.assign({} as FakeSentrySdk, {
       init(opts?: SentryInitOptions) {
-        initOpts = opts ?? null;
+        initOpts = opts;
       },
       close() {
         return Promise.resolve(true);
@@ -292,10 +297,10 @@ describe("Sentry AI data collection kill-switch", () => {
 
 describe("Sentry tracesSampler dynamic rates", () => {
   it("samples AI spans with aiRate and routine HTTP spans with httpRate", async () => {
-    let initOpts: SentryInitOptions | null = null;
+    let initOpts: SentryInitOptions | undefined;
     const sdk = Object.assign({} as FakeSentrySdk, {
       init(opts?: SentryInitOptions) {
-        initOpts = opts ?? null;
+        initOpts = opts;
       },
       close() {
         return Promise.resolve(true);
@@ -317,33 +322,35 @@ describe("Sentry tracesSampler dynamic rates", () => {
       logsEnabled: false,
       source: "config",
     });
-    expect(initOpts).toBeTruthy();
-    const sampler = initOpts?.tracesSampler;
-    expect(typeof sampler).toBe("function");
+    const tracesSampler = (initOpts as { tracesSampler?: (ctx: TracesSamplerFixture) => number | boolean })
+      .tracesSampler;
+    expect(tracesSampler).toBeTypeOf("function");
+    // SAFETY: fixtures only set fields the sampler reads (parentSampled, op, name).
+    const sample = (ctx: TracesSamplerFixture) => tracesSampler!(ctx);
 
     // Parent sampled decision inherited
-    expect(sampler({ parentSampled: true })).toBe(true);
-    expect(sampler({ parentSampled: false })).toBe(false);
+    expect(sample({ parentSampled: true })).toBe(true);
+    expect(sample({ parentSampled: false })).toBe(false);
 
     // AI operations sampled at aiRate (1.0)
-    expect(sampler({ attributes: { "sentry.op": "gen_ai.chat" } })).toBe(1.0);
-    expect(sampler({ attributes: { "sentry.op": "gen_ai.invoke_agent" } })).toBe(1.0);
-    expect(sampler({ attributes: { "sentry.op": "gen_ai.execute_tool" } })).toBe(1.0);
-    expect(sampler({ name: "gen_ai.chat" })).toBe(1.0);
+    expect(sample({ attributes: { "sentry.op": "gen_ai.chat" } })).toBe(1.0);
+    expect(sample({ attributes: { "sentry.op": "gen_ai.invoke_agent" } })).toBe(1.0);
+    expect(sample({ attributes: { "sentry.op": "gen_ai.execute_tool" } })).toBe(1.0);
+    expect(sample({ name: "gen_ai.chat" })).toBe(1.0);
 
     // HTTP server endpoints sampled at httpRate (0.05)
-    expect(sampler({ attributes: { "sentry.op": "http.server" }, name: "POST /api/chat" })).toBe(0.05);
-    expect(sampler({ name: "GET /api/bots" })).toBe(0.05);
+    expect(sample({ attributes: { "sentry.op": "http.server" }, name: "POST /api/chat" })).toBe(0.05);
+    expect(sample({ name: "GET /api/bots" })).toBe(0.05);
 
     // Routine health check endpoints heavily sampled / throttled
-    expect(sampler({ name: "GET /healthz" })).toBe(0.01);
-    expect(sampler({ name: "GET /api/telemetry/status" })).toBe(0.01);
+    expect(sample({ name: "GET /healthz" })).toBe(0.01);
+    expect(sample({ name: "GET /api/telemetry/status" })).toBe(0.01);
 
     // Outbound HTTP requests sampled at httpRate
-    expect(sampler({ attributes: { "sentry.op": "http.client" } })).toBe(0.05);
+    expect(sample({ attributes: { "sentry.op": "http.client" } })).toBe(0.05);
 
     // Other / fallback spans sampled at general rate (0.2)
-    expect(sampler({ name: "custom.operation" })).toBe(0.2);
+    expect(sample({ name: "custom.operation" })).toBe(0.2);
   });
 });
 
