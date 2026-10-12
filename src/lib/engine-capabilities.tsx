@@ -1310,29 +1310,32 @@ export const ENGINE_DISPLAY_ORDER: string[] = [
 /** Access surface shown in the matrix.  Billing stays in `pricing`; it cannot
  *  be inferred from access because MiniMax API uses a subscription-backed API
  *  key while Muse Code is a CLI with the same kind of account billing. */
-const ENGINE_ACCESS_LABELS: Readonly<Record<string, string>> = {
-  grok: "CLI + API",
-  cursor: "CLI",
-  claude: "CLI",
-  codex: "CLI",
-  antigravity: "CLI",
-  "deepseek-harness": "API",
-  minimax: "API",
-  mcode: "CLI",
-  muse: "CLI",
-  kimi: "CLI",
-  droid: "CLI",
-  opencode: "CLI",
-  qwen: "CLI",
-  hermes: "CLI",
-  pi: "CLI",
-  "openai-compat": "API",
-  box: "API",
-  "cli-wrapper": "CLI",
-};
-
 export function engineAccessLabel(entry: EngineCapabilityEntry): string {
-  return ENGINE_ACCESS_LABELS[entry.id] ?? "Access unknown";
+  switch (entry.id) {
+    case "grok":
+      return "CLI + API";
+    case "deepseek-harness":
+    case "minimax":
+    case "openai-compat":
+    case "box":
+      return "API";
+    case "cursor":
+    case "claude":
+    case "codex":
+    case "antigravity":
+    case "mcode":
+    case "muse":
+    case "kimi":
+    case "droid":
+    case "opencode":
+    case "qwen":
+    case "hermes":
+    case "pi":
+    case "cli-wrapper":
+      return "CLI";
+    default:
+      return "Access unknown";
+  }
 }
 
 /** Resolve the engine id from a driver-kind string when the registry and
