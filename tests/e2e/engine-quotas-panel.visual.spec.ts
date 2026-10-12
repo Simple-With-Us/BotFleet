@@ -37,9 +37,13 @@ test('visual: engine quotas panel disclosure', async ({ page }) => {
   const detail = page.getByTestId('engine-quotas-detail');
   await expect(detail).toBeVisible();
 
-  // The expanded panel is where the fix actually lives: the old UI said
-  // "(93% / 3% for 5h / w)" and these are the words that replaced it.
-  const museBlock = detail.getByTestId('engine-quota-muse');
+  // The engine the picker is showing answers "how much is left" without a
+  // click: its windows sit open under the header, the same place a capped
+  // engine shows its "Usage cap in effect" card.  These are the words that
+  // replaced the packed per-row chip "(93% / 3% for 5h / w)".
+  const active = page.getByTestId('engine-quotas-active');
+  await expect(active).toBeVisible();
+  const museBlock = active.getByTestId('engine-quota-muse');
   await expect(museBlock.getByText('5-Hour')).toBeVisible();
   await expect(museBlock.getByText('Weekly').first()).toBeVisible();
   await expect(museBlock.getByText('93% left', { exact: true })).toBeVisible();
@@ -48,10 +52,14 @@ test('visual: engine quotas panel disclosure', async ({ page }) => {
   // first.
   await expect(museBlock.getByText(/Weekly is nearly spent/)).toBeVisible();
 
+  // Every other engine stays one click away behind a disclosure that says so.
+  await expect(page.getByRole('button', { name: /Other Engines/ })).toBeVisible();
+  await expect(detail.getByTestId('engine-quota-mcode')).toBeVisible();
+
   // Tolerance is inline rather than inherited, matching the other visual specs:
   // a later edit to playwright.config's defaults must not silently tighten or
   // loosen this comparison.
-  await expect(detail).toHaveScreenshot('engine-quotas-panel.png', {
+  await expect(page.getByTestId('provider-icons-quotas-panel')).toHaveScreenshot('engine-quotas-panel.png', {
     ...stableShot,
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
