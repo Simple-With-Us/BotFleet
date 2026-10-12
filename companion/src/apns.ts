@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonValue } from "./json.ts";
 import { DATA_DIR, writeFileAtomic } from "./state.ts";
 
 export interface ApnsConfig {
@@ -377,10 +378,25 @@ export function liveActivityPayload(
   return { aps };
 }
 
-/** What the harness notify frame carries — today, plus the fields a newer
- * harness adds.  Every one is optional on purpose: this sidecar may run
- * against a harness that has not shipped them yet, and a missing field must
- * cost the island a caption, never the push. */
+/** One string out of a raw JSON frame.
+ *
+ * The frame is whatever `JSON.parse` returned, so a `title` that arrived as
+ * a number is not a string and must not become one here — the alert path
+ * falls back exactly as it would for an absent field rather than putting a
+ * number in a banner title. */
+const frameString = (frame: JsonObject, field: string): string | undefined => {
+  const value = frame[field];
+  return isJsonString(value) ? String(value) : undefined;
+};
+
+/** What the harness notify frame carries, once it has been parsed.
+ *
+ * The fields are optional because the frame is: a harness that predates the
+ * Live Activity work sends no `color`, no `options` and no `isPermission`,
+ * and that must cost the island a caption rather than the push.  They are
+ * optional in the type but NOT in the parsing — `parseLiveActivitySource`
+ * is what decides whether a value that IS there is the right shape, and
+ * this interface is only ever handed what that function returned. */
 export interface LiveActivitySource {
   title?: string;
   body?: string;
@@ -396,6 +412,134 @@ export interface LiveActivitySource {
   isPermission?: boolean;
   /** Epoch ms — when this kind began.  Defaults to now. */
   since?: number;
+}
+
+/** Every field the Live Activity reads, with the type it must have when it is
+ * there at all.  An absent field is fine — that is the degraded path — and a
+ * field of the wrong type is not: it would be indexed as if it were a string
+ * and reach a widget that decodes it strictly. */
+const LIVE_ACTIVITY_SOURCE_FIELDS = {
+  title: "string",
+  body: "string",
+  kind: "string",
+  threadId: "string",
+  botId: "string",
+  requestId: "string",
+  tool: "string",
+  botName: "string",
+  color: "string",
+  options: "string[]",
+  isPermission: "boolean",
+  since: "number",
+} as const satisfies Record<string, string>;
+
+/** What `parseLiveActivitySource` concluded about one inbound frame. */
+export type LiveActivitySourceParse =
+  | { ok: true; source: LiveActivitySource }
+  | { ok: false; error: string };
+
+/** True when `value` is what `expected` says, for the shapes above. */
+const conforms = (value: JsonValue, expected: string): boolean => {
+  if (expected === "string") return isJsonString(value);
+  if (expected === "boolean") return value === true || value === false;
+  if (expected === "number") return isFiniteJsonNumber(value);
+  if (expected === "string[]") return Array.isArray(value) && value.every((entry) => isJsonString(entry));
+  return false;
+};
+
+/** The strings out of an array `conforms` has already cleared.  Read entry by
+ * entry rather than asserted, so a value that slipped through is dropped
+ * rather than carried into the payload. */
+const jsonStrings = (value: JsonValue[]): string[] => {
+  const out: string[] = [];
+  for (const entry of value) {
+    if (isJsonString(entry)) out.push(String(entry));
+  }
+  return out;
+};
+
+/** Name the shape a rejected value actually had, so the log line says what
+ * arrived rather than only what was wanted. */
+const describeJson = (value: JsonValue): string => {
+  if (Array.isArray(value)) return "an array";
+  if (isJsonObject(value)) return "an object";
+  if (value === null) return "null";
+  return Object.prototype.toString.call(value).slice(8, -1).toLowerCase();
+};
+
+/** Put one already-checked value on the parsed source.  A switch rather than
+ * an index cast, so the field the value lands on is spelled out. */
+const assignSource = (source: LiveActivitySource, field: string, value: JsonValue): void => {
+  switch (field) {
+    case "title":
+      source.title = String(value);
+      return;
+    case "body":
+      source.body = String(value);
+      return;
+    case "kind":
+      source.kind = String(value);
+      return;
+    case "threadId":
+      source.threadId = String(value);
+      return;
+    case "botId":
+      source.botId = String(value);
+      return;
+    case "requestId":
+      source.requestId = String(value);
+      return;
+    case "tool":
+      source.tool = String(value);
+      return;
+    case "botName":
+      source.botName = String(value);
+      return;
+    case "color":
+      source.color = String(value);
+      return;
+    case "options":
+      source.options = jsonStrings(Array.isArray(value) ? value : []);
+      return;
+    case "isPermission":
+      source.isPermission = value === true;
+      return;
+    case "since":
+      source.since = Number(value);
+      return;
+    default:
+      return;
+  }
+};
+
+/** Parse one notify frame's notification before anything indexes off it.
+ *
+ * The frame arrives as raw JSON off the harness's loopback stream, and an
+ * interface alone is a promise about a value nobody checked: `??` catches a
+ * field that is ABSENT and nothing else.  A `title` that arrived as a
+ * number, or `options` that arrived as an object, would be copied straight
+ * into a payload the widget decodes strictly.  This is the boundary that
+ * says no.
+ *
+ * Unknown keys are ignored rather than refused, and that is deliberate.  The
+ * harness frame is a contract this sidecar neither owns nor versions against
+ * — `server/notify.ts` already sends `avatarUrl`, which nothing here reads,
+ * and refusing on an unrecognised key would drop every push from every bot
+ * that has a profile picture.  The fields the builder actually reads are the
+ * ones held to their types; a sparse frame still parses, and keeps its
+ * fallbacks. */
+export function parseLiveActivitySource(raw: JsonValue): LiveActivitySourceParse {
+  if (!isJsonObject(raw)) return { ok: false, error: "notification is not a JSON object" };
+  const source: LiveActivitySource = {};
+  for (const [field, expected] of Object.entries(LIVE_ACTIVITY_SOURCE_FIELDS)) {
+    const value = raw[field];
+    if (value === undefined || value === null) continue;
+    if (!conforms(value, expected)) {
+      return { ok: false, error: `${field} must be ${expected}, got ${describeJson(value)}` };
+    }
+    assignSource(source, field, value);
+  }
+  return { ok: true, source };
 }
 
 /** One notify frame, as the Live Activity sees it. */
@@ -2506,21 +2650,23 @@ export function watchHarnessNotifications(options: {
   };
 
   const deliver = (
-    // `LiveActivitySource` is the frame with the newer harness fields marked
-    // optional — a sidecar can outlive the harness build that fills them, and
-    // the builder degrades per field rather than refusing the frame.
-    notification: LiveActivitySource,
+    // Raw JSON, honestly typed: the frame is whatever `JSON.parse` handed
+    // back, and a field in it is a `JsonValue` until something says
+    // otherwise.  Both consumers below decode their own — the alert reads
+    // strings through `frameString`, the island through
+    // `parseLiveActivitySource`.
+    notification: JsonObject,
     seq?: number,
   ) => {
     const connected = new Set(options.connectedIds());
     const alert: ApnsAlert = {
-      title: notification.title ?? "BotFleet",
-      body: notification.body ?? "",
-      kind: notification.kind,
-      threadId: notification.threadId,
-      botId: notification.botId,
-      requestId: notification.requestId,
-      tool: notification.tool,
+      title: frameString(notification, "title") ?? "BotFleet",
+      body: frameString(notification, "body") ?? "",
+      kind: frameString(notification, "kind"),
+      threadId: frameString(notification, "threadId"),
+      botId: frameString(notification, "botId"),
+      requestId: frameString(notification, "requestId"),
+      tool: frameString(notification, "tool"),
       seq,
     };
     const blocking = alertIsBlocking(alert.kind);
@@ -2556,8 +2702,20 @@ export function watchHarnessNotifications(options: {
     // the socket already, so it is skipped by the same filter as the alerts
     // above — and it gets BOTH surfaces when it is not, which is the point:
     // the banner is history, the island is the thing you answer from.
+    //
+    // The frame is parsed first, and only here: the alert above is unchanged
+    // and still lands, because a banner built from the same frame is worth
+    // more than a rejected island and costs nothing to send.  A malformed
+    // frame is dropped here rather than indexed.
     if (blocking && options.liveActivityTokensForDisconnected) {
-      const content = liveActivityContent(notification, now());
+      const parsed = parseLiveActivitySource(notification);
+      if (!parsed.ok) {
+        if (firstTime(`liveactivity-frame:${parsed.error}`)) {
+          console.warn(`companion: notify frame not used for Live Activities — ${parsed.error}`);
+        }
+        return;
+      }
+      const content = liveActivityContent(parsed.source, now());
       for (const row of options.liveActivityTokensForDisconnected()) {
         if (connected.has(row.deviceId)) continue;
         enqueueLiveActivity(row.deviceId, row.token, {
@@ -2612,10 +2770,10 @@ export function watchHarnessNotifications(options: {
               resumed?: boolean;
               /** The stream position of this frame, stamped by `broadcast`. */
               seq?: number;
-              /** A notify frame.  Wider than the alert needs: the Live
-               * Activity builder reads `botName`, `color`, `options` and
-               * `isPermission` when a newer harness sends them. */
-              notification?: LiveActivitySource;
+              /** A notify frame, still raw: whatever `JSON.parse` returned.
+               *  `deliver` decodes it — the banner reads strings, the Live
+               * Activity builder parses the whole frame. */
+              notification?: JsonObject;
             };
             try {
               // SAFETY: the frame came off the harness's own loopback stream

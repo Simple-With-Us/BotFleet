@@ -20,7 +20,7 @@ import {
   MAX_COMPANION_ENDPOINTS,
   type CompanionEndpoint,
 } from "./endpoints.ts";
-import { companionBodyCheck, denyReason, isCloudDesktopJoin } from "./routes.ts";
+import { companionBodyCheck, companionLiveActivityTokenDenial, denyReason, isCloudDesktopJoin } from "./routes.ts";
 import { cleanDeviceName, parsePairRequestId } from "./devices.ts";
 import { isJsonObject, type JsonObject, type JsonValue } from "./json.ts";
 import { createSseScrubber, isJson, scrub } from "./wire.ts";
@@ -346,8 +346,12 @@ export function createProxyHandler(options: ProxyOptions) {
       }
       readJson(req).then(
         (body) => {
-          const live = String(body.token ?? "");
-          if (!options.setLiveActivityToken?.(deviceId, live)) {
+          // Validated before the field is read: this is a body off the
+          // network, and `String(body.token)` would coerce a number or an
+          // object into something the registry has to reject.
+          const denial = companionLiveActivityTokenDenial(body);
+          if (denial) return sendJson(res, denial.status, { error: denial.error });
+          if (!options.setLiveActivityToken?.(deviceId, String(body.token))) {
             return sendJson(res, 400, { error: "that Live Activity token is not usable" });
           }
           return sendJson(res, 200, { ok: true });

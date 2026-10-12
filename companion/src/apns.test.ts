@@ -22,6 +22,7 @@ import {
   liveActivityContent,
   liveActivityPayload,
   liveActivityTopic,
+  parseLiveActivitySource,
   providerToken,
   resetProviderTokens,
   retryAfterMs,
@@ -1612,6 +1613,43 @@ describe("watchHarnessNotifications", () => {
     expect(bare.state.kind).toBe("working");
   });
 
+  it("refuses a frame whose fields are the wrong shape, rather than coercing them", () => {
+    // An absent field falls back; a field of the wrong TYPE never reaches the
+    // widget at all, because the widget decodes it strictly.
+    expect(parseLiveActivitySource({ kind: "approval", title: 42 })).toEqual({
+      ok: false,
+      error: "title must be string, got number",
+    });
+    expect(parseLiveActivitySource({ kind: "approval", options: { a: 1 } })).toEqual({
+      ok: false,
+      error: "options must be string[], got an object",
+    });
+    expect(parseLiveActivitySource({ kind: "approval", options: ["Allow", 7] }).ok).toBe(false);
+    expect(parseLiveActivitySource({ isPermission: "yes" }).ok).toBe(false);
+    expect(parseLiveActivitySource({ since: "now" }).ok).toBe(false);
+    expect(parseLiveActivitySource("not an object").ok).toBe(false);
+    expect(parseLiveActivitySource(null).ok).toBe(false);
+    // A field nobody here reads is not a reason to refuse the frame: the
+    // harness sends `avatarUrl` on any bot with a profile picture.
+    expect(parseLiveActivitySource({ kind: "approval", avatarUrl: "https://x/y.png" }).ok).toBe(true);
+    // `null` reads as absent rather than as a malformed value.
+    expect(parseLiveActivitySource({ color: null })).toEqual({ ok: true, source: {} });
+  });
+
+  it("parses a sparse-but-valid frame, and keeps every fallback", () => {
+    // The degraded path must survive validation: a harness that predates the
+    // Live Activity work sends none of the new fields, and that is a valid
+    // frame, not a broken one.
+    const parsed = parseLiveActivitySource({ kind: "approval", title: "Forge needs you", body: "rm -rf", botId: "b1" });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(Object.keys(parsed.source).sort()).toEqual(["body", "botId", "kind", "title"]);
+    const content = liveActivityContent(parsed.source, 0);
+    expect(content.attributes.color).toBe(DEFAULT_LIVE_ACTIVITY_COLOR);
+    expect(content.state.options).toEqual(["Allow", "Deny"]);
+    expect(content.state.requestId).toBeUndefined();
+  });
+
   it("prefers the widened harness fields when the frame carries them", () => {
     const content = liveActivityContent(
       {
@@ -1665,6 +1703,65 @@ describe("watchHarnessNotifications", () => {
     // is the banner, and a second copy would be noise.
     expect(sent).toEqual([{ token: "22".repeat(32), event: "start", headline: "Scout finished needs you" }]);
     expect(banners).toEqual(["aa".repeat(32)]);
+  });
+
+  it("drops a malformed frame from the island and still sends the banner", async () => {
+    // The whole point of the parse: `title` arrives as a number.  Nothing may
+    // start an island from it — and nothing may be lost either, because the
+    // banner is the same frame on a path that was already its own business.
+    const islands: string[] = [];
+    const banners: string[] = [];
+    const malformed = `data: ${JSON.stringify({
+      kind: "notify",
+      notification: { kind: "approval", title: 42, body: "done", threadId: "t1", botId: "b1" },
+    })}\n\n`;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "banner", token: "aa".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () => new Response(malformed, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async (_config, token) => {
+        banners.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      sendLiveActivity: async (_config, token) => {
+        islands.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => banners.length > 0)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    watch.stop();
+    expect(islands).toEqual([]);
+    expect(banners).toEqual(["aa".repeat(32)]);
+  });
+
+  it("still starts an island from a sparse frame the harness actually sent", async () => {
+    const islands: { token: string; color: string; options: string[] }[] = [];
+    const sparse = `data: ${JSON.stringify({
+      kind: "notify",
+      notification: { kind: "question", title: "Forge asks", body: "Which branch?", threadId: "t1", botId: "b1" },
+    })}\n\n`;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () => new Response(sparse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async (_config, token, push) => {
+        islands.push({ token, color: push.attributes.color, options: push.state.options });
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => islands.length > 0)).toBe(true);
+    watch.stop();
+    // No color, no options, no requestId in the frame — the island goes out
+    // anyway, with the documented fallbacks rather than nothing.
+    expect(islands).toEqual([{ token: "22".repeat(32), color: DEFAULT_LIVE_ACTIVITY_COLOR, options: [] }]);
   });
 
   it("starts no island for a frame nobody is blocked on", async () => {

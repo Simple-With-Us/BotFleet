@@ -1286,6 +1286,30 @@ describe("APNs token registration", () => {
       });
       expect(unusable.status).toBe(400);
 
+      // The body is checked before the field is read.  `String(body.token)`
+      // would have turned each of these into a string the registry rejects
+      // for the wrong reason, and `{ token: 12 }` into "12" — a 400 that
+      // blames the token rather than the request.
+      for (const [label, body] of [
+        ["a non-string token", { token: 12 }],
+        ["an array token", { token: [1, 2] }],
+        ["a null token", { token: null }],
+        ["a missing token", {}],
+        ["an extra field", { token: hex, environment: "production" }],
+      ] as const) {
+        const rejected = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        expect(rejected.status, label).toBe(400);
+        const parsed = (await rejected.json()) as { error: string };
+        expect(typeof parsed.error, label).toBe("string");
+        expect(parsed.error.length, label).toBeGreaterThan(0);
+      }
+      // None of those reached the registry.
+      expect(stored).toEqual([]);
+
       const ok = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
         method: "POST",
         headers: {
