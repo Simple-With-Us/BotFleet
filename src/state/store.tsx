@@ -557,8 +557,9 @@ export interface ConfigStatus {
   /** Speech-to-speech call preference, mirrored from AppConfig.  `provider`
    * is undefined when the picker has no explicit preference and Auto picks
    * whichever provider has a key; `frontEngine` defaults to true, so an
-   * absent value reads as on, matching prepareStsSession. */
-  sts?: { provider?: "xai" | "gemini"; frontEngine?: boolean };
+   * absent value reads as on, matching prepareStsSession.  `engineTimeoutMs`
+   * is the deadline on one `bot_engine` call; absent means the default. */
+  sts?: { provider?: "xai" | "gemini"; frontEngine?: boolean; engineTimeoutMs?: number };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: { configured: boolean };
   /** who's using the app — collected in onboarding, shown in the sidebar */

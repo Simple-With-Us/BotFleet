@@ -17,6 +17,7 @@
 
 import { Loader2 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { z } from "zod";
 
 import { cn } from "@/lib/cn";
 import { STS_PROVIDERS, type StsProvider } from "@/lib/sts";
@@ -28,6 +29,49 @@ export type StsOption = "auto" | StsProvider;
 export interface StsConfigSlice {
   provider?: "xai" | "gemini" | null;
   frontEngine?: boolean;
+}
+
+/**
+ * The trust boundary for GET /api/config as this panel reads it.
+ *
+ * A TypeScript annotation is not a runtime check: the harness, a proxy, or a
+ * config.json hand-edited on disk can all answer with a `provider` this build
+ * has never heard of, or a `frontEngine` that arrived as the string "false".
+ * Both used to land straight in UI state and render as a real setting — the
+ * panel would claim Auto was chosen while the config said something else.
+ * Parsing first turns that into the same visible note a failed fetch already
+ * shows, instead of a confident wrong toggle.
+ *
+ * The envelope is deliberately not `.strict()`, because this panel reads one
+ * slice of a response that legitimately carries many others (`tts`, `vps`,
+ * `composio`, …) and must not reject a config for carrying them.  The `sts`
+ * object itself is strict: an unexpected field there is drift worth reporting.
+ * Every key is optional, because an older server predates the slice entirely
+ * and an absent value already has a defined meaning — Auto, engine on.
+ */
+export const StsConfigResponseSchema = z.object({
+  sts: z
+    .object({
+      provider: z.enum(["xai", "gemini"]).nullish(),
+      frontEngine: z.boolean().optional(),
+    })
+    .strict()
+    .optional(),
+});
+
+/**
+ * One line the panel can show for a body the schema refused.
+ *
+ * A raw ZodError stringifies to a multi-line JSON issue dump, which the alert
+ * renders as a wall of braces; this keeps the field and the complaint and drops
+ * the rest.  Sentence case, like every other status string in this panel.
+ */
+export function describeStsConfigFailure(failure: z.ZodError): string {
+  const first = failure.issues[0];
+  if (!first) return "Unreadable STS settings from GET /api/config.";
+  const where = first.path.join(".");
+  const complaint = first.message.toLowerCase();
+  return `Unreadable STS settings from GET /api/config — ${where ? `${where}: ` : ""}${complaint}.`;
 }
 
 const PROVIDER_TITLES = {
@@ -117,7 +161,11 @@ export function StsSettings() {
   }, [bridge]);
 
   // Hydrate the STS section from AppConfig once on mount; later edits go back
-  // through PUT /api/config rather than the bridge.
+  // through PUT /api/config rather than the bridge.  The body is parsed before
+  // a single field is read, so no annotation can quietly become the only gate
+  // again; a body that will not parse throws into the same catch a failed
+  // fetch does, and the panel shows the note rather than rendering defaults
+  // as if the server had sent them.
   useEffect(() => {
     let alive = true;
     fetch("/api/config")
@@ -125,15 +173,20 @@ export function StsSettings() {
         if (!res.ok) throw new Error(`GET /api/config → ${res.status}`);
         return res.json();
       })
-      .then((cfg: { sts?: StsConfigSlice }) => {
+      .then((body) => StsConfigResponseSchema.parse(body))
+      .then((cfg) => {
         if (!alive) return;
-        setProvider(stsEffectiveProvider(cfg?.sts));
-        setFrontEngine(stsEffectiveFrontEngine(cfg?.sts));
+        setProvider(stsEffectiveProvider(cfg.sts));
+        setFrontEngine(stsEffectiveFrontEngine(cfg.sts));
         setLoaded(true);
       })
       .catch((failure) => {
         if (!alive) return;
-        setError(failure instanceof Error ? failure.message : String(failure));
+        setError(
+          failure instanceof z.ZodError
+            ? describeStsConfigFailure(failure)
+            : failure instanceof Error ? failure.message : String(failure),
+        );
         setLoaded(true);
       });
     return () => { alive = false; };

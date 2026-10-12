@@ -30,6 +30,29 @@ import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
+import {
+  appendStsLine,
+  composeCallPersona,
+  createEngineTurnWaiter,
+  createStsBotEngine,
+  createStsCallDriver,
+  decideCallMode,
+  enginePrompt,
+  microphoneAvailable,
+  readStsKeys,
+  stsBridgeAvailable,
+  stsCapability,
+  stsLineText,
+  type CallModeDecision,
+  type EngineToolRunner,
+  type EngineTurnWaiter,
+  type StsCallDriver,
+  type StsLineView,
+  type StsProvider,
+} from "@/lib/sts/call-session";
+// The frozen STS index is the only place `prepareStsSession` lives, and it is
+// read-only here — this lane wires the call view, it does not change that layer.
+import { prepareStsSession } from "@/lib/sts";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { BotMascot } from "./Avatar";
@@ -60,6 +83,43 @@ export function CallButton({ bot }: { bot: Bot }) {
   );
 }
 
+/**
+ * Whether this workspace could run a speech-to-speech call, decided once for
+ * the button.
+ *
+ * `null` means "not known yet", which the button reads as no: a key can only be
+ * true after an async bridge read, and rendering the button on the strength of
+ * a guess would offer calls this workspace cannot make.  Chained calls are
+ * unaffected, so a build without the bridge behaves exactly as it did.
+ */
+function useStsDecision(preference: StsProvider | null | undefined): CallModeDecision | null {
+  const [decision, setDecision] = useState<CallModeDecision | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const bridge = globalThis.window?.ogb;
+    if (!stsBridgeAvailable(bridge)) return;
+    void (async () => {
+      const keys = await readStsKeys(bridge);
+      if (!alive) return;
+      setDecision(
+        decideCallMode({
+          capability: stsCapability({
+            platform: bridge?.platform ?? "unknown",
+            bridgeAvailable: true,
+            keys,
+            preference,
+          }),
+          microphoneAvailable: microphoneAvailable(),
+        }),
+      );
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [preference]);
+  return decision;
+}
+
 export function CallTargetButton({
   targetId,
   targetName,
@@ -81,6 +141,7 @@ export function CallTargetButton({
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
   const cloudConfigured = useTranscriptionAvailability();
+  const stsDecision = useStsDecision(state.config?.sts?.provider);
   const provider = pickSTTProvider({
     cloudSttConfigured: cloudConfigured,
     appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
@@ -106,12 +167,17 @@ export function CallTargetButton({
   // Owner 2026-09-03: with no voice provider configured the call button must not appear at all,
   // rather than render disabled with an explanation.  A Personal Voice this Mac can speak is a
   // provider, so a bot that only uses one gets its call button without a MiniMax key.
-  const voiceProviderConfigured = readiness.engineAvailable;
+  // A speech-to-speech provider is one too: it speaks on the call itself, so a workspace with an
+  // STS key and no chained TTS setup can still make calls.
+  const stsCall = stsDecision?.mode === "sts";
+  const voiceProviderConfigured = stsCall || readiness.engineAvailable;
   const hostedEngineMissing = readiness.needsHostedEngine && !configured;
   const personalVoiceChosen = readiness.personalVoiceChosen;
   const voiceReady = readiness.ready && !hostedEngineMissing;
-  const unavailable = !active && (!capabilitiesReady || !supported || !voiceReady);
-  const voiceSetupRequired = capabilitiesReady && supported && !voiceReady;
+  // An STS call brings its own dictation and its own voice, so the chained gates
+  // describe a path this call is not taking.  They still apply in full otherwise.
+  const unavailable = !active && (!capabilitiesReady || (!stsCall && (!supported || !voiceReady)));
+  const voiceSetupRequired = capabilitiesReady && !stsCall && supported && !voiceReady;
   const [helpOpen, setHelpOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -120,6 +186,8 @@ export function CallTargetButton({
     ? `Hang up on ${targetName}`
     : !capabilitiesReady
       ? "Checking call availability"
+      : stsCall
+        ? `Call ${targetName}`
       : !supported
         ? "Set up dictation to make calls"
         : hostedEngineMissing
@@ -134,21 +202,23 @@ export function CallTargetButton({
 
   const reason = !capabilitiesReady
     ? "Checking whether this device can make calls."
-    : !supported
-      ? provider.provider === null && provider.missing === "cloud-stt-key"
-        ? "Add an AssemblyAI API key in Settings to make calls on this computer."
-        : "This dictation provider is unavailable.\u00A0 Check your choice in Settings or restart BotFleet."
-      : hostedEngineMissing
-        ? "Add a MiniMax API key in Settings so the bot can speak during calls."
-        : !voiceReady
-          ? personalVoiceChosen
-            ? capabilities.dictation.reasonCode === "requires-macos-14"
-              ? "Apple Personal Voice needs macOS 14 or later, or an iPhone.\u00A0 Pick another voice to make calls on this computer."
-              : "Apple Personal Voice speaks on Apple devices (Mac and iPhone).\u00A0 Pick another voice to make calls on this computer."
-            : voices.length > 1
-              ? "Give every channel member a voice before starting a channel call."
-              : "Choose a voice before starting a call."
-          : "";
+    : stsCall
+      ? ""
+      : !supported
+        ? provider.provider === null && provider.missing === "cloud-stt-key"
+          ? "Add an AssemblyAI API key in Settings to make calls on this computer."
+          : "This dictation provider is unavailable.\u00A0 Check your choice in Settings or restart BotFleet."
+        : hostedEngineMissing
+          ? "Add a MiniMax API key in Settings so the bot can speak during calls."
+          : !voiceReady
+            ? personalVoiceChosen
+              ? capabilities.dictation.reasonCode === "requires-macos-14"
+                ? "Apple Personal Voice needs macOS 14 or later, or an iPhone.\u00A0 Pick another voice to make calls on this computer."
+                : "Apple Personal Voice speaks on Apple devices (Mac and iPhone).\u00A0 Pick another voice to make calls on this computer."
+              : voices.length > 1
+                ? "Give every channel member a voice before starting a channel call."
+                : "Choose a voice before starting a call."
+            : "";
 
   useEffect(() => {
     if (!helpOpen) return;
@@ -282,6 +352,22 @@ function Call({ bot }: { bot: Bot }) {
   const phaseRef = useRef<Phase>(initialPhase);
   const alive = useRef(true);
   const sayGeneration = useRef(0);
+  // ── speech-to-speech state ─────────────────────────────────────────────
+  // The mode is decided once, on mount, and never changes mid-call.  It lives in
+  // a ref as well as state because the chained callbacks below must not reopen a
+  // dictation session on an STS call, and a ref keeps them from being rebuilt
+  // (and the microphone effect from being torn down) every time it resolves.
+  const [callMode, setCallMode] = useState<CallModeDecision | null>(null);
+  const stsModeRef = useRef(false);
+  const [stsLines, setStsLines] = useState<StsLineView[]>([]);
+  const stsLineKey = useRef(0);
+  const stsDriverRef = useRef<StsCallDriver | null>(null);
+  const engineWaiterRef = useRef<EngineTurnWaiter | null>(null);
+  if (!engineWaiterRef.current) engineWaiterRef.current = createEngineTurnWaiter();
+  // The engine tool runs a real bot turn, so it needs the live conversation to
+  // tell a new reply from one that was already on screen.
+  const botRef = useRef(bot);
+  botRef.current = bot;
   // The STT provider session is chosen once per call and reused across every
   // listen cycle. The provider picker decides apple (macOS, no cloud key) vs
   // assemblyai (cross-platform, or macOS-with-key per the picker default).
@@ -301,6 +387,10 @@ function Call({ bot }: { bot: Bot }) {
 
   const listen = useCallback(() => {
     if (!alive.current || currentCall() !== bot.id) return;
+    // An STS call has no dictation session to open: the provider holds the
+    // microphone for the whole conversation.  Reaching here would start a second
+    // capture on top of it.
+    if (stsModeRef.current) return;
     move("listening");
     setHeard("");
     setNote(null);
@@ -339,6 +429,29 @@ function Call({ bot }: { bot: Bot }) {
       if (stillMine && phaseRef.current === "speaking") listen();
     },
     [listen, say],
+  );
+
+  /**
+   * The bot's own engine, as the `bot_engine` function tool.
+   *
+   * This is the same turn the chained path runs when it dispatches a send: the
+   * voice model decides to call the tool, the call dispatches a real turn, and
+   * the reply that lands resolves the tool.  Nothing here waits on a rendering
+   * effect or a second HTTP endpoint.
+   *
+   * The deadline is the provider's, not this function's: it aborts `signal`, the
+   * waiter rejects, `callBotEngine` records a bypass, and the model answers that
+   * turn itself with the transcript marked.
+   */
+  const runEngineTurn = useCallback<EngineToolRunner>(
+    async (call, signal) => {
+      const before = new Set(visibleMessages(botRef.current).map((message) => message.id));
+      const answer = engineWaiterRef.current?.arm(before, signal);
+      dispatch({ type: "send", botId: bot.id, text: enginePrompt(call) });
+      if (!answer) throw new Error("The bot's engine is not available on this call.");
+      return answer;
+    },
+    [bot.id, dispatch],
   );
 
   // Navigating away from this bot hangs up. Without ownership checking, the
@@ -479,6 +592,89 @@ function Call({ bot }: { bot: Bot }) {
     (async () => {
       const bridge = window.ogb;
       if (!bridge || detached) return;
+
+      // ── which mode this call runs in ───────────────────────────────────
+      // Asked before the dictation probe so an STS call never waits on one.
+      // Every failure here — no bridge, no key, no microphone — falls through
+      // to the chained path below exactly as before, silently: a call that
+      // quietly keeps working beats a call that refuses.
+      const decision = decideCallMode({
+        capability: stsCapability({
+          platform: bridge.platform ?? "unknown",
+          bridgeAvailable: stsBridgeAvailable(bridge),
+          keys: await readStsKeys(bridge),
+          preference: state.config?.sts?.provider ?? null,
+        }),
+        microphoneAvailable: microphoneAvailable(),
+      });
+      if (detached || !alive.current) return;
+      setCallMode(decision);
+
+      if (decision.mode === "sts" && decision.provider) {
+        const provider = decision.provider;
+        // Latched before the first await: the chained callbacks below read this
+        // synchronously, and React can render between any two awaits.
+        stsModeRef.current = true;
+        const frontEngine = state.config?.sts?.frontEngine !== false;
+        // Built even when the front engine is off, so the preference stays one
+        // setting read; prepareStsSession decides whether it is offered.
+        const botEngine = createStsBotEngine(runEngineTurn);
+        const prepared = prepareStsSession(provider, {
+          persona: composeCallPersona(bot),
+          engineTimeoutMs: state.config?.sts?.engineTimeoutMs,
+          frontEngine,
+          botEngine,
+        });
+        const engine = frontEngine ? botEngine : undefined;
+        const driver = createStsCallDriver(prepared.session, {
+          onLine: (line) => {
+            if (!alive.current || currentCall() !== bot.id) return;
+            setStsLines((current) => appendStsLine(current, line, stsLineKey.current++));
+          },
+          onError: (error) => {
+            if (!alive.current || currentCall() !== bot.id) return;
+            // Release the microphone but keep the call on screen, so the note
+            // is read rather than swallowed by a silent teardown.  A
+            // speech-to-speech session cannot be resumed by reopening a mic,
+            // so the only honest action left is to end the call.
+            void driver.stop().catch(() => {});
+            engineWaiterRef.current?.cancel();
+            setNote(`The voice connection dropped.\u00A0 ${error.message}`);
+          },
+          onClosed: (reason) => {
+            if (!alive.current || currentCall() !== bot.id) return;
+            // A vendor goAway or an expiry leaves nothing to talk to.  The call
+            // does not hang: the microphone is released, the status says the
+            // connection is gone, and the reason is on screen.  Ending the call
+            // silently instead would read as the app hanging up on the user.
+            void driver.stop().catch(() => {});
+            engineWaiterRef.current?.cancel();
+            setNote(`The voice connection ended.\u00A0 ${reason}`);
+          },
+        });
+        stsDriverRef.current = driver;
+        try {
+          // Listeners and the microphone attach first; the providers drop audio
+          // until their handshake lands, so nothing said in between is lost.
+          await driver.start();
+          await prepared.session.start({
+            instructions: prepared.instructions,
+            botEngine: engine,
+            engineTimeoutMs: prepared.timeoutMs,
+          });
+        } catch (error) {
+          if (alive.current && currentCall() === bot.id) {
+            setNote(error instanceof Error ? error.message : String(error));
+            endCall(bot.id);
+          }
+          return;
+        }
+        // The provider runs its own turn loop, so the phase machine stays on
+        // "listening": the bot is always reachable and never hands the mic back.
+        move("listening");
+        return;
+      }
+
       const status = await bridge.transcription?.status?.().catch(() => undefined);
       const cloudSttConfigured = Boolean(status?.configured);
       const platform = bridge.platform ?? "unknown";
@@ -519,14 +715,33 @@ function Call({ bot }: { bot: Bot }) {
       if (session?.provider === "apple") disposeAppleSTTSession(session);
       void session?.stop().catch(() => {});
       if (sttSessionRef.current === session) sttSessionRef.current = null;
+      // The STS driver is stopped on hangup and on unmount alike, and its own
+      // stop is idempotent, so the two paths cannot tear the session twice.
+      void stsDriverRef.current?.stop().catch(() => {});
+      if (stsDriverRef.current) stsDriverRef.current = null;
+      engineWaiterRef.current?.cancel();
     };
     // busy/approval are intentionally initial snapshots. Their live changes
     // are handled below without tearing down native event listeners.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bot.id, bot.threadId, dispatch, hush, listen, move, sayThenListen]);
+  }, [bot.id, bot.threadId, dispatch, hush, listen, move, runEngineTurn, sayThenListen]);
+
+  // ── the engine's reply, when the model called the tool ────────────────
+  useEffect(() => {
+    // A no-op unless a turn is armed, which only ever happens on an STS call.
+    engineWaiterRef.current?.observe(messages);
+  }, [messages]);
 
   // ── narrate the work, speak the answer, read the approvals ───────────
   useEffect(() => {
+    // An STS call speaks for itself: the provider owns both the voice and the
+    // turn loop.  Reading replies aloud here would talk over the model, and
+    // asking about approval cards aloud would need the dictation this call
+    // deliberately does not open.
+    if (stsModeRef.current) {
+      for (const m of messages) spokenIds.current.add(m.id);
+      return;
+    }
     // The request may be resolved from the normal approval UI or by another
     // client while this call is open. Do not keep treating future speech as
     // an answer to a card that no longer exists.
@@ -592,6 +807,9 @@ function Call({ bot }: { bot: Bot }) {
 
   // busy is the harness's word for "a turn is running"
   useEffect(() => {
+    // An STS call runs turns of its own, and this bot going busy means the
+    // engine tool is working — not that the microphone should close.
+    if (stsModeRef.current) return;
     if (bot.busy) {
       // An open approval deliberately keeps the mic live for yes/no. Every
       // other busy phase is half-duplex and must close capture.
@@ -630,8 +848,12 @@ function Call({ bot }: { bot: Bot }) {
 
   const mascotState =
     phase === "listening" ? "listening" : phase === "speaking" ? "sending" : phase === "sending" ? "thinking" : "working";
-  const status =
-    phase === "listening"
+  // A speech-to-speech call that has lost its session must not keep claiming
+  // it is listening to someone.
+  const stsBroken = callMode?.mode === "sts" && Boolean(note);
+  const status = stsBroken
+    ? "Not connected"
+    : phase === "listening"
       ? pushToTalk
         ? "Push to talk"
         : "Listening"
@@ -663,7 +885,29 @@ function Call({ bot }: { bot: Bot }) {
 
       {/* one line, whichever is current: what you're saying, or what it is */}
       <div className="min-h-[3.5rem] max-w-[560px] px-6 text-center text-[15px] leading-relaxed text-ink">
-        {phase === "listening" ? (
+        {callMode?.mode === "sts" ? (
+          stsLines.length ? (
+            <div className="flex flex-col items-center gap-1.5 text-left">
+              {stsLines.slice(-6).map((line) => (
+                <div
+                  key={line.key}
+                  className={cn(
+                    "w-full text-[14px]",
+                    line.from === "user" ? "text-ink-secondary" : "text-ink",
+                    // A turn the bot answered alone is marked, so the user can
+                    // tell it from the bot's own answer.
+                    line.engineBypassed && "text-warning",
+                    !line.final && "opacity-70",
+                  )}
+                >
+                  {stsLineText(line)}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <span className="text-ink-secondary">Say something…</span>
+          )
+        ) : phase === "listening" ? (
           heard || (
             <span className="text-ink-secondary">
               {pushToTalk ? "Release Control + Option to send…" : "Say something…"}
@@ -677,12 +921,24 @@ function Call({ bot }: { bot: Bot }) {
       {note && (
         <div className="flex max-w-[460px] flex-col items-center gap-2 text-center text-[12.5px] text-warning">
           <span>{note}</span>
-          <button
-            onClick={listen}
-            className="rounded-full border border-warning/40 px-3 py-1.5 text-[12px] hover:bg-warning/10"
-          >
-            Try microphone again
-          </button>
+          {callMode?.mode === "sts" ? (
+            // A speech-to-speech session cannot be resumed by reopening a
+            // microphone; the session is gone.  Ending the call is the only
+            // honest action left to offer.
+            <button
+              onClick={() => endCall(bot.id)}
+              className="rounded-full border border-warning/40 px-3 py-1.5 text-[12px] hover:bg-warning/10"
+            >
+              End Call
+            </button>
+          ) : (
+            <button
+              onClick={listen}
+              className="rounded-full border border-warning/40 px-3 py-1.5 text-[12px] hover:bg-warning/10"
+            >
+              Try microphone again
+            </button>
+          )}
         </div>
       )}
       {speech.error && <div className="max-w-[420px] text-center text-[12.5px] text-danger">{speech.error}</div>}
@@ -709,7 +965,11 @@ function Call({ bot }: { bot: Bot }) {
       </div>
 
       <div className="text-[11.5px] text-ink-secondary/70">
-        {sttSessionRef.current?.provider === "apple" ? "Hold Control + Option to talk · " : ""}Space interrupts · Esc hangs up
+        {callMode?.mode === "sts"
+          ? // The provider truncates its own playback when the caller speaks
+            // over the bot, so the chained Space interrupt would be a lie here.
+            "Talk over the bot to interrupt · Esc hangs up"
+          : `${sttSessionRef.current?.provider === "apple" ? "Hold Control + Option to talk · " : ""}Space interrupts · Esc hangs up`}
       </div>
     </div>
   );

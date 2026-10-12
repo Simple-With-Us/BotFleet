@@ -12,9 +12,12 @@ import { join } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import {
+  StsConfigResponseSchema,
   StsSettings,
+  describeStsConfigFailure,
   stsEffectiveFrontEngine,
   stsEffectiveProvider,
   stsKeyNotice,
@@ -155,6 +158,93 @@ describe("StsSettings", () => {
   });
 });
 
+describe("StsConfigResponseSchema", () => {
+  it("reads the slice a current server sends", () => {
+    const parsed = StsConfigResponseSchema.safeParse({ sts: { provider: "gemini", frontEngine: false } });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.sts).toEqual({ provider: "gemini", frontEngine: false });
+  });
+
+  it("reads an older server that predates the slice as no preference at all", () => {
+    // The slice being absent is a real, supported answer, not a fault: it
+    // means Auto and the engine on, which the two helpers render.
+    const otherSections = StsConfigResponseSchema.safeParse({ tts: { provider: "minimax" } });
+    expect(otherSections.success).toBe(true);
+    if (!otherSections.success) return;
+    expect(otherSections.data.sts).toBeUndefined();
+    // Auto is written back as the schema's null, so null has to survive too.
+    expect(StsConfigResponseSchema.safeParse({ sts: { provider: null } }).success).toBe(true);
+  });
+
+  it("tolerates the other slices a real config response carries", () => {
+    // Only `sts` is read here, so a response with twenty other sections must
+    // not be refused for carrying them.
+    expect(StsConfigResponseSchema.safeParse({
+      composio: { configured: false },
+      vps: { configured: false, sshAlias: "" },
+      rooms: { turnTimeoutMinutes: 30 },
+      tts: { provider: "minimax", configured: true },
+      sts: { provider: "xai" },
+    }).success).toBe(true);
+  });
+
+  it("refuses a provider this build has no provider card for", () => {
+    // The defect the annotation could not see: an unrecognised id rendered as
+    // Auto while the config said otherwise.
+    expect(StsConfigResponseSchema.safeParse({ sts: { provider: "openai" } }).success).toBe(false);
+  });
+
+  it("refuses a boolean that arrived as a string", () => {
+    // "false" is truthy, so an unchecked read would show the engine as on.
+    expect(StsConfigResponseSchema.safeParse({ sts: { frontEngine: "false" } }).success).toBe(false);
+  });
+
+  it("refuses a field the panel has never heard of inside the slice", () => {
+    // Strict on the slice: drift in the field this panel reads is worth a
+    // visible note rather than a silent drop.
+    expect(
+      StsConfigResponseSchema.safeParse({ sts: { provider: "xai", frontEngine: true, latencyHint: 42 } }).success,
+    ).toBe(false);
+  });
+
+  it("refuses a body that is not an object at all", () => {
+    for (const body of [null, "sts", 42, [{ provider: "xai" }]]) {
+      expect(StsConfigResponseSchema.safeParse(body).success).toBe(false);
+    }
+  });
+});
+
+describe("describeStsConfigFailure", () => {
+  /** The one-line message the panel's alert renders for a refused body. */
+  const lineFor = (body: Parameters<typeof StsConfigResponseSchema.safeParse>[0]) => {
+    const parsed = StsConfigResponseSchema.safeParse(body);
+    expect(parsed.success).toBe(false);
+    if (parsed.success) throw new Error("expected the schema to refuse this body");
+    return describeStsConfigFailure(parsed.error);
+  };
+
+  it("names the field that was wrong", () => {
+    expect(lineFor({ sts: { frontEngine: "nope" } })).toContain("sts.frontEngine");
+  });
+
+  it("says what was wrong on one readable line, never as a Zod issue dump", () => {
+    // The alert renders this at 12px; a stringified ZodError would be a wall
+    // of JSON braces in the user's settings.
+    const line = lineFor({ sts: { frontEngine: "nope" } });
+    expect(line.split("\n")).toHaveLength(1);
+    expect(line).not.toContain("[");
+    expect(line).not.toContain("{");
+    expect(line).not.toContain('"code"');
+    expect(line).toContain("Unreadable STS settings from GET /api/config");
+  });
+
+  it("still says something when the failure carries no issue", () => {
+    expect(describeStsConfigFailure(new z.ZodError([])))
+      .toBe("Unreadable STS settings from GET /api/config.");
+  });
+});
+
 /**
  * The save path is a closure over component state behind a click, and this
  * suite renders to static markup, so it is unreachable from here.  The
@@ -195,5 +285,38 @@ describe("StsSettings save path", () => {
   it("drops a second save while one is in flight", () => {
     const save = between("const save = async", "const saveProvider");
     expect(save).toContain("if (saving) return false;");
+  });
+});
+
+/**
+ * The load path is a promise chain inside an effect, which this suite's static
+ * render never runs.  What must not regress is the order: the body is parsed
+ * before any field is read, so no annotation can quietly become the only gate
+ * again.  Pinned at the source, for the same reason as the save path above.
+ */
+describe("StsSettings load path", () => {
+  const SRC = readFileSync(join(__dirname, "StsSettings.tsx"), "utf8");
+
+  it("parses the config body before reading any field off it", () => {
+    const chain = SRC.slice(
+      SRC.indexOf('fetch("/api/config")'),
+      SRC.indexOf("  // One writer for the whole slice"),
+    );
+    // res.json() hands over an untyped body; the schema is the next link, and
+    // the setState calls only ever see what the parse returns.
+    expect(chain).toContain("return res.json();");
+    expect(chain).toContain(".then((body) => StsConfigResponseSchema.parse(body))");
+    expect(chain).toContain("setProvider(stsEffectiveProvider(cfg.sts))");
+    expect(chain).toContain("setFrontEngine(stsEffectiveFrontEngine(cfg.sts))");
+    // No type annotation on the body anywhere: that annotation is the only
+    // gate this rule exists to stop being.
+    expect(chain).not.toContain("cfg: {");
+    expect(chain).not.toContain("cfg?.sts");
+    // The parse is inside the same chain, so its rejection lands in the catch
+    // that already paints the error note.
+    expect(chain.indexOf("StsConfigResponseSchema.parse")).toBeLessThan(chain.indexOf("setProvider"));
+    expect(chain).toContain(".catch((failure)");
+    expect(chain).toContain("failure instanceof z.ZodError");
+    expect(chain).toContain("describeStsConfigFailure(failure)");
   });
 });

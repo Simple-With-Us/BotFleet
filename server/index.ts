@@ -9509,6 +9509,9 @@ function configStatus() {
     // same configured-or-not way as every other credential
     tts: tts.describeVoice(cfg),
     callStt: { provider: cfg.callStt?.provider ?? undefined, keyterms: cfg.callStt?.keyterms ?? [] },
+    // The STS slice must ride this frame or the call view can never see an
+    // explicit provider preference and silently falls back to Auto.
+    sts: { provider: cfg.sts?.provider ?? undefined, frontEngine: cfg.sts?.frontEngine, engineTimeoutMs: cfg.sts?.engineTimeoutMs },
     imageGen: { configured: Boolean(cfg.imageGen?.key) },
     // Linq binding credentials live in env (BOTFLEET_LINQAPP_API_KEY or
     // legacy LINQ_API_TOKEN), so we never carry a token across this frame —

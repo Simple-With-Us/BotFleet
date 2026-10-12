@@ -25,7 +25,19 @@ describe("CallTargetButton visibility", () => {
     // src/lib/tts/readiness.test.ts) folds both into engineAvailable.
     expect(SRC).toMatch(/const configured = Boolean\(state\.config\?\.tts\?\.configured\);/);
     expect(SRC).toMatch(/const readiness = callVoiceReadiness\(\{/);
-    expect(SRC).toMatch(/const voiceProviderConfigured = readiness\.engineAvailable;/);
+    // A speech-to-speech provider is a provider too: it speaks on the call itself, so a
+    // workspace with an STS key and no chained TTS setup must still get the button.  The
+    // chained readiness rule is still what decides the chained half.
+    expect(SRC).toMatch(/const voiceProviderConfigured = stsCall \|\| readiness\.engineAvailable;/);
+  });
+
+  it("leaves the chained gates off the speech-to-speech path", () => {
+    // An STS call brings its own dictation and its own voice, so the dictation and
+    // voice gates describe a path it is not taking.  Pinning the shape keeps a
+    // later edit from re-gating the button behind a chained requirement.
+    expect(SRC).toMatch(/const unavailable = !active && \(!capabilitiesReady \|\| \(!stsCall && \(!supported \|\| !voiceReady\)\)\);/);
+    expect(SRC).toMatch(/const voiceSetupRequired = capabilitiesReady && !stsCall && supported && !voiceReady;/);
+    expect(SRC).toMatch(/const stsCall = stsDecision\?\.mode === "sts";/);
   });
 
   it("places the guard after every hook so hook order stays stable", () => {
