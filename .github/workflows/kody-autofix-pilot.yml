@@ -51,7 +51,7 @@ jobs:
       - run: node .github/autofix/kody-pilot.mjs prepare "$RUNNER_TEMP/pilot"
         env:
           GH_TOKEN: ${{ github.token }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kody-pilot-context
           path: ${{ runner.temp }}/pilot/snapshot.json
@@ -86,7 +86,7 @@ jobs:
         run: node .github/autofix/kody-pilot.mjs generate "$RUNNER_TEMP/pilot"
         env:
           DEEPSEEK_API_KEY: ${{ secrets.KODY_DEEPSEEK_API_KEY }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kody-pilot-answer
           path: ${{ runner.temp }}/pilot/answer.json
