@@ -244,10 +244,8 @@ export function MuseCodeMark({ size = 16, className }: IconProps) {
  *  borrows DeepSeek's whale as its own product mark. */
 export function ClutchMark({ size = 16, className }: IconProps) {
   return (
-    <svg width={size} height={size} viewBox="0 0 256 256" className={className} aria-hidden>
-      <rect width="256" height="256" fill="#151820" />
-      <rect y="253" width="256" height="3" fill="#1E293B" />
-      <path fill="#F8FAFC" d="M176.6 64.6A55 55 0 1 0 176.6 135.4L155.2 117.4A27 27 0 1 1 155.2 82.6z" />
+    <svg width={size} height={size} viewBox="45 40 145 120" className={cn("fill-mark", className)} aria-hidden>
+      <path d="M176.6 64.6A55 55 0 1 0 176.6 135.4L155.2 117.4A27 27 0 1 1 155.2 82.6z" />
     </svg>
   );
 }
