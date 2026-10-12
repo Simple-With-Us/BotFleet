@@ -94,10 +94,10 @@ describe("stsKeyNotice", () => {
 
   it("names the missing credential and says what actually happens", () => {
     expect(stsKeyNotice("xai", { xai: false })).toBe(
-      "No XAI_API_KEY — calls use Auto until one is added.",
+      "No xAI API key.  Calls stay on Auto until you add one.",
     );
     expect(stsKeyNotice("gemini", { xai: true, gemini: false })).toBe(
-      "No GEMINI_API_KEY — calls use Auto until one is added.",
+      "No Gemini API key.  Calls stay on Auto until you add one.",
     );
   });
 });
@@ -139,16 +139,16 @@ describe("StsSettings", () => {
   it("says so instead of crashing when the bridge is unavailable", () => {
     // No `window.ogb.sts` at all: the browser-without-desktop-app case.
     const html = render();
-    expect(html).toContain("Available in the installed desktop app.");
+    expect(html).toContain("Calls need the installed desktop app.");
   });
 
   it("shows the key-status warning when the bridge exists but status fails", () => {
     // Effects do not run under SSR, so the bridge is present and the key
     // state is still unknown: the panel must not claim a key is missing.
     const html = render({ sts: { status: () => Promise.reject(new Error("nope")) } });
-    expect(html).not.toContain("No XAI_API_KEY");
-    expect(html).not.toContain("No GEMINI_API_KEY");
-    expect(html).not.toContain("Available in the installed desktop app.");
+    expect(html).not.toContain("No xAI API key");
+    expect(html).not.toContain("No Gemini API key");
+    expect(html).not.toContain("Calls need the installed desktop app.");
   });
 
   it("uses a real non-breaking space, never the &nbsp; entity", () => {
@@ -236,12 +236,12 @@ describe("describeStsConfigFailure", () => {
     expect(line).not.toContain("[");
     expect(line).not.toContain("{");
     expect(line).not.toContain('"code"');
-    expect(line).toContain("Unreadable STS settings from GET /api/config");
+    expect(line).toContain("These settings did not load");
   });
 
   it("still says something when the failure carries no issue", () => {
     expect(describeStsConfigFailure(new z.ZodError([])))
-      .toBe("Unreadable STS settings from GET /api/config.");
+      .toBe("These settings did not load.  Try again.");
   });
 });
 

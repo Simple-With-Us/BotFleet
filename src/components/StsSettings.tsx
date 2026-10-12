@@ -68,10 +68,10 @@ export const StsConfigResponseSchema = z.object({
  */
 export function describeStsConfigFailure(failure: z.ZodError): string {
   const first = failure.issues[0];
-  if (!first) return "Unreadable STS settings from GET /api/config.";
+  if (!first) return "These settings did not load.  Try again.";
   const where = first.path.join(".");
   const complaint = first.message.toLowerCase();
-  return `Unreadable STS settings from GET /api/config — ${where ? `${where}: ` : ""}${complaint}.`;
+  return `These settings did not load.  ${where ? `${where}: ` : ""}${complaint}.`;
 }
 
 const PROVIDER_TITLES = {
@@ -80,14 +80,14 @@ const PROVIDER_TITLES = {
 } satisfies Record<StsProvider, string>;
 
 const PROVIDER_BLURBS = {
-  xai: "Realtime duplex speech on one connection.",
-  gemini: "Gemini Live duplex speech on one connection.",
+  xai: "Realtime speech on one connection.",
+  gemini: "Gemini Live speech on one connection.",
 } satisfies Record<StsProvider, string>;
 
-/** The credential each provider needs, named so a missing one is actionable. */
-const PROVIDER_CREDENTIALS = {
-  xai: "XAI_API_KEY",
-  gemini: "GEMINI_API_KEY",
+/** The human-readable name for each provider's missing key, for the panel copy. */
+const PROVIDER_KEY_NAMES = {
+  xai: "xAI API key",
+  gemini: "Gemini API key",
 } satisfies Record<StsProvider, string>;
 
 /** Narrow a config or radio value without a cast, off the list the picker uses. */
@@ -128,7 +128,7 @@ export function stsKeyNotice(provider: StsProvider, keys: StsKeyState): string |
   if (!keys) return null;
   return keys[provider]
     ? "Key configured."
-    : `No ${PROVIDER_CREDENTIALS[provider]} — calls use Auto until one is added.`;
+    : `No ${PROVIDER_KEY_NAMES[provider]}.  Calls stay on Auto until you add one.`;
 }
 
 export function StsSettings() {
@@ -170,7 +170,7 @@ export function StsSettings() {
     let alive = true;
     fetch("/api/config")
       .then((res) => {
-        if (!res.ok) throw new Error(`GET /api/config → ${res.status}`);
+        if (!res.ok) throw new Error("These settings did not load.  Try again.");
         return res.json();
       })
       .then((body) => StsConfigResponseSchema.parse(body))
@@ -205,7 +205,7 @@ export function StsSettings() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sts: patch }),
       });
-      if (!res.ok) throw new Error(`PUT /api/config → ${res.status}`);
+      if (!res.ok) throw new Error("These settings did not save.  Try again.");
       return true;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -232,7 +232,13 @@ export function StsSettings() {
         <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
           <span className={cn("size-1.5 rounded-full", configured.length > 0 ? "bg-success" : "bg-raised-hover")} />
           <span className="text-ink">Speech-to-Speech Calls</span>
-          {configured.length > 0 && <span className="text-[11px] text-success">Key Ready</span>}
+          {configured.length > 0 && (
+            <span className="text-[11px] text-success">
+              {configured.length === STS_PROVIDERS.length
+                ? "All keys ready"
+                : `1 key ready`}
+            </span>
+          )}
         </div>
         <p className="mb-2 text-[12px] leading-relaxed text-ink-secondary">
           The model hears the caller and speaks back on one connection, instead of transcribing
@@ -299,11 +305,11 @@ export function StsSettings() {
         </fieldset>
 
         {!bridge && (
-          <div className="mt-2 text-[12px] text-warning">Available in the installed desktop app.</div>
+          <div className="mt-2 text-[12px] text-warning">Calls need the installed desktop app.</div>
         )}
         {bridge && keysFailed && (
           <div className="mt-2 text-[12px] text-warning">
-            Key status unavailable — provider keys are stored by the desktop app.
+            Could not read the key status.  The desktop app stores provider keys.
           </div>
         )}
       </section>
@@ -328,7 +334,7 @@ export function StsSettings() {
             onChange={(event) => void saveFrontEngine(event.target.checked)}
             disabled={!loaded || saving}
             className="size-3 accent-accent"
-            aria-label="Hand real work to the bot's engine"
+            aria-label="Use The Bot's Coding Engine"
           />
           <div className="text-[13px] text-ink">Use The Bot's Coding Engine</div>
           <div className="ml-auto flex items-center gap-1.5 text-[11px] text-ink-secondary">

@@ -667,7 +667,7 @@ function Call({ bot }: { bot: Bot }) {
     const handleEnd = ({ code, reason }: { code: number; reason?: string }) => {
       if (!alive.current || currentCall() !== bot.id) return;
       if (code === 2) {
-        setNote("Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or use BotFleet for macOS.");
+        setNote("Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or install the desktop app for macOS.");
         return;
       }
       if (code === 1) {

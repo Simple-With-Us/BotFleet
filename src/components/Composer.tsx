@@ -568,7 +568,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
         setSpeechError(
           reason === "no-provider"
             ? "Add an AssemblyAI API key in Settings to use dictation on this computer."
-            : "Dictation needs a working provider.\u00A0 Add an AssemblyAI key or use BotFleet for macOS.",
+            : "Dictation needs a working provider.\u00A0 Add an AssemblyAI key, or install the desktop app for macOS.",
         );
       } else if (code === 1) {
         setSpeechError(
