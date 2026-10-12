@@ -91,6 +91,7 @@ export function CallTargetButton({
     appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
     platform: window.ogb?.platform ?? "unknown",
     explicitPreference: state.config?.callStt?.provider ?? undefined,
+    ladder: state.config?.callStt?.ladder,
   });
   const supported = provider.provider !== null;
   // `configured` is provider-scoped server-side (MiniMax => a key is on file; system => the Mac's
@@ -492,6 +493,7 @@ function Call({ bot }: { bot: Bot }) {
         appleSpeechAvailable: capabilities.dictation.available,
         platform,
         explicitPreference: state.config?.callStt?.provider ?? undefined,
+        ladder: state.config?.callStt?.ladder,
       });
       if (choice.provider === null) {
         if (alive.current && currentCall() === bot.id) {

@@ -199,6 +199,7 @@ function ComposerInner({
     appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
     platform: window.ogb?.platform ?? "unknown",
     explicitPreference: state.config?.callStt?.provider ?? undefined,
+    ladder: state.config?.callStt?.ladder,
   }).provider !== null;
   // Unified target: a 1:1 bot thread or a room. In a room the @ picker
   // offers members plus @everyone; explicit mentions override the room's
@@ -595,6 +596,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
           appleSpeechAvailable: hostPlatform === "darwin" && capabilities.dictation.available,
           platform: hostPlatform,
           explicitPreference: state.config?.callStt?.provider ?? undefined,
+          ladder: state.config?.callStt?.ladder,
         });
         if (choice.provider === null) {
           if (!detached) {

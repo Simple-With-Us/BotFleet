@@ -555,6 +555,7 @@ export interface ConfigStatus {
    * the user has set up; per-bot terms are layered on top in call-stt.ts. */
   callStt?: {
     provider?: "apple" | "assemblyai" | "xai" | "meta" | "azure" | "groq";
+    ladder?: Array<"meta" | "xai" | "assemblyai" | "azure" | "groq">;
     keyterms?: string[];
     cloud?: import("../../shared/voice-providers.ts").CloudSttCapabilities;
   };

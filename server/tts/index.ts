@@ -11,7 +11,13 @@ import * as minimax from "./minimax.ts";
 import * as systemVoices from "./system-voices.ts";
 import * as xai from "./xai.ts";
 
-import { type TtsProvider, parseTtsProvider, resolveHostedTtsLadder } from "../../shared/voice-providers.ts";
+import {
+  type HostedTtsProvider,
+  type TtsProvider,
+  isHostedTtsProvider,
+  parseTtsProvider,
+  resolveHostedTtsLadder,
+} from "../../shared/voice-providers.ts";
 import { speakWithFallback } from "./provider-ladder.ts";
 
 export type VoiceProvider = TtsProvider;
@@ -21,8 +27,10 @@ import { NoVoiceConfigured } from "./errors.ts";
 export function voiceProvider(cfg: AppConfig): VoiceProvider {
   const explicit = parseTtsProvider(cfg.tts?.provider);
   if (explicit) return explicit;
-  // Default to MiniMax.  Legacy configs with provider: "elevenlabs" fall
-  // through here and use MiniMax — ElevenLabs support was removed.
+  const ladder = resolveHostedTtsLadder(cfg);
+  if (ladder.length) return ladder[0]!;
+  // Legacy configs with provider: "elevenlabs" fall through here and use
+  // MiniMax — ElevenLabs support was removed.
   return "minimax";
 }
 
@@ -88,10 +96,9 @@ export function describeVoice(cfg: AppConfig) {
 
 export function verifyKey(key: string, cfg: AppConfig) {
   const provider = voiceProvider(cfg);
-  if (provider === "xai") return xai.verifyKey(key);
+  if (provider === "xai") return xai.verifyKey((cfg.xai?.key ?? key).trim());
   if (provider === "azure") {
-    const region = cfg.azureSpeech?.region ?? "";
-    return azure.verifyKey(key, region);
+    return azure.verifyKey((cfg.azureSpeech?.key ?? key).trim(), cfg.azureSpeech?.region ?? "");
   }
   return minimax.verifyKey(key);
 }
@@ -150,11 +157,13 @@ export function speak(cfg: AppConfig, rawText: string, voiceId?: string, run?: s
   const provider = voiceProvider(cfg);
   if (provider === "system") {
     const voice = voiceId || cfg.tts?.voice;
-    if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key");
-    if (!voice) throw new NoVoiceConfigured("voice");
+    if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key", "system");
+    if (!voice) throw new NoVoiceConfigured("voice", "system");
   } else {
-    if (!resolveHostedTtsLadder(cfg).length) throw new NoVoiceConfigured("key");
-    if (provider === "minimax" && !(voiceId || cfg.tts?.voice)) throw new NoVoiceConfigured("voice");
+    const ladder = resolveHostedTtsLadder(cfg);
+    const hosted: HostedTtsProvider = isHostedTtsProvider(provider) ? provider : "minimax";
+    if (!ladder.length) throw new NoVoiceConfigured("key", hosted);
+    if (provider === "minimax" && !(voiceId || cfg.tts?.voice)) throw new NoVoiceConfigured("voice", "minimax");
   }
   return speakWithFallback(cfg, text, voiceId, run);
 }

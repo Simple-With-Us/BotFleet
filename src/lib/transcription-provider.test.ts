@@ -40,11 +40,18 @@ describe("pickSTTProvider", () => {
     });
   });
 
-  it("prefers meta ahead of assemblyai when both are configured", () => {
+  it("prefers assemblyai when meta is configured but not bridged in this build", () => {
     expect(pickSTTProvider({
       ...base,
       cloudStt: { ...emptyCloudSttCapabilities(), meta: true, assemblyai: true },
-    })).toEqual({ provider: "meta", reason: "macos-with-key" });
+    })).toEqual({ provider: "assemblyai", reason: "macos-with-key" });
+  });
+
+  it("honours callStt.ladder order among bridged providers", () => {
+    expect(pickSTTProvider({
+      ...withAssemblyAi(),
+      ladder: ["groq", "assemblyai"],
+    })).toEqual({ provider: "assemblyai", reason: "macos-with-key" });
   });
 
   it("returns no-provider on Windows / Linux without a cloud key, with the missing key surfaced", () => {

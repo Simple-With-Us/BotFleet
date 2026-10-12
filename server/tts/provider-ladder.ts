@@ -33,24 +33,24 @@ async function synthesizeWithProvider(
   switch (provider) {
     case "minimax": {
       const key = cfg.tts?.key;
-      if (!key) throw new NoVoiceConfigured("key");
+      if (!key) throw new NoVoiceConfigured("key", "minimax");
       const voice = voiceId || cfg.tts?.voice;
-      if (!voice) throw new NoVoiceConfigured("voice");
+      if (!voice) throw new NoVoiceConfigured("voice", "minimax");
       return minimax.synthesize(text, voice, key);
     }
     case "xai": {
       const key = cfg.xai?.key;
-      if (!key) throw new NoVoiceConfigured("key");
+      if (!key) throw new NoVoiceConfigured("key", "xai");
       const voice = voiceId || cfg.tts?.voice || xai.CANNED_VOICES[0]?.id;
-      if (!voice) throw new NoVoiceConfigured("voice");
+      if (!voice) throw new NoVoiceConfigured("voice", "xai");
       return xai.synthesize(text, voice, key);
     }
     case "azure": {
       const key = cfg.azureSpeech?.key;
       const region = cfg.azureSpeech?.region;
-      if (!key || !region) throw new NoVoiceConfigured("key");
+      if (!key || !region) throw new NoVoiceConfigured("key", "azure");
       const voice = voiceId || cfg.tts?.voice || azure.CANNED_VOICES[0]?.id;
-      if (!voice) throw new NoVoiceConfigured("voice");
+      if (!voice) throw new NoVoiceConfigured("voice", "azure");
       return azure.synthesize(text, voice, key, region);
     }
     default:
@@ -67,13 +67,13 @@ export async function speakWithFallback(
 ): Promise<Audio> {
   if (isSystemProvider(cfg)) {
     const voice = voiceId || cfg.tts?.voice;
-    if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key");
-    if (!voice) throw new NoVoiceConfigured("voice");
+    if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key", "system");
+    if (!voice) throw new NoVoiceConfigured("voice", "system");
     return systemVoices.synthesizeSystem(text, voice, run);
   }
 
   const ladder = resolveHostedTtsLadder(cfg);
-  if (!ladder.length) throw new NoVoiceConfigured("key");
+  if (!ladder.length) throw new NoVoiceConfigured("key", ladder[0] ?? "minimax");
 
   const failures: Array<{ provider: HostedTtsProvider; message: string }> = [];
   for (const provider of ladder) {

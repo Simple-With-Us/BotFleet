@@ -365,6 +365,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
         appleSpeechAvailable: hostPlatform === "darwin",
         platform: hostPlatform,
         explicitPreference: state.config?.callStt?.provider ?? undefined,
+        ladder: state.config?.callStt?.ladder,
       });
       if (choice.provider === null) {
         if (alive.current && currentCall() === group.id) {
