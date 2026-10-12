@@ -1,6 +1,7 @@
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
 import { acceptComposerTranscript } from "@/lib/composer-dictation";
+import { mergeCloudSttCapabilities } from "@/lib/cloud-stt-capabilities";
 import { pickSTTProvider } from "@/lib/transcription-provider";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
@@ -189,8 +190,12 @@ function ComposerInner({
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
   const cloudConfigured = useTranscriptionAvailability();
+  const cloudStt = useMemo(
+    () => mergeCloudSttCapabilities(state.config?.callStt?.cloud, cloudConfigured),
+    [state.config?.callStt?.cloud, cloudConfigured],
+  );
   const dictationAvailable = pickSTTProvider({
-    cloudSttConfigured: cloudConfigured,
+    cloudStt,
     appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
     platform: window.ogb?.platform ?? "unknown",
     explicitPreference: state.config?.callStt?.provider ?? undefined,
@@ -586,7 +591,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
         const status = await bridge.transcription?.status?.().catch(() => undefined);
         const hostPlatform = bridge.platform ?? "unknown";
         const choice = pickSTTProvider({
-          cloudSttConfigured: Boolean(status?.configured),
+          cloudStt: mergeCloudSttCapabilities(state.config?.callStt?.cloud, Boolean(status?.configured)),
           appleSpeechAvailable: hostPlatform === "darwin" && capabilities.dictation.available,
           platform: hostPlatform,
           explicitPreference: state.config?.callStt?.provider ?? undefined,

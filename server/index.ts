@@ -49,6 +49,7 @@ import {
   isCredentialTargetId,
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
+import { TTS_PROVIDERS, cloudSttCapabilitiesFromConfig } from "../shared/voice-providers.ts";
 
 import { autoVerdict, coarseAlwaysAllowRefused, isOwnJobStartRequest, offerableApprovalKey } from "./auto-approve.ts";
 import {
@@ -9573,7 +9574,11 @@ function configStatus() {
     // the chosen voice is a setting, not a secret; the key is reported the
     // same configured-or-not way as every other credential
     tts: tts.describeVoice(cfg),
-    callStt: { provider: cfg.callStt?.provider ?? undefined, keyterms: cfg.callStt?.keyterms ?? [] },
+    callStt: {
+      provider: cfg.callStt?.provider ?? undefined,
+      keyterms: cfg.callStt?.keyterms ?? [],
+      cloud: cloudSttCapabilitiesFromConfig(cfg),
+    },
     imageGen: { configured: Boolean(cfg.imageGen?.key) },
     // Linq binding credentials live in env (BOTFLEET_LINQAPP_API_KEY or
     // legacy LINQ_API_TOKEN), so we never carry a token across this frame —
@@ -10329,7 +10334,6 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
-const TTS_PROVIDERS = ["minimax", "system"] as const;
 // The same list as a domain value, so a save is judged against the names the
 // harness actually has rather than against a string comparison in the handler.
 const ttsProviderName = z.enum(TTS_PROVIDERS);
@@ -10364,7 +10368,7 @@ function ttsProviderClaim(body: Record<string, unknown>): TtsProviderClaim {
   // those.  Anything else has to name a provider the harness knows.
   if (provider === undefined || provider === null) return {};
   const known = ttsProviderName.safeParse(ttsProviderFold.safeParse(provider).data).success;
-  return known ? {} : { error: "tts.provider must be minimax or system" };
+  return known ? {} : { error: `tts.provider must be one of: ${TTS_PROVIDERS.join(", ")}` };
 }
 
 function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {

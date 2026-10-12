@@ -17,6 +17,7 @@ import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
+import { mergeCloudSttCapabilities } from "@/lib/cloud-stt-capabilities";
 import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { useStore, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
@@ -360,7 +361,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       const status = await bridge.transcription?.status?.().catch(() => undefined);
       const hostPlatform = bridge.platform ?? "unknown";
       const choice: ProviderChoice = pickSTTProvider({
-        cloudSttConfigured: Boolean(status?.configured),
+        cloudStt: mergeCloudSttCapabilities(state.config?.callStt?.cloud, Boolean(status?.configured)),
         appleSpeechAvailable: hostPlatform === "darwin",
         platform: hostPlatform,
         explicitPreference: state.config?.callStt?.provider ?? undefined,

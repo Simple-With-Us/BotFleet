@@ -5,7 +5,7 @@ import { cn } from "@/lib/cn";
 import { announceTranscriptionStatus } from "@/lib/transcription-status";
 import { KEYTERMS_MAX, formatKeyterms, keytermsDirty, parseKeyterms, persistKeyterms } from "@/lib/stt-keyterms";
 
-type Provider = "auto" | "apple" | "assemblyai";
+type Provider = "auto" | "apple" | "assemblyai" | "xai" | "meta" | "azure" | "groq";
 
 const MAX_INPUT_HEIGHT_PX = 220;
 
@@ -41,7 +41,8 @@ export function TranscriptionSettings() {
       .then((cfg) => {
         if (!alive) return;
         const explicit = cfg?.callStt?.provider;
-        setProvider(explicit === "apple" || explicit === "assemblyai" ? explicit : "auto");
+        const known: Provider[] = ["apple", "assemblyai", "xai", "meta", "azure", "groq"];
+        setProvider(known.includes(explicit) ? explicit : "auto");
         const saved = parseKeyterms(formatKeyterms(Array.isArray(cfg?.callStt?.keyterms) ? cfg.callStt.keyterms : []));
         setGlobalKeyterms(formatKeyterms(saved));
         setLastSavedKeyterms(saved);
@@ -192,6 +193,26 @@ export function TranscriptionSettings() {
                 title: "AssemblyAI Cloud Recognition",
                 description:
                   "Cross-platform.\u00A0 Requires an API key above.\u00A0 Better accuracy and custom vocabulary.",
+              },
+              {
+                value: "xai" as Provider,
+                title: "xAI Cloud Recognition",
+                description: "Uses the xAI API key from Connections.\u00A0 Streaming bridge ships in a follow-up.",
+              },
+              {
+                value: "meta" as Provider,
+                title: "Meta Muse Voice Transcribe",
+                description: "Uses the Meta speech key from Connections.\u00A0 Streaming bridge ships in a follow-up.",
+              },
+              {
+                value: "azure" as Provider,
+                title: "Azure Speech",
+                description: "Uses the Azure Speech key and region from Connections.\u00A0 Streaming bridge ships in a follow-up.",
+              },
+              {
+                value: "groq" as Provider,
+                title: "Groq Whisper",
+                description: "Batch transcription path.\u00A0 Uses the Groq key from Connections.",
               },
             ]
           ).map((option) => (

@@ -17,7 +17,7 @@
 // every activity chip the harness narrates (`tool.spoken`) is read aloud as
 // it happens, which is why waiting feels like listening to someone work
 // rather than listening to nothing.
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Loader2, Phone, PhoneOff, X } from "lucide-react";
 
 import { useStore, visibleMessages, type Bot } from "@/state/store";
@@ -31,6 +31,7 @@ import { usePushToTalk } from "@/lib/push-to-talk";
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
+import { mergeCloudSttCapabilities } from "@/lib/cloud-stt-capabilities";
 import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { BotMascot } from "./Avatar";
 import { isRoutineApproval, pendingApprovals, spokenApprovalPrompt } from "./PendingApproval";
@@ -81,8 +82,12 @@ export function CallTargetButton({
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
   const cloudConfigured = useTranscriptionAvailability();
+  const cloudStt = useMemo(
+    () => mergeCloudSttCapabilities(state.config?.callStt?.cloud, cloudConfigured),
+    [state.config?.callStt?.cloud, cloudConfigured],
+  );
   const provider = pickSTTProvider({
-    cloudSttConfigured: cloudConfigured,
+    cloudStt,
     appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
     platform: window.ogb?.platform ?? "unknown",
     explicitPreference: state.config?.callStt?.provider ?? undefined,
@@ -480,10 +485,10 @@ function Call({ bot }: { bot: Bot }) {
       const bridge = window.ogb;
       if (!bridge || detached) return;
       const status = await bridge.transcription?.status?.().catch(() => undefined);
-      const cloudSttConfigured = Boolean(status?.configured);
+      const mergedCloud = mergeCloudSttCapabilities(state.config?.callStt?.cloud, Boolean(status?.configured));
       const platform = bridge.platform ?? "unknown";
       const choice: ProviderChoice = pickSTTProvider({
-        cloudSttConfigured,
+        cloudStt: mergedCloud,
         appleSpeechAvailable: capabilities.dictation.available,
         platform,
         explicitPreference: state.config?.callStt?.provider ?? undefined,

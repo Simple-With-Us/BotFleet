@@ -32,6 +32,12 @@ import {
   sanitizeStoredPronunciations,
   type Pronunciation,
 } from "../shared/pronunciations.ts";
+import {
+  CALL_STT_PROVIDERS,
+  CLOUD_STT_PROVIDERS,
+  HOSTED_TTS_PROVIDERS,
+  TTS_PROVIDERS,
+} from "../shared/voice-providers.ts";
 
 const optionalText = z.string().optional();
 const externalCredentialStorage = z.literal("external").optional();
@@ -326,10 +332,25 @@ const appConfigSchema = z.object({
   deepseek: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   /** Voice credentials, the workspace default voice id (what every bot
    * without a voice of its own speaks with), and the pronunciation list.
-   * `provider` picks the engine: "minimax" (default; needs a key) or
-   * "system" (the Mac's built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), pronunciations: pronunciationListSchema.optional(), credentialStorage: externalCredentialStorage }).optional(),
-  callStt: z.object({ provider: z.enum(["apple", "assemblyai"]).nullable().optional(), keyterms: z.array(z.string().trim().min(1)).max(100).optional() }).optional(),
+   * `provider` picks the engine; `ladder` overrides hosted fallback order. */
+  tts: z.object({
+    key: optionalText,
+    voice: optionalText,
+    provider: z.enum(TTS_PROVIDERS).optional(),
+    ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
+    optimizedSummary: z.boolean().optional(),
+    pronunciations: pronunciationListSchema.optional(),
+    credentialStorage: externalCredentialStorage,
+  }).optional(),
+  callStt: z.object({
+    provider: z.enum(CALL_STT_PROVIDERS).nullable().optional(),
+    ladder: z.array(z.enum(CLOUD_STT_PROVIDERS)).max(CLOUD_STT_PROVIDERS.length).optional(),
+    keyterms: z.array(z.string().trim().min(1)).max(100).optional(),
+  }).optional(),
+  azureSpeech: z.object({ key: optionalText, region: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  metaSpeech: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  groq: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  assemblyai: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   // Call-mode speech-to-speech.  Opt-in per workspace and deliberately separate
   // from callStt: an STS provider replaces the whole chained loop rather than
   // swapping one link of it.  `provider: null` means Auto — use whichever
@@ -563,17 +584,28 @@ export interface AppConfig {
   /** `voice` is the workspace default voice; `pronunciations` is the
    *  workspace list of terms and how to say them (shared/pronunciations.ts),
    *  absent until first saved, which means the seeded defaults. */
-  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; pronunciations?: Pronunciation[]; credentialStorage?: "external" };
+  tts?: {
+    key?: string;
+    voice?: string;
+    provider?: (typeof TTS_PROVIDERS)[number];
+    ladder?: Array<(typeof HOSTED_TTS_PROVIDERS)[number]>;
+    optimizedSummary?: boolean;
+    pronunciations?: Pronunciation[];
+    credentialStorage?: "external";
+  };
   /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
    *  falls back to platform defaults when `provider` is absent (Apple on
-   *  macOS without a cloud key, AssemblyAI on every other platform, and
-   *  AssemblyAI on macOS the moment a key lands). `keyterms` is the global
-   *  vocabulary the model is told to spell correctly — bot names, model
-   *  handles, product jargon that `format_turns` alone still mangles. */
+   *  macOS without a cloud key, cloud providers when keys land).
+   *  `keyterms` is the global vocabulary the model is told to spell correctly. */
   callStt?: {
-    provider?: "apple" | "assemblyai" | null;
+    provider?: (typeof CALL_STT_PROVIDERS)[number] | null;
+    ladder?: Array<(typeof CLOUD_STT_PROVIDERS)[number]>;
     keyterms?: string[];
   };
+  azureSpeech?: { key?: string; region?: string; credentialStorage?: "external" };
+  metaSpeech?: { key?: string; credentialStorage?: "external" };
+  groq?: { key?: string; credentialStorage?: "external" };
+  assemblyai?: { key?: string; credentialStorage?: "external" };
   sts?: {
     provider?: "xai" | "gemini" | null;
     frontEngine?: boolean;
@@ -792,7 +824,7 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
 
 export function parseConfigPatch(value: JsonValue): ConfigPatch {
   if (value && typeof value === "object" && !Array.isArray(value)) {
-    for (const section of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "infisical"]) {
+    for (const section of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "infisical"]) {
       const candidate = value[section];
       if (candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
           Object.hasOwn(candidate, "credentialStorage")) {
@@ -1472,6 +1504,15 @@ export function loadConfig(): AppConfig {
   if (process.env.DEEPSEEK_URL !== undefined) cfg.deepseek.url = process.env.DEEPSEEK_URL;
   cfg.tts = { ...cfg.tts };
   if (process.env.OMB_TTS_KEY !== undefined) cfg.tts.key = process.env.OMB_TTS_KEY;
+  cfg.azureSpeech = { ...cfg.azureSpeech };
+  if (process.env.AZURE_SPEECH_KEY !== undefined) cfg.azureSpeech.key = process.env.AZURE_SPEECH_KEY;
+  if (process.env.AZURE_SPEECH_REGION !== undefined) cfg.azureSpeech.region = process.env.AZURE_SPEECH_REGION;
+  cfg.metaSpeech = { ...cfg.metaSpeech };
+  if (process.env.META_SPEECH_API_KEY !== undefined) cfg.metaSpeech.key = process.env.META_SPEECH_API_KEY;
+  cfg.groq = { ...cfg.groq };
+  if (process.env.GROQ_API_KEY !== undefined) cfg.groq.key = process.env.GROQ_API_KEY;
+  cfg.assemblyai = { ...cfg.assemblyai };
+  if (process.env.ASSEMBLYAI_API_KEY !== undefined) cfg.assemblyai.key = process.env.ASSEMBLYAI_API_KEY;
   cfg.imageGen = { ...cfg.imageGen };
   if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
   // The secret store's own machine identity, which is the one credential pair
@@ -1542,6 +1583,10 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     // stay invisible to this process until the next launch.
     [patch.deepseek?.key, "DEEPSEEK_API_KEY"],
     [patch.tts?.key, "OMB_TTS_KEY"],
+    [patch.azureSpeech?.key, "AZURE_SPEECH_KEY"],
+    [patch.metaSpeech?.key, "META_SPEECH_API_KEY"],
+    [patch.groq?.key, "GROQ_API_KEY"],
+    [patch.assemblyai?.key, "ASSEMBLYAI_API_KEY"],
     [patch.imageGen?.key, "OMB_OPENAI_IMAGE_KEY"],
     [patch.usage?.ingestUrl, "USAGE_MONITOR_INGEST_URL"],
     [patch.usage?.ingestToken, "USAGE_MONITOR_INGEST_TOKEN"],
@@ -1567,6 +1612,10 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
   if (patch.deepseek?.url !== undefined) {
     if (patch.deepseek.url) process.env["DEEPSEEK_URL"] = patch.deepseek.url;
     else delete process.env["DEEPSEEK_URL"];
+  }
+  if (patch.azureSpeech?.region !== undefined) {
+    if (patch.azureSpeech.region) process.env["AZURE_SPEECH_REGION"] = patch.azureSpeech.region;
+    else delete process.env["AZURE_SPEECH_REGION"];
   }
   if (patch.infisical?.clientId !== undefined) {
     if (patch.infisical.clientId) process.env["INFISICAL_CLIENT_ID"] = patch.infisical.clientId;
@@ -1599,6 +1648,11 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
+  "AZURE_SPEECH_KEY",
+  "AZURE_SPEECH_REGION",
+  "META_SPEECH_API_KEY",
+  "GROQ_API_KEY",
+  "ASSEMBLYAI_API_KEY",
   "OMB_OPENAI_IMAGE_KEY",
   "COMPOSIO_API_KEY",
   "OMB_COMPOSIO_BROKER_TOKEN",
@@ -1655,7 +1709,21 @@ export const PROVIDER_CREDENTIAL_ENV = [
  * echoed back — callers report configured-or-not booleans only). */
 type CheckedConfigPatch = z.infer<ReturnType<typeof appConfigSchema.partial>>;
 
-type ExternalCredentialSection = "xai" | "openaiCompat" | "minimax" | "composio" | "box" | "opencodeGo" | "deepseek" | "tts" | "imageGen" | "infisical";
+type ExternalCredentialSection =
+  | "xai"
+  | "openaiCompat"
+  | "minimax"
+  | "composio"
+  | "box"
+  | "opencodeGo"
+  | "deepseek"
+  | "tts"
+  | "azureSpeech"
+  | "metaSpeech"
+  | "groq"
+  | "assemblyai"
+  | "imageGen"
+  | "infisical";
 
 export function saveConfig(
   patch: Partial<AppConfig>,
@@ -1750,7 +1818,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
