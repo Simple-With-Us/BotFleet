@@ -35,22 +35,29 @@ async function askThroughProxy(args: Record<string, unknown>): Promise<Record<st
   const socketPath = join(dir, "p.sock");
   const ask = new Promise<Record<string, unknown>>((resolve) => {
     broker = createServer((conn: Socket) => {
+      conn.on("error", () => {});
+      conn.setEncoding("utf8");
       let buffered = "";
       conn.on("data", (chunk) => {
         buffered += chunk;
-        const line = buffered.split("\n").find((candidate) => candidate.trim());
-        if (!line) return;
-        // SAFETY: this fake broker only ever receives the one JSON object the proxy
-        // under test writes, and the test reads `message.id` and compares fields.
-        const message = JSON.parse(line) as Record<string, unknown>;
-        // answer, so the proxy's tool call completes
-        conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "deny", message: "no" }) + "\n");
-        resolve(message);
+        let newline: number;
+        while ((newline = buffered.indexOf("\n")) !== -1) {
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          if (!line.trim()) continue;
+          // SAFETY: this fake broker only ever receives the one JSON object the proxy
+          // under test writes, and the test reads `message.id` and compares fields.
+          const message = JSON.parse(line) as Record<string, unknown>;
+          conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "deny", message: "no" }) + "\n");
+          conn.end();
+          resolve(message);
+          return;
+        }
       });
     });
   });
   await new Promise<void>((resolve) => broker?.listen(socketPath, resolve));
-  child = spawnDetached(process.execPath, [PROXY, socketPath], { stdio: ["pipe", "pipe", "ignore"] });
+  child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", PROXY, socketPath], { stdio: ["pipe", "pipe", "ignore"] });
   child.stdin?.write(
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "approve", arguments: args } }) + "\n",
   );
@@ -68,4 +75,53 @@ posixOnly("permission proxy", () => {
     expect(ask).toMatchObject({ t: "ask", tool: "Bash" });
     expect(ask.toolUseId).toBeUndefined();
   });
+
+  it("hands a large non-ASCII tool input to the broker byte for byte", async () => {
+    const content = "中文ok€".repeat(150_000);
+    dir = mkdtempSync(join(tmpdir(), "omb-pp-"));
+    const socketPath = join(dir, "p.sock");
+    const ask = new Promise<Record<string, unknown>>((resolve) => {
+      broker = createServer((conn: Socket) => {
+        conn.on("error", () => {});
+        conn.setEncoding("utf8");
+        let buffered = "";
+        conn.on("data", (chunk) => {
+          buffered += chunk;
+          let newline: number;
+          while ((newline = buffered.indexOf("\n")) !== -1) {
+            const line = buffered.slice(0, newline);
+            buffered = buffered.slice(newline + 1);
+            if (!line.trim()) continue;
+            const message = JSON.parse(line) as Record<string, unknown>;
+            conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "allow", updatedInput: message.input }) + "\n");
+            conn.end();
+            resolve(message);
+            return;
+          }
+        });
+      });
+    });
+    await new Promise<void>((resolve) => broker?.listen(socketPath, resolve));
+    child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", PROXY, socketPath], { stdio: ["pipe", "pipe", "ignore"] });
+    const payload = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "approve", arguments: { tool_name: "Write", input: { file_path: "notes.md", content } } },
+    }) + "\n";
+    await new Promise<void>((resolve, reject) => {
+      const stdin = child!.stdin;
+      if (!stdin) return reject(new Error("proxy stdin missing"));
+      const ok = stdin.write(payload, (error) => (error ? reject(error) : undefined));
+      if (ok) resolve();
+      else stdin.once("drain", () => resolve());
+    });
+    const frame = await ask;
+    const received = (frame.input as { content: string }).content;
+    expect(received.includes("\uFFFD")).toBe(false);
+    expect(received === content).toBe(true);
+    child.stdin?.end();
+    await waitForExit(child, { signal: "SIGTERM" });
+    child = undefined;
+  }, 30_000);
 });

@@ -11,6 +11,7 @@ import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
 import type { ReviewHook, ReviewPrompt } from "../shared/auto-review.ts";
+import type { ToolScope } from "../shared/tool-scope.ts";
 
 export type DriverKind = string;
 export type InstanceId = string;
@@ -230,6 +231,7 @@ export type RuntimeEvent = RuntimeEventBase &
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
+    | { type: "runtime.notice"; message: string }
     /** The harness put content in front of the model that the person did not
      * type (`shared/context-injection.ts`).  `itemId` keys the full text in the
      * side store; `preview` is one redacted, clipped line. */
@@ -396,6 +398,9 @@ export interface SendTurnInput {
     dweb?: { url: string };
     /** Shared Qdrant Agent RAG vector memory integration. */
     qdrant?: { command: string; args: string[]; env: Record<string, string> };
+    /** User-configured MCP servers (config.json `mcpServers`), each narrowed by
+     * `parseStoredMcpServer()` and mounted in `turnStdioMcpServers()`. */
+    custom?: Record<string, McpServerSpec>;
     /** Every computer this bot was granted for this turn, in the order the
      * person granted them. A grant is a capability, not a preference: each
      * entry is mounted as its own MCP server so the agent chooses per task.
@@ -414,6 +419,8 @@ export interface SendTurnInput {
   cwd?: string;
   /** True when the bot has autoApprove enabled by the user. */
   autoApprove?: boolean;
+  /** Fresh owner tool selection for this turn, independent of execution approval. */
+  toolScope?: ToolScope;
   /** True when the bot has Bypass Permissions enabled by the user.  The
    *  broker path reads the bot record itself (`autoVerdict`), so this exists
    *  only for a driver that has a native skip-approvals mode and NO broker
@@ -535,6 +542,22 @@ export interface TurnToolHost {
    *  an empty array, means nothing to say. */
   drainNotices?(): string[];
 }
+
+/** An MCP server this machine starts and talks to over stdio. */
+export interface StdioMcpSpec {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+/** An MCP server reached over HTTP (streamable HTTP or SSE). */
+export interface RemoteMcpSpec {
+  type: "http" | "sse";
+  url: string;
+  headers: Record<string, string>;
+}
+
+export type McpServerSpec = StdioMcpSpec | RemoteMcpSpec;
 
 export interface TurnStartResult {
   turnId: TurnId;

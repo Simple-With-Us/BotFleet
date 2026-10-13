@@ -4,3 +4,10 @@ minVersion = "v8.25.0"
 
 [extend]
 useDefault = true
+
+# MCP strict-handshake tests mount disposable x-api-key header literals.  Scope
+# this to generic-api-key only so real secrets in that file still fail other rules.
+[[allowlists]]
+description = "MCP strict handshake tests use disposable API-key header literals"
+targetRules = ["generic-api-key"]
+paths = ['''^server/mcp-strict-handshake\.test\.ts$''']
