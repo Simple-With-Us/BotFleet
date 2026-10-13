@@ -91,7 +91,7 @@
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
 const LINGERING_CHILD_MODES = new Set(["cancel-exits-with-child", "exit-with-lingering-child", "happy-with-lingering-child"]);
@@ -177,7 +177,7 @@ const configOptions = () => {
 // (`auto`). Off unless FAKE_ACP_SESSION_MODELS is set, so every existing mode
 // stays byte-identical. Format: "id|Name,id|Name" — the name is optional.
 const acpModels = (process.env.FAKE_ACP_SESSION_MODELS ?? "")
-  .split(",")
+  .split(/,(?![^[]*\])/)
   .filter(Boolean)
   .map((entry) => {
     const [modelId, name] = entry.split("|");
@@ -301,6 +301,16 @@ const rpcMethods: string[] = [];
 const recordMethod = (method: string) => {
   rpcMethods.push(method);
   if (process.env.FAKE_ACP_RPC_DUMP) writeFileSync(process.env.FAKE_ACP_RPC_DUMP, JSON.stringify(rpcMethods));
+  if (process.env.FAKE_ACP_RPC_APPEND_FILE) {
+    try {
+      appendFileSync(
+        process.env.FAKE_ACP_RPC_APPEND_FILE,
+        JSON.stringify({ pid: process.pid, method, cwd: process.cwd() }) + "\n",
+      );
+    } catch {
+      // test-only
+    }
+  }
 };
 if (mode === "hang-exit-gated") {
   process.on("SIGTERM", () => {
@@ -425,7 +435,7 @@ function handle(msg: any, resumed = false) {
         process.stderr.write("fake-acp: simulated crash before result\n");
         process.exit(3);
       }
-      const authMethods = mode === "no-auth" ? [] : [{ id: "cached_token" }];
+      const authMethods = mode === "no-auth" ? [] : [{ id: process.env.FAKE_ACP_AUTH_METHOD ?? "cached_token" }];
       const reply = () =>
         result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
       const initDelayMs = Number(process.env.FAKE_ACP_INIT_DELAY_MS ?? "0");
@@ -488,7 +498,11 @@ function handle(msg: any, resumed = false) {
         // an older agent that predates these methods
         return out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
       }
-      if (mode === "set-model-invalid-params" && msg.method === "session/set_model") {
+      if (
+        msg.method === "session/set_model" &&
+        (mode === "set-model-invalid-params" ||
+          (mode === "set-model-invalid-after-first" && configCalls.some((call) => call.method === "session/set_model")))
+      ) {
         // an agent whose ACP model namespace does not contain the id it was
         // sent — Cursor's answer when handed an argv slug like `auto`.
         // The reason rides in `data`, as grok 1.0.46 sends it for a model its

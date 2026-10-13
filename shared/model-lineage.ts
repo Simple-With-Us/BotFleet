@@ -164,6 +164,39 @@ const GPT: Family = {
   // decides (see withinPriceBand).
 };
 
+// ── Cursor (picker slugs; effort is encoded in the id) ───────────────────
+// `cursor-agent models` lists `grok-4.7-high-fast` while ACP uses
+// parameterised ids.  Lineage groups on the base slug so effort variants
+// of the same model are not treated as superseded siblings.
+const CURSOR_EFFORT_SUFFIX = /^(.+)-(minimal|low|medium|high|xhigh|max)$/;
+const CURSOR_VERSION_TAIL = /^(.+?)-(\d+)(?:[.](\d+))?(?:-\d+)*$/;
+
+/** Strip Cursor's `-fast` suffix and reasoning-effort tail for lineage. */
+export function cursorPickerBaseId(id: string): string {
+  let slug = id.trim().toLowerCase();
+  if (!slug || slug.includes("::")) return slug;
+  if (slug.endsWith("-fast")) slug = slug.slice(0, -"-fast".length);
+  const effort = CURSOR_EFFORT_SUFFIX.exec(slug);
+  if (effort) return effort[1]!;
+  return slug;
+}
+
+const CURSOR: Family = {
+  id: "cursor",
+  classes: [],
+  classify(id) {
+    const base = cursorPickerBaseId(id);
+    if (!base || base === "auto" || base === "default") return null;
+    const versioned = CURSOR_VERSION_TAIL.exec(base);
+    if (!versioned) return null;
+    const classKey = base;
+    return { classKey, rank: rankOf(num(versioned[2]), num(versioned[3])) };
+  },
+  label(id, _c) {
+    return id;
+  },
+};
+
 // ── Grok ─────────────────────────────────────────────────────────────────
 const GROK_PLAIN = /^grok-(\d+)(?:\.(\d+))?$/;
 const GROK_BUILD_FAST = /^grok-(\d+)(?:\.(\d+))?-build-fast$/;
@@ -227,6 +260,7 @@ const DRIVER_LINEAGE: Readonly<Record<string, DriverLineage>> = {
   grokAgent: { families: [GROK], subscription: true },
   grok: { families: [GROK], subscription: false },
   droidAgent: { families: [CLAUDE, GPT, GROK], subscription: true },
+  cursorAgent: { families: [CURSOR], subscription: true },
 };
 
 /** Owner-directed, one-time move (2026-09-30): every saved selection in

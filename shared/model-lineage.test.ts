@@ -4,6 +4,7 @@ import {
   anyLineageLabel,
   applyOwnerDirective,
   classifyModel,
+  cursorPickerBaseId,
   latestOptions,
   lineageStatus,
   modelPrice,
@@ -36,7 +37,24 @@ const ctx = (driverKind: string, offeredIds: string[], authoritative = true): Li
   authoritative,
 });
 
+describe("cursorPickerBaseId", () => {
+  it("strips fast and effort tails for lineage grouping", () => {
+    expect(cursorPickerBaseId("grok-4.7-high-fast")).toBe("grok-4.7");
+    expect(cursorPickerBaseId("gpt-5.3-codex-medium")).toBe("gpt-5.3-codex");
+    expect(cursorPickerBaseId("composer-2.5-fast")).toBe("composer-2.5");
+    expect(cursorPickerBaseId("auto")).toBe("auto");
+  });
+});
+
 describe("classifyModel", () => {
+  it("groups Cursor effort slugs on the same base id", () => {
+    expect(classifyModel("cursorAgent", "grok-4.7-high-fast")).toMatchObject({
+      classKey: "grok-4.7",
+      rank: [4, 7],
+    });
+    expect(classifyModel("cursorAgent", "grok-4.7-medium")).toMatchObject({ classKey: "grok-4.7", rank: [4, 7] });
+  });
+
   it("classifies current, dated, and legacy Claude ids", () => {
     expect(classifyModel("claudeAgent", "claude-sonnet-5-5")).toMatchObject({ classKey: "sonnet", rank: [5, 5] });
     expect(classifyModel("claudeAgent", "claude-opus-5")).toMatchObject({ classKey: "opus", rank: [5] });

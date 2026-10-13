@@ -230,6 +230,7 @@ export type RuntimeEvent = RuntimeEventBase &
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
+    | { type: "runtime.notice"; message: string }
     /** The harness put content in front of the model that the person did not
      * type (`shared/context-injection.ts`).  `itemId` keys the full text in the
      * side store; `preview` is one redacted, clipped line. */

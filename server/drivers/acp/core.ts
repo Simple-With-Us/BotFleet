@@ -305,8 +305,9 @@ export interface AcpSupport {
     ctx: { model?: string; requestedModel?: string },
   ): void;
   /** Pick the ACP authenticate methodId from initialize's advertised
-   * authMethods; return null to skip the authenticate step. */
-  pickAuthMethod(authMethods: Array<{ id?: string }>): string | null;
+   * authMethods; return null to skip the authenticate step. `env` is the
+   * environment the agent process was spawned with. */
+  pickAuthMethod(authMethods: Array<{ id?: string }>, env: Record<string, string | undefined>): string | null;
   /** "fail": abort the turn if snapshot auth is missing AND authenticate
    *  is missing/errors (subscription CLIs). A signed-in CLI still proceeds
    *  on its ambient login when initialize omits the expected method.
@@ -357,6 +358,11 @@ export interface AcpSupport {
      * the earlier list predates the switch, so it is withheld rather than
      * trusted. */
     sessionConfigOptions?: unknown[] | undefined;
+    /** Last model acknowledged by session/new/load/set_model. */
+    currentModelId?: string;
+    /** Tell the person the session runs another model than the one picked.
+     * Said once per process for the same message, like the core fallback. */
+    notice?: (message: string) => void;
   }): Promise<void>;
 }
 
@@ -1671,7 +1677,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               if (problem) throw new AcpAllowlistRefusedError(problem);
             }
             const methods: Array<{ id?: string }> = Array.isArray(init?.authMethods) ? init.authMethods : [];
-            const methodId = support.pickAuthMethod(methods);
+            const methodId = support.pickAuthMethod(methods, env);
             if (!skipSubscriptionAuthForLocalInject(turn.model)) {
               // Only fail-closed drivers (authFailure: "fail", currently just
               // Grok) need the ambient-login probe at all — a fail-open driver
@@ -1695,6 +1701,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
             const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
             let sessionResult: any = null;
+            let sessionConfigResult: any = null;
+            let fallbackNotice: string | undefined;
             if (cursor) {
               try {
                 sessionResult = await request(
@@ -1702,6 +1710,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   withAllowlistMeta({ sessionId: cursor, cwd, mcpServers }),
                   LOAD_SESSION_TIMEOUT,
                 );
+                sessionConfigResult = sessionResult;
                 sessionId = cursor;
               } catch (error) {
                 // The harness withheld inline replay because this cursor said
@@ -1716,6 +1725,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 withAllowlistMeta({ cwd, mcpServers }),
                 NEW_SESSION_TIMEOUT,
               );
+              sessionConfigResult = sessionResult;
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
             }
@@ -1793,15 +1803,36 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
               if (support.configureSession) {
                 await support.configureSession({
-                  request: (method, params, timeoutMs) =>
-                    request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT),
+                  request: async (method, params, timeoutMs) => {
+                    const result = await request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT);
+                    if (
+                      method === "session/set_model" &&
+                      params &&
+                      typeof params === "object" &&
+                      "modelId" in params &&
+                      typeof (params as { modelId?: unknown }).modelId === "string"
+                    ) {
+                      const modelId = (params as { modelId: string }).modelId;
+                      sessionConfigResult = {
+                        ...sessionConfigResult,
+                        models: { ...sessionConfigResult?.models, currentModelId: modelId },
+                      };
+                    }
+                    return result;
+                  },
                   sessionId,
                   config: turnConfig,
                   turn: cliTurn,
-                  sessionModels: Array.isArray(sessionResult?.models?.availableModels)
-                    ? sessionResult.models.availableModels
+                  sessionModels: Array.isArray(sessionConfigResult?.models?.availableModels)
+                    ? sessionConfigResult.models.availableModels
                     : [],
                   sessionConfigOptions: currentConfigOptions,
+                  currentModelId: sessionConfigResult?.models?.currentModelId,
+                  notice: (message) => {
+                    if (fallbackNotice === message) return;
+                    fallbackNotice = message;
+                    emit({ ...base(threadId, turnId), type: "runtime.notice", message });
+                  },
                 });
                 // initialize's currentModelId is the CLI default (grok-4.7),
                 // not the model this turn asked for. After a successful pin,
