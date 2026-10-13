@@ -14,6 +14,7 @@ import {
   CUT_TWICE,
   INTERRUPTED_OUTWARD,
   Runtime,
+  chmodTargetMissing,
   openRuntimeStore,
   type RuntimeStore,
   type TurnRunner,
@@ -64,6 +65,16 @@ describe("durable delegated jobs", () => {
     stores.push(store);
     return { store, runtime: new Runtime(store, runner(outward), { limits, log: () => {} }) };
   }
+
+  it("treats a vanished sidecar as gone and keeps every other chmod failure", () => {
+    const missing = new Error("gone");
+    Object.assign(missing, { code: "ENOENT" });
+    const denied = new Error("denied");
+    Object.assign(denied, { code: "EPERM" });
+    expect(chmodTargetMissing(missing)).toBe(true);
+    expect(chmodTargetMissing(denied)).toBe(false);
+    expect(chmodTargetMissing(new Error("plain"))).toBe(false);
+  });
 
   it("keeps the database and its WAL sidecars readable only by the owner", () => {
     if (process.platform === "win32") return;

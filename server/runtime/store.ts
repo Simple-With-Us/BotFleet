@@ -15,6 +15,11 @@ import { z } from "zod";
 
 import { TERMINAL, type Assignment, type AssignmentEvent, type EventKind, type InboxItem, type InboxKind, type Owner } from "./types.ts";
 
+/** A file can disappear between the existence check and chmod.  Every other failure stays visible. */
+export function chmodTargetMissing(error: Error): boolean {
+  return "code" in error && error.code === "ENOENT";
+}
+
 const evidenceSchema = z.object({
   commands: z.number().int().nonnegative().optional(),
   filesChanged: z.array(z.string()).optional(),
@@ -240,7 +245,9 @@ export function openRuntimeStore(path: string): RuntimeStore {
     closeSync(openSync(path, "a", 0o600));
     try {
       chmodSync(path, 0o600);
-    } catch {}
+    } catch (error) {
+      if (!(error instanceof Error && chmodTargetMissing(error))) throw error;
+    }
   }
   const db = new DatabaseSync(path);
   if (!memory) {
@@ -258,8 +265,10 @@ export function openRuntimeStore(path: string): RuntimeStore {
       if (!existsSync(side)) continue;
       try {
         chmodSync(side, 0o600);
-      } catch {
+      } catch (error) {
         // A sidecar that disappears between the check and the chmod is gone.
+        // Permission and I/O failures stay visible so a loose umask is not silent.
+        if (!(error instanceof Error && chmodTargetMissing(error))) throw error;
       }
     }
   };
