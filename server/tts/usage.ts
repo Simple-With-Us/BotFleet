@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 const usageFile = () => join(process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet"), "tts-usage.jsonl");
-export type SpeechProvider = "minimax" | "elevenlabs";
+export type SpeechProvider = "minimax" | "elevenlabs" | "xai" | "azure";
 export interface SpeechUsage { at: number; provider: SpeechProvider; characters: number; source: "provider" | "submitted" }
 
 /** Best-effort accounting cannot make a successful generated clip fail. */
@@ -19,6 +19,8 @@ export function speechUsageTotals(): Record<SpeechProvider, { characters: number
   const totals = {
     minimax: { characters: 0, requests: 0, providerReported: 0 },
     elevenlabs: { characters: 0, requests: 0, providerReported: 0 },
+    xai: { characters: 0, requests: 0, providerReported: 0 },
+    azure: { characters: 0, requests: 0, providerReported: 0 },
   };
   try {
     if (!existsSync(usageFile())) return totals;
@@ -26,7 +28,7 @@ export function speechUsageTotals(): Record<SpeechProvider, { characters: number
       if (!line) continue;
       try {
         const row = JSON.parse(line) as SpeechUsage;
-        if (row.provider !== "minimax" && row.provider !== "elevenlabs") continue;
+        if (!(row.provider in totals)) continue;
         if (!Number.isSafeInteger(row.characters) || row.characters < 0) continue;
         totals[row.provider].characters += row.characters;
         totals[row.provider].requests += 1;

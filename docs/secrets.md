@@ -106,6 +106,11 @@ running fleet.
 | `box.token` | `BOX_TOKEN` | `BOX_TOKEN` | yes | yes |
 | `opencodeGo.apiKey` | `OPENCODE_API_KEY` | `OPENCODE_API_KEY` | yes | yes |
 | `tts.key` | `OMB_TTS_KEY` | `OMB_TTS_KEY` | yes | no |
+| `azureSpeech.key` | `AZURE_SPEECH_KEY` | `AZURE_SPEECH_KEY` | yes | no |
+| `azureSpeech.region` | `AZURE_SPEECH_REGION` | `AZURE_SPEECH_REGION` | no | no |
+| `metaSpeech.key` | `META_SPEECH_API_KEY` | `META_SPEECH_API_KEY` | yes | no |
+| `groq.key` | `GROQ_API_KEY` | `GROQ_API_KEY` | yes | no |
+| `assemblyai.key` | `ASSEMBLYAI_API_KEY` | `ASSEMBLYAI_API_KEY` | yes | no |
 | `imageGen.key` | `OMB_OPENAI_IMAGE_KEY` | `OMB_OPENAI_IMAGE_KEY` | yes | no |
 | `deepseek.key` | `DEEPSEEK_API_KEY` | `DEEPSEEK_API_KEY` | yes | no |
 | `usage.ingestUrl` | `USAGE_MONITOR_INGEST_URL` | `USAGE_MONITOR_INGEST_URL` | no | no |

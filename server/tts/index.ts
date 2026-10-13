@@ -6,31 +6,31 @@
 import { isPersonalVoiceId, readableVoiceId } from "../../shared/bot-voice.ts";
 import { applyPronunciations, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
 import type { AppConfig } from "../config.ts";
+import * as azure from "./azure.ts";
 import * as minimax from "./minimax.ts";
 import * as systemVoices from "./system-voices.ts";
+import * as xai from "./xai.ts";
 
-export type VoiceProvider = "minimax" | "system";
+import {
+  type HostedTtsProvider,
+  type TtsProvider,
+  isHostedTtsProvider,
+  parseTtsProvider,
+  resolveHostedTtsLadder,
+} from "../../shared/voice-providers.ts";
+import { speakWithFallback } from "./provider-ladder.ts";
 
-export class NoVoiceConfigured extends Error {
-  // a plain field rather than a constructor parameter property: the harness
-  // runs under `node --experimental-strip-types`, which is strip-ONLY, so a
-  // parameter property is rejected at load time even though it typechecks
-  readonly reason: "key" | "voice";
-
-  constructor(reason: "key" | "voice") {
-    super(
-      reason === "key"
-        ? "Add a MiniMax key in Settings on the computer to turn on voice."
-        : "Pick a voice in the agent profile.",
-    );
-    this.reason = reason;
-  }
-}
+export type VoiceProvider = TtsProvider;
+export { NoVoiceConfigured } from "./errors.ts";
+import { NoVoiceConfigured } from "./errors.ts";
 
 export function voiceProvider(cfg: AppConfig): VoiceProvider {
-  if (cfg.tts?.provider === "system") return "system";
-  // Default to MiniMax.  Legacy configs with provider: "elevenlabs" fall
-  // through here and use MiniMax — ElevenLabs support was removed.
+  const explicit = parseTtsProvider(cfg.tts?.provider);
+  if (explicit) return explicit;
+  const ladder = resolveHostedTtsLadder(cfg);
+  if (ladder.length) return ladder[0]!;
+  // Legacy configs with provider: "elevenlabs" fall through here and use
+  // MiniMax — ElevenLabs support was removed.
   return "minimax";
 }
 
@@ -40,6 +40,8 @@ export function voiceProvider(cfg: AppConfig): VoiceProvider {
 export function providerConfigured(cfg: AppConfig): boolean {
   const provider = voiceProvider(cfg);
   if (provider === "system") return systemVoices.systemVoicesAvailable();
+  if (provider === "xai") return Boolean(cfg.xai?.key);
+  if (provider === "azure") return Boolean(cfg.azureSpeech?.key && cfg.azureSpeech?.region);
   return Boolean(cfg.tts?.key);
 }
 
@@ -92,12 +94,20 @@ export function describeVoice(cfg: AppConfig) {
   };
 }
 
-export function verifyKey(key: string, _cfg: AppConfig) {
+export function verifyKey(key: string, cfg: AppConfig) {
+  const provider = voiceProvider(cfg);
+  if (provider === "xai") return xai.verifyKey((cfg.xai?.key ?? key).trim());
+  if (provider === "azure") {
+    return azure.verifyKey((cfg.azureSpeech?.key ?? key).trim(), cfg.azureSpeech?.region ?? "");
+  }
   return minimax.verifyKey(key);
 }
 
 export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Promise<minimax.Voice[]> {
-  if (voiceProvider(cfg) === "system") return systemVoices.listSystemVoices(run);
+  const provider = voiceProvider(cfg);
+  if (provider === "system") return systemVoices.listSystemVoices(run);
+  if (provider === "xai") return [...xai.CANNED_VOICES];
+  if (provider === "azure") return [...azure.CANNED_VOICES];
   const key = cfg.tts?.key;
   let voices: minimax.Voice[] = [];
   if (key) {
@@ -144,19 +154,18 @@ export function speak(cfg: AppConfig, rawText: string, voiceId?: string, run?: s
   if (isPersonalVoice(voiceId || cfg.tts?.voice)) {
     throw new Error("Apple Personal Voices speak on-device on authorized Apple devices (macOS and iOS) and cannot be synthesized on the server.");
   }
-  if (voiceProvider(cfg) === "system") {
+  const provider = voiceProvider(cfg);
+  if (provider === "system") {
     const voice = voiceId || cfg.tts?.voice;
-    // An injected runner is the cross-platform test seam for `/usr/bin/say`;
-    // production calls omit it and remain strictly Darwin-gated.
-    if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key");
-    if (!voice) throw new NoVoiceConfigured("voice");
-    return systemVoices.synthesizeSystem(text, voice, run);
+    if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key", "system");
+    if (!voice) throw new NoVoiceConfigured("voice", "system");
+  } else {
+    const ladder = resolveHostedTtsLadder(cfg);
+    const hosted: HostedTtsProvider = isHostedTtsProvider(provider) ? provider : "minimax";
+    if (!ladder.length) throw new NoVoiceConfigured("key", hosted);
+    if (provider === "minimax" && !(voiceId || cfg.tts?.voice)) throw new NoVoiceConfigured("voice", "minimax");
   }
-  const key = cfg.tts?.key;
-  if (!key) throw new NoVoiceConfigured("key");
-  const voice = voiceId || cfg.tts?.voice;
-  if (!voice) throw new NoVoiceConfigured("voice");
-  return minimax.synthesize(text, voice, key);
+  return speakWithFallback(cfg, text, voiceId, run);
 }
 
 /** Clone a voice.  The harness route unpacks the base64 body and passes
