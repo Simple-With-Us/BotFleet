@@ -27,15 +27,22 @@ vi.hoisted(() => {
 });
 
 import { PendingApprovalActions, type Pending } from "./PendingApproval";
-import { StoreContext, initialState } from "@/state/store";
+import { StoreContext, initialState, type Bot } from "@/state/store";
 
 const dispatch = vi.fn();
 
-const bot = {
+const bot: Bot = {
   id: "bot-1",
+  threadId: "thread-1",
   name: "Test bot",
+  title: "Helper",
+  description: "",
+  notifications: true,
+  color: "green",
+  unread: false,
   modelSelection: { instanceId: "claude", model: "claude" },
-  alwaysAllow: [] as string[],
+  messages: [],
+  alwaysAllow: [],
 };
 
 const pending: Pending = {
