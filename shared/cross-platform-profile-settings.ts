@@ -129,11 +129,11 @@ export interface ComputerGrantRowModel {
   disabledReason: string | null;
 }
 
-const COMPUTER_ROW_LABELS: Record<ComputerGrantId, string> = {
+const COMPUTER_ROW_LABELS = {
   local: "Local Mac desktop",
   cloud: "Self-hosted VPS / Box",
   vm: "Local VM",
-};
+} satisfies Record<ComputerGrantId, string>;
 
 export function computerGrantRows(
   bot: { computers?: string[] },

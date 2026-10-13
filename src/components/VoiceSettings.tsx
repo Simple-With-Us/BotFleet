@@ -907,7 +907,7 @@ export function VoiceSettings({
             [
               ["mac", "Mac"],
               ["iphone", "Play on iPhone (while app is open)"],
-            ] as const
+            ] as const satisfies ReadonlyArray<[SpeechDeviceId, string]>
           ).map(([device, label]) => {
             const agentVoiceCanSpeakOnClient =
               configured || (isPersonalVoice(bot.voice ?? "") && personalVoiceAllowed);
@@ -936,7 +936,7 @@ export function VoiceSettings({
                       onPatch({
                         speechDevices: row.selected
                           ? devices.filter((item) => item !== device)
-                          : [...devices, device as SpeechDeviceId],
+                          : [...devices, device],
                       });
                     }}
                   />

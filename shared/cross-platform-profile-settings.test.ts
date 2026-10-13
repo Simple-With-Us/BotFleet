@@ -6,6 +6,7 @@ import {
   effectiveSpeechDevices,
   speechDeviceDisabledReason,
   speechDeviceRow,
+  type SpeechDeviceId,
 } from "./cross-platform-profile-settings";
 
 describe("effectiveSpeechDevices", () => {
@@ -17,7 +18,7 @@ describe("effectiveSpeechDevices", () => {
 });
 
 describe("speechDeviceRow", () => {
-  const bot = { voice: "standard-default", speechDevices: ["mac", "iphone"] as string[] };
+  const bot = { voice: "standard-default", speechDevices: ["mac", "iphone"] satisfies SpeechDeviceId[] };
 
   it("allows symmetric remote control for iPhone from Mac", () => {
     const row = speechDeviceRow("iphone", bot, {
@@ -40,7 +41,7 @@ describe("speechDeviceRow", () => {
   });
 
   it("keeps Mac playback editable on iOS when Personal Voice is selected", () => {
-    const personalBot = { voice: "personal:pv-1", speechDevices: ["mac"] as string[] };
+    const personalBot = { voice: "personal:pv-1", speechDevices: ["mac"] satisfies SpeechDeviceId[] };
     const row = speechDeviceRow("mac", personalBot, {
       platform: "ios",
       voice: personalBot.voice,
