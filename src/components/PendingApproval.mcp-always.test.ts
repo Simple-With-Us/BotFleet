@@ -5,8 +5,6 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const dispatch = vi.fn();
-
 vi.hoisted(() => {
   const happy = require("happy-dom");
   const win = new happy.Window({ url: "http://127.0.0.1:5199/" });
@@ -28,11 +26,10 @@ vi.hoisted(() => {
   for (const [key, value] of install) Reflect.set(globalThis, key, value);
 });
 
-vi.mock("@/state/store", () => ({
-  useStore: () => ({ dispatch }),
-}));
-
 import { PendingApprovalActions, type Pending } from "./PendingApproval";
+import { StoreContext, initialState } from "@/state/store";
+
+const dispatch = vi.fn();
 
 const bot = {
   id: "bot-1",
@@ -64,6 +61,13 @@ const pending: Pending = {
   detail: "create issue",
 };
 
+const storeValue = {
+  state: initialState,
+  dispatch,
+  flushBotPatches: async () => {},
+  refreshInstances: async () => {},
+};
+
 let root: Root | null = null;
 let container: HTMLElement | null = null;
 
@@ -75,12 +79,16 @@ function renderActions() {
   }
   act(() => {
     root!.render(
-      createElement(PendingApprovalActions, {
-        pending,
-        threadId: "thread-1",
-        bot,
-        onCancelTurn() {},
-      }),
+      createElement(
+        StoreContext.Provider,
+        { value: storeValue },
+        createElement(PendingApprovalActions, {
+          pending,
+          threadId: "thread-1",
+          bot,
+          onCancelTurn() {},
+        }),
+      ),
     );
   });
 }
