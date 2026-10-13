@@ -32,6 +32,20 @@ describe("a server's own requests to the client", () => {
   });
 });
 
+describe("legacy SSE stream lifetime", () => {
+  it("survives after the initialize abort signal fires", async () => {
+    fake = await startFakeHttpMcp({ transport: "sse", tools: [{ name: "report" }] });
+    client = new RemoteMcpClient({ type: "sse", url: fake.url, headers: {} });
+    const initBudget = AbortSignal.timeout(500);
+    await client.initialize("fixture", initBudget);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(initBudget.aborted).toBe(true);
+    const tools = await client.request("tools/list", {}, AbortSignal.timeout(5_000));
+    expect(Array.isArray((tools as { tools?: unknown[] }).tools)).toBe(true);
+    expect((tools as { tools: { name: string }[] }).tools.map((tool) => tool.name)).toContain("report");
+  });
+});
+
 describe("a server's JSON-RPC error", () => {
   it.each(["http", "sse"] as const)("keeps its code and words over %s, apart from transport failures", async (transport) => {
     fake = await startFakeHttpMcp({ transport, tools: [{ name: "report" }], callError: () => ({ code: -32602, message: "Missing required parameter 'campaignId'" }) });

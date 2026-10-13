@@ -335,7 +335,15 @@ export class RemoteMcpClient {
     if (this.sseEndpoint) return this.sseEndpoint;
     this.sseEndpoint = new Promise<string>((resolveEndpoint, rejectEndpoint) => {
       let settled = false;
+      const opening = new AbortController();
+      const onCallerAbort = () => {
+        if (!settled) opening.abort();
+      };
+      if (signal.aborted) onCallerAbort();
+      else signal.addEventListener("abort", onCallerAbort);
+      const detachCallerAbort = () => signal.removeEventListener("abort", onCallerAbort);
       const fail = (error: Error) => {
+        detachCallerAbort();
         if (!settled) {
           settled = true;
           rejectEndpoint(error);
@@ -345,10 +353,12 @@ export class RemoteMcpClient {
       };
       const headers = this.headers();
       headers.set("accept", "text/event-stream");
-      // the caller's signal covers the opening; once open, the stream lives
-      // until close(), because later requests are answered on it
-      const opening = AbortSignal.any([signal, this.sseAbort.signal]);
-      this.fetchImpl(this.target.url, { method: "GET", headers, signal: opening })
+      // The caller's signal (often a short initialize budget) must abort only
+      // until the endpoint event arrives.  After that the GET body is read for
+      // the life of the session under sseAbort alone — linking the caller's
+      // signal to fetch would let a fired init timeout tear down the stream.
+      const openingSignal = AbortSignal.any([opening.signal, this.sseAbort.signal]);
+      this.fetchImpl(this.target.url, { method: "GET", headers, signal: openingSignal })
         .then(async (response) => {
           if (!response.ok) {
             drain(response);
@@ -358,6 +368,7 @@ export class RemoteMcpClient {
             if (event.event === "endpoint") {
               if (!settled) {
                 settled = true;
+                detachCallerAbort();
                 try {
                   resolveEndpoint(new URL(event.data, this.target.url).toString());
                 } catch {
