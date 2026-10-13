@@ -146,6 +146,38 @@ describe("job host", () => {
     expect(starts.find((start) => start.botId === from.id)?.text).toContain("provider refused");
   });
 
+  it("records one assignment when the same peer is named more than once", () => {
+    const { from, target } = setup();
+    const handed = host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: ["@Helper", "Helper", target.id],
+      message: "once",
+      depth: 0,
+    });
+    expect(handed.body.assignments).toHaveLength(1);
+    expect(handed.body.assignments?.[0]?.botId).toBe(target.id);
+  });
+
+  it("admits queued work when a turn stops", async () => {
+    const { from, target } = setup();
+    const other = store.createBot({ name: "Other" }, { seedMessages: false });
+    store.patchBot(target.id, { busy: true });
+    host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: [target.id],
+      message: "wait until the peer is free",
+      depth: 0,
+    });
+    host.onTurnSettled(from.threadId, true, "queued behind a busy peer");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(starts).toEqual([]);
+    store.patchBot(target.id, { busy: false });
+    host.onTurnSettled(other.threadId, false, "");
+    await viWait(() => starts.some((start) => start.botId === target.id));
+  });
+
   it("refuses a second hop and an Off bot before anything is recorded", () => {
     const { from, target } = setup();
     store.patchBot(target.id, { off: true });

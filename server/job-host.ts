@@ -431,6 +431,7 @@ export function createJobHost(deps: JobHostDeps): JobHost {
       });
       const assignments: PublicAssignment[] = [];
       const errors: string[] = [];
+      const seen = new Set<string>();
       for (const rawId of input.botIds) {
         const token = rawId.trim();
         const target = deps.store.bots.find((bot) => bot.id === token || `@${bot.name}` === token || bot.name === token.replace(/^@/, ""));
@@ -438,6 +439,8 @@ export function createJobHost(deps: JobHostDeps): JobHost {
           errors.push(`no such bot: ${token}`);
           continue;
         }
+        if (seen.has(target.id)) continue;
+        seen.add(target.id);
         if (target.id === from.id) {
           errors.push("a bot cannot hand work to itself");
           continue;
@@ -515,6 +518,9 @@ export function createJobHost(deps: JobHostDeps): JobHost {
       const root = runningRoot(bot.id, threadId);
       if (!ok) {
         runtime.stopRequester({ botId: bot.id, threadId }, "Stopped by user");
+        // This bot is idle again.  Work queued for it, or for anyone it was
+        // blocking, still has to be admitted.
+        runtime.tick();
         return;
       }
       if (root) runtime.end(root.id, { ok: true, text: text.trim() || lastSpoken(threadId) });

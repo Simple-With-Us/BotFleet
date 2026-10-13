@@ -7406,6 +7406,31 @@ export function executeListRoutinesRequest(input: {
 /** What coordinate_bots answers for a peer that is switched Off. */
 const BOT_OFF_PEER_REFUSAL = Object.freeze({ status: 403, body: Object.freeze({ error: "that bot is off" }) });
 
+/** The HTTP body for coordinate_bots.  Unknown keys are refused. */
+const coordinateBotsBodySchema = z.object({
+  fromBotId: z.string().optional(),
+  depth: z.number().optional(),
+  botIds: z.array(z.string()).optional(),
+  bot_ids: z.array(z.string()).optional(),
+  toBotId: z.string().optional(),
+  bot_id: z.string().optional(),
+  message: z.string().optional(),
+  fromThreadId: z.string().optional(),
+  reason: z.string().optional(),
+  rework: z.boolean().optional(),
+  thread: z.enum(["standing", "new"]).optional(),
+  reply: z.enum(["resume", "none"]).optional(),
+  consult: z.boolean().optional(),
+  doneWhen: z.string().optional(),
+}).strict();
+
+/** The HTTP body for assignment_status.  Unknown keys are refused. */
+const assignmentStatusBodySchema = z.object({
+  fromBotId: z.string().optional(),
+  fromThreadId: z.string().optional(),
+  id: z.string().optional(),
+}).strict();
+
 function peerByToken(token: string) {
   const trimmed = token.trim();
   return store.bots.find((bot) => bot.id === trimmed || `@${bot.name}` === trimmed || bot.name === trimmed.replace(/^@/, ""));
@@ -11421,26 +11446,24 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const depth = Number(body.depth ?? 0) || 0;
         const refused = authorizeCommsIdentity(req.headers.authorization, { botId: fromBotId, depth });
         if (refused) return json(res, refused.status, refused.body);
-        const listed = Array.isArray(body.botIds) ? body.botIds : Array.isArray(body.bot_ids) ? body.bot_ids : [];
-        const named = body.toBotId === String(body.toBotId) ? String(body.toBotId) : body.bot_id === String(body.bot_id) ? String(body.bot_id) : "";
-        const botIds: string[] = [];
-        for (const item of listed) {
-          const text = String(item ?? "").trim();
-          if (text) botIds.push(text);
-        }
-        if (named.trim()) botIds.push(named.trim());
+        const parsed = coordinateBotsBodySchema.safeParse(body);
+        if (!parsed.success) return json(res, 400, { error: "invalid coordinate request" });
+        const data = parsed.data;
+        const botIds = [...(data.botIds ?? []), ...(data.bot_ids ?? [])].map((item) => item.trim()).filter(Boolean);
+        const named = (data.toBotId ?? data.bot_id ?? "").trim();
+        if (named) botIds.push(named);
         const result = executeCoordinateBotsRequest({
           fromBotId,
           botIds,
-          message: String(body.message ?? "").trim(),
+          message: (data.message ?? "").trim(),
           depth,
-          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
-          reason: typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : undefined,
-          rework: body.rework === true,
-          thread: body.thread === "new" || body.thread === "standing" ? body.thread : undefined,
-          reply: body.reply === "none" || body.reply === "resume" ? body.reply : undefined,
-          consult: body.consult === true,
-          doneWhen: body.doneWhen === String(body.doneWhen) ? String(body.doneWhen).trim() || undefined : undefined,
+          fromThreadId: data.fromThreadId,
+          reason: data.reason?.trim() || undefined,
+          rework: data.rework,
+          thread: data.thread,
+          reply: data.reply,
+          consult: data.consult,
+          doneWhen: data.doneWhen?.trim() || undefined,
         });
         return json(res, result.status, result.body);
       }
@@ -11449,10 +11472,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const fromBotId = String(body.fromBotId ?? "");
         const refused = authorizeCommsIdentity(req.headers.authorization, { botId: fromBotId });
         if (refused) return json(res, refused.status, refused.body);
+        const parsed = assignmentStatusBodySchema.safeParse(body);
+        if (!parsed.success) return json(res, 400, { error: "invalid assignment status request" });
         const result = executeAssignmentStatusRequest({
           fromBotId,
-          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
-          id: body.id === String(body.id) ? String(body.id).trim() || undefined : undefined,
+          fromThreadId: parsed.data.fromThreadId,
+          id: parsed.data.id?.trim() || undefined,
         });
         return json(res, result.status, result.body);
       }
