@@ -363,7 +363,7 @@ export interface AcpSupport {
     /** Last model acknowledged by session/new/load/set_model. */
     currentModelId?: string;
     /** Tell the person the session runs another model than the one picked.
-     * Said once per process for the same message, like the core fallback. */
+     * Said once per thread for the same message, like the core fallback. */
     notice?: (message: string) => void;
   }): Promise<void>;
 }
@@ -669,6 +669,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // attempt would look like the first one.  Mirrors claude.ts, which owns
       // the same shape for the same reason.
       const retryState = new Map<string, { attempt: number; cancelled: boolean }>();
+      /** Substitution notices (model pinned to a session variant, etc.) once per thread. */
+      const runtimeNoticesByThread = new Map<string, Set<string>>();
       // A relaunch waits real seconds; the fakes in acp.test.ts scale that
       // down so a scripted transient failure does not cost the suite its
       // backoff.  The `turn.retrying` event still reports the REAL delay.
@@ -1828,6 +1830,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   currentModelId: sessionConfigResult?.models?.currentModelId,
                   notice: (message) => {
                     if (fallbackNotice === message) return;
+                    let heard = runtimeNoticesByThread.get(threadId);
+                    if (!heard) {
+                      heard = new Set();
+                      runtimeNoticesByThread.set(threadId, heard);
+                    }
+                    if (heard.has(message)) return;
+                    heard.add(message);
                     fallbackNotice = message;
                     emit({ ...base(threadId, turnId), type: "runtime.notice", message });
                   },
