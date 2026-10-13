@@ -15,6 +15,7 @@
 // ignored everywhere below — the turn's own identity is the only one that
 // reaches an endpoint function.
 
+import { inboundText } from "../../shared/sign-in-request.ts";
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
 import { sectionKey } from "../store.ts";
 import { MAX_CREATED_BOTS_PER_TURN } from "./registry.ts";
@@ -444,22 +445,22 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
     },
 
     async request_sign_in(call, ctx): Promise<TurnToolOutcome> {
-      const site = call.arguments.site;
-      if (typeof site !== "string" || !site.trim()) {
+      const site = inboundText(call.arguments.site);
+      if (!site) {
         return failed(JSON.stringify({ error: "request_sign_in needs a site, like example.com" }), "bad arguments");
       }
-      const reason = typeof call.arguments.reason === "string" ? call.arguments.reason : undefined;
+      const reason = inboundText(call.arguments.reason);
       const result = await deps.executeRequestSignInRequest({
         fromBotId: ctx.botId,
         fromThreadId: ctx.threadId,
         site,
-        ...(reason ? { reason } : {}),
+        reason,
       });
       if (result.status >= 400) {
         const message = errorText(result.body, "that sign-in could not be requested");
         return failed(JSON.stringify({ error: message }), message);
       }
-      const named = typeof result.body.site === "string" ? result.body.site : site.trim();
+      const named = inboundText(result.body.site) || site;
       return {
         kind: "suspend",
         content:

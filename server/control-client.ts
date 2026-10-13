@@ -123,15 +123,16 @@ export function createControlClient(options?: {
       const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
       if (!res.ok) return UNCONFIRMED;
       const body: any = await res.json().catch(() => null);
-      if (typeof body?.held !== "boolean" || typeof body?.helpOpen !== "boolean") return UNCONFIRMED;
-      return {
-        held: body.held,
-        helpOpen: body.helpOpen,
-        ...(body.reason === "person" ? { reason: "person" as const } : {}),
-        ...(typeof body.blockedReason === "string" && body.blockedReason.trim()
-          ? { blockedReason: body.blockedReason }
-          : {}),
-      };
+      const held = body?.held === true ? true : body?.held === false ? false : null;
+      const helpOpen = body?.helpOpen === true ? true : body?.helpOpen === false ? false : null;
+      if (held === null || helpOpen === null) return UNCONFIRMED;
+      const state: ControlState = { held, helpOpen };
+      if (body.reason === "person") state.reason = "person";
+      if (Object.prototype.toString.call(body.blockedReason) === "[object String]") {
+        const blockedReason = String(body.blockedReason).trim();
+        if (blockedReason) state.blockedReason = blockedReason;
+      }
+      return state;
     } catch {
       return UNCONFIRMED;
     }

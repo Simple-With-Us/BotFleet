@@ -28,6 +28,7 @@
 import readline from "node:readline";
 
 import { CREDENTIAL_TARGETS, isCredentialTargetId } from "../../shared/credential-request.ts";
+import { inboundText } from "../../shared/sign-in-request.ts";
 import { MAX_CREATED_BOTS_PER_TURN, mcpToolDefinitions } from "../tools/registry.ts";
 import { routineFields } from "../tools/schedule.ts";
 
@@ -243,19 +244,20 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     };
   }
   if (name === "request_sign_in") {
-    const site = typeof args.site === "string" ? args.site.trim() : "";
+    const site = inboundText(args.site);
     if (!site) return { text: "request_sign_in needs a site, like example.com.", isError: true };
-    const reason = typeof args.reason === "string" ? args.reason.trim().slice(0, 280) : "";
+    const reason = inboundText(args.reason).slice(0, 280);
+    const payload = {
+      fromBotId: BOT_ID,
+      fromThreadId: THREAD_ID,
+      site,
+      reason,
+    };
     const r = await api("/api/internal/request-sign-in", {
       method: "POST",
-      body: JSON.stringify({
-        fromBotId: BOT_ID,
-        fromThreadId: THREAD_ID,
-        site,
-        ...(reason ? { reason } : {}),
-      }),
+      body: JSON.stringify(payload),
     });
-    const named = typeof r.site === "string" ? r.site : site;
+    const named = inboundText(r.site) || site;
     return {
       text: `A Sign in needed card for ${named} is now visible. End this turn. The person signs in on the computer where you work. Never ask them to paste a password or one-time code into chat.`,
     };

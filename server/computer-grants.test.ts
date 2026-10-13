@@ -1018,6 +1018,8 @@ describe("routine failure resiliency and unattended safety", () => {
       };
       return deps;
     };
+    // SAFETY: these cases only read the bot's cloud backend.  The empty config
+    // is the same fixture the other resolver tests use when no credential matters.
     const turn = (deps: TurnComputerDeps<object>, automationSource?: string) =>
       resolveTurnComputerMounts({
         bot: { id: "b1", name: "Auto", cloudBackend: "vps" },

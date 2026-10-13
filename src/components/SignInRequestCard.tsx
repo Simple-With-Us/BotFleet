@@ -7,58 +7,24 @@ import { api, useStore, type Message } from "@/state/store";
 
 const GAP = "\u00A0 ";
 
-export function SignInRequestCard({
-  botId,
-  threadId,
-  message,
+export function SignInRequestCardView({
+  card,
+  busy,
+  error,
+  onOpen,
+  onDone,
+  onCancel,
+  onDismissError,
 }: {
-  botId: string;
-  threadId: string;
-  message: Message;
+  card: SignInRequestCardData;
+  busy: "open" | "done" | "cancel" | null;
+  error: string | null;
+  onOpen: () => void;
+  onDone: () => void;
+  onCancel: () => void;
+  onDismissError: () => void;
 }) {
-  const { dispatch } = useStore();
-  const card = message.signIn as SignInRequestCardData;
-  const [busy, setBusy] = useState<"open" | "done" | "cancel" | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const open = card.status === "open";
-  const endpoint = `/api/bots/${encodeURIComponent(botId)}/sign-in-cards/${encodeURIComponent(message.id)}`;
-
-  const fail = (err: unknown) => {
-    const messageText = err instanceof Error ? err.message : "That sign-in action failed.";
-    setError(messageText);
-  };
-
-  const openComputer = async () => {
-    setBusy("open");
-    setError(null);
-    dispatch({ type: "toggleComputer", open: true });
-    try {
-      await api(`/api/bots/${encodeURIComponent(botId)}/computer/control`, {
-        method: "POST",
-        body: JSON.stringify({ action: "take" }),
-      });
-    } catch (err) {
-      fail(err);
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const settle = async (action: "done" | "cancel") => {
-    setBusy(action);
-    setError(null);
-    try {
-      await api(`${endpoint}/${action}`, {
-        method: "POST",
-        body: JSON.stringify({ threadId }),
-      });
-    } catch (err) {
-      fail(err);
-    } finally {
-      setBusy(null);
-    }
-  };
-
   const statusLine =
     card.status === "done"
       ? `Signed in on this bot's computer.${GAP}The bot will check the screen.`
@@ -83,7 +49,7 @@ export function SignInRequestCard({
       </div>
       {error ? (
         <div className="mt-2">
-          <PersistentActionErrorCard message={error} onDismiss={() => setError(null)} />
+          <PersistentActionErrorCard message={error} onDismiss={onDismissError} />
         </div>
       ) : null}
       {open ? (
@@ -92,7 +58,7 @@ export function SignInRequestCard({
             type="button"
             className="inline-flex items-center gap-1 rounded-lg bg-ink px-2.5 py-1.5 text-[12px] font-medium text-surface disabled:opacity-60"
             disabled={busy !== null}
-            onClick={() => void openComputer()}
+            onClick={onOpen}
           >
             <Monitor size={13} aria-hidden />
             {busy === "open" ? "Opening" : "Open"}
@@ -101,7 +67,7 @@ export function SignInRequestCard({
             type="button"
             className="inline-flex items-center gap-1 rounded-lg border border-line px-2.5 py-1.5 text-[12px] font-medium disabled:opacity-60"
             disabled={busy !== null}
-            onClick={() => void settle("done")}
+            onClick={onDone}
           >
             <Check size={13} aria-hidden />
             {busy === "done" ? "Sending" : "Done"}
@@ -110,7 +76,7 @@ export function SignInRequestCard({
             type="button"
             className="inline-flex items-center gap-1 rounded-lg border border-line px-2.5 py-1.5 text-[12px] font-medium text-ink-secondary disabled:opacity-60"
             disabled={busy !== null}
-            onClick={() => void settle("cancel")}
+            onClick={onCancel}
           >
             <X size={13} aria-hidden />
             {busy === "cancel" ? "Sending" : "Cancel"}
@@ -118,5 +84,69 @@ export function SignInRequestCard({
         </div>
       ) : null}
     </div>
+  );
+}
+
+export function SignInRequestCard({
+  botId,
+  threadId,
+  message,
+}: {
+  botId: string;
+  threadId: string;
+  message: Message;
+}) {
+  const { dispatch } = useStore();
+  const card = message.signIn;
+  const [busy, setBusy] = useState<"open" | "done" | "cancel" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  if (!card) return null;
+  const endpoint = `/api/bots/${encodeURIComponent(botId)}/sign-in-cards/${encodeURIComponent(message.id)}`;
+
+  const fail = (err: Error) => {
+    setError(err.message || "That sign-in action failed.");
+  };
+
+  const openComputer = async () => {
+    setBusy("open");
+    setError(null);
+    dispatch({ type: "toggleComputer", open: true });
+    try {
+      await api(`/api/bots/${encodeURIComponent(botId)}/computer/control`, {
+        method: "POST",
+        body: JSON.stringify({ action: "take" }),
+      });
+    } catch (err) {
+      fail(err instanceof Error ? err : new Error("That sign-in action failed."));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const settle = async (action: "done" | "cancel") => {
+    setBusy(action);
+    setError(null);
+    try {
+      await api(`${endpoint}/${action}`, {
+        method: "POST",
+        body: JSON.stringify({ threadId }),
+      });
+    } catch (err) {
+      fail(err instanceof Error ? err : new Error("That sign-in action failed."));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <SignInRequestCardView
+      card={card}
+      busy={busy}
+      error={error}
+      onOpen={() => void openComputer()}
+      onDone={() => void settle("done")}
+      onCancel={() => void settle("cancel")}
+      onDismissError={() => setError(null)}
+    />
   );
 }

@@ -51,6 +51,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 import {
+  inboundText,
   signInBodyHasSecret,
   signInReason,
   signInResumePrompt,
@@ -7729,9 +7730,9 @@ export function executeRequestCredentialRequest(input: {
 export function executeRequestSignInRequest(input: {
   fromBotId: string;
   fromThreadId?: string;
-  site: unknown;
-  reason?: unknown;
-}): { status: number; body: Record<string, unknown> } {
+  site: string;
+  reason?: string;
+}) {
   const from = store.bot(input.fromBotId);
   if (!from) return { status: 403, body: { error: "unknown sender" } };
   const fromThreadId = String(input.fromThreadId ?? from.threadId);
@@ -7739,7 +7740,7 @@ export function executeRequestSignInRequest(input: {
   if (!owner) return { status: 403, body: { error: "source conversation does not belong to sender" } };
   const site = signInSite(input.site);
   if (!site) return { status: 400, body: { error: "request_sign_in needs a site hostname, like example.com" } };
-  const reason = signInReason(input.reason);
+  const reason = signInReason(input.reason ?? "");
   for (const existing of store.messagesFor(fromThreadId)) {
     if (existing.kind === "sign-in" && existing.signIn?.status === "open" && existing.signIn.site === site) {
       store.patchMessage(fromThreadId, existing.id, {
@@ -7747,12 +7748,19 @@ export function executeRequestSignInRequest(input: {
       });
     }
   }
-  const message = store.appendMessage(fromThreadId, {
-    role: "bot",
-    kind: "sign-in",
-    ...(owner.group ? { from: { botId: from.id, name: from.name, color: from.color } } : {}),
-    signIn: { site, reason, status: "open" },
-  });
+  const signIn = { site, reason, status: "open" as const };
+  const message = owner.group
+    ? store.appendMessage(fromThreadId, {
+        role: "bot",
+        kind: "sign-in",
+        from: { botId: from.id, name: from.name, color: from.color },
+        signIn,
+      })
+    : store.appendMessage(fromThreadId, {
+        role: "bot",
+        kind: "sign-in",
+        signIn,
+      });
   notify(
     buildNotification("takeover", from, fromThreadId, `needs you to sign in to ${site}`, {
       snoozed: threadAlertsSnoozed(from.id, fromThreadId),
@@ -11786,11 +11794,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           botId: String(body.fromBotId ?? ""),
         });
         if (refused) return json(res, refused.status, refused.body);
+        const fromThreadId = inboundText(body.fromThreadId);
         const result = executeRequestSignInRequest({
           fromBotId: String(body.fromBotId ?? ""),
-          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
-          site: body.site,
-          reason: body.reason,
+          fromThreadId: fromThreadId ? fromThreadId : undefined,
+          site: inboundText(body.site),
+          reason: inboundText(body.reason),
         });
         return json(res, result.status, result.body);
       }

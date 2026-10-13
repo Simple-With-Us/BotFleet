@@ -5,35 +5,24 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
-vi.mock("@/state/store", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/state/store")>();
-  return {
-    ...actual,
-    useStore: () => ({ dispatch: vi.fn() }),
-    api: vi.fn(),
-  };
-});
-
-import { SignInRequestCard } from "./SignInRequestCard";
-import type { Message } from "@/state/store";
+import { SignInRequestCardView } from "./SignInRequestCard";
+import type { SignInRequestCardData } from "../../shared/sign-in-request.ts";
 
 const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "SignInRequestCard.tsx"), "utf8");
 
-function message(status: "open" | "done" | "cancelled" | "replaced"): Message {
-  return {
-    id: "msg-sign",
-    role: "bot",
-    kind: "sign-in",
-    at: 0,
-    signIn: { site: "example.com", reason: "the inbox", status },
-  };
-}
-
-function html(status: "open" | "done" | "cancelled" | "replaced"): string {
+function html(status: SignInRequestCardData["status"], error: string | null = null): string {
   return renderToStaticMarkup(
-    createElement(SignInRequestCard, { botId: "bot-1", threadId: "thread-1", message: message(status) }),
+    createElement(SignInRequestCardView, {
+      card: { site: "example.com", reason: "the inbox", status },
+      busy: null,
+      error,
+      onOpen: () => {},
+      onDone: () => {},
+      onCancel: () => {},
+      onDismissError: () => {},
+    }),
   );
 }
 
@@ -61,6 +50,9 @@ describe("SignInRequestCard", () => {
   });
 
   it("keeps action failures in a persistent card", () => {
+    const rendered = html("open", "The computer did not open.");
+    expect(rendered).toContain("The computer did not open.");
+    expect(rendered).toContain("role=\"alert\"");
     expect(SRC).toContain("PersistentActionErrorCard");
     expect(SRC).not.toMatch(/toast/i);
   });

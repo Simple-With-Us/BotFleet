@@ -547,7 +547,8 @@ describe("computer proxy control gate (fake box + fake control)", () => {
         return;
       }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ held, helpOpen, ...(held ? { reason: "person" } : {}) }));
+      const payload = held ? { held, helpOpen, reason: "person" } : { held, helpOpen };
+      res.end(JSON.stringify(payload));
     });
     await new Promise<void>((r) => controlServer.listen(0, "127.0.0.1", r));
     const controlPort = (controlServer.address() as any).port;

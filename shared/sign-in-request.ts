@@ -13,11 +13,17 @@ export interface SignInRequestCardData {
 const HOST =
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 
+/** Text from a JSON body or a tool argument.  Anything that is not a
+ * string becomes empty, so a password object never becomes card text. */
+export function inboundText(value: any): string {
+  if (Object.prototype.toString.call(value) !== "[object String]") return "";
+  return String(value).trim();
+}
+
 /** A public site hostname, or null when the text is not one.  Userinfo,
  * paths, and anything that could be a password are refused. */
-export function signInSite(input: unknown): string | null {
-  if (typeof input !== "string") return null;
-  const raw = input.trim();
+export function signInSite(rawInput: string): string | null {
+  const raw = rawInput.trim();
   if (!raw || raw.length > 2048) return null;
   if (/\s/.test(raw)) return null;
   let host = raw;
@@ -37,8 +43,7 @@ export function signInSite(input: unknown): string | null {
   return host;
 }
 
-export function signInReason(input: unknown): string {
-  if (typeof input !== "string") return "";
+export function signInReason(input: string): string {
   return input.replace(/\s+/g, " ").trim().slice(0, 280);
 }
 
@@ -46,12 +51,12 @@ const SECRET_BODY_KEYS = ["password", "passwd", "otp", "totp", "secret", "passco
 
 /** True when a card action tried to send a secret.  The caller refuses
  * the request and must not log the value. */
-export function signInBodyHasSecret(body: unknown): boolean {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
-  const record = body as Record<string, unknown>;
+export function signInBodyHasSecret(body: any): boolean {
+  if (body == null || Array.isArray(body) || Object.prototype.toString.call(body) !== "[object Object]") return false;
   return SECRET_BODY_KEYS.some((key) => {
-    const value = record[key];
-    return value !== undefined && value !== null && value !== "";
+    if (!Object.prototype.hasOwnProperty.call(body, key)) return false;
+    const value = body[key];
+    return value != null && value !== "";
   });
 }
 
