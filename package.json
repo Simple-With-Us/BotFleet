@@ -49,7 +49,7 @@
     "test:config-lock": "node --test electron/config-file-lock.node-test.mjs",
     "test:credential-patch": "node --test electron/credential-patch.node-test.mjs",
     "test:desktop-viewer": "node --test electron/desktop-viewer.node-test.mjs electron/desktop-workspace.node-test.mjs electron/sentry-desktop.node-test.mjs",
-    "test:package-link": "node --test electron/package-link.node-test.mjs electron/sts-packaging.node-test.mjs",
+    "test:package-link": "pnpm build:shared && node --test electron/package-link.node-test.mjs electron/sts-packaging.node-test.mjs",
     "test:save-file": "node --test electron/save-file.node-test.mjs electron/open-file.node-test.mjs",
     "test:server-boot-probe": "node --test electron/server-boot-probe.node-test.mjs electron/attached-ui-shim.node-test.mjs electron/harness-ownership.node-test.mjs electron/runtime-identity.node-test.mjs server/sts-launch.node-test.mjs",
     "bench:observation": "node --experimental-strip-types scripts/bench-observation.ts",
