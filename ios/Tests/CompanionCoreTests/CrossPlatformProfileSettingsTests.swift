@@ -10,17 +10,44 @@ final class CrossPlatformProfileSettingsTests: XCTestCase {
         XCTAssertEqual(rows.first?.disabledReason, CrossPlatformProfileSettings.computersMacOnlyReason)
     }
 
+    func testEffectiveSpeechDevicesFiltersUnknownIds() {
+        let devices = CrossPlatformProfileSettings.effectiveSpeechDevices(
+            speakReplies: nil,
+            speechDevices: ["mac", "watch", "iphone"]
+        )
+        XCTAssertEqual(devices, Set(["mac", "iphone"]))
+    }
+
+    func testEffectiveSpeechDevicesTreatsExplicitEmptyAsOff() {
+        let devices = CrossPlatformProfileSettings.effectiveSpeechDevices(
+            speakReplies: true,
+            speechDevices: []
+        )
+        XCTAssertEqual(devices, [])
+    }
+
     func testSpeechDeviceRowKeepsMacPlaybackEditableForPersonalVoiceOnPhone() {
         let row = CrossPlatformProfileSettings.speechDeviceRow(
             device: "mac",
             voice: "personal:pv-1",
-            speakReplies: nil,
             speechDevices: ["mac"],
             agentVoiceCanSpeakOnClient: true,
-            personalVoiceSelected: true
+            personalVoicePlaybackAllowed: true
         )
         XCTAssertTrue(row.selected)
         XCTAssertTrue(row.editable)
         XCTAssertNil(row.disabledReason)
+    }
+
+    func testSpeechDeviceRowGreysMacWhenPersonalVoiceNotAllowedOnComputer() {
+        let row = CrossPlatformProfileSettings.speechDeviceRow(
+            device: "mac",
+            voice: "personal:pv-1",
+            speechDevices: ["mac"],
+            agentVoiceCanSpeakOnClient: true,
+            personalVoicePlaybackAllowed: false
+        )
+        XCTAssertFalse(row.editable)
+        XCTAssertNotNil(row.disabledReason)
     }
 }

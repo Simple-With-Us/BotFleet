@@ -15,6 +15,14 @@ describe("effectiveSpeechDevices", () => {
     expect(effectiveSpeechDevices({ speakReplies: true })).toEqual(["mac"]);
     expect(effectiveSpeechDevices({})).toEqual([]);
   });
+
+  it("treats an explicit empty speechDevices array as off, not legacy speakReplies", () => {
+    expect(effectiveSpeechDevices({ speakReplies: true, speechDevices: [] })).toEqual([]);
+  });
+
+  it("drops unknown device ids", () => {
+    expect(effectiveSpeechDevices({ speechDevices: ["mac", "watch", "iphone"] })).toEqual(["mac", "iphone"]);
+  });
 });
 
 describe("speechDeviceRow", () => {
@@ -38,6 +46,33 @@ describe("speechDeviceRow", () => {
       personalVoicePlaybackAllowed: true,
     });
     expect(row.editable).toBe(true);
+  });
+
+  it("greys Mac playback on desktop when Personal Voice is not allowed here", () => {
+    const row = speechDeviceRow("mac", { voice: "personal:pv-1", speechDevices: ["mac"] }, {
+      platform: "mac",
+      voice: "personal:pv-1",
+      agentVoiceCanSpeakOnClient: true,
+      personalVoicePlaybackAllowed: false,
+    });
+    expect(row.editable).toBe(false);
+    expect(row.disabledReason).toMatch(/not available on this computer/i);
+  });
+
+  it("uses the device voice for can-speak, not only the shared bot.voice", () => {
+    const row = speechDeviceRow("mac", { voices: { mac: "personal:pv-1" }, speechDevices: ["mac"] }, {
+      platform: "mac",
+      voice: "personal:pv-1",
+      agentVoiceCanSpeakOnClient: true,
+      personalVoicePlaybackAllowed: true,
+    });
+    expect(row.editable).toBe(true);
+    const iphoneRow = speechDeviceRow("iphone", { voices: { iphone: "personal:iphone-pv" }, speechDevices: [] }, {
+      platform: "mac",
+      voice: "personal:iphone-pv",
+      agentVoiceCanSpeakOnClient: true,
+    });
+    expect(iphoneRow.editable).toBe(true);
   });
 
   it("keeps Mac playback editable on iOS when Personal Voice is selected", () => {

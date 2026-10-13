@@ -18,8 +18,10 @@ public enum CrossPlatformProfileSettings {
         speakReplies: Bool?,
         speechDevices: [String]?
     ) -> Set<String> {
-        if let speechDevices, !speechDevices.isEmpty {
-            return Set(speechDevices)
+        if let speechDevices {
+            if speechDevices.isEmpty { return [] }
+            let filtered = speechDevices.filter { $0 == "mac" || $0 == "iphone" }
+            return Set(filtered)
         }
         if speakReplies == true { return ["mac"] }
         return []
@@ -35,15 +37,18 @@ public enum CrossPlatformProfileSettings {
     public static func speechDeviceRow(
         device: String,
         voice: String,
-        speakReplies: Bool?,
         speechDevices: Set<String>,
         agentVoiceCanSpeakOnClient: Bool,
-        personalVoiceSelected: Bool
+        personalVoicePlaybackAllowed: Bool
     ) -> SpeechDeviceRow {
         let selected = speechDevices.contains(device)
         var reason: String?
         if !agentVoiceCanSpeakOnClient {
             reason = "Pick a voice this agent can speak before enabling playback."
+        } else if device == "mac",
+                  isPersonalVoiceId(voice),
+                  personalVoicePlaybackAllowed == false {
+            reason = "Personal Voice is not available on this computer.  Enable Play on iPhone instead."
         }
         let editable = reason == nil
         return SpeechDeviceRow(
@@ -85,6 +90,9 @@ public enum CrossPlatformProfileSettings {
     /// `COMPANION_PROFILE_PATCH_FIELDS` in companion/src/routes.ts.
     public static let companionPatchFields: Set<String> = [
         "name", "title", "description", "notifications", "avatarUrl", "avatarCrop",
-        "voice", "speakReplies", "speechDevices", "modelSelection",
+        "voice", "voices", "speakReplies", "speechDevices", "modelSelection",
+        "computers", "maxToolRounds", "cwd",
+        "autoApprove", "autoReview", "approvePeerComms", "bypassPermissions",
+        "off",
     ]
 }

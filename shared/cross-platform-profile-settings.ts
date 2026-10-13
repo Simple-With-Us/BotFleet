@@ -20,9 +20,18 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "avatarUrl",
   "avatarCrop",
   "voice",
+  "voices",
   "speakReplies",
   "speechDevices",
   "modelSelection",
+  "computers",
+  "maxToolRounds",
+  "cwd",
+  "autoApprove",
+  "autoReview",
+  "approvePeerComms",
+  "bypassPermissions",
+  "off",
 ] as const;
 
 export type CompanionProfilePatchField = (typeof COMPANION_PROFILE_PATCH_FIELDS)[number];
@@ -46,7 +55,7 @@ export function effectiveSpeechDevices(bot: {
   speakReplies?: boolean;
   speechDevices?: string[];
 }): SpeechDeviceId[] {
-  if (bot.speechDevices?.length) {
+  if (Array.isArray(bot.speechDevices)) {
     return bot.speechDevices.filter((d): d is SpeechDeviceId => d === "mac" || d === "iphone");
   }
   if (bot.speakReplies) return ["mac"];
@@ -84,7 +93,7 @@ export function speechDeviceRow(
   ctx: SpeechDeviceRowContext,
 ): SpeechDeviceRowModel {
   const selected = speechDeviceSelected(bot, device);
-  const voice = bot.voice ?? ctx.voice;
+  const voice = ctx.voice ?? bot.voice;
   const reason = speechDeviceDisabledReason(device, { ...ctx, voice });
 
   let editable = reason === null;

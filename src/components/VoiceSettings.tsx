@@ -33,6 +33,7 @@ import {
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import {
+  effectiveSpeechDevices,
   speechDeviceRow,
   type ClientPlatform,
   type SpeechDeviceId,
@@ -909,11 +910,14 @@ export function VoiceSettings({
               ["iphone", "Play on iPhone (while app is open)"],
             ] as const satisfies ReadonlyArray<[SpeechDeviceId, string]>
           ).map(([device, label]) => {
+            const deviceVoice = voiceForDevice(bot, device) || tts.voice || "";
             const agentVoiceCanSpeakOnClient =
-              configured || (isPersonalVoice(bot.voice ?? "") && personalVoiceAllowed);
+              configured ||
+              (isPersonalVoice(deviceVoice) &&
+                (device === "iphone" || personalVoiceAllowed));
             const row = speechDeviceRow(device, bot, {
               platform: clientPlatform(),
-              voice: bot.voice,
+              voice: deviceVoice,
               agentVoiceCanSpeakOnClient,
               personalVoicePlaybackAllowed: personalVoiceAllowed,
             });
@@ -932,11 +936,13 @@ export function VoiceSettings({
                     disabled={!row.editable}
                     onChange={() => {
                       if (!row.editable) return;
-                      const devices = bot.speechDevices ?? (bot.speakReplies ? ["mac"] : []);
+                      const devices = effectiveSpeechDevices(bot);
+                      const next = row.selected
+                        ? devices.filter((item) => item !== device)
+                        : [...devices, device];
                       onPatch({
-                        speechDevices: row.selected
-                          ? devices.filter((item) => item !== device)
-                          : [...devices, device],
+                        speechDevices: next,
+                        ...(next.length === 0 ? { speakReplies: false } : {}),
                       });
                     }}
                   />

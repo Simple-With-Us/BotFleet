@@ -866,10 +866,9 @@ struct AgentProfileView: View {
                     row: CrossPlatformProfileSettings.speechDeviceRow(
                         device: "mac",
                         voice: macVoice,
-                        speakReplies: current.speakReplies,
                         speechDevices: speechDevices,
                         agentVoiceCanSpeakOnClient: macVoiceCanSpeak,
-                        personalVoiceSelected: macVoiceIsPersonal
+                        personalVoicePlaybackAllowed: true
                     )
                 )
                 speechDeviceToggle(
@@ -878,10 +877,9 @@ struct AgentProfileView: View {
                     row: CrossPlatformProfileSettings.speechDeviceRow(
                         device: "iphone",
                         voice: iphoneVoice,
-                        speakReplies: current.speakReplies,
                         speechDevices: speechDevices,
                         agentVoiceCanSpeakOnClient: iphoneVoiceCanSpeak,
-                        personalVoiceSelected: iphoneVoiceIsPersonal
+                        personalVoicePlaybackAllowed: true
                     )
                 )
 
@@ -927,8 +925,9 @@ struct AgentProfileView: View {
         title: String,
         row: CrossPlatformProfileSettings.SpeechDeviceRow
     ) -> some View {
+        let displaySelected = row.editable ? row.selected : false
         Toggle(title, isOn: Binding(
-            get: { row.selected },
+            get: { displaySelected },
             set: { enabled in
                 guard row.editable else { return }
                 if enabled { speechDevices.insert(device) } else { speechDevices.remove(device) }
