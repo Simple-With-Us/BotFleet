@@ -162,22 +162,17 @@ const PLUGIN_HOST_CONFIG_SCHEMA = {
  *  secret-shaped fields, and shapes outside the closed schema are withheld. */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- AppConfig section values are narrowed and validated by strict Zod schemas before plugins see them
 export function parsePluginHostConfigValue(key: string, value: unknown): JsonValue | undefined {
-  if (!isPluginConfigKey(key)) return undefined;
-  const narrowed = narrowPluginConfigSection(key, value);
-  switch (key) {
-    case "rooms": {
-      const parsed = PLUGIN_HOST_CONFIG_SCHEMA.rooms.safeParse(narrowed);
-      return parsed.success ? parsed.data : undefined;
-    }
-    case "callStt": {
-      const parsed = PLUGIN_HOST_CONFIG_SCHEMA.callStt.safeParse(narrowed);
-      return parsed.success ? parsed.data : undefined;
-    }
-    default: {
-      const _exhaustive: never = key;
-      return _exhaustive;
-    }
+  if (key === "rooms") {
+    const narrowed = narrowPluginConfigSection(key, value);
+    const parsed = PLUGIN_HOST_CONFIG_SCHEMA.rooms.safeParse(narrowed);
+    return parsed.success ? parsed.data : undefined;
   }
+  if (key === "callStt") {
+    const narrowed = narrowPluginConfigSection(key, value);
+    const parsed = PLUGIN_HOST_CONFIG_SCHEMA.callStt.safeParse(narrowed);
+    return parsed.success ? parsed.data : undefined;
+  }
+  return undefined;
 }
 
 /** Short, stable correlation id for a plugin in logs.  The raw name comes
