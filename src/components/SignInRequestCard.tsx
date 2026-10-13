@@ -35,7 +35,7 @@ export function SignInRequestCardView({
           : `Sign in on this bot's computer.${GAP}BotFleet never sees the password.`;
 
   return (
-    <div className="my-2 max-w-md rounded-xl border border-line bg-surface px-3 py-3 text-[13px] text-ink">
+    <div data-testid="sign-in-card" className="my-2 max-w-md rounded-xl border border-line bg-surface px-3 py-3 text-[13px] text-ink">
       <div className="flex items-start gap-2">
         <LogIn size={16} className="mt-0.5 shrink-0 text-ink-secondary" aria-hidden />
         <div className="min-w-0 flex-1">
@@ -56,7 +56,7 @@ export function SignInRequestCardView({
         <div className="mt-3 flex flex-wrap gap-2">
           <button
             type="button"
-            className="inline-flex items-center gap-1 rounded-lg bg-ink px-2.5 py-1.5 text-[12px] font-medium text-surface disabled:opacity-60"
+            className="inline-flex items-center gap-1 rounded-lg bg-accent px-2.5 py-1.5 text-[12px] font-medium disabled:opacity-60"
             disabled={busy !== null}
             onClick={onOpen}
           >
