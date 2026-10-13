@@ -15,6 +15,7 @@ export { fleetSeatPromptsEnabled };
  *  once in a composed seat prompt.  Keep them stable; they are the contract. */
 export const FLEET_SHARED_RULE_MARKERS = [
   "fleet Zulip coordination channel",
+  "Linear-backed board CLI",
   "Recall CLI fallback",
   "[to iMessage]",
   "Never post unprompted status spam or routine commentary to Zulip",

@@ -190,6 +190,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "routine-calendar-density") {
+  // Visual-spec harness: the real calendar with the overlapping-run density
+  // that used to paint every card into one unreadable pile.
+  void import("./components/RoutineCalendarVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "bot-off") {
   // Visual-spec harness (tests/e2e/bot-off.visual.spec.ts): the bot On/Off
   // switch — sidebar rows, the Bot Profile card and the disabled composer.

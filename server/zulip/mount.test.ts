@@ -14,9 +14,11 @@ const base: ZulipMountInput = {
 const mounted = (over: Partial<ZulipMountInput>) => zulipToolsMounted({ ...base, ...over });
 
 describe("the Zulip tool mount", () => {
-  it("mounts on a Zulip turn, a continuation of one, and a turn the owner is attending", () => {
+  it("mounts on a Zulip turn, a continuation, an owner-authored routine, and a turn the owner is attending", () => {
     expect(mounted({ automationSource: "zulip", unattended: true })).toBe(true);
     expect(mounted({ continuesZulipTurn: true, unattended: true })).toBe(true);
+    expect(mounted({ automationSource: "schedule", unattended: true })).toBe(true);
+    expect(mounted({ automationSource: "manual", unattended: true })).toBe(true);
     expect(mounted({})).toBe(true);
   });
 
@@ -27,8 +29,8 @@ describe("the Zulip tool mount", () => {
     expect(mounted({ commsDepth: 2, unattended: true })).toBe(false);
   });
 
-  it("never mounts on a webhook, iMessage, routine or job turn, or on an unattended bot's plain turn", () => {
-    for (const automationSource of ["webhook", "imessage", "resource", "schedule", "manual", "job", "delegation"]) {
+  it("never mounts on an outside-event, job or peer turn, or on an unattended bot's plain turn", () => {
+    for (const automationSource of ["webhook", "imessage", "resource", "job", "delegation"]) {
       expect(mounted({ automationSource })).toBe(false);
     }
     expect(mounted({ unattended: true })).toBe(false);

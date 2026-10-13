@@ -6,13 +6,16 @@
 //     target rules and secret scan stand in for a card;
 //   - a continuation of one (a card answered, a model fallback): the same
 //     turn, resumed;
+//   - a scheduled or manually started routine.  Its prompt is saved by the
+//     owner, and outbound policy still limits zulip_post to configured
+//     channels while the secret scan applies to every post;
 //   - a turn the owner is attending in BotFleet: no automation source, no
 //     unattended mark, and NOT a peer-invoked (`ask_bot`) turn.  A peer's
 //     `ask_bot` arrives with no automation source and a comms depth above
 //     zero; it carries another bot's words and nobody is watching it, so it
 //     never gets an uncarded way to post as this bot.
 //
-// Webhook, iMessage, Linq, routine and job turns carry outside text with
+// Webhook, iMessage, Linq, resource and job turns carry outside text with
 // nobody watching, so they get nothing.  And nothing is mounted unless the
 // bot's own Zulip session is connected and not in a dry run.
 
@@ -34,5 +37,6 @@ export interface ZulipMountInput {
 export function zulipToolsMounted(input: ZulipMountInput): boolean {
   if (!input.outboundReady || input.commsDepth >= input.maxCommsDepth) return false;
   if (input.automationSource === "zulip" || input.continuesZulipTurn) return true;
+  if (input.automationSource === "schedule" || input.automationSource === "manual") return true;
   return input.automationSource === undefined && input.commsDepth === 0 && !input.unattended;
 }
