@@ -326,6 +326,8 @@ function CollaborationCopyReviewPanel({ routines, webhooks, onClose }: { routine
             <div className="flex items-center gap-2 rounded-xl bg-success/10 px-4 py-4 text-[12.5px] text-success"><CheckCircle2 size={16} />No saved routines or webhooks mention Slack.</div>
           ) : entries.map((entry) => {
             const key = `${entry.kind}:${entry.value.id}`;
+            const canConvert = convertSlackReferenceToZulip(entry.value.name) !== entry.value.name
+              || convertSlackReferenceToZulip(entry.value.prompt) !== entry.value.prompt;
             return (
               <div key={key} className="flex min-w-0 items-center gap-3 rounded-xl border border-hairline/45 bg-inset/35 px-3.5 py-3">
                 <span className="min-w-0 flex-1">
@@ -335,7 +337,7 @@ function CollaborationCopyReviewPanel({ routines, webhooks, onClose }: { routine
                   </span>
                   <span className="mt-1 block truncate text-[10.5px] text-ink-secondary" title={entry.value.prompt}>{entry.value.prompt || "Slack appears in the saved name."}</span>
                 </span>
-                <button type="button" disabled={working !== null} onClick={() => void convert(entry)} className="flex shrink-0 items-center gap-1.5 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-[11px] font-medium text-accent hover:bg-accent/15 disabled:opacity-45">
+                <button type="button" disabled={working !== null || !canConvert} title={canConvert ? "Replace retired fleet collaboration wording" : "URLs and identifiers require manual review"} onClick={() => void convert(entry)} className="flex shrink-0 items-center gap-1.5 rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-[11px] font-medium text-accent hover:bg-accent/15 disabled:opacity-45">
                   {working === key && <Loader2 size={12} className="animate-spin" />}Use Zulip
                 </button>
               </div>
@@ -396,7 +398,7 @@ export function CalendarGrid({
           ))}
         </div>
         {starts.map((start) => {
-          const dayItems = items.filter((item) => startOfDay(item.at) === start);
+          const dayItems = items.filter((item) => startOfDay(item.at) === start && itemBot(item, bots));
           const itemGroups = groupOverlappingCalendarItems(dayItems);
           const nowTop = (calendarMinuteOfDay(Date.now()) / 60) * HOUR_HEIGHT;
           return (

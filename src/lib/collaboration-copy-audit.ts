@@ -8,6 +8,7 @@ export function hasSlackReference(...values: Array<string | undefined | null>): 
 export function convertSlackReferenceToZulip(value: string): string {
   return value
     .replace(/slack-(?:sync|collab)/gi, "agent-sync")
-    .replace(/slack\.com/gi, "simplewithus.zulipchat.com")
-    .replace(/\bslack\b/gi, "Zulip");
+    // Replace only the standalone product name.  Keep URLs, channel names,
+    // environment variables, and other identifiers intact for manual review.
+    .replace(/(?<![A-Za-z0-9_.-])slack(?![A-Za-z0-9_.-])/gi, "Zulip");
 }

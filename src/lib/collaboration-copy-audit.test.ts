@@ -10,9 +10,14 @@ describe("collaboration copy audit", () => {
   });
 
   it("converts only after the user chooses Zulip", () => {
-    expect(convertSlackReferenceToZulip("Run slack-collab, then post to Slack at slack.com."))
-      .toBe("Run agent-sync, then post to Zulip at simplewithus.zulipchat.com.");
+    expect(convertSlackReferenceToZulip("Run slack-collab, then post to Slack."))
+      .toBe("Run agent-sync, then post to Zulip.");
     expect(convertSlackReferenceToZulip("Keep SLACK_BOT_TOKEN secret."))
       .toBe("Keep SLACK_BOT_TOKEN secret.");
+  });
+
+  it("does not rewrite Slack URLs, channel names, or identifiers", () => {
+    expect(convertSlackReferenceToZulip("POST https://hooks.slack.com/services/T/B/X to #slack-alerts."))
+      .toBe("POST https://hooks.slack.com/services/T/B/X to #slack-alerts.");
   });
 });
