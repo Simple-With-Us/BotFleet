@@ -601,6 +601,20 @@ export class Runtime {
     return true;
   }
 
+  /** Cancel these nodes, and anything under them, in one transaction. */
+  cancelMany(ids: readonly string[], reason = "Stopped by user"): void {
+    if (ids.length === 0) return;
+    this.withBatch(() => {
+      this.store.transaction(() => {
+        for (const id of ids) {
+          const n = this.store.get(id);
+          if (!n || isTerminal(n)) continue;
+          this.cancelTree(n, reason, "cancelled", "stopped");
+        }
+      });
+    });
+  }
+
   /** Cancel this node and everything under it; abort running turns. */
   cancel(id: string, reason = "Stopped by user", outcome: "stopped" | "failed" = "stopped"): void {
     const n = this.store.get(id);

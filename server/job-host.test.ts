@@ -45,7 +45,7 @@ describe("job host", () => {
     listener = undefined;
   });
 
-  function setup(startTurn?: JobHostDeps["startTurn"]) {
+  function setup(startTurn?: JobHostDeps["startTurn"], finishedRetentionMs?: number) {
     host?.close();
     closeMessageDb();
     rmSync(DATA_DIR, { recursive: true, force: true });
@@ -73,6 +73,7 @@ describe("job host", () => {
       },
       snoozed: () => false,
       unattended: () => false,
+      finishedRetentionMs,
     });
     return { from, target };
   }
@@ -262,6 +263,99 @@ describe("job host", () => {
     host.boot();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(starts).toHaveLength(1);
+  });
+
+  it("cancels every live assignment of a deleted bot and leaves other work queued", () => {
+    const { from, target } = setup();
+    const other = store.createBot({ name: "Other" }, { seedMessages: false });
+    const handed = host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: [target.id, other.id],
+      message: "split the work",
+      depth: 0,
+    });
+    const helperId = handed.body.assignments?.find((row) => row.botId === target.id)?.id;
+    const otherId = handed.body.assignments?.find((row) => row.botId === other.id)?.id;
+    host.releaseBot(target.id);
+    expect(host.status(from.id, from.threadId, helperId).body.assignment).toMatchObject({ status: "cancelled", outcome: "stopped" });
+    expect(host.status(from.id, from.threadId, otherId).body.assignment).toMatchObject({ status: "queued" });
+    host.releaseBot(from.id);
+    expect(host.status(from.id, from.threadId, otherId).body.assignment).toMatchObject({ status: "cancelled", outcome: "stopped" });
+    expect(starts).toEqual([]);
+  });
+
+  it("drops a finished assignment after its retention window and keeps a fresh one", async () => {
+    const { from, target } = setup(undefined, -1);
+    const handed = host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: [target.id],
+      message: "finish then age out",
+      depth: 0,
+    });
+    const childId = handed.body.assignments?.[0]?.id;
+    host.onTurnSettled(from.threadId, true, "asking now");
+    await viWait(() => host.status(from.id, from.threadId, childId).body.assignment?.status === "completed");
+    host.boot();
+    expect(host.status(from.id, from.threadId, childId).status).toBe(404);
+
+    const kept = setup();
+    const fresh = host.coordinate({
+      fromBotId: kept.from.id,
+      fromThreadId: kept.from.threadId,
+      botIds: [kept.target.id],
+      message: "still on file",
+      depth: 0,
+    });
+    const freshId = fresh.body.assignments?.[0]?.id;
+    host.onTurnSettled(kept.from.threadId, true, "asking now");
+    await viWait(() => host.status(kept.from.id, kept.from.threadId, freshId).body.assignment?.status === "completed");
+    host.boot();
+    expect(host.status(kept.from.id, kept.from.threadId, freshId).body.assignment?.status).toBe("completed");
+  });
+
+  it("retires a legacy queue that cannot be imported, and does not read it on the next boot", () => {
+    setup();
+    mkdirSync(DATA_DIR, { recursive: true });
+    const file = join(DATA_DIR, "delegations.json");
+    writeFileSync(file, "{not json");
+    host.boot();
+    expect(existsSync(file)).toBe(false);
+    expect(existsSync(`${file}.migrated`)).toBe(true);
+    expect(starts).toEqual([]);
+    host.close();
+    host = createJobHost({
+      store,
+      commsBus: { store, broadcast: () => {} },
+      approvalBus: approval,
+      startTurn: async (botId, text) => { starts.push({ botId, text }); },
+      subscribe: () => () => {},
+      snoozed: () => false,
+      unattended: () => false,
+    });
+    host.boot();
+    expect(starts).toEqual([]);
+  });
+
+  it("imports the valid rows of a legacy queue and skips the entries that do not match", async () => {
+    const { from, target } = setup();
+    mkdirSync(DATA_DIR, { recursive: true });
+    const file = join(DATA_DIR, "delegations.json");
+    writeFileSync(file, JSON.stringify({
+      [from.threadId]: [
+        { toBotId: target.id, message: "keep", depth: 1 },
+        { message: "missing the bot" },
+        "nope",
+      ],
+      "not-a-thread": "nope",
+    }));
+    host.boot();
+    await viWait(() => starts.length > 0);
+    expect(starts).toHaveLength(1);
+    expect(starts[0]?.text).toContain("keep");
+    expect(existsSync(file)).toBe(false);
+    expect(existsSync(`${file}.migrated`)).toBe(true);
   });
 });
 

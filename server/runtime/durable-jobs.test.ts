@@ -5,9 +5,11 @@
 // The same turn, still marked for that rerun, is not resumed a second time.
 // A turn that already pushed or sent is not run again at all.  Stop drops
 // work that has not started.
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -86,6 +88,38 @@ describe("durable delegated jobs", () => {
       expect(existsSync(file), file).toBe(true);
       expect(statSync(file).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it("restricts the data directory to the current account on Windows", () => {
+    if (process.platform !== "win32") return;
+    const opened = open();
+    opened.runtime.begin(personRoot("asker", "thread-a", "private brief"));
+    const listed = spawnSync("icacls", [dir], { encoding: "utf8", windowsHide: true });
+    expect(listed.status).toBe(0);
+    const text = listed.stdout;
+    expect(text).toContain(userInfo().username);
+    expect(text).not.toContain("Everyone");
+    expect(text).not.toContain("BUILTIN\\Users");
+    expect(text).not.toContain("Authenticated Users");
+  });
+
+  it("refuses a stored assignment that carries an unknown field", () => {
+    const opened = open();
+    const row = opened.runtime.begin(personRoot("asker", "thread-a", "private brief"));
+    const dbPath = opened.store.path;
+    for (const previous of stores) previous.close();
+    stores.length = 0;
+    const db = new DatabaseSync(dbPath);
+    const current = db.prepare("SELECT json FROM assignments WHERE id = ?").get(row.id);
+    const json = current?.json;
+    if (json !== String(json)) throw new Error("missing assignment row");
+    const body = JSON.parse(String(json));
+    body.extra = "nope";
+    db.prepare("UPDATE assignments SET json = ? WHERE id = ?").run(JSON.stringify(body), row.id);
+    db.close();
+    const again = openRuntimeStore(dbPath);
+    stores.push(again);
+    expect(() => again.get(row.id)).toThrow(/does not match the record schema/);
   });
 
   it("queues a cut turn once, and does not resume it after a second restart", () => {

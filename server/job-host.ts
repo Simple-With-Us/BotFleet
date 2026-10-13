@@ -6,8 +6,9 @@
 // conversation the person stopped.  Peer approval, section checks, Off
 // bots and the one-hop cap stay BotFleet's: they are stricter than the
 // upstream tree, and a Chief's approval switch does not raise a teammate.
-import { readFileSync, renameSync } from "node:fs";
+import { existsSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 
 import { botIsOff } from "../shared/bot-power.ts";
 import { getOrCreateChannel, mirrorExchange, type CommsBus } from "./comms-visibility.ts";
@@ -28,6 +29,21 @@ import {
 import { sectionKey, type BotRecord, type Store } from "./store.ts";
 
 const FANOUT_CAP = 4;
+
+/** Finished trees stay readable to assignment_status for this long. */
+export const FINISHED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
+/** One saved handoff.  Extra legacy fields, such as depth, are ignored. */
+const legacyItemSchema = z.object({
+  toBotId: z.string().min(1),
+  message: z.string().min(1),
+  reason: z.string().optional(),
+});
+
+const legacyQueueSchema = z.record(z.string(), z.unknown());
+const legacyListSchema = z.array(z.unknown());
 
 /** Activity rows that already changed something outside the workspace.
  *  A restart must not run that turn again. */
@@ -81,6 +97,8 @@ export interface JobHostDeps {
   watchDelegation?(threadId: string, channelId: string, botId: string): void;
   /** The turn never started.  Mirror that, once, into the channel. */
   abandonDelegation?(threadId: string, failureName: string): void;
+  /** How long a finished tree stays readable.  Tests pass a short window. */
+  finishedRetentionMs?: number;
 }
 
 export interface PublicAssignment {
@@ -123,6 +141,8 @@ export function createJobHost(deps: JobHostDeps): JobHost {
   const channels = new Map<string, string>();
   const dispatching = new Set<string>();
   let imported = false;
+  let lastPrune = 0;
+  const retentionMs = deps.finishedRetentionMs ?? FINISHED_RETENTION_MS;
 
   const namesOf = (assignment: Assignment) => {
     const requester = assignment.requester.botId ? deps.store.bot(assignment.requester.botId) : undefined;
@@ -363,28 +383,33 @@ export function createJobHost(deps: JobHostDeps): JobHost {
     const file = join(DATA_DIR, "delegations.json");
     const text = readLegacy(file);
     if (text === undefined) return;
+    const moved = importLegacyText(text);
+    retireLegacy(file);
+    if (moved) console.log(`delegations: imported ${moved} queued handoff(s) into the job runtime`);
+  }
+
+  function importLegacyText(text: string): number {
     let raw: unknown;
     try {
       raw = JSON.parse(text);
     } catch {
-      return;
+      return 0;
     }
-    if (raw === null || Array.isArray(raw) || Object(raw) !== raw) return;
+    const parsed = legacyQueueSchema.safeParse(raw);
+    if (!parsed.success) return 0;
     let moved = 0;
-    // SAFETY: the checks above leave a plain object whose values are read as lists below.
-    for (const [threadId, list] of Object.entries(raw as object)) {
-      if (!Array.isArray(list)) continue;
+    for (const [threadId, value] of Object.entries(parsed.data)) {
+      const list = legacyListSchema.safeParse(value);
+      if (!list.success) continue;
       const from = deps.store.botByThread(threadId);
       if (!from) continue;
-      for (const value of list) {
-        if (value === null || Array.isArray(value) || Object(value) !== value) continue;
-        // SAFETY: each list entry that survived the check above is one plain JSON object.
-        const record = value as { toBotId?: unknown; message?: unknown; reason?: unknown };
-        if (record.toBotId !== String(record.toBotId) || record.message !== String(record.message)) continue;
-        const message = String(record.message);
-        const reason = record.reason === String(record.reason) ? String(record.reason) : "";
-        const target = deps.store.bot(String(record.toBotId));
+      for (const entry of list.data) {
+        const item = legacyItemSchema.safeParse(entry);
+        if (!item.success) continue;
+        const target = deps.store.bot(item.data.toBotId);
         if (!target) continue;
+        const message = item.data.message;
+        const reason = item.data.reason ?? "";
         const requester: EnqueueRequest["requester"] = { kind: "bot_turn", botId: from.id, threadId };
         if (from.chiefOfStaff) requester.chief = true;
         const result = runtime.enqueue({
@@ -398,12 +423,14 @@ export function createJobHost(deps: JobHostDeps): JobHost {
         if (result.ok) moved += 1;
       }
     }
-    try {
-      renameSync(file, `${file}.migrated`);
-    } catch {
-      /* a second boot must not enqueue the same rows again; the rename is the mark */
-    }
-    if (moved) console.log(`delegations: imported ${moved} queued handoff(s) into the job runtime`);
+    return moved;
+  }
+
+  function sweepFinished(force: boolean): void {
+    const now = Date.now();
+    if (!force && now - lastPrune < PRUNE_INTERVAL_MS) return;
+    lastPrune = now;
+    runtime.prune(now - retentionMs);
   }
 
   const host: JobHost = {
@@ -532,9 +559,11 @@ export function createJobHost(deps: JobHostDeps): JobHost {
     boot() {
       runtime.open();
       importLegacy();
+      sweepFinished(true);
       runtime.tick();
     },
     tick() {
+      sweepFinished(false);
       runtime.tick();
     },
     edges() {
@@ -554,11 +583,11 @@ export function createJobHost(deps: JobHostDeps): JobHost {
       });
     },
     releaseBot(botId) {
+      const ids: string[] = [];
       for (const row of store.all({ nonTerminal: true })) {
-        if (row.assignee.botId === botId || row.requester.botId === botId) {
-          runtime.cancel(row.id, "Bot deleted");
-        }
+        if (row.assignee.botId === botId || row.requester.botId === botId) ids.push(row.id);
       }
+      runtime.cancelMany(ids, "Bot deleted");
     },
     close() {
       runtime.close();
@@ -594,7 +623,19 @@ function publicAssignment(assignment: Assignment): PublicAssignment {
 function readLegacy(file: string): string | undefined {
   try {
     return readFileSync(file, "utf8");
-  } catch {
-    return undefined;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function retireLegacy(file: string): void {
+  const marked = `${file}.migrated`;
+  const dest = existsSync(marked) ? `${marked}.${Date.now()}` : marked;
+  try {
+    renameSync(file, dest);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw error;
   }
 }

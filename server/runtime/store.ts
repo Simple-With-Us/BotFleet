@@ -8,7 +8,9 @@
 // so a row written by a newer or older build is refused, never half-read.
 // Every write the runtime cares about is one transaction: the row and its
 // event land together or not at all (write-before-act).
+import { spawnSync } from "node:child_process";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { userInfo } from "node:os";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { z } from "zod";
@@ -28,7 +30,7 @@ const evidenceSchema = z.object({
   okToolCalls: z.number().int().nonnegative().optional(),
   errors: z.array(z.string()).optional(),
   outward: z.array(z.string()).optional(),
-});
+}).strict();
 
 const assignmentSchema = z.object({
   id: z.string().min(1),
@@ -41,14 +43,14 @@ const assignmentSchema = z.object({
     ref: z.string().optional(),
     quote: z.string().optional(),
     onBehalfOf: z.string().optional(),
-  }),
+  }).strict(),
   requester: z.object({
     kind: z.enum(["person", "bot_turn", "routine_run", "external_runtime"]),
     botId: z.string().optional(),
     threadId: z.string().optional(),
     runId: z.string().optional(),
     chief: z.boolean().optional(),
-  }),
+  }).strict(),
   assignee: z.object({
     botId: z.string().min(1),
     // An empty thread id is a legacy-ledger import whose item named no
@@ -58,8 +60,8 @@ const assignmentSchema = z.object({
       kind: z.enum(["work_thread", "standing_thread", "room_thread"]),
       threadId: z.string(),
       groupId: z.string().optional(),
-    }).refine(d => d.threadId.length > 0 || d.kind === "standing_thread", { message: "threadId must not be empty" }),
-  }),
+    }).strict().refine(d => d.threadId.length > 0 || d.kind === "standing_thread", { message: "threadId must not be empty" }),
+  }).strict(),
   mode: z.enum(["work", "consult", "notify"]),
   reply: z.enum(["resume", "poll", "none"]),
   brief: z.string(),
@@ -84,18 +86,17 @@ const assignmentSchema = z.object({
   rework: z.boolean(),
   question: z.string().optional(),
   answer: z.string().optional(),
-  budgets: z.object({ since: z.number(), requests: z.number(), executions: z.number(), wakes: z.number() }).optional(),
-  // A root parked on the person's cards, and a node that continues in place:
-  // both must come back whole, or a park would lose its cards on the next
-  // read (the schema strips what it does not name).
+  budgets: z.object({ since: z.number(), requests: z.number(), executions: z.number(), wakes: z.number() }).strict().optional(),
+  // A root parked on the person's cards, and a node that continues in place.
+  // Unknown keys are refused, so a row is never read with part of it dropped.
   cards: z.array(z.string()).optional(),
-  continuation: z.object({ note: z.string(), handoffPath: z.string().optional(), count: z.number().int().nonnegative() }).optional(),
+  continuation: z.object({ note: z.string(), handoffPath: z.string().optional(), count: z.number().int().nonnegative() }).strict().optional(),
   // The loop guard's record outlives the continuation the dispatch consumes.
-  guard: z.object({ stale: z.number().int().nonnegative(), errors: z.array(z.string()) }).optional(),
+  guard: z.object({ stale: z.number().int().nonnegative(), errors: z.array(z.string()) }).strict().optional(),
   approved: z.boolean().optional(),
   batchKey: z.string().optional(),
   version: z.literal(1),
-});
+}).strict();
 
 export interface RuntimeStore {
   readonly path: string;
@@ -225,25 +226,47 @@ function readEvent(row: SqlRow): AssignmentEvent {
   return event;
 }
 
+function icacls(dir: string, args: string[], optional = false): void {
+  const result = spawnSync("icacls", [dir, ...args], { windowsHide: true, encoding: "utf8" });
+  if (optional) return;
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`runtime.db: icacls ${args[0] ?? ""} failed (${String(result.status)})`);
+}
+
+/** Owner-only directory.  Unix uses mode 0700.  Windows uses an ACL that
+ *  still includes delete, because mkdir's mode flag omits delete-child and
+ *  the test runner then cannot remove the directory. */
+function lockPrivateDirectory(dir: string): void {
+  if (process.platform !== "win32") {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(dir, 0o700);
+    } catch (error) {
+      // A directory that disappears between create and chmod is gone.
+      // Permission and I/O failures stay visible so a loose directory is not silent.
+      if (!(error instanceof Error && chmodTargetMissing(error))) throw error;
+    }
+    return;
+  }
+  mkdirSync(dir, { recursive: true });
+  const name = userInfo().username;
+  const domain = process.env.USERDOMAIN;
+  const account = domain ? `${domain}\\${name}` : name;
+  // Copy inherited entries, grant this account full control (including
+  // delete), then drop the broad groups.  Grant runs before the removals
+  // so the directory is never left with no access.
+  icacls(dir, ["/inheritance:d"]);
+  icacls(dir, ["/grant:r", `${account}:(OI)(CI)F`]);
+  icacls(dir, ["/remove:g", "*S-1-1-0"], true);
+  icacls(dir, ["/remove:g", "*S-1-5-32-545"], true);
+  icacls(dir, ["/remove:g", "*S-1-5-11"], true);
+}
+
 export function openRuntimeStore(path: string): RuntimeStore {
   const memory = path === ":memory:";
   if (!memory) {
     const dir = dirname(path);
-    // A new directory is created owner-only.  Windows maps that mode into an
-    // ACL the test runner cannot delete, so the file mode below is the
-    // restriction there.  An existing directory is tightened by the chmod.
-    if (process.platform === "win32") {
-      mkdirSync(dir, { recursive: true });
-    } else {
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-      try {
-        chmodSync(dir, 0o700);
-      } catch (error) {
-        // A directory that disappears between create and chmod is gone.
-        // Permission and I/O failures stay visible so a loose directory is not silent.
-        if (!(error instanceof Error && chmodTargetMissing(error))) throw error;
-      }
-    }
+    lockPrivateDirectory(dir);
     // Owner-only from the first byte, and repaired on a file that inherited
     // a loose umask.
     closeSync(openSync(path, "a", 0o600));
