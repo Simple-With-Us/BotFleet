@@ -180,7 +180,7 @@ final class BotExecutionPolicyTests: XCTestCase {
     }
 
     func testModelRiskFollowsTheDesktopsPatterns() {
-        for risky in ["claude-haiku-4-5", "gpt-4o-mini", "gemini-2.5-flash-lite", "Llama-3.1-8B", "qwen-14b", "o4-nano", "GPT-3.5-turbo", ""] {
+        for risky in ["claude-haiku-4-5", "gpt-4o-mini", "gemini-2.5-flash-lite", "Llama-3.1-8B", "qwen-14b", "o4-nano", "GPT-5.6-TERRA", ""] {
             XCTAssertTrue(BypassModelRisk.isHighRisk(model: risky), risky)
         }
         for sturdy in ["claude-sonnet-4-5", "claude-opus-4", "gpt-4o", "deepseek-r1", "grok-3", "MiniMax-M3"] {
