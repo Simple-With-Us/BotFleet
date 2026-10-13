@@ -4,7 +4,15 @@
 // holds none, so a client can only ever receive a short-lived token minted
 // here.  Nothing in this module returns, logs, or hints at a permanent key.
 
-import { isStsProvider, pickStsProvider, type StsKeyStatus, type StsProvider } from "../shared/sts-tokens.ts";
+import { z } from "zod";
+
+import {
+  pickStsProvider,
+  STS_PROVIDERS,
+  type StsChoiceReason,
+  type StsKeyStatus,
+  type StsProvider,
+} from "../shared/sts-tokens.ts";
 
 /** Reads a provider key out of the config without ever copying it anywhere
  *  the client can see.  `null` means "not configured", which is different
@@ -28,15 +36,34 @@ export function stsKeyStatus(read: CredentialReader): StsKeyStatus | null {
 }
 
 /** One sentence a person can act on, or null when there is nothing to say. */
-export function stsUnavailableReason(
-  requested: unknown,
-  keys: StsKeyStatus | null,
-): { status: number; error: string } | null {
+export interface StsRefusal {
+  status: number;
+  error: string;
+}
+
+/** The request body the token route accepts.  Parsed here, at the door, so
+ *  the policy below works on a domain value and never on raw JSON. */
+// SAFETY: `STS_PROVIDERS` is declared `readonly StsProvider[]` above and
+// holds exactly the two literals `StsProvider` names, so it satisfies the
+// non-empty tuple z.enum requires. The cast is the widening z.enum wants,
+// not a claim about input.
+const STS_PROVIDER_TUPLE: [StsProvider, StsProvider] = [STS_PROVIDERS[0], STS_PROVIDERS[1]];
+
+export const stsTokenRequest = z.object({ provider: z.enum(STS_PROVIDER_TUPLE) });
+
+/** Which provider a call would use, and why.  Mirrors the desktop's
+ *  `pickStsProvider` so a phone and the web client degrade identically. */
+export interface StsResolution {
+  provider: StsProvider | null;
+  reason: StsChoiceReason | "unknown";
+}
+
+export function stsUnavailableReason(requested: StsProvider | null, keys: StsKeyStatus | null): StsRefusal | null {
   if (keys === null) {
     // Not "no key": we could not read them.
     return { status: 503, error: "Could not read the voice provider keys on this computer." };
   }
-  if (!isStsProvider(requested)) {
+  if (!requested) {
     return { status: 400, error: "Unknown speech-to-speech provider." };
   }
   if (keys[requested]) return null;
@@ -47,15 +74,10 @@ export function stsUnavailableReason(
   };
 }
 
-/** The provider a call should actually use, and why.  Mirrors the desktop's
- *  `pickStsProvider` so a phone and the web client degrade identically. */
-export function resolveStsProvider(
-  keys: StsKeyStatus | null,
-  preference: unknown,
-): { provider: StsProvider | null; reason: string } {
+/** The provider a call should actually use, and why. */
+export function resolveStsProvider(keys: StsKeyStatus | null, preference: StsProvider | null): StsResolution {
   if (keys === null) return { provider: null, reason: "unknown" };
-  const wanted = isStsProvider(preference) ? preference : null;
-  return pickStsProvider(keys, wanted);
+  return pickStsProvider(keys, preference);
 }
 
 /** A client may not mint tokens back to back.  Each mint is a real request to

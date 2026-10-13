@@ -19,6 +19,8 @@
 // Node examples use the Authorization header.  A caller that copies the Node
 // example connects, sends audio, and silently receives nothing back.
 
+import { z } from "zod";
+
 export const XAI_TOKEN_ENDPOINT = "https://api.x.ai/v1/realtime/client_secrets";
 export const GEMINI_TOKEN_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/auth_tokens";
 
@@ -50,55 +52,83 @@ export interface StsKeyStatus {
   gemini: boolean;
 }
 
-export function isStsProvider(value: unknown): value is StsProvider {
+/** Why a provider was chosen, so a caller can explain itself rather than
+ *  reporting a silent null. */
+export type StsChoiceReason = "user-preference" | "auto-preference" | "auto-only-key" | "no-provider";
+
+export interface StsChoice {
+  provider: StsProvider | null;
+  reason: StsChoiceReason;
+}
+
+/** Why a preference was not honoured, in a sentence a person can act on.
+ *  `null` means there is nothing to say. */
+export interface StsKeyNotice {
+  configured: boolean;
+  reason: string | null;
+}
+
+export function isStsProvider(value: string): value is StsProvider {
   return value === "xai" || value === "gemini";
 }
 
 /** xAI permits a narrow range; stay inside it rather than trusting the caller. */
-function clampTtl(seconds: unknown, { min, max, fallback }: { min: number; max: number; fallback: number }): number {
+function clampTtl(seconds: number, bounds: { min: number; max: number; fallback: number }): number {
   const value = Math.round(Number(seconds));
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(min, Math.min(max, value));
+  if (!Number.isFinite(value)) return bounds.fallback;
+  return Math.max(bounds.min, Math.min(bounds.max, value));
 }
 
-export function xaiCredential(credentials: { xaiApiKey?: string } | undefined, env: Record<string, string | undefined> = process.env): string {
+export function xaiCredential(
+  credentials: { xaiApiKey?: string } | undefined,
+  env: Record<string, string | undefined> = process.env,
+): string {
   const stored = String(credentials?.xaiApiKey ?? "").trim();
   if (stored) return stored;
   return String(env.XAI_API_KEY ?? "").trim();
 }
 
-export function geminiCredential(credentials: { geminiApiKey?: string } | undefined, env: Record<string, string | undefined> = process.env): string {
+export function geminiCredential(
+  credentials: { geminiApiKey?: string } | undefined,
+  env: Record<string, string | undefined> = process.env,
+): string {
   const stored = String(credentials?.geminiApiKey ?? "").trim();
   if (stored) return stored;
   return String(env.GEMINI_API_KEY ?? "").trim();
 }
 
-/**
- * Pull the token out of the mint response.
- *
- * xAI's docs return the body verbatim without documenting its shape, so accept
- * the layouts this API family is known to use rather than betting on one and
- * failing closed on a valid token.  A missing token is still an error -- we never
- * fall back to handing back anything else.
- */
-function readXaiToken(body: unknown): string {
-  const record = body as Record<string, unknown> | null | undefined;
-  const candidates = [record?.client_secret, record?.clientSecret, record];
-  for (const candidate of candidates) {
-    if (!candidate || typeof candidate !== "object") continue;
-    const value = String((candidate as Record<string, unknown>).value ?? (candidate as Record<string, unknown>).token ?? "").trim();
-    if (value) return value;
-  }
-  return "";
-}
+// xAI's docs return the mint body verbatim without documenting its shape, so
+// this accepts the layouts this API family is known to use rather than betting
+// on one and failing closed on a valid token.  A missing token is still an
+// error -- we never fall back to handing back anything else.
+
+/** One layout xAI is known to answer with. */
+const xaiEnvelope = z.object({ value: z.string().optional(), token: z.string().optional() });
+
+// The third shape matters: the body itself is a candidate, so a top-level
+// `{ value }` is accepted as well as the nested ones.
+const xaiMintBody = z.object({
+  client_secret: xaiEnvelope.optional(),
+  clientSecret: xaiEnvelope.optional(),
+  value: z.string().optional(),
+  token: z.string().optional(),
+});
+
+/** Gemini returns the token itself in `name`, and nothing else we need. */
+const geminiMintBody = z.object({ name: z.string().optional() });
 
 export async function mintXaiRealtimeToken(
   apiKey: string,
-  { fetchImpl = fetch, expiresInSeconds = DEFAULT_XAI_TTL_SECONDS }: { fetchImpl?: typeof fetch; expiresInSeconds?: number } = {},
+  options: { fetchImpl?: typeof fetch; expiresInSeconds?: number } = {},
 ): Promise<StsSessionToken> {
+  const fetchImpl = options.fetchImpl ?? fetch;
   const secret = String(apiKey ?? "").trim();
   if (!secret) throw new Error("Add an xAI API key before starting a voice call.");
-  const ttl = clampTtl(expiresInSeconds, { min: 30, max: 3600, fallback: DEFAULT_XAI_TTL_SECONDS });
+  const ttl = clampTtl(options.expiresInSeconds ?? DEFAULT_XAI_TTL_SECONDS, {
+    min: 30,
+    max: 3600,
+    fallback: DEFAULT_XAI_TTL_SECONDS,
+  });
   const response = await fetchImpl(XAI_TOKEN_ENDPOINT, {
     method: "POST",
     headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
@@ -109,36 +139,50 @@ export async function mintXaiRealtimeToken(
     throw new Error("xAI rejected this API key. Replace it in Voice settings.");
   }
   if (!response.ok) throw new Error(`xAI would not issue a call token (HTTP ${response.status}).`);
-  const token = readXaiToken(await response.json());
+  const body = xaiMintBody.safeParse(await response.json());
+  if (!body.success) throw new Error("xAI returned an invalid temporary token.");
+  const envelope = body.data.client_secret ?? body.data.clientSecret;
+  const token = (envelope?.value ?? envelope?.token ?? body.data.value ?? body.data.token ?? "").trim();
   if (!token) throw new Error("xAI returned an invalid temporary token.");
   return { token, expiresInSeconds: ttl };
 }
 
 export async function mintGeminiLiveToken(
   apiKey: string,
-  {
-    fetchImpl = fetch,
-    sessionLeadSeconds = GEMINI_SESSION_LEAD_SECONDS,
-    ttlSeconds = GEMINI_TTL_SECONDS,
-    now = () => Date.now(),
-  }: { fetchImpl?: typeof fetch; sessionLeadSeconds?: number; ttlSeconds?: number; now?: () => number } = {},
+  options: {
+    fetchImpl?: typeof fetch;
+    sessionLeadSeconds?: number;
+    ttlSeconds?: number;
+    now?: () => number;
+  } = {},
 ): Promise<StsSessionToken> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const now = options.now ?? (() => Date.now());
   const secret = String(apiKey ?? "").trim();
   if (!secret) throw new Error("Add a Gemini API key before starting a voice call.");
-  const lead = clampTtl(sessionLeadSeconds, { min: 120, max: 3600, fallback: GEMINI_SESSION_LEAD_SECONDS });
-  const ttl = clampTtl(ttlSeconds, { min: 600, max: 3600, fallback: GEMINI_TTL_SECONDS });
+  const lead = clampTtl(options.sessionLeadSeconds ?? GEMINI_SESSION_LEAD_SECONDS, {
+    min: 120,
+    max: 3600,
+    fallback: GEMINI_SESSION_LEAD_SECONDS,
+  });
+  const ttl = clampTtl(options.ttlSeconds ?? GEMINI_TTL_SECONDS, {
+    min: 600,
+    max: 3600,
+    fallback: GEMINI_TTL_SECONDS,
+  });
   // Seconds precision, no milliseconds: this is the string the desktop's
   // existing tests assert on, and a `.000Z` suffix is a gratuitous format
   // change to ship alongside a refactor.
   const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
+  const at = now();
   const response = await fetchImpl(GEMINI_TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "x-goog-api-key": secret, "content-type": "application/json" },
     body: JSON.stringify({
       // Single use: one token opens one session.
       uses: 1,
-      expireTime: iso(now() + ttl * 1000),
-      newSessionExpireTime: iso(now() + lead * 1000),
+      expireTime: iso(at + ttl * 1000),
+      newSessionExpireTime: iso(at + lead * 1000),
     }),
     signal: AbortSignal.timeout(10_000),
   });
@@ -146,16 +190,26 @@ export async function mintGeminiLiveToken(
     throw new Error("Gemini rejected this API key. Replace it in Voice settings.");
   }
   if (!response.ok) throw new Error(`Gemini would not issue a call token (HTTP ${response.status}).`);
-  const body = (await response.json()) as { name?: string } | null;
-  const token = String(body?.name ?? "").trim();
+  const body = geminiMintBody.safeParse(await response.json());
+  if (!body.success) throw new Error("Gemini returned an invalid temporary token.");
+  const token = (body.data.name ?? "").trim();
   if (!token) throw new Error("Gemini returned an invalid temporary token.");
   return { token, expiresInSeconds: ttl };
 }
 
 /** Mint for one provider.  The single entry point both callers use, so a
- *  provider added here reaches the desktop and the phone together. */
-export function mintStsToken(provider: StsProvider, apiKey: string, options?: Parameters<typeof mintXaiRealtimeToken>[1]): Promise<StsSessionToken> {
-  return provider === "xai" ? mintXaiRealtimeToken(apiKey, options) : mintGeminiLiveToken(apiKey, options);
+ *  provider added here reaches the desktop and the phone together.  The
+ *  per-provider TTLs are each provider's own business and are not
+ *  overridable from here -- one caller must not be able to ask for a TTL the
+ *  vendor will refuse. */
+export function mintStsToken(
+  provider: StsProvider,
+  apiKey: string,
+  options: { fetchImpl?: typeof fetch } = {},
+): Promise<StsSessionToken> {
+  return provider === "xai"
+    ? mintXaiRealtimeToken(apiKey, options)
+    : mintGeminiLiveToken(apiKey, options);
 }
 
 /**
@@ -166,10 +220,7 @@ export function mintStsToken(provider: StsProvider, apiKey: string, options?: Pa
  * back to auto rather than failing, and "no key anywhere" is a distinct,
  * reportable reason rather than a silent null.
  */
-export function pickStsProvider(
-  keys: StsKeyStatus,
-  preference: StsProvider | null = null,
-): { provider: StsProvider | null; reason: "user-preference" | "auto-preference" | "auto-only-key" | "no-provider" } {
+export function pickStsProvider(keys: StsKeyStatus, preference: StsProvider | null = null): StsChoice {
   if (preference && keys[preference]) return { provider: preference, reason: "user-preference" };
   for (const provider of STS_PROVIDERS) {
     if (keys[provider]) return { provider, reason: preference ? "auto-preference" : "auto-only-key" };
@@ -177,12 +228,16 @@ export function pickStsProvider(
   return { provider: null, reason: "no-provider" };
 }
 
-/** Why a provider cannot be used, in a sentence a person can act on.  `null`
- *  means it can.  Never says "unavailable" without saying which key. */
-export function stsKeyNotice(provider: StsProvider, keys: StsKeyStatus | null): string | null {
-  if (!keys) return null; // unknown -- must not read as "no key"
-  if (keys[provider]) return "Key configured.";
-  return provider === "xai"
-    ? "No xAI API key.  Calls stay on Auto until you add one."
-    : "No Google Gemini API key.  Calls stay on Auto until you add one.";
+/** Why a provider cannot be used, in a sentence a person can act on.  The
+ *  message never says "unavailable" without saying which key. */
+export function stsKeyNotice(provider: StsProvider, keys: StsKeyStatus | null): StsKeyNotice {
+  // Unknown is not "no key": a failed read would otherwise send someone to
+  // Settings to add a key they already have.
+  if (!keys) return { configured: false, reason: null };
+  if (keys[provider]) return { configured: true, reason: "Key configured." };
+  const label = provider === "xai" ? "xAI API key" : "Google Gemini API key";
+  return {
+    configured: false,
+    reason: `No ${label}.  Calls stay on Auto until you add one.`,
+  };
 }

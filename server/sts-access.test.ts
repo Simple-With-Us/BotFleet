@@ -6,6 +6,7 @@ import {
   resolveStsProvider,
   StsMintThrottle,
   stsKeyStatus,
+  stsTokenRequest,
   stsUnavailableReason,
 } from "./sts-access.ts";
 
@@ -43,8 +44,9 @@ describe("unavailability is truthful and actionable", () => {
   });
 
   it("rejects a provider it does not implement rather than guessing one", () => {
-    expect(stsUnavailableReason("openai", { xai: true, gemini: true })?.status).toBe(400);
-    expect(stsUnavailableReason(undefined, { xai: true, gemini: true })?.status).toBe(400);
+    // The route parses the body first, so an unimplemented name arrives as
+    // null rather than as the string it was.
+    expect(stsUnavailableReason(null, { xai: true, gemini: true })?.status).toBe(400);
   });
 
   it("allows a provider that is configured", () => {
@@ -65,10 +67,21 @@ describe("provider resolution matches the desktop", () => {
   });
 
   it("ignores a preference that is not a provider it knows", () => {
-    expect(resolveStsProvider({ xai: true, gemini: true }, "openai")).toEqual({
+    expect(resolveStsProvider({ xai: true, gemini: true }, null)).toEqual({
       provider: "xai",
       reason: "auto-only-key",
     });
+  });
+});
+
+describe("the request body is parsed at the door", () => {
+  it("accepts only the two providers it mints for", () => {
+    expect(stsTokenRequest.safeParse({ provider: "xai" }).success).toBe(true);
+    expect(stsTokenRequest.safeParse({ provider: "gemini" }).success).toBe(true);
+    // A name it does not implement must not reach the mint path.
+    expect(stsTokenRequest.safeParse({ provider: "openai" }).success).toBe(false);
+    expect(stsTokenRequest.safeParse({}).success).toBe(false);
+    expect(stsTokenRequest.safeParse({ provider: 7 }).success).toBe(false);
   });
 });
 

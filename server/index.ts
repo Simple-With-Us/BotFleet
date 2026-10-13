@@ -442,7 +442,13 @@ import {
 } from "../shared/voice-summary.ts";
 import { isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
 import { mintStsToken, type StsProvider } from "../shared/sts-tokens.ts";
-import { resolveStsProvider, StsMintThrottle, stsKeyStatus, stsUnavailableReason } from "./sts-access.ts";
+import {
+  resolveStsProvider,
+  StsMintThrottle,
+  stsKeyStatus,
+  stsTokenRequest,
+  stsUnavailableReason,
+} from "./sts-access.ts";
 import { checkPronunciations, PronunciationDraftListSchema } from "../shared/pronunciations.ts";
 import { deterministicSpokenText, summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
 import { isWrittenScript, MessageAudio, type SummarizedSpeech } from "./tts/message-audio.ts";
@@ -16211,15 +16217,22 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (keys === null) {
         return json(res, 503, { error: "Could not read the voice provider keys on this computer." });
       }
-      return json(res, 200, { ...keys, provider: resolveStsProvider(keys, cfg.sts?.provider).provider });
+      // The stored preference is parsed the same way a request would be, so
+      // a stale or hand-edited config value cannot name a provider this
+      // build does not mint for.
+      const stored = stsTokenRequest.safeParse({ provider: cfg.sts?.provider });
+      const preference = stored.success ? stored.data.provider : null;
+      return json(res, 200, { ...keys, provider: resolveStsProvider(keys, preference).provider });
     }
     if (method === "POST" && path === "/api/sts/token") {
-      const body = await readBody(req);
-      const requested = typeof body?.provider === "string" ? body.provider : undefined;
-      const keys = stsKeyStatus((provider) => stsProviderCredential(provider));
-      const refusal = stsUnavailableReason(requested, keys);
+      // Parsed here, at the door: everything below works on a provider, not
+      // on whatever a device put in the body.
+      const parsed = stsTokenRequest.safeParse(await readBody(req));
+      if (!parsed.success) return json(res, 400, { error: "Unknown speech-to-speech provider." });
+      const provider = parsed.data.provider;
+      const keys = stsKeyStatus((candidate) => stsProviderCredential(candidate));
+      const refusal = stsUnavailableReason(provider, keys);
       if (refusal) return json(res, refusal.status, { error: refusal.error });
-      const provider = requested as StsProvider;
       const apiKey = stsProviderCredential(provider);
       // SAFETY: `stsUnavailableReason` returned null, which only happens when
       // `keys[provider]` was true, so this read is a non-empty string.

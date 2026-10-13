@@ -60,7 +60,7 @@ export function xaiRealtimeSubprotocol(token) {
  * the constrained v1beta endpoint.  It is single-use and short-lived, which is
  * why putting it in the URL is acceptable here.
  */
-export function geminiRealtimeUrl(token, model = "gemini-3.8-live") {
+export function geminiRealtimeUrl(token, _model = "gemini-3.8-live") {
   const value = String(token ?? "").trim();
   if (!value) throw new Error("Missing Gemini session token.");
   const endpoint =
