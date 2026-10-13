@@ -70,8 +70,10 @@ export function matchCursorAcpModel(
 
   const isFast = (id: string) => cursorAcpParams(id).get("fast") === "true";
   const sameBase = ids.filter((m) => base(m.modelId!) === want);
-  const byBase = sameBase.find((m) => !isFast(m.modelId!)) ?? sameBase[0];
-  if (byBase) return found(byBase.modelId!);
+  const nonFast = sameBase.find((m) => !isFast(m.modelId!));
+  if (nonFast) return found(nonFast.modelId!);
+  const onlyFast = sameBase[0];
+  if (onlyFast) return found(onlyFast.modelId!, false);
 
   const fastSlug = want.endsWith("-fast");
   const stem = fastSlug ? want.slice(0, -"-fast".length) : want;

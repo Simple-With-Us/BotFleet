@@ -53,6 +53,10 @@ describe("classifyModel", () => {
       rank: [4, 7],
     });
     expect(classifyModel("cursorAgent", "grok-4.7-medium")).toMatchObject({ classKey: "grok-4.7", rank: [4, 7] });
+    expect(classifyModel("cursorAgent", "gpt-5.3-codex-fast")).toMatchObject({
+      classKey: "gpt-5.3-codex",
+      rank: [0, 0],
+    });
   });
 
   it("classifies current, dated, and legacy Claude ids", () => {

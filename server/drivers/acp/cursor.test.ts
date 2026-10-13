@@ -400,6 +400,18 @@ describe("resolveCursorAcpModelId", () => {
       );
     });
 
+    it("marks a fast-only session variant inexact when the picker slug omits -fast", () => {
+      expect(
+        matchCursorAcpModel(
+          [{ modelId: "grok-4.7[context=256k,reasoning_effort=high,fast=true]", name: "grok-4.7" }],
+          "grok-4.7",
+        ),
+      ).toEqual({
+        modelId: "grok-4.7[context=256k,reasoning_effort=high,fast=true]",
+        exact: false,
+      });
+    });
+
     it("settles for the advertised variant of the base and marks it inexact", () => {
       expect(matchCursorAcpModel(ADVERTISED_EFFORT, "grok-4.7-medium-fast")).toEqual({
         modelId: "grok-4.7[context=256k,reasoning_effort=high,fast=true]",

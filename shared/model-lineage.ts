@@ -188,9 +188,8 @@ const CURSOR: Family = {
     const base = cursorPickerBaseId(id);
     if (!base || base === "auto" || base === "default") return null;
     const versioned = CURSOR_VERSION_TAIL.exec(base);
-    if (!versioned) return null;
-    const classKey = base;
-    return { classKey, rank: rankOf(num(versioned[2]), num(versioned[3])) };
+    const rank = versioned ? rankOf(num(versioned[2]), num(versioned[3])) : rankOf(0, 0);
+    return { classKey: base, rank };
   },
   label(id, _c) {
     return id;
