@@ -141,7 +141,22 @@ function initDesktopSentry() {
     const release = resolvedDesktopReleaseSha();
     Sentry.init({
       dsn,
-      sendDefaultPii: false,
+      // @sentry/electron v8 resolves the v11 JavaScript SDK.  v11 replaced
+      // sendDefaultPii with dataCollection and collects these categories by
+      // default, so keep the desktop client on an explicit restrictive policy.
+      dataCollection: {
+        userInfo: false,
+        cookies: false,
+        httpHeaders: { request: false, response: false },
+        httpBodies: [],
+        urlQueryParams: false,
+        genAI: { inputs: false, outputs: false },
+        databaseQueryData: false,
+        queues: false,
+        graphQL: { document: false, variables: false },
+        stackFrameVariables: false,
+        frameContextLines: 0,
+      },
       environment: String(process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() || "production",
       release,
       beforeSend(event) {

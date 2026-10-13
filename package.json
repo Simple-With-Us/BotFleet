@@ -99,7 +99,7 @@
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",
-    "@sentry/electron": "^7.20.1",
+    "@sentry/electron": "^8.0.0",
     "@sentry/node": "^11.0.0",
     "@sentry/profiling-node": "^11.0.0",
     "@sentry/react": "^11.0.0",
