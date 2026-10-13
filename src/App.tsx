@@ -1,5 +1,5 @@
 import { downloadAllBots, downloadAllConversations } from "@/lib/team-files";
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Menu, X } from "lucide-react";
 import { StoreProvider, useStore, getRoomTerminology, type AppSettingsSection } from "@/state/store";
 import { eligibleTaskApps } from "@/lib/task-app-context";
@@ -10,10 +10,13 @@ import { unreadConversationCount } from "@/lib/unread";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatView } from "@/components/ChatView";
 import { GroupView } from "@/components/GroupView";
+import { DataFaultBanner } from "@/components/DataFaultBanner";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
 import { noEngineCanRun } from "@/lib/engine-status";
+import { resolveAppContext, shownThreadId, threadIdForApp } from "@/lib/task-app-thread";
+import { useDismissOnSelection } from "@/lib/use-dismiss-on-selection";
 
 // UI2: every one of these is already conditionally rendered — near-modal
 // panels/pages that most sessions never open in a given launch — so they
@@ -32,6 +35,9 @@ const GroupSettingsPanel = lazy(() =>
 );
 const PluginsPanel = lazy(() =>
   import("@/components/PluginsPanel").then((m) => ({ default: m.PluginsPanel })),
+);
+const PluginsManagerView = lazy(() =>
+  import("@/components/PluginsManagerView").then((m) => ({ default: m.PluginsManagerView })),
 );
 const ComputerPanel = lazy(() =>
   import("@/components/ComputerPanel").then((m) => ({ default: m.ComputerPanel })),
@@ -98,19 +104,48 @@ function Shell() {
   const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
   const hasApps = state.groups.some((g) => !g.dm);
 
+  // The task-switch ack clears the pin, so a null pin means "the bot's active
+  // thread", not "left the App" (see resolveAppContext).
+  const appKeyboardRouting = Boolean(
+    selectedAppId &&
+      ((group && !group.dm && group.id === selectedAppId) ||
+        (bot &&
+          shownThreadId(bot, state.viewedThreadId) &&
+          shownThreadId(bot, state.viewedThreadId) === threadIdForApp(bot, selectedAppId))),
+  );
+
   // If a group was chosen in the sidebar or store, keep selectedAppId aligned
   useEffect(() => {
     if (group && !group.dm) {
       setSelectedAppId(group.id);
     }
-  }, [group?.id]);
+  }, [group?.id, group?.dm]);
 
-  // When selection changes via sidebar or store, yield matrix overview to the selected chat
+  // The overview covers the chat pane, so a pick from anywhere (sidebar, ⌘1–9,
+  // command palette, notification) has to close it.  Only a pick: the store
+  // streams bot and room updates all session and hydrate selects the first bot
+  // at launch, and none of that may dismiss the overview.  The deck, the matrix
+  // and the "All" tab close or open it in their own handlers below.
+  const dismissMatrixOverview = useCallback(() => setMatrixOverviewActive(false), []);
+  useDismissOnSelection(state.selectionNonce, dismissMatrixOverview);
+
+  // Drop the App highlight unless the selection is still in that App.  The
+  // decision is a pure function so it can be tested: this effect re-runs on
+  // every SSE frame, and only a changed selection may clear the highlight.
+  const lastSelectedId = useRef(state.selectedId);
   useEffect(() => {
-    if (state.selectedId) {
-      setMatrixOverviewActive(false);
-    }
-  }, [state.selectedId]);
+    const selectionChanged = lastSelectedId.current !== state.selectedId;
+    lastSelectedId.current = state.selectedId;
+    const decision = resolveAppContext({
+      selectedAppId,
+      selectedId: state.selectedId,
+      selectionChanged,
+      groups: state.groups,
+      bots: state.bots,
+      viewedThreadId: state.viewedThreadId,
+    });
+    if (decision.selectedAppId !== selectedAppId) setSelectedAppId(decision.selectedAppId);
+  }, [state.selectedId, state.viewedThreadId, state.bots, state.groups, selectedAppId]);
 
   // Nothing on this machine can run a bot. A missing cloud login does not
   // count — that CLI can still host a local model. Wait for the first
@@ -118,6 +153,15 @@ function Shell() {
   // yet", and flashing the setup screen at every launch would be worse.  An
   // engine whose probe has not answered yet is not proof of an empty Mac.
   const noEngines = state.connected && noEngineCanRun(state.instances);
+
+  const openBotInApp = useCallback((botId: string, appId: string) => {
+    const b = state.bots.find((x) => x.id === botId);
+    const threadId = threadIdForApp(b, appId);
+    dispatch({ type: "select", id: botId, viewedThreadId: threadId });
+    if (threadId && threadId !== b?.threadId && !b?.busy) {
+      dispatch({ type: "switchTask", botId, threadId });
+    }
+  }, [state.bots, dispatch]);
 
   // App-wide shortcuts: ⌘N new bot · ⌘1–9 jump to bot · ⌘⇧[ / ⌘⇧] prev/next.
   // Kept deliberately small; every panel already closes on Esc.
@@ -133,20 +177,28 @@ function Shell() {
         const target = bots[Number(e.key) - 1];
         if (target) {
           e.preventDefault();
-          dispatch({ type: "select", id: target.id });
+          if (selectedAppId && appKeyboardRouting) {
+            openBotInApp(target.id, selectedAppId);
+          } else {
+            dispatch({ type: "select", id: target.id });
+          }
         }
       } else if (e.shiftKey && (e.key === "[" || e.key === "]")) {
         const idx = bots.findIndex((b) => b.id === state.selectedId);
         const next = bots[(idx + (e.key === "]" ? 1 : -1) + bots.length) % bots.length];
         if (next) {
           e.preventDefault();
-          dispatch({ type: "select", id: next.id });
+          if (selectedAppId && appKeyboardRouting) {
+            openBotInApp(next.id, selectedAppId);
+          } else {
+            dispatch({ type: "select", id: next.id });
+          }
         }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [state.bots, state.selectedId, dispatch]);
+  }, [state.bots, state.selectedId, selectedAppId, appKeyboardRouting, dispatch, openBotInApp]);
 
   useEffect(() => {
     window.ogb?.setUnreadCount?.(unreadCount);
@@ -306,20 +358,13 @@ function Shell() {
   // `select` only changes client state.  Messages, reactions, recordings, and
   // loadEarlier follow `bot.threadId`, so a pin onto another thread would
   // render a transcript the store never loaded.
-  const openBotInApp = (botId: string, appId: string) => {
-    const b = state.bots.find((x) => x.id === botId);
-    const explicitTask = (b?.tasks ?? []).find((t) => t.workspaceContext?.appRef.id === appId);
-    const threadId = explicitTask?.threadId ?? b?.threadId;
-    dispatch({ type: "select", id: botId, viewedThreadId: threadId });
-    if (threadId && threadId !== b?.threadId) {
-      dispatch({ type: "switchTask", botId, threadId });
-    }
-  };
 
   return (
     <div className="flex h-full flex-col">
       {/* fixed-position popup, bottom-left — outside the layout flow */}
       <UpdateBanner />
+      {/* saved data that could not be used (set aside, never deleted); silent when there is none */}
+      <DataFaultBanner />
       {state.error && (
         <div
           role="alert"
@@ -393,6 +438,7 @@ function Shell() {
             activeBotId={bot?.id}
             onSelectBot={(botId) => {
               setMatrixOverviewActive(false);
+              setSelectedAppId(null);
               dispatch({ type: "select", id: botId });
             }}
             onSelectBotInApp={(botId, appId) => {
@@ -418,6 +464,7 @@ function Shell() {
                 }}
                 onSelectBot={(botId) => {
                   setMatrixOverviewActive(false);
+                  setSelectedAppId(null);
                   dispatch({ type: "select", id: botId });
                 }}
                 onSelectBotInApp={(botId, appId) => {
@@ -426,6 +473,7 @@ function Shell() {
                   setSelectedAppId(appId);
                   openBotInApp(botId, appId);
                 }}
+                filterAppId={selectedAppId}
                 onOpenAppRoom={(appId) => {
                   setMatrixOverviewActive(false);
                   setSelectedAppId(appId);
@@ -531,6 +579,11 @@ function Shell() {
       {state.pluginsOpen && (
         <Suspense fallback={<PanelFallback />}>
           <PluginsPanel />
+        </Suspense>
+      )}
+      {state.pluginsManagerOpen && (
+        <Suspense fallback={<PanelFallback />}>
+          <PluginsManagerView onClose={() => dispatch({ type: "togglePluginsManager", open: false })} />
         </Suspense>
       )}
       {/* mounted after the modals: same z-50 tier, so DOM order keeps the

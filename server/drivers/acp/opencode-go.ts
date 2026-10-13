@@ -10,16 +10,51 @@ import { createAcpDriver, type AcpSupport } from "./core.ts";
 import type { ModelCatalog, ProviderErrorCode } from "../../contracts.ts";
 import { execCli } from "../../procs.ts";
 
+/** Fallback catalog for a bot that has no saved model yet.
+ *
+ *  The id here used to be a hardcoded `opencode/x-preview-f-free`, and that
+ *  model is gone:  OpenCode answers `Model exo-free has been deprecated` for
+ *  it, so a new bot inherited a default that failed every turn.  Worse, the
+ *  CLI's own default was the equally-dead `exo-free`, so an unset model hit
+ *  the same wall from the other side.
+ *
+ *  A hardcoded id cannot be right for long — the free catalog rotates.  So the
+ *  fallback is deliberately the *first model the installed CLI lists*, resolved
+ *  per instance, with this entry only used when the probe yields nothing (a
+ *  CLI too old to answer, or one mid-upgrade).  `resolveModels` merges the
+ *  live catalog over this, and `resolveTurnModel` follows the bot's saved id
+ *  when it has one. */
 const STATIC_MODELS: ModelCatalog = {
-  default: "opencode/x-preview-f-free",
-  options: [
-    {
-      id: "opencode/x-preview-f-free",
-      label: "Zen · Ox Alpha Free",
-      contextWindow: 1_000_000,
-    },
-  ],
+  // Left empty on purpose: an empty `options` list cannot present a
+  // deprecated id to a user as if it were a choice.  A bot with no saved
+  // model and no live catalog surfaces as "no models available" rather than
+  // as one broken entry.
+  default: "",
+  options: [],
 };
+
+/** The first model the installed CLI will actually run, or null.
+ *
+ *  Read from the CLI's own `models` output — the same source of truth
+ *  `canListOpenCodeModels` trusts — so the default is whatever the user's
+ *  installed version currently serves rather than a string this file froze
+ *  when it was written. */
+async function firstLiveModel(
+  cli: string,
+  env: Record<string, string | undefined>,
+): Promise<string | null> {
+  try {
+    const stdout = await runOpenCodeModels(cli, env, false);
+    for (const line of stdout.split(/\r?\n/u)) {
+      const candidate = line.trim();
+      if (validModelSlug(candidate)) return candidate;
+    }
+  } catch {
+    // An unreadable catalog is not an error here: the caller falls back to
+    // reporting no models rather than inventing one.
+  }
+  return null;
+}
 
 let lastSuccessfulCatalog: ModelCatalog | null = null;
 const MODEL_PROBE_TTL_MS = 30_000;
@@ -125,8 +160,16 @@ export function parseOpenCodeModelsOutput(stdout: string): ModelCatalog | null {
   flush();
 
   if (!options.length) return null;
-  const preferred = options.find((option) => option.id === STATIC_MODELS.default);
-  return { default: (preferred ?? options[0]!).id, options };
+  // Prefer a first-party Zen model when the CLI offers one, because Zen is the
+  // route that works with no stored credential at all — a new bot should land
+  // on a model it can actually run rather than on whatever happens to be
+  // listed first (a third-party provider's model, for instance, which needs a
+  // key the user may never have configured).  Falls back to the first live
+  // entry, which is always a model this CLI just listed.
+  const preferred = options.find((option) => option.id.startsWith("opencode/"))
+    ?? options.find((option) => option.id.startsWith("opencode-go/"))
+    ?? options[0]!;
+  return { default: preferred.id, options };
 }
 
 function runOpenCodeModels(
@@ -150,6 +193,53 @@ function runOpenCodeModels(
   });
 }
 
+/** Why the last catalog probe came back empty, in words the engine row can
+ *  show.  `null` once a probe has succeeded. */
+let lastProbeProblem: string | null = null;
+
+export function openCodeModelProbeProblem(): string | null {
+  return lastProbeProblem;
+}
+
+/** Ask the CLI for its catalog, without assuming a flag it still has.
+ *
+ *  `--verbose` is what turns a bare id list into `provider/model` header lines
+ *  with metadata, so the parser wants it — but it is not part of that command's
+ *  contract.  opencode v2.0.26 answers `Unrecognized flag: --verbose` and exits,
+ *  and that rejection used to fall through to the empty fallback catalog with
+ *  nothing to say why.  A CLI that refuses the flag still answers the plain
+ *  command, so ask plainly first and add the flag only if the plain answer was
+ *  useless. */
+async function probeOpenCodeModels(
+  cli: string,
+  environment: Record<string, string | undefined>,
+): Promise<string> {
+  let plainProblem: string | null = null;
+  const plain = await runOpenCodeModels(cli, environment, false).catch((error: Error) => {
+    plainProblem = error?.message ?? String(error);
+    return "";
+  });
+  if (plain.trim()) return plain;
+  let verboseProblem: string | null = null;
+  const verbose = await runOpenCodeModels(cli, environment, true).catch((error: Error) => {
+    verboseProblem = error?.message ?? String(error);
+    return "";
+  });
+  if (verbose.trim()) return verbose;
+
+  // Neither shape produced a list, and the two failures mean different things.
+  // A plain command that ERRORED means the CLI itself is unusable, so its
+  // message is the answer.  A plain command that RAN and printed nothing means
+  // the CLI answered correctly and simply has nothing to list — and the verbose
+  // failure beside it is only ever about the flag, so it is reported as context
+  // rather than as the cause.  Collapsing both into one fallback string loses
+  // the difference between "your CLI is broken" and "your CLI has no models",
+  // which are the two things a person here is trying to tell apart.
+  if (plainProblem) throw new Error(plainProblem);
+  if (verboseProblem) throw new Error(`opencode models listed nothing (${verboseProblem})`);
+  throw new Error("opencode models answered nothing");
+}
+
 /** Ask the same OpenCode binary that will run ACP for its effective catalog.
  * This automatically includes Zen, Go, other connected providers, custom
  * config, and anonymous free models with the exact IDs the session accepts. */
@@ -158,17 +248,23 @@ export async function discoverOpenCodeModels(
   cli = "opencode",
 ): Promise<ModelCatalog> {
   try {
-    const catalog = parseOpenCodeModelsOutput(await runOpenCodeModels(cli, environment, true));
+    const catalog = parseOpenCodeModelsOutput(await probeOpenCodeModels(cli, environment));
     if (!catalog) throw new Error("OpenCode returned no usable models");
     lastSuccessfulCatalog = catalog;
+    lastProbeProblem = null;
     return catalog;
-  } catch {
+  } catch (error) {
+    // An engine with no models and no reason reads as broken.  It is not: the
+    // CLI answered and had nothing to list, and the person needs the sentence
+    // that says which of the two it was.
+    lastProbeProblem = error instanceof Error ? error.message : String(error);
     return lastSuccessfulCatalog ?? STATIC_MODELS;
   }
 }
 
 export function resetOpenCodeModelCache() {
   lastSuccessfulCatalog = null;
+  lastProbeProblem = null;
   modelProbeCache.clear();
 }
 
@@ -378,10 +474,25 @@ const support = (loadCatalog: OpenCodeCatalogLoader): AcpSupport => ({
   ),
   requireAuthenticationBeforeSpawn: true,
   classifyError: classifyOpenCodeError,
-  resolveModels: async (environment, config) => mergeLocalInject(
-    await loadCatalog(environment, config.cli),
-    environment,
-  ),
+  resolveModels: async (environment, config) => {
+    const catalog = await loadCatalog(environment, config.cli);
+    // Prefer the catalog's own default; if it is empty or points at a model the
+    // CLI no longer serves, fall back to whatever the CLI lists first.  This is
+    // what keeps a bot from being handed a deprecated id it cannot run.
+    const live = catalog.options.length > 0 ? catalog : null;
+    const fallback = live ? null : await firstLiveModel(config.cli, environment);
+    const merged = await mergeLocalInject(
+      live ?? {
+        default: fallback ?? "",
+        options: fallback ? [{ id: fallback, label: providerLabel(fallback.split("/")[0]!) }] : [],
+      },
+      environment,
+    );
+    if (merged.options.length > 0 && !merged.default) {
+      merged.default = merged.options[0]!.id;
+    }
+    return merged;
+  },
   buildPromptText: (turn) => turn.system ? `${turn.system}\n\n${turn.text}` : turn.text,
 });
 

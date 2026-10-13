@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  annotatePromptBudget,
+  captureTurnPrompt,
   classifyMessage,
   configureTurnIdentity,
+  formatGenAiMessages,
   genAiProvider,
+  isPromptCaptureEnabled,
   observeRuntimeEvent,
   recordExecutedTools,
   resetSentryAiForTests,
@@ -15,6 +19,11 @@ import {
 } from "./sentry-ai.ts";
 import { describeResult } from "../shared/tool-activity.ts";
 import type { RuntimeEvent } from "./contracts.ts";
+import {
+  resetSentryFleetForTests,
+  setFleetSinkForTests,
+  type FleetCapture,
+} from "./sentry-fleet.ts";
 
 function base(over: Partial<RuntimeEvent> & Pick<RuntimeEvent, "type">): RuntimeEvent {
   const event = {
@@ -64,6 +73,7 @@ function recordingSink() {
         attributes: { ...opts.attributes },
         ended: false,
         status: emptyStatus,
+        // SAFETY: recording sink stub — root spans have no parent handle in tests.
         handle: undefined as SpanLike | undefined,
         parent: opts.parentSpan,
       };
@@ -96,6 +106,7 @@ function recordingSink() {
 
 afterEach(() => {
   resetSentryAiForTests();
+  resetSentryFleetForTests();
 });
 
 describe("Sentry AI observability", () => {
@@ -118,6 +129,7 @@ describe("Sentry AI observability", () => {
       estimated.sink,
     );
     expect(estimated.spans[0].attributes["gen_ai.usage.cost"]).toBeUndefined();
+    expect(estimated.spans[0].attributes["botfleet.cost.estimated_usd"]).toBe(0.0421);
 
     resetSentryAiForTests();
     const invalid = recordingSink();
@@ -159,6 +171,27 @@ describe("Sentry AI observability", () => {
     expect(spans[0].attributes["gen_ai.agent.name"]).toBe("Scout");
   });
 
+  it("attaches prompt bytes before and after, and the trimmed flag, to the invoke_agent span", () => {
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    annotatePromptBudget("thread-1", "turn-1", {
+      before: { stable: 4000, volatile: 9000 },
+      after: { stable: 4000, volatile: 120 },
+      trimmed: true,
+    });
+    expect(spans[0].op).toBe("gen_ai.invoke_agent");
+    expect(spans[0].attributes["botfleet.prompt.stable_bytes_before"]).toBe(4000);
+    expect(spans[0].attributes["botfleet.prompt.volatile_bytes_before"]).toBe(9000);
+    expect(spans[0].attributes["botfleet.prompt.stable_bytes_after"]).toBe(4000);
+    expect(spans[0].attributes["botfleet.prompt.volatile_bytes_after"]).toBe(120);
+    expect(spans[0].attributes["botfleet.prompt.trimmed"]).toBe(true);
+    expect(() => annotatePromptBudget("missing", "turn", {
+      before: { stable: 1, volatile: 1 },
+      after: { stable: 1, volatile: 1 },
+      trimmed: false,
+    })).not.toThrow();
+  });
+
   it("opens an invoke_agent span, tags the conversation, model, tokens, and tools", () => {
     const { sink, spans, conversations } = recordingSink();
     observeRuntimeEvent(base({ type: "turn.started" }), sink);
@@ -184,6 +217,9 @@ describe("Sentry AI observability", () => {
     expect(spans[0].attributes["gen_ai.usage.input_tokens"]).toBe(11);
     expect(spans[0].attributes["gen_ai.usage.output_tokens"]).toBe(7);
     expect(spans[1].attributes["gen_ai.tool.name"]).toBe("bash");
+    expect(spans[1].attributes["gen_ai.system"]).toBe("openai-compat");
+    expect(spans[1].attributes["gen_ai.provider.name"]).toBe("openai-compat");
+    expect(spans[1].attributes["gen_ai.request.model"]).toBe("gpt-test");
     expect(spans.every((s) => s.ended)).toBe(true);
   });
 
@@ -963,7 +999,16 @@ describe("Sentry provider vocabulary", () => {
     expect(genAiProvider("kimiAgent")).toBe("moonshot");
     expect(genAiProvider("cursorAgent")).toBe("cursor");
     expect(genAiProvider("minimax")).toBe("minimax");
+    expect(genAiProvider("minimaxAgent")).toBe("minimax");
+    expect(genAiProvider("mcode")).toBe("minimax");
+    expect(genAiProvider("mcodeAgent")).toBe("minimax");
     expect(genAiProvider("boxAgent")).toBe("box");
+  });
+
+  it("corrects a multi-provider engine from the model id", () => {
+    expect(genAiProvider("dshAgent", "MiniMax-M3.1-Flash-Preview")).toBe("minimax");
+    expect(genAiProvider("dshAgent", "DeepSeek-V4.1-Flash")).toBe("deepseek");
+    expect(genAiProvider("dshAgent")).toBe("deepseek");
   });
 
   it("keeps an engine Sentry has no name for as its own kind", () => {
@@ -1240,5 +1285,189 @@ describe("runtime error text is redacted before it reaches the sink", () => {
     const [error] = exceptions as Error[];
     expect(error.message).not.toContain(SYNTHETIC_KEY);
     expect(error.message).toMatch(/«redacted \d+ chars»/);
+  });
+});
+
+describe("catalog cost fallback", () => {
+  it("stamps gen_ai.usage.cost from the MiniMax catalog when the agent reported none", () => {
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash-Preview" }));
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "mcodeAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "session.started",
+        provider: "mcodeAgent",
+        sessionId: "s",
+        model: "MiniMax-M3.1-Flash-Preview",
+      }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "turn.completed",
+        provider: "mcodeAgent",
+        ok: true,
+        usage: { input: 100_000, output: 50_000 },
+        cost: null,
+      }),
+      sink,
+    );
+    expect(spans[0].attributes["gen_ai.usage.cost"]).toBeCloseTo(
+      (100_000 * 0.3 + 50_000 * 1.2) / 1_000_000,
+      10,
+    );
+    expect(spans[0].attributes["botfleet.cost.source"]).toBe("catalog");
+    expect(spans[0].attributes["gen_ai.provider.name"]).toBe("minimax");
+    expect(spans[0].attributes["gen_ai.system"]).toBe("minimax");
+  });
+
+  it("mirrors a completed catalog-priced turn to the fleet sink", () => {
+    const captured: FleetCapture[] = [];
+    setFleetSinkForTests({ capture: (event) => captured.push(event) });
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash-Preview", botName: "Coder" }));
+    const { sink } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "mcodeAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "item.started",
+        itemType: "tool",
+        itemId: "t1",
+        title: "bash",
+      }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "turn.completed",
+        provider: "mcodeAgent",
+        ok: true,
+        usage: { input: 100_000, output: 50_000 },
+        cost: null,
+      }),
+      sink,
+    );
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.tags.platform).toBe("botfleet");
+    expect(captured[0]?.tags["gen_ai.system"]).toBe("minimax");
+    expect(captured[0]?.extra["botfleet.tool.names"]).toBe("bash");
+    expect(captured[0]?.extra["gen_ai.usage.cost"]).toBeCloseTo(
+      (100_000 * 0.3 + 50_000 * 1.2) / 1_000_000,
+      10,
+    );
+  });
+
+  it("puts a catalog-priced estimated cost on gen_ai.usage.cost as well", () => {
+    configureTurnIdentity(() => ({ model: "DeepSeek-V4.1-Flash" }));
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "dshAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "session.started",
+        provider: "dshAgent",
+        sessionId: "s",
+        model: "DeepSeek-V4.1-Flash",
+      }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({
+        type: "turn.completed",
+        provider: "dshAgent",
+        ok: true,
+        usage: { input: 1_000_000, output: 0 },
+        cost: 0.3,
+        billingMode: "estimated",
+      }),
+      sink,
+    );
+    expect(spans[0].attributes["gen_ai.usage.cost"]).toBe(0.3);
+    expect(spans[0].attributes["botfleet.cost.estimated_usd"]).toBe(0.3);
+    expect(spans[0].attributes["botfleet.cost.source"]).toBe("catalog");
+    expect(spans[0].attributes["gen_ai.provider.name"]).toBe("deepseek");
+  });
+
+  it("still skips estimated Claude dollars on gen_ai.usage.cost", () => {
+    configureTurnIdentity(() => ({ model: "claude-sonnet-4-5" }));
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "claudeAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "turn.completed",
+        provider: "claudeAgent",
+        ok: true,
+        usage: { input: 2, output: 1 },
+        cost: 0.0421,
+        billingMode: "estimated",
+      }),
+      sink,
+    );
+    expect(spans[0].attributes["gen_ai.usage.cost"]).toBeUndefined();
+    expect(spans[0].attributes["botfleet.cost.estimated_usd"]).toBe(0.0421);
+  });
+});
+
+describe("opt-in prompt capture", () => {
+  const previous = process.env.SENTRY_AI_PROMPT_CAPTURE;
+
+  const restore = () => {
+    if (previous === undefined) delete process.env.SENTRY_AI_PROMPT_CAPTURE;
+    else process.env.SENTRY_AI_PROMPT_CAPTURE = previous;
+  };
+
+  afterEach(restore);
+
+  it("is off by default so exclusion tests keep their contract", () => {
+    delete process.env.SENTRY_AI_PROMPT_CAPTURE;
+    expect(isPromptCaptureEnabled()).toBe(false);
+    expect(formatGenAiMessages([{ role: "user", content: "secret task" }])).toContain("secret task");
+  });
+
+  it("stamps redacted input and output on the turn when the flag is on", () => {
+    process.env.SENTRY_AI_PROMPT_CAPTURE = "1";
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    captureTurnPrompt("thread-1", "turn-1", "User asked about sk-live-not-a-real-key-aaaaaaaa");
+    observeRuntimeEvent(
+      base({ type: "content.delta", streamKind: "assistant_text", delta: "Here is the " }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({ type: "content.delta", streamKind: "assistant_text", delta: "answer." }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true }), sink);
+    expect(spans[0].attributes["gen_ai.input.messages"]).toMatch(/User asked about/);
+    expect(spans[0].attributes["gen_ai.input.messages"]).not.toContain("sk-live-not-a-real-key-aaaaaaaa");
+    expect(spans[0].attributes["gen_ai.output.messages"]).toBe("Here is the answer.");
+  });
+
+  it("stamps chat-span messages only when the flag is on", async () => {
+    delete process.env.SENTRY_AI_PROMPT_CAPTURE;
+    const off = recordingSink();
+    await withChatSpan(
+      { model: "MiniMax-M3", conversationId: "thread-9", provider: "minimax", input: "do the thing" },
+      async () => ({ text: "done", usage: { input: 1, output: 1 } }),
+      off.sink,
+    );
+    expect(off.spans[0].attributes["gen_ai.input.messages"]).toBeUndefined();
+    expect(off.spans[0].attributes["gen_ai.output.messages"]).toBeUndefined();
+
+    process.env.SENTRY_AI_PROMPT_CAPTURE = "yes";
+    const on = recordingSink();
+    await withChatSpan(
+      { model: "MiniMax-M3", conversationId: "thread-9", provider: "minimax", input: "do the thing" },
+      async () => ({ text: "done", usage: { input: 1, output: 1 } }),
+      on.sink,
+    );
+    expect(on.spans[0].attributes["gen_ai.input.messages"]).toBe("do the thing");
+    expect(on.spans[0].attributes["gen_ai.output.messages"]).toBe("done");
+  });
+
+  it("stamps system and model on recordExecutedTools when identity has a model", () => {
+    configureTurnIdentity(() => ({ model: "MiniMax-M3.1-Flash-Preview" }));
+    const { sink, spans } = recordingSink();
+    recordExecutedTools("thread-1", ["read_file"], sink, "turn-1");
+    expect(spans[0].attributes["gen_ai.request.model"]).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(spans[0].attributes["gen_ai.system"]).toBe("minimax");
   });
 });

@@ -4,14 +4,15 @@ import { acceptComposerTranscript } from "@/lib/composer-dictation";
 import { pickSTTProvider } from "@/lib/transcription-provider";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { currentCall, useOnCall } from "@/lib/call";
-import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
+import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, Zap, Hash, AppWindow, MessageSquare, Pencil, Trash2 } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
 import { foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
+import { BotOffComposer } from "./BotOffComposer";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import {
@@ -31,6 +32,7 @@ import { PendingApprovalActions, PendingApprovalPanel, pendingApprovals } from "
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { ReplyQuote } from "./ReplyQuote";
 import { instanceSupportsLocalComputer } from "@/lib/local-computer";
+import { queuedChipLabel, useUpdateDrain } from "@/lib/update-control";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { resolveRoomLabels } from "../../shared/terminology";
 import { readCachedInventory } from "@/lib/connected-apps-cache";
@@ -136,8 +138,34 @@ function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto
   );
 }
 
-/** Renders the editable message composer and its pending attachments. */
-export function Composer({
+/** Renders the editable message composer and its pending attachments.
+ *
+ *  A 1:1 bot that is switched Off (shared/bot-power.ts) gets the disabled
+ *  state instead: the harness refuses every new turn for it, so offering an
+ *  input would only collect a message that can never send.  The chat above
+ *  stays as it was, and the draft survives (it is keyed by bot, not by this
+ *  component).  Rooms keep their composer: a message there still lands in the
+ *  transcript, and an Off member is skipped with a notice. */
+export function Composer(props: ComponentProps<typeof ComposerInner>) {
+  const { state: store, dispatch: send } = useStore();
+  const bot = props.bot;
+  if (bot && !props.group && bot.off === true) {
+    // Read the live record, not the prop, so a Turn On from another window
+    // swaps the real composer back in without a remount of the whole chat.
+    const live = store.bots.find((candidate) => candidate.id === bot.id) ?? bot;
+    if (live.off === true) {
+      return (
+        <BotOffComposer
+          botName={live.name}
+          onTurnOn={() => send({ type: "updateBot", botId: live.id, patch: { off: false } })}
+        />
+      );
+    }
+  }
+  return <ComposerInner {...props} />;
+}
+
+function ComposerInner({
   bot,
   group,
   members,
@@ -300,9 +328,102 @@ export function Composer({
   // queue), but stay off the transcript until drain — the chip here is the
   // pending row so they cannot become the active leaf mid-turn.
   const [queued, setQueued] = useState<{ text: string; replyToId?: string; sent: SentDraft<Message> } | null>(null);
-  const pendingChip = group
-    ? queued?.text
-    : (bot ? state.pendingQueued?.[bot.threadId]?.at(-1)?.text : undefined);
+  const pendingItems = useMemo(() => {
+    if (group) {
+      // The room's held message is one client-side entry, so the pill's entry
+      // is built here rather than read from pendingQueued.  It carries the
+      // same shape the bot branch gets, attachments included, so handleEditQueued
+      // has one contract instead of two.
+      return queued
+        ? [{
+            queueId: "group-queued",
+            text: queued.text,
+            at: Date.now(),
+            reply: queued.sent.reply,
+            attachments: queued.sent.attachments,
+          }]
+        : [];
+    }
+    if (!bot) return [];
+    return state.pendingQueued?.[bot.threadId] ?? [];
+  }, [group, queued, bot, state.pendingQueued]);
+
+  /** Focus the composer and put the caret at the end of whatever it now holds.
+ * Not entry.text: on a restore the box is the merged draft, which can be a
+ * different length from the composed text the pill was showing. */
+const focusCaretToEnd = useCallback(() => {
+  requestAnimationFrame(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    input.focus();
+    const end = input.value.length;
+    input.setSelectionRange(end, end);
+  });
+}, []);
+
+const handleEditQueued = useCallback((entry: { queueId: string; text: string; rawText?: string; reply?: Message; attachments: Attachment[] }) => {
+    if (group && queued) {
+      // The held message carries more than its text: the draft it took, which
+      // is where the attachment chips live, and the reply it was aimed at.
+      // Putting only entry.text back would leave the attachments stranded on
+      // a queued item that no longer exists and drop the reply target, so the
+      // restore path is the one a refused send already uses.
+      const { sent } = queued;
+      setQueued(null);
+      restoreFailedSend(sent);
+      return;
+    }
+    if (bot) {
+      // The bot's queued entry carries reply (the Message, not just the id)
+      // and the attachments, because the server only sees replyToId: putting
+      // only entry.text back would drop the reply quote and the attachment
+      // chips on the floor.  Restore through the same path a refused send
+      // uses so the quote and the chips come back with the text.
+      const sent: SentDraft<Message> = {
+        draftId,
+        threadId,
+        text: entry.rawText ?? entry.text,
+        attachments: entry.attachments,
+        reply: entry.reply,
+      };
+      dispatch({
+        type: "cancelQueued",
+        botId: bot.id,
+        queueId: entry.queueId,
+        // Restore only once the harness has taken the queued message, and
+        // only when it did: a fast resend while the DELETE is in flight sends
+        // the original and the copy together, and restoring on failure leaves
+        // the draft sitting beside a message that is still going to be sent.
+        // A refusal keeps the pill and the error, and the person can edit
+        // again.  The caret moves with the restore, because on this path the
+        // box is still empty until the DELETE answers.
+        onSettled: () => {
+          restoreFailedSend(sent);
+          focusCaretToEnd();
+        },
+      });
+      return;
+    }
+  }, [group, bot, queued, draftId, threadId, dispatch, restoreFailedSend, focusCaretToEnd]);
+
+  const handleCancelQueued = useCallback((queueId: string) => {
+    if (group) {
+      setQueued(null);
+    } else if (bot) {
+      dispatch({ type: "cancelQueued", botId: bot.id, queueId });
+    }
+  }, [group, bot, dispatch]);
+
+  const handleSteerQueued = useCallback(() => {
+    if (group) {
+      dispatch({ type: "interruptGroup", groupId: group.id });
+    } else if (bot) {
+      dispatch({ type: "interrupt", botId: bot.id });
+    }
+  }, [group, bot, dispatch]);
+  // While an update holds new work, a queued send waits for the restart and
+  // not for the bot, which may be idle.  The chip says so.
+  const updateHolding = useUpdateDrain() !== null;
   // a chip on its own is a message: the send control has to appear for it
   const fileInput = useRef<HTMLInputElement>(null);
   const [autoWarn, setAutoWarn] = useState(false);
@@ -378,7 +499,17 @@ export function Composer({
       dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, onError });
+      dispatch({
+        type: "send",
+        botId: bot.id,
+        text: t,
+        // Composer text before compose.  Queued edit restores this, not the wire prompt.
+        rawText: text,
+        replyToId: replyTo?.id,
+        reply: replyTo ?? undefined,
+        attachments,
+        onError,
+      });
       if (busy && opts?.steerNow) {
         dispatch({ type: "interrupt", botId: bot.id });
       }
@@ -607,44 +738,51 @@ export function Composer({
           {speechError}
         </div>
       )}
-        {pendingChip && (
-          <div className="mb-2 flex items-center gap-2 rounded-lg border border-hairline/40 bg-panel px-3 py-2 text-[12.5px] text-ink-secondary">
-            <Clock size={13} className="shrink-0" />
-            <span className="min-w-0 flex-1 truncate" title={`Queued — sends when ${busyName} finishes: “${pendingChip}”`}>
-              Queued — sends when {busyName} finishes: “{pendingChip}”
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                if (group) {
-                  dispatch({ type: "interruptGroup", groupId: group.id });
-                } else if (bot) {
-                  dispatch({ type: "interrupt", botId: bot.id });
-                }
-              }}
-              className="rounded px-2 py-0.5 text-[11.5px] font-medium text-accent hover:bg-raised hover:underline"
-              title="Interrupt current turn and send queued messages immediately"
-            >
-              Steer Now
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                if (group) {
-                  setQueued(null);
-                  return;
-                }
-                if (!bot) return;
-                for (const entry of state.pendingQueued?.[bot.threadId] ?? []) {
-                  dispatch({ type: "cancelQueued", botId: bot.id, queueId: entry.queueId });
-                }
-              }}
-              aria-label="Cancel Queued Message"
-              title="Cancel Queued Message"
-              className="flex size-5 shrink-0 items-center justify-center rounded text-ink-secondary hover:bg-raised hover:text-ink"
-            >
-              <X size={13} strokeWidth={2.5} />
-            </button>
+        {pendingItems.length > 0 && (
+          <div className="mb-2 flex flex-col gap-1.5 max-h-36 overflow-y-auto pr-0.5">
+            {pendingItems.map((entry) => (
+              <div
+                key={entry.queueId}
+                className="flex items-center gap-2 rounded-xl border border-hairline/40 bg-panel px-3 py-1.5 text-[12.5px] text-ink shadow-xs transition-colors hover:border-hairline"
+              >
+                <MessageSquare size={13} className="shrink-0 text-ink-secondary" aria-hidden="true" />
+                <span
+                  className="min-w-0 flex-1 truncate font-normal"
+                  title={queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
+                >
+                  {queuedChipLabel({ text: entry.text, busyName, draining: updateHolding })}
+                </span>
+                <div className="flex shrink-0 items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => handleEditQueued(entry)}
+                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink transition-colors"
+                    title="Puts the message back in the composer to edit."
+                    aria-label="Edit Queued Message"
+                  >
+                    <Pencil size={12} strokeWidth={2} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleCancelQueued(entry.queueId)}
+                    className="flex size-6 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-danger transition-colors"
+                    title="Cancel Queued Message"
+                    aria-label="Cancel Queued Message"
+                  >
+                    <Trash2 size={12} strokeWidth={2} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSteerQueued}
+                    className="flex size-6 items-center justify-center rounded-md text-accent hover:bg-accent/15 transition-colors"
+                    title="Stops the current turn and sends this now."
+                    aria-label="Steer Now"
+                  >
+                    <ArrowUp size={13} strokeWidth={2.5} />
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
         {pickerOpen && (
@@ -716,11 +854,17 @@ export function Composer({
             can type again, so a waiting bot is impossible to miss. */}
         {approval && (
           <div className="mb-2 overflow-hidden rounded-2xl border border-accent/40 bg-card">
-            <PendingApprovalPanel pending={approval} count={approvals.length} index={0} />
+            <PendingApprovalPanel
+              pending={approval}
+              count={approvals.length}
+              index={0}
+              bypassActive={Boolean(approvalBot?.bypassPermissions)}
+            />
             <PendingApprovalActions
               pending={approval}
               threadId={threadId}
               bot={approvalBot}
+              totalCount={approvals.length}
               onCancelTurn={() => {
                 if (group) dispatch({ type: "interruptGroup", groupId: group.id });
                 else if (bot) dispatch({ type: "interrupt", botId: bot.id });
@@ -832,6 +976,12 @@ export function Composer({
               onEditLast();
               return;
             }
+            // When queued messages exist and input is empty, Cmd/Ctrl+Enter steers all queued messages
+            if (pendingItems.length > 0 && !hasContent && (e.metaKey || e.ctrlKey) && e.key === "Enter") {
+              e.preventDefault();
+              handleSteerQueued();
+              return;
+            }
             // Shift+Enter inserts a newline; plain Enter sends; Alt/Cmd+Enter steers immediately when busy
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
@@ -851,6 +1001,8 @@ export function Composer({
               ? "Answer the approval above to continue"
               : recording
               ? "Listening…"
+              : pendingItems.length > 0
+              ? "Cmd/Ctrl+Enter steers all queued messages"
               : busy && canSteer
                 ? `${busyName} is working — Enter sends this into the running turn`
               : busy

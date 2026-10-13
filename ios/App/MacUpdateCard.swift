@@ -36,14 +36,41 @@ struct MacUpdateSection: View {
     /// running" would otherwise sit there, stale, long after that run
     /// finished.
     @State private var installErrorStatus: MacUpdateStatus?
+    /// The value the automatic-checks switch shows while its save is in
+    /// flight.  Without it the switch would snap back to the stored value
+    /// until the reply lands; nil means "show what the Mac has".
+    @State private var autoUpdatePending: Bool?
+    @State private var autoUpdateSaving = false
+    /// Why the last save of the automatic-checks switch did not stick.
+    @State private var autoUpdateError: String?
+    /// The paired Mac answered that it has no route for the switch.
+    @State private var autoUpdateNeedsMacUpdate = false
 
     private var status: MacUpdateStatus? { session.state.macUpdateStatus }
+
+    /// The stored preference.  Nil until the config has loaded, and on a Mac
+    /// that predates automatic checks, where it is unknown rather than off.
+    private var storedAutoUpdate: Bool? { session.config?.autoUpdate?.enabled }
+
+    /// The config loaded and has no `autoUpdate`, so this Mac cannot be asked.
+    private var autoUpdateUnsupported: Bool {
+        autoUpdateNeedsMacUpdate || (session.config != nil && storedAutoUpdate == nil)
+    }
 
     var body: some View {
         Section {
             if let status {
                 installedRow(status)
                 availabilityRow(status)
+                // The Mac is holding new work while bots finish: say what
+                // happens to a message sent now, and when the restart begins.
+                // Separate from the run row because a hold is also real when
+                // the update was started from the Mac's own terminal.
+                // Judged again against the timeline's clock inside `holdRow`;
+                // this check only keeps an already-expired hold from adding a row.
+                if let drain = status.drain, drain.isActive(at: Date()) {
+                    holdRow(drain, updating: status.running == nil)
+                }
                 if let lastRun = status.lastRun, status.running == nil {
                     lastRunRow(lastRun)
                 }
@@ -63,6 +90,9 @@ struct MacUpdateSection: View {
                     ProgressView().controlSize(.small)
                 }
             }
+            // The preference lives in the Mac's config, not in the update
+            // status, so it stays here even when that status could not load.
+            autoUpdateRow
         } header: {
             Text("Mac Update")
         } footer: {
@@ -118,6 +148,38 @@ struct MacUpdateSection: View {
                 .foregroundStyle(.secondary)
             Button("Retry") {
                 Task { await loadStatus() }
+            }
+        }
+    }
+
+    /// Enable Automatic Update Checks, as on the desktop's Updates card.  It
+    /// shows the stored value, never a guess: disabled until the config has
+    /// loaded, and on a Mac that cannot be asked.
+    private var autoUpdateRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: Binding(
+                get: { autoUpdatePending ?? storedAutoUpdate ?? false },
+                set: { enabled in
+                    Task { await saveAutoUpdate(enabled) }
+                }
+            )) {
+                Text("Enable Automatic Update Checks")
+            }
+            .disabled(autoUpdateSaving || storedAutoUpdate == nil || autoUpdateNeedsMacUpdate)
+
+            if autoUpdateUnsupported {
+                Text("Update BotFleet on your Mac to change this from your phone.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Auto-checks at most once per 6 hours.\u{00A0} You can still check any time.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let autoUpdateError {
+                    Text("Automatic update preference was not saved.\u{00A0} \(autoUpdateError)")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
         }
     }
@@ -205,11 +267,16 @@ struct MacUpdateSection: View {
                 Spacer()
                 ProgressView().controlSize(.small)
             }
-            Text(running.step)
+            // The wait's own words when the step is waiting on something
+            // ("Waiting for 3 bots to finish"), else the step.
+            Text(running.headline)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .padding(.leading, 40)
-            if let progress = running.progress {
+            // No bar while a step waits: `progress` is the run's own step
+            // count and does not move then, so a bar would sit still and read
+            // as stuck.  The spinner above already says it is working.
+            if running.showsPercent, let progress = running.progress {
                 ProgressView(value: min(max(progress, 0), 1))
                     .padding(.leading, 40)
             }
@@ -219,6 +286,33 @@ struct MacUpdateSection: View {
                     .foregroundStyle(.tertiary)
                     .lineLimit(2)
                     .padding(.leading, 40)
+            }
+        }
+    }
+
+    /// What a message sent now will do, and when the restart begins.  The
+    /// whole row, not just its countdown, is judged against the clock the
+    /// timeline ticks, so a hold whose lease runs out while the card is open
+    /// stops saying "Updating…" at the deadline rather than waiting for the
+    /// next status to arrive.
+    private func holdRow(_ drain: MacUpdateDrain, updating: Bool) -> some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            if drain.isActive(at: context.date) {
+                VStack(alignment: .leading, spacing: 8) {
+                    if updating {
+                        HStack(spacing: 12) {
+                            MacUpdateIcon(symbol: "arrow.triangle.2.circlepath", color: .orange)
+                            Text("Updating…")
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                    Text(drain.summaryText(at: context.date))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 40)
+                }
             }
         }
     }
@@ -340,6 +434,27 @@ struct MacUpdateSection: View {
         installing = false
     }
 
+    /// One save at a time.  The switch shows the new value while it saves
+    /// and falls back to whatever the Mac has once the reply lands, so a
+    /// refusal reverts it on its own.
+    private func saveAutoUpdate(_ enabled: Bool) async {
+        guard !autoUpdateSaving else { return }
+        autoUpdateSaving = true
+        autoUpdatePending = enabled
+        autoUpdateError = nil
+        let outcome = await session.setAutoUpdateEnabled(enabled)
+        switch outcome {
+        case .saved:
+            break
+        case .needsMacUpdate:
+            autoUpdateNeedsMacUpdate = true
+        case let .failed(message):
+            autoUpdateError = message
+        }
+        autoUpdatePending = nil
+        autoUpdateSaving = false
+    }
+
     // MARK: - Formatting
 
     /// Whether `availabilityRow` is itself rendering `checkError`, which is
@@ -416,5 +531,51 @@ private struct MacUpdateIcon: View {
             .frame(width: 28, height: 28)
             .background(color, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
             .accessibilityHidden(true)
+    }
+}
+
+/// The line a chat or a room shows while the paired Mac holds new work for an
+/// update.
+///
+/// A message sent in that window is accepted and kept, and runs after the
+/// restart.  Nothing else on screen changes, so a bot looks stuck and a room
+/// goes quiet.  This says why, and when the restart begins.  Silent when no
+/// update is holding anything, and against a Mac that predates the field.
+///
+/// The hold arrives on the same `update.status` event the Mac Update card
+/// reads (`GET /api/update/status` is the one update route a paired phone may
+/// ask; `GET /api/runtime`, which reports the same hold, stays Mac-only).  A
+/// phone that never opened Settings has no status yet, so the first appearance
+/// asks for it once.
+struct UpdateHoldNotice: View {
+    @EnvironmentObject private var session: Session
+
+    var body: some View {
+        Group {
+            if let drain = session.state.macUpdateStatus?.drain {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    if drain.isActive(at: context.date) {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                            Text(drain.noticeText(at: context.date))
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .accessibilityElement(children: .combine)
+                    }
+                }
+            }
+        }
+        .task {
+            if session.state.macUpdateStatus == nil {
+                await session.loadMacUpdateStatus()
+            }
+        }
     }
 }

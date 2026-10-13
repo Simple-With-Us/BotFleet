@@ -193,6 +193,7 @@ describe("sentence gap outside chat", () => {
     ["components/SettingsModal.tsx", "subtitle={\"Shown in the sidebar.\\u00a0 Saved as you go.\"}"],
     ["components/SettingsModal.tsx", "subtitle={\"Which binary each engine runs.\\u00a0 Saved as you go.\"}"],
     ["components/SettingsPanel.tsx", "placeholder={\"Nothing remembered yet.\\u00a0 The bot"],
+    ["components/SharedVpsRuntimeCard.tsx", "subtitle={\"The shared Linux sandbox running on your VPS, with a separate desktop for each bot.\\u00a0 Bots share"],
     ["components/SkillRecorderPage.tsx", "once.{\"\\u00a0 \"}Let every"],
     ["components/SkillRecorderPage.tsx", "remain.{\"\\u00a0 \"}The narration"],
     ["components/TeamMapPage.tsx", "turn.{\"\\u00a0 \"}Only you"],
@@ -214,4 +215,37 @@ describe("sentence gap outside chat", () => {
       expect(source!.text).toContain(gap);
     });
   }
+});
+
+describe("JSX attribute strings are not JavaScript strings", () => {
+  // A quoted JSX attribute (subtitle="...") is read by the JSX compiler, not
+  // the JavaScript parser, so `\u00a0` inside it is not an escape: it reaches
+  // the screen as the six characters backslash, u, 0, 0, a, 0.  That is how the
+  // Shared VPS card's subtitle printed "bot.\u00a0 Bots share".  The sentence
+  // gap, and any other escape, belongs in a JS expression: ={"...\u00a0 ..."}.
+  const ESCAPE_IN_QUOTED_ATTRIBUTE = /\s([A-Za-z][\w:-]*)="([^"]*\\(?:u[0-9a-fA-F{]|x[0-9a-fA-F]{2})[^"]*)"/g;
+
+  function escapedAttributes(text: string): string[] {
+    return [...text.matchAll(ESCAPE_IN_QUOTED_ATTRIBUTE)].map((match) => `${match[1]}="${match[2]}"`);
+  }
+
+  it("flags the quoted form and accepts the expression form", () => {
+    expect(escapedAttributes('<Card subtitle="One.\\u00a0 Two." />')).toEqual(['subtitle="One.\\u00a0 Two."']);
+    expect(escapedAttributes('<Card subtitle="One.\\x41 Two." />')).toHaveLength(1);
+    expect(escapedAttributes('<Card\n  title="A"\n  subtitle="One.\\u00a0\n  Two."\n/>')).toHaveLength(1);
+    expect(escapedAttributes('<Card subtitle={"One.\\u00a0 Two."} />')).toEqual([]);
+    expect(escapedAttributes("<Card subtitle={`One.\\u00a0 Two.`} />")).toEqual([]);
+    expect(escapedAttributes('<Card title="Plain" className="a b" />')).toEqual([]);
+    // Only an escape is a problem; a regex-looking value without \u or \x is not.
+    expect(escapedAttributes('<input pattern="\\d+" />')).toEqual([]);
+  });
+
+  it("finds no escape inside a quoted JSX attribute anywhere in the renderer", () => {
+    const offenders: string[] = [];
+    for (const { rel, text } of FILES) {
+      if (!rel.endsWith(".tsx") || rel.endsWith(".test.tsx")) continue;
+      for (const attribute of escapedAttributes(text)) offenders.push(`${rel}: ${attribute}`);
+    }
+    expect(offenders).toEqual([]);
+  });
 });

@@ -1,6 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 
-// The Why This Engine block, in both shapes it can take.  The fixture mounts
+// The More Info block, in both shapes it can take.  The fixture mounts
 // the real `EngineCalloutBody` via /?fixture=engine-callout (see src/main.tsx).
 // There is no visual-tests/ directory; this follows tests/e2e/visual.spec.ts.
 //
@@ -27,10 +27,10 @@ async function pinFonts(page: Page): Promise<void> {
 test.use({ viewport: { width: 640, height: 420 }, locale: 'en-US' });
 
 // The sentence gap.  NBSP + space survives some renderers, so \s covers it.
-const LABEL = 'Why This Engine?';
-const HEADLINE = /DeepSeek models over the Clutch ACP bridge/;
+const LABEL = 'More Info.';
+const HEADLINE = /DeepSeek, Muse, and MiniMax models through the Clutch bridge/;
 
-test('visual: engine callout with two provider marks (Clutch)', async ({ page }) => {
+test('visual: engine callout with three provider marks (Clutch)', async ({ page }) => {
   await page.goto('/?fixture=engine-callout');
   await pinFonts(page);
 
@@ -41,9 +41,9 @@ test('visual: engine callout with two provider marks (Clutch)', async ({ page })
   await expect(clutch.getByText(LABEL, { exact: false })).toBeVisible();
   await expect(clutch.getByText(HEADLINE)).toBeVisible();
 
-  // Two marks, and both are titled with the brand they stand for — Clutch is
-  // the row whose name hides that it hosts two providers.
+  // Three provider/model marks follow Clutch's own app mark on the row.
   await expect(clutch.getByTitle('DeepSeek models')).toBeVisible();
+  await expect(clutch.getByTitle('Meta Muse models')).toBeVisible();
   await expect(clutch.getByTitle('MiniMax models')).toBeVisible();
 
   // The label and the headline must be one inline run:  no flex gap may land
@@ -53,7 +53,7 @@ test('visual: engine callout with two provider marks (Clutch)', async ({ page })
   // a pixel diff would not tell you which of the two broke.
   const shape = await clutch.evaluate((root) => {
     const strong = Array.from(root.querySelectorAll('strong')).find(
-      (node) => node.textContent?.trim() === 'Why This Engine?',
+      (node) => node.textContent?.trim() === 'More Info.',
     );
     const parent = strong?.parentElement;
     if (!parent) return null;
@@ -61,7 +61,7 @@ test('visual: engine callout with two provider marks (Clutch)', async ({ page })
       tag: parent.tagName,
       // The headline is a text node inside that same parent.
       holdsHeadline: (parent.textContent ?? '').includes(
-        'DeepSeek models over the Clutch ACP bridge',
+        'DeepSeek, Muse, and MiniMax models through the Clutch bridge',
       ),
     };
   });

@@ -10,7 +10,7 @@ final class CrossPlatformProfileSettingsTests: XCTestCase {
         XCTAssertEqual(rows.first?.disabledReason, CrossPlatformProfileSettings.computersMacOnlyReason)
     }
 
-    func testSpeechDeviceRowGreysMacForPersonalVoiceOnPhone() {
+    func testSpeechDeviceRowKeepsMacPlaybackEditableForPersonalVoiceOnPhone() {
         let row = CrossPlatformProfileSettings.speechDeviceRow(
             device: "mac",
             voice: "personal:pv-1",
@@ -20,7 +20,7 @@ final class CrossPlatformProfileSettingsTests: XCTestCase {
             personalVoiceSelected: true
         )
         XCTAssertTrue(row.selected)
-        XCTAssertFalse(row.editable)
-        XCTAssertNotNil(row.disabledReason)
+        XCTAssertTrue(row.editable)
+        XCTAssertNil(row.disabledReason)
     }
 }

@@ -39,7 +39,7 @@ describe("speechDeviceRow", () => {
     expect(row.editable).toBe(true);
   });
 
-  it("greys Mac playback on iOS for Personal Voice with a reason", () => {
+  it("keeps Mac playback editable on iOS when Personal Voice is selected", () => {
     const personalBot = { voice: "personal:pv-1", speechDevices: ["mac"] as string[] };
     const row = speechDeviceRow("mac", personalBot, {
       platform: "ios",
@@ -47,8 +47,8 @@ describe("speechDeviceRow", () => {
       agentVoiceCanSpeakOnClient: true,
     });
     expect(row.selected).toBe(true);
-    expect(row.editable).toBe(false);
-    expect(row.disabledReason).toMatch(/iPhone only/i);
+    expect(row.editable).toBe(true);
+    expect(row.disabledReason).toBeNull();
   });
 
   it("blocks all devices when the agent voice cannot speak here", () => {

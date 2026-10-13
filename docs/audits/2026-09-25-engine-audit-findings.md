@@ -71,7 +71,7 @@ Forty-six findings survived a three-lens adversarial check (code truth, producti
 
 **Impact:** Every turn routed to MiniMax-M3 via the DSH engine that requests reasoning-effort 'max', or that sends a two-element model-option array, is rejected outright before any model call happens -- a pure engine-capability/compatibility bug, not a transient failure.
 
-**Fix:** Per AGENTS.md, the DSH catalog/version-gate/model-id round-trip is owned by jaywedgeworth22/Harness (imported as harness/dsh/acp) and must NOT be patched in server/drivers/acp/dsh.ts. Fix the reasoning-effort enum (drop or remap 'max' to a value MiniMax-M3 actually supports) and the model-id serialization (single string, not a 2-element array) in Harness, then bump BotFleet's git dependency on the fixed Harness version.
+**Fix:** Per AGENTS.md, the DSH catalog/version-gate/model-id round-trip is owned by Simple-With-Us/Clutch (imported as `clutch/dsh/acp`) and must NOT be patched in server/drivers/acp/dsh.ts. Fix the reasoning-effort enum (drop or remap 'max' to a value MiniMax-M3 actually supports) and the model-id serialization (single string, not a 2-element array) in Clutch, then bump BotFleet's git dependency on the fixed Clutch revision.
 
 ### P0 Antigravity 'always-proceed tool policy' issue marked resolved in Sentry but still firing in production
 

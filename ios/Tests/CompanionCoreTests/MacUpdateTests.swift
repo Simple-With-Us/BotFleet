@@ -351,4 +351,145 @@ final class MacUpdateTests: XCTestCase {
         XCTAssertNil(MacUpdateTimestamp.date(from: "never"))
         XCTAssertNil(MacUpdateTimestamp.date(from: ""))
     }
+
+    // MARK: - The hold an update has on new work
+
+    /// The status the harness sends while it holds new work and the updater is
+    /// waiting on bots: `detail` replaces the step's percent (`progress` is
+    /// withheld by the harness too), and `drain` carries the hold.
+    private static let holdingJSON = Data(#"""
+    {
+      "installed": {"version": "1.0.30", "sourceCommit": "abc1234"},
+      "available": null,
+      "checkedAt": "2026-09-13T09:00:00Z",
+      "running": {
+        "runId": "run-1",
+        "startedAt": "2026-09-13T09:05:00Z",
+        "step": "Holding new work",
+        "detail": "Waiting for 3 bots to finish",
+        "logTail": []
+      },
+      "lastRun": null,
+      "capabilities": {"canCheck": false, "canRun": false, "reasons": ["An update is already running."]},
+      "drain": {
+        "startedAt": 1000000,
+        "windowEndsAt": 1360000,
+        "deadline": 1480000,
+        "bots": 3,
+        "rooms": 0,
+        "held": {"sends": 2, "rooms": 1, "routineRuns": 0}
+      }
+    }
+    """#.utf8)
+
+    private func date(milliseconds: Double) -> Date {
+        Date(timeIntervalSince1970: milliseconds / 1000)
+    }
+
+    func testTheHoldAndTheWaitDecodeFromTheStatus() throws {
+        let status = try JSONDecoder().decode(MacUpdateStatus.self, from: Self.holdingJSON)
+        let running = try XCTUnwrap(status.running)
+        XCTAssertEqual(running.detail, "Waiting for 3 bots to finish")
+        XCTAssertEqual(running.headline, "Waiting for 3 bots to finish")
+        let drain = try XCTUnwrap(status.drain)
+        XCTAssertEqual(drain.bots, 3)
+        XCTAssertEqual(drain.windowEndsAt, 1_360_000)
+        XCTAssertEqual(drain.held, MacUpdateDrain.Held(sends: 2, rooms: 1, routineRuns: 0))
+        XCTAssertEqual(drain.heldMessageCount, 3)
+    }
+
+    /// An older harness never says either, and the card must not need it to.
+    func testAnOlderHarnessWithNoHoldStillDecodes() throws {
+        let json = Data(#"""
+        {
+          "installed": {"version": "1.0.30", "sourceCommit": "abc1234"},
+          "available": null,
+          "checkedAt": null,
+          "running": {"runId": "r", "startedAt": "t", "step": "Building and signing the app", "progress": 0.5, "logTail": []},
+          "lastRun": null,
+          "capabilities": {"canCheck": true, "canRun": false, "reasons": []}
+        }
+        """#.utf8)
+        let status = try JSONDecoder().decode(MacUpdateStatus.self, from: json)
+        XCTAssertNil(status.drain)
+        let running = try XCTUnwrap(status.running)
+        XCTAssertNil(running.detail)
+        XCTAssertEqual(running.headline, "Building and signing the app")
+    }
+
+    /// A step's own percent is true until a step waits on something outside
+    /// the run; then it is a number the wait never reaches.
+    func testAPercentIsDrawnOnlyWhileItIsStillMoving() {
+        let base = MacUpdateRun(runId: "r", startedAt: "t", step: "Installing dependencies", progress: 0.25)
+        XCTAssertTrue(base.showsPercent)
+        XCTAssertTrue(MacUpdateRun(runId: "r", startedAt: "t", step: "s", progress: 0).showsPercent)
+        XCTAssertFalse(MacUpdateRun(runId: "r", startedAt: "t", step: "s").showsPercent)
+        let waiting = MacUpdateRun(
+            runId: "r", startedAt: "t", step: "Holding new work",
+            detail: "Waiting for 3 bots to finish", progress: 0.4
+        )
+        XCTAssertFalse(waiting.showsPercent)
+        XCTAssertEqual(waiting.headline, "Waiting for 3 bots to finish")
+        // An empty detail is no detail.
+        let empty = MacUpdateRun(runId: "r", startedAt: "t", step: "Building", detail: "", progress: 0.4)
+        XCTAssertTrue(empty.showsPercent)
+        XCTAssertEqual(empty.headline, "Building")
+    }
+
+    func testTheChatNoticeSaysWhatHappensToAMessageAndWhenTheRestartBegins() throws {
+        let drain = try XCTUnwrap(JSONDecoder().decode(MacUpdateStatus.self, from: Self.holdingJSON).drain)
+        let gap = "\u{00A0} "
+        XCTAssertEqual(
+            drain.noticeText(at: date(milliseconds: 1_000_000)),
+            "BotFleet is updating.\(gap)Messages you send now are saved and will run after the restart.\(gap)The restart begins within about 6 minutes."
+        )
+        XCTAssertTrue(drain.noticeText(at: date(milliseconds: 1_320_000)).hasSuffix("within about 40 seconds."))
+        XCTAssertTrue(drain.noticeText(at: date(milliseconds: 1_357_000)).hasSuffix("The restart begins shortly."))
+        // Past the window is still a sentence, never a negative wait.
+        XCTAssertTrue(drain.noticeText(at: date(milliseconds: 1_400_000)).hasSuffix("The restart begins shortly."))
+    }
+
+    func testTheCardCountsMessagesAndStillExplainsWhenNoneAreWaiting() throws {
+        var drain = try XCTUnwrap(JSONDecoder().decode(MacUpdateStatus.self, from: Self.holdingJSON).drain)
+        let gap = "\u{00A0} "
+        let now = date(milliseconds: 1_000_000)
+        XCTAssertEqual(
+            drain.summaryText(at: now),
+            "3 messages are saved and will run after the restart.\(gap)The restart begins within about 6 minutes."
+        )
+        drain.held = MacUpdateDrain.Held(sends: 1)
+        XCTAssertTrue(drain.summaryText(at: now).hasPrefix("1 message is saved and will run after the restart."))
+        drain.held = MacUpdateDrain.Held(sends: 0, rooms: 0, routineRuns: 5)
+        XCTAssertTrue(drain.summaryText(at: now).hasPrefix("New messages are saved and will run after the restart."))
+    }
+
+    /// The same rounding as `waitLabel` in src/lib/update-control.ts, so the
+    /// phone and the desktop quote the same wait.
+    func testTheWaitIsRoundedUpTheWayTheDesktopRoundsIt() {
+        XCTAssertNil(MacUpdateDrain.waitPhrase(milliseconds: 5_000))
+        XCTAssertNil(MacUpdateDrain.waitPhrase(milliseconds: 0))
+        XCTAssertNil(MacUpdateDrain.waitPhrase(milliseconds: -30_000))
+        XCTAssertNil(MacUpdateDrain.waitPhrase(milliseconds: .nan))
+        XCTAssertEqual(MacUpdateDrain.waitPhrase(milliseconds: 6_000), "about 10 seconds")
+        XCTAssertEqual(MacUpdateDrain.waitPhrase(milliseconds: 41_000), "about 50 seconds")
+        XCTAssertEqual(MacUpdateDrain.waitPhrase(milliseconds: 89_000), "about 90 seconds")
+        XCTAssertEqual(MacUpdateDrain.waitPhrase(milliseconds: 90_000), "about 2 minutes")
+        XCTAssertEqual(MacUpdateDrain.waitPhrase(milliseconds: 300_001), "about 6 minutes")
+    }
+
+    func testAHoldPastItsLeaseIsAMacThatWentAway() throws {
+        let drain = try XCTUnwrap(JSONDecoder().decode(MacUpdateStatus.self, from: Self.holdingJSON).drain)
+        XCTAssertTrue(drain.isActive(at: date(milliseconds: 1_479_999)))
+        XCTAssertFalse(drain.isActive(at: date(milliseconds: 1_480_000)))
+    }
+
+    func testTheCopyHasNoOrdinaryDoubleSpaceAndNeverSaysAgent() throws {
+        let drain = try XCTUnwrap(JSONDecoder().decode(MacUpdateStatus.self, from: Self.holdingJSON).drain)
+        let now = date(milliseconds: 1_000_000)
+        for text in [drain.noticeText(at: now), drain.summaryText(at: now)] {
+            XCTAssertTrue(text.contains(".\u{00A0} "))
+            XCTAssertFalse(text.contains(".  "))
+            XCTAssertFalse(text.lowercased().contains("agent"))
+        }
+    }
 }

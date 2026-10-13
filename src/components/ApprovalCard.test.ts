@@ -3,8 +3,14 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import { ApprovalCard } from "./ApprovalCard";
-import { pendingApprovalLabel, spokenApprovalPrompt, type Pending } from "./PendingApproval";
-import type { Message } from "@/state/store";
+import {
+  PendingApprovalActions,
+  PendingApprovalPanel,
+  pendingApprovalLabel,
+  spokenApprovalPrompt,
+  type Pending,
+} from "./PendingApproval";
+import { StoreProvider, type Message } from "@/state/store";
 
 const routineRequest = {
   version: 1 as const,
@@ -147,5 +153,66 @@ describe("a background job's approval", () => {
 
   it("names the job approval in the composer strip", () => {
     expect(pendingApprovalLabel({ message, requestId: "req-job", tool: "job_start", detail: "job: pnpm test" })).toBe("Background job approval requested");
+  });
+});
+
+describe("PendingApprovalPanel and Actions", () => {
+  const pending: Pending = {
+    message: {
+      id: "msg-1",
+      role: "bot",
+      kind: "options",
+      at: 1,
+      card: { title: "Approve bash?", subtitle: "ls -la", options: ["Allow", "Deny"], requestId: "req-1", tool: "Bash" },
+    },
+    requestId: "req-1",
+    tool: "Bash",
+    detail: "ls -la",
+  };
+
+  it("shows Bypass Active pill when bypassActive is true", () => {
+    const markup = renderToStaticMarkup(
+      createElement(PendingApprovalPanel, {
+        pending,
+        count: 1,
+        index: 0,
+        bypassActive: true,
+      }),
+    );
+    expect(markup).toContain("Bypass Active");
+  });
+
+  it("shows Approve All button when totalCount is greater than 1", () => {
+    const markup = renderToStaticMarkup(
+      createElement(
+        StoreProvider,
+        null,
+        createElement(PendingApprovalActions, {
+          pending,
+          threadId: "th-1",
+          totalCount: 4,
+          onCancelTurn() {},
+        }),
+      ),
+    );
+    expect(markup).toContain("Approve All (4)");
+    expect(markup).toContain("Allow Once");
+  });
+
+  it("omits Approve All button when totalCount is 1", () => {
+    const markup = renderToStaticMarkup(
+      createElement(
+        StoreProvider,
+        null,
+        createElement(PendingApprovalActions, {
+          pending,
+          threadId: "th-1",
+          totalCount: 1,
+          onCancelTurn() {},
+        }),
+      ),
+    );
+    expect(markup).not.toContain("Approve All");
+    expect(markup).toContain("Allow Once");
   });
 });

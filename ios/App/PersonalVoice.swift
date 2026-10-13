@@ -1,9 +1,16 @@
 // On-device Apple Personal Voice integration for BotFleet companion.
 //
-// Uses AVFoundation's AVSpeechSynthesizer on iOS 17+ / macOS 14+ to:
+// Uses AVFoundation's AVSpeechSynthesizer on iOS 17+ to:
 //   1. Request and inspect Personal Voice authorization (TCC).
 //   2. Discover user-created Personal Voices (matching `.isPersonalVoice` trait).
-//   3. Directly synthesize and speak bot replies on-device with zero server latency.
+//   3. Speak bot replies on this device, from the utterances the harness
+//      projected for speech (or the local fallback projection).
+//
+// A long read has to survive what a short one never meets: a synthesizer
+// that cancels an utterance on its own, one that stops calling back, a
+// phone call, and headphones being unplugged.  Each of those ends in a
+// known state here, so `isSpeaking` (and the chat's "Stop Voice") never
+// sticks.
 //
 // Lives in the app target because it links AVFoundation / AVFAudio.
 import AVFoundation
@@ -18,17 +25,77 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
     @Published private(set) var authorizationStatus: AVSpeechSynthesizer.PersonalVoiceAuthorizationStatus = .notDetermined
     @Published private(set) var personalVoices: [AVSpeechSynthesisVoice] = []
     @Published private(set) var isSpeaking = false
-    @Published private(set) var currentUtteranceText: String?
 
-    private let synthesizer = AVSpeechSynthesizer()
+    enum SpeakError: LocalizedError {
+        case noVoice
+        case stalled
+
+        var errorDescription: String? {
+            switch self {
+            case .noVoice:
+                return "No voice on this iPhone can read this reply.\u{00A0} Choose a voice for this iPhone in the bot's profile."
+            case .stalled:
+                return "Personal Voice stopped responding partway through this reply.\u{00A0} Try Read Aloud again."
+            }
+        }
+    }
+
+    /// A word about to be spoken, for karaoke.  `segment` indexes the
+    /// `segments` passed to `speak`, `location` is the UTF-16 offset of the
+    /// word in that segment's text (a retry's remainder is mapped back), and
+    /// `at` is when the synthesizer said so, in `CACurrentMediaTime()`
+    /// seconds.  The start of each utterance is reported too, because
+    /// whether willSpeakRange fires for every Personal Voice is unverified.
+    struct WordProgress {
+        let segment: Int
+        let location: Int
+        let at: CFTimeInterval
+    }
+
+    /// What happened during one `speak`, for the caller's status and telemetry.
+    struct SpeakReport {
+        /// The requested Personal Voice is not on this iPhone, so another
+        /// voice read the reply.
+        var usedFallbackVoice = false
+        /// Utterances given up on after their retries ran out.
+        var skippedSegments = 0
+    }
+
     private enum ChunkOutcome {
         case finished
         case cancelled
+        case stalled
     }
 
+    /// Replaced after a stall: a synthesizer that stopped calling back is
+    /// not trusted with the next utterance.
+    private var synthesizer = AVSpeechSynthesizer()
     private var chunkContinuation: CheckedContinuation<ChunkOutcome, Never>?
     private var turnGuard = SpeechTurnGuard()
     private var cancellables = Set<AnyCancellable>()
+
+    // Progress of the utterance being spoken, for resume and the watchdog.
+    private var nextRangeLocation = 0
+    private var sawWordProgress = false
+    private var utteranceStartedAt = Date()
+    private var lastProgressAt = Date()
+    private var activeLength = 0
+    private var watchdog: Task<Void, Never>?
+
+    // Karaoke: which segment is speaking, and where the utterance's text
+    // starts in it (a retry speaks only the remainder).
+    private var onProgress: (@MainActor (WordProgress) -> Void)?
+    private var activeSegment = -1
+    private var activeSegmentOffset = 0
+
+    // An audio interruption (a call, Siri, an alarm) pauses the turn.
+    private var interrupted = false
+    private var pausedAt: Date?
+    private var interruptionWaiter: CheckedContinuation<Bool, Never>?
+    /// How long a turn waits for an interruption to end before giving up.
+    private static let interruptionLimit: TimeInterval = 300
+    /// Attempts per utterance, counting the first.
+    private static let maxAttempts = 3
 
     override init() {
         super.init()
@@ -41,6 +108,14 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
             .sink { [weak self] _ in
                 self?.refreshStatus()
             }
+            .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in self?.handleInterruption(note) }
+            .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in self?.handleRouteChange(note) }
             .store(in: &cancellables)
     }
 
@@ -99,82 +174,129 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
         return personalVoices.first { $0.identifier == raw || $0.name == raw }
     }
 
-    /// Speak text aloud using a Personal Voice directly on the device.
-    ///
-    /// Splits long replies into natural sentence-bounded chunks to avoid
-    /// on-device utterance size limits, synthesizing each chunk with per-chunk
-    /// retry and smooth prosody transitions between chunks.
+    /// True when `voiceId` is a Personal Voice this iPhone has.  Unknown
+    /// (false) until Personal Voice is authorized.
+    func hasVoice(_ voiceId: String) -> Bool {
+        authorizationStatus == .authorized && resolveVoice(for: voiceId) != nil
+    }
+
+    /// Speak free text (the profile preview).
     func speak(text: String, voiceId: String) async throws {
+        _ = try await speak(segments: SpeechProjection.segments(fromReply: text), voiceId: voiceId)
+    }
+
+    /// Speak projected utterances with the Personal Voice `voiceId`.
+    ///
+    /// A Personal Voice belongs to the device that made it.  When this
+    /// iPhone does not have `voiceId`, it reads with this iPhone's own
+    /// Personal Voice, or the system voice, and says so in the report rather
+    /// than failing silently or not at all.
+    func speak(
+        segments: [SpeechSegment],
+        voiceId: String,
+        onProgress: (@MainActor (WordProgress) -> Void)? = nil
+    ) async throws -> SpeakReport {
         // stop() invalidates any in-flight invocation, including one parked
         // in the retry backoff where no continuation is installed.
         stop()
         let generation = turnGuard.beginInvocation()
+        self.onProgress = onProgress
+        var report = SpeakReport()
 
         if authorizationStatus == .notDetermined {
             _ = await requestAuthorization()
         }
         // A second speak() can pass this await (AgentProfileView preview
         // never calls Session.stopVoice()) and must not share this turn.
-        guard turnGuard.ownsInvocation(generation) else { return }
+        guard turnGuard.ownsInvocation(generation) else { return report }
 
-        guard let targetVoice = resolveVoice(for: voiceId) ?? personalVoices.first else {
-            throw APIError.transport("Apple Personal Voice '\(voiceId)' is not available or authorized.")
-        }
+        let resolved = resolveVoice(for: voiceId)
+        report.usedFallbackVoice = resolved == nil
+        guard let targetVoice = resolved
+            ?? personalVoices.first
+            ?? AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
+        else { throw SpeakError.noVoice }
 
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-
-        let chunks = PersonalVoiceChunker.chunk(text: trimmed)
-        guard !chunks.isEmpty else { return }
-        guard turnGuard.ownsInvocation(generation) else { return }
+        // Keep each piece's index in `segments` for progress reports.
+        let pieces = segments.enumerated().filter { !$0.element.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !pieces.isEmpty else { return report }
 
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
         try audioSession.setActive(true)
-        guard turnGuard.ownsInvocation(generation) else { return }
+        guard turnGuard.ownsInvocation(generation) else { return report }
 
         isSpeaking = true
-        currentUtteranceText = trimmed
-
-        chunkLoop: for chunk in chunks {
-            guard isSpeaking, turnGuard.ownsInvocation(generation) else { break }
-
-            var attempts = 0
-            let maxAttempts = 2
-            var chunkSuccess = false
-
-            while attempts < maxAttempts && !chunkSuccess && isSpeaking && turnGuard.ownsInvocation(generation) {
-                attempts += 1
-                let utterance = AVSpeechUtterance(string: chunk)
-                utterance.voice = targetVoice
-                utterance.rate = AVSpeechUtteranceDefaultSpeechRate
-                utterance.postUtteranceDelay = 0.05
-
-                let outcome = await speakChunkUtterance(utterance, generation: generation)
-                switch outcome {
-                case .finished:
-                    chunkSuccess = true
-                case .cancelled:
-                    // Stopping supersedes this turn.  `break` alone would
-                    // leave only the switch, and the loop would retry.
-                    if !isSpeaking || !turnGuard.ownsInvocation(generation) {
-                        break chunkLoop
-                    }
-                    if attempts < maxAttempts {
-                        try? await Task.sleep(nanoseconds: 50_000_000)
-                    }
-                }
-                if !isSpeaking || !turnGuard.ownsInvocation(generation) {
-                    break chunkLoop
-                }
+        startWatchdog(generation: generation)
+        defer {
+            // A newer speak() may already be the owner.  Clearing here would
+            // mark that turn idle while its audio is still queued.
+            if turnGuard.ownsInvocation(generation) {
+                isSpeaking = false
+                stopWatchdog()
+                self.onProgress = nil
+                activeSegment = -1
             }
         }
 
-        // A newer speak() may already be the owner.  Clearing here would
-        // mark that turn idle while its audio is still queued.
-        guard turnGuard.ownsInvocation(generation) else { return }
-        isSpeaking = false
-        currentUtteranceText = nil
+        segmentLoop: for (index, piece) in pieces.enumerated() {
+            let segment = piece.element
+            var text = segment.text
+            // Where `text` starts in `segment.text`, in UTF-16 units.
+            var textOffset = 0
+            var attempts = 0
+            while true {
+                guard isSpeaking, turnGuard.ownsInvocation(generation) else { break segmentLoop }
+                if interrupted {
+                    // The synthesizer gave the utterance up to the
+                    // interruption.  Resume where it stopped once it ends.
+                    guard await waitForInterruptionEnd(),
+                          isSpeaking, turnGuard.ownsInvocation(generation)
+                    else { break segmentLoop }
+                }
+                attempts += 1
+                let utterance = AVSpeechUtterance(string: text)
+                utterance.voice = targetVoice
+                utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+                utterance.postUtteranceDelay = index == pieces.count - 1 ? 0 : (segment.endsParagraph ? 0.25 : 0.05)
+
+                activeSegment = piece.offset
+                activeSegmentOffset = textOffset
+                let outcome = await speakChunkUtterance(utterance, generation: generation)
+                if outcome == .finished { break }
+                // Stopping supersedes this turn.
+                guard isSpeaking, turnGuard.ownsInvocation(generation) else { break segmentLoop }
+
+                let length = (text as NSString).length
+                if outcome == .stalled {
+                    VoiceTelemetry.watchdogTripped(
+                        characters: length,
+                        attempt: attempts,
+                        sawWordProgress: sawWordProgress
+                    )
+                }
+                let remainder = PersonalVoiceResume.remainder(of: text, nextRangeLocation: nextRangeLocation)
+                if remainder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { break }
+                // A cancel the interruption caused is not the synthesizer
+                // failing, so it does not spend this utterance's retries.
+                if interrupted && outcome == .cancelled { attempts -= 1 }
+                if attempts >= Self.maxAttempts {
+                    if outcome == .stalled { throw SpeakError.stalled }
+                    // A synthesizer that keeps cancelling one utterance gets
+                    // past it rather than ending the read; the skip is
+                    // reported, not silent.
+                    report.skippedSegments += 1
+                    VoiceTelemetry.synthesizerGaveUp(characters: length, attempts: attempts)
+                    break
+                }
+                // The remainder is a suffix of `text`, so its start in the
+                // segment moves by what was cut off the front.
+                textOffset += length - (remainder as NSString).length
+                text = remainder
+                if !interrupted { try? await Task.sleep(nanoseconds: 50_000_000) }
+            }
+        }
+        return report
     }
 
     private func speakChunkUtterance(_ utterance: AVSpeechUtterance, generation: UInt64) async -> ChunkOutcome {
@@ -188,6 +310,11 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
             }
             self.chunkContinuation = continuation
             self.turnGuard.begin(utterance: utterance)
+            self.nextRangeLocation = 0
+            self.sawWordProgress = false
+            self.activeLength = (utterance.speechString as NSString).length
+            self.utteranceStartedAt = Date()
+            self.lastProgressAt = self.utteranceStartedAt
             self.synthesizer.speak(utterance)
         }
     }
@@ -195,17 +322,190 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
     /// Stop ongoing speech playback immediately.
     func stop() {
         turnGuard.supersedeInvocation()
-        if synthesizer.isSpeaking {
+        onProgress = nil
+        activeSegment = -1
+        if synthesizer.isSpeaking || synthesizer.isPaused {
             synthesizer.stopSpeaking(at: .immediate)
         }
         isSpeaking = false
-        currentUtteranceText = nil
+        stopWatchdog()
+        // An interruption belongs to the read it paused.  Left set, the next
+        // read would wait out `interruptionLimit` in silence for an end that
+        // already came (or never will), with the watchdog switched off.
+        interrupted = false
+        pausedAt = nil
         let cont = chunkContinuation
         chunkContinuation = nil
         cont?.resume(returning: .cancelled)
+        let waiter = interruptionWaiter
+        interruptionWaiter = nil
+        waiter?.resume(returning: false)
+    }
+
+    // MARK: - Watchdog
+
+    private func startWatchdog(generation: UInt64) {
+        stopWatchdog()
+        watchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self, !Task.isCancelled, self.turnGuard.ownsInvocation(generation) else { return }
+                self.checkForStall()
+            }
+        }
+    }
+
+    private func stopWatchdog() {
+        watchdog?.cancel()
+        watchdog = nil
+    }
+
+    private func checkForStall() {
+        guard chunkContinuation != nil, !interrupted, pausedAt == nil else { return }
+        let deadline = SpeechWatchdog.deadline(
+            startedAt: utteranceStartedAt,
+            lastProgressAt: lastProgressAt,
+            utf16Length: activeLength
+        )
+        guard Date() > deadline else { return }
+        // Do not wait for a didCancel that a wedged synthesizer may never
+        // send: end the utterance here, ignore its late callbacks, and give
+        // the next attempt a fresh synthesizer.
+        turnGuard.stop()
+        let wedged = synthesizer
+        wedged.delegate = nil
+        wedged.stopSpeaking(at: .immediate)
+        synthesizer = AVSpeechSynthesizer()
+        synthesizer.delegate = self
+        let cont = chunkContinuation
+        chunkContinuation = nil
+        cont?.resume(returning: .stalled)
+    }
+
+    // MARK: - Audio session events
+
+    private func handleInterruption(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw)
+        else { return }
+        switch type {
+        case .began:
+            guard isSpeaking else { return }
+            interrupted = true
+            pausedAt = Date()
+            if synthesizer.isSpeaking { synthesizer.pauseSpeaking(at: .word) }
+        case .ended:
+            // Only an interruption this read saw begin.  A stale end must
+            // not stop a read that started after it.
+            guard interrupted else { return }
+            let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
+                .map(AVAudioSession.InterruptionOptions.init(rawValue:)) ?? []
+            // Cleared even when the read already stopped (Session's own
+            // observer can stop it first): only resuming needs a live read.
+            interrupted = false
+            resumeClock()
+            guard isSpeaking else { return }
+            guard options.contains(.shouldResume) else {
+                // Another app kept the audio.  End the read cleanly rather
+                // than leave it paused with nothing to resume it.
+                stop()
+                return
+            }
+            try? AVAudioSession.sharedInstance().setActive(true)
+            if synthesizer.isPaused { synthesizer.continueSpeaking() }
+            let waiter = interruptionWaiter
+            interruptionWaiter = nil
+            waiter?.resume(returning: true)
+        @unknown default:
+            break
+        }
+    }
+
+    private func handleRouteChange(_ note: Notification) {
+        guard isSpeaking,
+              let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable
+        else { return }
+        // Headphones came out: never move a read to the loudspeaker.
+        stop()
+    }
+
+    /// Paused time does not count against the watchdog.
+    private func resumeClock() {
+        guard let pausedAt else { return }
+        let paused = Date().timeIntervalSince(pausedAt)
+        utteranceStartedAt = utteranceStartedAt.addingTimeInterval(paused)
+        lastProgressAt = Date()
+        self.pausedAt = nil
+    }
+
+    /// Waits for the current interruption to end.  False when it ends
+    /// without permission to resume, the turn is stopped, or it outlasts
+    /// `interruptionLimit`.
+    private func waitForInterruptionEnd() async -> Bool {
+        guard interrupted else { return true }
+        let limit = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.interruptionLimit * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            let waiter = self.interruptionWaiter
+            self.interruptionWaiter = nil
+            waiter?.resume(returning: false)
+        }
+        defer { limit.cancel() }
+        let resumed = await withCheckedContinuation { continuation in
+            interruptionWaiter = continuation
+        }
+        if !resumed && isSpeaking { stop() }
+        return resumed
     }
 
     // MARK: - AVSpeechSynthesizerDelegate
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        let at = CACurrentMediaTime()
+        Task { @MainActor [weak self] in
+            guard let self, self.turnGuard.isActive(utterance: utterance) else { return }
+            self.lastProgressAt = Date()
+            self.reportProgress(location: 0, at: at)
+        }
+    }
+
+    nonisolated func speechSynthesizer(
+        _ synthesizer: AVSpeechSynthesizer,
+        willSpeakRangeOfSpeechString characterRange: NSRange,
+        utterance: AVSpeechUtterance
+    ) {
+        // Taken before the hop to the main actor, so a busy main thread does
+        // not make the word start late.
+        let at = CACurrentMediaTime()
+        Task { @MainActor [weak self] in
+            guard let self, self.turnGuard.isActive(utterance: utterance) else { return }
+            self.nextRangeLocation = characterRange.location
+            self.sawWordProgress = true
+            self.lastProgressAt = Date()
+            self.reportProgress(location: characterRange.location, at: at)
+        }
+    }
+
+    /// A word of the active utterance, as an offset in its segment.
+    private func reportProgress(location: Int, at: CFTimeInterval) {
+        guard let onProgress, activeSegment >= 0, location >= 0 else { return }
+        onProgress(WordProgress(segment: activeSegment, location: activeSegmentOffset + location, at: at))
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didPause utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            guard let self, self.turnGuard.isActive(utterance: utterance), self.pausedAt == nil else { return }
+            self.pausedAt = Date()
+        }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didContinue utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            guard let self, self.turnGuard.isActive(utterance: utterance) else { return }
+            self.resumeClock()
+        }
+    }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         Task { @MainActor [weak self] in

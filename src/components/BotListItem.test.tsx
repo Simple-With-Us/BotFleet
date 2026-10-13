@@ -9,7 +9,9 @@ const APP_SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../A
 
 describe("BotListItem click and selection reliability", () => {
   it("wraps the avatar in pointer-events-none so avatar clicks bubble cleanly", () => {
-    expect(SIDEBAR_SRC).toMatch(/<div className="[^"]*pointer-events-none[^"]*">\s*<BotAvatar/);
+    // Extra attributes after className are fine (the Off dimming hook, data-off);
+    // what matters is that the wrapper around the avatar swallows pointer events.
+    expect(SIDEBAR_SRC).toMatch(/<div className="[^"]*pointer-events-none[^"]*"[^>]*>\s*<BotAvatar/);
   });
 
   it("passes embedded and onActivate to RenameTitle in the bot row", () => {

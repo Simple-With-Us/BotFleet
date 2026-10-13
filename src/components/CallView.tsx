@@ -23,7 +23,9 @@ import { Loader2, Phone, PhoneOff, X } from "lucide-react";
 import { useStore, visibleMessages, type Bot } from "@/state/store";
 import { currentCall, deferCallCleanup, endCall, startCall, useOnCall } from "@/lib/call";
 import { speaker } from "@/lib/tts";
+import { callVoiceReadiness } from "@/lib/tts/readiness";
 import { spokenReply } from "../../shared/voice-summary";
+import { voiceForDevice } from "../../shared/bot-voice";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
@@ -42,12 +44,6 @@ import { useDesktopCapabilities } from "./DesktopCapabilities";
 const YES = /^(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|allow|approve|approved|fine|please do)\b/i;
 const NO = /^(no|nope|don'?t|do not|stop|deny|denied|cancel|never|skip it)\b/i;
 
-/** Apple Personal Voices speak on-device on iOS, not through the desktop
- * call path - server-side voiceReady refuses them, so a desktop call
- * started with one connects and stays silent. */
-const isPersonalVoiceId = (voice?: string): boolean =>
-  typeof voice === "string" && (voice.startsWith("personal:") || voice.startsWith("apple-personal:"));
-
 type Phase = "listening" | "sending" | "working" | "speaking";
 const CALL_ENDPOINT_MS = 850;
 
@@ -56,7 +52,7 @@ export function CallButton({ bot }: { bot: Bot }) {
     <CallTargetButton
       targetId={bot.id}
       targetName={bot.name}
-      voices={[bot.voice]}
+      voices={[voiceForDevice(bot, "mac")]}
       setupBotId={bot.id}
       requireExplicitVoices={false}
       onStart={() => track("call_started", { driver: bot.modelSelection?.instanceId })}
@@ -92,29 +88,28 @@ export function CallTargetButton({
     explicitPreference: state.config?.callStt?.provider ?? undefined,
   });
   const supported = provider.provider !== null;
+  // `configured` is provider-scoped server-side (MiniMax => a key is on file; system => the Mac's
+  // built-in voices are available).  It is what a hosted voice needs.
   const configured = Boolean(state.config?.tts?.configured);
-  // Owner 2026-09-03: with no voice provider configured the call button must not appear at all,
-  // rather than render disabled with an explanation.  `configured` is provider-scoped server-side
-  // (MiniMax => a key is on file; system => the Mac's built-in voices are available), so this
-  // hides the button when there is no MiniMax key AND system voices are not the chosen provider,
-  // while leaving it working for anyone who deliberately picked the built-in voices.
-  const voiceProviderConfigured = configured;
-  const everyTargetHasVoice = voices.length > 0 && voices.every((voice) => Boolean(voice));
   // Apple Personal Voices speak on-device on macOS and iOS companion devices.
   // The main process already gates the flag on the host's macOS version, so a
   // macOS 13 Mac is not offered a call button that can only fail.
   const isPersonalSpeakable = capabilities.dictation.personalVoice === true;
-  const isVoiceSpeakable = (voice?: string) =>
-    Boolean(voice) && (!isPersonalVoiceId(voice) || isPersonalSpeakable);
-
-  const everyTargetSpeakable = everyTargetHasVoice && voices.every(isVoiceSpeakable);
-  const fallbackSpeakable = Boolean(state.config?.tts?.ready) &&
-    (!isPersonalVoiceId(state.config?.tts?.voice) || isPersonalSpeakable);
-  const personalVoiceChosen = voices.some((voice) => isPersonalVoiceId(voice)) ||
-    (!everyTargetSpeakable && isPersonalVoiceId(state.config?.tts?.voice));
-  const voiceReady =
-    configured && (isPersonalSpeakable || !voices.some((voice) => isPersonalVoiceId(voice))) &&
-    (requireExplicitVoices ? everyTargetSpeakable : Boolean(fallbackSpeakable || everyTargetSpeakable));
+  // One rule for every voice the call would use (src/lib/tts/readiness.ts): a Personal Voice needs
+  // the capability flag and never a MiniMax key; a hosted voice needs `configured`.
+  const readiness = callVoiceReadiness({
+    voices,
+    tts: state.config?.tts,
+    personalVoiceAvailable: isPersonalSpeakable,
+    requireExplicitVoices,
+  });
+  // Owner 2026-09-03: with no voice provider configured the call button must not appear at all,
+  // rather than render disabled with an explanation.  A Personal Voice this Mac can speak is a
+  // provider, so a bot that only uses one gets its call button without a MiniMax key.
+  const voiceProviderConfigured = readiness.engineAvailable;
+  const hostedEngineMissing = readiness.needsHostedEngine && !configured;
+  const personalVoiceChosen = readiness.personalVoiceChosen;
+  const voiceReady = readiness.ready && !hostedEngineMissing;
   const unavailable = !active && (!capabilitiesReady || !supported || !voiceReady);
   const voiceSetupRequired = capabilitiesReady && supported && !voiceReady;
   const [helpOpen, setHelpOpen] = useState(false);
@@ -127,7 +122,7 @@ export function CallTargetButton({
       ? "Checking call availability"
       : !supported
         ? "Set up dictation to make calls"
-        : !configured
+        : hostedEngineMissing
           ? "Set up a voice in a bot profile to make calls"
           : !voiceReady
             ? personalVoiceChosen
@@ -143,7 +138,7 @@ export function CallTargetButton({
       ? provider.provider === null && provider.missing === "cloud-stt-key"
         ? "Add an AssemblyAI API key in Settings to make calls on this computer."
         : "This dictation provider is unavailable.\u00A0 Check your choice in Settings or restart BotFleet."
-      : !configured
+      : hostedEngineMissing
         ? "Add a MiniMax API key in Settings so the bot can speak during calls."
         : !voiceReady
           ? personalVoiceChosen
@@ -246,6 +241,8 @@ export function CallOverlay({ bot }: { bot: Bot }) {
 function Call({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
+  // This Mac's voice for the bot: its Mac override, else the shared voice.
+  const macVoice = voiceForDevice(bot, "mac");
   const speech = useSpeech();
   const initialPhase: Phase = bot.busy ? "working" : "listening";
   const [phase, setPhase] = useState<Phase>(initialPhase);
@@ -330,10 +327,10 @@ function Call({ bot }: { bot: Bot }) {
       hush();
       // A bot reply goes through the server's message audio route so the voice
       // summary mode and clip cache apply; other prompts are spoken as written.
-      await speaker.speak(text, { botId: bot.id, voiceId: bot.voice, ...(messageId ? { messageId, threadId: bot.threadId } : {}) });
+      await speaker.speak(text, { botId: bot.id, voiceId: macVoice, ...(messageId ? { messageId, threadId: bot.threadId } : {}) });
       return alive.current && currentCall() === bot.id && sayGeneration.current === mine;
     },
-    [bot.id, bot.voice, bot.threadId, hush, move],
+    [bot.id, macVoice, bot.threadId, hush, move],
   );
 
   const sayThenListen = useCallback(

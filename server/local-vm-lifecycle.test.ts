@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { containerRuntimeLockdownEnv } from "./container-runtime-guard.ts";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 
@@ -72,6 +73,9 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     child = spawn(process.execPath, [join(serverDir, "index.ts")], {
       cwd: join(serverDir, ".."), stdio: ["ignore", "pipe", "pipe"],
       env: { HOME: home, USERPROFILE: home, PATH: process.env.PATH, OMB_EXTRA_PATH: bin,
+        // Container runtimes are off for the harness except the fixture above,
+        // which runs by absolute path so PATH can never reach the real docker.
+        ...containerRuntimeLockdownEnv(), BOTFLEET_CONTAINER_RUNTIME_FIXTURE_DIR: bin,
         OMB_PORT: String(port), OMB_WEBHOOK_PORT: String(39000 + Math.floor(Math.random() * 10000)),
         OMB_DISABLE_ANTIGRAVITY_QUOTA: "1", VITEST: "1" },
     });

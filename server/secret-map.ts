@@ -65,6 +65,16 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
     reloadProviders: true,
   },
   {
+    id: "gemini.key",
+    label: "Google Gemini API key",
+    section: "gemini",
+    path: ["key"],
+    env: ["GEMINI_API_KEY"],
+    infisicalName: "GEMINI_API_KEY",
+    secret: true,
+    reloadProviders: true,
+  },
+  {
     id: "openaiCompat.key",
     label: "OpenAI-compatible API key",
     section: "openaiCompat",
@@ -281,6 +291,18 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
     path: ["sentryDsn"],
     env: ["SENTRY_DSN", "BOTFLEET_SENTRY_DSN"],
     infisicalName: "SENTRY_DSN",
+    secret: true,
+    reloadProviders: false,
+  },
+  {
+    id: "observability.sentryFleetDsn",
+    // Second Sentry project (fleet-infra).  `SENTRY_FLEET_DSN` is harness-only
+    // (see secret-map.test HARNESS_ONLY) — not an engine spawn alias.
+    label: "Sentry fleet-infra DSN",
+    section: "observability",
+    path: ["sentryFleetDsn"],
+    env: ["SENTRY_FLEET_DSN"],
+    infisicalName: "SENTRY_FLEET_DSN",
     secret: true,
     reloadProviders: false,
   },

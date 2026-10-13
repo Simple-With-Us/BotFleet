@@ -69,6 +69,20 @@ describe("speakable", () => {
     expect(speakable("Done.\n\n\n- one\n\n- two")).toBe("Done. one. two");
   });
 
+  it("reads HTML entities as the character the chat shows", () => {
+    // The fleet sentence gap is `.&nbsp; `.  Read verbatim it was the word
+    // "nbsp" after every sentence.
+    expect(speakable("The build passed.&nbsp; I pushed the fix to **main**.&nbsp; Want me to open the PR?")).toBe(
+      "The build passed. I pushed the fix to main. Want me to open the PR?",
+    );
+    expect(speakable("One.&#160; Two.&#xA0; Three &NBSP; four")).toBe("One. Two. Three four");
+    expect(speakable("Tom &amp; Jerry use a &lt;div&gt; and &quot;it&#39;s&quot; &apos;ok&apos;")).toBe(
+      "Tom & Jerry use a <div> and \"it's\" 'ok'",
+    );
+    // One pass: an escaped entity is shown, and read, as the entity's text.
+    expect(speakable("Write &amp;nbsp; for the gap")).toBe("Write &nbsp; for the gap");
+  });
+
   it("is empty for empty input", () => {
     expect(speakable("")).toBe("");
     expect(speakable("   \n\n  ")).toBe("");
@@ -81,6 +95,14 @@ describe("toUtterances", () => {
     expect(out).toHaveLength(3);
     expect(out[0]).toBe("The tests pass now.");
     expect(out[2]).toBe("Want me to push it?");
+  });
+
+  it("splits at the fleet sentence gap", () => {
+    expect(toUtterances("The build passed today.&nbsp; I pushed the fix to main.&nbsp; Want me to open the PR?")).toEqual([
+      "The build passed today.",
+      "I pushed the fix to main.",
+      "Want me to open the PR?",
+    ]);
   });
 
   it("does not split inside a decimal or an abbreviation", () => {

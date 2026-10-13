@@ -27,6 +27,9 @@ const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-claude-cli.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
+// Skipped on Windows: the cases that follow create symbolic links to prove a
+// write cannot escape its folder, and an unelevated Windows account (the hosted
+// runner included) cannot create one without Developer Mode.
 const posixOnly = describe.skipIf(process.platform === "win32");
 
 let child: ChildProcess;

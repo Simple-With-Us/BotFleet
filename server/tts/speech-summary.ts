@@ -1,4 +1,6 @@
 import { z } from "zod";
+import type { Pronunciation } from "../../shared/pronunciations.ts";
+import { utterancesWithSpans } from "../../shared/speech-spans.ts";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
 import { sanitizeForTTS } from "./minimax.ts";
 import { speakable } from "./speech-text.ts";
@@ -84,12 +86,95 @@ OUTPUT: "Here are your options for the flight. <#0.3#> First, American Airlines 
 </example_transformation>
 </system_prompt>`;
 
+/**
+ * The system prompt with the workspace pronunciation list appended, so a
+ * distilled script made after the list changes already says each term the
+ * way the owner asked ("sequel" for SQL).  Scripts stored before the change
+ * are reused as they are, with their clips (server/index.ts voiceSummaryFor),
+ * so the list reaches them only through the engine-side pass in
+ * server/tts/index.ts speak.  Kept deliberately small; the prompt itself is
+ * rewritten separately.
+ */
+export function voiceSummarySystemPrompt(pronunciations: readonly Pronunciation[] = []): string {
+  if (!pronunciations.length) return DEEPSEEK_FLASH_TTS_PROMPT;
+  // JSON-quoted, so a term or a respelling can never close the block or
+  // read as an instruction of its own.
+  const pairs = pronunciations.map((p) => `- ${JSON.stringify(p.term)} is said ${JSON.stringify(p.say)}`).join("\n");
+  return `${DEEPSEEK_FLASH_TTS_PROMPT}
+<pronunciations>
+Always say these terms exactly as given.  Write the respelling in place of the term, wherever the term appears as a whole word in the spoken text.  This overrides the acronym rule above: do not spell these terms out letter by letter.
+${pairs}
+</pronunciations>`;
+}
+
+/**
+ * The deterministic spoken text for `text`: speakable()'s rules, split into
+ * utterances and joined with single spaces.  This is exactly the written-mode
+ * script (shared/speech-spans.ts utterancesWithSpans), so when the distiller
+ * is skipped (a short plain reply) or falls back (no key, timeout, a cut-off
+ * rewrite), server/tts/message-audio.ts can recognize the
+ * text it stored and hand clients the source spans that guide the karaoke
+ * highlight.  MiniMax still gets its acoustic pass: synthesize() runs
+ * sanitizeForTTS on every utterance.
+ */
+export function deterministicSpokenText(text: string): string {
+  return utterancesWithSpans(text).map((u) => u.text).join(" ");
+}
+
 export interface SummarizeVoiceOptions {
   key?: string;
   baseUrl?: string;
   url?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** The workspace pronunciation list, appended to the prompt
+   * (voiceSummarySystemPrompt).  The deterministic fallback leaves it to
+   * the engine-side pass. */
+  pronunciations?: readonly Pronunciation[];
+}
+
+/** Where the speech text came from.  "summary" is the model's rewrite;
+ * "short" is the deterministic pass for a short, plain reply; "fallback" is
+ * the deterministic pass standing in for a rewrite that was not usable. */
+export type VoiceSummarySource = "summary" | "short" | "fallback";
+
+/** Why a rewrite was not used.  "unavailable" is transient (network error,
+ * non-200, empty answer) and worth retrying later.  The others reproduce on
+ * a retry, so the deterministic text can be stored in place of the rewrite.
+ * That includes "timeout": the same long reply at the same budget runs out of
+ * time again, and each retry would cost the full deadline before speech. */
+export type VoiceSummaryFallbackReason = "no-key" | "truncated" | "incomplete" | "timeout" | "unavailable";
+
+export interface VoiceSummaryResult {
+  text: string;
+  source: VoiceSummarySource;
+  reason?: VoiceSummaryFallbackReason;
+}
+
+export const SUMMARY_MIN_TOKENS = 500;
+/** Roughly the 12,000-character spoken cap (server/tts/message-audio.ts) at
+ * about three characters a token.  The 15-second request timeout still
+ * applies, so a reply that would need more simply falls back to the full
+ * deterministic text instead of being cut. */
+export const SUMMARY_MAX_TOKENS = 4_000;
+
+/** The completion budget for a reply of `inputChars` characters.  The prompt
+ * asks for a spoken rewrite, not a digest, so output tracks input length and
+ * spelled-out numbers make it longer; a fixed 500 cut long replies short. */
+export function voiceSummaryMaxTokens(inputChars: number): number {
+  return Math.min(SUMMARY_MAX_TOKENS, Math.max(SUMMARY_MIN_TOKENS, Math.ceil(inputChars / 3)));
+}
+
+/** Whether this result is worth keeping as message.voiceText.  A transient
+ * provider failure (network error, non-200, empty answer) is not: the next
+ * play asks the distiller again, on any device, and a hosted voice's clips of
+ * the stand-in are stamped as the reply as written so they are reused if the
+ * distiller is still down and replaced if it answers (server/tts/
+ * message-audio.ts).  A cut-off rewrite is never returned as text (the full
+ * deterministic text stands in), and that stand-in is kept, because asking
+ * again would only be cut off again and billed again. */
+export function voiceSummaryWorthStoring(result: VoiceSummaryResult): boolean {
+  return !(result.source === "fallback" && result.reason === "unavailable");
 }
 
 export function normalizeDeepSeekChatUrl(baseUrl?: string): string {
@@ -127,8 +212,19 @@ export async function summarizeForVoice(
   legacySignal?: AbortSignal,
   extraOptions: { url?: string; timeoutMs?: number } = {},
 ): Promise<string> {
+  return (await summarizeForVoiceDetailed(rawText, optionsOrKey, legacySignal, extraOptions)).text;
+}
+
+/** summarizeForVoice, plus where the text came from, so the caller can
+ * decide whether it is worth storing. */
+export async function summarizeForVoiceDetailed(
+  rawText: string,
+  optionsOrKey?: string | SummarizeVoiceOptions,
+  legacySignal?: AbortSignal,
+  extraOptions: { url?: string; timeoutMs?: number } = {},
+): Promise<VoiceSummaryResult> {
   const cleanInput = stripVoiceSummaryTags(rawText);
-  if (!cleanInput.trim()) return "";
+  if (!cleanInput.trim()) return { text: "", source: "short" };
 
   // Short replies without technical artifacts don't need summarization
   const hasTechnicalContent =
@@ -141,11 +237,10 @@ export async function summarizeForVoice(
     /[*#_\[\]]/.test(cleanInput);
 
   if (cleanInput.length <= 120 && !hasTechnicalContent) {
-    // Normalize the markdown and paragraph structure *before* the acoustic
-    // pass: sanitizeForTTS collapses newlines, and the line anchors that
-    // strip list markers and add audible paragraph pauses only match on the
-    // original text.
-    return sanitizeForTTS(speakable(cleanInput));
+    // The deterministic script, span-aligned to the reply (see
+    // deterministicSpokenText); its markdown and paragraph rules run on the
+    // original text, before synthesize()'s acoustic pass collapses newlines.
+    return { text: deterministicSpokenText(cleanInput), source: "short" };
   }
 
   const options: SummarizeVoiceOptions =
@@ -153,13 +248,16 @@ export async function summarizeForVoice(
       ? { key: optionsOrKey, signal: legacySignal }
       : (optionsOrKey ?? {});
 
+  const deterministic = () => deterministicSpokenText(spokenReply(rawText));
+  const fallback = (reason: VoiceSummaryFallbackReason): VoiceSummaryResult => ({ text: deterministic(), source: "fallback", reason });
+
   const key = resolveDeepSeekKey(options.key);
-  if (!key) {
-    return sanitizeForTTS(speakable(spokenReply(rawText)));
-  }
+  if (!key) return fallback("no-key");
 
   const endpoint = completionsUrl(options.baseUrl || options.url || extraOptions.url);
   const timeoutMs = options.timeoutMs ?? extraOptions.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxTokens = voiceSummaryMaxTokens(cleanInput.length);
+  const systemPrompt = voiceSummarySystemPrompt(options.pronunciations);
   const timeoutController = new AbortController();
   const timer = setTimeout(() => {
     timeoutController.abort(new Error("Voice summary request timed out"));
@@ -178,6 +276,26 @@ export async function summarizeForVoice(
     }
   }
 
+  /** A usable rewrite, a reason to stop with the deterministic text, or
+   * null to try the next model. */
+  const judge = (data: DeepSeekChatResponse | null): VoiceSummaryResult | null => {
+    const choice = data?.choices?.[0];
+    const content = choice?.message?.content?.trim();
+    if (!content) return null;
+    // finish_reason "length" means max_tokens cut the rewrite off mid-reply.
+    // Anything but "stop" is an incomplete answer; asking a second model the
+    // same question at the same budget would cut it again.
+    const finish = choice?.finish_reason;
+    if (finish === "length") return fallback("truncated");
+    if (finish && finish !== "stop") return fallback("incomplete");
+    // A finished rewrite is used however much shorter than the reply it is:
+    // the prompt asks the model to leave out hashes, code and links, so a
+    // condensed rewrite is what it is for, not a sign of lost content.
+    const cleaned = cleanSummaryForTTS(content);
+    if (!cleaned) return null;
+    return { text: cleaned, source: "summary" };
+  };
+
   try {
     const response = await fetch(endpoint, {
       method: "POST",
@@ -188,10 +306,10 @@ export async function summarizeForVoice(
       body: JSON.stringify({
         model: "deepseek-flash",
         messages: [
-          { role: "system", content: DEEPSEEK_FLASH_TTS_PROMPT },
+          { role: "system", content: systemPrompt },
           { role: "user", content: cleanInput },
         ],
-        max_tokens: 500,
+        max_tokens: maxTokens,
         temperature: 0.3,
         thinking: { type: "disabled" },
       }),
@@ -199,15 +317,9 @@ export async function summarizeForVoice(
     });
 
     if (response.ok) {
-      const rawData: unknown = await response.json();
-      const parsed = DeepSeekChatResponseSchema.safeParse(rawData);
-      if (parsed.success) {
-        const summary = parsed.data.choices?.[0]?.message?.content?.trim();
-        if (summary) {
-          const cleaned = cleanSummaryForTTS(summary);
-          if (cleaned) return cleaned;
-        }
-      }
+      const parsed = DeepSeekChatResponseSchema.safeParse(await response.json());
+      const verdict = judge(parsed.success ? parsed.data : null);
+      if (verdict) return verdict;
     }
 
     // Fallback: try deepseek-chat if deepseek-flash returned empty or non-200
@@ -220,28 +332,24 @@ export async function summarizeForVoice(
       body: JSON.stringify({
         model: "deepseek-chat",
         messages: [
-          { role: "system", content: DEEPSEEK_FLASH_TTS_PROMPT },
+          { role: "system", content: systemPrompt },
           { role: "user", content: cleanInput },
         ],
-        max_tokens: 300,
+        max_tokens: maxTokens,
         temperature: 0.3,
       }),
       signal: timeoutController.signal,
     });
 
     if (fallbackResponse.ok) {
-      const fbRawData: unknown = await fallbackResponse.json();
-      const fbParsed = DeepSeekChatResponseSchema.safeParse(fbRawData);
-      if (fbParsed.success) {
-        const fbSummary = fbParsed.data.choices?.[0]?.message?.content?.trim();
-        if (fbSummary) {
-          const cleaned = cleanSummaryForTTS(fbSummary);
-          if (cleaned) return cleaned;
-        }
-      }
+      const parsed = DeepSeekChatResponseSchema.safeParse(await fallbackResponse.json());
+      const verdict = judge(parsed.success ? parsed.data : null);
+      if (verdict) return verdict;
     }
   } catch {
-    // Graceful fallback to deterministic spoken text
+    // Graceful fallback to deterministic spoken text.  Our own deadline (not
+    // the caller cancelling) is the one failure that will repeat.
+    if (timeoutController.signal.aborted && !effectiveSignal?.aborted) return fallback("timeout");
   } finally {
     clearTimeout(timer);
     if (options.signal) {
@@ -249,5 +357,5 @@ export async function summarizeForVoice(
     }
   }
 
-  return sanitizeForTTS(speakable(spokenReply(rawText)));
+  return fallback("unavailable");
 }

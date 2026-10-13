@@ -6,12 +6,12 @@ from a single pinned commit, verifies every artifact the way a user would
 receive it, and preserves one complete artifact set in Actions.  That default
 mode does not create or change a GitHub Release.  Tick **draft** to upload the
 verified set to a draft on this repository's own
-[Releases page](https://github.com/jaywedgeworth22/BotFleet/releases).  Tick
+[Releases page](https://github.com/Simple-With-Us/BotFleet/releases).  Tick
 **publish** only when that exact run should create or update the draft and make
 it public immediately.
 
 There is exactly one publish target: this repository.  `electron-builder.yml`
-`publish` names `jaywedgeworth22/BotFleet`, which electron-builder bakes into
+`publish` names `Simple-With-Us/BotFleet`, which electron-builder bakes into
 every packaged app's `app-update.yml`; `release.yml` uploads to the same
 repository through its `RELEASES_REPO` variable.  Keep the two in step, or
 installed apps check a feed no release ever lands on.  The repository is
@@ -37,7 +37,7 @@ electron-updater reads a feed file, not the DMG:
 - **Ubuntu:** `latest-linux.yml` plus the AppImage.
 
 A release that carries only DMGs, as
-[`v0.1.38`](https://github.com/jaywedgeworth22/BotFleet/releases/tag/v0.1.38)
+[`v0.1.38`](https://github.com/Simple-With-Us/BotFleet/releases/tag/v0.1.38)
 did, cannot be found by any installed app: **Check for updates** fails
 on every platform.  `1.0.31` is the first desktop version prepared to ship
 with `latest-mac.yml` and both macOS zips from `release.yml`.  Never
@@ -109,5 +109,5 @@ surgery: `pnpm package:mac:release`, gate both applications with
 notarize with the local keychain profile (`xcrun notarytool submit …
 --keychain-profile AC_PASSWORD`), staple, re-zip, regenerate blockmaps and
 `node scripts/regenerate-mac-feed.mjs`, upload to the matching
-`jaywedgeworth22/BotFleet` release, publish, and always verify the
+`Simple-With-Us/BotFleet` release, publish, and always verify the
 published bytes against the published feed by downloading them back.

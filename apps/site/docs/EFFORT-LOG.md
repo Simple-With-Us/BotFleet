@@ -1,5 +1,8 @@
 # Effort Log — botfleet-site
 
+> **ARCHIVED Sun, Oct 11, 2026.**  Linear is the system of record: team BF, https://linear.app/simple-with-us/team/BF.
+> This file is read-only history.  Do not edit it or add rows.  See EFFORT-LOG-PROTOCOL.md.
+
 Repo mirror of the live fleet effort board (see `EFFORT-LOG-PROTOCOL.md` in the maintainer's fleet checkout).  Newest first.  Never delete another agent's row.
 
 | Date | Agent | Env | Where | Status | Work |

@@ -15,6 +15,7 @@ import { isQuotaOrCapText, parseQuotaResetTime } from "../model-fallback.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import { buildTurnEvents } from "../telemetry.ts";
 import {
   ANTIGRAVITY_COMPUTER_MCP_KEY,
@@ -405,6 +406,42 @@ describe("Antigravity turns (fake CLI)", () => {
   it("respondToRequest resolves `unavailable` — no interactive permission channel, so the caller denies", async () => {
     await create();
     await expect(instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" })).resolves.toBe("unavailable");
+  });
+
+  it("launches each bot's agy with its own seat and none of the harness's identity, from one shared instance", async () => {
+    const restore = inheritHarnessIdentity();
+    const dir = mkdtempSync(join(tmpdir(), "omb-agy-launch-"));
+    const dump = join(dir, "dump.json");
+    const inst = await AntigravityDriver.create({
+      instanceId: "agy-launch",
+      displayName: undefined,
+      // an instance-level identity must not survive either
+      environment: { FAKE_AGY_DUMP: dump, AGENT_SEAT: "CODEX", ZULIP_API_KEY: "instance-api-key" },
+      enabled: true,
+      config: AntigravityDriver.decodeConfig({ cli: FAKE_CLI }),
+    });
+    const rec = recordEvents(inst.adapter);
+    const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+      const started = await inst.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+      await rec.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+      return readEngineDump(dump).env;
+    };
+    try {
+      const plumber = await seenFor("t-agy-plumber", { seat: "BF-PLUMBER", session: "t-agy-plumber" });
+      const fixer = await seenFor("t-agy-fixer", { seat: "BF-FIXER", session: "t-agy-fixer" });
+      const none = await seenFor("t-agy-none", { seat: null, session: "t-agy-none" });
+      const bare = await seenFor("t-agy-bare", undefined);
+      expectLaunchedAs(plumber, { seat: "BF-PLUMBER", session: "t-agy-plumber" });
+      expectLaunchedAs(fixer, { seat: "BF-FIXER", session: "t-agy-fixer" });
+      expectLaunchedAs(none, { seat: null, session: "t-agy-none" });
+      expectLaunchedAs(bare, { seat: null });
+      expect(JSON.stringify([plumber, fixer, none, bare])).not.toContain("instance-api-key");
+    } finally {
+      rec.stop();
+      await inst.dispose();
+      restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("spawns agy with --mode accept-edits by default, and the bypass only when opted in", async () => {
@@ -894,6 +931,12 @@ describe("Antigravity computer MCP config", () => {
       expect(acceptEdits.adapter.capabilities.computerMcp).toBe(true);
       expect(acceptEdits.adapter.capabilities.localComputerMcp).toBe(true);
       expect(acceptEdits.adapter.capabilities.agentsMcp).toBe(true);
+      // No permission hook in print mode, in either mode: auto-review can
+      // only watch each step as it streams, and no turn can be held.
+      for (const instance of [fullAuto, acceptEdits]) {
+        expect(instance.adapter.capabilities.reviewHook).toBe("after");
+        expect(instance.adapter.capabilities.asksWhenHeld).toBeUndefined();
+      }
     } finally {
       await fullAuto.dispose();
       await acceptEdits.dispose();
@@ -1293,6 +1336,7 @@ describe("Antigravity host control", () => {
     beforeDispose?: () => Promise<void>,
     autoApprove?: boolean,
     unattended?: boolean,
+    bypassPermissions?: boolean,
   ) => {
     const dump = join(home, `${name}.json`);
     const instance = await AntigravityDriver.create({
@@ -1304,7 +1348,14 @@ describe("Antigravity host control", () => {
     });
     const recorder = recordEvents(instance.adapter);
     try {
-      await instance.adapter.sendTurn({ threadId: `t-host-${name}`, text: "hi", integrations, autoApprove, unattended });
+      await instance.adapter.sendTurn({
+        threadId: `t-host-${name}`,
+        text: "hi",
+        integrations,
+        autoApprove,
+        unattended,
+        bypassPermissions,
+      });
       await recorder.until((e) => e.type === "turn.completed");
       if (beforeDispose) await beforeDispose();
       return {
@@ -1350,6 +1401,43 @@ describe("Antigravity host control", () => {
     expect(sandbox.argv).not.toContain("--dangerously-skip-permissions");
     const mode = sandbox.argv.indexOf("--mode");
     expect(sandbox.argv.slice(mode, mode + 2)).toEqual(["--mode", "accept-edits"]);
+  });
+
+  it("carries a bot's Bypass Permissions to a turn that does not control this computer", async () => {
+    // Print mode has no approval cards, so the bot's own switch is the only
+    // way it can reach the engine's skip-permissions mode.  Without it a bot
+    // the person put in bypass had its shell commands refused by agy and
+    // nothing to approve them.
+    const sandbox = await runTurn("sandbox-bypass", false, sandboxIntegrations, {}, undefined, false, false, true);
+    expect(sandbox.argv).toContain("--dangerously-skip-permissions");
+    expect(sandbox.argv).not.toContain("--mode");
+
+    const plain = await runTurn("plain-bypass", false, undefined, {}, undefined, false, false, true);
+    expect(plain.argv).toContain("--dangerously-skip-permissions");
+
+    // Off stays off: only the bot's switch (or the engine's) turns it on.
+    const off = await runTurn("sandbox-no-bypass", false, sandboxIntegrations, {}, undefined, false, false, false);
+    expect(off.argv).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("never lets Bypass Permissions reach a turn that controls this computer", async () => {
+    // The broker draws the same line: a bot in bypass is still asked about
+    // anything that controls This Mac.  Here there is no broker, so the
+    // bypass is dropped and the host-control notice says why.
+    const host = await runTurn("host-bypass", false, hostIntegrations, {}, undefined, false, false, true);
+    expect(host.argv).not.toContain("--dangerously-skip-permissions");
+    const mode = host.argv.indexOf("--mode");
+    expect(host.argv.slice(mode, mode + 2)).toEqual(["--mode", "accept-edits"]);
+
+    const viaComputers = await runTurn("host-computers-bypass", false, hostComputersIntegrations, {}, undefined, false, false, true);
+    expect(viaComputers.argv).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("applies Bypass Permissions to an unattended turn, as the broker's bypass does", async () => {
+    // Unlike autoApprove (withheld below), bypass is the person's standing
+    // choice to have nothing ask, webhook turns included.
+    const sandbox = await runTurn("sandbox-bypass-unattended", false, sandboxIntegrations, {}, undefined, false, true, true);
+    expect(sandbox.argv).toContain("--dangerously-skip-permissions");
   });
 
   it("withholds the bypass for an unattended host-control turn even with autoApprove", async () => {

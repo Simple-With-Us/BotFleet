@@ -518,6 +518,17 @@ describe("Store", () => {
     expect(store.branchMessage(bot.threadId, "nope", "x")).toBeNull();
   });
 
+  it("branchMessage keeps a routine's command allowlist, so an edit or retry is still held to it", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const toolPolicy = { mode: "allowlist" as const, commands: [], writePaths: ["/Users/you/apps/state/line.md"], readPaths: [] };
+    const routine = store.appendMessage(bot.threadId, { role: "system", kind: "text", text: "run the routine", automationSource: "manual", toolPolicy });
+    const edited = store.branchMessage(bot.threadId, routine.id, "run the routine again")!;
+    expect(edited.toolPolicy).toEqual(toolPolicy);
+    const chat = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "hello" });
+    expect(store.branchMessage(bot.threadId, chat.id, "hello again")!.toolPolicy).toBeUndefined();
+  });
+
   it("branchMessage retains delegated attribution but drops the stale peer-thread link", () => {
     const store = new Store(selection);
     const bot = store.createBot();

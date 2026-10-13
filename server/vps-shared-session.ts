@@ -35,7 +35,7 @@ export function vpsSharedDisplayForBot(botId: string): string {
   return botDesktopDisplayFor(botId);
 }
 
-/** Deterministic display + Cua socket for one bot on the shared container. */
+/** Deterministic display + CUA socket for one bot on the shared container. */
 export function vpsSharedBotSession(botId: string): VpsSharedBotSession {
   return { occupancyKey: perBotOccupancyKey(botId), ...botDesktopSession(botId, "vps") };
 }

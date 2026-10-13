@@ -107,14 +107,8 @@ export function speechDeviceDisabledReason(
     return "Pick a voice this agent can speak before enabling playback.";
   }
 
-  if (device === "mac" && personal) {
-    if (onPhone) {
-      return "Personal Voice plays on this iPhone only.  Mac playback stays off while this voice is selected.";
-    }
-    if (ctx.personalVoicePlaybackAllowed === false) {
-      return "Personal Voice is not available on this computer.  Enable Play on iPhone instead.";
-    }
-    return null;
+  if (device === "mac" && personal && !onPhone && ctx.personalVoicePlaybackAllowed === false) {
+    return "Personal Voice is not available on this computer.  Enable Play on iPhone instead.";
   }
 
   if (device === "iphone" && !onPhone) {

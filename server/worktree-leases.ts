@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { mkdir, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
@@ -16,6 +17,12 @@ function canonicalPath(p: string): string {
 }
 
 export const WORKTREES_BASE_DIR = join(DATA_DIR, "worktrees");
+
+/** Async existence check for the lease queue.  Each repository's queue is one
+ * async chain, and a synchronous `existsSync`, `mkdirSync` or `rmSync` inside it
+ * runs on the main thread: deleting a worktree full of `node_modules` and build
+ * output would stall every other bot's turn, not just the next lease. */
+const pathExists = (path: string): Promise<boolean> => stat(path).then(() => true, () => false);
 
 export interface WorktreeLease {
   readonly lease: ExactTurnLease;
@@ -36,8 +43,13 @@ export interface AcquireWorktreeOptions {
 export interface ReleaseWorktreeOptions {
   /** Keep the worktree directory on disk instead of removing it. */
   keepWorktree?: boolean;
-  /** Delete the worktree's Git branch after removal. */
+  /** Delete the worktree's Git branch after removal.  Commits that only that
+   *  branch points at are lost with it, so this runs only together with
+   *  `confirmBranchDeletion`. */
   removeBranch?: boolean;
+  /** The caller has decided that losing the branch's unmerged commits is fine.
+   *  Without it `removeBranch` is refused before anything is touched. */
+  confirmBranchDeletion?: boolean;
 }
 
 export interface WorktreeLeaseManagerOptions {
@@ -60,6 +72,24 @@ function sanitizeRefSegment(str: string): string {
   return str.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
+/** The directory one bot+thread pair works in, a single segment under the repo
+ *  hash.
+ *
+ *  Joining the two sanitized ids with a hyphen cannot be read back: the
+ *  sanitizer keeps `-`, so bot `bot-1` on thread `thread-1` and bot
+ *  `bot-1-thread` on thread `1` both spelled `bot-1-thread-1`.  Their lease
+ *  keys differ, so both were admitted, and the second `acquire` removed and
+ *  re-created the first turn's live working tree.  The tail here is a digest
+ *  of the RAW pair, framed as JSON so no choice of ids can move a boundary,
+ *  and it is a fixed length so the name cannot be split two ways. */
+function worktreeDirName(botId: string, threadId: string): string {
+  const pair = createHash("sha256")
+    .update(JSON.stringify([botId, threadId]))
+    .digest("hex")
+    .slice(0, 16);
+  return `${sanitizeRefSegment(botId)}-${pair}`;
+}
+
 /**
  * Strict Git Worktree Lease Engine (Option C).
  *
@@ -74,6 +104,10 @@ export class WorktreeLeaseManager {
   readonly gitTimeoutMs: number;
 
   private readonly repoQueues = new Map<string, Promise<unknown>>();
+  /** Worktree directories this manager has leased and not yet released.  The
+   *  directory name is a digest, so a directory cannot be mapped back to a
+   *  lease key; the path itself is what the prune pass compares. */
+  private readonly activePaths = new Set<string>();
 
   constructor(options: WorktreeLeaseManagerOptions = {}) {
     this.baseDir = options.baseDir ?? WORKTREES_BASE_DIR;
@@ -156,9 +190,15 @@ export class WorktreeLeaseManager {
   /**
    * Acquires a strict worktree lease for a turn.
    *
-   * Creates an isolated worktree directory under `baseDir/<repoHash>/<botId>-<threadId>`
-   * checked out to branch `botfleet/<botId>/<threadId>`, protected by an exact turn
-   * occupancy claim.
+   * Creates an isolated worktree directory under
+   * `baseDir/<repoHash>/<botId>-<pairDigest>` (see `worktreeDirName`) checked out
+   * to branch `botfleet/<botId>/<threadId>`, protected by an exact turn occupancy
+   * claim.
+   *
+   * The branch is reset with `-B` on every acquire and survives `release` unless
+   * the caller deletes it (`removeBranch` with `confirmBranchDeletion`), so work
+   * a turn left only on that branch stays reachable until the next acquire for
+   * the same bot and thread resets it.
    */
   async acquire(
     repoRoot: string,
@@ -195,27 +235,23 @@ export class WorktreeLeaseManager {
       );
     }
 
-    const worktreePath = join(
-      this.baseDir,
-      repoHash,
-      `${safeBotId}-${safeThreadId}`,
-    );
+    const worktreePath = join(this.baseDir, repoHash, worktreeDirName(botId, threadId));
 
     try {
       await this.serialize(root, async () => {
         // If a leftover directory exists from a prior killed turn or crash, remove it first.
-        if (existsSync(worktreePath)) {
+        if (await pathExists(worktreePath)) {
           await this.runGit(
             ["worktree", "remove", "--force", worktreePath],
             root,
           ).catch(() => {});
           await this.runGit(["worktree", "prune"], root).catch(() => {});
-          if (existsSync(worktreePath)) {
-            rmSync(worktreePath, { recursive: true, force: true });
+          if (await pathExists(worktreePath)) {
+            await rm(worktreePath, { recursive: true, force: true });
           }
         }
 
-        mkdirSync(dirname(worktreePath), { recursive: true, mode: 0o700 });
+        await mkdir(dirname(worktreePath), { recursive: true, mode: 0o700 });
 
         const addResult = await this.runGit(
           ["worktree", "add", "--force", "-B", branch, worktreePath, commitIsh],
@@ -229,6 +265,7 @@ export class WorktreeLeaseManager {
         }
       });
 
+      this.activePaths.add(worktreePath);
       return {
         lease,
         repoRoot: root,
@@ -253,6 +290,15 @@ export class WorktreeLeaseManager {
   ): Promise<void> {
     try {
       await this.serialize(leaseInfo.repoRoot, async () => {
+        // Refuse a branch deletion nobody confirmed BEFORE the worktree goes:
+        // the old order threw after the removal, so the caller was told "no"
+        // about a branch while its working tree was already destroyed.
+        if (options.removeBranch && !options.confirmBranchDeletion) {
+          throw new Error("Branch deletion requires explicit owner confirmation");
+        }
+        if (options.removeBranch && options.keepWorktree) {
+          throw new Error("Cannot delete a branch while keeping its worktree checked out");
+        }
         if (!options.keepWorktree) {
           await this.runGit(
             ["worktree", "remove", "--force", leaseInfo.worktreePath],
@@ -261,9 +307,9 @@ export class WorktreeLeaseManager {
           await this.runGit(["worktree", "prune"], leaseInfo.repoRoot).catch(
             () => {},
           );
-          if (existsSync(leaseInfo.worktreePath)) {
+          if (await pathExists(leaseInfo.worktreePath)) {
             try {
-              rmSync(leaseInfo.worktreePath, { recursive: true, force: true });
+              await rm(leaseInfo.worktreePath, { recursive: true, force: true });
             } catch {
               // Ignore disk removal error if Git already detached it
             }
@@ -271,10 +317,19 @@ export class WorktreeLeaseManager {
         }
 
         if (options.removeBranch) {
-          throw new Error("Branch deletion requires explicit owner confirmation");
+          const deleted = await this.runGit(
+            ["branch", "-D", leaseInfo.branch],
+            leaseInfo.repoRoot,
+          );
+          if (deleted.code !== 0) {
+            throw new Error(
+              `Failed to delete branch ${leaseInfo.branch}: ${deleted.stderr.trim() || deleted.stdout.trim()}`,
+            );
+          }
         }
       });
     } finally {
+      this.activePaths.delete(leaseInfo.worktreePath);
       this.exactTurnLeases.release(leaseInfo.lease);
     }
   }
@@ -307,11 +362,14 @@ export class WorktreeLeaseManager {
             const ageMs = now - stats.mtimeMs;
             if (ageMs < maxAgeMs) continue;
 
-            // Check if any lease is holding this entry
-            const targetKeySuffix = entry.name.replace("-", ":");
-            const targetKey = `worktree:${hashDir.name}:${targetKeySuffix}`;
-            if (this.exactTurnLeases.hasTarget(targetKey)) continue;
+            // A directory a live lease is using is never stale, whatever its
+            // mtime says.  Compared by path: the name is a digest of the
+            // bot+thread pair and cannot be turned back into a lease key.
+            if (this.activePaths.has(entryPath)) continue;
 
+            // Reclaiming the rest needs the owning repository, which the
+            // repo-hash directory cannot give back, so a stale directory is
+            // left for the next acquire of the same bot and thread to remove.
             continue;
           } catch {
             errors++;

@@ -9,6 +9,7 @@ import {
   AUTO_FALLBACK_PRIORITY,
   DEFAULT_QUOTA_COOLDOWN_TTL_MS,
   bootRecoveryTurnOpts,
+  continuedTurnToolPolicy,
   isModelRejectionText,
   isQuotaOrCapText,
   isShortProviderErrorText,
@@ -66,23 +67,36 @@ function decide(messagesAfterUser: FallbackScanMessage[], opts: {
 describe("DSH vision route migration", () => {
   it("updates the Pro primary and matching fallback without changing unrelated routes", () => {
     const original: ModelSelection = {
-      instanceId: "dsh", model: "DeepSeek-V4.1-Pro", effort: "high",
+      instanceId: "dsh", model: "DeepSeek-V4-Pro", effort: "high",
       fallbacks: [
-        { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
-        { instanceId: "dsh", model: "DeepSeek-V4.1-Pro", effort: "none" },
+        { instanceId: "claude", model: "DeepSeek-V4-Pro" },
+        { instanceId: "dsh", model: "DeepSeek-V4-Pro", effort: "none" },
         { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
       ],
     };
     expect(dshVisionSelection(original)).toEqual({
       instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "high",
       fallbacks: [
-        { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
+        { instanceId: "claude", model: "DeepSeek-V4-Pro" },
         { instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "none" },
         { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
       ],
     });
-    expect(original.model).toBe("DeepSeek-V4.1-Pro");
-    expect(original.fallbacks?.[1]?.model).toBe("DeepSeek-V4.1-Pro");
+    expect(original.model).toBe("DeepSeek-V4-Pro");
+    expect(original.fallbacks?.[1]?.model).toBe("DeepSeek-V4-Pro");
+  });
+
+  it("still routes the retired DeepSeek-V4.1-Pro spelling off Pro", () => {
+    // A send path can carry the old id before the store rewrite reaches it, and
+    // a Pro turn that stayed on Pro would fail on the image instead of routing.
+    expect(
+      dshVisionSelection({ instanceId: "dsh", model: "DeepSeek-V4.1-Pro" }),
+    ).toEqual({ instanceId: "dsh", model: "DeepSeek-V4.1-Flash" });
+  });
+
+  it("leaves a non-dsh entry named DeepSeek-V4-Pro alone", () => {
+    const chain: ModelSelection = { instanceId: "claude", model: "DeepSeek-V4-Pro" };
+    expect(dshVisionSelection(chain)).toEqual(chain);
   });
 });
 
@@ -576,6 +590,34 @@ describe("AUTO_FALLBACK_PRIORITY — #90 auto-failover ordering", () => {
   });
 });
 
+describe("continuedTurnToolPolicy", () => {
+  const toolPolicy = { mode: "allowlist" as const, commands: [], writePaths: [], readPaths: [] };
+
+  it("returns the allowlist on the turn starter a card continuation resumes", () => {
+    expect(
+      continuedTurnToolPolicy([
+        { role: "user", kind: "text", text: "earlier chat" },
+        { role: "bot", kind: "text", text: "reply" },
+        { role: "system", kind: "text", text: "run the routine", toolPolicy },
+        { role: "bot", kind: "activity", tool: { name: "connector" } },
+        { role: "bot", kind: "options" },
+      ]),
+    ).toEqual(toolPolicy);
+  });
+
+  it("returns none when the turn being continued is an ordinary one", () => {
+    expect(
+      continuedTurnToolPolicy([
+        { role: "system", kind: "text", text: "run the routine", toolPolicy },
+        { role: "bot", kind: "text", text: "done" },
+        { role: "user", kind: "text", text: "now a chat turn" },
+        { role: "bot", kind: "options" },
+      ]),
+    ).toBeUndefined();
+    expect(continuedTurnToolPolicy([])).toBeUndefined();
+  });
+});
+
 describe("lastTurnStartIndex", () => {
   it("finds the last user text, ignoring later bot chips", () => {
     expect(
@@ -636,6 +678,15 @@ describe("shouldReplayPersistedStarter", () => {
 });
 
 describe("bootRecoveryTurnOpts", () => {
+  it("carries a routine's command allowlist on the continuation path as well as on replay", () => {
+    const toolPolicy = { mode: "allowlist" as const, commands: [], writePaths: [], readPaths: [] };
+    const resume = { role: "system", automationSource: "manual" as const, toolPolicy };
+    // false is the BOOT_RECOVERY_NOTICE continuation, which never reuses the starter as userMessage
+    expect(bootRecoveryTurnOpts(resume, false)).toEqual({ automationSource: "manual", unattended: true, toolPolicy });
+    expect(bootRecoveryTurnOpts(resume, true)).toEqual({ automationSource: "manual", unattended: true, toolPolicy });
+    expect(bootRecoveryTurnOpts({ role: "user" }, false)).not.toHaveProperty("toolPolicy");
+  });
+
   it("forwards webhook automationSource and marks unattended on both replay and BOOT_RECOVERY_NOTICE paths", () => {
     const resume = { role: "system", automationSource: "webhook" as const };
     const notice = bootRecoveryTurnOpts(resume, false);

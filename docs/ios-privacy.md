@@ -97,7 +97,7 @@ holder asks for deletion. Some minimal records may be retained when required
 for security, fraud prevention, dispute resolution, or law.
 
 To request a copy or deletion of hosted account data, open an
-[BotFleet Support](https://github.com/jaywedgeworth22/BotFleet/issues) request
+[BotFleet Support](https://github.com/Simple-With-Us/BotFleet/issues) request
 without posting an OTP, pairing code, device token, connector token, or other
 secret. The maintainer will provide a private way to verify control of the
 email address. Deleting hosted account data does not delete transcripts stored
@@ -106,4 +106,4 @@ on the user's own computer.
 ## Support
 
 Privacy questions can be opened at
-[BotFleet Support](https://github.com/jaywedgeworth22/BotFleet/issues).
+[BotFleet Support](https://github.com/Simple-With-Us/BotFleet/issues).

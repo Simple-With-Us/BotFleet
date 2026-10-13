@@ -18,6 +18,10 @@ struct GroupProfileView: View {
     @State private var memberIds: Set<String> = []
     @State private var photo: PhotosPickerItem? = nil
     @State private var busy = false
+    /// Set while the delete confirmation is up.
+    @State private var deleteTarget: Chat?
+    /// The harness's refusal of a delete, shown in this sheet.
+    @State private var deleteError: String?
 
     private var roomTerm: String {
         session.config?.roomTerminologyLabel ?? "Channel"
@@ -138,6 +142,7 @@ struct GroupProfileView: View {
                         )) {
                             HStack(spacing: 10) {
                                 BotAvatarView(bot: bot, size: 28)
+                                    .providerBadge(for: bot, avatarSize: 28)
                                 VStack(alignment: .leading) {
                                     Text(bot.name)
                                         .font(.body)
@@ -166,6 +171,11 @@ struct GroupProfileView: View {
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                         .lineLimit(3...8)
+                }
+
+                // Bot-to-bot chats stay out of user management, as on the desktop.
+                if room.dm != true {
+                    deleteSection
                 }
             }
             .navigationTitle("\(roomTerm) Settings")
@@ -207,6 +217,41 @@ struct GroupProfileView: View {
             .onChange(of: photo) { _, item in
                 guard let item else { return }
                 Task { await upload(item) }
+            }
+            .modifier(DeleteChatAlert(target: $deleteTarget, roomTerm: roomTerm, onConfirm: { _ in
+                Task { await deleteRoom() }
+            }))
+            .modifier(InlineErrorAlert(message: $deleteError, title: "Could Not Delete"))
+        }
+    }
+
+    /// Last in the form, behind a confirmation that names the room and what
+    /// is lost.
+    private var deleteSection: some View {
+        Section {
+            Button(
+                BotOrganize.deleteRoomConfirmation(name: room.name, roomTerm: roomTerm).confirmLabel,
+                systemImage: "trash",
+                role: .destructive
+            ) {
+                deleteTarget = .room(session.state.rooms.first(where: { $0.id == room.id }) ?? room)
+            }
+            .disabled(busy)
+        } footer: {
+            Text("Deleting removes every conversation in this \(roomTerm.lowercased()) for good.\u{00A0} Its bots stay.")
+        }
+    }
+
+    /// The chat screen under this sheet closes itself once the room is gone.
+    private func deleteRoom() async {
+        busy = true
+        defer { busy = false }
+        do {
+            try await session.deleteRoom(room)
+            dismiss()
+        } catch {
+            if !session.isCancellation(error) {
+                deleteError = error.localizedDescription
             }
         }
     }

@@ -24,6 +24,7 @@ import { effectiveDefaultResponder, groupResponseHint } from "@/lib/group-routin
 import { ChatMarkdown } from "./ChatMarkdown";
 import { MentionText } from "./MentionText";
 import { Composer } from "./Composer";
+import { UpdateDrainNotice } from "./UpdateDrainNotice";
 import { ErrorRow, TurnErrorAnnouncement, latestTurnErrorMessage } from "./ErrorRow";
 import { ChatFindBar } from "./ChatFindBar";
 import { GroupThreadTabs } from "./ThreadTabs";
@@ -981,8 +982,12 @@ export function GroupView({ group }: { group: Group }) {
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
   const macInset = capabilities.windowChrome === "mac-inset";
-  const dragStyle = macInset ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
-  const noDragStyle = macInset ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const stream = useStreaming();
   const streaming = stream.streaming[group.threadId];
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1631,6 +1636,7 @@ export function GroupView({ group }: { group: Group }) {
         </button>
       )}
       <div className="w-full">
+      <UpdateDrainNotice />
       <Composer
         key={group.threadId}
         group={group}

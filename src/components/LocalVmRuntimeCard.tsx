@@ -13,12 +13,21 @@
 // available".  Keeping them split lets a future ops change to the
 // runtime not drag the settings UX with it, and vice versa.
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Check, Circle, ExternalLink, Loader2, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
+import { AlertTriangle, Check, Circle, Loader2, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
 import { api, useStore, type ConfigStatus } from "@/state/store";
 import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { productErrorHeadline } from "@/lib/product-error";
+import { redactCommandSecrets } from "@/lib/redact-command-secrets";
+import { localVmSetupLine } from "@/lib/local-vm-setup-line";
+import { PersistentActionErrorCard } from "./PersistentActionErrorCard";
+
+// Must outlast the harness's worst case for one status read: a 4 s presence
+// check, then the runtime health probe, which retries once on a timeout (two
+// 12 s attempts).  A shorter wait aborts the request in exactly the case the
+// "slow to respond" message exists for, and each abandoned request keeps
+// running on the harness.
+const STATUS_TIMEOUT_MS = 40_000;
 
 type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
 
@@ -27,6 +36,8 @@ interface Status {
   runtime: string | null;
   available: string[];
   daemonUp: boolean;
+  /** Installed, but its health check timed out twice: unknown, not stopped. */
+  daemonSlow?: boolean;
   image: boolean;
   imageMatches: boolean;
   managed: boolean;
@@ -43,7 +54,6 @@ interface Status {
   container_name: string;
   workspace_path: string;
   workspace_guest_path: string;
-  viewer_url: string;
   idle_timeout_ms: number;
   max_instances: number;
   commands: {
@@ -54,7 +64,6 @@ interface Status {
     start: string | null;
     stop: string | null;
     remove: string | null;
-    view: string;
   };
 }
 
@@ -112,7 +121,8 @@ export function LocalVmRuntimeCard() {
   const [status, setStatus] = useState<Status | null>(null);
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<Action | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<null | { title: string; body: string; confirmLabel: string; action: Action }>(null);
   const [modePending, setModePending] = useState(false);
   const [modeError, setModeError] = useState<string | null>(null);
@@ -138,7 +148,7 @@ export function LocalVmRuntimeCard() {
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error ?? `Status request failed (${response.status})`);
     setStatus(body as Status);
-    setError(null);
+    setStatusError(null);
   }, []);
 
   useEffect(() => {
@@ -147,14 +157,26 @@ export function LocalVmRuntimeCard() {
     let controller: AbortController | undefined;
     const poll = async () => {
       controller = new AbortController();
+      let timedOut = false;
+      const timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller?.abort();
+      }, STATUS_TIMEOUT_MS);
       try {
         await refresh(controller.signal);
       } catch (e) {
-        if (active && !(e instanceof DOMException && e.name === "AbortError")) {
-          setStatus(null);
-          setError(e instanceof Error ? e.message : String(e));
-        }
+        if (!active) return;
+        if (e instanceof DOMException && e.name === "AbortError" && !timedOut) return;
+        const message = e instanceof Error ? e.message : String(e);
+        setStatusError(
+          redactCommandSecrets(
+            timedOut
+              ? `Status check timed out after ${Math.round(STATUS_TIMEOUT_MS / 1000)} seconds. The container runtime may be busy or not responding.`
+              : message,
+          ),
+        );
       } finally {
+        window.clearTimeout(timeoutId);
         if (active) {
           setLoading(false);
           timer = window.setTimeout(() => void poll(), 5000);
@@ -200,7 +222,7 @@ export function LocalVmRuntimeCard() {
       return;
     }
     setPending(action);
-    setError(null);
+    setActionError(null);
     try {
       if (action === "recreate") {
         await post("remove");
@@ -210,7 +232,7 @@ export function LocalVmRuntimeCard() {
       }
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setActionError(redactCommandSecrets(e instanceof Error ? e.message : String(e)));
     } finally {
       setPending(null);
     }
@@ -228,7 +250,7 @@ export function LocalVmRuntimeCard() {
         status?.security === "unsafe" ||
         status?.persistence === "unsafe"),
   );
-  const unavailable = !loading && !status;
+  const unavailable = !loading && !status && Boolean(statusError);
   const host = status?.platform === "darwin" ? "Mac" : "computer";
   const perBotRuntimeUnsupported = perBot && status?.runtime === "container";
   const headerReady = perBot ? Boolean(status?.daemonUp && status?.image && !perBotRuntimeUnsupported) : ready;
@@ -275,7 +297,7 @@ export function LocalVmRuntimeCard() {
                     ? "Per-bot mode requires Docker or Podman"
                   : ready
                     ? "Ready"
-                    : (status?.problem ?? "Not ready")}
+                    : localVmSetupLine(status, perBot)}
           </span>
           <button
             onClick={() => {
@@ -287,18 +309,17 @@ export function LocalVmRuntimeCard() {
           >
             <RefreshCw size={12} /> Re-check
           </button>
-          {ready && !perBot && (
-            <a
-              href={status?.viewer_url ?? c?.view}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink hover:bg-control"
-            >
-              <ExternalLink size={12} /> Watch Screen
-            </a>
-          )}
         </div>
-        {error && <div className="mt-3 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger" title={error}>{productErrorHeadline(error)}</div>}
+        {statusError && (
+          <div className="mt-3">
+            <PersistentActionErrorCard message={statusError} onDismiss={() => setStatusError(null)} />
+          </div>
+        )}
+        {actionError && (
+          <div className="mt-3">
+            <PersistentActionErrorCard message={actionError} onDismiss={() => setActionError(null)} />
+          </div>
+        )}
       </Card>
 
       <Card
@@ -358,10 +379,20 @@ export function LocalVmRuntimeCard() {
 
           <Step
             n={2}
-            title={status?.runtime && !status.daemonUp ? `Open and start ${status.runtime}` : "Start the container runtime"}
+            title={
+              status?.runtime && status.daemonSlow && !status.daemonUp
+                ? `Waiting for ${status.runtime} to respond`
+                : status?.runtime && !status.daemonUp
+                  ? `Open and start ${status.runtime}`
+                  : "Start the container runtime"
+            }
             done={Boolean(status?.daemonUp)}
           >
-            {!status?.runtime ? null : c?.runtimeStart ? (
+            {!status?.runtime ? null : status.daemonSlow && !status.daemonUp ? (
+              <div className="text-[13px] text-ink-secondary">
+                The container runtime ({status.runtime}) is installed but did not answer in time, usually because this {host} is busy.{"\u00a0 "}BotFleet keeps checking.
+              </div>
+            ) : c?.runtimeStart ? (
               <CommandLine command={c.runtimeStart} />
             ) : (
               <div className="text-[13px] text-ink-secondary">Open the installed runtime and start its engine, then re-check.</div>
@@ -403,11 +434,32 @@ export function LocalVmRuntimeCard() {
                 )}
               </>
             ) : status?.container === "stopped" ? (
-              <ActionButton action="start" pending={pending} onClick={() => void act("start")} disabled={localVmOff}>Start Local VM</ActionButton>
+              <>
+                <div className="flex gap-2 text-[13px] text-warning">
+                  <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+                  <span>{status?.problem ?? "This desktop cannot be resumed safely. Create a new Local VM instead."}</span>
+                </div>
+                {status?.image ? (
+                  <ActionButton action="recreate" pending={pending} onClick={() => void act("recreate")} danger disabled={localVmOff}>
+                    <RotateCcw size={13} /> Delete and recreate
+                  </ActionButton>
+                ) : (
+                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Linux desktop above before recreating this VM.</div>
+                )}
+              </>
             ) : status?.container === "running" ? (
               <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={13} className="animate-spin" /> Waiting for the desktop…</div>
             ) : status?.image ? (
               <ActionButton action="run" pending={pending} onClick={() => void act("run")} disabled={localVmOff}>Create Local VM</ActionButton>
+            ) : status ? (
+              // The VM comes last: say which step is still ahead of it.
+              <div className="text-[13px] text-ink-secondary">
+                {status.daemonUp
+                  ? "Prepare the Linux desktop above first.\u00a0 Then create the VM here."
+                  : status.daemonSlow
+                    ? "Waiting for the container runtime to respond."
+                    : "Start the container runtime above first."}
+              </div>
             ) : null}
             {localVmOff && !perBot && (
               <div className="text-[13px] text-ink-secondary">Local VM is turned off in Computer settings.{"\u00a0 "}Turn it on above to create or start it.</div>
@@ -429,8 +481,8 @@ export function LocalVmRuntimeCard() {
       <Card
         title="Safety and Storage"
         subtitle={perBot
-          ? `Computer Driver operates only this VM's desktop.\u00a0 Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement.\u00a0 Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container.\u00a0 Each VM keeps the existing 8 GB, 4 CPU, 512-process and dropped-capability limits.\u00a0 VMs can still reach the internet.`
-          : `Computer Driver operates only the VM's desktop.\u00a0 Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable.\u00a0 The password-protected viewer is available only on this machine.\u00a0 Docker and Podman runs are limited to 8 GB memory, 4 CPUs and 512 processes; all Linux capabilities are dropped except the two the desktop supervisor needs to switch to its unprivileged user.\u00a0 The VM can still reach the internet, and every bot sees the same files and sign-ins.`}
+          ? `Computer Driver operates only this VM's desktop.\u00a0 Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement.\u00a0 Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container.\u00a0 CPU and memory are sized to your container runtime (about 2 CPUs and 2–3 GiB by default), with a 512-process cap and dropped Linux capabilities.\u00a0 VMs can still reach the internet.`
+          : `Computer Driver operates only the VM's desktop.\u00a0 Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable.\u00a0 The password-protected viewer is available only on this machine.\u00a0 Docker and Podman runs are sized to your runtime (about 2 CPUs and 2–3 GiB by default), capped at 512 processes, with all Linux capabilities dropped except the two the desktop supervisor needs.\u00a0 The VM can still reach the internet, and every bot sees the same files and sign-ins.`}
       >
         {existing && (
           <div className="flex flex-wrap gap-2">

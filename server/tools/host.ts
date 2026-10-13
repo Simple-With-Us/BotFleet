@@ -29,6 +29,7 @@ import { isAbsolute, resolve } from "node:path";
 
 import { looksSensitive } from "../auto-approve.ts";
 import type {
+  LaunchIdentity,
   RequestOutcome,
   ToolArguments,
   TurnToolCall,
@@ -42,6 +43,7 @@ import {
   type AgentToolDeps,
   type AgentToolExecutor,
 } from "./agents.ts";
+import { launchEnvironment } from "../launch-identity.ts";
 import { createComputerTools } from "./computer.ts";
 import { createJobTools, jobCommandRefusal, type JobToolsOptions } from "./jobs.ts";
 import { TurnProcessGroups } from "./process-group.ts";
@@ -49,6 +51,7 @@ import { createGithubTools } from "./github.ts";
 import { createPhoneTools } from "./phone.ts";
 import { createRecallTools } from "./recall.ts";
 import { createLinqTools, type LinqToolDeps } from "./linq.ts";
+import { createZulipTools, type ZulipToolSend } from "./zulip.ts";
 import type { RecallSettings } from "../recall-transport.ts";
 import { harnessTool, toolsFor, type ToolApproval, type ToolGateContext } from "./registry.ts";
 
@@ -79,6 +82,10 @@ export interface TurnToolHostContext {
   workspace?: boolean;
   /** Working directory for file and shell operations. */
   cwd?: string;
+  /** Who BotFleet says this bot is for this turn (server/launch-identity.ts).
+   *  `bash` runs with it in its environment.  Absent, the shell is still
+   *  marked as launched, with no seat. */
+  launchIdentity?: LaunchIdentity;
   /** When set, the file tools refuse any path whose realpath escapes this
    *  workspace root.  Passed straight through to `createComputerTools`'s
    *  `confinement` option.  A bot with a workspace but no This Computer
@@ -104,6 +111,10 @@ export interface TurnToolHostContext {
    *  the dispatch offered them in the catalog — the same one boolean feeds
    *  both, so a job tool the model was not offered finds no executor here. */
   jobs?: Pick<JobToolsOptions, "registry" | "onComplete" | "wakes" | "maxWaitSeconds">;
+  /** This bot's Zulip identity is connected, so `zulip_reply` and
+   *  `zulip_post` are offered.  `send` is the hub's, bound by the dispatch;
+   *  the host hands it this turn's identity, never the model's arguments. */
+  zulip?: { send: ZulipToolSend };
   /** Job notices waiting for this turn (server/steer-queue.ts): the driver's
    *  tool loop drains them between model rounds. */
   drainNotices?: () => string[];
@@ -184,7 +195,12 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
   // Every process group this turn's `bash` calls start; what is still alive
   // when the turn ends is stopped by `settle` below.
   const processGroups = new TurnProcessGroups();
-  const computerTools = createComputerTools({ cwd: ctx.cwd, confinement: ctx.confinement, processGroups });
+  const computerTools = createComputerTools({
+    cwd: ctx.cwd,
+    confinement: ctx.confinement,
+    processGroups,
+    launchEnv: launchEnvironment(ctx.launchIdentity),
+  });
   const executors = new Map<string, AgentToolExecutor>([
     ...Object.entries(createAgentTools(ctx.deps)),
     ...Object.entries(computerTools),
@@ -229,6 +245,7 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
           ),
         )
       : []),
+    ...(ctx.zulip ? Object.entries(createZulipTools({ send: ctx.zulip.send })) : []),
   ]);
   const gate: ToolGateContext = {
     // The dispatch only builds a host when the agents integration is
@@ -254,6 +271,7 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
     github: Boolean(ctx.localComputer),
     linq: Boolean(ctx.linq),
     jobs: Boolean(ctx.jobs),
+    zulip: Boolean(ctx.zulip),
   };
   // The same gate the catalog handed the model.  A hallucinated name, or a
   // real name the model was not offered this turn, finds no executor.

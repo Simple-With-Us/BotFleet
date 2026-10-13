@@ -15,6 +15,8 @@
 // <userData>/cua-connection.json for the harness server to hand to drivers.
 
 import { app, ipcMain } from "electron";
+import { parseCuaPermissionsStdout } from "./cua-permissions-status.mjs";
+import { classifyNativeProbe, nativeProbeFailureMessage, probeNativeSync } from "./native-version-probe.mjs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import fs from "node:fs";
@@ -101,7 +103,7 @@ function ensureLinuxRuntime() {
 }
 
 export function setCuaStateListener(listener) {
-  stateListener = typeof listener === "function" ? listener : () => {};
+  stateListener = listener instanceof Function ? listener : () => {};
 }
 
 function persistAndNotify(next) {
@@ -158,7 +160,19 @@ async function attachStandalone() {
     // Launch CuaDriver.app through LaunchServices so Accessibility /
     // Screen Recording stay on com.trycua.driver — the identity this
     // machine already granted — instead of the freshly signed BotFleet.
-    spawnSync("open", ["-a", "CuaDriver"], { timeout: 8000 });
+    const launchProbe = probeNativeSync("open", {
+      args: ["-a", "CuaDriver"],
+      timeoutMs: 8_000,
+      attempts: 1,
+      matchVersion: () => "launched",
+      probeLabel: "CuaDriver launch probe",
+    });
+    if (!launchProbe.ok && launchProbe.reason === "timeout") {
+      console.warn(
+        "[cua]",
+        nativeProbeFailureMessage("Launching CuaDriver.app did not complete", launchProbe),
+      );
+    }
     for (let i = 0; i < 25; i++) {
       if (await socketAlive(STANDALONE_SOCKET)) break;
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -254,16 +268,36 @@ export async function startCua() {
 export function cuaPermissionsStatus() {
   const binary = resolveDriverBinary();
   if (!binary) return { available: false };
-  const out = spawnSync(binary, ["permissions", "status", "--json"], {
+  // Parse stdout even when the driver exits non-zero for denied permissions —
+  // the JSON payload is the product, not exit status 0.
+  const timeoutMs = 15_000;
+  const result = spawnSync(binary, ["permissions", "status", "--json"], {
     encoding: "utf8",
-    timeout: 5000,
+    windowsHide: true,
     env: { ...process.env, ...CUA_ENV },
+    timeout: timeoutMs,
   });
-  try {
-    return { available: true, ...JSON.parse(out.stdout) };
-  } catch {
-    return { available: true, raw: out.stdout?.trim() };
+  const parsed = parseCuaPermissionsStdout(result.stdout ?? "");
+  if (parsed.ok) return { available: true, ...parsed.data };
+  const probe = {
+    ...classifyNativeProbe(result, () => null),
+    result,
+    attempt: 1,
+    attempts: 1,
+    timeoutMs,
+  };
+  // Incomplete probe (error/signal/non-zero) reports status evidence; only an
+  // exit-0 unparseable body is "invalid CUA permissions status".
+  if (result.error || result.signal || result.status !== 0) {
+    return {
+      available: false,
+      reason: nativeProbeFailureMessage(
+        "cua-driver permissions status did not complete",
+        probe,
+      ),
+    };
   }
+  return { available: false, reason: "invalid CUA permissions status" };
 }
 
 export async function stopCua() {

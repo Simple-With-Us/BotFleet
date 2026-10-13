@@ -1,5 +1,6 @@
-# pnpm 11 reads allowBuilds, pnpm 10 reads onlyBuiltDependencies — keep both
-# so either version runs the postinstalls this project actually needs.
+# pnpm 12 reads allowBuilds only.  Packages not listed are unreviewed and
+# fail the install with ERR_PNPM_IGNORED_BUILDS.  Keep the old allowlist:
+# electron and esbuild run postinstalls; everything else is an explicit no.
 # A packages list is required for `pnpm list` (electron-builder's collector).
 packages:
   - "."
@@ -8,7 +9,23 @@ packages:
 allowBuilds:
   electron: true # postinstall downloads the Electron dist
   esbuild: true # postinstall validates the platform binary
+  "@sentry/cli": true # postinstall fetches the platform sentry-cli binary (vite source maps)
+  "@sentry/node-cpu-profiler": true # native addon for @sentry/profiling-node
   electron-winstaller: false # unused — Windows builds ship NSIS
-onlyBuiltDependencies:
-  - electron
-  - esbuild
+  "@deepseek-ai/dsh-subprocess-local": false
+  "@google/genai": false
+  core-js: false
+  koffi: false
+  node-pty: false
+  protobufjs: false
+  workerd: false
+overrides:
+  "@xmldom/xmldom@0.8.13": "0.8.15"
+  "js-yaml@4.3.1": "5.4.3"
+  "lodash-es": "4.18.1"
+  "sharp@0.35.2": "0.35.5"
+  "sharp@0.35.3": "0.35.5"
+supportedArchitectures:
+  cpu:
+    - "arm64"
+    - "x64"

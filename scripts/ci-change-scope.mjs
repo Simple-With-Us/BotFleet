@@ -45,6 +45,28 @@ export function isControlPlanePath(path) {
   return path.startsWith("cloudflare/");
 }
 
+/** The Mac pre-merge packaging gate (scripts/mac-package-gate.mjs) reuses
+ * `isPackagingPath` and widens it.  Kept separate from `isPackagingPath` so the
+ * Linux package job's existing scope in ci.yml is unchanged — widening a
+ * predicate the running workflow already consumes is a behaviour change nobody
+ * asked for, and this only needs to be additive.
+ *
+ * `mac-package-gate.yml` itself is intentionally absent.  Unlike `ios`, whose
+ * job lives inside ci.yml so a workflow edit can change that job, this gate's
+ * logic lives in scripts/mac-package-gate.mjs, which IS tracked here and is
+ * unit-tested on every run.  Rewiring the gate's own YAML should not cost a
+ * macOS runner.
+ */
+export function isMacPackagingPath(path) {
+  return (
+    isPackagingPath(path) ||
+    // The post-merge build this gate pre-empts.  Changing it changes what the
+    // Mac updater consumes, so it deserves the same pre-merge proof.
+    path === ".github/workflows/mac-commit-build.yml" ||
+    path === "scripts/mac-package-gate.mjs"
+  );
+}
+
 export function classifyCIPaths(paths) {
   const changedPaths = paths.filter(Boolean);
   const hasChanges = changedPaths.length > 0;

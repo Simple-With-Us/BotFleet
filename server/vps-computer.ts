@@ -1,16 +1,14 @@
 // BYO Linux VPS computer. The agent process stays local; Docker's own SSH
-// transport reaches the user's daemon and the official Cua MCP server stays
+// transport reaches the user's daemon and the official CUA MCP server stays
 // inside one managed container per bot.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createConnection, createServer, type AddressInfo } from "node:net";
+import { z } from "zod";
 
 import {
   BASE_IMAGE,
-  CLI_CREDENTIAL_CANDIDATES,
   CUA_DRIVER_VERSION,
   CUA_SOCKET,
   DISPLAY,
@@ -29,8 +27,11 @@ import {
   DRIVER_LABEL,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
+  MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   MANAGED_LABEL,
 } from "./container-computer.ts";
+import { resolveRuntimeCommand } from "./container-runtime-guard.ts";
+import { judgeDesktopProbeFailure, problemText } from "./desktop-probe.ts";
 import {
   ensureSharedVpsSessionExecArgs,
   isSharedVpsMode,
@@ -52,6 +53,16 @@ import {
   type AppConfig,
 } from "./config.ts";
 import { augmentedPath } from "./env-path.ts";
+import {
+  credentialPermissionHardeningShell,
+  guestCredentialOwnershipRepairShell,
+  guestPathForCredentialRel,
+  listArchiveRelPaths,
+  packageCredentialArchive,
+  prepareCredentialSyncWorkspace,
+  VM_CLI_GUEST_HOME,
+  type CredentialSyncResult,
+} from "./vm-cli-credentials.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 
 /** The per-desktop budget for one managed VPS container.  The run arguments
@@ -158,7 +169,7 @@ const PIDS_LIMIT = 512;
 const INTERNAL_VIEWER_PORT = 6901;
 const VIEWER_VERSION = "1";
 const lifecycleLocks = new Map<string, Promise<void>>();
-/** Per-bot shared-session setup (Xvfb + Cua serve) — not the container lock. */
+/** Per-bot shared-session setup (Xvfb + CUA serve) — not the container lock. */
 const botSessionLocks = new Map<string, Promise<void>>();
 /** Concurrent shared-mode provisions of the one container coalesce into a
  * single flight.  Provision is the idempotent turn-start path: when N bots
@@ -245,6 +256,10 @@ export interface VpsComputerStatus {
   security: "hardened" | "unsafe" | "unknown";
   desktopReady: boolean;
   desktop_error: string | null;
+  /** One desktop check timed out or lost its transport, so the desktop's state
+   * is unknown right now.  Never a "failed to start": the container is known
+   * to be running, and the next poll re-checks. */
+  desktopUnreachable: boolean;
   ready: boolean;
   problem: string | null;
   image_ref: string;
@@ -253,6 +268,16 @@ export interface VpsComputerStatus {
   container_name: string;
   container_id: string | null;
   image_id: string | null;
+  /** The image the running container was actually started from.  Bots refuse
+   *  a container when this differs from `image_id`; label drift alone does
+   *  NOT trigger the refuse / swap because the swap destroys the container
+   *  filesystem. */
+  container_image_id: string | null;
+  /** The host's pinned-image build: idle, building, failed, or ready. */
+  imageBuild: VpsImageBuildState;
+  /** A BotFleet container exists but is not on the pinned image, so bots
+   *  refuse it until it is switched (see vpsContainerOutdated). */
+  imageOutdated: boolean;
 }
 
 function containerNamePart(botId: string): string {
@@ -377,6 +402,22 @@ export function closeAllVpsDesktopTunnels(): void {
 }
 
 const STREAM_CAP_CHARS = 16 * 1024 * 1024;
+/** How much stderr a failed docker-over-SSH command keeps for the error.  A
+ *  reader needs every failing path in it, and the message is what reaches the
+ *  harness log: GNU tar names one refused member per line, so a 1000-char tail
+ *  of a gcloud log-tree extraction started mid-word and reported the cause as
+ *  `kdir: Permission denied` instead of `Cannot mkdir: Permission denied`. */
+const RUNNER_STDERR_CHARS = 8_000;
+
+/** The tail of a command's stderr, sized to stay readable in a log line, with
+ *  an explicit marker when it did not fit — never a silently clipped message
+ *  that starts mid-sentence.  `NAME=…` secrets are scrubbed either way. */
+export function runnerFailureDetail(stderr: string, status: string | number | null | undefined): string {
+  const full = stderr.trim();
+  const tail = full.slice(-RUNNER_STDERR_CHARS);
+  const trimmed = tail === full ? tail : `… ${full.length - tail.length} earlier characters omitted …\n${tail}`;
+  return redactSecrets(trimmed) || `Docker-over-SSH exited ${status ?? "without a status"}`;
+}
 
 /** Keeps the LAST 16MB of a stream without rebuilding one giant string per
  * chunk (a 10-minute `docker build` stream made that rebuild quadratic).
@@ -404,7 +445,10 @@ function tailCollector() {
 
 export function defaultRunner(args: string[], options: VpsCommandOptions = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("docker", args, {
+    // `docker -H ssh://…` ignores DOCKER_HOST, so the container-runtime kill
+    // switch is enforced here, before the spawn.  A throw in this executor
+    // rejects the promise.
+    const child = spawn(resolveRuntimeCommand("docker"), args, {
       shell: false,
       env: { ...process.env, PATH: augmentedPath() },
       stdio: ["pipe", "pipe", "pipe"],
@@ -457,8 +501,7 @@ export function defaultRunner(args: string[], options: VpsCommandOptions = {}): 
       }
       settle(() => {
         if (code === 0) return resolve({ stdout: stdout.text(), stderr: stderr.text() });
-        const detail = redactSecrets(stderr.text().trim().slice(-1000));
-        reject(new Error(detail || `Docker-over-SSH exited ${code ?? signal ?? "without a status"}`));
+        reject(new Error(runnerFailureDetail(stderr.text(), code ?? signal)));
       });
     });
     try {
@@ -483,6 +526,7 @@ function emptyStatus(target: VpsTarget, alias: string | null): VpsComputerStatus
     security: "unknown",
     desktopReady: false,
     desktop_error: null,
+    desktopUnreachable: false,
     ready: false,
     problem: alias ? "Docker over SSH is not reachable" : "Configure a VPS SSH alias in App Settings → Connections",
     image_ref: VPS_IMAGE,
@@ -491,6 +535,9 @@ function emptyStatus(target: VpsTarget, alias: string | null): VpsComputerStatus
     container_name: target.containerName,
     container_id: null,
     image_id: null,
+    container_image_id: null,
+    imageBuild: { phase: "idle", startedAt: null, elapsedMs: null, error: null },
+    imageOutdated: false,
   };
 }
 
@@ -504,7 +551,7 @@ function isMissingObjectMessage(message: string): boolean {
 }
 
 function transportFailure(message: string): string {
-  return `Docker over SSH failed while checking the VPS: ${message.trim().slice(0, 200) || "unknown transport error"}`;
+  return `Docker over SSH failed while checking the VPS: ${problemText(message, 200) || "unknown transport error"}`;
 }
 
 function privateDockerIpv4(value: string | undefined): boolean {
@@ -562,6 +609,7 @@ function statusProblem(status: VpsComputerStatus): string | null {
   if (status.mounts === "unsafe") return "The VPS container has host mounts; refusing to use it";
   if (status.security === "unsafe") return "The VPS container is missing BotFleet safety limits";
   if (status.container === "stopped") return "The BotFleet VPS container is stopped";
+  if (status.desktopUnreachable) return "Couldn't reach the VPS desktop just now; retrying";
   if (status.desktop_error) return `The VPS CUA desktop failed to start: ${status.desktop_error}`;
   if (!status.desktopReady) return "The VPS container started, but CUA Driver is not ready yet";
   return null;
@@ -614,6 +662,14 @@ async function computeVpsComputerStatus(
   botId: string,
   runner: VpsCommandRunner,
 ): Promise<VpsComputerStatus> {
+  return withImageBuildState(await inspectVpsComputer(cfg, botId, runner), vpsSshAlias(cfg));
+}
+
+async function inspectVpsComputer(
+  cfg: AppConfig,
+  botId: string,
+  runner: VpsCommandRunner,
+): Promise<VpsComputerStatus> {
   const alias = vpsSshAlias(cfg);
   const target = vpsTargetFor(cfg, botId);
   const status = emptyStatus(target, alias);
@@ -624,15 +680,12 @@ async function computeVpsComputerStatus(
 
   let inspectedImageId: string | null = null;
   try {
-    const inspected = JSON.parse((await run(["image", "inspect", VPS_IMAGE])).stdout) as Array<{
-      Id?: string;
-      id?: string;
-      Config?: { Labels?: Record<string, string> };
-      config?: { Labels?: Record<string, string>; labels?: Record<string, string> };
-    }>;
+    const inspected = VpsDockerImageInspectSchema.parse(
+      JSON.parse((await run(["image", "inspect", VPS_IMAGE])).stdout),
+    );
     status.daemonUp = true;
     const image = inspected[0];
-    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels;
+    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels ?? undefined;
     const imageId = image?.Id ?? image?.id;
     inspectedImageId = imageId && IMAGE_ID.test(imageId) ? imageId : null;
     status.image_id = inspectedImageId;
@@ -692,6 +745,8 @@ async function computeVpsComputerStatus(
       detail?.Image === inspectedImageId &&
       imageLabelsMatch(labels) &&
       labels?.[VPS_VIEWER_LABEL] === VIEWER_VERSION;
+    const containerImageRef = detail?.Image;
+    status.container_image_id = containerImageRef && IMAGE_ID.test(containerImageRef) ? containerImageRef : null;
     const managedFlag =
       labels?.[VPS_MANAGED_LABEL] === "1" ||
       LEGACY_VPS_MANAGED_LABELS.some((key) => labels?.[key] === "1");
@@ -734,7 +789,13 @@ async function computeVpsComputerStatus(
     if (canProbe && containerRef) {
       try {
         const version = await run(cuaExecArgs(["--version"], { container: containerRef }));
-        if (version.stdout.trim() !== `cua-driver ${CUA_DRIVER_VERSION}`) throw new Error("unexpected CUA Driver version");
+        if (version.stdout.trim() !== `cua-driver ${CUA_DRIVER_VERSION}`) {
+          // Say which version answered: the Driver's own update notice names
+          // the newest release, which is easy to mistake for the one running.
+          throw new Error(
+            `unexpected CUA Driver version "${problemText(version.stdout, 60) || "none"}" (expected ${CUA_DRIVER_VERSION})`,
+          );
+        }
         await run(cuaExecArgs(["status", "--socket", CUA_SOCKET], { container: containerRef }));
         const health = await run(
           cuaExecArgs(["call", "health_report", "{}", "--socket", CUA_SOCKET], { container: containerRef }),
@@ -764,20 +825,24 @@ async function computeVpsComputerStatus(
         status.desktopReady = true;
       } catch (error) {
         status.desktopReady = false;
-        status.desktop_error = error instanceof Error ? error.message.slice(0, 320) : null;
-        // Mirror the Local VM's probe: when the desktop fails, the
-        // supervisor's error log says WHY — a bounded tail turns an endless
-        // "not ready yet" into something the user can act on.
+        // Mirror the Local VM's probe: the supervisor's error log says WHY the
+        // desktop failed.  A bounded tail of it is only a reason when it holds
+        // a real fault: a healthy Driver writes its update notice and WARN
+        // lines to the same file, so the log is judged, never pasted.
+        let supervisorLog: string | null = null;
         try {
           const errorLog = await run(
-            ["exec", containerRef, "tail", "-n", "4", "/var/log/supervisor/cua-driver.error.log"],
+            ["exec", containerRef, "tail", "-n", "12", "/var/log/supervisor/cua-driver.error.log"],
             10_000,
           );
-          status.desktop_error =
-            errorLog.stdout.replace(/\s+/g, " ").trim().slice(0, 320) || status.desktop_error;
+          supervisorLog = errorLog.stdout;
         } catch {
-          // The log may not exist during the first seconds of container boot.
+          // The log may not exist during the first seconds of container boot,
+          // or the link that failed the probe may fail this read too.
         }
+        const verdict = judgeDesktopProbeFailure(error instanceof Error ? error : new Error(String(error)), supervisorLog);
+        status.desktop_error = verdict.desktopError;
+        status.desktopUnreachable = verdict.unreachable;
       }
     }
   } catch (error) {
@@ -792,6 +857,9 @@ async function computeVpsComputerStatus(
   }
 
   status.problem = statusProblem(status);
+  // Every path to this string (a transport message, a probe message, a log
+  // line) may carry terminal colour codes; strip them once, here.
+  if (status.problem) status.problem = problemText(status.problem, 600);
   status.ready = status.problem === null;
   return status;
 }
@@ -810,7 +878,9 @@ export async function vpsComputerStatus(
   const cacheable = runner === defaultRunner && key !== null;
   if (cacheable) {
     const cached = statusCache.get(key);
-    if (cached && cached.expiresAt > Date.now()) return cached.status;
+    // The build phase and its elapsed time are re-derived on every poll; only
+    // the SSH inspection is served from the cache.
+    if (cached && cached.expiresAt > Date.now()) return withImageBuildState(cached.status, vpsSshAlias(cfg));
   }
   const status = await computeVpsComputerStatus(cfg, botId, runner);
   if (cacheable) statusCache.set(key, { status, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
@@ -900,12 +970,236 @@ function assertUsableContainer(status: VpsComputerStatus) {
   }
 }
 
-async function prepareVpsImage(alias: string, runner: VpsCommandRunner) {
+async function buildVpsImage(alias: string, runner: VpsCommandRunner) {
   await runner(vpsDockerArgs(alias, ["pull", BASE_IMAGE]), { timeoutMs: 10 * 60_000 });
   await runner(vpsDockerArgs(alias, ["build", "-t", VPS_IMAGE, "-"]), {
     input: managedImageDockerfile(),
-    timeoutMs: 10 * 60_000,
+    timeoutMs: MANAGED_IMAGE_BUILD_TIMEOUT_MS,
   });
+}
+
+// ── Image build-ahead ─────────────────────────────────────────────────────
+// The pinned image belongs to the VPS host, not to a container, so its build
+// is single-flight per SSH alias.  A provision that finds no container and a
+// "Prepare Image" press from Settings share one `docker build`, and neither
+// ever runs two builds of the same tag at once.  The build deliberately does
+// NOT hold the lifecycle lock: that lock gives up after 5 seconds, and a
+// 20 to 45 minute build under it would 409 every bot's turn-start provision.
+
+export type VpsImageBuildPhase = "idle" | "building" | "failed" | "ready";
+
+export interface VpsImageBuildState {
+  phase: VpsImageBuildPhase;
+  /** Epoch ms the running (or last) build started; null when none has run. */
+  startedAt: number | null;
+  /** Milliseconds since startedAt, measured on the harness clock so the
+   *  panel's elapsed time never depends on the viewer's clock. */
+  elapsedMs: number | null;
+  /** Why the last build failed; set only in the "failed" phase. */
+  error: string | null;
+}
+
+interface VpsImageBuildRecord {
+  flight: Promise<void> | null;
+  startedAt: number;
+  error: string | null;
+}
+
+const imageBuilds = new Map<string, VpsImageBuildRecord>();
+
+/** Test hook: forget every build record (a real harness starts empty). */
+export function resetVpsImageBuildState(): void {
+  imageBuilds.clear();
+}
+
+function forgetStatusCacheForAlias(alias: string) {
+  for (const key of statusCache.keys()) {
+    if (key.startsWith(`${alias}:`)) statusCache.delete(key);
+  }
+}
+
+/** The phase is derived from the inspected image where it can be: "ready"
+ * means the pinned image is present with matching labels, whatever this
+ * process remembers, so a harness restart mid-build recovers the truth on
+ * the next poll.  Only "building" and "failed" come from memory. */
+export function vpsImageBuildState(alias: string | null, imagePresent: boolean, now = Date.now()): VpsImageBuildState {
+  const record = alias ? imageBuilds.get(alias) : undefined;
+  if (record?.flight) {
+    return { phase: "building", startedAt: record.startedAt, elapsedMs: Math.max(0, now - record.startedAt), error: null };
+  }
+  if (imagePresent) return { phase: "ready", startedAt: null, elapsedMs: null, error: null };
+  if (record?.error) return { phase: "failed", startedAt: record.startedAt, elapsedMs: null, error: record.error };
+  return { phase: "idle", startedAt: null, elapsedMs: null, error: null };
+}
+
+/** "docker image inspect" payload, parsed at the SSH trust line.  Docker and
+ *  Podman use different capitalisation (Id / id, Config / config / labels);
+ *  the schema accepts both so a runner swap does not silently mis-parse.
+ *  `.passthrough()` keeps Docker/Podman field additions from silently changing
+ *  the runtime shape; we read only a fixed subset. */
+export const VpsDockerImageInspectSchema = z.array(
+  z
+    .object({
+      Id: z.string().optional(),
+      id: z.string().optional(),
+      Config: z
+        .object({
+          // Docker prints `"Labels": null` for an image without labels.
+          Labels: z.record(z.string(), z.string()).nullish(),
+        })
+        .passthrough()
+        .nullish(),
+      config: z
+        .object({
+          Labels: z.record(z.string(), z.string()).nullish(),
+          labels: z.record(z.string(), z.string()).nullish(),
+        })
+        .passthrough()
+        .nullish(),
+    })
+    .passthrough(),
+);
+export type VpsDockerImageInspect = z.infer<typeof VpsDockerImageInspectSchema>;
+
+/** True when the pinned tag is present on the VPS with BotFleet's labels.
+ * Throws on a transport failure; a clean "no such image" is false. */
+async function pinnedVpsImagePresent(alias: string, runner: VpsCommandRunner): Promise<boolean> {
+  try {
+    const inspected = VpsDockerImageInspectSchema.parse(
+      JSON.parse((await runner(vpsDockerArgs(alias, ["image", "inspect", VPS_IMAGE]), { timeoutMs: 30_000 })).stdout),
+    );
+    const image = inspected[0];
+    const imageId = image?.Id ?? image?.id;
+    const labels = image?.Config?.Labels ?? image?.config?.Labels ?? image?.config?.labels ?? undefined;
+    return Boolean(imageId && IMAGE_ID.test(imageId)) && imageLabelsMatch(labels);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isMissingObjectMessage(message)) return false;
+    throw error;
+  }
+}
+
+/** Join the host's in-progress build, or start one.  The returned promise
+ * settles when the build does; a failure is remembered for the panel and
+ * rethrown to the caller. */
+function prepareVpsImage(alias: string, runner: VpsCommandRunner): Promise<void> {
+  const existing = imageBuilds.get(alias);
+  if (existing?.flight) return existing.flight;
+  const record: VpsImageBuildRecord = { flight: null, startedAt: Date.now(), error: null };
+  record.flight = (async () => {
+    try {
+      // A finished build from another flight (or by hand on the VPS) is
+      // reused; the 20-minute build runs only when the tag is truly absent.
+      if (!(await pinnedVpsImagePresent(alias, runner))) await buildVpsImage(alias, runner);
+    } catch (error) {
+      record.error = problemText(error instanceof Error ? error.message : String(error), 600) || "the image build failed";
+      throw error;
+    } finally {
+      record.flight = null;
+      forgetStatusCacheForAlias(alias);
+    }
+  })();
+  imageBuilds.set(alias, record);
+  return record.flight;
+}
+
+/** Settings → "Prepare Image": start (or join) the build in the background
+ * and answer at once with its state.  The current container keeps running;
+ * nothing here touches it. */
+export async function vpsPrepareImageAhead(
+  cfg: AppConfig,
+  runner: VpsCommandRunner = defaultRunner,
+): Promise<VpsImageBuildState> {
+  const alias = vpsSshAlias(cfg);
+  if (!alias) throw Object.assign(new Error("VPS is not configured — add an SSH config alias in App Settings → Connections"), { status: 409 });
+  // A present image makes the build a no-op; report "ready" instead of
+  // briefly advertising a build that will never run.
+  const alreadyPresent = await pinnedVpsImagePresent(alias, runner);
+  if (alreadyPresent) return vpsImageBuildState(alias, true);
+  const flight = prepareVpsImage(alias, runner);
+  // The HTTP request never waits on the build, so its failure must be
+  // observed here or Node treats it as an unhandled rejection.  The error
+  // is already recorded for the panel.
+  flight.catch(() => undefined);
+  return vpsImageBuildState(alias, false);
+}
+
+/** Settings → "Switch to New Image": replace the shared container with one
+ * created from the already-built pinned image.  Downtime is a container
+ * restart, not a rebuild, and the container filesystem is reset exactly as
+ * a remove would reset it.  Refuses unless the new image is ready. */
+export async function vpsSwitchToPreparedImage(
+  cfg: AppConfig,
+  runner: VpsCommandRunner = defaultRunner,
+): Promise<VpsComputerStatus> {
+  const alias = vpsSshAlias(cfg);
+  if (!alias) throw Object.assign(new Error("VPS is not configured — add an SSH config alias in App Settings → Connections"), { status: 409 });
+  if (!isSharedVpsMode(cfg)) {
+    throw Object.assign(new Error("Switching images from Settings is only for the shared VPS — use each bot's Computer panel in per-bot mode"), { status: 409 });
+  }
+  const target = SHARED_VPS_TARGET;
+  const botId = "workspace";
+  const key = `${alias}:${target.containerName}`;
+  const after = await withVpsLifecycleLock(key, async () => {
+    statusCache.delete(key);
+    try {
+      if (imageBuilds.get(alias)?.flight) {
+        throw Object.assign(new Error("The new image is still building — switch once it is ready"), { status: 409 });
+      }
+      const before = await computeVpsComputerStatus(cfg, botId, runner);
+      if (!before.daemonUp) throw Object.assign(new Error(before.problem ?? "Docker over SSH is not reachable"), { status: 409 });
+      if (!before.image || !before.image_id) {
+        throw Object.assign(new Error("The new image isn't ready yet — prepare it first"), { status: 409 });
+      }
+      if (before.container === "missing") {
+        throw Object.assign(new Error("No shared VPS container exists — a bot's next turn creates one from the new image"), { status: 409 });
+      }
+      if (!before.managed) {
+        throw Object.assign(
+          new Error("The VPS container name is occupied by a container BotFleet did not create — remove it on the VPS yourself"),
+          { status: 409 },
+        );
+      }
+      if (!vpsContainerOutdated(before)) {
+        throw Object.assign(new Error("The shared VPS container already runs the current image"), { status: 409 });
+      }
+      closeAllVpsDesktopTunnels();
+      const run = (args: string[]) => runner(vpsDockerArgs(alias, args), { timeoutMs: 2 * 60_000 });
+      await run(["rm", "-f", before.container_id ?? before.container_name]);
+      await run(vpsContainerRunArgs(before.container_name, before.image_id, undefined, vpsDesktopSize(cfg)));
+      return await waitForVpsReady(cfg, botId, runner);
+    } finally {
+      statusCache.delete(key);
+    }
+  });
+  // Each bot's own desktop session is started by its next turn's provision,
+  // as after any fresh container; only the shared CLI logins are restored here.
+  if (cfg.localVm?.shareCliCredentials && after.ready) {
+    await autoSyncCliCredentials(cfg, target, after.container_id ?? after.container_name, runner);
+  }
+  return withImageBuildState(after, alias);
+}
+
+/** A container BotFleet created that is not on the pinned image: bots
+ * refuse it, and a swap onto the prepared image is how it is replaced.
+ * Label drift alone does NOT count — reconciling it would destroy the
+ * container filesystem for a problem the swap cannot fix. */
+export function vpsContainerOutdated(status: VpsComputerStatus): boolean {
+  // With the pinned tag absent, no container can be on it.
+  return (
+    status.daemonUp &&
+    status.container !== "missing" &&
+    status.managed &&
+    (!status.image || status.container_image_id !== status.image_id)
+  );
+}
+
+function withImageBuildState(status: VpsComputerStatus, alias: string | null): VpsComputerStatus {
+  return {
+    ...status,
+    imageBuild: vpsImageBuildState(alias, status.image),
+    imageOutdated: vpsContainerOutdated(status),
+  };
 }
 
 /** Waits for the driver inside a verified, running container to come up.
@@ -1101,12 +1395,14 @@ export async function vpsComputerAction(
 
 }
 
-export interface VpsSyncCredentialsResult {
-  ok: boolean;
-  synced: string[];
+export interface VpsSyncCredentialsResult extends CredentialSyncResult {
   containerName: string;
 }
 
+/** Manifest-driven host → cloud VPS credential sync for every target
+ * (shared cloud container and per-bot VPS containers). Settings and
+ * per-bot Computer panels call this with `SHARED_VPS_TARGET` or
+ * `vpsTargetFor(cfg, botId)`; auto-sync on provision/start uses the same path. */
 export async function vpsSyncCliCredentials(
   cfg: AppConfig,
   target: VpsTarget = SHARED_VPS_TARGET,
@@ -1141,72 +1437,139 @@ export async function vpsSyncCliCredentials(
     throw Object.assign(new Error(`The VPS container ${target.containerName} is not running`), { status: 409 });
   }
 
-  const existingPaths: string[] = [];
-  const syncedLabels: string[] = [];
-  for (const candidate of CLI_CREDENTIAL_CANDIDATES) {
-    const fullPath = join(homeDir, ...candidate.relPath);
-    if (existsSync(fullPath)) {
-      existingPaths.push(candidate.relPath.join("/"));
-      syncedLabels.push(candidate.relPath[0]);
+  const shareGpgPrivateKeys = Boolean(cfg.localVm?.shareGpgPrivateKeys);
+  const { plan, cleanup } = await prepareCredentialSyncWorkspace(homeDir, { shareGpgPrivateKeys });
+  try {
+    const tarArchive = await packageCredentialArchive(homeDir, plan);
+    if (!tarArchive) {
+      return {
+        ok: true,
+        syncedTools: [],
+        skippedTools: plan.skippedTools,
+        containerName: target.containerName,
+      };
     }
-  }
 
-  const uniqueSynced = Array.from(new Set(syncedLabels));
-  if (existingPaths.length === 0) {
-    return { ok: true, synced: [], containerName: target.containerName };
-  }
+    // Verify every member the archive actually packed, not just the top-level
+    // directories.  A directory can exist on the guest while the credential
+    // file inside it was refused (disk full, per-member permission), and a
+    // directory-level probe calls that a complete sync.
+    const plannedGuestPaths = (await listArchiveRelPaths(tarArchive)).map((rel) => guestPathForCredentialRel(rel));
+    // Repair still works on the credential ROOTS: what blocks an extract is a
+    // root-owned parent directory, and a member that failed to arrive is by
+    // definition absent, so there is nothing for the repair to remove.
+    const repairGuestPaths = [
+      ...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths].map((rel) => guestPathForCredentialRel(rel))),
+    ].sort();
+    const extractArgs = ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", VM_CLI_GUEST_HOME];
+    const extractArchive = () => run(extractArgs, 60_000, tarArchive);
 
-  const tarArchive = await new Promise<Buffer>((resolve, reject) => {
-    const tar = spawn(
-      "tar",
-      [
-        "--format=ustar",
-        "-C",
-        homeDir,
-        "--no-xattrs",
-        "--exclude=*/virtenv*",
-        "--exclude=*/agent/*",
-        "--exclude=*.sock",
-        "--exclude=*cm-*",
-        "--exclude=*.DS_Store",
-        "-cf",
-        "-",
-        ...existingPaths,
-      ],
-      {
-        env: { ...process.env, COPYFILE_DISABLE: "1" },
-      },
+    let extractError: unknown = null;
+    try {
+      await extractArchive();
+    } catch (err) {
+      extractError = err;
+    }
+
+    if (extractError) {
+      // GNU tar reports per-member errors only after extracting everything it
+      // can, so a non-zero exit does not mean the credentials are missing — it
+      // means at least one member could not be written.  Verify before failing
+      // the whole sync, otherwise one unwritable path on the guest silently
+      // denies every other tool its credentials (observed: gcloud's root-owned
+      // ~/.config/gcloud/logs, which cost the shared VPS a sync every ~5
+      // minutes).
+      let missing = await missingGuestCredentialPaths(run, target.containerName, plannedGuestPaths);
+      // A destination can also be absent because a root-owned leftover sits
+      // exactly where the archive wants to put it.  Clear those roots and
+      // re-run the extract once before deciding the sync failed.
+      if (
+        missing.length > 0 &&
+        (await repairGuestCredentialOwnership(run, target.containerName, repairGuestPaths))
+      ) {
+        try {
+          await extractArchive();
+          extractError = null;
+        } catch (err) {
+          extractError = err;
+        }
+      }
+
+      if (extractError) {
+        // Keep tar's own message in both outcomes: it is the only thing that
+        // says *why* a member was refused, and the runner already redacts it.
+        const detail = extractError instanceof Error ? extractError.message : String(extractError);
+        missing = await missingGuestCredentialPaths(run, target.containerName, plannedGuestPaths);
+        if (missing.length > 0) {
+          throw new Error(
+            `credential extract failed and ${missing.length} of ${plannedGuestPaths.length} packed member(s) are missing: ${missing.slice(0, 5).join(", ")} (tar: ${detail})`,
+          );
+        }
+        console.warn(
+          `[vps] credential extract reported errors but all ${plannedGuestPaths.length} packed member(s) are present (tar: ${detail})`,
+        );
+      }
+    }
+
+    await run(["exec", "-u", "cua", target.containerName, "sh", "-c", credentialPermissionHardeningShell()], 15_000).catch(
+      () => {},
     );
-    const chunks: Buffer[] = [];
-    tar.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
-    tar.on("error", reject);
-    tar.on("close", (code) => {
-      if (code === 0) resolve(Buffer.concat(chunks));
-      else reject(new Error(`tar packaging failed with code ${code}`));
-    });
-  });
 
-  await run(
-    ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", "/home/cua"],
-    60_000,
-    tarArchive,
-  );
+    return {
+      ok: true,
+      syncedTools: plan.syncedTools,
+      skippedTools: plan.skippedTools,
+      containerName: target.containerName,
+    };
+  } finally {
+    await cleanup();
+  }
+}
 
-  await run([
-    "exec",
-    "-u",
-    "cua",
-    target.containerName,
-    "sh",
-    "-c",
-    'for d in .ssh .infisical .aws .config .azure .oci .kube .cargo; do [ -d "/home/cua/$d" ] && chmod 700 "/home/cua/$d" 2>/dev/null || true; done; [ -d "/home/cua/.ssh" ] && chmod 600 /home/cua/.ssh/id_* /home/cua/.ssh/known_hosts* /home/cua/.ssh/config 2>/dev/null || true',
-  ], 15_000).catch(() => {});
+/**
+ * Hand the guest's own user ownership of the credential destinations the
+ * extract could not write.  Runs as uid 0 because that is the only identity in
+ * a `--cap-drop ALL` container that can remove a root-owned path, and it can
+ * do nothing useful if the container has no root to ask.
+ */
+async function repairGuestCredentialOwnership(
+  run: (args: string[], timeoutMs?: number, input?: string | Buffer) => Promise<{ stdout: string; stderr: string }>,
+  containerName: string,
+  guestPaths: string[],
+): Promise<boolean> {
+  if (guestPaths.length === 0) return false;
+  try {
+    await run(["exec", "-u", "0", containerName, "sh", "-c", guestCredentialOwnershipRepairShell(guestPaths)], 20_000);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  return {
-    ok: true,
-    synced: uniqueSynced,
-    containerName: target.containerName,
-  };
+/**
+ * Which of the planned guest credential destinations are absent after a
+ * failed extract.  Best-effort: a verification probe that itself fails reports
+ * everything as missing so the caller still surfaces the original failure
+ * instead of claiming a partial sync succeeded.
+ */
+async function missingGuestCredentialPaths(
+  run: (args: string[], timeoutMs?: number, input?: string | Buffer) => Promise<{ stdout: string; stderr: string }>,
+  containerName: string,
+  guestPaths: string[],
+): Promise<string[]> {
+  if (guestPaths.length === 0) return [];
+  const probe = guestPaths
+    .map((path) => `[ -e '${path.replace(/'/g, "'\\''")}' ] || echo '${path.replace(/'/g, "'\\''")}'`)
+    .join("; ");
+  try {
+    const { stdout } = await run(
+      ["exec", "-u", "cua", containerName, "sh", "-c", probe],
+      20_000,
+    );
+    return stdout.split("\n").map((line) => line.trim()).filter((line) => guestPaths.includes(line));
+  } catch {
+    return [...guestPaths];
+  }
 }
 
 /** Auto is intentionally read-only: it can attach only to an existing ready
@@ -1387,7 +1750,9 @@ export async function vpsComputerScreenshot(
   const cacheable = runner === defaultRunner;
   const loadStatus = async () => {
     const cached = cacheable ? statusCache.get(key) : undefined;
-    if (cached && cached.expiresAt > Date.now()) return cached.status;
+    // The build phase and its elapsed time are re-derived on every poll; only
+    // the SSH inspection is served from the cache.
+    if (cached && cached.expiresAt > Date.now()) return withImageBuildState(cached.status, vpsSshAlias(cfg));
     return computeVpsComputerStatus(cfg, botId, runner);
   };
   const status = cacheable

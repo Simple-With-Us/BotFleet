@@ -32,7 +32,15 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+// One definition, shared with the updater's own sweeper.  Two copies of this
+// allowlist existed and drifted, and the drift was a multi-gigabyte disk leak
+// rather than a cosmetic bug — see scripts/stage-entries.mjs.
+import { stageIsPrunable } from "../scripts/stage-entries.mjs";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
+import type { UpdateDrainView } from "./update-drain.ts";
+
+export type { UpdateDrainView } from "./update-drain.ts";
 
 export const UPDATE_PROGRESS_SCHEMA_VERSION = 1;
 export const UPDATE_LAUNCH_LABEL = "com.jay.botfleet-update";
@@ -47,6 +55,8 @@ const GAP = "\u00a0 ";
 const LOG_TAIL_LINES = 24;
 const LOG_TAIL_BYTES = 64 * 1024;
 const LOG_LINE_MAX = 400;
+/** A progress detail is one short line; anything longer is clipped. */
+const DETAIL_MAX = 200;
 /** Commit subjects shown in "what is new".  Beyond this the count carries it. */
 const MAX_LISTED_COMMITS = 20;
 /** A run with no progress file this long after launch never started. */
@@ -75,19 +85,7 @@ const KEPT_RUN_ARTIFACTS = 8;
 /** What the updater itself puts in a stage directory — the same list
  * `scripts/update-botfleet-mac.mjs` sweeps by.  Anything else in there was
  * put there by a person, and a person decides when it goes. */
-const KNOWN_STAGE_ENTRIES = new Set([
-  "BotFleet.app",
-  "node_modules",
-  "prepared.json",
-  "rollback",
-  "source",
-  "pending-recovery.json",
-  "credential-migration.json",
-]);
-/** A stage holding either of these is load-bearing: `prepared.json` is a
- * build a later `apply` can still install, and `rollback` holds the verified
- * bundle the installed app would be rolled back to. */
-const PROTECTED_STAGE_ENTRIES = new Set(["prepared.json", "rollback"]);
+
 
 export interface UpdateCommit {
   sha: string;
@@ -99,12 +97,33 @@ export interface UpdateAvailable {
   version?: string;
   aheadBy: number;
   commits: UpdateCommit[];
+  /** The INSTALLED commit this `aheadBy` was counted from.
+   *
+   *  `aheadBy` is a distance, so it means nothing without its baseline.  The
+   *  baseline used to be implied by the install's own timestamp, which cannot
+   *  survive an update: the replacement bundle's `build-identity.json` mtime
+   *  dates the BUILD, not the install, and a build staged hours before the
+   *  install left a remembered answer looking newer than the install it
+   *  predated.  The status route then served that answer forever — a Mac that
+   *  had just installed and verified the newest build still advertised "125
+   *  commits behind" when the true distance was 4.
+   *
+   *  Recording the baseline makes staleness a question of identity instead of
+   *  clock comparison: an answer counted from any commit other than the one
+   *  installed now describes a Mac that no longer exists.  Answers written
+   *  before this field existed have no baseline and are refused as
+   *  unplaceable, which is the same treatment an unparseable `checkedAt`
+   *  already gets below. */
+  baselineCommit?: string;
 }
 
 export interface UpdateRunning {
   runId: string;
   startedAt: string;
   step: string;
+  /** What the step is waiting on, when the updater says ("Waiting for 3 bots
+   * to finish" while it drains).  Absent the rest of the time. */
+  detail?: string;
   progress?: number;
   logTail: string[];
 }
@@ -130,8 +149,7 @@ export type UpdateCapabilityCode =
   | "checkout-missing"
   | "updater-missing"
   | "updater-outdated"
-  | "already-running"
-  | "busy";
+  | "already-running";
 
 export interface UpdateCapabilities {
   canCheck: boolean;
@@ -139,6 +157,11 @@ export interface UpdateCapabilities {
   reasons: string[];
   /** One code per `reasons` entry, same order and length. */
   codes: UpdateCapabilityCode[];
+  /** Bots are working right now.  Not a reason the update cannot run: the
+   * updater holds new work, gives this work a short grace, then pauses what
+   * is left and resumes it after the restart (server/update-drain.ts), so
+   * surfaces only say that will happen. */
+  busy: boolean;
 }
 
 /** What `currentRuntimeReadiness()` in the harness reports: whether any turn,
@@ -148,10 +171,6 @@ export interface RuntimeReadiness {
   activeWorkCount: number | null;
 }
 
-/** The one refusal `force` is meant to override, so the capability reason and
- * the refusal are the same string and can be compared. */
-export const BUSY_REFUSAL =
-  "BotFleet is working right now.\u00a0 The updater will not interrupt a turn in flight.";
 
 export interface UpdateInstalled {
   version: string;
@@ -173,6 +192,12 @@ export interface UpdateStatus {
   running: UpdateRunning | null;
   lastRun: UpdateLastRun | null;
   capabilities: UpdateCapabilities;
+  /** An update is holding new work while bots finish: what is running, what
+   * is waiting, and how long the wait can last.  Present only while that is
+   * true, and independent of `running` — an updater started from a terminal
+   * holds work without the harness knowing it as a run.  The same numbers
+   * `GET /api/runtime` reports, which neither the app nor a phone can read. */
+  drain?: UpdateDrainView;
 }
 
 export interface CommandResult {
@@ -192,6 +217,10 @@ export interface LaunchPlan {
    * `exec node` would not resolve without it. */
   nodeDirectory: string;
   force?: boolean;
+  /** Harness owner bearer credential for the ubf runtime shortcut probe only. */
+  harnessOwnerNonce?: string;
+  /** Mode-0600 env file sourced by the launchd job (avoids secret export lines in `-c`). */
+  launchEnvFilePath?: string;
 }
 
 export interface LaunchResult {
@@ -223,6 +252,12 @@ export interface UpdateControlDeps {
    * busy because of the question.  This one answers `GET /api/update/status`,
    * which holds no admission. */
   readiness: () => RuntimeReadiness;
+  /** The hold an update has on new work, or null when there is none.  Called
+   * on every status build, so it must be cheap; one that throws is treated
+   * as "no hold" rather than taking the status route down. */
+  drain: () => UpdateDrainView | null;
+  /** Live harness-owner nonce for updater child env (BOTFLEET_OWNER_NONCE). */
+  harnessOwnerNonce?: () => string | null;
   /** How a state file reaches disk.  A seam rather than a detail: the
    * behaviour that matters here is what happens when it THROWS, and a test
    * that arranged that with directory permissions would only be testing them
@@ -240,21 +275,9 @@ export interface UpdateControlDeps {
 }
 
 /** What one run's progress file holds, once validated. */
-export interface ProgressRecord {
-  schemaVersion: number;
-  runId: string;
-  command: string;
-  pid: number;
-  startedAt: string;
-  updatedAt: string;
-  step: string | null;
-  progress: number | null;
-  targetCommit: string | null;
-  receiptPath: string | null;
-  finishedAt: string | null;
-  outcome: UpdateOutcome | null;
-  message: string | null;
-}
+/** A progress record as this build reads it: derived from the schema that
+ *  checks it (`ProgressRecordSchema`), so the type and the check cannot drift. */
+export type ProgressRecord = z.infer<typeof ProgressRecordSchema>;
 
 interface CurrentRunRecord {
   runId: string;
@@ -295,31 +318,43 @@ function writeJsonFile(path: string, value: unknown): void {
   renameSync(temporary, path);
 }
 
+/** A field the updater writes but a record can live without: its value when
+ *  it has the right shape, null otherwise.  One bad field costs only itself,
+ *  never the whole record — the status route reads this file while another
+ *  process writes it. */
+const optionalString = z.string().nullable().catch(null);
+
+/** A progress file written by `scripts/update-progress.mjs`, checked at the
+ *  trust boundary.  The identity fields are required and a record without
+ *  them is "no record"; everything else falls back field by field.  Fields
+ *  this build does not read (`rolledBack`, newer ones) are dropped. */
+const ProgressRecordSchema = z.object({
+  schemaVersion: z.literal(UPDATE_PROGRESS_SCHEMA_VERSION),
+  runId: z.string().min(1),
+  startedAt: z.string(),
+  command: z.string().catch("update"),
+  pid: z.number().int().catch(0),
+  updatedAt: optionalString,
+  step: optionalString,
+  // One short line: trimmed, clipped, and absent when empty.
+  detail: z.string().nullable().catch(null)
+    .transform((detail) => detail?.trim().slice(0, DETAIL_MAX) || null),
+  // A fraction of the run: clamped to [0, 1], absent when not a finite number.
+  progress: z.number().nullable().catch(null)
+    .transform((progress) => (progress === null || !Number.isFinite(progress) ? null : Math.min(1, Math.max(0, progress)))),
+  targetCommit: optionalString,
+  receiptPath: optionalString,
+  finishedAt: optionalString,
+  outcome: z.string().nullable().catch(null).transform((outcome) => (isOutcome(outcome) ? outcome : null)),
+  message: optionalString,
+})
+  // A record that never said when it last moved last moved when it started.
+  .transform((record) => ({ ...record, updatedAt: record.updatedAt ?? record.startedAt }));
+
 /** Validate a progress file written by `scripts/update-progress.mjs`. */
 export function parseProgressRecord(value: unknown): ProgressRecord | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
-  if (raw.schemaVersion !== UPDATE_PROGRESS_SCHEMA_VERSION) return null;
-  if (typeof raw.runId !== "string" || !raw.runId) return null;
-  if (typeof raw.startedAt !== "string") return null;
-  const progress = typeof raw.progress === "number" && Number.isFinite(raw.progress)
-    ? Math.min(1, Math.max(0, raw.progress))
-    : null;
-  return {
-    schemaVersion: UPDATE_PROGRESS_SCHEMA_VERSION,
-    runId: raw.runId,
-    command: typeof raw.command === "string" ? raw.command : "update",
-    pid: Number.isInteger(raw.pid) ? (raw.pid as number) : 0,
-    startedAt: raw.startedAt,
-    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : raw.startedAt,
-    step: typeof raw.step === "string" ? raw.step : null,
-    progress,
-    targetCommit: typeof raw.targetCommit === "string" ? raw.targetCommit : null,
-    receiptPath: typeof raw.receiptPath === "string" ? raw.receiptPath : null,
-    finishedAt: typeof raw.finishedAt === "string" ? raw.finishedAt : null,
-    outcome: isOutcome(raw.outcome) ? raw.outcome : null,
-    message: typeof raw.message === "string" ? raw.message : null,
-  };
+  const parsed = ProgressRecordSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
 }
 
 /** Sentences a person reads while they wait.  Kept here rather than in the
@@ -332,8 +367,11 @@ export const UPDATE_STEP_LABELS: Record<string, string> = {
   installDependencies: "Installing dependencies",
   buildBundle: "Building and signing the app",
   validateBundle: "Verifying the signature and identity",
+  smokeTestBundle: "Verifying the new build actually starts",
   persistPrepared: "Recording the prepared build",
   validatePrepared: "Re-checking the prepared build",
+  sweepLeftovers: "Clearing what an earlier update left behind",
+  ensureRunning: "Making sure BotFleet is running",
   preflight: "Checking for work in flight",
   capturePrevious: "Snapshotting what is installed now",
   materializeCandidate: "Placing the new build alongside",
@@ -395,7 +433,14 @@ export function runningFrom(record: ProgressRecord, logTail: string[]): UpdateRu
     step: stepLabel(record.step),
     logTail,
   };
-  if (record.progress !== null) running.progress = record.progress;
+  if (record.detail) running.detail = record.detail;
+  // `progress` is the run's own step count and does not move while a step
+  // waits on something outside it — bots finishing, a process letting go of
+  // BotFleet's files.  "Waiting for 3 bots to finish (40%)" read as 40% of
+  // the wait, and stayed there for a minute.  Every surface drops the percent
+  // beside a detail; withholding it here as well means an app or phone build
+  // that predates that rule stops showing a frozen bar too.
+  if (record.progress !== null && !record.detail) running.progress = record.progress;
   return running;
 }
 
@@ -444,6 +489,12 @@ export function availableIsStale(input: {
 }): boolean {
   if (!input.available) return true;
   if (input.available.sourceCommit === input.installedCommit) return true;
+  // Identity before clock.  An answer counted from a commit other than the one
+  // installed now cannot be refreshed into a correct one, whatever its
+  // timestamp says, so refuse it outright.  An answer carrying no baseline
+  // predates this field and is equally unplaceable; both cases drop to a fresh
+  // check instead of being served.
+  if (input.available.baselineCommit !== input.installedCommit) return true;
   const recorded = input.checkedAt ? Date.parse(input.checkedAt) : Number.NaN;
   // An answer with no readable timestamp cannot be placed relative to the
   // install, and an unplaceable answer is not one to act on.
@@ -469,12 +520,11 @@ export function runRefusal(input: {
   force: boolean;
 }): string | null {
   if (input.running) return "An update is already running.";
-  // Readiness comes before the structural reasons because it is the one
-  // `force` is meant to override.  Forcing does not make it safe: the
-  // updater's own preflight refuses a busy machine too, and the run then
-  // ends `refused` rather than interrupting a turn.
-  if (!input.readiness.safeToRestart && !input.force) return BUSY_REFUSAL;
-  const structural = input.capabilities.reasons.find((reason) => reason !== BUSY_REFUSAL);
+  // A busy Mac is never a refusal.  A run holds new work, gives the work in
+  // flight a short grace to finish, then pauses what is left and resumes it
+  // after the restart (server/update-drain.ts); a forced run skips the grace.
+  // `readiness` only describes the Mac now.
+  const structural = input.capabilities.reasons[0];
   if (!input.capabilities.canRun && structural) return structural;
   if (input.dirty) {
     return "The always-on checkout has uncommitted changes, so the updater would refuse.";
@@ -545,8 +595,7 @@ export function stagesToPrune(entries: StageDirectoryEntry[], options: {
   const protect = options.protect ?? [];
   const prunable = entries.filter((entry) => {
     if (protect.includes(entry.path)) return false;
-    if (entry.names.some((name) => PROTECTED_STAGE_ENTRIES.has(name))) return false;
-    return entry.names.every((name) => KNOWN_STAGE_ENTRIES.has(name));
+    return stageIsPrunable(entry.names);
   });
   return [...prunable]
     .sort((left, right) => right.stamp - left.stamp)
@@ -639,6 +688,9 @@ export function launchPlanCommand(plan: LaunchPlan): { command: string; args: st
   const forceArg = plan.force ? " --force" : "";
   const script = [
     `export PATH=${quote(plan.nodeDirectory)}:"$PATH"`,
+    ...(plan.launchEnvFilePath
+      ? [`set -a && . ${quote(plan.launchEnvFilePath)} && set +a`]
+      : []),
     `exec /bin/bash ${quote(plan.scriptPath)} --progress ${quote(plan.progressPath)} --run-id ${quote(plan.runId)}${forceArg}`,
   ].join("\n");
   return {
@@ -715,22 +767,44 @@ async function defaultLaunch(plan: LaunchPlan): Promise<LaunchResult> {
   // A finished label stays registered and makes the next `submit` fail
   // outright, so it is cleared — but only now that it is known to be dead.
   await execCommand("/bin/launchctl", ["remove", plan.label]);
-  const { command, args } = launchPlanCommand(plan);
+  const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
+  const launchPlan: LaunchPlan = { ...plan };
+  let launchEnvFilePath = plan.launchEnvFilePath;
+  if (harnessOwnerNonce && !launchEnvFilePath) {
+    launchEnvFilePath = join(dirname(plan.progressPath), `${plan.runId}.launch.env`);
+    mkdirSync(dirname(launchEnvFilePath), { recursive: true, mode: 0o700 });
+    writeFileSync(launchEnvFilePath, `BOTFLEET_OWNER_NONCE=${harnessOwnerNonce}\n`, { mode: 0o600 });
+    launchPlan.launchEnvFilePath = launchEnvFilePath;
+  }
+  const { command, args } = launchPlanCommand(launchPlan);
   const submitted = await execCommand(command, args);
   if (submitted.code === 0) return { launcher: "launchd" };
+  if (launchEnvFilePath) {
+    try {
+      rmSync(launchEnvFilePath, { force: true });
+    } catch {
+      /* a leftover env file is swept with the run artifacts */
+    }
+  }
   // launchd refused (an old label still settling, a sandboxed domain).  A
   // detached, session-leading child is still better than not updating: it
   // outlives the desktop app, and the harness restart it performs is a
   // launchd kickstart, not a signal to this process group.
   const log = openSync(plan.logPath, "a");
   try {
+    const harnessOwnerNonce = plan.harnessOwnerNonce?.trim();
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `${plan.nodeDirectory}:${process.env.PATH ?? ""}`,
+    };
+    if (harnessOwnerNonce) childEnv.BOTFLEET_OWNER_NONCE = harnessOwnerNonce;
     const child = spawn(
       "/bin/bash",
       [plan.scriptPath, "--progress", plan.progressPath, "--run-id", plan.runId, ...(plan.force ? ["--force"] : [])],
       {
         detached: true,
         stdio: ["ignore", log, log],
-        env: { ...process.env, PATH: `${plan.nodeDirectory}:${process.env.PATH ?? ""}` },
+        env: childEnv,
       },
     );
     child.unref();
@@ -796,6 +870,7 @@ function defaultDeps(overrides: Partial<UpdateControlDeps>): UpdateControlDeps {
     launch: overrides.launch ?? defaultLaunch,
     exec: overrides.exec ?? execCommand,
     readiness: overrides.readiness ?? (() => ({ safeToRestart: true, activeWorkCount: 0 })),
+    drain: overrides.drain ?? (() => null),
     writeState: overrides.writeState ?? writeJsonFile,
     processAlive: overrides.processAlive ?? ((pid) => {
       try {
@@ -832,6 +907,10 @@ export interface UpdateControl {
     { ok: true; runId: string; status: UpdateStatus } | { ok: false; error: string; status: UpdateStatus }
   >;
   reconcile(): void;
+  /** Broadcast the status if it differs from the last one sent, for a caller
+   * that changed something the status reports without a run to poll for it
+   * (the hold an update has on new work). */
+  notify(): void;
   dispose(): void;
 }
 
@@ -906,9 +985,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
 
   /** What this Mac is equipped to do, before anything about what it is doing
    * right now.  Separated from `capabilities` because the dirty-checkout
-   * precheck has to run on a busy machine too: `force` talks past readiness,
-   * and a forced run on a dirty checkout must be refused here rather than
-   * launched for the updater to refuse a minute later. */
+   * precheck has to run on a busy machine too: a run on a dirty checkout must
+   * be refused here rather than launched for the updater to refuse a minute
+   * later. */
   const structural = () => {
     const darwin = deps.platform === "darwin";
     const checkoutPresent = darwin && existsSync(join(deps.checkout, ".git"));
@@ -926,9 +1005,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
 
   /** What this Mac may do right now.  `readiness` overrides the harness-wide
    * reading for a caller that holds an admission of its own — without it a
-   * `POST` route answers with `canRun: false` and "BotFleet is working right
-   * now." on a completely idle Mac, and the client that stores that status
-   * stops offering Install Update until something else refreshes it. */
+   * `POST` route reports `busy` on a completely idle Mac, because the request
+   * asking is itself the work it counts. */
   const capabilities = (running: boolean, readiness?: RuntimeReadiness): UpdateCapabilities => {
     const able = structural();
     const reasons: string[] = [];
@@ -955,13 +1033,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       reasons.push("An update is already running.");
       codes.push("already-running");
     }
-    // Listed last, and the only reason `force` can talk past — see runRefusal.
-    const idle = (readiness ?? deps.readiness()).safeToRestart;
-    if (!idle) {
-      reasons.push(BUSY_REFUSAL);
-      codes.push("busy");
-    }
-    return { canCheck: able.canCheck, canRun: able.canRun && !running && idle, reasons, codes };
+    // Not a reason: an update on a busy Mac waits for its bots (see runRefusal).
+    const busy = !(readiness ?? deps.readiness()).safeToRestart;
+    return { canCheck: able.canCheck, canRun: able.canRun && !running, reasons, codes, busy };
   };
 
   const loadAvailable = () => {
@@ -983,6 +1057,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       sourceCommit: value.sourceCommit,
       version: typeof value.version === "string" ? value.version : undefined,
       aheadBy: Number.isInteger(value.aheadBy) ? (value.aheadBy as number) : 0,
+      baselineCommit: typeof value.baselineCommit === "string" && /^[a-f0-9]{40}$/.test(value.baselineCommit)
+        ? value.baselineCommit
+        : undefined,
       commits: Array.isArray(value.commits)
         ? (value.commits as unknown[])
             .filter((one): one is UpdateCommit =>
@@ -1171,6 +1248,17 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
     }
   };
 
+  /** The hold, or nothing.  A callback that throws (it reads harness state
+   * that may not exist yet while the harness is still booting) is "no hold":
+   * a status that cannot be built is worse than one missing a courtesy. */
+  const readDrain = (): UpdateDrainView | null => {
+    try {
+      return deps.drain();
+    } catch {
+      return null;
+    }
+  };
+
   const buildStatus = (readiness?: RuntimeReadiness): UpdateStatus => {
     let running: UpdateRunning | null = null;
     if (current) {
@@ -1184,7 +1272,7 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
             logTail: readLogTail(current.logPath),
           };
     }
-    return {
+    const status: UpdateStatus = {
       installed: deps.installed,
       // Belt and braces: an answer recorded before this build was installed
       // never reaches a client, whichever commit it names.
@@ -1195,6 +1283,10 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       lastRun,
       capabilities: capabilities(Boolean(running), readiness),
     };
+    // Absent, not null, when nothing is held: an older client never sees a key it does not know.
+    const drain = readDrain();
+    if (drain) status.drain = drain;
+    return status;
   };
 
   /** Broadcast the status when it has changed.  The caller's readiness is
@@ -1291,6 +1383,10 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
           sourceCommit: target,
           version,
           aheadBy: Number.isFinite(aheadBy) ? aheadBy : 0,
+          // `aheadBy` is counted from whatever is installed right now, so say
+          // so in the same breath.  A remembered answer whose baseline no
+          // longer matches is refused on sight.
+          baselineCommit: deps.installed.sourceCommit,
           commits: listed.code === 0
             ? listed.stdout
                 .split("\n")
@@ -1345,10 +1441,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       running: before.running,
       available: before.available,
       readiness: readiness ?? deps.readiness(),
-      // Asked whenever this Mac is equipped to run one at all, not only when
-      // it is free to: `force` talks past readiness, and a forced run on a
-      // dirty checkout has to be refused here rather than launched for the
-      // updater to refuse a minute later.
+      // Asked whenever this Mac is equipped to run one at all, busy or not:
+      // a run on a dirty checkout has to be refused here rather than
+      // launched for the updater to refuse a minute later.
       dirty: structural().canRun ? await dirtyCheckout() : false,
       force,
     });
@@ -1426,6 +1521,7 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
         label: deps.label,
         nodeDirectory: deps.nodeDirectory,
         force,
+        harnessOwnerNonce: deps.harnessOwnerNonce?.() ?? undefined,
       });
     } catch (error) {
       // Nothing started, so the record must not outlive the attempt.
@@ -1469,6 +1565,7 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       reconcile();
       emitIfChanged();
     },
+    notify: () => emitIfChanged(),
     dispose: () => {
       if (timer) clearInterval(timer);
       timer = null;

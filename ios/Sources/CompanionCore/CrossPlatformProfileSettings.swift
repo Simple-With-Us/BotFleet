@@ -44,8 +44,6 @@ public enum CrossPlatformProfileSettings {
         var reason: String?
         if !agentVoiceCanSpeakOnClient {
             reason = "Pick a voice this agent can speak before enabling playback."
-        } else if device == "mac", personalVoiceSelected {
-            reason = "Personal Voice plays on this iPhone only.  Mac playback stays off while this voice is selected."
         }
         let editable = reason == nil
         return SpeechDeviceRow(

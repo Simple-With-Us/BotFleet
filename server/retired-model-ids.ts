@@ -11,11 +11,16 @@ import type { ModelSelection } from "./contracts.ts";
  *  Applies across dsh and the native minimax driver: both dropped the
  *  same M3 / plain M2.7 rows for the same product reason.  DeepSeek's
  *  retired wire/display id folds onto the V4.1 Flash picker id (wire
- *  translation to deepseek-flash lives in Clutch / dshModelOptionValue). */
+ *  translation to deepseek-flash lives in Clutch / dshModelOptionValue).
+ *  `DeepSeek-V4.1-Pro` is a different retirement: DeepSeek never published a
+ *  4.1 Pro (its catalog is `DeepSeek-V4.1-Flash` plus `DeepSeek-V4-Pro-0813`),
+ *  so the picker row was simply misnamed and every bot saved against it needs
+ *  the rewrite or it would send an id no engine accepts. */
 const RETIRED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
   "MiniMax-M3": "MiniMax-M3.1-Flash-Preview",
   "MiniMax-M2.7": "MiniMax-M2.7-highspeed",
   "deepseek-v4-flash": "DeepSeek-V4.1-Flash",
+  "DeepSeek-V4.1-Pro": "DeepSeek-V4-Pro",
 };
 
 /** Live replacement for a retired model id, or the input when it is still

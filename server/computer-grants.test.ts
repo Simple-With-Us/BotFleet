@@ -178,7 +178,7 @@ describe("computerSystemPrompt", () => {
   });
 
   it("describes the host as a desktop only to an engine that is handed one", () => {
-    // An MCP engine mounts the Cua Driver server and really can see and click
+    // An MCP engine mounts the CUA Driver server and really can see and click
     // the desktop.  A driver-loop engine mounts no MCP server at all: its
     // host surface is the harness's own bash and file tools, and that
     // registry holds no screenshot, click or desktop-state tool.  Telling it
@@ -965,6 +965,11 @@ describe("routine failure resiliency and unattended safety", () => {
     });
     expect(result.hasHostComputer).toBe(true);
     expect(result.mounts.map((m) => m.kind)).toEqual(["vm"]);
+    const prompt = computerSystemPrompt(result.mounts, {
+      hasHostTerminal: true,
+      hostPlatform: "darwin",
+    });
+    expect(prompt).toContain("bash");
   });
 
   it("enables host computer tools without mounting host CUA when allowHostTerminal is set on Cloud VPS", async () => {
