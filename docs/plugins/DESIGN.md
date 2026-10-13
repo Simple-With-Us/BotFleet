@@ -173,8 +173,7 @@ state across plugins.
       "updatedAt": "2026-10-04T12:00:00.000Z",
       "source": {
         "kind": "folder",           // "folder" | "git"
-        "path": "<plugin-folder>",
-        "ref": null
+        "path": "<plugin-folder>"
       },
       "warnings": []                // reserved for the future scan pass
     }
