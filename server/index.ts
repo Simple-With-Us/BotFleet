@@ -2788,6 +2788,10 @@ function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
       const message = redactSecretsInText(event.message);
       return message === event.message ? event : { ...event, message };
     }
+    case "runtime.notice": {
+      const message = redactSecretsInText(event.message);
+      return message === event.message ? event : { ...event, message };
+    }
     case "context.injected": {
       // built redacted already; the wire never has to trust that
       const preview = redactSecretsInText(event.preview);
@@ -4642,6 +4646,17 @@ bus.subscribe((event: RuntimeEvent) => {
         // (chat-completions) knows its real maximum better than the shared
         // default a CLI driver retries against
         tool: { name: `retrying — attempt ${event.attempt + 1}/${event.maxAttempts ?? RETRY_MAX_ATTEMPTS} in ${Math.round(event.delayMs / 1000)}s — ${event.reason}`, ok: true },
+      });
+      break;
+    case "runtime.notice":
+      pushMessage({
+        role: "bot",
+        kind: "activity",
+        tool: {
+          name: `notice: ${redactSecretsInText(event.message).slice(0, 240)}`,
+          ok: true,
+          kind: "notice",
+        },
       });
       break;
     case "runtime.error": {
