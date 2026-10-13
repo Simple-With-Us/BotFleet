@@ -234,15 +234,17 @@ const failed = (content: string, detail?: string): TurnToolOutcome =>
 /** Model arguments for request_sign_in.  Strict, so a password, code, or
  * any other extra field is refused.  The refusal text is fixed and never
  * includes the rejected value. */
-const SIGN_IN_CALL = z
+export const SIGN_IN_CALL = z
   .object({
     site: z.string().min(1),
     reason: z.string().optional(),
   })
   .strict();
 
+export type SignInCall = z.infer<typeof SIGN_IN_CALL>;
+
 const SIGN_IN_CALL_REFUSAL =
-  "request_sign_in accepts only a site and an optional reason.  Never send a password or one-time code.";
+  "request_sign_in accepts only a site and an optional reason.\u00A0 Never send a password or one-time code.";
 
 const errorText = (body: Record<string, unknown>, fallback: string): string =>
   typeof body.error === "string" && body.error ? body.error : fallback;
