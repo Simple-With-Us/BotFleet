@@ -13,6 +13,11 @@ export type CustomMcpServer =
   | { command: string; args: string[]; env: Record<string, string> }
   | { type: "http" | "sse"; url: string; headers: Record<string, string> };
 
+/** Validated MCP servers keyed by config entry name. */
+export interface CustomMcpServerByName {
+  [serverName: string]: CustomMcpServer;
+}
+
 const mcpName = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/);
 const stringRecord = z.record(z.string(), z.string());
 const stdioMcp = z.object({
@@ -57,11 +62,11 @@ function parseStoredMcpServer(name: string, raw: JsonValue): { ok: true; config:
 }
 
 /** The validated, normalized custom servers from config — or {}. */
-export function customMcpServers(cfg: AppConfig, only?: string[]): Record<string, CustomMcpServer> {
-  const out: Record<string, CustomMcpServer> = {};
+export function customMcpServers(cfg: AppConfig, only?: string[]): CustomMcpServerByName {
+  const out: CustomMcpServerByName = {};
   for (const [name, raw] of Object.entries(cfg.mcpServers ?? {})) {
     if (only && !only.includes(name)) continue;
-    const parsed = parseStoredMcpServer(name, raw as JsonValue);
+    const parsed = parseStoredMcpServer(name, raw);
     if (!parsed.ok) {
       if (parsed.error !== "disabled") {
         skipMcpEntry(
@@ -77,6 +82,6 @@ export function customMcpServers(cfg: AppConfig, only?: string[]): Record<string
 }
 
 /** Configured MCP servers that may reach this bot's engine. */
-export function engineMcpServers(cfg: AppConfig, botMcpServers?: string[] | null): Record<string, CustomMcpServer> {
+export function engineMcpServers(cfg: AppConfig, botMcpServers?: string[] | null): CustomMcpServerByName {
   return customMcpServers(cfg, botMcpServers ?? undefined);
 }

@@ -12,10 +12,7 @@
 
 import { z } from "zod";
 
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  if (value === null || value === undefined || Array.isArray(value)) return false;
-  return Object.prototype.toString.call(value) === "[object Object]";
-}
+import { isJsonObject, type JsonValue } from "./plugin-manifest.ts";
 
 export type OutboundPolicy = {
   /** ask: every outbound call waits for a tap. allow: up to dailyCap a day. */
@@ -102,7 +99,7 @@ const outboundPolicySchema = z.object({
 });
 
 /** The stored shape, or null when the value is not one. */
-export function normalizeOutboundPolicy(value: unknown): OutboundPolicy | null {
+export function normalizeOutboundPolicy(value: JsonValue): OutboundPolicy | null {
   if (!isJsonObject(value)) return null;
   const parsed = outboundPolicySchema.safeParse(value);
   if (!parsed.success) return null;
@@ -117,10 +114,10 @@ export const DEFAULT_OUTBOUND_POLICY: OutboundPolicy = { policy: "ask", dailyCap
  * request carries them. */
 export interface ConnectorCall {
   slug: string;
-  arguments?: unknown;
+  arguments?: JsonValue;
 }
 
-function connectorCall(slug: string, args?: unknown): ConnectorCall {
+function connectorCall(slug: string, args?: JsonValue): ConnectorCall {
   if (args === undefined) return { slug };
   return { slug, arguments: args };
 }
@@ -130,10 +127,10 @@ function connectorCall(slug: string, args?: unknown): ConnectorCall {
  * arguments. Arbitrary workbench/bash code is opaque: it requires an
  * explicit unrestricted approval, never an inferred app or send count.
  * Search, schema lookup, and connection management run no app tools. */
-export function connectorCallsIn(name: string, args: unknown): ConnectorCall[] {
+export function connectorCallsIn(name: string, args: JsonValue | undefined): ConnectorCall[] {
   if (name === "COMPOSIO_MULTI_EXECUTE_TOOL") {
-    const tools = isJsonObject(args) && Array.isArray(args.tools) ? args.tools
-      : isJsonObject(args) && "tool_slug" in args && isJsonObject(args) ? [args] : [];
+    const tools = args !== undefined && isJsonObject(args) && Array.isArray(args.tools) ? args.tools
+      : args !== undefined && isJsonObject(args) && "tool_slug" in args ? [args] : [];
     if (!tools.length) return [connectorCall("COMPOSIO_PROXY_EXECUTE", args)];
     const calls: ConnectorCall[] = [];
     for (const item of tools) {
@@ -160,6 +157,6 @@ export function connectorCallsIn(name: string, args: unknown): ConnectorCall[] {
 }
 
 /** The subset of a request's app tools that would send something. */
-export function outboundCallsIn(name: string, args: unknown): ConnectorCall[] {
+export function outboundCallsIn(name: string, args: JsonValue | undefined): ConnectorCall[] {
   return connectorCallsIn(name, args).filter((call) => isOutboundTool(call.slug));
 }

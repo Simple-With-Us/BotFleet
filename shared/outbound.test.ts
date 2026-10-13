@@ -78,7 +78,7 @@ describe("normalizeOutboundPolicy", () => {
   });
 
   it("refuses anything else", () => {
-    expect(normalizeOutboundPolicy(null)).toBeNull();
+    expect(normalizeOutboundPolicy(null as never)).toBeNull();
     expect(normalizeOutboundPolicy({ policy: "maybe" })).toBeNull();
     expect(normalizeOutboundPolicy({ policy: "ask", dailyCap: 0 })).toBeNull();
   });
