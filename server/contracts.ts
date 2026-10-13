@@ -6,6 +6,7 @@
 // readable.
 
 import type { ComputerMount } from "./computer-grants.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
@@ -439,6 +440,11 @@ export interface SendTurnInput {
    *  driver that spawns a child for the turn applies it to that child's
    *  environment; absent means a launched child with no seat. */
   launchIdentity?: LaunchIdentity;
+  /** A routine's command allowlist (server/tool-policy.ts).  Present only on
+   *  a routine turn whose routine set one, and on every re-dispatch of that
+   *  turn.  A driver whose capabilities say `toolPolicy: true` holds the turn
+   *  to it;  the harness refuses to send such a turn to any other driver. */
+  toolPolicy?: ToolPolicy;
 }
 
 /** The decoded `arguments` object of one tool call.
@@ -623,6 +629,10 @@ export interface ProviderAdapter {
      * a host-control turn already gets, so every ask reaches the reviewer
      * before it runs.  Meaningful only beside `reviewHook: "after"`. */
     asksWhenHeld?: boolean;
+    /** True when the driver holds a turn to `SendTurnInput.toolPolicy` (or
+     *  refuses it when the engine instance cannot be held).  Absent: the
+     *  harness never sends this driver an allowlist turn. */
+    toolPolicy?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
@@ -748,8 +758,9 @@ export interface ModelCatalog {
     /** Short tag rendered next to the label in the model picker (e.g. a
      * price/speed tradeoff the user should see before picking).  Drivers
      * set it on static catalog rows; the picker renders it as a chip with
-     * `badgeTitle` (full sentence) on hover.  Keep the chip under ~10 chars
-     * so it does not push the label to a second line on narrow chat heads. */
+     * `badgeTitle` (full sentence) on hover.  Keep the chip short: in a
+     * narrow picker the row's tags wrap onto their own line rather than
+     * squeezing the name, so a long chip costs the list a row of height. */
     badge?: string;
     /** Hover explanation for `badge`.  Without this the chip renders
      * without a tooltip and a screen-reader hint. */

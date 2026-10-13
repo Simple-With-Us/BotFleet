@@ -17,7 +17,7 @@
 // every activity chip the harness narrates (`tool.spoken`) is read aloud as
 // it happens, which is why waiting feels like listening to someone work
 // rather than listening to nothing.
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Loader2, Phone, PhoneOff, X } from "lucide-react";
 
 import { useStore, visibleMessages, type Bot } from "@/state/store";
@@ -62,6 +62,7 @@ import {
 // read-only here — this lane wires the call view, it does not change that layer.
 import { prepareStsSession } from "@/lib/sts";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
+import { mergeCloudSttCapabilities } from "@/lib/cloud-stt-capabilities";
 import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { BotMascot } from "./Avatar";
 import { isRoutineApproval, pendingApprovals, spokenApprovalPrompt, type Pending } from "./PendingApproval";
@@ -162,12 +163,20 @@ export function CallTargetButton({
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
   const cloudConfigured = useTranscriptionAvailability();
+<<<<<<< HEAD
   const stsDecision = useStsDecision(state.config?.sts?.provider);
+=======
+  const cloudStt = useMemo(
+    () => mergeCloudSttCapabilities(state.config?.callStt?.cloud, cloudConfigured),
+    [state.config?.callStt?.cloud, cloudConfigured],
+  );
+>>>>>>> origin/main
   const provider = pickSTTProvider({
-    cloudSttConfigured: cloudConfigured,
+    cloudStt,
     appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
     platform: window.ogb?.platform ?? "unknown",
     explicitPreference: state.config?.callStt?.provider ?? undefined,
+    ladder: state.config?.callStt?.ladder,
   });
   const supported = provider.provider !== null;
   // `configured` is provider-scoped server-side (MiniMax => a key is on file; system => the Mac's
@@ -779,13 +788,14 @@ function Call({ bot }: { bot: Bot }) {
       }
 
       const status = await bridge.transcription?.status?.().catch(() => undefined);
-      const cloudSttConfigured = Boolean(status?.configured);
+      const mergedCloud = mergeCloudSttCapabilities(state.config?.callStt?.cloud, Boolean(status?.configured));
       const platform = bridge.platform ?? "unknown";
       const choice: ProviderChoice = pickSTTProvider({
-        cloudSttConfigured,
+        cloudStt: mergedCloud,
         appleSpeechAvailable: capabilities.dictation.available,
         platform,
         explicitPreference: state.config?.callStt?.provider ?? undefined,
+        ladder: state.config?.callStt?.ladder,
       });
       if (choice.provider === null) {
         if (alive.current && currentCall() === bot.id) {

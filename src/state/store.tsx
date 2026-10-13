@@ -545,7 +545,7 @@ export interface ConfigStatus {
     configured: boolean;
     ready: boolean;
     voice: string;
-    provider?: "minimax" | "system";
+    provider?: "minimax" | "system" | "xai" | "azure";
     optimizedSummary?: boolean;
     pronunciations?: Pronunciation[];
   };
@@ -553,7 +553,12 @@ export interface ConfigStatus {
    * `provider` is undefined when the picker has no explicit preference and
    * chooses the platform default. `keyterms` is the global voice vocabulary
    * the user has set up; per-bot terms are layered on top in call-stt.ts. */
-  callStt?: { provider?: "apple" | "assemblyai"; keyterms?: string[] };
+  callStt?: {
+    provider?: "apple" | "assemblyai" | "xai" | "meta" | "azure" | "groq";
+    ladder?: Array<"meta" | "xai" | "assemblyai" | "azure" | "groq">;
+    keyterms?: string[];
+    cloud?: import("../../shared/voice-providers.ts").CloudSttCapabilities;
+  };
   /** Speech-to-speech call preference, mirrored from AppConfig.  `provider`
    * is undefined when the picker has no explicit preference and Auto picks
    * whichever provider has a key; `frontEngine` defaults to true, so an

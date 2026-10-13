@@ -640,12 +640,71 @@ export async function dependencyFingerprint(nodeModulesPath) {
   return digest.digest("hex");
 }
 
+/** The one lockfile document pnpm actually wrote, from a project lockfile
+ *  that may be a YAML STREAM.
+ *
+ *  pnpm 12 records `packageManagerDependencies` — the self-hosted pnpm it
+ *  installs for `packageManager: "pnpm@12.x"` — as a SEPARATE leading document,
+ *  with the real lockfile after a second `---`.  Its internal copy at
+ *  `node_modules/.pnpm/lock.yaml` is that second document alone: verified
+ *  byte-for-byte on this repo, in both directions.
+ *
+ *  This matters because comparing the two whole files compares a stream against
+ *  one of its own documents, which can never match — so the dependency gate
+ *  below rejected EVERY install on every Mac.  That is silent in the common
+ *  case (`pnpm install --frozen-lockfile` still succeeds, because pnpm reads
+ *  what it needs), so it only surfaces as "update failed" at the one moment
+ *  someone tries to update, fleet-wide.
+ *
+ *  Split on a line that is exactly `---`, after an optional leading one, and
+ *  take the last chunk.  A single-document lockfile (pnpm < 12) is returned
+ *  unchanged apart from that leading marker, which is what it was. */
+export function effectiveLockDocument(text) {
+  const body = text.startsWith("---\n") ? text.slice(4) : text;
+  const chunks = body.split("\n---\n");
+  return chunks[chunks.length - 1];
+}
+
+/** Say out loud when the always-on checkout is not serving origin/main.
+ *
+ *  The updater leaves that checkout detached at the commit it applied, so the
+ *  normal state is origin/main and nothing is printed.  Anything else — a seat
+ *  having switched it to a working branch, a merge left unpulled — is drift
+ *  the owner cannot see from inside the app, and it is the whole answer to
+ *  "why is this running old code".  Advisory only: the update proceeds and
+ *  repairs the checkout on apply, which is where the fix belongs.
+ *
+ *  Never throws.  A checkout in a state git cannot describe here is reported
+ *  as unknown rather than failing an update that would otherwise succeed. */
+export async function reportCheckoutDrift(checkout) {
+  try {
+    // Module-level `output`, not the `gitOutput` closure inside createConfig —
+    // that one is not in scope here, and reaching for it fails at runtime in a
+    // way this function's own catch would quietly turn back into silence.
+    const readGit = (args) => output("git", ["-C", checkout, ...args]);
+    const head = (await readGit(["rev-parse", "--short", "HEAD"])).trim();
+    const remote = (await readGit(["rev-parse", "--short", "origin/main"])).trim();
+    const branch = await readGit(["symbolic-ref", "--short", "HEAD"]).catch(() => null);
+    if (head === remote) return null;
+    const where = branch ? `branch ${branch.trim()}` : "a detached HEAD";
+    const message = `Always-on checkout is on ${where} at ${head}, not origin/main ${remote}; this update moves it to ${remote}.`;
+    console.error(`WARNING:  ${message}`);
+    return message;
+  } catch {
+    return null;
+  }
+}
+
 async function assertDependenciesMatchSource(nodeModulesPath, sourcePath) {
   const [sourceLock, installedLock] = await Promise.all([
     readFile(join(sourcePath, "pnpm-lock.yaml")),
     readFile(join(nodeModulesPath, ".pnpm/lock.yaml")),
   ]);
-  if (!sourceLock.equals(installedLock)) {
+  // A Buffer comparison, because `effectiveLockDocument` returns a string and
+  // String has no `.equals` — calling one throws a TypeError that surfaces as
+  // an unexplained updater crash instead of the message below.
+  const effective = Buffer.from(effectiveLockDocument(sourceLock.toString("utf8")), "utf8");
+  if (!effective.equals(installedLock)) {
     throw new Error("Staged dependency tree does not match the exact source lockfile");
   }
 }
@@ -3660,6 +3719,14 @@ function createOperations(config) {
     },
 
     preflight: async (_prepared) => {
+      // The always-on checkout is supposed to be a detached origin/main
+      // checkout; this update moves it there when it applies.  If something
+      // else moved it — a seat switching the checkout to a working branch is
+      // the way this happens — the harness keeps serving that branch until the
+      // next successful update, which is a long time to run code nobody
+      // deployed on purpose.  Naming it costs one line and answers "why is my
+      // app weeks behind main" without anyone having to remember to ask.
+      await reportCheckoutDrift(config.checkout);
       lastPreflight = await runtimePreflight(config);
       return lastPreflight;
     },

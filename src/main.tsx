@@ -74,6 +74,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "model-rows") {
+  // Visual-spec harness (tests/e2e/model-rows.visual.spec.ts): the real
+  // `ModelRow` at the pane widths where a slug used to break one character per
+  // line, beside the usage block that replaced the per-row quota chip.
+  void import("./components/ModelRowsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "team-map-context") {
   void import("./components/TeamMapPage").then((mod) => {
     const Fixture = mod.TeamMapSharedContextVisualFixture;
@@ -100,6 +112,17 @@ if (fixtureParam === "tv-face") {
   // for in the real app boot path.  The App render below is unchanged for any
   // other URL.
   void import("./components/HostCliIntegrationCardVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "transcription-settings") {
+  // Visual-spec harness: mount the real call-dictation selector with fixed
+  // config.  The real app boot path stays unchanged for other URLs.
+  void import("./components/TranscriptionSettingsVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>

@@ -29,7 +29,6 @@ import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
 import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
-import { quotaWindows, bindingQuotaWindow } from "@/lib/quota-display";
 import { cn } from "@/lib/cn";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
 import {
@@ -219,7 +218,9 @@ function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNo
     <EngineCallout
       key={instance.instanceId}
       driverKind={instance.driverKind}
-      instanceId={instance.instanceId}
+      models={instance.models.options
+        .filter((model) => !isInjectedLocalModel(model))
+        .map((model) => model.id)}
     />
   );
 }
@@ -279,13 +280,18 @@ export function railEngines(instances: InstanceInfo[], selectedInstanceId: strin
   });
 }
 
-function ModelRow({
+/** One model row: the name, then whatever tags the catalog attached to it.
+ *
+ *  Exported for the visual fixture (tests/e2e/model-rows.visual.spec.ts): this
+ *  row is where the owner saw names break one character per line, and only a
+ *  fixture that mounts the real component can prove the fix rather than a copy
+ *  of it. */
+export function ModelRow({
   option,
   current,
   defaultId,
   onPick,
   quota,
-  engineWindowsLabel,
 }: {
   option: ModelOption;
   current: boolean;
@@ -297,12 +303,6 @@ function ModelRow({
     secondaryRemainingPercent?: number | null;
     windowsLabel?: string;
   };
-  /** Engine-level fallback label, used when a per-model quota entry carries
-   *  none.  `quota.models[id].windowsLabel` is optional in the contract
-   *  (server/contracts.ts), and without this the row hint falls back to the
-   *  generic "Current"/"Longer" names and says "Low longer quota" while the
-   *  panel above it correctly says "Weekly". */
-  engineWindowsLabel?: string;
 }) {
   return (
     <button
@@ -314,80 +314,61 @@ function ModelRow({
         quota?.capped && "opacity-60",
       )}
     >
-      <span className="flex min-w-0 flex-1 items-center gap-1.5">
-        {/* `truncate`, not `break-words`.  This span is `flex-1` (basis 0), so
-            when the Default/ctx/quota chips beside it claim the row, the label
-            shrinks to nothing — and `break-words` then breaks it one character
-            per line, which is how "MiniMax M2.7" rendered as a vertical column
-            of letters.  Truncating keeps the name on one line and hands the
-            overflow to the title attribute instead. */}
-        <span className="min-w-0 flex-1 truncate" title={option.label}>{option.label}</span>
-        {option.id === defaultId && (
-          <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
-        )}
-        {option.loaded && (
-          <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Loaded</span>
-        )}
-        {option.contextWindow && (
-          <span
-            className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
-            title={`${option.contextWindow.toLocaleString()} tokens max`}
-          >
-            {option.contextWindow >= 1000000
-              ? `${Math.floor(option.contextWindow / 1000000)}M`
-              : `${Math.floor(option.contextWindow / 1000)}K`}
-          </span>
-        )}
-        {option.badge && (
-          <span
-            className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
-            title={option.badgeTitle ?? option.badge}
-            aria-label={option.badgeTitle ?? option.badge}
-          >
-            {option.badge}
-          </span>
-        )}
-        {quota?.capped && (
-          <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">Exhausted</span>
-        )}
-        {!quota?.capped && (
-          <EngineQuotaHint quota={quota} fallbackWindowsLabel={engineWindowsLabel} />
-        )}
+      <span className="flex min-w-0 flex-1 flex-wrap items-center gap-x-1.5 gap-y-1">
+        {/* The name is the thing being chosen, so it gets the row's slack and
+            the tags take what is left, dropping to their own line when that is
+            not enough.  `mr-auto` rather than `flex-1`: a `flex-1` label grows
+            to fill the line and pushes the tags down every time, even beside a
+            short slug.  The width floor is what stops the reverse failure —
+            without it the label is the only shrinkable item, so it collapses
+            toward zero width under tag pressure and `break-words` breaks it one
+            character per line ("DeepSeek-V" as a column of letters) while
+            `truncate` reduces it to a bare ellipsis.  `min(9rem, 100%)` is
+            wide enough to read a slug and capped so the row can never be
+            forced wider than the pane holding it. */}
+        <span
+          data-testid="model-row-label"
+          className="min-w-[min(9rem,100%)] max-w-full mr-auto truncate"
+          title={option.label}
+        >
+          {option.label}
+        </span>
+        {/* One wrapping unit rather than loose chips: a group of tags that
+            cannot fit beside the name moves below it whole, instead of leaving
+            "Default" beside the slug and "1M" on the line under. */}
+        <span data-testid="model-row-tags" className="flex shrink-0 flex-wrap items-center gap-x-1.5 gap-y-1">
+          {option.id === defaultId && (
+            <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
+          )}
+          {option.loaded && (
+            <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Loaded</span>
+          )}
+          {option.contextWindow && (
+            <span
+              className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
+              title={`${option.contextWindow.toLocaleString()} tokens max`}
+            >
+              {option.contextWindow >= 1000000
+                ? `${Math.floor(option.contextWindow / 1000000)}M`
+                : `${Math.floor(option.contextWindow / 1000)}K`}
+            </span>
+          )}
+          {option.badge && (
+            <span
+              className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
+              title={option.badgeTitle ?? option.badge}
+              aria-label={option.badgeTitle ?? option.badge}
+            >
+              {option.badge}
+            </span>
+          )}
+          {quota?.capped && (
+            <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">Exhausted</span>
+          )}
+        </span>
       </span>
       {current && <Check size={14} className="shrink-0 text-accent" />}
     </button>
-  );
-}
-
-/** A short per-row nudge, now that the full numbers live in Engine Quotas.
- *
- *  The old chip printed every engine's whole quota state on every model —
- *  `(93% / 3% for 5h / w)` — which said the same thing down the whole list and
- *  explained nothing.  A row now only speaks up when the engine is genuinely
- *  low, and then in words: "Low weekly quota".  Everything else is one click
- *  away in the panel under the header, where it can be labelled properly. */
-function EngineQuotaHint({ quota, fallbackWindowsLabel }: {
-  quota?: {
-    remainingPercent?: number | null;
-    secondaryRemainingPercent?: number | null;
-    windowsLabel?: string;
-  };
-  fallbackWindowsLabel?: string;
-}) {
-  const windows = quotaWindows(quota?.remainingPercent, quota?.secondaryRemainingPercent, {
-    windowsLabel: quota?.windowsLabel ?? fallbackWindowsLabel,
-  });
-  const binding = bindingQuotaWindow(windows);
-  if (!binding) return null;
-  if (binding.remainingPercent > 10) return null;
-  const tone =
-    binding.remainingPercent <= 0
-      ? "bg-danger/10 text-danger"
-      : "bg-amber-500/15 text-amber-700 dark:text-amber-300";
-  return (
-    <span className={cn("shrink-0 rounded px-1.5 py-px text-[10px]", tone)}>
-      {binding.remainingPercent <= 0 ? `${binding.label} spent` : `Low ${binding.label.toLowerCase()} quota`}
-    </span>
   );
 }
 
@@ -469,10 +450,6 @@ export function LocalModelsPanel({
                 defaultId=""
                 onPick={() => onPick(group.instance, option.id)}
                 quota={group.instance.snapshot.quota?.models?.[option.id]}
-                engineWindowsLabel={
-                  group.instance.snapshot.quota?.models?.[option.id]?.windowsLabel ??
-                  group.instance.snapshot.quota?.windowsLabel
-                }
               />
             ))}
           </div>
@@ -667,7 +644,6 @@ export function ModelPicker({
       defaultId={railInstance?.models.default ?? ""}
       onPick={() => railInstance && pick(railInstance, option.id)}
       quota={railInstance?.snapshot.quota?.models?.[option.id]}
-      engineWindowsLabel={railInstance?.snapshot.quota?.windowsLabel}
     />
   );
 
@@ -838,11 +814,21 @@ export function ModelPicker({
             ) : railInstance ? (
               <>
                 <div className="shrink-0 px-4 pb-2 pt-3.5">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="truncate text-[14px] font-semibold text-ink" title={railInstance.displayName}>{railInstance.displayName}</div>
+                  <div className="flex items-center justify-between gap-2">
+                    {/* The engine name is the heading, so it wraps rather than
+                        truncating, and the status pill beside it is capped: a
+                        build-style version ("2026.09.26-dd393fe") used to eat
+                        the row and cut "Cursor" down to "Cu…".  The pill keeps
+                        the full string in its tooltip. */}
+                    <div
+                      className="min-w-0 flex-1 text-[14px] font-semibold leading-snug break-words text-ink"
+                      title={railInstance.displayName}
+                    >
+                      {railInstance.displayName}
+                    </div>
                     <span
                       className={cn(
-                        "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
+                        "max-w-[45%] shrink-0 truncate rounded-full px-2 py-0.5 text-[10.5px] font-medium",
                         railInstance.snapshot.quota?.capped
                           ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
                           : checking
@@ -851,6 +837,7 @@ export function ModelPicker({
                           ? "bg-warning/10 text-warning"
                           : "bg-success/10 text-success",
                       )}
+                      title={pane === "custom" && !blocked ? "Local models" : engineStatus(railInstance)}
                     >
                       {pane === "custom" && !blocked ? "Local models" : engineStatus(railInstance)}
                     </span>

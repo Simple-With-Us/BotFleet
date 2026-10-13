@@ -257,10 +257,30 @@ email address is the one value on this list that identifies a person.  The
 iOS app is a different product with no analytics SDK at all — see
 [iOS privacy](ios-privacy.md).
 
+## Fleet-infra export
+
+Completed bot turns can also send one summary event to the shared
+`fleet-infra` Sentry project.  That DSN is `SENTRY_FLEET_DSN` in Infisical
+prod (or the same name in the process environment).  It is never hardcoded,
+and it is never the product `SENTRY_DSN`.  The summary carries provider,
+model, tokens, catalog or reported cost, duration, and tool names — not
+prompts.  Missing `SENTRY_FLEET_DSN` leaves the export inert.
+
+## Release and source maps
+
+Node and the Electron renderer set `release` to a git SHA (`SENTRY_RELEASE`,
+then `GITHUB_SHA`, then `VERCEL_GIT_COMMIT_SHA`, then the harness build
+identity).  That is the same SHA `sentry-deploy.yml` records, so Issues and
+deploys line up.
+
+`@sentry/vite-plugin` uploads renderer source maps when `SENTRY_AUTH_TOKEN`
+is in the package-job environment.  Without that token the plugin stays
+disabled and the build does not emit maps.  Electron main uses
+`@sentry/electron`.  The harness loads `@sentry/profiling-node` when the
+package is installed.
+
 ## What is intentionally out of scope
 
-- A second Sentry project — everything lands in `simple-with-us/botfleet`.
-- `@sentry/profiling-node` — not installed; `profilingAvailable` reports
-  `false` and the harness warns once rather than silently no-oping.
+- Shipping a default DSN — every surface stays off until a DSN is configured.
 - `ios/App/SentryTelemetry.swift` and `ios/project.yml` already handle an
   empty DSN and are unchanged by any of this.

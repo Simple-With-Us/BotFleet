@@ -193,6 +193,53 @@ function runOpenCodeModels(
   });
 }
 
+/** Why the last catalog probe came back empty, in words the engine row can
+ *  show.  `null` once a probe has succeeded. */
+let lastProbeProblem: string | null = null;
+
+export function openCodeModelProbeProblem(): string | null {
+  return lastProbeProblem;
+}
+
+/** Ask the CLI for its catalog, without assuming a flag it still has.
+ *
+ *  `--verbose` is what turns a bare id list into `provider/model` header lines
+ *  with metadata, so the parser wants it — but it is not part of that command's
+ *  contract.  opencode v2.0.26 answers `Unrecognized flag: --verbose` and exits,
+ *  and that rejection used to fall through to the empty fallback catalog with
+ *  nothing to say why.  A CLI that refuses the flag still answers the plain
+ *  command, so ask plainly first and add the flag only if the plain answer was
+ *  useless. */
+async function probeOpenCodeModels(
+  cli: string,
+  environment: Record<string, string | undefined>,
+): Promise<string> {
+  let plainProblem: string | null = null;
+  const plain = await runOpenCodeModels(cli, environment, false).catch((error: Error) => {
+    plainProblem = error?.message ?? String(error);
+    return "";
+  });
+  if (plain.trim()) return plain;
+  let verboseProblem: string | null = null;
+  const verbose = await runOpenCodeModels(cli, environment, true).catch((error: Error) => {
+    verboseProblem = error?.message ?? String(error);
+    return "";
+  });
+  if (verbose.trim()) return verbose;
+
+  // Neither shape produced a list, and the two failures mean different things.
+  // A plain command that ERRORED means the CLI itself is unusable, so its
+  // message is the answer.  A plain command that RAN and printed nothing means
+  // the CLI answered correctly and simply has nothing to list — and the verbose
+  // failure beside it is only ever about the flag, so it is reported as context
+  // rather than as the cause.  Collapsing both into one fallback string loses
+  // the difference between "your CLI is broken" and "your CLI has no models",
+  // which are the two things a person here is trying to tell apart.
+  if (plainProblem) throw new Error(plainProblem);
+  if (verboseProblem) throw new Error(`opencode models listed nothing (${verboseProblem})`);
+  throw new Error("opencode models answered nothing");
+}
+
 /** Ask the same OpenCode binary that will run ACP for its effective catalog.
  * This automatically includes Zen, Go, other connected providers, custom
  * config, and anonymous free models with the exact IDs the session accepts. */
@@ -201,17 +248,23 @@ export async function discoverOpenCodeModels(
   cli = "opencode",
 ): Promise<ModelCatalog> {
   try {
-    const catalog = parseOpenCodeModelsOutput(await runOpenCodeModels(cli, environment, true));
+    const catalog = parseOpenCodeModelsOutput(await probeOpenCodeModels(cli, environment));
     if (!catalog) throw new Error("OpenCode returned no usable models");
     lastSuccessfulCatalog = catalog;
+    lastProbeProblem = null;
     return catalog;
-  } catch {
+  } catch (error) {
+    // An engine with no models and no reason reads as broken.  It is not: the
+    // CLI answered and had nothing to list, and the person needs the sentence
+    // that says which of the two it was.
+    lastProbeProblem = error instanceof Error ? error.message : String(error);
     return lastSuccessfulCatalog ?? STATIC_MODELS;
   }
 }
 
 export function resetOpenCodeModelCache() {
   lastSuccessfulCatalog = null;
+  lastProbeProblem = null;
   modelProbeCache.clear();
 }
 

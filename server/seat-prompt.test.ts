@@ -28,12 +28,13 @@ describe("fleet seat prompt composition", () => {
     }
   });
 
-  it("covers exactly the ten BotFleet roles, none of them a platform seat or a Grok Bot tag", () => {
+  it("covers exactly the eleven BotFleet roles, none of them a platform seat or a Grok Bot tag", () => {
     expect([...FLEET_SEAT_IDS].sort()).toEqual([
       "builder",
       "compiler",
       "deployer",
       "designer",
+      "director",
       "fixer",
       "housekeeper",
       "monitor",
@@ -87,7 +88,7 @@ describe("fleet seat prompt composition", () => {
   });
 
   it("no longer maps a BF- bot to a platform seat or a Grok Bot tag", () => {
-    for (const name of ["BF-Claude", "BF-Codex", "BF-Grok", "BF-Cursor", "BF-Director", "BF-Monet"]) {
+    for (const name of ["BF-Claude", "BF-Codex", "BF-Grok", "BF-Cursor", "BF-Monet"]) {
       expect(resolveFleetSeatId({ name }), name).toBeNull();
     }
     expect(resolveFleetSeatId({ name: "Claude" })).toBeNull();

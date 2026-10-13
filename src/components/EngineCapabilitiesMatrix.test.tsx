@@ -42,6 +42,7 @@ import {
 } from "@/lib/engine-capabilities.tsx";
 
 const html = renderToStaticMarkup(createElement(EngineCapabilitiesMatrix));
+const MATRIX_ENGINE_IDS = ENGINE_DISPLAY_ORDER.filter((id) => id !== "box");
 
 /** `renderToStaticMarkup` drops event handlers and class maps that never made
  *  it onto an element, so the behaviour assertions below read the component
@@ -78,11 +79,15 @@ describe("EngineCapabilitiesMatrix layout budget", () => {
 });
 
 describe("EngineCapabilitiesMatrix orientation", () => {
-  it("renders one row per engine", () => {
-    for (const id of ENGINE_DISPLAY_ORDER) {
+  it("renders one row per engine with its platform mark and keeps Box in Computer settings", () => {
+    for (const id of MATRIX_ENGINE_IDS) {
       const entry = ENGINE_CAPABILITIES[id];
       expect(html, `${entry.displayName} row missing`).toContain(entry.displayName);
     }
+    expect(html).not.toContain("ASCII.dev Box");
+    expect(html).toContain("<svg");
+    expect(source).toContain("<ProviderMark");
+    expect(source).not.toContain("entry.capabilityBadgeColor");
   });
 
   it("renders one column per capability", () => {
@@ -107,7 +112,7 @@ describe("EngineCapabilitiesMatrix orientation", () => {
   });
 
   it("gives every cell an accessible name that states the verdict in words", () => {
-    for (const id of ENGINE_DISPLAY_ORDER) {
+    for (const id of MATRIX_ENGINE_IDS) {
       const entry = ENGINE_CAPABILITIES[id];
       for (const key of CAPABILITY_KEYS) {
         const state = entry.capabilities[key];
@@ -119,15 +124,11 @@ describe("EngineCapabilitiesMatrix orientation", () => {
     }
   });
 
-  it("renders a pricing pill for every engine", () => {
-    // The Subscription · $X/mo pill wording is the legacy vocabulary we
-    // kept; pin at least one match across the registered engines.
-    expect(html).toMatch(/Subscription/);
-    // Subscription + API engines emit "Subscription + API · $X/mo";
-    // MiniMax and Grok both qualify, so the string must appear at
-    // least twice.
-    const subscriptionApiMatches = html.match(/Subscription \+ API/g) ?? [];
-    expect(subscriptionApiMatches.length).toBeGreaterThanOrEqual(2);
+  it("renders an access pill for every engine without conflating billing", () => {
+    expect(html).toContain("CLI + API");
+    expect(html).toContain("CLI");
+    expect(html).toContain("API");
+    expect(html).not.toContain("Subscription");
   });
 });
 
@@ -187,7 +188,7 @@ describe("EngineCapabilitiesMatrix cell vocabulary", () => {
   it("gives every capability note, and every engine a resolvable one", () => {
     for (const key of CAPABILITY_KEYS) {
       expect(CAPABILITY_NOTES[key], `${key} has no capability note`).toBeTruthy();
-      for (const id of ENGINE_DISPLAY_ORDER) {
+      for (const id of MATRIX_ENGINE_IDS) {
         const entry = ENGINE_CAPABILITIES[id];
         expect(capabilityNoteFor(entry, key), `${id}/${key}`).toBeTruthy();
       }

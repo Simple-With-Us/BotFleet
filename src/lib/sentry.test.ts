@@ -104,6 +104,8 @@ describe("browser Sentry", () => {
     expect(src).toMatch(/urlQueryParams:\s*false/);
     expect(src).not.toMatch(/sendDefaultPii/);
     expect(src).toMatch(/genAI:\s*\{\s*inputs:\s*false,\s*outputs:\s*false/);
+    expect(src).toMatch(/VITE_SENTRY_RELEASE/);
+    expect(src).toMatch(/release:\s*options\.release/);
   });
 
   it("iOS Cocoa reads SENTRY_DSN from Info.plist only", () => {

@@ -26,6 +26,8 @@ import {
   DEFAULT_PORTS,
   DEFAULT_STARTUP_TIMEOUT_MS,
   dependencyFingerprint,
+  effectiveLockDocument,
+  reportCheckoutDrift,
   describeLaunchdExit,
   isRecoverableResolutionFailure,
   parseLaunchdJob,
@@ -217,6 +219,90 @@ test("dependency fingerprints cover package contents and symlink targets", async
   await rm(join(dependencies, "package-link"));
   await symlink("other-package", join(dependencies, "package-link"));
   assert.notEqual(await dependencyFingerprint(dependencies), contentChanged);
+});
+
+// The always-on checkout is supposed to be a detached origin/main checkout and
+// the updater leaves it there on apply.  When a seat switched it to a working
+// branch instead, the harness served that branch for days with nothing on
+// screen saying so.  Advisory only: it must never fail an update.
+test("checkout drift is reported, and only when it is real", async () => {
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  const root = await mkdtemp(join(tmpdir(), "omb-checkout-drift-"));
+  const repo = join(root, "repo");
+  await run("git", ["init", "-q", repo]);
+  await run("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+  await run("git", ["-C", repo, "config", "user.name", "T"]);
+  await writeFile(join(repo, "f"), "1");
+  await run("git", ["-C", repo, "add", "f"]);
+  await run("git", ["-C", repo, "commit", "-qm", "one"]);
+  // A real origin/main ref, because that is what the drift check compares
+  // against — without one, "not origin/main" is indistinguishable from "no
+  // origin", and the check stays quiet on every checkout.
+  await run("git", ["-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+  // At origin/main: silent, because there is nothing to say.
+  assert.equal(await reportCheckoutDrift(repo), null);
+
+  // A branch at the SAME commit is not drift: the harness would be serving
+  // identical code, so there is nothing worth a warning.
+  await run("git", ["-C", repo, "checkout", "-q", "-b", "seat-work"]);
+  assert.equal(await reportCheckoutDrift(repo), null);
+
+  // A branch with its own commit IS drift, and it names itself — this is the
+  // shape that let a seat's working branch serve the harness for days.
+  await writeFile(join(repo, "f"), "2");
+  await run("git", ["-C", repo, "commit", "-qam", "two"]);
+  const drifted = await reportCheckoutDrift(repo);
+  assert.ok(drifted, "drift on a branch should be reported");
+  assert.match(drifted, /seat-work/);
+
+  // A path that is not a checkout reports nothing rather than failing an update.
+  assert.equal(await reportCheckoutDrift(join(root, "not-a-repo")), null);
+});
+
+// The first version of this fix tested only the document helper and left the
+// gate calling `.equals()` on a STRING, which throws a TypeError and surfaces
+// as an unexplained updater crash.  These cases drive the comparison the gate
+// actually performs, so a type slip cannot pass again.
+test("the gate comparison is byte-wise and type-correct", async () => {
+  const lock = "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n";
+  const stream = `---\nlockfileVersion: '9.0'\n\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.10.1\n---\n${lock}`;
+  // Exactly the expression assertDependenciesMatchSource runs.
+  const gate = (sourceLock, installedLock) =>
+    Buffer.from(effectiveLockDocument(sourceLock.toString("utf8")), "utf8").equals(installedLock);
+
+  assert.equal(gate(Buffer.from(stream), Buffer.from(lock)), true);
+  assert.equal(gate(Buffer.from(lock), Buffer.from(lock)), true);
+  assert.equal(gate(Buffer.from(stream), Buffer.from(`${lock}\n# drift\n`)), false);
+  assert.equal(gate(Buffer.from(lock), Buffer.from(stream)), false);
+});
+
+// The dependency gate compared the whole project lockfile against pnpm's
+// internal copy.  Since pnpm 12 those are different BYTE LENGTHS by design —
+// the project file is a two-document stream carrying `packageManagerDependencies`
+// and pnpm writes only the real lockfile — so the gate rejected every install
+// on every Mac while `pnpm install --frozen-lockfile` kept working, and the
+// only symptom was "update failed" at the moment someone tried to update.
+test("the dependency gate compares the document pnpm wrote, not the whole stream", () => {
+  const lock = "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n";
+  // pnpm 12: a leading document for the self-hosted package manager, then the
+  // real lockfile after a second `---`.
+  const stream = `---\nlockfileVersion: '9.0'\n\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.10.1\n        version: 12.10.1\n---\n${lock}`;
+  assert.equal(effectiveLockDocument(stream), lock);
+  assert.notEqual(stream, lock);
+
+  // pnpm < 12: one document, no separator.  A leading marker alone is not a
+  // document boundary, so the content comes back unchanged.
+  assert.equal(effectiveLockDocument(lock), lock);
+  assert.equal(effectiveLockDocument(`---\n${lock}`), lock);
+
+  // A real drift still fails: different dependency content is not equal.
+  assert.notEqual(effectiveLockDocument(stream), `${lock}\n# drift\n`);
 });
 
 test("command results wait for output pipes to close", async () => {

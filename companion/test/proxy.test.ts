@@ -15,6 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createProxyHandler } from "../src/proxy.ts";
 import { createConnectedDeviceTracker } from "../src/connected-devices.ts";
+import { isJsonObject, isJsonString } from "../src/json.ts";
 import type { CompanionEndpoint } from "../src/endpoints.ts";
 import { harnessReady } from "../../server/testing/harness-ready.ts";
 
@@ -1250,6 +1251,86 @@ describe("APNs token registration", () => {
       expect(stored).toEqual({ id: "d1", token: hex });
     } finally {
       await new Promise<void>((resolve) => pushServer.close(() => resolve()));
+    }
+  });
+
+  it("stores a Live Activity token locally, beside the alert token", async () => {
+    const stored: string[] = [];
+    const liveServer = createServer(
+      createProxyHandler({
+        harnessPort: 1,
+        authenticate: (token) => (token === TOKEN ? { id: "d1", cloudDesktopAccess: false } : null),
+        redeem: () => ({ error: "not used" }),
+        serverName: () => "Test computer",
+        setLiveActivityToken: (id, token) => {
+          if (!/^[0-9a-f]{64,}$/.test(token)) return false;
+          stored.push(`${id}:${token}`);
+          return true;
+        },
+      }),
+    );
+    await new Promise<void>((resolve) => liveServer.listen(0, "127.0.0.1", resolve));
+    const port = (liveServer.address() as { port: number }).port;
+    const hex = "cd".repeat(32);
+    try {
+      const denied = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: hex }),
+      });
+      expect(denied.status).toBe(401);
+
+      const unusable = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ token: "not-hex" }),
+      });
+      expect(unusable.status).toBe(400);
+
+      // The body is checked before the field is read.  `String(body.token)`
+      // would have turned each of these into a string the registry rejects
+      // for the wrong reason, and `{ token: 12 }` into "12" — a 400 that
+      // blames the token rather than the request.
+      for (const [label, body] of [
+        ["a non-string token", { token: 12 }],
+        ["an array token", { token: [1, 2] }],
+        ["a null token", { token: null }],
+        ["a missing token", {}],
+        ["an extra field", { token: hex, environment: "production" }],
+      ] as const) {
+        const rejected = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        expect(rejected.status, label).toBe(400);
+        // Narrowed at runtime rather than cast: a wire shape that stopped
+        // being `{ error: string }` should fail this assertion saying so,
+        // not throw on `parsed.error.length` of something else.  The
+        // companion declares no dependencies, so this is the package's own
+        // json.ts guard, not a schema library.
+        const payload: unknown = await rejected.json();
+        expect(isJsonObject(payload), `${label}: a JSON object`).toBe(true);
+        const error = isJsonObject(payload) ? payload.error : undefined;
+        expect(isJsonString(error), `${label}: a string error`).toBe(true);
+        expect(typeof error === "string" && error.length > 0, label).toBe(true);
+      }
+      // None of those reached the registry.
+      expect(stored).toEqual([]);
+
+      const ok = await fetch(`http://127.0.0.1:${port}/api/companion/live-activity-token`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ token: hex }),
+      });
+      expect(ok.status).toBe(200);
+      expect(await ok.json()).toEqual({ ok: true });
+      expect(stored).toEqual([`d1:${hex}`]);
+    } finally {
+      await new Promise<void>((resolve) => liveServer.close(() => resolve()));
     }
   });
 });
