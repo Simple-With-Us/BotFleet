@@ -223,9 +223,20 @@ function readEvent(row: SqlRow): AssignmentEvent {
 export function openRuntimeStore(path: string): RuntimeStore {
   const memory = path === ":memory:";
   if (!memory) {
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    // Briefs and results are private conversations: owner-only from the
-    // first byte, and repaired on a file that inherited a loose umask.
+    const dir = dirname(path);
+    mkdirSync(dir, { recursive: true });
+    // Briefs and results are private conversations.  Unix locks the directory
+    // down too.  Windows maps that mode into an ACL the test runner cannot
+    // delete, so the file mode below is the restriction there.
+    if (process.platform !== "win32") {
+      try {
+        chmodSync(dir, 0o700);
+      } catch {
+        // A shared data directory may already be locked down by its owner.
+      }
+    }
+    // Owner-only from the first byte, and repaired on a file that inherited
+    // a loose umask.
     closeSync(openSync(path, "a", 0o600));
     try {
       chmodSync(path, 0o600);
@@ -395,7 +406,11 @@ export function openRuntimeStore(path: string): RuntimeStore {
       });
     },
     close() {
-      db.close();
+      try {
+        db.close();
+      } catch {
+        // A second close, or a database Windows already released, is done.
+      }
     },
   };
 }
