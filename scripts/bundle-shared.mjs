@@ -48,26 +48,7 @@ await build({
   allowOverwrite: true,
 });
 
-// Symlink the d.ts so editors see the public types without a separate
-// tsc build.  The `.d.ts` was generated when the harness ran tsc; if it
-// is not present, this is a no-op (the d.ts is published by `tsc -p
-// tsconfig.server.build.json` from the harness's own pipeline, not from
-// this bundler).
-try {
-  const { copyFileSync, existsSync } = await import("node:fs");
-  const dts = join(root, "dist-shared", "sts-tokens.d.ts");
-  if (existsSync(dts)) {
-    // already there from a prior tsc run; leave it
-  } else {
-    // emit a minimal `declare module` so the .js bundle's exports type-check
-    // when the source .ts is gone.  The repo's CI runs tsc before this
-    // script, so the real .d.ts will be in place; this branch is only for
-    // running the bundler on its own.
-    copyFileSync(
-      join(root, "shared", "sts-tokens.d.ts.placeholder"),
-      join(root, "dist-shared", "sts-tokens.d.ts"),
-    );
-  }
-} catch {
-  // best-effort; do not fail the build for a missing d.ts
-}
+// Types come from the tsc half of `pnpm build:shared`
+// (--emitDeclarationOnly into dist-shared-types), not from this bundler.
+// There is deliberately no .d.ts fallback here: a stale or fabricated
+// declaration would type-check against a surface the bundle does not have.

@@ -142,6 +142,21 @@ describe("minting", () => {
     await expect(mintStsToken("gemini", "   ")).rejects.toThrow(/Gemini API key/);
   });
 
+  it("turns a dead network into a sentence, not a raw TypeError", async () => {
+    // A fetch that throws must never surface as `TypeError: fetch failed`
+    // in the 502 body -- the person reading it needs the provider name and
+    // an action, not the socket's autobiography.
+    const dead: typeof fetch = async () => {
+      throw new TypeError("fetch failed");
+    };
+    await expect(mintXaiRealtimeToken("k", { fetchImpl: dead })).rejects.toThrow(
+      /Could not reach xAI.*network connection/,
+    );
+    await expect(mintGeminiLiveToken("k", { fetchImpl: dead })).rejects.toThrow(
+      /Could not reach Gemini.*network connection/,
+    );
+  });
+
   it("fails closed when the response carries no token", async () => {
     const { impl } = fetchDouble({});
     await expect(mintXaiRealtimeToken("k", { fetchImpl: impl })).rejects.toThrow(/invalid temporary token/);

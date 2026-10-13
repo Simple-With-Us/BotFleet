@@ -117,6 +117,24 @@ const xaiMintBody = z.object({
 /** Gemini returns the token itself in `name`, and nothing else we need. */
 const geminiMintBody = z.object({ name: z.string().optional() });
 
+/** POST to a vendor mint endpoint, translating transport failures into
+ *  sentences a person can act on.  Without this, a dead network surfaces as
+ *  a raw `TypeError: fetch failed` in the 502 body -- accurate about the
+ *  socket, useless about what to do.
+ */
+async function postMint(
+  fetchImpl: typeof fetch,
+  provider: string,
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  try {
+    return await fetchImpl(url, init);
+  } catch {
+    throw new Error(`Could not reach ${provider} to start a voice call. Check this computer's network connection and try again.`);
+  }
+}
+
 export async function mintXaiRealtimeToken(
   apiKey: string,
   options: { fetchImpl?: typeof fetch; expiresInSeconds?: number } = {},
@@ -129,7 +147,7 @@ export async function mintXaiRealtimeToken(
     max: 3600,
     fallback: DEFAULT_XAI_TTL_SECONDS,
   });
-  const response = await fetchImpl(XAI_TOKEN_ENDPOINT, {
+  const response = await postMint(fetchImpl, "xAI", XAI_TOKEN_ENDPOINT, {
     method: "POST",
     headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
     body: JSON.stringify({ expires_after: { seconds: ttl } }),
@@ -175,7 +193,7 @@ export async function mintGeminiLiveToken(
   // change to ship alongside a refactor.
   const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
   const at = now();
-  const response = await fetchImpl(GEMINI_TOKEN_ENDPOINT, {
+  const response = await postMint(fetchImpl, "Gemini", GEMINI_TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "x-goog-api-key": secret, "content-type": "application/json" },
     body: JSON.stringify({

@@ -37,6 +37,19 @@ function pack(t) {
   return staging;
 }
 
+test("electron-builder maps dist-shared into the asar as shared/", (t) => {
+  // The `from: dist-shared, to: shared` mapping is load-bearing: without it
+  // the bundle lands at app.asar/dist-shared/sts-tokens.js while the import
+  // resolves to app.asar/shared/sts-tokens.js.  Assert the mapping exists so
+  // the staging below (and the real asar) cannot drift from it again.
+  const yml = readFileSync(path.join(root, "electron-builder.yml"), "utf8");
+  assert.match(
+    yml,
+    /from:\s*dist-shared\s*\n\s*to:\s*shared/,
+    "electron-builder.yml must map dist-shared to shared/",
+  );
+});
+
 test("dist-shared/sts-tokens.js is built and ESM-importable from the packaged shape", (t) => {
   const staging = pack(t);
   const result = spawnSyncNode(

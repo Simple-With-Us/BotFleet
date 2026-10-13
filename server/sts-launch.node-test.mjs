@@ -65,6 +65,11 @@ test("the whole harness entry parses under --experimental-strip-types", async ()
 
 test("the harness boots under --experimental-strip-types and serves /api/sts/status", async (t) => {
   const port = await freePort();
+  // The harness also binds a webhook receiver at OMB_WEBHOOK_PORT, defaulting
+  // to PORT+1.  Reserving only the main port leaves the webhook on a fixed
+  // address a parallel runner may hold, which fails the boot this test is
+  // trying to prove.  Reserve both.
+  const webhookPort = await freePort();
   const home = mkdtempSync(path.join(tmpdir(), "bf-sts-launch-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
 
@@ -81,6 +86,7 @@ test("the harness boots under --experimental-strip-types and serves /api/sts/sta
         HOME: home,
         USERPROFILE: home,
         OMB_PORT: String(port),
+        OMB_WEBHOOK_PORT: String(webhookPort),
         // Block anything that reaches for a sibling container or the Local VM.
         OMB_LOCAL_VM_DISABLED: "1",
         OMB_LOCAL_VM_CONTAINER_RUNTIME_GUARD: "off",
