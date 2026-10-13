@@ -18,6 +18,7 @@ import { isIP } from "node:net";
 import { extname, join } from "node:path";
 
 import { z } from "zod";
+import { instanceModelsSchema } from "./instance-models.ts";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
 import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
@@ -15607,25 +15608,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
 
       if (body?.models !== undefined) {
-        if (!Array.isArray(body.models) || body.models.length > 100) {
-          return json(res, 400, { error: "models must be an array with at most 100 entries" });
-        }
-        const models: Array<{ id: string; label: string }> = [];
-        const seen = new Set<string>();
-        for (const candidate of body.models) {
-          if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
-            return json(res, 400, { error: "each model must have an id and label" });
-          }
-          const id = typeof candidate.id === "string" ? candidate.id.trim() : "";
-          const label = typeof candidate.label === "string" ? candidate.label.trim() : "";
-          if (!id || !label || id.length > 200 || label.length > 200 || /[\n\r]/.test(id) || /[\n\r]/.test(label)) {
-            return json(res, 400, { error: "each model must have a valid id and label" });
-          }
-          if (seen.has(id)) return json(res, 400, { error: `duplicate model id "${id}"` });
-          seen.add(id);
-          models.push({ id, label });
-        }
-        patchOptions.models = models;
+        const parsedModels = instanceModelsSchema.safeParse(body.models);
+        if (!parsedModels.success) return json(res, 400, { error: "models must contain at most 100 unique IDs with valid labels" });
+        patchOptions.models = parsedModels.data;
       }
 
       if (body?.fullAuto !== undefined) {

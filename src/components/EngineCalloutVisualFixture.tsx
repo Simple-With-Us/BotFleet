@@ -1,6 +1,6 @@
 // Visual harness for neutral Engine Settings facts and OpenAI-compatible visibility.
 import { EngineCallout } from "./EngineCallout";
-import { showBuiltInOpenAiCompatible } from "./EnginesSettings";
+import { showBuiltInOpenAiCompatible } from "@/lib/engine-status";
 import { ProviderMark } from "./ProviderIcons";
 
 function EngineFactRow(props: {

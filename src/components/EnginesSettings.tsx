@@ -8,7 +8,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Loader2, Plus, Search, TriangleAlert, Upload, X } from "lucide-react";
 
 import { api, useStore, type InstanceInfo } from "@/state/store";
-import { listedInEnginesSettings } from "@/lib/engine-status";
+import { listedInEnginesSettings, showBuiltInOpenAiCompatible } from "@/lib/engine-status";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
 import { EngineCapabilitiesMatrix } from "./EngineCapabilitiesMatrix";
@@ -953,10 +953,6 @@ function AddCustomEngineModal({ onClose, onAdded }: { onClose: () => void; onAdd
       </div>
     </div>
   );
-}
-
-export function showBuiltInOpenAiCompatible(configured: boolean, url?: string): boolean {
-  return Boolean(configured || url);
 }
 
 export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: string) => string | undefined }) {

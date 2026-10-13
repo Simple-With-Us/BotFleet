@@ -2,6 +2,10 @@
 // problems.  Shared so every surface answers the same way.
 import type { InstanceInfo } from "@/state/store";
 
+export function showBuiltInOpenAiCompatible(configured: boolean, url?: string): boolean {
+  return Boolean(configured || url);
+}
+
 /** The last probe gave no answer (a CLI that did not respond in time on a
  *  busy Mac) and there is no earlier answer to stand in for it.  Not "not
  *  installed", not "sign-in required" — the next probe settles it. */

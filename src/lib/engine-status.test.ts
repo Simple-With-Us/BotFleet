@@ -4,7 +4,16 @@
 import { describe, expect, it } from "vitest";
 
 import type { InstanceInfo } from "@/state/store";
-import { isCheckingEngine, isHiddenEngine, listedInEnginesSettings, noEngineCanRun } from "./engine-status";
+import { isCheckingEngine, isHiddenEngine, listedInEnginesSettings, noEngineCanRun, showBuiltInOpenAiCompatible } from "./engine-status";
+
+describe("built-in OpenAI-compatible visibility", () => {
+  it("hides an unconfigured endpoint and shows either a configured flag or a URL", () => {
+    expect(showBuiltInOpenAiCompatible(false)).toBe(false);
+    expect(showBuiltInOpenAiCompatible(false, "")).toBe(false);
+    expect(showBuiltInOpenAiCompatible(true)).toBe(true);
+    expect(showBuiltInOpenAiCompatible(false, "https://api.example.test/v1")).toBe(true);
+  });
+});
 
 const snap = (snapshot: InstanceInfo["snapshot"]) => ({ snapshot });
 

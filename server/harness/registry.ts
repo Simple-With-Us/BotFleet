@@ -6,6 +6,8 @@
 // touching its siblings.
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { z } from "zod";
+import { instanceModelsSchema } from "../instance-models.ts";
 import { writeFileAtomic } from "../atomic.ts";
 import { usageQuotaPoller } from "../usage-quota.ts";
 import { windowHeadlines, windowsLabelFromHeadlines } from "../../src/lib/quota-display.ts";
@@ -222,15 +224,12 @@ function fullAutoOfRaw(raw: unknown): boolean {
   return (raw as { fullAuto?: unknown } | undefined)?.fullAuto === true;
 }
 
-function userModelsOfRaw(raw: unknown): Array<{ id: string; label: string; custom: true }> {
-  const models = (raw as { userModels?: unknown } | undefined)?.userModels;
-  if (!Array.isArray(models)) return [];
-  return models.flatMap((model) => {
-    if (!model || typeof model !== "object" || Array.isArray(model)) return [];
-    const id = typeof (model as { id?: unknown }).id === "string" ? (model as { id: string }).id.trim() : "";
-    const label = typeof (model as { label?: unknown }).label === "string" ? (model as { label: string }).label.trim() : "";
-    return id && label ? [{ id, label, custom: true as const }] : [];
-  });
+const userModelConfigSchema = z.object({ userModels: instanceModelsSchema.optional() }).passthrough();
+
+function userModelsOfRaw(raw: InstanceConfig["config"]): Array<{ id: string; label: string; custom: true }> {
+  const parsed = userModelConfigSchema.safeParse(raw);
+  if (!parsed.success) return [];
+  return (parsed.data.userModels ?? []).map((model) => ({ ...model, custom: true as const }));
 }
 
 export interface DescribedInstance {
