@@ -22,6 +22,8 @@ describe("MuseCodeMark", () => {
     expect(svg).toMatch(/#087cf0/i);
     expect(svg).not.toContain("linearGradient");
     expect(svg.match(/<path/g)).toHaveLength(1);
+    expect(svg).toContain("a6.624 6.624 0 0 0 .265.86");
+    expect(svg).toContain("c.07-.109.141-.224.211-.327");
   });
 
   it("resolves through ProviderMark for both driver kinds", () => {
