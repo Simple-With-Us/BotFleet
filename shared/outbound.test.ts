@@ -65,6 +65,7 @@ describe("isReadOnlyTool", () => {
       "mcp__linear__save_issue",
       "mcp__linear__delete_issue",
       "mcp__linear__create_comment",
+      "mcp__linear__get_or_create_issue",
       "mcp__computer__click",
       "Bash",
     ]) expect(isReadOnlyTool(name), name).toBe(false);

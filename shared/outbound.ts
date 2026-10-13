@@ -53,6 +53,27 @@ const SENT_NOUNS = new Set(["MESSAGE", "COMMENT", "POST", "EMAIL", "MAIL", "INVO
  * REDDIT_GET_POST fetches a post, it does not post. */
 const READ_VERBS = new Set(["GET", "LIST", "FETCH", "SEARCH", "READ", "FIND", "RETRIEVE", "LOOKUP", "DOWNLOAD", "VIEW", "CHECK", "COUNT"]);
 
+/** Mutations that can follow a read verb in compound tool names (`get_or_create`). */
+const MUTATION_VERBS = new Set([
+  ...CREATE_VERBS,
+  "UPDATE",
+  "DELETE",
+  "REMOVE",
+  "SET",
+  "PUT",
+  "PATCH",
+  "UPSERT",
+  "INSERT",
+  "WRITE",
+  "SAVE",
+  "MERGE",
+  "ARCHIVE",
+  "ASSIGN",
+  "CANCEL",
+  "CLOSE",
+  "EDIT",
+]);
+
 /** The action part of a tool name, as upper-case word tokens. Composio's
  * TOOLKIT_ACTION drops its toolkit; an MCP server's mcp__server__action
  * drops its server; a bare built-in like Bash stays as it is. */
@@ -77,7 +98,8 @@ function actionTokens(name: string): string[] {
  * become reads merely because they send nothing to another person. */
 export function isReadOnlyTool(name: string): boolean {
   const tokens = actionTokens(name);
-  return tokens.length > 0 && READ_VERBS.has(tokens[0]);
+  if (tokens.length === 0 || !READ_VERBS.has(tokens[0])) return false;
+  return !tokens.some((token) => MUTATION_VERBS.has(token));
 }
 
 /** Does this tool send something to someone, or move money? */

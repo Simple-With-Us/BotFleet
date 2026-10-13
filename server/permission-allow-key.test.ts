@@ -17,6 +17,9 @@ describe("resolvePermissionAllowKey", () => {
     const write = resolvePermissionAllowKey(cfg, bot, "mcp__linear__create_issue", "create issue", {});
     expect(write.allowKey).toMatch(/^provider-tool:claude:linear:create_issue:/);
     expect(write.allowKeyWarnWrite).toBe(true);
+
+    const compound = resolvePermissionAllowKey(cfg, bot, "mcp__linear__get_or_create_project", "get or create", {});
+    expect(compound.allowKeyWarnWrite).toBe(true);
   });
 
   it("falls back to native offerable keys", () => {
