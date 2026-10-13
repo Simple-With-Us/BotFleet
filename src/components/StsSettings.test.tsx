@@ -114,7 +114,7 @@ describe("StsSettings", () => {
     // frontEngine defaults to on, so the checkbox ships checked.
     const checkbox = html.match(/<input[^>]*type="checkbox"[^>]*>/)?.[0] ?? "";
     expect(checkbox).toContain('checked=""');
-    expect(html).toContain("Use The Bot&#x27;s Coding Engine");
+    expect(html).toContain("Use the Bot&#x27;s Coding Engine");
   });
 
   it("describes Auto as preferring the first provider in the picker order", () => {
