@@ -96,6 +96,19 @@ import {
 const acpNonemptyString = z.string().min(1);
 
 const acpSessionSetModelParams = z.object({ modelId: acpNonemptyString }).passthrough();
+const acpAvailableModel = z.object({
+  modelId: z.string().optional(),
+  name: z.string().optional(),
+}).passthrough();
+const acpSessionResultModels = z.object({
+  availableModels: z.array(acpAvailableModel).optional(),
+  currentModelId: z.string().optional(),
+}).passthrough();
+const acpSessionResult = z.object({ models: acpSessionResultModels.optional() }).passthrough();
+const parseAcpSessionModels = (value: unknown): z.infer<typeof acpSessionResultModels> | undefined => {
+  const parsed = acpSessionResult.safeParse(value);
+  return parsed.success ? parsed.data.models : undefined;
+};
 
 /** Stdio MCP server as ACP session/new sends it. */
 export type AcpStdioMcpServer = {
@@ -1705,7 +1718,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
             const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
             let sessionResult: any = null;
-            let sessionConfigResult: any = null;
+            let sessionModelsState: z.infer<typeof acpSessionResultModels> | undefined;
             let fallbackNotice: string | undefined;
             if (cursor) {
               try {
@@ -1714,7 +1727,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   withAllowlistMeta({ sessionId: cursor, cwd, mcpServers }),
                   LOAD_SESSION_TIMEOUT,
                 );
-                sessionConfigResult = sessionResult;
+                sessionModelsState = parseAcpSessionModels(sessionResult);
                 sessionId = cursor;
               } catch (error) {
                 // The harness withheld inline replay because this cursor said
@@ -1729,7 +1742,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 withAllowlistMeta({ cwd, mcpServers }),
                 NEW_SESSION_TIMEOUT,
               );
-              sessionConfigResult = sessionResult;
+              sessionModelsState = parseAcpSessionModels(sessionResult);
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
             }
@@ -1812,10 +1825,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     if (method === "session/set_model") {
                       const parsed = acpSessionSetModelParams.safeParse(params);
                       if (parsed.success) {
-                        sessionConfigResult = {
-                          ...sessionConfigResult,
-                          models: { ...sessionConfigResult?.models, currentModelId: parsed.data.modelId },
-                        };
+                        sessionModelsState = { ...sessionModelsState, currentModelId: parsed.data.modelId };
                       }
                     }
                     return result;
@@ -1823,11 +1833,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   sessionId,
                   config: turnConfig,
                   turn: cliTurn,
-                  sessionModels: Array.isArray(sessionConfigResult?.models?.availableModels)
-                    ? sessionConfigResult.models.availableModels
-                    : [],
+                  sessionModels: sessionModelsState?.availableModels ?? [],
                   sessionConfigOptions: currentConfigOptions,
-                  currentModelId: sessionConfigResult?.models?.currentModelId,
+                  currentModelId: sessionModelsState?.currentModelId,
                   notice: (message) => {
                     if (fallbackNotice === message) return;
                     let heard = runtimeNoticesByThread.get(threadId);

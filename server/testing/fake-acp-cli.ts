@@ -92,6 +92,7 @@
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { z } from "zod";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
 const LINGERING_CHILD_MODES = new Set(["cancel-exits-with-child", "exit-with-lingering-child", "happy-with-lingering-child"]);
@@ -326,13 +327,14 @@ if (mode === "hang-exit-gated") {
 // session/set_mode + session/set_model calls seen this run (and prior runs when
 // FAKE_ACP_DUMP is set — each turn spawns a fresh child, so tests that assert
 // multi-turn wiring read accumulated calls from the dump sidecar).
+const configCallFile = z.array(z.object({ method: z.string(), params: z.unknown() }).strict());
 const configCalls: Array<{ method: string; params: unknown }> = [];
 if (process.env.FAKE_ACP_DUMP) {
   const priorConfig = `${process.env.FAKE_ACP_DUMP}.config.json`;
   if (existsSync(priorConfig)) {
     try {
-      const parsed = JSON.parse(readFileSync(priorConfig, "utf8"));
-      if (Array.isArray(parsed)) configCalls.push(...parsed);
+      const parsed = configCallFile.safeParse(JSON.parse(readFileSync(priorConfig, "utf8")));
+      if (parsed.success) configCalls.push(...parsed.data);
     } catch {
       // test-only
     }
