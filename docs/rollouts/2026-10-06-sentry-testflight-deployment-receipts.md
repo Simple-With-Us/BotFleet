@@ -49,18 +49,18 @@ git diff --check
 
 The new fixture is included in `pnpm test:ios-ship`, already part of the complete `pnpm test` gate.  Coverage includes archive/ASC/source mismatches, Cocoa release formatting, invalid receipts, ASC ready/error/timeout branches exercised through Bash, absent credentials, mismatched existing release refs, idempotent re-reporting, scoped API payloads, redirect rejection and sanitized reporting failures.  Additional fixtures execute the actual saved-state and same-source upload gate after a failing receipt helper, then execute the separate workflow validation with an explicit failure indicator before any credential loading.
 
-BotFleet verification trio (npm rule names mapped to this repo):
+BotFleet verification trio (npm rule names mapped to this repo; outcomes tied to evidence):
 
 ```
-pnpm run lint -> ok (Node CI `lint` job)
-pnpm typecheck -> ok (`tsc -b` + server project; same intent as `npx tsc --noEmit`)
-pnpm test -> ok (full Vitest gate including receipt fixtures above)
-pnpm build -> ok (production web + server bundle via the standard CI package path)
+pnpm run lint -> ok (Node CI lint on PR #880 run 38384737101, head 0814ccc3)
+pnpm typecheck -> ok (CI macOS/ubuntu typecheck + test on the same run)
+pnpm test -> ok (CI typecheck + test jobs on the same run; receipt fixtures above are the isolated proof for ios-ship-only paths)
+pnpm build -> ok (CI package + smoke on the same run)
 ```
 
 Production acceptance still requires a successful normal ship, the matching Sentry release/ref and named deploy, and an independently observed runtime event with the same Cocoa release.  A passing test or merge alone does not establish acceptance.
 
-Cloud validation on October 13: `pnpm typecheck` passed on the hosted macOS/ubuntu CI jobs for PR #880 after merging `main`; Swift tests + iOS build passed on `xcode-27`.  Focused receipt fixtures above remain the isolated proof for this rollout doc.
+Cloud validation on October 13: hosted CI for PR #880 (`0814ccc3`) reported green for Node lint, full `pnpm typecheck` + `pnpm test` matrix, package smoke, and Swift tests + iOS build on `xcode-27`.  October 6 cloud work on this doc still notes an EPERM socket limit when a broader Vitest gate was attempted in a different executor; that older note is not the source of truth for the PR #880 receipt.
 
 ## Next Steps & Blockers
 
