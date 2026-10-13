@@ -198,31 +198,21 @@ public enum CodeBlockWindow {
     private static func renderedLineCount(_ text: String) -> Int {
         if text.isEmpty { return 0 }
         var count = 1
-        for character in text where character == "\n" { count += 1 }
-        if text.hasSuffix("\n") { count -= 1 }
+        for character in text where character == "\n" || character == "\r" { count += 1 }
+        if text.hasSuffix("\n") || text.hasSuffix("\r") { count -= 1 }
         return max(count, 1)
     }
 
     /// Fence bodies are already `\n` after `Markdown.blocks`.  A raw CR or
     /// CRLF still has to count as a line break, or one long run walks around
-    /// the line cap.  Do not gate on `contains("\r")` — NSString bridging
-    /// can hide CR while layout still sees lone `\r` line endings.
+    /// the line cap.  Gate on UTF-8 `0x0D`, not `String.contains("\r")`,
+    /// because NSString bridging can hide CR from the latter while slices
+    /// still carry lone `\r` line endings.
     private static func normalisedNewlines(_ source: String) -> String {
-        guard source.contains("\r") else { return source }
-        var out = ""
-        out.reserveCapacity(source.count)
-        var index = source.startIndex
-        while index < source.endIndex {
-            let character = source[index]
-            if isLineBreak(character, in: source, at: index) {
-                out.append("\n")
-                index = lineBreakEnd(in: source, at: index)
-                continue
-            }
-            out.append(character)
-            index = source.index(after: index)
-        }
-        return out
+        guard source.utf8.contains(0x0D) else { return source }
+        return source
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
     }
 
     private static func isLineBreak(_ character: Character, in source: String, at index: String.Index) -> Bool {

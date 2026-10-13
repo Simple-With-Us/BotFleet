@@ -223,8 +223,8 @@ final class CodeBlockWindowTests: XCTestCase {
     private func renderedLines(_ text: String) -> Int {
         if text.isEmpty { return 0 }
         var count = 1
-        for character in text where character == "\n" { count += 1 }
-        if text.hasSuffix("\n") { count -= 1 }
+        for character in text where character == "\n" || character == "\r" { count += 1 }
+        if text.hasSuffix("\n") || text.hasSuffix("\r") { count -= 1 }
         return max(count, 1)
     }
 
