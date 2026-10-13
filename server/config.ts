@@ -61,7 +61,8 @@ export const MIN_LOCAL_VM_MAX_INSTANCES = 1;
 export const MAX_LOCAL_VM_MAX_INSTANCES = 4;
 
 export function isValidSshAlias(value: unknown): value is string {
-  return typeof value === "string" && SSH_ALIAS.test(value);
+  if (Object.prototype.toString.call(value) !== "[object String]") return false;
+  return SSH_ALIAS.test(String(value));
 }
 
 /** Custom webhook ingress must be a real origin, not a scheme-less host. */

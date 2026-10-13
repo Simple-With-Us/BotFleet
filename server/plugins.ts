@@ -26,6 +26,7 @@ import {
   HOST_API_VERSION,
   parsePluginManifestJson,
   satisfiesBotfleetVersion,
+  type JsonValue,
   type PluginManifestIssue,
 } from "../shared/plugin-manifest.ts";
 
@@ -67,7 +68,7 @@ import type {
 export interface PluginRuntimeInputs {
   listBots(): PluginHostBotSummary[];
   listConfigKeys(): readonly string[];
-  readConfig<T = unknown>(key: string): T | undefined;
+  readConfig(key: string): JsonValue | undefined;
   /** Receives allow-listed structured events only.  No event carries
    *  plugin-supplied text; see PluginLogEvent. */
   logger(event: PluginLogEvent): void;
@@ -107,7 +108,7 @@ function inputsOrThrow(): PluginHostInputs {
   return {
     listBots: () => runtimeInputs!.listBots(),
     listConfigKeys: () => runtimeInputs!.listConfigKeys(),
-    readConfig: <T>(key: string) => runtimeInputs!.readConfig<T>(key),
+    readConfig: (key: string) => runtimeInputs!.readConfig(key),
     logger: (event) => runtimeInputs!.logger(event),
   };
 }
@@ -547,6 +548,8 @@ function hostVersionError(listing: PluginListing): PluginError | null {
   };
 }
 
+const PLUGIN_COMMAND_ARGS = z.string().max(8192);
+
 /** Run a plugin's slash command. */
 export async function runPluginCommand(
   name: string,
@@ -554,6 +557,8 @@ export async function runPluginCommand(
   args: string,
   baseDir: string = PLUGINS_DIR,
 ): Promise<{ text: string } | { error: string }> {
+  const parsedArgs = PLUGIN_COMMAND_ARGS.safeParse(args);
+  if (!parsedArgs.success) return { error: "command args are too long" };
   const listing = listingFor(name, baseDir);
   if ("error" in listing) return listing;
   const registry = readRegistry(baseDir);
@@ -574,7 +579,11 @@ export async function runPluginCommand(
   const plugin = await liveSandbox(listing, baseDir);
   if ("error" in plugin) return { error: plugin.error };
   if (!plugin.sandbox.exports.runCommand) return { error: `plugin "${name}" does not implement runCommand` };
-  const result = await invokePlugin(plugin, { handler: "runCommand", command, args }, inputsOrThrow());
+  const result = await invokePlugin(
+    plugin,
+    { handler: "runCommand", command, args: parsedArgs.data },
+    inputsOrThrow(),
+  );
   if (!result.ok) return { error: `plugin "${name}" command failed (${result.reason})` };
   // The child is untrusted: its reply must be text, not whatever it sent.
   const text = PluginCommandResultSchema.safeParse(result.value);
