@@ -514,17 +514,28 @@ export type EngineToolRunner = (call: EngineToolCall, signal: AbortSignal) => Pr
  */
 const engineToolArguments = z.looseObject({});
 
-const approvalCallSchema = z.object({
-  action: z.enum(["check", "ask", "decide"]).optional(),
-  requestId: z.string().optional(),
-  answer: z.string().optional(),
-});
+// Both strip.  These decode what a language model sent us, and the contract is
+// that only the fields named here reach the turn: an unexpected key is dropped
+// rather than carried into text the bot would read back as though the caller had
+// asked for it.  Strip rather than strict because strict refuses the whole call
+// over a stray key, and rather than passthrough because that keeps the very
+// fields this adapter exists to drop.  Stated explicitly so the intent is not
+// read as an accident of the default.
+const approvalCallSchema = z
+  .object({
+    action: z.enum(["check", "ask", "decide"]).optional(),
+    requestId: z.string().optional(),
+    answer: z.string().optional(),
+  })
+  .strip();
 
-const engineToolCallSchema = z.object({
-  task: z.string().optional(),
-  context: z.string().optional(),
-  approval: approvalCallSchema.optional(),
-});
+const engineToolCallSchema = z
+  .object({
+    task: z.string().optional(),
+    context: z.string().optional(),
+    approval: approvalCallSchema.optional(),
+  })
+  .strip();
 
 /**
  * Decode what the model sent the tool.

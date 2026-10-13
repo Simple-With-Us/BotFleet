@@ -189,6 +189,30 @@ describe("StsConfigResponseSchema", () => {
     }).success).toBe(true);
   });
 
+  it("accepts the whole real server frame, timeout included", () => {
+    // Regression guard.  The `sts` object is strict, so a field the server
+    // sends but the schema does not declare is not a shrug — it is an
+    // unreadable panel for every user.  This seed is the exact shape
+    // GET /api/config produces; when the frame grew a field, this failed.
+    const parsed = StsConfigResponseSchema.safeParse({
+      sts: { provider: "xai", frontEngine: true, engineTimeoutMs: 1500 },
+    });
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data.sts?.engineTimeoutMs).toBe(1500);
+  });
+
+  it("keeps sibling slices rather than stripping them", () => {
+    // The envelope is explicitly open.  A bare z.object would parse fine and
+    // quietly drop everything it does not name, so assert the keys survive.
+    const parsed = StsConfigResponseSchema.safeParse({ tts: { provider: "minimax" } });
+    expect(parsed.success && "tts" in parsed.data).toBe(true);
+  });
+
+  it("still refuses a timeout that is not a positive integer", () => {
+    expect(StsConfigResponseSchema.safeParse({ sts: { engineTimeoutMs: "soon" } }).success).toBe(false);
+    expect(StsConfigResponseSchema.safeParse({ sts: { engineTimeoutMs: -1 } }).success).toBe(false);
+  });
+
   it("refuses a provider this build has no provider card for", () => {
     // The defect the annotation could not see: an unrecognised id rendered as
     // Auto while the config said otherwise.

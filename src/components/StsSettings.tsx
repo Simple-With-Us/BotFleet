@@ -49,15 +49,24 @@ export interface StsConfigSlice {
  * Every key is optional, because an older server predates the slice entirely
  * and an absent value already has a defined meaning — Auto, engine on.
  */
-export const StsConfigResponseSchema = z.object({
-  sts: z
-    .object({
-      provider: z.enum(["xai", "gemini"]).nullish(),
-      frontEngine: z.boolean().optional(),
-    })
-    .strict()
-    .optional(),
-});
+export const StsConfigResponseSchema = z
+  .object({
+    sts: z
+      .object({
+        provider: z.enum(["xai", "gemini"]).nullish(),
+        frontEngine: z.boolean().optional(),
+        // Carried by the server frame but not surfaced as a control here.  It
+        // still has to be declared: the inner object is strict, so omitting it
+        // makes the panel reject every real response as unreadable.
+        engineTimeoutMs: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  // Explicit, because the envelope is deliberately open: this response carries
+  // `tts`, `vps`, `composio` and the rest.  A bare z.object strips unknown
+  // keys, which is not the same thing as tolerating them, so say so.
+  .passthrough();
 
 /**
  * One line the panel can show for a body the schema refused.
