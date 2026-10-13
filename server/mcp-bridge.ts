@@ -186,8 +186,9 @@ export function createLineSplitter(onLine: (line: string) => void): {
  * refused; every other frame — handshakes, tools/list, notifications,
  * lines that are not JSON — passes through untouched. A check that throws
  * refuses as unconfirmed, never as a person's hold. A call answered free
- * only after `actWithinMs` from reaching the bridge is not forwarded
- * either (CONTROL_ACT_WITHIN_MS). */
+ * only after `actWithinMs` from the start of this frame's own turn on
+ * the queue is not forwarded (CONTROL_ACT_WITHIN_MS). Time spent behind
+ * an earlier frame does not count against this one. */
 export function createGateInterceptor(options: {
   check: () => Promise<ControlState>;
   forward: (line: string) => void;
@@ -197,8 +198,8 @@ export function createGateInterceptor(options: {
   const actWithinMs = options.actWithinMs ?? CONTROL_ACT_WITHIN_MS;
   let queue: Promise<void> = Promise.resolve();
   return (line: string) => {
-    const arrivedAt = Date.now();
     queue = queue.then(async () => {
+      const arrivedAt = Date.now();
       let frame: any = null;
       try {
         frame = JSON.parse(line);

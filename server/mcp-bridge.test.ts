@@ -248,4 +248,26 @@ describe("createGateInterceptor", () => {
     expect(forwarded).toEqual([]);
     expect(JSON.parse(refused[0]!).result.content[0].text).toBe(CONTROL_WAITED);
   });
+
+  it("does not charge time behind an earlier check against the next call", async () => {
+    let calls = 0;
+    const forwarded: string[] = [];
+    const refused: string[] = [];
+    const intercept = createGateInterceptor({
+      check: async () => {
+        calls += 1;
+        if (calls === 1) await new Promise((resolve) => setTimeout(resolve, 40));
+        return free;
+      },
+      actWithinMs: 10,
+      forward: (line) => forwarded.push(line),
+      refuse: (line) => refused.push(line),
+    });
+    intercept(frame("tools/call", 1));
+    intercept(frame("tools/call", 2));
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(JSON.parse(refused[0]!).result.content[0].text).toBe(CONTROL_WAITED);
+    expect(JSON.parse(refused[0]!).id).toBe(1);
+    expect(forwarded.map((line) => JSON.parse(line).id)).toEqual([2]);
+  });
 });
