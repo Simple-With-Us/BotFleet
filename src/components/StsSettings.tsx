@@ -343,9 +343,9 @@ export function StsSettings() {
             onChange={(event) => void saveFrontEngine(event.target.checked)}
             disabled={!loaded || saving}
             className="size-3 accent-accent"
-            aria-label="Use The Bot's Coding Engine"
+            aria-label="Use the Bot's Coding Engine"
           />
-          <div className="text-[13px] text-ink">Use The Bot's Coding Engine</div>
+          <div className="text-[13px] text-ink">Use the Bot's Coding Engine</div>
           <div className="ml-auto flex items-center gap-1.5 text-[11px] text-ink-secondary">
             {saving && <Loader2 size={12} className="animate-spin" />}
             {frontEngine ? "On" : "Off"}

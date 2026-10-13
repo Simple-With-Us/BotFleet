@@ -110,7 +110,7 @@ test('visual: speech-to-speech panel in Settings → Connections', async ({ page
   await expect(panel.getByText('Speech-to-Speech Calls')).toBeVisible();
   await expect(panel.getByText('The model hears the caller and speaks back on one connection,', { exact: false }))
     .toBeVisible();
-  await expect(panel.getByText("Hand Real Work To The Bot's Engine")).toBeVisible();
+  await expect(panel.getByText("Use the Bot's Coding Engine")).toBeVisible();
 
   // One radio per provider, in picker order, with Auto offered first.
   const radios = panel.locator('input[name="sts-provider"]');
@@ -123,17 +123,17 @@ test('visual: speech-to-speech panel in Settings → Connections', async ({ page
   await expect(radios.nth(2)).not.toBeChecked();
 
   // The engine toggle is on, matching the seeded config rather than a default.
-  const engine = panel.getByRole('checkbox', { name: "Hand real work to the bot's engine" });
+  const engine = panel.getByRole('checkbox', { name: "Use the Bot's Coding Engine" });
   await expect(engine).toBeChecked();
   await expect(panel.getByText('On', { exact: true })).toBeVisible();
   await expect(panel.getByText('On by default.')).toBeVisible();
 
   // Masked below, so the copy they carry is asserted here instead: each
   // provider's credential line, and the header pill that reports one is ready.
-  await expect(panel.getByText('Realtime duplex speech on one connection.', { exact: false })).toBeVisible();
-  await expect(panel.getByText('Gemini Live duplex speech on one connection.', { exact: false })).toBeVisible();
+  await expect(panel.getByText('Realtime speech on one connection.', { exact: false })).toBeVisible();
+  await expect(panel.getByText('Gemini Live speech on one connection.', { exact: false })).toBeVisible();
   await expect(panel.getByText('Key configured.', { exact: false })).toBeVisible();
-  await expect(panel.getByText('No GEMINI_API_KEY — calls use Auto until one is added.')).toBeVisible();
+  await expect(panel.getByText('No Gemini API key.  Calls stay on Auto until you add one.')).toBeVisible();
 
   await expect(panel).toHaveScreenshot('sts-connections-panel.png', {
     ...stableShot,
@@ -144,7 +144,7 @@ test('visual: speech-to-speech panel in Settings → Connections', async ({ page
     mask: [
       panel.getByText('Key Ready'),
       panel.getByText('Key configured.', { exact: false }),
-      panel.getByText('No GEMINI_API_KEY — calls use Auto until one is added.'),
+      panel.getByText('No Gemini API key.  Calls stay on Auto until you add one.'),
     ],
   });
 });
