@@ -839,6 +839,10 @@ function AddCustomEngineModal({ onClose, onAdded }: { onClose: () => void; onAdd
   );
 }
 
+export function showBuiltInOpenAiCompatible(configured: boolean, url?: string): boolean {
+  return Boolean(configured || url);
+}
+
 export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: string) => string | undefined }) {
   const { state, dispatch, refreshInstances } = useStore();
   const [busyInstanceId, setBusyInstanceId] = useState<string | null>(null);
@@ -875,7 +879,10 @@ export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: s
     .filter(listedInEnginesSettings)
     .filter((instance) => {
       if (instance.driverKind !== "openai-compat" || isCustomEngineInstance(instance)) return true;
-      return Boolean(state.config?.openaiCompat?.configured || state.config?.openaiCompat?.url);
+      return showBuiltInOpenAiCompatible(
+        state.config?.openaiCompat?.configured ?? false,
+        state.config?.openaiCompat?.url,
+      );
     });
   // Engines the user has turned off used to sit behind a "Show (N)" link
   // that defaulted to hidden, so a newly added engine whose CLI is not
