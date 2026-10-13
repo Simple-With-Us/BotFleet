@@ -8,7 +8,7 @@ async function pinFonts(page: Page): Promise<void> {
 
 test.use({ viewport: { width: 1500, height: 900 }, locale: "en-US", timezoneId: "UTC" });
 
-test("visual: dense routine collisions become one readable stack", async ({ page }, testInfo) => {
+test("visual: dense routine collisions become one readable stack", async ({ page }) => {
   await page.clock.install({ time: FIXED_NOW });
   await page.goto("/?fixture=routine-calendar-density");
   await pinFonts(page);
@@ -26,7 +26,8 @@ test("visual: dense routine collisions become one readable stack", async ({ page
   await expect(panel).toContainText("18 Overlapping Items");
   await expect(panel.getByText("Compile gates", { exact: true })).toHaveCount(4);
 
-  const screenshot = testInfo.outputPath("routine-calendar-density.png");
-  await page.screenshot({ path: screenshot, animations: "disabled", caret: "hide" });
-  await testInfo.attach("routine-calendar-density", { path: screenshot, contentType: "image/png" });
+  await expect(page).toHaveScreenshot("routine-calendar-density.png", {
+    animations: "disabled",
+    caret: "hide",
+  });
 });

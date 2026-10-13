@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { z } from "zod";
 import {
   CalendarClock,
   CalendarDays,
@@ -69,6 +70,29 @@ import {
   startOfDayInTimeZone,
   startOfWeekInTimeZone,
 } from "../../shared/time-zone";
+
+const routineScheduleResponse = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("once"), at: z.number() }).strict(),
+  z.object({ type: z.literal("daily"), time: z.string(), weekdays: z.array(z.number()), timeZone: z.string().optional() }).strict(),
+]);
+const routineResponse = z.object({
+  routine: z.object({
+    id: z.string(), name: z.string(), prompt: z.string(), botId: z.string(),
+    runOn: z.enum(["bot", "cloud"]), enabled: z.boolean(), schedule: routineScheduleResponse,
+    scheduleTimeZoneSource: z.enum(["stored", "host"]).optional(), durationMinutes: z.number(),
+    oneShotWake: z.boolean().optional(), nextRunAt: z.number().nullable(), createdAt: z.number(), updatedAt: z.number(),
+  }).strict(),
+}).strict();
+const webhookResponse = z.object({
+  webhook: z.object({
+    id: z.string(), endpointId: z.string(), name: z.string(), prompt: z.string(), botId: z.string(),
+    runOn: z.enum(["bot", "cloud"]), enabled: z.boolean(), createdAt: z.number(), updatedAt: z.number(),
+    lastReceivedAt: z.number().optional(), lastRunId: z.string().optional(), deliveryCount: z.number(),
+    verificationPending: z.boolean().optional(), verifiedAt: z.number().optional(),
+    verificationSample: z.object({ receivedAt: z.number(), eventName: z.string().optional(), contentType: z.string().optional(), preview: z.string() }).strict().optional(),
+    eventTypes: z.array(z.string()).optional(), minGapMinutes: z.number().optional(), oneShotWake: z.boolean().optional(),
+  }).strict(),
+}).strict();
 
 const HOUR_HEIGHT = 68;
 
@@ -302,8 +326,8 @@ function CollaborationCopyReviewPanel({ routines, webhooks, onClose }: { routine
           prompt: convertSlackReferenceToZulip(entry.value.prompt),
         }),
       });
-      if (entry.kind === "routine") dispatch({ type: "routinePatched", routine: response.routine });
-      else dispatch({ type: "webhookPatched", webhook: response.webhook });
+      if (entry.kind === "routine") dispatch({ type: "routinePatched", routine: routineResponse.parse(response).routine });
+      else dispatch({ type: "webhookPatched", webhook: webhookResponse.parse(response).webhook });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {

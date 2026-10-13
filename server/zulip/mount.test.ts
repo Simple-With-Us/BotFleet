@@ -14,11 +14,11 @@ const base: ZulipMountInput = {
 const mounted = (over: Partial<ZulipMountInput>) => zulipToolsMounted({ ...base, ...over });
 
 describe("the Zulip tool mount", () => {
-  it("mounts on a Zulip turn, a continuation, an owner-authored routine, and a turn the owner is attending", () => {
+  it("mounts on a Zulip turn, a continuation, a scheduled owner-authored routine, and a turn the owner is attending", () => {
     expect(mounted({ automationSource: "zulip", unattended: true })).toBe(true);
     expect(mounted({ continuesZulipTurn: true, unattended: true })).toBe(true);
     expect(mounted({ automationSource: "schedule", unattended: true })).toBe(true);
-    expect(mounted({ automationSource: "manual", unattended: true })).toBe(true);
+    expect(mounted({ automationSource: "manual", unattended: true })).toBe(false);
     expect(mounted({})).toBe(true);
   });
 

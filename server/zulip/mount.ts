@@ -6,8 +6,8 @@
 //     target rules and secret scan stand in for a card;
 //   - a continuation of one (a card answered, a model fallback): the same
 //     turn, resumed;
-//   - a scheduled or manually started routine.  Its prompt is saved by the
-//     owner, and outbound policy still limits zulip_post to configured
+//   - a scheduled routine.  Its prompt is saved by the owner, and outbound
+//     policy still limits zulip_post to configured
 //     channels while the secret scan applies to every post;
 //   - a turn the owner is attending in BotFleet: no automation source, no
 //     unattended mark, and NOT a peer-invoked (`ask_bot`) turn.  A peer's
@@ -37,6 +37,6 @@ export interface ZulipMountInput {
 export function zulipToolsMounted(input: ZulipMountInput): boolean {
   if (!input.outboundReady || input.commsDepth >= input.maxCommsDepth) return false;
   if (input.automationSource === "zulip" || input.continuesZulipTurn) return true;
-  if (input.automationSource === "schedule" || input.automationSource === "manual") return true;
+  if (input.automationSource === "schedule") return true;
   return input.automationSource === undefined && input.commsDepth === 0 && !input.unattended;
 }
