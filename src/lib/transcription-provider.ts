@@ -100,6 +100,9 @@ export function pickSTTProvider(input: ProviderPickerInput): ProviderChoice {
   if (appleUsable && cloudUsable) {
     const cloud = firstBridgedCloudProvider(cloudStt, ladder);
     if (cloud) return { provider: cloud, reason: "macos-with-key" };
+    // A credential for an unbridged provider must not disable working
+    // on-device dictation.  Keep Apple until that cloud bridge ships.
+    return { provider: "apple" };
   }
   if (!appleUsable && cloudUsable) {
     const cloud = firstBridgedCloudProvider(cloudStt, ladder);

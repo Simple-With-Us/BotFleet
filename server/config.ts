@@ -341,16 +341,16 @@ const appConfigSchema = z.object({
     optimizedSummary: z.boolean().optional(),
     pronunciations: pronunciationListSchema.optional(),
     credentialStorage: externalCredentialStorage,
-  }).optional(),
+  }).strict().optional(),
   callStt: z.object({
     provider: z.enum(CALL_STT_PROVIDERS).nullable().optional(),
     ladder: z.array(z.enum(CLOUD_STT_PROVIDERS)).max(CLOUD_STT_PROVIDERS.length).optional(),
     keyterms: z.array(z.string().trim().min(1)).max(100).optional(),
-  }).optional(),
-  azureSpeech: z.object({ key: optionalText, region: optionalText, credentialStorage: externalCredentialStorage }).optional(),
-  metaSpeech: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
-  groq: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
-  assemblyai: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
+  }).strict().optional(),
+  azureSpeech: z.object({ key: optionalText, region: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  metaSpeech: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  groq: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
+  assemblyai: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).strict().optional(),
   // Call-mode speech-to-speech.  Opt-in per workspace and deliberately separate
   // from callStt: an STS provider replaces the whole chained loop rather than
   // swapping one link of it.  `provider: null` means Auto — use whichever

@@ -17,6 +17,12 @@ function withAssemblyAi(): ProviderPickerInput {
   };
 }
 
+function withUnbridgedProvider(provider: "xai" | "meta" | "azure" | "groq"): ProviderPickerInput {
+  const cloudStt = emptyCloudSttCapabilities();
+  cloudStt[provider] = true;
+  return { ...base, cloudStt };
+}
+
 describe("pickSTTProvider", () => {
   it("returns apple on macOS with no cloud key and no explicit preference", () => {
     expect(pickSTTProvider(base)).toEqual({ provider: "apple" });
@@ -46,6 +52,15 @@ describe("pickSTTProvider", () => {
       cloudStt: { ...emptyCloudSttCapabilities(), meta: true, assemblyai: true },
     })).toEqual({ provider: "assemblyai", reason: "macos-with-key" });
   });
+
+  it.each(["xai", "meta", "azure", "groq"] as const)(
+    "keeps Apple dictation available when only %s is configured without a shipped bridge",
+    (provider) => {
+      const input = withUnbridgedProvider(provider);
+      expect(pickSTTProvider(input)).toEqual({ provider: "apple" });
+      expect(pickSTTProvider({ ...input, explicitPreference: provider })).toEqual({ provider: "apple" });
+    },
+  );
 
   it("honours callStt.ladder order among bridged providers", () => {
     expect(pickSTTProvider({
