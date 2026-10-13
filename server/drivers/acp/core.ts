@@ -105,10 +105,6 @@ const acpSessionResultModels = z.object({
   currentModelId: z.string().optional(),
 }).passthrough();
 const acpSessionResult = z.object({ models: acpSessionResultModels.optional() }).passthrough();
-const parseAcpSessionModels = (value: unknown): z.infer<typeof acpSessionResultModels> | undefined => {
-  const parsed = acpSessionResult.safeParse(value);
-  return parsed.success ? parsed.data.models : undefined;
-};
 
 /** Stdio MCP server as ACP session/new sends it. */
 export type AcpStdioMcpServer = {
@@ -1727,7 +1723,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   withAllowlistMeta({ sessionId: cursor, cwd, mcpServers }),
                   LOAD_SESSION_TIMEOUT,
                 );
-                sessionModelsState = parseAcpSessionModels(sessionResult);
+                const parsedSessionResult = acpSessionResult.safeParse(sessionResult);
+                sessionModelsState = parsedSessionResult.success ? parsedSessionResult.data.models : undefined;
                 sessionId = cursor;
               } catch (error) {
                 // The harness withheld inline replay because this cursor said
@@ -1742,7 +1739,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 withAllowlistMeta({ cwd, mcpServers }),
                 NEW_SESSION_TIMEOUT,
               );
-              sessionModelsState = parseAcpSessionModels(sessionResult);
+              const parsedSessionResult = acpSessionResult.safeParse(sessionResult);
+              sessionModelsState = parsedSessionResult.success ? parsedSessionResult.data.models : undefined;
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
             }
