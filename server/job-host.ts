@@ -19,6 +19,7 @@ import {
   composeReport,
   openRuntimeStore,
   type Assignment,
+  type EnqueueRequest,
   type EnqueueResult,
   type RunInput,
   type RunResult,
@@ -71,7 +72,7 @@ export interface JobHostDeps {
       comm?: { groupId: string; withBotId: string; withName: string; withColor: string };
       onDispatchError?: (message: string) => void;
     },
-  ): Promise<unknown>;
+  ): Promise<void>;
   subscribe(listener: (event: { type: string; threadId?: string; text?: string; ok?: boolean; itemType?: string }) => void): () => void;
   snoozed(botId: string): boolean;
   /** True when the caller is unattended, so the peer turn is too. */
@@ -82,16 +83,31 @@ export interface JobHostDeps {
   abandonDelegation?(threadId: string, failureName: string): void;
 }
 
-interface LegacyItem {
-  toBotId?: string;
+export interface PublicAssignment {
+  id: string;
+  status: string;
+  outcome?: string;
+  outcomeDetail?: string;
+  botId: string;
+  botName?: string;
+  duplicate?: boolean;
+  result?: string;
+  reply?: string;
+}
+
+export interface JobHostBody {
+  error?: string;
   message?: string;
-  reason?: string;
-  depth?: number;
+  assignments?: PublicAssignment[];
+  assignment?: PublicAssignment;
+  children?: PublicAssignment[];
+  errors?: string[];
+  [key: string]: unknown;
 }
 
 export interface JobHost {
-  coordinate(input: CoordinateInput): { status: number; body: Record<string, unknown> };
-  status(fromBotId: string, fromThreadId: string, id?: string): { status: number; body: Record<string, unknown> };
+  coordinate(input: CoordinateInput): { status: number; body: JobHostBody };
+  status(fromBotId: string, fromThreadId: string, id?: string): { status: number; body: JobHostBody };
   stopThread(botId: string, threadId: string): void;
   onTurnSettled(threadId: string, ok: boolean, text: string): void;
   boot(): void;
@@ -243,7 +259,7 @@ export function createJobHost(deps: JobHostDeps): JobHost {
       },
     }).then(
       () => true,
-      (error: unknown) => {
+      (error) => {
         dispatchError = error instanceof Error ? error.message : String(error);
         return false;
       },
@@ -330,27 +346,35 @@ export function createJobHost(deps: JobHostDeps): JobHost {
     const file = join(DATA_DIR, "delegations.json");
     const text = readLegacy(file);
     if (text === undefined) return;
-    let raw: Record<string, unknown>;
+    let raw: unknown;
     try {
-      raw = JSON.parse(text) as Record<string, unknown>;
+      raw = JSON.parse(text);
     } catch {
       return;
     }
+    if (raw === null || Array.isArray(raw) || Object(raw) !== raw) return;
     let moved = 0;
-    for (const [threadId, list] of Object.entries(raw)) {
+    // SAFETY: the checks above leave a plain object whose values are read as lists below.
+    for (const [threadId, list] of Object.entries(raw as object)) {
       if (!Array.isArray(list)) continue;
       const from = deps.store.botByThread(threadId);
       if (!from) continue;
       for (const value of list) {
-        const item = value as LegacyItem;
-        if (typeof item?.toBotId !== "string" || typeof item.message !== "string") continue;
-        const target = deps.store.bot(item.toBotId);
+        if (value === null || Array.isArray(value) || Object(value) !== value) continue;
+        // SAFETY: each list entry that survived the check above is one plain JSON object.
+        const record = value as { toBotId?: unknown; message?: unknown; reason?: unknown };
+        if (record.toBotId !== String(record.toBotId) || record.message !== String(record.message)) continue;
+        const message = String(record.message);
+        const reason = record.reason === String(record.reason) ? String(record.reason) : "";
+        const target = deps.store.bot(String(record.toBotId));
         if (!target) continue;
+        const requester: EnqueueRequest["requester"] = { kind: "bot_turn", botId: from.id, threadId };
+        if (from.chiefOfStaff) requester.chief = true;
         const result = runtime.enqueue({
           origin: { kind: "person", source: "chat", ref: threadId },
-          requester: { kind: "bot_turn", botId: from.id, threadId, ...(from.chiefOfStaff ? { chief: true } : {}) },
+          requester,
           assignee: { botId: target.id, destination: { kind: "standing_thread", threadId: target.threadId } },
-          brief: item.reason ? `${item.message}\n\n[Reason: ${item.reason}]` : item.message,
+          brief: reason ? `${message}\n\n[Reason: ${reason}]` : message,
           reply: "none",
           levels: { own: target.autoApprove ? "auto" : "ask" },
         });
@@ -379,14 +403,16 @@ export function createJobHost(deps: JobHostDeps): JobHost {
       if (!message || input.botIds.length === 0) {
         return { status: 400, body: { error: "bot_ids and message are required" } };
       }
+      const requester: EnqueueRequest["requester"] = { kind: "bot_turn", botId: from.id, threadId: input.fromThreadId };
+      if (from.chiefOfStaff) requester.chief = true;
       const root = runningRoot(from.id, input.fromThreadId) ?? runtime.begin({
         origin: { kind: "person", source: "chat", ref: input.fromThreadId, quote: message.slice(0, 400) },
-        requester: { kind: "bot_turn", botId: from.id, threadId: input.fromThreadId, ...(from.chiefOfStaff ? { chief: true } : {}) },
+        requester,
         assignee: { botId: from.id, destination: { kind: "standing_thread", threadId: input.fromThreadId } },
         brief: message,
         level: from.autoApprove ? "auto" : "ask",
       });
-      const assignments: Array<Record<string, unknown>> = [];
+      const assignments: PublicAssignment[] = [];
       const errors: string[] = [];
       for (const rawId of input.botIds) {
         const token = rawId.trim();
@@ -404,18 +430,21 @@ export function createJobHost(deps: JobHostDeps): JobHost {
           errors.push(where.reason);
           continue;
         }
-        const result: EnqueueResult = runtime.enqueue({
+        const levels: EnqueueRequest["levels"] = { own: target.autoApprove ? "auto" : "ask" };
+        if (from.autoApprove) levels.chief = "auto";
+        const request: EnqueueRequest = {
           parentId: root.id,
           origin: root.origin,
           requester: root.requester,
           assignee: { botId: target.id, destination: { kind: where.kind, threadId: where.threadId } },
           mode: input.consult ? "consult" : "work",
-          reply: input.reply ?? (input.consult ? "resume" : "resume"),
+          reply: input.reply ?? "resume",
           brief: input.reason ? `${message}\n\n[Reason: ${input.reason}]` : message,
-          ...(input.doneWhen ? { doneWhen: input.doneWhen } : {}),
-          ...(input.rework ? { rework: true } : {}),
-          levels: { own: target.autoApprove ? "auto" : "ask", ...(from.autoApprove ? { chief: "auto" as const } : {}) },
-        });
+          levels,
+        };
+        if (input.doneWhen) request.doneWhen = input.doneWhen;
+        if (input.rework) request.rework = true;
+        const result: EnqueueResult = runtime.enqueue(request);
         if (!result.ok) {
           errors.push(result.reason);
           continue;
@@ -442,14 +471,9 @@ export function createJobHost(deps: JobHostDeps): JobHost {
       const messageBack = reply === "none"
         ? `Sent to ${names}.  Nothing comes back.`
         : `Handed to ${names}.  The result comes back on this conversation when the work finishes.`;
-      return {
-        status: 200,
-        body: {
-          assignments,
-          ...(errors.length ? { errors } : {}),
-          message: messageBack,
-        },
-      };
+      const body: JobHostBody = { assignments, message: messageBack };
+      if (errors.length) body.errors = errors;
+      return { status: 200, body };
     },
     status(fromBotId, fromThreadId, id) {
       const from = deps.store.bot(fromBotId);
@@ -495,14 +519,15 @@ export function createJobHost(deps: JobHostDeps): JobHost {
         const row = store.all({ nonTerminal: true }).find((item) =>
           item.assignee.botId === edge.targetBotId && item.assignee.destination.threadId === edge.threadId && item.parentId
         );
-        return {
+        const mapped = {
           sourceBotId: edge.sourceBotId,
           targetBotId: edge.targetBotId,
           state: edge.state,
           threadId: edge.threadId,
-          ...(edge.groupId ? { groupId: edge.groupId } : {}),
-          ...(row?.brief ? { reason: row.brief.slice(0, 80) } : {}),
+          groupId: edge.groupId,
+          reason: row?.brief ? row.brief.slice(0, 80) : undefined,
         };
+        return mapped;
       });
     },
     releaseBot(botId) {
@@ -530,16 +555,17 @@ export function createJobHost(deps: JobHostDeps): JobHost {
   return host;
 }
 
-function publicAssignment(assignment: Assignment): Record<string, unknown> {
-  return {
+function publicAssignment(assignment: Assignment): PublicAssignment {
+  const view: PublicAssignment = {
     id: assignment.id,
     status: assignment.status,
-    outcome: assignment.outcome,
-    outcomeDetail: assignment.outcomeDetail,
     botId: assignment.assignee.botId,
     result: assignment.result,
-    reply: assignment.reply,
   };
+  if (assignment.outcome) view.outcome = assignment.outcome;
+  if (assignment.outcomeDetail) view.outcomeDetail = assignment.outcomeDetail;
+  if (assignment.reply) view.reply = assignment.reply;
+  return view;
 }
 
 function readLegacy(file: string): string | undefined {

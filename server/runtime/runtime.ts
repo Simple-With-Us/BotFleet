@@ -16,7 +16,7 @@ import type { RuntimeStore } from "./store.ts";
 import { awaited, childrenSince, clip, continuations, CUT_TWICE, duration, isTerminal, loopStop, nextGuard, outwardDetail, ownsConversation, path, restartNote, wakeOwner } from "./tree.ts";
 import { DEFAULT_LIMITS, type Assignment, type Assignee, type Clock, type EndResult, type EnqueueRequest, type EnqueueResult, type EnvelopeNames,
   type EventKind, type InboxItem, type InboxKind, type Level, type Limits, type LiveEdge, type Origin, type Outcome, type Owner,
-  type Reply, type Requester, type RunInput, type RunResult, type StatusView, type TurnRunner } from "./types.ts";
+  type PollResult, type Reply, type Requester, type RunInput, type RunResult, type StatusView, type TurnRunner } from "./types.ts";
 
 export interface RuntimeOptions {
   /** Default: Date.now and performance.now. */
@@ -164,8 +164,8 @@ export class Runtime {
       mode: "work", reply: req.reply ?? "resume", brief: clip(req.brief, BRIEF_MAX), status: "running",
       level: req.level, levelSource: "own", executions: 1, restarts: 0, createdAt: now, startedAt: now, lastActivityAt: now,
       result: "", rework: false, budgets: { since: now, requests: 0, executions: 1, wakes: 0 }, version: 1,
-      ...(req.goalRunId ? { goalRunId: req.goalRunId } : {}),
     };
+    if (req.goalRunId) root.goalRunId = req.goalRunId;
     this.store.transaction(() => {
       this.store.insert(root, { kind: "enqueued", at: now, detail: "queued: root" });
       this.store.update(root, { kind: "started", at: now, detail: `running: turn 1 (host), level ${root.level}` });
@@ -186,14 +186,19 @@ export class Runtime {
     // host that also ends it here is heard once: the handle goes without an
     // abort, and the run() result that follows is ignored (turnEnded).
     this.turns.delete(rootId);
-    const evidence = result.evidence ? { evidence: result.evidence } : {};
-    const outcome: RunResult = result.needsInput
-      ? { kind: "needs_input", question: result.needsInput.question, ...(result.needsInput.cards ? { cards: result.needsInput.cards } : {}), ...evidence }
-      : result.continue
-        ? { kind: "continue", text: result.text, note: result.continue.note, ...(result.continue.handoffPath ? { handoffPath: result.continue.handoffPath } : {}), ...evidence }
-        : result.ok
-          ? { kind: "completed", text: result.text, ...evidence }
-          : { kind: "failed", outcome: "provider_error", text: result.text, ...evidence };
+    let outcome: RunResult;
+    if (result.needsInput) {
+      outcome = { kind: "needs_input", question: result.needsInput.question };
+      if (result.needsInput.cards) outcome.cards = result.needsInput.cards;
+    } else if (result.continue) {
+      outcome = { kind: "continue", text: result.text, note: result.continue.note };
+      if (result.continue.handoffPath) outcome.handoffPath = result.continue.handoffPath;
+    } else if (result.ok) {
+      outcome = { kind: "completed", text: result.text };
+    } else {
+      outcome = { kind: "failed", outcome: "provider_error", text: result.text };
+    }
+    if (result.evidence) outcome.evidence = result.evidence;
     try {
       this.withBatch(() => this.finishTurn(n, outcome));
     } catch (error) {
@@ -249,14 +254,17 @@ export class Runtime {
     const { level, source } = this.level({ own: req.levels.own, chief: req.levels.chief, origin: (root ?? req).origin.kind, chiefLineage,
       driverKind: req.driverKind });
     const node: Assignment = {
-      id: randomUUID(), rootId: parent ? parent.rootId : "", ...(parent ? { parentId: parent.id } : {}), depth: parent ? parent.depth + 1 : 0,
+      id: randomUUID(), rootId: parent ? parent.rootId : "", depth: parent ? parent.depth + 1 : 0,
       // The origin is written once at the root and copied down.
       origin: root ? root.origin : req.origin, requester: req.requester, assignee: target, mode,
-      reply: req.reply ?? (mode === "notify" ? "none" : "resume"), brief, ...(req.doneWhen ? { doneWhen: req.doneWhen } : {}),
+      reply: req.reply ?? (mode === "notify" ? "none" : "resume"), brief,
       status: "queued", level, levelSource: source, executions: 0, restarts: 0, createdAt: now, lastActivityAt: now, result: "",
-      rework: Boolean(req.rework), ...(req.approved !== undefined ? { approved: req.approved } : {}),
-      ...(req.batchKey !== undefined ? { batchKey: req.batchKey } : {}), version: 1,
+      rework: Boolean(req.rework), version: 1,
     };
+    if (parent) node.parentId = parent.id;
+    if (req.doneWhen) node.doneWhen = req.doneWhen;
+    if (req.approved !== undefined) node.approved = req.approved;
+    if (req.batchKey !== undefined) node.batchKey = req.batchKey;
     if (!parent) { node.rootId = node.id; node.budgets = { since: now, requests: 0, executions: 0, wakes: 0 }; }
     const problem = this.safe("validate", () => this.runner.validate(node, parent));
     if (this.lastThrew) return refuse("The host could not validate the request now");
@@ -379,7 +387,7 @@ export class Runtime {
       if (problem) { this.cancelTree(n, problem, "failed", "refused"); continue; }
       const can = this.safe("canStart", () => this.runner.canStart(n));
       if (can !== true) {
-        if (typeof can === "string" && !this.admissionNoted.has(n.id)) {
+        if (can !== false && can !== undefined && !this.admissionNoted.has(n.id)) {
           this.admissionNoted.add(n.id);
           this.store.update(n, { kind: "admitted", at: this.clock.now(), detail: `waiting: ${can}` });
           this.touch(n);
@@ -413,11 +421,14 @@ export class Runtime {
         resumed: turn !== "first",
         restartNote: restartNote(n, children, child => this.names(child, n).assignee),
         envelope: composeEnvelope(n, names, parent),
-        ...(n.answer !== undefined ? { answer: n.answer } : {}),
-        ...(n.continuation ? { continuation: { note: n.continuation.note, ...(n.continuation.handoffPath ? { handoffPath: n.continuation.handoffPath } : {}) } } : {}),
-        ...(settled.length ? { settled } : {}),
         level: n.level, mode: n.mode,
       };
+      if (n.answer !== undefined) input.answer = n.answer;
+      if (n.continuation) {
+        input.continuation = { note: n.continuation.note };
+        if (n.continuation.handoffPath) input.continuation.handoffPath = n.continuation.handoffPath;
+      }
+      if (settled.length) input.settled = settled;
       // Every undelivered item about its children rides this one turn.
       const ids = new Set(children.map(c => c.id));
       delivered = this.store.inbox({ threadId: n.assignee.destination.threadId }, true).filter(i => ids.has(i.assignmentId)).map(i => i.id);
@@ -516,7 +527,8 @@ export class Runtime {
         return;
       }
       n.status = "queued"; n.lastActivityAt = now;
-      n.continuation = { note: result.note, ...(result.handoffPath ? { handoffPath: result.handoffPath } : {}), count: continuations(this.store, n.id) + 1 };
+      n.continuation = { note: result.note, count: continuations(this.store, n.id) + 1 };
+      if (result.handoffPath) n.continuation.handoffPath = result.handoffPath;
       if (root && root.id !== n.id) root.lastActivityAt = now;
       this.store.transaction(() => {
         this.store.update(n, { kind: "continued", at: now, detail: `queued: ${clip(result.note, DETAIL_MAX)}` });
@@ -647,15 +659,18 @@ export class Runtime {
       if (!n.parentId) continue;
       const parent = this.store.get(n.parentId);
       if (!parent || parent.assignee.botId === n.assignee.botId) continue;
-      const state: LiveEdge["state"] = n.status === "resume" ? "waiting" : n.status as LiveEdge["state"];
-      edges.push({ sourceBotId: parent.assignee.botId, targetBotId: n.assignee.botId, state, threadId: n.assignee.destination.threadId,
-        ...(n.assignee.destination.groupId ? { groupId: n.assignee.destination.groupId } : {}) });
+      const state: LiveEdge["state"] = n.status === "resume" ? "waiting"
+        : n.status === "queued" || n.status === "running" || n.status === "needs_input" || n.status === "waiting" ? n.status
+        : "waiting";
+      const edge: LiveEdge = { sourceBotId: parent.assignee.botId, targetBotId: n.assignee.botId, state, threadId: n.assignee.destination.threadId };
+      if (n.assignee.destination.groupId) edge.groupId = n.assignee.destination.groupId;
+      edges.push(edge);
     }
     return edges;
   }
 
   /** Undelivered inbox items for this owner, marked delivered now. */
-  poll(owner: Owner): { items: InboxItem[]; assignments: Assignment[] } {
+  poll(owner: Owner): PollResult {
     const now = this.clock.now();
     const items = this.store.inbox(owner, true);
     this.store.markDelivered(items.map(i => i.id), now);
@@ -781,7 +796,14 @@ export class Runtime {
     const port = this.runner.outward;
     if (!port) return [];
     const labels = this.safe("outward", () => port.call(this.runner, n));
-    return Array.isArray(labels) ? labels.filter(label => typeof label === "string" && label.trim() !== "") : [];
+    if (!Array.isArray(labels)) return [];
+    const out: string[] = [];
+    for (const label of labels) {
+      if (label !== String(label)) continue;
+      const text = String(label).trim();
+      if (text) out.push(text);
+    }
+    return out;
   }
 
   private names(n: Assignment, parent: Assignment | undefined): EnvelopeNames {

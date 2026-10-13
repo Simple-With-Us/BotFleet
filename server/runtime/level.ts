@@ -14,10 +14,12 @@ export function assignmentLevel(input: {
   origin: OriginKind;
   chiefLineage: boolean;
   driverKind?: string;
-}): { level: Level; source: LevelSource } {
+}) {
   void input.chief;
   void input.origin;
   void input.chiefLineage;
   void input.driverKind;
-  return { level: input.own, source: "own" };
+  const level: Level = input.own;
+  const source: LevelSource = "own";
+  return { level, source };
 }

@@ -54,7 +54,7 @@ const asksToDelegateBot = (message: string, reason?: string) => ({
   kind: "sse" as const,
   frames: [
     `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_delegate","function":{"name":"coordinate_bots","arguments":${JSON.stringify(
-      JSON.stringify({ bot_ids: ["@peer"], message, ...(reason ? { reason } : {}) }),
+      JSON.stringify(reason ? { bot_ids: ["@peer"], message, reason } : { bot_ids: ["@peer"], message }),
     )}}}]}}]}`,
     '{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}',
     "[DONE]",

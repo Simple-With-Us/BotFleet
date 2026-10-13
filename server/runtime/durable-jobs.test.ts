@@ -55,7 +55,7 @@ describe("durable delegated jobs", () => {
     dir = "";
   });
 
-  function open(outward: string[] = []): { store: RuntimeStore; runtime: Runtime } {
+  function open(outward: string[] = []) {
     dir = dir || mkdtempSync(join(tmpdir(), "bf-runtime-"));
     // One connection at a time, so the next open reads what the last one committed.
     for (const previous of stores) previous.close();

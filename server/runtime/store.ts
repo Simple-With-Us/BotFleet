@@ -10,10 +10,10 @@
 // event land together or not at all (write-before-act).
 import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { z } from "zod";
 
-import { TERMINAL, type Assignment, type AssignmentEvent, type EventKind, type InboxItem, type Owner } from "./types.ts";
+import { TERMINAL, type Assignment, type AssignmentEvent, type EventKind, type InboxItem, type InboxKind, type Owner } from "./types.ts";
 
 const evidenceSchema = z.object({
   commands: z.number().int().nonnegative().optional(),
@@ -162,9 +162,29 @@ const SCHEMA = `
 
 const terminalList = TERMINAL.map(s => `'${s}'`).join(", ");
 
-type Row = Record<string, unknown>;
+type SqlRow = Record<string, SQLOutputValue>;
 
-function readAssignment(row: Row): Assignment {
+const EVENT_KINDS = [
+  "enqueued", "refused", "admitted", "started", "progress", "parked", "answered",
+  "waiting", "resume_due", "settled", "reported", "woken", "cancelled",
+  "restart_reconciled", "budget", "stalled", "continued",
+] as const satisfies readonly EventKind[];
+
+const INBOX_KINDS = ["settled", "needs_input", "stalled"] as const satisfies readonly InboxKind[];
+
+function eventKindOf(value: SQLOutputValue | undefined): EventKind {
+  const text = String(value ?? "");
+  for (const kind of EVENT_KINDS) if (kind === text) return kind;
+  throw new Error(`runtime.db: unknown event kind ${text}`);
+}
+
+function inboxKindOf(value: SQLOutputValue | undefined): InboxKind {
+  const text = String(value ?? "");
+  for (const kind of INBOX_KINDS) if (kind === text) return kind;
+  throw new Error(`runtime.db: unknown inbox kind ${text}`);
+}
+
+function readAssignment(row: SqlRow): Assignment {
   let parsed: unknown;
   try {
     parsed = JSON.parse(String(row.json));
@@ -180,10 +200,10 @@ function readAssignment(row: Row): Assignment {
  * written, so optional fields are never written as null. */
 const toJson = (a: Assignment): string => JSON.stringify(a);
 
-function readInbox(row: Row): InboxItem {
+function readInbox(row: SqlRow): InboxItem {
   const item: InboxItem = {
     id: String(row.id), assignmentId: String(row.assignment_id),
-    kind: row.kind as InboxItem["kind"], createdAt: Number(row.created_at),
+    kind: inboxKindOf(row.kind), createdAt: Number(row.created_at),
   };
   if (row.owner_bot_id != null) item.ownerBotId = String(row.owner_bot_id);
   if (row.owner_thread_id != null) item.ownerThreadId = String(row.owner_thread_id);
@@ -192,9 +212,9 @@ function readInbox(row: Row): InboxItem {
   return item;
 }
 
-function readEvent(row: Row): AssignmentEvent {
+function readEvent(row: SqlRow): AssignmentEvent {
   const event: AssignmentEvent = {
-    id: Number(row.id), assignmentId: String(row.assignment_id), at: Number(row.at), kind: row.kind as EventKind,
+    id: Number(row.id), assignmentId: String(row.assignment_id), at: Number(row.at), kind: eventKindOf(row.kind),
   };
   if (row.detail != null) event.detail = String(row.detail);
   return event;
@@ -280,18 +300,18 @@ export function openRuntimeStore(path: string): RuntimeStore {
   return {
     path,
     get(id) {
-      const row = statements.get.get(id) as Row | undefined;
+      const row = statements.get.get(id);
       return row ? readAssignment(row) : undefined;
     },
     children(id) {
-      return (statements.children.all(id) as Row[]).map(readAssignment);
+      return (statements.children.all(id)).map(readAssignment);
     },
     root(id) {
-      const row = statements.get.get(id) as Row | undefined;
+      const row = statements.get.get(id);
       if (!row) return undefined;
       const a = readAssignment(row);
       if (a.rootId === a.id) return a;
-      const rootRow = statements.get.get(a.rootId) as Row | undefined;
+      const rootRow = statements.get.get(a.rootId);
       return rootRow ? readAssignment(rootRow) : undefined;
     },
     all(filter = {}) {
@@ -301,7 +321,7 @@ export function openRuntimeStore(path: string): RuntimeStore {
       if (filter.nonTerminal) where.push(`status NOT IN (${terminalList})`);
       if (filter.ownerThreadId !== undefined) { where.push("requester_thread_id = ?"); params.push(filter.ownerThreadId); }
       const sql = `SELECT id, json FROM assignments${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at, rowid`;
-      return (db.prepare(sql).all(...params) as Row[]).map(readAssignment);
+      return (db.prepare(sql).all(...params)).map(readAssignment);
     },
     insert(a, event) {
       transaction(() => {
@@ -318,7 +338,7 @@ export function openRuntimeStore(path: string): RuntimeStore {
     },
     transaction,
     events(assignmentId) {
-      return (statements.events.all(assignmentId) as Row[]).map(readEvent);
+      return (statements.events.all(assignmentId)).map(readEvent);
     },
     addInbox(item) {
       statements.addInbox.run(item.id, item.ownerBotId ?? null, item.ownerThreadId ?? null, item.ownerRunId ?? null,
@@ -335,7 +355,7 @@ export function openRuntimeStore(path: string): RuntimeStore {
       if (where.length === 0) return [];
       if (undeliveredOnly) where.push("delivered_at IS NULL");
       const sql = `SELECT * FROM inbox WHERE ${where.join(" AND ")} ORDER BY created_at, rowid`;
-      return (db.prepare(sql).all(...params) as Row[]).map(readInbox);
+      return (db.prepare(sql).all(...params)).map(readInbox);
     },
     markDelivered(ids, at) {
       if (ids.length === 0) return;
@@ -345,7 +365,7 @@ export function openRuntimeStore(path: string): RuntimeStore {
     },
     prune(before) {
       return transaction(() => {
-        const roots = (statements.prunable.all(before) as Row[]).map(row => String(row.id));
+        const roots = (statements.prunable.all(before)).map(row => String(row.id));
         let removed = 0;
         for (const rootId of roots) {
           statements.pruneEvents.run(rootId);

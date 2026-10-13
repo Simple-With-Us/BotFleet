@@ -40,7 +40,7 @@ describe("job host", () => {
     listener = undefined;
   });
 
-  function setup(): { from: ReturnType<Store["createBot"]>; target: ReturnType<Store["createBot"]> } {
+  function setup() {
     rmSync(DATA_DIR, { recursive: true, force: true });
     store = new Store(() => selection);
     const from = store.createBot({ name: "Asker" }, { seedMessages: false });
@@ -81,7 +81,7 @@ describe("job host", () => {
       depth: 0,
     });
     expect(handed.status).toBe(200);
-    const rows = handed.body.assignments as Array<{ id: string; status: string }>;
+    const rows = handed.body.assignments ?? [];
     expect(rows).toHaveLength(1);
     expect(rows[0]?.status).toBe("queued");
     expect(starts).toEqual([]);

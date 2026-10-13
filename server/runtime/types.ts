@@ -384,4 +384,10 @@ export interface StatusView {
   inbox: InboxItem[];
 }
 
+/** What poll() hands back after marking the lane delivered. */
+export interface PollResult {
+  items: InboxItem[];
+  assignments: Assignment[];
+}
+
 export const terminal = (status: Status): boolean => TERMINAL.includes(status);

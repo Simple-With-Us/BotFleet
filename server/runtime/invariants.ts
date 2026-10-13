@@ -8,6 +8,7 @@ import { isTerminal, wakeOwner } from "./tree.ts";
 import type { Assignment, AssignmentEvent, InboxItem, Status } from "./types.ts";
 
 const STATUSES: readonly Status[] = ["queued", "running", "needs_input", "waiting", "resume", "completed", "failed", "cancelled"];
+// SAFETY: Status is a string union, and Array.includes on the wider string array is the membership test.
 const isStatus = (value: string): value is Status => (STATUSES as readonly string[]).includes(value);
 
 /** The status an event leaves the row in, or undefined when it changes

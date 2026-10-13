@@ -297,9 +297,11 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
     async coordinate_bots(call, ctx): Promise<TurnToolOutcome> {
       const listed = Array.isArray(call.arguments.bot_ids) ? call.arguments.bot_ids : [];
       const single = call.arguments.bot_id ?? call.arguments.bot;
-      const tokens = [...listed, ...(single !== undefined ? [single] : [])]
-        .map((value) => String(value ?? "").trim())
-        .filter(Boolean);
+      const tokens = listed.map((value) => String(value ?? "").trim()).filter(Boolean);
+      if (single !== undefined && single !== null) {
+        const extra = String(single).trim();
+        if (extra) tokens.push(extra);
+      }
       const message = String(call.arguments.message ?? call.arguments.task ?? "").trim();
       if (tokens.length === 0 || !message) {
         return failed(
@@ -325,12 +327,12 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
         message,
         depth: ctx.commsDepth,
         fromThreadId: ctx.threadId,
-        ...(reason ? { reason } : {}),
-        ...(call.arguments.rework === true ? { rework: true } : {}),
-        ...(thread ? { thread } : {}),
-        ...(reply ? { reply } : {}),
-        ...(call.arguments.consult === true ? { consult: true } : {}),
-        ...(doneWhen ? { doneWhen } : {}),
+        reason: reason || undefined,
+        rework: call.arguments.rework === true ? true : undefined,
+        thread,
+        reply,
+        consult: call.arguments.consult === true ? true : undefined,
+        doneWhen: doneWhen || undefined,
       });
       if (result.body.error && !Array.isArray(result.body.assignments)) {
         const errorMessage = String(result.body.error);
@@ -345,7 +347,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       const result = await deps.executeAssignmentStatusRequest({
         fromBotId: ctx.botId,
         fromThreadId: ctx.threadId,
-        ...(id ? { id } : {}),
+        id: id || undefined,
       });
       if (result.status >= 400 || result.body.error) {
         const errorMessage = errorText(result.body, "that assignment could not be read");

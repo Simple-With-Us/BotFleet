@@ -334,7 +334,7 @@ import { mirrorActivity, mirrorReply, type CommsBus } from "./comms-visibility.t
 import { DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
 import { exportMessageSpeaker, promptWithReply, transcriptText } from "./replies.ts";
 import { lastInterruptedChatStarter, resumedDelegationChannel } from "./update-turn-starter.ts";
-import { createJobHost, type JobHost } from "./job-host.ts";
+import { createJobHost, type JobHost, type JobHostBody } from "./job-host.ts";
 import {
   cancelSteeredMessage,
   drainJobNotices,
@@ -7425,7 +7425,7 @@ export function executeCoordinateBotsRequest(input: {
   reply?: "resume" | "none";
   consult?: boolean;
   doneWhen?: string;
-}): { status: number; body: Record<string, unknown> } {
+}): { status: number; body: JobHostBody } {
   if (!jobHost) return { status: 503, body: { error: "the job runtime is not ready" } };
   const from = store.bot(input.fromBotId);
   if (!from) return { status: 404, body: { error: "no such bot" } };
@@ -7440,12 +7440,12 @@ export function executeCoordinateBotsRequest(input: {
     botIds: input.botIds,
     message: input.message,
     depth: input.depth,
-    ...(input.reason ? { reason: input.reason } : {}),
-    ...(input.rework ? { rework: true } : {}),
-    ...(input.thread ? { thread: input.thread } : {}),
-    ...(input.reply ? { reply: input.reply } : {}),
-    ...(input.consult ? { consult: true } : {}),
-    ...(input.doneWhen ? { doneWhen: input.doneWhen } : {}),
+    reason: input.reason,
+    rework: input.rework,
+    thread: input.thread,
+    reply: input.reply,
+    consult: input.consult,
+    doneWhen: input.doneWhen,
   });
 }
 
@@ -7454,7 +7454,7 @@ export function executeAssignmentStatusRequest(input: {
   fromBotId: string;
   fromThreadId?: string;
   id?: string;
-}): { status: number; body: Record<string, unknown> } {
+}): { status: number; body: JobHostBody } {
   if (!jobHost) return { status: 503, body: { error: "the job runtime is not ready" } };
   const from = store.bot(input.fromBotId);
   if (!from) return { status: 404, body: { error: "no such bot" } };
@@ -7651,13 +7651,15 @@ jobHost = createJobHost({
   approvalBus,
   startTurn,
   subscribe: (listener) => bus.subscribe((event) => {
-    listener({
-      type: event.type,
-      threadId: "threadId" in event ? event.threadId : undefined,
-      text: "text" in event && typeof event.text === "string" ? event.text : undefined,
-      ok: "ok" in event && typeof event.ok === "boolean" ? event.ok : undefined,
-      itemType: "itemType" in event && typeof event.itemType === "string" ? event.itemType : undefined,
-    });
+    if (event.type === "turn.completed") {
+      listener({ type: event.type, threadId: event.threadId, ok: event.ok });
+      return;
+    }
+    if (event.type === "item.completed" && event.itemType === "assistant_text") {
+      listener({ type: event.type, threadId: event.threadId, itemType: event.itemType, text: event.text });
+      return;
+    }
+    listener({ type: event.type, threadId: event.threadId });
   }),
   snoozed: (botId) => routines?.isBotSnoozed(botId) === true,
   unattended: (botId) => isUnattended(botId),
@@ -11420,8 +11422,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const refused = authorizeCommsIdentity(req.headers.authorization, { botId: fromBotId, depth });
         if (refused) return json(res, refused.status, refused.body);
         const listed = Array.isArray(body.botIds) ? body.botIds : Array.isArray(body.bot_ids) ? body.bot_ids : [];
-        const single = typeof body.toBotId === "string" ? body.toBotId : typeof body.bot_id === "string" ? body.bot_id : "";
-        const botIds = [...listed, ...(single ? [single] : [])].map((value) => String(value ?? "").trim()).filter(Boolean);
+        const named = body.toBotId === String(body.toBotId) ? String(body.toBotId) : body.bot_id === String(body.bot_id) ? String(body.bot_id) : "";
+        const botIds: string[] = [];
+        for (const item of listed) {
+          const text = String(item ?? "").trim();
+          if (text) botIds.push(text);
+        }
+        if (named.trim()) botIds.push(named.trim());
         const result = executeCoordinateBotsRequest({
           fromBotId,
           botIds,
@@ -11433,7 +11440,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           thread: body.thread === "new" || body.thread === "standing" ? body.thread : undefined,
           reply: body.reply === "none" || body.reply === "resume" ? body.reply : undefined,
           consult: body.consult === true,
-          doneWhen: typeof body.doneWhen === "string" && body.doneWhen.trim() ? body.doneWhen.trim() : undefined,
+          doneWhen: body.doneWhen === String(body.doneWhen) ? String(body.doneWhen).trim() || undefined : undefined,
         });
         return json(res, result.status, result.body);
       }
@@ -11445,7 +11452,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const result = executeAssignmentStatusRequest({
           fromBotId,
           fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
-          id: typeof body.id === "string" && body.id.trim() ? body.id.trim() : undefined,
+          id: body.id === String(body.id) ? String(body.id).trim() || undefined : undefined,
         });
         return json(res, result.status, result.body);
       }
@@ -11802,12 +11809,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const queued = edges.flatMap((edge) => {
         if (edge.state === "running") return [];
         if (!visible.has(edge.sourceBotId) || !visible.has(edge.targetBotId)) return [];
-        return [{ sourceBotId: edge.sourceBotId, targetBotId: edge.targetBotId, ...(edge.reason ? { reason: edge.reason } : {}) }];
+        const queuedEdge: { sourceBotId: string; targetBotId: string; reason?: string } = {
+          sourceBotId: edge.sourceBotId,
+          targetBotId: edge.targetBotId,
+        };
+        if (edge.reason) queuedEdge.reason = edge.reason;
+        return [queuedEdge];
       });
       const running = edges.flatMap((edge) => {
         if (edge.state !== "running") return [];
         if (!visible.has(edge.sourceBotId) || !visible.has(edge.targetBotId)) return [];
-        return [{ sourceBotId: edge.sourceBotId, targetBotId: edge.targetBotId, threadId: edge.threadId, ...(edge.groupId ? { groupId: edge.groupId } : {}) }];
+        const runningEdge: { sourceBotId: string; targetBotId: string; threadId: string; groupId?: string } = {
+          sourceBotId: edge.sourceBotId,
+          targetBotId: edge.targetBotId,
+          threadId: edge.threadId,
+        };
+        if (edge.groupId) runningEdge.groupId = edge.groupId;
+        return [runningEdge];
       });
       return json(res, 200, { collaborations, queued, running });
     }

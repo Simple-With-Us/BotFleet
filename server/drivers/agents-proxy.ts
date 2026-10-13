@@ -165,7 +165,11 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
   if (name === "coordinate_bots") {
     const listed = Array.isArray(args.bot_ids) ? args.bot_ids : [];
     const single = args.bot_id;
-    const botIds = [...listed, ...(single !== undefined ? [single] : [])].map((value) => String(value ?? "").trim()).filter(Boolean);
+    const botIds = listed.map((value) => String(value ?? "").trim()).filter(Boolean);
+    if (single !== undefined && single !== null) {
+      const extra = String(single).trim();
+      if (extra) botIds.push(extra);
+    }
     const message = String(args.message ?? "").trim();
     if (botIds.length === 0 || !message) return { text: "coordinate_bots needs bot_ids and message.", isError: true };
     const body: Record<string, unknown> = {
@@ -180,17 +184,20 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     if (args.thread === "standing" || args.thread === "new") body.thread = args.thread;
     if (args.reply === "resume" || args.reply === "none") body.reply = args.reply;
     if (args.consult === true) body.consult = true;
-    if (typeof args.done_when === "string" && args.done_when.trim()) body.doneWhen = args.done_when.trim();
+    if (args.done_when === String(args.done_when)) {
+      const doneWhen = String(args.done_when).trim();
+      if (doneWhen) body.doneWhen = doneWhen;
+    }
     const r = await api(`/api/internal/coordinate-bots`, { method: "POST", body: JSON.stringify(body) });
     if (r.error && !Array.isArray(r.assignments)) return { text: `Couldn't hand that off: ${r.error}`, isError: true };
     return { text: typeof r.message === "string" ? r.message : "Handed off." };
   }
   if (name === "assignment_status") {
-    const id = typeof args.id === "string" ? args.id.trim() : "";
+    const id = args.id === String(args.id) ? String(args.id).trim() : "";
     const query = id ? `?id=${encodeURIComponent(id)}` : "";
     const r = await api(`/api/internal/assignment-status${query}`, {
       method: "POST",
-      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, ...(id ? { id } : {}) }),
+      body: JSON.stringify(id ? { fromBotId: BOT_ID, fromThreadId: THREAD_ID, id } : { fromBotId: BOT_ID, fromThreadId: THREAD_ID }),
     });
     if (r.error) return { text: `Couldn't read that assignment: ${r.error}`, isError: true };
     return { text: JSON.stringify(r) };
