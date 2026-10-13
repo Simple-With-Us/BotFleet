@@ -164,13 +164,6 @@ public enum CodeBlockWindow {
             let next = source.index(after: index)
             if isLineBreak(character, in: source, at: index) {
                 let afterBreak = lineBreakEnd(in: source, at: index)
-                // A full page must close before this newline.  `linesInPage > 0`
-                // keeps an empty page from spinning if the budget is ever zero.
-                if linesInPage >= maxLines, linesInPage > 0 {
-                    close(at: afterBreak, endLine: line, nextStartLine: line)
-                    index = afterBreak
-                    continue
-                }
                 charsInPage += 1
                 linesInPage += 1
                 let finished = line
