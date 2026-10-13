@@ -80,9 +80,10 @@ export interface ControlState {
 
 export interface ControlClient {
   /** Current state, cached for `cacheMs`.  `fresh` bypasses the cache.
-   * Every gated tools/call asks fresh, and may be held open by the harness
-   * for up to CONTROL_WAIT_MS while the computer is busy. */
-  state(fresh?: boolean): Promise<ControlState>;
+   * An action check (`wait`) may be held open by the harness for up to
+   * CONTROL_WAIT_MS while the computer is busy.  A help poll passes
+   * `wait: false` so it sees the screen as it is, without waiting out a hold. */
+  state(fresh?: boolean, wait?: boolean): Promise<ControlState>;
   /** Surface the bot's plea in the app.  Returns its expiry id, or null when
    * the harness could not be told. */
   requestHelp(reason: string): Promise<string | null>;
@@ -118,9 +119,14 @@ export function createControlClient(options?: {
   let cachedAt = 0;
   let cached: ControlState = DISENGAGED;
 
-  async function read(): Promise<ControlState> {
+  function readUrl(wait: boolean): string {
+    if (wait) return url;
+    return `${url}${url.includes("?") ? "&" : "?"}immediate=1`;
+  }
+
+  async function read(wait: boolean): Promise<ControlState> {
     try {
-      const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+      const res = await fetchImpl(readUrl(wait), { headers, signal: AbortSignal.timeout(timeoutMs) });
       if (!res.ok) return UNCONFIRMED;
       const body: any = await res.json().catch(() => null);
       const held = body?.held === true ? true : body?.held === false ? false : null;
@@ -140,11 +146,11 @@ export function createControlClient(options?: {
 
   return {
     configured,
-    async state(fresh = false): Promise<ControlState> {
+    async state(fresh = false, wait = true): Promise<ControlState> {
       if (!configured) return DISENGAGED;
       const now = Date.now();
       if (!fresh && now - cachedAt < cacheMs) return cached;
-      cached = await read();
+      cached = await read(wait);
       cachedAt = Date.now();
       return cached;
     },

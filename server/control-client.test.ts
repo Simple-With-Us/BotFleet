@@ -120,4 +120,23 @@ describe("createControlClient", () => {
     expect(state).toEqual({ held: false, helpOpen: false, blockedReason: "busy" });
     expect(controlRefusal(state)).not.toBe(CONTROL_REFUSAL_PLAIN);
   });
+
+  it("asks for an immediate read when a help poll must not wait out a hold", async () => {
+    const seen: string[] = [];
+    const client = createControlClient({
+      url: "http://127.0.0.1:9/api/internal/computer-control?botId=b1",
+      token: "test-token",
+      fetchImpl: async (input) => {
+        seen.push(String(input));
+        return new Response(JSON.stringify({ held: true, helpOpen: false, reason: "person" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    await client.state(true, false);
+    await client.state(true);
+    expect(seen[0]).toContain("immediate=1");
+    expect(seen[1]).not.toContain("immediate=1");
+  });
 });

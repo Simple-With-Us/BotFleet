@@ -3211,6 +3211,7 @@ function releaseStalledTurnIfUnowned(
   drainQueuedSends();
   drainConnectorResumes();
   drainSecretResumes();
+  drainSignInResumes();
   return "release";
 }
 
@@ -5121,6 +5122,7 @@ bus.subscribe((event: RuntimeEvent) => {
         drainRoomQueue();
         drainConnectorResumes();
         drainSecretResumes();
+        drainSignInResumes();
       }
       // group busy/unread settle in the group turn engine, which knows
       // whether more member turns are queued behind this one
@@ -6784,6 +6786,7 @@ async function startTurn(
         drainQueuedSends();
         drainConnectorResumes();
         drainSecretResumes();
+        drainSignInResumes();
       }
     }
   })();
@@ -8622,6 +8625,7 @@ async function runGroupMemberTurn(
     drainRoomQueue();
     drainConnectorResumes();
     drainSecretResumes();
+    drainSignInResumes();
     return true;
   }
   // Record the lease BEFORE the cancelled check: a stale dispatch still
@@ -8665,6 +8669,7 @@ async function runGroupMemberTurn(
     drainRoomQueue();
     drainConnectorResumes();
     drainSecretResumes();
+    drainSignInResumes();
     return false;
   }
   // One function for both lanes, so the room cannot set `computers` without
@@ -8948,6 +8953,7 @@ async function runGroupMemberTurn(
     drainRoomQueue();
     drainConnectorResumes();
     drainSecretResumes();
+    drainSignInResumes();
   }
 
   const pendingFallback = pendingMemberFallback.get(threadId);
@@ -10233,6 +10239,7 @@ function drainProviderReloadContinuations(): void {
   drainRoomQueue();
   drainConnectorResumes();
   drainSecretResumes();
+  drainSignInResumes();
 }
 
 async function runInstanceProviderReload(
@@ -12018,6 +12025,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const bot = store.bot(botId);
         if (!bot) return json(res, 404, { error: "no such bot" });
         if (method === "GET") {
+          // Help polls and status reads ask for the screen as it is.  Waiting
+          // here would turn a hand-back into a new plea.
+          if (url.searchParams.get("immediate") === "1") {
+            const current = computerControl.snapshot(botId);
+            const immediate = {
+              held: current.held,
+              helpOpen: current.helpReason !== null,
+              reason: current.held ? "person" : undefined,
+            };
+            return json(res, 200, immediate);
+          }
           // The gate may hold this check while a person has the computer.
           // A bridge that hung up stops the wait.
           const abort = new AbortController();
