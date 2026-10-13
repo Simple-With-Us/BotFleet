@@ -218,7 +218,9 @@ function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNo
     <EngineCallout
       key={instance.instanceId}
       driverKind={instance.driverKind}
-      models={instance.models.options.map((model) => model.id)}
+      models={instance.models.options
+        .filter((model) => !isInjectedLocalModel(model))
+        .map((model) => model.id)}
     />
   );
 }
