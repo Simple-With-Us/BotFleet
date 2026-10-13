@@ -262,6 +262,97 @@ function CustomPicker({
   );
 }
 
+function AddModelForm({
+  instance,
+  isBusy,
+  onCancel,
+  onSave,
+}: {
+  instance: InstanceInfo;
+  isBusy: boolean;
+  onCancel: () => void;
+  onSave: (models: Array<{ id: string; label: string }>) => Promise<{ ok: boolean; error?: string }>;
+}) {
+  const [slug, setSlug] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const normalizedSlug = slug.trim();
+  const normalizedName = displayName.trim();
+  const duplicate = instance.models.options.some((model) => model.id === normalizedSlug);
+
+  const add = async () => {
+    if (!normalizedSlug || !normalizedName || duplicate || saving || isBusy) return;
+    setSaving(true);
+    setError(null);
+    const models = [
+      ...instance.models.options
+        .filter((model) => model.custom)
+        .map((model) => ({ id: model.id, label: model.label })),
+      { id: normalizedSlug, label: normalizedName },
+    ];
+    try {
+      const result = await onSave(models);
+      if (result.ok) onCancel();
+      else setError(result.error ?? "Failed to add model");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to add model");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="mt-2.5 rounded-lg border border-hairline/40 bg-inset p-3">
+      <div className="mb-2 text-[11px] leading-relaxed text-ink-secondary">
+        Add a model identifier accepted by this engine.  The display name is what BotFleet shows in model pickers.
+      </div>
+      <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+        <input
+          value={slug}
+          onChange={(event) => setSlug(event.target.value)}
+          placeholder="Model slug"
+          aria-label={`${instance.displayName} model slug`}
+          spellCheck={false}
+          disabled={saving || isBusy}
+          className="rounded-lg border border-hairline/40 bg-surface px-3 py-2 font-mono text-[12px] text-ink placeholder:font-sans placeholder:text-ink-secondary focus:border-hairline focus:outline-none disabled:opacity-50"
+        />
+        <input
+          value={displayName}
+          onChange={(event) => setDisplayName(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter") return;
+            event.preventDefault();
+            void add();
+          }}
+          placeholder="Display name"
+          aria-label={`${instance.displayName} model display name`}
+          disabled={saving || isBusy}
+          className="rounded-lg border border-hairline/40 bg-surface px-3 py-2 text-[12px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none disabled:opacity-50"
+        />
+        <button
+          type="button"
+          onClick={() => void add()}
+          disabled={!normalizedSlug || !normalizedName || duplicate || saving || isBusy}
+          className="flex items-center justify-center gap-1.5 rounded-lg bg-raised px-3 py-2 text-[12px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {saving ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
+          Add Model
+        </button>
+      </div>
+      {duplicate && normalizedSlug && (
+        <div role="alert" className="mt-2 text-[11px] text-warning">That model slug is already available on this engine.</div>
+      )}
+      {error && <div role="alert" className="mt-2 text-[11px] text-danger">{error}</div>}
+      <div className="mt-2 flex justify-end">
+        <button type="button" onClick={onCancel} disabled={saving || isBusy} className="text-[11.5px] text-ink-secondary hover:text-ink disabled:opacity-50">
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function EngineRow({
   instance,
   busyInstanceId,
@@ -271,7 +362,7 @@ function EngineRow({
   instance: InstanceInfo;
   busyInstanceId: string | null;
   onPatch: (
-    patch: { cli?: string; fullAuto?: boolean; enabled?: boolean },
+    patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }> },
   ) => Promise<{ ok: boolean; error?: string }>;
   /** One line saying why this engine is not usable right now.  Rendered
    *  only where the panel knows the answer. */
@@ -279,6 +370,7 @@ function EngineRow({
 }) {
   const { refreshInstances } = useStore();
   const [open, setOpen] = useState(false);
+  const [modelFormOpen, setModelFormOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -308,7 +400,7 @@ function EngineRow({
     wasOpenFor.current = instance.cli ?? null;
   }, [instance.cli]);
 
-  const patchWithLocalError = async (patch: { cli?: string; fullAuto?: boolean; enabled?: boolean }) => {
+  const patchWithLocalError = async (patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }> }) => {
     setError(null);
     const res = await onPatch(patch);
     if (!res.ok && res.error) {
@@ -429,6 +521,22 @@ function EngineRow({
           />
           Bypass permissions (autonomous mode)
         </label>
+        <button
+          type="button"
+          onClick={() => setModelFormOpen((value) => !value)}
+          disabled={!enabled || isBusy || deleting}
+          aria-expanded={modelFormOpen}
+          className={cn(
+            "shrink-0 rounded-lg border border-hairline/40 px-3 py-1 text-[12px]",
+            !enabled || isBusy || deleting
+              ? "cursor-not-allowed opacity-40"
+              : modelFormOpen
+                ? "bg-accent/15 text-accent"
+                : "text-ink-secondary hover:bg-raised/50 hover:text-ink",
+          )}
+        >
+          Add Model…
+        </button>
         {hasCli && (
           <button
             onClick={() => setOpen((v) => !v)}
@@ -476,6 +584,14 @@ function EngineRow({
         models={instance.models.options.map((model) => model.id)}
       />
       {error && <div role="alert" className="mt-1 text-[12px] text-danger">{error}</div>}
+      {modelFormOpen && enabled && (
+        <AddModelForm
+          instance={instance}
+          isBusy={isBusy}
+          onCancel={() => setModelFormOpen(false)}
+          onSave={(models) => patchWithLocalError({ models })}
+        />
+      )}
       {open && enabled && (
         <CustomPicker
           instance={instance}
@@ -851,7 +967,7 @@ export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: s
   const handlePatch = useCallback(
     async (
       instanceId: string,
-      patch: { cli?: string; fullAuto?: boolean; enabled?: boolean },
+      patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; models?: Array<{ id: string; label: string }> },
     ): Promise<{ ok: boolean; error?: string }> => {
       setBusyInstanceId(instanceId);
       setGlobalError(null);
