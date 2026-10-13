@@ -53,6 +53,9 @@ function stubDeps(): TurnToolHostDeps {
     executeRequestCredentialRequest: vi.fn(
       async () => ({ status: 201, body: { messageId: "msg-1", label: "key" } }),
     ),
+    executeRequestSignInRequest: vi.fn(
+      async () => ({ status: 201, body: { messageId: "msg-sign", site: "example.com" } }),
+    ),
     executeRoutineRequestRequest: vi.fn(
       async () => ({ status: 201, body: { summary: "Weekdays at 09:00" } }),
     ),

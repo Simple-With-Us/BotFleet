@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   availableAgentToolNames,
   credentialPromptFor,
+  signInPromptFor,
   hasFileTools,
   LEGACY_MCP_AGENT_TOOLS,
   promptFragmentsFor,
@@ -89,6 +90,14 @@ describe("credentialPromptFor", () => {
 
   it("names request_credential only when it is actually available", () => {
     expect(credentialPromptFor(["request_credential"])).toContain("request_credential");
+  });
+});
+
+describe("signInPromptFor", () => {
+  it("is silent unless request_sign_in is available", () => {
+    expect(signInPromptFor(["request_credential"])).toBe("");
+    expect(signInPromptFor(["request_sign_in"])).toContain("request_sign_in");
+    expect(signInPromptFor(["request_sign_in"])).toContain("password");
   });
 });
 

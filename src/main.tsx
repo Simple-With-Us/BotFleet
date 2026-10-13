@@ -298,6 +298,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "sign-in-card") {
+  // Visual-spec harness (tests/e2e/sign-in-card.visual.spec.ts): the Sign in
+  // needed card, open, with a persistent error, and after Done.
+  void import("./components/SignInRequestCardVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else {
   createRoot(rootElement).render(
     <StrictMode>

@@ -374,6 +374,32 @@ const REQUEST_CREDENTIAL: HarnessTool = {
     "If a supported API key is missing, use request_credential to show the secure in-app card. Never ask the user to paste credentials into chat.",
 };
 
+const REQUEST_SIGN_IN: HarnessTool = {
+  name: "request_sign_in",
+  description:
+    "Ask the person to sign in to a website on the computer where you work. Use this instead of asking them to paste a password or one-time code into chat. One Sign in needed card is shown. After calling this tool, end the turn; BotFleet resumes after they press Done or Cancel. You never receive the password.",
+  schema: {
+    type: "object",
+    properties: {
+      site: {
+        type: "string",
+        description: "The site hostname, for example example.com. Not a password, not a username, and not a URL with a path.",
+      },
+      reason: {
+        type: "string",
+        description: "Optional short, non-sensitive explanation of why the task needs the sign-in.",
+      },
+    },
+    required: ["site"],
+  },
+  surfaces: { mcp: true, http: true },
+  gate: anyAgentsBot,
+  sideEffect: "write",
+  settles: "suspend",
+  promptFragment:
+    "When a task needs a website sign-in, use request_sign_in. Never ask the person to paste a password or one-time code into chat.",
+};
+
 const WEEKDAYS_ENUM = [
   "monday",
   "tuesday",
@@ -1369,6 +1395,7 @@ export const HARNESS_TOOLS: readonly HarnessTool[] = [
   DELEGATE_BOT,
   CREATE_BOT,
   REQUEST_CREDENTIAL,
+  REQUEST_SIGN_IN,
   LIST_ROUTINES,
   PROPOSE_ROUTINE,
   PROPOSE_ROUTINE_ACTION,
