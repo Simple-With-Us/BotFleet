@@ -1813,7 +1813,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
 export function patchInstanceConfig(
   cfg: AppConfig,
   instanceId: string,
-  patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean },
+  patch: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }> },
 ): InstanceCliUpdate {
   const next: AppConfig = structuredClone(cfg);
   const map = instanceConfigs(next);
@@ -1850,6 +1850,14 @@ export function patchInstanceConfig(
       nextConfig.cli = cliKey;
     } else {
       delete nextConfig.cli;
+    }
+  }
+
+  if (patch.models !== undefined) {
+    if (patch.models.length) {
+      nextConfig.userModels = patch.models;
+    } else {
+      delete nextConfig.userModels;
     }
   }
 
