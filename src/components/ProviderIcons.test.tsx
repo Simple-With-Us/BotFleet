@@ -57,6 +57,17 @@ describe("MiniMaxMark", () => {
   });
 });
 
+describe("ClutchMark routing", () => {
+  it("uses Clutch's app mark for the engine, not DeepSeek's whale", () => {
+    const clutch = markup(<ProviderMark driverKind="dshAgent" size={18} />);
+    const deepseek = markup(<ProviderMark driverKind="deepseekAgent" size={18} />);
+
+    expect(clutch).toContain('viewBox="45 40 145 120"');
+    expect(deepseek).toContain('viewBox="85 85 360 330"');
+    expect(clutch).not.toBe(deepseek);
+  });
+});
+
 describe("ProviderMark monogram fallback", () => {
   it("still monograms an engine we hold no artwork for", () => {
     // The fallback is still correct behaviour for a genuinely unknown engine;
