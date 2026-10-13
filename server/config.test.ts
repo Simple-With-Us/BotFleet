@@ -57,6 +57,31 @@ import { isSentryDsn as isBrowserSentryDsn } from "../src/lib/observability-conf
 const SENTINEL_DSN = "https://abc123@o0.ingest.sentry.io/1";
 
 describe("configuration boundaries", () => {
+  it("accepts voice provider fields and rejects unknown keys in those schemas", () => {
+    expect(parseConfigPatch({
+      tts: { provider: "xai" },
+      callStt: { provider: "meta" },
+      azureSpeech: { region: "westus" },
+      metaSpeech: {},
+      groq: {},
+      assemblyai: {},
+    })).toEqual({
+      tts: { provider: "xai" },
+      callStt: { provider: "meta" },
+      azureSpeech: { region: "westus" },
+      metaSpeech: {},
+      groq: {},
+      assemblyai: {},
+    });
+
+    expect(() => parseConfigPatch({ tts: { provider: "xai", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ callStt: { provider: "meta", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ azureSpeech: { region: "westus", typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ metaSpeech: { typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ groq: { typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ assemblyai: { typo: true } })).toThrow(/Unrecognized key/);
+  });
+
   it("keeps supported stored settings and drops unrelated top-level data", () => {
     expect(
       parseStoredConfig({

@@ -142,6 +142,23 @@ describe("VoiceSettings", () => {
     expect(html).not.toContain("Apple Personal Voice:");
   });
 
+  it("greys Mac playback with a reason when Personal Voice is unavailable on this computer", () => {
+    mockPersonalVoice = false;
+    try {
+      const html = renderToStaticMarkup(
+        createElement(VoiceSettings, {
+          bot: { ...sampleBot("personal:pv-1"), speechDevices: ["mac"] },
+          onPatch: () => {},
+        }),
+      );
+      expect(html).toContain("disabled");
+      expect(html).toMatch(/Personal Voice is not available on this computer/i);
+      expect(html).toMatch(/Play on iPhone/i);
+    } finally {
+      mockPersonalVoice = false;
+    }
+  });
+
   it("shows the iPhone's Personal Voice greyed with the reason, not as a choice", () => {
     const html = render(sampleBot(undefined, { iphone: "personal:iphone-voice" }));
     expect(html).toContain("Personal Voice from your iPhone.\u00A0 Choose it on the iPhone.");

@@ -1002,11 +1002,17 @@ describe("runTurnLoop — the round's idle clock and hard ceiling", () => {
       const h = harness([
         async (opts) =>
           new Promise<TurnRoundResult>((_resolve, reject) => {
-            // live for 100s, then silent forever
+            // live for 100s, then silent forever.  The last chunk is a
+            // setTimeout, not the 100s interval tick: Vitest 5 can fire
+            // clearInterval first when both are due at the same instant.
             const ticker = setInterval(() => opts.onChunk?.(), 10_000);
-            setTimeout(() => clearInterval(ticker), 100_000);
+            const stop = setTimeout(() => {
+              clearInterval(ticker);
+              opts.onChunk?.();
+            }, 100_000);
             opts.signal.addEventListener("abort", () => {
               clearInterval(ticker);
+              clearTimeout(stop);
               reject(new DOMException("aborted", "AbortError"));
             });
           }),

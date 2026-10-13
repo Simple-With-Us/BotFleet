@@ -1,65 +1,57 @@
-// Test harness for tests/e2e/engine-callout.visual.spec.ts.
-//
-// Mounts the real More Info block in the two shapes it can take, side
-// by side.  The block grew a provider-mark row, and both shapes are load
-// bearing:  Clutch is the only engine that lists brands (it hosts DeepSeek,
-// Muse, and MiniMax models, which the single "Clutch" name says nothing about), while
-// every other engine lists none and its label and headline must sit in normal
-// inline flow.  A layout that reads well with marks present can easily push a
-// 6px flex gap into the space between "More Info" and the headline when
-// there are none, so both are pinned.
-import { EngineCalloutBody } from "@/lib/engine-capabilities";
+// Visual harness for neutral Engine Settings facts and OpenAI-compatible visibility.
+import { EngineCallout } from "./EngineCallout";
+import { showBuiltInOpenAiCompatible } from "@/lib/engine-status";
+import { ProviderMark } from "./ProviderIcons";
 
-const CLUTCH = "deepseek-harness";
-const MINIMAX = "mcode";
+function EngineFactRow(props: {
+  driverKind: string;
+  name: string;
+  models: readonly string[];
+}) {
+  return (
+    <div className="border-b border-hairline/30 py-3 last:border-b-0">
+      <div className="flex items-center gap-2 text-[13px] text-ink">
+        <ProviderMark driverKind={props.driverKind} size={18} />
+        <span className="font-medium">{props.name}</span>
+      </div>
+      <EngineCallout driverKind={props.driverKind} models={props.models} />
+    </div>
+  );
+}
 
 export default function EngineCalloutVisualFixture() {
+  const openAiConfigured = showBuiltInOpenAiCompatible(true, "https://api.example.test/v1");
+  const openAiHidden = showBuiltInOpenAiCompatible(false, "");
+
   return (
     <div
-      data-testid="engine-callout-board"
-      className="flex flex-col gap-4 bg-inset/30 p-6"
-      style={{ background: "#f4f4f5", width: 560 }}
+      data-testid="engine-settings-visibility-board"
+      className="grid gap-5 bg-inset/30 p-6"
+      style={{ background: "#f4f4f5", width: 640 }}
     >
-      {/* Two brands:  marks lead, then the label and headline as one inline
-          run.  Asserted by the `clutch-callout` testid below. */}
-      <div data-testid="clutch-callout">
-        <EngineCalloutBody
-          entry={{
-            id: CLUTCH,
-            displayName: "Clutch",
-            capabilityBadgeColor: "bg-rose-600 text-white",
-            providerKinds: ["deepseekAgent", "muse", "minimax"],
-            group: "Cloud",
-            pricing: { kind: "unknown" },
-            capabilities: {},
-            whyThisEngine: {
-              headline: "DeepSeek, Muse, and MiniMax models through the Clutch bridge.",
-              prose: ["Clutch runs DeepSeek, Meta Muse, and MiniMax models through BotFleet's Clutch ACP bridge."],
-            },
-            defaultModels: [],
-          }}
-        />
-      </div>
+      <section data-testid="openai-hidden-state" className="rounded-xl border border-hairline/40 bg-raised px-4">
+        <h2 className="pt-3 text-[12px] font-medium uppercase tracking-wide text-ink-secondary">
+          No OpenAI-Compatible Endpoint
+        </h2>
+        <EngineFactRow driverKind="codexAgent" name="Codex" models={["gpt-6.1-codex"]} />
+        {openAiHidden && (
+          <EngineFactRow driverKind="openai-compat" name="OpenAI-Compatible" models={[]} />
+        )}
+      </section>
 
-      {/* No brands:  the same block with no mark row at all.  The label and
-          headline must still read as one sentence. */}
-      <div data-testid="single-brand-callout">
-        <EngineCalloutBody
-          entry={{
-            id: MINIMAX,
-            displayName: "MiniMax Code",
-            capabilityBadgeColor: "bg-violet-500 text-white",
-            group: "Cloud",
-            pricing: { kind: "unknown" },
-            capabilities: {},
-            whyThisEngine: {
-              headline: "MiniMax's own coding CLI, driven over the same Token Plan.",
-              prose: ["MiniMax Code runs MiniMax's coding CLI inside BotFleet."],
-            },
-            defaultModels: [],
-          }}
-        />
-      </div>
+      <section data-testid="openai-configured-state" className="rounded-xl border border-hairline/40 bg-raised px-4">
+        <h2 className="pt-3 text-[12px] font-medium uppercase tracking-wide text-ink-secondary">
+          Configured Endpoint
+        </h2>
+        <EngineFactRow driverKind="codexAgent" name="Codex" models={["gpt-6.1-codex"]} />
+        {openAiConfigured && (
+          <EngineFactRow
+            driverKind="openai-compat"
+            name="OpenAI-Compatible"
+            models={["vendor/model-a", "vendor/model-b"]}
+          />
+        )}
+      </section>
     </div>
   );
 }

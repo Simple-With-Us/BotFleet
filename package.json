@@ -99,7 +99,7 @@
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",
-    "@sentry/electron": "^7.20.1",
+    "@sentry/electron": "^8.0.0",
     "@sentry/node": "^11.0.0",
     "@sentry/profiling-node": "^11.0.0",
     "@sentry/react": "^11.0.0",
@@ -142,7 +142,7 @@
     "typebox": "1.3.36",
     "typescript": "^7.0.0",
     "vite": "^8.0.0",
-    "vitest": "^4.1.11",
+    "vitest": "^5.0.0",
     "wrangler": "4.148.0"
   }
 }
