@@ -27,6 +27,11 @@ describe("parsePluginHostConfigValue", () => {
     expect(parsePluginHostConfigValue("rooms", { turnTimeoutMinutes: 0 })).toBeUndefined();
   });
 
+  it("treats undefined config sections as absent instead of throwing", () => {
+    expect(parsePluginHostConfigValue("rooms", undefined)).toBeUndefined();
+    expect(parsePluginHostConfigValue("callStt", undefined)).toBeUndefined();
+  });
+
   it("exposes only callStt provider, not keyterms", () => {
     expect(
       parsePluginHostConfigValue("callStt", {
