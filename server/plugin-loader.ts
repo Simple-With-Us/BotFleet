@@ -108,7 +108,7 @@ export function isSecretConfigKey(key: string): boolean {
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- type guard over arbitrary host config
 function isRedactableRecord(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  if (value === undefined || value === null || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
 }
