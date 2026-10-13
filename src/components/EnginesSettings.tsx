@@ -355,7 +355,7 @@ function EngineRow({
   };
 
   return (
-    <div>
+    <div className="border-b border-hairline/30 py-3 first:pt-0 last:border-b-0">
       <div className="flex items-center gap-2 text-[13px]">
         <label
           className={cn(
@@ -453,9 +453,9 @@ function EngineRow({
             onClick={deleteEngine}
             disabled={isBusy || deleting}
             className="shrink-0 rounded-lg border border-danger/30 px-2.5 py-1 text-[12px] text-danger hover:bg-danger/10 disabled:opacity-40"
-            title="Delete this custom engine"
+            title="Remove this added connection"
           >
-            {deleting ? "Deleting…" : "Delete"}
+            {deleting ? "Removing…" : "Remove"}
           </button>
         )}
       </div>
@@ -472,22 +472,10 @@ function EngineRow({
           permission guards do not apply.
         </div>
       )}
-      {["minimax", "claude", "grok", "codex", "antigravity", "cursorAgent", "deepseekAgent", "dshAgent", "antigravityAgent", "grokAgent", "claudeAgent", "mcodeAgent", "museAgent"].includes(instance.driverKind) && (
-        <EngineCallout driverKind={instance.driverKind} instanceId={instance.instanceId} />
-      )}
-      {instance.driverKind === "boxAgent" && (
-        <div className="mt-2 rounded bg-accent/10 px-2 py-1.5 text-[11px] leading-relaxed text-ink-secondary border border-accent/20">
-          <strong className="text-ink">Runs on Its Own Computer.</strong>
-          {"  "}A bot on the ASCII.dev Box engine runs its turn on box.ascii.dev, not on this computer, so it has no team tools, no peers to ask, no approval cards, no memory, and no skills.
-          {"  "}Pick another engine for a bot that has to work with the rest of your team.
-        </div>
-      )}
-      {isCustom && (
-        <div className="mt-2 rounded bg-accent/10 px-2 py-1.5 text-[11px] leading-relaxed text-ink-secondary border border-accent/20">
-          <strong className="text-ink">{customEngineCalloutTitle(instance.driverKind)}</strong>
-          {"  "}Configured models: {instance.models.options.map((o) => o.label || o.id).join(", ") || "default"}.
-        </div>
-      )}
+      <EngineCallout
+        driverKind={instance.driverKind}
+        models={instance.models.options.map((model) => model.id)}
+      />
       {error && <div role="alert" className="mt-1 text-[12px] text-danger">{error}</div>}
       {open && enabled && (
         <CustomPicker
@@ -500,9 +488,9 @@ function EngineRow({
       )}
       <ConfirmDialog
         open={confirmDelete}
-        title="Delete Custom Engine?"
-        body={`Delete “${instance.displayName}”?  This cannot be undone.`}
-        confirmLabel="Delete Engine"
+        title="Remove Added Connection?"
+        body={`Remove “${instance.displayName}”?  Built-in engines cannot be removed.`}
+        confirmLabel="Remove Connection"
         onCancel={() => setConfirmDelete(false)}
         onConfirm={confirmDeleteEngine}
       />
@@ -884,7 +872,12 @@ export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: s
     [dispatch],
   );
 
-  const rows = state.instances.filter(listedInEnginesSettings);
+  const rows = state.instances
+    .filter(listedInEnginesSettings)
+    .filter((instance) => {
+      if (instance.driverKind !== "openai-compat" || isCustomEngineInstance(instance)) return true;
+      return Boolean(state.config?.openaiCompat?.configured || state.config?.openaiCompat?.url);
+    });
   // Engines the user has turned off used to sit behind a "Show (N)" link
   // that defaulted to hidden, so a newly added engine whose CLI is not
   // installed yet was simply absent from Settings — the reader saw a count
