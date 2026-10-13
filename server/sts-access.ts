@@ -84,12 +84,21 @@ export function resolveStsProvider(keys: StsKeyStatus | null, preference: StsPro
  *  a paid vendor endpoint, so an unthrottled loop from a paired device is a
  *  way to spend someone's quota.  One token per provider per window. */
 export class StsMintThrottle {
+  // Explicit fields, not constructor parameter properties: the harness boots
+  // under `node --experimental-strip-types`, which runs in *strip-only* mode
+  // and refuses parameter property shorthand.  `now` is injectable so tests
+  // can drive the clock deterministically.
   private readonly last = new Map<StsProvider, number>();
+  private readonly windowMs: number;
+  private readonly now: () => number;
 
   constructor(
-    private readonly windowMs = 10_000,
-    private readonly now: () => number = () => Date.now(),
-  ) {}
+    windowMs: number = 10_000,
+    now: () => number = () => Date.now(),
+  ) {
+    this.windowMs = windowMs;
+    this.now = now;
+  }
 
   /** True when this provider may mint now, and records the attempt. */
   take(provider: StsProvider): boolean {

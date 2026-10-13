@@ -36,6 +36,13 @@ afterPack: ./scripts/after-pack.mjs
 # ELECTRON_RUN_AS_NODE (the agentcal-hq pattern).
 files:
   - electron/**
+  # Compiled JS for the modules `electron/**` imports from `../shared/`.  The
+  # shared `.ts` sources are also bundled (so the harness's dev boot keeps
+  # working) but the .js is what the packaged Electron main process actually
+  # loads at runtime -- the main process is not launched with strip-types
+  # and an asar inlined `.ts` import dies with ERR_MODULE_NOT_FOUND.
+  - dist-shared/**
+  - shared/sts-tokens.ts
   - "!electron/**/*.test.*"
   - "!electron/resources/speech-helper"
   - "!electron/resources/speech-helper.swift"

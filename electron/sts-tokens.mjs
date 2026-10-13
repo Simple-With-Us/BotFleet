@@ -24,7 +24,7 @@ import {
   mintGeminiLiveToken,
   mintXaiRealtimeToken,
   XAI_REALTIME_MODEL,
-} from "../shared/sts-tokens.ts";
+} from "../shared/sts-tokens.js";
 
 export {
   GEMINI_LIVE_MODEL,
