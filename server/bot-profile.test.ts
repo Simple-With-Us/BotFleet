@@ -1,7 +1,11 @@
 // The profile patch parser is the boundary that keeps paired clients from
-// writing anything but identity fields. The strict half is the one that
-// matters: a privileged bot field arriving here must be refused by NAME,
-// so a future field cannot silently become remotely writable.
+// writing a bot field nobody ruled on. The strict half is the one that
+// matters: a field arriving here that is not in the schema must be refused by
+// NAME, so a future field cannot silently become remotely writable.  The
+// execution-policy fields are in the schema since the owner's 2026-10-09
+// ruling that a paired phone may set them; which bots may have Auto or Bypass
+// switched on from a phone is decided in the profile route (see
+// companion/test/proxy.test.ts), where the stored bot is.
 import { describe, expect, it } from "vitest";
 
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
@@ -12,6 +16,53 @@ describe("parseBotProfilePatch (strict — the paired boundary)", () => {
     expect(result).toEqual({ ok: false, error: "unsupported profile field: color" });
     const result2 = parseBotProfilePatch({ unknownProperty: true } as never, true);
     expect(result2).toEqual({ ok: false, error: "unsupported profile field: unknownProperty" });
+  });
+
+  it("accepts the execution-policy switches on the paired boundary, in strict mode too", () => {
+    // Owner ruling 2026-10-09: bots get Bypass Permissions, Auto-Approve, Auto
+    // Review and peer-contact approval from the phone.  Strict mode used to
+    // refuse bypassPermissions by name (AG, #870).
+    for (const strict of [true, false]) {
+      expect(parseBotProfilePatch({ bypassPermissions: true }, strict)).toEqual({
+        ok: true,
+        patch: { bypassPermissions: true },
+      });
+      expect(parseBotProfilePatch({ bypassPermissions: false }, strict)).toEqual({
+        ok: true,
+        patch: { bypassPermissions: false },
+      });
+      expect(
+        parseBotProfilePatch(
+          { autoApprove: true, autoReview: "enforce", approvePeerComms: false, bypassPermissions: true },
+          strict,
+        ),
+      ).toEqual({
+        ok: true,
+        patch: { autoApprove: true, autoReview: "enforce", approvePeerComms: false, bypassPermissions: true },
+      });
+    }
+  });
+
+  it("still validates each switch's value, so a stray string or number writes nothing", () => {
+    // Parsed from JSON the way a request body arrives, so the wrong types are
+    // the wire's and need no cast.
+    const wire = (json: string) => parseBotProfilePatch(JSON.parse(json), true);
+    expect(wire('{"bypassPermissions":"true"}')).toEqual({
+      ok: false,
+      error: "bypassPermissions must be true or false",
+    });
+    expect(wire('{"autoApprove":1}')).toEqual({
+      ok: false,
+      error: "autoApprove must be true or false",
+    });
+    expect(wire('{"approvePeerComms":null}')).toEqual({
+      ok: false,
+      error: "approvePeerComms must be true or false",
+    });
+    expect(wire('{"autoReview":"always"}')).toEqual({
+      ok: false,
+      error: "autoReview must be off, shadow, or enforce",
+    });
   });
 
   it("accepts the full identity and configuration surface", () => {
@@ -65,6 +116,54 @@ describe("parseBotProfilePatch (both modes)", () => {
     expect(parseBotProfilePatch({ speechDevices: [] }, true)).toEqual({ ok: true, patch: { speechDevices: [] } });
     for (const speechDevices of [["mac", "mac"], ["ipad"], ["iphone", "mac", "iphone"]]) {
       expect(parseBotProfilePatch({ speechDevices } as never, true).ok).toBe(false);
+    }
+  });
+
+  it("accepts per-device voices on both boundaries and merges them into the stored record", () => {
+    for (const strict of [true, false]) {
+      expect(parseBotProfilePatch({ voices: { iphone: "English_Graceful_Lady" } }, strict)).toEqual({
+        ok: true,
+        patch: { voices: { iphone: "English_Graceful_Lady" } },
+      });
+      // A phone saving its own voice keeps the Mac's.
+      const merged = parseBotProfilePatch({ voices: { iphone: "vx" } }, strict, { voices: { mac: "personal:mac" } });
+      expect(merged).toEqual({ ok: true, patch: { voices: { mac: "personal:mac", iphone: "vx" } } });
+    }
+  });
+
+  it("clears one device with null or an empty string, and every device with voices: null", () => {
+    const current = { voices: { mac: "personal:mac", iphone: "vx" } };
+    expect(parseBotProfilePatch({ voices: { mac: null } }, true, current)).toEqual({ ok: true, patch: { voices: { iphone: "vx" } } });
+    expect(parseBotProfilePatch({ voices: { iphone: "" } }, true, current)).toEqual({ ok: true, patch: { voices: { mac: "personal:mac" } } });
+    const cleared = parseBotProfilePatch({ voices: null }, true, current);
+    expect(cleared.ok && "voices" in cleared.patch && cleared.patch.voices === undefined).toBe(true);
+    const lastCleared = parseBotProfilePatch({ voices: { mac: null, iphone: null } }, true, current);
+    expect(lastCleared.ok && "voices" in lastCleared.patch && lastCleared.patch.voices === undefined).toBe(true);
+  });
+
+  it("leaves voices alone when a PATCH does not name them", () => {
+    const result = parseBotProfilePatch({ name: "Mira" }, true, { voices: { mac: "personal:mac" } });
+    expect(result.ok && "voices" in result.patch).toBe(false);
+  });
+
+  it("rejects malformed per-device voices", () => {
+    // SAFETY: deliberately malformed input; parseBotProfilePatch validates at runtime.
+    expect(parseBotProfilePatch({ voices: { ipad: "vx" } } as never, true)).toEqual({
+      ok: false,
+      error: "voices only accepts mac and iphone, not ipad",
+    });
+    // SAFETY: deliberately malformed input; parseBotProfilePatch validates at runtime.
+    expect(parseBotProfilePatch({ voices: { mac: 7 } } as never, true)).toEqual({ ok: false, error: "voices.mac must be a voice id or null" });
+    expect(parseBotProfilePatch({ voices: { iphone: "v".repeat(201) } }, true)).toEqual({
+      ok: false,
+      error: "voices.iphone must be at most 200 characters",
+    });
+    for (const voices of ["vx", ["vx"], 3]) {
+      // SAFETY: deliberately malformed input; parseBotProfilePatch validates at runtime.
+      expect(parseBotProfilePatch({ voices } as never, true)).toEqual({
+        ok: false,
+        error: "voices must be an object with mac and iphone voice ids",
+      });
     }
   });
 

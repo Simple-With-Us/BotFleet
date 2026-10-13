@@ -496,7 +496,7 @@ export function GroupSettingsPanel({ group }: { group: Group }) {
               <AlertTriangle size={15} /> Delete Channel
             </div>
             <p className="text-[11.5px] text-ink-secondary">
-              Deleting this channel removes its transcript and task history. Bot definitions are preserved.
+              Deleting this channel removes its transcript and task history.{"\u00a0 "}Bot definitions are preserved.
             </p>
             {confirmDelete ? (
               <div className="mt-2 flex items-center gap-2">

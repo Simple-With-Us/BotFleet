@@ -10,13 +10,14 @@
 // this module rather than importing @sentry/node itself) so its extensive
 // unit tests never have to stand up or stub the SDK.
 import type { Routine, RoutineRun } from "./routines.ts";
-import { getSentry, isSentryActive } from "./sentry.ts";
+import { getSentry, isSentryActive, type SentryNode } from "./sentry.ts";
 
 // Derived rather than imported from @sentry/core, the same way sentry-ai.ts
 // derives its span options type: @sentry/node is loaded lazily so vitest
 // never pays the Node SDK tax, and a top-level type import here would undo
 // that for one field.
 type MonitorConfig = NonNullable<Parameters<NonNullable<ReturnType<typeof getSentry>>["captureCheckIn"]>[1]>;
+type CheckIn = Parameters<NonNullable<ReturnType<typeof getSentry>>["captureCheckIn"]>[0];
 
 /** `a b c` -> `a-b-c`, ASCII-lowercase, no leading/trailing/doubled hyphens. */
 function slugify(value: string): string {
@@ -78,26 +79,116 @@ export function checkInRoutineStart(run: RoutineRun, routine: Routine): string |
   const monitorConfig = routineMonitorConfig(routine);
   if (!monitorConfig) return undefined;
   try {
-    return sdk.captureCheckIn({ monitorSlug: routineMonitorSlug(run), status: "in_progress" }, monitorConfig);
+    const checkInId = sdk.captureCheckIn(
+      { monitorSlug: routineMonitorSlug(run), status: "in_progress" },
+      monitorConfig,
+    );
+    // The SDK fabricates a uuid when the client is missing or closed; never
+    // store that as a real Crons check-in id on the run record.
+    if (!checkInId || !isSentryActive()) return undefined;
+    return checkInId;
   } catch {
     return undefined;
   }
 }
 
+/** How long one `sdk.flush` may spend draining the transport before the close
+ *  counts as undelivered.  Sentry's own swap budget for a client shutdown is
+ *  the same order of magnitude, and the run this belongs to has already
+ *  finished by then. */
+const CHECK_IN_CLOSE_FLUSH_MS = 10_000;
+/** Wait before retry 1, retry 2 and retry 3 of a close the transport never
+ *  accepted.  Bounded: the longest a close is retried is 2m35s after the run
+ *  ended, which is still inside the monitor's `checkinMargin`. */
+const CHECK_IN_CLOSE_RETRY_BACKOFF_MS = [5_000, 30_000, 120_000] as const;
+
+/** Detached close deliveries still waiting on a flush or a backoff.  The run
+ *  never awaits this map; it exists so tests (and a future shutdown path)
+ *  can settle the in-flight work deterministically. */
+const pendingCheckInCloses = new Set<Promise<void>>();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    // Unref'd: a routine finishing must not be what holds the harness open.
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
+/** Did the transport actually take the close?  `false` from `sdk.flush` means
+ *  the envelope was still buffered when the budget ran out — which is the
+ *  exact state that leaves a monitor stuck `in_progress` until Sentry's cron
+ *  monitor calls it an error.  An SDK with no `flush` has already handed the
+ *  event over synchronously, so there is nothing to wait for. */
+async function flushCheckInClose(sdk: SentryNode): Promise<boolean> {
+  try {
+    if (typeof sdk.flush !== "function") return true;
+    return await sdk.flush(CHECK_IN_CLOSE_FLUSH_MS);
+  } catch {
+    return false;
+  }
+}
+
+/** Confirm the close left the process, and re-send it while it has not.
+ *
+ *  `captureCheckIn` only enqueues: it returns before the envelope reaches
+ *  Sentry, so on a saturated host (the failure this exists for was a run that
+ *  finished while the box was at load 19-89 per core with 91-94% swap) the
+ *  buffered event is simply dropped at process exit and the monitor stays
+ *  `in_progress` until the cron check times it out as an error.  Re-sending
+ *  the same `checkInId` is idempotent on Sentry's side, so a close that
+ *  actually landed is harmless to repeat. */
+async function deliverCheckInClose(sdk: SentryNode, checkIn: CheckIn, runId: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    if (await flushCheckInClose(sdk)) return;
+    const backoff = CHECK_IN_CLOSE_RETRY_BACKOFF_MS[attempt];
+    if (backoff === undefined) {
+      console.warn(`[sentry-crons] check-in close failed slug=${checkIn.monitorSlug} run=${runId}`);
+      return;
+    }
+    await sleep(backoff);
+    try {
+      sdk.captureCheckIn(checkIn);
+    } catch {
+      /* the flush below is the arbiter; a throw here is not the end of it */
+    }
+  }
+}
+
 /** Close a check-in `checkInRoutineStart` opened.  No-op if that call
  *  returned nothing (Sentry off, or a one-off routine never got a
- *  monitor). */
+ *  monitor).  Returns as soon as the close is queued — confirming it left
+ *  the process is detached, so a slow or dead Sentry cannot delay or fail the
+ *  run that just finished. */
 export function checkInRoutineFinish(run: RoutineRun, checkInId: string, ok: boolean): void {
   if (!isSentryActive()) return;
   const sdk = getSentry();
   if (!sdk) return;
+  const checkIn: CheckIn = {
+    monitorSlug: routineMonitorSlug(run),
+    status: ok ? "ok" : "error",
+    checkInId,
+  };
   try {
-    sdk.captureCheckIn({
-      monitorSlug: routineMonitorSlug(run),
-      status: ok ? "ok" : "error",
-      checkInId,
-    });
+    sdk.captureCheckIn(checkIn);
   } catch {
     /* check-in reporting must never take down a run */
+    return;
   }
+  const delivery = deliverCheckInClose(sdk, checkIn, run.id);
+  pendingCheckInCloses.add(delivery);
+  void delivery.finally(() => pendingCheckInCloses.delete(delivery));
+}
+
+/** Resolves once every detached close has settled — after its final retry, or
+ *  after the one log line that says it never left.  Never awaited on the
+ *  run's completion path; tests use it instead of racing timers. */
+export async function awaitPendingCheckInCloses(): Promise<void> {
+  await Promise.all(pendingCheckInCloses);
+}
+
+/** Drop in-flight close deliveries so a failed test cannot stall the next
+ *  `awaitPendingCheckInCloses()` under real timers. */
+export function resetSentryCronsForTests(): void {
+  pendingCheckInCloses.clear();
 }

@@ -1,11 +1,15 @@
 # 2026-09-22 — Bundle Identifier Migration
 
 
-## 2026-10-01 — iOS Ship IDs Stay On `app.botfleet` Until ASC App ID Exists
+## 2026-10-07 — iOS Ship IDs On `app.botfleet.ios` (ASC Live)
 
-Schedule run [36839653889](https://github.com/jaywedgeworth22/BotFleet/actions/runs/36839653889) failed the asc-seq gate (`rc=2`) because `scripts/ios-fleet/apps.json` briefly pointed at `app.botfleet.ios`, which has **no** App Store Connect app record.  Live ASC iOS app remains `app.botfleet` / appleId `6806379515`.
+Owner confirmed the App Store Connect app for **`app.botfleet.ios`** (appleId **`6820175685`**).  Hosted ios-ship, `scripts/ios-fleet/apps.json`, `ios/project.yml`, and `TestFlightUpdateCheck.swift` now target that record.  `ship-testflight.sh` refuses legacy **`app.botfleet`** / `6806379515`.  Widget extension bundle **`app.botfleet.ios.widgets`** is registered in the Developer Portal (owner 2026-10-08).  Universal Links AASA on `botfleet.app` still lists the legacy app ID until the owner updates hosting (out of scope for repo-only ship-ID flips).
 
-Until the owner registers `app.botfleet.ios` (and widgets) in App Store Connect, hosted ios-ship keeps `bundleId: app.botfleet` in `scripts/ios-fleet/apps.json`, matches `ios/project.yml` / `TestFlightUpdateCheck.swift`, and uses appleId `6806379515` so `latest-build-seq` and `ensure-tf-ready` can verify against the live app.  `asc-api.mjs` exact-matches `filter[bundleId]` results and can fall back to `appleId` when provided.
+## 2026-10-01 — iOS Ship IDs Stayed On `app.botfleet` Until ASC App ID Exists (superseded 2026-10-07)
+
+Schedule run [36839653889](https://github.com/Simple-With-Us/BotFleet/actions/runs/36839653889) failed the asc-seq gate (`rc=2`) because `scripts/ios-fleet/apps.json` briefly pointed at `app.botfleet.ios`, which had **no** App Store Connect app record at that time.  Live ASC iOS app was `app.botfleet` / appleId `6806379515`.
+
+Until `app.botfleet.ios` existed in App Store Connect, hosted ios-ship kept `bundleId: app.botfleet` in `scripts/ios-fleet/apps.json`, matched `ios/project.yml` / `TestFlightUpdateCheck.swift`, and used appleId `6806379515` so `latest-build-seq` and `ensure-tf-ready` could verify against the live app.  `asc-api.mjs` exact-matches `filter[bundleId]` results and can fall back to `appleId` when provided.
 
 Issue raised on the macOS signing-cert change window, where the owner approved a fleet-wide bundle rename to `app.<name>.<platform>` plus a fresh app group (`app.<name>`) and associated domain (`<name>.app`).  This document covers **BotFleet only**; the rest of the fleet (Autorotate, ContactLogo, DealDex, HogHunter, Socratic.Trade, Congress.Trade, Usage-Monitor, the MiniMax-ios companion) is on separate lanes owned by other seats.  The fleet-wide context lives in `/Users/jay/.minimax/sessions/mvs_0bdfe8c73c1046a986df888aa99dcb2e/workspace/fleet-bundle-id-plan.md`.
 
@@ -49,7 +53,7 @@ The same LaunchAgent rename is replicated outside the repo so the live harness m
 - `~/Library/LaunchAgents/com.jay.botfleet-server.plist` — `Label` → `app.botfleet.server`.  File name will move to `~/Library/LaunchAgents/app.botfleet.server.plist` on the owner's reload.
 - `/Users/jay/apps/botfleet-server-start.sh` — `PREFIX` and `~/Library/Logs/botfleet/server.log` references updated to the new label.
 - `/Users/jay/apps/botfleet-imessage-relay.py` — searched for any reference to the LaunchAgent label or bundle ID; none were found (it talks to `http://127.0.0.1:8799`, not to launchd), so the file is untouched.
-- `/Users/jay/apps/botfleet-server` (worktree) — left untouched.  It is a worktree of `jaywedgeworth22/BotFleet`; once the PR merges to `main` and the detached harness re-fetches, the source tree there will carry the new strings.
+- `/Users/jay/apps/botfleet-server` (worktree) — left untouched.  It is a worktree of the canonical BotFleet source (private operations record); once the PR merges to `main` and the detached harness re-fetches, the source tree there will carry the new strings.
 
 ## Owner Action Items
 
@@ -87,6 +91,18 @@ The same LaunchAgent rename is replicated outside the repo so the live harness m
 - **macOS safeStorage.** Changing `appId` changes the designated requirement, so the renamed executable cannot decrypt `credentials.bin`.  Before the updater swaps bundles, the still-authorized `com.botfleet.app` binary is launched with `--export-safe-storage-migration` and writes `credentials.migration.json` (mode 0600) next to `credentials.bin`.  The renamed app imports that file on first read, re-encrypts with its own `safeStorage` key, and deletes the handoff file.
 - **iOS pairing.** `CompanionConnectionStore.exportLegacyPairingToSharedStorage()` copies `UserDefaults.standard` into `group.app.botfleet` at launch without overwriting a suite that already has data.  A future rename to `app.botfleet.ios` reads the suite first, then standard.  Keychain writes use `CC8UTF7ATG.group.app.botfleet` with a private-group fallback on read.
 - **URL scheme.** Pairing QR codes use `botfleet-ios://pair`.  The iOS app also still registers legacy `botfleet://` so older links and Live Activities can land here.
+
+## A New App Record Starts With No TestFlight Groups (added 2026-10-09)
+
+A new bundle ID is a new App Store Connect app record, and it carries none of the old record's TestFlight groups or testers.  The iOS ship moved to `app.botfleet.ios` (appleId 6820175685) on Oct 7 and uploaded 14 VALID builds that reached nobody: the legacy record had an internal group ("BotFleet Testers", access to all builds) holding the owner, the new one had none, and the external "Public Beta" testers stay NOT_INVITED until a build clears Beta App Review (GH #1018).  Every run was green because `internalBuildState` only says Apple finished processing.
+
+What keeps this from recurring:
+
+- `asc-api.mjs ensure-standing-testers` (the "Sync standing TestFlight testers" step) creates or reuses an internal group with access to all builds and adds every standing email that is an App Store Connect user.  Internal testers need no Beta App Review and get each build as soon as it processes.  Emails that are not App Store Connect users stay in the external group only.
+- `asc-api.mjs ensure-tf-ready` counts the testers of internal all-builds groups after a build is processed.  When the count is zero it exits 5, and `ship-testflight.sh` logs a warning plus a `::warning` annotation instead of "internal testers can install this build".
+- Tester records are per app: an address has a separate record for every app it was added to, and assigning another app's record answers 409 "Tester(s) cannot be assigned".  The tester add creates the record for the internal group (Apple returns the app's own record when it exists) rather than reusing the first record found by email.
+
+Owner steps when a new app record appears: accept the TestFlight invitation email for the new record (it is a different app from the old install, so it is a fresh install, not an update), and rename or retire the old record so TestFlight shows one "BotFleet".
 
 ## Out Of Scope
 

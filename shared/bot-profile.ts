@@ -39,6 +39,40 @@ export function toolRoundsCaption(): string {
  *  Returns the effective number rather than `undefined` so callers stop
  *  re-deriving "12 because nothing said otherwise" in three separate places
  *  and disagreeing about it. */
+/** Why the scheduler may not start a bot's work right now.
+ *
+ *  Only the values the loop actually branches on.  A value such as
+ *  `"blocked"` (a breaker refusing work silently) was considered and
+ *  rejected: the tick loop is `if (busy) continue; if (missing) failRun(...)`
+ *  and then it dispatches, so any value that is not branched on
+ *  reaches the dispatch attempt and is indistinguishable from `"ready"` at
+ *  every call site.  Adding the value without a branch for it would have
+ *  looked like a fix while changing nothing.  The loop must handle a new value
+ *  explicitly (routines.ts `tick`) before it may be produced.
+ *
+ *  `"off"` is the one that has those branches: the bot's On/Off switch
+ *  (shared/bot-power.ts).  Schedule ticks, webhook and resource enqueues and
+ *  the queued-run loop all record a skipped receipt for it and never dispatch,
+ *  and a queued run is settled, not left to wait for the bot to come back.
+ *
+ *  Declared once here rather than spelled out in `routines.ts`, `webhooks.ts`
+ *  and `resource-triggers.ts`, where three independent copies of the union had
+ *  already drifted apart once. */
+export type BotDispatchState = "ready" | "busy" | "missing" | "off";
+
+/** One reason a dispatch is being held, in words fit for a receipt.
+ *
+ *  `canStart` used to return a bare boolean, so a run that stayed queued for
+ *  fifteen minutes gave nobody anything to read.  A reason is only useful if it
+ *  names the ENGINE rather than the symptom, because the symptom ("waiting")
+ *  is identical whether the CLI is missing, the account is capped, or the fleet
+ *  is over its spend ceiling. */
+export interface DispatchHold {
+  reason: string;
+  /** What the operator can do about it, when there is something. */
+  hint?: string;
+}
+
 export function effectiveToolRounds(
   configured: number | undefined,
 ): { rounds: number; explicit: boolean } {

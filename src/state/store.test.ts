@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   configStatusFromFrame,
+  MessagePostResponseSchema,
+  TaskSwitchResponseSchema,
   getRoomTerminology,
   initialState,
   isHarnessUnreachableError,
@@ -18,6 +20,65 @@ import {
   type Group,
   type Message,
 } from "./store";
+
+describe("API response contracts", () => {
+  const bot = {
+    id: "bot-1",
+    threadId: "thread-1",
+    name: "Bot",
+    title: "Bot",
+    description: "A test bot",
+    notifications: true,
+    color: "blue",
+    unread: false,
+    modelSelection: { instanceId: "engine-1", model: "model-1" },
+    messages: [],
+  };
+
+  it("keeps only the task-switch thread identity and rejects a bad envelope", () => {
+    const parsed = TaskSwitchResponseSchema.safeParse({
+      bot: {
+        ...bot,
+        messages: [{ id: "m1", role: "user", kind: "text", at: 1, injected: true }],
+        unexpected: true,
+      },
+    });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.bot).toEqual({ id: "bot-1", threadId: "thread-1" });
+    expect(TaskSwitchResponseSchema.safeParse({ bot, extra: true }).success).toBe(false);
+    expect(TaskSwitchResponseSchema.safeParse({ bot: { ...bot, threadId: 42 } }).success).toBe(false);
+    expect(TaskSwitchResponseSchema.safeParse({ bot: { id: "bot-1" } }).success).toBe(false);
+  });
+
+  it("accepts each message post outcome and rejects unvalidated fields", () => {
+    expect(MessagePostResponseSchema.safeParse({ ok: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, steered: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, ignored: "self_echo" }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, replayed: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, steered: true, replayed: true }).success).toBe(true);
+    expect(
+      MessagePostResponseSchema.safeParse({
+        ok: true,
+        ignored: "self_echo",
+        replayed: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      MessagePostResponseSchema.safeParse({
+        ok: true,
+        queued: true,
+        queueId: "queue-1",
+        threadId: "thread-1",
+        replayed: true,
+      }).success,
+    ).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, queued: true, queueId: 7, threadId: "thread-1" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, extra: "unexpected" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, ignored: "other" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, replayed: false }).success).toBe(false);
+  });
+});
 
 describe("renderer hydration recovery", () => {
   const retainedBot = {
@@ -1040,5 +1101,259 @@ describe("instances ordering guard", () => {
     // Ordering holds again from that stamp on.
     const late = reducer(restarted, { type: "instances", instances: [engine("late")], describedAt: 3_000 });
     expect(late.instances[0].snapshot.version).toBe("restarted");
+  });
+});
+
+describe("viewed thread pin stays with its selection", () => {
+  const bot = (id: string, threadId: string): Bot => ({
+    id,
+    threadId,
+    name: id,
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "x", model: "y" },
+    messages: [],
+  });
+
+  const pinned = {
+    ...initialState,
+    bots: [bot("a", "thread-a"), bot("b", "thread-b")],
+    selectedId: "a",
+    viewedThreadId: "app-thread",
+  };
+
+  it("drops the pin when botAdded selects the new bot", () => {
+    const next = reducer(pinned, { type: "botAdded", bot: bot("c", "thread-c") });
+    expect(next.selectedId).toBe("c");
+    expect(next.viewedThreadId).toBeNull();
+  });
+
+  it("keeps the pin when botAdded folds the bot that is already selected", () => {
+    const next = reducer(pinned, { type: "botAdded", bot: bot("a", "thread-a") });
+    expect(next.selectedId).toBe("a");
+    expect(next.viewedThreadId).toBe("app-thread");
+  });
+
+  it("drops the pin when the selected bot is deleted and keeps it otherwise", () => {
+    const deleted = reducer(pinned, { type: "deleteBot", botId: "a" });
+    expect(deleted.selectedId).not.toBe("a");
+    expect(deleted.viewedThreadId).toBeNull();
+    const other = reducer(pinned, { type: "deleteBot", botId: "b" });
+    expect(other.selectedId).toBe("a");
+    expect(other.viewedThreadId).toBe("app-thread");
+  });
+
+  it("drops the pin when hydrate has to move the selection, and keeps it when the bot remains", () => {
+    const moved = reducer(pinned, {
+      type: "hydrate",
+      bots: [bot("b", "thread-b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(moved.selectedId).toBe("b");
+    expect(moved.viewedThreadId).toBeNull();
+    const kept = reducer(pinned, {
+      type: "hydrate",
+      bots: [bot("a", "thread-a"), bot("b", "thread-b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(kept.selectedId).toBe("a");
+    expect(kept.viewedThreadId).toBe("app-thread");
+  });
+});
+
+describe("task switch transcript", () => {
+  const message = (id: string): Message => ({ id, role: "user", kind: "text", text: id, at: 1 });
+  const bot = (threadId: string, messages: Message[]): Bot => ({
+    id: "a",
+    threadId,
+    name: "a",
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "x", model: "y" },
+    messages,
+  });
+
+  it("keeps the transcript when a task switch ack omits messages", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("old-thread", [message("old")])],
+      selectedId: "a",
+      viewedThreadId: "new-thread",
+    };
+    const next = reducer(state, { type: "taskSwitched", bot: { id: "a", threadId: "new-thread" } });
+    expect(next.bots[0]?.threadId).toBe("new-thread");
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["old"]);
+    expect(next.viewedThreadId).toBeNull();
+  });
+
+  it("replaces the transcript when a later bot frame is a different thread's snapshot", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("new-thread", [message("old")])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("new-thread", [message("fresh")]), messages: [message("fresh")] },
+    });
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
+  });
+
+  it("does not replace a same-thread snapshot that overlaps the current transcript", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("same", [message("keep"), message("local")])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("same", [message("keep")]), messages: [message("keep")] },
+    });
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["keep", "local"]);
+  });
+
+  it("replaces the retained transcript when the new thread snapshot is empty", () => {
+    const held = reducer(
+      {
+        ...initialState,
+        bots: [bot("old-thread", [message("old")])],
+        selectedId: "a",
+      },
+      { type: "taskSwitched", bot: { id: "a", threadId: "new-thread" } },
+    );
+    expect(held.bots[0]?.threadId).toBe("new-thread");
+    expect(held.bots[0]?.messages.map((entry) => entry.id)).toEqual(["old"]);
+    const next = reducer(held, {
+      type: "botPatched",
+      bot: { ...bot("new-thread", []), messages: [] },
+    });
+    expect(next.bots[0]?.threadId).toBe("new-thread");
+    expect(next.bots[0]?.messages).toEqual([]);
+  });
+
+  it("applies a non-empty snapshot when the client transcript is empty", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("thread", [])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("thread", [message("fresh")]), messages: [message("fresh")] },
+    });
+    expect(next.bots[0]?.threadId).toBe("thread");
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
+  });
+});
+
+// The Fleet Matrix overview closes when the person picks a chat, and only then.
+// `selectedId` cannot say that: a click on the open chat leaves it unchanged,
+// and the store rewrites it by itself when a hydrate loses the selection or a
+// delete falls back.  `selectionNonce` is the signal, so this pins which
+// actions move it.
+describe("selectionNonce", () => {
+  const botNamed = (id: string) =>
+    ({
+      id,
+      threadId: `${id}-thread`,
+      name: id,
+      title: "",
+      description: "",
+      notifications: true,
+      color: "blue",
+      unread: false,
+      modelSelection: { instanceId: "x", model: "y" },
+      messages: [],
+    }) satisfies Bot;
+  const roomNamed = (id: string) =>
+    ({
+      id,
+      threadId: `${id}-thread`,
+      name: id,
+      memberIds: ["a"],
+      defaultResponder: { kind: "everyone" },
+      bulletin: "",
+      unread: false,
+      createdAt: 1,
+      messages: [],
+    }) satisfies Group;
+  const open = {
+    ...initialState,
+    bots: [botNamed("a"), botNamed("b")],
+    groups: [roomNamed("room")],
+    selectedId: "a",
+  };
+
+  it("counts picking another bot or a room", () => {
+    const toBot = reducer(open, { type: "select", id: "b" });
+    expect(toBot.selectionNonce).toBe(open.selectionNonce + 1);
+    const toRoom = reducer(toBot, { type: "select", id: "room" });
+    expect(toRoom.selectionNonce).toBe(open.selectionNonce + 2);
+  });
+
+  it("counts a click on the chat that is already open, which selectedId cannot show", () => {
+    const sameBot = reducer(open, { type: "select", id: "a" });
+    expect(sameBot.selectedId).toBe(open.selectedId);
+    expect(sameBot.selectionNonce).toBe(open.selectionNonce + 1);
+
+    const inRoom = { ...open, selectedId: "room" };
+    const sameRoom = reducer(inRoom, { type: "select", id: "room" });
+    expect(sameRoom.selectedId).toBe("room");
+    expect(sameRoom.selectionNonce).toBe(inRoom.selectionNonce + 1);
+  });
+
+  it("counts a new bot taking the selection, not a second fold of the bot already on screen", () => {
+    const added = reducer(open, { type: "botAdded", bot: botNamed("c") });
+    expect(added.selectedId).toBe("c");
+    expect(added.selectionNonce).toBe(open.selectionNonce + 1);
+    const refolded = reducer(added, { type: "botAdded", bot: botNamed("c") });
+    expect(refolded.selectedId).toBe("c");
+    expect(refolded.selectionNonce).toBe(added.selectionNonce);
+  });
+
+  it("does not move for a bot or room update streamed in the background", () => {
+    const busy = reducer(open, { type: "botPatched", bot: { ...botNamed("a"), busy: true } });
+    const arrived = reducer(busy, { type: "botPatched", bot: botNamed("elsewhere") });
+    const room = reducer(arrived, { type: "groupPatched", group: { id: "room", unread: true } });
+    const thread = reducer(room, { type: "taskSwitched", bot: { id: "a", threadId: "a-other" } });
+    expect(thread.selectionNonce).toBe(open.selectionNonce);
+  });
+
+  it("does not move when hydrate picks the first bot at launch or after the selection vanished", () => {
+    const launch = reducer(initialState, {
+      type: "hydrate",
+      bots: [botNamed("a"), botNamed("b")],
+      groups: [roomNamed("room")],
+      computerControl: {},
+    });
+    expect(launch.selectedId).toBe("a");
+    expect(launch.selectionNonce).toBe(initialState.selectionNonce);
+
+    const lost = reducer({ ...open, selectedId: "gone" }, {
+      type: "hydrate",
+      bots: [botNamed("b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(lost.selectedId).toBe("b");
+    expect(lost.selectionNonce).toBe(open.selectionNonce);
+  });
+
+  it("does not move when a delete makes the store fall back to another chat", () => {
+    const roomGone = reducer({ ...open, selectedId: "room" }, { type: "groupDeleted", groupId: "room" });
+    expect(roomGone.selectedId).toBe("a");
+    expect(roomGone.selectionNonce).toBe(open.selectionNonce);
+
+    const botGone = reducer(open, { type: "deleteBot", botId: "a" });
+    expect(botGone.selectedId).toBe("b");
+    expect(botGone.selectionNonce).toBe(open.selectionNonce);
   });
 });

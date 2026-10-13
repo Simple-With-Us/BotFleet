@@ -8,13 +8,13 @@
 
 ## What landed
 
-- **C7** Site Download CTA and previous-builds link now go to `jaywedgeworth22/botfleet-releases`.  Mac button prefers `BotFleet.dmg` via GitHub `latest/download`.
+- **C7** Site Download CTA and previous-builds link now point at the current release location.  Mac button prefers `BotFleet.dmg` via the latest download asset.
 - **C8** `--ink-muted` is defined on the site stylesheet (`#6b7280`).
-- **C6** README relationship paragraph: this distribution is `jaywedgeworth22/BotFleet`, a friendly fork of `milind-soni/OpenMausBot`.  Releases live in `jaywedgeworth22/botfleet-releases`.  Quick start points at latest assets, not frozen `v0.1.37`.
+- **C6** README relationship paragraph: this distribution is a friendly fork of `milind-soni/OpenMausBot`.  Releases live at the current release location.  Quick start points at latest assets, not frozen `v0.1.37`.
 - **Site honesty:** example fleet is Builder / Reviewer / Scout (no Director ladder).  iPhone companion, iPad compatibility mode.  Studio (light) is the first-visit theme; System Auto is a picker row.  Fallback card is Beta / in review, not "degrades automatically."  Closed-app copy says SSE + local notifications while open.  Provenance cites verified PRs only (`#89`, `#12`, `#26`) or host/main notes.
 - **C1** Prod `wrangler.jsonc` `REGISTRATION_MODE` is `closed`.
 - **C2** Session upgrade attempts persist on the existing D1 `installations` table (`session_upgrade_attempted`, migration `0002_session_upgrade.sql`).  Cold isolates no longer recreate Sessions forever.  Concurrent create uses a compare-and-swap `UPDATE`.
-- **SEC** SECURITY.md documents packaged `safeStorage` migration and GitHub private vulnerability reporting on `jaywedgeworth22/BotFleet`.  Upstream mailbox removed.
+- **SEC** SECURITY.md documents packaged `safeStorage` migration and private vulnerability reporting for this distribution.  Upstream mailbox removed.
 - **LOG** Resource-triggers (#65/#80) and iOS Sentry Cocoa (#55) moved to Completed with a GROK correction note.  Delta-audit implementation row is In Progress.
 
 Audit register: `docs/audits/2026-09-01-delta-audit.md`.
@@ -27,7 +27,7 @@ D1 was already bound (`botfleet-composio`, `database_id` 435bcde1-…).  This pa
 
 - **Inspector / Computer / Settings overlay layout** from the 31 Aug audit.  Dedicated PR.  Do not mix with copy or broker work.
 - Batch 1 fallbacks (`server/index.ts`), Batch 2 ATS (`ios/project.yml`), Batch 3 Electron trust (`electron/main.mjs`), CSS `@theme` (`src/styles.css`), `telemetry.ts` handoff-file read, DeepSeek prices, deleteBot / avatarCrop / VM stall.
-- Cut a `v0.1.38` GitHub release in `botfleet-releases` when packaging is ready.  This unit does not cut one.
+- Cut a `v0.1.38` release when packaging is ready.  This unit does not cut one.
 - Apply broker migration 0002 remotely, then deploy the Worker so C1 is live on workers.dev.
 
 ## Verify

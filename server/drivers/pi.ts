@@ -55,6 +55,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
+import { applyLaunchIdentity } from "../launch-identity.ts";
 import {
   decodeInjectId,
   encodeInjectId,
@@ -457,7 +458,13 @@ function piEnvironment(source: Record<string, string | undefined>): Record<strin
 
 export const PiDriver: ProviderDriver<PiConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "pi", supportsMultipleInstances: true, access: "custom" },
+  metadata: {
+    displayName: "pi",
+    supportsMultipleInstances: true,
+    access: "custom",
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "npm install -g @earendil-works/pi-coding-agent",
@@ -563,11 +570,14 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           return spawnCli(config.cli, childArgs, {
             stdio: ["pipe", "pipe", "pipe"],
             cwd: turn.cwd,
-            env: piEnvironment({
-              ...process.env,
-              ...input.environment,
-              ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
-            }),
+            env: applyLaunchIdentity(
+              piEnvironment({
+                ...process.env,
+                ...input.environment,
+                ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
+              }),
+              turn.launchIdentity,
+            ),
           });
         } catch (err) {
           if (mcpTempDir) {
@@ -1050,6 +1060,11 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // xhigh/max only land on models that expose them; pi rejects an
           // unsupported level and the turn keeps the engine default.
           effortLevels: EFFORT_LEVELS,
+          // pi core runs its own bash/edit/write without asking, in every
+          // mode (fullAuto changes nothing here); only host-control MCP calls
+          // reach a card, and auto-review never answers those.  Its steps do
+          // arrive as tool_execution_start, so review can watch them.
+          reviewHook: "after",
           // Jobs matrix: BotFleet's own job tools arrive through the same
           // pi-mcp-extension that already carries ask_bot, and the chain is
           // proven end to end in server/drivers/pi-jobs.test.ts — the real

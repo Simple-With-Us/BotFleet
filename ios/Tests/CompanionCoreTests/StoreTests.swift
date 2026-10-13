@@ -373,6 +373,66 @@ final class StoreTests: XCTestCase {
         XCTAssertNil(state.pendingQueued[threadId])
     }
 
+    func testQueuedSendKeepsRawTextAndAttachmentsForEditRestore() throws {
+        var state = CompanionState()
+        let threadId = "t-queued-edit"
+        let attachment = PendingChatAttachment(name: "shot.png", mime: "image/png", data: Data("x".utf8))
+        let composed = ChatAttachments.composeMessage(
+            text: "check this",
+            attachments: [ChatPromptAttachment(kind: .image, path: "/tmp/shot.png")]
+        )
+        state.rememberPendingSend(
+            threadId: threadId,
+            id: "q-edit",
+            text: composed,
+            queued: true,
+            rawText: "check this",
+            attachments: [attachment]
+        )
+        let entry = try XCTUnwrap(state.pendingQueued[threadId]?.first)
+        XCTAssertEqual(entry.rawText, "check this")
+        XCTAssertEqual(entry.text, composed)
+        XCTAssertEqual(entry.attachments.count, 1)
+        XCTAssertEqual(entry.attachments.first?.name, "shot.png")
+        let restored = entry.rawText ?? entry.text
+        let resent = ChatAttachments.composeMessage(
+            text: restored,
+            attachments: [ChatPromptAttachment(kind: .image, path: "/tmp/shot.png")]
+        )
+        XCTAssertEqual(resent.components(separatedBy: "<attached-image").count - 1, 1)
+    }
+
+    func testLegacyQueuedSendWithoutRawTextRestoresComposedTextWithoutAttachments() {
+        let attachment = PendingChatAttachment(name: "shot.png", mime: "image/png", data: Data("x".utf8))
+        let composed = ChatAttachments.composeMessage(
+            text: "check this",
+            attachments: [ChatPromptAttachment(kind: .image, path: "/tmp/shot.png")]
+        )
+        let entry = QueuedSend(
+            queueId: "q-legacy",
+            text: composed,
+            rawText: nil,
+            attachments: [attachment],
+            queued: true
+        )
+        let draft: String
+        let restoredAttachments: [PendingChatAttachment]
+        if let rawText = entry.rawText {
+            draft = rawText
+            restoredAttachments = entry.attachments
+        } else {
+            draft = entry.text
+            restoredAttachments = []
+        }
+        XCTAssertEqual(draft, composed)
+        XCTAssertTrue(restoredAttachments.isEmpty)
+        let resent = ChatAttachments.composeMessage(
+            text: draft,
+            attachments: restoredAttachments.map { ChatPromptAttachment(kind: $0.kind, path: "/tmp/shot.png") }
+        )
+        XCTAssertEqual(resent.components(separatedBy: "<attached-image").count - 1, 1)
+    }
+
 
     // MARK: - Bots
 

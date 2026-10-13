@@ -32,8 +32,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: pnpm
@@ -47,12 +47,13 @@ jobs:
       - name: Resolve the Sentry DSN
         uses: ./.github/actions/infisical-secrets
         with:
-          names: SENTRY_DSN VITE_SENTRY_DSN
+          names: SENTRY_DSN VITE_SENTRY_DSN SENTRY_AUTH_TOKEN
           project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
           client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
         env:
           GH_FALLBACK_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          GH_FALLBACK_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
 
       # Vite inlines VITE_SENTRY_DSN at build time, so it must be in the
       # environment before the package step runs.  Infisical/GitHub hold no
@@ -114,8 +115,14 @@ jobs:
           fi
           [ -f "$res/app-update.yml" ] || { echo "::error::missing $res/app-update.yml"; fail=1; }
           if [ -f "$res/app-update.yml" ]; then
+            # `owner` and `repo` are separate keys in the generated file, and
+            # only the repo was being checked — so a build that fell back to the
+            # former owner would have passed this gate while the error message
+            # claimed the owner was verified. Check both.
+            grep -q "^owner: Simple-With-Us$" "$res/app-update.yml" || {
+              echo "::error::app-update.yml does not point at Simple-With-Us/BotFleet releases"; fail=1; }
             grep -q "^repo: BotFleet$" "$res/app-update.yml" || {
-              echo "::error::app-update.yml does not point at jaywedgeworth22/BotFleet releases"; fail=1; }
+              echo "::error::app-update.yml does not point at Simple-With-Us/BotFleet releases"; fail=1; }
             # while the build is unsigned, a publisherName makes
             # electron-updater reject every update as untrusted
             if grep -q "publisherName" "$res/app-update.yml"; then
@@ -151,7 +158,7 @@ jobs:
           kill $pid 2>/dev/null || true
           exit 1
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-installer
           path: |
@@ -170,8 +177,8 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
-      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: pnpm
@@ -265,7 +272,7 @@ jobs:
           fi
       - name: Archive the unsigned app
         run: ditto -c -k --sequesterRsrc --keepParent release/mac-arm64/BotFleet.app release/BotFleet-unsigned-arm64.zip
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: botfleet-unsigned-macos-arm64
           path: release/BotFleet-unsigned-arm64.zip

@@ -20,7 +20,7 @@ The GitHub repo still carried OpenMausBot's Polar support-payment links (README 
 grep -RInE 'polar\.sh|Support the project' README.md apps/site .github || true
 test ! -f .github/FUNDING.yml
 node apps/site/build.mjs
-gh repo view jaywedgeworth22/BotFleet --json description
+gh repo view Simple-With-Us/BotFleet --json description
 ```
 
 Docs and site copy only.  App icons untouched.

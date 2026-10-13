@@ -149,7 +149,17 @@ type SkillRecordingPayload = {
       personalVoice?: {
         isAvailable(): Promise<boolean>;
         list(): Promise<Array<{ id: string; name: string; locale?: string }>>;
-        speak(text: string, voiceId?: string): Promise<void>;
+        /** `onRange` fires as each word is about to be spoken.  `location`
+         * and `length` are UTF-16 offsets into `text` (JavaScript string
+         * indices); `elapsedMs` is the synthesizer's own clock since speech
+         * began, or null. */
+        speak(
+          text: string,
+          voiceId?: string,
+          options?: {
+            onRange?: (range: { location: number; length: number; elapsedMs: number | null }) => void;
+          },
+        ): Promise<void>;
         stop(): Promise<void>;
       };
       skillRecorder?: {
@@ -164,6 +174,16 @@ type SkillRecordingPayload = {
         status(): Promise<{ configured: boolean }>;
         setKey(value: string): Promise<{ configured: boolean }>;
         streamingToken(): Promise<{ token: string; expiresInSeconds: number }>;
+      };
+      // Speech-to-speech session tokens.  The permanent provider key stays in
+      // the encrypted main-process store; the renderer only ever receives one
+      // of these short-lived, single-session tokens, exactly like
+      // transcription.streamingToken above.
+      sts?: {
+        /** Which STS providers have a credential configured. */
+        status(): Promise<{ xai: boolean; gemini: boolean }>;
+        xaiToken(): Promise<{ token: string; expiresInSeconds: number }>;
+        geminiToken(): Promise<{ token: string; expiresInSeconds: number }>;
       };
       /** Absolute path of a dropped File ("" when the drag carried no
        * file on disk). Absent in older builds of the shell. */

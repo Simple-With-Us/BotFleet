@@ -4,13 +4,13 @@ The marketing / status site for **[BotFleet.app](https://botfleet.app)**.  A sta
 
 ## Deploy source of truth
 
-This directory (`apps/site` in the `jaywedgeworth22/BotFleet` monorepo) is the **only** deploy source for `botfleet.app`.  Vercel project `botfleet-site` has Root Directory set to `apps/site` and builds (`npm run build` → `node build.mjs`) on every push to this monorepo's `main` — whatever is committed here is what ships, gated by `vercel-ignore-hourly.sh` (skips previews, skips commits that did not touch site files, production at most once per three hours unless `VERCEL_FORCE_DEPLOY=1`).  The cooldown requires `VERCEL_TOKEN` and `VERCEL_PROJECT_ID` in the Vercel build environment; if either is missing or the Vercel deployment-status API fails, the ignored-build step skips the automatic production deploy rather than bypassing the limit. An empty successful deployment history permits the first deploy. `VERCEL_ORG_ID` is optional for team-scoped projects. There is no GitHub Actions workflow for the site in this monorepo; Vercel's own Git integration does the build, no Action needed.
+This directory (`apps/site` in the `Simple-With-Us/BotFleet` monorepo) is the **only** deploy source for `botfleet.app`.  Builds (`npm run build` → `node build.mjs`) trigger on push to `main` — whatever is committed here is what ships, gated by `vercel-ignore-hourly.sh` (skips previews, skips commits that did not touch site files, production at most once per three hours unless forced).  Hosting credentials and project settings live in the private operations inventory and deployment environment.
 
-A separate `jaywedgeworth22/botfleet-site` repo previously also deployed to the same Vercel project and the two fought over which build won.  That repo no longer exists (confirmed 404 via the GitHub API on 2026-09-02) so there is nothing left to disable.  If it is ever recreated or reconnected to the `botfleet-site` Vercel project, its deploy workflow must be disabled (or the project's Git integration repointed here) before it is allowed to push again — otherwise the dual-deploy race comes back.
+This directory is the single source of truth for the site.  Deployment history — including a retired standalone site repository that once deployed to the same domain and fought this build for which version won — is recorded in the private operations inventory rather than here.
 
 ## Stack
 
-Static HTML/CSS rendered from `features.json` via `node build.mjs`, hosted on Vercel.  DNS is a Cloudflare zone (`botfleet.app`) on the Usage.Jays.Services account; the registrar is Namecheap with nameservers pointed at Cloudflare.
+Static HTML/CSS rendered from `features.json` via `node build.mjs`, hosted on Vercel.  DNS is a Cloudflare zone for the product domain; the account, zone ids, registrar and nameserver values live in the private operations inventory.
 
 - `features.json` — the feature list (the only file to edit for content changes).
 - `template.html` + `build.mjs` — render `dist/index.html` from the data.
@@ -44,7 +44,7 @@ Edit `features.json`, run `node build.mjs` (or `npm run build`), push to
 - No internal agent seat names on the public site.
 - The bot roster is an example fleet, not a product claim — keep it framed that way.
 
-Manual deploy fallback: `vercel deploy --prod` from `apps/site` (project `botfleet-site`).
+Manual deploy fallback: `vercel deploy --prod` from `apps/site`.  The project name is in the private operations inventory, not here.
 
 ## Coordination
 

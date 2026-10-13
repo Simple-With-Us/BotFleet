@@ -19,17 +19,26 @@ import {
   getOrOpenSession,
   inspectTransportError,
   isTransportFailure,
+  liveActivityContent,
+  liveActivityPayload,
+  liveActivityTopic,
+  parseLiveActivitySource,
   providerToken,
   resetProviderTokens,
   retryAfterMs,
   sendApnsAlert,
+  sendApnsLiveActivity,
   startHttp2PingKeepalive,
   tokenIsDead,
   watchHarnessNotifications,
   APNS_CIRCUIT_WINDOW_MS,
   APNS_TRANSPORT_SUMMARY_MS,
   APNS_TRANSPORT_THRESHOLD,
+  APPLE_REFERENCE_DATE_OFFSET,
+  DEFAULT_LIVE_ACTIVITY_COLOR,
+  LIVE_ACTIVITY_ATTRIBUTES_TYPE,
   type ApnsConfig,
+  type ApnsSendOptions,
   type ApnsPayload,
   type Http2ApnsSession,
   type Http2SessionFactory,
@@ -72,7 +81,7 @@ function testConfig(overrides: Partial<ApnsConfig> = {}): ApnsConfig {
   return {
     keyId: "ABC123",
     teamId: "TEAMID1",
-    bundleId: "app.botfleet",
+    bundleId: "app.botfleet.ios",
     p8: testP8(),
     production: true,
     ...overrides,
@@ -300,7 +309,7 @@ describe("sendApnsAlert", () => {
     expect(result).toEqual({ ok: true, status: 200, attempts: 1, failureKind: "none" });
     expect(url).toBe(`https://api.push.apple.com/3/device/${token}`);
     expect(headers?.get("apns-push-type")).toBe("alert");
-    expect(headers?.get("apns-topic")).toBe("app.botfleet");
+    expect(headers?.get("apns-topic")).toBe("app.botfleet.ios");
     expect(body.aps?.alert).toEqual({ title: "Scout finished", body: "done" });
     expect(body.aps?.["content-available"]).toBe(1);
     expect(body.aps?.category).toBe("BOTFLEET_UPDATE");
@@ -1396,6 +1405,465 @@ describe("watchHarnessNotifications", () => {
     });
     expect(watch.health().configured).toBe(false);
     expect(watch.health().production).toBeNull();
+    watch.stop();
+  });
+
+  // Live Activity pushes: the island a phone wears, not the banner it hears.
+  // These pin the JSON contract against `BotActivityAttributes` in
+  // ios/Shared/BotActivity.swift — the widget decodes it, so a renamed key is
+  // an island that quietly stops updating.
+  it("starts a Live Activity with the attributes type, an alert, and a Date as a number", () => {
+    const since = Date.UTC(2026, 9, 11, 22, 0, 0);
+    const body = liveActivityPayload(
+      "start",
+      { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+      {
+        face: "thinking",
+        kind: "needsYou",
+        headline: "Forge needs you",
+        line: "Run rm -rf ./build",
+        requestId: "req-7",
+        options: ["Allow", "Deny"],
+        isPermission: true,
+        since: (since - APPLE_REFERENCE_DATE_OFFSET * 1000) / 1000,
+      },
+      { title: "Forge needs you", body: "Run rm -rf ./build" },
+      { timestamp: 1_800_000_000 },
+    );
+    expect(body.aps["attributes-type"]).toBe(LIVE_ACTIVITY_ATTRIBUTES_TYPE);
+    expect(body.aps["attributes-type"]).toBe("BotActivityAttributes");
+    expect(body.aps.attributes).toEqual({ botId: "b1", threadId: "t1", name: "Scout", color: "coral" });
+    expect(body.aps.alert).toEqual({ title: "Forge needs you", body: "Run rm -rf ./build" });
+    expect(body.aps.event).toBe("start");
+    expect(body.aps.timestamp).toBe(1_800_000_000);
+    // A Swift `Date` decodes from seconds since the Apple reference date, so
+    // the number here is the Unix time MINUS 978307200 — never an ISO string.
+    expect(body.aps["content-state"].since).toBe(since / 1000 - APPLE_REFERENCE_DATE_OFFSET);
+    expect(Number.isFinite(body.aps["content-state"].since)).toBe(true);
+    expect(JSON.stringify(body)).not.toContain("T00:00");
+  });
+
+  it("gives a start an alert even when the caller has none to give", () => {
+    // Apple rejects a start with no alert, so the builder never emits one.
+    const body = liveActivityPayload(
+      "start",
+      { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+      {
+        face: "thinking",
+        kind: "needsYou",
+        headline: "Forge needs you",
+        line: "Run rm -rf ./build",
+        options: [],
+        isPermission: false,
+        since: 800_000_000,
+      },
+      undefined,
+      { timestamp: 1 },
+    );
+    expect(body.aps.alert).toEqual({ title: "Forge needs you", body: "Run rm -rf ./build" });
+  });
+
+  it("sends attributes on the start alone, and leaves requestId out when there is none", () => {
+    const attributes = { botId: "b1", threadId: "t1", name: "Scout", color: "coral" };
+    const state = {
+      face: "thinking",
+      kind: "needsYou",
+      headline: "Forge needs you",
+      line: "Run rm -rf ./build",
+      options: ["Allow", "Deny"],
+      isPermission: true,
+      since: 800_000_000,
+    };
+    for (const event of ["update", "end"] as const) {
+      const body = liveActivityPayload(event, attributes, state, undefined, { timestamp: 2 });
+      expect(body.aps.event).toBe(event);
+      expect(body.aps.attributes).toBeUndefined();
+      expect(body.aps["attributes-type"]).toBeUndefined();
+      expect(body.aps.alert).toBeUndefined();
+      expect(body.aps.timestamp).toBe(2);
+      // requestId is `String?` in Swift; an absent optional decodes as nil,
+      // and a literal null is what a hand-written encoder would have sent.
+      expect("requestId" in body.aps["content-state"]).toBe(false);
+      expect(JSON.stringify(body)).not.toContain("null");
+    }
+    const dismissal = liveActivityPayload("end", attributes, state, undefined, { timestamp: 3, dismissalDate: 4 });
+    expect(dismissal.aps["dismissal-date"]).toBe(4);
+  });
+
+  it("addresses Live Activity pushes to the bundle's own channel", () => {
+    // Derived, not spelled out: a build that moves between sandbox and
+    // production moves both channels together.
+    expect(liveActivityTopic("app.botfleet.ios")).toBe("app.botfleet.ios.push-type.liveactivity");
+    expect(liveActivityTopic("app.botfleet.ios")).not.toBe("app.botfleet.ios");
+  });
+
+  it("posts a liveactivity push with its own topic, type and start priority", async () => {
+    const seen: { topic: string | null; pushType: string | null; priority: string | null; auth: string | null; body: string }[] = [];
+    // Typed by assignment, not asserted: the stand-in IS a fetch.
+    const fetchImpl: NonNullable<ApnsSendOptions["fetchImpl"]> = async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      seen.push({
+        topic: headers.get("apns-topic"),
+        pushType: headers.get("apns-push-type"),
+        priority: headers.get("apns-priority"),
+        auth: headers.get("authorization"),
+        body: String(init?.body),
+      });
+      return new Response("", { status: 200 });
+    };
+    const result = await sendApnsLiveActivity(
+      testConfig(),
+      "ab".repeat(32),
+      {
+        event: "start",
+        attributes: { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+        state: {
+          face: "thinking",
+          kind: "needsYou",
+          headline: "Scout needs you",
+          line: "done",
+          options: [],
+          isPermission: false,
+          since: 812_345_678.5,
+        },
+        timestamp: 1_800_000_000,
+      },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].pushType).toBe("liveactivity");
+    expect(seen[0].topic).toBe("app.botfleet.ios.push-type.liveactivity");
+    // 10 is what creates the island; an update could not use it.
+    expect(seen[0].priority).toBe("10");
+    expect(seen[0].auth).toMatch(/^bearer /);
+    expect(JSON.parse(seen[0].body).aps["content-state"].since).toBe(812_345_678.5);
+  });
+
+  it("gives an update or an end the power-friendly priority", async () => {
+    const priorities: (string | null)[] = [];
+    const config = testConfig();
+    const fetchImpl: NonNullable<ApnsSendOptions["fetchImpl"]> = async (_input, init) => {
+      priorities.push(new Headers(init?.headers).get("apns-priority"));
+      return new Response("", { status: 200 });
+    };
+    const state = {
+      face: "thinking",
+      kind: "needsYou",
+      headline: "Scout needs you",
+      line: "done",
+      options: [],
+      isPermission: false,
+      since: 1,
+    };
+    const attributes = { botId: "b1", threadId: "t1", name: "Scout", color: "coral" };
+    await sendApnsLiveActivity(config, "ab".repeat(32), { event: "update", attributes, state }, { fetchImpl });
+    await sendApnsLiveActivity(config, "ab".repeat(32), { event: "end", attributes, state }, { fetchImpl });
+    expect(priorities).toEqual(["5", "5"]);
+  });
+
+  it("refuses a malformed Live Activity token before it reaches Apple", async () => {
+    let called = 0;
+    const fetchImpl: NonNullable<ApnsSendOptions["fetchImpl"]> = async () => {
+      called += 1;
+      return new Response("", { status: 200 });
+    };
+    const result = await sendApnsLiveActivity(
+      testConfig(),
+      "not-hex",
+      {
+        event: "start",
+        attributes: { botId: "b1", threadId: "t1", name: "Scout", color: "coral" },
+        state: { face: "idle", kind: "working", headline: "h", line: "l", options: [], isPermission: false, since: 1 },
+      },
+      { fetchImpl },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(400);
+    expect(result.reason).toBe("BadDeviceToken");
+    expect(called).toBe(0);
+  });
+
+  it("degrades a frame from an older harness instead of refusing it", () => {
+    // The harness that predates botName/color/options/isPermission sends none
+    // of them, and the island should still start rather than be skipped.
+    const content = liveActivityContent(
+      { kind: "approval", title: "Forge needs you", body: "Run rm -rf ./build", threadId: "t1", botId: "b1", requestId: "req-7" },
+      Date.UTC(2026, 9, 11, 22, 0, 0),
+    );
+    expect(content.attributes.name).toBe("Forge needs you");
+    expect(content.attributes.color).toBe(DEFAULT_LIVE_ACTIVITY_COLOR);
+    expect(content.state.kind).toBe("needsYou");
+    expect(content.state.face).toBe("thinking");
+    expect(content.state.isPermission).toBe(true);
+    // A permission card offers the verdict; a question wants an answer typed.
+    expect(content.state.options).toEqual(["Allow", "Deny"]);
+    expect(content.state.requestId).toBe("req-7");
+    expect(content.state.since).toBe(Date.UTC(2026, 9, 11, 22, 0, 0) / 1000 - APPLE_REFERENCE_DATE_OFFSET);
+
+    const question = liveActivityContent({ kind: "question", title: "Forge asks", body: "Which branch?" }, 0);
+    expect(question.state.isPermission).toBe(false);
+    expect(question.state.options).toEqual([]);
+    expect(question.state.requestId).toBeUndefined();
+
+    // No fields at all still builds: the widget degrades one field at a time.
+    const bare = liveActivityContent({}, 0);
+    expect(bare.attributes).toEqual({ botId: "", threadId: "", name: "BotFleet", color: "gray" });
+    expect(bare.state.headline).toBe("BotFleet is working");
+    expect(bare.state.kind).toBe("working");
+  });
+
+  it("refuses a frame whose fields are the wrong shape, rather than coercing them", () => {
+    // An absent field falls back; a field of the wrong TYPE never reaches the
+    // widget at all, because the widget decodes it strictly.
+    expect(parseLiveActivitySource({ kind: "approval", title: 42 })).toEqual({
+      ok: false,
+      error: "title must be string, got number",
+    });
+    expect(parseLiveActivitySource({ kind: "approval", options: { a: 1 } })).toEqual({
+      ok: false,
+      error: "options must be string[], got an object",
+    });
+    expect(parseLiveActivitySource({ kind: "approval", options: ["Allow", 7] }).ok).toBe(false);
+    expect(parseLiveActivitySource({ isPermission: "yes" }).ok).toBe(false);
+    expect(parseLiveActivitySource({ since: "now" }).ok).toBe(false);
+    expect(parseLiveActivitySource("not an object").ok).toBe(false);
+    expect(parseLiveActivitySource(null).ok).toBe(false);
+    // A field nobody here reads is not a reason to refuse the frame: the
+    // harness sends `avatarUrl` on any bot with a profile picture.
+    expect(parseLiveActivitySource({ kind: "approval", avatarUrl: "https://x/y.png" }).ok).toBe(true);
+    // `null` reads as absent rather than as a malformed value.
+    expect(parseLiveActivitySource({ color: null })).toEqual({ ok: true, source: {} });
+  });
+
+  it("parses a sparse-but-valid frame, and keeps every fallback", () => {
+    // The degraded path must survive validation: a harness that predates the
+    // Live Activity work sends none of the new fields, and that is a valid
+    // frame, not a broken one.
+    const parsed = parseLiveActivitySource({ kind: "approval", title: "Forge needs you", body: "rm -rf", botId: "b1" });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(Object.keys(parsed.source).sort()).toEqual(["body", "botId", "kind", "title"]);
+    const content = liveActivityContent(parsed.source, 0);
+    expect(content.attributes.color).toBe(DEFAULT_LIVE_ACTIVITY_COLOR);
+    expect(content.state.options).toEqual(["Allow", "Deny"]);
+    expect(content.state.requestId).toBeUndefined();
+  });
+
+  it("prefers the widened harness fields when the frame carries them", () => {
+    const content = liveActivityContent(
+      {
+        kind: "question",
+        title: "Forge asks",
+        body: "Which branch?",
+        botName: "Forge",
+        color: "coral",
+        options: ["main", "dev"],
+        isPermission: true,
+        since: (800_000_000 + APPLE_REFERENCE_DATE_OFFSET) * 1000,
+      },
+      0,
+    );
+    expect(content.attributes).toEqual({ botId: "", threadId: "", name: "Forge", color: "coral" });
+    expect(content.state.options).toEqual(["main", "dev"]);
+    expect(content.state.isPermission).toBe(true);
+    expect(content.state.since).toBe(800_000_000);
+  });
+
+  it("starts an island on a blocking frame for a disconnected phone that registered one", async () => {
+    const sent: { token: string; event: string; headline?: string }[] = [];
+    const banners: string[] = [];
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => ["streaming"],
+      tokensForDisconnected: () => [{ deviceId: "banner", token: "aa".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [
+        { deviceId: "streaming", token: "11".repeat(32) },
+        { deviceId: "island", token: "22".repeat(32) },
+      ],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async (_config, token) => {
+        banners.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      sendLiveActivity: async (_config, token, push) => {
+        sent.push({ token, event: push.event, headline: push.state.headline });
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => sent.length > 0 && banners.length > 0)).toBe(true);
+    watch.stop();
+    // Both surfaces, as intended: the banner for a closed app and the island
+    // to answer from.  A phone already streaming gets no island — the socket
+    // is the banner, and a second copy would be noise.
+    expect(sent).toEqual([{ token: "22".repeat(32), event: "start", headline: "Scout finished needs you" }]);
+    expect(banners).toEqual(["aa".repeat(32)]);
+  });
+
+  it("drops a malformed frame from the island and still sends the banner", async () => {
+    // The whole point of the parse: `title` arrives as a number.  Nothing may
+    // start an island from it — and nothing may be lost either, because the
+    // banner is the same frame on a path that was already its own business.
+    const islands: string[] = [];
+    const banners: string[] = [];
+    const malformed = `data: ${JSON.stringify({
+      kind: "notify",
+      notification: { kind: "approval", title: 42, body: "done", threadId: "t1", botId: "b1" },
+    })}\n\n`;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [{ deviceId: "banner", token: "aa".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () => new Response(malformed, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async (_config, token) => {
+        banners.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      sendLiveActivity: async (_config, token) => {
+        islands.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => banners.length > 0)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    watch.stop();
+    expect(islands).toEqual([]);
+    expect(banners).toEqual(["aa".repeat(32)]);
+  });
+
+  it("still starts an island from a sparse frame the harness actually sent", async () => {
+    const islands: { token: string; color: string; options: string[] }[] = [];
+    const sparse = `data: ${JSON.stringify({
+      kind: "notify",
+      notification: { kind: "question", title: "Forge asks", body: "Which branch?", threadId: "t1", botId: "b1" },
+    })}\n\n`;
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () => new Response(sparse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async (_config, token, push) => {
+        islands.push({ token, color: push.attributes.color, options: push.state.options });
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    expect(await waitFor(() => islands.length > 0)).toBe(true);
+    watch.stop();
+    // No color, no options, no requestId in the frame — the island goes out
+    // anyway, with the documented fallbacks rather than nothing.
+    expect(islands).toEqual([{ token: "22".repeat(32), color: DEFAULT_LIVE_ACTIVITY_COLOR, options: [] }]);
+  });
+
+  it("starts no island for a frame nobody is blocked on", async () => {
+    const sent: string[] = [];
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("done"), { status: 200, headers: { "content-type": "text/event-stream" } }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async (_config, token) => {
+        sent.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    watch.stop();
+    expect(sent).toEqual([]);
+  });
+
+  it("does not count a Live Activity token in the health page's phone totals", async () => {
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      // One phone, two tokens.  Health counts the phones on the alert list
+      // only, or every phone reads as two against the trip thresholds.
+      tokensForDisconnected: () => [{ deviceId: "island", token: "22".repeat(32) }],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "33".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async () => ({ ok: true, status: 200, attempts: 1 }),
+    });
+    expect(await waitFor(() => watch.health().sent > 0)).toBe(true);
+    const health = watch.health();
+    watch.stop();
+    expect(health.tokensRegistered).toBe(1);
+  });
+
+  it("drops a Live Activity token Apple has retired, through its own forget path", async () => {
+    const forgotten: Array<[string, string]> = [];
+    const alerts: string[] = [];
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "stale", token: "cc".repeat(32) }],
+      config: testConfig(),
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async (_config, token) => {
+        alerts.push(token);
+        return { ok: true, status: 200, attempts: 1 };
+      },
+      forgetToken: () => {
+        throw new Error("the alert path's forget must not be reached");
+      },
+      sendLiveActivity: async () => ({ ok: false, status: 410, reason: "Unregistered", attempts: 1 }),
+      forgetLiveActivityToken: (deviceId, token) => forgotten.push([deviceId, token]),
+    });
+    expect(await waitFor(() => forgotten.length > 0)).toBe(true);
+    watch.stop();
+    expect(forgotten).toEqual([["stale", "cc".repeat(32)]]);
+    expect(alerts).toEqual([]);
+  });
+
+  it("treats a refused key on the Live Activity channel as the key fault it is", async () => {
+    const store = memoryKeyFaultStore();
+    const watch = watchHarnessNotifications({
+      harnessPort: 1,
+      connectedIds: () => [],
+      tokensForDisconnected: () => [],
+      liveActivityTokensForDisconnected: () => [{ deviceId: "island", token: "33".repeat(32) }],
+      config: testConfig(),
+      keyStamp: () => "stamp-1",
+      keyFaultStore: store,
+      fetchImpl: async () =>
+        new Response(notifyFrame("approval"), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      send: async () => ({ ok: true, status: 200, attempts: 1 }),
+      sendLiveActivity: async () => ({
+        ok: false,
+        status: 403,
+        reason: "InvalidProviderToken",
+        attempts: 1,
+        failureKind: "key_fault",
+      }),
+    });
+    expect(await waitFor(() => store.current !== null)).toBe(true);
+    expect(store.current?.reason).toBe("InvalidProviderToken");
     watch.stop();
   });
 });

@@ -7,6 +7,9 @@ import test from "node:test";
 import {
   abandonedStages,
   failedInstallBundles,
+  failedInstallBundlesToPrune,
+  failedInstallStamp,
+  FAILED_INSTALL_KEEP,
   generationBelongsToApp,
   ownedRuntimePids,
   prunablePath,
@@ -393,7 +396,68 @@ test("the receipt names the build the rollback bundle actually is, not just the 
   assert.match(source, /installedCommit: previous\?\.installedCommit/);
 });
 
-test("bundles left behind by a failed install are reported, never deleted", () => {
+test("failed-install bundles are capped, keeping the newest as evidence", () => {
+  const names = [
+    "BotFleet.app",
+    "BotFleet.app.failed-1789260170446",
+    "BotFleet.app.failed-1789111111111",
+    "BotFleet.app.failed-1789000000000",
+    "BotFleet.app.failed-1788000000000",
+    "BotFleet.app.failed-1787000000000",
+  ];
+  // Newest three are evidence; the rest are disk.
+  assert.deepEqual(failedInstallBundlesToPrune(names, "BotFleet.app", 3), [
+    "BotFleet.app.failed-1788000000000",
+    "BotFleet.app.failed-1787000000000",
+  ]);
+  // Nothing to prune under the cap, and nothing to prune on a clean install.
+  assert.deepEqual(failedInstallBundlesToPrune(names.slice(0, 3), "BotFleet.app", 3), []);
+  assert.deepEqual(failedInstallBundlesToPrune(["BotFleet.app"], "BotFleet.app", 3), []);
+});
+
+test("the stamp is what ages a bundle, and a bundle without one is never aged out", () => {
+  assert.equal(failedInstallStamp("BotFleet.app.failed-1789260170446", "BotFleet.app"), 1789260170446);
+  assert.equal(failedInstallStamp("BotFleet.app", "BotFleet.app"), null);
+  assert.equal(failedInstallStamp("BotFleet Beta.app.failed-1789260170446", "BotFleet.app"), null);
+  // A malformed suffix is not ours to delete: guessing could remove the wrong
+  // thing, so it is left strictly alone rather than sorted to the front.
+  assert.equal(failedInstallStamp("BotFleet.app.failed-not-a-stamp", "BotFleet.app"), null);
+  // With a cap of 1 the one well-formed bundle is the newest and is kept, so
+  // there is nothing to prune; the malformed one is never a candidate either
+  // way.  Adding a well-formed bundle older than both is what proves the
+  // malformed name is not being silently sorted into the newest slot.
+  assert.deepEqual(
+    failedInstallBundlesToPrune(
+      [
+        "BotFleet.app.failed-1789000000000",
+        "BotFleet.app.failed-1788000000000",
+        "BotFleet.app.failed-not-a-stamp",
+      ],
+      "BotFleet.app",
+      1,
+    ),
+    ["BotFleet.app.failed-1788000000000"],
+  );
+  assert.deepEqual(
+    failedInstallBundlesToPrune(
+      ["BotFleet.app.failed-not-a-stamp", "BotFleet.app.failed-also-not-a-stamp"],
+      "BotFleet.app",
+      0,
+    ),
+    [],
+  );
+});
+
+test("another bundle's failures are never pruned by this updater", () => {
+  const names = [
+    "BotFleet.app.failed-1789000000000",
+    "BotFleet Beta.app.failed-1788000000000",
+    "BotFleet Beta.app.failed-1787000000000",
+  ];
+  assert.deepEqual(failedInstallBundlesToPrune(names, "BotFleet.app", 1), []);
+});
+
+test("bundles left behind by a failed install are reported, never silently deleted", () => {
   const names = [
     "BotFleet.app",
     "BotFleet.app.failed-1789260170446",
@@ -546,6 +610,27 @@ test("leftover stages are pruned only when empty or entirely this updater's own 
   for (const kept of ["prepared", "generation", "referenced"]) {
     assert.equal([...prune, ...report].some((path) => path.includes(kept)), false, `${kept} must be untouched`);
   }
+});
+
+test("a stage the ci policy built is sweepable, because the hosted tree is ours", () => {
+  const now = 1789300000000;
+  const day = 24 * 60 * 60 * 1000;
+  // The default `ci` policy unpacks the hosted build into `<stage>/hosted`
+  // before `persistPrepared` copies the bundle to `<stage>/BotFleet.app`.  If
+  // `hosted` were not on the allowlist, every stage the new default produces
+  // would read as "holds files this updater did not write" and leak a full
+  // extra copy of the app plus node_modules in the updates cache forever.
+  const entry = {
+    name: `hosted-${now - 2 * day}`,
+    path: `/updates/hosted-${now - 2 * day}`,
+    names: ["hosted", "BotFleet.app", "node_modules"],
+    mtimeMs: now,
+    hasPrepared: false,
+    hasGeneration: false,
+  };
+  const { prune, report } = abandonedStages([entry], { now });
+  assert.deepEqual(prune, [`/updates/hosted-${now - 2 * day}`]);
+  assert.deepEqual(report, []);
 });
 
 test("stage age comes from the name the updater gave it", () => {

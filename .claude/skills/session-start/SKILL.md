@@ -1,7 +1,7 @@
 ---
 name: session-start
 description: >-
-  Start every Monet session on this Mac — poll Slack, read THE BOARD, pin AGENT_SEAT="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}", pick the seat worktree, then triple-claim before editing. Use at session start, after a resume, when switching apps, or whenever you are about to begin substantial work. Monet (not Claude) — never skip this for "just a small fix."
+  Start every Monet session on this Mac — poll Slack, read THE BOARD, settle your seat (a launcher's assignment first), pick the seat worktree, then triple-claim before editing. Use at session start, after a resume, when switching apps, or whenever you are about to begin substantial work. Monet (not Claude) — never skip this for "just a small fix."
 ---
 
 # Session start (MONET)
@@ -13,21 +13,31 @@ description: >-
 > Cursor, Grok, Grok Bot, Codex, AG, DeepSeek, Kimi, and Fx have their own skill dirs and must not take identity from here.
 
 
-This shared pack is for the Claude-family login that is active right now.  Pin `AGENT_SEAT` to **MONET**, **CLAUDE**, or **RENOIR** before Slack or `board --by`.  Do not guess from the worktree folder.
+This shared pack is for sessions that load `~/.claude/skills` or this repo's `.claude/skills`: an ordinary Claude Code session, and any bot a launcher started on the claude engine.  Do not guess your seat from the worktree folder or the model.
 
 ## 1. Identity
 
+Your fleet seat is the first of these that applies:
+
+1. A seat the owner names to you in this conversation.
+2. A seat your launcher assigned:  `AGENT_LAUNCH_SEAT` in your environment, with `AGENT_LAUNCHER` set.  A bot BotFleet started is one of these, and its seat is one of `BF-BUILDER`, `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER`, or `BF-PUBLISHER`.  It beats this file, whatever model or engine you run on.
+3. Otherwise this is an ordinary Claude Code session, and your seat is **CLAUDE**.
+
+If `AGENT_LAUNCHER` is set with no `AGENT_LAUNCH_SEAT`, you have no seat:  do no fleet action, and say so.  Never write `AGENT_LAUNCH_SEAT` or `AGENT_LAUNCHER`, and never overwrite an `AGENT_SEAT` you found already set.
+
 ```bash
-export AGENT_SEAT="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}"
-export AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}"
+if [ -n "${AGENT_LAUNCH_SEAT:-}" ]; then SEAT="$AGENT_LAUNCH_SEAT"
+elif [ -n "${AGENT_LAUNCHER:-}" ]; then echo "no seat assigned by $AGENT_LAUNCHER" >&2; exit 3
+else SEAT="${AGENT_SEAT:-CLAUDE}"; fi
+export AGENT_SEAT="${AGENT_SEAT:-$SEAT}"
 ```
 
-Never open or push `claude/*` from a Monet session.
+Your branch prefix is your seat in lower case (`claude/*` for CLAUDE).  Never open or push another seat's branch prefix from your session.
 
 ## 2. Read live coordination
 
 ```bash
-AGENT_TAG="${AGENT_SEAT:?set MONET, CLAUDE, or RENOIR}" /usr/bin/python3 /Users/jay/apps/agent-sync-poll.py
+AGENT_TAG="$SEAT" /usr/bin/python3 /Users/jay/apps/agent-sync-poll.py
 board stats
 board list --status open,in_progress --severity P0,P1 --limit 25
 ```

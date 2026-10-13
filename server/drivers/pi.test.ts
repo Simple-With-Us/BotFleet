@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { expectLaunchedAs, inheritHarnessIdentity } from "../testing/launch-identity.ts";
 import { encodeInjectId, localHost } from "./local-inject.ts";
 import {
   applyPiLocalCatalog,
@@ -130,7 +131,7 @@ describe("buildMcpServers", () => {
     });
   });
 
-  it("passes a local computer (Cua/VPS) through as a direct stdio server", () => {
+  it("passes a local computer (CUA/VPS) through as a direct stdio server", () => {
     const servers = buildMcpServers({
       threadId: "t",
       text: "hi",
@@ -414,6 +415,12 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(instance.adapter.capabilities.effortLevels).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
   });
 
+  it("tells auto-review it can only watch: pi runs its own tools without a card", async () => {
+    await create();
+    expect(instance.adapter.capabilities.reviewHook).toBe("after");
+    expect(instance.adapter.capabilities.asksWhenHeld).toBeUndefined();
+  });
+
   it("declares the shared-memory mount the dispatcher gates on", async () => {
     // The dispatcher only builds the qdrant integration for a driver that
     // says it can mount it, so the flag and the mount above stand or fall
@@ -499,6 +506,39 @@ describe("PiDriver turns (fake CLI)", () => {
     }
     expect(JSON.stringify(rows)).not.toContain("anthropic-secret-value");
     expect(JSON.stringify(rows)).not.toContain("openai-secret-value");
+  });
+
+  it("launches each bot's turn with its own seat and none of the harness's identity", async () => {
+    const restore = inheritHarnessIdentity();
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-launch-"));
+    const dump = join(dir, "dump.jsonl");
+    try {
+      // an instance-level identity must not survive either
+      await create(undefined, { FAKE_PI_DUMP: dump, AGENT_SEAT: "CODEX", ZULIP_API_KEY: "instance-api-key" });
+      const identityRows = () =>
+        (existsSync(dump) ? readFileSync(dump, "utf8").trim().split("\n").filter(Boolean) : [])
+          .map((line) => JSON.parse(line))
+          // one row per spawn carries the environment; the rest record prompts and settings
+          .filter((row) => row.identityEnv !== undefined);
+      const seenFor = async (threadId: string, launchIdentity: { seat: string | null; session: string } | undefined) => {
+        const before = identityRows().length;
+        const started = await instance.adapter.sendTurn({ threadId, text: "hi", launchIdentity });
+        await recorder.until((e) => e.type === "turn.completed" && e.turnId === started.turnId);
+        // the turn's child is the row added by this turn; model probes are other rows
+        return identityRows().slice(before).at(-1)!.identityEnv;
+      };
+      const plumber = await seenFor("t-pi-plumber", { seat: "BF-PLUMBER", session: "t-pi-plumber" });
+      const fixer = await seenFor("t-pi-fixer", { seat: "BF-FIXER", session: "t-pi-fixer" });
+      const none = await seenFor("t-pi-none", { seat: null, session: "t-pi-none" });
+      const bare = await seenFor("t-pi-bare", undefined);
+      expectLaunchedAs(plumber, { seat: "BF-PLUMBER", session: "t-pi-plumber" });
+      expectLaunchedAs(fixer, { seat: "BF-FIXER", session: "t-pi-fixer" });
+      expectLaunchedAs(none, { seat: null, session: "t-pi-none" });
+      expectLaunchedAs(bare, { seat: null });
+    } finally {
+      restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("mounts integrations as stdio MCP servers and loads the pi-mcp-extension", async () => {

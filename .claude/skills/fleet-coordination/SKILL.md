@@ -25,16 +25,16 @@ Use these canonical acronyms in Apple Notes titles (`[APP, Agent] topic`), commi
 
 | Acronym | App / Scope | Repository |
 | :--- | :--- | :--- |
-| **`ST`** | Socratic.Trade | `jaywedgeworth22/Socratic.Trade` |
-| **`CT`** | Congress.Trade | `jaywedgeworth22/Congress.Trade` |
-| **`UM`** | Usage-Monitor | `jaywedgeworth22/Usage-Monitor` |
-| **`DD`** | DealDex | `jaywedgeworth22/DealDex` |
-| **`CL`** | ContactLogo | `jaywedgeworth22/ContactLogo` |
-| **`AR`** | Autorotate (formerly TopSpin) | `jaywedgeworth22/Autorotate` |
-| **`AFL`** | ai-fleet-coordinator (this repo / Mac collab / skill pack) | `jaywedgeworth22/ai-fleet-coordinator` |
-| **`OPS`** | fleet-ops (sibling identity; do not invent a checkout here) | `jaywedgeworth22/fleet-ops` |
-| **`PS`** | Personal-Site | `jaywedgeworth22/Personal-Site` |
-| **`CTS`** | congress-trading-shared | `jaywedgeworth22/congress-trading-shared` |
+| **`ST`** | Socratic.Trade | `Simple-With-Us/Socratic-Trade` |
+| **`CT`** | Congress.Trade | `Simple-With-Us/Congress.Trade` |
+| **`UM`** | Usage-Monitor | `Simple-With-Us/Usage-Monitor` |
+| **`DD`** | DealDex | `Simple-With-Us/DealDex` |
+| **`CL`** | ContactLogo | `Simple-With-Us/ContactLogo` |
+| **`AR`** | Autorotate (formerly TopSpin) | `Simple-With-Us/Autorotate` |
+| **`AFL`** | ai-fleet-coordinator (this repo / Mac collab / skill pack) | `Simple-With-Us/ai-fleet-coordinator` |
+| **`OPS`** | fleet-ops (sibling identity; do not invent a checkout here) | `Simple-With-Us/fleet-ops` |
+| **`PS`** | Personal-Site | `Simple-With-Us/Personal-Site` |
+| **`CTS`** | congress-trading-shared | `Simple-With-Us/congress-trading-shared` |
 | **`FLEET`** | Slack wake: every Grok Bot seat | Not a repo.  Not the coordinator.  `[SENDER->FLEET]` means every `[GB-<NAME>]` seat must spend time. |
 
 **Self-id:** this coordinator/ops system signs as **`AFL`**.  Never `[FLEET]`.  Never `[GB-FLEET]`.  Former aliases `AFC` / `AIFC` / `FC` are retired.  Sibling infra identity is **`OPS`**.
@@ -135,8 +135,10 @@ Visibly wider gap (two visible spaces) after terminal punctuation (`.`, `!`, `?`
 
 | Surface | Syntax | Why |
 | :--- | :--- | :--- |
-| **Markdown Chat UIs / HTML** | `&nbsp;` plus normal space (`Sentence one.&nbsp; Sentence two.`) | Survives HTML/Markdown whitespace collapse |
-| **Source Files** (docs, commit messages, PRs, comments) | Two literal ASCII spaces | Read in raw text editors / terminals |
+| **Markdown chat panes** (Claude Code desktop Code tab, owner-verified 2026-10-08; other panes by ruling, unverified) | `&nbsp;` plus normal space after each sentence, outside code spans (`Sentence one.&nbsp; Sentence two.`) | The renderer decodes the entity; a raw U+00A0 from the model arrives as a plain space |
+| **GitHub PR and issue titles, bodies and comments, Zulip posts, other rendered tool output** | A real U+00A0 plus a space (never the entity) | Tools preserve the character; the entity would show literally in a plain-text squash commit |
+| **Terminal TUI chat, Slack, source files** (docs, commit messages, code comments, config) | Two literal ASCII spaces | Read in raw text editors / terminals; an entity would print literally |
+| **HTML / JSX / SwiftUI product copy** | A real U+00A0 plus a space, or `SENTENCE_GAP` | Raw doubles collapse in HTML |
 
 *Do not apply after abbreviations (`e.g.`, `v1.2.3`) or in URLs/identifiers.*
 

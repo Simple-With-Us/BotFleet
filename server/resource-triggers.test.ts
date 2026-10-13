@@ -10,6 +10,7 @@ import {
   ResourceTriggerManager,
   sampleHost,
   valueFor,
+  webhookDispatchHoldReason,
   webhookDispatchHot,
   type HostSample,
 } from "./resource-triggers.ts";
@@ -52,6 +53,32 @@ describe("webhookDispatchHot", () => {
     ).toBe(true);
     // Ordinary Mac swap percent is not hot.  The admission ceiling is.
     expect(webhookDispatchHot({ swapUsedPercent: 94, load: load(cores) })).toBe(false);
+  });
+
+  it("names load per core and swap percent on the hold reason", () => {
+    expect(
+      webhookDispatchHoldReason({
+        swapUsedPercent: 98.4,
+        load: load(35),
+      }),
+    ).toBe("Host is busy (load 3.5 per core, swap 98%)");
+    expect(
+      webhookDispatchHoldReason({
+        swapUsedPercent: null,
+        load: load(40),
+      }),
+    ).toBe("Host is busy (load 4 per core, swap unknown)");
+    expect(
+      webhookDispatchHoldReason({
+        swapUsedPercent: 99,
+        load: null,
+      }),
+    ).toBe("Host is busy (load unknown per core, swap 99%)");
+  });
+
+  it("returns no reason when the host is cool enough to dispatch", () => {
+    expect(webhookDispatchHoldReason({ swapUsedPercent: null, load: null })).toBeNull();
+    expect(webhookDispatchHoldReason({ swapUsedPercent: 94, load: load(cores) })).toBeNull();
   });
 });
 

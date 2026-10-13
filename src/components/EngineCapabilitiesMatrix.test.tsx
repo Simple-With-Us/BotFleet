@@ -119,15 +119,11 @@ describe("EngineCapabilitiesMatrix orientation", () => {
     }
   });
 
-  it("renders a pricing pill for every engine", () => {
-    // The Subscription · $X/mo pill wording is the legacy vocabulary we
-    // kept; pin at least one match across the registered engines.
-    expect(html).toMatch(/Subscription/);
-    // Subscription + API engines emit "Subscription + API · $X/mo";
-    // MiniMax and Grok both qualify, so the string must appear at
-    // least twice.
-    const subscriptionApiMatches = html.match(/Subscription \+ API/g) ?? [];
-    expect(subscriptionApiMatches.length).toBeGreaterThanOrEqual(2);
+  it("renders an access pill for every engine without conflating billing", () => {
+    expect(html).toContain("CLI + API");
+    expect(html).toContain("CLI");
+    expect(html).toContain("API");
+    expect(html).not.toContain("Subscription");
   });
 });
 

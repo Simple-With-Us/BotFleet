@@ -89,6 +89,75 @@ try {
 }
 const nativeActions = nativeDesktopActions(process.platform);
 const require = createRequire(import.meta.url);
+
+// Match server/sentry.ts: all-zeros is an unknown checkout, never a release.
+const UNKNOWN_COMMIT = "0".repeat(40);
+const RELEASE_SHA = /^[0-9a-f]{7,40}$/i;
+
+function resolvedDesktopReleaseSha() {
+  const candidates = [];
+  for (const key of ["SENTRY_RELEASE", "GITHUB_SHA", "VERCEL_GIT_COMMIT_SHA"]) {
+    const value = process.env[key]?.trim();
+    if (value) candidates.push(value);
+  }
+  // Packaged Electron builds stamp a real SHA in build-identity.json; env
+  // overrides still win when set.
+  if (process.resourcesPath) {
+    try {
+      const build = readPackagedBuildIdentity(path.join(process.resourcesPath, "server"));
+      if (build?.sourceCommit) candidates.push(build.sourceCommit);
+    } catch {
+      /* dev runs and unpackaged CI have no identity; release stays env-only */
+    }
+  }
+  for (const candidate of candidates) {
+    if (candidate && candidate !== UNKNOWN_COMMIT && RELEASE_SHA.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function redactQueryStringTokens(url) {
+  if (url == null || url === "") return url;
+  return String(url).replace(/([?&])(token|key|secret|authorization)=[^&]*/gi, "$1$2=[redacted]");
+}
+
+function scrubDesktopSentryRequest(event) {
+  if (!event) return event;
+  if (event.request) {
+    if (event.request.headers) event.request.headers = {};
+    if (event.request.query_string) {
+      event.request.query_string = "[redacted]";
+    }
+  }
+  return event;
+}
+
+function initDesktopSentry() {
+  if (process.env.VITEST === "true" || process.env.NODE_ENV === "test") return;
+  const dsn = String(process.env.SENTRY_DSN || process.env.VITE_SENTRY_DSN || "").trim();
+  if (!dsn) return;
+  try {
+    const Sentry = require("@sentry/electron/main");
+    const release = resolvedDesktopReleaseSha();
+    Sentry.init({
+      dsn,
+      sendDefaultPii: false,
+      environment: String(process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() || "production",
+      release,
+      beforeSend(event) {
+        return scrubDesktopSentryRequest(event);
+      },
+      beforeBreadcrumb(breadcrumb) {
+        if (breadcrumb?.data?.url) breadcrumb.data.url = redactQueryStringTokens(breadcrumb.data.url);
+        return breadcrumb;
+      },
+    });
+  } catch {
+    /* @sentry/electron is optional in a source checkout */
+  }
+}
+initDesktopSentry();
+
 const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource } = require(
   "./screen-preview.cjs",
 );
@@ -913,6 +982,7 @@ async function startServerOn(port) {
     OMB_STATIC_DIR: path.join(process.resourcesPath, "ui"),
     OMB_RESOURCES_PATH: process.resourcesPath,
     OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
+    OMB_BOTS_DIR: path.join(process.resourcesPath, "bots"),
     OMB_PORT: String(port),
     OMB_USER_DATA: app.getPath("userData"),
     ...(secureCredentials.composioApiKey
@@ -1809,9 +1879,20 @@ ipcMain.handle("personal-voice:list", async () => {
   if (!nativeActions.appleSpeech) return [];
   return listPersonalVoices();
 });
-ipcMain.handle("personal-voice:speak", async (_event, text, voiceId) => {
+ipcMain.handle("personal-voice:speak", async (event, text, voiceId, options) => {
   if (!nativeActions.appleSpeech) throw new Error("Personal Voice requires macOS.");
-  return speakPersonalVoice(text, voiceId);
+  // Word ranges go back only to the window that asked, tagged with the id
+  // its preload chose, and carry numbers only: no text crosses back.
+  const progressId = Number(options?.progressId);
+  const sender = event.sender;
+  const onRange = Number.isSafeInteger(progressId) && progressId > 0
+    ? ({ location, length, elapsedMs }) => {
+      if (!sender.isDestroyed()) {
+        sender.send("personal-voice:range", { id: progressId, location, length, elapsedMs });
+      }
+    }
+    : undefined;
+  return speakPersonalVoice(text, voiceId, { onRange });
 });
 ipcMain.handle("personal-voice:stop", () => {
   if (nativeActions.appleSpeech) stopPersonalVoice();
@@ -2235,7 +2316,7 @@ function setupApplicationMenu() {
       submenu: [
         {
           label: "BotFleet Documentation",
-          click: () => shell.openExternal("https://github.com/jaywedgeworth22/BotFleet"),
+          click: () => shell.openExternal("https://github.com/Simple-With-Us/BotFleet"),
         },
         {
           label: "Open Logs & Data Folder",

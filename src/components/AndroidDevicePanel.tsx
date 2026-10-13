@@ -202,7 +202,7 @@ export function AndroidDevicePanel({ status }: { status: AndroidDeviceStatus }) 
               <Smartphone size={16} className="text-success" /> {deviceLabel(selected)}
             </div>
             <div className="mt-1 text-[12px] leading-relaxed text-ink-secondary">
-              Connected directly over USB. The screen and controls stay on this computer.
+              Connected directly over USB.{"\u00a0 "}The screen and controls stay on this computer.
             </div>
           </div>
           <span className="flex shrink-0 items-center gap-1 text-[11px] text-success">

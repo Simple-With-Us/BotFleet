@@ -22,6 +22,12 @@ struct CompanionApp: App {
         SentryTelemetry.start()
         let session = Session()
         _session = StateObject(wrappedValue: session)
+        // Answer from the island or the Lock Screen.  Installed here rather
+        // than in `onAppear` because a `LiveActivityIntent` launches this
+        // process in the background without ever showing the scene, so a route
+        // wired on appearance would be nil at exactly the moment a Lock Screen
+        // tap needs it.
+        LiveActivityApprovalRoute.install(session: session)
         appDelegate.onDeviceToken = { hex in
             Task { await session.registerPushToken(hex) }
         }
@@ -50,6 +56,11 @@ struct CompanionApp: App {
                     liveActivities.attach(to: session)
                     liveActivities.transition(to: liveActivityPhase(scenePhase))
                     Task { await testFlightUpdate.checkIfDue() }
+                    #if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains("-live-activity-preview") {
+                        LiveActivityCoordinator.startPreviewActivity()
+                    }
+                    #endif
                 }
                 .onOpenURL { session.receiveOpenURL($0) }
                 .onChange(of: scenePhase) { _, phase in
@@ -60,7 +71,9 @@ struct CompanionApp: App {
                         Task { await session.refreshNotificationAuthorization() }
                         Task { await testFlightUpdate.checkIfDue() }
                     case .background:
-                        session.stopVoice()
+                        // A reply being read keeps going: the `audio`
+                        // background mode lets it outlast auto-lock, which
+                        // used to cut every long read off partway.
                         session.linger()
                     case .inactive: break
                     @unknown default: break

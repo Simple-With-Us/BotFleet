@@ -31,6 +31,7 @@ import {
   LastKnownAnswer,
   logProbeFailure,
   spawnCli,
+  trackCliGroup,
 } from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
@@ -41,6 +42,13 @@ import {
   resolveInitDeadline,
   SLOW_INIT_LOG_MS,
 } from "./init-deadline.ts";
+import { estimateCatalogCost } from "../../gen-ai-cost.ts";
+import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
+import {
+  applyAcpPromptBudget,
+  decodeAcpPromptBudgetBytes,
+  resolveAcpPromptBudgetBytes,
+} from "./prompt-budget.ts";
 
 /**
  * A `host::model` pick talks to a loopback server with its own key.
@@ -64,6 +72,7 @@ import type {
   ProviderErrorCode,
 } from "../../contracts.ts";
 import { newEventId, newId } from "../../contracts.ts";
+import { applyLaunchIdentity } from "../../launch-identity.ts";
 import { computerProxyEnv } from "../../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../../computer-grants.ts";
 import { augmentedPath } from "../../env-path.ts";
@@ -75,6 +84,14 @@ const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
 import { getBool } from "../../feature-flags.ts";
+import type { JsonValue } from "../../schema.ts";
+import {
+  ALLOWLIST_CLIENT_CAPABILITIES,
+  AllowlistGate,
+  allowlistHookMeta,
+  HOOK_METHODS,
+  type HookAnswer,
+} from "./allowlist.ts";
 
 const acpNonemptyString = z.string().min(1);
 
@@ -105,8 +122,8 @@ export function acpMcpServers(turn: Pick<SendTurnInput, "integrations">): AcpStd
     });
   }
   // The bot's computers, mounted exactly like the Claude driver does.
-  // Cloud boxes use the REST adapter; host, sandbox, and VPS Cua
-  // connections expose Cua Driver's official MCP server directly. Every
+  // Cloud boxes use the REST adapter; host, sandbox, and VPS CUA
+  // connections expose CUA Driver's official MCP server directly. Every
   // grant gets its own server — this was an if/else if that dropped the
   // second computer a bot had been given.
   for (const mount of turnComputerMounts(turn.integrations)) {
@@ -173,6 +190,11 @@ export interface AcpConfig {
    * never cut off; only a fully wedged one is.  `promptTimeoutMs` still
    * applies underneath this as the absolute backstop. */
   promptIdleMs?: number;
+  /** UTF-8 byte ceiling for the composed `session/prompt` text.  Omitted
+   * uses the default.  `0` disables the budget and sends the prompt whole.
+   * The stable system block and the current user message are never cut to
+   * meet it. */
+  promptBudgetBytes?: number;
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -234,6 +256,18 @@ export interface AcpSupport {
   /** Optional rewrite of the spawned CLI.  DSH sits a stdio bridge in front
    * of stock `dsh` so session/new mcpServers are accepted and delivered. */
   wrapSpawn?(cli: string, args: string[], turn: SendTurnInput): AcpSpawnRewrite;
+  /** How this engine is held to a routine's command allowlist
+   *  (`SendTurnInput.toolPolicy`, server/drivers/acp/allowlist.ts).  Absent
+   *  means the engine cannot be held:  it runs tools without asking BotFleet
+   *  first (mcode's Ask mode does, and ignores the client terminal), so an
+   *  allowlist turn is refused before anything spawns. */
+  allowlist?: {
+    /** Spawn argv for an allowlist turn.  Never a bypass permission mode. */
+    spawnArgs(config: AcpConfig, turn: SendTurnInput): string[];
+    /** Why the engine, as its `initialize` answer describes it, cannot be held
+     *  (for example, no blocking pre-tool hook);  null when it can. */
+    verifyInitialize(init: JsonValue | undefined): string | null;
+  };
   /** Resume RPC used by this ACP server.  Most older harnesses implement
    * `session/load`; current ACP v1 servers may expose `session/resume`. */
   resumeMethod?: "session/load" | "session/resume";
@@ -401,6 +435,15 @@ export class AcpModelRejectedError extends Error {
   }
 }
 
+/** An allowlist turn on an engine that cannot be held to it.  Refused, not
+ *  retried:  the next launch would be the same engine. */
+class AcpAllowlistRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AcpAllowlistRefusedError";
+  }
+}
+
 class AcpResumeError extends Error {
   constructor(options?: { cause?: unknown }) {
     super(
@@ -467,6 +510,7 @@ function decodeAcpConfig(defaultCli: string) {
       o.promptIdleMs <= MAX_PROMPT_IDLE_MS
         ? o.promptIdleMs
         : undefined;
+    const promptBudgetBytes = decodeAcpPromptBudgetBytes(o.promptBudgetBytes);
     return {
       cli: typeof o.cli === "string" ? o.cli : defaultCli,
       fullAuto: o.fullAuto === true,
@@ -474,6 +518,7 @@ function decodeAcpConfig(defaultCli: string) {
       ...(initTimeoutMs === undefined ? {} : { initTimeoutMs }),
       ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
       ...(promptIdleMs === undefined ? {} : { promptIdleMs }),
+      ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }),
     };
   };
 }
@@ -523,6 +568,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
   const decodeConfig = decodeAcpConfig(support.defaultCli);
+  /** Resolved ONCE, at registration, because the capability matrix reads it
+   *  statically.  Both answers are a pure function of `support`, so deriving
+   *  them here and reading them from `metadata.channelWiring` cannot disagree
+   *  with the per-instance block below, which reads these same two values. */
+  const mountsMcpServers = support.mcpServers !== false;
+  const acceptsImages = support.images !== false;
   // Experimental V2 driver rollout gate — when this flips to `true` the V2
   // session runtime in `acp/core.v2.ts` will be wired in here.  Today the
   // flag is `false` and the branch is a single boot-time log line so the
@@ -539,6 +590,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       displayName: support.displayName,
       supportsMultipleInstances: true,
       access: support.access ?? "subscription",
+      // Static mirror of the flags below that the runtime resolves
+      // mechanically, published so a consumer that cannot afford to create an
+      // instance (the capability-matrix test) can check a claim against the
+      // driver instead of against a comment.  The ACP core answers every MCP
+      // flag from one question, so these four are all the same boolean.
+      channelWiring: {
+        agentsMcp: mountsMcpServers,
+        computerMcp: mountsMcpServers,
+        composioMcp: mountsMcpServers,
+        localComputerMcp: mountsMcpServers,
+        images: acceptsImages,
+      },
     },
     install: support.install,
     models: withModelCapabilities(support.models, support),
@@ -663,7 +726,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // full-auto bot mount the local computer at all.
         const computerMounts = turnComputerMounts(turn.integrations);
         const controlsHost = hostToolPrefix(computerMounts) !== null;
-        const turnConfig: AcpConfig = controlsHost && config.fullAuto ? { ...config, fullAuto: false } : config;
+        // A turn the harness holds for auto-review is spawned in the same
+        // asking mode, so each `session/request_permission` reaches the
+        // reviewer instead of being answered here.
+        //
+        // A routine with a command allowlist is never full-auto either:  the
+        // allowlist gate answers every ask, and the engine is spawned in a
+        // mode that asks (never a bypass mode).
+        const toolPolicy = turn.toolPolicy;
+        const turnConfig: AcpConfig =
+          (controlsHost || turn.holdForReview === true || toolPolicy) && config.fullAuto ? { ...config, fullAuto: false } : config;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
         // Carried across a relaunch (see maybeRetry): `attempt` is how many
@@ -747,6 +819,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         }
         const cancelled = cancelledBeforeDispatch();
         if (cancelled) return cancelled;
+        // Fail closed:  an engine that cannot be held to the allowlist never
+        // runs an allowlist turn.  The run says why, and setup marks it as the
+        // engine's limit rather than this run's fault.
+        if (toolPolicy && !support.allowlist) {
+          return finishBeforeDispatch(false, "setup_required", {
+            message: `This routine runs under a command allowlist, and ${support.displayName} cannot be held to one:  it runs tools without asking BotFleet first.  Run the routine on a bot whose engine is Grok Build.`,
+            setup: true,
+          });
+        }
         let resolvedModel: string | undefined;
         try {
           resolvedModel = support.resolveTurnModel?.(turn.model, env);
@@ -760,18 +841,29 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           resolvedModel !== undefined && resolvedModel !== turn.model
             ? { ...turn, model: resolvedModel }
             : turn;
-        const mcpServers = acpMcpServers(turn);
+        // An allowlist turn mounts nothing:  every tool it may use is the
+        // engine's own shell or file tool, routed back through BotFleet.
+        const mcpServers = toolPolicy ? [] : acpMcpServers(turn);
 
         let child;
+        // What the engine child runs with.  An allowlisted command BotFleet
+        // runs on the engine's behalf gets the same environment, launch
+        // identity included, and never the variables the engine passes.
+        let launchEnv: Record<string, string | undefined> = env;
         try {
-          const requestedArgs = support.spawnArgs(turnConfig, cliTurn);
+          const requestedArgs = toolPolicy && support.allowlist
+            ? support.allowlist.spawnArgs(turnConfig, cliTurn)
+            : support.spawnArgs(turnConfig, cliTurn);
           const spawned = support.wrapSpawn?.(config.cli, requestedArgs, cliTurn) ?? {
             cli: config.cli,
             args: requestedArgs,
           };
+          // Last, over the instance's env and a wrapper's additions alike:
+          // the launch identity is this bot's and this turn's.
+          launchEnv = applyLaunchIdentity(spawned.env ? { ...env, ...spawned.env } : env, turn.launchIdentity);
           child = spawnCli(spawned.cli, spawned.args, {
             cwd,
-            env: spawned.env ? { ...env, ...spawned.env } : env,
+            env: launchEnv,
             stdio: ["pipe", "pipe", "pipe"],
           });
         } catch (error) {
@@ -781,6 +873,25 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             ...(failure.setup ? { setup: true } : {}),
           });
         }
+
+        // Armed at spawn so the group is probed in the same tick its leader
+        // is reaped: that is what lets stop() keep reaping a lingering MCP
+        // descendant after the leader has gone, without ever signalling a
+        // process-group id the OS may have handed to someone else.
+        const group = trackCliGroup(child);
+
+        // The allowlist gate for this attempt (null on every other turn).
+        const gate = toolPolicy
+          ? new AllowlistGate({
+              policy: toolPolicy,
+              env: launchEnv,
+              cwd,
+              log: (line) => console.warn(`[acp:${DRIVER_KIND}] ${line}`),
+            })
+          : null;
+        /** session/new and session/load params, with the allowlist's hook
+         *  registered on an allowlist turn. */
+        const withAllowlistMeta = <T extends object>(params: T) => (gate ? { ...params, _meta: allowlistHookMeta() } : params);
 
         // `sawOutput` is the replay-safety gate, and it is PROTOCOL state, not
         // a reading of the error text: it flips the moment this child put
@@ -901,17 +1012,63 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             send({ jsonrpc: "2.0", id, method, params });
           });
 
-        const stop = () => killCliTree(child);
+        // One force-kill per child, however many paths call stop().
+        let forceKillArmed = false;
+        const stop = () => {
+          // SIGTERM the whole group while the leader is alive.  A no-op once
+          // the leader has exited: killCliTree early-returns then.
+          killCliTree(child);
+          const leaderAlive = child.exitCode === null && child.signalCode === null;
+          if (process.platform === "win32") {
+            // No process groups here; taskkill /T /F already forced the
+            // tree.  Keep a direct kill for a leader taskkill missed.
+            if (!leaderAlive || forceKillArmed) return;
+            forceKillArmed = true;
+            const forceTimer = setTimeout(() => {
+              if (child.exitCode !== null || child.signalCode !== null) return;
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+            }, FORCE_EXIT_AFTER_MS);
+            forceTimer.unref?.();
+            return;
+          }
+          // The leader already exited before anyone asked it to stop, so
+          // killCliTree sent nothing, but an MCP descendant may still be
+          // alive in the group holding the session lock.  Ask it to go
+          // first.  `group.signal` only sends while the group id is still
+          // provably this child's (see trackCliGroup), never to a pgid the OS
+          // may have recycled.
+          if (!leaderAlive) group.signal("SIGTERM");
+          // Group already empty: a clean teardown, nothing left to force.
+          if (!group.owned || forceKillArmed) return;
+          forceKillArmed = true;
+          // Then force it.  This must NOT be gated on the leader still being
+          // alive: on a normal completion the leader dies on the SIGTERM
+          // above within milliseconds, while a SIGTERM-ignoring descendant
+          // lives on, and settle() has already dropped this turn from
+          // `active`, so stopAll/dispose can no longer reach it.  It is gated
+          // on the group instead: if the group empties first, trackCliGroup
+          // disowns it and this send is a no-op.
+          const forceTimer = setTimeout(() => group.signal("SIGKILL"), FORCE_EXIT_AFTER_MS);
+          forceTimer.unref?.();
+        };
         const stopAndWaitForExit = async () => {
           state.deadlineTerminating = true;
-          const pid = child.pid;
           const forceExit = () => {
-            try {
-              if (process.platform !== "win32" && pid) process.kill(-pid, "SIGKILL");
-              else child.kill("SIGKILL");
-            } catch {
-              // already gone
+            if (process.platform === "win32") {
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+              return;
             }
+            // Same ownership rule as stop(): reap a lingering descendant, but
+            // never signal a group id that has emptied and may be recycled.
+            group.signal("SIGKILL");
           };
           if (child.exitCode !== null || child.signalCode !== null) {
             forceExit();
@@ -959,13 +1116,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
          *  while grok and minimax did.  The fleet spend view was therefore
          *  a confident fraction of the truth with nothing marking the gap.
          *
-         *  Only a number the agent itself reported counts.  Inventing one
-         *  from a price table here would be a worse lie than a blank:
-         *  these are subscription logins, so an API-equivalent figure is an
-         *  estimate, not a charge, and `billingMode` exists to say so.
-         *  An agent that reports nothing keeps `null` and is counted as
-         *  UNPRICED by rolling-spend rather than as free. */
+         *  A number the agent itself reported is provider truth and is
+         *  billed as actual.  When the agent reports none, MiniMax Code,
+         *  DSH, and DeepSeek fall back to the published catalog (marked
+         *  `estimated`) so Usage Monitor and Sentry show dollars instead
+         *  of a blank.  Grok and the rest stay null — they have no catalog
+         *  row, and inventing one would be a worse lie than a blank. */
         let turnCost: number | null | undefined;
+        let turnBillingMode: "actual" | "estimated" | undefined;
 
         const settle = (ok: boolean, stopReason: string | null) => {
           if (state.settled || state.retrying) return;
@@ -980,18 +1138,20 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
           rpcPending.clear();
           active.delete(threadId);
+          gate?.dispose();
           flushAssistantText();
-          emit({
+          const completed: Extract<RuntimeEvent, { type: "turn.completed" }> = {
             ...base(threadId, turnId),
             type: "turn.completed",
             ok,
             stopReason,
-            // `turnCost` is only ever a figure the agent itself reported, so
-            // it is a provider number and not an estimate — hence no
-            // `billingMode`, which defaults to "actual".
             cost: turnCost ?? null,
+            billingMode: turnBillingMode,
             ...(turnUsage ? { usage: turnUsage } : {}),
-          });
+          };
+          // What a routine's allowlist refused, by program or tool name.
+          if (gate && gate.denials.length > 0) completed.denials = [...gate.denials];
+          emit(completed);
           stop(); // the agent process does not exit on its own
         };
 
@@ -1037,6 +1197,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             p.reject(new Error("turn retrying"));
           }
           rpcPending.clear();
+          gate?.dispose();
           stop();
           // The thread STAYS claimed through the backoff — that entry is what
           // makes a stop during the wait reach this turn instead of racing a
@@ -1087,8 +1248,51 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           return true;
         };
 
+        // An allowlist turn's own client calls:  the engine's pre-tool hook,
+        // and the terminal and file calls BotFleet runs on its behalf.
+        const handleAllowlistRequest = (msg: any): boolean => {
+          if (!gate) return false;
+          if (HOOK_METHODS.has(msg.method)) {
+            state.sawOutput = true;
+            let answer: HookAnswer;
+            try {
+              answer = gate.hook(msg.params);
+            } catch {
+              // A gate that cannot decide denies:  an error answer would make
+              // the engine fail OPEN.
+              answer = { decision: "deny", reason: "BotFleet's routine allowlist could not decide this tool." };
+            }
+            send({ jsonrpc: "2.0", id: msg.id, result: answer });
+            return true;
+          }
+          if (gate.handles(msg.method)) {
+            state.sawOutput = true;
+            void gate
+              .client(msg.method, msg.params)
+              .catch(() => ({ error: { code: -32000, message: `${msg.method} failed` } }))
+              .then((answer) => {
+                if (!state.settled) send({ jsonrpc: "2.0", id: msg.id, ...answer });
+              });
+            return true;
+          }
+          return false;
+        };
+
+        /** The engine ran a tool the gate never allowed:  stop the turn now. */
+        const tripAllowlist = (tool: string) => {
+          if (state.settled) return;
+          console.warn(`[acp:${DRIVER_KIND}] allowlist bypassed by ${tool}; stopping the turn`);
+          emit({
+            ...base(threadId, turnId),
+            type: "runtime.error",
+            message: `BotFleet stopped this routine:  the engine ran a tool (${tool}) that the command allowlist had not approved.`,
+          });
+          settle(false, "capability_denied");
+        };
+
         // server→client permission request → canonical request.opened
         const handleServerRequest = (msg: any) => {
+          if (handleAllowlistRequest(msg)) return;
           if (msg.method !== "session/request_permission") {
             // never leave an unknown server request hanging — the agent blocks
             return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
@@ -1110,6 +1314,27 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             });
 
           const toolCall = params.toolCall ?? {};
+          if (gate) {
+            // The allowlist answers, never a person, and never with an
+            // "always" option:  that would write a standing allow rule into
+            // the engine's own config.
+            const allowOnce = options.find((o) => o.kind === "allow_once")?.optionId;
+            // reject_once only, for the same reason:  reject_always is a
+            // standing rule too.  No such option means a plain cancel.
+            const rejectOnce = options.find((o) => o.kind === "reject_once")?.optionId;
+            let allowed = false;
+            try {
+              allowed = gate.permission(params) && Boolean(allowOnce);
+            } catch {
+              allowed = false;
+            }
+            const optionId = allowed ? allowOnce : rejectOnce;
+            return send({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: optionId ? { outcome: { outcome: "selected", optionId } } : cancelled,
+            });
+          }
           if (turnConfig.fullAuto) {
             const allow = optionFor("allow");
             if (!allow) missing("allow");
@@ -1163,6 +1388,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             ...base(threadId, turnId),
             type: "request.opened",
             requestId,
+            // the tool call this ask is about, the same id its item.started
+            // carried, so the auto-review step watch leaves it to the card
+            itemId: z.string().min(1).safeParse(toolCall.toolCallId).data,
             requestType: "permission",
             tool,
             summary,
@@ -1199,6 +1427,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             case "tool_call": {
               state.sawOutput = true;
+              const bypassedBy = gate?.bypassed(u);
+              if (bypassedBy) return tripAllowlist(bypassedBy);
               // prepared once: the same text is filed with the event and
               // fingerprinted for the update that may follow
               const announced = u.rawInput === undefined ? undefined : prepareInput(u.rawInput);
@@ -1227,6 +1457,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               break;
             }
             case "tool_call_update": {
+              const bypassedBy = gate?.bypassed(u);
+              if (bypassedBy) return tripAllowlist(bypassedBy);
               // The schema lets a call's input arrive or settle on an update,
               // at any status: take it when it is new text for this call.
               const settled = typeof u.toolCallId === "string" && u.rawInput !== undefined ? prepareInput(u.rawInput) : undefined;
@@ -1415,7 +1647,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             try {
               init = await request(
                 "initialize",
-                { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } },
+                {
+                  protocolVersion: 1,
+                  clientCapabilities: gate
+                    ? ALLOWLIST_CLIENT_CAPABILITIES
+                    : { fs: { readTextFile: false, writeTextFile: false } },
+                },
                 initDeadline.timeoutMs,
               );
             } catch (error) {
@@ -1428,6 +1665,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             const initElapsedMs = Date.now() - initStartedAt;
             if (initElapsedMs >= SLOW_INIT_LOG_MS) {
               console.warn(`[acp] ${DRIVER_KIND} ${describeSlowInit(initElapsedMs, initDeadline)}`);
+            }
+            if (gate && support.allowlist) {
+              const problem = support.allowlist.verifyInitialize(init);
+              if (problem) throw new AcpAllowlistRefusedError(problem);
             }
             const methods: Array<{ id?: string }> = Array.isArray(init?.authMethods) ? init.authMethods : [];
             const methodId = support.pickAuthMethod(methods);
@@ -1458,7 +1699,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               try {
                 sessionResult = await request(
                   support.resumeMethod ?? "session/load",
-                  { sessionId: cursor, cwd, mcpServers },
+                  withAllowlistMeta({ sessionId: cursor, cwd, mcpServers }),
                   LOAD_SESSION_TIMEOUT,
                 );
                 sessionId = cursor;
@@ -1470,7 +1711,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               }
             }
             if (!sessionId) {
-              sessionResult = await request("session/new", { cwd, mcpServers }, NEW_SESSION_TIMEOUT);
+              sessionResult = await request(
+                "session/new",
+                withAllowlistMeta({ cwd, mcpServers }),
+                NEW_SESSION_TIMEOUT,
+              );
               sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
             }
@@ -1571,11 +1816,23 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             emitSessionStarted();
             state.promptSent = true;
-            const text = support.buildPromptText
+            // Budget the prompt about to be sent.  This does not decide
+            // whether the system prompt is inlined on resume.  Under the
+            // ceiling the composed text is unchanged.
+            const composed = support.buildPromptText
               ? support.buildPromptText(turn)
               : turn.system
                 ? `${turn.system}\n\n${turn.text}`
                 : turn.text;
+            const budgeted = applyAcpPromptBudget({
+              composed,
+              sections: turn.systemSections,
+              userText: turn.text,
+              budgetBytes: resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes),
+            });
+            annotatePromptBudget(threadId, turnId, budgeted);
+            captureTurnPrompt(threadId, turnId, budgeted.text);
+            const text = budgeted.text;
             const result = await request(
               "session/prompt",
               {
@@ -1621,14 +1878,26 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 ...turnUsage,
               });
             }
-            // Only a figure the agent itself reported.  See `turnCost`.
             const reportedCost = acpNumber(usage, "cost", "costUsd", "cost_usd", "totalCostUsd");
-            if (reportedCost != null && reportedCost > 0) turnCost = reportedCost;
+            if (reportedCost != null && reportedCost > 0) {
+              turnCost = reportedCost;
+            } else {
+              const catalog = estimateCatalogCost(selectedModel, turnUsage);
+              if (catalog != null) {
+                turnCost = catalog;
+                turnBillingMode = "estimated";
+              }
+            }
             const reason = normalizeStopReason(result?.stopReason);
             if (reason === "end_turn" || reason === "max_tokens") settle(true, null);
             else if (reason === "cancelled") settle(true, "cancelled");
             else settle(false, reason ?? "failed");
           } catch (e) {
+            if (!state.settled && !state.retrying && e instanceof AcpAllowlistRefusedError) {
+              emit({ ...base(threadId, turnId), type: "runtime.error", message: e.message, setup: true });
+              settle(false, "setup_required");
+              return;
+            }
             if (!state.settled && !state.retrying) {
               const resumeFailure = e instanceof AcpResumeError;
               const classifiedFailure = resumeFailure && e.cause !== undefined ? e.cause : e;
@@ -1744,8 +2013,6 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         return { state: "available", version, authenticated: await support.isAuthenticated(env, config) };
       };
 
-      const mountsMcpServers = support.mcpServers !== false;
-
       return {
         instanceId,
         driverKind: DRIVER_KIND,
@@ -1767,7 +2034,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             composioMcp: mountsMcpServers,
             phoneMcp: mountsMcpServers,
             qdrantMcp: mountsMcpServers,
-            images: support.images !== false,
+            images: acceptsImages,
             effortLevels: support.effortLevels,
             localComputerMcp: mountsMcpServers,
             // Jobs matrix: native jobs die when the turn settles, and BotFleet
@@ -1777,6 +2044,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // says so.  Named helper rows come in P3.
             backgroundJobs: mountsMcpServers ? "emulated" : "none",
             helpers: "none",
+            // `session/request_permission` becomes request.opened; a
+            // full-auto instance answers it itself unless the turn is held
+            reviewHook: config.fullAuto ? "after" : "before",
+            asksWhenHeld: true,
+            // Holds a routine's command allowlist (allowlist.ts), or refuses it.
+            toolPolicy: Boolean(support.allowlist),
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

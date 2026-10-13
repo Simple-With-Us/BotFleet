@@ -1,6 +1,6 @@
 // Postinstall: compile the `clutch` dependency from TypeScript to JavaScript.
 //
-// The `clutch` package (github:jaywedgeworth22/Clutch) ships TypeScript
+// The `clutch` package (github:Simple-With-Us/Clutch) ships TypeScript
 // sources only.  Node's native type-stripping refuses to load `.ts` files
 // under `node_modules/` (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING), which
 // breaks every `node server/index.ts` execution — notably the e2e fixtures

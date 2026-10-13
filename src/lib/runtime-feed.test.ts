@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RuntimeEvent } from "../../server/contracts.ts";
+import type { JsonObject } from "../../server/schema.ts";
 import { createDelayedRun, createEventBatcher, publishRuntimeEvent, publishRuntimeGap, subscribeRuntimeEvents, subscribeRuntimeGap, watchedThreadCount } from "./runtime-feed.ts";
 
-const ev = (threadId: string, over: Record<string, unknown> = {}): RuntimeEvent =>
+const ev = (threadId: string, over: JsonObject = {}): RuntimeEvent =>
   ({ eventId: `e-${Math.random()}`, provider: "claude", threadId, createdAt: "2026-09-29T14:00:00.000Z", type: "turn.started", ...over }) as RuntimeEvent;
 
 describe("the runtime feed", () => {

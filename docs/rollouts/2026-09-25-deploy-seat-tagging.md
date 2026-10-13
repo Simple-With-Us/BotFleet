@@ -5,7 +5,7 @@
 THE BOARD row `1af9e286` (its duplicate `0a4a04ed` was closed pointing here):
 add which fleet seat and PR shipped a production Sentry deploy record, so a
 deploy in the Sentry UI is traceable back to the agent and PR that produced
-it.  This mirrors jaywedgeworth22/Usage-Monitor PR #1536 and its
+it.  This mirrors Simple-With-Us/Usage-Monitor PR #1536 and its
 `docs/rollouts/2026-09-24-deploy-seat-tagging.md`, which documents the same
 pattern and its portable recipe for BotFleet, Socratic.Trade, and
 Congress.Trade.

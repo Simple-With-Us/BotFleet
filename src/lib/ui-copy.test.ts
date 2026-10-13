@@ -161,3 +161,91 @@ describe("Bot Chats sidebar section appears once", () => {
     expect(matches).toHaveLength(1);
   });
 });
+
+describe("sentence gap outside chat", () => {
+  // Chat bubbles and <pre> panes use whitespace-pre-wrap, so two ASCII
+  // spaces survive there.  Everywhere else the default white-space:normal
+  // collapses them, and styles.css sets no white-space of its own.  A CSS
+  // change cannot turn the single ASCII space these strings ship with into
+  // the sentence gap.  The gap that still renders is NBSP + space, written
+  // {"\u00a0 "} in JSX children.  A quoted attribute does not decode \u,
+  // so attribute copy uses the same marker inside a JS expression: ={"...\u00a0 ..."}.
+  // Assert that marker is present.  A negative-only rule
+  // (not.toMatch(/[a-z0-9)]\. {1,2}[A-Z]/)) stays green when the gap is
+  // deleted outright, which is how #810 shipped a removed gap.
+  const GAPS: Array<[file: string, gap: string]> = [
+    ["components/AndroidDevicePanel.tsx", "USB.{\"\\u00a0 \"}The screen"],
+    ["components/BotProfileAvatarCard.tsx", "aria-label={\"Bot avatar.\\u00a0 Drop"],
+    ["components/CompanionSection.tsx", "read.{\"\\u00a0 \"}Check MagicDNS"],
+    ["components/ComputerPanel.tsx", "Connections.{\"\\u00a0 \"}Auto only"],
+    ["components/ComputerPanel.tsx", "default.{\"\\u00a0 \"}When enabled"],
+    ["components/ComputerPanel.tsx", "Off.{\"\\u00a0 \"}Choose ASCII"],
+    ["components/EngineSetup.tsx", "platform.{\"\\u00a0 \"}Use the setup"],
+    ["components/GroupSettingsPanel.tsx", "history.{\"\\u00a0 \"}Bot definitions"],
+    ["components/GroupView.tsx", "attached.{\"\\u00a0 \"}Add more"],
+    ["components/RoutinesPage.tsx", "answer.{\"\\u00a0 \"}Open its"],
+    ["components/RoutinesPage.tsx", "work.{\"\\u00a0 \"}Every run"],
+    ["components/SettingsModal.tsx", "subtitle={\"Anonymous product events — app opened, which features get used.\\u00a0 Never"],
+    ["components/SettingsModal.tsx", "output.\\u00a0 Your email is only attached if you shared it during setup.\"}"],
+    ["components/SettingsModal.tsx", "tools.{\"\\u00a0 \"}Errors"],
+    ["components/SettingsModal.tsx", "subtitle={\"Early features may change while we test them.\\u00a0 They stay"],
+    ["components/SettingsModal.tsx", "subtitle={\"Versions, configuration on/off state and a redacted server log tail.\\u00a0 Review"],
+    ["components/SettingsModal.tsx", "subtitle={\"Shown in the sidebar.\\u00a0 Saved as you go.\"}"],
+    ["components/SettingsModal.tsx", "subtitle={\"Which binary each engine runs.\\u00a0 Saved as you go.\"}"],
+    ["components/SettingsPanel.tsx", "placeholder={\"Nothing remembered yet.\\u00a0 The bot"],
+    ["components/SharedVpsRuntimeCard.tsx", "subtitle={\"The shared Linux sandbox running on your VPS, with a separate desktop for each bot.\\u00a0 Bots share"],
+    ["components/SkillRecorderPage.tsx", "once.{\"\\u00a0 \"}Let every"],
+    ["components/SkillRecorderPage.tsx", "remain.{\"\\u00a0 \"}The narration"],
+    ["components/TeamMapPage.tsx", "turn.{\"\\u00a0 \"}Only you"],
+    ["components/TeamMapPage.tsx", "yet.{\"\\u00a0 \"}Ask a"],
+    ["components/WebhooksPanel.tsx", "once.{\"\\u00a0 \"}Generate"],
+    ["components/WebhooksPanel.tsx", "now.{\"\\u00a0 \"}Keep BotFleet"],
+    ["components/WebhooksPanel.tsx", "yet.{\"\\u00a0 \"}Use the"],
+    // Search results render the same sentences from this table, not from the modal.
+    ["lib/settings-search.ts", "used.\\u00a0 Never"],
+    ["lib/settings-search.ts", "them.\\u00a0 They stay"],
+    ["lib/settings-search.ts", "tail.\\u00a0 Review"],
+    ["lib/settings-search.ts", "sidebar.\\u00a0 Saved"],
+  ];
+
+  for (const [file, gap] of GAPS) {
+    it(`${file} keeps ${gap.replaceAll("\\u00a0", "NBSP")}`, () => {
+      const source = FILES.find((entry) => entry.rel === file);
+      expect(source, `${file} is missing`).toBeDefined();
+      expect(source!.text).toContain(gap);
+    });
+  }
+});
+
+describe("JSX attribute strings are not JavaScript strings", () => {
+  // A quoted JSX attribute (subtitle="...") is read by the JSX compiler, not
+  // the JavaScript parser, so `\u00a0` inside it is not an escape: it reaches
+  // the screen as the six characters backslash, u, 0, 0, a, 0.  That is how the
+  // Shared VPS card's subtitle printed "bot.\u00a0 Bots share".  The sentence
+  // gap, and any other escape, belongs in a JS expression: ={"...\u00a0 ..."}.
+  const ESCAPE_IN_QUOTED_ATTRIBUTE = /\s([A-Za-z][\w:-]*)="([^"]*\\(?:u[0-9a-fA-F{]|x[0-9a-fA-F]{2})[^"]*)"/g;
+
+  function escapedAttributes(text: string): string[] {
+    return [...text.matchAll(ESCAPE_IN_QUOTED_ATTRIBUTE)].map((match) => `${match[1]}="${match[2]}"`);
+  }
+
+  it("flags the quoted form and accepts the expression form", () => {
+    expect(escapedAttributes('<Card subtitle="One.\\u00a0 Two." />')).toEqual(['subtitle="One.\\u00a0 Two."']);
+    expect(escapedAttributes('<Card subtitle="One.\\x41 Two." />')).toHaveLength(1);
+    expect(escapedAttributes('<Card\n  title="A"\n  subtitle="One.\\u00a0\n  Two."\n/>')).toHaveLength(1);
+    expect(escapedAttributes('<Card subtitle={"One.\\u00a0 Two."} />')).toEqual([]);
+    expect(escapedAttributes("<Card subtitle={`One.\\u00a0 Two.`} />")).toEqual([]);
+    expect(escapedAttributes('<Card title="Plain" className="a b" />')).toEqual([]);
+    // Only an escape is a problem; a regex-looking value without \u or \x is not.
+    expect(escapedAttributes('<input pattern="\\d+" />')).toEqual([]);
+  });
+
+  it("finds no escape inside a quoted JSX attribute anywhere in the renderer", () => {
+    const offenders: string[] = [];
+    for (const { rel, text } of FILES) {
+      if (!rel.endsWith(".tsx") || rel.endsWith(".test.tsx")) continue;
+      for (const attribute of escapedAttributes(text)) offenders.push(`${rel}: ${attribute}`);
+    }
+    expect(offenders).toEqual([]);
+  });
+});

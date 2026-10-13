@@ -11,6 +11,10 @@ public enum LiveActivityLifecyclePhase: Sendable, Equatable {
 public enum LiveActivityLifecycleAction: Sendable, Equatable {
     case awaitFreshState
     case endAll
+    /// End the ambient activities and keep the ones a person still has to
+    /// answer.  `.endAll` is what sign-out and a cold reset use; backgrounding
+    /// uses this, so an unanswered ask stays on the Lock Screen.
+    case endAmbient
     case resetAndAwaitFreshState
 }
 
@@ -18,9 +22,11 @@ public enum LiveActivityLifecycleAction: Sendable, Equatable {
 ///
 /// `.inactive` is a transition on the way to system UI or background.  It
 /// retains the preceding update policy; only `.background` disables updates
-/// and ends activities.  Initial activation and the first `.active` after
-/// `.background` start a fresh generation, but updates stay disabled until a
-/// post-resume snapshot lands.
+/// and ends ambient activities — an activity still waiting on a person is
+/// kept, because `LiveActivityRetention` decides that, not the clock.
+/// Initial activation and the first `.active` after `.background` start a
+/// fresh generation, but updates stay disabled until a post-resume snapshot
+/// lands.
 public struct LiveActivityLifecycle: Sendable {
     public private(set) var phase: LiveActivityLifecyclePhase = .inactive
     public private(set) var generation = 0
@@ -46,7 +52,7 @@ public struct LiveActivityLifecycle: Sendable {
             freshStateRequired = true
             generation += 1
             updatesEnabled = false
-            return .endAll
+            return .endAmbient
         }
     }
 

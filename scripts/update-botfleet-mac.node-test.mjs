@@ -3,19 +3,34 @@ import { chmod, copyFile, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { downloadBuiltBundle, ResolutionError } from "./ci-build-resolver.mjs";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import {
   applicationAttachmentError,
+  captureProcessIdentities,
+  exactAppPidsFromPs,
+  isZombieState,
+  processIsAlive,
+  processStates,
+  withoutExitedPids,
   applicationIdentitiesCanTransition,
+  classifySmokeFailure,
   SAFE_STORAGE_EXPORT_FLAG,
   shouldExportSafeStorageBeforeRename,
   authenticatedRuntimeError,
   bootOutHarnessForQuiesce,
   credentialPreparationReceiptPath,
   DEFAULT_PORTS,
+  DEFAULT_STARTUP_TIMEOUT_MS,
   dependencyFingerprint,
+  effectiveLockDocument,
+  reportCheckoutDrift,
+  describeLaunchdExit,
+  isRecoverableResolutionFailure,
+  parseLaunchdJob,
   designatedRequirementFromOutput,
   fenceRuntimeAdmission,
   healthTopologyResult,
@@ -23,27 +38,49 @@ import {
   harnessLaunchdLabel,
   isExpectedBotFleetProcess,
   launchAgentPlistLabel,
+  launchdExitReason,
   loadPrepared,
   main,
   parseArguments,
+  parseHealthBody,
   pendingRecoveryReceiptPath,
   quiesceBootoutLabels,
   rollbackHarnessBootoutLabels,
   rollbackHarnessBootstrapPlists,
   rollbackReadinessError,
+  resolveHarnessBearerCredential,
   run,
+  runStagedSmokeTest,
   runtimePreflight,
   settledRunOutcome,
   signalProcess,
+  smokeFailureMessage,
+  smokeTestEnabled,
   stableApplicationProcessError,
   startedHarnessLabel,
+  startupProgress,
   swapPreparedFiles,
   terminateVerified,
   validateBuiltBundle,
   waitForLaunchdBootout,
+  waitForStableApplication,
+  waitForStartup,
 } from "./update-botfleet-mac.mjs";
 
 const scripts = dirname(fileURLToPath(import.meta.url));
+
+/** Wrapper tests must not read ~/.botfleet or /Applications/BotFleet.app. */
+function wrapperFixtureEnv(checkout, fixture) {
+  return {
+    BOTFLEET_CHECKOUT: checkout,
+    BOTFLEET_DATA_DIR: join(fixture, "data"),
+    BOTFLEET_APP_PATH: join(fixture, "no-app.app"),
+  };
+}
+
+// A real 40-char commit, so the resolver is driven with a target it will accept.
+const COMMIT = "c".repeat(40);
+
 
 test("a detached run is given a progress file and a run id to report under", () => {
   const parsed = parseArguments(["update", "--progress", "/tmp/state/run.json", "--run-id", "run_one"]);
@@ -184,6 +221,90 @@ test("dependency fingerprints cover package contents and symlink targets", async
   assert.notEqual(await dependencyFingerprint(dependencies), contentChanged);
 });
 
+// The always-on checkout is supposed to be a detached origin/main checkout and
+// the updater leaves it there on apply.  When a seat switched it to a working
+// branch instead, the harness served that branch for days with nothing on
+// screen saying so.  Advisory only: it must never fail an update.
+test("checkout drift is reported, and only when it is real", async () => {
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  const root = await mkdtemp(join(tmpdir(), "omb-checkout-drift-"));
+  const repo = join(root, "repo");
+  await run("git", ["init", "-q", repo]);
+  await run("git", ["-C", repo, "config", "user.email", "t@example.invalid"]);
+  await run("git", ["-C", repo, "config", "user.name", "T"]);
+  await writeFile(join(repo, "f"), "1");
+  await run("git", ["-C", repo, "add", "f"]);
+  await run("git", ["-C", repo, "commit", "-qm", "one"]);
+  // A real origin/main ref, because that is what the drift check compares
+  // against — without one, "not origin/main" is indistinguishable from "no
+  // origin", and the check stays quiet on every checkout.
+  await run("git", ["-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+  // At origin/main: silent, because there is nothing to say.
+  assert.equal(await reportCheckoutDrift(repo), null);
+
+  // A branch at the SAME commit is not drift: the harness would be serving
+  // identical code, so there is nothing worth a warning.
+  await run("git", ["-C", repo, "checkout", "-q", "-b", "seat-work"]);
+  assert.equal(await reportCheckoutDrift(repo), null);
+
+  // A branch with its own commit IS drift, and it names itself — this is the
+  // shape that let a seat's working branch serve the harness for days.
+  await writeFile(join(repo, "f"), "2");
+  await run("git", ["-C", repo, "commit", "-qam", "two"]);
+  const drifted = await reportCheckoutDrift(repo);
+  assert.ok(drifted, "drift on a branch should be reported");
+  assert.match(drifted, /seat-work/);
+
+  // A path that is not a checkout reports nothing rather than failing an update.
+  assert.equal(await reportCheckoutDrift(join(root, "not-a-repo")), null);
+});
+
+// The first version of this fix tested only the document helper and left the
+// gate calling `.equals()` on a STRING, which throws a TypeError and surfaces
+// as an unexplained updater crash.  These cases drive the comparison the gate
+// actually performs, so a type slip cannot pass again.
+test("the gate comparison is byte-wise and type-correct", async () => {
+  const lock = "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n";
+  const stream = `---\nlockfileVersion: '9.0'\n\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.10.1\n---\n${lock}`;
+  // Exactly the expression assertDependenciesMatchSource runs.
+  const gate = (sourceLock, installedLock) =>
+    Buffer.from(effectiveLockDocument(sourceLock.toString("utf8")), "utf8").equals(installedLock);
+
+  assert.equal(gate(Buffer.from(stream), Buffer.from(lock)), true);
+  assert.equal(gate(Buffer.from(lock), Buffer.from(lock)), true);
+  assert.equal(gate(Buffer.from(stream), Buffer.from(`${lock}\n# drift\n`)), false);
+  assert.equal(gate(Buffer.from(lock), Buffer.from(stream)), false);
+});
+
+// The dependency gate compared the whole project lockfile against pnpm's
+// internal copy.  Since pnpm 12 those are different BYTE LENGTHS by design —
+// the project file is a two-document stream carrying `packageManagerDependencies`
+// and pnpm writes only the real lockfile — so the gate rejected every install
+// on every Mac while `pnpm install --frozen-lockfile` kept working, and the
+// only symptom was "update failed" at the moment someone tried to update.
+test("the dependency gate compares the document pnpm wrote, not the whole stream", () => {
+  const lock = "lockfileVersion: '9.0'\n\nimporters:\n  .: {}\n";
+  // pnpm 12: a leading document for the self-hosted package manager, then the
+  // real lockfile after a second `---`.
+  const stream = `---\nlockfileVersion: '9.0'\n\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.10.1\n        version: 12.10.1\n---\n${lock}`;
+  assert.equal(effectiveLockDocument(stream), lock);
+  assert.notEqual(stream, lock);
+
+  // pnpm < 12: one document, no separator.  A leading marker alone is not a
+  // document boundary, so the content comes back unchanged.
+  assert.equal(effectiveLockDocument(lock), lock);
+  assert.equal(effectiveLockDocument(`---\n${lock}`), lock);
+
+  // A real drift still fails: different dependency content is not equal.
+  assert.notEqual(effectiveLockDocument(stream), `${lock}\n# drift\n`);
+});
+
 test("command results wait for output pipes to close", async () => {
   const script = `
     const { spawn } = require("node:child_process");
@@ -266,6 +387,8 @@ test("the stable wrapper bootstraps updater policy from the fetched target", asy
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -334,6 +457,8 @@ test("the stable wrapper rejects an unmerged --target before running any of its 
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -386,6 +511,8 @@ test("the stable wrapper resolves a revision-expression --target instead of fetc
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -437,6 +564,8 @@ test("unquiesce ignores update targets and bootstraps the recovery from origin/m
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -493,6 +622,8 @@ test("the stable wrapper resolves env and equals-form targets to the pinned vali
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -544,6 +675,8 @@ test("the stable wrapper builds the commit it validated, even when main moves mi
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -617,6 +750,8 @@ test("the stable wrapper runs with no arguments and no update target", { skip: p
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -658,6 +793,8 @@ test("the stable wrapper detects a linked worktree checkout, where .git is a fil
   for (const path of [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -680,14 +817,14 @@ test("the stable wrapper detects a linked worktree checkout, where .git is a fil
 
   // Up-to-date check: the worktree is already at origin/main, so an unforced
   // run must short-circuit instead of running any updater.
-  const current = await run("bash", [wrapper], { env: { BOTFLEET_CHECKOUT: checkout }, allowFailure: true });
+  const current = await run("bash", [wrapper], { env: wrapperFixtureEnv(checkout, fixture), allowFailure: true });
   assert.equal(current.code, 0, current.stderr);
   assert.match(current.stdout, /Already at .*Nothing to update/);
   assert.equal(await readFile(marker, "utf8").catch(() => null), null, "an up-to-date worktree runs no updater");
 
   // Bootstrap: a forced run must archive and run the target's updater from
   // the worktree, not fall back to the installed implementation.
-  const forced = await run("bash", [wrapper], { env: { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1" }, allowFailure: true });
+  const forced = await run("bash", [wrapper], { env: { ...wrapperFixtureEnv(checkout, fixture), BOTFLEET_FORCE: "1" }, allowFailure: true });
   assert.equal(forced.code, 0, forced.stderr);
   assert.doesNotMatch(forced.stderr, /using the installed implementation/);
   const mainCommit = (await git(checkout, ["rev-parse", "origin/main"])).stdout.trim();
@@ -706,6 +843,8 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -738,7 +877,7 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
   // No BOTFLEET_FORCE anywhere below: every run sees HEAD == origin/main.
   const invoke = async (args, extraEnv = {}) => {
     await rm(marker, { force: true });
-    const result = await run("bash", [wrapper, ...args], { env: { BOTFLEET_CHECKOUT: checkout, ...extraEnv }, allowFailure: true });
+    const result = await run("bash", [wrapper, ...args], { env: { ...wrapperFixtureEnv(checkout, fixture), ...extraEnv }, allowFailure: true });
     const executed = await readFile(marker, "utf8").then(JSON.parse, () => null);
     return { ...result, executed };
   };
@@ -782,6 +921,47 @@ test("the stable wrapper does not test for a .git directory to find the checkout
   assert.match(source, /git -C "\$BOTFLEET_CHECKOUT" rev-parse --git-dir/);
 });
 
+test("the up-to-date runtime probe reads the bearer credential from BOTFLEET_OWNER_NONCE only", async () => {
+  const wrapper = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const helper = await readFile(join(scripts, "update-botfleet-runtime-commit.mjs"), "utf8");
+  assert.match(wrapper, /update-botfleet-runtime-commit\.mjs/);
+  assert.match(wrapper, /BOTFLEET_OWNER_NONCE/);
+  assert.match(wrapper, /BOTFLEET_OWNER_NONCE is required when a harness owner record exists/);
+  assert.doesNotMatch(wrapper, /\|\| RUNTIME_COMMIT=""/);
+  assert.doesNotMatch(wrapper, /owner\.nonce/);
+  assert.doesNotMatch(wrapper, /console\.log\(.*nonce/);
+  assert.match(helper, /process\.env\.BOTFLEET_OWNER_NONCE/);
+  assert.doesNotMatch(helper, /owner\.nonce/);
+  assert.match(helper, /BOTFLEET_OWNER_NONCE is required/);
+  assert.match(helper, /res\.statusCode === 401 \|\| res\.statusCode === 403/);
+  assert.match(helper, /maskedCredentialEnvRef/);
+});
+
+test("the mac updater prefers BOTFLEET_OWNER_NONCE and falls back to the live owner record", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  assert.match(source, /requireHarnessBearerCredential/);
+  assert.match(source, /resolveHarnessBearerCredential/);
+  assert.match(source, /process\.env\.BOTFLEET_OWNER_NONCE/);
+  assert.doesNotMatch(source, /Authorization: `Bearer \$\{owner\.nonce\}`/);
+});
+
+test("resolveHarnessBearerCredential falls back to the live owner record for old launchers", () => {
+  const owner = { version: 1, pid: 42, port: 8799, nonce: "c".repeat(64) };
+  const previous = process.env.BOTFLEET_OWNER_NONCE;
+  try {
+    delete process.env.BOTFLEET_OWNER_NONCE;
+    assert.equal(resolveHarnessBearerCredential(owner), owner.nonce);
+    assert.throws(() => resolveHarnessBearerCredential(null), /BOTFLEET_OWNER_NONCE is required/);
+    process.env.BOTFLEET_OWNER_NONCE = "d".repeat(64);
+    assert.equal(resolveHarnessBearerCredential(owner), "d".repeat(64));
+    process.env.BOTFLEET_OWNER_NONCE = "short";
+    assert.throws(() => resolveHarnessBearerCredential(owner), /not a valid harness bearer credential/);
+  } finally {
+    if (previous === undefined) delete process.env.BOTFLEET_OWNER_NONCE;
+    else process.env.BOTFLEET_OWNER_NONCE = previous;
+  }
+});
+
 test("apply bootstraps the updater recorded in the stage manifest, not a newer origin/main", { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false }, async (t) => {
   const fixture = await mkdtemp(join(tmpdir(), "ubf-stage-bootstrap-"));
   t.after(() => rm(fixture, { recursive: true, force: true }));
@@ -794,6 +974,8 @@ test("apply bootstraps the updater recorded in the stage manifest, not a newer o
     for (const path of [
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -992,16 +1174,33 @@ function processTable(entries) {
       if (entry.exitDuringLsof) entry.alive = false;
       return entry.cwd;
     },
+    txtPathsOf: async () => [],
     kill: (pid, signal) => {
       const entry = table.get(pid);
       if (entry?.killError) throw entry.killError;
       if (!entry?.alive) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH", errno: -3, syscall: "kill" });
       signals.push([pid, signal]);
-      if (signal === "SIGTERM" && !entry.ignoresTerm) entry.alive = false;
+      if (signal === "SIGTERM" && !entry.ignoresTerm) {
+        // zombieOnTerm: the process exits on SIGTERM but its parent never
+        // reaps it, so the pid stays (kill -0 still succeeds) in state Z.
+        if (entry.zombieOnTerm) entry.zombie = true;
+        else entry.alive = false;
+      }
     },
     wait: async () => {},
   };
   return { table, signals, deps };
+}
+
+// The real zombie-aware liveness check over a process table: `kill -0` answers
+// for every pid still in the table, and the `ps` state column says Z for the
+// ones marked zombie.  A zombie entry keeps `alive: true` because that is
+// exactly what kill -0 reports for one.
+function zombieAwareIsAlive(table) {
+  return (pid) => processIsAlive(pid, {
+    exists: (target) => table.get(target)?.alive === true,
+    statesOf: async (targets) => new Map(targets.map((target) => [target, table.get(target)?.zombie ? "Z" : "S"])),
+  });
 }
 
 const quiesceConfig = {
@@ -1057,7 +1256,8 @@ test("quiesce treats a process that exits between verification and SIGTERM as st
   assert.deepEqual(strict.signals, [[501, "SIGTERM"]]);
 });
 
-test("quiesce skips a process that exits while ps is describing it instead of calling it foreign", async () => {
+// quiesce helpers shell out to lsof, which is unavailable on win32 CI hosts.
+test("quiesce skips a process that exits while ps is describing it instead of calling it foreign", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
   const { signals, deps } = processTable({
     501: { command: electronMain, cwd: "/", exitDuringPs: true },
     16529: { command: checkoutHarness, cwd: quiesceConfig.checkout },
@@ -1069,7 +1269,8 @@ test("quiesce skips a process that exits while ps is describing it instead of ca
   assert.deepEqual(signals, [[16529, "SIGTERM"]]);
 });
 
-test("quiesce re-resolves the harness when its pid changed between capture and quiesce", async () => {
+// quiesce helpers shell out to lsof, which is unavailable on win32 CI hosts.
+test("quiesce re-resolves the harness when its pid changed between capture and quiesce", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
   // Capture recorded harness pid 233.  By quiesce that harness is gone, 233
   // names an unrelated process, and the replacement harness 16529 holds the
   // database and answers port 8799.
@@ -1117,6 +1318,208 @@ test("quiesce still refuses a process that rejects or survives SIGTERM, and neve
     /BotFleet did not exit after graceful quit and SIGTERM \(pid 501\); refusing SIGKILL/,
   );
   assert.deepEqual(stubborn.signals, [[501, "SIGTERM"]]);
+});
+
+// 2026-10-08 apply: "BotFleet did not exit after graceful quit and SIGTERM
+// (pid 61872, 89539); refusing SIGKILL".  Both pids were `cua-driver`
+// processes that had already exited, state Z, parent a grok CLI that never
+// reaped them.  kill -0 succeeds on a zombie, so the old probe counted them as
+// running forever and the apply rolled back.
+const cuaDriver = "/Applications/BotFleet.app/Contents/Resources/cua-driver mcp";
+
+test("processIsAlive treats a zombie as exited, and any doubt as alive", async () => {
+  const exists = () => true;
+  assert.equal(isZombieState("Z"), true);
+  assert.equal(isZombieState("Z+"), true);
+  assert.equal(isZombieState(" Zs \n"), true);
+  for (const state of ["S", "Ss", "R+", "U", "T", "I", "", undefined]) {
+    assert.equal(isZombieState(state), false, `state ${JSON.stringify(state)} is not a zombie`);
+  }
+  const statesOf = (state) => async (pids) => new Map(pids.map((pid) => [pid, state]));
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Z") }), false);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Z+") }), false);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("Ss") }), true);
+  // ESRCH is still the proof of absence, and ps is not even consulted.
+  let asked = 0;
+  assert.equal(await processIsAlive(61872, { exists: () => false, statesOf: async () => { asked += 1; return new Map(); } }), false);
+  assert.equal(asked, 0);
+  // A ps that prints nothing for the pid, or fails, proves nothing: the process
+  // is treated as running, so the swap never proceeds under a live BotFleet
+  // because of a ps hiccup on a loaded Mac.
+  assert.equal(await processIsAlive(61872, { exists, statesOf: async () => new Map() }), true);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: statesOf("") }), true);
+  assert.equal(await processIsAlive(61872, { exists, statesOf: async () => { throw new Error("spawn ps EAGAIN"); } }), true);
+});
+
+test("withoutExitedPids awaits an asynchronous verdict instead of treating every Promise as alive", async () => {
+  assert.deepEqual(await withoutExitedPids([1, 2, 3], { isAlive: async (pid) => pid === 2 }), [2]);
+  assert.deepEqual(await withoutExitedPids([1, 2, 3], { isAlive: (pid) => pid !== 2 }), [1, 3]);
+  assert.deepEqual(await withoutExitedPids([], { isAlive: async () => true }), []);
+});
+
+test("withoutExitedPids reads every state with one ps spawn per poll, not one per pid", async () => {
+  // A quiesce polls every 250 ms for up to 20 s: one spawn per pid per tick
+  // would burn the budget on a loaded Mac before any process exits.
+  const seen = [];
+  const states = new Map([[10, "Ss"], [11, "Z"], [12, "R+"], [13, "Z+"]]);
+  const options = {
+    exists: (pid) => pid !== 14,
+    statesOf: async (pids) => { seen.push([...pids]); return states; },
+  };
+  assert.deepEqual(await withoutExitedPids([10, 11, 12, 13, 14], options), [10, 12]);
+  assert.deepEqual(seen, [[10, 11, 12, 13]], "one lookup for the four pids kill -0 still sees; the gone pid never reaches ps");
+  // Nothing left after kill -0: no spawn at all.
+  assert.deepEqual(await withoutExitedPids([14], options), []);
+  assert.equal(seen.length, 1);
+  // A pid with no ps row stays alive, and a failed lookup keeps every pid.
+  assert.deepEqual(await withoutExitedPids([10, 11, 12], { ...options, statesOf: async () => new Map([[11, "Z"]]) }), [10, 12]);
+  assert.deepEqual(await withoutExitedPids([10, 11], { ...options, statesOf: async () => { throw new Error("spawn ps EAGAIN"); } }), [10, 11]);
+});
+
+test("processStates parses one real ps row per pid and ignores a pid that is not there", { skip: process.platform === "win32" ? "ps is not available on win32" : false }, async () => {
+  // A reaped child's pid is a real pid that no longer exists.
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await once(child, "exit");
+  const states = await processStates([process.pid, child.pid]);
+  assert.equal(states.has(process.pid), true);
+  assert.equal(isZombieState(states.get(process.pid)), false);
+  assert.equal(states.has(child.pid), false, "a pid with no row is absent, and does not hide the others");
+  assert.equal((await processStates([])).size, 0);
+});
+
+test("quiesce treats a zombie as exited: it is never waited on, inspected or signalled", async () => {
+  const { table, signals, deps } = processTable({
+    61872: { command: cuaDriver, cwd: "/", zombie: true },
+    89539: { command: cuaDriver, cwd: "/", zombie: true },
+  });
+  const inspected = [];
+  const previous = {
+    runtimePids: [],
+    appPids: [61872, 89539],
+    processCommands: { 61872: cuaDriver, 89539: cuaDriver },
+    processCwds: { 61872: "/", 89539: "/" },
+  };
+  const zombieDeps = {
+    ...deps,
+    isAlive: zombieAwareIsAlive(table),
+    commandOf: async (pid) => { inspected.push(pid); return deps.commandOf(pid); },
+  };
+  await terminateVerified([61872, 89539], previous, quiesceConfig, { current: [61872, 89539], ...zombieDeps });
+  await terminateVerified([61872, 89539], previous, quiesceConfig, zombieDeps);
+  assert.deepEqual(signals, [], "no signal reaches a zombie, and nothing is sent to its parent");
+  assert.deepEqual(inspected, []);
+
+  // The same table under the old kill -0 probe is the 2026-10-08 failure.
+  const naive = processTable({
+    61872: { command: cuaDriver, cwd: "/", ignoresTerm: true },
+    89539: { command: cuaDriver, cwd: "/", ignoresTerm: true },
+  });
+  await assert.rejects(
+    terminateVerified([61872, 89539], previous, quiesceConfig, { current: [61872, 89539], ...naive.deps }),
+    /BotFleet did not exit after graceful quit and SIGTERM \(pid 61872, 89539\); refusing SIGKILL/,
+  );
+});
+
+test("quiesce waits for a process that exits on SIGTERM but is never reaped, because the zombie has already exited", async () => {
+  // The likely production sequence: BotFleet's helper is live when quiesce
+  // starts, exits on SIGTERM, and its parent leaves it defunct.
+  const { table, signals, deps } = processTable({
+    501: { command: electronMain, cwd: "/", zombieOnTerm: true },
+  });
+  await terminateVerified([501], { processCommands: {}, processCwds: {} }, quiesceConfig, {
+    current: [501],
+    ...deps,
+    isAlive: zombieAwareIsAlive(table),
+  });
+  assert.deepEqual(signals, [[501, "SIGTERM"]]);
+  assert.equal(table.get(501).zombie, true);
+});
+
+test("quiesce ignores a zombie yet still refuses a live process that ignores SIGTERM, naming only the live pid", async () => {
+  const { table, signals, deps } = processTable({
+    61872: { command: cuaDriver, cwd: "/", zombie: true },
+    501: { command: electronMain, cwd: "/", ignoresTerm: true },
+  });
+  const previous = { runtimePids: [], appPids: [], processCommands: {}, processCwds: {} };
+  await assert.rejects(
+    terminateVerified([61872, 501], previous, quiesceConfig, { current: [61872, 501], ...deps, isAlive: zombieAwareIsAlive(table) }),
+    (error) => error.message.endsWith("(pid 501); refusing SIGKILL") && !error.message.includes("61872"),
+  );
+  assert.deepEqual(signals, [[501, "SIGTERM"]], "only the live process is signalled, and never with SIGKILL");
+});
+
+// quiesce helpers shell out to lsof, which is unavailable on win32 CI hosts.
+test("capture skips zombies instead of recording or verifying them, and still refuses a live foreign process", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
+  const { table, deps } = processTable({
+    501: { command: electronMain, cwd: "/" },
+    // A zombie's command line and working directory are gone or unreliable:
+    // verifying it would refuse the whole update with "owns BotFleet state".
+    61872: { command: "(cua-driver)", cwd: "", zombie: true },
+    89539: { command: "", cwd: "", zombie: true },
+  });
+  const captured = await captureProcessIdentities([61872, 501, 89539, 501], quiesceConfig, {
+    isAlive: zombieAwareIsAlive(table),
+    commandOf: deps.commandOf,
+    cwdOf: deps.cwdOf,
+  });
+  assert.deepEqual(captured.pids, [501], "duplicates collapse and zombies are dropped");
+  assert.deepEqual(captured.processCommands, { 501: electronMain });
+  assert.deepEqual(captured.processCwds, { 501: "/" });
+
+  // A live process that is not BotFleet is still a refusal, not a skip.
+  const foreign = processTable({ 987654: { command: "/usr/libexec/unrelated-daemon --serve", cwd: "/" } });
+  await assert.rejects(
+    captureProcessIdentities([987654], quiesceConfig, {
+      isAlive: zombieAwareIsAlive(foreign.table),
+      commandOf: foreign.deps.commandOf,
+      cwdOf: foreign.deps.cwdOf,
+    }),
+    /Process 987654 owns BotFleet state but does not match an expected BotFleet executable/,
+  );
+});
+
+test("the process list match for the installed bundle skips rows in a zombie state", () => {
+  const executable = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
+  const psOutput = [
+    `  501 Ss   ${executable}`,
+    `  502 Z    ${executable}`,
+    `  503 S+   ${executable} --flag value`,
+    `  504 Z+   ${executable} --flag value`,
+    "  505 S    /usr/libexec/unrelated-daemon --serve",
+    `  506 S    ${executable}-other`,
+    "",
+  ].join("\n");
+  assert.deepEqual(exactAppPidsFromPs(psOutput, executable), [501, 503]);
+  assert.deepEqual(exactAppPidsFromPs("", executable), []);
+});
+
+// A real zombie, made the way the grok CLI made them: a child that has exited
+// whose parent never calls wait().  The shell backgrounds a `sleep 0`, prints
+// its pid, then execs into a `sleep` that never reaps it.  Only this test's
+// own child is ever signalled, and only to clean up.
+test("a real unreaped child is a zombie: kill -0 still succeeds, processIsAlive says exited, and quiesce passes it", { skip: process.platform === "win32" ? "ps and sh semantics differ on win32" : false }, async () => {
+  const parent = spawn("/bin/sh", ["-c", "/bin/sleep 0 & echo $!; exec /bin/sleep 30"], { stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    let stdout = "";
+    parent.stdout.setEncoding("utf8");
+    parent.stdout.on("data", (chunk) => { stdout += chunk; });
+    const deadline = Date.now() + 10_000;
+    while (!stdout.includes("\n") && Date.now() < deadline) await delay(25);
+    const zombiePid = Number(stdout.trim());
+    assert.ok(Number.isInteger(zombiePid) && zombiePid > 0, `the shell reported a pid, got ${JSON.stringify(stdout)}`);
+    // The pid keeps answering kill -0 until the parent reaps it, which is the
+    // premise of the bug; processIsAlive must see through it once it has exited.
+    while (await processIsAlive(zombiePid) && Date.now() < deadline) await delay(25);
+    assert.equal(await processIsAlive(zombiePid), false, "an unreaped, exited child reads as exited");
+    assert.doesNotThrow(() => process.kill(zombiePid, 0), "kill -0 alone still reports the zombie as present");
+    assert.equal(await processIsAlive(parent.pid), true, "the parent that never reaped it is a live process");
+    assert.equal(await processIsAlive(process.pid), true);
+    const previous = { runtimePids: [], appPids: [zombiePid], processCommands: {}, processCwds: {} };
+    await terminateVerified([zombiePid], previous, { ...quiesceConfig, gracefulExitMs: 1_000, termExitMs: 1_000 }, { current: [zombiePid] });
+  } finally {
+    parent.kill("SIGKILL");
+    await once(parent, "exit");
+  }
 });
 
 test("quiesce confirms a harness bootout with launchctl print and boots out a job loaded since capture", async () => {
@@ -1171,7 +1574,7 @@ test("quiesce confirms a harness bootout with launchctl print and boots out a jo
 test("quiesce re-resolves current holders, bundle processes and port owners before signalling", async () => {
   const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
   const quiesce = source.indexOf("quiesce: async (previous) => {");
-  const assertQuiesced = source.indexOf("assertQuiesced: async () => {", quiesce);
+  const assertQuiesced = source.indexOf("assertQuiesced: async (previous) => {", quiesce);
   assert.ok(quiesce >= 0 && assertQuiesced > quiesce);
   const body = source.slice(quiesce, assertQuiesced);
   assert.match(body, /await bootOutHarnessForQuiesce\(config, previous\)/);
@@ -1248,19 +1651,19 @@ test("desktop local-update UI does not report normal packaging latency as failur
   assert.doesNotMatch(source, /did not finish\. Quit the app and try again/);
 });
 
-test("process verification binds relative server commands to the live checkout cwd", () => {
+test("process verification binds relative server commands to the live checkout cwd", async () => {
   const config = { appPath: "/Applications/BotFleet.app", checkout: "/Users/test/apps/botfleet-server" };
   assert.equal(
-    isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", config.checkout, config),
+    await isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", config.checkout, config),
     true,
   );
   assert.equal(
-    isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", "/tmp/decoy", config),
+    await isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", "/tmp/decoy", config),
     false,
   );
-  assert.equal(isExpectedBotFleetProcess("/usr/bin/python3 server/index.ts", config.checkout, config), false);
-  assert.equal(isExpectedBotFleetProcess("/Applications/Other.app/Contents/MacOS/BotFleet", "/", config), false);
-  assert.equal(isExpectedBotFleetProcess("/Applications/BotFleet.app/Contents/MacOS/BotFleet", "/", config), true);
+  assert.equal(await isExpectedBotFleetProcess("/usr/bin/python3 server/index.ts", config.checkout, config), false);
+  assert.equal(await isExpectedBotFleetProcess("/Applications/Other.app/Contents/MacOS/BotFleet", "/", config), false);
+  assert.equal(await isExpectedBotFleetProcess("/Applications/BotFleet.app/Contents/MacOS/BotFleet", "/", config), true);
 });
 
 test("the updater covers every desktop harness fallback port", () => {
@@ -1278,9 +1681,15 @@ test("unused foreign fallback ports do not hide one valid BotFleet owner", () =>
   assert.match(healthTopologyResult([owner, { kind: "unavailable" }]).reason, /unavailable or ambiguous/);
 });
 
-test("a post-fence ownership exception releases runtime admission", async () => {
+test("a post-fence ownership exception releases runtime admission", async (t) => {
   const releases = [];
   const owner = { version: 1, pid: 42, port: 8799, nonce: "a".repeat(64) };
+  const previousNonce = process.env.BOTFLEET_OWNER_NONCE;
+  process.env.BOTFLEET_OWNER_NONCE = owner.nonce;
+  t.after(() => {
+    if (previousNonce === undefined) delete process.env.BOTFLEET_OWNER_NONCE;
+    else process.env.BOTFLEET_OWNER_NONCE = previousNonce;
+  });
   const result = await fenceRuntimeAdmission(
     { dataDirectory: "/private/data", ports: [8799] },
     {
@@ -1752,6 +2161,8 @@ test("the updater runs its entry point when invoked through a symlinked director
   const { linked, root } = await symlinkedCopy(t, [
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
+    "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]);
@@ -1787,3 +2198,799 @@ test("another script with the same entry guard runs through a symlinked director
   assert.notEqual(result.code, 0);
   assert.match(result.stderr, /GH_TOKEN is required to verify the release tag/);
 });
+
+// --- Pre-activation smoke test ------------------------------------------------
+//
+// The Sep 17 and Oct 1 outages were both a healthy binary plus a starved CPU,
+// and the first version of this gate would have called both of them a corrupt
+// build.  These cases exist to keep that mistake from returning: a timeout and
+// a real failure must stay distinguishable, and only a timeout may be retried.
+// The diagnosis is not re-derived here either — fleet recall ("busy host update
+// timeout classified as corrupt artifact not a failure", 2026-10-04) returns the
+// Oct 1 cloudflared probe incident (PR #780, board fd1736f8) and the open board
+// sweep for the same failure in six other probes.
+test("the smoke test is on unless it is explicitly switched off", () => {
+  assert.equal(smokeTestEnabled({}), true);
+  assert.equal(smokeTestEnabled({ BOTFLEET_UPDATE_SMOKE: "1" }), true);
+  for (const value of ["0", "off", "FALSE", "no", " off "]) {
+    assert.equal(smokeTestEnabled({ BOTFLEET_UPDATE_SMOKE: value }), false, `${value} should disable the probe`);
+  }
+});
+
+test("a boot that never became ready is a busy host, not a corrupt candidate", () => {
+  assert.equal(classifySmokeFailure({ exitCode: null, signal: null }), "server-never-ready");
+  assert.equal(classifySmokeFailure({ spawnTimedOut: true }), "sqlite-probe-timed-out");
+  const timeoutMessage = smokeFailureMessage({
+    cause: "server-never-ready",
+    exitCode: null,
+    signal: null,
+    targetCommit: "b".repeat(40),
+  });
+  assert.match(timeoutMessage, /too busy/);
+  assert.match(timeoutMessage, /commit=b{12}\b/);
+  // The whole point: a starved host must not be reported as a broken build.
+  assert.doesNotMatch(timeoutMessage, /corrupt|invalid|bad build/i);
+});
+
+test("a candidate that exits or cannot spawn is named as a real failure", () => {
+  assert.equal(classifySmokeFailure({ exitCode: 1, signal: null }), "server-exited");
+  assert.equal(classifySmokeFailure({ exitCode: null, signal: "SIGSEGV" }), "server-killed-SIGSEGV");
+  assert.equal(classifySmokeFailure({ spawnError: new Error("ENOENT") }), "spawn-failed");
+  const exited = smokeFailureMessage({
+    cause: "server-exited",
+    exitCode: 1,
+    signal: null,
+    targetCommit: "b".repeat(40),
+    output: "Error: Cannot find package 'zod'",
+  });
+  assert.match(exited, /exited during boot/);
+  assert.match(exited, /exit=1/);
+  assert.match(exited, /Cannot find package/);
+  assert.match(smokeFailureMessage({ cause: "spawn-failed", spawnError: "EACCES", targetCommit: "b".repeat(40) }), /spawn=EACCES/);
+});
+
+test("candidate output is capped in the failure message", () => {
+  const message = smokeFailureMessage({
+    cause: "server-exited",
+    exitCode: 1,
+    targetCommit: "b".repeat(40),
+    output: "x".repeat(50_000),
+  });
+  assert.ok(message.length < 4_000, `message should stay small, got ${message.length}`);
+});
+
+const smokeOk = { ready: true, output: "", sqlite: { ok: true, timedOut: false, detail: null } };
+const smokeNeverReady = { ready: false, output: "", exitCode: null, signal: null };
+const smokeExited = { ready: false, output: "boom", exitCode: 1, signal: null };
+
+test("a candidate that starts and initializes SQLite passes without a retry", async () => {
+  let calls = 0;
+  const result = await runStagedSmokeTest({
+    builtBundle: "/stage/BotFleet.app",
+    targetCommit: "b".repeat(40),
+    smokeImpl: async () => {
+      calls += 1;
+      return smokeOk;
+    },
+  });
+  assert.deepEqual(result, { ok: true, attempts: 1 });
+  assert.equal(calls, 1);
+});
+
+test("a readiness timeout is retried once, and a second timeout is reported as a busy host", async () => {
+  let calls = 0;
+  const retries = [];
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return smokeNeverReady;
+      },
+      onRetry: (event) => retries.push(event),
+    }),
+    /too busy/,
+  );
+  assert.equal(calls, 2, "exactly one retry, never a loop");
+  assert.deepEqual(retries, [{ attempt: 1, attempts: 2 }]);
+});
+
+test("a busy first attempt followed by a healthy candidate succeeds", async () => {
+  let calls = 0;
+  const result = await runStagedSmokeTest({
+    builtBundle: "/stage/BotFleet.app",
+    targetCommit: "b".repeat(40),
+    smokeImpl: async () => {
+      calls += 1;
+      return calls === 1 ? smokeNeverReady : smokeOk;
+    },
+  });
+  assert.deepEqual(result, { ok: true, attempts: 2 });
+  assert.equal(calls, 2);
+});
+
+test("a candidate that exits is never retried, because waiting cannot change the answer", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return smokeExited;
+      },
+    }),
+    /exited during boot/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("a missing node:sqlite binding is a real failure, not a slow host", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return { ready: true, output: "", sqlite: { ok: false, timedOut: false, detail: "node:sqlite did not initialize (exit=1)" } };
+      },
+    }),
+    /node:sqlite did not initialize/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("a probe-reported cause wins over the busy-host default", async () => {
+  // A live child that never reported readiness would normally classify as
+  // "too busy" and be retried.  When the probe knows better — the owner record
+  // named a different pid — that is a real defect, and saying "too busy" would
+  // send the operator after the wrong problem entirely.
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return {
+          ready: false,
+          cause: "owner-mismatch",
+          output: "owner record pid 1 does not match the staged server pid 2",
+          exitCode: null,
+          signal: null,
+        };
+      },
+    }),
+    /owner record naming a different process/,
+  );
+  assert.equal(calls, 1, "a real defect must not be retried as a slow host");
+});
+
+test("only a well-formed health body establishes readiness", () => {
+  // `body?.ready !== false` accepts every one of these, because each is "not
+  // false" — including a truncated body, an HTML error page, and a bare `{}`.
+  // Any of them would have declared a candidate ready.
+  assert.equal(parseHealthBody({ app: "botfleet", ready: true }), true);
+  assert.equal(parseHealthBody({ app: "botfleet", ready: false }), false);
+  for (const body of [null, undefined, "ready", 42, [], {}, { ready: true }, { app: "botfleet" },
+    { app: "botfleet", ready: "true" }, { app: "botfleet", ready: 1 }]) {
+    assert.equal(parseHealthBody(body), false, `${JSON.stringify(body)} must not establish readiness`);
+  }
+});
+
+test("only an expected cancellation justifies packaging on this Mac", async () => {
+  // The real class: the check is an instanceof, so a stand-in would make the
+  // test pass for the wrong reason.
+
+  // The `auto` policy exists for "this commit was not built".  A build that
+  // actually FAILED is a signal — its signature gate, tests, or packaging step
+  // rejected the commit — and quietly building it locally for 15 minutes would
+  // turn a broken pipeline into a deceptively successful install.
+  // This used to construct a `ResolutionError("x")` and hand-assign `cause` and
+  // `conclusion` onto it — which is a restatement of the function's own body.
+  // It would still pass if ci-build-resolver.mjs were deleted outright, so it
+  // could not catch the bug it was written for: the resolver reporting
+  // "still running" while the consumer tests for "in_progress".
+  //
+  // So the error is produced by the RESOLVER, from a real workflow status, and
+  // the assertion is on the value the consumer actually reads — not on the
+  // prose, which is identical for "in_progress" and "still running".
+  const fromResolver = async (status, conclusion) => {
+    const fetchImpl = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        workflow_runs: [{ id: 1, head_sha: COMMIT, status, conclusion, event: "push" }],
+      }),
+    });
+    try {
+      await downloadBuiltBundle({ commit: COMMIT, destination: "/tmp/unused-by-this-test", fetchImpl });
+    } catch (error) {
+      return error;
+    }
+    throw new Error(`expected the resolver to refuse a run with status=${status}`);
+  };
+
+  // Sanity: the run really is refused, with the cause the consumer branches on.
+  const stillRunning = await fromResolver("in_progress", null);
+  assert.equal(stillRunning.cause, "build-failed");
+  // THE BUG.  The prose says "still running"; the value is the raw status.
+  assert.equal(stillRunning.conclusion, "in_progress",
+    "the resolver must carry the raw workflow status, because the consumer compares against that literal");
+  assert.equal(isRecoverableResolutionFailure(stillRunning), true, "a build still running is worth a moment");
+
+  const cancelled = await fromResolver("completed", "cancelled");
+  assert.equal(cancelled.conclusion, "cancelled");
+  assert.equal(isRecoverableResolutionFailure(cancelled), true, "a superseded build is expected, not a failure");
+
+  const failed = await fromResolver("completed", "failure");
+  assert.equal(isRecoverableResolutionFailure(failed), false,
+    "a build that actually rejected the commit must surface, not fall back to a local package");
+  assert.equal(isRecoverableResolutionFailure(await fromResolver("completed", "timed_out")), false);
+
+  assert.equal(isRecoverableResolutionFailure(new ResolutionError("x", "no-build")), true,
+    "the commit predates the workflow");
+  for (const cause of ["network-failed", "network-timed-out", "rate-limited", "checksum-mismatch", "bad-manifest", "bad-response", "unauthorized", "pointer-lost"]) {
+    assert.equal(
+      isRecoverableResolutionFailure(new ResolutionError("x", cause)),
+      false,
+      `${cause} must surface rather than fall back`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// With no target named, the wrapper installs the newest commit with a green
+// hosted build instead of main's tip (whose build is usually still running or
+// was cancelled by the next push).  The selection itself is covered in
+// ci-build-resolver.node-test.mjs; these tests cover what the wrapper does with
+// an answer.
+// ---------------------------------------------------------------------------
+
+const wrapperOnly = { skip: process.platform === "win32" ? "the stable wrapper requires bash" : false };
+
+/**
+ * A remote whose main has two commits, each carrying its own stub updater
+ * ("older" and "tip") and a stand-in for ci-build-resolver.mjs whose answer the
+ * test dictates through the environment.  The wrapper runs the TIP's resolver,
+ * so the stand-in is identical in both.  The stub updater records the label of
+ * the commit it was archived from, its arguments, and the hand-off variable.
+ */
+async function newestGreenFixture(t, { resolver } = {}) {
+  const fixture = await mkdtemp(join(tmpdir(), "ubf-newest-green-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
+  const remote = join(fixture, "remote");
+  const checkout = join(fixture, "checkout");
+  const marker = join(fixture, "executed.json");
+  const selectLog = join(fixture, "selection.log");
+  await mkdir(remote, { recursive: true });
+  const git = (cwd, args) => run("git", ["-C", cwd, ...args]);
+  const fakeResolver = resolver ?? [
+    'import { appendFileSync } from "node:fs";',
+    "export async function selectUpdateTarget(options) {",
+    '  appendFileSync(process.env.UBF_SELECT_LOG, JSON.stringify({ checkout: options.checkout, appPath: options.appPath }) + "\\n");',
+    "  if (process.env.UBF_SELECT_THROW) throw new Error(process.env.UBF_SELECT_THROW);",
+    "  return { status: process.env.UBF_SELECT_STATUS, commit: process.env.UBF_SELECT_COMMIT, message: process.env.UBF_SELECT_MESSAGE };",
+    "}",
+    "",
+  ].join("\n");
+  const writeCommit = async (label) => {
+    for (const path of [
+      "scripts/update-botfleet-mac.mjs",
+      "scripts/mac-update-transaction.mjs",
+      "scripts/ci-build-resolver.mjs",
+      "scripts/stage-entries.mjs",
+      "scripts/update-progress.mjs",
+      "electron/update-credential-preparation.mjs",
+    ]) {
+      await mkdir(dirname(join(remote, path)), { recursive: true });
+      let text = "// placeholder\n";
+      if (path.endsWith("update-botfleet-mac.mjs")) {
+        text = `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, JSON.stringify({ label: ${JSON.stringify(label)}, args: process.argv.slice(2), hint: process.env.BOTFLEET_UPDATE_SELECTION_FAILURE ?? null }));\n`;
+      } else if (path.endsWith("ci-build-resolver.mjs")) {
+        text = fakeResolver;
+      }
+      await writeFile(join(remote, path), text);
+    }
+  };
+  await git(fixture, ["init", "-b", "main", "remote"]);
+  await git(remote, ["config", "user.email", "test@example.com"]);
+  await git(remote, ["config", "user.name", "Test"]);
+  await writeCommit("older");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "older"]);
+  const older = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  // A commit that never reached main, for the ancestry rule.
+  await git(remote, ["checkout", "-b", "evil"]);
+  await writeCommit("evil");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "evil"]);
+  const evil = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  await git(remote, ["checkout", "main"]);
+  await writeCommit("tip");
+  await git(remote, ["add", "."]);
+  await git(remote, ["commit", "-m", "tip"]);
+  const tip = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
+  await git(fixture, ["clone", "remote", "checkout"]);
+  const wrapper = join(scripts, "update-botfleet.sh");
+  const invoke = async (args, env = {}) => {
+    await rm(marker, { force: true });
+    await rm(selectLog, { force: true });
+    const result = await run("bash", [wrapper, ...args], {
+      env: {
+        BOTFLEET_CHECKOUT: checkout,
+        BOTFLEET_FORCE: "1",
+        BOTFLEET_APP_PATH: join(fixture, "BotFleet.app"),
+        UBF_SELECT_LOG: selectLog,
+        UBF_SELECT_STATUS: "",
+        UBF_SELECT_COMMIT: "",
+        UBF_SELECT_MESSAGE: "",
+        UBF_SELECT_THROW: "",
+        BOTFLEET_UPDATE_TARGET: "",
+        BOTFLEET_UPDATE_SELECTION_FAILURE: "",
+        ...env,
+      },
+      allowFailure: true,
+    });
+    const executed = await readFile(marker, "utf8").then(JSON.parse, () => null);
+    const consulted = await readFile(selectLog, "utf8").then((text) => text.trim().split("\n").map((line) => JSON.parse(line)), () => []);
+    return { ...result, executed, consulted };
+  };
+  return { fixture, checkout, older, evil, tip, invoke };
+}
+
+test("with no target the wrapper installs the chosen commit, using that commit's own updater", wrapperOnly, async (t) => {
+  const { fixture, checkout, older, tip, invoke } = await newestGreenFixture(t);
+  const message = `Updating to ${older.slice(0, 12)} (main is 1 commit ahead; its build was cancelled)`;
+  const chosen = { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: older, UBF_SELECT_MESSAGE: message };
+
+  const plain = await invoke([], chosen);
+  assert.equal(plain.code, 0, plain.stderr);
+  // The updater policy comes from the commit being installed, not from the tip.
+  assert.deepEqual(plain.executed, { label: "older", args: ["--target", older], hint: null });
+  assert.match(plain.stdout, new RegExp(escapeRegExp(message)));
+  assert.notEqual(older, tip);
+  // The selection saw this checkout and this app, not defaults.
+  assert.deepEqual(plain.consulted, [{ checkout, appPath: join(fixture, "BotFleet.app") }]);
+
+  const prepare = await invoke(["prepare"], chosen);
+  assert.deepEqual(prepare.executed, { label: "older", args: ["prepare", "--target", older], hint: null });
+
+  // The harness's detached run: its flags are forwarded untouched, ahead of the pin.
+  const progress = join(fixture, "run.json");
+  const detached = await invoke(["--progress", progress, "--run-id", "run_one"], chosen);
+  assert.deepEqual(detached.executed, {
+    label: "older",
+    args: ["--progress", progress, "--run-id", "run_one", "--target", older],
+    hint: null,
+  });
+});
+
+test("when nothing newer is green the explanation reaches the tip's updater, which fails with it", wrapperOnly, async (t) => {
+  const { tip, invoke } = await newestGreenFixture(t);
+  const message = "No newer hosted build to install.  The installed build is 111111111111.  Main is at 222222222222, 2 commits ahead, and its build is still running.";
+  const result = await invoke([], { UBF_SELECT_STATUS: "none", UBF_SELECT_MESSAGE: message });
+  assert.equal(result.code, 0, result.stderr);
+  // The wrapper does not end the run itself: a run that ends in the wrapper
+  // writes no progress record, and the harness reports it as never started.
+  assert.deepEqual(result.executed, { label: "tip", args: ["--target", tip], hint: message });
+});
+
+test("any doubt in the selection installs main's tip exactly as before", wrapperOnly, async (t) => {
+  const { tip, older, invoke } = await newestGreenFixture(t);
+  const expected = { label: "tip", args: ["--target", tip], hint: null };
+  for (const [label, env] of [
+    ["skip", { UBF_SELECT_STATUS: "skip", UBF_SELECT_MESSAGE: "the installed build is already main's tip" }],
+    ["an unknown status", { UBF_SELECT_STATUS: "banana", UBF_SELECT_COMMIT: older }],
+    ["a selection with no commit", { UBF_SELECT_STATUS: "selected", UBF_SELECT_MESSAGE: "Updating to nothing" }],
+    ["a selection naming something that is not a full commit", { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: "abc1234" }],
+  ]) {
+    const result = await invoke([], env);
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.deepEqual(result.executed, expected, label);
+    assert.doesNotMatch(result.stdout, /Updating to/, label);
+  }
+
+  // A lookup that blows up is a warning, and the update goes on with the tip.
+  const thrown = await invoke([], { UBF_SELECT_THROW: "GitHub is unreachable" });
+  assert.equal(thrown.code, 0, thrown.stderr);
+  assert.deepEqual(thrown.executed, expected);
+  assert.match(thrown.stderr, /WARNING:.*Could not choose among the hosted builds \(GitHub is unreachable\)\..*origin\/main's tip/);
+});
+
+test("a resolver that predates the selection is skipped without a word", wrapperOnly, async (t) => {
+  const { tip, invoke } = await newestGreenFixture(t, { resolver: "// placeholder\n" });
+  const result = await invoke([]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(result.executed, { label: "tip", args: ["--target", tip], hint: null });
+  assert.doesNotMatch(result.stderr, /WARNING/);
+  assert.deepEqual(result.consulted, []);
+});
+
+test("an explicit target, apply, unquiesce and imported sources are never second-guessed", wrapperOnly, async (t) => {
+  const { fixture, older, tip, invoke } = await newestGreenFixture(t);
+  const stage = join(fixture, "stage");
+  await mkdir(stage, { recursive: true });
+  await writeFile(join(stage, "prepared.json"), JSON.stringify({ sourceCommit: tip }));
+  // A selection that would change every one of these if it were consulted.
+  const tempting = { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: older, UBF_SELECT_MESSAGE: "Updating to the wrong commit" };
+  for (const { args, env = {}, expected } of [
+    { args: ["--target", "origin/main"], expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: ["--target=origin/main"], expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: ["--target", tip], expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: ["--target", "origin/main~1"], expected: { label: "older", args: ["--target", older], hint: null } },
+    { args: [], env: { BOTFLEET_UPDATE_TARGET: "origin/main" }, expected: { label: "tip", args: ["--target", tip], hint: null } },
+    { args: [], env: { BOTFLEET_UPDATE_TARGET: "origin/main~1" }, expected: { label: "older", args: ["--target", older], hint: null } },
+    { args: ["unquiesce"], expected: { label: "tip", args: ["unquiesce"], hint: null } },
+    { args: ["apply", "--stage", stage], expected: { label: "tip", args: ["apply", "--stage", stage], hint: null } },
+    { args: ["--source", fixture], expected: { label: "tip", args: ["--source", fixture, "--target", tip], hint: null } },
+    { args: ["--help"], expected: { label: "tip", args: ["--help", "--target", tip], hint: null } },
+  ]) {
+    const label = `${JSON.stringify(args)} ${JSON.stringify(env)}`;
+    const result = await invoke(args, { ...tempting, ...env });
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.deepEqual(result.consulted, [], `${label} must not consult the selection`);
+    assert.deepEqual(result.executed, expected, label);
+    assert.doesNotMatch(result.stdout, /Updating to the wrong commit/, label);
+  }
+});
+
+test("a chosen commit that is not on origin/main is refused before any of its code runs", wrapperOnly, async (t) => {
+  const { evil, invoke } = await newestGreenFixture(t);
+  const result = await invoke([], { UBF_SELECT_STATUS: "selected", UBF_SELECT_COMMIT: evil, UBF_SELECT_MESSAGE: "Updating to evil" });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /not reachable from origin\/main/);
+  assert.equal(result.executed, null, "no archived updater code ran");
+});
+
+test("an explanation left in the caller's environment is not believed", wrapperOnly, async (t) => {
+  const { tip, invoke } = await newestGreenFixture(t);
+  const result = await invoke([], {
+    BOTFLEET_UPDATE_SELECTION_FAILURE: "No newer hosted build to install.  (planted)",
+    UBF_SELECT_STATUS: "skip",
+  });
+  assert.deepEqual(result.executed, { label: "tip", args: ["--target", tip], hint: null });
+});
+
+test("the selection runs after the tip is fetched and before anything is archived for execution", async () => {
+  const source = (await readFile(join(scripts, "update-botfleet.sh"), "utf8")).replace(/\r\n/g, "\n");
+  const bootstrapDir = source.indexOf('BOOTSTRAP_DIR="$(mktemp -d');
+  const selection = source.indexOf('SELECT_NEWEST_GREEN=0');
+  const tipFetch = source.indexOf('fetch --quiet origin main 2>/dev/null; then\n      SELECT_TIP');
+  const resolverArchive = source.indexOf('show "$SELECT_TIP:scripts/ci-build-resolver.mjs"');
+  const chosen = source.indexOf('BOOTSTRAP_REF="$SELECTION_COMMIT"');
+  const fetch = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin "$BOOTSTRAP_FETCH_REF"');
+  const ancestry = source.indexOf('merge-base --is-ancestor "$BOOTSTRAP_COMMIT" origin/main');
+  const archive = source.indexOf('git -C "$BOTFLEET_CHECKOUT" archive "$BOOTSTRAP_COMMIT"');
+  assert.ok(bootstrapDir >= 0 && selection > bootstrapDir, "the scratch directory exists before the resolver is archived into it");
+  assert.ok(tipFetch > selection && resolverArchive > tipFetch, "the tip is refreshed before its resolver is read");
+  assert.ok(chosen > resolverArchive && chosen < fetch, "the choice replaces the ref before it is fetched, resolved and checked");
+  assert.ok(ancestry > chosen && archive > ancestry, "a chosen commit meets the same origin/main ancestry rule before its updater is archived");
+  // Only a plain update or prepare with no target of any kind is eligible.
+  assert.match(source, /if \[\[ "\$HAS_BOOTSTRAP_TARGET" == "0" && -z "\$\{BOTFLEET_UPDATE_TARGET:-\}" \]\]; then/);
+  assert.match(source, /apply\|unquiesce\) ;;/);
+  // Nothing new is passed to the updater as an argument: the chosen commit may
+  // predate this feature, and an unknown option would stop it.
+  assert.doesNotMatch(source, /PINNED_ARGS\+=\(--(?!target)/);
+});
+
+test("the updater hands the wrapper's explanation back as a failure the progress record keeps", { skip: process.platform === "win32" ? "the updater reads the POSIX user id (process.getuid) when it builds its configuration" : false }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-no-green-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const progressPath = join(root, "run.json");
+  const explanation = "No newer hosted build to install.  The installed build is 111111111111.  Main is at 222222222222, 2 commits ahead, and its build is still running.";
+  const scratch = {
+    BOTFLEET_UPDATE_ALLOW_NON_DARWIN: "1",
+    BOTFLEET_CHECKOUT: join(root, "checkout"),
+    BOTFLEET_APP_PATH: join(root, "BotFleet.app"),
+    BOTFLEET_DATA_DIR: join(root, "data"),
+    BOTFLEET_UPDATE_LOCK: join(root, "update.lock"),
+    BOTFLEET_UPDATE_ROOT: join(root, "updates"),
+    BOTFLEET_UPDATE_SELECTION_FAILURE: explanation,
+  };
+  const restore = Object.fromEntries(Object.keys(scratch).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, scratch);
+  t.after(() => {
+    for (const [key, value] of Object.entries(restore)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  await assert.rejects(
+    main(["update", "--progress", progressPath, "--run-id", "run_none", "--target", "2".repeat(40)]),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "no-green-build");
+      assert.equal(error.message, explanation);
+      return true;
+    },
+  );
+  const record = JSON.parse(await readFile(progressPath, "utf8"));
+  assert.equal(record.runId, "run_none");
+  assert.equal(record.outcome, "failed");
+  assert.equal(record.message, explanation, "the harness, the desktop app and the phone read this line");
+  assert.equal(record.steps.at(-1).name, "resolveTarget");
+  assert.equal(record.steps.at(-1).ok, false);
+  assert.ok(!record.steps.some((step) => step.name === "prepareSource"), "nothing was staged");
+});
+
+test("resolveTarget raises the wrapper's explanation before it touches git", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  const resolveTarget = source.indexOf("resolveTarget: async (plan) => {");
+  const body = source.slice(resolveTarget, source.indexOf("prepareSource:", resolveTarget));
+  const hint = body.indexOf("BOTFLEET_UPDATE_SELECTION_FAILURE");
+  assert.ok(hint > 0, "resolveTarget reads the hand-off variable");
+  assert.ok(hint < body.indexOf('["fetch", "origin", "main"]'), "the explanation is raised before any fetch");
+  assert.match(body, /new ResolutionError\(nothingNewer, "no-green-build"\)/);
+});
+
+test("the selection gives up long before the harness decides a run never started", async () => {
+  // The selection runs before the updater writes its first progress record.  The
+  // harness settles a run with no record after LAUNCH_GRACE_MS and removes its
+  // launchd job, so a slow GitHub must not be able to outlast that.
+  const control = await readFile(join(scripts, "..", "server/update-control.ts"), "utf8");
+  const grace = Number(/const LAUNCH_GRACE_MS = ([\d_]+)/.exec(control)?.[1]?.replaceAll("_", ""));
+  assert.ok(grace > 0, "the harness's launch grace is still where this test looks for it");
+
+  const wrapper = (await readFile(join(scripts, "update-botfleet.sh"), "utf8")).replace(/\r\n/g, "\n");
+  const watchdog = Number(/\}, (\d+)\);\n\s+try \{/.exec(wrapper)?.[1]);
+  assert.ok(watchdog > 0 && watchdog <= grace / 2, `the wrapper's watchdog (${watchdog}ms) must be at most half of ${grace}ms`);
+
+  const resolver = await readFile(join(scripts, "ci-build-resolver.mjs"), "utf8");
+  const selection = resolver.slice(resolver.indexOf("Choosing WHICH commit to install"));
+  const requests = selection.match(/requestJson\(/g)?.length ?? 0;
+  const bounded = selection.match(/timeoutMs: SELECTION_REQUEST_TIMEOUT_MS/g)?.length ?? 0;
+  assert.ok(requests >= 3, "the selection still makes its Actions requests");
+  assert.equal(bounded, requests, "every Actions request the selection makes carries the short timeout");
+  assert.match(selection, /const SELECTION_REQUEST_TIMEOUT_MS = 10_000;/);
+});
+
+// ---------------------------------------------------------------------------
+// A slow boot is not a failure.  On 2026-10-09 a good build was rolled back
+// because the new harness logged "booting" and was still working through its
+// start-up when the old 90-second window closed (load averages of 150 to 900),
+// and the restored build then needed about two minutes of its own.
+// ---------------------------------------------------------------------------
+
+function fakeClock() {
+  let time = 0;
+  return { now: () => time, wait: async (ms) => { time += ms; }, at: () => time };
+}
+
+const notYet = { safe: false, reason: "Authenticated runtime readiness could not be verified" };
+
+test("the start-up wait is long by default and still overridable", async () => {
+  assert.ok(DEFAULT_STARTUP_TIMEOUT_MS >= 10 * 60_000 && DEFAULT_STARTUP_TIMEOUT_MS <= 15 * 60_000,
+    "a slow boot under load gets 10 to 15 minutes");
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  assert.match(source, /startupTimeoutMs: environmentMs\("BOTFLEET_STARTUP_TIMEOUT_MS", DEFAULT_STARTUP_TIMEOUT_MS\)/);
+  assert.doesNotMatch(source, /BOTFLEET_STARTUP_TIMEOUT_MS \|\| 90_000/);
+  // Both waits that follow a start go through the shared wait, so neither can
+  // quietly keep a fixed window of its own.
+  const verify = source.indexOf("verifyHarness: async");
+  assert.match(source.slice(verify, source.indexOf("startApplication:", verify)), /waitForStartup\(/);
+  const restored = source.indexOf("Restored BotFleet runtime did not regain safe single ownership");
+  assert.match(source.slice(restored - 900, restored), /waitForStartup\(/);
+});
+
+const OWN_APP_PID = [4242];
+
+test("an app that never produces a process times out with the timeout message, not a pid-stability one", async () => {
+  const clock = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => [],
+      attachmentError: async () => { throw new Error("nothing to attach to"); },
+      timeoutMs: 5 * 60_000,
+      now: clock.now,
+      wait: clock.wait,
+    }),
+    (error) => error.message === "Timeout waiting for application to stabilize",
+  );
+  assert.ok(clock.at() >= 5 * 60_000, "a slow launch is waited out for the whole window");
+});
+
+test("an app that starts late, settles to one process and attaches passes", async () => {
+  const clock = fakeClock();
+  const reports = [];
+  await waitForStableApplication({
+    samplePids: async () => (clock.at() >= 3 * 60_000 ? OWN_APP_PID : []),
+    attachmentError: async () => null,
+    timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+    report: (line) => reports.push(line),
+    now: clock.now,
+    wait: clock.wait,
+  });
+  assert.ok(clock.at() >= 3 * 60_000 && clock.at() < 4 * 60_000);
+  assert.deepEqual(reports, [
+    "Waiting for the app to start, 1 min so far",
+    "Waiting for the app to start, 2 min so far",
+    "Waiting for the app to start, 3 min so far",
+  ]);
+});
+
+test("an app that was running and vanished fails at once, and an unstable one reports its pids", async () => {
+  const gone = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => (gone.at() < 3_000 ? OWN_APP_PID : []),
+      attachmentError: async () => "not attached yet",
+      timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+      now: gone.now,
+      wait: gone.wait,
+    }),
+    (error) => error.message === "The updated application exited after it had started",
+  );
+  assert.ok(gone.at() < 10_000, `failed after ${gone.at()}ms`);
+
+  const unstable = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => [1, 2],
+      attachmentError: async () => null,
+      timeoutMs: 10_000,
+      now: unstable.now,
+      wait: unstable.wait,
+    }),
+    (error) => /did not remain running as one exact installed-bundle process/.test(error.message),
+  );
+
+  // Running and stable but never attaching ends with the attachment reason.
+  const detached = fakeClock();
+  await assert.rejects(
+    waitForStableApplication({
+      samplePids: async () => OWN_APP_PID,
+      attachmentError: async () => "Updated application did not attach to the authenticated single data owner",
+      timeoutMs: 10_000,
+      now: detached.now,
+      wait: detached.wait,
+    }),
+    (error) => error.message === "Updated application did not attach to the authenticated single data owner",
+  );
+});
+
+test("a slow but successful boot passes, and says how long it has been waiting", async () => {
+  const clock = fakeClock();
+  const reports = [];
+  const snapshot = await waitForStartup({
+    attempt: async () => (clock.at() >= 4 * 60_000 ? { safe: true, mode: "authenticated" } : notYet),
+    crashed: async () => null,
+    timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+    what: "the new version",
+    fallback: "never reached",
+    report: (line) => reports.push(line),
+    now: clock.now,
+    wait: clock.wait,
+  });
+  assert.equal(snapshot.safe, true);
+  assert.ok(clock.at() >= 4 * 60_000 && clock.at() < 5 * 60_000, `waited ${clock.at()}ms`);
+  assert.deepEqual(reports, [
+    "Waiting for the new version to start, 1 min so far",
+    "Waiting for the new version to start, 2 min so far",
+    "Waiting for the new version to start, 3 min so far",
+  ]);
+});
+
+test("a boot that crashed fails promptly with the reason, not after the whole window", async () => {
+  const clock = fakeClock();
+  let asked = 0;
+  await assert.rejects(
+    waitForStartup({
+      attempt: async () => ({ safe: false, reason: "BotFleet harness (pid 4242) is not running" }),
+      crashed: async () => (++asked >= 3 ? "launchd job app.botfleet.server: its process exited with code 1" : null),
+      timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+      what: "the new version",
+      fallback: "never reached",
+      now: clock.now,
+      wait: clock.wait,
+    }),
+    (error) => {
+      assert.match(error.message, /^The new version stopped before it was ready: launchd job app\.botfleet\.server: its process exited with code 1\./);
+      assert.match(error.message, /Last check: BotFleet harness \(pid 4242\) is not running/);
+      return true;
+    },
+  );
+  assert.ok(clock.at() < 5_000, `failed after ${clock.at()}ms, not after ${DEFAULT_STARTUP_TIMEOUT_MS}ms`);
+});
+
+test("a build that came up is never called crashed, and a boot that never finishes ends at the deadline", async () => {
+  const clock = fakeClock();
+  const up = await waitForStartup({
+    attempt: async () => ({ safe: true }),
+    crashed: async () => { throw new Error("must not be asked once the build is up"); },
+    timeoutMs: 1_000,
+    what: "the new version",
+    fallback: "never reached",
+    now: clock.now,
+    wait: clock.wait,
+  });
+  assert.equal(up.safe, true);
+
+  const late = fakeClock();
+  await assert.rejects(
+    waitForStartup({
+      attempt: async () => notYet,
+      timeoutMs: 120_000,
+      what: "the restored version",
+      fallback: "never reached",
+      now: late.now,
+      wait: late.wait,
+    }),
+    (error) => error.message === notYet.reason,
+  );
+  assert.equal(late.at(), 120_000, "the wait runs to the deadline and no further");
+});
+
+test("progress is quiet for the first minute and then reports once a minute", () => {
+  const clock = fakeClock();
+  const lines = [];
+  const tick = startupProgress("the app", { report: (line) => lines.push(line), now: clock.now });
+  // Elapsed: 0:30 (quiet), 1:00 (1 min), 1:59 (quiet), 2:00 (2 min), 3:00 (3 min).
+  // wait() is async but synchronous in effect for this clock.
+  for (const step of [30_000, 30_000, 59_000, 1_000, 60_000]) {
+    clock.wait(step);
+    tick();
+  }
+  assert.deepEqual(lines, [
+    "Waiting for the app to start, 1 min so far",
+    "Waiting for the app to start, 2 min so far",
+    "Waiting for the app to start, 3 min so far",
+  ]);
+});
+
+const LAUNCHD_RUNNING = `gui/501/app.botfleet.server = {
+\tactive count = 4
+\tpath = /Users/jay/Library/LaunchAgents/app.botfleet.server.plist
+\ttype = LaunchAgent
+\tstate = running
+
+\tprogram = /bin/bash
+\trun interval = 0 seconds
+\truns = 1
+\tpid = 62210
+\tlast exit code = (never exited)
+
+\tevent triggers = {
+\t}
+\tsubmitted by = launchd
+\tproperties = runatload | inferred program
+}`;
+
+test("only a launchd job that has exited counts as a crash; one that is still booting does not", async () => {
+  assert.deepEqual(parseLaunchdJob(LAUNCHD_RUNNING), { state: "running", runs: 1, lastExit: "(never exited)", signal: undefined });
+  assert.equal(describeLaunchdExit(parseLaunchdJob(LAUNCHD_RUNNING)), null);
+
+  const exited = LAUNCHD_RUNNING.replace("state = running", "state = not running").replace("(never exited)", "1").replace("\tpid = 62210\n", "");
+  assert.equal(describeLaunchdExit(parseLaunchdJob(exited)), "its process exited with code 1");
+
+  const signalled = `${LAUNCHD_RUNNING.replace("(never exited)", "9")}\n\tlast terminating signal = Segmentation fault: 11`;
+  assert.match(describeLaunchdExit(parseLaunchdJob(signalled)), /killed by a signal \(Segmentation fault: 11\)/);
+
+  const zeroSignal = `${LAUNCHD_RUNNING}\n\tlast terminating signal = 0\n`;
+  assert.equal(describeLaunchdExit(parseLaunchdJob(zeroSignal)), null,
+    "signal 0 is launchd's no-signal sentinel, not a crash; the trailing newline must be trimmed");
+
+  const restarted = LAUNCHD_RUNNING.replace("runs = 1", "runs = 3");
+  assert.equal(describeLaunchdExit(parseLaunchdJob(restarted)), "launchd has had to start it 3 times");
+
+  const prints = { "app.botfleet.server": { code: 0, stdout: exited }, "com.jay.botfleet-server": { code: 113, stdout: "" } };
+  const print = async (label) => prints[label];
+  assert.equal(
+    await launchdExitReason(["com.jay.botfleet-server", "app.botfleet.server"], { print }),
+    "launchd job app.botfleet.server: its process exited with code 1",
+    "a label launchd does not know is skipped, not a crash",
+  );
+  assert.equal(
+    await launchdExitReason(["app.botfleet.server"], { print: async () => ({ code: 0, stdout: LAUNCHD_RUNNING }) }),
+    null,
+  );
+  assert.equal(await launchdExitReason(["app.botfleet.server"], { print: async () => ({ code: 1, stdout: "" }) }), null,
+    "a print that fails says nothing; the timeout is the backstop");
+});
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

@@ -14,6 +14,7 @@ import {
   ENGINE_DISPLAY_ORDER,
   capabilityCellGlyph,
   capabilityCellLabel,
+  engineAccessLabel,
   capabilityNoteFor,
   engineIdFromDriverKind,
   pricingModeLabel,
@@ -23,6 +24,10 @@ import {
   type PricingMode,
 } from "./engine-capabilities.tsx";
 
+// The engines the matrix describes.  It used to list eight while
+// `BUILT_IN_DRIVERS` carried seventeen: the rest had no row, so they fell
+// through to the "engine not in the registry yet" placeholder.  Keep this in
+// step with `ENGINE_DISPLAY_ORDER` — the test below fails if it drifts.
 const KNOWN_ENGINE_IDS = [
   "grok",
   "cursor",
@@ -32,6 +37,16 @@ const KNOWN_ENGINE_IDS = [
   "deepseek-harness",
   "minimax",
   "mcode",
+  "muse",
+  "kimi",
+  "droid",
+  "opencode",
+  "qwen",
+  "hermes",
+  "pi",
+  "openai-compat",
+  "box",
+  "cli-wrapper",
 ];
 
 describe("ENGINE_CAPABILITIES registry", () => {
@@ -107,8 +122,21 @@ describe("ENGINE_CAPABILITIES registry", () => {
     }
   });
 
-  it("has at least one default model per engine", () => {
+  it("has at least one default model per engine, unless its catalog is host-driven", () => {
+    // The Usage tab attributes a legacy task by its model id, so a row wants at
+    // least one id.  An engine whose catalog is whatever local hosts the user
+    // has configured has no fleet-wide id to name — its picker rows are
+    // `host::model` inject ids that depend on the machine.  Those rows declare
+    // `catalogIsHostDriven` and say "no default" out loud rather than shipping
+    // a plausible-looking id that resolves on nobody's setup.
     for (const [id, entry] of Object.entries(ENGINE_CAPABILITIES)) {
+      if (entry.catalogIsHostDriven) {
+        expect(
+          entry.defaultModels.length,
+          `${id} is host-driven, so it must declare no default model rather than an invented one`,
+        ).toBe(0);
+        continue;
+      }
       expect(entry.defaultModels.length, `${id} must declare at least one default model`).toBeGreaterThan(0);
       for (const model of entry.defaultModels) {
         expect(model.id.length).toBeGreaterThan(0);
@@ -239,6 +267,18 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // ACP coding CLI, so the suffix strip has to reach the mcode row.
     expect(engineIdFromDriverKind("mcodeAgent")).toBe("mcode");
     expect(engineIdFromDriverKind("mcode")).toBe("mcode");
+    expect(engineIdFromDriverKind("museAgent")).toBe("muse");
+    // The OpenCode driver keeps its historical `opencodeGo` kind while the
+    // product name expanded, so the mapping needs the alias spelled out.
+    expect(engineIdFromDriverKind("opencodeGo")).toBe("opencode");
+    expect(engineIdFromDriverKind("kimiAgent")).toBe("kimi");
+    expect(engineIdFromDriverKind("droidAgent")).toBe("droid");
+    expect(engineIdFromDriverKind("qwenAgent")).toBe("qwen");
+    expect(engineIdFromDriverKind("hermesAgent")).toBe("hermes");
+    expect(engineIdFromDriverKind("piAgent")).toBe("pi");
+    expect(engineIdFromDriverKind("boxAgent")).toBe("box");
+    expect(engineIdFromDriverKind("openai-compat")).toBe("openai-compat");
+    expect(engineIdFromDriverKind("cli-wrapper")).toBe("cli-wrapper");
     expect(engineIdFromDriverKind("unknown-engine")).toBeNull();
     expect(engineIdFromDriverKind(undefined)).toBeNull();
   });
@@ -326,7 +366,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(capabilityCellLabel("yes")).toBe("Available");
     expect(capabilityCellLabel("no")).toBe("Not available");
     expect(capabilityCellLabel("limited")).toBe("Limited");
-    expect(capabilityCellLabel("yes-pro-only")).toBe("Pro plan only");
+    expect(CAPABILITY_STATES).not.toContain("yes-pro-only");
     // A missing key and an explicit "unknown" say the same thing, and
     // neither of them says "not available".
     expect(capabilityCellLabel("unknown")).toBe("Not audited");
@@ -480,21 +520,21 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
       "Clutch runs models over the Clutch ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.",
     );
     expect(entry.whyThisEngine).toEqual({
-      headline: "DeepSeek models over the Clutch ACP bridge, billed pay-as-you-go.",
+      headline: "DeepSeek, Muse, and MiniMax models through the Clutch bridge.",
       prose: [
-        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
-        "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "BotFleet does not support image attachments on Clutch yet.",
+        "Clutch runs DeepSeek, Meta Muse, and MiniMax models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments remain per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4-Pro carries a No Vision badge.",
+        "Muse and MiniMax use subscription-backed API-key access.  DeepSeek remains pay-as-you-go; the rates below are its public API catalog, not a subscription invoice.",
       ],
     });
-    expect(entry.capabilities.imageAttachments).toBe("no");
+    expect(entry.providerKinds).toEqual(["deepseekAgent", "muse", "minimax"]);
+    expect(engineAccessLabel(entry)).toBe("API");
+    expect(entry.capabilities.imageAttachments).toBe("yes");
     const copy = [
       entry.pricing.notes ?? "",
       entry.pricing.api.notes ?? "",
       entry.whyThisEngine.headline,
       ...entry.whyThisEngine.prose,
     ].join("\n");
-    expect(copy).toContain("BotFleet does not support image attachments");
     expect(copy).not.toContain("Bundled with Claude Max");
     expect(copy).not.toContain("Claude Max");
     expect(copy).not.toContain("same Claude Max seat");
@@ -508,5 +548,13 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     expect(copy).not.toMatch(/on this seat/i);
     expect(pricingModeLabel(entry.pricing)).toBe("API · $0.00027/1k in");
     expect(pricingModeLabel(entry.pricing).toLowerCase()).not.toContain("bundled");
+  });
+
+  it("keeps access separate from billing", () => {
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.grok)).toBe("CLI + API");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.minimax)).toBe("API");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.mcode)).toBe("CLI");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.muse)).toBe("CLI");
+    expect(pricingModeLabel(ENGINE_CAPABILITIES.minimax.pricing)).toContain("Subscription + API");
   });
 });

@@ -15,6 +15,27 @@
       "matchUpdateTypes": ["major"],
       "automerge": false,
       "labels": ["dependencies", "major"]
+    },
+    {
+      "description": [
+        "@trycua/cua-driver is pinned in several places that must move together in one deliberate PR:",
+        "package.json (this SDK), scripts/prepare-cua.mjs (CUA_RELEASE: the macOS executable asset and its sha256), server/container-computer.ts (CUA_DRIVER_VERSION and the Linux wheel URLs and hashes for the Local VM image), and server/remote-computer.ts (REMOTE_CUA_VERSION and the same wheels for the VPS driver).",
+        "The Linux desktop binary in scripts/cua-linux-release.mjs is pinned separately and is not part of this bump.",
+        "A bare package.json bump broke the Mac packaging step in #919, so Renovate must never raise it on its own.",
+        "This rule stays last so it overrides the non-major grouping rule above."
+      ],
+      "matchPackageNames": ["@trycua/cua-driver"],
+      "enabled": false
+    },
+    {
+      "description": [
+        "@xmldom/xmldom must stay on the 0.8 line.",
+        "electron-builder's plist parsing (through the plist package) calls DOMParser.parseFromString without a mimeType, which xmldom 0.9 requires, so packaging fails with 'the provided mimeType \"undefined\" is not valid'.",
+        "#919 moved the pnpm override in package.json to 0.9.12 and broke the Mac build.",
+        "Lift this cap only in a PR that proves electron-builder packages on the newer line."
+      ],
+      "matchPackageNames": ["@xmldom/xmldom", "@xmldom/xmldom@*"],
+      "allowedVersions": "<0.9"
     }
   ],
   "vulnerabilityAlerts": { "labels": ["security"] }

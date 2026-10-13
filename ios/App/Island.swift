@@ -95,6 +95,7 @@ struct NeedsYouIsland: View {
                         // square; the face sits clear of it, centred.
                         Button { open(shown.chat) } label: {
                             ChatAvatarView(chat: shown.chat, size: 120, state: BotState.forChat(shown.chat, in: session.state), animated: attentionLive, comets: attentionLive)
+                                .providerBadge(for: shown.chat, avatarSize: 120)
                         }
                         .buttonStyle(.plain)
                         .task(id: shown.chat.id) {

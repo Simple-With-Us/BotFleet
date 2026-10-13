@@ -49,4 +49,41 @@ final class SpeechTurnGuardTests: XCTestCase {
         var turnGuard = SpeechTurnGuard()
         XCTAssertFalse(turnGuard.finish(utterance: FakeUtterance()))
     }
+
+    func testSupersedeDropsOwnershipSoAPausedSpeakCannotResume() {
+        var turnGuard = SpeechTurnGuard()
+        let first = turnGuard.beginInvocation()
+        XCTAssertTrue(turnGuard.ownsInvocation(first))
+
+        // stop(), or the stop() a newer speak() runs before it awaits
+        // authorization, invalidates the parked invocation.
+        turnGuard.supersedeInvocation()
+        XCTAssertFalse(turnGuard.ownsInvocation(first))
+
+        let second = turnGuard.beginInvocation()
+        XCTAssertTrue(turnGuard.ownsInvocation(second))
+        // The older token must not be treated as the owner that clears
+        // speaking state when its loop wakes up.
+        XCTAssertFalse(turnGuard.ownsInvocation(first))
+    }
+
+    func testFinishingAnUtteranceDoesNotEndTheInvocation() {
+        var turnGuard = SpeechTurnGuard()
+        let token = turnGuard.beginInvocation()
+        let utterance = FakeUtterance()
+        turnGuard.begin(utterance: utterance)
+        XCTAssertTrue(turnGuard.finish(utterance: utterance))
+        // The next chunk of the same speak() still owns the turn.
+        XCTAssertTrue(turnGuard.ownsInvocation(token))
+    }
+
+    func testSupersedeRejectsLateCallbackForTheOldUtterance() {
+        var turnGuard = SpeechTurnGuard()
+        let utterance = FakeUtterance()
+        let token = turnGuard.beginInvocation()
+        turnGuard.begin(utterance: utterance)
+        turnGuard.supersedeInvocation()
+        XCTAssertFalse(turnGuard.ownsInvocation(token))
+        XCTAssertFalse(turnGuard.finish(utterance: utterance))
+    }
 }

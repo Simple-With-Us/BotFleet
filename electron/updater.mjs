@@ -12,6 +12,7 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
+import { readHarnessOwner } from "./harness-ownership.mjs";
 import { createUpdaterCoordinator } from "./updater-coordinator.mjs";
 import {
   AUTO_CHECK_FAILURE_BACKOFF_MS,
@@ -160,14 +161,33 @@ export function registerUpdaterIpc() {
     const logFile = join(logDir, "updater-local.log");
     try { mkdirSync(logDir, { recursive: true, mode: 0o700 }); } catch { /* already exists */ }
 
+    const dataDir = process.env.OMB_DATA_DIR || process.env.BOTFLEET_DATA_DIR || join(homedir(), ".botfleet");
+    let harnessOwner;
+    try {
+      harnessOwner = readHarnessOwner(dataDir);
+    } catch {
+      setState({ status: "error", message: "Could not read harness ownership for the local update." });
+      return;
+    }
+    const childEnv = {
+      ...process.env,
+      PATH: childPath,
+      BOTFLEET_CHECKOUT: join(homedir(), "apps", "botfleet-server"),
+    };
+    if (harnessOwner) {
+      if (!harnessOwner.nonce) {
+        setState({
+          status: "error",
+          message: "Harness bearer credential is missing.\u00A0 Restart the harness before updating locally.",
+        });
+        return;
+      }
+      childEnv.BOTFLEET_OWNER_NONCE = harnessOwner.nonce;
+    }
     const child = spawn("/bin/bash", [script], {
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],
-      env: {
-        ...process.env,
-        PATH: childPath,
-        BOTFLEET_CHECKOUT: join(homedir(), "apps", "botfleet-server"),
-      },
+      env: childEnv,
     });
 
     // Capture stderr to the log so a 127 / missing-node error is visible.
@@ -256,7 +276,7 @@ export function startUpdater(mainWindow) {
       const fallbackConfig = join(fallbackDir, "app-update.yml");
       if (!existsSync(fallbackConfig)) {
         const content = [
-          "owner: jaywedgeworth22",
+          "owner: Simple-With-Us",
           "repo: BotFleet",
           "provider: github",
           "updaterCacheDirName: botfleet-updater",
@@ -347,6 +367,13 @@ export function startUpdater(mainWindow) {
     // gate a permanently broken feed retries every hour forever.
     if (Date.now() < autoCheckBackoffUntilMs) return false;
     const record = readAutoUpdateConfig(configPath());
+    // The harness owns the toggle and writes it to this same file, whoever
+    // flipped it: this window's checkbox goes through the update:set-enabled
+    // handler as well, but a paired phone changes it through the harness
+    // alone, and with the window closed nothing would tell this process.
+    // Reading it back every tick keeps the cached copy from outliving the
+    // stored one.  An unreadable file reads as off, as it does at launch.
+    autoUpdateEnabled = record.enabled === true;
     return shouldRunAutomaticCheck({
       enabled: autoUpdateEnabled,
       lastCheckMs: record.lastCheckMs,

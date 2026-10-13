@@ -1,0 +1,39 @@
+name: Claude Code Autofix
+
+on:
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to run the autofix loop on"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: pr-autofix-${{ github.repository }}-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  autofix:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.user.type == 'Bot' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    uses: Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@825f8ee008d6ce104107f2a7267c14d370e6013e
+    secrets:
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+    with:
+      prompt: |
+        You are the fleet's autofix bot.  A review bot (Codex, Kody, or Cursor) just reviewed this pull request.
+        1. Read every unresolved review comment from that review.  For each, decide against the current code whether it is a real defect.
+        2. Fix real defects with the smallest change that answers the comment.  Do not refactor unrelated code, rename things, or reformat files.
+        3. Never edit files under .github/workflows, never add or print secrets, and never weaken a test to make it pass.
+        4. Run this repo's verify command (below) and make sure it passes before committing.  If you cannot make it pass, commit nothing.
+        5. Commit with a subject starting "autofix:" and push to the PR branch.  Stop after one round.
+        6. If a comment is not a real defect or is unclear, change nothing for it.
+        This repo's verify command: `pnpm typecheck && pnpm test`.

@@ -30,7 +30,7 @@ Copies host developer CLI credentials into a Local VM or Cloud VPS container.
 
 Options:
   -t, --target <local|vps|all>   Target environment:
-                                  local: Local VM container (default: botfleet-computer)
+                                  local: Local VM container (default: botfleet-computer-<user>, legacy botfleet-computer)
                                   vps:   Cloud VPS container (default: botfleet-vps-shared)
                                   all:   Sync to both local and VPS containers
                                  (default: auto-detect from active config/containers)
@@ -131,45 +131,63 @@ if [ -z "$SSH_ALIAS" ]; then
   SSH_ALIAS="$(resolve_config_alias)"
 fi
 
-# Candidate developer credentials to sync
-CANDIDATES=(
-  ".infisical"
-  ".config/infisical"
-  ".ssh"
-  ".gitconfig"
-  ".config/git"
-  ".config/gh"
-  ".netrc"
-  ".aws"
-  ".config/gcloud"
-  ".azure"
-  ".oci"
-  ".docker/config.json"
-  ".kube"
-  ".npmrc"
-  ".cargo/credentials.toml"
-  ".cargo/credentials"
-  ".cargo/config.toml"
-  ".cargo/config"
-  ".pypirc"
-  ".vercel"
-  ".fly"
-  ".config/cloudflare"
-  ".wrangler"
-  ".config/stripe"
-  ".config/supabase"
-  ".config/huggingface"
-  ".sentryclirc"
-  ".terraform.d"
-)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SHARE_GPG_PRIVATE_KEYS="${BOTFLEET_SHARE_GPG_PRIVATE_KEYS:-0}"
 
-# Detect which candidates exist in the source home
+# Candidate developer credentials to sync (manifest-driven)
 FOUND=()
-for rel in "${CANDIDATES[@]}"; do
-  if [ -e "$SRC_HOME/$rel" ]; then
-    FOUND+=("$rel")
+TAR_ROOT=""
+CREDENTIAL_PLAN="$(
+  cd "$REPO_ROOT" && SRC_HOME="$SRC_HOME" SHARE_GPG_PRIVATE_KEYS="$SHARE_GPG_PRIVATE_KEYS" node --experimental-strip-types - <<'NODE'
+import { credentialSyncExcludePatterns, prepareCredentialSyncWorkspace } from "./server/vm-cli-credentials.ts";
+const homeDir = process.env.SRC_HOME ?? "";
+const shareGpgPrivateKeys = process.env.SHARE_GPG_PRIVATE_KEYS === "1";
+const { plan } = await prepareCredentialSyncWorkspace(homeDir, { shareGpgPrivateKeys });
+const root = plan.stagingDir ?? homeDir;
+const rels = [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])].sort();
+console.log(JSON.stringify({ root, rels, excludes: credentialSyncExcludePatterns() }));
+NODE
+)" || { echo "Error: manifest-driven credential discovery failed." >&2; exit 1; }
+TAR_ROOT=""
+TAR_EXCLUDES=()
+
+cleanup_staging() {
+  if [ -n "$TAR_ROOT" ] && [ "$TAR_ROOT" != "$SRC_HOME" ] && [ -d "$TAR_ROOT" ]; then
+    rm -rf "$TAR_ROOT"
   fi
-done
+}
+trap cleanup_staging EXIT
+trap 'cleanup_staging; exit 130' INT
+trap 'cleanup_staging; exit 143' TERM
+
+# A silent parse failure here would empty ROOT, FOUND or TAR_EXCLUDES and would
+# quietly restore the churn this path exists to exclude.  An `exit` inside a
+# $(...) subshell cannot stop the parent, so the plan is decoded ONCE up front
+# and the script aborts on a non-zero status instead.
+if ! PLAN_DECODED="$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+missing = [k for k in ("root", "rels", "excludes") if k not in d]
+if missing:
+    sys.exit("credential plan is missing key(s): " + ", ".join(missing))
+print(d["root"])
+for pattern in d["excludes"]:
+    print("EXCLUDE\t" + pattern)
+for rel in d["rels"]:
+    print("PATH\t" + rel)
+')"; then
+  echo "Error: could not decode the credential plan; refusing to sync." >&2
+  exit 1
+fi
+
+TAR_ROOT="$(printf '%s\n' "$PLAN_DECODED" | sed -n '1p')"
+
+while IFS=$'\t' read -r kind value; do
+  case "$kind" in
+    EXCLUDE) [ -n "$value" ] && TAR_EXCLUDES+=("--exclude=$value") ;;
+    PATH) [ -n "$value" ] && FOUND+=("$value") ;;
+  esac
+done <<< "$(printf '%s\n' "$PLAN_DECODED" | sed -n '2,$p')"
 
 if [ ${#FOUND[@]} -eq 0 ]; then
   log "No matching CLI credentials found in $SRC_HOME."
@@ -237,20 +255,18 @@ sync_to_container() {
 
   log "Syncing ${#FOUND[@]} credential path(s) to '$c_name' ($mode)..."
 
-  # Stream tar archive into container
-  COPYFILE_DISABLE=1 tar --format=ustar -C "$SRC_HOME" --no-xattrs \
-    --exclude="*/virtenv*" \
-    --exclude="*/agent/*" \
-    --exclude="*.sock" \
-    --exclude="*cm-*" \
-    --exclude="*.DS_Store" \
+  # Stream tar archive into container (staged docker/gnupg transforms use TAR_ROOT)
+  # Excludes come from the manifest plan (credentialSyncExcludePatterns) so the
+  # shell path and the server path never drift.
+  COPYFILE_DISABLE=1 tar --format=ustar -C "$TAR_ROOT" --no-xattrs \
+    "${TAR_EXCLUDES[@]}" \
     -cf - \
     "${FOUND[@]}" | \
     "${docker_cmd[@]}" exec -i -u "$CONTAINER_USER" "$c_name" tar -xf - -C "/home/$CONTAINER_USER"
 
   # Harden permissions inside container
   "${docker_cmd[@]}" exec -u "$CONTAINER_USER" "$c_name" sh -c "
-    for d in .ssh .infisical .aws .config .azure .oci .kube .cargo; do
+    for d in .ssh .infisical .aws .config .azure .oci .kube .cargo .cf .kodus; do
       if [ -d \"/home/$CONTAINER_USER/\$d\" ]; then
         chmod 700 \"/home/$CONTAINER_USER/\$d\" 2>/dev/null || true
       fi
@@ -274,7 +290,24 @@ if [ "$TARGET" = "vps" ] || [ "$TARGET" = "all" ]; then
 fi
 
 if [ "$TARGET" = "local" ] || [ "$TARGET" = "all" ]; then
-  LOCAL_CONTAINER="${CONTAINER:-botfleet-computer}"
+  if [ -n "$CONTAINER" ]; then
+    LOCAL_CONTAINER="$CONTAINER"
+  else
+    USER_CLEAN="$(echo "${USER:-$(whoami)}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_.-' '-' | sed 's/^-//;s/-$//')"
+    DEFAULT_LOCAL_CONTAINER="botfleet-computer-${USER_CLEAN:-user}"
+    LOCAL_CONTAINER="$DEFAULT_LOCAL_CONTAINER"
+    for check_cmd in "docker" "podman"; do
+      if command -v "$check_cmd" >/dev/null 2>&1; then
+        if "$check_cmd" inspect --format '{{.State.Running}}' "$DEFAULT_LOCAL_CONTAINER" 2>/dev/null | grep -q "true"; then
+          LOCAL_CONTAINER="$DEFAULT_LOCAL_CONTAINER"
+          break
+        elif "$check_cmd" inspect --format '{{.State.Running}}' "botfleet-computer" 2>/dev/null | grep -q "true"; then
+          LOCAL_CONTAINER="botfleet-computer"
+          break
+        fi
+      fi
+    done
+  fi
   if sync_to_container "local" "$LOCAL_CONTAINER"; then
     SYNCED_TARGETS+=("local:$LOCAL_CONTAINER")
   fi

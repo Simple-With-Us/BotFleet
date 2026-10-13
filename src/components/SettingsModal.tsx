@@ -13,6 +13,7 @@ import {
   ROOM_LABEL_MAX_LENGTH,
   ROOM_TERMINOLOGY_OPTIONS,
   ROOM_TERMINOLOGY_PRESETS,
+  lowerRoomLabels,
   suggestPlural,
   type RoomLabels,
   type RoomTerminology,
@@ -29,21 +30,26 @@ import { ApiKeyRow, EngineKeyRow, VpsConnection } from "./ApiKeys";
 import { LinqSettings } from "./LinqSettings";
 import { useUpdaterState } from "@/lib/updater";
 import {
+  activeDrain,
   availableLabel,
+  drainLabel,
   idleLabel,
-  installBlockedBusy,
+  installPausesWork,
+  PAUSES_WORK_COPY,
   installBlockedReason,
   installedLabel,
   lastRunDetail,
   lastRunLabel,
   runningLabel,
   updateSource,
+  useNow,
   useUpdateControl,
 } from "@/lib/update-control";
 import { EnginesSettings } from "./EnginesSettings";
 import { FleetModelsSection } from "./FleetModelsSection";
 import { BotComputerDefaults } from "./BotComputerDefaults";
 import { LocalComputerSection } from "./LocalComputerSection";
+import { HostCliIntegrationCard } from "./HostCliIntegrationCard";
 import { LocalVmRuntimeCard } from "./LocalVmRuntimeCard";
 import { SharedVpsRuntimeCard } from "./SharedVpsRuntimeCard";
 import { CompanionSection } from "./CompanionSection";
@@ -460,6 +466,9 @@ function UpdatesRow() {
   // only path that works there — and on a Mac that has both, it is the one
   // that can actually install without waiting for a published build.
   const local = useUpdateControl();
+  // A countdown while an update holds new work, so it ticks; a hook, so it
+  // comes before the early return below.
+  const holdNow = useNow(local.status?.drain ? 1_000 : null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const hasBridge = Boolean(window.ogb?.updater);
@@ -488,12 +497,13 @@ function UpdatesRow() {
   // Why Install Update is down.  The harness ships a reason with every
   // refusal it can see coming, and no surface rendered one — so a card with an
   const blockedReason = source === "harness" ? installBlockedReason(status) : null;
-  const isBusyBlocked = installBlockedBusy(status);
-  const isBlocked = blockedReason !== null && !isBusyBlocked;
-  const subtitleReason = isBusyBlocked ? "Work will pause and resume after update" : blockedReason;
+  const isBlocked = blockedReason !== null;
+  const subtitleReason = blockedReason ?? (source === "harness" && installPausesWork(status) ? PAUSES_WORK_COPY : null);
+  // How many messages are saved for after the restart, and when it begins.
+  const holdLine = source === "harness" ? drainLabel(activeDrain(status, holdNow), holdNow) : null;
   const subtitle =
     source === "harness" && status
-      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}`
+      ? `Installed ${installedLabel(status)}.${"\u00A0 "}${harnessLine}${subtitleReason ? `.${"\u00A0 "}${subtitleReason}` : ""}${holdLine ? `${"\u00A0 "}${holdLine}` : ""}`
       : `${feedLabel}${"\u00A0 "}Auto-checks at most once per 6 hours;${"\u00A0 "}you can manually check any time if an update is available.`;
   const lastRun = source === "harness" ? lastRunLabel(status?.lastRun ?? null) : null;
   // The updater's own message for that run — a hover only, never inline.
@@ -566,7 +576,7 @@ function UpdatesRow() {
             </button>
             {hasUpdate && (
               <button
-                onClick={() => void local.install({ force: true })}
+                onClick={() => void local.install()}
                 disabled={local.busy !== null || isBlocked}
                 className="rounded-lg bg-accent px-3 py-1.5 text-[13px] font-medium text-white disabled:bg-control disabled:text-ink-secondary"
               >
@@ -629,6 +639,8 @@ export function ConversationModeRow() {
   const { state, dispatch } = useStore();
   const current = parseConversationMode(state.config?.conversationMode);
   const labels = state.config?.roomLabels ?? { singular: "Channel", plural: "Channels" };
+  // Mid-sentence form:  keeps the capitals of a custom proper noun such as HUB.
+  const lower = lowerRoomLabels(labels);
   const [saving, setSaving] = useState(false);
   const [pendingSimple, setPendingSimple] = useState(false);
   const save = async (conversationMode: ConversationMode, mergeThreads = false) => {
@@ -662,14 +674,14 @@ export function ConversationModeRow() {
   return (
     <Card
       title="Workspace Arrangement"
-      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${labels.plural.toLowerCase()} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
+      subtitle={`Choose how your bots and ${lower.plural} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${lower.plural} mode treats each ${lower.singular} as a category for threads.`}
     >
       <div className="flex flex-col gap-2">
         {CONVERSATION_MODES.map((mode) => {
           const copy = CONVERSATION_MODE_COPY[mode];
           const selected = current === mode;
           const displayTitle = mode === "projects" ? labels.plural : copy.title;
-          const displaySubtitle = copy.subtitle;
+          const displaySubtitle = copy.subtitle(lower.singular);
           return (
             <button
               key={mode}
@@ -691,7 +703,7 @@ export function ConversationModeRow() {
           <div className="rounded-lg border border-hairline/40 bg-raised/40 px-3 py-2.5">
             <div className="text-[14px] font-medium text-ink">Merge Extra Threads?</div>
             <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved but hidden.
+              Simple is one conversation per bot.{"\u00A0"} Merge extra threads into that conversation, or keep them saved and out of the sidebar.
             </div>
             <div className="mt-2 flex flex-wrap gap-2">
               <button
@@ -708,7 +720,7 @@ export function ConversationModeRow() {
                 onClick={() => void save("simple")}
                 className="rounded-lg border border-hairline/40 px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-raised/60"
               >
-                Keep Extra Threads Hidden
+                Keep Them Out of the Sidebar
               </button>
               <button
                 type="button"
@@ -867,7 +879,7 @@ function AnalyticsRow() {
   return (
     <Card
       title="Usage Analytics"
-      subtitle="Anonymous product events — app opened, which features get used. Never conversations, prompts, file contents, or bot output. Your email is only attached if you shared it during setup."
+      subtitle={"Anonymous product events — app opened, which features get used.\u00a0 Never conversations, prompts, file contents, or bot output.\u00a0 Your email is only attached if you shared it during setup."}
     >
       <button
         role="switch"
@@ -920,7 +932,7 @@ function ToolCallsRow() {
           <div className="min-w-0">
             <div className="text-[14px] font-medium text-ink">Show tool calls</div>
             <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Named chips for Bash, search, and other tools. Errors and bot-to-bot messages still appear.
+              Named chips for Bash, search, and other tools.{"\u00a0 "}Errors and bot-to-bot messages still appear.
             </div>
           </div>
           <button
@@ -985,7 +997,7 @@ function ExperimentalFeaturesRow() {
   return (
     <Card
       title="Experimental Features"
-      subtitle="Early features may change while we test them. They stay off unless you enable them."
+      subtitle={"Early features may change while we test them.\u00a0 They stay off unless you enable them."}
     >
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
@@ -1039,7 +1051,7 @@ function DiagnosticsRow() {
   return (
     <Card
       title="Diagnostics"
-      subtitle="Versions, configuration on/off state and a redacted server log tail. Review the file before sharing it."
+      subtitle={"Versions, configuration on/off state and a redacted server log tail.\u00a0 Review the file before sharing it."}
     >
       <div className="flex min-w-0 flex-col items-end gap-2">
         <button
@@ -1352,7 +1364,7 @@ export function SettingsModal() {
                     id="setting-general-profile"
                     className={highlightClass("setting-general-profile")}
                     title="Profile"
-                    subtitle="Shown in the sidebar. Saved as you go."
+                    subtitle={"Shown in the sidebar.\u00a0 Saved as you go."}
                   >
                     <ProfileFields />
                   </Card>
@@ -1468,7 +1480,7 @@ export function SettingsModal() {
                   id="setting-engines-clis"
                   className={highlightClass("setting-engines-clis")}
                   title="Engine CLIs"
-                  subtitle="Which binary each engine runs. Saved as you go."
+                  subtitle={"Which binary each engine runs.\u00a0 Saved as you go."}
                 >
                   <EnginesSettings highlightClass={highlightClass} />
                 </Card>
@@ -1490,6 +1502,9 @@ export function SettingsModal() {
                 <>
                   <div id="setting-computers-providers" className={highlightClass("setting-computers-providers")}>
                     <LocalComputerSection />
+                  </div>
+                  <div className={highlightClass("setting-computers-cli-credentials")}>
+                    <HostCliIntegrationCard />
                   </div>
                   <div id="setting-computers-local-vm" className={highlightClass("setting-computers-local-vm")}>
                     <LocalVmRuntimeCard />

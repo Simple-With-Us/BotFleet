@@ -1,12 +1,19 @@
 import { botDesktopSession } from "./bot-desktop-session.ts";
-import { CUA_EXECUTABLE, cuaExecArgs, defaultCommandRunner, type CommandRunner } from "./container-computer.ts";
+import {
+  CUA_EXECUTABLE,
+  cuaExecArgs,
+  defaultCommandRunner,
+  healCuaShimsExecArgs,
+  shouldHealCuaShims,
+  type CommandRunner,
+} from "./container-computer.ts";
 import type { BotDesktopSession } from "./bot-desktop-session.ts";
 import type { AppConfig } from "./config.ts";
 
 /** Per-bot desktop identity inside the ONE shared Local VM container.
  *
  * This mirrors Cloud VPS shared mode: the container is shared, the desktop is
- * not.  Each bot gets its own Xvfb display, its own Cua socket and its own
+ * not.  Each bot gets its own Xvfb display, its own CUA socket and its own
  * screenshot path, so N bots can drive the same container concurrently.
  *
  * The `:1` desktop stays exactly as the supervisor started it — that is the
@@ -27,7 +34,7 @@ export function localVmSharedLaneKey(botId: string): string {
   return `localvm-bot:${botDesktopSession(botId, "local-vm").short}`;
 }
 
-/** Deterministic display + Cua socket + screenshot path for one bot. */
+/** Deterministic display + CUA socket + screenshot path for one bot. */
 export function localVmSharedBotSession(botId: string): LocalVmSharedBotSession {
   return botDesktopSession(botId, "local-vm");
 }
@@ -75,7 +82,7 @@ export function ensureLocalVmSessionExecArgs(
     `  ${CUA_EXECUTABLE} status --socket "$socket" >/dev/null 2>&1 && exit 0`,
     `  sleep 0.25`,
     `done`,
-    `echo "Cua Driver did not answer on $socket" >&2`,
+    `echo "CUA Driver did not answer on $socket" >&2`,
     `exit 1`,
   ].join("\n");
   return cuaExecArgs(["-ec", script], {
@@ -88,7 +95,7 @@ export function ensureLocalVmSessionExecArgs(
 /** Start (or confirm) one bot's own desktop inside a shared Local VM container.
  *
  * The container's supervisor owns the `:1` desktop for the human noVNC preview
- * and is left untouched; this brings up the extra Xvfb display and Cua socket
+ * and is left untouched; this brings up the extra Xvfb display and CUA socket
  * that one bot's MCP bridge talks to.  Safe to call on every turn (the argv
  * exits 0 as soon as that socket answers) and safe to call for two bots at once,
  * because each writes only its own display and socket.
@@ -101,5 +108,11 @@ export async function ensureContainerComputerSession(
   botId: string,
   runner: CommandRunner = defaultCommandRunner,
 ): Promise<void> {
+  // Best effort: a container built before the image gained the PATH symlinks
+  // is repaired here instead of by replacing it under the bots that use it.
+  if (shouldHealCuaShims(`${runtime}:${containerName}`)) {
+    await runner(runtime, healCuaShimsExecArgs(containerName), 15_000).catch(() => undefined);
+  }
   await runner(runtime, ensureLocalVmSessionExecArgs(containerName, localVmSharedBotSession(botId)), 60_000);
 }
+

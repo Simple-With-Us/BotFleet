@@ -9,60 +9,15 @@
 // contributes from its manifest — text summaries only, the host does
 // not render plugin-supplied UI here.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { z } from "zod";
 import { ArrowUpCircle, Loader2, Power, PowerOff, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
-
-export interface PluginSource {
-  kind: "folder" | "git";
-  path?: string;
-  url?: string;
-  ref?: string | null;
-}
-
-export interface PluginContributionCard {
-  id: string;
-  title: string;
-  description?: string;
-  layout: "stat-grid" | "key-value" | "list";
-  fields?: string[];
-}
-
-export interface PluginContributionCommand {
-  name: string;
-  description: string;
-  args?: string[];
-}
-
-export interface PluginListing {
-  name: string;
-  version: string;
-  description: string;
-  author?: string;
-  license?: string;
-  botfleet: string;
-  entry: string;
-  enabled: boolean;
-  installedAt: string;
-  updatedAt: string;
-  source: PluginSource;
-  warnings: string[];
-  capabilities: string[];
-  contributes?: {
-    cards?: PluginContributionCard[];
-    commands?: PluginContributionCommand[];
-  };
-}
+import { PluginsResponseSchema, type PluginListing, type PluginsResponse } from "../../server/plugin-types";
 
 interface PluginInstallIssue {
   field: string;
   message: string;
-}
-
-interface PluginsResponse {
-  plugins: PluginListing[];
 }
 
 interface ApiError {
@@ -115,49 +70,11 @@ async function readApiError(response: Response): Promise<ApiError | null> {
   return { error: errorText, issues };
 }
 
-const PluginSourceSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("folder"), path: z.string().min(1) }).passthrough(),
-  z.object({
-    kind: z.literal("git"),
-    url: z.string().min(1),
-    ref: z.string().nullable().optional(),
-    path: z.string().optional(),
-  }).passthrough(),
-]);
-
-const PluginListingSchema = z.object({
-  name: z.string().min(1),
-  version: z.string().min(1),
-  description: z.string(),
-  author: z.string().optional(),
-  license: z.string().optional(),
-  botfleet: z.string().min(1),
-  entry: z.string().min(1),
-  enabled: z.boolean(),
-  installedAt: z.string().min(1),
-  updatedAt: z.string().min(1),
-  source: PluginSourceSchema,
-  warnings: z.array(z.string()),
-  capabilities: z.array(z.string()),
-  contributes: z.object({
-    cards: z.array(z.object({
-      id: z.string(),
-      title: z.string(),
-      description: z.string().optional(),
-      layout: z.enum(["stat-grid", "key-value", "list"]),
-      fields: z.array(z.string()).optional(),
-    }).passthrough()).optional(),
-    commands: z.array(z.object({
-      name: z.string(),
-      description: z.string(),
-      args: z.array(z.string()).optional(),
-    }).passthrough()).optional(),
-  }).passthrough().optional(),
-}).passthrough();
-
-const PluginsResponseSchema = z.object({
-  plugins: z.array(PluginListingSchema),
-});
+// The schemas are the single definition of what the plugins route returns, and
+// they live in server/plugin-types so the server and the view cannot drift
+// apart.  The view's types are derived from them (`z.infer`), and the boundary
+// is strict: a server-added field fails the parse instead of being silently
+// dropped from `parsed.data`.
 
 async function readPluginsResponse(response: Response): Promise<PluginsResponse | null> {
   let body: unknown;
@@ -167,8 +84,7 @@ async function readPluginsResponse(response: Response): Promise<PluginsResponse 
     return null;
   }
   const parsed = PluginsResponseSchema.safeParse(body);
-  // SAFETY: PluginsResponseSchema established the listing fields at runtime; PluginListing is the consumer shape.
-  return parsed.success ? (parsed.data as PluginsResponse) : null;
+  return parsed.success ? parsed.data : null;
 }
 
 function errorMessage(error: ErrorLike): string {

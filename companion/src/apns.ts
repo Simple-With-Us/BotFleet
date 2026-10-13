@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { isFiniteJsonNumber, isJsonObject, isJsonString, type JsonObject, type JsonValue } from "./json.ts";
 import { DATA_DIR, writeFileAtomic } from "./state.ts";
 
 export interface ApnsConfig {
@@ -41,7 +42,7 @@ export function apnsKeyStamp(path = apnsKeyPath()): string | null {
 export function loadApnsConfig(): ApnsConfig | null {
   const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
   const teamId = process.env.APNS_TEAM_ID?.trim() || "CC8UTF7ATG";
-  const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet";
+  const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet.ios";
   const p8Path = apnsKeyPath();
   if (!existsSync(p8Path)) return null;
   let p8: string;
@@ -240,6 +241,353 @@ export function apnsPayload(alert: ApnsAlert): ApnsPayload {
     // from Apple, and again when the wake reconnects and the harness replays
     // the very frame the push was built from.
     seq: alert.seq,
+  };
+}
+
+// --- Live Activities ------------------------------------------------------
+//
+// A Live Activity has its own APNs channel: a different push type, a
+// different topic, and a body that is decoded by the synthesized `Codable` on
+// `BotActivityAttributes` in ios/Shared/BotActivity.swift rather than by our
+// own app.  Every key below is that struct's field name, and the type name
+// travels as a string, so nothing here may be "cleaned up" — a renamed key is
+// a widget that silently stops updating.
+
+/** The literal Swift type name `attributes-type` must carry.  Change this and
+ * the system has no type to decode the attributes against. */
+export const LIVE_ACTIVITY_ATTRIBUTES_TYPE = "BotActivityAttributes";
+
+/** Seconds between the Unix epoch and Apple's reference date
+ * (2001-01-01T00:00:00Z).  A synthesized `Codable` reads a Swift `Date` from a
+ * NUMBER of seconds since that date; an ISO-8601 string here decodes as a
+ * crash on the phone, not a wrong-looking timer. */
+export const APPLE_REFERENCE_DATE_OFFSET = 978_307_200;
+
+/** A `BotState` raw value — the face the island wears. */
+export type LiveActivityFace = string;
+
+/** The static, immutable half of the activity: what the widget was started
+ * for.  Sent once, on `start`, and never again — ActivityKit refuses to
+ * change it. */
+export interface LiveActivityAttributes {
+  botId: string;
+  threadId: string;
+  name: string;
+  /** A `BotPalette` name.  An unknown name falls back to neutral grey in the
+   * widget rather than failing the decode. */
+  color: string;
+}
+
+/** `BotActivityAttributes.ContentState` — the half that changes. */
+export interface LiveActivityContentState {
+  face: LiveActivityFace;
+  /** "needsYou" | "working" | "toReview" */
+  kind: string;
+  headline: string;
+  line: string;
+  requestId?: string;
+  options: string[];
+  isPermission: boolean;
+  /** Seconds since Apple's reference date.  See
+   * `APPLE_REFERENCE_DATE_OFFSET` for why this is a number. */
+  since: number;
+}
+
+export interface LiveActivityAlertBody {
+  title: string;
+  body: string;
+}
+
+export type LiveActivityEvent = "start" | "update" | "end";
+
+export interface LiveActivityPayload {
+  aps: {
+    /** Unix seconds. */
+    timestamp: number;
+    event: LiveActivityEvent;
+    "content-state": LiveActivityContentState;
+    /** Start only. */
+    "attributes-type"?: string;
+    /** Start only. */
+    attributes?: LiveActivityAttributes;
+    /** Start only — and the system rejects a start without one. */
+    alert?: LiveActivityAlertBody;
+    /** End only: when the activity should leave the island. */
+    "dismissal-date"?: number;
+  };
+}
+
+/** The topic a Live Activity push is addressed to.  Derived from the
+ * configured bundle id rather than spelled out, so moving a build between
+ * sandbox and production moves both channels together and the two can never
+ * disagree about which app it is talking to. */
+export function liveActivityTopic(bundleId: string): string {
+  return `${bundleId}.push-type.liveactivity`;
+}
+
+/** The palette name used when the frame did not say.  `BotPalette.color`
+ * resolves anything it does not know to the same neutral grey, so a missing
+ * field costs the island its colour and nothing else. */
+export const DEFAULT_LIVE_ACTIVITY_COLOR = "gray";
+
+/** What one Live Activity push says.  Attributes travel on every event here
+ * because they are the same value throughout the activity's life — the start
+ * carries them and the updates below do not resend them. */
+export interface LiveActivityPush {
+  event: LiveActivityEvent;
+  attributes: LiveActivityAttributes;
+  state: LiveActivityContentState;
+  /** Defaults to the state's own headline and line, because a start without
+   * an alert is rejected outright. */
+  alert?: LiveActivityAlertBody;
+  /** Unix seconds; defaults to now. */
+  timestamp?: number;
+  /** Unix seconds; `end` only. */
+  dismissalDate?: number;
+}
+
+/** The JSON body for one Live Activity event.  Exported so a test can read
+ * the shape without standing up a fetch. */
+export function liveActivityPayload(
+  event: LiveActivityEvent,
+  attributes: LiveActivityAttributes,
+  state: LiveActivityContentState,
+  alert?: LiveActivityAlertBody,
+  options: { timestamp?: number; dismissalDate?: number } = {},
+): LiveActivityPayload {
+  const timestamp = options.timestamp ?? Math.floor(Date.now() / 1000);
+  // `requestId` is `String?` in Swift, and a synthesized decoder reads an
+  // absent optional as nil.  Both halves are built explicitly rather than
+  // spread over an empty object, so the two shapes stay visible.
+  const { requestId, ...stateWithoutRequest } = state;
+  const contentState: LiveActivityContentState =
+    requestId === undefined ? { ...stateWithoutRequest } : { ...stateWithoutRequest, requestId };
+  const aps: LiveActivityPayload["aps"] = {
+    timestamp,
+    event,
+    "content-state": contentState,
+  };
+  if (event === "start") {
+    aps["attributes-type"] = LIVE_ACTIVITY_ATTRIBUTES_TYPE;
+    aps.attributes = attributes;
+    aps.alert = alert ?? { title: state.headline, body: state.line };
+  }
+  if (event === "end" && options.dismissalDate !== undefined) {
+    aps["dismissal-date"] = options.dismissalDate;
+  }
+  return { aps };
+}
+
+/** One string out of a raw JSON frame.
+ *
+ * The frame is whatever `JSON.parse` returned, so a `title` that arrived as
+ * a number is not a string and must not become one here — the alert path
+ * falls back exactly as it would for an absent field rather than putting a
+ * number in a banner title. */
+const frameString = (frame: JsonObject, field: string): string | undefined => {
+  const value = frame[field];
+  return isJsonString(value) ? String(value) : undefined;
+};
+
+/** What the harness notify frame carries, once it has been parsed.
+ *
+ * The fields are optional because the frame is: a harness that predates the
+ * Live Activity work sends no `color`, no `options` and no `isPermission`,
+ * and that must cost the island a caption rather than the push.  They are
+ * optional in the type but NOT in the parsing — `parseLiveActivitySource`
+ * is what decides whether a value that IS there is the right shape, and
+ * this interface is only ever handed what that function returned. */
+export interface LiveActivitySource {
+  title?: string;
+  body?: string;
+  kind?: string;
+  threadId?: string;
+  botId?: string;
+  requestId?: string;
+  tool?: string;
+  /** Newer harness frames carry the bot's own name and palette colour. */
+  botName?: string;
+  color?: string;
+  options?: string[];
+  isPermission?: boolean;
+  /** Epoch ms — when this kind began.  Defaults to now. */
+  since?: number;
+}
+
+/** Every field the Live Activity reads, with the type it must have when it is
+ * there at all.  An absent field is fine — that is the degraded path — and a
+ * field of the wrong type is not: it would be indexed as if it were a string
+ * and reach a widget that decodes it strictly. */
+const LIVE_ACTIVITY_SOURCE_FIELDS = {
+  title: "string",
+  body: "string",
+  kind: "string",
+  threadId: "string",
+  botId: "string",
+  requestId: "string",
+  tool: "string",
+  botName: "string",
+  color: "string",
+  options: "string[]",
+  isPermission: "boolean",
+  since: "number",
+} as const satisfies Record<string, string>;
+
+/** What `parseLiveActivitySource` concluded about one inbound frame. */
+export type LiveActivitySourceParse =
+  | { ok: true; source: LiveActivitySource }
+  | { ok: false; error: string };
+
+/** True when `value` is what `expected` says, for the shapes above. */
+const conforms = (value: JsonValue, expected: string): boolean => {
+  if (expected === "string") return isJsonString(value);
+  if (expected === "boolean") return value === true || value === false;
+  if (expected === "number") return isFiniteJsonNumber(value);
+  if (expected === "string[]") return Array.isArray(value) && value.every((entry) => isJsonString(entry));
+  return false;
+};
+
+/** The strings out of an array `conforms` has already cleared.  Read entry by
+ * entry rather than asserted, so a value that slipped through is dropped
+ * rather than carried into the payload. */
+const jsonStrings = (value: JsonValue[]): string[] => {
+  const out: string[] = [];
+  for (const entry of value) {
+    if (isJsonString(entry)) out.push(String(entry));
+  }
+  return out;
+};
+
+/** Name the shape a rejected value actually had, so the log line says what
+ * arrived rather than only what was wanted. */
+const describeJson = (value: JsonValue): string => {
+  if (Array.isArray(value)) return "an array";
+  if (isJsonObject(value)) return "an object";
+  if (value === null) return "null";
+  return Object.prototype.toString.call(value).slice(8, -1).toLowerCase();
+};
+
+/** Put one already-checked value on the parsed source.  A switch rather than
+ * an index cast, so the field the value lands on is spelled out. */
+const assignSource = (source: LiveActivitySource, field: string, value: JsonValue): void => {
+  switch (field) {
+    case "title":
+      source.title = String(value);
+      return;
+    case "body":
+      source.body = String(value);
+      return;
+    case "kind":
+      source.kind = String(value);
+      return;
+    case "threadId":
+      source.threadId = String(value);
+      return;
+    case "botId":
+      source.botId = String(value);
+      return;
+    case "requestId":
+      source.requestId = String(value);
+      return;
+    case "tool":
+      source.tool = String(value);
+      return;
+    case "botName":
+      source.botName = String(value);
+      return;
+    case "color":
+      source.color = String(value);
+      return;
+    case "options":
+      source.options = jsonStrings(Array.isArray(value) ? value : []);
+      return;
+    case "isPermission":
+      source.isPermission = value === true;
+      return;
+    case "since":
+      source.since = Number(value);
+      return;
+    default:
+      return;
+  }
+};
+
+/** Parse one notify frame's notification before anything indexes off it.
+ *
+ * The frame arrives as raw JSON off the harness's loopback stream, and an
+ * interface alone is a promise about a value nobody checked: `??` catches a
+ * field that is ABSENT and nothing else.  A `title` that arrived as a
+ * number, or `options` that arrived as an object, would be copied straight
+ * into a payload the widget decodes strictly.  This is the boundary that
+ * says no.
+ *
+ * Unknown keys are ignored rather than refused, and that is deliberate.  The
+ * harness frame is a contract this sidecar neither owns nor versions against
+ * — `server/notify.ts` already sends `avatarUrl`, which nothing here reads,
+ * and refusing on an unrecognised key would drop every push from every bot
+ * that has a profile picture.  The fields the builder actually reads are the
+ * ones held to their types; a sparse frame still parses, and keeps its
+ * fallbacks. */
+export function parseLiveActivitySource(raw: JsonValue): LiveActivitySourceParse {
+  if (!isJsonObject(raw)) return { ok: false, error: "notification is not a JSON object" };
+  const source: LiveActivitySource = {};
+  for (const [field, expected] of Object.entries(LIVE_ACTIVITY_SOURCE_FIELDS)) {
+    const value = raw[field];
+    if (value === undefined || value === null) continue;
+    if (!conforms(value, expected)) {
+      return { ok: false, error: `${field} must be ${expected}, got ${describeJson(value)}` };
+    }
+    assignSource(source, field, value);
+  }
+  return { ok: true, source };
+}
+
+/** One notify frame, as the Live Activity sees it. */
+export interface LiveActivityContent {
+  attributes: LiveActivityAttributes;
+  state: LiveActivityContentState;
+  alert: LiveActivityAlertBody;
+}
+
+/** Map a harness notify frame onto the widget's contract, degrading field by
+ * field rather than refusing to build: a frame from an older harness has no
+ * bot name, no palette and no option list, and the island should still start
+ * with a caption and a timer instead of nothing at all. */
+export function liveActivityContent(
+  notification: LiveActivitySource,
+  now: number = Date.now(),
+): LiveActivityContent {
+  const kind = notification.kind;
+  const blocking = alertIsBlocking(kind);
+  // The title is the frame's own headline ("Forge needs you") when no name
+  // came with it — one word too long on the island, and never absent.
+  const name = notification.botName ?? notification.title ?? "BotFleet";
+  // A permission card answers allow/deny; a question wants an answer typed,
+  // so a frame that says nothing offers the verdict only when the kind says
+  // it is a permission.
+  const isPermission = notification.isPermission ?? kind === "approval";
+  const headline = blocking ? `${name} needs you` : `${name} is working`;
+  const state: LiveActivityContentState = {
+    face: blocking ? "thinking" : "idle",
+    kind: blocking ? "needsYou" : kind === "done" ? "toReview" : "working",
+    headline,
+    line: notification.body ?? "",
+    options: notification.options ?? (isPermission ? ["Allow", "Deny"] : []),
+    isPermission,
+    since: (notification.since ?? now) / 1000 - APPLE_REFERENCE_DATE_OFFSET,
+  };
+  // Absent rather than null: a synthesized decoder reads a missing optional as
+  // nil, and a literal null in the body is what a hand-written encoder sends.
+  if (notification.requestId !== undefined) state.requestId = notification.requestId;
+  return {
+    attributes: {
+      botId: notification.botId ?? "",
+      threadId: notification.threadId ?? "",
+      name,
+      color: notification.color ?? DEFAULT_LIVE_ACTIVITY_COLOR,
+    },
+    state,
+    alert: { title: headline, body: notification.body ?? "" },
   };
 }
 
@@ -985,11 +1333,19 @@ function sendOver(
   req.end(init?.body ?? "");
 }
 
-export async function sendApnsAlert(
+/** One APNs request: the shared transport, retry ladder and failure
+ * classification behind both push channels.
+ *
+ * Everything push-type specific — topic, priority, body — arrives as an
+ * argument, so a Live Activity goes through the same HTTP/2 session cache, the
+ * same 20-minute provider-token cache and the same key-fault handling as an
+ * alert.  A refused key is the key's verdict, not a channel's, and splitting
+ * the ladder would have meant teaching the watcher a second one. */
+async function sendApnsPush(
   config: ApnsConfig,
   deviceToken: string,
-  alert: ApnsAlert,
-  options: ApnsSendOptions = {},
+  request: { topic: string; pushType: string; priority: string; body: string },
+  options: ApnsSendOptions,
 ): Promise<ApnsSendResult> {
   // The default transport is the http2 path, keyed by the SIGNING KEY and
   // opened through the injected session factory when one is given; tests
@@ -1010,7 +1366,7 @@ export async function sendApnsAlert(
   if (!/^[0-9a-f]{64,}$/.test(token)) {
     return { ok: false, status: 400, reason: "BadDeviceToken", attempts: 0, failureKind: "bad_token" };
   }
-  const body = JSON.stringify(apnsPayload(alert));
+  const body = request.body;
 
   let attempts = 0;
   let resigned = false;
@@ -1028,9 +1384,9 @@ export async function sendApnsAlert(
         method: "POST",
         headers: {
           authorization: `bearer ${providerToken(config, now())}`,
-          "apns-topic": config.bundleId,
-          "apns-push-type": "alert",
-          "apns-priority": "10",
+          "apns-topic": request.topic,
+          "apns-push-type": request.pushType,
+          "apns-priority": request.priority,
           "content-type": "application/json",
         },
         body,
@@ -1099,6 +1455,57 @@ export async function sendApnsAlert(
     errorCode: lastErrorCode,
     errorTimestamp: lastErrorTimestamp,
   };
+}
+
+/** Post one banner alert on the ordinary push channel. */
+export async function sendApnsAlert(
+  config: ApnsConfig,
+  deviceToken: string,
+  alert: ApnsAlert,
+  options: ApnsSendOptions = {},
+): Promise<ApnsSendResult> {
+  return sendApnsPush(
+    config,
+    deviceToken,
+    {
+      topic: config.bundleId,
+      pushType: "alert",
+      priority: "10",
+      body: JSON.stringify(apnsPayload(alert)),
+    },
+    options,
+  );
+}
+
+/** Start, update or end one Live Activity.
+ *
+ * `start` carries priority 10 because it is the push that puts the island on
+ * the screen; `update` and `end` carry 5, which Apple treats as
+ * power-friendly and is all a content change or a dismissal needs.  The
+ * attributes go on the start alone — ActivityKit treats them as immutable,
+ * and resending them is at best wasted bytes. */
+export async function sendApnsLiveActivity(
+  config: ApnsConfig,
+  deviceToken: string,
+  push: LiveActivityPush,
+  options: ApnsSendOptions = {},
+): Promise<ApnsSendResult> {
+  return sendApnsPush(
+    config,
+    deviceToken,
+    {
+      topic: liveActivityTopic(config.bundleId),
+      pushType: "liveactivity",
+      priority: push.event === "start" ? "10" : "5",
+      body: JSON.stringify(
+        liveActivityPayload(push.event, push.attributes, push.state, push.alert, {
+          timestamp: push.timestamp,
+          dismissalDate: push.dismissalDate,
+        }),
+      ),
+    },
+    options,
+  );
 }
 
 /** Bucketed shape of why a HTTP-layer call did not land.  Decision table:
@@ -1550,6 +1957,11 @@ export const APNS_KEY_RECHECK_MS = 5 * 60 * 1000;
  * backlog does form the newest alerts are the ones worth keeping. */
 export const APNS_MAX_QUEUED_PER_DEVICE = 8;
 
+/** The same cap for Live Activity starts, on their own lanes.  Small on
+ * purpose: a phone that has been asleep through five approvals wants the
+ * newest one on its island, not a queue replayed at it on wake. */
+export const APNS_MAX_QUEUED_LIVE_ACTIVITIES = 2;
+
 /** How often a link that keeps failing is allowed to say so.  A broken
  * transport produced 6,003 identical log lines over two days — one per
  * attempt cycle, forever — because transport failures were the one outcome
@@ -1579,10 +1991,23 @@ export function watchHarnessNotifications(options: {
   /** Retire a token Apple has rejected.  The token is named so a phone
    * that registered a replacement while this send was in flight keeps it. */
   forgetToken?: (deviceId: string, token: string) => void;
+  /** Phones holding a push-to-start Live Activity token.  Its own list, never
+   * appended to `tokensForDisconnected`: health counts the phones on that one
+   * to decide whether pushes are off, and counting a phone twice there would
+   * have every phone counted against itself. */
+  liveActivityTokensForDisconnected?: () => { deviceId: string; token: string }[];
+  /** Test seam, the Live Activity twin of `send`. */
+  sendLiveActivity?: typeof sendApnsLiveActivity;
+  /** Retire a Live Activity token Apple has rejected.  Separate from
+   * `forgetToken` because the registry holds two independent tokens and
+   * clearing one against the other would silently do nothing. */
+  forgetLiveActivityToken?: (deviceId: string, token: string) => void;
   fetchImpl?: typeof fetch;
   now?: () => number;
   keyRecheckMs?: number;
   maxQueuedPerDevice?: number;
+  /** How many Live Activity starts one phone may have waiting. */
+  maxQueuedLiveActivities?: number;
   /** Where a key fault is remembered across restarts.  The sidecar hands in
    * `diskKeyFaultStore()`; a watcher without one keeps the fault in memory
    * for this process only, which is what a test wants. */
@@ -1615,6 +2040,19 @@ export function watchHarnessNotifications(options: {
   const queues = new Map<string, DeviceQueue>();
   const queueDepth = (queue: DeviceQueue): number => queue.blocking.length + queue.normal.length;
 
+  // Live Activity pushes get their own lanes, keyed the same way but never
+  // sharing a queue with the alerts above.  `queues` drops the oldest entry
+  // when a phone's lane is full, and it is specified to drop a report before
+  // an approval — a rule that says nothing about islands, and one that would
+  // silently discard a start.  Depth is deliberately NOT reported to health:
+  // `tokensRegistered` counts the phones on `tokensForDisconnected`, and a
+  // second token type counted there would count every phone twice against the
+  // unreachable/off thresholds.
+  const liveQueues = new Map<string, LiveDeviceQueue>();
+  /** How many starts one phone may have waiting.  An island is a summary, not
+   * a transcript: past this the newest one says everything the backlog did. */
+  const maxLiveQueued = Math.max(1, options.maxQueuedLiveActivities ?? APNS_MAX_QUEUED_LIVE_ACTIVITIES);
+
   const health = createHealthTracker(
     () => options.tokensForDisconnected().length,
     () => new Map([...queues].map(([deviceId, queue]) => [deviceId, queueDepth(queue)])),
@@ -1629,6 +2067,7 @@ export function watchHarnessNotifications(options: {
   }
 
   const send = options.send ?? sendApnsAlert;
+  const sendLiveActivity = options.sendLiveActivity ?? sendApnsLiveActivity;
   // The harness SSE stream is HTTP/1.1 loopback; native `fetch` is the
   // right choice for it.  APNs pushes go through the http2 path inside
   // `sendApnsAlert`, not here — the watcher never calls `fetch` against
@@ -1900,6 +2339,129 @@ export function watchHarnessNotifications(options: {
     running: boolean;
   }
 
+  interface QueuedLiveActivity {
+    token: string;
+    push: LiveActivityPush;
+  }
+
+  /** One phone's island lane.  Separate from `DeviceQueue` so a full alert
+   * backlog can never decide whether an island starts, and so nothing here is
+   * read by the health snapshot. */
+  interface LiveDeviceQueue {
+    pending: QueuedLiveActivity[];
+    running: boolean;
+  }
+
+  /** Send one island push and do the bookkeeping that is safe for it.
+   *
+   * Deliberately narrower than `recordOutcome`: no sent/failed counter, no
+   * circuit run, no per-device health row.  This is a second surface for the
+   * same phones, and counting it there would double every phone on the health
+   * page and let an island's failures trip a breaker the alert queue is
+   * already using.  What it does share is the two verdicts that are about the
+   * sender rather than the phone: a refused key is the same key fault, and a
+   * dead token is still a dead token. */
+  const sendLiveOne = async (config: ApnsConfig, deviceId: string, token: string, push: LiveActivityPush) => {
+    let result: ApnsSendResult;
+    try {
+      result = await sendLiveActivity(config, token, push);
+    } catch (err) {
+      const info = inspectTransportError(err);
+      console.warn(
+        `companion: Live Activity push failed (${classifyTransportError(info)}` +
+          `${info.code ? ` ${info.code}` : ""}); the banner for that phone is unaffected`,
+      );
+      return;
+    }
+    try {
+      recordLiveOutcome(config, deviceId, token, result);
+    } catch {
+      console.warn("companion: Live Activity bookkeeping after a send failed");
+    }
+  };
+
+  const recordLiveOutcome = (
+    config: ApnsConfig,
+    deviceId: string,
+    token: string,
+    result: ApnsSendResult,
+  ) => {
+    if (result.ok) return;
+    // The key, not the phone — exactly the alert path's reading, down to the
+    // rotation guard, because it IS the same key.
+    if (result.reason === INVALID_PROVIDER_TOKEN) {
+      const current = fixed ?? discovered;
+      if (current !== null && providerTokenKey(config) === providerTokenKey(current)) {
+        onKeyFault(config, result.reason, result.errorTimestamp);
+      }
+      return;
+    }
+    // The registry holds this token separately, so it needs its own forget:
+    // `clearPushToken` compares against the alert token and would no-op.
+    if (tokenIsDead(result.status, result.reason)) {
+      options.forgetLiveActivityToken?.(deviceId, token);
+      if (firstTime(`${deviceId}:dead-live:${result.reason ?? result.status}`)) {
+        console.warn(
+          `companion: APNs ${result.status}${result.reason ? ` ${result.reason}` : ""} — dropped that phone's ` +
+            "Live Activity token; it will register a new one",
+        );
+      }
+      return;
+    }
+    if (isTransportFailure(result.failureKind ?? "transport") || result.status === 0) return;
+    if (firstTime(`${deviceId}:live:${result.status}:${result.reason ?? ""}`)) {
+      console.warn(
+        `companion: Live Activity push ${result.status}${result.reason ? ` ${result.reason}` : ""} — ` +
+          "the banner for that phone is unaffected",
+      );
+    }
+  };
+
+  const drainLive = async (deviceId: string, queue: LiveDeviceQueue) => {
+    queue.running = true;
+    try {
+      while (!stopped) {
+        const config = activeConfig();
+        if (!config) break;
+        if (queue.pending.length === 0) break;
+        // An open circuit means Apple is unreachable.  An island is a summary
+        // of right now, so this one is dropped rather than held: an approval
+        // that starts its activity three hours late is worse than no island.
+        if (health.circuitIsOpen(deviceId, now())) {
+          if (firstTime(`${deviceId}:live-defer`)) {
+            console.warn(
+              `companion: APNs is unreachable — skipping ${queue.pending.length} Live Activity start(s) for a phone`,
+            );
+          }
+          queue.pending.length = 0;
+          break;
+        }
+        const next = queue.pending.shift();
+        if (!next) break;
+        await sendLiveOne(config, deviceId, next.token, next.push);
+      }
+    } catch {
+      console.warn("companion: Live Activity queue drain failed");
+    } finally {
+      queue.running = false;
+      if (queue.pending.length === 0) liveQueues.delete(deviceId);
+    }
+  };
+
+  /** Put one island push on that phone's lane and start draining it. */
+  const enqueueLiveActivity = (deviceId: string, token: string, push: LiveActivityPush) => {
+    let queue = liveQueues.get(deviceId);
+    if (!queue) {
+      queue = { pending: [], running: false };
+      liveQueues.set(deviceId, queue);
+    }
+    queue.pending.push({ token, push });
+    // Newest wins: an island that starts with an hour-old approval says
+    // something untrue about what is waiting now.
+    while (queue.pending.length > maxLiveQueued) queue.pending.shift();
+    if (!queue.running) void drainLive(deviceId, queue);
+  };
+
   // The circuit is checked by `drain` BEFORE it takes an alert off a lane,
   // not here: this function is only reached for an alert that is already
   // detached from its queue, and skipping it there is what used to destroy
@@ -2088,26 +2650,23 @@ export function watchHarnessNotifications(options: {
   };
 
   const deliver = (
-    notification: {
-      title?: string;
-      body?: string;
-      kind?: string;
-      threadId?: string;
-      botId?: string;
-      requestId?: string;
-      tool?: string;
-    },
+    // Raw JSON, honestly typed: the frame is whatever `JSON.parse` handed
+    // back, and a field in it is a `JsonValue` until something says
+    // otherwise.  Both consumers below decode their own — the alert reads
+    // strings through `frameString`, the island through
+    // `parseLiveActivitySource`.
+    notification: JsonObject,
     seq?: number,
   ) => {
     const connected = new Set(options.connectedIds());
     const alert: ApnsAlert = {
-      title: notification.title ?? "BotFleet",
-      body: notification.body ?? "",
-      kind: notification.kind,
-      threadId: notification.threadId,
-      botId: notification.botId,
-      requestId: notification.requestId,
-      tool: notification.tool,
+      title: frameString(notification, "title") ?? "BotFleet",
+      body: frameString(notification, "body") ?? "",
+      kind: frameString(notification, "kind"),
+      threadId: frameString(notification, "threadId"),
+      botId: frameString(notification, "botId"),
+      requestId: frameString(notification, "requestId"),
+      tool: frameString(notification, "tool"),
       seq,
     };
     const blocking = alertIsBlocking(alert.kind);
@@ -2136,6 +2695,37 @@ export function watchHarnessNotifications(options: {
         }
       }
       if (!queue.running) void drain(row.deviceId, queue);
+    }
+
+    // The island, for the same phones and only for the kinds a person is
+    // actually blocked on.  A phone that is streaming gets the banner over
+    // the socket already, so it is skipped by the same filter as the alerts
+    // above — and it gets BOTH surfaces when it is not, which is the point:
+    // the banner is history, the island is the thing you answer from.
+    //
+    // The frame is parsed first, and only here: the alert above is unchanged
+    // and still lands, because a banner built from the same frame is worth
+    // more than a rejected island and costs nothing to send.  A malformed
+    // frame is dropped here rather than indexed.
+    if (blocking && options.liveActivityTokensForDisconnected) {
+      const parsed = parseLiveActivitySource(notification);
+      if (!parsed.ok) {
+        if (firstTime(`liveactivity-frame:${parsed.error}`)) {
+          console.warn(`companion: notify frame not used for Live Activities — ${parsed.error}`);
+        }
+        return;
+      }
+      const content = liveActivityContent(parsed.source, now());
+      for (const row of options.liveActivityTokensForDisconnected()) {
+        if (connected.has(row.deviceId)) continue;
+        enqueueLiveActivity(row.deviceId, row.token, {
+          event: "start",
+          attributes: content.attributes,
+          state: content.state,
+          alert: content.alert,
+          timestamp: Math.floor(now() / 1000),
+        });
+      }
     }
   };
 
@@ -2180,15 +2770,10 @@ export function watchHarnessNotifications(options: {
               resumed?: boolean;
               /** The stream position of this frame, stamped by `broadcast`. */
               seq?: number;
-              notification?: {
-                title?: string;
-                body?: string;
-                kind?: string;
-                threadId?: string;
-                botId?: string;
-                requestId?: string;
-                tool?: string;
-              };
+              /** A notify frame, still raw: whatever `JSON.parse` returned.
+               *  `deliver` decodes it — the banner reads strings, the Live
+               * Activity builder parses the whole frame. */
+              notification?: JsonObject;
             };
             try {
               // SAFETY: the frame came off the harness's own loopback stream
@@ -2247,6 +2832,8 @@ export function watchHarnessNotifications(options: {
         queue.normal.length = 0;
       }
       queues.clear();
+      for (const queue of liveQueues.values()) queue.pending.length = 0;
+      liveQueues.clear();
       // Close the persistent http2 session on the way out.  Tests do not
       // expect open sockets across runs.
       dropHttp2Sessions();

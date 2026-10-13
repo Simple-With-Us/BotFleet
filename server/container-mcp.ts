@@ -1,4 +1,4 @@
-// Transparent stdio bridge into Cua Driver's official MCP server inside the
+// Transparent stdio bridge into CUA Driver's official MCP server inside the
 // Local VM. This process defines no tools and parses no MCP messages; the
 // piping, drain-safe exit, and watchdog live in mcp-bridge.ts, shared with
 // the VPS entry point.
@@ -23,7 +23,7 @@ const controlToken = process.env.OMB_CONTROL_TOKEN ?? "";
 runMcpBridge({
   command: runtime,
   args: cuaExecArgs(["mcp", "--socket", socket], { container, interactive: true }),
-  label: "Cua Driver",
+  label: "CUA Driver",
   // No liveness watchdog: the runtime CLI talks to a local daemon and fails
   // fast on its own — there is no silent WAN peer to wedge on.
   ...(controlUrl && controlToken ? { gate: { url: controlUrl, token: controlToken } } : {}),

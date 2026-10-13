@@ -48,7 +48,7 @@ import {
   type PluginRefusal,
   type SandboxHostSnapshot,
 } from "./plugin-sandbox-protocol.ts";
-import type { PluginExports, PluginListing, PluginSource } from "./plugin-types.ts";
+import type { PluginExports, PluginListing, PluginListingSource } from "./plugin-types.ts";
 
 /** A plugin's bot summary, used by `host.getBots()`.  Kept narrow on
  *  purpose: the plugin does not need the full bot record. */
@@ -491,7 +491,7 @@ export async function startPluginSandbox(
 export interface LoadedPlugin {
   name: string;
   version: string;
-  source: PluginSource;
+  source: PluginListingSource;
   capabilities: readonly string[];
   sandbox: PluginSandbox;
 }

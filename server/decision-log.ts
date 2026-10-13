@@ -32,7 +32,13 @@ export type DecisionKind =
   | "user-approved"
   | "user-denied"
   | "review-would-approve"
-  | "review-would-deny";
+  | "review-would-deny"
+  // auto-review watching an engine that cannot be paused: On stopped the
+  // turn after a step the reviewer refused
+  | "review-stopped-turn"
+  // a step the watch could not review (no reviewer answered, or the queue
+  // was full), so nothing was checked and nothing was stopped
+  | "review-skipped";
 
 /** Who or what produced the decision. The AutoVerdictSource values carry
  * straight through from auto-approve.ts; `question` marks cards a rule may
@@ -47,6 +53,8 @@ export type DecisionSource =
   | "user"
   | "auto-review"
   | "auto-review-shadow"
+  // the after-the-fact review of a step an engine ran without asking
+  | "auto-review-watch"
   // the per-bot connectorTools grant check at the connected-apps relay
   | "connector-scope";
 
@@ -64,6 +72,9 @@ export interface DecisionRow {
   rule?: string;
   /** the turn ran with nobody at the keyboard when this was decided */
   unattended?: boolean;
+  /** Which engine answered an auto-review row: the asking engine itself or
+   *  the owner's fallback reviewer.  Its instance id, never a model reply. */
+  reviewer?: string;
 }
 
 const FILE_NAME = "decisions.ndjson";
