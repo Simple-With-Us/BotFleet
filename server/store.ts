@@ -81,6 +81,8 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** When true, always-allow on this card needs an extra write-tool warning. */
+  allowKeyWarnWrite?: boolean;
   /** Local actions never share remembered grants with cloud/tool approvals. */
   approvalScope?: "local-computer" | "disposable-computer";
   /** A durable chat-created routine proposal. The scheduler only applies it
@@ -638,6 +640,8 @@ export interface BotRecord {
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
+  /** Optional subset of config `mcpServers` this bot may mount; absent = all enabled. */
+  mcpServers?: string[];
   /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
    * HTTP / openai-compat). Unset = DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts),
    * which DEFAULT_TURN_LOOP_BUDGET.maxRounds is derived from.

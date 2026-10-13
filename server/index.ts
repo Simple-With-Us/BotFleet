@@ -52,7 +52,8 @@ import {
 } from "../shared/credential-request.ts";
 import { TTS_PROVIDERS, cloudSttCapabilitiesFromConfig } from "../shared/voice-providers.ts";
 
-import { autoVerdict, coarseAlwaysAllowRefused, isOwnJobStartRequest, offerableApprovalKey } from "./auto-approve.ts";
+import { autoVerdict, coarseAlwaysAllowRefused, isOwnJobStartRequest } from "./auto-approve.ts";
+import { resolvePermissionAllowKey } from "./permission-allow-key.ts";
 import {
   grantLabel,
   heldGrantText,
@@ -4312,12 +4313,20 @@ bus.subscribe((event: RuntimeEvent) => {
           dataDir: DATA_DIR,
         })
         : undefined;
+      const permissionAllow = permission && asker
+        ? resolvePermissionAllowKey(cfg, asker, event.tool, event.summary, {
+          providerInstanceId: event.providerInstanceId,
+          scope: event.approvalScope,
+          fileWrite,
+        })
+        : { mcpToolAllowKey: null };
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, {
           unattended,
           ownJobStart,
           scope: event.approvalScope,
           fileWrite,
+          mcpToolAllowKey: permissionAllow.mcpToolAllowKey,
         })
         : null;
       if (verdict?.approve && asker && event.requestId) {
@@ -4342,7 +4351,8 @@ bus.subscribe((event: RuntimeEvent) => {
               // same way: a job start (ruling c), host control, a bare shell
               // runner, a destructive or sensitive action, and a write
               // outside the bot's folders are never offered as "always".
-              allowKey: offerableApprovalKey(tool, summary, event.approvalScope, { fileWrite }),
+              allowKey: permissionAllow.allowKey,
+              allowKeyWarnWrite: permissionAllow.allowKeyWarnWrite,
               held,
               approvalScope: event.approvalScope,
             },
@@ -4504,10 +4514,8 @@ bus.subscribe((event: RuntimeEvent) => {
           // client and server can never derive it differently. Bare shell
           // runners, destructive operations, and sensitive paths are never
           // offered as "Always allow" grants.
-          allowKey:
-            permission
-              ? offerableApprovalKey(event.tool, event.summary, event.approvalScope, { fileWrite })
-              : undefined,
+          allowKey: permission ? permissionAllow.allowKey : undefined,
+          allowKeyWarnWrite: permission ? permissionAllow.allowKeyWarnWrite : undefined,
           // in auto mode a card can only mean the guard stopped it — say so accurately
           held:
             permission && asker?.autoApprove

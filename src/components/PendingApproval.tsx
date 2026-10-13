@@ -7,9 +7,10 @@
 // the detail printed raw in a monospace block that is NEVER truncated
 // (it scrolls instead), and the buttons ordered least-destructive-last so
 // the primary action sits under your thumb.
-import { memo } from "react";
+import { memo, useState } from "react";
 import { useStore, type Bot, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface ApprovalLabels {
   [tool: string]: string;
@@ -21,6 +22,7 @@ export interface Pending {
   tool: string;
   /** the narrow grant "always allow" writes, computed server-side */
   allowKey?: string;
+  allowKeyWarnWrite?: boolean;
   detail: string;
   held?: string;
 }
@@ -40,6 +42,7 @@ export function pendingApprovals(messages: Message[]): Pending[] {
       requestId: m.card!.requestId!,
       tool: m.card!.tool!,
       allowKey: m.card!.allowKey,
+      allowKeyWarnWrite: m.card!.allowKeyWarnWrite,
       detail: m.card!.subtitle,
       held: m.card!.held,
     }));
@@ -144,6 +147,7 @@ export function PendingApprovalActions({
   onApproveAll?: () => void;
 }) {
   const { dispatch } = useStore();
+  const [writeAlwaysConfirm, setWriteAlwaysConfirm] = useState(false);
   const isRoutineRequest = isRoutineApproval(pending);
   const decide = (behavior: "allow" | "deny", always = false) =>
     dispatch({
@@ -173,13 +177,34 @@ export function PendingApprovalActions({
       </button>
       {!isRoutineRequest && bot && pending.allowKey && (
         <button
-          onClick={() => decide("allow", true)}
+          onClick={() => {
+            if (pending.allowKeyWarnWrite) setWriteAlwaysConfirm(true);
+            else decide("allow", true);
+          }}
           title={`Stop asking ${bot.name} about ${pending.allowKey}`}
           className={cn(base, "border border-hairline/50 text-ink hover:bg-control")}
         >
           Always allow
         </button>
       )}
+      <ConfirmDialog
+        open={writeAlwaysConfirm}
+        title="Always allow this write tool?"
+        body={
+          <>
+            This tool can change data outside a read-only lookup.&nbsp; BotFleet will stop asking{" "}
+            <span className="font-mono text-[12px]">{pending.allowKey}</span> on every future turn until you revoke it in
+            this bot&apos;s settings.
+          </>
+        }
+        confirmLabel="Always allow"
+        destructive
+        onCancel={() => setWriteAlwaysConfirm(false)}
+        onConfirm={() => {
+          setWriteAlwaysConfirm(false);
+          decide("allow", true);
+        }}
+      />
       {totalCount !== undefined && totalCount > 1 && (
         <button
           onClick={approveAll}

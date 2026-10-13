@@ -555,6 +555,8 @@ const appConfigSchema = z.object({
     })
     .optional(),
   instances: instanceConfigMapSchema.optional(),
+  /** Owner-managed MCP servers (Claude/Cursor `mcpServers` shape). */
+  mcpServers: z.record(z.string(), z.unknown()).optional(),
 });
 // `deleteInstance` also lives on the base schema (saveConfig's internal
 // callers use appConfigSchema.partial() directly, not this schema) but must
@@ -784,6 +786,8 @@ export interface AppConfig {
    * `terminology` is "custom"; resolved for clients by `resolveRoomLabels`. */
   terminologyCustom?: CustomRoomLabels;
   instances?: InstanceConfigMap;
+  /** Owner-managed MCP servers (Claude/Cursor `mcpServers` shape). */
+  mcpServers?: Record<string, unknown>;
 }
 export type ConfigPatch = Omit<z.output<typeof appConfigPatchSchema>, "conversationMode"> & {
   conversationMode?: ConversationMode;
