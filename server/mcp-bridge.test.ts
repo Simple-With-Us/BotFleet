@@ -4,6 +4,7 @@
 // silence PLUS a failed liveness probe does, and traffic always vetoes.
 import { describe, expect, it, vi } from "vitest";
 
+import { CONTROL_UNCONFIRMED, CONTROL_WAITED, type ControlState } from "./control-client.ts";
 import {
   createGateInterceptor,
   createInactivityWatchdog,
@@ -155,11 +156,14 @@ describe("createGateInterceptor", () => {
   const frame = (method: string, id?: number) => JSON.stringify({ jsonrpc: "2.0", id, method, params: {} });
   const drain = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-  function harness(isHeld: () => Promise<boolean>) {
+  const free: ControlState = { held: false, helpOpen: false };
+  const person: ControlState = { held: true, helpOpen: false, reason: "person" };
+
+  function harness(check: () => Promise<ControlState>) {
     const forwarded: string[] = [];
     const refused: string[] = [];
     const intercept = createGateInterceptor({
-      isHeld,
+      check,
       forward: (line) => forwarded.push(line),
       refuse: (line) => refused.push(line),
     });
@@ -167,7 +171,7 @@ describe("createGateInterceptor", () => {
   }
 
   it("forwards everything untouched while nobody is driving", async () => {
-    const { forwarded, refused, intercept } = harness(async () => false);
+    const { forwarded, refused, intercept } = harness(async () => free);
     for (const line of [frame("initialize", 1), frame("tools/list", 2), frame("tools/call", 3), "not json at all"]) {
       intercept(line);
     }
@@ -179,7 +183,7 @@ describe("createGateInterceptor", () => {
   });
 
   it("refuses only tools/call while the person is driving", async () => {
-    const { forwarded, refused, intercept } = harness(async () => true);
+    const { forwarded, refused, intercept } = harness(async () => person);
     intercept(frame("tools/list", 1));
     intercept(frame("tools/call", 2));
     await drain();
@@ -194,12 +198,12 @@ describe("createGateInterceptor", () => {
   it("preserves protocol order even though the held-check is async", async () => {
     const order: string[] = [];
     let calls = 0;
-    let releaseFirst!: (held: boolean) => void;
-    const first = new Promise<boolean>((resolve) => (releaseFirst = resolve));
+    let releaseFirst!: (state: ControlState) => void;
+    const first = new Promise<ControlState>((resolve) => (releaseFirst = resolve));
     let drained!: () => void;
     const allForwarded = new Promise<void>((resolve) => (drained = resolve));
     const intercept = createGateInterceptor({
-      isHeld: () => (calls++ === 0 ? first : Promise.resolve(false)),
+      check: () => (calls++ === 0 ? first : Promise.resolve(free)),
       forward: (line) => {
         const parsed = JSON.parse(line);
         order.push(`fwd:${parsed.id ?? parsed.marker}`);
@@ -211,18 +215,37 @@ describe("createGateInterceptor", () => {
     intercept(frame("tools/call", 2));
     intercept(JSON.stringify({ marker: "drained" }));
     expect(order).toEqual([]);
-    releaseFirst(false);
+    releaseFirst(free);
     await allForwarded;
     expect(order).toEqual(["fwd:1", "fwd:2", "fwd:drained"]);
   });
 
-  it("fails open: a broken held-check forwards rather than wedging the computer", async () => {
+  it("fails closed: a broken check refuses as unconfirmed, never as a person", async () => {
     const { forwarded, refused, intercept } = harness(async () => {
       throw new Error("harness went away");
     });
     intercept(frame("tools/call", 1));
     await drain();
-    expect(refused).toEqual([]);
-    expect(forwarded).toHaveLength(1);
+    expect(forwarded).toEqual([]);
+    expect(refused).toHaveLength(1);
+    expect(JSON.parse(refused[0]!).result.content[0].text).toBe(CONTROL_UNCONFIRMED);
+  });
+
+  it("does not forward a call that was answered free only after it had waited", async () => {
+    const forwarded: string[] = [];
+    const refused: string[] = [];
+    const intercept = createGateInterceptor({
+      check: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return free;
+      },
+      actWithinMs: 10,
+      forward: (line) => forwarded.push(line),
+      refuse: (line) => refused.push(line),
+    });
+    intercept(frame("tools/call", 1));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(forwarded).toEqual([]);
+    expect(JSON.parse(refused[0]!).result.content[0].text).toBe(CONTROL_WAITED);
   });
 });

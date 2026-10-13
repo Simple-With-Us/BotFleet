@@ -172,6 +172,12 @@ export interface AgentToolDeps {
   executeRequestCredentialRequest(
     input: RequestCredentialRequestInput,
   ): AgentRequestResult | Promise<AgentRequestResult>;
+  executeRequestSignInRequest(input: {
+    fromBotId: string;
+    fromThreadId?: string;
+    site: unknown;
+    reason?: unknown;
+  }): AgentRequestResult | Promise<AgentRequestResult>;
   executeRoutineRequestRequest(input: RoutineRequestInput): AgentRequestResult | Promise<AgentRequestResult>;
 }
 
@@ -198,6 +204,7 @@ export type AgentToolName =
   | "delegate_bot"
   | "create_bot"
   | "request_credential"
+  | "request_sign_in"
   | "list_routines"
   | "propose_routine"
   | "propose_routine_action";
@@ -432,6 +439,31 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       return {
         kind: "suspend",
         content: `A secure ${label} card is now visible to the user. End this turn; BotFleet will resume the task after they save or decline. Never ask them to paste the key into chat.`,
+        stopReason: "awaiting_human",
+      };
+    },
+
+    async request_sign_in(call, ctx): Promise<TurnToolOutcome> {
+      const site = call.arguments.site;
+      if (typeof site !== "string" || !site.trim()) {
+        return failed(JSON.stringify({ error: "request_sign_in needs a site, like example.com" }), "bad arguments");
+      }
+      const reason = typeof call.arguments.reason === "string" ? call.arguments.reason : undefined;
+      const result = await deps.executeRequestSignInRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        site,
+        ...(reason ? { reason } : {}),
+      });
+      if (result.status >= 400) {
+        const message = errorText(result.body, "that sign-in could not be requested");
+        return failed(JSON.stringify({ error: message }), message);
+      }
+      const named = typeof result.body.site === "string" ? result.body.site : site.trim();
+      return {
+        kind: "suspend",
+        content:
+          `A Sign in needed card for ${named} is now visible. End this turn. The person signs in on the computer where you work. Never ask them to paste a password or one-time code into chat.`,
         stopReason: "awaiting_human",
       };
     },

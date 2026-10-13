@@ -1585,17 +1585,53 @@ export async function reuseVps(
   return status.ready ? status : null;
 }
 
+/** Auto inspections in flight, by container.  A turn that asks while one
+ * runs joins it, as long as nothing has queued on the lifecycle lock behind
+ * it.  A burst of turns on one bot's VPS then pays for one inspection
+ * instead of queueing one each behind the lock — on an unreachable VPS,
+ * one connect timeout instead of a chain of them.  A start or stop queued
+ * behind it is never jumped: an ask after that queues too, and sees what
+ * the change left. */
+const pendingAutoInspections = new Map<
+  string,
+  { inspection: Promise<VpsComputerStatus>; lock?: Promise<void>; runner: VpsCommandRunner }
+>();
+
 /** Auto needs the complete fresh status to explain a failed attach, while
- * retaining reuseVps's no-cache/no-mutation routing guarantee. */
+ * retaining reuseVps's no-cache/no-mutation routing guarantee: an answer is
+ * never older than the inspection it joined. */
 export async function inspectVpsForAuto(
   cfg: AppConfig,
   botId: string,
   runner: VpsCommandRunner = defaultRunner,
 ): Promise<VpsComputerStatus> {
   const key = vpsLockKey(cfg, botId);
-  const status = key
-    ? await withVpsLifecycleLock(key, () => computeVpsComputerStatus(cfg, botId, runner))
-    : await computeVpsComputerStatus(cfg, botId, runner);
+  if (!key) return inspectVpsStatus(cfg, botId, runner);
+  const pending = pendingAutoInspections.get(key);
+  if (pending && pending.runner === runner && lifecycleLocks.get(key) === pending.lock) return pending.inspection;
+  // withVpsLifecycleLock takes its place in line synchronously, so the
+  // newest lock slot right now is this inspection's own.
+  const inspection = withVpsLifecycleLock(key, () => computeVpsComputerStatus(cfg, botId, runner)).then(async (status) => {
+    if (isSharedVpsMode(cfg) && status.ready && (status.container_id ?? status.container_name)) {
+      await ensureSharedVpsBotSession(cfg, botId, status.container_id ?? status.container_name, runner);
+    }
+    return status;
+  });
+  const entry = { inspection, lock: lifecycleLocks.get(key), runner };
+  pendingAutoInspections.set(key, entry);
+  try {
+    return await inspection;
+  } finally {
+    if (pendingAutoInspections.get(key) === entry) pendingAutoInspections.delete(key);
+  }
+}
+
+async function inspectVpsStatus(
+  cfg: AppConfig,
+  botId: string,
+  runner: VpsCommandRunner,
+): Promise<VpsComputerStatus> {
+  const status = await computeVpsComputerStatus(cfg, botId, runner);
   if (isSharedVpsMode(cfg) && status.ready && (status.container_id ?? status.container_name)) {
     await ensureSharedVpsBotSession(cfg, botId, status.container_id ?? status.container_name, runner);
   }

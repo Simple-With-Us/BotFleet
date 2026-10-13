@@ -3,12 +3,13 @@
 // It defines no tools and parses no MCP messages: bytes in, bytes out.
 //
 // The single exception to that transparency is the who-is-driving gate
-// (opt-in via `gate`). While the person holds control of this computer in
-// the app, a `tools/call` from the agent is answered with a refusal HERE,
-// on the near side, and never forwarded — CUA Driver on the far side has
-// no concept of a person holding the wheel, so the refusal cannot come
-// from anywhere else. Everything that is not a tools/call still passes
-// through untouched, and with no gate configured the bridge remains the
+// (opt-in via `gate`). Before a `tools/call` reaches the driver, the
+// harness says whether this turn may act now — it waits there while the
+// computer is busy — and a call it holds back is answered HERE, in its
+// words, and never forwarded. CUA Driver on the far side has no concept
+// of a person holding the wheel, so the refusal cannot come from anywhere
+// else. Everything that is not a tools/call still passes through
+// untouched, and with no gate configured the bridge remains the
 // byte-for-byte pipe described above.
 //
 // Two behaviors live here so neither entry point can drift:
@@ -23,7 +24,14 @@
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
-import { CONTROL_REFUSAL_PLAIN, createControlClient } from "./control-client.ts";
+import {
+  CONTROL_ACT_WITHIN_MS,
+  CONTROL_UNCONFIRMED,
+  CONTROL_WAITED,
+  controlRefusal,
+  createControlClient,
+  type ControlState,
+} from "./control-client.ts";
 import { ContainerRuntimeDisabledError, resolveRuntimeCommand } from "./container-runtime-guard.ts";
 import { augmentedPath } from "./env-path.ts";
 
@@ -173,19 +181,23 @@ export function createLineSplitter(onLine: (line: string) => void): {
 
 /** The gate itself, factored free of process wiring so a test can drive it
  * with plain strings. Frames are handled on a serialized queue: the
- * held-check is async, and answering frame N+1 before frame N would
+ * check is async, and answering frame N+1 before frame N would
  * reorder the agent's protocol stream. Only a `tools/call` is ever
  * refused; every other frame — handshakes, tools/list, notifications,
- * lines that are not JSON — passes through untouched. */
+ * lines that are not JSON — passes through untouched. A check that throws
+ * refuses as unconfirmed, never as a person's hold. A call answered free
+ * only after `actWithinMs` from reaching the bridge is not forwarded
+ * either (CONTROL_ACT_WITHIN_MS). */
 export function createGateInterceptor(options: {
-  isHeld: () => Promise<boolean>;
+  check: () => Promise<ControlState>;
   forward: (line: string) => void;
   refuse: (line: string) => void;
-  refusalText?: string;
+  actWithinMs?: number;
 }): (line: string) => void {
-  const refusalText = options.refusalText ?? CONTROL_REFUSAL_PLAIN;
+  const actWithinMs = options.actWithinMs ?? CONTROL_ACT_WITHIN_MS;
   let queue: Promise<void> = Promise.resolve();
   return (line: string) => {
+    const arrivedAt = Date.now();
     queue = queue.then(async () => {
       let frame: any = null;
       try {
@@ -198,8 +210,10 @@ export function createGateInterceptor(options: {
         options.forward(line);
         return;
       }
-      const held = await options.isHeld().catch(() => false);
-      if (!held) {
+      const state = await options.check().catch(
+        (): ControlState => ({ held: true, helpOpen: false, blockedReason: CONTROL_UNCONFIRMED }),
+      );
+      if (!state.held && Date.now() - arrivedAt <= actWithinMs) {
         options.forward(line);
         return;
       }
@@ -207,7 +221,10 @@ export function createGateInterceptor(options: {
         JSON.stringify({
           jsonrpc: "2.0",
           id: frame.id ?? null,
-          result: { content: [{ type: "text", text: refusalText }], isError: true },
+          result: {
+            content: [{ type: "text", text: state.held ? controlRefusal(state) : CONTROL_WAITED }],
+            isError: true,
+          },
         }),
       );
     });
@@ -239,7 +256,7 @@ export function runMcpBridge(options: BridgeOptions): void {
     const client = createControlClient({ url: options.gate.url, token: options.gate.token });
     const inbound = createLineSplitter(
       createGateInterceptor({
-        isHeld: async () => (await client.state(true)).held,
+        check: () => client.state(true),
         forward: (line) => child.stdin.write(line + "\n"),
         refuse: (line) => process.stdout.write(line + "\n"),
       }),

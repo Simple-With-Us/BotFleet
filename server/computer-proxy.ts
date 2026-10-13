@@ -35,7 +35,7 @@ import {
   type BrowserTarget,
   type CropRegion,
 } from "./computer-observation.ts";
-import { CONTROL_REFUSAL, createControlClient } from "./control-client.ts";
+import { controlRefusal, createControlClient } from "./control-client.ts";
 import {
   ensureRemoteCuaCommand,
   REMOTE_CUA_EXECUTABLE,
@@ -803,8 +803,9 @@ async function semanticActAndObserve(
 const OPEN_WHILE_DRIVEN = new Set(["computer_request_help", "computer_status", "observation_metrics"]);
 
 async function call(id: unknown, name: string, args: any) {
-  if (!OPEN_WHILE_DRIVEN.has(name) && (await control.state(true)).held) {
-    return text(id, CONTROL_REFUSAL, true);
+  const driving = await control.state(true);
+  if (!OPEN_WHILE_DRIVEN.has(name) && driving.held) {
+    return text(id, controlRefusal(driving), true);
   }
   if (name === "computer_request_help") {
     if (!control.configured) {

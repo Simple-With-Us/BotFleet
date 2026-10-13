@@ -1,5 +1,5 @@
 // Agent-to-agent comms MCP proxy — spawned as an MCP server inside a bot's
-// agent process (via the "agents" integration). Exposes eight tools that
+// agent process (via the "agents" integration). Exposes the fleet tools that
 // let one bot talk to another, routed back through the harness so the
 // harness stays the single owner of turns, permissions, and recursion
 // limits:
@@ -13,6 +13,7 @@
 //   create_bot(name, role, instructions) → Chiefs can add a specialist to
 //                                          their own section
 //   request_credential(id, reason?)       → show a secure, allowlisted key card
+//   request_sign_in(site, reason?)        → show a Sign in needed card; never a password
 //   list_routines()                       → inspect this bot's scheduled work
 //   propose_routine(...)                  → show a confirmation card for a new routine
 //   propose_routine_action(...)           → show a confirmation card for a routine change
@@ -82,6 +83,7 @@ const MCP_TOOL_ORDER = [
   "delegate_bot",
   "create_bot",
   "request_credential",
+  "request_sign_in",
   "list_routines",
   "propose_routine",
   "propose_routine_action",
@@ -238,6 +240,24 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     }
     return {
       text: `A secure ${r.label ?? CREDENTIAL_TARGETS[credentialId].label} card is now visible to the user. End this turn; BotFleet will resume the task after they save or decline. Never ask them to paste the key into chat.`,
+    };
+  }
+  if (name === "request_sign_in") {
+    const site = typeof args.site === "string" ? args.site.trim() : "";
+    if (!site) return { text: "request_sign_in needs a site, like example.com.", isError: true };
+    const reason = typeof args.reason === "string" ? args.reason.trim().slice(0, 280) : "";
+    const r = await api("/api/internal/request-sign-in", {
+      method: "POST",
+      body: JSON.stringify({
+        fromBotId: BOT_ID,
+        fromThreadId: THREAD_ID,
+        site,
+        ...(reason ? { reason } : {}),
+      }),
+    });
+    const named = typeof r.site === "string" ? r.site : site;
+    return {
+      text: `A Sign in needed card for ${named} is now visible. End this turn. The person signs in on the computer where you work. Never ask them to paste a password or one-time code into chat.`,
     };
   }
   if (name === "list_routines") {

@@ -22,6 +22,7 @@ import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { withoutNestedFallbacks } from "../shared/model-limits.ts";
 import type { BotVoices } from "../shared/bot-voice.ts";
+import type { SignInRequestCardData } from "../shared/sign-in-request.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
@@ -131,7 +132,7 @@ export interface Message {
   /** On a routine's prompt message:  the routine's command allowlist
    *  (server/tool-policy.ts), so a re-dispatch of this message is held to it. */
   toolPolicy?: ToolPolicy;
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "sign-in";
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
@@ -160,6 +161,8 @@ export interface Message {
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  /** A website sign-in the person completes on the computer.  Never a password. */
+  signIn?: SignInRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the same chip as
    * a phrase a voice can read ("reading a file") — computed once here so
    * call mode never has to re-derive it from the raw tool name, and absent
@@ -550,6 +553,13 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
       label: redactSecretsInText(out.secret.label),
       description: redactSecretsInText(out.secret.description),
       error: out.secret.error ? redactSecretsInText(out.secret.error) : undefined,
+    };
+  }
+  if (out.signIn) {
+    out.signIn = {
+      ...out.signIn,
+      reason: redactSecretsInText(out.signIn.reason),
+      error: out.signIn.error ? redactSecretsInText(out.signIn.error) : undefined,
     };
   }
   return out;

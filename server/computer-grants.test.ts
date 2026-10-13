@@ -7,6 +7,8 @@ import {
   resolveGrants,
   resolveTurnComputerMounts,
   computerSystemPrompt,
+  vpsUnavailableHint,
+  autoVpsOutageFailsTurn,
   hostToolPrefix,
   nameMounts,
   turnComputerMounts,
@@ -1002,6 +1004,74 @@ describe("routine failure resiliency and unattended safety", () => {
     });
     expect(result.hasHostComputer).toBe(true);
     expect(result.mounts.map((m) => m.kind)).toEqual(["vps"]);
+  });
+
+  describe("an unreachable Auto VPS", () => {
+    const engine = { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false };
+    const down = (notices: string[] = []) => {
+      const deps: TurnComputerDeps<object> = {
+        ...makeBaseDeps(notices),
+        readHostConnection: () => null,
+      };
+      deps.vps.inspectVpsForAuto = async () => {
+        throw new Error("Docker over SSH is not reachable");
+      };
+      return deps;
+    };
+    const turn = (deps: TurnComputerDeps<object>, automationSource?: string) =>
+      resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Auto", cloudBackend: "vps" },
+        cfg: {} as AppConfig,
+        engine,
+        threadId: "t1",
+        dispatchId: 1,
+        automationSource,
+        allowed: null,
+        deps,
+      });
+
+    it("lets a chat turn run and tells the model the VPS is not mounted", async () => {
+      const result = await turn(down());
+      expect(result.mounts).toEqual([]);
+      expect(result.unavailableNote).toContain("Docker over SSH is not reachable");
+      expect(result.unavailableNote).toContain("no computer is mounted");
+      expect(result.unavailableNote).toContain("Work that needs no screen can go ahead");
+    });
+
+    it("still fails a scheduled run and says why", async () => {
+      await expect(turn(down(), "schedule")).rejects.toThrow(/scheduled run tried to start the VPS computer/);
+    });
+
+    it("lets a delegated turn run", async () => {
+      const result = await turn(down(), "delegation");
+      expect(result.mounts).toEqual([]);
+      expect(result.unavailableNote).toContain("no computer is mounted");
+    });
+
+    it("keeps the host computer when Auto can still mount it, with no outage note", async () => {
+      const deps = makeBaseDeps();
+      deps.vps.inspectVpsForAuto = async () => {
+        throw new Error("Docker over SSH is not reachable");
+      };
+      const result = await turn(deps);
+      expect(result.mounts.map((m) => m.kind)).toEqual(["local"]);
+      expect(result.unavailableNote).toBe("");
+    });
+
+    it("names the way on that fits what the check found", () => {
+      const connection = "Check the VPS connection in App Settings → Connections.";
+      expect(vpsUnavailableHint({ reachable: true })).toBe(
+        "Open Computer and enable Start VPS automatically, or choose Cloud to start it manually.",
+      );
+      expect(vpsUnavailableHint({ reachable: false })).toBe(connection);
+      expect(vpsUnavailableHint({ autoStartVps: true, reachable: true })).toBe(connection);
+      expect(vpsUnavailableHint({})).toBe("");
+      expect(vpsUnavailableHint({ automationSource: "schedule" })).toMatch(/^This scheduled run tried to start the VPS computer/);
+      expect(vpsUnavailableHint({ automationSource: "webhook" })).toMatch(/^This automation run tried to start the VPS computer/);
+      expect(autoVpsOutageFailsTurn("schedule")).toBe(true);
+      expect(autoVpsOutageFailsTurn("delegation")).toBe(false);
+      expect(autoVpsOutageFailsTurn(undefined)).toBe(false);
+    });
   });
 
   describe("hostShellGranted", () => {

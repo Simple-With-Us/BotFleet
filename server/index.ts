@@ -50,6 +50,13 @@ import {
   isCredentialTargetId,
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
+import {
+  signInBodyHasSecret,
+  signInReason,
+  signInResumePrompt,
+  signInSite,
+  type SignInRequestCardData,
+} from "../shared/sign-in-request.ts";
 import { TTS_PROVIDERS, cloudSttCapabilitiesFromConfig } from "../shared/voice-providers.ts";
 
 import { autoVerdict, coarseAlwaysAllowRefused, isOwnJobStartRequest, offerableApprovalKey } from "./auto-approve.ts";
@@ -219,6 +226,7 @@ import {
   revokedTurnProviders,
 } from "./config-reload-keys.ts";
 import { computerReach } from "./computer-capability.ts";
+import { waitForComputerCall } from "./computer-call-gate.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
 import {
   ensureDirs,
@@ -301,6 +309,7 @@ import { toolsFor } from "./tools/registry.ts";
 import {
   availableAgentToolNames,
   credentialPromptFor,
+  signInPromptFor,
   hasFileTools,
   routinePromptFor,
 } from "./tools/prompts.ts";
@@ -6163,6 +6172,7 @@ async function startTurn(
         dispatchId: dispatchOwner.dispatchId,
         runOn: opts?.runOn,
         unattended: isUnattended(bot.id),
+        automationSource: opts?.automationSource,
         allowed: allowedBotComputers(cfg),
         deps: turnComputerDeps(
           bot.id,
@@ -6306,7 +6316,7 @@ async function startTurn(
                 " rather than stopping without action.",
             ].join(" ")
           : "";
-      const credentialPrompt = credentialPromptFor(availableAgentTools);
+      const credentialPrompt = credentialPromptFor(availableAgentTools) + signInPromptFor(availableAgentTools);
       const routinePrompt = routinePromptFor(availableAgentTools);
 
       // (activeVpsThreads was already claimed above, before the provision or
@@ -6413,7 +6423,7 @@ async function startTurn(
             toolLoopSurface: httpOnlyToolSurface,
             hasHostTerminal: hasHostComputer && !granted_mounts.some((m) => m.kind === "local"),
             vpsShared: isSharedVpsMode(cfg),
-          }),
+          }) + turnComputers.unavailableNote,
         },
         // `integrations.composio` exists only when the selected driver
         // declared and mounted that capability above.
@@ -6631,6 +6641,7 @@ async function startTurn(
                 executeDelegateBotRequest,
                 executeCreateBotRequest,
                 executeRequestCredentialRequest,
+                executeRequestSignInRequest,
                 executeRoutineRequestRequest,
               },
             })
@@ -7712,6 +7723,44 @@ export function executeRequestCredentialRequest(input: {
   return { status: 201, body: { messageId: message.id, label: target.label } };
 }
 
+/** The `POST /api/internal/request-sign-in` body.  Opens one card and
+ * never accepts a password.  A newer open card for the same site replaces
+ * the previous one without resuming it. */
+export function executeRequestSignInRequest(input: {
+  fromBotId: string;
+  fromThreadId?: string;
+  site: unknown;
+  reason?: unknown;
+}): { status: number; body: Record<string, unknown> } {
+  const from = store.bot(input.fromBotId);
+  if (!from) return { status: 403, body: { error: "unknown sender" } };
+  const fromThreadId = String(input.fromThreadId ?? from.threadId);
+  const owner = connectorThread(from.id, fromThreadId);
+  if (!owner) return { status: 403, body: { error: "source conversation does not belong to sender" } };
+  const site = signInSite(input.site);
+  if (!site) return { status: 400, body: { error: "request_sign_in needs a site hostname, like example.com" } };
+  const reason = signInReason(input.reason);
+  for (const existing of store.messagesFor(fromThreadId)) {
+    if (existing.kind === "sign-in" && existing.signIn?.status === "open" && existing.signIn.site === site) {
+      store.patchMessage(fromThreadId, existing.id, {
+        signIn: { ...existing.signIn, status: "replaced" },
+      });
+    }
+  }
+  const message = store.appendMessage(fromThreadId, {
+    role: "bot",
+    kind: "sign-in",
+    ...(owner.group ? { from: { botId: from.id, name: from.name, color: from.color } } : {}),
+    signIn: { site, reason, status: "open" },
+  });
+  notify(
+    buildNotification("takeover", from, fromThreadId, `needs you to sign in to ${site}`, {
+      snoozed: threadAlertsSnoozed(from.id, fromThreadId),
+    }),
+  );
+  return { status: 201, body: { messageId: message.id, site } };
+}
+
 /** The `POST /api/internal/routine-requests` body, factored the same way.
  * One shape for both `propose_routine` (action `create`) and
  * `propose_routine_action` (every other action) — `routineRequests.propose`
@@ -8460,6 +8509,7 @@ async function runGroupMemberTurn(
     "Format replies with clean Github-Flavored Markdown (headers, code fences with language tags, bullet lists, tables, bold/italic). When referencing local files on this Mac, use absolute paths or file links (e.g. `file:///path/to/file`) so they are directly clickable in the UI.",
     `Reply as yourself, briefly and conversationally. To bring a teammate in, mention them like @Name — they'll see the conversation and respond.`,
     credentialPromptFor(availableAgentTools).trim(),
+    signInPromptFor(availableAgentTools).trim(),
     routinePromptFor(availableAgentTools).trim(),
   ]
     .filter(Boolean)
@@ -8666,7 +8716,7 @@ async function runGroupMemberTurn(
         toolLoopSurface: httpOnlyToolSurface,
         hasHostTerminal: hasHostComputer && !turnComputers.mounts.some((m) => m.kind === "local"),
         vpsShared: isSharedVpsMode(cfg),
-      }),
+      }) + turnComputers.unavailableNote,
     },
     // The room lane mounts the same recall proxy the 1:1 lane does (see the
     // `integrations.qdrant` assignment above), so it owes the bot the same
@@ -8755,6 +8805,7 @@ async function runGroupMemberTurn(
             executeDelegateBotRequest,
             executeCreateBotRequest,
             executeRequestCredentialRequest,
+            executeRequestSignInRequest,
             executeRoutineRequestRequest,
           },
         })
@@ -9351,10 +9402,122 @@ function drainSecretResumes() {
   }
 }
 
+type SignInResumeEntry = {
+  botId: string;
+  threadId: string;
+  messageId: string;
+  site: string;
+  outcome: "done" | "cancelled";
+};
+const pendingSignInResumes = new Map<string, SignInResumeEntry>();
+
+function signInMessage(botId: string, threadId: string, messageId: string): Message | null {
+  if (!connectorThread(botId, threadId)) return null;
+  const message = store.messagesFor(threadId).find((candidate) => candidate.id === messageId);
+  return message?.kind === "sign-in" && message.signIn ? message : null;
+}
+
+function markSignInResumeFailed(threadId: string, messageId: string, error: string) {
+  const message = store.messagesFor(threadId).find((candidate) => candidate.id === messageId);
+  if (!message?.signIn) return;
+  store.patchMessage(threadId, message.id, {
+    signIn: { ...message.signIn, resumed: false, error: error.slice(0, 180) },
+  });
+}
+
+function dispatchSignInResume(entry: SignInResumeEntry) {
+  const owner = connectorThread(entry.botId, entry.threadId);
+  if (!owner) return;
+  if (providerReloadInProgress) {
+    pendingSignInResumes.set(`${entry.threadId}:${entry.messageId}`, entry);
+    return;
+  }
+  const prompt = signInResumePrompt(entry.site, entry.outcome);
+  if (owner.bot.busy) {
+    pendingSignInResumes.set(`${entry.threadId}:${entry.messageId}`, entry);
+    return;
+  }
+  if (owner.group) {
+    const groupId = owner.group.id;
+    const toolPolicy = continuedTurnToolPolicy(store.activePath(entry.threadId));
+    const operation = beginGroupTurnOperation(groupId, entry.threadId);
+    const previous = groupQueues.get(groupId) ?? Promise.resolve();
+    const next = previous.then(async () => {
+      if (operation.cancelled) return;
+      const current = connectorThread(entry.botId, entry.threadId);
+      if (!current?.group) return;
+      if (current.bot.busy) {
+        pendingSignInResumes.set(`${entry.threadId}:${entry.messageId}`, entry);
+        return;
+      }
+      await runGroupMemberTurn(
+        current.group.id,
+        entry.threadId,
+        entry.botId,
+        0,
+        new Set(),
+        prompt,
+        (message) => markSignInResumeFailed(entry.threadId, entry.messageId, message),
+        () => operation.cancelled,
+        undefined,
+        toolPolicy,
+      );
+    });
+    const tracked = next.finally(() => finishGroupTurnOperation(groupId, operation));
+    groupQueues.set(
+      groupId,
+      tracked.catch((error) => {
+        markSignInResumeFailed(entry.threadId, entry.messageId, error instanceof Error ? error.message : String(error));
+      }),
+    );
+    return;
+  }
+  void startTurn(entry.botId, prompt, {
+    threadId: entry.threadId,
+    cardContinuation: true,
+    toolPolicy: continuedTurnToolPolicy(store.activePath(entry.threadId)),
+    onDispatchError: (message) => markSignInResumeFailed(entry.threadId, entry.messageId, message),
+  }).catch((error) => {
+    if (isBotStoppedError(error)) {
+      markSignInResumeFailed(entry.threadId, entry.messageId, error instanceof Error ? error.message : botStopRefusalMessage());
+      return;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (/already working/i.test(message)) {
+      pendingSignInResumes.set(`${entry.threadId}:${entry.messageId}`, entry);
+    } else {
+      markSignInResumeFailed(entry.threadId, entry.messageId, message);
+    }
+  });
+}
+
+function resumeSignInCard(botId: string, threadId: string, messageId: string, outcome: SignInResumeEntry["outcome"]) {
+  const message = signInMessage(botId, threadId, messageId);
+  if (!message?.signIn || message.signIn.status !== "open") return false;
+  const next: SignInRequestCardData = {
+    ...message.signIn,
+    status: outcome,
+    resumed: true,
+    error: undefined,
+  };
+  store.patchMessage(threadId, message.id, { signIn: next });
+  dispatchSignInResume({ botId, threadId, messageId, site: message.signIn.site, outcome });
+  return true;
+}
+
+function drainSignInResumes() {
+  for (const [key, entry] of pendingSignInResumes) {
+    if (store.bot(entry.botId)?.busy) continue;
+    pendingSignInResumes.delete(key);
+    dispatchSignInResume(entry);
+  }
+}
+
 bus.subscribe((event: RuntimeEvent) => {
   if (event.type === "turn.completed") {
     drainConnectorResumes();
     drainSecretResumes();
+    drainSignInResumes();
   }
 });
 
@@ -11610,6 +11773,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         });
         return json(res, result.status, result.body);
       }
+      if (method === "POST" && path === "/api/internal/request-sign-in") {
+        const body = await readBody(req);
+        if (signInBodyHasSecret(body)) {
+          return json(res, 400, { error: "A sign-in request does not accept a password." });
+        }
+        const refused = authorizeCommsIdentity(req.headers.authorization, {
+          botId: String(body.fromBotId ?? ""),
+        });
+        if (refused) return json(res, refused.status, refused.body);
+        const result = executeRequestSignInRequest({
+          fromBotId: String(body.fromBotId ?? ""),
+          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
+          site: body.site,
+          reason: body.reason,
+        });
+        return json(res, result.status, result.body);
+      }
       // Zulip tools for the MCP lane (docs/zulip.md).  Like the job tools
       // below, the comms grant is the caller's only identity: the hub posts
       // as the grant's bot and replies to the conversation bound to the
@@ -11825,8 +12005,24 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const bot = store.bot(botId);
         if (!bot) return json(res, 404, { error: "no such bot" });
         if (method === "GET") {
-          const snapshot = computerControl.snapshot(botId);
-          return json(res, 200, { held: snapshot.held, helpOpen: snapshot.helpReason !== null });
+          // The gate may hold this check while a person has the computer.
+          // A bridge that hung up stops the wait.
+          const abort = new AbortController();
+          res.once("close", () => {
+            if (!res.writableEnded) abort.abort();
+          });
+          const snapshot = () => computerControl.snapshot(botId);
+          return json(res, 200, await waitForComputerCall({
+            snapshot: () => {
+              const current = snapshot();
+              return {
+                held: current.held,
+                helpReason: current.helpReason,
+                heldSinceMs: current.heldSinceMs,
+              };
+            },
+            signal: abort.signal,
+          }));
         }
         if (method === "POST") {
           const body = await readBody(req);
@@ -17486,6 +17682,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (!message.secret.provided) resumeSecretCard(m[1], threadId, message.id, "dismissed");
       return json(res, 200, { dismissed: true, resumed: true });
+    }
+
+    m = path.match(/^\/api\/bots\/([\w-]+)\/sign-in-cards\/([\w-]+)\/(done|cancel)$/);
+    if (m && method === "POST") {
+      const body = await readBody(req);
+      if (signInBodyHasSecret(body)) {
+        return json(res, 400, { error: "A sign-in card does not accept a password. Sign in on the computer, then press Done." });
+      }
+      const threadId = String(body.threadId ?? "");
+      const message = signInMessage(m[1], threadId, m[2]);
+      if (!message?.signIn) return json(res, 404, { error: "no such sign-in request" });
+      if (message.signIn.status !== "open") {
+        return json(res, 409, { error: "this sign-in request is no longer open" });
+      }
+      const outcome = m[3] === "done" ? "done" : "cancelled";
+      resumeSignInCard(m[1], threadId, message.id, outcome);
+      return json(res, 200, { status: outcome, resumed: true });
     }
 
     // Inline connection cards are bound to both the bot and the exact task
