@@ -4334,6 +4334,99 @@ describe("harness HTTP API", () => {
     expect(response.status).toBe(415);
   });
 
+  it("POST /api/instances/probe-models answers what a connection actually serves", async () => {
+    // The server runs in a child process, so a mocked fetch here would not
+    // intercept its probe.  A real local endpoint, exercised over the wire.
+    const seen: string[] = [];
+    const endpoint = createServer((req, res) => {
+      seen.push(req.url ?? "");
+      if (req.url === "/v1/models" && req.headers.authorization === "Bearer probe-key") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ id: "meta-llama/llama-3.3-70b-instruct" }, { id: "qwen3-32b" }, { id: "qwen3-32b" }] }));
+        return;
+      }
+      res.writeHead(401).end("no");
+    });
+    await new Promise<void>((resolve) => endpoint.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a bound `net` listener always reports a port; the assertions below read it back.
+    const port = (endpoint.address() as { port: number }).port;
+    try {
+      const found = await api("POST", "/api/instances/probe-models", {
+        endpoint: `http://127.0.0.1:${port}/v1`,
+        key: "probe-key",
+      });
+      expect(found.status).toBe(200);
+      expect(found.body.ok).toBe(true);
+      // The duplicate id is collapsed: the textarea is a list to edit, not a
+      // copy of the provider's array.
+      expect(found.body.models).toEqual(["meta-llama/llama-3.3-70b-instruct", "qwen3-32b"]);
+      expect(seen).toContain("/v1/models");
+
+      // A rejected key is reported as the status it came back with, so the UI
+      // can say "that endpoint rejected the API key" instead of "failed".
+      const rejected = await api("POST", "/api/instances/probe-models", {
+        endpoint: `http://127.0.0.1:${port}/v1`,
+        key: "wrong-key",
+      });
+      expect(rejected.status).toBe(200);
+      expect(rejected.body.ok).toBe(false);
+      expect(rejected.body.status).toBe(401);
+      expect(rejected.body.models).toEqual([]);
+
+      // A malformed endpoint is refused before anything is sent to it.
+      const bad = await api("POST", "/api/instances/probe-models", { endpoint: "not a url" });
+      expect(bad.status).toBe(400);
+    } finally {
+      await new Promise<void>((resolve) => endpoint.close(() => resolve()));
+    }
+  });
+
+  it("POST /api/instances/probe-models refuses a body that is not JSON", async () => {
+    // Same CSRF gate as every other mutating route: a page elsewhere on this
+    // machine must not be able to ride the harness into fetching a URL.
+    const res = await fetch(`${BASE}/api/instances/probe-models`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: "endpoint=http://example.invalid",
+    });
+    expect(res.status).toBe(415);
+  });
+
+  it("POST /api/instances creates an OpenAI-compatible engine with no hand-typed models", async () => {
+    // The empty-list refusal and the driver's own `/models` probe were mutually
+    // exclusive: a non-empty config list is exactly what suppresses the probe,
+    // so every engine added through the UI had to have its models retyped by
+    // hand.  Blank is allowed now, and discovery fills it in.
+    const endpoint = createServer((req, res) => {
+      if (req.url === "/v1/models") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ id: "discovered-model" }] }));
+        return;
+      }
+      res.writeHead(404).end("no");
+    });
+    await new Promise<void>((resolve) => endpoint.listen(0, "127.0.0.1", resolve));
+    // SAFETY: a bound `net` listener always reports a port; the body below reads it back.
+    const port = (endpoint.address() as { port: number }).port;
+    const created = await api("POST", "/api/instances", {
+      name: "Discovered fixture",
+      endpoint: `http://127.0.0.1:${port}/v1`,
+    });
+    expect(created.status).toBe(201);
+    try {
+      const listed = await api("GET", "/api/instances");
+      // SAFETY: the harness's own JSON answer, read back by its test; the assertions below check it.
+      const instance = listed.body.instances.find((i: { instanceId: string }) => i.instanceId === created.body.instanceId);
+      expect(instance).toBeTruthy();
+      // Either the endpoint's own answer or the driver's documented fallback
+      // is acceptable; a blank catalog is not.
+      expect(instance.models.options.length).toBeGreaterThan(0);
+    } finally {
+      await api("DELETE", `/api/instances/${created.body.instanceId}`);
+      await new Promise<void>((resolve) => endpoint.close(() => resolve()));
+    }
+  });
+
   it("POST /api/ingress/test reports the tunnel when Cloudflare is in front", async () => {
     // The server runs in a child process, so mocking globalThis.fetch here
     // would not intercept its probe.  Spin up a real local HTTP server and
@@ -6311,7 +6404,14 @@ describe("instance CLI override API", () => {
   it("creates, describes, and deletes a custom OpenAI-compatible engine", async () => {
     expect((await api("POST", "/api/instances", { name: "" })).status).toBe(400);
     expect((await api("POST", "/api/instances", { name: "Ollama", endpoint: "not-a-url" })).status).toBe(400);
-    expect((await api("POST", "/api/instances", { name: "Ollama", endpoint: "http://localhost:11434/v1", models: [] })).status).toBe(400);
+    // Sixteen ids is still one too many: the route stores at most 15.
+    expect((await api("POST", "/api/instances", {
+      name: "Ollama",
+      endpoint: "http://localhost:11434/v1",
+      models: Array.from({ length: 16 }, (_, i) => `model-${i}`),
+    })).status).toBe(400);
+    // An EMPTY list is deliberately not a 400 any more: it is how a connection
+    // says "ask the endpoint", and the driver already does exactly that.
 
     const created = await api("POST", "/api/instances", {
       name: "Ollama Local",

@@ -1154,6 +1154,17 @@ final class Session: ObservableObject {
         UserDefaults.standard.set(data, forKey: Self.postedPushTokenKey)
     }
 
+    /// Hand a Live Activity token to the sidecar.
+    ///
+    /// Quietly, and deliberately without the dedupe the device token gets.
+    /// ActivityKit's push-to-start sequence re-emits on rotation rather than
+    /// once per launch, so the repetition here is rotation being reported, not
+    /// a redundant POST — and a token the sidecar has not been told about is
+    /// an app that cannot be reached while it is dead.
+    func registerLiveActivityToken(_ hex: String, kind: LiveActivityTokenKind) async {
+        await perform(quietly: true) { try await $0.registerLiveActivityToken(hex, kind: kind) }
+    }
+
     func dropPendingQueued(threadId: String, queueId: String) {
         state.cancelPendingQueued(threadId: threadId, queueId: queueId)
     }

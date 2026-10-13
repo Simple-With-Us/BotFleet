@@ -29,6 +29,7 @@ final class LiveActivityCoordinator {
 
     func attach(to session: Session) {
         self.session = session
+        observePushToStartToken(on: session)
         cancellable = session.$state
             .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
             .sink { [weak self] state in self?.scheduleSync(state) }
@@ -75,6 +76,27 @@ final class LiveActivityCoordinator {
                   self.lifecycle.acceptFreshState(for: generation)
             else { return }
             self.scheduleSync(freshState)
+        }
+    }
+
+    /// Watch the per-device push-to-start token and hand it to the sidecar.
+    ///
+    /// This is the credential that makes an ask reachable when the app is *not*
+    /// running: the sidecar uses it to start an ActivityKit activity from an
+    /// APNs push, which is the only way a Lock Screen card appears for a phone
+    /// whose app has been killed.  ActivityKit mints it whether or not an
+    /// activity is running, so this is observed once at attach rather than per
+    /// activity.
+    ///
+    /// The sequence re-emits on rotation, so every value is posted and the last
+    /// one wins on the sidecar.
+    private func observePushToStartToken(on session: Session) {
+        Task { [weak session] in
+            for await tokenData in Activity<BotActivityAttributes>.pushToStartTokenUpdates {
+                guard let session else { return }
+                let hex = tokenData.map { String(format: "%02x", $0) }.joined()
+                await session.registerLiveActivityToken(hex, kind: .pushToStart)
+            }
         }
     }
 
@@ -241,11 +263,14 @@ final class LiveActivityCoordinator {
         // Activity.request() does a synchronous XPC round-trip; run it on a
         // background executor so it never touches the main thread directly.
         let activity: Activity<BotActivityAttributes>? = await Task.detached(priority: .userInitiated) {
-            // Closed-app push is not in this version; keep the activity local.
+            // `.token` so the sidecar can later update or end this activity
+            // remotely; the per-activity token it mints is deliberately NOT
+            // posted, because the sidecar keeps one slot per device and that
+            // slot belongs to the push-to-start token.
             try? Activity.request(
                 attributes: attributes,
                 content: .init(state: content, staleDate: nil),
-                pushType: nil
+                pushType: .token
             )
         }.value
 

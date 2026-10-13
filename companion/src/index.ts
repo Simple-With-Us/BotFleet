@@ -179,6 +179,13 @@ const pushWatch = watchHarnessNotifications({
   forgetToken: (id, token) => {
     devices.clearPushToken(id, token);
   },
+  // Its own list, its own lanes, its own token: a phone can hold both, and
+  // neither the health totals nor the alert queue may be asked to tell them
+  // apart.
+  liveActivityTokensForDisconnected: () => devices.liveActivityTokens(),
+  forgetLiveActivityToken: (id, token) => {
+    devices.clearLiveActivityToken(id, token);
+  },
   // A key Apple has refused stays refused across relaunches.  Without this
   // the sidecar came back up sending at full rate against a .p8 that had
   // been rejected days earlier, once every forty seconds, while every
@@ -199,6 +206,7 @@ const proxy = createProxyHandler({
     endpoints: () => companionEndpointCandidates(COMPANION_PORT, undefined, undefined, hostedUrl, undefined, lanPolicy),
     connected: connectedDevices.open,
     setPushToken: (id, token) => devices.setPushToken(id, token),
+    setLiveActivityToken: (id, token) => devices.setLiveActivityToken(id, token),
     pushHealth: pushWatch.health,
   });
 const companion = createServer(proxy);

@@ -8,9 +8,11 @@
 //
 // This panel is deliberately scoped to the *engine* rather than the model: the
 // windows belong to the account, not to any one model, so repeating them per
-// row was also repeating a fact that does not vary.  Each engine gets one
-// entry, each window gets its own name, bar and reset time, and the engine
-// with the least headroom is named as the one that will stop a turn first.
+// row was also repeating a fact that does not vary.  The engine being browsed
+// gets its windows on screen, open, under the header; every other engine stays
+// behind the disclosure below it.  Each window gets its own name, bar and reset
+// time, and the engine with the least headroom is named as the one that will
+// stop a turn first.
 import * as React from "react";
 import { useMemo, useState } from "react";
 import { ChevronDown } from "lucide-react";
@@ -92,6 +94,19 @@ function WindowRow({ window }: { window: QuotaWindow }) {
   );
 }
 
+/** "This engine is the first to stop accepting turns" — said only when the
+ *  window with the least headroom is nearly gone.  One component so the
+ *  always-open block and the disclosure below it cannot drift apart. */
+function NearlySpent({ windows }: { windows: QuotaWindow[] }) {
+  const binding = bindingQuotaWindow(windows);
+  if (!binding || binding.remainingPercent > 10) return null;
+  return (
+    <p className="mt-1.5 text-[10.5px] leading-relaxed text-amber-700 dark:text-amber-300">
+      <strong>{binding.label}</strong> is nearly spent — this engine is the first to stop accepting turns.
+    </p>
+  );
+}
+
 /** The named windows and source label for one engine. */
 interface EngineWindows {
   windows: QuotaWindow[];
@@ -163,6 +178,14 @@ export function EngineQuotasPanel({
     [engines],
   );
 
+  // The engine being browsed answers "how much is left on this one" without a
+  // click: its windows sit open, directly under the header, in the same place
+  // a capped engine shows its "Usage cap in effect" card.  Every other engine
+  // with quota stays behind the disclosure below it, so the header area stays
+  // short.
+  const activeRow = activeInstanceId ? rows.find((row) => row.engine.instanceId === activeInstanceId) ?? null : null;
+  const otherRows = activeRow ? rows.filter((row) => row !== activeRow) : rows;
+
   // Worst engine on this Mac, named in the collapsed trigger so the button
   // carries information before it is ever opened.
   const tightest = rows[0];
@@ -171,67 +194,87 @@ export function EngineQuotasPanel({
   if (rows.length === 0) return null;
 
   const detailId = "engine-quotas-detail";
+  const cappedBadge = (engine: QuotaEngineInfo) =>
+    engine.snapshot.quota?.capped ? (
+      <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">
+        Capped
+      </span>
+    ) : null;
+
   return (
     <div className={cn("mt-2", className)}>
-      <button
-        type="button"
-        onClick={() => setOpen((value) => !value)}
-        aria-expanded={open}
-        aria-controls={open ? detailId : undefined}
-        className="flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-[11.5px] text-ink-secondary hover:text-ink"
-      >
-        <span className="min-w-0 flex-1 truncate">
-          <strong className="font-medium">Engine Quotas</strong>
-          {tightest && tightestWindow && (
-            <span className="text-ink-secondary">
-              {" · "}
-              {tightest.engine.displayName} {tightestWindow.label.toLowerCase()} at {tightestWindow.remainingPercent}%
-            </span>
-          )}
-        </span>
-        <ChevronDown
-          size={13}
-          className={cn("shrink-0 text-ink-secondary transition-transform", open && "rotate-180")}
-          aria-hidden
-        />
-      </button>
-
-      {open && (
+      {activeRow && (
         <div
-          id={detailId}
-          data-testid="engine-quotas-detail"
-          className="mt-1.5 max-h-56 space-y-3 overflow-y-auto rounded-lg border border-hairline/40 bg-inset/30 px-3 py-2.5"
+          data-testid="engine-quotas-active"
+          className="rounded-lg border border-hairline/40 bg-inset/30 px-3 py-2"
         >
-          {rows.map(({ engine, windows }) => {
-            const binding = bindingQuotaWindow(windows);
-            const isActive = engine.instanceId === activeInstanceId;
-            return (
-              <div key={engine.instanceId} data-testid={`engine-quota-${engine.instanceId}`} className={cn(isActive && "rounded bg-control/40 px-1.5 py-1 -mx-1.5")}>
-                <div className="mb-1 flex items-baseline justify-between gap-2">
-                  <span className="truncate text-[12px] font-medium text-ink">
-                    {engine.displayName}
-                    {isActive && <span className="ml-1.5 text-[10.5px] font-normal text-ink-secondary">selected</span>}
-                  </span>
-                  {engine.snapshot.quota?.capped && (
-                    <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">
-                      Capped
-                    </span>
-                  )}
-                </div>
-                <div className="space-y-2">
-                  {windows.map((window) => (
-                    <WindowRow key={window.kind} window={window} />
-                  ))}
-                </div>
-                {binding && binding.remainingPercent <= 10 && (
-                  <p className="mt-1.5 text-[10.5px] leading-relaxed text-amber-700 dark:text-amber-300">
-                    <strong>{binding.label}</strong> is nearly spent — this engine is the first to stop accepting turns.
-                  </p>
-                )}
-              </div>
-            );
-          })}
+          <div data-testid={`engine-quota-${activeRow.engine.instanceId}`} className="space-y-2">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="text-[11.5px] text-ink-secondary">Usage</span>
+              {cappedBadge(activeRow.engine)}
+            </div>
+            {activeRow.windows.map((window) => (
+              <WindowRow key={window.kind} window={window} />
+            ))}
+            <NearlySpent windows={activeRow.windows} />
+          </div>
         </div>
+      )}
+
+      {otherRows.length > 0 && (
+        <>
+          <button
+            type="button"
+            onClick={() => setOpen((value) => !value)}
+            aria-expanded={open}
+            aria-controls={open ? detailId : undefined}
+            className="mt-1 flex w-full items-center gap-1.5 rounded px-1 py-1 text-left text-[11.5px] text-ink-secondary hover:text-ink"
+          >
+            <span className="min-w-0 flex-1 truncate">
+              <strong className="font-medium">{activeRow ? "Other Engines" : "Engine Quotas"}</strong>
+              {tightest && tightestWindow && (
+                <span className="text-ink-secondary">
+                  {" · "}
+                  {tightest.engine.displayName} {tightestWindow.label.toLowerCase()} at {tightestWindow.remainingPercent}%
+                </span>
+              )}
+            </span>
+            <ChevronDown
+              size={13}
+              className={cn("shrink-0 text-ink-secondary transition-transform", open && "rotate-180")}
+              aria-hidden
+            />
+          </button>
+
+          {open && (
+            <div
+              id={detailId}
+              data-testid="engine-quotas-detail"
+              className="mt-1.5 max-h-56 space-y-3 overflow-y-auto rounded-lg border border-hairline/40 bg-inset/30 px-3 py-2.5"
+            >
+              {otherRows.map(({ engine, windows }) => {
+                const isActive = engine.instanceId === activeInstanceId;
+                return (
+                  <div key={engine.instanceId} data-testid={`engine-quota-${engine.instanceId}`} className={cn(isActive && "rounded bg-control/40 px-1.5 py-1 -mx-1.5")}>
+                    <div className="mb-1 flex items-baseline justify-between gap-2">
+                      <span className="truncate text-[12px] font-medium text-ink">
+                        {engine.displayName}
+                        {isActive && <span className="ml-1.5 text-[10.5px] font-normal text-ink-secondary">selected</span>}
+                      </span>
+                      {cappedBadge(engine)}
+                    </div>
+                    <div className="space-y-2">
+                      {windows.map((window) => (
+                        <WindowRow key={window.kind} window={window} />
+                      ))}
+                    </div>
+                    <NearlySpent windows={windows} />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
