@@ -797,6 +797,36 @@ public struct CompanionClient: Sendable {
         )
     }
 
+    /// Which speech-to-speech providers this computer can reach, and which
+    /// one a call would actually use.
+    ///
+    /// Booleans and a choice — never a key.  The keys stay on the computer;
+    /// this is the phone asking what exists so it can say so honestly instead
+    /// of offering a call that cannot start.  A Mac older than the route
+    /// answers 404, which `check` turns into an `APIError`.
+    public func stsStatus() async throws -> StsStatus {
+        try await send(try makeRequest("GET", "/api/sts/status"), as: StsStatus.self)
+    }
+
+    /// One short-lived, single-session token for a voice call.
+    ///
+    /// The permanent provider key never leaves the computer: the harness
+    /// mints this from a credential only it holds, which is the same rule the
+    /// desktop follows over IPC.  The token is spent opening one realtime
+    /// session and is not a credential for anything else.
+    ///
+    /// The harness throttles this, so a caller that loops answers 429.  That
+    /// is a real answer, not an error to retry in a tight loop.
+    public func stsToken(provider: String) async throws -> StsSessionToken {
+        struct Body: Encodable {
+            let provider: String
+        }
+        return try await send(
+            try makeRequest("POST", "/api/sts/token", encodedBody: Body(provider: provider)),
+            as: StsSessionToken.self
+        )
+    }
+
     /// Room Turn Timeout, in whole minutes.  Same phone-safe pattern as
     /// terminology — never opens `/api/config` to a paired device.
     public func updateRoomTurnTimeout(minutes: Int) async throws -> ConfigStatus {
