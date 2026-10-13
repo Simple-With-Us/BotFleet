@@ -5,7 +5,7 @@
 // The same turn, still marked for that rerun, is not resumed a second time.
 // A turn that already pushed or sent is not run again at all.  Stop drops
 // work that has not started.
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -64,6 +64,17 @@ describe("durable delegated jobs", () => {
     stores.push(store);
     return { store, runtime: new Runtime(store, runner(outward), { limits, log: () => {} }) };
   }
+
+  it("keeps the database and its WAL sidecars readable only by the owner", () => {
+    if (process.platform === "win32") return;
+    const opened = open();
+    opened.runtime.begin(personRoot("asker", "thread-a", "private brief"));
+    const dbPath = join(dir, "runtime.db");
+    for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+      expect(existsSync(file), file).toBe(true);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+    }
+  });
 
   it("queues a cut turn once, and does not resume it after a second restart", () => {
     const first = open();

@@ -8,7 +8,7 @@
 // so a row written by a newer or older build is refused, never half-read.
 // Every write the runtime cares about is one transaction: the row and its
 // event land together or not at all (write-before-act).
-import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { z } from "zod";
@@ -237,6 +237,22 @@ export function openRuntimeStore(path: string): RuntimeStore {
     db.exec("PRAGMA synchronous = NORMAL");
   }
   db.exec(SCHEMA);
+  // WAL creates runtime.db-wal and runtime.db-shm on the first write.  Those
+  // sidecars inherit the process umask, so they are locked down here and
+  // again after every committed write.
+  const lockSidecars = () => {
+    if (memory) return;
+    for (const suffix of ["-wal", "-shm"]) {
+      const side = `${path}${suffix}`;
+      if (!existsSync(side)) continue;
+      try {
+        chmodSync(side, 0o600);
+      } catch {
+        // A sidecar that disappears between the check and the chmod is gone.
+      }
+    }
+  };
+  lockSidecars();
 
   const statements = {
     get: db.prepare("SELECT id, json FROM assignments WHERE id = ?"),
@@ -286,7 +302,10 @@ export function openRuntimeStore(path: string): RuntimeStore {
     } catch (error) {
       db.exec("ROLLBACK");
       throw error;
-    } finally { depth = 0; }
+    } finally {
+      depth = 0;
+      lockSidecars();
+    }
   }
 
   const columns = (a: Assignment): SQLInputValue[] => [
