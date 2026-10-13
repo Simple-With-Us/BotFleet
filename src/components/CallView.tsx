@@ -163,14 +163,11 @@ export function CallTargetButton({
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
   const cloudConfigured = useTranscriptionAvailability();
-<<<<<<< HEAD
-  const stsDecision = useStsDecision(state.config?.sts?.provider);
-=======
   const cloudStt = useMemo(
     () => mergeCloudSttCapabilities(state.config?.callStt?.cloud, cloudConfigured),
     [state.config?.callStt?.cloud, cloudConfigured],
   );
->>>>>>> origin/main
+  const stsDecision = useStsDecision(state.config?.sts?.provider);
   const provider = pickSTTProvider({
     cloudStt,
     appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
@@ -589,7 +586,9 @@ function Call({ bot }: { bot: Bot }) {
           : "Dictation stopped unexpectedly.\u00A0 Check Microphone and Speech Recognition access.");
         return;
       }
-      if (typeof line.text !== "string") return;
+      // `line.text` is `string` by contract and the bridge validates it with
+      // zod before it arrives, so re-checking the representation here would
+      // guard against nothing.
       setHeard(line.text);
       if (line.partial !== false) return;
       // final result — the recognizer decided the turn ended
