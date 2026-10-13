@@ -17,7 +17,8 @@ let package = Package(
     // Mac is to hand. The app's iOS 27 floor lives in project.yml.
     platforms: [.iOS(.v27), .macOS(.v13)],
     products: [
-        .library(name: "CompanionCore", targets: ["CompanionCore"])
+        .library(name: "CompanionCore", targets: ["CompanionCore"]),
+        .executable(name: "CodeBlockLayoutProbe", targets: ["CodeBlockLayoutProbe"]),
     ],
     targets: [
         .target(name: "CompanionCore"),
@@ -25,6 +26,13 @@ let package = Package(
             name: "CompanionCoreTests",
             dependencies: ["CompanionCore"],
             resources: [.copy("Fixtures")]
+        ),
+        // Timing probe.  `swift test` compiles it.  Run the measurement with
+        // `swift run --package-path ios CodeBlockLayoutProbe`.
+        .executableTarget(
+            name: "CodeBlockLayoutProbe",
+            dependencies: ["CompanionCore"],
+            path: "Scripts/CodeBlockLayoutProbe"
         ),
     ],
     swiftLanguageModes: [.v5]
