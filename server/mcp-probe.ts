@@ -33,6 +33,10 @@ export const STDIO_PROBE_TIMEOUT_MS = 8_000;
  * failed it was the old 1 MiB response cap, never the clock. */
 export const REMOTE_PROBE_TIMEOUT_MS = REMOTE_MCP_STARTUP_MS;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function probeEnvironment(server: StoredStdioMcpServer): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath() };
   stripWorkspaceCredentialEnv(env);
@@ -185,16 +189,15 @@ function probeStdioMcpServer(
       } catch {
         return;
       }
-      if (!frame || typeof frame !== "object") return;
-      const value = frame as Record<string, unknown>;
-      if (value.id === 1 && value.result && !initialized) {
+      if (!isRecord(frame)) return;
+      if (frame.id === 1 && frame.result !== undefined && !initialized) {
         initialized = true;
         write({ jsonrpc: "2.0", method: "notifications/initialized" });
         write({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
         return;
       }
-      if (value.id !== 2) return;
-      const result = value.result as { tools?: unknown } | undefined;
+      if (frame.id !== 2) return;
+      const result = isRecord(frame.result) ? frame.result : undefined;
       if (!Array.isArray(result?.tools)) {
         finish({ ok: false, error: publicProbeError("protocol") });
         return;

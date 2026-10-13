@@ -196,7 +196,7 @@ describe("scoped remote MCP subprocess", () => {
 });
 
 describe("remote MCP tool directory", () => {
-  type Frame = { id?: number | string; method?: string; result?: any; error?: { code: number; message: string } };
+  type Frame = { id?: number | string; method?: string; result?: unknown; error?: { code: number; message: string } };
   type Descriptor = { command: string; args?: string[]; env?: Record<string, string> };
   let child: ChildProcessWithoutNullStreams | undefined;
   let fake: FakeHttpMcp | undefined;

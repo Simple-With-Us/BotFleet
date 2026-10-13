@@ -397,8 +397,8 @@ export interface SendTurnInput {
     dweb?: { url: string };
     /** Shared Qdrant Agent RAG vector memory integration. */
     qdrant?: { command: string; args: string[]; env: Record<string, string> };
-    /** User-configured MCP servers (config.json `mcpServers`), validated by
-     * customMcpServers(). Mounted through each driver's normal permission flow. */
+    /** User-configured MCP servers (config.json `mcpServers`), each narrowed by
+     * `parseStoredMcpServer()` and mounted in `turnStdioMcpServers()`. */
     custom?: Record<string, McpServerSpec>;
     /** Every computer this bot was granted for this turn, in the order the
      * person granted them. A grant is a capability, not a preference: each

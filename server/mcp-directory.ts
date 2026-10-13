@@ -1,4 +1,6 @@
 /* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, anti-slop/no-known-value-widening, anti-slop/no-shape-in-symbol-names, anti-slop/no-chained-type-assertions -- OpenMausBot MCP reliability port: JSON-RPC, HTTP, and OAuth boundary parsing with hand-rolled guards. */
+import { z } from "zod";
+
 // A big MCP catalog, searched instead of listed.
 //
 // Claude Code and Codex on its own login defer MCP tools natively (tool
@@ -73,6 +75,11 @@ const ABOUT_CHARS = 400;
 /** The upstream initialize instructions a searched server passes through. */
 export const INSTRUCTIONS_CHARS = 2_000;
 const QUERY_CHARS = 1_000;
+
+const SearchArgs = z.object({
+  query: z.string().trim().min(1).max(QUERY_CHARS),
+  limit: z.number().finite().optional(),
+}).strict();
 
 function isRecord(value: unknown): value is Json {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -625,12 +632,12 @@ export class ToolDirectory {
   /** search_tools: ranked matches with bounded descriptions, signatures and
    * the hints the server's annotations give. */
   async search(args: unknown): Promise<DirectoryResult> {
-    const query = isRecord(args) && typeof args.query === "string" ? args.query.trim() : "";
-    const rawLimit = isRecord(args) ? args.limit : undefined;
-    if (!query || query.length > QUERY_CHARS || (rawLimit !== undefined && (typeof rawLimit !== "number" || !Number.isFinite(rawLimit)))) {
+    const parsed = SearchArgs.safeParse(args);
+    if (!parsed.success) {
       return guidance(`${SEARCH_TOOL} needs { "query": "a few words", "limit"?: a number from 1 to ${SEARCH_LIMIT_MAX} }. Say what you want to do, for example "list payments".`);
     }
-    const limit = Math.min(SEARCH_LIMIT_MAX, Math.max(1, Math.floor((rawLimit as number | undefined) ?? SEARCH_LIMIT_DEFAULT)));
+    const { query, limit: rawLimit } = parsed.data;
+    const limit = Math.min(SEARCH_LIMIT_MAX, Math.max(1, Math.floor(rawLimit ?? SEARCH_LIMIT_DEFAULT)));
     const found = await this.ranker(query, this.tools, limit);
     const matches = found.slice(0, limit).filter((tool) => this.index.get(tool.name) === tool).map((tool) => {
       const annotations = isRecord(tool.annotations) ? tool.annotations : {};
