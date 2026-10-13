@@ -95,6 +95,8 @@ import {
 
 const acpNonemptyString = z.string().min(1);
 
+const acpSessionSetModelParams = z.object({ modelId: acpNonemptyString }).passthrough();
+
 /** Stdio MCP server as ACP session/new sends it. */
 export type AcpStdioMcpServer = {
   name: string;
@@ -1805,18 +1807,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 await support.configureSession({
                   request: async (method, params, timeoutMs) => {
                     const result = await request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT);
-                    if (
-                      method === "session/set_model" &&
-                      params &&
-                      typeof params === "object" &&
-                      "modelId" in params &&
-                      typeof (params as { modelId?: unknown }).modelId === "string"
-                    ) {
-                      const modelId = (params as { modelId: string }).modelId;
-                      sessionConfigResult = {
-                        ...sessionConfigResult,
-                        models: { ...sessionConfigResult?.models, currentModelId: modelId },
-                      };
+                    if (method === "session/set_model") {
+                      const parsed = acpSessionSetModelParams.safeParse(params);
+                      if (parsed.success) {
+                        sessionConfigResult = {
+                          ...sessionConfigResult,
+                          models: { ...sessionConfigResult?.models, currentModelId: parsed.data.modelId },
+                        };
+                      }
                     }
                     return result;
                   },
