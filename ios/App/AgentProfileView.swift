@@ -860,16 +860,28 @@ struct AgentProfileView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Toggle("Play on Mac", isOn: Binding(
-                    get: { speechDevices.contains("mac") },
-                    set: { if $0 { speechDevices.insert("mac") } else { speechDevices.remove("mac") } }
-                ))
-                .disabled(!macVoiceCanSpeak)
-                Toggle("Play on iPhone (while app is open)", isOn: Binding(
-                    get: { speechDevices.contains("iphone") },
-                    set: { if $0 { speechDevices.insert("iphone") } else { speechDevices.remove("iphone") } }
-                ))
-                .disabled(!iphoneVoiceCanSpeak)
+                speechDeviceToggle(
+                    device: "mac",
+                    title: "Play on Mac",
+                    row: CrossPlatformProfileSettings.speechDeviceRow(
+                        device: "mac",
+                        voice: macVoice,
+                        speechDevices: speechDevices,
+                        agentVoiceCanSpeakOnClient: macVoiceCanSpeak,
+                        personalVoicePlaybackAllowed: true
+                    )
+                )
+                speechDeviceToggle(
+                    device: "iphone",
+                    title: "Play on iPhone (while app is open)",
+                    row: CrossPlatformProfileSettings.speechDeviceRow(
+                        device: "iphone",
+                        voice: iphoneVoice,
+                        speechDevices: speechDevices,
+                        agentVoiceCanSpeakOnClient: iphoneVoiceCanSpeak,
+                        personalVoicePlaybackAllowed: true
+                    )
+                )
 
                 if !hasWorkspaceDefaultVoice, iphoneVoice.isEmpty || macVoice.isEmpty {
                     Label("Pick a voice for each device before turning on speech.", systemImage: "info.circle")
@@ -905,6 +917,28 @@ struct AgentProfileView: View {
     /// The workspace default voice by name ("Jay Wedgeworth 001").
     private var defaultVoiceName: String {
         BotVoice.displayName(config?.workspaceDefaultVoice ?? "", voices: voices)
+    }
+
+    @ViewBuilder
+    private func speechDeviceToggle(
+        device: String,
+        title: String,
+        row: CrossPlatformProfileSettings.SpeechDeviceRow
+    ) -> some View {
+        let displaySelected = row.editable ? row.selected : false
+        Toggle(title, isOn: Binding(
+            get: { displaySelected },
+            set: { enabled in
+                guard row.editable else { return }
+                if enabled { speechDevices.insert(device) } else { speechDevices.remove(device) }
+            }
+        ))
+        .disabled(!row.editable)
+        if let reason = row.disabledReason {
+            Text(reason)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
     }
 
     /// Every picker's first option names the workspace default voice,

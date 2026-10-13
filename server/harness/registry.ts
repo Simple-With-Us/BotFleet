@@ -6,6 +6,8 @@
 // touching its siblings.
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { z } from "zod";
+import { instanceModelsSchema } from "../instance-models.ts";
 import { writeFileAtomic } from "../atomic.ts";
 import { usageQuotaPoller } from "../usage-quota.ts";
 import { windowHeadlines, windowsLabelFromHeadlines } from "../../src/lib/quota-display.ts";
@@ -222,6 +224,14 @@ function fullAutoOfRaw(raw: unknown): boolean {
   return (raw as { fullAuto?: unknown } | undefined)?.fullAuto === true;
 }
 
+const userModelConfigSchema = z.object({ userModels: instanceModelsSchema.optional() }).passthrough();
+
+function userModelsOfRaw(raw: InstanceConfig["config"]): Array<{ id: string; label: string; custom: true }> {
+  const parsed = userModelConfigSchema.safeParse(raw);
+  if (!parsed.success) return [];
+  return (parsed.data.userModels ?? []).map((model) => ({ ...model, custom: true as const }));
+}
+
 export interface DescribedInstance {
   instanceId: InstanceId;
   driverKind: string;
@@ -383,6 +393,14 @@ export class ProviderRegistry {
         enabled,
         config,
       });
+      const userModels = userModelsOfRaw(entry.config);
+      if (userModels.length) {
+        const byId = new Map(live.models.options.map((model) => [model.id, model]));
+        for (const model of userModels) {
+          byId.set(model.id, { ...byId.get(model.id), ...model });
+        }
+        live.models.options = [...byId.values()];
+      }
       this.byId.set(instanceId, { instanceId, live });
       return live;
     } catch (e) {

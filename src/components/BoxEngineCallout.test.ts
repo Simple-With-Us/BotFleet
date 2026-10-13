@@ -43,26 +43,9 @@ function expectNoCollapsingSentenceGaps(box: string): void {
   }
 }
 
-describe("ASCII.dev Box engine callout — EnginesSettings row", () => {
-  const box = engineBox(ENGINES_SETTINGS_SRC, 'instance.driverKind === "boxAgent"');
-
-  it("names where the turn actually runs", () => {
-    expect(box).toMatch(/runs its turn on box\.ascii\.dev/);
-    expect(box).toMatch(/not on this computer/);
-  });
-
-  it("lists every capability the engine does not have", () => {
-    for (const missing of ["no team tools", "no peers to ask", "no approval cards", "no memory", "no skills"]) {
-      expect(box).toContain(missing);
-    }
-  });
-
-  it("tells the reader what to do instead", () => {
-    expect(box).toMatch(/Pick another engine/);
-  });
-
-  it("never lets a sentence gap collapse to one space under HTML whitespace rules", () => {
-    expect(() => expectNoCollapsingSentenceGaps(box)).not.toThrow();
+describe("ASCII.dev Box placement", () => {
+  it("keeps Box out of Engine Settings because it belongs in Computer settings", () => {
+    expect(ENGINES_SETTINGS_SRC).not.toContain('instance.driverKind === "boxAgent"');
   });
 });
 

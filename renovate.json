@@ -12,7 +12,12 @@
       "platformAutomerge": true
     },
     {
+      "description": [
+        "Major version dependency updates are never auto-merged: the new line may drop APIs the harness, electron, or iOS code still calls, change required peer dependencies, or shift platform/runtime minimums.",
+        "The PR body below lists the verification recipe the reviewer must run before merge; the Renovate dashboard entry is the linked task."
+      ],
       "matchUpdateTypes": ["major"],
+      "prBodyTemplate": "## Major dependency update: `{{depName}}` {{currentVersion}} -> {{newVersion}}\n\nThis is a major version bump of `{{depName}}`.\n\n### Why this requires manual review\n\nMajor versions may include breaking API changes, dropped APIs the codebase still calls, new peer-dependency requirements, or shifted runtime minimums. Renovate does not auto-merge major bumps (see `renovate.json`).\n\n### Acceptance criteria\n\n- [ ] `pnpm install` resolves cleanly with no new peer-dependency warnings\n- [ ] `pnpm typecheck` passes\n- [ ] `pnpm test` passes\n- [ ] Release notes reviewed; any breaking change in code paths this repo exercises is either patched here or called out in the PR description\n- [ ] For Electron/iOS-native bumps: `pnpm package:mac:local` (or the matching iOS path) still builds\n\n### Verification recipe\n\nRun the commands above in an isolated checkout, then arm auto-merge once CI is green. Document any deviations from the new package's release notes in the PR comments.",
       "automerge": false,
       "labels": ["dependencies", "major"]
     },

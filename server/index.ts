@@ -18,6 +18,7 @@ import { isIP } from "node:net";
 import { extname, join } from "node:path";
 
 import { z } from "zod";
+import { instanceModelsSchema } from "./instance-models.ts";
 import { ScreenPollers } from "./screen-poller.ts";
 import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseClient } from "./sse-broadcast.ts";
 import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
@@ -49,6 +50,7 @@ import {
   isCredentialTargetId,
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
+import { TTS_PROVIDERS, cloudSttCapabilitiesFromConfig } from "../shared/voice-providers.ts";
 
 import { autoVerdict, coarseAlwaysAllowRefused, isOwnJobStartRequest, offerableApprovalKey } from "./auto-approve.ts";
 import {
@@ -9583,7 +9585,11 @@ function configStatus() {
     // the chosen voice is a setting, not a secret; the key is reported the
     // same configured-or-not way as every other credential
     tts: tts.describeVoice(cfg),
-    callStt: { provider: cfg.callStt?.provider ?? undefined, keyterms: cfg.callStt?.keyterms ?? [] },
+    callStt: {
+      provider: cfg.callStt?.provider ?? undefined,
+      keyterms: cfg.callStt?.keyterms ?? [],
+      cloud: cloudSttCapabilitiesFromConfig(cfg),
+    },
     imageGen: { configured: Boolean(cfg.imageGen?.key) },
     // Linq binding credentials live in env (BOTFLEET_LINQAPP_API_KEY or
     // legacy LINQ_API_TOKEN), so we never carry a token across this frame —
@@ -10339,7 +10345,6 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
-const TTS_PROVIDERS = ["minimax", "system"] as const;
 // The same list as a domain value, so a save is judged against the names the
 // harness actually has rather than against a string comparison in the handler.
 const ttsProviderName = z.enum(TTS_PROVIDERS);
@@ -10374,7 +10379,7 @@ function ttsProviderClaim(body: Record<string, unknown>): TtsProviderClaim {
   // those.  Anything else has to name a provider the harness knows.
   if (provider === undefined || provider === null) return {};
   const known = ttsProviderName.safeParse(ttsProviderFold.safeParse(provider).data).success;
-  return known ? {} : { error: "tts.provider must be minimax or system" };
+  return known ? {} : { error: `tts.provider must be one of: ${TTS_PROVIDERS.join(", ")}` };
 }
 
 function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
@@ -15608,12 +15613,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
-      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean } = {};
+      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }> } = {};
 
       if (body?.cli !== undefined) {
         if (typeof body.cli !== "string") return json(res, 400, { error: "cli must be a string" });
         if (/[\n\r]/.test(body.cli)) return json(res, 400, { error: "cli must not contain newlines" });
         patchOptions.cli = body.cli;
+      }
+
+      if (body?.models !== undefined) {
+        const parsedModels = instanceModelsSchema.safeParse(body.models);
+        if (!parsedModels.success) return json(res, 400, { error: "models must contain at most 100 unique IDs with valid labels" });
+        patchOptions.models = parsedModels.data;
       }
 
       if (body?.fullAuto !== undefined) {

@@ -32,6 +32,12 @@ import {
 } from "@/lib/tts/schema";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
+import {
+  effectiveSpeechDevices,
+  speechDeviceRow,
+  type ClientPlatform,
+  type SpeechDeviceId,
+} from "../../shared/cross-platform-profile-settings";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
 import { defaultVoiceOptionLabel, isPersonalVoiceId, voiceForDevice } from "../../shared/bot-voice";
 import { DefaultVoicePicker, PronunciationSettings } from "./WorkspaceVoiceSettings";
@@ -89,6 +95,14 @@ const overrideFor = (bot: Bot, device: "mac" | "iphone"): string => {
   const own = bot.voices?.[device];
   return typeof own === "string" && own.trim() ? own : "";
 };
+
+function clientPlatform(): ClientPlatform {
+  const platform = typeof window !== "undefined" ? window.ogb?.platform : undefined;
+  if (platform === "darwin") return "mac";
+  if (platform === "win32") return "windows";
+  if (platform === "linux") return "linux";
+  return "web";
+}
 
 export function VoiceSettings({
   bot,
@@ -889,15 +903,56 @@ export function VoiceSettings({
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="text-[13px] font-medium text-ink">Play Replies On</div>
         <p className="mt-0.5 text-[11.5px] text-ink-secondary">Choose where this bot speaks as answers arrive.{"\u00A0 "}Voice clips stay on their messages for replay.</p>
-        <div className="mt-3 flex gap-4">
-          {([['mac', 'Mac'], ['iphone', 'Play on iPhone (while app is open)']] as const).map(([device, label]) => {
-            const selected = bot.speechDevices ? bot.speechDevices.includes(device) : device === 'mac' && Boolean(bot.speakReplies);
-            return <label key={device} className="flex items-center gap-2 text-[13px] text-ink cursor-pointer">
-              <input type="checkbox" checked={selected} onChange={() => {
-                const devices = bot.speechDevices ?? (bot.speakReplies ? ['mac'] : []);
-                onPatch({ speechDevices: selected ? devices.filter((item) => item !== device) : [...devices, device] });
-              }} />{label}
-            </label>;
+        <div className="mt-3 space-y-2">
+          {(
+            [
+              ["mac", "Mac"],
+              ["iphone", "Play on iPhone (while app is open)"],
+            ] as const satisfies ReadonlyArray<[SpeechDeviceId, string]>
+          ).map(([device, label]) => {
+            const deviceVoice = voiceForDevice(bot, device) || tts.voice || "";
+            const agentVoiceCanSpeakOnClient =
+              configured ||
+              (isPersonalVoice(deviceVoice) &&
+                (device === "iphone" || personalVoiceAllowed));
+            const row = speechDeviceRow(device, bot, {
+              platform: clientPlatform(),
+              voice: deviceVoice,
+              agentVoiceCanSpeakOnClient,
+              personalVoicePlaybackAllowed: personalVoiceAllowed,
+            });
+            return (
+              <div key={device} className="flex flex-col gap-0.5">
+                <label
+                  className={cn(
+                    "flex items-center gap-2 text-[13px] text-ink select-none",
+                    row.editable ? "cursor-pointer" : "cursor-not-allowed opacity-50",
+                  )}
+                  title={row.disabledReason ?? undefined}
+                >
+                  <input
+                    type="checkbox"
+                    checked={row.selected}
+                    disabled={!row.editable}
+                    onChange={() => {
+                      if (!row.editable) return;
+                      const devices = effectiveSpeechDevices(bot);
+                      const next = row.selected
+                        ? devices.filter((item) => item !== device)
+                        : [...devices, device];
+                      onPatch({
+                        speechDevices: next,
+                        ...(next.length === 0 ? { speakReplies: false } : {}),
+                      });
+                    }}
+                  />
+                  {label}
+                </label>
+                {row.disabledReason && (
+                  <p className="pl-6 text-[11.5px] leading-relaxed text-ink-secondary">{row.disabledReason}</p>
+                )}
+              </div>
+            );
           })}
         </div>
       </div>

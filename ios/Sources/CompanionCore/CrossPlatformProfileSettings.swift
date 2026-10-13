@@ -1,0 +1,98 @@
+import Foundation
+
+/// Cross-platform profile presentation rules.  Keep in sync with
+/// `shared/cross-platform-profile-settings.ts`.
+public enum CrossPlatformProfileSettings {
+    public static let computersMacOnlyReason =
+        "Computer grants can only be changed in BotFleet on your computer."
+
+    public static let computersAutoCaption =
+        "Where this bot runs is inherited from your computer (auto).  Grants you change on the computer sync here."
+
+    public static func isPersonalVoiceId(_ voice: String?) -> Bool {
+        guard let voice else { return false }
+        return voice.hasPrefix("personal:") || voice.hasPrefix("apple-personal:")
+    }
+
+    public static func effectiveSpeechDevices(
+        speakReplies: Bool?,
+        speechDevices: [String]?
+    ) -> Set<String> {
+        if let speechDevices {
+            if speechDevices.isEmpty { return [] }
+            let filtered = speechDevices.filter { $0 == "mac" || $0 == "iphone" }
+            return Set(filtered)
+        }
+        if speakReplies == true { return ["mac"] }
+        return []
+    }
+
+    public struct SpeechDeviceRow: Equatable, Sendable {
+        public var device: String
+        public var selected: Bool
+        public var editable: Bool
+        public var disabledReason: String?
+    }
+
+    public static func speechDeviceRow(
+        device: String,
+        voice: String,
+        speechDevices: Set<String>,
+        agentVoiceCanSpeakOnClient: Bool,
+        personalVoicePlaybackAllowed: Bool
+    ) -> SpeechDeviceRow {
+        let selected = speechDevices.contains(device)
+        var reason: String?
+        if !agentVoiceCanSpeakOnClient {
+            reason = "Pick a voice this agent can speak before enabling playback."
+        } else if device == "mac",
+                  isPersonalVoiceId(voice),
+                  personalVoicePlaybackAllowed == false {
+            reason = "Personal Voice is not available on this computer.  Enable Play on iPhone instead."
+        }
+        let editable = reason == nil
+        return SpeechDeviceRow(
+            device: device,
+            selected: selected,
+            editable: editable,
+            disabledReason: editable ? nil : reason
+        )
+    }
+
+    public struct ComputerGrantRow: Equatable, Sendable {
+        public var id: String
+        public var label: String
+        public var selected: Bool
+        public var editable: Bool
+        public var disabledReason: String?
+    }
+
+    private static let computerLabels: [String: String] = [
+        "local": "Local Mac desktop",
+        "cloud": "Self-hosted VPS / Box",
+        "vm": "Local VM",
+    ]
+
+    public static func computerGrantRows(computers: [String]?) -> [ComputerGrantRow] {
+        let grantSet = Set(computers ?? [])
+        return ["local", "cloud", "vm"].map { id in
+            ComputerGrantRow(
+                id: id,
+                label: computerLabels[id] ?? id,
+                selected: grantSet.contains(id),
+                editable: false,
+                disabledReason: computersMacOnlyReason
+            )
+        }
+    }
+
+    /// Profile fields the companion proxy accepts from a phone.  Mirrors
+    /// `COMPANION_PROFILE_PATCH_FIELDS` in companion/src/routes.ts.
+    public static let companionPatchFields: Set<String> = [
+        "name", "title", "description", "notifications", "avatarUrl", "avatarCrop",
+        "voice", "voices", "speakReplies", "speechDevices", "modelSelection",
+        "computers", "maxToolRounds", "cwd",
+        "autoApprove", "autoReview", "approvePeerComms", "bypassPermissions",
+        "off",
+    ]
+}
