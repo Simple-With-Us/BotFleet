@@ -69,7 +69,7 @@ beforeAll(async () => {
         }),
       );
     }
-    if (req.method === "POST" && req.url === "/api/internal/ask-bot") {
+    if (req.method === "POST" && req.url === "/api/internal/coordinate-bots") {
       let data = "";
       req.on("data", (c) => (data += c));
       req.on("end", () => {
@@ -79,7 +79,7 @@ beforeAll(async () => {
       });
       return;
     }
-    if (req.method === "POST" && req.url === "/api/internal/delegate-bot") {
+    if (req.method === "POST" && req.url === "/api/internal/assignment-status") {
       let data = "";
       req.on("data", (c) => (data += c));
       req.on("end", () => {
@@ -168,8 +168,8 @@ describe("agents-proxy MCP surface", () => {
     const list = await rpc("tools/list");
     expect(list.result.tools.map((t: { name: string }) => t.name)).toEqual([
       "list_bots",
-      "ask_bot",
-      "delegate_bot",
+      "coordinate_bots",
+      "assignment_status",
       "create_bot",
       "request_credential",
       "list_routines",
@@ -212,46 +212,45 @@ describe("agents-proxy MCP surface", () => {
     expect(lastAuth).toBe(`Bearer ${TOKEN}`);
   });
 
-  it("ask_bot forwards sender + depth and returns the reply", async () => {
-    askResponse = { botName: "Helper", text: "hi from helper" };
-    const res = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping" });
-    expect(res.result.content[0].text).toContain("Helper replied:");
-    expect(res.result.content[0].text).toContain("hi from helper");
+  it("coordinate_bots forwards sender, depth and bot ids", async () => {
+    askResponse = { message: "Handed to @Helper.  The result comes back on this conversation when the work finishes.", assignments: [{ id: "asg-1" }] };
+    const res = await callTool("coordinate_bots", { bot_ids: ["bot-helper"], message: "ping" });
+    expect(res.result.content[0].text).toContain("Handed to @Helper");
     expect(lastAskBody).toMatchObject({
       fromBotId: "bot-asker",
       fromThreadId: "thread-asker-routine",
-      toBotId: "bot-helper",
+      botIds: ["bot-helper"],
       message: "ping",
       depth: 0,
     });
   });
 
-  it("renders a busy peer as a clean answer, not an error", async () => {
-    askResponse = { busy: true };
-    const res = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping" });
-    expect(res.result.content[0].text).toContain("busy");
+  it("assignment_status reads without changing work", async () => {
+    delegateResponse = { assignments: [] };
+    const res = await callTool("assignment_status", {});
     expect(res.result.isError).toBeFalsy();
+    expect(res.result.content[0].text).toContain("assignments");
+    expect(lastDelegateBody).toMatchObject({ fromBotId: "bot-asker", fromThreadId: "thread-asker-routine" });
   });
 
   it("surfaces the harness's depth refusal as a tool error", async () => {
-    askResponse = { error: "message chains are limited to one hop" };
-    const res = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping" });
+    askResponse = { error: "delegation chains are limited to one hop — do this one yourself" };
+    const res = await callTool("coordinate_bots", { bot_ids: ["bot-helper"], message: "ping" });
     expect(res.result.isError).toBe(true);
     expect(res.result.content[0].text).toContain("one hop");
   });
 
-  it("forwards the source thread when queueing a delegation", async () => {
-    delegateResponse = { queued: true, message: "Delegation queued." };
-    const res = await callTool("delegate_bot", {
-      bot_id: "bot-helper",
+  it("forwards the reason when recording a handoff", async () => {
+    askResponse = { message: "Handed to @Helper.", assignments: [{ id: "asg-2" }] };
+    const res = await callTool("coordinate_bots", {
+      bot_ids: ["bot-helper"],
       message: "take this",
       reason: "follow-up",
     });
-    expect(res.result.content[0].text).toContain("Delegation queued");
-    expect(lastDelegateBody).toMatchObject({
+    expect(res.result.content[0].text).toContain("Handed to @Helper");
+    expect(lastAskBody).toMatchObject({
       fromBotId: "bot-asker",
-      fromThreadId: "thread-asker-routine",
-      toBotId: "bot-helper",
+      botIds: ["bot-helper"],
       message: "take this",
       reason: "follow-up",
       depth: 0,
@@ -259,8 +258,8 @@ describe("agents-proxy MCP surface", () => {
   });
 
   it("returns queue refusal guidance to the agent as a tool error", async () => {
-    delegateResponse = { error: "delegation chains are limited to one hop — do this one yourself" };
-    const res = await callTool("delegate_bot", { bot_id: "bot-helper", message: "take this" });
+    askResponse = { error: "delegation chains are limited to one hop — do this one yourself" };
+    const res = await callTool("coordinate_bots", { bot_ids: ["bot-helper"], message: "take this" });
     expect(res.result.isError).toBe(true);
     expect(res.result.content[0].text).toContain("do this one yourself");
   });
@@ -498,7 +497,7 @@ describe("agents-proxy MCP surface", () => {
   });
 
   it("requires bot_id and message", async () => {
-    const res = await callTool("ask_bot", { bot_id: "", message: "" });
+    const res = await callTool("coordinate_bots", { bot_ids: [], message: "" });
     expect(res.result.isError).toBe(true);
   });
 });

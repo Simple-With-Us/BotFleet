@@ -11,14 +11,15 @@ describe("buildTurnTools", () => {
     const tools = buildTurnTools({ agents: { section: "ops" } });
     const names = tools.map((t) => t.name);
     expect(names).toContain("list_bots");
-    expect(names).toContain("ask_bot");
+    expect(names).toContain("coordinate_bots");
+    expect(names).toContain("assignment_status");
   });
 
-  it("marks ask_bot as requiring both bot_id and task", () => {
+  it("marks coordinate_bots as requiring bot_ids and message", () => {
     const tools = buildTurnTools({ agents: {} });
-    const askBot = tools.find((t) => t.name === "ask_bot");
-    expect(askBot).toBeDefined();
-    expect(askBot?.parameters?.required).toEqual(["bot_id", "task"]);
+    const tool = tools.find((t) => t.name === "coordinate_bots");
+    expect(tool).toBeDefined();
+    expect(tool?.parameters?.required).toEqual(["bot_ids", "message"]);
   });
 
   it("renders the registry rather than a second set of definitions", () => {
@@ -47,8 +48,8 @@ describe("buildTurnTools", () => {
     // routine-proposal tools — create_bot excluded here since chiefOfStaff
     // is false) do not.
     expect(names).not.toContain("list_bots");
-    expect(names).not.toContain("ask_bot");
-    expect(names).not.toContain("delegate_bot");
+    expect(names).not.toContain("coordinate_bots");
+    expect(names).not.toContain("assignment_status");
     expect(names).toEqual(["request_credential", "list_routines", "propose_routine", "propose_routine_action"]);
   });
 

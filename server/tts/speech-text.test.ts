@@ -149,6 +149,7 @@ describe("narrateTool", () => {
   it("sees through an MCP tool prefix", () => {
     expect(narrateTool("mcp__computer__click")).toBe("using the computer");
     expect(narrateTool("mcp__agents__ask_bot")).toBe("asking a teammate");
+    expect(narrateTool("mcp__agents__coordinate_bots")).toBe("handing work to a teammate");
   });
 
   it("stays quiet for chips the user is already told about another way", () => {

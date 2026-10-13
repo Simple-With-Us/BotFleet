@@ -1,10 +1,11 @@
 // Agent-to-agent comms, end to end: boots the real harness server with the
 // grokAgent driver pointed at the fake ACP CLI in ask-peer mode, then has
 // bot A's "agent" reach bot B through the injected agents proxy (list_bots →
-// ask_bot → B runs a real depth-1 turn → reply folds back into A's answer).
-// This exercises the whole chain the packaged app uses: startTurn →
-// session/new mcpServers → agents-proxy → /api/internal/ask-bot →
-// askBotAndWait → bus fold. The internal endpoints' auth is pinned too.
+// coordinate_bots → B runs a real depth-1 turn after A's turn settles →
+// the result comes back on A's conversation).  This exercises the whole
+// chain the packaged app uses: startTurn → session/new mcpServers →
+// agents-proxy → /api/internal/coordinate-bots → the job runtime.
+// The internal endpoints' auth is pinned too.
 //
 // The fake CLI is a shebang script — POSIX-only until resolveCliSpawn
 // turned it into `node <script>` on Windows too, so the e2e half now runs
@@ -102,9 +103,9 @@ describe("comms e2e (fake ACP fleet)", () => {
       join(home, ".botfleet", "config.json"),
       JSON.stringify({
         instances: {
-          // the ask-peer fleet: both bots run "ask-peer" so A can ask B
-          // synchronously (existing ask_bot e2e + the approval-gate e2e,
-          // which uses the same sync path under a human card).
+          // the ask-peer fleet: both bots run "ask-peer" so A records a
+          // handoff and B runs after that turn settles.  The approval-gate
+          // e2e uses the same path, with the card on the dispatch.
           grok: {
             driver: "grokAgent",
             environment: { FAKE_ACP_MODE: "ask-peer" },
@@ -185,7 +186,7 @@ describe("comms e2e (fake ACP fleet)", () => {
   it("seals the internal comms endpoints behind the boot token", async () => {
     const agents = await api("GET", "/api/internal/agents?self=x");
     expect(agents.status).toBe(401);
-    const ask = await api("POST", "/api/internal/ask-bot", { toBotId: "x", message: "hi" });
+    const ask = await api("POST", "/api/internal/coordinate-bots", { toBotId: "x", message: "hi" });
     expect(ask.status).toBe(401);
   });
 
@@ -204,15 +205,23 @@ describe("comms e2e (fake ACP fleet)", () => {
       const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper ping" });
       expect(send.status).toBe(202);
 
-      // wait for A's turn to settle with the peer's reply folded in
+      // The handoff returns immediately.  B runs after A's turn, and the
+      // report that wakes A carries B's actual reply.
       const deadline = Date.now() + 25_000;
       let askerBot: any;
+      let helperBot: any;
       for (;;) {
-        askerBot = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === asker.id);
-        const settled = askerBot.messages.some(
+        const state = (await api("GET", "/api/bots")).body;
+        askerBot = state.bots.find((b: any) => b.id === asker.id);
+        helperBot = state.bots.find((b: any) => b.id === helper.id);
+        const handed = askerBot.messages.some(
           (m: any) => m.kind === "text" && m.role === "bot" && m.text?.includes("peer says:"),
         );
-        if (settled && !askerBot.busy) break;
+        const helperReplied = helperBot.messages.some(
+          (m: any) => m.role === "bot" && m.kind === "text" && m.text?.includes("hello from fake acp"),
+        );
+        const broughtBack = askerBot.messages.some((m: any) => m.text?.includes("hello from fake acp"));
+        if (handed && helperReplied && broughtBack && !askerBot.busy && !helperBot.busy) break;
         if (Date.now() > deadline) {
           throw new Error(
             `A never got the peer reply. messages: ${JSON.stringify(askerBot.messages.slice(-6))}\nstderr: ${stderr.slice(-2000)}`,
@@ -221,10 +230,16 @@ describe("comms e2e (fake ACP fleet)", () => {
         await new Promise((r) => setTimeout(r, 250));
       }
 
-      // A's answer contains B's actual reply, via the proxy's wrapper
-      const reply = askerBot.messages.findLast((m: any) => m.kind === "text" && m.role === "bot");
-      expect(reply.text).toContain("Helper replied:");
-      expect(reply.text).toContain("hello from fake acp"); // B's happy-path turn text
+      // The first spoken line is the handoff acknowledgement.  The helper's
+      // words come back afterwards, on the report that resumes this conversation.
+      const ack = askerBot.messages.find(
+        (m: any) => m.kind === "text" && m.role === "bot" && m.text?.includes("peer says:"),
+      );
+      expect(ack?.text).toContain("peer says:");
+      const report = askerBot.messages.find(
+        (m: any) => m.role === "system" && m.automationSource === "delegation" && m.text?.includes("hello from fake acp"),
+      );
+      expect(report?.text).toContain("[BotFleet report");
 
       // visibility: A's thread shows a clickable "Messaged @Helper" chip
       // that links to the auto-created bot⇄bot channel
@@ -242,11 +257,12 @@ describe("comms e2e (fake ACP fleet)", () => {
       expect(channel.messages.some((m: any) => m.from?.botId === asker.id)).toBe(true);
       expect(channel.messages.some((m: any) => m.from?.botId === helper.id && m.text?.includes("hello from fake acp"))).toBe(true);
 
-      // B's thread received the attributed message and ran a real turn,
+      // B's thread received the harness envelope and ran a real turn,
       // plus a receive-side chip pointing at the same channel
-      const helperBot = state.bots.find((b: any) => b.id === helper.id);
-      const inbound = helperBot.messages.find((m: any) => m.role === "user" && m.kind === "text");
-      expect(inbound.text).toContain("[Message from @Asker");
+      const inbound = helperBot.messages.find(
+        (m: any) => m.role === "system" && m.automationSource === "delegation" && m.kind === "text",
+      );
+      expect(inbound.text).toContain("[BotFleet assignment");
       expect(inbound.text).toContain("ping from fake");
       const rnote = helperBot.messages.find((m: any) => m.kind === "activity" && m.tool?.name === "Message from @Asker");
       expect(rnote?.comm?.groupId).toBe(note.comm.groupId);
@@ -301,15 +317,15 @@ describe("comms e2e (fake ACP fleet)", () => {
     45_000,
   );
 
-  // ── async peer handoff (delegate_bot) ───────────────────────────────
-  // A's fake CLI uses FAKE_ACP_MODE=delegate-peer, which calls delegate_bot
-  // (returns immediately with "Delegation queued"). After A's turn
-  // settles, the harness fires B's depth-1 turn — B runs plain happy text
-  // because the depth guard refuses to inject the agents integration at
-  // depth >= MAX_COMMS_DEPTH. The exchange mirrors into a bot⇄bot channel
-  // and shows up as chips on both 1:1 threads, just like ask_bot.
+  // ── async peer handoff (coordinate_bots) ───────────────────────────
+  // A's fake CLI uses FAKE_ACP_MODE=delegate-peer, which calls
+  // coordinate_bots and returns immediately.  After A's turn settles, the
+  // harness fires B's depth-1 turn.  B runs plain happy text because the
+  // depth guard refuses to inject the agents integration at
+  // depth >= MAX_COMMS_DEPTH.  The exchange mirrors into a bot⇄bot channel
+  // and shows up as chips on both 1:1 threads.
   it(
-    "hands the task off async via delegate_bot and lets B run after A's turn settles",
+    "hands the task off via coordinate_bots and lets B run after A's turn settles",
     async () => {
       const seeded = (await api("GET", "/api/bots")).body.bots[0];
       await api("PATCH", `/api/bots/${seeded.id}`, { hidden: true });
@@ -323,9 +339,9 @@ describe("comms e2e (fake ACP fleet)", () => {
       const send = await api("POST", `/api/bots/${asker.id}/messages`, { text: "hey @Helper please pick this up" });
       expect(send.status).toBe(202);
 
-      // wait for A's turn to settle: it should NOT have a "peer says:" line
-      // (delegate_bot doesn't return the peer's reply to A) and the channel
-      // chip should be the "Messaged @Helper" kind, not the ask_bot one.
+      // wait for A's turn to settle.  The tool returns as soon as the
+      // handoff is recorded; B runs afterwards.  The channel chip is
+      // "Messaged @Helper".
       const deadline = Date.now() + 30_000;
       let askerBot: any;
       let helperBot: any;
@@ -338,7 +354,7 @@ describe("comms e2e (fake ACP fleet)", () => {
         // We also want B to have actually run (its busy flag is false and
         // it has a bot text reply).
         const askerDelegated = askerBot.messages.some(
-          (m: any) => m.kind === "activity" && m.tool?.name === "Delegated to @Helper: followup",
+          (m: any) => m.kind === "activity" && m.tool?.name === "Handed to @Helper: followup",
         );
         note = askerBot.messages.find(
           (m: any) => m.kind === "activity" && m.tool?.name === "Messaged @Helper",
@@ -346,7 +362,10 @@ describe("comms e2e (fake ACP fleet)", () => {
         const helperReplied = helperBot.messages.some(
           (m: any) => m.role === "bot" && m.kind === "text" && m.text?.includes("hello from fake acp"),
         );
-        if (askerDelegated && note && helperReplied && !helperBot.busy) break;
+        const broughtBack = askerBot.messages.some(
+          (m: any) => m.role === "system" && m.automationSource === "delegation" && m.text?.includes("hello from fake acp"),
+        );
+        if (askerDelegated && note && helperReplied && broughtBack && !helperBot.busy && !askerBot.busy) break;
         if (Date.now() > deadline) {
           throw new Error(
             `delegate handoff never settled. asker busy=${askerBot.busy} helper busy=${helperBot.busy}\n` +
@@ -358,10 +377,17 @@ describe("comms e2e (fake ACP fleet)", () => {
         await new Promise((r) => setTimeout(r, 250));
       }
 
-      // A's reply is the queue-ack text the proxy returns, NOT a peer reply
-      const askerFinal = askerBot.messages.findLast((m: any) => m.kind === "text" && m.role === "bot");
-      expect(askerFinal.text).toContain("delegated:");
-      expect(askerFinal.text).not.toContain("hello from fake acp");
+      // The spoken acknowledgement is the queue receipt.  The helper's words
+      // arrive later, in the report that resumes this conversation.
+      const ack = askerBot.messages.find(
+        (m: any) => m.kind === "text" && m.role === "bot" && m.text?.includes("delegated:"),
+      );
+      expect(ack?.text).toContain("delegated:");
+      expect(ack?.text).not.toContain("hello from fake acp");
+      const report = askerBot.messages.find(
+        (m: any) => m.role === "system" && m.automationSource === "delegation" && m.text?.includes("[BotFleet report"),
+      );
+      expect(report?.text).toContain("hello from fake acp");
 
       // A's comm chip links to the channel, attributed to @Helper
       expect(note).toBeTruthy();
@@ -373,7 +399,7 @@ describe("comms e2e (fake ACP fleet)", () => {
       const helperInbound = helperBot.messages.find(
         (m: any) => m.role === "system" && m.automationSource === "delegation" && m.kind === "text",
       );
-      expect(helperInbound.text).toContain("[Delegated by @Asker");
+      expect(helperInbound.text).toContain("[BotFleet assignment");
       expect(helperInbound.text).toContain("delegated task");
       expect(helperInbound.text).toContain("[Reason: followup]");
       const helperReply = helperBot.messages.findLast(
@@ -634,13 +660,13 @@ describe("comms e2e (fake ACP fleet)", () => {
   );
 
   // ── approval gate (approvePeerComms) ─────────────────────────────────
-  // When the SOURCE bot has approvePeerComms = true, an ask_bot call must
-  // not run the peer turn until the user clicks Allow on a card pushed to
-  // the source's thread. The card carries a requestId that
-  // /api/bots/:id/respond resolves BEFORE forwarding to the provider
-  // adapter, so the provider never sees the request.
+  // When the SOURCE bot has approvePeerComms = true, the peer turn must
+  // not start until the user clicks Allow on a card pushed to the source's
+  // thread.  The card carries a requestId that /api/bots/:id/respond
+  // resolves BEFORE forwarding to the provider adapter, so the provider
+  // never sees the request.
   it(
-    "blocks ask_bot behind a card and only runs B after the user allows",
+    "blocks coordinate_bots behind a card and only runs B after the user allows",
     async () => {
       const seeded = (await api("GET", "/api/bots")).body.bots[0];
       await api("PATCH", `/api/bots/${seeded.id}`, { hidden: true });
@@ -672,7 +698,7 @@ describe("comms e2e (fake ACP fleet)", () => {
         askerBot = state.bots.find((b: any) => b.id === asker.id);
         helperBot = state.bots.find((b: any) => b.id === helper.id);
         card = askerBot.messages.find(
-          (m: any) => m.kind === "options" && m.card?.requestId && m.card?.tool === "ask_bot",
+          (m: any) => m.kind === "options" && m.card?.requestId && m.card?.tool === "coordinate_bots",
         );
         const helperStarted =
           helperBot.messages.some((m: any) => m.role === "user" && m.kind === "text") ||
@@ -691,7 +717,7 @@ describe("comms e2e (fake ACP fleet)", () => {
 
       // The card carries the allowKey the Always-allow flow mirrors back
       // into bot.alwaysAllow, and offers Allow / Deny / Always allow.
-      expect(card.card.allowKey).toBe(`ask_bot:${helper.id}`);
+      expect(card.card.allowKey).toBe(`coordinate_bots:${helper.id}`);
       expect(card.card.options).toEqual(["Allow", "Deny", "Always allow"]);
       expect(card.card.title).toContain("@Asker");
       expect(card.card.title).toContain("@Helper");
@@ -711,13 +737,11 @@ describe("comms e2e (fake ACP fleet)", () => {
         const state = (await api("GET", "/api/bots")).body;
         finalAsker = state.bots.find((b: any) => b.id === asker.id);
         finalHelper = state.bots.find((b: any) => b.id === helper.id);
-        const peerFolded = finalAsker.messages.findLast(
-          (m: any) => m.kind === "text" && m.role === "bot",
-        )?.text?.includes("peer says:");
+        const broughtBack = finalAsker.messages.some((m: any) => m.text?.includes("hello from fake acp"));
         const helperReplied = finalHelper.messages.some(
           (m: any) => m.role === "bot" && m.kind === "text" && m.text?.includes("hello from fake acp"),
         );
-        if (peerFolded && helperReplied && !finalHelper.busy && !finalAsker.busy) break;
+        if (broughtBack && helperReplied && !finalHelper.busy && !finalAsker.busy) break;
         if (Date.now() > settledDeadline) {
           throw new Error(
             `B never ran after allow\n` +
@@ -732,7 +756,7 @@ describe("comms e2e (fake ACP fleet)", () => {
     60_000,
   );
 
-  it("refuses ask_bot with a denial chip and never starts B when the user denies", async () => {
+  it("refuses coordinate_bots with a denial and never starts B when the user denies", async () => {
     const seeded = (await api("GET", "/api/bots")).body.bots[0];
     await api("PATCH", `/api/bots/${seeded.id}`, { hidden: true });
     const selection = { instanceId: "grok", model: "fake-model" };
@@ -757,7 +781,7 @@ describe("comms e2e (fake ACP fleet)", () => {
       askerBot = state.bots.find((b: any) => b.id === asker.id);
       helperBot = state.bots.find((b: any) => b.id === helper.id);
       card = askerBot.messages.find(
-        (m: any) => m.kind === "options" && m.card?.requestId && m.card?.tool === "ask_bot",
+        (m: any) => m.kind === "options" && m.card?.requestId && m.card?.tool === "coordinate_bots",
       );
       if (card) break;
       if (Date.now() > cardDeadline) {
@@ -775,19 +799,18 @@ describe("comms e2e (fake ACP fleet)", () => {
     );
     expect(deny.status).toBe(200);
 
-    // The harness returns {error:"denied by user"} to the agents proxy,
-    // which wraps it as "Couldn't reach that bot: denied by user" and
-    // returns it to A's agent. A's final assistant text carries that
-    // signal — wait for A's turn to settle with it.
+    // The denial lands after the handoff was recorded: the peer turn
+    // fails, and the report that comes back names the denial.  B never
+    // starts.
     const settledDeadline = Date.now() + 20_000;
     for (;;) {
       const state = (await api("GET", "/api/bots")).body;
       askerBot = state.bots.find((b: any) => b.id === asker.id);
       helperBot = state.bots.find((b: any) => b.id === helper.id);
-      const finalText = askerBot.messages.findLast(
-        (m: any) => m.role === "bot" && m.kind === "text" && m.text,
+      const denied = askerBot.messages.some(
+        (m: any) => m.text?.includes("denied by user") || m.tool?.name?.includes("denied"),
       );
-      if (finalText?.text?.includes("denied by user") && !askerBot.busy) break;
+      if (denied && !askerBot.busy) break;
       if (Date.now() > settledDeadline) {
         throw new Error(
           `deny test: denial didn't reach A\nasker tail: ${JSON.stringify(askerBot.messages.slice(-8))}\nstderr: ${stderr.slice(-2000)}`,
@@ -813,19 +836,19 @@ describe("comms e2e (fake ACP fleet)", () => {
   }, 50_000);
 
   // ── depth guard regression ───────────────────────────────────────────
-  // A bot invoked via ask_bot or delegate_bot runs at depth=1, which equals
-  // MAX_COMMS_DEPTH. The depth guard in startTurn must refuse to inject
+  // A bot invoked via coordinate_bots runs at depth=1, which equals
+  // MAX_COMMS_DEPTH.  The depth guard in startTurn must refuse to inject
   // the agents integration, so B's CLI sees no agents mcpServer and falls
   // through to its plain happy text — NOT a "one hop" error from a depth-1
-  // ask_bot. If the guard were removed, B's fake (also in ask-peer mode)
-  // would call ask_bot, the harness would refuse recursion, and B's reply
-  // would contain "peer error: ... one hop". The absence of that error is
-  // the regression signal.
+  // coordinate_bots.  If the guard were removed, B's fake (also in
+  // ask-peer mode) would call coordinate_bots, the harness would refuse
+  // recursion, and B's reply would contain "peer error: ... one hop".
+  // The absence of that error is the regression signal.
   it("does not inject the agents integration into a depth-1 turn", async () => {
     const seeded = (await api("GET", "/api/bots")).body.bots[0];
     await api("PATCH", `/api/bots/${seeded.id}`, { hidden: true });
     // A runs delegate-peer and hands off to B, which runs ask-peer. If the
-    // depth guard broke, B's depth-1 turn would call ask_bot and its reply
+    // depth guard broke, B's depth-1 turn would call coordinate_bots and its reply
     // would carry the "one hop" refusal — the regression signal.
     const selection = { instanceId: "grok", model: "fake-model" };
     const askerSelection = { instanceId: "askerDelegate", model: "fake-model" };
@@ -861,7 +884,7 @@ describe("comms e2e (fake ACP fleet)", () => {
     const reply = helperBot.messages.findLast(
       (m: any) => m.role === "bot" && m.kind === "text" && m.text?.includes("hello from fake acp"),
     );
-    // If the guard were broken, B would have called ask_bot at depth=1 and
+    // If the guard were broken, B would have called coordinate_bots at depth=1 and
     // received "message chains are limited to one hop" back from the
     // harness. That error text would surface here as `peer error: ... one hop`.
     expect(reply.text).toContain("hello from fake acp");

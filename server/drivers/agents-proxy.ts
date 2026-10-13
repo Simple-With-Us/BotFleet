@@ -5,8 +5,8 @@
 // limits:
 //
 //   list_bots()                          → the other bots in this section + their status
-//   ask_bot(bot_id, msg)                 → send msg to that bot, wait, return its reply
-//   delegate_bot(bot_id, msg, reason?)   → hand the task to a peer ASYNC: returns
+//   coordinate_bots(bot_ids, message, ...)  → record a durable handoff and return
+//   assignment_status(id?)                  → read handoffs, change nothing
 //                                          immediately, the peer runs after your
 //                                          current turn finishes, the user sees
 //                                          the peer's reply as its own turn
@@ -78,8 +78,8 @@ const REGISTRY_TOOLS = mcpToolDefinitions({
 // list too.
 const MCP_TOOL_ORDER = [
   "list_bots",
-  "ask_bot",
-  "delegate_bot",
+  "coordinate_bots",
+  "assignment_status",
   "create_bot",
   "request_credential",
   "list_routines",
@@ -160,38 +160,40 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
       const about = b.description ? ` (${String(b.description).slice(0, 120)})` : "";
       return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${b.busy ? ", busy" : ""}]`;
     });
-    return { text: `Other bots you can message with ask_bot:\n${lines.join("\n")}` };
+    return { text: `Other bots you can message with coordinate_bots:\n${lines.join("\n")}` };
   }
-  if (name === "ask_bot") {
-    const toBotId = String(args.bot_id ?? "").trim();
+  if (name === "coordinate_bots") {
+    const listed = Array.isArray(args.bot_ids) ? args.bot_ids : [];
+    const single = args.bot_id;
+    const botIds = [...listed, ...(single !== undefined ? [single] : [])].map((value) => String(value ?? "").trim()).filter(Boolean);
     const message = String(args.message ?? "").trim();
-    if (!toBotId || !message) return { text: "ask_bot needs bot_id and message.", isError: true };
-    const r = await api(`/api/internal/ask-bot`, {
-      method: "POST",
-      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, toBotId, message, depth: DEPTH }),
-    });
-    if (r.busy) return { text: `That bot is busy right now — try again after it finishes.` };
-    if (r.error) return { text: `Couldn't reach that bot: ${r.error}`, isError: true };
-    return { text: `${r.botName ?? "Bot"} replied:\n${r.text ?? "(no reply)"}` };
-  }
-  if (name === "delegate_bot") {
-    const toBotId = String(args.bot_id ?? "").trim();
-    const message = String(args.message ?? "").trim();
-    const reason = typeof args.reason === "string" ? args.reason.trim() : "";
-    if (!toBotId || !message) return { text: "delegate_bot needs bot_id and message.", isError: true };
+    if (botIds.length === 0 || !message) return { text: "coordinate_bots needs bot_ids and message.", isError: true };
     const body: Record<string, unknown> = {
       fromBotId: BOT_ID,
       fromThreadId: THREAD_ID,
-      toBotId,
+      botIds,
       message,
       depth: DEPTH,
     };
-    if (reason) body.reason = reason;
-    const r = await api(`/api/internal/delegate-bot`, { method: "POST", body: JSON.stringify(body) });
-    if (r.error) return { text: `Couldn't queue the delegation: ${r.error}`, isError: true };
-    // Fire-and-forget by contract: the harness returns immediately, the
-    // peer turn runs after our current turn finishes.
-    return { text: typeof r.message === "string" ? r.message : "Delegation queued." };
+    if (typeof args.reason === "string" && args.reason.trim()) body.reason = args.reason.trim();
+    if (args.rework === true) body.rework = true;
+    if (args.thread === "standing" || args.thread === "new") body.thread = args.thread;
+    if (args.reply === "resume" || args.reply === "none") body.reply = args.reply;
+    if (args.consult === true) body.consult = true;
+    if (typeof args.done_when === "string" && args.done_when.trim()) body.doneWhen = args.done_when.trim();
+    const r = await api(`/api/internal/coordinate-bots`, { method: "POST", body: JSON.stringify(body) });
+    if (r.error && !Array.isArray(r.assignments)) return { text: `Couldn't hand that off: ${r.error}`, isError: true };
+    return { text: typeof r.message === "string" ? r.message : "Handed off." };
+  }
+  if (name === "assignment_status") {
+    const id = typeof args.id === "string" ? args.id.trim() : "";
+    const query = id ? `?id=${encodeURIComponent(id)}` : "";
+    const r = await api(`/api/internal/assignment-status${query}`, {
+      method: "POST",
+      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, ...(id ? { id } : {}) }),
+    });
+    if (r.error) return { text: `Couldn't read that assignment: ${r.error}`, isError: true };
+    return { text: JSON.stringify(r) };
   }
   if (name === "create_bot") {
     const botName = String(args.name ?? "").trim();
@@ -215,7 +217,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     });
     createdThisTurn += 1;
     return {
-      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}]. Assign work with delegate_bot.`,
+      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}]. Assign work with coordinate_bots.`,
     };
   }
   if (name === "request_credential") {

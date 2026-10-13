@@ -21,9 +21,9 @@ import {
   type AgentRequestResult,
   type AgentToolCallContext,
   type AgentToolDeps,
-  type AskBotRequestInput,
+  type CoordinateBotsRequestInput,
   type CreateBotRequestInput,
-  type DelegateBotRequestInput,
+  type AssignmentStatusRequestInput,
   type RequestCredentialRequestInput,
   type RoutineRequestInput,
 } from "./agents.ts";
@@ -46,17 +46,17 @@ const deps = (over: Partial<AgentToolDeps> = {}): AgentToolDeps => ({
   // The real endpoint body, bound to a fixed roster instead of the live
   // store — the same function `index.ts` binds to `store.bots`.
   executeListAgentsRequest: ({ selfId }) => listAgentsResponse(selfId, bots),
-  executeAskBotRequest: vi.fn(
-    async (_input: AskBotRequestInput): Promise<AgentRequestResult> => ({
+  executeCoordinateBotsRequest: vi.fn(
+    async (_input: CoordinateBotsRequestInput): Promise<AgentRequestResult> => ({
       status: 200,
-      body: { botName: "peer", text: "hi" },
+      body: { message: "Handed off.", assignments: [{ id: "asg-1" }] },
     }),
   ),
   executeListRoutinesRequest: () => ({ status: 200, body: { ...routinesBody } }),
-  executeDelegateBotRequest: vi.fn(
-    async (_input: DelegateBotRequestInput): Promise<AgentRequestResult> => ({
+  executeAssignmentStatusRequest: vi.fn(
+    async (_input: AssignmentStatusRequestInput): Promise<AgentRequestResult> => ({
       status: 200,
-      body: { queued: true, message: "Delegation queued." },
+      body: { assignments: [] },
     }),
   ),
   executeCreateBotRequest: vi.fn(
@@ -155,80 +155,69 @@ describe("list_bots is the same implementation on both lanes", () => {
   });
 });
 
-describe("ask_bot still goes through executeAskBotRequest", () => {
+describe("coordinate_bots goes through executeCoordinateBotsRequest", () => {
   it("passes the turn's own identity, never the model's", async () => {
-    const executeAskBotRequest = vi.fn(
+    const executeCoordinateBotsRequest = vi.fn(
       async (): Promise<AgentRequestResult> => ({
         status: 200,
-        body: { botName: "peer", text: "here you go" },
+        body: { message: "Handed to @peer.", assignments: [{ id: "asg-1" }] },
       }),
     );
-    const tools = createAgentTools(deps({ executeAskBotRequest }));
-    const outcome = await tools.ask_bot(
-      // the model also passes a fromBotId; it must be ignored
-      call("ask_bot", { bot_id: "@peer", task: "summarize", fromBotId: "bot-other" }),
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest }));
+    const outcome = await tools.coordinate_bots(
+      call("coordinate_bots", { bot_ids: ["@peer"], message: "summarize", fromBotId: "bot-other" }),
       ctx({ commsDepth: 1 }),
       runtime,
     );
-    expect(executeAskBotRequest).toHaveBeenCalledWith({
+    expect(executeCoordinateBotsRequest).toHaveBeenCalledWith({
       fromBotId: "bot-self",
-      toBotId: "bot-peer",
+      botIds: ["bot-peer"],
       message: "summarize",
       depth: 1,
       fromThreadId: "thread-1",
     });
-    expect(outcome).toMatchObject({ kind: "result", content: "peer replied:\nhere you go" });
+    expect(outcome.kind).toBe("result");
+    expect(outcome.content).toContain("Handed to @peer.");
   });
 
-  it("accepts both advertised argument names — the lanes' declared deviation", async () => {
-    const executeAskBotRequest = vi.fn(
-      async (_input: AskBotRequestInput): Promise<AgentRequestResult> => ({
+  it("accepts a single bot_id and the old task spelling", async () => {
+    const executeCoordinateBotsRequest = vi.fn(
+      async (_input: CoordinateBotsRequestInput): Promise<AgentRequestResult> => ({
         status: 200,
-        body: { botName: "peer", text: "ok" },
+        body: { message: "Handed off.", assignments: [] },
       }),
     );
-    const tools = createAgentTools(deps({ executeAskBotRequest }));
-    // `message` is what the MCP lane advertises, `task` what the HTTP lane
-    // advertises.  One body has to answer to both.
-    await tools.ask_bot(call("ask_bot", { bot_id: "bot-peer", message: "x" }), ctx(), runtime);
-    await tools.ask_bot(call("ask_bot", { bot_id: "bot-peer", task: "y" }), ctx(), runtime);
-    expect(executeAskBotRequest.mock.calls.map(([input]) => input.message)).toEqual(["x", "y"]);
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest }));
+    await tools.coordinate_bots(call("coordinate_bots", { bot_id: "bot-peer", message: "x" }), ctx(), runtime);
+    await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["bot-peer"], task: "y" }), ctx(), runtime);
+    expect(executeCoordinateBotsRequest.mock.calls.map(([input]) => input.message)).toEqual(["x", "y"]);
   });
 
   it("resolves a target only against the roster the model was shown", async () => {
-    const executeAskBotRequest = vi.fn(
-      async (): Promise<AgentRequestResult> => ({ status: 200, body: { text: "ok" } }),
+    const executeCoordinateBotsRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 200, body: { message: "ok", assignments: [] } }),
     );
-    const tools = createAgentTools(deps({ executeAskBotRequest }));
+    const tools = createAgentTools(deps({ executeCoordinateBotsRequest }));
     for (const target of ["bot-hidden", "bot-other", "bot-self"]) {
-      const outcome = await tools.ask_bot(call("ask_bot", { bot_id: target, task: "x" }), ctx(), runtime);
+      const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: [target], message: "x" }), ctx(), runtime);
       expect(outcome.kind, target).toBe("error");
       expect(JSON.parse(outcome.content).error).toMatch(/no bot matches/);
     }
-    expect(executeAskBotRequest).not.toHaveBeenCalled();
+    expect(executeCoordinateBotsRequest).not.toHaveBeenCalled();
   });
 
-  it("requires both arguments", async () => {
+  it("requires bot_ids and message", async () => {
     const tools = createAgentTools(deps());
-    const outcome = await tools.ask_bot(call("ask_bot", { bot_id: "@peer" }), ctx(), runtime);
+    const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["@peer"] }), ctx(), runtime);
     expect(outcome.kind).toBe("error");
-    expect(JSON.parse(outcome.content).error).toMatch(/requires both/);
-  });
-
-  it("turns a busy peer into something the model can act on", async () => {
-    const tools = createAgentTools(
-      deps({ executeAskBotRequest: async () => ({ status: 200, body: { busy: true } }) }),
-    );
-    const outcome = await tools.ask_bot(call("ask_bot", { bot_id: "@peer", task: "x" }), ctx(), runtime);
-    expect(outcome.kind).toBe("error");
-    expect(JSON.parse(outcome.content).error).toMatch(/busy/);
+    expect(JSON.parse(outcome.content).error).toMatch(/requires/);
   });
 
   it("passes the peer path's own refusal straight through", async () => {
     const tools = createAgentTools(
-      deps({ executeAskBotRequest: async () => ({ status: 200, body: { error: "denied by user" } }) }),
+      deps({ executeCoordinateBotsRequest: async () => ({ status: 200, body: { error: "denied by user" } }) }),
     );
-    const outcome = await tools.ask_bot(call("ask_bot", { bot_id: "@peer", task: "x" }), ctx(), runtime);
+    const outcome = await tools.coordinate_bots(call("coordinate_bots", { bot_ids: ["@peer"], message: "x" }), ctx(), runtime);
     expect(JSON.parse(outcome.content).error).toBe("denied by user");
   });
 });
@@ -280,45 +269,37 @@ describe("list_routines", () => {
   });
 });
 
-describe("delegate_bot", () => {
-  it("queues the handoff with the turn's own identity, never the model's", async () => {
-    const executeDelegateBotRequest = vi.fn(
-      async (): Promise<AgentRequestResult> => ({ status: 200, body: { queued: true, message: "Delegation queued." } }),
+describe("assignment_status", () => {
+  it("reads with the turn's own identity", async () => {
+    const executeAssignmentStatusRequest = vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 200, body: { assignments: [] } }),
     );
-    const tools = createAgentTools(deps({ executeDelegateBotRequest }));
-    const outcome = await tools.delegate_bot(
-      call("delegate_bot", { bot_id: "bot-peer", message: "take this", reason: "follow-up", fromBotId: "bot-other" }),
-      ctx({ commsDepth: 1 }),
-      runtime,
-    );
-    expect(executeDelegateBotRequest).toHaveBeenCalledWith({
+    const tools = createAgentTools(deps({ executeAssignmentStatusRequest }));
+    const outcome = await tools.assignment_status(call("assignment_status", { id: "asg-1" }), ctx(), runtime);
+    expect(executeAssignmentStatusRequest).toHaveBeenCalledWith({
       fromBotId: "bot-self",
-      toBotId: "bot-peer",
-      message: "take this",
-      depth: 1,
       fromThreadId: "thread-1",
-      reason: "follow-up",
+      id: "asg-1",
     });
-    expect(outcome).toMatchObject({ kind: "result", content: "Delegation queued." });
+    expect(outcome.kind).toBe("result");
   });
+});
 
-  it("requires both bot_id and message", async () => {
-    const tools = createAgentTools(deps());
-    const outcome = await tools.delegate_bot(call("delegate_bot", { bot_id: "bot-peer" }), ctx(), runtime);
-    expect(outcome.kind).toBe("error");
-    expect(JSON.parse(outcome.content).error).toMatch(/requires both/);
-  });
-
-  it("surfaces a queue refusal as an error the model can act on", async () => {
+describe("coordinate_bots refusals", () => {
+  it("surfaces a one-hop refusal as an error the model can act on", async () => {
     const tools = createAgentTools(
       deps({
-        executeDelegateBotRequest: async () => ({
+        executeCoordinateBotsRequest: async () => ({
           status: 200,
           body: { error: "delegation chains are limited to one hop — do this one yourself" },
         }),
       }),
     );
-    const outcome = await tools.delegate_bot(call("delegate_bot", { bot_id: "bot-peer", message: "x" }), ctx(), runtime);
+    const outcome = await tools.coordinate_bots(
+      call("coordinate_bots", { bot_ids: ["bot-peer"], message: "x" }),
+      ctx(),
+      runtime,
+    );
     expect(outcome.kind).toBe("error");
     expect(JSON.parse(outcome.content).error).toMatch(/one hop/);
   });

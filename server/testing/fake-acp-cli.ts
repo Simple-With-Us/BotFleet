@@ -740,7 +740,7 @@ function handle(msg: any, resumed = false) {
         void driveMcp(agentsMcp, [
           { name: "list_bots", args: () => ({}) },
           {
-            name: "ask_bot",
+            name: "coordinate_bots",
             args: (list) => ({ bot_id: /id: ([\w-]+)/.exec(list)?.[1] ?? "", message: "ping from fake" }),
           },
         ])
@@ -765,9 +765,9 @@ function handle(msg: any, resumed = false) {
             }),
           },
           {
-            name: "delegate_bot",
+            name: "coordinate_bots",
             args: (created) => ({
-              bot_id: /id: ([\w-]+)/.exec(created)?.[1] ?? "",
+              bot_ids: [/id: ([\w-]+)/.exec(created)?.[1] ?? ""],
               message: "Review the new onboarding flow.",
               reason: "design review",
             }),
@@ -813,9 +813,9 @@ function handle(msg: any, resumed = false) {
         void driveMcp(agentsMcp, [
           { name: "list_bots", args: () => ({}) },
           {
-            name: "delegate_bot",
+            name: "coordinate_bots",
             args: (list) => ({
-              bot_id: /id: ([\w-]+)/.exec(list)?.[1] ?? "",
+              bot_ids: [/id: ([\w-]+)/.exec(list)?.[1] ?? ""],
               message: "delegated task",
               reason: "followup",
             }),

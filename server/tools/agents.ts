@@ -100,12 +100,18 @@ export function listAgentsResponse(selfId: string, all: readonly AgentBot[]): Ag
   return { status: 200, body: { section, bots } };
 }
 
-export interface AskBotRequestInput {
+export interface CoordinateBotsRequestInput {
   fromBotId: string;
-  toBotId: string;
+  botIds: string[];
   message: string;
   depth: number;
   fromThreadId?: string;
+  reason?: string;
+  rework?: boolean;
+  thread?: "standing" | "new";
+  reply?: "resume" | "none";
+  consult?: boolean;
+  doneWhen?: string;
 }
 
 export interface ListRoutinesRequestInput {
@@ -114,13 +120,10 @@ export interface ListRoutinesRequestInput {
   routineId?: string;
 }
 
-export interface DelegateBotRequestInput {
+export interface AssignmentStatusRequestInput {
   fromBotId: string;
-  toBotId: string;
-  message: string;
-  depth: number;
   fromThreadId?: string;
-  reason?: string;
+  id?: string;
 }
 
 export interface CreateBotRequestInput {
@@ -161,12 +164,14 @@ export interface RoutineRequestInput {
  *  loopback hop are the same function with the same guards. */
 export interface AgentToolDeps {
   executeListAgentsRequest(input: { selfId: string }): AgentRequestResult | Promise<AgentRequestResult>;
-  executeAskBotRequest(input: AskBotRequestInput): Promise<AgentRequestResult>;
+  executeCoordinateBotsRequest(
+    input: CoordinateBotsRequestInput,
+  ): AgentRequestResult | Promise<AgentRequestResult>;
   executeListRoutinesRequest(
     input: ListRoutinesRequestInput,
   ): AgentRequestResult | Promise<AgentRequestResult>;
-  executeDelegateBotRequest(
-    input: DelegateBotRequestInput,
+  executeAssignmentStatusRequest(
+    input: AssignmentStatusRequestInput,
   ): AgentRequestResult | Promise<AgentRequestResult>;
   executeCreateBotRequest(input: CreateBotRequestInput): AgentRequestResult | Promise<AgentRequestResult>;
   executeRequestCredentialRequest(
@@ -194,8 +199,8 @@ export type AgentToolExecutor = (
  *  `registry.test.ts` is what keeps the two lists in step. */
 export type AgentToolName =
   | "list_bots"
-  | "ask_bot"
-  | "delegate_bot"
+  | "coordinate_bots"
+  | "assignment_status"
   | "create_bot"
   | "request_credential"
   | "list_routines"
@@ -289,77 +294,64 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       );
     },
 
-    async ask_bot(call, ctx): Promise<TurnToolOutcome> {
-      // Both spellings: the MCP lane advertises `message`, the HTTP lane
-      // advertises `task` (see the declared wire deviation in registry.ts).
-      // One body, two advertised names, so neither lane can drift.
-      const target = String(call.arguments.bot_id ?? call.arguments.bot ?? "").trim();
-      const text = String(call.arguments.message ?? call.arguments.task ?? "").trim();
-      if (!target || !text) {
+    async coordinate_bots(call, ctx): Promise<TurnToolOutcome> {
+      const listed = Array.isArray(call.arguments.bot_ids) ? call.arguments.bot_ids : [];
+      const single = call.arguments.bot_id ?? call.arguments.bot;
+      const tokens = [...listed, ...(single !== undefined ? [single] : [])]
+        .map((value) => String(value ?? "").trim())
+        .filter(Boolean);
+      const message = String(call.arguments.message ?? call.arguments.task ?? "").trim();
+      if (tokens.length === 0 || !message) {
         return failed(
-          JSON.stringify({ error: "ask_bot requires both `bot_id` and `task`" }),
+          JSON.stringify({ error: "coordinate_bots requires `bot_ids` and `message`" }),
           "bad arguments",
         );
       }
       const list = await roster(ctx);
       if (typeof list === "string") return failed(JSON.stringify({ error: list }), list);
-      // Resolved against the roster the model was actually shown, so a bot
-      // it cannot see is a bot it cannot reach.
-      const peer = list.rows.find((row) => row.id === target || `@${row.name}` === target);
-      if (!peer) return failed(JSON.stringify({ error: `no bot matches ${target}` }), "no such bot");
-      // Every guard that matters — depth cap, section, thread ownership,
-      // approvePeerComms, mirroring — lives in executeAskBotRequest, which
-      // is why this calls it rather than reimplementing the hop.
-      const result = await deps.executeAskBotRequest({
-        fromBotId: ctx.botId,
-        toBotId: peer.id,
-        message: text,
-        depth: ctx.commsDepth,
-        fromThreadId: ctx.threadId,
-      });
-      if (result.body.busy) {
-        return failed(
-          JSON.stringify({ error: "That bot is busy right now — try again after it finishes." }),
-          "peer busy",
-        );
+      const botIds: string[] = [];
+      for (const token of tokens) {
+        const peer = list.rows.find((row) => row.id === token || `@${row.name}` === token || row.name === token.replace(/^@/, ""));
+        if (!peer) return failed(JSON.stringify({ error: `no bot matches ${token}` }), "no such bot");
+        botIds.push(peer.id);
       }
-      if (result.body.error) {
-        const message = String(result.body.error);
-        return failed(JSON.stringify({ error: message }), message);
-      }
-      const reply = typeof result.body.text === "string" ? result.body.text : "";
-      const name = typeof result.body.botName === "string" ? result.body.botName : peer.name;
-      if (!reply) return failed(JSON.stringify({ error: "no reply" }), "no reply");
-      return ok(`${name} replied:\n${reply}`, `@${name} replied`);
-    },
-
-    async delegate_bot(call, ctx): Promise<TurnToolOutcome> {
-      const target = String(call.arguments.bot_id ?? "").trim();
-      const message = String(call.arguments.message ?? "").trim();
       const reason = typeof call.arguments.reason === "string" ? call.arguments.reason.trim() : "";
-      if (!target || !message) {
-        return failed(
-          JSON.stringify({ error: "delegate_bot requires both `bot_id` and `message`" }),
-          "bad arguments",
-        );
-      }
-      // Async handoff: the harness queues it and returns immediately. Every
-      // guard that matters — section, thread ownership, depth, the queue
-      // cap — lives in executeDelegateBotRequest, same as ask_bot's hop.
-      const result = await deps.executeDelegateBotRequest({
+      const thread = call.arguments.thread === "new" || call.arguments.thread === "standing" ? call.arguments.thread : undefined;
+      const reply = call.arguments.reply === "none" || call.arguments.reply === "resume" ? call.arguments.reply : undefined;
+      const doneWhen = typeof call.arguments.done_when === "string" ? call.arguments.done_when.trim() : "";
+      const result = await deps.executeCoordinateBotsRequest({
         fromBotId: ctx.botId,
-        toBotId: target,
+        botIds,
         message,
         depth: ctx.commsDepth,
         fromThreadId: ctx.threadId,
         ...(reason ? { reason } : {}),
+        ...(call.arguments.rework === true ? { rework: true } : {}),
+        ...(thread ? { thread } : {}),
+        ...(reply ? { reply } : {}),
+        ...(call.arguments.consult === true ? { consult: true } : {}),
+        ...(doneWhen ? { doneWhen } : {}),
       });
-      if (result.body.error) {
+      if (result.body.error && !Array.isArray(result.body.assignments)) {
         const errorMessage = String(result.body.error);
         return failed(JSON.stringify({ error: errorMessage }), errorMessage);
       }
-      const text = typeof result.body.message === "string" ? result.body.message : "Delegation queued.";
-      return ok(text);
+      const text = typeof result.body.message === "string" ? result.body.message : "Handed off.";
+      return ok(JSON.stringify(result.body), text);
+    },
+
+    async assignment_status(call, ctx): Promise<TurnToolOutcome> {
+      const id = typeof call.arguments.id === "string" ? call.arguments.id.trim() : "";
+      const result = await deps.executeAssignmentStatusRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        ...(id ? { id } : {}),
+      });
+      if (result.status >= 400 || result.body.error) {
+        const errorMessage = errorText(result.body, "that assignment could not be read");
+        return failed(JSON.stringify({ error: errorMessage }), errorMessage);
+      }
+      return ok(JSON.stringify(result.body));
     },
 
     async create_bot(call, ctx): Promise<TurnToolOutcome> {
@@ -394,7 +386,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       createdThisTurn += 1;
       const createdName = typeof result.body.name === "string" ? result.body.name : name;
       const section = typeof result.body.section === "string" ? result.body.section : "General";
-      return ok(`Created @${createdName} in ${section} [id: ${result.body.id}]. Assign work with delegate_bot.`);
+      return ok(`Created @${createdName} in ${section} [id: ${result.body.id}]. Assign work with coordinate_bots.`);
     },
 
     async request_credential(call, ctx): Promise<TurnToolOutcome> {

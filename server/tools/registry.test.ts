@@ -15,7 +15,6 @@ import {
   CREDENTIAL_TARGET_IDS,
   HARNESS_TOOLS,
   MAX_CREATED_BOTS_PER_TURN,
-  descriptionFor,
   harnessTool,
   httpToolDefinitions,
   mcpToolDefinitions,
@@ -164,22 +163,13 @@ describe("both lanes derive from the same records", () => {
     }
   });
 
-  it("carry ask_bot's longer per-tool ceiling onto the HTTP lane (DR9)", () => {
-    // The loop's uniform 90s clock cut ask_bot off mid-peer-turn, under the
-    // three minutes the fleet documents for a peer reply.  The number lives
-    // on the tool so it travels with the behaviour that needs it.
-    const askBot = harnessTool("ask_bot")!;
-    expect(askBot.timeoutMs).toBe(240_000);
-    expect(askBot.promptFragment).toContain("prefer delegate_bot");
-
-    const http = new Map(
-      httpToolDefinitions(gate({ localComputer: true })).map((t) => [t.name, t]),
-    );
-    expect(http.get("ask_bot")!.timeoutMs).toBe(240_000);
-    // and a tool with no declared ceiling carries none, so the loop keeps
-    // its own default for it
+  it("returns immediately, so coordinate_bots has no peer-turn timeout", () => {
+    const tool = harnessTool("coordinate_bots")!;
+    expect(tool.timeoutMs).toBeUndefined();
+    expect(tool.promptFragment).toContain("assignment_status");
+    const http = new Map(httpToolDefinitions(gate({ localComputer: true })).map((t) => [t.name, t]));
+    expect(http.get("coordinate_bots")!.timeoutMs).toBeUndefined();
     expect(http.get("bash")!.timeoutMs).toBeUndefined();
-    expect("timeoutMs" in http.get("bash")!).toBe(false);
   });
 
   it("tell the model read_file is bounded and how to page past the cut (DR5)", () => {
@@ -233,17 +223,17 @@ describe("both lanes derive from the same records", () => {
     }
   });
 
-  it("keeps ask_bot's two argument spellings in step — same required arity, one alias", () => {
-    const tool = harnessTool("ask_bot")!;
-    expect(schemaFor(tool, "mcp").required).toEqual(["bot_id", "message"]);
-    expect(schemaFor(tool, "http").required).toEqual(["bot_id", "task"]);
-    expect(schemaFor(tool, "http").required!.length).toBe(schemaFor(tool, "mcp").required!.length);
-    expect(descriptionFor(tool, "mcp")).not.toBe(descriptionFor(tool, "http"));
+  it("advertises one coordinate_bots schema on both lanes", () => {
+    const tool = harnessTool("coordinate_bots")!;
+    expect(schemaFor(tool, "mcp").required).toEqual(["bot_ids", "message"]);
+    expect(schemaFor(tool, "http").required).toEqual(["bot_ids", "message"]);
+    expect(tool.wire).toBeUndefined();
   });
 
-  it("declares no wire deviation for any of the five PR 7 tools — one schema, both lanes", () => {
+  it("declares no wire deviation for the coordination tools or the PR 7 tools — one schema, both lanes", () => {
     for (const name of [
-      "delegate_bot",
+      "coordinate_bots",
+      "assignment_status",
       "create_bot",
       "request_credential",
       "propose_routine",
@@ -290,8 +280,8 @@ describe("gating", () => {
     const ctx = gate({ commsDepth: 1, maxCommsDepth: 1 });
     const names = mcpToolDefinitions(ctx).map((t) => t.name);
     expect(names).not.toContain("list_bots");
-    expect(names).not.toContain("ask_bot");
-    expect(names).not.toContain("delegate_bot");
+    expect(names).not.toContain("coordinate_bots");
+    expect(names).not.toContain("assignment_status");
     // None of these are a hop, so the ceiling does not apply to them.
     expect(names).toContain("list_routines");
     expect(names).toContain("create_bot");
@@ -312,8 +302,8 @@ describe("gating", () => {
   it("offers the full set to a depth-0 chief bot with comms on", () => {
     expect(mcpToolDefinitions(gate()).map((t) => t.name)).toEqual([
       "list_bots",
-      "ask_bot",
-      "delegate_bot",
+      "coordinate_bots",
+      "assignment_status",
       "create_bot",
       "request_credential",
       "list_routines",
@@ -325,8 +315,8 @@ describe("gating", () => {
   it("offers everything but create_bot to a depth-0 non-chief bot with comms on", () => {
     expect(mcpToolDefinitions(gate({ chiefOfStaff: false })).map((t) => t.name)).toEqual([
       "list_bots",
-      "ask_bot",
-      "delegate_bot",
+      "coordinate_bots",
+      "assignment_status",
       "request_credential",
       "list_routines",
       "propose_routine",
