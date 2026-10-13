@@ -2,6 +2,8 @@
 // code, or any other secret.  The person types those on the computer where
 // the bot works, and that text never enters app state, logs, or chat.
 
+import { z } from "zod";
+
 export interface SignInRequestCardData {
   site: string;
   reason: string;
@@ -49,14 +51,21 @@ export function signInReason(input: string): string {
 
 const SECRET_BODY_KEYS = new Set(["password", "passwd", "otp", "totp", "secret", "passcode", "code"]);
 
+/** A card-action body.  Anything that is not a plain object fails the
+ * parse, and the caller treats that as no secret rather than card text. */
+export const SIGN_IN_BODY = z.record(z.string(), z.unknown());
+
+export type SignInBody = z.infer<typeof SIGN_IN_BODY>;
+
 /** True when a card action tried to send a secret.  Key match ignores
  * case, so PASSWORD and Otp are refused the same way as password.  The
  * caller refuses the request and must not log the value. */
 export function signInBodyHasSecret(body: any): boolean {
-  if (body == null || Array.isArray(body) || Object.prototype.toString.call(body) !== "[object Object]") return false;
-  for (const key of Object.keys(body)) {
+  const parsed = SIGN_IN_BODY.safeParse(body);
+  if (!parsed.success) return false;
+  for (const key of Object.keys(parsed.data)) {
     if (!SECRET_BODY_KEYS.has(key.toLowerCase())) continue;
-    const value = body[key];
+    const value = parsed.data[key];
     if (value != null && value !== "") return true;
   }
   return false;

@@ -35,6 +35,8 @@ describe("sign-in card secrets", () => {
     expect(signInBodyHasSecret({ Otp: "123456" })).toBe(true);
     expect(signInBodyHasSecret({ otp: "123456" })).toBe(true);
     expect(signInBodyHasSecret({ password: "" })).toBe(false);
+    expect(signInBodyHasSecret(null)).toBe(false);
+    expect(signInBodyHasSecret(["password"])).toBe(false);
   });
 
   it("tells the bot to check the screen and never to ask for a password", () => {
