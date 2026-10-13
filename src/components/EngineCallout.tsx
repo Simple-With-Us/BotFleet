@@ -1,4 +1,4 @@
-// Shared "Why This Engine?" callout.  Replaces the MiniMax-only
+// Shared "More Info" callout.  Replaces the MiniMax-only
 // `<MiniMaxCallout>` so every engine row gets the same prose block —
 // the panel used to render detail copy only for the MiniMax row, and a
 // reader flipping through Claude / Codex / Cursor had to infer the
@@ -28,6 +28,7 @@ import { useId, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import {
   engineCapability,
+  engineAccessLabel,
   engineIdFromDriverKind,
   pricingModeLabel,
   type EngineCapabilityEntry,
@@ -84,6 +85,7 @@ function EngineCalloutDisclosure(props: {
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
+        aria-label={`More Info about ${entry.displayName}`}
         // Only point at the detail region while it is rendered; a collapsed
         // callout has no element with this id.
         aria-controls={open ? detailId : undefined}
@@ -96,7 +98,7 @@ function EngineCalloutDisclosure(props: {
         className="inline-flex w-auto max-w-full items-center gap-1 rounded-md px-1.5 py-0.5 text-left text-[11.5px] text-ink-secondary transition-colors hover:bg-raised/50 hover:text-ink"
       >
         <span className="min-w-0 truncate">
-          Why <strong className="font-medium text-ink">{entry.displayName}</strong>?
+          More Info
         </span>
         <ChevronDown
           size={12}
@@ -116,7 +118,7 @@ function EngineCalloutDisclosure(props: {
             </p>
           ))}
           <p className="mt-1.5 text-[11px] text-ink-secondary/80">
-            Pricing: {pricingModeLabel(entry.pricing)}.
+            Access: {engineAccessLabel(entry)}.  Billing: {pricingModeLabel(entry.pricing)}.
           </p>
         </div>
       )}
@@ -124,9 +126,9 @@ function EngineCalloutDisclosure(props: {
   );
 }
 
-/** Header chip used by `<EngineCapabilitiesMatrix>` — exposes the same
- *  pricing-mode label the callout uses, so the two stay in sync. */
-export function PricingModeChip(props: { entry: EngineCapabilityEntry }): React.ReactElement {
+/** Access chip used by `<EngineCapabilitiesMatrix>`.  Access and billing are
+ *  intentionally separate: an API key can still draw on a subscription. */
+export function AccessModeChip(props: { entry: EngineCapabilityEntry }): React.ReactElement {
   const { entry } = props;
   return (
     <span
@@ -135,7 +137,7 @@ export function PricingModeChip(props: { entry: EngineCapabilityEntry }): React.
         ? `${entry.pricing.subscription.tierLabel}${typeof entry.pricing.subscription.costPerMonth === "number" ? ` · $${entry.pricing.subscription.costPerMonth.toFixed(2)}/mo` : ""}; API ${entry.pricing.api.inputPer1k}/1k in`
         : undefined}
     >
-      {pricingModeLabel(entry.pricing)}
+      {engineAccessLabel(entry)}
     </span>
   );
 }
