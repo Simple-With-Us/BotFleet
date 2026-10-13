@@ -121,6 +121,14 @@ export class ComputerControl {
     return this.changed(botId);
   }
 
+  /** Hand back a hold the person took from the panel or a sign-in card.
+   * A workspace lease is left alone: Done on a card must not steal it. */
+  releasePlainHold(botId: string): ControlSnapshot {
+    const entry = this.entries.get(botId);
+    if (!entry || entry.heldSinceMs === null || entry.controlLeaseId !== null) return this.snapshot(botId);
+    return this.release(botId);
+  }
+
   /** Release only the hold created by this workspace lease. A newer or legacy
    * holder is observed but never disturbed. */
   releaseLease(botId: string, controlLeaseId: string): ControlLeaseReleaseResult {

@@ -9501,6 +9501,10 @@ function resumeSignInCard(botId: string, threadId: string, messageId: string, ou
     error: undefined,
   };
   store.patchMessage(threadId, message.id, { signIn: next });
+  // Done is the person handing the computer back, so the bot can look.
+  // A workspace lease is not this card's hold, and Cancel leaves the screen
+  // with whoever already has it.
+  if (outcome === "done") computerControl.releasePlainHold(botId);
   dispatchSignInResume({ botId, threadId, messageId, site: message.signIn.site, outcome });
   return true;
 }
