@@ -89,9 +89,15 @@ public struct CompanionState: Sendable {
     /// The active branch of a bot conversation. Rooms and legacy linear
     /// threads return their full transcript.
     public func visibleTranscript(forThread threadId: String) -> [Message] {
+        visibleTranscript(forThread: threadId, activeLeafId: bot(forThread: threadId)?.activeLeafId)
+    }
+
+    /// `visibleTranscript(forThread:)` with the owning bot's leaf already
+    /// resolved, so callers that already hold the bot skip the roster scan.
+    private func visibleTranscript(forThread threadId: String, activeLeafId: String?) -> [Message] {
         let all = transcript(forThread: threadId)
         let branch: [Message]
-        if let leafId = bot(forThread: threadId)?.activeLeafId {
+        if let leafId = activeLeafId {
             let byId = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { _, newest in newest })
             if var current = byId[leafId] {
                 var visible: [Message] = []
@@ -235,13 +241,20 @@ public struct CompanionState: Sendable {
     /// Every unanswered approval or question, newest first. This is the
     /// screen the whole companion exists for.
     public var pendingApprovals: [(threadId: String, message: Message)] {
+        // Read on every chat-list render, so it must stay cheap: resolve each
+        // bot's leaf from the bot we are already iterating (no per-thread
+        // `bot(forThread:)` scan or Bot copy), and skip the branch walk for
+        // threads holding no pending card at all — queued sends never do.
         var out: [(threadId: String, message: Message)] = []
-        let activeThreads = bots.map(\.threadId) + rooms.map(\.threadId)
-        for threadId in activeThreads {
-            for message in visibleTranscript(forThread: threadId) where message.card?.isPending == true {
+        func collect(_ threadId: String, activeLeafId: String?) {
+            guard transcript(forThread: threadId).contains(where: { $0.card?.isPending == true }) else { return }
+            for message in visibleTranscript(forThread: threadId, activeLeafId: activeLeafId)
+            where message.card?.isPending == true {
                 out.append((threadId: threadId, message: message))
             }
         }
+        for bot in bots { collect(bot.threadId, activeLeafId: bot.activeLeafId) }
+        for room in rooms { collect(room.threadId, activeLeafId: nil) }
         return out.sorted { $0.message.at > $1.message.at }
     }
 
