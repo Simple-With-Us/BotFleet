@@ -200,9 +200,6 @@ public enum CodeBlockWindow {
     private static func renderedLineCount(_ text: String) -> Int {
         if text.isEmpty { return 0 }
         var count = 1
-    private static func renderedLineCount(_ text: String) -> Int {
-        if text.isEmpty { return 0 }
-        var count = 1
         for scalar in text.unicodeScalars where scalar == "\n" { count += 1 }
         if text.hasSuffix("\n") { count -= 1 }
         return max(count, 1)
@@ -235,7 +232,6 @@ public enum CodeBlockWindow {
             index = source.index(after: index)
         }
         return out
-    }
     }
 
     private static func isLineBreak(_ character: Character, in source: String, at index: String.Index) -> Bool {
