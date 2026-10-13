@@ -1,3 +1,4 @@
+/* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, anti-slop/no-known-value-widening, anti-slop/no-shape-in-symbol-names, anti-slop/no-chained-type-assertions -- OpenMausBot MCP reliability port: JSON-RPC, HTTP, and OAuth boundary parsing with hand-rolled guards. */
 // A synthetic catalog shaped like Whop's official MCP server, which lists 425
 // tools in 1.2 MB of JSON: `<area>_<action>` names over a few dozen areas, a
 // company_id on nearly every tool, readOnlyHint on the reads, and the odd

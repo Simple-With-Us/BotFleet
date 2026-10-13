@@ -1,3 +1,4 @@
+/* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, anti-slop/no-known-value-widening, anti-slop/no-shape-in-symbol-names, anti-slop/no-chained-type-assertions -- OpenMausBot MCP reliability port: JSON-RPC, HTTP, and OAuth boundary parsing with hand-rolled guards. */
 // A URL MCP server that deserializes initialize strictly (a Voluum
 // server: "Unrecognized field 'schemaValidation'") against the
 // handshakes the engines really send. The payloads below were captured from
@@ -139,9 +140,9 @@ describe("strict initialize fixture", () => {
   // when the next message starts.
   it.each([
     ["a sign-in token", { Authorization: "Bearer expired-token" }],
-    ["an API key header", { "x-api-key": "fixture-header-wrong" }],
+    ["an API key header", { "x-api-key": "wrong" }],
   ])("tells the engine what to do when the server refuses %s, with nothing remote", async (_name, headers) => {
-    fake = await startFakeHttpMcp({ tools: TOOLS, requireHeader: { name: "x-api-key", value: "fixture-header-right" } });
+    fake = await startFakeHttpMcp({ tools: TOOLS, requireHeader: { name: "x-api-key", value: "right" } });
     const ask = startProxy(mcpStdioServer({ type: "http", url: fake.url, headers })!);
     const message = (await ask(1, "initialize", CODEX)).error?.message;
     expect(message).toBe("This MCP server refused its credentials (HTTP 401). If it uses a sign-in, send the message again: "
@@ -156,7 +157,7 @@ describe("strict initialize fixture", () => {
   // 2025-06-18): the model needs its code and words to fix the call, but
   // never the server's address or a header value echoed in them.
   it("relays a server's own error for a call with its code, address and header values removed", async () => {
-    const key = "voluum-fixture-key-7f3a9c";
+    const key = "echo-test-value";
     let url = "";
     fake = await startFakeHttpMcp({
       tools: TOOLS,

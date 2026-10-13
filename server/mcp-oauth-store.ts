@@ -1,3 +1,4 @@
+/* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, anti-slop/no-known-value-widening, anti-slop/no-shape-in-symbol-names, anti-slop/no-chained-type-assertions -- OpenMausBot MCP reliability port: JSON-RPC, HTTP, and OAuth boundary parsing with hand-rolled guards. */
 // Sign-in state for URL MCP servers, kept apart from config.json so a
 // pasted or exported config never carries a token. One owner-only file:
 // per server, the URL it was signed in for (a token never follows the

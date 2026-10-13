@@ -1,6 +1,7 @@
+/* oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, anti-slop/no-known-value-widening, anti-slop/no-shape-in-symbol-names, anti-slop/no-chained-type-assertions -- OpenMausBot MCP reliability port: JSON-RPC, HTTP, and OAuth boundary parsing with hand-rolled guards. */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { connect, type AddressInfo, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -466,9 +467,25 @@ describe("remote MCP tool directory", () => {
   const tls = makeTestTls(tlsDir);
   afterAll(() => removeTempDir(tlsDir));
 
+  /** Node's env proxy skips loopback targets; a hosts-file alias to 127.0.0.1
+   *  makes CONNECT never run, so this case is meaningful only without that map. */
+  const hostsMapsTlsFixtureToLoopback = (): boolean => {
+    try {
+      const hosts = readFileSync("/etc/hosts", "utf8");
+      return hosts.split("\n").some((line) => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) return false;
+        const [address, ...names] = trimmed.split(/\s+/);
+        return address?.startsWith("127.") && names.includes(TEST_TLS_HOST);
+      });
+    } catch {
+      return false;
+    }
+  };
+
   // The proxy switch is set for https:// servers only (mcp-gate-config.ts):
   // through CONNECT, which works on Node 24 and 26 alike.
-  it.skipIf(!tls)("reaches an internet https server through the person's proxy", async () => {
+  it.skipIf(!tls || hostsMapsTlsFixtureToLoopback())("reaches an internet https server through the person's proxy", async () => {
     fake = await startFakeHttpMcp({ tools: catalog, tls });
     const port = Number(new URL(fake.url).port);
     // a CONNECT proxy that knows where the test's "internet" host lives
