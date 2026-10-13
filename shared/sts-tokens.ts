@@ -127,7 +127,10 @@ export async function mintGeminiLiveToken(
   if (!secret) throw new Error("Add a Gemini API key before starting a voice call.");
   const lead = clampTtl(sessionLeadSeconds, { min: 120, max: 3600, fallback: GEMINI_SESSION_LEAD_SECONDS });
   const ttl = clampTtl(ttlSeconds, { min: 600, max: 3600, fallback: GEMINI_TTL_SECONDS });
-  const iso = (ms: number) => new Date(ms).toISOString();
+  // Seconds precision, no milliseconds: this is the string the desktop's
+  // existing tests assert on, and a `.000Z` suffix is a gratuitous format
+  // change to ship alongside a refactor.
+  const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d+Z$/, "Z");
   const response = await fetchImpl(GEMINI_TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "x-goog-api-key": secret, "content-type": "application/json" },
