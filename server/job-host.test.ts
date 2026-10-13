@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
 import { createJobHost, isOutwardActivity, type JobHost, type JobHostDeps } from "./job-host.ts";
+import { closeMessageDb } from "./message-db.ts";
 import { resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import { Store } from "./store.ts";
 
@@ -35,12 +36,18 @@ describe("job host", () => {
   afterEach(() => {
     host?.close();
     store?.flushBotsNow();
+    // Windows will not remove a directory that still holds an open database.
+    // The runtime handle closes with the host.  The message database is a
+    // process-wide handle and has to close before this directory goes.
+    closeMessageDb();
     rmSync(DATA_DIR, { recursive: true, force: true });
     starts.length = 0;
     listener = undefined;
   });
 
   function setup(startTurn?: JobHostDeps["startTurn"]) {
+    host?.close();
+    closeMessageDb();
     rmSync(DATA_DIR, { recursive: true, force: true });
     store = new Store(() => selection);
     const from = store.createBot({ name: "Asker" }, { seedMessages: false });
