@@ -31,6 +31,8 @@ describe("sign-in card secrets", () => {
     expect(signInReason("x".repeat(400))).toHaveLength(280);
     expect(signInBodyHasSecret({ threadId: "t1" })).toBe(false);
     expect(signInBodyHasSecret({ password: "hunter2" })).toBe(true);
+    expect(signInBodyHasSecret({ PASSWORD: "hunter2" })).toBe(true);
+    expect(signInBodyHasSecret({ Otp: "123456" })).toBe(true);
     expect(signInBodyHasSecret({ otp: "123456" })).toBe(true);
     expect(signInBodyHasSecret({ password: "" })).toBe(false);
   });

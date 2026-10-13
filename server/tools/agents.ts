@@ -15,7 +15,9 @@
 // ignored everywhere below — the turn's own identity is the only one that
 // reaches an endpoint function.
 
-import { inboundText } from "../../shared/sign-in-request.ts";
+import { z } from "zod";
+
+import { inboundText, signInReason, signInSite } from "../../shared/sign-in-request.ts";
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
 import { sectionKey } from "../store.ts";
 import { MAX_CREATED_BOTS_PER_TURN } from "./registry.ts";
@@ -228,6 +230,19 @@ const ok = (content: string, detail?: string): TurnToolOutcome =>
 
 const failed = (content: string, detail?: string): TurnToolOutcome =>
   detail ? { kind: "error", content, detail } : { kind: "error", content };
+
+/** Model arguments for request_sign_in.  Strict, so a password, code, or
+ * any other extra field is refused.  The refusal text is fixed and never
+ * includes the rejected value. */
+const SIGN_IN_CALL = z
+  .object({
+    site: z.string().min(1),
+    reason: z.string().optional(),
+  })
+  .strict();
+
+const SIGN_IN_CALL_REFUSAL =
+  "request_sign_in accepts only a site and an optional reason.  Never send a password or one-time code.";
 
 const errorText = (body: Record<string, unknown>, fallback: string): string =>
   typeof body.error === "string" && body.error ? body.error : fallback;
@@ -445,11 +460,15 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
     },
 
     async request_sign_in(call, ctx): Promise<TurnToolOutcome> {
-      const site = inboundText(call.arguments.site);
+      const parsed = SIGN_IN_CALL.safeParse(call.arguments);
+      if (!parsed.success) {
+        return failed(JSON.stringify({ error: SIGN_IN_CALL_REFUSAL }), "bad arguments");
+      }
+      const site = signInSite(parsed.data.site);
       if (!site) {
         return failed(JSON.stringify({ error: "request_sign_in needs a site, like example.com" }), "bad arguments");
       }
-      const reason = inboundText(call.arguments.reason);
+      const reason = signInReason(parsed.data.reason ?? "");
       const result = await deps.executeRequestSignInRequest({
         fromBotId: ctx.botId,
         fromThreadId: ctx.threadId,

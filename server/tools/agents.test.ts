@@ -407,14 +407,27 @@ describe("request_sign_in", () => {
   it("shows a sign-in card and suspends without asking for a password", async () => {
     const tools = createAgentTools(deps());
     const outcome = await tools.request_sign_in(
-      call("request_sign_in", { site: "example.com", reason: "the inbox", password: "nope" }),
+      call("request_sign_in", { site: "example.com", reason: "the inbox" }),
       ctx(),
       runtime,
     );
     expect(outcome.kind).toBe("suspend");
     expect(outcome.content).toContain("example.com");
     expect(outcome.content).toContain("Never ask them to paste a password");
+  });
+
+  it("refuses a password field and does not repeat the value", async () => {
+    const executeRequestSignInRequest = vi.fn();
+    const tools = createAgentTools(deps({ executeRequestSignInRequest }));
+    const outcome = await tools.request_sign_in(
+      call("request_sign_in", { site: "example.com", reason: "the inbox", password: "nope" }),
+      ctx(),
+      runtime,
+    );
+    expect(outcome.kind).toBe("error");
     expect(outcome.content).not.toContain("nope");
+    expect(outcome.detail ?? "").not.toContain("nope");
+    expect(executeRequestSignInRequest).not.toHaveBeenCalled();
   });
 
   it("refuses a call with no site", async () => {
