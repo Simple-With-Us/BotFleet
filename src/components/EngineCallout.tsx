@@ -118,7 +118,7 @@ function EngineCalloutDisclosure(props: {
             </p>
           ))}
           <p className="mt-1.5 text-[11px] text-ink-secondary/80">
-            Access: {engineAccessLabel(entry)}.  Billing: {pricingModeLabel(entry.pricing)}.
+            Access: {engineAccessLabel(entry)}.  Billing: {pricingModeLabel(entry.pricing)}.
           </p>
         </div>
       )}
