@@ -139,17 +139,23 @@ interface ActiveCell {
   key: CapabilityKey;
 }
 
-const ENGINE_MARK_KIND: Readonly<Record<string, string>> = {
-  "deepseek-harness": "dshAgent",
-  mcode: "mcodeAgent",
-  muse: "museAgent",
-  opencode: "opencodeGo",
-  box: "boxAgent",
-  "cli-wrapper": "cli-wrapper",
-};
-
 function engineMarkKind(entry: EngineCapabilityEntry): string {
-  return ENGINE_MARK_KIND[entry.id] ?? entry.id;
+  switch (entry.id) {
+    case "deepseek-harness":
+      return "dshAgent";
+    case "mcode":
+      return "mcodeAgent";
+    case "muse":
+      return "museAgent";
+    case "opencode":
+      return "opencodeGo";
+    case "box":
+      return "boxAgent";
+    case "cli-wrapper":
+      return "cli-wrapper";
+    default:
+      return entry.id;
+  }
 }
 
 export function EngineCapabilitiesMatrix(props: {
