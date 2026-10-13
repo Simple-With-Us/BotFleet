@@ -87,7 +87,10 @@ struct ChatListView: View {
                 }
             }
         }
-        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+        // Same AX5 ceiling as the transcript (ChatView.swift): a roster row
+        // that stops growing at AX3 is unreadable at the sizes those readers
+        // chose.  Rows reflow; they do not truncate.
+        .dynamicTypeSize(...DynamicTypeSize.accessibility5)
         .onAppear { migrateLegacyCollapsedSections() }
         .onChange(of: session.notificationChat) { _, chat in
             guard let chat else { return }

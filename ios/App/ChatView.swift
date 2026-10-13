@@ -220,7 +220,11 @@ struct ChatView: View {
         .overlay(alignment: .bottom) { plusSheet }
         .toolbar(.hidden, for: .navigationBar)
         .navigationBarBackButtonHidden(true)
-        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+        // A transcript that stops growing at AX3 is unreadable for the
+        // readers who turned Dynamic Type up in the first place, and bot
+        // text used to be pinned outright.  AX5 is the last step; the
+        // bubbles reflow rather than truncate.
+        .dynamicTypeSize(...DynamicTypeSize.accessibility5)
         .photosPicker(isPresented: $pickingPhoto, selection: $photoItem, matching: .images)
         .onChange(of: photoItem) { _, item in
             guard let item else { return }
@@ -789,13 +793,13 @@ struct ChatView: View {
             ZStack(alignment: .bottom) {
                 Color.black.opacity(0.35)
                     .ignoresSafeArea()
-                    .onTapGesture { withAnimation(.snappy(duration: 0.28)) { showingPlus = false } }
+                    .onTapGesture { withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus = false } }
 
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 0) {
                         ForEach(plusActions) { action in
                             Button {
-                                withAnimation(.snappy(duration: 0.28)) { showingPlus = false }
+                                withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus = false }
                                 action.run()
                             } label: {
                                 HStack(spacing: 16) {
@@ -870,7 +874,7 @@ struct ChatView: View {
             id: "commands", systemImage: "command", title: "Slash commands",
             subtitle: "Computer, tasks, and more"
         ) {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+            withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.75)) {
                 showCommandHUD = true
             }
             draft = ComposerSendRecovery.slashCommandDraft(from: draft)
@@ -1298,7 +1302,7 @@ struct ChatView: View {
                     Button {
                         dictation.stop()
                         composerFocused = false
-                        withAnimation(.snappy(duration: 0.28)) { showingPlus.toggle() }
+                        withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus.toggle() }
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: 20, weight: .medium))
@@ -1328,7 +1332,7 @@ struct ChatView: View {
                             // prevent competing edits without dimming the text.
                             .allowsHitTesting(!dictation.isListening && !dictation.isStarting)
                             .onChange(of: draft) { _, value in
-                                withAnimation(.easeInOut(duration: 0.15)) {
+                                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
                                     showCommandHUD = value.hasPrefix("/")
                                 }
                             }
@@ -1342,7 +1346,7 @@ struct ChatView: View {
                                     .foregroundStyle(Color.red)
                                     .frame(width: 32, height: 32)
                                     .background(Circle().fill(Color.red.opacity(0.2)))
-                                    .symbolEffect(.pulse, isActive: true)
+                                    .symbolEffect(.pulse, isActive: !reduceMotion)
                             }
                             .buttonStyle(.plain)
                             .padding(.bottom, 6)
@@ -1362,7 +1366,7 @@ struct ChatView: View {
                         .disabled(!canSend)
                         .padding(.trailing, 6)
                         .padding(.bottom, 6)
-                        .animation(.easeOut(duration: 0.15), value: canSend)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: canSend)
                         .contextMenu {
                             if canSend {
                                 Button {
@@ -1662,6 +1666,43 @@ struct MessageRow: View {
         return session.instanceDriverKinds[selection.instanceId]
     }
 
+    /// Who this message reads as coming from, in the reader's own words.  The
+    /// avatar says it on screen, but an avatar is a picture, so VoiceOver said
+    /// nothing at all about who had spoken.
+    private var accessibilitySender: String {
+        if message.role == .user { return "You" }
+        if message.role == .system {
+            let body = message.text ?? ""
+            if WebhookMessageView.parse(message.text) != nil { return "Webhook" }
+            if ImessageMessageView.parse(message.text) != nil { return "iMessage" }
+            if let delegation = DelegationMessageView.parse(
+                message.text,
+                role: message.role,
+                fromName: message.from?.name,
+                automationSource: message.automationSource
+            ) {
+                return delegation.headline
+            }
+            return ChatView.automationSourceLabel(message.automationSource, body: body)
+        }
+        if let from = message.from?.name, !from.isEmpty { return from }
+        if let name = senderBot?.name { return name }
+        if case let .room(room) = chat { return room.name }
+        return "Bot"
+    }
+
+    /// "3 minutes ago", from the same formatter the push diagnostics use, so
+    /// the row says when it arrived without the reader leaving the transcript
+    /// to find out.
+    private var accessibilityTime: String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(
+            for: Date(timeIntervalSince1970: message.at / 1_000),
+            relativeTo: Date()
+        )
+    }
+
     @ViewBuilder
     private var avatarBadge: some View {
         // A `.system` row is an auto-delivered routine/webhook/resource
@@ -1808,6 +1849,12 @@ struct MessageRow: View {
             avatarBadge
             messageContent
         }
+        // `.contain`, not `.combine`: the row names itself, then its buttons
+        // stay reachable.  Combining would fold the approval card, the
+        // reaction chips and the version switcher into one blob of prose and
+        // take every one of them out of the reach of VoiceOver.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(accessibilitySender), \(accessibilityTime)")
         .contextMenu {
             // `at` is epoch milliseconds on the wire, like every other timestamp
             // the harness sends; SwiftUI's time style wants a Date.
@@ -2131,6 +2178,9 @@ struct TextBubble: View {
                             .foregroundStyle(Color.primary)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
+                            // Keep Markdown links independently reachable by
+                            // VoiceOver.  MessageRow already supplies the
+                            // speaker/time summary for this container.
                             // While this reply is read aloud, its words
                             // follow the voice (Karaoke.swift).  Only this
                             // bubble's blocks observe the per-word paint.
@@ -2205,6 +2255,7 @@ struct ChannelEventCard: View {
     let systemImage: String
     let accessibilityName: String
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
 
     var body: some View {
@@ -2214,7 +2265,7 @@ struct ChannelEventCard: View {
             Group {
                 if expandable {
                     Button {
-                        withAnimation(.spring(response: 0.32, dampingFraction: 0.76)) {
+                        withAnimation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.76)) {
                             isExpanded.toggle()
                         }
                         Haptics.selection()
@@ -2332,6 +2383,7 @@ struct ActivityRunView: View {
     let chat: Chat
     let messages: [Message]
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded: Bool = false
 
     private var hasFailure: Bool {
@@ -2352,7 +2404,7 @@ struct ActivityRunView: View {
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.spring(response: 0.32, dampingFraction: 0.76)) {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.76)) {
                     isExpanded.toggle()
                 }
                 Haptics.selection()
@@ -2684,6 +2736,14 @@ struct LiveReplyRow: View {
         return (sender.name, sender.color)
     }
 
+    /// Who is typing, for the row's single announcement.  There is no
+    /// timestamp to give: the message has not landed yet.
+    private var accessibilitySender: String {
+        if let name = sender?.name { return name }
+        if case let .room(room) = chat { return room.name }
+        return "Bot"
+    }
+
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
             avatar
@@ -2710,6 +2770,11 @@ struct LiveReplyRow: View {
                 }
             }
         }
+        // One label, and one that does not change. The streaming subtree is
+        // hidden, so nothing here is re-announced as tokens land; the settled
+        // reply replaces this row and carries its own label.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(accessibilitySender) is replying")
     }
 }
 
@@ -2764,6 +2829,13 @@ struct StreamingBubble: View {
                     MarkdownText(source: text, caret: true)
                         .foregroundStyle(Color.primary)
                         .fixedSize(horizontal: false, vertical: true)
+                        // Hidden while it streams, not combined: this subtree
+                        // is rebuilt on every token frame, so VoiceOver would
+                        // re-announce the whole reply as it grows and drown out
+                        // everything else. The settled bubble that replaces
+                        // this row announces the finished text instead, and the
+                        // row around it says who is replying.
+                        .accessibilityHidden(true)
                 }
             }
             .padding(.horizontal, 15)
