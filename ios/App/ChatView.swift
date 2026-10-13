@@ -238,10 +238,10 @@ struct ChatView: View {
         let status = headerConnectionStatus
         return HStack(spacing: 4) {
             Image(systemName: status.systemImage)
-                .font(.system(size: 10, weight: .bold))
+                .font(.scaled(10, weight: .bold, relativeTo: .caption2))
                 .symbolEffect(.pulse, options: .repeating, isActive: !status.settled)
             Text(status.text)
-                .font(.caption.weight(.medium))
+                .font(.scaled(12, weight: .medium, relativeTo: .caption))
                 .lineLimit(1)
                 .monospacedDigit()
         }
@@ -269,7 +269,11 @@ struct ChatView: View {
         .overlay(alignment: .bottom) { plusSheet }
         .toolbar(.hidden, for: .navigationBar)
         .navigationBarBackButtonHidden(true)
-        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+        // A transcript that stops growing at AX3 is unreadable for the
+        // readers who turned Dynamic Type up in the first place, and bot
+        // text used to be pinned outright.  AX5 is the last step; the
+        // bubbles reflow rather than truncate.
+        .dynamicTypeSize(...DynamicTypeSize.accessibility5)
         .photosPicker(isPresented: $pickingPhoto, selection: $photoItem, matching: .images)
         .onChange(of: photoItem) { _, item in
             guard let item else { return }
@@ -848,13 +852,13 @@ struct ChatView: View {
             ZStack(alignment: .bottom) {
                 Color.black.opacity(0.35)
                     .ignoresSafeArea()
-                    .onTapGesture { withAnimation(.snappy(duration: 0.28)) { showingPlus = false } }
+                    .onTapGesture { withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus = false } }
 
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 0) {
                         ForEach(plusActions) { action in
                             Button {
-                                withAnimation(.snappy(duration: 0.28)) { showingPlus = false }
+                                withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus = false }
                                 action.run()
                             } label: {
                                 HStack(spacing: 16) {
@@ -929,7 +933,7 @@ struct ChatView: View {
             id: "commands", systemImage: "command", title: "Slash commands",
             subtitle: "Computer, tasks, and more"
         ) {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+            withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.75)) {
                 showCommandHUD = true
             }
             draft = ComposerSendRecovery.slashCommandDraft(from: draft)
@@ -1286,7 +1290,7 @@ struct ChatView: View {
                                 steerNow()
                             } label: {
                                 Image(systemName: "arrow.up")
-                                    .font(.system(size: 13, weight: .bold))
+                                    .font(.scaled(13, weight: .bold, relativeTo: .caption))
                                     .foregroundStyle(BubbleColor.mine)
                                     .frame(width: 28, height: 28)
                                     .contentShape(Rectangle())
@@ -1357,7 +1361,7 @@ struct ChatView: View {
                     Button {
                         dictation.stop()
                         composerFocused = false
-                        withAnimation(.snappy(duration: 0.28)) { showingPlus.toggle() }
+                        withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus.toggle() }
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: 20, weight: .medium))
@@ -1387,7 +1391,7 @@ struct ChatView: View {
                         // prevent competing edits without dimming the text.
                         .allowsHitTesting(!dictation.isListening && !dictation.isStarting)
                         .onChange(of: draft) { _, value in
-                            withAnimation(.easeInOut(duration: 0.15)) {
+                            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
                                 showCommandHUD = value.hasPrefix("/")
                             }
                         }
@@ -1430,7 +1434,7 @@ struct ChatView: View {
             Haptics.selection()
         } label: {
             Image(systemName: dictation.isListening ? "mic.fill" : "mic")
-                .font(.system(size: 16, weight: .semibold))
+                .font(.scaled(16, weight: .semibold, relativeTo: .footnote))
                 .foregroundStyle(dictation.isListening ? Color.red : Color.secondary)
                 .frame(width: 34, height: 34)
                 .background(
@@ -1462,7 +1466,7 @@ struct ChatView: View {
             Haptics.impact(.medium)
         } label: {
             Image(systemName: "stop.fill")
-                .font(.system(size: 13, weight: .bold))
+                .font(.scaled(13, weight: .bold, relativeTo: .caption))
                 .foregroundStyle(Color(uiColor: .systemBackground))
                 .frame(width: 34, height: 34)
                 .background(Circle().fill(Color(uiColor: .label)))
@@ -1479,7 +1483,7 @@ struct ChatView: View {
     private var composerSendButton: some View {
         Button { submit() } label: {
             Image(systemName: "arrow.up")
-                .font(.system(size: 15, weight: .bold))
+                .font(.scaled(15, weight: .bold, relativeTo: .footnote))
                 .foregroundStyle(canSend ? Color.white : Color.secondary)
                 .frame(width: 34, height: 34)
                 .background(
@@ -1779,6 +1783,43 @@ struct MessageRow: View {
         return session.instanceDriverKinds[selection.instanceId]
     }
 
+    /// Who this message reads as coming from, in the reader's own words.  The
+    /// avatar says it on screen, but an avatar is a picture, so VoiceOver said
+    /// nothing at all about who had spoken.
+    private var accessibilitySender: String {
+        if message.role == .user { return "You" }
+        if message.role == .system {
+            let body = message.text ?? ""
+            if WebhookMessageView.parse(message.text) != nil { return "Webhook" }
+            if ImessageMessageView.parse(message.text) != nil { return "iMessage" }
+            if let delegation = DelegationMessageView.parse(
+                message.text,
+                role: message.role,
+                fromName: message.from?.name,
+                automationSource: message.automationSource
+            ) {
+                return delegation.headline
+            }
+            return Self.automationSourceLabel(message.automationSource, body: body)
+        }
+        if let from = message.from?.name, !from.isEmpty { return from }
+        if let name = senderBot?.name { return name }
+        if case let .room(room) = chat { return room.name }
+        return "Bot"
+    }
+
+    /// "3 minutes ago", from the same formatter the push diagnostics use, so
+    /// the row says when it arrived without the reader leaving the transcript
+    /// to find out.
+    private var accessibilityTime: String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(
+            for: Date(timeIntervalSince1970: message.at / 1_000),
+            relativeTo: Date()
+        )
+    }
+
     @ViewBuilder
     private var avatarBadge: some View {
         // A `.system` row is an auto-delivered routine/webhook/resource
@@ -1925,6 +1966,12 @@ struct MessageRow: View {
             avatarBadge
             messageContent
         }
+        // `.contain`, not `.combine`: the row names itself, then its buttons
+        // stay reachable.  Combining would fold the approval card, the
+        // reaction chips and the version switcher into one blob of prose and
+        // take every one of them out of the reach of VoiceOver.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(accessibilitySender), \(accessibilityTime)")
         .contextMenu {
             // `at` is epoch milliseconds on the wire, like every other timestamp
             // the harness sends; SwiftUI's time style wants a Date.
@@ -2248,6 +2295,9 @@ struct TextBubble: View {
                             .foregroundStyle(Color.primary)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
+                            // Keep Markdown links independently reachable by
+                            // VoiceOver.  MessageRow already supplies the
+                            // speaker/time summary for this container.
                             // While this reply is read aloud, its words
                             // follow the voice (Karaoke.swift).  Only this
                             // bubble's blocks observe the per-word paint.
@@ -2322,6 +2372,7 @@ struct ChannelEventCard: View {
     let systemImage: String
     let accessibilityName: String
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
 
     var body: some View {
@@ -2331,7 +2382,7 @@ struct ChannelEventCard: View {
             Group {
                 if expandable {
                     Button {
-                        withAnimation(.spring(response: 0.32, dampingFraction: 0.76)) {
+                        withAnimation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.76)) {
                             isExpanded.toggle()
                         }
                         Haptics.selection()
@@ -2448,6 +2499,9 @@ struct ActivityChip: View {
 struct ActivityRunView: View {
     let chat: Chat
     let messages: [Message]
+    // No colorScheme environment here: this body uses semantic colors
+    // throughout, so every appearance is correct without branching on the
+    // scheme.  An unused environment property would warn.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded: Bool = false
 
@@ -2492,7 +2546,7 @@ struct ActivityRunView: View {
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.76)) {
                     isExpanded.toggle()
                 }
                 Haptics.selection()
@@ -2509,11 +2563,11 @@ struct ActivityRunView: View {
                                 .tint(badgeTint)
                         } else if hasFailure {
                             Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.system(size: 12, weight: .bold))
+                                .font(.scaled(12, weight: .bold, relativeTo: .footnote))
                                 .foregroundStyle(Color.red)
                         } else {
                             Image(systemName: "wrench.and.screwdriver.fill")
-                                .font(.system(size: 12, weight: .semibold))
+                                .font(.scaled(12, weight: .semibold, relativeTo: .footnote))
                                 .foregroundStyle(badgeTint)
                         }
                     }
@@ -2522,25 +2576,25 @@ struct ActivityRunView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 5) {
                             Text(desc.headline)
-                                .font(.subheadline.weight(.semibold))
+                                .font(.scaled(15, weight: .semibold, relativeTo: .subheadline))
                                 .foregroundStyle(Color.primary)
                                 .lineLimit(1)
 
                             if hasFailure {
                                 Text("• \(desc.failedCount) failed")
-                                    .font(.caption.weight(.medium))
+                                    .font(.scaled(12, weight: .medium, relativeTo: .caption))
                                     .foregroundStyle(Color.red)
                                     .lineLimit(1)
                             } else if !isRunning {
                                 Text("• Complete")
-                                    .font(.caption.weight(.medium))
+                                    .font(.scaled(12, weight: .medium, relativeTo: .caption))
                                     .foregroundStyle(Color.green)
                                     .lineLimit(1)
                             }
                         }
 
                         Text(desc.summary)
-                            .font(.footnote)
+                            .font(.scaled(13, relativeTo: .footnote))
                             .foregroundStyle(Color.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -2554,11 +2608,11 @@ struct ActivityRunView: View {
                     // hidden from VoiceOver, which gets the whole row instead.
                     HStack(spacing: 4) {
                         Text(isExpanded ? "Collapse" : "Details")
-                            .font(.footnote.weight(.medium))
+                            .font(.scaled(13, weight: .medium, relativeTo: .footnote))
                             .foregroundStyle(tint)
 
                         Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 10, weight: .bold))
+                            .font(.scaled(10, weight: .bold, relativeTo: .caption2))
                             .foregroundStyle(tint)
                     }
                     .padding(.horizontal, 8)
@@ -2838,6 +2892,14 @@ struct LiveReplyRow: View {
         return (sender.name, sender.color)
     }
 
+    /// Who is typing, for the row's single announcement.  There is no
+    /// timestamp to give: the message has not landed yet.
+    private var accessibilitySender: String {
+        if let name = sender?.name { return name }
+        if case let .room(room) = chat { return room.name }
+        return "Bot"
+    }
+
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
             avatar
@@ -2864,6 +2926,11 @@ struct LiveReplyRow: View {
                 }
             }
         }
+        // One label, and one that does not change. The streaming subtree is
+        // hidden, so nothing here is re-announced as tokens land; the settled
+        // reply replaces this row and carries its own label.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(accessibilitySender) is replying")
     }
 }
 
@@ -2918,6 +2985,13 @@ struct StreamingBubble: View {
                     MarkdownText(source: text, caret: true)
                         .foregroundStyle(Color.primary)
                         .fixedSize(horizontal: false, vertical: true)
+                        // Hidden while it streams, not combined: this subtree
+                        // is rebuilt on every token frame, so VoiceOver would
+                        // re-announce the whole reply as it grows and drown out
+                        // everything else. The settled bubble that replaces
+                        // this row announces the finished text instead, and the
+                        // row around it says who is replying.
+                        .accessibilityHidden(true)
                 }
             }
             .padding(.horizontal, 15)

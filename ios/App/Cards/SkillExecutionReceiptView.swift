@@ -21,7 +21,6 @@ public struct SkillExecutionReceiptView: View {
     public let parameters: String
     public let output: String
 
-    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded: Bool = false
 
@@ -95,7 +94,7 @@ public struct SkillExecutionReceiptView: View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
                 guard hasDetails else { return }
-                withAnimation(reduceMotion ? nil : .snappy(duration: 0.25)) {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.75)) {
                     isExpanded.toggle()
                 }
                 Haptics.selection()
@@ -130,7 +129,7 @@ public struct SkillExecutionReceiptView: View {
                 // shows without one — a card you have to expand to learn
                 // what ran is a card most people never expand.
                 Text(parameters)
-                    .font(.system(.caption, design: .monospaced))
+                    .font(.scaled(12, design: .monospaced, relativeTo: .caption))
                     .foregroundStyle(Color.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -184,11 +183,11 @@ public struct SkillExecutionReceiptView: View {
     private func detailSection(title: String, value: String, tint: Color) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title.uppercased())
-                .font(.caption2.weight(.bold))
+                .font(.scaled(11, weight: .bold, relativeTo: .caption2))
                 .tracking(0.5)
                 .foregroundStyle(Color.secondary)
             Text(value)
-                .font(.system(.footnote, design: .monospaced))
+                .font(.scaled(13, design: .monospaced, relativeTo: .footnote))
                 .foregroundStyle(tint)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
@@ -200,18 +199,18 @@ public struct SkillExecutionReceiptView: View {
 /// name its own line and drops the state under it.
 private func receiptRow(compact: Bool) -> some View {
     let name = Text(skillName)
-        .font(.subheadline.weight(.semibold))
+        .font(.scaled(15, weight: .semibold, relativeTo: .subheadline))
         .foregroundStyle(Color.primary)
         .lineLimit(1)
 
     let duration = Text("\(durationMs)ms")
-        .font(.system(.caption, design: .monospaced))
+        .font(.scaled(12, design: .monospaced, relativeTo: .caption))
         .foregroundStyle(Color.secondary)
         .monospacedDigit()
         .fixedSize()
 
     let disclosure = Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-        .font(.system(size: 10, weight: .bold))
+        .font(.scaled(10, weight: .bold, relativeTo: .caption2))
         .foregroundStyle(Color.secondary)
 
     return Group {
@@ -244,7 +243,7 @@ private func receiptRow(compact: Bool) -> some View {
 
 private var wrench: some View {
     Image(systemName: "wrench.and.screwdriver.fill")
-        .font(.caption.weight(.semibold))
+        .font(.scaled(12, weight: .semibold, relativeTo: .caption))
         .foregroundStyle(Color.secondary)
 }
 
@@ -256,11 +255,11 @@ private var statusBadge: some View {
                     .tint(state.tint)
             } else {
                 Image(systemName: state.systemImage)
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.scaled(11, weight: .bold, relativeTo: .caption))
                     .foregroundStyle(state.tint)
             }
             Text(state.label)
-                .font(.caption.weight(.semibold))
+                .font(.scaled(12, weight: .semibold, relativeTo: .caption))
                 .foregroundStyle(state.tint)
         }
         .padding(.horizontal, 8)

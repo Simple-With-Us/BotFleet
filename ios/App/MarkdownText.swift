@@ -10,17 +10,14 @@
 // typed is shown as you typed it, because markdown you did not intend is
 // worse than markdown you did.
 //
-// Every text size here is a semantic style (`.body`, `.footnote`,
-// `.system(.caption2, design: .monospaced)`, ...), never a bare
+// Every text size here is `.scaled()` (ScaledFont.swift), never a bare
 // `.system(size:)`.  A fixed point size does not move when the reader changes
 // their text size, so the transcript stayed 17pt at every accessibility
 // setting -- the reply was the one thing on screen that could not be made
-// larger.  Semantic styles are the same size at the default setting and scale
-// from there, so nothing moves for a reader who never changes it.
-// (`Font.custom(_:size:relativeTo:)` is the one API that scales from a fixed
-// point size, but it names a font file; the system font has no such entry
-// point.)  SF Symbol glyphs keep fixed sizes -- they sit inside fixed frames,
-// and a symbol that grows past its frame is a clipped symbol.
+// larger.  `.scaled()` returns exactly `size` at the default setting and
+// grows from there, so nothing moves for a reader who never changes it.
+// SF Symbol glyphs keep fixed sizes -- they sit inside fixed frames, and a
+// symbol that grows past its frame is a clipped symbol.
 import SwiftUI
 import CompanionCore
 
@@ -64,14 +61,18 @@ struct MarkdownText: View {
         switch block {
         case let .paragraph(text):
             inline(text, tail: tail)
-                .font(.body)
+                .font(.scaled(17, relativeTo: .body))
                 .fixedSize(horizontal: false, vertical: true)
 
         case let .heading(level, text):
             // Three sizes, not six. A chat bubble is not a document, and an
             // h4 that looks exactly like body text is a heading that failed.
             inline(text, tail: tail)
-                .font(headingFont(level))
+                .font(.scaled(
+                    level <= 1 ? 21 : level == 2 ? 19 : 17,
+                    weight: .semibold,
+                    relativeTo: level <= 1 ? .title2 : level == 2 ? .title3 : .headline
+                ))
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 2)
 
@@ -87,7 +88,7 @@ struct MarkdownText: View {
                     .fill(Color.secondary.opacity(0.4))
                     .frame(width: 3)
                 inline(text, tail: tail)
-                    .font(.body)
+                    .font(.scaled(17, relativeTo: .body))
                     .foregroundStyle(Color.secondary)
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -100,24 +101,13 @@ struct MarkdownText: View {
         }
     }
 
-    /// Three heading sizes, as semantic styles so they scale with the
-    /// reader's text size.  A fixed 21pt heading would stay 21pt at every
-    /// accessibility setting, which is the same defect as a fixed body size.
-    private func headingFont(_ level: Int) -> Font {
-        switch level {
-        case ...1: return .title2.weight(.semibold)
-        case 2: return .title3.weight(.semibold)
-        default: return .body.weight(.semibold)
-        }
-    }
-
     private func marker(_ symbol: String, indent: Int, text: String, tail: Bool) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(symbol)
-                .font(.body)
+                .font(.scaled(17, relativeTo: .body))
                 .foregroundStyle(Color.secondary)
                 .frame(minWidth: 16, alignment: .trailing)
-            inline(text, tail: tail).font(.body)
+            inline(text, tail: tail).font(.scaled(17, relativeTo: .body))
         }
         .padding(.leading, CGFloat(indent) * 14)
         .fixedSize(horizontal: false, vertical: true)
@@ -167,7 +157,7 @@ private struct CodeBlockView: View {
             HStack(spacing: 8) {
                 if let language, !language.isEmpty {
                     Text(language)
-                        .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                        .font(.scaled(11, weight: .semibold, design: .monospaced, relativeTo: .caption2))
                         .textCase(.uppercase)
                         .tracking(0.5)
                         .foregroundStyle(Color.secondary)
@@ -183,10 +173,10 @@ private struct CodeBlockView: View {
             codeScroll(preview.text, showCaret: tail && !preview.hasLater)
             if preview.needsPaging {
                 Text(preview.caption)
-                    .font(.caption)
+                    .font(.scaled(12, relativeTo: .caption))
                     .foregroundStyle(Color.secondary)
                 Button("Show Full Code") { showingFullCode = true }
-                    .font(.caption.weight(.semibold))
+                    .font(.scaled(12, weight: .semibold, relativeTo: .caption))
             }
         }
         .padding(10)
