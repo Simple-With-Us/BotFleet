@@ -11,7 +11,9 @@ import { join } from "node:path";
  * the desktop-capabilities and speech stacks; the guard itself is a single unconditional branch,
  * so pinning its shape and its position relative to the hooks is what actually protects it.
  */
-const SRC = readFileSync(join(__dirname, "CallView.tsx"), "utf8");
+// Normalised to LF: a Windows checkout has CRLF, and these source-shape
+// assertions embed `\n`, which would never match `,\r\n` in the raw file.
+const SRC = readFileSync(join(__dirname, "CallView.tsx"), "utf8").replace(/\r\n/g, "\n");
 
 describe("CallTargetButton visibility", () => {
   it("returns null when no voice provider is configured", () => {
@@ -25,7 +27,19 @@ describe("CallTargetButton visibility", () => {
     // src/lib/tts/readiness.test.ts) folds both into engineAvailable.
     expect(SRC).toMatch(/const configured = Boolean\(state\.config\?\.tts\?\.configured\);/);
     expect(SRC).toMatch(/const readiness = callVoiceReadiness\(\{/);
-    expect(SRC).toMatch(/const voiceProviderConfigured = readiness\.engineAvailable;/);
+    // A speech-to-speech provider is a provider too: it speaks on the call itself, so a
+    // workspace with an STS key and no chained TTS setup must still get the button.  The
+    // chained readiness rule is still what decides the chained half.
+    expect(SRC).toMatch(/const voiceProviderConfigured = stsCall \|\| readiness\.engineAvailable;/);
+  });
+
+  it("leaves the chained gates off the speech-to-speech path", () => {
+    // An STS call brings its own dictation and its own voice, so the dictation and
+    // voice gates describe a path it is not taking.  Pinning the shape keeps a
+    // later edit from re-gating the button behind a chained requirement.
+    expect(SRC).toMatch(/const unavailable = !active && \(!capabilitiesReady \|\| \(!stsCall && \(!supported \|\| !voiceReady\)\)\);/);
+    expect(SRC).toMatch(/const voiceSetupRequired = capabilitiesReady && !stsCall && supported && !voiceReady;/);
+    expect(SRC).toMatch(/const stsCall = stsDecision\?\.mode === "sts";/);
   });
 
   it("places the guard after every hook so hook order stays stable", () => {
@@ -79,5 +93,82 @@ describe("Personal Voice desktop call support", () => {
     // A non-Apple computer may still be told the feature is Mac or iPhone.
     expect(SRC).toMatch(/Personal Voice needs a Mac or iPhone/);
     expect(SRC).toMatch(/Apple Personal Voice speaks on Apple devices \(Mac and iPhone\)/);
+  });
+});
+
+/**
+ * Approvals by voice, on a speech-to-speech call.
+ *
+ * Source-level for the same reason as the rest of this file: the decision logic
+ * is a pure function and is unit-tested in `call-session.test.ts`, while what is
+ * worth protecting here is the wiring — that a spoken answer reaches the same
+ * action the card's own buttons dispatch, and that the call view never settles
+ * a card itself.
+ */
+describe("approvals by voice", () => {
+  it("reads a spoken answer with the shared anchored rules", () => {
+    // The chained path and the speech-to-speech path must judge an answer by
+    // the same standard, so the rules live with the policy rather than here.
+    expect(SRC).not.toMatch(/\bYES\s*=\s*\/\^/);
+    expect(SRC).not.toMatch(/\bNO\s*=\s*\/\^/);
+    expect(SRC).toMatch(/const spoken = spokenApprovalDecision\(said\);/);
+    expect(SRC).toMatch(/if \(spoken !== "unclear"\)/);
+  });
+
+  it("records the same denial note whichever path heard it", () => {
+    expect(SRC).toMatch(/message: allow \? undefined : VOICE_DENIAL_MESSAGE/);
+  });
+
+  it("submits a voice decision through the card's own action", () => {
+    // `decideRequest` is what PendingApprovalActions dispatches, so a spoken
+    // "yes" and a clicked "Allow Once" are one decision with one record.
+    const decisions = SRC.match(/type: "decideRequest"/g) ?? [];
+    expect(decisions.length).toBe(2);
+    expect(SRC).toMatch(/type: "decideRequest",\n\s*threadId: bot\.threadId,\n\s*requestId,\n\s*behavior: decision,/);
+  });
+
+  it("never lets the call itself answer or hide a card", () => {
+    // The card stays in the chat whatever the voice decided; the call only
+    // submits, and the server's patch is what settles it.
+    expect(SRC).not.toMatch(/dismissCard/);
+    expect(SRC).not.toMatch(/answered:/);
+    expect(SRC).not.toMatch(/alwaysAllow/);
+  });
+
+  it("answers nothing until the policy has read the user's words", () => {
+    expect(SRC).toMatch(/const outcome = resolveStsApproval\(request, approvalsRef\.current, decidedRef\.current\);/);
+    expect(SRC).toMatch(/if \(outcome\.kind !== "decided"\) return outcome\.text;/);
+  });
+
+  it("claims a request before submitting it, and hands the claim back on failure", () => {
+    expect(SRC).toMatch(/decidedRef\.current\.add\(requestId\);/);
+    expect(SRC).toMatch(/decidedRef\.current\.delete\(requestId\);/);
+    expect(SRC).toMatch(/waiter\?\.note\(/);
+  });
+
+  it("turns a turn blocked on a permission into the question to ask out loud", () => {
+    // The stall this replaces: the engine was waiting on the user and the wait
+    // used to time out into a bypass instead of reaching the model.
+    expect(SRC).toMatch(/if \(result\.kind !== "approval"\) return result\.text;/);
+    expect(SRC).toMatch(/\{ action: "ask", requestId: result\.requestId \}/);
+    expect(SRC).toMatch(/if \(call\.approval\) return runVoiceApproval\(call\.approval, signal\);/);
+  });
+
+  it("reads the prompt the card already renders rather than inventing one", () => {
+    expect(SRC).toMatch(/prompt: spokenApprovalPrompt\(pending, botName\),/);
+    expect(SRC).toMatch(/approvalsRef\.current = pendingApprovals\(messages\)\.map/);
+  });
+
+  it("teaches the model the rule only when the tool is offered", () => {
+    expect(SRC).toMatch(
+      /const instructions = frontEngine\s*\? `\$\{prepared\.instructions\}\\n\\n\$\{stsApprovalInstructions\(\)\}`\s*: prepared\.instructions;/,
+    );
+  });
+
+  it("leaves the chained narration early-return alone", () => {
+    // An STS call still speaks for itself; the chained path still reads
+    // approvals aloud, and neither is changed by this.
+    expect(SRC).toMatch(/if \(stsModeRef\.current\) \{\s*for \(const m of messages\) spokenIds\.current\.add\(m\.id\);\s*return;/);
+    expect(SRC).toMatch(/void sayThenListen\(spokenApprovalPrompt\(approval, bot\.name\)\);/);
   });
 });

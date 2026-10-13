@@ -122,6 +122,14 @@ contextBridge.exposeInMainWorld("ogb", {
     setKey: (value) => ipcRenderer.invoke("assemblyai:set-key", value),
     streamingToken: () => ipcRenderer.invoke("assemblyai:streaming-token"),
   },
+  /** Speech-to-speech call tokens.  The permanent provider keys stay in the
+   *  encrypted store; the renderer only ever receives one short-lived,
+   *  single-session token, same rule as transcription.streamingToken. */
+  sts: {
+    status: () => ipcRenderer.invoke("sts:status"),
+    xaiToken: () => ipcRenderer.invoke("sts:xai-token"),
+    geminiToken: () => ipcRenderer.invoke("sts:gemini-token"),
+  },
   /** Absolute path of a dropped File — Electron 32 removed File.path, and
    * only the preload can ask. "" when the drag carried no file on disk. */
   getPathForFile: (file) => {

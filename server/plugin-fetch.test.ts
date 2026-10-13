@@ -41,6 +41,11 @@ describe("parseGitPluginSource", () => {
     expect(result.ok).toBe(false);
   });
 
+  it("rejects input longer than the install source cap", () => {
+    const result = parseGitPluginSource("a".repeat(4097));
+    expect(result.ok).toBe(false);
+  });
+
   it("rejects garbage", () => {
     const result = parseGitPluginSource("hello there");
     expect(result.ok).toBe(false);

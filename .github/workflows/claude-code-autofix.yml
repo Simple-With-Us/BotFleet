@@ -27,6 +27,13 @@ jobs:
     uses: Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@825f8ee008d6ce104107f2a7267c14d370e6013e
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+      # A push made with the default GITHUB_TOKEN does not trigger workflows:
+      # GitHub suppresses runs from GITHUB_TOKEN pushes to stop CI recursing.
+      # The autofix push therefore lands with no check-runs at all and the PR
+      # sits BLOCKED until a human approves the workflows by hand.  The
+      # reusable workflow uses this PAT for its push instead; until it is
+      # wired up there, approving the run is the only way past it.
+      GH_ADMIN_PAT: ${{ secrets.GH_ADMIN_PAT }}
     with:
       prompt: |
         You are the fleet's autofix bot.  A review bot (Codex, Kody, or Cursor) just reviewed this pull request.

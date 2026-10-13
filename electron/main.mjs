@@ -9,6 +9,12 @@ import { startCua, stopCua, registerCuaIpc, setCuaStateListener } from "./cua.mj
 import { createAndroidDeviceController } from "./android-device.mjs";
 import { assemblyAICredential, mintAssemblyAIStreamingToken } from "./assemblyai.mjs";
 import {
+  geminiCredential,
+  mintGeminiLiveToken,
+  mintXaiRealtimeToken,
+  xaiCredential,
+} from "./sts-tokens.mjs";
+import {
   finishSpeech,
   listPersonalVoices,
   speakPersonalVoice,
@@ -1999,6 +2005,23 @@ ipcMain.handle("assemblyai:set-key", async (_event, value) => {
 
 ipcMain.handle("assemblyai:streaming-token", () =>
   mintAssemblyAIStreamingToken(assemblyAICredential(secureCredentials)),
+);
+
+// Speech-to-speech call sessions.  Same rule as the transcription token above:
+// the renderer gets a short-lived, single-session token and never a permanent
+// key.  A provider with no key fails here rather than at socket-open time, so
+// the call view can say which key is missing.
+ipcMain.handle("sts:status", () => ({
+  xai: Boolean(xaiCredential(secureCredentials)),
+  gemini: Boolean(geminiCredential(secureCredentials)),
+}));
+
+ipcMain.handle("sts:xai-token", () =>
+  mintXaiRealtimeToken(xaiCredential(secureCredentials)),
+);
+
+ipcMain.handle("sts:gemini-token", () =>
+  mintGeminiLiveToken(geminiCredential(secureCredentials)),
 );
 
 const CREDENTIAL_PATCH = {

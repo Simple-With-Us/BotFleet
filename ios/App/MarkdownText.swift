@@ -52,14 +52,18 @@ struct MarkdownText: View {
         switch block {
         case let .paragraph(text):
             inline(text, tail: tail)
-                .font(.system(size: 17))
+                .font(.scaled(17, relativeTo: .body))
                 .fixedSize(horizontal: false, vertical: true)
 
         case let .heading(level, text):
             // Three sizes, not six. A chat bubble is not a document, and an
             // h4 that looks exactly like body text is a heading that failed.
             inline(text, tail: tail)
-                .font(.system(size: level <= 1 ? 21 : level == 2 ? 19 : 17, weight: .semibold))
+                .font(.scaled(
+                    level <= 1 ? 21 : level == 2 ? 19 : 17,
+                    weight: .semibold,
+                    relativeTo: level <= 1 ? .title2 : level == 2 ? .title3 : .headline
+                ))
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 2)
 
@@ -75,7 +79,7 @@ struct MarkdownText: View {
                     .fill(Color.secondary.opacity(0.4))
                     .frame(width: 3)
                 inline(text, tail: tail)
-                    .font(.system(size: 17))
+                    .font(.scaled(17, relativeTo: .body))
                     .foregroundStyle(Color.secondary)
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -91,10 +95,10 @@ struct MarkdownText: View {
     private func marker(_ symbol: String, indent: Int, text: String, tail: Bool) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(symbol)
-                .font(.system(size: 17))
+                .font(.scaled(17, relativeTo: .body))
                 .foregroundStyle(Color.secondary)
                 .frame(minWidth: 16, alignment: .trailing)
-            inline(text, tail: tail).font(.system(size: 17))
+            inline(text, tail: tail).font(.scaled(17, relativeTo: .body))
         }
         .padding(.leading, CGFloat(indent) * 14)
         .fixedSize(horizontal: false, vertical: true)
@@ -136,7 +140,7 @@ private struct CodeBlockView: View {
         VStack(alignment: .leading, spacing: 4) {
             if let language, !language.isEmpty {
                 Text(language)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .font(.scaled(11, weight: .medium, design: .monospaced, relativeTo: .caption2))
                     .foregroundStyle(Color.secondary)
             }
             // Horizontal scroll rather than wrapping: wrapped code is
@@ -145,10 +149,10 @@ private struct CodeBlockView: View {
             codeScroll(preview.text, showCaret: tail && !preview.hasLater)
             if preview.needsPaging {
                 Text(preview.caption)
-                    .font(.system(size: 11))
+                    .font(.scaled(11, relativeTo: .caption2))
                     .foregroundStyle(Color.secondary)
                 Button("Show Full Code") { showingFullCode = true }
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.scaled(12, weight: .semibold, relativeTo: .caption))
             }
         }
         .padding(10)
@@ -165,7 +169,7 @@ private struct CodeBlockView: View {
     private func codeScroll(_ source: String, showCaret: Bool) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             (Text(source) + streamingCaret(showCaret))
-                .font(.system(size: 14, design: .monospaced))
+                .font(.scaled(14, design: .monospaced, relativeTo: .footnote))
                 .textSelection(.enabled)
         }
     }
@@ -195,12 +199,12 @@ private struct CodeBlockReader: View {
                 ScrollView {
                     ScrollView(.horizontal, showsIndicators: false) {
                         Text(page.text)
-                            .font(.system(size: 14, design: .monospaced))
+                            .font(.scaled(14, design: .monospaced, relativeTo: .footnote))
                             .textSelection(.enabled)
                     }
                 }
                 Text(page.caption)
-                    .font(.system(size: 12))
+                    .font(.scaled(12, relativeTo: .caption))
                     .foregroundStyle(Color.secondary)
                 HStack {
                     Button("Earlier Lines") {
@@ -215,7 +219,7 @@ private struct CodeBlockReader: View {
                     }
                     .disabled(!page.hasLater)
                 }
-                .font(.system(size: 15, weight: .semibold))
+                .font(.scaled(15, weight: .semibold, relativeTo: .body))
             }
             .padding(16)
             .navigationTitle("Full Code")
