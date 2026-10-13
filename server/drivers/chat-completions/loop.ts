@@ -317,10 +317,8 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
 /** Push a pending timer's deadline out by its full delay, in place.  Node's
  *  `Timeout.refresh()` does that without allocating, which matters on a path
  *  that runs once per streamed chunk; where it is missing the caller re-arms
- *  instead.  Skipped under `VITEST=1` because Vitest 5 fake timers expose
- *  `refresh()` without moving the deadline. */
+ *  instead. */
 function refreshTimer(timer: ReturnType<typeof setTimeout>): boolean {
-  if (process.env.VITEST === "1") return false;
   const handle: { refresh?: () => unknown } = timer;
   if (typeof handle.refresh !== "function") return false;
   handle.refresh();
@@ -688,8 +686,6 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
       // a request that already ended.
       // Refresh the deadline in place when `Timeout.refresh()` is honest
       // (production Node): zero allocations on the per-chunk hot path.
-      // Vitest 5 fake timers expose `refresh()` without moving the deadline,
-      // so the helper short-circuits under `VITEST=1` and we re-arm instead.
       const noteProgress = () => {
         if (idleTimer === null || request.signal.aborted) return;
         if (!refreshTimer(idleTimer)) armIdle();
