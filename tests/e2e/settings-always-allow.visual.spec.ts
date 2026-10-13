@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 
 // Agent settings → Always allowed revoke list.  Fixture:
 // /?fixture=settings-always-allow&state=empty|populated
@@ -27,6 +27,11 @@ test.use({
   userAgent: LINUX_CHROME_UA,
 });
 
+/** Stored grant keys include config fingerprints; mask them, assert via getByRole labels. */
+function alwaysAllowKeyMask(fixture: Locator): Locator[] {
+  return [fixture.locator('.font-mono')];
+}
+
 test('visual: always allowed empty state', async ({ page }) => {
   await page.goto('/?fixture=settings-always-allow&state=empty');
   await pinFonts(page);
@@ -54,5 +59,6 @@ test('visual: always allowed populated revoke list', async ({ page }) => {
     ...stableShot,
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
+    mask: alwaysAllowKeyMask(fixture),
   });
 });

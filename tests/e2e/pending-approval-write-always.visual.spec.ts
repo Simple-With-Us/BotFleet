@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 
 // Write-shaped MCP always-allow: confirmation dialog and composer action strip.
 // Fixture: /?fixture=pending-approval-write-always&variant=dialog|strip
@@ -34,20 +34,37 @@ async function blurFocus(page: Page) {
   });
 }
 
+/** Grant keys and approval detail copy vary per tool/config; mask them, assert separately. */
+function pendingApprovalDynamicMask(fixture: Locator, dialog?: Locator): Locator[] {
+  const panel = fixture.getByRole('region', { name: 'Pending approval' });
+  const mask: Locator[] = [
+    panel.locator('pre'),
+    panel.locator('.font-mono'),
+  ];
+  if (dialog) {
+    mask.push(dialog.locator('#confirm-dialog-body .font-mono'));
+  }
+  return mask;
+}
+
 test('visual: write-tool always-allow confirmation dialog', async ({ page }) => {
   await page.goto('/?fixture=pending-approval-write-always&variant=dialog');
   await pinFonts(page);
 
+  const fixture = page.getByTestId('pending-approval-write-fixture');
   const dialog = page.getByRole('dialog');
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole('heading', { name: 'Always allow this write tool?' })).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'Always allow' })).toBeVisible();
   await blurFocus(page);
 
+  await expect(dialog.getByText(/provider-tool:claude:linear:create_issue:/)).toBeVisible();
+
   await expect(dialog).toHaveScreenshot('pending-approval-write-confirm-dialog.png', {
     ...stableShot,
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
+    mask: pendingApprovalDynamicMask(fixture, dialog),
   });
 });
 
@@ -61,9 +78,12 @@ test('visual: pending approval strip with Always allow for write MCP tool', asyn
   await expect(fixture.getByRole('button', { name: 'Allow Once' })).toBeVisible();
   await blurFocus(page);
 
+  await expect(fixture.getByText('mcp__linear__create_issue')).toBeVisible();
+
   await expect(fixture).toHaveScreenshot('pending-approval-write-actions.png', {
     ...stableShot,
     maxDiffPixelRatio: 0.02,
     threshold: 0.2,
+    mask: pendingApprovalDynamicMask(fixture),
   });
 });
