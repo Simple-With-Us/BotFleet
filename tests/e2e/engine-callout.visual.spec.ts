@@ -30,7 +30,7 @@ test('visual: OpenAI-compatible stays hidden until configured', async ({ page })
   const hidden = page.getByTestId('openai-hidden-state');
   await expect(hidden).toBeVisible();
   await expect(hidden.getByText('OpenAI-Compatible', { exact: true })).toHaveCount(0);
-  await expect(hidden.getByText('Codex')).toBeVisible();
+  await expect(hidden.getByText('Codex', { exact: true })).toBeVisible();
   await expect(hidden).toHaveScreenshot('engine-settings-openai-hidden.png', stableShot);
 });
 
