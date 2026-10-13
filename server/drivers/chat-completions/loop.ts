@@ -315,9 +315,9 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
 }
 
 /** Push a pending timer's deadline out by its full delay, in place.  Node's
- *  `Timeout.refresh()` does that without allocating, which matters on a
- *  path that runs once per streamed chunk; where it is missing the caller
- *  re-arms instead. */
+ *  `Timeout.refresh()` does that without allocating, which matters on a path
+ *  that runs once per streamed chunk; where it is missing the caller re-arms
+ *  instead. */
 function refreshTimer(timer: ReturnType<typeof setTimeout>): boolean {
   const handle: { refresh?: () => unknown } = timer;
   if (typeof handle.refresh !== "function") return false;
@@ -684,6 +684,8 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
       // Progress from the driver.  A no-op once the attempt is over or the
       // clock has fired, so a straggling chunk can never re-arm a timer for
       // a request that already ended.
+      // Refresh the deadline in place when `Timeout.refresh()` is honest
+      // (production Node): zero allocations on the per-chunk hot path.
       const noteProgress = () => {
         if (idleTimer === null || request.signal.aborted) return;
         if (!refreshTimer(idleTimer)) armIdle();
