@@ -15598,12 +15598,34 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
-      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean } = {};
+      const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean; models?: Array<{ id: string; label: string }> } = {};
 
       if (body?.cli !== undefined) {
         if (typeof body.cli !== "string") return json(res, 400, { error: "cli must be a string" });
         if (/[\n\r]/.test(body.cli)) return json(res, 400, { error: "cli must not contain newlines" });
         patchOptions.cli = body.cli;
+      }
+
+      if (body?.models !== undefined) {
+        if (!Array.isArray(body.models) || body.models.length > 100) {
+          return json(res, 400, { error: "models must be an array with at most 100 entries" });
+        }
+        const models: Array<{ id: string; label: string }> = [];
+        const seen = new Set<string>();
+        for (const candidate of body.models) {
+          if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+            return json(res, 400, { error: "each model must have an id and label" });
+          }
+          const id = typeof candidate.id === "string" ? candidate.id.trim() : "";
+          const label = typeof candidate.label === "string" ? candidate.label.trim() : "";
+          if (!id || !label || id.length > 200 || label.length > 200 || /[\n\r]/.test(id) || /[\n\r]/.test(label)) {
+            return json(res, 400, { error: "each model must have a valid id and label" });
+          }
+          if (seen.has(id)) return json(res, 400, { error: `duplicate model id "${id}"` });
+          seen.add(id);
+          models.push({ id, label });
+        }
+        patchOptions.models = models;
       }
 
       if (body?.fullAuto !== undefined) {
