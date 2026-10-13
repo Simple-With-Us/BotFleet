@@ -1683,7 +1683,7 @@ struct MessageRow: View {
             ) {
                 return delegation.headline
             }
-            return ChatView.automationSourceLabel(message.automationSource, body: body)
+            return Self.automationSourceLabel(message.automationSource, body: body)
         }
         if let from = message.from?.name, !from.isEmpty { return from }
         if let name = senderBot?.name { return name }
