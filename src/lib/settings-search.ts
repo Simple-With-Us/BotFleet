@@ -146,6 +146,16 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
     badge: "Voice",
   },
   {
+    id: "connections:sts",
+    sectionId: "connections",
+    sectionLabel: "Connections",
+    title: "Speech-to-Speech Calls",
+    subtitle: "The model hears the caller and speaks back on one connection, instead of transcribing each turn.",
+    keywords: ["speech-to-speech", "speech to speech", "sts", "realtime", "voice call", "xai realtime", "gemini live", "call", "calls", "voice", "audio"],
+    domId: "setting-connections-sts",
+    badge: "Voice",
+  },
+  {
     id: "connections:apiKeys",
     sectionId: "connections",
     sectionLabel: "Connections",

@@ -338,7 +338,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       if (!alive.current || currentCall() !== group.id) return;
       if (code === 2) {
         setNote(
-          "Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or use BotFleet for macOS.",
+          "Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or install the desktop app for macOS.",
         );
         return;
       }

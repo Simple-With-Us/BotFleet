@@ -9,6 +9,9 @@
 // prefers over the file (server/config.ts loadConfig).
 export const WORKSPACE_CREDENTIALS = [
   { section: "xai", field: "key", name: "xaiApiKey", env: "XAI_API_KEY" },
+  // Google Gemini backs the second speech-to-speech call provider.  Same
+  // treatment as the xAI key: encrypted at rest, env var preferred on spawn.
+  { section: "gemini", field: "key", name: "geminiApiKey", env: "GEMINI_API_KEY" },
   // The two engines configured with an endpoint and a key rather than a CLI
   // login.  Only the key migrates; each one's `url` is configuration and
   // stays readable in config.json.

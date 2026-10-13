@@ -9580,6 +9580,9 @@ function configStatus() {
       keyterms: cfg.callStt?.keyterms ?? [],
       cloud: cloudSttCapabilitiesFromConfig(cfg),
     },
+    // The STS slice must ride this frame or the call view can never see an
+    // explicit provider preference and silently falls back to Auto.
+    sts: { provider: cfg.sts?.provider ?? undefined, frontEngine: cfg.sts?.frontEngine, engineTimeoutMs: cfg.sts?.engineTimeoutMs },
     imageGen: { configured: Boolean(cfg.imageGen?.key) },
     // Linq binding credentials live in env (BOTFLEET_LINQAPP_API_KEY or
     // legacy LINQ_API_TOKEN), so we never carry a token across this frame —
