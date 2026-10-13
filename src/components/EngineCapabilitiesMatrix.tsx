@@ -153,6 +153,12 @@ function engineMarkKind(entry: EngineCapabilityEntry): string {
       return "boxAgent";
     case "cli-wrapper":
       return "cli-wrapper";
+    case "qwen":
+      return "qwenAgent";
+    case "hermes":
+      return "hermesAgent";
+    case "pi":
+      return "piAgent";
     default:
       return entry.id;
   }
@@ -167,14 +173,10 @@ export function EngineCapabilitiesMatrix(props: {
   // Resolve the engine list up front so a future filter (engines the user
   // has not installed, engines hidden by preference) can replace this
   // constant without touching the renderer.
-  const listedIds = props.instances
-    ? new Set(props.instances.map(engineIdFor).filter((id): id is string => Boolean(id)))
-    : null;
   const engines = ENGINE_DISPLAY_ORDER
     .map((id) => ENGINE_CAPABILITIES[id])
     .filter((entry): entry is EngineCapabilityEntry => Boolean(entry))
-    .filter((entry) => entry.id !== "box")
-    .filter((entry) => listedIds === null || listedIds.has(entry.id));
+    .filter((entry) => entry.id !== "box");
 
   // Latched, not hovered.  `setActive` is called on mouse enter and on
   // focus and is *never* cleared by leaving — that is the fix.  A global
