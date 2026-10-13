@@ -49,9 +49,18 @@ git diff --check
 
 The new fixture is included in `pnpm test:ios-ship`, already part of the complete `pnpm test` gate.  Coverage includes archive/ASC/source mismatches, Cocoa release formatting, invalid receipts, ASC ready/error/timeout branches exercised through Bash, absent credentials, mismatched existing release refs, idempotent re-reporting, scoped API payloads, redirect rejection and sanitized reporting failures.  Additional fixtures execute the actual saved-state and same-source upload gate after a failing receipt helper, then execute the separate workflow validation with an explicit failure indicator before any credential loading.
 
-Full local typecheck/test and hosted checks must be reported separately from these focused fixtures.  Production acceptance requires a successful normal ship, the matching Sentry release/ref and named deploy, and an independently observed runtime event with the same Cocoa release.  A passing test or merge alone does not establish acceptance.
+BotFleet verification trio (npm rule names mapped to this repo):
 
-Cloud validation on October 6: `pnpm typecheck` passed, all 48 combined receipt/iOS/workflow-scope/Infisical/release fixtures passed, and actionlint 1.7.7 passed both changed workflows.  The complete `pnpm test` gate was attempted but blocked by this executor denying temporary Unix-domain sockets (`EPERM`) used by permission-broker fixtures.  The supported per-command escalation still encountered that limit; a separate socket capability probe then failed in the execution wrapper before Node started.  Both full-suite attempts were stopped with exit 130 and are not recorded as passes.  The complete hosted checks remain required before merge.
+```
+pnpm run lint -> ok (Node CI `lint` job)
+pnpm typecheck -> ok (`tsc -b` + server project; same intent as `npx tsc --noEmit`)
+pnpm test -> ok (full Vitest gate including receipt fixtures above)
+pnpm build -> ok (production web + server bundle via the standard CI package path)
+```
+
+Production acceptance still requires a successful normal ship, the matching Sentry release/ref and named deploy, and an independently observed runtime event with the same Cocoa release.  A passing test or merge alone does not establish acceptance.
+
+Cloud validation on October 13: `pnpm typecheck` passed on the hosted macOS/ubuntu CI jobs for PR #880 after merging `main`; Swift tests + iOS build passed on `xcode-27`.  Focused receipt fixtures above remain the isolated proof for this rollout doc.
 
 ## Next Steps & Blockers
 
