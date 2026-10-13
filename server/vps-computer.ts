@@ -1591,7 +1591,9 @@ export async function reuseVps(
  * instead of queueing one each behind the lock — on an unreachable VPS,
  * one connect timeout instead of a chain of them.  A start or stop queued
  * behind it is never jumped: an ask after that queues too, and sees what
- * the change left. */
+ * the change left.  The joined promise is only the container status.  Each
+ * bot still opens its own shared-desktop session afterwards, so two bots
+ * on one container do not collapse into one session. */
 const pendingAutoInspections = new Map<
   string,
   { inspection: Promise<VpsComputerStatus>; lock?: Promise<void>; runner: VpsCommandRunner }
@@ -1606,17 +1608,26 @@ export async function inspectVpsForAuto(
   runner: VpsCommandRunner = defaultRunner,
 ): Promise<VpsComputerStatus> {
   const key = vpsLockKey(cfg, botId);
-  if (!key) return inspectVpsStatus(cfg, botId, runner);
+  const status = key
+    ? await joinPendingAutoInspection(key, cfg, botId, runner)
+    : await computeVpsComputerStatus(cfg, botId, runner);
+  if (isSharedVpsMode(cfg) && status.ready && (status.container_id ?? status.container_name)) {
+    await ensureSharedVpsBotSession(cfg, botId, status.container_id ?? status.container_name, runner);
+  }
+  return status;
+}
+
+async function joinPendingAutoInspection(
+  key: string,
+  cfg: AppConfig,
+  botId: string,
+  runner: VpsCommandRunner,
+): Promise<VpsComputerStatus> {
   const pending = pendingAutoInspections.get(key);
   if (pending && pending.runner === runner && lifecycleLocks.get(key) === pending.lock) return pending.inspection;
   // withVpsLifecycleLock takes its place in line synchronously, so the
   // newest lock slot right now is this inspection's own.
-  const inspection = withVpsLifecycleLock(key, () => computeVpsComputerStatus(cfg, botId, runner)).then(async (status) => {
-    if (isSharedVpsMode(cfg) && status.ready && (status.container_id ?? status.container_name)) {
-      await ensureSharedVpsBotSession(cfg, botId, status.container_id ?? status.container_name, runner);
-    }
-    return status;
-  });
+  const inspection = withVpsLifecycleLock(key, () => computeVpsComputerStatus(cfg, botId, runner));
   const entry = { inspection, lock: lifecycleLocks.get(key), runner };
   pendingAutoInspections.set(key, entry);
   try {
@@ -1624,18 +1635,6 @@ export async function inspectVpsForAuto(
   } finally {
     if (pendingAutoInspections.get(key) === entry) pendingAutoInspections.delete(key);
   }
-}
-
-async function inspectVpsStatus(
-  cfg: AppConfig,
-  botId: string,
-  runner: VpsCommandRunner,
-): Promise<VpsComputerStatus> {
-  const status = await computeVpsComputerStatus(cfg, botId, runner);
-  if (isSharedVpsMode(cfg) && status.ready && (status.container_id ?? status.container_name)) {
-    await ensureSharedVpsBotSession(cfg, botId, status.container_id ?? status.container_name, runner);
-  }
-  return status;
 }
 
 /** Open a temporary noVNC connection through the configured SSH alias. The
