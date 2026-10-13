@@ -325,7 +325,7 @@ export function StsSettings() {
 
       <section>
         <div className="mb-1.5 flex items-center gap-2 text-[13px] text-ink-secondary">
-          <span className="text-ink">Hand Real Work To The Bot's Engine</span>
+          <span className="text-ink">Hand Real Work to the Bot's Engine</span>
         </div>
         <p className="mb-2 text-[12px] leading-relaxed text-ink-secondary">
           The model hands real work to the bot's own coding engine.{"\u00A0 "}When that engine is
