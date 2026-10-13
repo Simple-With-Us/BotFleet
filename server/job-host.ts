@@ -230,9 +230,12 @@ export function createJobHost(deps: JobHostDeps): JobHost {
     const freshFrom = requester ? deps.store.bot(requester.id) : undefined;
     if (!fresh || (requester && !freshFrom)) return { kind: "failed", outcome: "refused", text: "no such bot" };
     if (fresh.busy) return { kind: "failed", outcome: "refused", text: `@${fresh.name} is busy` };
-    const channel = freshFrom ? getOrCreateChannel(deps.store, freshFrom, fresh) : undefined;
+    // A resume of the requester is that bot continuing its own conversation.
+    // A channel with itself would match any direct message it already has.
+    const self = freshFrom?.id === fresh.id;
+    const channel = freshFrom && !self ? getOrCreateChannel(deps.store, freshFrom, fresh) : undefined;
     if (channel) channels.set(assignment.id, channel.id);
-    if (freshFrom && input.turn === "first") {
+    if (freshFrom && !self && input.turn === "first") {
       mirrorExchange(deps.commsBus, freshFrom, fresh, assignment.brief, channel, assignment.requester.threadId);
     }
     const settled = input.settled ?? [];
@@ -241,21 +244,26 @@ export function createJobHost(deps: JobHostDeps): JobHost {
     const threadId = assignment.assignee.destination.threadId;
     if (channel) deps.watchDelegation?.(threadId, channel.id, fresh.id);
     let dispatchError: string | undefined;
+    let releaseWait = (_message: string) => {};
+    const settledTurn = waitForTurn(threadId, signal, (release) => {
+      releaseWait = release;
+    });
+    let from: { botId: string; name: string; color: string } | undefined;
+    let comm: { groupId: string; withBotId: string; withName: string; withColor: string } | undefined;
+    if (freshFrom && !self) {
+      from = { botId: freshFrom.id, name: freshFrom.name, color: freshFrom.color };
+      if (channel) comm = { groupId: channel.id, withBotId: freshFrom.id, withName: freshFrom.name, withColor: freshFrom.color };
+    }
     const started = deps.startTurn(fresh.id, text, {
       commsDepth: assignment.depth,
       threadId,
       unattended: deps.unattended(freshFrom?.id),
       automationSource: "delegation",
-      ...(freshFrom
-        ? {
-            from: { botId: freshFrom.id, name: freshFrom.name, color: freshFrom.color },
-            ...(channel
-              ? { comm: { groupId: channel.id, withBotId: freshFrom.id, withName: freshFrom.name, withColor: freshFrom.color } }
-              : {}),
-          }
-        : {}),
+      from,
+      comm,
       onDispatchError: (message) => {
         dispatchError = message;
+        releaseWait(message);
       },
     }).then(
       () => true,
@@ -264,13 +272,17 @@ export function createJobHost(deps: JobHostDeps): JobHost {
         return false;
       },
     );
-    const settledTurn = waitForTurn(threadId, signal);
     const startedOk = await started;
     if (!startedOk || dispatchError) {
+      releaseWait(dispatchError ?? "the turn could not start");
       noteCouldNotStart(assignment, threadId);
       return { kind: "failed", outcome: "provider_error", text: dispatchError ?? "the turn could not start" };
     }
     const result = await settledTurn;
+    if (dispatchError) {
+      noteCouldNotStart(assignment, threadId);
+      return { kind: "failed", outcome: "provider_error", text: dispatchError };
+    }
     // A turn that actually started is mirrored by the harness fold (and by
     // a provider reload) through the watch registered above.  Mirroring
     // here as well would write the same ending twice.
@@ -290,7 +302,11 @@ export function createJobHost(deps: JobHostDeps): JobHost {
     deps.abandonDelegation?.(threadId, "Delegated turn could not start");
   }
 
-  function waitForTurn(threadId: string, signal: AbortSignal): Promise<{ ok: boolean; text: string }> {
+  function waitForTurn(
+    threadId: string,
+    signal: AbortSignal,
+    bindFailure: (release: (message: string) => void) => void,
+  ): Promise<{ ok: boolean; text: string }> {
     return new Promise((resolve) => {
       let text = "";
       let done = false;
@@ -301,6 +317,7 @@ export function createJobHost(deps: JobHostDeps): JobHost {
         unsub();
         resolve({ ok, text: out });
       };
+      bindFailure((message) => finish(false, message));
       const onAbort = () => finish(false, text || "Stopped");
       signal.addEventListener("abort", onAbort, { once: true });
       const unsub = deps.subscribe((event) => {

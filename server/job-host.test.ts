@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
-import { createJobHost, isOutwardActivity, type JobHost } from "./job-host.ts";
+import { createJobHost, isOutwardActivity, type JobHost, type JobHostDeps } from "./job-host.ts";
 import { resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import { Store } from "./store.ts";
 
@@ -40,7 +40,7 @@ describe("job host", () => {
     listener = undefined;
   });
 
-  function setup() {
+  function setup(startTurn?: JobHostDeps["startTurn"]) {
     rmSync(DATA_DIR, { recursive: true, force: true });
     store = new Store(() => selection);
     const from = store.createBot({ name: "Asker" }, { seedMessages: false });
@@ -50,14 +50,14 @@ describe("job host", () => {
       store,
       commsBus: { store, broadcast: () => {} },
       approvalBus: approval,
-      startTurn: async (botId, text, opts) => {
+      startTurn: startTurn ?? (async (botId, text, opts) => {
         starts.push({ botId, text });
         const threadId = opts.threadId ?? botId;
         queueMicrotask(() => {
           listener?.({ type: "item.completed", threadId, itemType: "assistant_text", text: "hello from peer", ok: true });
           listener?.({ type: "turn.completed", threadId, ok: true });
         });
-      },
+      }),
       subscribe: (fn) => {
         listener = fn;
         return () => {
@@ -111,6 +111,39 @@ describe("job host", () => {
     expect(starts[0]?.text).toContain("ping from the test");
     await viWait(() => starts.some((start) => start.botId === from.id && start.text.includes("hello from peer")));
     expect(starts.filter((start) => start.botId === target.id)).toHaveLength(1);
+    expect(store.groups.some((group) => group.dm && group.memberIds.includes(from.id) && group.memberIds.includes(target.id))).toBe(true);
+    expect(store.groups.some((group) => group.dm && group.memberIds.every((id) => id === from.id))).toBe(false);
+  });
+
+  it("fails the handoff when dispatch reports an error after startTurn returns", async () => {
+    let calls = 0;
+    const { from, target } = setup(async (botId, text, opts) => {
+      calls += 1;
+      if (calls === 1) {
+        setTimeout(() => opts?.onDispatchError?.("provider refused"), 30);
+        return;
+      }
+      starts.push({ botId, text });
+      const threadId = opts.threadId ?? botId;
+      queueMicrotask(() => listener?.({ type: "turn.completed", threadId, ok: true }));
+    });
+    const handed = host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: [target.id],
+      message: "this dispatch will fail",
+      depth: 0,
+    });
+    const childId = handed.body.assignments?.[0]?.id;
+    host.onTurnSettled(from.threadId, true, "asking now");
+    await viWait(() => host.status(from.id, from.threadId, childId).body.assignment?.status === "failed");
+    expect(host.status(from.id, from.threadId, childId).body.assignment).toMatchObject({
+      status: "failed",
+      outcome: "provider_error",
+    });
+    expect(store.messagesFor(from.threadId).some((message) => message.tool?.name === "Delegated turn could not start")).toBe(true);
+    await viWait(() => starts.some((start) => start.botId === from.id));
+    expect(starts.find((start) => start.botId === from.id)?.text).toContain("provider refused");
   });
 
   it("refuses a second hop and an Off bot before anything is recorded", () => {
