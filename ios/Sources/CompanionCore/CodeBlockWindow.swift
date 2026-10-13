@@ -117,9 +117,9 @@ public enum CodeBlockWindow {
             }
             let resolved = min(max(0, index), marks.count - 1)
             let resumes = mark.start > source.startIndex
-                && source[source.index(before: mark.start)] != "\n"
+                && !endsLine(in: source, before: mark.start)
             let continues = mark.end < source.endIndex
-                && source[source.index(before: mark.end)] != "\n"
+                && !endsLine(in: source, before: mark.end)
             let text = String(source[mark.start..<mark.end])
             assert(text.count <= maxCharacters)
             assert(renderedLineCount(text) <= maxLines)
@@ -162,18 +162,20 @@ public enum CodeBlockWindow {
         while index < source.endIndex {
             let character = source[index]
             let next = source.index(after: index)
-            if character == "\n" {
+            if isLineBreak(character, in: source, at: index) {
+                let afterBreak = lineBreakEnd(in: source, at: index)
                 // A full page must close before this newline.  `linesInPage > 0`
                 // keeps an empty page from spinning if the budget is ever zero.
                 if linesInPage >= maxLines, linesInPage > 0 {
-                    close(at: index, endLine: line, nextStartLine: line)
+                    close(at: afterBreak, endLine: line, nextStartLine: line)
+                    index = afterBreak
                     continue
                 }
                 charsInPage += 1
                 linesInPage += 1
                 let finished = line
                 line += 1
-                index = next
+                index = afterBreak
                 if linesInPage >= maxLines || charsInPage >= maxCharacters {
                     close(at: index, endLine: finished, nextStartLine: line)
                 }
@@ -191,7 +193,7 @@ public enum CodeBlockWindow {
         }
 
         if pageStart < source.endIndex {
-            let endedOnNewline = source[source.index(before: source.endIndex)] == "\n"
+            let endedOnNewline = endsLine(in: source, before: source.endIndex)
             let endLine = endedOnNewline ? line - 1 : line
             close(at: source.endIndex, endLine: endLine, nextStartLine: line)
         }
@@ -208,13 +210,48 @@ public enum CodeBlockWindow {
         return max(count, 1)
     }
 
-    /// Fence bodies are already `\n` after `Markdown.blocks`.  A raw CR
-    /// still has to count as a line break, or one long `\r\n` run becomes
-    /// a single line and walks around the line cap.
+    /// Fence bodies are already `\n` after `Markdown.blocks`.  A raw CR or
+    /// CRLF still has to count as a line break, or one long run walks around
+    /// the line cap.  Do not gate on `contains("\r")` — NSString bridging
+    /// can hide CR while layout still sees lone `\r` line endings.
     private static func normalisedNewlines(_ source: String) -> String {
-        guard source.contains("\r") else { return source }
-        return source
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
+        var out = ""
+        out.reserveCapacity(source.count)
+        var index = source.startIndex
+        while index < source.endIndex {
+            let character = source[index]
+            if isLineBreak(character, in: source, at: index) {
+                out.append("\n")
+                index = lineBreakEnd(in: source, at: index)
+                continue
+            }
+            out.append(character)
+            index = source.index(after: index)
+        }
+        return out
+    }
+
+    private static func isLineBreak(_ character: Character, in source: String, at index: String.Index) -> Bool {
+        if character == "\n" || character == "\r" { return true }
+        if character.isNewline { return true }
+        return false
+    }
+
+    private static func lineBreakEnd(in source: String, at index: String.Index) -> String.Index {
+        if source[index] == "\r" {
+            let next = source.index(after: index)
+            if next < source.endIndex, source[next] == "\n" {
+                return source.index(after: next)
+            }
+        }
+        return source.index(after: index)
+    }
+
+    private static func endsLine(in source: String, before index: String.Index) -> Bool {
+        guard index > source.startIndex else { return false }
+        let prior = source.index(before: index)
+        if source[prior] == "\n" { return true }
+        if source[prior] == "\r" { return true }
+        return source[prior].isNewline
     }
 }
