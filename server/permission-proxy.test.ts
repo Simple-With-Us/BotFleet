@@ -35,6 +35,7 @@ async function askThroughProxy(args: Record<string, unknown>): Promise<Record<st
   const socketPath = join(dir, "p.sock");
   const ask = new Promise<Record<string, unknown>>((resolve) => {
     broker = createServer((conn: Socket) => {
+      conn.on("error", () => {});
       conn.setEncoding("utf8");
       let buffered = "";
       conn.on("data", (chunk) => {
@@ -48,6 +49,7 @@ async function askThroughProxy(args: Record<string, unknown>): Promise<Record<st
           // under test writes, and the test reads `message.id` and compares fields.
           const message = JSON.parse(line) as Record<string, unknown>;
           conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "deny", message: "no" }) + "\n");
+          conn.end();
           resolve(message);
           return;
         }
@@ -80,6 +82,7 @@ posixOnly("permission proxy", () => {
     const socketPath = join(dir, "p.sock");
     const ask = new Promise<Record<string, unknown>>((resolve) => {
       broker = createServer((conn: Socket) => {
+        conn.on("error", () => {});
         conn.setEncoding("utf8");
         let buffered = "";
         conn.on("data", (chunk) => {
@@ -91,6 +94,7 @@ posixOnly("permission proxy", () => {
             if (!line.trim()) continue;
             const message = JSON.parse(line) as Record<string, unknown>;
             conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "allow", updatedInput: message.input }) + "\n");
+            conn.end();
             resolve(message);
             return;
           }
@@ -99,17 +103,25 @@ posixOnly("permission proxy", () => {
     });
     await new Promise<void>((resolve) => broker?.listen(socketPath, resolve));
     child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", PROXY, socketPath], { stdio: ["pipe", "pipe", "ignore"] });
-    child.stdin?.write(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: 2,
-        method: "tools/call",
-        params: { name: "approve", arguments: { tool_name: "Write", input: { file_path: "notes.md", content } } },
-      }) + "\n",
-    );
+    const payload = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "approve", arguments: { tool_name: "Write", input: { file_path: "notes.md", content } } },
+    }) + "\n";
+    await new Promise<void>((resolve, reject) => {
+      const stdin = child!.stdin;
+      if (!stdin) return reject(new Error("proxy stdin missing"));
+      const ok = stdin.write(payload, (error) => (error ? reject(error) : undefined));
+      if (ok) resolve();
+      else stdin.once("drain", () => resolve());
+    });
     const frame = await ask;
     const received = (frame.input as { content: string }).content;
     expect(received.includes("\uFFFD")).toBe(false);
     expect(received === content).toBe(true);
+    child.stdin?.end();
+    await waitForExit(child, { signal: "SIGTERM" });
+    child = undefined;
   }, 30_000);
 });
