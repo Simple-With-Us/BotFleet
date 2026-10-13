@@ -240,14 +240,14 @@ final class DefaultModelSlotsTests: XCTestCase {
     func testFilterMatchesNameTitleAndModelsAndSkipsHiddenBots() throws {
         let bots = [
             try bot("a", name: "Ada", title: "Research", instanceId: "claude", model: "claude-sonnet-4-6"),
-            try bot("b", name: "Grace", instanceId: "codex", model: "gpt-5.5", fallbackModels: ["o4-mini"]),
+            try bot("b", name: "Grace", instanceId: "codex", model: "gpt-5.5", fallbackModels: ["gpt-5.6-terra"]),
             try bot("c", name: "Archived", instanceId: "claude", model: "claude-sonnet-4-6", hidden: true),
         ]
         XCTAssertEqual(FleetModels.filteredBots(bots, query: "").map(\.id), ["a", "b"])
         XCTAssertEqual(FleetModels.filteredBots(bots, query: "  ada ").map(\.id), ["a"])
         XCTAssertEqual(FleetModels.filteredBots(bots, query: "RESEARCH").map(\.id), ["a"])
         XCTAssertEqual(FleetModels.filteredBots(bots, query: "sonnet").map(\.id), ["a"])
-        XCTAssertEqual(FleetModels.filteredBots(bots, query: "o4-mini").map(\.id), ["b"])
+        XCTAssertEqual(FleetModels.filteredBots(bots, query: "gpt-5.6-terra").map(\.id), ["b"])
         XCTAssertEqual(FleetModels.filteredBots(bots, query: "archived").map(\.id), [])
         XCTAssertEqual(FleetModels.standIn(bots)?.id, "a")
         XCTAssertNil(FleetModels.standIn([try bot("z", name: "Z", instanceId: "c", model: "m", hidden: true)]))

@@ -99,8 +99,8 @@ describe("modelEffortLevels", () => {
     };
     expect(modelEffortLevels(codex, { id: "gpt-4o" })).toEqual([]);
     expect(modelEffortLevels(codex, { id: "gpt-4o-mini" })).toEqual([]);
-    expect(modelEffortLevels(codex, { id: "gpt-4" })).toEqual([]);
-    expect(modelEffortLevels(codex, { id: "gpt-3.5-turbo" })).toEqual([]);
+    expect(modelEffortLevels(codex, { id: "gpt-5.6-sol" })).toEqual([]);
+    expect(modelEffortLevels(codex, { id: "gpt-5.6-terra" })).toEqual([]);
 
     expect(modelEffortLevels(codex, { id: "gpt-5.6-luna" })).toEqual([
       "low",
