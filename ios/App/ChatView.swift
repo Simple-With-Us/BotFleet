@@ -185,14 +185,14 @@ struct ChatView: View {
     }
 
     /// VoiceOver for the header identity button. The explicit button label
-    /// replaces child accessibility content, so the provider mark must be
-    /// named here or it would become silent chrome.
+    /// replaces child accessibility content, so the provider mark and the
+    /// connection state must be named here or they would become silent chrome.
     private var headerProfileAccessibilityLabel: String {
         let bypass = headerShowsBypass ? ", Bypass Permissions is on" : ""
         if let currentDriverKind {
-            return "Open \(current.name) profile, \(ProviderMarkView.displayName(for: currentDriverKind, model: currentModelSelection?.model))\(bypass)"
+            return "Open \(current.name) profile, \(ProviderMarkView.displayName(for: currentDriverKind, model: currentModelSelection?.model))\(bypass). \(headerConnectionStatus.text)"
         }
-        return "Open \(current.name) profile\(bypass)"
+        return "Open \(current.name) profile\(bypass). \(headerConnectionStatus.text)"
     }
 
     /// A bot with Bypass Permissions on carries a mark beside its name.  A room
@@ -200,6 +200,55 @@ struct ChatView: View {
     private var headerShowsBypass: Bool {
         if case let .bot(bot) = current { return bot.bypassPermissions == true }
         return false
+    }
+
+    /// Whether the phone is talking to the Mac, in the words a person would
+    /// use.  The same vocabulary as the chat list's header, so the two never
+    /// describe one connection two different ways.
+    ///
+    /// A lost connection outranks a working turn on purpose: "Working" claims
+    /// a reply is still coming, which is exactly what a dropped connection
+    /// denies, so showing it over a dead link is the one wrong answer here.
+    private var headerConnectionStatus: (text: String, systemImage: String, tint: Color, settled: Bool) {
+        switch session.status {
+        case .live where current.busy:
+            return ("Working", "ellipsis", BotPalette.color(current.color), true)
+        case .live:
+            return ("Connected", "checkmark.circle.fill", .green, true)
+        case .connecting:
+            return ("Connecting…", "arrow.triangle.2.circlepath", .orange, false)
+        case .offline:
+            return ("Reconnecting…", "wifi.exclamationmark", .orange, false)
+        case .macOffline:
+            return ("Mac offline", "desktopcomputer", .red, false)
+        case .unauthorized:
+            return ("Unpaired", "link.badge.plus", .red, false)
+        case .unpaired:
+            return ("Not paired", "link.badge.plus", .secondary, false)
+        }
+    }
+
+    /// The header's connection mark, beside the bot's name.  A label, not a
+    /// control: it lives inside the identity button, and a button inside a
+    /// button never receives the tap — the outer one takes every one — while
+    /// VoiceOver reads the pair as something neither of them is.  Recovery is
+    /// the reconnect loop's job, and a dead link already raises the app's
+    /// own error banner.
+    private var headerConnectionMark: some View {
+        let status = headerConnectionStatus
+        return HStack(spacing: 4) {
+            Image(systemName: status.systemImage)
+                .font(.system(size: 10, weight: .bold))
+                .symbolEffect(.pulse, options: .repeating, isActive: !status.settled)
+            Text(status.text)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .monospacedDigit()
+        }
+        .foregroundStyle(status.tint)
+        // The identity button carries an explicit label that already names the
+        // state, so letting this one speak too would read it out twice.
+        .accessibilityHidden(true)
     }
 
     var body: some View {
@@ -243,6 +292,10 @@ struct ChatView: View {
 #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("-open-plus") { showingPlus = true }
             if ProcessInfo.processInfo.arguments.contains("-open-profile") { showingProfile = true }
+            // Raises the keyboard on open, for checking that the composer
+            // clears it: the transcript has to stay visible above the
+            // keyboard rather than behind it.
+            if ProcessInfo.processInfo.arguments.contains("-open-composer") { composerFocused = true }
 #endif
         }
         .onChange(of: current.unread) { _, unread in
@@ -631,7 +684,7 @@ struct ChatView: View {
 
     private func stretchSeparator(_ date: Date) -> some View {
         Text(RelativeStamp.separator(date))
-            .font(.system(size: 12, weight: .medium))
+            .font(.caption.weight(.medium))
             .foregroundStyle(Color.secondary.opacity(0.7))
             .frame(maxWidth: .infinity)
             .padding(.top, 10)
@@ -682,7 +735,7 @@ struct ChatView: View {
                                 .font(.system(size: 17, weight: .semibold))
                             if unreadElsewhere > 0 {
                                 Text("\(unreadElsewhere)")
-                                    .font(.system(size: 13, weight: .semibold))
+                                    .font(.footnote.weight(.semibold))
                                     .padding(.horizontal, 7)
                                     .frame(minWidth: 22, minHeight: 22)
                                     .background(Capsule().fill(Color.secondary.opacity(0.22)))
@@ -720,14 +773,20 @@ struct ChatView: View {
                         VStack(alignment: .leading, spacing: 1) {
                             HStack(spacing: 6) {
                                 Text(current.name)
-                                    .font(.system(size: 15, weight: .semibold))
+                                    .font(.headline.weight(.semibold))
                                     .foregroundStyle(Color.primary)
                                     .lineLimit(1)
                                 if headerShowsBypass { BypassBadge() }
+                                // A label inside the identity button: the
+                                // state reads as part of who you are talking
+                                // to, and that button's own accessibility
+                                // label already names it, so this one stays
+                                // silent itself.
+                                headerConnectionMark
                             }
                             if !current.subtitle.isEmpty {
                                 Text(current.subtitle)
-                                    .font(.system(size: 12))
+                                    .font(.caption)
                                     .foregroundStyle(Color.secondary)
                                     .lineLimit(1)
                             }
@@ -806,10 +865,10 @@ struct ChatView: View {
                                         .background(Circle().fill(Color.primary.opacity(0.10)))
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(action.title)
-                                            .font(.system(size: 19, weight: .medium))
+                                            .font(.title3.weight(.medium))
                                             .foregroundStyle(action.destructive ? Color.red : Color.primary)
                                         Text(action.subtitle)
-                                            .font(.system(size: 13))
+                                            .font(.footnote)
                                             .foregroundStyle(Color.secondary)
                                     }
                                     Spacer(minLength: 0)
@@ -1131,7 +1190,7 @@ struct ChatView: View {
             }
             if let error = dictation.error {
                 Text(error)
-                    .font(.system(size: 13))
+                    .font(.footnote)
                     .foregroundStyle(.orange)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 4)
@@ -1205,7 +1264,7 @@ struct ChatView: View {
                                 .font(.system(size: 13, weight: .medium))
                                 .foregroundStyle(Color.secondary)
                             Text(item.text)
-                                .font(.system(size: 13))
+                                .font(.footnote)
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                                 .foregroundStyle(Color.primary)
@@ -1312,74 +1371,38 @@ struct ChatView: View {
                     .glassCapsule()
                     .accessibilityLabel(showingPlus ? "Close" : "More")
 
-                    HStack(alignment: .bottom, spacing: 6) {
-                        TextField(
-                            dictation.isListening ? "Listening…" : "Ask \(current.name)",
-                            text: $draft,
-                            axis: .vertical
-                        )
-                            .lineLimit(1...8)
-                            .font(.body)
-                            .padding(.leading, 14)
-                            .padding(.vertical, 11)
-                            .focused($composerFocused)
-                            .submitLabel(.return)
-                            // Partial transcripts rebuild from a frozen base;
-                            // prevent competing edits without dimming the text.
-                            .allowsHitTesting(!dictation.isListening && !dictation.isStarting)
-                            .onChange(of: draft) { _, value in
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    showCommandHUD = value.hasPrefix("/")
-                                }
+                    TextField(
+                        dictation.isListening ? "Listening…" : "Ask \(current.name)",
+                        text: $draft,
+                        axis: .vertical
+                    )
+                        .lineLimit(1...8)
+                        .font(.body)
+                        .padding(.leading, 14)
+                        .padding(.trailing, 14)
+                        .padding(.vertical, 11)
+                        .focused($composerFocused)
+                        .submitLabel(.return)
+                        // Partial transcripts rebuild from a frozen base;
+                        // prevent competing edits without dimming the text.
+                        .allowsHitTesting(!dictation.isListening && !dictation.isStarting)
+                        .onChange(of: draft) { _, value in
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                showCommandHUD = value.hasPrefix("/")
                             }
+                        }
+                        .frame(minHeight: 44)
+                        .glassRounded(cornerRadius: 18, interactive: false)
 
-                        if dictation.isListening {
-                            Button {
-                                dictation.toggle(capturing: draft)
-                            } label: {
-                                Image(systemName: "mic.fill")
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .foregroundStyle(Color.red)
-                                    .frame(width: 32, height: 32)
-                                    .background(Circle().fill(Color.red.opacity(0.2)))
-                                    .symbolEffect(.pulse, isActive: true)
-                            }
-                            .buttonStyle(.plain)
-                            .padding(.bottom, 6)
-                            .accessibilityLabel("Stop dictation")
-                        }
-
-                        Button { submit() } label: {
-                            Image(systemName: "arrow.up")
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundStyle(canSend ? Color.white : Color.secondary)
-                                .frame(width: 32, height: 32)
-                                .background(
-                                    Circle().fill(canSend ? BubbleColor.mine : Color.secondary.opacity(0.18))
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!canSend)
-                        .padding(.trailing, 6)
-                        .padding(.bottom, 6)
-                        .animation(.easeOut(duration: 0.15), value: canSend)
-                        .contextMenu {
-                            if canSend {
-                                Button {
-                                    steerSend()
-                                } label: {
-                                    Label("Steer Now", systemImage: "bolt.fill")
-                                }
-                                Button {
-                                    submit()
-                                } label: {
-                                    Label("Queue Message", systemImage: "clock")
-                                }
-                            }
-                        }
+                    // Mic, Stop and Send live outside the text pill.  Inside
+                    // it, a draft that grows past a few lines pushed them
+                    // toward the edge and a Stop you cannot see is the same
+                    // as no Stop at all.
+                    HStack(spacing: 0) {
+                        composerMicButton
+                        if current.busy { composerStopButton }
+                        composerSendButton
                     }
-                    .frame(minHeight: 44)
-                    .glassRounded(cornerRadius: 18, interactive: false)
                 }
             }
         }
@@ -1392,6 +1415,100 @@ struct ChatView: View {
         }
     }
 
+    /// The microphone, always on screen.  It used to appear only once
+    /// dictation was already running, which left the only way to start
+    /// talking buried two taps deep in the + sheet — a control you had to go
+    /// looking for, on the one input where typing is the slower option.
+    private var composerMicButton: some View {
+        Button {
+            if dictation.isListening {
+                dictation.stop()
+            } else {
+                composerFocused = false
+                dictation.toggle(capturing: draft)
+            }
+            Haptics.selection()
+        } label: {
+            Image(systemName: dictation.isListening ? "mic.fill" : "mic")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(dictation.isListening ? Color.red : Color.secondary)
+                .frame(width: 34, height: 34)
+                .background(
+                    Circle().fill(dictation.isListening ? Color.red.opacity(0.18) : Color.clear)
+                )
+                .contentShape(Circle())
+                .symbolEffect(.pulse, isActive: dictation.isListening)
+        }
+        .buttonStyle(.plain)
+        .disabled(dictation.isStarting)
+        // The glyph is 34pt; the target a thumb lands on is not.  This is the
+        // control a person reaches for one-handed while holding the phone.
+        .frame(minWidth: 44, minHeight: 44)
+        .contentShape(Rectangle())
+        .accessibilityLabel(dictation.isListening ? "Stop dictation" : "Dictate")
+        .accessibilityHint(dictation.isListening
+                           ? "Stops listening and keeps the words already spoken"
+                           : "Speak instead of typing")
+    }
+
+    /// Stop, for while the bot holds the turn.  It used to live only in the +
+    /// sheet as "Interrupt", so the control that ends a run was further away
+    /// than anything else in the composer.  It sits beside Send rather than
+    /// replacing it, because sending during a turn is a real action (queue,
+    /// or steer) and must not become unreachable.
+    private var composerStopButton: some View {
+        Button {
+            steerNow()
+            Haptics.impact(.medium)
+        } label: {
+            Image(systemName: "stop.fill")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(Color(uiColor: .systemBackground))
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(Color(uiColor: .label)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .frame(minWidth: 44, minHeight: 44)
+        .contentShape(Rectangle())
+        .accessibilityLabel("Stop")
+        .accessibilityHint("Stops \(current.name)'s current turn")
+    }
+
+    /// Send.  The long-press menu (Steer Now, Queue) rides along unchanged.
+    private var composerSendButton: some View {
+        Button { submit() } label: {
+            Image(systemName: "arrow.up")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(canSend ? Color.white : Color.secondary)
+                .frame(width: 34, height: 34)
+                .background(
+                    Circle().fill(canSend ? BubbleColor.mine : Color.secondary.opacity(0.18))
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!canSend)
+        .frame(minWidth: 44, minHeight: 44)
+        .contentShape(Rectangle())
+        .animation(.easeOut(duration: 0.15), value: canSend)
+        .contextMenu {
+            if canSend {
+                Button {
+                    steerSend()
+                } label: {
+                    Label("Steer Now", systemImage: "bolt.fill")
+                }
+                Button {
+                    submit()
+                } label: {
+                    Label("Queue Message", systemImage: "clock")
+                }
+            }
+        }
+        .accessibilityLabel("Send")
+    }
+
     /// What replaces the composer while the bot is Off (`shared/bot-power.ts`):
     /// the disabled notice and one button, Turn On.  The two-space gap is a
     /// non-breaking space plus a space so the layout cannot collapse it.
@@ -1402,14 +1519,14 @@ struct ChatView: View {
                 .foregroundStyle(Color.secondary)
                 .accessibilityHidden(true)
             Text("This bot is off.\u{00A0} Turn it on to chat.")
-                .font(.system(size: 15))
+                .font(.subheadline)
                 .foregroundStyle(Color.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button {
                 Task { _ = await session.updateProfile(BotProfilePatch(off: false), for: bot) }
             } label: {
                 Text("Turn On")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.footnote.weight(.semibold))
                     .foregroundStyle(.white)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
@@ -1718,11 +1835,11 @@ struct MessageRow: View {
                     Image(systemName: "clock")
                     Text("Queued — sends when this turn finishes")
                 }
-                .font(.system(size: 11))
+                .font(.caption2)
                 .foregroundStyle(Color.secondary)
             } else if message.steered == true {
                 Text("Sent mid-turn")
-                    .font(.system(size: 11))
+                    .font(.caption2)
                     .foregroundStyle(Color.secondary)
             }
 
@@ -2100,7 +2217,7 @@ struct TextBubble: View {
             VStack(alignment: .leading, spacing: 4) {
                 if let speaker, !mine {
                     Text(speaker.name)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.footnote.weight(.semibold))
                         .foregroundStyle(BotPalette.color(speaker.color))
                 }
                 // Bots get markdown, you do not — the same split the desktop
@@ -2124,7 +2241,7 @@ struct TextBubble: View {
                         let toImessage = ImessageMessageView.stripToImessagePrefix(split.display)
                         if toImessage != nil {
                             Text("To iMessage")
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.caption2.weight(.semibold))
                                 .foregroundStyle(Color.accentColor)
                         }
                         MarkdownText(source: toImessage ?? split.display)
@@ -2232,7 +2349,7 @@ struct ChannelEventCard: View {
                     .overlay(Color.primary.opacity(isDark ? 0.12 : 0.08))
                 ScrollView {
                     Text(payload)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(Color.secondary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2274,13 +2391,13 @@ struct ChannelEventCard: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(headline)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.footnote.weight(.semibold))
                     .foregroundStyle(isDark ? Color.white : Color.primary)
                     .lineLimit(isExpanded ? 4 : 2)
                     .truncationMode(.tail)
                 if let subtitle {
                     Text(subtitle)
-                        .font(.system(size: 11.5))
+                        .font(.caption)
                         .foregroundStyle(Color.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -2292,7 +2409,7 @@ struct ChannelEventCard: View {
             if payload != nil {
                 HStack(spacing: 4) {
                     Text(isExpanded ? "Collapse" : "Details")
-                        .font(.system(size: 11.5, weight: .semibold))
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(Color.accentColor)
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 10, weight: .bold))
@@ -2331,11 +2448,27 @@ struct ActivityChip: View {
 struct ActivityRunView: View {
     let chat: Chat
     let messages: [Message]
-    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded: Bool = false
 
     private var hasFailure: Bool {
         messages.contains { $0.tool?.ok == false }
+    }
+
+    /// One sentence for the whole header.  The row carries a headline, a
+    /// tool-name summary, a state and a disclosure, which VoiceOver read as
+    /// four unlabelled fragments with no indication that tapping did anything.
+    private var accessibilityText: String {
+        let desc = describeActivityRun(messages)
+        var parts = [desc.headline, desc.summary]
+        if isRunning {
+            parts.append("Still running")
+        } else if hasFailure {
+            parts.append("\(desc.failedCount) failed")
+        } else {
+            parts.append("Complete")
+        }
+        return parts.joined(separator: ", ")
     }
 
     private var isRunning: Bool {
@@ -2346,66 +2479,82 @@ struct ActivityRunView: View {
         BotPalette.color(chat.color)
     }
 
+    /// The round badge beside the headline wears the bot's own colour, so a
+    /// reader can tell whose run this is at a glance.  A failure overrides it
+    /// with red, because a failed step is the one state that matters more
+    /// than whose it was.
+    private var badgeTint: Color {
+        hasFailure ? .red : tint
+    }
+
     var body: some View {
-        let isDark = colorScheme == .dark
         let desc = describeActivityRun(messages)
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.spring(response: 0.32, dampingFraction: 0.76)) {
+                withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) {
                     isExpanded.toggle()
                 }
                 Haptics.selection()
             } label: {
-                HStack(alignment: .center, spacing: 8) {
+                HStack(alignment: .center, spacing: 10) {
                     ZStack {
                         Circle()
-                            .fill(hasFailure ? Color.red.opacity(0.18) : (isRunning ? tint.opacity(0.18) : Color.purple.opacity(0.14)))
+                            .fill(badgeTint.opacity(0.18))
                             .frame(width: 26, height: 26)
 
                         if isRunning {
                             ProgressView()
-                                .scaleEffect(0.65)
+                                .controlSize(.mini)
+                                .tint(badgeTint)
                         } else if hasFailure {
                             Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.system(size: 11, weight: .bold))
+                                .font(.system(size: 12, weight: .bold))
                                 .foregroundStyle(Color.red)
                         } else {
                             Image(systemName: "wrench.and.screwdriver.fill")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(Color.purple)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(badgeTint)
                         }
                     }
+                    .accessibilityHidden(true)
 
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 5) {
                             Text(desc.headline)
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(isDark ? Color.white : Color.primary)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(Color.primary)
+                                .lineLimit(1)
 
                             if hasFailure {
                                 Text("• \(desc.failedCount) failed")
-                                    .font(.system(size: 11, weight: .medium))
+                                    .font(.caption.weight(.medium))
                                     .foregroundStyle(Color.red)
+                                    .lineLimit(1)
                             } else if !isRunning {
                                 Text("• Complete")
-                                    .font(.system(size: 11, weight: .medium))
+                                    .font(.caption.weight(.medium))
                                     .foregroundStyle(Color.green)
+                                    .lineLimit(1)
                             }
                         }
 
                         Text(desc.summary)
-                            .font(.system(size: 11.5))
+                            .font(.footnote)
                             .foregroundStyle(Color.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
 
-                    Spacer()
+                    Spacer(minLength: 4)
 
+                    // The word, not only the chevron: a chevron is a shape a
+                    // VoiceOver rotor user never reaches and a glance-reader
+                    // has to decode.  It stays inside the tap target and is
+                    // hidden from VoiceOver, which gets the whole row instead.
                     HStack(spacing: 4) {
                         Text(isExpanded ? "Collapse" : "Details")
-                            .font(.system(size: 11.5, weight: .medium))
+                            .font(.footnote.weight(.medium))
                             .foregroundStyle(tint)
 
                         Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
@@ -2414,21 +2563,26 @@ struct ActivityRunView: View {
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(tint.opacity(0.1))
-                    .clipShape(Capsule())
+                    .background(Capsule().fill(tint.opacity(0.12)))
+                    .accessibilityHidden(true)
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
+                .frame(minHeight: 44)
                 .background(
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.03))
+                        .fill(Color(uiColor: .secondarySystemBackground).opacity(0.6))
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(hasFailure ? Color.red.opacity(0.3) : Color.secondary.opacity(0.15), lineWidth: 0.75)
+                        .stroke(hasFailure ? Color.red.opacity(0.35) : Color.secondary.opacity(0.18), lineWidth: 1)
                 )
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(accessibilityText)
+            .accessibilityHint("Double tap to \(isExpanded ? "collapse" : "show") each tool call")
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 4) {
@@ -2496,7 +2650,7 @@ struct CardView: View {
             }
         } label: {
             Text(ApproveAll.label(count: count))
-                .font(.system(size: 15, weight: .semibold))
+                .font(.subheadline.weight(.semibold))
                 .foregroundStyle(tint)
                 .frame(maxWidth: .infinity)
                 .frame(height: 40)
@@ -2516,12 +2670,12 @@ struct CardView: View {
                         .foregroundStyle(tint)
                 }
                 Text(card.title)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                     .foregroundStyle(Color.primary)
                     .fixedSize(horizontal: false, vertical: true)
                 if !card.subtitle.isEmpty {
                     Text(card.subtitle)
-                        .font(.system(size: 15))
+                        .font(.subheadline)
                         .foregroundStyle(Color.secondary)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
@@ -2544,7 +2698,7 @@ struct CardView: View {
                                 }
                             } label: {
                                 Text(card.displayChoice(for: option))
-                                    .font(.system(size: 15, weight: .semibold))
+                                    .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(Self.isRefusal(option) ? Color.primary : .white)
                                     .frame(maxWidth: .infinity)
                                     .frame(height: 40)
@@ -2742,7 +2896,7 @@ struct StreamingBubble: View {
             VStack(alignment: .leading, spacing: 4) {
                 if let speaker {
                     Text(speaker.name)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.footnote.weight(.semibold))
                         .foregroundStyle(BotPalette.color(speaker.color))
                 }
                 if let reasoning, !reasoning.isEmpty, text?.isEmpty != false {

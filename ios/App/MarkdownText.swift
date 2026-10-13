@@ -9,6 +9,18 @@
 // Only bot messages get this. The desktop makes the same split: what you
 // typed is shown as you typed it, because markdown you did not intend is
 // worse than markdown you did.
+//
+// Every text size here is a semantic style (`.body`, `.footnote`,
+// `.system(.caption2, design: .monospaced)`, ...), never a bare
+// `.system(size:)`.  A fixed point size does not move when the reader changes
+// their text size, so the transcript stayed 17pt at every accessibility
+// setting -- the reply was the one thing on screen that could not be made
+// larger.  Semantic styles are the same size at the default setting and scale
+// from there, so nothing moves for a reader who never changes it.
+// (`Font.custom(_:size:relativeTo:)` is the one API that scales from a fixed
+// point size, but it names a font file; the system font has no such entry
+// point.)  SF Symbol glyphs keep fixed sizes -- they sit inside fixed frames,
+// and a symbol that grows past its frame is a clipped symbol.
 import SwiftUI
 import CompanionCore
 
@@ -52,14 +64,14 @@ struct MarkdownText: View {
         switch block {
         case let .paragraph(text):
             inline(text, tail: tail)
-                .font(.system(size: 17))
+                .font(.body)
                 .fixedSize(horizontal: false, vertical: true)
 
         case let .heading(level, text):
             // Three sizes, not six. A chat bubble is not a document, and an
             // h4 that looks exactly like body text is a heading that failed.
             inline(text, tail: tail)
-                .font(.system(size: level <= 1 ? 21 : level == 2 ? 19 : 17, weight: .semibold))
+                .font(headingFont(level))
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 2)
 
@@ -75,7 +87,7 @@ struct MarkdownText: View {
                     .fill(Color.secondary.opacity(0.4))
                     .frame(width: 3)
                 inline(text, tail: tail)
-                    .font(.system(size: 17))
+                    .font(.body)
                     .foregroundStyle(Color.secondary)
             }
             .fixedSize(horizontal: false, vertical: true)
@@ -88,13 +100,24 @@ struct MarkdownText: View {
         }
     }
 
+    /// Three heading sizes, as semantic styles so they scale with the
+    /// reader's text size.  A fixed 21pt heading would stay 21pt at every
+    /// accessibility setting, which is the same defect as a fixed body size.
+    private func headingFont(_ level: Int) -> Font {
+        switch level {
+        case ...1: return .title2.weight(.semibold)
+        case 2: return .title3.weight(.semibold)
+        default: return .body.weight(.semibold)
+        }
+    }
+
     private func marker(_ symbol: String, indent: Int, text: String, tail: Bool) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(symbol)
-                .font(.system(size: 17))
+                .font(.body)
                 .foregroundStyle(Color.secondary)
                 .frame(minWidth: 16, alignment: .trailing)
-            inline(text, tail: tail).font(.system(size: 17))
+            inline(text, tail: tail).font(.body)
         }
         .padding(.leading, CGFloat(indent) * 14)
         .fixedSize(horizontal: false, vertical: true)
@@ -130,25 +153,40 @@ private struct CodeBlockView: View {
     let text: String
     let tail: Bool
     @State private var showingFullCode = false
+    @State private var copied = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let preview = CodeBlockWindow.preview(text, anchorToEnd: tail)
-        VStack(alignment: .leading, spacing: 4) {
-            if let language, !language.isEmpty {
-                Text(language)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            // The header row sits outside the horizontal scroll view on
+            // purpose.  Inside it, the language tag and the Copy button
+            // travel with the code and slide off the right edge of a long
+            // line -- the one block where you most want to copy would be the
+            // one whose button you cannot reach.
+            HStack(spacing: 8) {
+                if let language, !language.isEmpty {
+                    Text(language)
+                        .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                        .textCase(.uppercase)
+                        .tracking(0.5)
+                        .foregroundStyle(Color.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                copyButton
             }
+
             // Horizontal scroll rather than wrapping: wrapped code is
             // harder to read than code you have to push sideways, and
             // indentation is most of what a snippet is saying.
             codeScroll(preview.text, showCaret: tail && !preview.hasLater)
             if preview.needsPaging {
                 Text(preview.caption)
-                    .font(.system(size: 11))
+                    .font(.caption)
                     .foregroundStyle(Color.secondary)
                 Button("Show Full Code") { showingFullCode = true }
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.caption.weight(.semibold))
             }
         }
         .padding(10)
@@ -162,10 +200,45 @@ private struct CodeBlockView: View {
         }
     }
 
+    /// Copies `text`, the whole fence -- never `preview.text`.
+    ///
+    /// This is the one place the bounded renderer and the Copy button could
+    /// disagree, and the disagreement would be silent: a paged block shows
+    /// page one, so copying what is on screen would hand back a truncated
+    /// file that looks complete and is not.  A snippet you cannot paste
+    /// whole is worse than no Copy button at all.
+    private var copyButton: some View {
+        Button {
+            PlatformBridge.copyToPasteboard(text)
+            copied = true
+            AccessibilityNotification.Announcement("Code copied").post()
+            Task {
+                try? await Task.sleep(for: .seconds(2))
+                copied = false
+            }
+        } label: {
+            Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(copied ? Color.green : Color.secondary)
+                .padding(.horizontal, 10)
+                .frame(height: 28)
+                .background(Capsule().fill(Color(uiColor: .systemBackground).opacity(0.7)))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        // The visible label is 28pt tall; the tap target is not, and this is
+        // the control a person reaches for one-handed at the end of a reply.
+        .frame(minWidth: 44, minHeight: 44)
+        .contentShape(Rectangle())
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: copied)
+        .accessibilityLabel(copied ? "Copied" : "Copy code")
+        .accessibilityHint("Copies this whole code block to the clipboard")
+    }
+
     private func codeScroll(_ source: String, showCaret: Bool) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             (Text(source) + streamingCaret(showCaret))
-                .font(.system(size: 14, design: .monospaced))
+                .font(.system(.footnote, design: .monospaced))
                 .textSelection(.enabled)
         }
     }
@@ -195,12 +268,12 @@ private struct CodeBlockReader: View {
                 ScrollView {
                     ScrollView(.horizontal, showsIndicators: false) {
                         Text(page.text)
-                            .font(.system(size: 14, design: .monospaced))
+                            .font(.system(.footnote, design: .monospaced))
                             .textSelection(.enabled)
                     }
                 }
                 Text(page.caption)
-                    .font(.system(size: 12))
+                    .font(.caption)
                     .foregroundStyle(Color.secondary)
                 HStack {
                     Button("Earlier Lines") {
@@ -215,7 +288,7 @@ private struct CodeBlockReader: View {
                     }
                     .disabled(!page.hasLater)
                 }
-                .font(.system(size: 15, weight: .semibold))
+                .font(.body.weight(.semibold))
             }
             .padding(16)
             .navigationTitle("Full Code")

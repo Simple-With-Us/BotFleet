@@ -1,15 +1,30 @@
 import SwiftUI
 
+/// One tool call: what it was, how it went, and — when you open it — what it
+/// was given and what it said back.
+///
+/// Sizes are semantic styles, not bare `.system(size:)`. The fixed sizes this
+/// replaced (8.5pt and 9.5pt for the labels and the command) did not move at
+/// all when the reader changed their text size, so the one card that carries a
+/// raw command was the one card they could not read larger. The base sizes are
+/// also raised: even at the default setting, 9.5pt is below what iOS considers
+/// a legible control label.
+///
+/// Colour is semantic throughout — `secondary`, `systemBackground`, and
+/// state colours that carry their own meaning — so the card is correct in
+/// light and dark without a second set of hand-picked hexes drifting apart
+/// from the system palette.
 public struct SkillExecutionReceiptView: View {
     public let skillName: String
     public let status: String // "running", "success", "error"
     public let durationMs: Int
     public let parameters: String
     public let output: String
-    
+
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded: Bool = false
-    
+
     public init(
         skillName: String,
         status: String = "success",
@@ -23,130 +38,234 @@ public struct SkillExecutionReceiptView: View {
         self.parameters = parameters
         self.output = output
     }
-    
+
+    /// The three states a tool call can be in, as one shape.  Derived from
+    /// the same `status` string the transcript carries, so a card cannot say
+    /// "Running" in its badge and draw itself as a failure.
+    private enum State {
+        case running, success, failure
+
+        init(_ raw: String) {
+            switch raw {
+            case "running": self = .running
+            case "error": self = .failure
+            default: self = .success
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .running: return "Running"
+            case .success: return "Done"
+            case .failure: return "Failed"
+            }
+        }
+
+        var tint: Color {
+            switch self {
+            case .running: return .accentColor
+            case .success: return .green
+            case .failure: return .red
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .running: return "circle.dotted"
+            case .success: return "checkmark.circle.fill"
+            case .failure: return "exclamationmark.triangle.fill"
+            }
+        }
+    }
+
+    private var state: State { State(status) }
+    private var hasDetails: Bool { !parameters.isEmpty || !output.isEmpty }
+
+    /// One sentence for the whole row.  Without it VoiceOver read the tool
+    /// name, the duration and the state as three unlabelled fragments, and
+    /// the badge dot carried nothing at all.
+    private var accessibilityText: String {
+        var parts = [skillName, state.label]
+        if durationMs > 0 { parts.append("\(durationMs) milliseconds") }
+        parts.append(isExpanded ? "Details open" : "Details closed")
+        return parts.joined(separator: ", ")
+    }
+
     public var body: some View {
-        let isDark = colorScheme == .dark
-        let hasDetails = !parameters.isEmpty || !output.isEmpty
-        
         VStack(alignment: .leading, spacing: 6) {
             Button {
                 guard hasDetails else { return }
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                withAnimation(reduceMotion ? nil : .snappy(duration: 0.25)) {
                     isExpanded.toggle()
                 }
                 Haptics.selection()
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "wrench.and.screwdriver.fill")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color(hex: "#8B5CF6"))
-                    
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(skillName)
-                            .font(.caption2.weight(.bold))
-                            .foregroundColor(isDark ? Color(hex: "#F8FAFC") : Color(hex: "#0F172A"))
-                        if !parameters.isEmpty {
-                            Text(parameters)
-                                .font(.system(size: 9.5, design: .monospaced))
-                                .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                    }
-                    
-                    if durationMs > 0 {
-                        Text("• \(durationMs)ms")
-                            .font(.system(size: 9.5, design: .monospaced))
-                            .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
-                    }
-                    
-                    Spacer()
-                    
-                    statusBadge
-                    
-                    if hasDetails {
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
-                    }
+                // Two shapes, and `ViewThatFits` takes the first that fits.
+                // At a large text size the one-row shape squeezes the name
+                // and then the status badge — and a badge reading "Fa…" is
+                // not a status.  Neither the badge nor the duration is ever
+                // allowed to compress; the second shape gives the name its
+                // own line instead.
+                ViewThatFits(in: .horizontal) {
+                    receiptRow(compact: true)
+                    receiptRow(compact: false)
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(isDark ? Color.white.opacity(0.08) : Color.black.opacity(0.04))
-                .clipShape(Capsule())
+                .padding(.vertical, 8)
+                .frame(minHeight: 34)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color(uiColor: .secondarySystemBackground))
+                )
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(!hasDetails)
-            
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(accessibilityText)
+            .accessibilityHint(hasDetails ? "Double tap to \(isExpanded ? "hide" : "show") the command and its output" : "")
+
+            if !parameters.isEmpty, !isExpanded {
+                // The command is the reason a person opens this card, so it
+                // shows without one — a card you have to expand to learn
+                // what ran is a card most people never expand.
+                Text(parameters)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(Color.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.horizontal, 10)
+            }
+
             if isExpanded && hasDetails {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 10) {
                     if !parameters.isEmpty {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("COMMAND / INPUT")
-                                .font(.system(size: 8.5, weight: .heavy, design: .monospaced))
-                                .foregroundColor(Color(hex: "#8B5CF6"))
-                            Text(parameters)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(isDark ? Color(hex: "#E2E8F0") : Color(hex: "#1E293B"))
-                                .textSelection(.enabled)
-                        }
+                        detailSection(title: "Input", value: parameters, tint: Color.secondary)
                     }
-                    
                     if !output.isEmpty {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(status == "error" ? "ERROR" : "OUTPUT")
-                                .font(.system(size: 8.5, weight: .heavy, design: .monospaced))
-                                .foregroundColor(status == "error" ? Color.red : Color(hex: "#10B981"))
-                            Text(output)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(isDark ? Color(hex: "#E2E8F0") : Color(hex: "#1E293B"))
-                                .lineLimit(16)
-                                .textSelection(.enabled)
-                        }
+                        detailSection(
+                            title: state == .failure ? "Error" : "Output",
+                            value: output,
+                            tint: state == .failure ? .red : .primary
+                        )
                     }
                 }
-                .padding(8)
-                .background(isDark ? Color.black.opacity(0.35) : Color.white.opacity(0.85))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color(uiColor: .tertiarySystemBackground))
+                )
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .padding(6)
+        .padding(8)
         .background(
-            LinearGradient(
-                colors: isDark ? [
-                    Color(hex: "#18181B").opacity(0.92),
-                    Color(hex: "#0F172A").opacity(0.88)
-                ] : [
-                    Color.white.opacity(0.94),
-                    Color(hex: "#F8FAFC").opacity(0.88)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemBackground).opacity(0.55))
         )
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color(hex: "#8B5CF6").opacity(0.25), lineWidth: 0.65)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(borderTint, lineWidth: 1)
         )
-        .shadow(color: Color.black.opacity(isDark ? 0.20 : 0.04), radius: 3, y: 1)
     }
-    
-    @ViewBuilder
-    private var statusBadge: some View {
-        HStack(spacing: 3) {
-            Circle()
-                .fill(status == "success" ? Color.green : (status == "running" ? Color.orange : Color.red))
-                .frame(width: 5, height: 5)
-            Text(status.capitalized)
-                .font(.system(size: 9, weight: .bold))
-                .foregroundColor(status == "success" ? Color.green : (status == "running" ? Color.orange : Color.red))
+
+    /// Only a failure earns a coloured edge.  A run that succeeded or is still
+    /// running gets a neutral one, so a transcript full of completed tool
+    /// calls does not read as a wall of alerts.
+    private var borderTint: Color {
+        switch state {
+        case .failure: return .red.opacity(0.4)
+        case .running: return .accentColor.opacity(0.35)
+        case .success: return Color.secondary.opacity(0.18)
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(Color.white.opacity(0.08))
-        .clipShape(Capsule())
+    }
+
+    private func detailSection(title: String, value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title.uppercased())
+                .font(.caption2.weight(.bold))
+                .tracking(0.5)
+                .foregroundStyle(Color.secondary)
+            Text(value)
+                .font(.system(.footnote, design: .monospaced))
+                .foregroundStyle(tint)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// `compact` puts the state on the same line as the name; `false` gives the
+/// name its own line and drops the state under it.
+private func receiptRow(compact: Bool) -> some View {
+    let name = Text(skillName)
+        .font(.subheadline.weight(.semibold))
+        .foregroundStyle(Color.primary)
+        .lineLimit(1)
+
+    let duration = Text("\(durationMs)ms")
+        .font(.system(.caption, design: .monospaced))
+        .foregroundStyle(Color.secondary)
+        .monospacedDigit()
+        .fixedSize()
+
+    let disclosure = Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+        .font(.system(size: 10, weight: .bold))
+        .foregroundStyle(Color.secondary)
+
+    return Group {
+        if compact {
+            HStack(spacing: 8) {
+                wrench
+                name
+                Spacer(minLength: 4)
+                if durationMs > 0 { duration }
+                statusBadge.fixedSize()
+                if hasDetails { disclosure }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    wrench
+                    name
+                    Spacer(minLength: 0)
+                    if hasDetails { disclosure }
+                }
+                HStack(spacing: 8) {
+                    if durationMs > 0 { duration }
+                    Spacer(minLength: 0)
+                    statusBadge.fixedSize()
+                }
+            }
+        }
+    }
+}
+
+private var wrench: some View {
+    Image(systemName: "wrench.and.screwdriver.fill")
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(Color.secondary)
+}
+
+private var statusBadge: some View {
+        HStack(spacing: 4) {
+            if state == .running {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(state.tint)
+            } else {
+                Image(systemName: state.systemImage)
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(state.tint)
+            }
+            Text(state.label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(state.tint)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 22)
+        .background(Capsule().fill(state.tint.opacity(0.14)))
+        .accessibilityHidden(true)
     }
 }
