@@ -31,7 +31,8 @@ export type PluginSourceInput =
  *  - https://github.com/owner/repo
  *  - https://github.com/owner/repo/tree/<ref>/<path>
  */
-const GIT_PLUGIN_SOURCE_INPUT = z.string().trim().min(1).max(4096);
+export const GIT_PLUGIN_SOURCE_INPUT = z.string().trim().min(1).max(4096);
+export type GitPluginSourceInput = z.infer<typeof GIT_PLUGIN_SOURCE_INPUT>;
 
 export function parseGitPluginSource(input: string): PluginSourceInput {
   const parsedInput = GIT_PLUGIN_SOURCE_INPUT.safeParse(input);

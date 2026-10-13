@@ -160,12 +160,24 @@ const PLUGIN_HOST_CONFIG_SCHEMA = {
 
 /** Validate one allow-listed config value for plugin host APIs.  Unknown keys,
  *  secret-shaped fields, and shapes outside the closed schema are withheld. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- AppConfig section values are narrowed and validated by strict Zod schemas before plugins see them
 export function parsePluginHostConfigValue(key: string, value: unknown): JsonValue | undefined {
   if (!isPluginConfigKey(key)) return undefined;
   const narrowed = narrowPluginConfigSection(key, value);
-  const schema = PLUGIN_HOST_CONFIG_SCHEMA[key as keyof typeof PLUGIN_HOST_CONFIG_SCHEMA];
-  const parsed = schema.safeParse(narrowed);
-  return parsed.success ? parsed.data : undefined;
+  switch (key) {
+    case "rooms": {
+      const parsed = PLUGIN_HOST_CONFIG_SCHEMA.rooms.safeParse(narrowed);
+      return parsed.success ? parsed.data : undefined;
+    }
+    case "callStt": {
+      const parsed = PLUGIN_HOST_CONFIG_SCHEMA.callStt.safeParse(narrowed);
+      return parsed.success ? parsed.data : undefined;
+    }
+    default: {
+      const _exhaustive: never = key;
+      return _exhaustive;
+    }
+  }
 }
 
 /** Short, stable correlation id for a plugin in logs.  The raw name comes

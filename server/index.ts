@@ -991,8 +991,15 @@ pluginsModule.initPluginRuntime({
   // code.
   readConfig: (key: string) => {
     if (!isPluginConfigKey(key)) return undefined;
-    if (!Object.prototype.hasOwnProperty.call(cfg, key)) return undefined;
-    return parsePluginHostConfigValue(key, cfg[key as keyof typeof cfg]);
+    if (key === "rooms") {
+      if (!Object.prototype.hasOwnProperty.call(cfg, "rooms")) return undefined;
+      return parsePluginHostConfigValue(key, cfg.rooms);
+    }
+    if (key === "callStt") {
+      if (!Object.prototype.hasOwnProperty.call(cfg, "callStt")) return undefined;
+      return parsePluginHostConfigValue(key, cfg.callStt);
+    }
+    return undefined;
   },
   // Plugin events are allow-listed structures from plugin-loader.ts: an
   // event name, a level, a hashed plugin id, and a length or stable code.
