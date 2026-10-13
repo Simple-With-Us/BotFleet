@@ -222,6 +222,17 @@ function fullAutoOfRaw(raw: unknown): boolean {
   return (raw as { fullAuto?: unknown } | undefined)?.fullAuto === true;
 }
 
+function userModelsOfRaw(raw: unknown): Array<{ id: string; label: string; custom: true }> {
+  const models = (raw as { userModels?: unknown } | undefined)?.userModels;
+  if (!Array.isArray(models)) return [];
+  return models.flatMap((model) => {
+    if (!model || typeof model !== "object" || Array.isArray(model)) return [];
+    const id = typeof (model as { id?: unknown }).id === "string" ? (model as { id: string }).id.trim() : "";
+    const label = typeof (model as { label?: unknown }).label === "string" ? (model as { label: string }).label.trim() : "";
+    return id && label ? [{ id, label, custom: true as const }] : [];
+  });
+}
+
 export interface DescribedInstance {
   instanceId: InstanceId;
   driverKind: string;
@@ -383,6 +394,14 @@ export class ProviderRegistry {
         enabled,
         config,
       });
+      const userModels = userModelsOfRaw(entry.config);
+      if (userModels.length) {
+        const byId = new Map(live.models.options.map((model) => [model.id, model]));
+        for (const model of userModels) {
+          byId.set(model.id, { ...byId.get(model.id), ...model });
+        }
+        live.models.options = [...byId.values()];
+      }
       this.byId.set(instanceId, { instanceId, live });
       return live;
     } catch (e) {
