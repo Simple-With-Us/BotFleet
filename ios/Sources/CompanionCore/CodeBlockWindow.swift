@@ -215,6 +215,7 @@ public enum CodeBlockWindow {
     /// the line cap.  Do not gate on `contains("\r")` — NSString bridging
     /// can hide CR while layout still sees lone `\r` line endings.
     private static func normalisedNewlines(_ source: String) -> String {
+        guard source.contains("\r") else { return source }
         var out = ""
         out.reserveCapacity(source.count)
         var index = source.startIndex

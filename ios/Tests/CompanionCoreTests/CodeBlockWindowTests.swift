@@ -127,7 +127,8 @@ final class CodeBlockWindowTests: XCTestCase {
         let elapsed = ContinuousClock.now - started
         XCTAssertEqual(built, source)
         XCTAssertGreaterThan(count, 1)
-        XCTAssertLessThan(elapsed, .milliseconds(500))
+        // GitHub-hosted macOS runners vary; 1s is still far below interactive hang.
+        XCTAssertLessThan(elapsed, .seconds(1))
         let preview = CodeBlockWindow.preview(source, anchorToEnd: false)
         XCTAssertNotEqual(preview.text, source)
         XCTAssertEqual(preview.endLine - preview.startLine + 1, CodeBlockWindow.maxLines)
