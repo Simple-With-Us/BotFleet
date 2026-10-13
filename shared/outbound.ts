@@ -10,6 +10,13 @@
 //
 // Ported from OpenMausBot (MIT), milind-soni/OpenMausBot.
 
+import { z } from "zod";
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || value === undefined || Array.isArray(value)) return false;
+  return Object.prototype.toString.call(value) === "[object Object]";
+}
+
 export type OutboundPolicy = {
   /** ask: every outbound call waits for a tap. allow: up to dailyCap a day. */
   policy: "ask" | "allow";
@@ -89,14 +96,18 @@ export function isOutboundTool(name: string): boolean {
   return tokens.some((token) => CREATE_VERBS.has(token)) && tokens.some((token) => SENT_NOUNS.has(token));
 }
 
+const outboundPolicySchema = z.object({
+  policy: z.enum(["ask", "allow"]),
+  dailyCap: z.number().int().min(1).max(OUTBOUND_MAX_CAP).optional(),
+});
+
 /** The stored shape, or null when the value is not one. */
 export function normalizeOutboundPolicy(value: unknown): OutboundPolicy | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const { policy, dailyCap } = value as { policy?: unknown; dailyCap?: unknown };
-  if (policy !== "ask" && policy !== "allow") return null;
-  if (dailyCap === undefined) return { policy, dailyCap: OUTBOUND_DEFAULT_CAP };
-  if (typeof dailyCap !== "number" || !Number.isInteger(dailyCap) || dailyCap < 1 || dailyCap > OUTBOUND_MAX_CAP) return null;
-  return { policy, dailyCap };
+  if (!isJsonObject(value)) return null;
+  const parsed = outboundPolicySchema.safeParse(value);
+  if (!parsed.success) return null;
+  const dailyCap = parsed.data.dailyCap ?? OUTBOUND_DEFAULT_CAP;
+  return { policy: parsed.data.policy, dailyCap };
 }
 
 /** What a bot without a stored policy does: ask, every time. */
@@ -109,8 +120,10 @@ export interface ConnectorCall {
   arguments?: unknown;
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+function connectorCall(slug: string, args?: unknown): ConnectorCall {
+  if (args === undefined) return { slug };
+  return { slug, arguments: args };
+}
 
 /** Composio's session exposes a handful of meta tools and runs the app
  * tools inside them: a multi-execute call carries a list of slugs with
@@ -119,28 +132,31 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
  * Search, schema lookup, and connection management run no app tools. */
 export function connectorCallsIn(name: string, args: unknown): ConnectorCall[] {
   if (name === "COMPOSIO_MULTI_EXECUTE_TOOL") {
-    const tools = isRecord(args) && Array.isArray(args.tools) ? args.tools
-      : isRecord(args) && typeof args.tool_slug === "string" ? [args] : [];
-    if (!tools.length) return [{ slug: "COMPOSIO_PROXY_EXECUTE", arguments: args }];
+    const tools = isJsonObject(args) && Array.isArray(args.tools) ? args.tools
+      : isJsonObject(args) && "tool_slug" in args && isJsonObject(args) ? [args] : [];
+    if (!tools.length) return [connectorCall("COMPOSIO_PROXY_EXECUTE", args)];
     const calls: ConnectorCall[] = [];
     for (const item of tools) {
-      if (!isRecord(item)) return [{ slug: "COMPOSIO_PROXY_EXECUTE", arguments: args }];
-      const slug = [item.tool_slug, item.slug, item.name, item.tool].find((value) => typeof value === "string" && value);
-      if (typeof slug !== "string") return [{ slug: "COMPOSIO_PROXY_EXECUTE", arguments: args }];
-      calls.push({ slug, ...(item.arguments !== undefined ? { arguments: item.arguments } : {}) });
+      if (!isJsonObject(item)) return [connectorCall("COMPOSIO_PROXY_EXECUTE", args)];
+      const slug = [item.tool_slug, item.slug, item.name, item.tool].find(
+        (value): value is string | number | boolean => !isJsonObject(value) && value !== null && value !== undefined,
+      );
+      if (slug === undefined) {
+        return [connectorCall("COMPOSIO_PROXY_EXECUTE", args)];
+      }
+      const slugText = String(slug);
+      calls.push(item.arguments !== undefined ? connectorCall(slugText, item.arguments) : connectorCall(slugText));
     }
     return calls;
   }
   if (name === "COMPOSIO_REMOTE_WORKBENCH" || name === "COMPOSIO_REMOTE_BASH_TOOL") {
-    // Arbitrary code can compute tool names and repeat calls. Its app and
-    // outbound count cannot be inferred from literals in the source.
-    return [{ slug: "COMPOSIO_PROXY_EXECUTE", arguments: args }];
+    return [connectorCall("COMPOSIO_PROXY_EXECUTE", args)];
   }
   if (["COMPOSIO_SEARCH_TOOLS", "COMPOSIO_GET_TOOL_SCHEMAS", "COMPOSIO_MANAGE_CONNECTIONS", "COMPOSIO_WAIT_FOR_CONNECTIONS"].includes(name)) {
     return [];
   }
-  if (name.startsWith("COMPOSIO_")) return [{ slug: "COMPOSIO_PROXY_EXECUTE", arguments: args }];
-  return [{ slug: name, ...(args !== undefined ? { arguments: args } : {}) }];
+  if (name.startsWith("COMPOSIO_")) return [connectorCall("COMPOSIO_PROXY_EXECUTE", args)];
+  return [connectorCall(name, args)];
 }
 
 /** The subset of a request's app tools that would send something. */
