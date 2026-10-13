@@ -49,6 +49,7 @@ import {
   type EngineCapabilityEntry,
 } from "@/lib/engine-capabilities";
 import { AccessModeChip } from "./EngineCallout";
+import { ProviderMark } from "./ProviderIcons";
 import { cn } from "@/lib/cn";
 import type { InstanceInfo } from "@/state/store";
 
@@ -138,6 +139,31 @@ interface ActiveCell {
   key: CapabilityKey;
 }
 
+function engineMarkKind(entry: EngineCapabilityEntry): string {
+  switch (entry.id) {
+    case "deepseek-harness":
+      return "dshAgent";
+    case "mcode":
+      return "mcodeAgent";
+    case "muse":
+      return "museAgent";
+    case "opencode":
+      return "opencodeGo";
+    case "box":
+      return "boxAgent";
+    case "cli-wrapper":
+      return "cli-wrapper";
+    case "qwen":
+      return "qwenAgent";
+    case "hermes":
+      return "hermesAgent";
+    case "pi":
+      return "piAgent";
+    default:
+      return entry.id;
+  }
+}
+
 export function EngineCapabilitiesMatrix(props: {
   /** Live instances, so the engine column can say which engines are
    *  actually usable on this computer.  Omit it and every engine reports
@@ -149,7 +175,8 @@ export function EngineCapabilitiesMatrix(props: {
   // constant without touching the renderer.
   const engines = ENGINE_DISPLAY_ORDER
     .map((id) => ENGINE_CAPABILITIES[id])
-    .filter((entry): entry is EngineCapabilityEntry => Boolean(entry));
+    .filter((entry): entry is EngineCapabilityEntry => Boolean(entry))
+    .filter((entry) => entry.id !== "box");
 
   // Latched, not hovered.  `setActive` is called on mouse enter and on
   // focus and is *never* cleared by leaving — that is the fix.  A global
@@ -226,12 +253,8 @@ export function EngineCapabilitiesMatrix(props: {
                       title={AVAILABILITY_LABEL[availability]}
                       className={cn("size-1.5 shrink-0 rounded-full", AVAILABILITY_TONE[availability])}
                     />
-                    <span
-                      className={cn(
-                        "flex shrink-0 items-center justify-center rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide",
-                        entry.capabilityBadgeColor,
-                      )}
-                    >
+                    <ProviderMark driverKind={engineMarkKind(entry)} size={16} />
+                    <span className="min-w-0 truncate text-[11.5px] font-medium text-ink">
                       {entry.displayName}
                     </span>
                     <span className="ml-auto shrink-0">
@@ -278,14 +301,8 @@ export function EngineCapabilitiesMatrix(props: {
         {activeEntry && active ? (
           <>
             <div className="flex flex-wrap items-center gap-2 text-[12px] font-medium text-ink">
-              <span
-                className={cn(
-                  "flex items-center justify-center rounded-md px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-wide",
-                  activeEntry.capabilityBadgeColor,
-                )}
-              >
-                {activeEntry.displayName}
-              </span>
+              <ProviderMark driverKind={engineMarkKind(activeEntry)} size={16} />
+              <span>{activeEntry.displayName}</span>
               <span className="text-ink-secondary">·</span>
               <span>{CAPABILITY_LABELS[active.key]}</span>
               <span className="text-ink-secondary">·</span>

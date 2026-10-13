@@ -1,31 +1,8 @@
-// Shared "More Info" callout.  Replaces the MiniMax-only
-// `<MiniMaxCallout>` so every engine row gets the same prose block —
-// the panel used to render detail copy only for the MiniMax row, and a
-// reader flipping through Claude / Codex / Cursor had to infer the
-// differences themselves.  Reads from the capability registry at
-// `src/lib/engine-capabilities.tsx` so the prose and the matrix table
-// stay in sync.
-//
-// Compact by default (collapsed to the Title Case label) so ModelPicker
-// can keep the model list on screen.  Expand reveals the headline, full
-// prose, and pricing.  The capability matrix no longer reads the whole
-// prose block on hover — its detail strip shows a capability-specific
-// note instead, so hovering a cell does not re-read the sales pitch —
-// but `EngineCalloutBody` stays exported as the shared prose block.
-//
-// Props:
-//   - `engineId`  — registry key (e.g. "minimax", "claude", "grok").
-//   - `driverKind`— optional runtime driver-kind id.  When the driver
-//                   layer reports a name like "grokAgent" the registry
-//                   id is "grok"; the helper handles the mapping.
-//   - `instanceId`— optional instance id so aria-controls stays unique
-//                   when EnginesSettings renders several callouts.
-//   - `defaultOpen` — start expanded (default false).
-//   - `className` — optional override; default matches the legacy
-//                   MiniMax callout's box style.
+// Neutral engine facts shared by Settings → Engines and the capability matrix.
+// This component deliberately avoids recommendation or marketing copy.  It
+// reports only the access surface, billing mode, and model ids BotFleet knows.
 import * as React from "react";
-import { useId, useState } from "react";
-import { ChevronDown } from "lucide-react";
+
 import {
   engineCapability,
   engineAccessLabel,
@@ -33,13 +10,11 @@ import {
   pricingModeLabel,
   type EngineCapabilityEntry,
 } from "@/lib/engine-capabilities";
-import { cn } from "@/lib/cn";
 
 export interface EngineCalloutProps {
   engineId?: string;
   driverKind?: string;
-  instanceId?: string;
-  defaultOpen?: boolean;
+  models?: readonly string[];
   className?: string;
 }
 
@@ -47,87 +22,29 @@ export function EngineCallout(props: EngineCalloutProps): React.ReactElement | n
   const id = props.engineId ?? engineIdFromDriverKind(props.driverKind);
   if (!id) return null;
   const entry = engineCapability(id);
-  return (
-    <EngineCalloutDisclosure
-      entry={entry}
-      instanceId={props.instanceId ?? id}
-      defaultOpen={props.defaultOpen ?? false}
-      className={props.className}
-    />
-  );
-}
-
-function EngineCalloutDisclosure(props: {
-  entry: EngineCapabilityEntry;
-  instanceId: string;
-  defaultOpen: boolean;
-  className?: string;
-}): React.ReactElement {
-  const { entry, instanceId, defaultOpen, className } = props;
-  const [open, setOpen] = useState(defaultOpen);
-  const reactId = useId();
-  // Prefer the instance id so EnginesSettings rows never collide; fall
-  // back to React's useId when somehow blank.
-  const detailId = `engine-callout-detail-${instanceId || reactId}`;
+  const modelIds = props.models?.filter(Boolean) ?? entry.defaultModels.map((model) => model.id);
+  const visibleModels = modelIds.slice(0, 6);
+  const remaining = modelIds.length - visibleModels.length;
 
   return (
-    <div
-      className={
-        className ??
-        // No card, no border, no background while collapsed:  a full-width
-        // bordered bar under an engine name is a section heading, which is
-        // what this was mistaken for.  When it opens, the detail below it
-        // carries its own panel, so the trigger does not need one.
-        "mt-1.5 text-[12.5px] leading-relaxed text-ink-secondary"
-      }
-    >
-      <button
-        type="button"
-        onClick={() => setOpen((value) => !value)}
-        aria-expanded={open}
-        aria-label={`More Info about ${entry.displayName}`}
-        // Only point at the detail region while it is rendered; a collapsed
-        // callout has no element with this id.
-        aria-controls={open ? detailId : undefined}
-        // A control, not a heading.  This bar spans the whole row width with a
-        // bold label and a chevron, which is exactly the shape of a section
-        // heading — and it sits directly under an engine name, so it read as
-        // the title of the block of engines below it.  Naming the engine turns
-        // it back into a question about that engine ("Why Clutch?"), and
-        // shrinking it to an inline pill stops it stretching across the row.
-        className="inline-flex w-auto max-w-full items-center gap-1 rounded-md px-1.5 py-0.5 text-left text-[11.5px] text-ink-secondary transition-colors hover:bg-raised/50 hover:text-ink"
-      >
-        <span className="min-w-0 truncate">
-          More Info
+    <div className={props.className ?? "mt-2 grid gap-1 text-[11.5px] leading-relaxed text-ink-secondary"}>
+      <div className="flex flex-wrap gap-x-4 gap-y-1">
+        <span><span className="text-ink-secondary/70">Access:</span> {engineAccessLabel(entry)}</span>
+        <span><span className="text-ink-secondary/70">Billing:</span> {pricingModeLabel(entry.pricing)}</span>
+      </div>
+      <div className="flex min-w-0 items-baseline gap-1.5">
+        <span className="shrink-0 text-ink-secondary/70">Models:</span>
+        <span className="min-w-0 break-words font-mono text-[11px] text-ink-secondary">
+          {visibleModels.length > 0 ? visibleModels.join(", ") : "Discovered from the configured endpoint"}
+          {remaining > 0 ? ` +${remaining} more` : ""}
         </span>
-        <ChevronDown
-          size={12}
-          className={cn("shrink-0 transition-transform", open && "rotate-180")}
-          aria-hidden
-        />
-      </button>
-      {open && (
-        <div
-          id={detailId}
-          className="mt-1.5 max-h-40 overflow-y-auto rounded-lg border border-hairline/30 bg-inset/30 px-3 py-2"
-        >
-          <p className="mb-1.5 text-ink">{entry.whyThisEngine.headline}</p>
-          {entry.whyThisEngine.prose.map((line, index) => (
-            <p key={index} className="mb-1 last:mb-0">
-              {line}
-            </p>
-          ))}
-          <p className="mt-1.5 text-[11px] text-ink-secondary/80">
-            Access: {engineAccessLabel(entry)}.  Billing: {pricingModeLabel(entry.pricing)}.
-          </p>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
 
-/** Access chip used by `<EngineCapabilitiesMatrix>`.  Access and billing are
- *  intentionally separate: an API key can still draw on a subscription. */
+/** Access chip used by <EngineCapabilitiesMatrix>.  Access and billing stay
+ * separate because an API key can still draw on a subscription. */
 export function AccessModeChip(props: { entry: EngineCapabilityEntry }): React.ReactElement {
   const { entry } = props;
   return (
