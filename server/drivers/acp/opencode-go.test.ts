@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,8 +10,11 @@ import {
   classifyOpenCodeError,
   canListOpenCodeModels,
   createOpenCodeDriver,
+  discoverOpenCodeModels,
   normalizeLegacyOpenCodeModel,
+  openCodeModelProbeProblem,
   parseOpenCodeModelsOutput,
+  resetOpenCodeModelCache,
 } from "./opencode-go.ts";
 import type { ModelCatalog } from "../../contracts.ts";
 
@@ -84,6 +87,110 @@ describe("OpenCode catalog", () => {
     await expect(canListOpenCodeModels({}, "counting-opencode", runModels)).resolves.toBe(true);
 
     expect(runModels).toHaveBeenCalledOnce();
+  });
+
+  // A `#!/bin/sh` fixture with a mode bit:  Windows cannot execute one at
+  // all, so the probe's flag handling is asserted on the platforms that run
+  // this driver's real CLIs.  Same guard as the sibling ACP suites.
+  it.skipIf(process.platform === "win32")(
+    "asks a CLI that refuses --verbose anyway, instead of reporting nothing",
+    async () => {
+    // opencode v2.0.26 answers `Unrecognized flag: --verbose` and exits.  The
+    // probe used to send only that form, so the rejection fell through to the
+    // empty fallback catalog and the engine read as having no models at all —
+    // for a CLI that lists them perfectly well without the flag.
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-noverbose-"));
+    const cli = join(scratch, "opencode");
+    writeFileSync(cli, [
+      "#!/bin/sh",
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "--verbose" ]; then',
+      '    echo "ERROR  Unrecognized flag: --verbose in command opencode models" >&2',
+      "    exit 1",
+      "  fi",
+      "done",
+      'echo "anthropic/claude-sonnet-5"',
+      'echo "minimax/minimax-m2"',
+      "",
+    ].join("\n"));
+    chmodSync(cli, 0o755);
+    resetOpenCodeModelCache();
+    try {
+      const found = await discoverOpenCodeModels({}, cli);
+      expect(found.options.map((option) => option.id)).toContain("anthropic/claude-sonnet-5");
+      expect(openCodeModelProbeProblem()).toBeNull();
+    } finally {
+      resetOpenCodeModelCache();
+      await removeTempDir(scratch);
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps the two empty-list failures apart rather than collapsing them",
+    async () => {
+      // "Your CLI is broken" and "your CLI has no models" are the two things a
+      // person here is trying to tell apart, so a plain command that ERRORED
+      // must never be reported as a plain command that printed nothing — and a
+      // verbose failure that is only about the flag must not be reported as the
+      // cause of an empty catalog.
+      const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-twofailures-"));
+      const broken = join(scratch, "opencode-broken");
+      // Exits non-zero for BOTH shapes: the CLI itself is unusable.
+      writeFileSync(broken, ["#!/bin/sh", 'echo "ENOENT: no such binary" >&2', "exit 127", ""].join("\n"));
+      const flagOnly = join(scratch, "opencode-flagonly");
+      // Exits 0 with no output for plain, and refuses only the verbose form.
+      writeFileSync(
+        flagOnly,
+        [
+          "#!/bin/sh",
+          'for arg in "$@"; do',
+          '  if [ "$arg" = "--verbose" ]; then',
+          '    echo "Unrecognized flag: --verbose in command opencode models" >&2',
+          "    exit 1",
+          "  fi",
+          "done",
+          "exit 0",
+          "",
+        ].join("\n"),
+      );
+      chmodSync(broken, 0o755);
+      chmodSync(flagOnly, 0o755);
+      resetOpenCodeModelCache();
+      try {
+        await discoverOpenCodeModels({}, broken);
+        expect(openCodeModelProbeProblem()).toContain("no such binary");
+        expect(openCodeModelProbeProblem()).not.toContain("listed nothing");
+
+        await discoverOpenCodeModels({}, flagOnly);
+        // The CLI answered correctly and had nothing to list; the flag refusal
+        // is context, not the cause.
+        expect(openCodeModelProbeProblem()).toContain("listed nothing");
+        expect(openCodeModelProbeProblem()).toContain("Unrecognized flag");
+      } finally {
+        resetOpenCodeModelCache();
+        await removeTempDir(scratch);
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "records why the catalog is empty when the CLI lists nothing",
+    async () => {
+    // An engine with no models and no reason reads as broken.  It is not: the
+    // CLI answered and had nothing to list, and the person needs that sentence.
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-emptymodels-"));
+    const cli = join(scratch, "opencode");
+    writeFileSync(cli, ["#!/bin/sh", "exit 0", ""].join("\n"));
+    chmodSync(cli, 0o755);
+    resetOpenCodeModelCache();
+    try {
+      const found = await discoverOpenCodeModels({}, cli);
+      expect(found.options).toEqual([]);
+      expect(openCodeModelProbeProblem()).toBeTruthy();
+    } finally {
+      resetOpenCodeModelCache();
+      await removeTempDir(scratch);
+    }
   });
 
   it("accepts header-only output from older CLIs and rejects malformed lines", () => {

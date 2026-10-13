@@ -48,12 +48,15 @@ export interface BotfleetRole {
   seat: string;
 }
 
-/** The ten BotFleet role seats, in alphabetical order. */
+/** The eleven BotFleet role seats, in alphabetical order.  Director joined on
+ *  2026-10-11 (owner):  it has its own Zulip bot now, so it gets a seat like
+ *  every other role. */
 export const BOTFLEET_ROLES = [
   { id: "builder", name: "Builder", seat: "BF-BUILDER" },
   { id: "compiler", name: "Compiler", seat: "BF-COMPILER" },
   { id: "deployer", name: "Deployer", seat: "BF-DEPLOYER" },
   { id: "designer", name: "Designer", seat: "BF-DESIGNER" },
+  { id: "director", name: "Director", seat: "BF-DIRECTOR" },
   { id: "fixer", name: "Fixer", seat: "BF-FIXER" },
   { id: "housekeeper", name: "Housekeeper", seat: "BF-HOUSEKEEPER" },
   { id: "monitor", name: "Monitor", seat: "BF-MONITOR" },
@@ -86,8 +89,7 @@ function roleFromSlug(raw: string): KnownBotfleetRole | null {
 /** The role a bot record names, or null when it names none.  In order:
  *  an `@fleet-seat:` line in its description, a `BF-` or `BF ` prefixed name,
  *  then a bare name that is exactly a role (`Plumber`, case folded).  A name
- *  that only contains a role word (`Plumber 2`) names none, and neither does
- *  `BF-Director`, which has no role seat. */
+ *  that only contains a role word (`Plumber 2`) names none. */
 export function resolveBotfleetRole(bot: { name: string; description?: string | null }): KnownBotfleetRole | null {
   const fromDescription = bot.description?.match(DESC_SEAT)?.[1];
   if (fromDescription) {

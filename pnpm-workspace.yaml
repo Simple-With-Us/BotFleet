@@ -9,6 +9,8 @@ packages:
 allowBuilds:
   electron: true # postinstall downloads the Electron dist
   esbuild: true # postinstall validates the platform binary
+  "@sentry/cli": true # postinstall fetches the platform sentry-cli binary (vite source maps)
+  "@sentry/node-cpu-profiler": true # native addon for @sentry/profiling-node
   electron-winstaller: false # unused — Windows builds ship NSIS
   "@deepseek-ai/dsh-subprocess-local": false
   "@google/genai": false

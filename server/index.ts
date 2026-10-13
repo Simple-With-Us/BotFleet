@@ -155,6 +155,7 @@ import {
   selectionForFallbackPick,
   shouldReplayPersistedStarter,
   bootRecoveryTurnOpts,
+  continuedTurnToolPolicy,
   sliceIsShortProviderError,
   turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
@@ -325,6 +326,7 @@ import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 // MiniMax key at all.  The driver's own resolver is the authority on
 // precedence; this only reports what the secret map structurally cannot see.
 import { loadLocalMiniMaxConfig } from "./drivers/minimax.ts";
+import { fetchProviderModels, providerModelIds } from "./drivers/model-discovery.ts";
 import { flushNativeTee } from "./drivers/native.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
@@ -493,6 +495,7 @@ import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
 import { fleetSeatPromptPart } from "./seat-prompt.ts";
 import { launchEnvironment, launchIdentityFor } from "./launch-identity.ts";
+import type { ToolPolicy } from "./tool-policy.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
@@ -4570,11 +4573,15 @@ bus.subscribe((event: RuntimeEvent) => {
         // The request id travels with the frame so a phone can answer THIS
         // card from a lock screen rather than looking for whatever is
         // pending on the thread — which is the wrong card as soon as two
-        // are open at once.
+        // are open at once.  The card's own choices travel with it for the
+        // same reason: a phone that shows this as a Live Activity has no
+        // transcript to re-read, so it can only offer the verbs it is given.
         notify(
           buildNotification(permission ? "approval" : "question", asker, event.threadId, event.summary, {
             requestId: event.requestId,
             tool: event.tool,
+            options: card.options,
+            isPermission: permission,
             snoozed: threadAlertsSnoozed(asker.id, event.threadId),
           }),
         );
@@ -5339,6 +5346,8 @@ function drainRoomQueue() {
         undefined,
         undefined,
         round.turnSelection,
+        // A queued card continuation comes back to the routine's allowlist.
+        continuedTurnToolPolicy(store.activePath(round.threadId)),
       ).catch((error) => {
         store.appendMessage(round.threadId, {
           role: "bot",
@@ -5644,6 +5653,10 @@ async function startTurn(
      * `server/bot-stop-policy.ts`.
      */
     personInitiated?: boolean;
+    /** A routine's command allowlist (server/tool-policy.ts).  Stored on the
+     *  turn's prompt message, so every re-dispatch of that message (a model
+     *  fail-over, a credential card, a boot resume) keeps it. */
+    toolPolicy?: ToolPolicy;
   },
 ) {
   if (runtimeQuiescing) {
@@ -5798,6 +5811,19 @@ async function startTurn(
       { status: 409, pickUnusable: true },
     );
   }
+  // A routine's command allowlist, fresh from the routine or carried on the
+  // prompt message a re-dispatch replays.  Only a driver that holds a turn to
+  // it (or refuses it) may receive the turn;  any other engine would run the
+  // routine with everything the bot can do.
+  const turnToolPolicy = opts?.toolPolicy ?? opts?.userMessage?.toolPolicy;
+  if (turnToolPolicy && instance.adapter.capabilities.toolPolicy !== true) {
+    throw Object.assign(
+      new Error(
+        `This routine runs under a command allowlist, and the ${instance.displayName || instance.driverKind} engine cannot be held to one.  Run it on a bot whose engine is Grok Build.`,
+      ),
+      { status: 409, pickUnusable: true },
+    );
+  }
   const workspaceError = taskWorkspaceExecutionError(task.workspaceContext, instance.driverKind, opts?.runOn, task.cwd);
   if (workspaceError) throw Object.assign(new Error(workspaceError), { status: 409 });
   const instanceId = instance.instanceId;
@@ -5884,6 +5910,7 @@ async function startTurn(
           automationSource: opts?.automationSource,
           from: opts?.from,
           comm: opts?.comm,
+          toolPolicy: turnToolPolicy,
         });
   }
 
@@ -6614,6 +6641,7 @@ async function startTurn(
         unattended: isUnattended(bot.id),
         holdForReview: holdTurnForReview(bot, instance) || undefined,
         launchIdentity: launchIdentityFor(bot, threadId),
+        toolPolicy: turnToolPolicy,
       };
       // What the harness put in front of the model that the person did not
       // type: the bot's memory, the skills and playbooks this message
@@ -6883,6 +6911,7 @@ routines = new RoutineManager({
       automationSource: triggerSource,
       onDispatchError,
       ephemeralDispatch: turnOpts?.ephemeralDispatch,
+      toolPolicy: turnOpts?.toolPolicy,
     }),
   interruptTurn: async (botId, threadId, runOn) => {
     const bot = store.bot(botId);
@@ -8112,6 +8141,11 @@ async function runGroupMemberTurn(
   onDispatchError?: (message: string) => void,
   isCancelled?: () => boolean,
   turnSelection?: ModelSelection,
+  // A routine's command allowlist, threaded through so a connector/secret
+  // card resumption in a group keeps it (the prompt message in the active
+  // path carries it, but `runGroupMemberTurn` does not call `startTurn` —
+  // it has its own dispatch path and its own `sendTurn` call).
+  toolPolicy?: ToolPolicy,
 ): Promise<boolean> {
   if (isCancelled?.()) return false;
   const group = store.group(groupId);
@@ -8182,6 +8216,20 @@ async function runGroupMemberTurn(
   const userName = cfg.profile?.name?.trim() || "User";
   if (!instance) {
     const message = `${bot.name}'s model is unavailable`;
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: `error: ${message}`, ok: false },
+    });
+    onDispatchError?.(message);
+    return true;
+  }
+  // A routine's command allowlist must hold the turn, the same fail-closed
+  // check the 1:1 dispatch makes.  An engine whose capabilities lack
+  // `toolPolicy` would run the routine with everything the bot can do.
+  if (toolPolicy && instance.adapter.capabilities.toolPolicy !== true) {
+    const message = `This routine runs under a command allowlist, and the ${instance.displayName || instance.driverKind} engine cannot be held to one.  Run it on a bot whose engine is Grok Build.`;
     store.appendMessage(threadId, {
       role: "bot",
       kind: "activity",
@@ -8764,6 +8812,8 @@ async function runGroupMemberTurn(
         holdForReview: holdTurnForReview(bot, instance) || undefined,
         launchIdentity: launchIdentityFor(bot, threadId),
         ...memberTurnSelection(selection),
+        // the rest of the turn the card paused, held to that turn's allowlist
+        toolPolicy,
       });
     })
       .then((started) => {
@@ -8851,6 +8901,7 @@ async function runGroupMemberTurn(
         onDispatchError,
         isCancelled,
         pendingFallback.selection,
+        toolPolicy,
       );
     }
   }
@@ -8863,7 +8914,7 @@ async function runGroupMemberTurn(
     for (const next of roomResponders(replyText, members, { kind: "mentions" })) {
       if (isCancelled?.()) return false;
       if (spoken.has(next.id)) continue;
-      if (!(await runGroupMemberTurn(groupId, threadId, next.id, hop + 1, spoken, undefined, undefined, isCancelled))) {
+      if (!(await runGroupMemberTurn(groupId, threadId, next.id, hop + 1, spoken, undefined, undefined, isCancelled, undefined, toolPolicy))) {
         return false;
       }
     }
@@ -9087,6 +9138,9 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
   }
   if (owner.group) {
     const groupId = owner.group.id;
+    // The continuation is held to the routine's allowlist, the same way the
+    // 1:1 dispatcher does (lines below).  Compute it once before any await.
+    const toolPolicy = continuedTurnToolPolicy(store.activePath(entry.threadId));
     const operation = beginGroupTurnOperation(groupId, entry.threadId);
     const previous = groupQueues.get(groupId) ?? Promise.resolve();
     const next = previous.then(async () => {
@@ -9106,6 +9160,8 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
         prompt,
         (message) => markConnectorResumeFailed(entry.threadId, entry.resumeKey, message),
         () => operation.cancelled,
+        undefined,
+        toolPolicy,
       );
     });
     const tracked = next.finally(() => finishGroupTurnOperation(groupId, operation));
@@ -9120,6 +9176,8 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
   void startTurn(entry.botId, prompt, {
     threadId: entry.threadId,
     cardContinuation: true,
+    // the rest of the turn the card paused, held to that turn's allowlist
+    toolPolicy: continuedTurnToolPolicy(store.activePath(entry.threadId)),
     onDispatchError: (message) => markConnectorResumeFailed(entry.threadId, entry.resumeKey, message),
   }).catch((error) => {
     // A stopped bot is a decision, not a fault: settle the card quietly rather
@@ -9195,6 +9253,9 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
   }
   if (owner.group) {
     const groupId = owner.group.id;
+    // The continuation is held to the routine's allowlist, the same way the
+    // 1:1 dispatcher does (lines below).  Compute it once before any await.
+    const toolPolicy = continuedTurnToolPolicy(store.activePath(entry.threadId));
     const operation = beginGroupTurnOperation(groupId, entry.threadId);
     const previous = groupQueues.get(groupId) ?? Promise.resolve();
     const next = previous.then(async () => {
@@ -9214,6 +9275,8 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
         prompt,
         (message) => markSecretResumeFailed(entry.threadId, entry.messageId, message),
         () => operation.cancelled,
+        undefined,
+        toolPolicy,
       );
     });
     const tracked = next.finally(() => finishGroupTurnOperation(groupId, operation));
@@ -9232,6 +9295,8 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
   void startTurn(entry.botId, prompt, {
     threadId: entry.threadId,
     cardContinuation: true,
+    // the rest of the turn the card paused, held to that turn's allowlist
+    toolPolicy: continuedTurnToolPolicy(store.activePath(entry.threadId)),
     onDispatchError: (message) => markSecretResumeFailed(entry.threadId, entry.messageId, message),
   }).catch((error) => {
     // See the connector resume above: a stopped bot settles the card instead
@@ -15640,6 +15705,58 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
 
+    // ── ask a connection what it can run, before it is saved ──
+    // POST /api/instances/probe-models {endpoint: string, key?: string}
+    //
+    // The create route below cannot ask this question and get a useful answer:
+    // `openai-compat` skips its own `/models` probe whenever the config already
+    // names models (drivers/openai-compat.ts), and the route refuses an empty
+    // list, so every engine added through the UI permanently disabled the one
+    // code path that could have filled that list in.  This route breaks the
+    // knot: it is the same `GET {baseUrl}/models` the driver would make, asked
+    // while the person can still see the answer and fix a wrong endpoint.
+    //
+    // It is loopback-only for the same reason the desktop-open route is: this
+    // turns the harness into an on-demand fetcher for a URL the caller chose.
+    // That is not a new capability class — creating the engine makes the driver
+    // issue the identical request — and it stays behind the same JSON
+    // content-type gate as every other mutating route, which is what stops a
+    // page elsewhere on the machine from riding the user's session.
+    if (method === "POST" && path === "/api/instances/probe-models") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
+      }
+      if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        return json(res, 403, { error: "forbidden: a connection can only be tested from this computer" });
+      }
+      const body = await readBody(req);
+      // Parsed, not narrowed by hand: the body is untrusted JSON, and a schema
+      // is what makes `endpoint` a string rather than a claim about one.
+      const probeBody = z
+        .object({ endpoint: z.string().trim().min(1), key: z.string().trim().optional() })
+        .safeParse(body);
+      if (!probeBody.success) {
+        return json(res, 400, { error: "endpoint is required" });
+      }
+      const endpoint = probeBody.data.endpoint;
+      if (!isAbsoluteHttpUrl(endpoint)) {
+        return json(res, 400, { error: "endpoint must be a valid http:// or https:// URL" });
+      }
+      // The key is read here and never stored, logged, or echoed back: it is
+      // the one the person just typed, on its way to the endpoint that issued
+      // it, exactly as the driver would send it.
+      const probeKey = probeBody.data.key || undefined;
+      const probe = await fetchProviderModels({ baseUrl: endpoint, apiKey: probeKey });
+      if (!probe.ok) {
+        return json(res, 200, { ok: false, status: probe.status ?? null, models: [] });
+      }
+      // The picker shows five and "show all"; a provider with thousands of ids
+      // (OpenRouter) is not a list anybody scrolls, and the create route stores
+      // at most 15 anyway.
+      const models = providerModelIds(probe).slice(0, 200);
+      return json(res, 200, { ok: true, status: probe.status ?? null, models });
+    }
+
     // ── add a second instance of a multi-instance engine ──
     // POST /api/instances {name: string, endpoint: string, driver?: string,
     //                      key?: string, models?: string[] | string, iconUrl?: string}
@@ -15723,14 +15840,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       } else if (typeof body?.models === "string") {
         rawModels = body.models.split(/[\n,]+/).map((s: string) => s.trim()).filter(Boolean);
       }
-      // openai-compat points at an arbitrary vendor and has no catalog it can
-      // trust for that endpoint, so the caller has to name the models. A
-      // driver that ships its own published catalog — MiniMax — does not:
-      // asking for a model list there would make the operator retype names
-      // the driver already knows, and get them wrong.
-      if (rawModels.length === 0 && driverKind === "openai-compat") {
-        return json(res, 400, { error: "at least one model ID is required" });
-      }
+      // openai-compat points at an arbitrary vendor, so the endpoint itself is
+      // the only honest catalog: the driver already asks `{url}/models` and
+      // falls back to a small default list when the endpoint cannot answer.
+      // Requiring the operator to retype what the endpoint already publishes
+      // made that probe unreachable (a non-empty `models` list is exactly what
+      // suppresses it), so naming models is now optional here.  A driver that
+      // ships its own published catalog — MiniMax — still takes none: asking
+      // for a model list there would make the operator retype names the driver
+      // already knows, and get them wrong.
       if (rawModels.length > 15) {
         return json(res, 400, { error: "at most 15 models can be configured per engine" });
       }

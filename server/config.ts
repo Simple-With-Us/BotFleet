@@ -494,6 +494,7 @@ const appConfigSchema = z.object({
   // upgraded install never goes quiet without saying why.
   observability: z.object({
     sentryDsn: optionalText,
+    sentryFleetDsn: optionalText,
     enabled: z.boolean().optional(),
     environment: optionalText,
     tracesSampleRate: z.number().min(0).max(1).optional(),
@@ -704,6 +705,7 @@ export interface AppConfig {
    * it off on purpose. */
   observability?: {
     sentryDsn?: string;
+    sentryFleetDsn?: string;
     enabled?: boolean;
     environment?: string;
     tracesSampleRate?: number;
@@ -812,6 +814,10 @@ export function parseConfigPatch(value: JsonValue): ConfigPatch {
   const sentryDsn = rest.observability?.sentryDsn;
   if (sentryDsn !== undefined && sentryDsn.trim() && !isSentryDsn(sentryDsn)) {
     throw Object.assign(new Error("observability.sentryDsn must be a Sentry https:// DSN"), { status: 400 });
+  }
+  const sentryFleetDsn = rest.observability?.sentryFleetDsn;
+  if (sentryFleetDsn !== undefined && sentryFleetDsn.trim() && !isSentryDsn(sentryFleetDsn)) {
+    throw Object.assign(new Error("observability.sentryFleetDsn must be a Sentry https:// DSN"), { status: 400 });
   }
   const sentryEnvironment = rest.observability?.environment;
   if (
@@ -961,6 +967,7 @@ export const DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE = 0.1;
  * own project or nothing, because BotFleet ships no DSN. */
 export interface ObservabilitySettings {
   dsn: string | null;
+  fleetDsn: string | null;
   enabled: boolean;
   environment: string;
   tracesSampleRate: number;
@@ -975,6 +982,11 @@ export interface ObservabilitySettings {
  * status card instead of disappearing as "not configured". */
 export function sentryDsnConfigured(cfg: AppConfig): string | null {
   const raw = cfg.observability?.sentryDsn?.trim();
+  return raw || null;
+}
+
+export function sentryFleetDsnConfigured(cfg: AppConfig): string | null {
+  const raw = cfg.observability?.sentryFleetDsn?.trim();
   return raw || null;
 }
 
@@ -1018,6 +1030,7 @@ export function observabilitySettings(cfg: AppConfig): ObservabilitySettings {
     "production";
   return {
     dsn: sentryDsnConfigured(cfg),
+    fleetDsn: sentryFleetDsnConfigured(cfg),
     enabled: observabilityEnabled(cfg),
     environment: environment.slice(0, MAX_OBSERVABILITY_ENVIRONMENT_LENGTH),
     tracesSampleRate: Math.min(Math.max(rate, 0), 1),
@@ -1671,6 +1684,7 @@ export function saveConfig(
   // does not get baked into `~/.botfleet/config.json` either, or the file
   // starts shadowing the store it is supposed to defer to.  Knob values are
   // not sensitive, so this is about authority, not cleartext.
+  // SAFETY: same partial-config invariant as `stripVaultManagedValues` above.
   const strippedKnobsFromDisk = stripVaultManagedKnobs(checkedPatch as Partial<AppConfig>);
   if (strippedKnobsFromDisk.length > 0) {
     console.warn(`[secrets] not persisting vault-managed knobs: ${strippedKnobsFromDisk.join(", ")}`);

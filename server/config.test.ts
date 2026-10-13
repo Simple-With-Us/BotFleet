@@ -1185,6 +1185,9 @@ describe("observability settings", () => {
     expect(parseConfigPatch({ observability: { sentryDsn: "" } })).toEqual({
       observability: { sentryDsn: "" },
     });
+    expect(() => parseConfigPatch({ observability: { sentryFleetDsn: "http://abc123@o0.ingest.sentry.io/1" } })).toThrow(
+      "observability.sentryFleetDsn must be a Sentry https:// DSN",
+    );
     expect(
       parseConfigPatch({
         observability: { sentryDsn: SENTINEL_DSN, enabled: false, tracesSampleRate: 0, logsEnabled: false },
@@ -1226,6 +1229,7 @@ describe("observability settings", () => {
   it("defaults the environment, sample rate, and log forwarding", () => {
     expect(observabilitySettings({})).toEqual({
       dsn: null,
+      fleetDsn: null,
       enabled: true,
       environment: "production",
       tracesSampleRate: DEFAULT_SENTRY_TRACES_SAMPLE_RATE,

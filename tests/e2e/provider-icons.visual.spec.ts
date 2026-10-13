@@ -68,7 +68,7 @@ test('visual: provider marks for muse and mcode through ProviderMark', async ({ 
   });
 });
 
-test('visual: muse mark carries the Meta blue ramp, mcode carries the brand red ramp', async ({ page }) => {
+test('visual: muse mark carries Meta blue, mcode carries the brand red ramp', async ({ page }) => {
   await page.clock.setFixedTime(new Date('2026-10-10T15:00:00Z'));
   await page.goto('/?fixture=provider-icons');
   await pinFonts(page);
@@ -76,8 +76,9 @@ test('visual: muse mark carries the Meta blue ramp, mcode carries the brand red 
   // Brand colours are the assertion that survives rasterisation:  a snapshot
   // diff alone cannot say which palette a mark is wearing.
   const museSvg = await page.getByTestId('provider-mark-muse').locator('svg').first().evaluate((root) => root.outerHTML);
-  expect(museSvg).toMatch(/#0081fb/i);
-  expect(museSvg).toContain('bf-muse-grad-1');
+  expect(museSvg).toMatch(/#087cf0/i);
+  expect(museSvg).not.toContain('linearGradient');
+  expect((museSvg.match(/<path/g) ?? []).length).toBe(1);
 
   const mcodeSvg = await page.getByTestId('provider-mark-mcode').locator('svg').first().evaluate((root) => root.outerHTML);
   expect(mcodeSvg).toMatch(/#E5195F/i);

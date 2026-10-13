@@ -206,6 +206,29 @@ function isJsonString(value: JsonValue | undefined): value is string {
   return Object.prototype.toString.call(value) === "[object String]";
 }
 
+/** The body `{ "token": "<hex>" }` and nothing else.
+ *
+ * This route is terminated by the sidecar rather than forwarded, so its body
+ * never reaches the harness — but it is still a body off the network, and
+ * `String(body.token)` would quietly turn a number, an array or an object
+ * into the string "42" / "…" and hand it to the registry to reject.  Naming
+ * the one field and its type keeps the 400 honest about what arrived.
+ *
+ * Whole-request rejection, like the profile and organize routes: a device
+ * that sends something else has a bug or an intent, and neither should be
+ * answered with a token. */
+export function companionLiveActivityTokenDenial(body: JsonObject): Denial | null {
+  const fields = Object.keys(body);
+  const unsupported = fields.find((field) => field !== "token");
+  if (unsupported) {
+    return { status: 400, error: `${unsupported} is not part of a Live Activity token registration` };
+  }
+  const token = body.token;
+  if (token === undefined) return { status: 400, error: "a Live Activity token is required" };
+  if (!isJsonString(token)) return { status: 400, error: "token must be a string" };
+  return null;
+}
+
 /** The body check a request needs before it is forwarded, or null when the
  * allowlist alone decides it.  One lookup for the proxy, so a new filtered
  * route is one line here rather than another branch there. */
@@ -249,6 +272,10 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // locally; it never becomes a newly exposed harness route.
   { method: "GET", path: /^\/api\/companion\/endpoints$/ },
   { method: "POST", path: /^\/api\/companion\/push-token$/ },
+  // The push-to-start token for the Live Activity: a second APNs token the
+  // phone registers on its own channel, so it gets its own door rather than
+  // a second field on an existing one.
+  { method: "POST", path: /^\/api\/companion\/live-activity-token$/ },
   // Whether closed-app wake is actually working, so the phone can say so in
   // Settings instead of leaving a silent push path looking healthy.  Counts
   // and Apple's own status strings only — never anything about the key.

@@ -18,7 +18,7 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@12.9.1",
+  "packageManager": "pnpm@12.10.1",
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "lint": "node scripts/check-lint-baseline.mjs",
@@ -41,14 +41,14 @@
     "test:e2e": "playwright test",
     "e2e:update": "playwright test --update-snapshots=changed",
     "test:tvface": "vitest run --config vitest.tvface.config.ts",
-    "test:ios-ship": "node --test scripts/ios-ship-workflow.node-test.mjs",
+    "test:ios-ship": "node --test scripts/ios-ship-workflow.node-test.mjs scripts/sentry-testflight.node-test.mjs",
     "test:infisical-fetch": "node --test scripts/infisical-fetch.node-test.mjs",
     "test:release-workflow": "node --test scripts/release-workflow.node-test.mjs",
     "test:updater": "node --test electron/updater-coordinator.node-test.mjs electron/updater-throttle.node-test.mjs",
     "test:mac-updater": "node --test scripts/harness-release-store.node-test.mjs scripts/effort-log-integrity.node-test.mjs scripts/mac-update-transaction.node-test.mjs scripts/update-botfleet-mac.node-test.mjs scripts/update-botfleet-hold.node-test.mjs scripts/mac-update-rollback-placement.node-test.mjs scripts/mac-update-rollback-hardening.node-test.mjs scripts/update-botfleet-arch.node-test.mjs scripts/ci-build-resolver.node-test.mjs",
     "test:config-lock": "node --test electron/config-file-lock.node-test.mjs",
     "test:credential-patch": "node --test electron/credential-patch.node-test.mjs",
-    "test:desktop-viewer": "node --test electron/desktop-viewer.node-test.mjs electron/desktop-workspace.node-test.mjs",
+    "test:desktop-viewer": "node --test electron/desktop-viewer.node-test.mjs electron/desktop-workspace.node-test.mjs electron/sentry-desktop.node-test.mjs",
     "test:package-link": "node --test electron/package-link.node-test.mjs",
     "test:save-file": "node --test electron/save-file.node-test.mjs electron/open-file.node-test.mjs",
     "test:server-boot-probe": "node --test electron/server-boot-probe.node-test.mjs electron/attached-ui-shim.node-test.mjs electron/harness-ownership.node-test.mjs electron/runtime-identity.node-test.mjs",
@@ -99,7 +99,9 @@
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",
+    "@sentry/electron": "^7.20.1",
     "@sentry/node": "^11.0.0",
+    "@sentry/profiling-node": "^11.0.0",
     "@sentry/react": "^11.0.0",
     "@trycua/cua-driver": "0.20.0",
     "clsx": "^2.1.1",
@@ -124,6 +126,7 @@
     "@assistant-ui/react-ui": "^0.2.1",
     "@oxlint/plugins": "1.87.0",
     "@playwright/test": "^1.62.0",
+    "@sentry/vite-plugin": "^5.0.0",
     "@tailwindcss/vite": "^4.1.11",
     "@types/node": "^26.2.0",
     "@types/react": "^19.1.9",
@@ -137,7 +140,7 @@
     "oxlint": "1.87.0",
     "tailwindcss": "^4.1.11",
     "typebox": "1.3.36",
-    "typescript": "^5.8.3",
+    "typescript": "^7.0.0",
     "vite": "^8.0.0",
     "vitest": "^5.0.0",
     "wrangler": "4.148.0"
