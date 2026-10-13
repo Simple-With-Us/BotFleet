@@ -229,15 +229,19 @@ export function openRuntimeStore(path: string): RuntimeStore {
   const memory = path === ":memory:";
   if (!memory) {
     const dir = dirname(path);
-    mkdirSync(dir, { recursive: true });
-    // Briefs and results are private conversations.  Unix locks the directory
-    // down too.  Windows maps that mode into an ACL the test runner cannot
-    // delete, so the file mode below is the restriction there.
-    if (process.platform !== "win32") {
+    // A new directory is created owner-only.  Windows maps that mode into an
+    // ACL the test runner cannot delete, so the file mode below is the
+    // restriction there.  An existing directory is tightened by the chmod.
+    if (process.platform === "win32") {
+      mkdirSync(dir, { recursive: true });
+    } else {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
       try {
         chmodSync(dir, 0o700);
-      } catch {
-        // A shared data directory may already be locked down by its owner.
+      } catch (error) {
+        // A directory that disappears between create and chmod is gone.
+        // Permission and I/O failures stay visible so a loose directory is not silent.
+        if (!(error instanceof Error && chmodTargetMissing(error))) throw error;
       }
     }
     // Owner-only from the first byte, and repaired on a file that inherited

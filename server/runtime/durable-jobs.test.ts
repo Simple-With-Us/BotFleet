@@ -81,6 +81,7 @@ describe("durable delegated jobs", () => {
     const opened = open();
     opened.runtime.begin(personRoot("asker", "thread-a", "private brief"));
     const dbPath = join(dir, "runtime.db");
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
     for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
       expect(existsSync(file), file).toBe(true);
       expect(statSync(file).mode & 0o777).toBe(0o600);
