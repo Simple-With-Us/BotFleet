@@ -35,17 +35,22 @@ async function askThroughProxy(args: Record<string, unknown>): Promise<Record<st
   const socketPath = join(dir, "p.sock");
   const ask = new Promise<Record<string, unknown>>((resolve) => {
     broker = createServer((conn: Socket) => {
+      conn.setEncoding("utf8");
       let buffered = "";
       conn.on("data", (chunk) => {
         buffered += chunk;
-        const line = buffered.split("\n").find((candidate) => candidate.trim());
-        if (!line) return;
-        // SAFETY: this fake broker only ever receives the one JSON object the proxy
-        // under test writes, and the test reads `message.id` and compares fields.
-        const message = JSON.parse(line) as Record<string, unknown>;
-        // answer, so the proxy's tool call completes
-        conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "deny", message: "no" }) + "\n");
-        resolve(message);
+        let newline: number;
+        while ((newline = buffered.indexOf("\n")) !== -1) {
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          if (!line.trim()) continue;
+          // SAFETY: this fake broker only ever receives the one JSON object the proxy
+          // under test writes, and the test reads `message.id` and compares fields.
+          const message = JSON.parse(line) as Record<string, unknown>;
+          conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "deny", message: "no" }) + "\n");
+          resolve(message);
+          return;
+        }
       });
     });
   });
@@ -79,11 +84,16 @@ posixOnly("permission proxy", () => {
         let buffered = "";
         conn.on("data", (chunk) => {
           buffered += chunk;
-          const line = buffered.split("\n").find((candidate) => candidate.trim());
-          if (!line) return;
-          const message = JSON.parse(line) as Record<string, unknown>;
-          conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "allow", updatedInput: message.input }) + "\n");
-          resolve(message);
+          let newline: number;
+          while ((newline = buffered.indexOf("\n")) !== -1) {
+            const line = buffered.slice(0, newline);
+            buffered = buffered.slice(newline + 1);
+            if (!line.trim()) continue;
+            const message = JSON.parse(line) as Record<string, unknown>;
+            conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "allow", updatedInput: message.input }) + "\n");
+            resolve(message);
+            return;
+          }
         });
       });
     });
