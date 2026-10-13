@@ -323,8 +323,21 @@ if (mode === "hang-exit-gated") {
   });
 }
 
-// session/set_mode + session/set_model calls seen this run
+// session/set_mode + session/set_model calls seen this run (and prior runs when
+// FAKE_ACP_DUMP is set — each turn spawns a fresh child, so tests that assert
+// multi-turn wiring read accumulated calls from the dump sidecar).
 const configCalls: Array<{ method: string; params: unknown }> = [];
+if (process.env.FAKE_ACP_DUMP) {
+  const priorConfig = `${process.env.FAKE_ACP_DUMP}.config.json`;
+  if (existsSync(priorConfig)) {
+    try {
+      const parsed = JSON.parse(readFileSync(priorConfig, "utf8"));
+      if (Array.isArray(parsed)) configCalls.push(...parsed);
+    } catch {
+      // test-only
+    }
+  }
+}
 
 // pending server→client permission request id → resolver
 let pendingPermissionId: number | null = null;
@@ -490,8 +503,7 @@ function handle(msg: any, resumed = false) {
     }
     // per-session settings (droid sets model/autonomy here, not via argv).
     // Recorded next to FAKE_ACP_DUMP so a test can assert what was applied.
-    // NOTE: last writer wins — each turn spawns a fresh child, so a two-turn
-    // test would only ever see the final turn's calls.
+    // Prior calls are loaded at process start so multi-turn tests accumulate.
     case "session/set_mode":
     case "session/set_model": {
       if (mode === "no-session-config") {

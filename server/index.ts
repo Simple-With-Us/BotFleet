@@ -4652,7 +4652,11 @@ bus.subscribe((event: RuntimeEvent) => {
       pushMessage({
         role: "bot",
         kind: "activity",
-        tool: { name: `notice: ${redactSecretsInText(event.message).slice(0, 240)}`, ok: true },
+        tool: {
+          name: `notice: ${redactSecretsInText(event.message).slice(0, 240)}`,
+          ok: true,
+          kind: "notice",
+        },
       });
       break;
     case "runtime.error": {
