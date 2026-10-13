@@ -89,9 +89,11 @@
 //                        `used` value before the (usage-free) prompt result —
 //                        what @deepseek-ai/dsh-acp actually does.
 //
-// Keep this file dependency-free — it runs as a bare `node` subprocess.
+// Runs as a bare `node --experimental-strip-types` subprocess in driver tests.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+
+import { fakeAcpConfigCallFileSchema } from "./fake-acp-config-schema.ts";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
 const LINGERING_CHILD_MODES = new Set(["cancel-exits-with-child", "exit-with-lingering-child", "happy-with-lingering-child"]);
@@ -331,8 +333,9 @@ if (process.env.FAKE_ACP_DUMP) {
   const priorConfig = `${process.env.FAKE_ACP_DUMP}.config.json`;
   if (existsSync(priorConfig)) {
     try {
-      const parsed = JSON.parse(readFileSync(priorConfig, "utf8"));
-      if (Array.isArray(parsed)) configCalls.push(...parsed);
+      const raw = JSON.parse(readFileSync(priorConfig, "utf8"));
+      const parsed = fakeAcpConfigCallFileSchema.safeParse(raw);
+      if (parsed.success) configCalls.push(...parsed.data);
     } catch {
       // test-only
     }

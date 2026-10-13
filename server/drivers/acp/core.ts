@@ -49,6 +49,13 @@ import {
   decodeAcpPromptBudgetBytes,
   resolveAcpPromptBudgetBytes,
 } from "./prompt-budget.ts";
+import {
+  type AcpSessionLifecycleResult,
+  mergeSessionCurrentModelId,
+  parseAcpSessionLifecycleResult,
+  sessionAvailableModels,
+  sessionCurrentModelId,
+} from "./session-schema.ts";
 
 /**
  * A `host::model` pick talks to a loopback server with its own key.
@@ -1704,17 +1711,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
 
             const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
-            let sessionResult: any = null;
-            let sessionConfigResult: any = null;
+            let sessionConfigResult: AcpSessionLifecycleResult | null = null;
             let fallbackNotice: string | undefined;
             if (cursor) {
               try {
-                sessionResult = await request(
+                const loaded = await request(
                   support.resumeMethod ?? "session/load",
                   withAllowlistMeta({ sessionId: cursor, cwd, mcpServers }),
                   LOAD_SESSION_TIMEOUT,
                 );
-                sessionConfigResult = sessionResult;
+                sessionConfigResult = parseAcpSessionLifecycleResult(loaded);
                 sessionId = cursor;
               } catch (error) {
                 // The harness withheld inline replay because this cursor said
@@ -1724,13 +1730,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               }
             }
             if (!sessionId) {
-              sessionResult = await request(
+              const created = await request(
                 "session/new",
                 withAllowlistMeta({ cwd, mcpServers }),
                 NEW_SESSION_TIMEOUT,
               );
-              sessionConfigResult = sessionResult;
-              sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
+              sessionConfigResult = parseAcpSessionLifecycleResult(created);
+              sessionId = sessionConfigResult?.sessionId ?? null;
               if (!sessionId) throw new Error("session/new returned no sessionId");
             }
             let selectedModel: string | null = null;
@@ -1749,9 +1755,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // What configureSession is told the session offers.  Starts as the
             // list session/new or session/load returned and is replaced when the
             // model switch below changes it.
-            let currentConfigOptions: unknown[] | undefined = Array.isArray(sessionResult?.configOptions)
-              ? sessionResult.configOptions
-              : undefined;
+            let currentConfigOptions: unknown[] | undefined = sessionConfigResult?.configOptions;
             try {
               if (support.selectModel) {
                 const { configId, valueForModel, modelForValue } = support.selectModel;
@@ -1760,13 +1764,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 // "reported as some other value": a stock `dsh` ACKs
                 // session/set_config_option with a bare `{}`, and reading that
                 // as a failed switch raised BOTFLEET-M on every dsh turn.
-                const reportedValue = (r: any) =>
-                  (Array.isArray(r?.configOptions) ? r.configOptions : []).find(
-                    (o: any) => o?.id === configId,
-                  )?.currentValue;
-                let selectedValue = reportedValue(sessionResult);
+                const valueFromConfigOptions = (options: unknown[] | undefined) => {
+                  if (!options) return undefined;
+                  for (const o of options) {
+                    if (typeof o !== "object" || o === null) continue;
+                    const rec = o as { id?: unknown; currentValue?: unknown };
+                    if (rec.id === configId) return rec.currentValue;
+                  }
+                  return undefined;
+                };
+                let selectedValue = valueFromConfigOptions(sessionConfigResult?.configOptions);
                 const mappedValue = cliTurn.model && valueForModel
-                  ? valueForModel(cliTurn.model, sessionResult?.configOptions)
+                  ? valueForModel(cliTurn.model, sessionConfigResult?.configOptions)
                   : undefined;
                 const requestedValue = cliTurn.model
                   ? mappedValue === null
@@ -1779,13 +1788,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     { sessionId, configId, value: requestedValue },
                     INIT_TIMEOUT,
                   );
-                  const applied = reportedValue(switchReply);
+                  const applied = valueFromConfigOptions(parseAcpSessionLifecycleResult(switchReply)?.configOptions);
                   // The option list can change with the model.  Only a reply
                   // that carries one is current; a bare ACK leaves the earlier
                   // list stale, so it is dropped rather than kept.
-                  currentConfigOptions = Array.isArray(switchReply?.configOptions)
-                    ? switchReply.configOptions
-                    : undefined;
+                  currentConfigOptions = parseAcpSessionLifecycleResult(switchReply)?.configOptions;
                   // an agent that answers OK but keeps its old model is worse than
                   // one that errors: it burns a paid turn on the wrong thing.  Only
                   // a *reported* mismatch proves that, though — a bare ACK that
@@ -1812,10 +1819,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     if (method === "session/set_model") {
                       const parsed = acpSessionSetModelParams.safeParse(params);
                       if (parsed.success) {
-                        sessionConfigResult = {
-                          ...sessionConfigResult,
-                          models: { ...sessionConfigResult?.models, currentModelId: parsed.data.modelId },
-                        };
+                        sessionConfigResult = mergeSessionCurrentModelId(sessionConfigResult, parsed.data.modelId);
                       }
                     }
                     return result;
@@ -1823,11 +1827,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   sessionId,
                   config: turnConfig,
                   turn: cliTurn,
-                  sessionModels: Array.isArray(sessionConfigResult?.models?.availableModels)
-                    ? sessionConfigResult.models.availableModels
-                    : [],
+                  sessionModels: sessionAvailableModels(sessionConfigResult),
                   sessionConfigOptions: currentConfigOptions,
-                  currentModelId: sessionConfigResult?.models?.currentModelId,
+                  currentModelId: sessionCurrentModelId(sessionConfigResult),
                   notice: (message) => {
                     if (fallbackNotice === message) return;
                     let heard = runtimeNoticesByThread.get(threadId);
