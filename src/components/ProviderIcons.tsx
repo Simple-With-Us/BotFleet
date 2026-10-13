@@ -194,47 +194,17 @@ export function MiniMaxMark({ size = 16, className }: IconProps) {
   );
 }
 
-/** Official Muse Code mark — Meta's loop glyph in the brand blue ramp.
- *
- *  Muse Code had no case in `ProviderMark` at all, so it fell through to the
- *  two-letter monogram and rendered as a bare "M" in the engine rail — the one
- *  tile that read as a placeholder rather than a product, next to real marks.
- *  Geometry and the blue ramp are lifted from the Muse Code provider mark that
- *  ships with CodeCaps, so the same engine wears the same mark in both apps.
- *
- *  The three paths keep the source's own layering: a flat base, a gradient
- *  body, and a lighter leading edge.  The source shipped a padded
- *  `-36.22 -84.5 360 360` viewBox, which floats the glyph off-centre inside a
- *  square slot; this uses the tight artwork bounds instead, so the mark sits
- *  centred like every other one in the rail.  It is wider than tall, and the
- *  default `preserveAspectRatio` centres it vertically in the square. */
+/** Muse Code's compact Meta loop, matching the provider UI at rail size.
+ *  Path data: Simple Icons' Meta mark (CC0-1.0), derived from Meta's official
+ *  brand artwork.  The single cut-out silhouette stays readable at 14–18px;
+ *  the former three-layer gradient collapsed into a filled blue blob there. */
 export function MuseCodeMark({ size = 16, className }: IconProps) {
   return (
-    <svg width={size} height={size} viewBox="-2 -2 292 196" className={className} aria-hidden>
+    <svg width={size} height={size} viewBox="0 0 24 24" className={className} aria-hidden>
       <path
-        fill="#0081fb"
-        d="M31.06,126c0,11,2.41,19.41,5.56,24.51A19,19,0,0,0,53.19,160c8.1,0,15.51-2,29.79-21.76,11.44-15.83,24.92-38,34-52l15.36-23.6c10.67-16.39,23-34.61,37.18-47C181.07,5.6,193.54,0,206.09,0c21.07,0,41.14,12.21,56.5,35.11,16.81,25.08,25,56.5,25,89.27,0,19.38-3.82,33.62-10.32,44.87C271,180.13,258.72,191,238.13,191V160c17.63,0,22-16.2,22-34.74l27.4-.86c0,19.38-3.82,33.62-10.32,44.87C271,180.13,258.72,191,238.13,191c-12.8,0-24.14-2.78-36.68-14.61-9.64-9.08-20.91-25.21-29.58-39.71L146.08,93.6c-12.94-21.62-24.81-37.74-31.68-45C107,40.71,97.51,31.23,82.35,31.23c-12.27,0-22.69,8.61-31.41,21.78C38.61,71.62,31.06,99.34,31.06,126Z"
+        fill="#087cf0"
+        d="M6.915 4.03c-1.968 0-3.683 1.28-4.871 3.113C.704 9.208 0 11.883 0 14.449c0 .706.07 1.369.21 1.973.071.307.16.594.265.86.107.27.23.524.371.761.696 1.159 1.818 1.927 3.593 1.927 1.497 0 2.633-.671 3.965-2.444.76-1.012 1.144-1.626 2.663-4.32l.756-1.339.186-.325c.061.1.121.196.183.3l2.152 3.595c.724 1.21 1.665 2.556 2.47 3.314 1.046.987 1.992 1.22 3.06 1.22 1.075 0 1.876-.355 2.455-.843.329-.277.6-.602.81-.973.542-.939.861-2.127.861-3.745 0-2.72-.681-5.357-2.084-7.45-1.282-1.912-2.957-2.93-4.716-2.93-1.047 0-2.088.467-3.053 1.308-.652.57-1.257 1.29-1.82 2.05-.69-.875-1.335-1.547-1.958-2.056-1.182-.966-2.315-1.303-3.454-1.303Zm10.16 2.053c1.147 0 2.188.758 2.992 1.999 1.132 1.748 1.647 4.195 1.647 6.4 0 1.548-.368 2.9-1.839 2.9-.58 0-1.027-.23-1.664-1.004-.496-.601-1.343-1.878-2.832-4.358l-.617-1.028a44.908 44.908 0 0 0-1.255-1.98l.211-.327c1.12-1.667 2.118-2.602 3.358-2.602Zm-10.201.553c1.265 0 2.058.791 2.675 1.446.307.327.737.871 1.234 1.579l-1.02 1.566c-.757 1.163-1.882 3.017-2.837 4.338-1.191 1.649-1.81 1.817-2.486 1.817-.524 0-1.038-.237-1.383-.794-.263-.426-.464-1.13-.464-2.046 0-2.221.63-4.535 1.66-6.088.454-.687.964-1.226 1.533-1.533a2.264 2.264 0 0 1 1.088-.285Z"
       />
-      <path
-        fill="url(#bf-muse-grad-1)"
-        d="M24.49,37.3C38.73,15.35,59.28,0,82.85,0c13.65,0,27.22,4,41.39,15.61,15.5,12.65,32,33.48,52.63,67.81l7.39,12.32c17.84,29.72,28,45,33.93,52.22,7.64,9.26,13,12,19.94,12,17.63,0,22-16.2,22-34.74l27.4-.86c0,19.38-3.82,33.62-10.32,44.87C271,180.13,258.72,191,238.13,191c-12.8,0-24.14-2.78-36.68-14.61-9.64-9.08-20.91-25.21-29.58-39.71L146.08,93.6c-12.94-21.62-24.81-37.74-31.68-45C107,40.71,97.51,31.23,82.35,31.23c-12.27,0-22.69,8.61-31.41,21.78Z"
-      />
-      <path
-        fill="url(#bf-muse-grad-2)"
-        d="M82.35,31.23c-12.27,0-22.69,8.61-31.41,21.78C38.61,71.62,31.06,99.34,31.06,126c0,11,2.41,19.41,5.56,24.51L10.14,167.91C3.34,156.6,0,141.76,0,124.85,0,94.1,8.44,62.05,24.49,37.3,38.73,15.35,59.28,0,82.85,0Z"
-      />
-      <defs>
-        <linearGradient id="bf-muse-grad-1" gradientUnits="userSpaceOnUse" x1="62.34" y1="101.45" x2="260.34" y2="91.45">
-          <stop offset="0" stopColor="#0064e1" />
-          <stop offset="0.4" stopColor="#0064e1" />
-          <stop offset="0.83" stopColor="#0073ee" />
-          <stop offset="1" stopColor="#0082fb" />
-        </linearGradient>
-        <linearGradient id="bf-muse-grad-2" gradientUnits="userSpaceOnUse" x1="41.42" y1="53" x2="41.42" y2="126">
-          <stop offset="0" stopColor="#0082fb" />
-          <stop offset="1" stopColor="#0064e0" />
-        </linearGradient>
-      </defs>
     </svg>
   );
 }
