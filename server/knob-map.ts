@@ -48,6 +48,28 @@ export interface KnobFieldSpec {
  * deliberately-out-of-scope list. */
 export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
   {
+    // How long a voice call waits for the bot's own engine before the model
+    // answers that turn alone.  A coding engine regularly takes 10-30s, and the
+    // vendor preamble only covers the first couple of seconds, so this is the
+    // knob that decides when a call degrades instead of going quiet.
+    id: "sts.engineTimeoutMs",
+    label: "Voice call engine timeout",
+    section: "sts",
+    path: ["engineTimeoutMs"],
+    infisicalName: "BOTFLEET_STS_ENGINE_TIMEOUT_MS",
+    kind: "int",
+    min: 1000,
+    max: 120000,
+  },
+  {
+    id: "sts.frontEngine",
+    label: "Voice calls use the bot's engine",
+    section: "sts",
+    path: ["frontEngine"],
+    infisicalName: "BOTFLEET_STS_FRONT_ENGINE",
+    kind: "bool",
+  },
+  {
     id: "jobs.defaultMinutes",
     label: "Default job run limit",
     section: "jobs",
@@ -95,6 +117,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     infisicalName: "BOTFLEET_JOBS_MIN_FREE_DISK_MB",
     kind: "float",
     min: 0,
+  },
+  {
+    id: "jobs.webhookHotDeferMinutes",
+    label: "Webhook hot-host deferral limit",
+    section: "jobs",
+    path: ["webhookHotDeferMinutes"],
+    infisicalName: "BOTFLEET_WEBHOOK_HOT_DEFER_MINUTES",
+    kind: "int",
+    min: 1,
+    max: 720,
   },
   {
     id: "observability.tracesSampleRate",
@@ -154,6 +186,18 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     kind: "float",
     min: 0,
     max: 1,
+  },
+  {
+    // Reviewer calls one turn may spend on auto-review (server/auto-review.ts
+    // `ReviewBudget`).  Bounds mirror shared/auto-review.ts.
+    id: "autoReview.maxReviewsPerTurn",
+    label: "Auto-review limit per turn",
+    section: "autoReview",
+    path: ["maxReviewsPerTurn"],
+    infisicalName: "BOTFLEET_AUTO_REVIEW_MAX_PER_TURN",
+    kind: "int",
+    min: 1,
+    max: 500,
   },
   {
     id: "infisical.refreshMinutes",

@@ -87,6 +87,50 @@ function localComputerBody(state: 'normal' | 'per-bot' | 'replacement'): Record<
   };
 }
 
+// A shared container still on the previous image, in the three faces the
+// card gives it: before the build, while it builds (a fixed elapsed time so
+// the shot is stable), and once the new image is ready to switch to.
+const SHARED_VPS_STALE = {
+  backend: 'vps',
+  configured: true,
+  sshAlias: 'vps',
+  daemonUp: true,
+  managed: true,
+  container: 'running',
+  ready: false,
+  imageOutdated: true,
+};
+function sharedVpsOutdatedBody(pageState: string) {
+  switch (pageState) {
+    case 'vps-outdated':
+      return {
+        ...SHARED_VPS_STALE,
+        image: false,
+        imageMatches: false,
+        imageBuild: { phase: 'idle', startedAt: null, elapsedMs: null, error: null },
+        problem: 'Prepare the pinned BotFleet CUA image on the VPS (Driver 0.20.0)',
+      };
+    case 'vps-building':
+      return {
+        ...SHARED_VPS_STALE,
+        image: false,
+        imageMatches: false,
+        imageBuild: { phase: 'building', startedAt: 1, elapsedMs: 754_000, error: null },
+        problem: 'Prepare the pinned BotFleet CUA image on the VPS (Driver 0.20.0)',
+      };
+    case 'vps-switch':
+      return {
+        ...SHARED_VPS_STALE,
+        image: true,
+        imageMatches: false,
+        imageBuild: { phase: 'ready', startedAt: null, elapsedMs: null, error: null },
+        problem: 'The VPS container uses an incompatible or untrusted BotFleet image',
+      };
+    default:
+      return null;
+  }
+}
+
 test.use({
   viewport: { width: 1280, height: 1000 },
   locale: 'en-US',
@@ -129,9 +173,31 @@ test.beforeEach(async ({ page }) => {
     // aborted in `test.afterEach`.
     if (route.request().method() !== 'GET') return route.fallback();
     const pageState = new URL(page.url()).searchParams.get('state') ?? 'normal';
-    if (pageState === 'normal' || pageState === 'loading') {
+    if (pageState === 'loading') {
       pendingVpsRoutes.push(route);
       return;
+    }
+    const outdated = sharedVpsOutdatedBody(pageState);
+    if (outdated) {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(outdated) });
+    }
+    if (pageState === 'normal' || pageState === 'shared') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          backend: 'vps',
+          configured: true,
+          sshAlias: 'vps',
+          daemonUp: true,
+          image: true,
+          imageMatches: true,
+          managed: true,
+          container: 'running',
+          ready: true,
+          problem: null,
+        }),
+      });
     }
     return route.fulfill({
       status: 200,
@@ -222,6 +288,21 @@ test('visual: SharedVpsRuntimeCard — Fetching VPS status… loading state', as
   });
 });
 
+test('visual: SharedVpsRuntimeCard — shared ready state', async ({ page }) => {
+  await page.goto('/?fixture=runtime-cards&card=shared-vps&state=normal', {
+    waitUntil: 'domcontentloaded',
+  });
+  await pinFonts(page);
+  const board = page.getByTestId('runtime-cards-shared-vps');
+  await expect(board).toBeVisible();
+  await expect(board.getByText('Shared VPS VM')).toBeVisible();
+  await expect(board.getByText('Running', { exact: true })).toBeVisible();
+  await expect(board).toHaveScreenshot('runtime-cards-shared-vps-ready.png', {
+    ...stableShot,
+    mask: [board.locator('.animate-spin')],
+  });
+});
+
 test('visual: SharedVpsRuntimeCard — per-bot caption', async ({ page }) => {
   await page.goto('/?fixture=runtime-cards&card=shared-vps&state=per-bot-caption', {
     waitUntil: 'domcontentloaded',
@@ -232,4 +313,54 @@ test('visual: SharedVpsRuntimeCard — per-bot caption', async ({ page }) => {
   await expect(board.getByText('Self-Hosted VPS')).toBeVisible();
   await expect(board.getByText(/Per-bot mode:/)).toBeVisible();
   await expect(board).toHaveScreenshot('runtime-cards-shared-vps-per-bot-caption.png', stableShot);
+});
+
+test('visual: SharedVpsRuntimeCard — outdated image, Prepare Image', async ({ page }) => {
+  await page.goto('/?fixture=runtime-cards&card=shared-vps&state=vps-outdated', {
+    waitUntil: 'domcontentloaded',
+  });
+  await pinFonts(page);
+  const board = page.getByTestId('runtime-cards-shared-vps');
+  await expect(board.getByText('Running (outdated image)')).toBeVisible();
+  await expect(board.getByText('Running', { exact: true })).toHaveCount(0);
+  await expect(board.getByRole('button', { name: 'Prepare Image' })).toBeVisible();
+  await expect(board).toHaveScreenshot('runtime-cards-shared-vps-outdated.png', stableShot);
+});
+
+test('visual: SharedVpsRuntimeCard — outdated image, building with elapsed time', async ({ page }) => {
+  await page.goto('/?fixture=runtime-cards&card=shared-vps&state=vps-building', {
+    waitUntil: 'domcontentloaded',
+  });
+  await pinFonts(page);
+  const board = page.getByTestId('runtime-cards-shared-vps');
+  await expect(board.getByText(/Building the new image on the VPS: 12m 34s so far/)).toBeVisible();
+  await expect(board.getByRole('button', { name: 'Prepare Image' })).toHaveCount(0);
+  await expect(board).toHaveScreenshot('runtime-cards-shared-vps-building.png', {
+    ...stableShot,
+    mask: [board.locator('.animate-spin')],
+  });
+});
+
+test('visual: SharedVpsRuntimeCard — new image ready, Switch to New Image with confirm', async ({ page }) => {
+  await page.goto('/?fixture=runtime-cards&card=shared-vps&state=vps-switch', {
+    waitUntil: 'domcontentloaded',
+  });
+  await pinFonts(page);
+  const board = page.getByTestId('runtime-cards-shared-vps');
+  const button = board.getByRole('button', { name: 'Switch to New Image' });
+  await expect(button).toBeVisible();
+  await expect(board).toHaveScreenshot('runtime-cards-shared-vps-switch.png', stableShot);
+  // The switch resets the container filesystem, so it asks first and posts
+  // nothing until confirmed.
+  let posted = false;
+  await page.route('**/api/vps-computer/switch-image', (route: Route) => {
+    posted = true;
+    return route.fulfill({ status: 409, contentType: 'application/json', body: '{"error":"fixture"}' });
+  });
+  await button.click();
+  const dialog = page.getByRole('dialog', { name: 'Switch to New Image?' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText(/Everything saved inside the container is reset/)).toBeVisible();
+  await expect(dialog).toHaveScreenshot('runtime-cards-shared-vps-switch-confirm.png', stableShot);
+  expect(posted).toBe(false);
 });

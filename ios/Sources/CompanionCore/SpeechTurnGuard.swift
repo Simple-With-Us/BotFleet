@@ -49,6 +49,12 @@ public struct SpeechTurnGuard {
         activeUtteranceID = nil
     }
 
+    /// Whether `utterance` is the one the current turn is speaking.  Progress
+    /// callbacks (willSpeakRange, didStart) for any other utterance are stale.
+    public func isActive(utterance: AnyObject) -> Bool {
+        activeUtteranceID == ObjectIdentifier(utterance)
+    }
+
     /// A didFinish/didCancel callback.  Returns true only when it belongs
     /// to the current turn, which it then ends; callbacks for superseded
     /// or already-ended turns return false and change nothing.

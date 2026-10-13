@@ -41,20 +41,24 @@ export function toolRoundsCaption(): string {
  *  and disagreeing about it. */
 /** Why the scheduler may not start a bot's work right now.
  *
- *  Only the three values the loop actually branches on.  A fourth value such
- *  as `"blocked"` (a breaker refusing work silently) was considered and
+ *  Only the values the loop actually branches on.  A value such as
+ *  `"blocked"` (a breaker refusing work silently) was considered and
  *  rejected: the tick loop is `if (busy) continue; if (missing) failRun(...)`
- *  and then it dispatches, so any value that is not `busy` or `missing`
+ *  and then it dispatches, so any value that is not branched on
  *  reaches the dispatch attempt and is indistinguishable from `"ready"` at
  *  every call site.  Adding the value without a branch for it would have
- *  looked like a fix while changing nothing.  The loop must handle `blocked`
- *  explicitly (routines.ts `tick`) before the value may be produced — and no
- *  producer exists yet (index.ts `botState` returns only these three).
+ *  looked like a fix while changing nothing.  The loop must handle a new value
+ *  explicitly (routines.ts `tick`) before it may be produced.
+ *
+ *  `"off"` is the one that has those branches: the bot's On/Off switch
+ *  (shared/bot-power.ts).  Schedule ticks, webhook and resource enqueues and
+ *  the queued-run loop all record a skipped receipt for it and never dispatch,
+ *  and a queued run is settled, not left to wait for the bot to come back.
  *
  *  Declared once here rather than spelled out in `routines.ts`, `webhooks.ts`
  *  and `resource-triggers.ts`, where three independent copies of the union had
  *  already drifted apart once. */
-export type BotDispatchState = "ready" | "busy" | "missing";
+export type BotDispatchState = "ready" | "busy" | "missing" | "off";
 
 /** One reason a dispatch is being held, in words fit for a receipt.
  *

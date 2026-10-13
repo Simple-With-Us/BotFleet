@@ -69,3 +69,62 @@ describe("a composer send reports its failure", () => {
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
   });
 });
+
+describe("cancelQueued DELETE errors", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function seedQueuedBot(dispatch: (action: Action) => void) {
+    dispatch({
+      type: "botPatched",
+      bot: {
+        id: "b1",
+        threadId: "t1",
+        name: "Ada",
+        title: "",
+        description: "",
+        notifications: false,
+        color: "green",
+        unread: false,
+        modelSelection: { instanceId: "acp", model: "fake" },
+        messages: [],
+      },
+    });
+    dispatch({
+      type: "pendingQueued",
+      threadId: "t1",
+      queueId: "q-drop",
+      text: "hold",
+    });
+  }
+
+  it("keeps the chip and skips onSettled when the harness has no DELETE route", async () => {
+    const fetchMock = stubFetch(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ error: "no route: DELETE /api/bots/b1/queue/q-drop" }), {
+          status: 404,
+          statusText: "Not Found",
+        }),
+      ),
+    );
+    const dispatch = dispatchFromProvider();
+    seedQueuedBot(dispatch);
+    const onSettled = vi.fn();
+    dispatch({ type: "cancelQueued", botId: "b1", queueId: "q-drop", onSettled });
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(onSettled).not.toHaveBeenCalled();
+  });
+
+  it("drops the chip and runs onSettled when a 404 means the entry is already gone", async () => {
+    stubFetch(() =>
+      Promise.resolve(new Response(JSON.stringify({ error: "queue entry not found" }), { status: 404 })),
+    );
+    const dispatch = dispatchFromProvider();
+    seedQueuedBot(dispatch);
+    const onSettled = vi.fn();
+    dispatch({ type: "cancelQueued", botId: "b1", queueId: "q-drop", onSettled });
+
+    await vi.waitFor(() => expect(onSettled).toHaveBeenCalledTimes(1));
+  });
+});

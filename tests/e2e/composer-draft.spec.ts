@@ -57,9 +57,16 @@ const roomState = { busy: false };
  * bot or room send to `onSend`.  Returns the sends the server received, in
  * order.  The event stream says hello and ends, which makes the page read
  * the roster again each time it reconnects. */
-async function mockServer(page: Page, onSend: (route: Route, attempt: number) => Promise<void> | void) {
+async function mockServer(
+  page: Page,
+  onSend: (route: Route, attempt: number) => Promise<void> | void,
+  opts?: { busyBotIds?: string[] },
+) {
   const sends: Sent[] = [];
   roomState.busy = false;
+  const bots = [DRAFTSMAN, SECOND].map((candidate) =>
+    opts?.busyBotIds?.includes(candidate.id) ? { ...candidate, busy: true } : candidate,
+  );
   await page.route('**/api/**', async (route) => {
     const { pathname } = new URL(route.request().url());
     const method = route.request().method();
@@ -72,7 +79,7 @@ async function mockServer(page: Page, onSend: (route: Route, attempt: number) =>
       });
     }
     if (pathname === '/api/bots' && method === 'GET') {
-      return route.fulfill(json({ bots: [DRAFTSMAN, SECOND], groups: [room(roomState.busy)], computerControl: {} }));
+      return route.fulfill(json({ bots, groups: [room(roomState.busy)], computerControl: {} }));
     }
     if (pathname === `/api/groups/${room(false).id}/interrupt`) return route.fulfill(json({ ok: true, stopped: true }));
     if (send && method === 'POST') {
@@ -329,4 +336,130 @@ test('two room messages held for a busy member come back together when the serve
   roomState.busy = false;
   await expect.poll(() => sends.length).toBe(1);
   await expect(box).toHaveValue('first thought\n\nsecond thought');
+});
+
+test('editing a message held for a busy room brings its attachments back too', async ({ page }) => {
+  const sends = await mockServer(page, accept);
+  roomState.busy = true;
+  await openApp(page);
+  const box = await openRoom(page);
+  const chip = page.getByRole('button', { name: 'Remove pasted text' });
+
+  // a long paste becomes a chip rather than text in the box
+  await box.evaluate((field, long) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData('text/plain', long);
+    field.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
+  }, 'a pasted line of an enormous log\n'.repeat(60));
+  await expect(chip).toBeVisible();
+
+  // the room is mid-turn, so this is held client-side and nothing goes out
+  await box.fill('worth checking against the earlier answer');
+  await box.press('Enter');
+  await expect(box).toHaveValue('');
+  await expect(chip).toBeHidden();
+  expect(sends).toHaveLength(0);
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
+
+  // editing the held pill puts the message back where it can be changed.
+  // The paste it was carrying has to come back with it: the pill's text is
+  // the composed string, so restoring that string alone drops the attachment
+  // on the floor and the person loses an enormous log to a two-word edit.
+  await page.getByRole('button', { name: 'Edit Queued Message' }).first().click();
+  await expect(box).toHaveValue('worth checking against the earlier answer');
+  await expect(chip).toBeVisible();
+
+  // editing takes the message out of the hold: it is a draft again, waiting
+  // for the person to send it, so the pill is gone and nothing is in flight.
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(0);
+  expect(sends).toHaveLength(0);
+
+  roomState.busy = false;
+  await box.press('Enter');
+  await expect.poll(() => sends.length).toBe(1);
+  expect(sends[0].text).toContain('worth checking against the earlier answer');
+  await expect(chip).toBeHidden();
+});
+
+test('editing a queued bot message waits for the harness before restoring the draft', async ({ page }) => {
+  const cancel = held();
+  // The server, not the client, decides a send is queued: the pill only
+  // exists once the POST answers queued: true with a queueId.
+  await mockServer(page, (route) =>
+    route.fulfill(json({ ok: true, queued: true, queueId: 'q-1', threadId: `thread-${DRAFTSMAN.id}` }, 202)),
+  );
+  // Hold the DELETE that retires a queued message, so the window Kody named is
+  // wide open: the queued send is still live on the server the whole time.
+  await page.route('**/api/bots/*/queue/*', async (route) => {
+    await cancel.released;
+    return route.fulfill(json({ ok: true }));
+  });
+  await openApp(page);
+  const box = await openBot(page, DRAFTSMAN.name);
+
+  await box.fill('worth a second look');
+  await box.press('Enter');
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
+
+  await page.getByRole('button', { name: 'Edit Queued Message' }).first().click();
+
+  // While the DELETE is in flight the message is still queued, so the draft
+  // must NOT be back in the box: a fast resend here would put the original and
+  // the copy on the wire together.  The assertions below are the wait; no bare
+  // sleep, because a fixed 300ms is either too short or a lie on a slow run.
+  await expect(box).toHaveValue('');
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
+
+  cancel.release();
+  await expect(box).toHaveValue('worth a second look');
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(0);
+  // The restore fills the box after the DELETE answers, so the caret has to
+  // move with it.  Asserting the value alone would not notice a caret left at
+  // position 0, which is what reading the value before the restore produced.
+  await expect
+    .poll(() => box.evaluate((field) => field.selectionStart))
+    .toBe('worth a second look'.length);
+});
+
+test('editing a queued bot message restores attachments without duplicating wire markers', async ({ page }) => {
+  let sendAttempt = 0;
+  const sends = await mockServer(
+    page,
+    (route) => {
+      sendAttempt += 1;
+      if (sendAttempt === 1) {
+        return route.fulfill(
+          json({ ok: true, queued: true, queueId: 'q-attach', threadId: `thread-${DRAFTSMAN.id}` }, 202),
+        );
+      }
+      return route.fulfill(json({ ok: true }, 202));
+    },
+    { busyBotIds: [DRAFTSMAN.id] },
+  );
+  await page.route('**/api/bots/*/queue/*', (route) => route.fulfill(json({ ok: true })));
+  await openApp(page);
+  const box = await openBot(page, DRAFTSMAN.name);
+  const chip = page.getByRole('button', { name: 'Remove pasted text' });
+
+  await box.evaluate((field, long) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData('text/plain', long);
+    field.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
+  }, 'a pasted line of an enormous log\n'.repeat(60));
+  await expect(chip).toBeVisible();
+
+  await box.fill('worth checking against the earlier answer');
+  await box.press('Enter');
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(1);
+
+  await page.getByRole('button', { name: 'Edit Queued Message' }).first().click();
+  await expect(box).toHaveValue('worth checking against the earlier answer');
+  await expect(chip).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Edit Queued Message' })).toHaveCount(0);
+
+  await box.press('Enter');
+  await expect.poll(() => sends.length).toBe(2);
+  const wire = sends[1]!.text;
+  expect((wire.match(/<pasted-text/g) ?? []).length).toBe(1);
+  expect(wire).toContain('worth checking against the earlier answer');
 });

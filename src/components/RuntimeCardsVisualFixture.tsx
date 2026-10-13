@@ -11,6 +11,7 @@
 //
 //   card  = local-vm | shared-vps | both
 //   state = per-bot | shared | replacement | normal | loading | per-bot-caption
+//           | vps-outdated | vps-building | vps-switch (Shared VPS image states)
 //
 // The fixture fulfils /api/local-computer and /api/vps-computer via
 // `page.route(...)` in the spec, so the card's own status poll gets a
@@ -30,7 +31,17 @@ const RuntimeCardsVisualFixtureParamsSchema = z
   .object({
     card: z.enum(["local-vm", "shared-vps", "both"]).default("both"),
     state: z
-      .enum(["per-bot", "shared", "replacement", "normal", "loading", "per-bot-caption"])
+      .enum([
+        "per-bot",
+        "shared",
+        "replacement",
+        "normal",
+        "loading",
+        "per-bot-caption",
+        "vps-outdated",
+        "vps-building",
+        "vps-switch",
+      ])
       .default("normal"),
   })
   .strip();

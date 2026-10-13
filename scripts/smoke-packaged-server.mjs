@@ -34,6 +34,13 @@ const child = spawn(process.execPath, [join(staging, "server", "index.js")], {
     HOME: home,
     USERPROFILE: home,
     OMB_PORT: String(port),
+    // The smoke boots a real harness against a throwaway HOME, but container
+    // runtimes are machine-wide and the Local VM container name follows the OS
+    // username, so the boot-time probe would inspect the owner's real
+    // container.  Switch them off (server/container-runtime-guard.ts).
+    BOTFLEET_DISABLE_CONTAINER_RUNTIME: "1",
+    DOCKER_HOST: "unix:///nonexistent.sock",
+    CONTAINER_HOST: "unix:///nonexistent.sock",
     // This fake loopback DSN exercises SDK loading without contacting the
     // owner's Sentry project.  The staged server has no node_modules.
     SENTRY_DSN: "https://0123456789abcdef0123456789abcdef@127.0.0.1:1/1",

@@ -48,7 +48,7 @@ import {
   type CapabilityState,
   type EngineCapabilityEntry,
 } from "@/lib/engine-capabilities";
-import { PricingModeChip } from "./EngineCallout";
+import { AccessModeChip } from "./EngineCallout";
 import { cn } from "@/lib/cn";
 import type { InstanceInfo } from "@/state/store";
 
@@ -84,7 +84,6 @@ const CELL_TONE = {
   yes: "text-emerald-700 dark:text-emerald-300 bg-emerald-500/10",
   no: "text-ink-secondary/70 bg-inset/30",
   limited: "text-amber-700 dark:text-amber-300 bg-amber-500/10",
-  "yes-pro-only": "text-violet-700 dark:text-violet-300 bg-violet-500/10",
   unknown: "text-ink-secondary/50 border border-dashed border-hairline/50 bg-transparent",
 } satisfies Record<CapabilityState, string>;
 
@@ -236,7 +235,7 @@ export function EngineCapabilitiesMatrix(props: {
                       {entry.displayName}
                     </span>
                     <span className="ml-auto shrink-0">
-                      <PricingModeChip entry={entry} />
+                      <AccessModeChip entry={entry} />
                     </span>
                   </span>
                 </th>

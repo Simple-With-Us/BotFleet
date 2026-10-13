@@ -14,6 +14,9 @@ import {
   PAIRING_TTL_MS,
 } from "../src/devices.ts";
 
+/** Test-only handle to force `persist()` failures without a read-only disk. */
+type RegistryPersistHarness = { persist: () => void };
+
 const pair = (registry: DeviceRegistry, name = "iPhone") => {
   const { code } = registry.openPairing();
   const result = registry.redeem(code, name);
@@ -253,10 +256,71 @@ describe("DeviceRegistry", () => {
     expect(registry.pushTokens()).toEqual([]);
   });
 
+  it("stores a hex Live Activity token apart from the alert one", () => {
+    const registry = new DeviceRegistry();
+    const { device } = pair(registry);
+    const alertToken = "a".repeat(64);
+    const liveToken = "b".repeat(64);
+
+    expect(registry.setPushToken(device.id, alertToken)).toBe(true);
+    expect(registry.setLiveActivityToken(device.id, liveToken)).toBe(true);
+
+    // Two tokens, two lists: clearing one must never disturb the other, and a
+    // Live Activity push never rides the alert token.
+    expect(registry.pushTokens()).toEqual([{ deviceId: device.id, token: alertToken }]);
+    expect(registry.liveActivityTokens()).toEqual([{ deviceId: device.id, token: liveToken }]);
+
+    expect(registry.clearLiveActivityToken(device.id)).toBe(true);
+    expect(registry.liveActivityTokens()).toEqual([]);
+    expect(registry.pushTokens()).toEqual([{ deviceId: device.id, token: alertToken }]);
+
+    // Same validation as the alert token, and the same rejection paths.
+    expect(registry.setLiveActivityToken(device.id, "not-hex")).toBe(false);
+    expect(registry.setLiveActivityToken("missing", liveToken)).toBe(false);
+    expect(registry.liveActivityTokens()).toEqual([]);
+    expect(registry.clearLiveActivityToken(device.id)).toBe(false);
+    expect(registry.clearLiveActivityToken("missing")).toBe(false);
+
+    // It survives a relaunch, which is the point of storing it at all.
+    expect(registry.setLiveActivityToken(device.id, liveToken.toUpperCase())).toBe(true);
+    expect(new DeviceRegistry().liveActivityTokens()).toEqual([{ deviceId: device.id, token: liveToken }]);
+  });
+
+  it("clears only the Live Activity token Apple actually rejected", () => {
+    // A send can be in flight while the phone registers a replacement; clearing
+    // on the old one's rejection would throw the good token away.
+    const registry = new DeviceRegistry();
+    const { device } = pair(registry);
+    const stale = "a".repeat(64);
+    const fresh = "b".repeat(64);
+
+    expect(registry.setLiveActivityToken(device.id, stale)).toBe(true);
+    expect(registry.setLiveActivityToken(device.id, fresh)).toBe(true);
+    expect(registry.clearLiveActivityToken(device.id, stale)).toBe(false);
+    expect(registry.liveActivityTokens()).toEqual([{ deviceId: device.id, token: fresh }]);
+    expect(registry.clearLiveActivityToken(device.id, fresh.toUpperCase())).toBe(true);
+    expect(registry.liveActivityTokens()).toEqual([]);
+  });
+
+  it("never shows a Live Activity token to the pairing UI", () => {
+    // A secret-bearing field that reaches `list()` is a token printed on the
+    // control page for anyone standing at the computer.
+    const registry = new DeviceRegistry();
+    const { device } = pair(registry);
+    const liveToken = "c".repeat(64);
+    expect(registry.setLiveActivityToken(device.id, liveToken)).toBe(true);
+
+    const [publicDevice] = registry.list();
+    expect(publicDevice).not.toHaveProperty("liveActivityToken");
+    expect(publicDevice).not.toHaveProperty("pushToken");
+    expect(publicDevice).not.toHaveProperty("tokenHash");
+    expect(JSON.stringify(registry.list())).not.toContain(liveToken);
+  });
+
   it("rolls cloud desktop access back when it cannot be saved", () => {
     const registry = new DeviceRegistry();
     const { token, device } = pair(registry);
-    (registry as unknown as { persist: () => void }).persist = () => {
+    (registry as unknown as RegistryPersistHarness).persist = () => {
       throw new Error("ENOSPC: no space left on device");
     };
 
@@ -377,7 +441,7 @@ describe("authenticate under a failing disk", () => {
     // it. Assigning on the instance shadows the prototype method for this
     // registry only — the failing disk is simulated where the disk is used,
     // rather than by mocking node:fs for the whole file.
-    (registry as unknown as { persist: () => void }).persist = () => {
+    (registry as unknown as RegistryPersistHarness).persist = () => {
       attempted++;
       throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
     };
@@ -401,7 +465,7 @@ describe("a pairing that cannot be saved", () => {
     // SAFETY: as above — the private `persist` shadowed on this one instance,
     // which is the only way to make the write fail without a filesystem that
     // really is read-only.
-    (registry as unknown as { persist: () => void }).persist = () => {
+    (registry as unknown as RegistryPersistHarness).persist = () => {
       throw new Error("EROFS: read-only file system");
     };
 

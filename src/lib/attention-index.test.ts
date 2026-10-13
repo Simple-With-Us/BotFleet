@@ -162,7 +162,12 @@ describe("computeRoomAttentionIndex", () => {
         errors: { count: 1, bots: [{ botId: "b1", botName: "Bot 1" }] },
         needsAction: { count: 0, bots: [] },
         working: { count: 1, bots: [{ botId: "b1", botName: "Bot 1" }] },
-        unread: { count: 2, hasUnread: true },
+        unread: {
+          count: 2,
+          hasUnread: true,
+          roomUnread: true,
+          bots: [{ botId: "b1", botName: "Bot 1" }],
+        },
       },
       {
         roomId: "r2",
@@ -171,7 +176,7 @@ describe("computeRoomAttentionIndex", () => {
         errors: { count: 0, bots: [] },
         needsAction: { count: 2, bots: [{ botId: "b2", botName: "Bot 2" }, { botId: "b3", botName: "Bot 3" }] },
         working: { count: 0, bots: [] },
-        unread: { count: 0, hasUnread: false },
+        unread: { count: 0, hasUnread: false, roomUnread: false, bots: [] },
       },
     ];
 
@@ -376,5 +381,111 @@ describe("computeRoomAttentionIndex", () => {
       ["Scout", "Turn error: cycle leaf"],
       ["Fixer", "Turn error: flat fallback"],
     ]);
+  });
+});
+
+describe("summarizeFleetAttention", () => {
+  const room = (
+    id: string,
+    memberIds: string[],
+    extra: Partial<MinimalGroup> = {},
+  ): MinimalGroup => ({ id, name: id, memberIds, unread: false, ...extra });
+
+  it("counts a bot once however many rooms it belongs to", () => {
+    // One working bot and one dead bot, each a member of all three rooms.
+    const groups = [
+      room("room-a", ["bot-worker", "bot-crashed"]),
+      room("room-b", ["bot-worker", "bot-crashed"]),
+      room("room-c", ["bot-worker", "bot-crashed"]),
+    ];
+    const bots: MinimalBot[] = [
+      { id: "bot-worker", name: "Worker", activity: "working" },
+      { id: "bot-crashed", name: "Crashed", activity: "dead" },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    // Every room still shows the bot's one global state, so the per-room chips
+    // and matrix rows are unchanged.
+    expect(rooms.map((r) => r.working.count)).toEqual([1, 1, 1]);
+    expect(rooms.map((r) => r.errors.count)).toEqual([1, 1, 1]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalWorking).toBe(1);
+    expect(summary.totalErrors).toBe(1);
+    expect(summary.totalNeedsAction).toBe(0);
+    expect(summary.totalUnread).toBe(0);
+    // How many rooms are affected is a different question, and it stays per room.
+    expect(summary.roomsWorking).toBe(3);
+    expect(summary.roomsWithErrors).toBe(3);
+  });
+
+  it("still counts different bots separately when their rooms overlap", () => {
+    const groups = [
+      room("room-a", ["bot-a", "bot-c"]),
+      room("room-b", ["bot-a", "bot-b", "bot-c", "bot-d"]),
+      room("room-c", ["bot-b", "bot-d"]),
+    ];
+    const bots: MinimalBot[] = [
+      { id: "bot-a", name: "A", activity: "working" },
+      { id: "bot-b", name: "B", activity: "working" },
+      { id: "bot-c", name: "C", activity: "waiting-on-you" },
+      { id: "bot-d", name: "D", activity: "waiting-on-you" },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    expect(rooms.map((r) => r.working.count)).toEqual([1, 2, 1]);
+    expect(rooms.map((r) => r.needsAction.count)).toEqual([1, 2, 1]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalWorking).toBe(2);
+    expect(summary.totalNeedsAction).toBe(2);
+  });
+
+  it("counts a working bot once whether its activity or its room's busy marker says so", () => {
+    const groups = [
+      room("room-a", ["bot-global"], { busyBotId: "bot-global" }),
+      room("room-b", ["bot-global", "bot-room-only"], { busyBotId: "bot-room-only" }),
+    ];
+    const bots: MinimalBot[] = [
+      { id: "bot-global", name: "Global", activity: "working" },
+      { id: "bot-room-only", name: "Room Only", activity: "idle" },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    // room-a lists bot-global once although two signals mark it working, and
+    // room-b adds a bot that is busy only in that room.
+    expect(rooms.map((r) => r.working.bots.map((b) => b.botId))).toEqual([
+      ["bot-global"],
+      ["bot-global", "bot-room-only"],
+    ]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalWorking).toBe(2);
+    expect(summary.roomsWorking).toBe(2);
+  });
+
+  it("counts an unread bot once, plus each room chat that is unread itself", () => {
+    const groups = [
+      room("room-a", ["bot-reader"]),
+      room("room-b", ["bot-reader"], { unread: true }),
+      room("room-c", ["bot-reader"]),
+    ];
+    const bots: MinimalBot[] = [
+      { id: "bot-reader", name: "Reader", activity: "idle", unread: true },
+    ];
+
+    const rooms = computeRoomAttentionIndex(groups, bots);
+    // Per room: the bot's thread, plus the room chat where it is unread.
+    expect(rooms.map((r) => r.unread.count)).toEqual([1, 2, 1]);
+    expect(rooms.map((r) => r.unread.roomUnread)).toEqual([false, true, false]);
+    expect(rooms.map((r) => r.unread.bots.map((b) => b.botId))).toEqual([
+      ["bot-reader"],
+      ["bot-reader"],
+      ["bot-reader"],
+    ]);
+
+    const summary = summarizeFleetAttention(rooms);
+    expect(summary.totalUnread).toBe(2); // the bot once, plus room-b's chat
+    expect(summary.roomsWithUnread).toBe(3);
   });
 });

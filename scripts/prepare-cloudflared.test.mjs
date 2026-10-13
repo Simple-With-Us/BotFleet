@@ -241,7 +241,9 @@ describe("identifying the staged cloudflared executable", () => {
   it("waits 60s and allows one retry by default, not the old 10s ceiling", () => {
     expect(VERSION_PROBE_TIMEOUT_MS).toBe(60_000);
     expect(VERSION_PROBE_ATTEMPTS).toBe(2);
-    const { spawn, calls } = fakeSpawn([probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION}\n` })]);
+    const { spawn, calls } = fakeSpawn([
+      probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION} (abc)\n` }),
+    ]);
     probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toEqual(["version"]);
@@ -252,7 +254,7 @@ describe("identifying the staged cloudflared executable", () => {
     // The Oct 1, 2026 incident: the binary was correct, the host was not.
     const { spawn, calls } = fakeSpawn([
       timedOutResult(),
-      probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION}\n` }),
+      probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION} (abc)\n` }),
     ]);
     const probe = probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
     expect(probe.ok).toBe(true);
@@ -274,6 +276,19 @@ describe("identifying the staged cloudflared executable", () => {
     expect(message).toContain("ETIMEDOUT");
     // The cause a person can act on, not the "corrupt download" dead end.
     expect(message).not.toMatch(/did not report the pinned version/);
+  });
+
+  it("does not accept a pinned version mention on stderr alone", () => {
+    const { spawn, calls } = fakeSpawn([
+      probeResult({
+        stdout: "cloudflared version 2026.7.1\n",
+        stderr: `cloudflared version ${CLOUDFLARED_VERSION}\n`,
+      }),
+    ]);
+    const probe = probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
+    expect(probe.ok).toBe(false);
+    expect(probe.reason).toBe("version");
+    expect(calls).toHaveLength(1);
   });
 
   it("still reports a genuine version mismatch, without retrying", () => {
@@ -320,9 +335,19 @@ describe("identifying the staged cloudflared executable", () => {
     expect(versionProbeFailureMessage("linux-x64", probe)).toMatch(/could not be run/);
   });
 
-  it("accepts the version from either stream and ignores an unversioned failure", () => {
-    expect(classifyVersionProbe(probeResult({ stderr: `cloudflared ${CLOUDFLARED_VERSION}\n` }))).toEqual({
+  it("requires the version line on stdout and ignores stderr-only mentions", () => {
+    expect(
+      classifyVersionProbe(
+        probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION} (abc)\n` }),
+      ),
+    ).toEqual({
       ok: true,
+      reason: "version",
+    });
+    expect(
+      classifyVersionProbe(probeResult({ stderr: `cloudflared version ${CLOUDFLARED_VERSION}\n` })),
+    ).toEqual({
+      ok: false,
       reason: "version",
     });
     expect(classifyVersionProbe(probeResult({ status: 0, stdout: "some other tunnel client\n" }))).toEqual({

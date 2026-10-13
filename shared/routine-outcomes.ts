@@ -1,6 +1,6 @@
 export type RoutineOutcomeCode =
   | "completed" | "cancelled" | "capability_denied" | "auth_required"
-  | "quota_exhausted" | "timeout" | "runtime_restart" | "runtime_reconfigured" | "bot_stopped"
+  | "quota_exhausted" | "timeout" | "runtime_restart" | "runtime_reconfigured" | "bot_stopped" | "bot_off"
   | "bot_missing" | "thread_missing" | "dispatch_failed" | "engine_unavailable" | "resume_failed"
   | "budget_exhausted" | "execution_failed" | "missed_offline" | "combined_unverified";
 
@@ -52,7 +52,7 @@ export function routineFailureCode(reason?: string | null, setup = false, denied
 }
 
 export function routineFailurePhase(code: RoutineOutcomeCode): RoutineFailurePhase {
-  if (["runtime_restart", "runtime_reconfigured", "bot_stopped", "cancelled"].includes(code)) return "lifecycle";
+  if (["runtime_restart", "runtime_reconfigured", "bot_stopped", "bot_off", "cancelled"].includes(code)) return "lifecycle";
   if (["bot_missing", "thread_missing", "dispatch_failed", "auth_required", "engine_unavailable", "resume_failed"].includes(code)) return "dispatch";
   if (code === "capability_denied") return "approval";
   if (code === "missed_offline") return "schedule";
@@ -62,7 +62,7 @@ export function routineFailurePhase(code: RoutineOutcomeCode): RoutineFailurePha
 export const ROUTINE_OUTCOME_LABELS: Record<RoutineOutcomeCode, string> = {
   completed: "Completed", cancelled: "Cancelled", capability_denied: "Capability denied",
   auth_required: "Sign-in required", quota_exhausted: "Quota exhausted", timeout: "Timed out",
-  runtime_restart: "Interrupted by restart", runtime_reconfigured: "Interrupted by settings change", bot_stopped: "Bot stopped", bot_missing: "Bot unavailable",
+  runtime_restart: "Interrupted by restart", runtime_reconfigured: "Interrupted by settings change", bot_stopped: "Bot stopped", bot_off: "Bot off", bot_missing: "Bot unavailable",
   thread_missing: "Conversation unavailable", dispatch_failed: "Could not start", engine_unavailable: "Engine unavailable",
   resume_failed: "Could not resume",
   budget_exhausted: "Round budget reached",

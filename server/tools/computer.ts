@@ -62,6 +62,12 @@ export interface ComputerToolsOptions {
     /** The precomputed realpath of the bot's workspace root. */
     workspaceRealpath: string;
   };
+  /** The launch variables `bash` adds to its minimal environment
+   *  (server/launch-identity.ts): the shell is a child of the engine like any
+   *  other, and without them a fleet tool run from it would see no launcher
+   *  and take a platform default.  Absent, `bash` runs with the minimal
+   *  environment alone. */
+  launchEnv?: NodeJS.ProcessEnv;
   /** Where `bash` records the process group of every command it starts, so
    *  the turn can stop whatever is still running when it ends.  The tool
    *  host passes one per turn; absent, nothing is tracked past the call. */
@@ -133,7 +139,7 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
     // command started, not just the shell (server/tools/process-group.ts).
     const run = await runInProcessGroup(shell, shellArgs, {
       cwd: workingDir,
-      env: modelShellEnv(),
+      env: { ...modelShellEnv(), ...options.launchEnv },
       timeoutMs: bashTimeoutMs,
       maxBuffer: BASH_MAX_BUFFER,
       signal: runtime.signal,

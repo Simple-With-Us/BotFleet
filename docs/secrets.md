@@ -117,6 +117,7 @@ running fleet.
 | `qdrant.accessClientId` | `OMB_RECALL_ACCESS_CLIENT_ID` | `OMB_RECALL_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_ID` | no | yes |
 | `qdrant.accessClientSecret` | `OMB_RECALL_ACCESS_CLIENT_SECRET` | `OMB_RECALL_ACCESS_CLIENT_SECRET`, `CF_ACCESS_CLIENT_SECRET` | yes | yes |
 | `observability.sentryDsn` | `SENTRY_DSN` | `SENTRY_DSN`, `BOTFLEET_SENTRY_DSN` | yes | no |
+| `observability.sentryFleetDsn` | `SENTRY_FLEET_DSN` | `SENTRY_FLEET_DSN` | yes | no |
 
 This table lives once, in code, at `server/secret-map.ts`'s `SECRET_FIELDS` —
 this list is kept in step with it by hand, so treat the source as

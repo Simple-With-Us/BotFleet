@@ -41,17 +41,50 @@ export function readPackagedBuildIdentity(directory) {
   return value;
 }
 
-/** Capture once at build/startup, so moving a checkout cannot relabel a live process. */
-export function readSourceBuildIdentity(root) {
-  const git = (...args) => execFileSync("git", ["-C", root, ...args], {
-    encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+/** Capture once at build/startup, so moving a checkout cannot relabel a live process.
+ *
+ * Pass `requireGit: true` when the identity is being stamped into a shipped
+ * manifest: a build that writes this into `build-identity.json` must know its
+ * real source commit, or the packaged app would ship a fabricated all-zeros
+ * commit as provenance.  The server keeps the default for startup, where an
+ * unavailable git is not a reason to refuse to boot. */
+export function readSourceBuildIdentity(root, { requireGit = false } = {}) {
+  // Git is not guaranteed to be on PATH: a checkout started from a GUI app, a
+  // stripped container, or a test that scrubs PATH cannot run it.  That is not
+  // a reason for the server to refuse to start, so an unavailable git reports
+  // the commit as all zeros and the build as dirty.  Marking it dirty is what
+  // makes this safe — `buildCompatibility` never calls two dirty builds
+  // "matching", so an unknown commit can never read as agreement between a
+  // stale UI bundle and this server.
+  const unknownCommit = "0".repeat(40);
+  let sourceCommit = unknownCommit;
+  let sourceDirty = true;
+  try {
+    const git = (...args) => execFileSync("git", ["-C", root, ...args], {
+      encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    const head = git("rev-parse", "HEAD");
+    if (/^[a-f0-9]{40}$/.test(head)) {
+      sourceCommit = head;
+      sourceDirty = git("status", "--porcelain", "--untracked-files=no").length > 0;
+    }
+  } catch {
+    // Git may be absent, timed out, or unable to read the index.  A real HEAD
+    // already captured above still stands; only an unknown commit is refused
+    // below when requireGit is set.  A status failure after HEAD succeeds keeps
+    // sourceDirty true (the safe default), matching the documented fallback.
+    /* commit stays unknown when HEAD never arrived; otherwise keep what we have */
+  }
   const value = {
     app: "botfleet", version: JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
-    apiVersion: HARNESS_API_VERSION, sourceCommit: git("rev-parse", "HEAD"),
-    sourceDirty: git("status", "--porcelain", "--untracked-files=no").length > 0,
-    uiHash: null,
+    apiVersion: HARNESS_API_VERSION, sourceCommit, sourceDirty, uiHash: null,
   };
+  // A manifest stamped into a shipped bundle must name a real commit: git ran
+  // but reported no usable HEAD (shallow archive, corrupt repo), so the
+  // all-zeros fallback would be fabricated provenance.
+  if (requireGit && sourceCommit === unknownCommit) {
+    throw new Error(`cannot read git identity for ${root}: git reported no usable HEAD`);
+  }
   if (!validBuildIdentity(value)) throw new Error("BotFleet source identity is invalid");
   return value;
 }

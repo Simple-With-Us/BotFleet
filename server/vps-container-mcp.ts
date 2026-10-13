@@ -1,4 +1,4 @@
-// Transparent stdio bridge to the official Cua MCP server in a VPS
+// Transparent stdio bridge to the official CUA MCP server in a VPS
 // container. Docker's SSH transport handles authentication through the
 // user's normal SSH config and agent; this process stores no credentials.
 // The piping, drain-safe exit, and dead-transport watchdog live in

@@ -62,6 +62,7 @@ struct NewGroupSheet: View {
                         } label: {
                             HStack(spacing: 12) {
                                 BotAvatarView(bot: bot, size: 36, state: .idle, animated: false)
+                                    .providerBadge(for: bot, avatarSize: 36)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(bot.name).font(.system(size: 16, weight: .semibold)).foregroundStyle(Color.primary)
                                     if !bot.title.isEmpty {
@@ -89,26 +90,24 @@ struct NewGroupSheet: View {
                         creating = true
                         Task {
                             let ordered = bots.map(\.id).filter(members.contains)
-                            if var room = await session.createRoom(name: name, memberIds: ordered) {
-                                let trimmedCwd = cwd.trimmingCharacters(in: .whitespaces)
-                                let trimmedBulletin = bulletin.trimmingCharacters(in: .whitespaces)
-                                let responder = GroupResponder(kind: responderKind, botId: responderKind == "member" ? (leadBotId.isEmpty ? nil : leadBotId) : nil)
-                                if !trimmedCwd.isEmpty || !trimmedBulletin.isEmpty || responderKind != "everyone" {
-                                    if await session.updateRoom(
-                                        id: room.id,
-                                        name: name.isEmpty ? room.name : name,
-                                        bulletin: trimmedBulletin,
-                                        avatarCrop: nil,
-                                        cwd: trimmedCwd.isEmpty ? nil : trimmedCwd,
-                                        extraCwds: nil,
-                                        defaultResponder: responder,
-                                        memberIds: ordered
-                                    ) {
-                                        if let updated = session.state.rooms.first(where: { $0.id == room.id }) {
-                                            room = updated
-                                        }
-                                    }
-                                }
+                            // One request, so a refusal leaves no room behind.
+                            // The folder, bulletin and responder used to follow
+                            // the create in a PATCH: a folder this computer
+                            // would not let a phone choose (403) then left a
+                            // half-made room, and the message about it, behind.
+                            let responder: GroupResponder? = responderKind == "everyone"
+                                ? nil
+                                : GroupResponder(
+                                    kind: responderKind,
+                                    botId: responderKind == "member" ? (leadBotId.isEmpty ? nil : leadBotId) : nil
+                                )
+                            if let room = await session.createRoom(
+                                name: name,
+                                memberIds: ordered,
+                                cwd: cwd,
+                                bulletin: bulletin,
+                                defaultResponder: responder
+                            ) {
                                 created(room)
                             }
                             creating = false

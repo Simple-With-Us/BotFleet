@@ -28,6 +28,17 @@ struct SettingsView: View {
     @FocusState private var focusedProfileField: ProfileField?
 
     private enum ProfileField: Hashable { case name, email }
+
+    /// DEBUG `-store-preview -preview-voice -open-settings`: the Voice
+    /// section comes first, so the screenshot harness can see it without
+    /// scrolling (the same rule AgentProfileView uses).
+    private static var voiceSectionFirst: Bool {
+#if DEBUG
+        ProcessInfo.processInfo.arguments.contains("-preview-voice")
+#else
+        false
+#endif
+    }
     private let onConnect: (() -> Void)?
 
     init(onConnect: (() -> Void)? = nil) {
@@ -36,6 +47,9 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            if Self.voiceSectionFirst, session.connection != nil {
+                WorkspaceVoiceSection()
+            }
             Section("Computer") {
                 if let connection = session.connection {
                     NavigationLink {
@@ -83,7 +97,7 @@ struct SettingsView: View {
                     .accessibilityHint(notificationAccessibilityHint)
                 }
             } footer: {
-                Text("Alerts arrive while BotFleet is open or was recently in the background. Closed-app delivery is not available yet.")
+                Text("Alerts reach this iPhone while BotFleet is open or in the background.\u{00A0} Closed-app delivery needs push set up on your computer, and the section below says whether it is working.")
             }
 
             if session.connection != nil {
@@ -118,6 +132,45 @@ struct SettingsView: View {
                         }
                     }
 
+                    NavigationLink {
+                        FleetModelsView()
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Models")
+                                Text("Every bot's primary and fallbacks")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            SettingsIcon(symbol: "cpu", color: .green)
+                        }
+                    }
+
+                    NavigationLink {
+                        UsageView()
+                    } label: {
+                        Label {
+                            Text("Usage & Cost")
+                        } icon: {
+                            SettingsIcon(symbol: "chart.bar.xaxis", color: .green)
+                        }
+                    }
+
+                    NavigationLink {
+                        SharedMemoryView()
+                    } label: {
+                        HStack {
+                            Label {
+                                Text("Shared Memory")
+                            } icon: {
+                                SettingsIcon(symbol: "memorychip", color: .pink)
+                            }
+                            Spacer()
+                            SharedMemoryStateText()
+                        }
+                    }
+
                     Picker(selection: Binding(
                         get: { session.config?.isProjectsMode == true ? "projects" : "simple" },
                         set: { mode in
@@ -132,7 +185,7 @@ struct SettingsView: View {
                         Text("Projects").tag("projects")
                     } label: {
                         Label {
-                            Text("Workspace Layout")
+                            Text("Workspace Arrangement")
                         } icon: {
                             SettingsIcon(symbol: "square.grid.2x2", color: .teal)
                         }
@@ -196,6 +249,10 @@ struct SettingsView: View {
                     Text("Workspace")
                 } footer: {
                     Text(workspaceFooter)
+                }
+
+                if !Self.voiceSectionFirst {
+                    WorkspaceVoiceSection()
                 }
 
                 Section {
@@ -488,6 +545,7 @@ struct SettingsView: View {
 
     private var roomTerm: String { session.config?.roomTerminologyLabel ?? "Channel" }
     private var roomTermPlural: String { session.config?.roomTerminologyPlural ?? "Channels" }
+    private var roomTermLowered: String { session.config?.roomTerminologyLabelLowered ?? "channel" }
 
     private var normalizedProfileName: String {
         profileName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -546,10 +604,10 @@ struct SettingsView: View {
 
     private var workspaceFooter: String {
         guard settingsLoaded else {
-            return "Workspace layout, terminology, and tool toggles unlock after settings load from your computer."
+            return "Workspace arrangement, terminology, and tool toggles unlock after settings load from your computer."
         }
         return session.config?.isProjectsMode == true
-            ? "Projects hides named bots.  That word is a category that any number of threads can sit under."
+            ? "Any number of threads under each bot and \(roomTermLowered).\u{00A0} A thread can be tied to one \(roomTermLowered) on your computer."
             : "Simple is one conversation per bot.  That word is a group thread invited bots and you can all write in."
     }
 
@@ -682,7 +740,8 @@ private struct ComputerSettingsRow: View {
     }
 }
 
-private struct SettingsIcon: View {
+/// Shared with WorkspaceVoiceSettings.swift, so the Voice rows match.
+struct SettingsIcon: View {
     let symbol: String
     let color: Color
 

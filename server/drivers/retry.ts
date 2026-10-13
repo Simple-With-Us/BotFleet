@@ -55,6 +55,8 @@ export interface ErrorClassification {
 // limit", "out of credits", "insufficient balance" phrases stay as
 // explicit disjunction arms — every test case in retry.test.ts still
 // matches one of them.
+//
+// "status" is already one of the cue words below, so "unexpected status 503/429/401" already reads as a status-code cue on its own — no separate "unexpected status" cue needed for the Unit 2 fix.
 const HTTP_STATUS_CONTEXT = "\\b(?:https?://|status|http|code|error)\\b[^\\s\\n]{0,4}(?:[:=\\s]\\s*[(\\[]?|[(\\[])";
 
 function hasHttpStatusCode(text: string, code: RegExp): boolean {
@@ -87,7 +89,20 @@ const TRANSIENT_PATTERNS: Array<{ pattern: RegExp; reason: TransientReason }> = 
   { pattern: /\btimeout(ed)?\b|\btimed? out\b/i, reason: "timeout" },
 ];
 
-const TERMINAL_PATTERNS: Array<{ pattern: RegExp; reason: TerminalReason }> = [
+// Terminal arms that must win over everything else — including a
+// transient-looking phrase elsewhere in the same text — because they are
+// unrecoverable by definition: no retry count fixes a bad key, an empty
+// wallet, or a turn the user already stopped.  Checked first, in both the
+// CliExit and Error/text shapes, so a message that is both quota-shaped and
+// mentions "capacity" (RESOURCE_EXHAUSTED bodies do) always classifies as
+// quota, never as the transient "overloaded" reading — and a stop phrase
+// that happens to also carry transient vocabulary (a socket reset while the
+// user's cancel was landing) always classifies as interrupted, never as a
+// retryable connection reset.  See classifyError's single ordered pass below
+// (2026-09-25 fix for "classifyError verdict depends on input shape"; the
+// interrupted arm moved here from the general terminal group on the FIX
+// round because it lost to TRANSIENT_PATTERNS there).
+const PRIORITY_TERMINAL_PATTERNS: Array<{ pattern: RegExp; reason: TerminalReason }> = [
   {
     // Auth-shaped words OR a status-code-driven 401/403.  "free range
     // 401 chickens" no longer triggers the auth path; "401 Unauthorized"
@@ -103,16 +118,44 @@ const TERMINAL_PATTERNS: Array<{ pattern: RegExp; reason: TerminalReason }> = [
     // expired" / "out of credits".  Bare "billing", "subscription",
     // "402", and "quota" no longer match — those substrings appear
     // in too many benign contexts (an audit finding).
+    // "rate limit reached" is quota ONLY when the same clause names a
+    // monthly, billing-cycle, plan or hard cap ("rate limit reached for this
+    // month", "Rate limit reached for your plan").  A bare "Rate limit
+    // reached ..." is the per-minute throttle every provider sends (OpenAI's
+    // "Rate limit reached for gpt-4.1 ... on tokens per min (TPM) ... Please
+    // try again in 6s" is the canonical one) and must stay a transient,
+    // retryable rate_limited.
     pattern:
-      /\bsession limit\b|\busage cap\b|\busage limit\b|\bquota exceeded\b|\brate limit reached\b|\bplan limit\b|(?<!-)\btier limit\b|\bmonthly limit\b|\bfree\s*tier\s+limit\b|\bspend limit\b|\bbudget exceeded\b|\bcredits?\b[^.\n]{0,30}\b(?:exhausted|depleted|empty|insufficient|zero)\b|\bout of (?:usage|credits)\b|\binsufficient.?balance\b|\binsufficient.?funds\b|\bzero balance\b|\bresource.?exhausted\b|\bresource_exhausted\b|\bexhausted your.*quota\b|\bdaily quota\b|\bslow pool\b|\bpayment required\b|\bsubscription\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due)\b|\bbilling\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due|not active|failed)\b/i,
+      /\bsession limit\b|\busage cap\b|\busage limit\b|\bquota exceeded\b|\brate limit reached\b[^.\n]{0,60}\b(?:this month|per month|monthly|billing (?:cycle|period)|your plan|hard limit)\b|\b(?:monthly|hard) rate limit reached\b|\bplan limit\b|(?<!-)\btier limit\b|\bmonthly limit\b|\bfree\s*tier\s+limit\b|\bspend limit\b|\bbudget exceeded\b|\bcredits?\b[^.\n]{0,30}\b(?:exhausted|depleted|empty|insufficient|zero)\b|\bout of (?:usage|credits)\b|\binsufficient.?balance\b|\binsufficient.?funds\b|\bzero balance\b|\bresource.?exhausted\b|\bresource_exhausted\b|\bexhausted your.*quota\b|\bdaily quota\b|\bslow pool\b|\bpayment required\b|\bsubscription\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due)\b|\bbilling\b[^.\n]{0,30}\b(?:expired|inactive|disabled|ended|past due|not active|failed)\b/i,
     reason: "quota",
   },
+  {
+    // Narrowed to the drivers' own stop-path phrases (interrupted BY USER,
+    // cancelled by user) — a turn the user stopped must never come back as
+    // an auto-retry, even when the same text also carries transient
+    // vocabulary ("turn cancelled by user: socket hang up" must not read as
+    // a retryable connection reset).  That is why this arm has to outrank
+    // TRANSIENT_PATTERNS, exactly like auth and quota above.  Bare
+    // "interrupted" does NOT match here, so a transient reconnect message
+    // like "stream interrupted" still falls through to the transient
+    // vocabulary (or "unknown" when nothing else matches) instead of being
+    // swallowed into a permanent give-up.
+    pattern: /\b(?:interrupted by user|cancelled by user)\b/i,
+    reason: "interrupted",
+  },
+];
+
+// Remaining terminal arms — checked AFTER the transient vocabulary, so a
+// transient-looking status code or phrase is never shadowed by a coincidental
+// terminal word later in the same message.  "unexpected status" used to live
+// here (matching regardless of the digits that followed), which is exactly
+// the shape-dependent bug this file fixes: a CliExit's "unexpected status
+// 503" and an Error's "unexpected status 503" now both fall through to
+// `classifyByStatusCode`, which reads the digits instead of the word.
+const TERMINAL_PATTERNS: Array<{ pattern: RegExp; reason: TerminalReason }> = [
   { pattern: /\bmodel not found\b|\bunknown model\b|\bdoes not exist for model\b|\bunsupported model\b/i, reason: "unknown_model" },
-  { pattern: /\b(?:invalid request|malformed|unexpected status)\b/i, reason: "invalid_request" },
+  { pattern: /\b(?:invalid request|malformed)\b/i, reason: "invalid_request" },
   { pattern: /\b(?:no such thread|thread gone)\b/i, reason: "not_found" },
-  // interrupt/cancel vocabulary from the drivers' own stop paths — a turn the
-  // user stopped must never come back as an auto-retry
-  { pattern: /\b(?:interrupted|cancelled by user)\b/i, reason: "interrupted" },
 ];
 
 /** A CLI exit report, as drivers assemble it from a child process's close
@@ -163,35 +206,50 @@ function classifyByStatusCode(text: string): ErrorClassification | undefined {
 
 /** Classify a thrown error or a CLI exit into retry-worthy vs terminal.
  *
- * Exit-report shape: a nonzero exit with no error text is treated as
+ * One order, for every input shape (Error, `{text}`, or a CLI exit report):
+ *   1. a signal kill (negative exit code) is never retried;
+ *   2. the priority terminal arms (auth, quota, interrupted) — unrecoverable
+ *      or already stopped by the user, so they outrank a transient-looking
+ *      word elsewhere in the same text (a stop that also carries a socket
+ *      error must still read as interrupted, never as a retryable reset);
+ *   3. the transient vocabulary;
+ *   4. the remaining terminal arms (unknown_model, invalid_request,
+ *      not_found);
+ *   5. the numeric HTTP status code, when the text carries one with a
+ *      recognizable cue nearby.
+ * Before this fix, a CliExit checked transient before terminal while an
+ * Error/text checked terminal before transient — so the same message could
+ * classify differently depending only on which shape carried it in (board:
+ * "classifyError verdict depends on input shape").
+ *
+ * Exit-report shape only: a nonzero exit with NO error text at all is
  * terminal (`terminal_exit`) — drivers only reach it after the CLI already
- * reported its own protocol-level failure. A signal kill (negative code) is
- * never retried either.
+ * reported its own protocol-level failure with nothing on stderr to classify.
+ * A nonzero exit whose stderr just doesn't match anything above falls
+ * through to `unknown`, same as the other two shapes, so the reason a caller
+ * sees for the same text never depends on whether it arrived as an Error, a
+ * `{text}`, or a CLI exit report.
  */
 export function classifyError(err: FailureInput): ErrorClassification {
   const text = messageOf(err);
-  let isInterrupted = false;
-  let hasExitCode = false;
+  const exit = err && "exitCode" in err ? err : null;
+  if (exit && exit.exitCode !== null && exit.exitCode < 0) return { transient: false, reason: "interrupted" };
 
-  if (err && "exitCode" in err) {
-    hasExitCode = true;
-    const { exitCode: code } = err;
-    if (code !== null && code < 0) isInterrupted = true;
+  for (const { pattern, reason } of PRIORITY_TERMINAL_PATTERNS) {
+    if (pattern.test(text)) return { transient: false, reason };
   }
-
-  if (isInterrupted) return { transient: false, reason: "interrupted" };
-
   for (const { pattern, reason } of TRANSIENT_PATTERNS) {
     if (pattern.test(text)) return { transient: true, reason };
   }
   for (const { pattern, reason } of TERMINAL_PATTERNS) {
     if (pattern.test(text)) return { transient: false, reason };
   }
-  
   const byCode = classifyByStatusCode(text);
   if (byCode) return byCode;
-  
-  return { transient: false, reason: hasExitCode ? "terminal_exit" : "unknown" };
+  if (exit && exit.exitCode !== null && exit.exitCode !== 0 && !text.trim()) {
+    return { transient: false, reason: "terminal_exit" };
+  }
+  return { transient: false, reason: "unknown" };
 }
 
 /** Capped exponential delay with jitter, in milliseconds. Attempt 0 (the

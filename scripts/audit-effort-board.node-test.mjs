@@ -49,3 +49,14 @@ test("recognizes PR lists without treating later issue numbers or foreign links 
   const finding = report.findings.find((row) => row.kind === "merged-reference-needs-scope-review");
   assert.deepEqual(finding.references.map((row) => row.number), [314, 316, 324, 332, 339, 47, 49, 90, 121, 9999998]);
 });
+
+test("accepts board issue UIDs from either owner so a pre-move root row is not a false finding", () => {
+  const row = { id: "a", app: "botfleet", source_kind: "agent-report", status: "open", title: "Track the fleet owner rename" };
+  const base = { issues: [], mergedPullRequests: [] };
+  const flagged = (board) => auditEffortBoard({ ...base, board }).findings.filter((finding) => finding.kind === "missing-canonical-issue-link");
+  assert.equal(flagged([row]).length, 1);
+  for (const owner of ["jaywedgeworth22", "Simple-With-Us"]) {
+    assert.equal(flagged([{ ...row, external_uid: `issue-${owner}/BotFleet-da11b074` }]).length, 0, owner);
+  }
+  assert.equal(flagged([{ ...row, external_uid: "issue-some-other-org/BotFleet-da11b074" }]).length, 1);
+});

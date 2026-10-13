@@ -57,7 +57,7 @@ const DERIVED_CELLS: ReadonlyArray<readonly [CapabilityKey, keyof EngineChannelW
 ];
 
 /** Verdicts that assert the channel is present. */
-const AFFIRMATIVE: ReadonlySet<CapabilityState> = new Set<CapabilityState>(["yes", "yes-pro-only"]);
+const AFFIRMATIVE: ReadonlySet<CapabilityState> = new Set<CapabilityState>(["yes"]);
 
 interface EngineWiring {
   /** driverKind -> what that one driver mounts. */

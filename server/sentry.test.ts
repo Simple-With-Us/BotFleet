@@ -10,14 +10,47 @@ import {
   scrubSentryPayload,
   scrubWebhookSecrets,
   sentryDsnFromEnv,
+  sentryReleaseName,
+  asSentryNodeTestStandIn,
+  sentryTestLoader,
   setSentryLoaderForTests,
+  type SentryNode,
 } from "./sentry.ts";
+
+type SentryInitOptions = Parameters<SentryNode["init"]>[0];
+type SentryHttpIntegrationOptions = Parameters<NonNullable<SentryNode["httpIntegration"]>>[0];
+type TracesSamplerFixture = {
+  parentSampled?: boolean;
+  name?: string;
+  attributes?: { "sentry.op"?: string };
+};
+
+interface FakeSentryClient {
+  getDsn(): { host?: string } | undefined;
+  getOptions(): { enabled: boolean };
+  getTransport(): Record<string, never> | undefined;
+}
+
+interface FakeSentrySdk {
+  init(opts?: SentryInitOptions): void;
+  close(): Promise<boolean>;
+  addIntegration(): void;
+  consoleLoggingIntegration(): { name: string };
+  isEnabled?(): boolean;
+  getClient?(): FakeSentryClient;
+  httpIntegration?(options: SentryHttpIntegrationOptions): {
+    name: string;
+    options: SentryHttpIntegrationOptions;
+  };
+}
 
 afterEach(() => {
   resetSentryForTests();
   delete process.env.SENTRY_DSN;
   delete process.env.BOTFLEET_SENTRY_DSN;
   delete process.env.SENTRY_AI_DATA_COLLECTION;
+  delete process.env.SENTRY_RELEASE;
+  delete process.env.GITHUB_SHA;
 });
 
 describe("server Sentry init", () => {
@@ -39,11 +72,97 @@ describe("server Sentry init", () => {
     );
   });
 
+  it("prefers SENTRY_RELEASE, then GITHUB_SHA, then VERCEL_GIT_COMMIT_SHA, and skips an all-zero fallback", () => {
+    expect(sentryReleaseName({})).toBeUndefined();
+    expect(sentryReleaseName({}, "0".repeat(40))).toBeUndefined();
+    expect(sentryReleaseName({ GITHUB_SHA: "abc1234" })).toBe("abc1234");
+    expect(sentryReleaseName({ SENTRY_RELEASE: "deadbeef", GITHUB_SHA: "abc1234" })).toBe("deadbeef");
+    expect(sentryReleaseName({ VERCEL_GIT_COMMIT_SHA: "abcdef1234567" })).toBe("abcdef1234567");
+    expect(sentryReleaseName({ GITHUB_SHA: "abc1234", VERCEL_GIT_COMMIT_SHA: "abcdef1234567" })).toBe("abc1234");
+    expect(sentryReleaseName({}, "c".repeat(40))).toBe("c".repeat(40));
+  });
+
+  it("survives a synchronous throw from sdk.close during re-init", async () => {
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init() {},
+      close() {
+        throw new Error("close blew up synchronously");
+      },
+      addIntegration() {},
+      consoleLoggingIntegration() {
+        return { name: "ConsoleLogs" };
+      },
+      isEnabled: () => true,
+      getClient: () => ({
+        getDsn: () => ({}),
+        getOptions: () => ({ enabled: true }),
+        getTransport: () => ({}),
+      }),
+    });
+    setSentryLoaderForTests(sentryTestLoader(sdk));
+    const base = {
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 0.2,
+      logsEnabled: true,
+      source: "config" as const,
+    };
+    await applySentryConfig(base);
+    await expect(applySentryConfig({ ...base, tracesSampleRate: 0.1 })).resolves.toMatchObject({
+      active: true,
+    });
+  });
+
+  it("does not call init until the previous client has finished closing", async () => {
+    let closing = false;
+    let initWhileClosing = false;
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init() {
+        if (closing) initWhileClosing = true;
+      },
+      close() {
+        closing = true;
+        return new Promise<boolean>((resolve) => {
+          setTimeout(() => {
+            closing = false;
+            resolve(true);
+          }, 15);
+        });
+      },
+      addIntegration() {},
+      consoleLoggingIntegration() {
+        return { name: "ConsoleLogs" };
+      },
+      isEnabled: () => !closing,
+      getClient: () => ({
+        getDsn: () => ({}),
+        getOptions: () => ({ enabled: true }),
+        getTransport: () => ({}),
+      }),
+    });
+    setSentryLoaderForTests(sentryTestLoader(sdk));
+    const base = {
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 0.2,
+      logsEnabled: true,
+      source: "config" as const,
+    };
+    await applySentryConfig(base);
+    await applySentryConfig({ ...base, tracesSampleRate: 0.1 });
+    expect(initWhileClosing).toBe(false);
+    expect(isSentryActive()).toBe(true);
+  });
+
   it("serializes concurrent applies so the same fingerprint inits once", async () => {
     let inits = 0;
     let inflight = 0;
     let maxInflight = 0;
-    const sdk = {
+    const sdk = Object.assign({} as FakeSentrySdk, {
       init() {
         inits += 1;
       },
@@ -54,13 +173,13 @@ describe("server Sentry init", () => {
       consoleLoggingIntegration() {
         return { name: "ConsoleLogs" };
       },
-    } as unknown as typeof import("@sentry/node");
+    });
     setSentryLoaderForTests(async () => {
       inflight += 1;
       maxInflight = Math.max(maxInflight, inflight);
       await new Promise((resolve) => setTimeout(resolve, 25));
       inflight -= 1;
-      return sdk;
+      return asSentryNodeTestStandIn(sdk);
     });
     const input = {
       dsn: "https://abc123@o0.ingest.sentry.io/1",
@@ -96,10 +215,10 @@ describe("Sentry AI data collection kill-switch", () => {
     });
   });
 
-  it("passes streamGenAiSpans and dataCollection into Sentry.init", async () => {
-    let initOpts: Record<string, unknown> | null = null;
-    const sdk = {
-      init(opts: Record<string, unknown>) {
+  it("passes dataCollection and a static trace lifecycle into Sentry.init", async () => {
+    let initOpts: SentryInitOptions | undefined;
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init(opts?: SentryInitOptions) {
         initOpts = opts;
       },
       close() {
@@ -109,8 +228,8 @@ describe("Sentry AI data collection kill-switch", () => {
       consoleLoggingIntegration() {
         return { name: "ConsoleLogs" };
       },
-    } as unknown as typeof import("@sentry/node");
-    setSentryLoaderForTests(async () => sdk);
+    });
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     process.env.SENTRY_AI_DATA_COLLECTION = "1";
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
@@ -121,14 +240,17 @@ describe("Sentry AI data collection kill-switch", () => {
       source: "config",
     });
     expect(initOpts).toMatchObject({
-      streamGenAiSpans: true,
+      traceLifecycle: "static",
       dataCollection: { genAI: { inputs: true, outputs: true }, httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, urlQueryParams: false },
     });
+    expect(initOpts).not.toHaveProperty("sendDefaultPii");
+    expect(initOpts).not.toHaveProperty("streamGenAiSpans");
+    expect(initOpts).not.toHaveProperty("enableLogs");
 
     resetSentryForTests();
-    setSentryLoaderForTests(async () => sdk);
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     process.env.SENTRY_AI_DATA_COLLECTION = "0";
-    initOpts = null;
+    initOpts = undefined;
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -138,18 +260,17 @@ describe("Sentry AI data collection kill-switch", () => {
       source: "config",
     });
     expect(initOpts).toMatchObject({
-      streamGenAiSpans: true,
+      traceLifecycle: "static",
       dataCollection: { genAI: { inputs: false, outputs: false } },
     });
     delete process.env.SENTRY_AI_DATA_COLLECTION;
   });
-});
 
-describe("Sentry tracesSampler dynamic rates", () => {
-  it("samples AI spans with aiRate and routine HTTP spans with httpRate", async () => {
-    let initOpts: Record<string, unknown> | null = null;
-    const sdk = {
-      init(opts: Record<string, unknown>) {
+  it("stamps a git SHA release on the Node client", async () => {
+    let initOpts: SentryInitOptions | undefined;
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init(opts?: SentryInitOptions) {
         initOpts = opts;
       },
       close() {
@@ -159,8 +280,37 @@ describe("Sentry tracesSampler dynamic rates", () => {
       consoleLoggingIntegration() {
         return { name: "ConsoleLogs" };
       },
-    } as unknown as typeof import("@sentry/node");
-    setSentryLoaderForTests(async () => sdk);
+    });
+    setSentryLoaderForTests(sentryTestLoader(sdk));
+    await applySentryConfig({
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 0.2,
+      logsEnabled: false,
+      source: "config",
+      release: "d".repeat(40),
+    });
+    expect(initOpts).toMatchObject({ release: "d".repeat(40) });
+  });
+});
+
+describe("Sentry tracesSampler dynamic rates", () => {
+  it("samples AI spans with aiRate and routine HTTP spans with httpRate", async () => {
+    let initOpts: SentryInitOptions | undefined;
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init(opts?: SentryInitOptions) {
+        initOpts = opts;
+      },
+      close() {
+        return Promise.resolve(true);
+      },
+      addIntegration() {},
+      consoleLoggingIntegration() {
+        return { name: "ConsoleLogs" };
+      },
+    });
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -172,33 +322,35 @@ describe("Sentry tracesSampler dynamic rates", () => {
       logsEnabled: false,
       source: "config",
     });
-    expect(initOpts).toBeTruthy();
-    const sampler = (initOpts as unknown as { tracesSampler: (ctx: Record<string, unknown>) => number | boolean }).tracesSampler;
-    expect(typeof sampler).toBe("function");
+    const tracesSampler = (initOpts as { tracesSampler?: (ctx: TracesSamplerFixture) => number | boolean })
+      .tracesSampler;
+    expect(tracesSampler).toBeTypeOf("function");
+    // SAFETY: fixtures only set fields the sampler reads (parentSampled, op, name).
+    const sample = (ctx: TracesSamplerFixture) => tracesSampler!(ctx);
 
     // Parent sampled decision inherited
-    expect(sampler({ parentSampled: true })).toBe(true);
-    expect(sampler({ parentSampled: false })).toBe(false);
+    expect(sample({ parentSampled: true })).toBe(true);
+    expect(sample({ parentSampled: false })).toBe(false);
 
     // AI operations sampled at aiRate (1.0)
-    expect(sampler({ attributes: { "sentry.op": "gen_ai.chat" } })).toBe(1.0);
-    expect(sampler({ attributes: { "sentry.op": "gen_ai.invoke_agent" } })).toBe(1.0);
-    expect(sampler({ attributes: { "sentry.op": "gen_ai.execute_tool" } })).toBe(1.0);
-    expect(sampler({ name: "gen_ai.chat" })).toBe(1.0);
+    expect(sample({ attributes: { "sentry.op": "gen_ai.chat" } })).toBe(1.0);
+    expect(sample({ attributes: { "sentry.op": "gen_ai.invoke_agent" } })).toBe(1.0);
+    expect(sample({ attributes: { "sentry.op": "gen_ai.execute_tool" } })).toBe(1.0);
+    expect(sample({ name: "gen_ai.chat" })).toBe(1.0);
 
     // HTTP server endpoints sampled at httpRate (0.05)
-    expect(sampler({ attributes: { "sentry.op": "http.server" }, name: "POST /api/chat" })).toBe(0.05);
-    expect(sampler({ name: "GET /api/bots" })).toBe(0.05);
+    expect(sample({ attributes: { "sentry.op": "http.server" }, name: "POST /api/chat" })).toBe(0.05);
+    expect(sample({ name: "GET /api/bots" })).toBe(0.05);
 
     // Routine health check endpoints heavily sampled / throttled
-    expect(sampler({ name: "GET /healthz" })).toBe(0.01);
-    expect(sampler({ name: "GET /api/telemetry/status" })).toBe(0.01);
+    expect(sample({ name: "GET /healthz" })).toBe(0.01);
+    expect(sample({ name: "GET /api/telemetry/status" })).toBe(0.01);
 
     // Outbound HTTP requests sampled at httpRate
-    expect(sampler({ attributes: { "sentry.op": "http.client" } })).toBe(0.05);
+    expect(sample({ attributes: { "sentry.op": "http.client" } })).toBe(0.05);
 
     // Other / fallback spans sampled at general rate (0.2)
-    expect(sampler({ name: "custom.operation" })).toBe(0.2);
+    expect(sample({ name: "custom.operation" })).toBe(0.2);
   });
 });
 
@@ -216,7 +368,7 @@ describe("webhook secrets never reach Sentry", () => {
 
   async function initWithStandIn(): Promise<ScrubHooks> {
     let initOpts: ScrubHooks | null = null;
-    const sdk = {
+    const sdk = Object.assign({} as FakeSentrySdk, {
       init(opts: ScrubHooks) {
         initOpts = opts;
       },
@@ -230,8 +382,8 @@ describe("webhook secrets never reach Sentry", () => {
       httpIntegration(options: { ignoreIncomingRequests?: (url: string) => boolean }) {
         return { name: "Http", options };
       },
-    } as unknown as typeof import("@sentry/node");
-    setSentryLoaderForTests(async () => sdk);
+    });
+    setSentryLoaderForTests(sentryTestLoader(sdk));
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -305,7 +457,7 @@ describe("webhook secrets never reach Sentry", () => {
     const http = hooks.integrations.find((integration) => integration.name === "Http");
     expect(http?.options?.ignoreIncomingRequests?.(`/hooks/${endpoint}/${secret}`)).toBe(true);
     expect(http?.options?.ignoreIncomingRequests?.("/api/bots")).toBe(false);
-    expect((http?.options as Record<string, unknown>)?.maxIncomingRequestBodySize).toBe("none");
+    expect((http?.options as Record<string, unknown>)?.maxRequestBodySize).toBe("none");
     expect(hooks.integrations.some((integration) => integration.name === "ConsoleLogs")).toBe(true);
     expect(isWebhookIngressPath("/health")).toBe(false);
   });

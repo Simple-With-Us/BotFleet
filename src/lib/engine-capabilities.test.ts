@@ -14,6 +14,7 @@ import {
   ENGINE_DISPLAY_ORDER,
   capabilityCellGlyph,
   capabilityCellLabel,
+  engineAccessLabel,
   capabilityNoteFor,
   engineIdFromDriverKind,
   pricingModeLabel,
@@ -365,7 +366,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(capabilityCellLabel("yes")).toBe("Available");
     expect(capabilityCellLabel("no")).toBe("Not available");
     expect(capabilityCellLabel("limited")).toBe("Limited");
-    expect(capabilityCellLabel("yes-pro-only")).toBe("Pro plan only");
+    expect(CAPABILITY_STATES).not.toContain("yes-pro-only");
     // A missing key and an explicit "unknown" say the same thing, and
     // neither of them says "not available".
     expect(capabilityCellLabel("unknown")).toBe("Not audited");
@@ -519,25 +520,21 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
       "Clutch runs models over the Clutch ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.",
     );
     expect(entry.whyThisEngine).toEqual({
-      headline: "DeepSeek models over the Clutch ACP bridge, billed pay-as-you-go.",
+      headline: "DeepSeek, Muse, and MiniMax models through the Clutch bridge.",
       prose: [
-        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
-        "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "Image attachments are not available on the Clutch engine yet.",
+        "Clutch runs DeepSeek, Meta Muse, and MiniMax models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments remain per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4-Pro carries a No Vision badge.",
+        "Muse and MiniMax use subscription-backed API-key access.  DeepSeek remains pay-as-you-go; the rates below are its public API catalog, not a subscription invoice.",
       ],
     });
-    expect(entry.capabilities.imageAttachments).toBe("no");
+    expect(entry.providerKinds).toEqual(["deepseekAgent", "muse", "minimax"]);
+    expect(engineAccessLabel(entry)).toBe("API");
+    expect(entry.capabilities.imageAttachments).toBe("yes");
     const copy = [
       entry.pricing.notes ?? "",
       entry.pricing.api.notes ?? "",
       entry.whyThisEngine.headline,
       ...entry.whyThisEngine.prose,
     ].join("\n");
-    // The copy must say images are unavailable on THIS ENGINE, rather than
-    // making a BotFleet-wide statement.  "BotFleet does not support X" reads
-    // as a claim about the app, which is the confusion the owner flagged.
-    expect(copy).toContain("Image attachments are not available on the Clutch engine yet.");
-    expect(copy).not.toContain("BotFleet does not support");
     expect(copy).not.toContain("Bundled with Claude Max");
     expect(copy).not.toContain("Claude Max");
     expect(copy).not.toContain("same Claude Max seat");
@@ -551,5 +548,13 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     expect(copy).not.toMatch(/on this seat/i);
     expect(pricingModeLabel(entry.pricing)).toBe("API · $0.00027/1k in");
     expect(pricingModeLabel(entry.pricing).toLowerCase()).not.toContain("bundled");
+  });
+
+  it("keeps access separate from billing", () => {
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.grok)).toBe("CLI + API");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.minimax)).toBe("API");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.mcode)).toBe("CLI");
+    expect(engineAccessLabel(ENGINE_CAPABILITIES.muse)).toBe("CLI");
+    expect(pricingModeLabel(ENGINE_CAPABILITIES.minimax.pricing)).toContain("Subscription + API");
   });
 });

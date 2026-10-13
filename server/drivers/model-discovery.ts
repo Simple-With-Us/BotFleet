@@ -136,6 +136,23 @@ export function mergeDiscoveredModels(
   return { default: defaultId, options: merged };
 }
 
+/** The ids out of a `/models` answer, in provider order, duplicates dropped.
+ *  Reuses `readProviderRow`, so the narrowing of an untrusted provider row
+ *  lives in exactly one place instead of once per caller.  Takes the whole
+ *  result rather than the rows array so the untrusted `unknown[]` never
+ *  appears in this module's own signature. */
+export function providerModelIds(result: ModelDiscoveryResult): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const row of result.rows ?? []) {
+    const read = readProviderRow(row);
+    if (!read || seen.has(read.id)) continue;
+    seen.add(read.id);
+    ids.push(read.id);
+  }
+  return ids;
+}
+
 /** Memoize a discovery fetch for `ttlMs`.  Drivers used to hand-roll this —
  *  minimax at 60 s, cursor at 5 min — and the drift is why `describe` fans out
  *  into a burst of duplicate `/models` calls every time the registry memo

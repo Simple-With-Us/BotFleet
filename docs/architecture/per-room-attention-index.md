@@ -52,6 +52,8 @@ Four types.  They are never summed into one number.
 
 Each badge is clickable to the bot, the task, the reason, and the next action.  Reading an error does not resolve it; opening a room does not approve anything.  Tool logs and bot-to-bot chatter must not inflate the unread count — that is the transcript rule in `channel-triggers-and-concurrency.md`, applied to the counter rather than the channel.
 
+At the fleet altitude (the All Apps tab and the Fleet Matrix header) a badge counts distinct bots, never room rows.  A bot that belongs to N rooms is one error, one needs-action or one working bot, however many rooms list it, and the per-room row keeps its own count.  Unread there counts each unread room chat once and each unread member bot once.  `summarizeFleetAttention` (`src/lib/attention-index.ts`) holds that rule.
+
 The dock's existing single number stays.  `unreadConversationCount` (`src/lib/unread.ts:1`) feeds the app-level badge at `src/App.tsx:75`, and at that altitude one number is correct.  The dock number and the per-room typed row are different questions and should not be unified.
 
 ## Ranking

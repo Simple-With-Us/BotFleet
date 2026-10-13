@@ -63,6 +63,60 @@ test("source identity stays pinned after the checkout advances; packaged identit
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+// A checkout the server starts from may have no usable git: a GUI launch with a
+// thin PATH, a stripped container, a source archive.  The server still boots,
+// and says its commit is unknown and its build dirty, which buildCompatibility
+// never calls a match.  A build that stamps the identity into a shipped
+// manifest asks for `requireGit` instead and refuses to invent a commit.
+test("source identity falls back to an unknown, dirty commit when git cannot name HEAD, and requireGit refuses it", () => {
+  const unknown = "0".repeat(40);
+  const plain = mkdtempSync(join(tmpdir(), "bf-build-identity-nogit-"));
+  const emptyRepo = mkdtempSync(join(tmpdir(), "bf-build-identity-empty-"));
+  const bin = mkdtempSync(join(tmpdir(), "bf-build-identity-bin-"));
+  const pathBefore = process.env.PATH;
+  try {
+    for (const root of [plain, emptyRepo]) writeFileSync(join(root, "package.json"), JSON.stringify({ version: "1.0.30" }));
+    execFileSync("git", ["-C", emptyRepo, "init"], { stdio: "pipe" }); // a repo with no commit has no HEAD
+
+    for (const root of [plain, emptyRepo]) {
+      const identity = readSourceBuildIdentity(root);
+      assert.equal(identity.sourceCommit, unknown);
+      assert.equal(identity.sourceDirty, true, "an unknown commit must never read as a clean build");
+      assert.equal(identity.version, "1.0.30");
+      assert.throws(() => readSourceBuildIdentity(root, { requireGit: true }), /cannot read git identity for/);
+    }
+
+    // No git on PATH at all: the default still boots, requireGit still refuses.
+    process.env.PATH = bin;
+    assert.equal(readSourceBuildIdentity(plain).sourceCommit, unknown);
+    assert.throws(() => readSourceBuildIdentity(plain, { requireGit: true }), /cannot read git identity for/);
+    // The refusal names the checkout and says nothing about its contents.
+    assert.throws(() => readSourceBuildIdentity(plain, { requireGit: true }), (error) => !String(error).includes("1.0.30"));
+  } finally {
+    process.env.PATH = pathBefore;
+    for (const dir of [plain, emptyRepo, bin]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("requireGit returns the real commit and a clean flag from a committed checkout", () => {
+  const root = mkdtempSync(join(tmpdir(), "bf-build-identity-real-"));
+  const git = (...args) => execFileSync("git", ["-C", root, ...args], { stdio: "pipe", encoding: "utf8" }).trim();
+  try {
+    git("init");
+    git("config", "user.email", "test@example.invalid");
+    git("config", "user.name", "Test");
+    writeFileSync(join(root, "package.json"), JSON.stringify({ version: "1.0.30" }));
+    git("add", ".");
+    git("commit", "-m", "initial");
+    const head = git("rev-parse", "HEAD");
+    const identity = readSourceBuildIdentity(root, { requireGit: true });
+    assert.equal(identity.sourceCommit, head);
+    assert.match(identity.sourceCommit, /^[a-f0-9]{40}$/);
+    assert.equal(identity.sourceDirty, false);
+    assert.deepEqual(readSourceBuildIdentity(root), identity, "requireGit changes only what is refused, never what is reported");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 function fakeFetch(runtime, { proof = true, status = 200 } = {}) {
   const calls = [];
   const fetchImpl = async (url, options) => {

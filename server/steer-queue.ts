@@ -17,6 +17,7 @@
 // stop-then-steer (queue a correction, hit Stop, the correction runs) is
 // the feature.
 
+import { botOffQueuedNotSent } from "../shared/bot-power.ts";
 import { newId } from "./contracts.ts";
 import type { BotRecord, Message } from "./store.ts";
 
@@ -25,6 +26,22 @@ export interface SteerStore {
   bot(id: string): BotRecord | null;
   appendMessage(threadId: string, message: Omit<Message, "id" | "at">): Message;
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null;
+  messagesFor(threadId: string): Message[];
+}
+
+/** A batch already in the transcript: an update committed it for a restart
+ *  (server/update-drain.ts) and it waits here again, after the restart or
+ *  because the restart did not come.  It drains as a turn of its own, in its
+ *  place in line, with nothing appended. */
+export interface CommittedBatch {
+  /** The last line of the batch; the turn answers it. */
+  userMessageId: string;
+  /** Every line of the batch, kept out of transcript replay. */
+  excludeIds: string[];
+  /** Any line came over a relay, so the turn runs unattended (S8). */
+  relayed: boolean;
+  /** When the update first held it, for the carrier's staleness rule. */
+  heldAt: number;
 }
 
 interface QueuedItem {
@@ -36,6 +53,7 @@ interface QueuedItem {
   /** Set when the words came from an outside channel (iMessage relay), so
    * the drained turn keeps running unattended (S8). */
   automationSource?: Message["automationSource"];
+  committed?: CommittedBatch;
 }
 
 interface QueueEntry {
@@ -84,9 +102,15 @@ export function drainSteeredMessages(
     userMessage: Message,
     excludeIds: string[],
     linqChatId?: string,
+    /** Set for a batch that was already committed (`CommittedBatch`). */
+    carried?: CommittedBatch,
   ) => void | Promise<void>,
 ): void {
   const leftovers: Array<[string, QueueEntry]> = [];
+  // One batch per bot per pass.  A bot can have sends waiting on more than
+  // one of its threads, and two starts in one pass would leave the second
+  // refused as "already working"; the next settle runs the next one.
+  const started = new Set<string>();
   // deleting only the entry being visited is safe under Map iteration
   for (const [threadId, entry] of queues) {
     const bot = store.bot(entry.botId);
@@ -95,21 +119,45 @@ export function drainSteeredMessages(
       queues.delete(threadId);
       continue;
     }
-    if (bot.busy) continue; // still working — the next settle tries again
+    if (bot.busy || started.has(entry.botId)) continue; // still working — the next settle tries again
+    // A bot switched Off while these waited gets nothing new: the turn they
+    // were queued behind has finished, and the next one will not start.  They
+    // are the person's own words, so say they were not sent rather than drop
+    // them silently — and never append them to the transcript as if sent.
+    if (bot.off === true) {
+      dropForOffBot(store, threadId, entry);
+      continue;
+    }
     // committed to draining: the entry leaves the map before anything runs,
     // so a settle racing another settle can never fire the same queue twice
     queues.delete(threadId);
-    const firstLinq = entry.items.findIndex((item) => item.linqChatId);
-    const batch = firstLinq === 0
-      ? entry.items.slice(0, 1)
-      : firstLinq > 0
-        ? entry.items.slice(0, firstLinq)
-        : entry.items;
-    const rest = firstLinq === 0
-      ? entry.items.slice(1)
-      : firstLinq > 0
-        ? entry.items.slice(firstLinq)
-        : [];
+    let items = entry.items;
+    // A batch an update already committed runs alone, as the turn it was.
+    // One whose line has gone from the thread has nothing left to answer.
+    let carried: { item: QueuedItem; committed: CommittedBatch; userMessage: Message } | null = null;
+    while (!carried && items.length > 0) {
+      const head = items[0];
+      const committed = head?.committed;
+      if (!head || !committed) break;
+      items = items.slice(1);
+      const userMessage = store.messagesFor(threadId).find((message) => message.id === committed.userMessageId);
+      if (userMessage) carried = { item: head, committed, userMessage };
+    }
+    if (carried) {
+      if (items.length) leftovers.push([threadId, { botId: entry.botId, items }]);
+      started.add(entry.botId);
+      const { item, committed, userMessage } = carried;
+      void run(entry.botId, threadId, item.prompt, userMessage, committed.excludeIds, item.linqChatId, committed);
+      continue;
+    }
+    if (!items.length) continue;
+    const firstLinq = items.findIndex((item) => item.linqChatId);
+    // A committed batch further down is a boundary too: it keeps its place.
+    const firstCommitted = items.findIndex((item) => item.committed);
+    let end = firstLinq === 0 ? 1 : firstLinq > 0 ? firstLinq : items.length;
+    if (firstCommitted > 0) end = Math.min(end, firstCommitted);
+    const batch = items.slice(0, end);
+    const rest = items.slice(end);
     // Requeue after this pass so a same-loop Map insert cannot start the
     // next Linq chat before the current startTurn marks the bot busy.
     if (rest.length) leftovers.push([threadId, { botId: entry.botId, items: rest }]);
@@ -130,6 +178,7 @@ export function drainSteeredMessages(
     }
     const last = appended.at(-1);
     if (!last) continue;
+    started.add(entry.botId);
     const prompt = batch.map((item) => item.prompt).join("\n");
     void run(
       entry.botId,
@@ -148,6 +197,51 @@ export function drainSteeredMessages(
   }
 }
 
+/** Settle a queue whose bot is Off: the entry leaves the map and one
+ *  transcript line says how many messages were not sent. */
+function dropForOffBot(store: SteerStore, threadId: string, entry: QueueEntry): void {
+  queues.delete(threadId);
+  if (entry.items.length === 0) return;
+  store.appendMessage(threadId, {
+    role: "bot",
+    kind: "activity",
+    tool: { name: botOffQueuedNotSent(entry.items.length), ok: false },
+  });
+}
+
+/** The bot was just switched Off while idle: nothing is running for its
+ *  queue to wait behind, so settle every queue it owns now instead of at a
+ *  settle that may never come.  A busy bot's queue is left for
+ *  `drainSteeredMessages`, which settles it when the running turn ends.
+ *  Returns how many messages were dropped. */
+export function dropQueuedForOffBot(store: SteerStore, botId: string): number {
+  let dropped = 0;
+  // deleting only the entry being visited is safe under Map iteration
+  for (const [threadId, entry] of queues) {
+    if (entry.botId !== botId) continue;
+    dropped += entry.items.length;
+    dropForOffBot(store, threadId, entry);
+  }
+  return dropped;
+}
+
+/** Drain every batch that can drain now, pass after pass, until the queue is
+ *  empty or a pass moves nothing: a bot still busy keeps its queue.  For a
+ *  `run` that starts no turn (an update committing held sends for its
+ *  restart), every idle bot's queue empties completely — one batch per bot per
+ *  pass, however many Linq chats or committed batches it holds.  No pass cap:
+ *  each pass that continues has taken at least one batch, so the loop ends,
+ *  and nothing is ever left behind because a counter ran out.  Whatever is
+ *  left (a busy bot's) is still in the queue for the caller to carry. */
+export function drainEveryReadyBatch(store: SteerStore, run: Parameters<typeof drainSteeredMessages>[1]): void {
+  for (let before = queuedMessageCount(); before > 0;) {
+    drainSteeredMessages(store, run);
+    const after = queuedMessageCount();
+    if (after >= before) return;
+    before = after;
+  }
+}
+
 /** Drop one waiting send so it never drains. Returns false when that
  * queue id was not in the in-memory queue (already drained, or a restart
  * lost the auto-run intent). */
@@ -161,9 +255,54 @@ export function cancelSteeredMessage(threadId: string, messageId: string): boole
   return true;
 }
 
-/** Count pending sends without exposing message text to diagnostics. */
-export function queuedMessageCount(): number {
-  return [...queues.values()].reduce((total, entry) => total + entry.items.length, 0);
+/** One thread's waiting sends, as an update carries them across a restart. */
+export interface SteerQueueSnapshot {
+  threadId: string;
+  botId: string;
+  items: Array<{
+    messageId: string;
+    text: string;
+    prompt: string;
+    replyToId?: string;
+    linqChatId?: string;
+    automationSource?: Message["automationSource"];
+    committed?: CommittedBatch;
+  }>;
+}
+
+/** Take the chosen bots' waiting sends out of the queue, untouched: still off
+ *  the transcript, so a restart can carry them and put them back in the same
+ *  place in line (`restoreSteeredEntries`).  An update uses this for a bot it
+ *  interrupted, whose own turn must resume before these run. */
+export function takeSteeredEntries(pick: (botId: string) => boolean): SteerQueueSnapshot[] {
+  const taken: SteerQueueSnapshot[] = [];
+  for (const [threadId, entry] of queues) {
+    if (!pick(entry.botId)) continue;
+    queues.delete(threadId);
+    taken.push({ threadId, botId: entry.botId, items: entry.items.map((item) => ({ ...item })) });
+  }
+  return taken;
+}
+
+/** Put carried sends back, ahead of anything queued on the thread since. */
+export function restoreSteeredEntries(entries: readonly SteerQueueSnapshot[]): void {
+  for (const entry of entries) {
+    if (entry.items.length === 0) continue;
+    const existing = queues.get(entry.threadId);
+    queues.set(entry.threadId, {
+      botId: entry.botId,
+      items: [...entry.items.map((item) => ({ ...item })), ...(existing?.items ?? [])],
+    });
+  }
+}
+
+/** Count pending sends without exposing message text to diagnostics.
+ *  `ignoreBot` leaves out the queues of bots that will never drain them (an Off
+ *  bot's waiting sends are dropped, not run), so they cannot hold an update. */
+export function queuedMessageCount(ignoreBot?: (botId: string) => boolean): number {
+  return [...queues.values()]
+    .filter((entry) => !ignoreBot?.(entry.botId))
+    .reduce((total, entry) => total + entry.items.length, 0);
 }
 
 /** Test helper: how many messages remain queued for a thread. */

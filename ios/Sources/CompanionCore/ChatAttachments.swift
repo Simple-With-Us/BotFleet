@@ -11,7 +11,7 @@ public enum ChatAttachmentKind: String, Sendable, Equatable {
 }
 
 /// One file waiting to be uploaded, then folded into the prompt.
-public struct PendingChatAttachment: Sendable, Identifiable, Equatable {
+public struct PendingChatAttachment: Sendable, Identifiable, Equatable, Hashable {
     public let id: UUID
     public var name: String
     public var mime: String
@@ -32,6 +32,10 @@ public struct PendingChatAttachment: Sendable, Identifiable, Equatable {
 
     public static func == (left: PendingChatAttachment, right: PendingChatAttachment) -> Bool {
         left.id == right.id
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
     }
 }
 

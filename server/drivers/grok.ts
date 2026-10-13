@@ -14,6 +14,7 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
 import { splitChatPrompt } from "./prompt-split.ts";
 import { toolFields } from "../tool-fields.ts";
@@ -390,6 +391,9 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           // server/tools/jobs.ts); helpers stay `delegate_bot`.
           backgroundJobs: "emulated",
           helpers: "none",
+          // Every tool with an `ask` policy opens a card on the in-process
+          // permission broker (server/tools/approvals.ts) before it runs.
+          reviewHook: "before",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
@@ -405,6 +409,20 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       },
       generateText: async (prompt: string) => {
         const { text } = await complete([{ role: "user", content: prompt }], "grok-3-mini", { stream: false });
+        return text;
+      },
+      // Auto-review on this same xAI account: no `tools`, the brief as the
+      // system message and the action as the user message, cancelled by the
+      // reviewer's own deadline.
+      reviewPermission: async (prompt: ReviewPrompt, signal?: AbortSignal) => {
+        const { text } = await complete(
+          [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.data },
+          ],
+          "grok-3-mini",
+          { stream: false, signal },
+        );
         return text;
       },
       dispose: async () => {
