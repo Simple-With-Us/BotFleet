@@ -19,29 +19,30 @@ describe("MuseCodeMark", () => {
 
   it("is the Meta loop in the brand blue, not an arbitrary colour", () => {
     const svg = markup(<MuseCodeMark size={18} />);
-    expect(svg).toMatch(/#0081fb/i);
-    expect(svg).toContain("bf-muse-grad-1");
+    expect(svg).toMatch(/#087cf0/i);
+    expect(svg).not.toContain("linearGradient");
+    expect(svg.match(/<path/g)).toHaveLength(1);
+    expect(svg).toContain("a6.624 6.624 0 0 0 .265.86");
+    expect(svg).toContain("c.07-.109.141-.224.211-.327");
   });
 
   it("resolves through ProviderMark for both driver kinds", () => {
     for (const kind of ["muse", "museAgent"]) {
       const svg = markup(<ProviderMark driverKind={kind} size={18} />);
       expect(svg).toContain("<svg");
-      expect(svg).toMatch(/#0081fb/i);
+      expect(svg).toMatch(/#087cf0/i);
     }
   });
 
   it("keeps the artwork inside the square slot it is drawn in", () => {
-    // The source asset shipped a padded viewBox that floated the glyph
-    // off-centre.  Assert the box is tight around the artwork rather than
-    // eyeballing it:  the glyph is wider than tall, so the viewBox must be too.
+    // The compact source uses its canonical 24px icon box, which keeps the
+    // cut-out loop centered and consistent with the other rail icons.
     const svg = markup(<MuseCodeMark size={18} />);
     const viewBox = svg.match(/viewBox="([^"]+)"/)?.[1] ?? "";
     const [, , w, h] = viewBox.split(/\s+/).map(Number);
     expect(w).toBeGreaterThan(0);
     expect(h).toBeGreaterThan(0);
-    expect(w / h).toBeGreaterThan(1.3);
-    expect(w / h).toBeLessThan(1.7);
+    expect(w / h).toBe(1);
   });
 });
 
@@ -55,6 +56,17 @@ describe("MiniMaxMark", () => {
     // The old Harness-rebrand ramp must be gone.
     expect(svg).not.toMatch(/#0A2540/i);
     expect(svg).not.toMatch(/#1E40AF/i);
+  });
+});
+
+describe("ClutchMark routing", () => {
+  it("uses Clutch's app mark for the engine, not DeepSeek's whale", () => {
+    const clutch = markup(<ProviderMark driverKind="dshAgent" size={18} />);
+    const deepseek = markup(<ProviderMark driverKind="deepseekAgent" size={18} />);
+
+    expect(clutch).toContain('viewBox="45 40 145 120"');
+    expect(deepseek).toContain('viewBox="85 85 360 330"');
+    expect(clutch).not.toBe(deepseek);
   });
 });
 
@@ -88,7 +100,7 @@ import { createElement } from "react";
 // adds `fill="#D97757"` back, without anyone having to notice a screenshot.
 //
 // Scope after the rebase onto #1047: the MiniMax and Muse Code marks deliberately
-// wear their fixed brand paint (red-to-orange gradient, Meta blue ramp) so the
+// wear their fixed brand paint (red-to-orange gradient, compact Meta blue) so the
 // rail tiles read as logos rather than placeholders. Those four driver kinds
 // live in BRAND_KINDS below with their own theme-immunity assertion instead of
 // this loop. Re-neutralising them is a product call for Jay, not a cleanup.
