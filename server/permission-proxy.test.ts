@@ -50,7 +50,7 @@ async function askThroughProxy(args: Record<string, unknown>): Promise<Record<st
     });
   });
   await new Promise<void>((resolve) => broker?.listen(socketPath, resolve));
-  child = spawnDetached(process.execPath, [PROXY, socketPath], { stdio: ["pipe", "pipe", "ignore"] });
+  child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", PROXY, socketPath], { stdio: ["pipe", "pipe", "ignore"] });
   child.stdin?.write(
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "approve", arguments: args } }) + "\n",
   );
@@ -68,4 +68,38 @@ posixOnly("permission proxy", () => {
     expect(ask).toMatchObject({ t: "ask", tool: "Bash" });
     expect(ask.toolUseId).toBeUndefined();
   });
+
+  it("hands a large non-ASCII tool input to the broker byte for byte", async () => {
+    const content = "中文ok€".repeat(150_000);
+    dir = mkdtempSync(join(tmpdir(), "omb-pp-"));
+    const socketPath = join(dir, "p.sock");
+    const ask = new Promise<Record<string, unknown>>((resolve) => {
+      broker = createServer((conn: Socket) => {
+        conn.setEncoding("utf8");
+        let buffered = "";
+        conn.on("data", (chunk) => {
+          buffered += chunk;
+          const line = buffered.split("\n").find((candidate) => candidate.trim());
+          if (!line) return;
+          const message = JSON.parse(line) as Record<string, unknown>;
+          conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "allow", updatedInput: message.input }) + "\n");
+          resolve(message);
+        });
+      });
+    });
+    await new Promise<void>((resolve) => broker?.listen(socketPath, resolve));
+    child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", PROXY, socketPath], { stdio: ["pipe", "pipe", "ignore"] });
+    child.stdin?.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "approve", arguments: { tool_name: "Write", input: { file_path: "notes.md", content } } },
+      }) + "\n",
+    );
+    const frame = await ask;
+    const received = (frame.input as { content: string }).content;
+    expect(received.includes("\uFFFD")).toBe(false);
+    expect(received === content).toBe(true);
+  }, 30_000);
 });

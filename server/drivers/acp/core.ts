@@ -73,16 +73,14 @@ import type {
 } from "../../contracts.ts";
 import { newEventId, newId } from "../../contracts.ts";
 import { applyLaunchIdentity } from "../../launch-identity.ts";
-import { computerProxyEnv } from "../../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../../computer-grants.ts";
 import { augmentedPath } from "../../env-path.ts";
 
 // Resolved from the server root, never relative to this file: bundling inlines
 // this module two directories up, so the `".."` pair here would climb past the
 // packaged server dir entirely. See server/proxy-paths.ts.
-const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
-import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
+import { turnStdioMcpServers } from "../turn-mcp.ts";
 import { getBool } from "../../feature-flags.ts";
 import type { JsonValue } from "../../schema.ts";
 import {
@@ -104,64 +102,11 @@ export type AcpStdioMcpServer = {
 };
 
 /** Build the same mcpServers array every mcpServers:true ACP engine receives. */
-export function acpMcpServers(turn: Pick<SendTurnInput, "integrations">): AcpStdioMcpServer[] {
-  const servers: AcpStdioMcpServer[] = [];
-  const acpEnv = (env: Record<string, string>) =>
-    Object.entries(env).map(([name, value]) => ({ name, value: String(value) }));
-  const agents = turn.integrations?.agents;
-  if (agents) {
-    servers.push({ name: "agents", command: agents.command, args: agents.args, env: acpEnv(agents.env) });
-  }
-  const composio = turn.integrations?.composio;
-  if (composio) {
-    servers.push({
-      name: "composio",
-      command: composio.command,
-      args: composio.args,
-      env: acpEnv(composio.env),
-    });
-  }
-  // The bot's computers, mounted exactly like the Claude driver does.
-  // Cloud boxes use the REST adapter; host, sandbox, and VPS CUA
-  // connections expose CUA Driver's official MCP server directly. Every
-  // grant gets its own server — this was an if/else if that dropped the
-  // second computer a bot had been given.
-  for (const mount of turnComputerMounts(turn.integrations)) {
-    if (mount.box) {
-      servers.push({
-        name: mount.name,
-        command: process.execPath,
-        args: [COMPUTER_PROXY_PATH],
-        env: acpEnv({ ELECTRON_RUN_AS_NODE: "1", ...computerProxyEnv(mount.box) }),
-      });
-    } else if (mount.stdio) {
-      servers.push({
-        name: mount.name,
-        command: mount.stdio.command,
-        args: mount.stdio.args,
-        env: acpEnv(mount.stdio.env ?? {}),
-      });
-    }
-  }
-  const phone = turn.integrations?.phone;
-  if (phone) {
-    servers.push({
-      name: "phone",
-      command: phone.command,
-      args: phone.args,
-      env: acpEnv(phone.env ?? {}),
-    });
-  }
-  const qdrant = turn.integrations?.qdrant;
-  if (qdrant) {
-    servers.push({
-      name: "qdrant",
-      command: qdrant.command,
-      args: qdrant.args,
-      env: acpEnv(qdrant.env ?? {}),
-    });
-  }
-  return servers;
+export function acpMcpServers(turn: Pick<SendTurnInput, "integrations" | "toolScope"> & { threadId?: string }): AcpStdioMcpServer[] {
+  return turnStdioMcpServers(turn).map((server) => ({
+    ...server,
+    env: Object.entries(server.env).map(([name, value]) => ({ name, value: String(value) })),
+  }));
 }
 
 /** Result of `AcpSupport.wrapSpawn`: a possibly rewritten CLI and argv. */
