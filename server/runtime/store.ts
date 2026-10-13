@@ -11,7 +11,7 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { userInfo } from "node:os";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { z } from "zod";
 
@@ -227,7 +227,11 @@ function readEvent(row: SqlRow): AssignmentEvent {
 }
 
 function icacls(dir: string, args: string[], optional = false): void {
-  const result = spawnSync("icacls", [dir, ...args], { windowsHide: true, encoding: "utf8" });
+  // The harness can start with a PATH that does not include System32.
+  // An absolute path still finds the tool.
+  const root = process.env.SystemRoot ?? "C:\\Windows";
+  const exe = join(root, "System32", "icacls.exe");
+  const result = spawnSync(exe, [dir, ...args], { windowsHide: true, encoding: "utf8" });
   if (optional) return;
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`runtime.db: icacls ${args[0] ?? ""} failed (${String(result.status)})`);
