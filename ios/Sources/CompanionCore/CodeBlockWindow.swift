@@ -166,13 +166,6 @@ public enum CodeBlockWindow {
             let next = scalars.index(after: index)
             if scalar == "\n" {
                 let afterBreak = next
-                // A full page must close before this newline.  `linesInPage > 0`
-                // keeps an empty page from spinning if the budget is ever zero.
-                if linesInPage >= maxLines, linesInPage > 0 {
-                    close(at: afterBreak, endLine: line, nextStartLine: line)
-                    index = afterBreak
-                    continue
-                }
                 charsInPage += 1
                 linesInPage += 1
                 let finished = line
@@ -207,22 +200,27 @@ public enum CodeBlockWindow {
     private static func renderedLineCount(_ text: String) -> Int {
         if text.isEmpty { return 0 }
         var count = 1
+    private static func renderedLineCount(_ text: String) -> Int {
+        if text.isEmpty { return 0 }
+        var count = 1
         for scalar in text.unicodeScalars where scalar == "\n" { count += 1 }
         if text.hasSuffix("\n") { count -= 1 }
         return max(count, 1)
     }
 
-    /// Fence bodies are usually `\n` after `Markdown.blocks`.  Keep that
-    /// common path allocation-free, but normalize every other Unicode line
-    /// separator as well as CR and CRLF before counting page boundaries.
+    /// Most fences already use `\n`, so leave that common case unchanged.
+    /// Normalize CR/CRLF and other Unicode line separators before counting
+    /// page boundaries.  Detect CR through UTF-8 because String bridging can
+    /// hide it in some slices.
     private static func normalisedNewlines(_ source: String) -> String {
-        let needsNormalization = source.unicodeScalars.contains { scalar in
+        let hasCarriageReturn = source.utf8.contains(0x0D)
+        let hasOtherLineSeparator = source.unicodeScalars.contains { scalar in
             switch scalar.value {
-            case 0x000B, 0x000C, 0x000D, 0x0085, 0x2028, 0x2029: true
+            case 0x000B, 0x000C, 0x0085, 0x2028, 0x2029: true
             default: false
             }
         }
-        guard needsNormalization else { return source }
+        guard hasCarriageReturn || hasOtherLineSeparator else { return source }
         var out = ""
         out.reserveCapacity(source.count)
         var index = source.startIndex
@@ -237,6 +235,7 @@ public enum CodeBlockWindow {
             index = source.index(after: index)
         }
         return out
+    }
     }
 
     private static func isLineBreak(_ character: Character, in source: String, at index: String.Index) -> Bool {
