@@ -79,7 +79,12 @@ class MockWebSocket {
   sent: string[] = [];
   closeCount = 0;
   readonly listeners = new Map<string, Set<(event: Event) => void>>();
-  constructor(readonly url: string) {
+  constructor(
+    readonly url: string,
+    // Captured because asserting the URL alone never caught the shipped bug:
+    // the socket was opened with no credentials at all.
+    readonly protocols?: string | string[],
+  ) {
     sockets.push(this);
   }
   addEventListener(type: string, fn: (event: Event) => void) {
@@ -175,6 +180,18 @@ afterEach(() => {
 });
 
 describe("xAI realtime session handshake", () => {
+  it("authenticates the socket with the xAI client-secret subprotocol", async () => {
+    const { session } = setup();
+    const socket = await open(session);
+
+    // The assertion that was missing.  The session minted a token and then
+    // connected without it, which is indistinguishable from success: the socket
+    // opens, session.updated arrives, audio flows up, and the vendor sends
+    // nothing back.  Asserting the URL alone could never have caught this.
+    expect(socket.protocols).toEqual(["xai-client-secret.ephemeral-abc"]);
+    await session.stop();
+  });
+
   it("opens the documented endpoint and sends the session config", async () => {
     const { session } = setup();
     const bot = engine();

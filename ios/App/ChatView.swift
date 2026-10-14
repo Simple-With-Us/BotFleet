@@ -1306,7 +1306,7 @@ struct ChatView: View {
                                 steerNow()
                             } label: {
                                 Image(systemName: "arrow.up")
-                                    .font(.scaled(13, weight: .bold, relativeTo: .caption))
+                                    .font(.system(size: 13, weight: .bold))
                                     .foregroundStyle(BubbleColor.mine)
                                     .frame(width: 28, height: 28)
                                     .contentShape(Rectangle())
@@ -1450,7 +1450,7 @@ struct ChatView: View {
             Haptics.selection()
         } label: {
             Image(systemName: dictation.isListening ? "mic.fill" : "mic")
-                .font(.scaled(16, weight: .semibold, relativeTo: .footnote))
+                .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(dictation.isListening ? Color.red : Color.secondary)
                 .frame(width: 34, height: 34)
                 .background(
@@ -1482,7 +1482,7 @@ struct ChatView: View {
             Haptics.impact(.medium)
         } label: {
             Image(systemName: "stop.fill")
-                .font(.scaled(13, weight: .bold, relativeTo: .caption))
+                .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(Color(uiColor: .systemBackground))
                 .frame(width: 34, height: 34)
                 .background(Circle().fill(Color(uiColor: .label)))
@@ -1499,7 +1499,7 @@ struct ChatView: View {
     private var composerSendButton: some View {
         Button { submit() } label: {
             Image(systemName: "arrow.up")
-                .font(.scaled(15, weight: .bold, relativeTo: .footnote))
+                .font(.system(size: 15, weight: .bold))
                 .foregroundStyle(canSend ? Color.white : Color.secondary)
                 .frame(width: 34, height: 34)
                 .background(

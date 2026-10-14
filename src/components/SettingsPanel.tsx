@@ -30,6 +30,7 @@ import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { effortLabel } from "@/lib/model-effort";
 import { selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
 import { CONNECTED_APPS_HEADING, connectedAppsBlurb } from "@/lib/connected-apps-copy";
+import { BotAlwaysAllowCard } from "./BotAlwaysAllowCard";
 
 function Field({
   label,
@@ -383,6 +384,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "voiceSummaryMode"
         | "chiefOfStaff"
         | "approvePeerComms"
+        | "alwaysAllow"
         | "composio"
         | "modelSelection"
         | "maxToolRounds"
@@ -390,6 +392,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       >
     > & { acknowledgeLocalAuto?: boolean; connectorTools?: Bot["connectorTools"] },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
+  const alwaysAllow = bot.alwaysAllow ?? [];
   const activeState = stateForBot(bot);
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const modelRisk = evaluateModelRiskForBypass(bot.modelSelection?.model, bot.modelSelection?.instanceId);
@@ -553,6 +556,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               />
             </button>
           </div>
+
+          <BotAlwaysAllowCard
+            alwaysAllow={alwaysAllow}
+            onRemove={(key) => patch({ alwaysAllow: alwaysAllow.filter((entry) => entry !== key) })}
+          />
 
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
             <div>

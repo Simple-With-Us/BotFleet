@@ -2,17 +2,25 @@
 // The rule these protect: a client never holds a permanent provider key, and
 // an unavailable provider says which key is missing rather than failing
 // silently.
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
+import type { z } from "zod";
+
 import {
   GEMINI_TOKEN_ENDPOINT,
+  geminiMintBody,
   isStsProvider,
   mintGeminiLiveToken,
   mintStsToken,
   mintXaiRealtimeToken,
   pickStsProvider,
   stsKeyNotice,
+  xaiEnvelope,
+  xaiMintBody,
   XAI_TOKEN_ENDPOINT,
+  type GeminiMintBody,
   type StsKeyStatus,
+  type XaiEnvelope,
+  type XaiMintBody,
 } from "./sts-tokens.ts";
 
 /** A fetch double that records what it was asked for and answers with a
@@ -35,6 +43,20 @@ type StsVendorReply = Record<string, string | { value?: string; token?: string }
 
 const bothKeys: StsKeyStatus = { xai: true, gemini: true };
 const noKeys: StsKeyStatus = { xai: false, gemini: false };
+
+describe("vendor mint schemas export their inferred types", () => {
+  it("derives each envelope type from the parser that reads it", () => {
+    expectTypeOf<XaiEnvelope>().toEqualTypeOf<z.infer<typeof xaiEnvelope>>();
+    expectTypeOf<XaiMintBody>().toEqualTypeOf<z.infer<typeof xaiMintBody>>();
+    expectTypeOf<GeminiMintBody>().toEqualTypeOf<z.infer<typeof geminiMintBody>>();
+  });
+
+  it("keeps an unknown vendor field from failing an otherwise valid token", () => {
+    expect(xaiMintBody.safeParse({ client_secret: { value: "ephemeral", expires_at: 1 }, extra: true }).success).toBe(true);
+    expect(geminiMintBody.safeParse({ name: "tokens/abc", extra: true }).success).toBe(true);
+    expect(xaiEnvelope.safeParse({ value: "ephemeral", region: "us" }).success).toBe(true);
+  });
+});
 
 describe("provider selection", () => {
   it("honours a preference that has a key", () => {

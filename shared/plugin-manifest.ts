@@ -23,6 +23,12 @@ export interface JsonObject {
 }
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 
+/** JSON object branch of {@link JsonValue} — not arrays or primitives. */
+export function isJsonObject(value: JsonValue): value is JsonObject {
+  if (value === null || Array.isArray(value)) return false;
+  return Object.prototype.toString.call(value) === "[object Object]";
+}
+
 /** Plugin name gate.  Same shape as skill names so the on-disk layout
  *  stays predictable and `..` is structurally impossible. */
 export const PLUGIN_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;

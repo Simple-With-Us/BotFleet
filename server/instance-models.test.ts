@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 import { instanceModelsSchema } from "./instance-models.ts";
 
 describe("instance model edits", () => {
-  it("trims and strips incoming fields, and accepts an explicit cleared catalog", () => {
-    expect(instanceModelsSchema.parse([{ id: " model/a ", label: " Model A ", unexpected: true }]))
+  it("trims model text and accepts an explicit cleared catalog", () => {
+    expect(instanceModelsSchema.parse([{ id: " model/a ", label: " Model A " }]))
       .toEqual([{ id: "model/a", label: "Model A" }]);
     expect(instanceModelsSchema.parse([])).toEqual([]);
+  });
+
+  it("rejects unknown fields instead of dropping them", () => {
+    expect(instanceModelsSchema.safeParse([{ id: "model/a", label: "Model A", unexpected: true }]).success).toBe(false);
   });
 
   it("rejects malformed, excessive, multiline, and duplicate entries", () => {

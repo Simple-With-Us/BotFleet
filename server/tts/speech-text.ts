@@ -217,6 +217,7 @@ export function narrateTool(toolName: string): string | null {
     [/^open_url$/, "opening a page"],
     [/^list_bots$/, "checking who's around"],
     [/^ask_bot$/, "asking a teammate"],
+    [/^coordinate_bots$/, "handing work to a teammate"],
   ];
   for (const [pattern, phrase] of verbs) {
     if (pattern.test(bare)) return phrase;

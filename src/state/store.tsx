@@ -15,6 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import { z } from "zod";
+import type { SignInRequestCardData } from "../../shared/sign-in-request.ts";
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { AccessTokenState } from "../../server/recall-access.ts";
 import type { ComputerReach } from "../../server/computer-capability.ts";
@@ -68,6 +69,8 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** Extra confirmation before always-allow on a write-shaped MCP tool. */
+  allowKeyWarnWrite?: boolean;
   approvalScope?: "local-computer" | "disposable-computer";
   /** Persisted proposal used by the server when the user confirms it. */
   routineRequest?: RoutineRequestCardData;
@@ -106,7 +109,7 @@ export interface Message {
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
   automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "sign-in";
   /** A "Job Finished" row: a background job of the bot's ended. */
   job?: import("../../shared/jobs").JobRowData;
   text?: string;
@@ -121,6 +124,7 @@ export interface Message {
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  signIn?: SignInRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the server's
    * narration of the same chip ("reading a file"), used by call mode. */
   /** `setup` marks an error fixed by installing something, not by retrying. */
@@ -2504,8 +2508,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return result.bot;
         },
         reconcile: async (botId, signal) => {
-          const result: { bots: BotAnnouncement[] } = await api("/api/bots", { signal });
-          return result.bots.find((candidate) => candidate.id === botId) ?? null;
+          // `?messages=0` — this only needs the bot row to roll the optimistic
+          // patch back, never the transcript. Unpaged, the server answered with
+          // every bot's and group's full history, so one rejected PATCH
+          // serialized megabytes of transcript per conflict (BF-2424).
+          const result: { bots: BotAnnouncement[] } = await api("/api/bots?messages=0", { signal });
+          const found = result.bots.find((candidate) => candidate.id === botId) ?? null;
+          if (!found) return null;
+          // messages=0 answers with `messages: []`, and the reducer treats an
+          // incoming transcript sharing no ids with the screen as a full
+          // snapshot — vacuously true for an empty array, so handing that back
+          // would blank the conversation on every rejected save. This re-read
+          // is for the bot ROW; carry the transcript already on screen.
+          const current = stateRef.current.bots.find((candidate) => candidate.id === botId);
+          return { ...found, messages: current?.messages ?? found.messages };
         },
         onAuthoritative: (bot, optimisticOverlay) => {
           rawDispatch({ type: "botPatched", bot: applyBotPatch(bot, optimisticOverlay) });

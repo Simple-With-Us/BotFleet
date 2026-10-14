@@ -134,13 +134,10 @@ describe("automation", () => {
 });
 
 describe("peers", () => {
-  it("refuses ask_bot and delegate_bot to an Off bot before anything is queued", () => {
-    const ask = functionBody("export async function executeAskBotRequest(");
-    expect(ask.indexOf("botIsOff(target)")).toBeGreaterThan(-1);
-    expect(ask.indexOf("botIsOff(target)")).toBeLessThan(ask.indexOf("askBotAndWait("));
-    const delegate = functionBody("export function executeDelegateBotRequest(");
-    expect(delegate.indexOf("botIsOff(target)")).toBeGreaterThan(-1);
-    expect(delegate.indexOf("botIsOff(target)")).toBeLessThan(delegate.indexOf("queueDelegation("));
+  it("refuses coordinate_bots to an Off bot before the handoff is recorded", () => {
+    const body = functionBody("export function executeCoordinateBotsRequest(");
+    expect(body.indexOf("botIsOff(target)")).toBeGreaterThan(-1);
+    expect(body.indexOf("botIsOff(target)")).toBeLessThan(body.indexOf("jobHost.coordinate("));
   });
 });
 
@@ -151,7 +148,7 @@ describe("update readiness", () => {
     const body = functionBody("function runtimeWorkCounts(");
     expect(body).toContain("queuedMessageCount(botIsOffId)");
     expect(body).toContain("_queuedRoomCount(botIsOffId)");
-    expect(body).toContain("botIsOffId(item.toBotId)");
+    expect(body).toContain("botIsOffId(item.targetBotId)");
     expect(body).toContain('run.status === "queued" && botIsOffId(run.botId)');
     // `turns` is deliberately not filtered: a turn that is running is real work.
     const turnsLine = body.split("\n").find((line) => line.includes("turns:")) ?? "";

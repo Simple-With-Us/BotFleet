@@ -190,6 +190,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "routine-calendar-density") {
+  // Visual-spec harness: the real calendar with the overlapping-run density
+  // that used to paint every card into one unreadable pile.
+  void import("./components/RoutineCalendarVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "bot-off") {
   // Visual-spec harness (tests/e2e/bot-off.visual.spec.ts): the bot On/Off
   // switch — sidebar rows, the Bot Profile card and the disabled composer.
@@ -291,6 +302,39 @@ if (fixtureParam === "tv-face") {
   // Visual-spec harness (tests/e2e/bypass-warning.visual.spec.ts): the Permission
   // Bypass confirmation dialog, standard, high-risk model and busy.
   void import("./components/BypassPermissionsWarningVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "sign-in-card") {
+  // Visual-spec harness (tests/e2e/sign-in-card.visual.spec.ts): the Sign in
+  // needed card, open, with a persistent error, and after Done.
+  void import("./components/SignInRequestCardVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "pending-approval-write-always") {
+  // Visual-spec harness (tests/e2e/pending-approval-write-always.visual.spec.ts):
+  // write-shaped MCP always-allow confirm dialog and approval action strip.
+  void import("./components/PendingApprovalWriteAlwaysVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "settings-always-allow") {
+  // Visual-spec harness (tests/e2e/settings-always-allow.visual.spec.ts):
+  // Agent settings Always allowed empty and populated revoke list.
+  void import("./components/SettingsAlwaysAllowVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>

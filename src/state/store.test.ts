@@ -567,6 +567,56 @@ describe("cross-client bot creation", () => {
   });
 });
 
+// BF-2424: the optimistic-patch reconcile re-reads a bot after a rejected
+// PATCH. It asks for `?messages=0`, which answers with `messages: []`, and an
+// incoming transcript sharing no ids with what is on screen is read as a full
+// snapshot and replaces — vacuously true for an empty array. So the visible
+// conversation would blank on every rejected save. The reconcile therefore
+// carries the transcript already on screen instead of the empty one.
+describe("reconcile frames must not blank the transcript", () => {
+  const seedBot = {
+    id: "bot-1",
+    threadId: "t1",
+    name: "Ada",
+    title: "",
+    description: "",
+    notifications: false,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "acp", model: "fake" },
+  } satisfies Omit<Bot, "messages">;
+
+  const seeded = reducer(initialState, {
+    type: "botPatched",
+    bot: { ...seedBot, messages: [] },
+  });
+  const withTranscript = reducer(seeded, {
+    type: "messageAdded",
+    threadId: "t1",
+    message: { id: "m1", role: "user", kind: "text", text: "still here", at: 1 },
+  });
+
+  it("documents the hazard: a bare empty transcript from the same thread DOES replace", () => {
+    // This is the existing, intended behaviour for a task-switch snapshot that
+    // arrives empty (see "task switch transcript" below). It is exactly why the
+    // reconcile must not hand an empty array back: the reducer cannot tell the
+    // two apart, so the caller has to carry the real transcript.
+    const blanked = reducer(withTranscript, {
+      type: "botPatched",
+      bot: { ...seedBot, messages: [] },
+    });
+    expect(blanked.bots[0]?.messages).toEqual([]);
+  });
+
+  it("keeps the transcript when the reconcile carries the messages already on screen", () => {
+    const reconciled = reducer(withTranscript, {
+      type: "botPatched",
+      bot: { ...seedBot, messages: withTranscript.bots[0]!.messages },
+    });
+    expect(reconciled.bots[0]?.messages.map((m) => m.id)).toEqual(["m1"]);
+  });
+});
+
 describe("section Chiefs", () => {
   const bot = (id: string, section: string, chiefOfStaff = false) => ({
     id,

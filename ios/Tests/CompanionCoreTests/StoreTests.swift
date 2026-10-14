@@ -561,6 +561,32 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(pending.first?.threadId, secondThread)
     }
 
+    /// BOTFLEET-30: `pendingApprovals` resolves each bot's leaf directly
+    /// rather than via `bot(forThread:)`, and must still honor the branch.
+    func testPendingApprovalsOnlyCountTheActiveBranch() throws {
+        var state = try hydrated()
+        let bot = try XCTUnwrap(state.bots.first)
+        func pendingCard(_ id: String, at: Double, parent: String) -> Message {
+            var message = Message(id: id, role: .bot, kind: .options, at: at)
+            message.parentId = parent
+            message.card = OptionCard(
+                title: "Approval needed", subtitle: "rm -rf ./build", options: ["Allow", "Deny"],
+                answered: nil, dismissed: nil, requestId: "r-\(id)", tool: "Bash",
+                held: nil, allowKey: "Bash:rm"
+            )
+            return message
+        }
+        let root = message("root")
+        let offBranch = pendingCard("off-branch", at: 2, parent: root.id)
+        let onBranch = pendingCard("on-branch", at: 3, parent: root.id)
+        for threadId in Array(state.messages.keys) { state.messages[threadId] = [] }
+        state.messages[bot.threadId] = [root, offBranch, onBranch]
+
+        state.apply(.thread(threadId: bot.threadId, activeLeafId: onBranch.id))
+        XCTAssertEqual(state.pendingApprovals.map(\.message.id), ["on-branch"])
+        XCTAssertEqual(state.pendingApprovals.first?.threadId, bot.threadId)
+    }
+
     // MARK: - Cursor
 
     func testTheCursorFollowsTheStreamAndKeepsItsStreamId() {

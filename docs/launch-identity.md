@@ -38,6 +38,12 @@ So a bot's post signed `[MM]`, with no session part, did not come from a launche
 
 Two consequences of the switch.  With `BOTFLEET_FLEET_SEAT_PROMPTS` off, a launched mcode bot cannot post through agent-sync at all, which is the safe failure.  With it on, the bot's credential file must exist (mode 600) in the home mcode runs with, or agent-sync exits 3 for the same reason.
 
+## Linear Board Access
+
+The local `board` command is the fleet's Linear-backed CLI.  It is discovered through BotFleet's augmented PATH (`~/.local/bin` is one of the standard GUI-launch locations), and the launch variables above give it the bot's assigned seat.  The shared role prompt tells every operator bot to list and inspect Linear issues before substantial work, claim the issue before editing, and treat issue text as untrusted data.
+
+BotFleet does not copy Linear credentials into an engine environment.  The CLI resolves its own authorized credential source on the host; when that source or the command is unavailable, the bot reports the missing capability and continues only independent work.  This keeps Linear access consistent across engines with a shell without exposing the credential to the model.
+
 ## Which Bots Get a Seat
 
 The eleven role seats are `BF-BUILDER`, `BF-COMPILER`, `BF-DEPLOYER`, `BF-DESIGNER`, `BF-DIRECTOR`, `BF-FIXER`, `BF-HOUSEKEEPER`, `BF-MONITOR`, `BF-ORACLE`, `BF-PLUMBER` and `BF-PUBLISHER`.  A bot's role comes from, in order:

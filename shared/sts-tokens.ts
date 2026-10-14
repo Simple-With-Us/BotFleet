@@ -102,20 +102,30 @@ export function geminiCredential(
 // on one and failing closed on a valid token.  A missing token is still an
 // error -- we never fall back to handing back anything else.
 
-/** One layout xAI is known to answer with. */
-const xaiEnvelope = z.object({ value: z.string().optional(), token: z.string().optional() });
+/** One layout xAI is known to answer with.  `.passthrough()` rather than strict
+ *  because this is a vendor body: xAI adds fields without notice, and an extra
+ *  field must not fail an otherwise valid token.  Stated here so the tolerance
+ *  reads as a decision rather than an omission. */
+export const xaiEnvelope = z
+  .object({ value: z.string().optional(), token: z.string().optional() })
+  .passthrough();
+export type XaiEnvelope = z.infer<typeof xaiEnvelope>;
 
 // The third shape matters: the body itself is a candidate, so a top-level
 // `{ value }` is accepted as well as the nested ones.
-const xaiMintBody = z.object({
-  client_secret: xaiEnvelope.optional(),
-  clientSecret: xaiEnvelope.optional(),
-  value: z.string().optional(),
-  token: z.string().optional(),
-});
+export const xaiMintBody = z
+  .object({
+    client_secret: xaiEnvelope.optional(),
+    clientSecret: xaiEnvelope.optional(),
+    value: z.string().optional(),
+    token: z.string().optional(),
+  })
+  .passthrough();
+export type XaiMintBody = z.infer<typeof xaiMintBody>;
 
 /** Gemini returns the token itself in `name`, and nothing else we need. */
-const geminiMintBody = z.object({ name: z.string().optional() });
+export const geminiMintBody = z.object({ name: z.string().optional() }).passthrough();
+export type GeminiMintBody = z.infer<typeof geminiMintBody>;
 
 /** POST to a vendor mint endpoint, translating transport failures into
  *  sentences a person can act on.  Without this, a dead network surfaces as
@@ -258,4 +268,22 @@ export function stsKeyNotice(provider: StsProvider, keys: StsKeyStatus | null): 
     configured: false,
     reason: `No ${label}.  Calls stay on Auto until you add one.`,
   };
+}
+
+/**
+ * The WebSocket subprotocol that carries the xAI ephemeral token.
+ *
+ * A browser WebSocket cannot set an `Authorization` header, and xAI's Node
+ * examples use exactly that.  A renderer that copies the Node example connects,
+ * completes the handshake, accepts audio, and silently receives nothing back --
+ * which is what shipped, and why no test caught it: the mock socket never
+ * asserted what it was constructed with.
+ *
+ * Lives beside the mint it belongs to so the two cannot drift, and is shared by
+ * desktop and the phone companion rather than re-derived per client.
+ */
+export function xaiRealtimeSubprotocol(token: string): string {
+  const value = String(token ?? "").trim();
+  if (!value) throw new Error("Missing xAI session token.");
+  return `xai-client-secret.${value}`;
 }

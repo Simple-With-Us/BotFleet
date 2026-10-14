@@ -16,7 +16,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { StsErrorBodySchema, StsStatusSchema } from "./sts-access.ts";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// Both bodies this route answers with live in server/sts-access.ts, exported
+// with their inferred types.  A private schema in this file could not carry
+// a type, and a second copy would drift from the route.  The assertions
+// below used to reach into a bare JSON.parse result, so a route that
+// answered 200 with the wrong shape still passed as long as the keys
+// happened to be present.  Parsing here fails loudly on drift instead.
 
 function freePort() {
   // Reserve a free port by listening on 0 and capturing the assigned one,
@@ -127,13 +136,22 @@ test("the harness boots under --experimental-strip-types and serves /api/sts/sta
   const parsed = JSON.parse(response.body);
   assert.equal(typeof parsed, "object");
   if (response.status === 503) {
+    const refused = StsErrorBodySchema.safeParse(parsed);
+    assert.ok(
+      refused.success,
+      `503 from /api/sts/status must be { error: string }, got ${response.body}`,
+    );
     assert.match(
-      String(parsed.error ?? ""),
+      refused.data.error,
       /voice provider keys/,
       "503 from /api/sts/status must say the keys could not be read",
     );
   } else {
-    assert.ok("xai" in parsed && "gemini" in parsed, "200 must carry xai and gemini booleans");
+    const ready = StsStatusSchema.safeParse(parsed);
+    assert.ok(
+      ready.success,
+      `200 from /api/sts/status must be { xai, gemini, provider }, got ${response.body}`,
+    );
   }
 
   child.kill("SIGTERM");

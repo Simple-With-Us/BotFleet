@@ -1,0 +1,456 @@
+// The durable store of the job runtime:
+// one row per assignment, an append-only event per transition, and the
+// inbox that is the one wake lane. node:sqlite like messages.db, so nothing
+// new ships with the app; ":memory:" for the suite.
+//
+// The row's columns exist for lookups (tree, status, owners); the record
+// itself travels whole in the json column and is validated on every read,
+// so a row written by a newer or older build is refused, never half-read.
+// Every write the runtime cares about is one transaction: the row and its
+// event land together or not at all (write-before-act).
+import { spawnSync } from "node:child_process";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { userInfo } from "node:os";
+import { dirname, join } from "node:path";
+import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
+import { z } from "zod";
+
+import { TERMINAL, type Assignment, type AssignmentEvent, type EventKind, type InboxItem, type InboxKind, type Owner } from "./types.ts";
+
+/** A file can disappear between the existence check and chmod.  Every other failure stays visible. */
+export function chmodTargetMissing(error: Error): boolean {
+  return "code" in error && error.code === "ENOENT";
+}
+
+const evidenceSchema = z.object({
+  commands: z.number().int().nonnegative().optional(),
+  filesChanged: z.array(z.string()).optional(),
+  toolCalls: z.number().int().nonnegative().optional(),
+  summary: z.string().optional(),
+  okToolCalls: z.number().int().nonnegative().optional(),
+  errors: z.array(z.string()).optional(),
+  outward: z.array(z.string()).optional(),
+}).strict();
+
+const assignmentSchema = z.object({
+  id: z.string().min(1),
+  rootId: z.string().min(1),
+  parentId: z.string().min(1).optional(),
+  depth: z.number().int().nonnegative(),
+  origin: z.object({
+    kind: z.enum(["person", "routine", "outside"]),
+    source: z.enum(["chat", "routine", "webhook", "relay", "external_runtime", "guest", "peer", "api"]),
+    ref: z.string().optional(),
+    quote: z.string().optional(),
+    onBehalfOf: z.string().optional(),
+  }).strict(),
+  requester: z.object({
+    kind: z.enum(["person", "bot_turn", "routine_run", "external_runtime"]),
+    botId: z.string().optional(),
+    threadId: z.string().optional(),
+    runId: z.string().optional(),
+    chief: z.boolean().optional(),
+  }).strict(),
+  assignee: z.object({
+    botId: z.string().min(1),
+    // An empty thread id is a legacy-ledger import whose item named no
+    // thread (types.ts, Assignee): allowed on a standing_thread destination
+    // only, so the host resolves or refuses it instead of the read failing.
+    destination: z.object({
+      kind: z.enum(["work_thread", "standing_thread", "room_thread"]),
+      threadId: z.string(),
+      groupId: z.string().optional(),
+    }).strict().refine(d => d.threadId.length > 0 || d.kind === "standing_thread", { message: "threadId must not be empty" }),
+  }).strict(),
+  mode: z.enum(["work", "consult", "notify"]),
+  reply: z.enum(["resume", "poll", "none"]),
+  brief: z.string(),
+  doneWhen: z.string().optional(),
+  goalRunId: z.string().optional(),
+  status: z.enum(["queued", "running", "needs_input", "waiting", "resume", "completed", "failed", "cancelled"]),
+  outcome: z.enum(["done", "needs_input", "cap_continued", "stalled", "interrupted", "budget", "provider_error", "denied",
+    "expired", "stopped", "refused", "duplicate"]).optional(),
+  outcomeDetail: z.string().optional(),
+  level: z.enum(["ask", "auto"]),
+  levelSource: z.enum(["own", "chief", "engine_cap"]),
+  executions: z.number().int().nonnegative(),
+  restarts: z.number().int().nonnegative(),
+  restart: z.enum(["rerun", "cut", "teammates"]).optional(),
+  createdAt: z.number(),
+  startedAt: z.number().optional(),
+  lastActivityAt: z.number(),
+  finishedAt: z.number().optional(),
+  result: z.string(),
+  evidence: evidenceSchema.optional(),
+  reportedAt: z.number().optional(),
+  rework: z.boolean(),
+  question: z.string().optional(),
+  answer: z.string().optional(),
+  budgets: z.object({ since: z.number(), requests: z.number(), executions: z.number(), wakes: z.number() }).strict().optional(),
+  // A root parked on the person's cards, and a node that continues in place.
+  // Unknown keys are refused, so a row is never read with part of it dropped.
+  cards: z.array(z.string()).optional(),
+  continuation: z.object({ note: z.string(), handoffPath: z.string().optional(), count: z.number().int().nonnegative() }).strict().optional(),
+  // The loop guard's record outlives the continuation the dispatch consumes.
+  guard: z.object({ stale: z.number().int().nonnegative(), errors: z.array(z.string()) }).strict().optional(),
+  approved: z.boolean().optional(),
+  batchKey: z.string().optional(),
+  version: z.literal(1),
+}).strict();
+
+export interface RuntimeStore {
+  readonly path: string;
+  get(id: string): Assignment | undefined;
+  /** Direct children, createdAt order. */
+  children(id: string): Assignment[];
+  /** The root of this id's tree. */
+  root(id: string): Assignment | undefined;
+  all(filter?: { rootId?: string; nonTerminal?: boolean; ownerThreadId?: string }): Assignment[];
+  /** Insert a new row and its event in one transaction. */
+  insert(a: Assignment, event: { kind: EventKind; detail?: string; at?: number }): void;
+  /** Write the whole row and (optionally) an event in one transaction. */
+  update(a: Assignment, event?: { kind: EventKind; detail?: string; at?: number }): void;
+  /** Nested calls join the outer transaction (a savepoint inside it). */
+  transaction<T>(fn: () => T): T;
+  /** Oldest first. */
+  events(assignmentId: string): AssignmentEvent[];
+  addInbox(item: InboxItem): void;
+  inbox(owner: Owner, undeliveredOnly?: boolean): InboxItem[];
+  markDelivered(ids: string[], at: number): void;
+  /** Remove terminal trees whose root finished before `before`; never a tree
+   * with a non-terminal node. Returns assignment rows removed. */
+  prune(before: number): number;
+  close(): void;
+}
+
+const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS assignments (
+    id TEXT PRIMARY KEY,
+    root_id TEXT NOT NULL,
+    parent_id TEXT,
+    status TEXT NOT NULL,
+    requester_thread_id TEXT,
+    requester_run_id TEXT,
+    assignee_bot_id TEXT NOT NULL,
+    assignee_thread_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    json TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS assignments_root ON assignments(root_id);
+  CREATE INDEX IF NOT EXISTS assignments_parent ON assignments(parent_id);
+  CREATE INDEX IF NOT EXISTS assignments_status ON assignments(status);
+  CREATE INDEX IF NOT EXISTS assignments_requester_thread ON assignments(requester_thread_id);
+  CREATE INDEX IF NOT EXISTS assignments_requester_run ON assignments(requester_run_id);
+  CREATE INDEX IF NOT EXISTS assignments_assignee ON assignments(assignee_bot_id, assignee_thread_id);
+  CREATE TABLE IF NOT EXISTS assignment_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    assignment_id TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT
+  );
+  CREATE INDEX IF NOT EXISTS assignment_events_assignment ON assignment_events(assignment_id, id);
+  CREATE TABLE IF NOT EXISTS inbox (
+    id TEXT PRIMARY KEY,
+    owner_bot_id TEXT,
+    owner_thread_id TEXT,
+    owner_run_id TEXT,
+    assignment_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    delivered_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS inbox_thread ON inbox(owner_thread_id, delivered_at);
+  CREATE INDEX IF NOT EXISTS inbox_run ON inbox(owner_run_id, delivered_at);
+  CREATE INDEX IF NOT EXISTS inbox_assignment ON inbox(assignment_id);
+`;
+
+const terminalList = TERMINAL.map(s => `'${s}'`).join(", ");
+
+type SqlRow = Record<string, SQLOutputValue>;
+
+const EVENT_KINDS = [
+  "enqueued", "refused", "admitted", "started", "progress", "parked", "answered",
+  "waiting", "resume_due", "settled", "reported", "woken", "cancelled",
+  "restart_reconciled", "budget", "stalled", "continued",
+] as const satisfies readonly EventKind[];
+
+const INBOX_KINDS = ["settled", "needs_input", "stalled"] as const satisfies readonly InboxKind[];
+
+function eventKindOf(value: SQLOutputValue | undefined): EventKind {
+  const text = String(value ?? "");
+  for (const kind of EVENT_KINDS) if (kind === text) return kind;
+  throw new Error(`runtime.db: unknown event kind ${text}`);
+}
+
+function inboxKindOf(value: SQLOutputValue | undefined): InboxKind {
+  const text = String(value ?? "");
+  for (const kind of INBOX_KINDS) if (kind === text) return kind;
+  throw new Error(`runtime.db: unknown inbox kind ${text}`);
+}
+
+function readAssignment(row: SqlRow): Assignment {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(String(row.json));
+  } catch (error) {
+    throw new Error(`runtime.db: assignment ${String(row.id)} holds invalid JSON (${String(error)})`);
+  }
+  const result = assignmentSchema.safeParse(parsed);
+  if (!result.success) throw new Error(`runtime.db: assignment ${String(row.id)} does not match the record schema: ${result.error.message}`);
+  return result.data;
+}
+
+/** JSON drops undefined fields; the row read back must equal the row
+ * written, so optional fields are never written as null. */
+const toJson = (a: Assignment): string => JSON.stringify(a);
+
+function readInbox(row: SqlRow): InboxItem {
+  const item: InboxItem = {
+    id: String(row.id), assignmentId: String(row.assignment_id),
+    kind: inboxKindOf(row.kind), createdAt: Number(row.created_at),
+  };
+  if (row.owner_bot_id != null) item.ownerBotId = String(row.owner_bot_id);
+  if (row.owner_thread_id != null) item.ownerThreadId = String(row.owner_thread_id);
+  if (row.owner_run_id != null) item.ownerRunId = String(row.owner_run_id);
+  if (row.delivered_at != null) item.deliveredAt = Number(row.delivered_at);
+  return item;
+}
+
+function readEvent(row: SqlRow): AssignmentEvent {
+  const event: AssignmentEvent = {
+    id: Number(row.id), assignmentId: String(row.assignment_id), at: Number(row.at), kind: eventKindOf(row.kind),
+  };
+  if (row.detail != null) event.detail = String(row.detail);
+  return event;
+}
+
+function icacls(dir: string, args: string[], optional = false): void {
+  // The harness can start with a PATH that does not include System32.
+  // An absolute path still finds the tool.
+  const root = process.env.SystemRoot ?? "C:\\Windows";
+  const exe = join(root, "System32", "icacls.exe");
+  const result = spawnSync(exe, [dir, ...args], { windowsHide: true, encoding: "utf8" });
+  if (optional) return;
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`runtime.db: icacls ${args[0] ?? ""} failed (${String(result.status)})`);
+}
+
+/** Owner-only directory.  Unix uses mode 0700.  Windows uses an ACL that
+ *  still includes delete, because mkdir's mode flag omits delete-child and
+ *  the test runner then cannot remove the directory. */
+function lockPrivateDirectory(dir: string): void {
+  if (process.platform !== "win32") {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(dir, 0o700);
+    } catch (error) {
+      // A directory that disappears between create and chmod is gone.
+      // Permission and I/O failures stay visible so a loose directory is not silent.
+      if (!(error instanceof Error && chmodTargetMissing(error))) throw error;
+    }
+    return;
+  }
+  mkdirSync(dir, { recursive: true });
+  const name = userInfo().username;
+  const domain = process.env.USERDOMAIN;
+  const account = domain ? `${domain}\\${name}` : name;
+  // Copy inherited entries, grant this account full control (including
+  // delete), then drop the broad groups.  Grant runs before the removals
+  // so the directory is never left with no access.
+  icacls(dir, ["/inheritance:d"]);
+  icacls(dir, ["/grant:r", `${account}:(OI)(CI)F`]);
+  icacls(dir, ["/remove:g", "*S-1-1-0"], true);
+  icacls(dir, ["/remove:g", "*S-1-5-32-545"], true);
+  icacls(dir, ["/remove:g", "*S-1-5-11"], true);
+}
+
+export function openRuntimeStore(path: string): RuntimeStore {
+  const memory = path === ":memory:";
+  if (!memory) {
+    const dir = dirname(path);
+    lockPrivateDirectory(dir);
+    // Owner-only from the first byte, and repaired on a file that inherited
+    // a loose umask.
+    closeSync(openSync(path, "a", 0o600));
+    try {
+      chmodSync(path, 0o600);
+    } catch (error) {
+      if (!(error instanceof Error && chmodTargetMissing(error))) throw error;
+    }
+  }
+  const db = new DatabaseSync(path);
+  if (!memory) {
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA synchronous = NORMAL");
+  }
+  db.exec(SCHEMA);
+  // WAL creates runtime.db-wal and runtime.db-shm on the first write.  Those
+  // sidecars inherit the process umask, so they are locked down here and
+  // again after every committed write.
+  const lockSidecars = () => {
+    if (memory) return;
+    for (const suffix of ["-wal", "-shm"]) {
+      const side = `${path}${suffix}`;
+      if (!existsSync(side)) continue;
+      try {
+        chmodSync(side, 0o600);
+      } catch (error) {
+        // A sidecar that disappears between the check and the chmod is gone.
+        // Permission and I/O failures stay visible so a loose umask is not silent.
+        if (!(error instanceof Error && chmodTargetMissing(error))) throw error;
+      }
+    }
+  };
+  lockSidecars();
+
+  const statements = {
+    get: db.prepare("SELECT id, json FROM assignments WHERE id = ?"),
+    children: db.prepare("SELECT id, json FROM assignments WHERE parent_id = ? ORDER BY created_at, rowid"),
+    insert: db.prepare(`INSERT INTO assignments (id, root_id, parent_id, status, requester_thread_id, requester_run_id,
+      assignee_bot_id, assignee_thread_id, created_at, finished_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+    update: db.prepare(`UPDATE assignments SET root_id = ?, parent_id = ?, status = ?, requester_thread_id = ?,
+      requester_run_id = ?, assignee_bot_id = ?, assignee_thread_id = ?, created_at = ?, finished_at = ?, json = ? WHERE id = ?`),
+    event: db.prepare("INSERT INTO assignment_events (assignment_id, at, kind, detail) VALUES (?, ?, ?, ?)"),
+    events: db.prepare("SELECT id, assignment_id, at, kind, detail FROM assignment_events WHERE assignment_id = ? ORDER BY id"),
+    addInbox: db.prepare(`INSERT INTO inbox (id, owner_bot_id, owner_thread_id, owner_run_id, assignment_id, kind, created_at, delivered_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+    deliver: db.prepare("UPDATE inbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL"),
+    prunable: db.prepare(`SELECT id FROM assignments r WHERE r.parent_id IS NULL AND r.status IN (${terminalList})
+      AND r.finished_at IS NOT NULL AND r.finished_at < ?
+      AND NOT EXISTS (SELECT 1 FROM assignments c WHERE c.root_id = r.id AND c.status NOT IN (${terminalList}))`),
+    pruneEvents: db.prepare("DELETE FROM assignment_events WHERE assignment_id IN (SELECT id FROM assignments WHERE root_id = ?)"),
+    pruneInbox: db.prepare("DELETE FROM inbox WHERE assignment_id IN (SELECT id FROM assignments WHERE root_id = ?)"),
+    pruneRows: db.prepare("DELETE FROM assignments WHERE root_id = ?"),
+  };
+
+  // Nested writes use savepoints, as message-db.ts does: a caught inner
+  // error never commits half of an inner step, and the outermost call
+  // still owns durability.
+  let depth = 0;
+  function transaction<T>(fn: () => T): T {
+    if (depth > 0) {
+      const savepoint = `runtime_${depth}`;
+      db.exec(`SAVEPOINT ${savepoint}`);
+      depth += 1;
+      try {
+        const result = fn();
+        db.exec(`RELEASE ${savepoint}`);
+        return result;
+      } catch (error) {
+        db.exec(`ROLLBACK TO ${savepoint}`);
+        db.exec(`RELEASE ${savepoint}`);
+        throw error;
+      } finally { depth -= 1; }
+    }
+    db.exec("BEGIN IMMEDIATE");
+    depth = 1;
+    try {
+      const result = fn();
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      depth = 0;
+      lockSidecars();
+    }
+  }
+
+  const columns = (a: Assignment): SQLInputValue[] => [
+    a.rootId, a.parentId ?? null, a.status, a.requester.threadId ?? null, a.requester.runId ?? null,
+    a.assignee.botId, a.assignee.destination.threadId, a.createdAt, a.finishedAt ?? null, toJson(a),
+  ];
+  const writeEvent = (id: string, event: { kind: EventKind; detail?: string; at?: number }) => {
+    statements.event.run(id, event.at ?? Date.now(), event.kind, event.detail ?? null);
+  };
+
+  return {
+    path,
+    get(id) {
+      const row = statements.get.get(id);
+      return row ? readAssignment(row) : undefined;
+    },
+    children(id) {
+      return (statements.children.all(id)).map(readAssignment);
+    },
+    root(id) {
+      const row = statements.get.get(id);
+      if (!row) return undefined;
+      const a = readAssignment(row);
+      if (a.rootId === a.id) return a;
+      const rootRow = statements.get.get(a.rootId);
+      return rootRow ? readAssignment(rootRow) : undefined;
+    },
+    all(filter = {}) {
+      const where: string[] = [];
+      const params: SQLInputValue[] = [];
+      if (filter.rootId !== undefined) { where.push("root_id = ?"); params.push(filter.rootId); }
+      if (filter.nonTerminal) where.push(`status NOT IN (${terminalList})`);
+      if (filter.ownerThreadId !== undefined) { where.push("requester_thread_id = ?"); params.push(filter.ownerThreadId); }
+      const sql = `SELECT id, json FROM assignments${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at, rowid`;
+      return (db.prepare(sql).all(...params)).map(readAssignment);
+    },
+    insert(a, event) {
+      transaction(() => {
+        statements.insert.run(a.id, ...columns(a));
+        writeEvent(a.id, event);
+      });
+    },
+    update(a, event) {
+      transaction(() => {
+        const changes = statements.update.run(...columns(a), a.id).changes;
+        if (changes === 0) throw new Error(`runtime.db: assignment ${a.id} does not exist`);
+        if (event) writeEvent(a.id, event);
+      });
+    },
+    transaction,
+    events(assignmentId) {
+      return (statements.events.all(assignmentId)).map(readEvent);
+    },
+    addInbox(item) {
+      statements.addInbox.run(item.id, item.ownerBotId ?? null, item.ownerThreadId ?? null, item.ownerRunId ?? null,
+        item.assignmentId, item.kind, item.createdAt, item.deliveredAt ?? null);
+    },
+    inbox(owner, undeliveredOnly = false) {
+      // Every field the caller names must match: a thread owner with a bot
+      // id reads only that bot's lane; an external runtime reads by run id.
+      const where: string[] = [];
+      const params: SQLInputValue[] = [];
+      if (owner.botId !== undefined) { where.push("owner_bot_id = ?"); params.push(owner.botId); }
+      if (owner.threadId !== undefined) { where.push("owner_thread_id = ?"); params.push(owner.threadId); }
+      if (owner.runId !== undefined) { where.push("owner_run_id = ?"); params.push(owner.runId); }
+      if (where.length === 0) return [];
+      if (undeliveredOnly) where.push("delivered_at IS NULL");
+      const sql = `SELECT * FROM inbox WHERE ${where.join(" AND ")} ORDER BY created_at, rowid`;
+      return (db.prepare(sql).all(...params)).map(readInbox);
+    },
+    markDelivered(ids, at) {
+      if (ids.length === 0) return;
+      transaction(() => {
+        for (const id of ids) statements.deliver.run(at, id);
+      });
+    },
+    prune(before) {
+      return transaction(() => {
+        const roots = (statements.prunable.all(before)).map(row => String(row.id));
+        let removed = 0;
+        for (const rootId of roots) {
+          statements.pruneEvents.run(rootId);
+          statements.pruneInbox.run(rootId);
+          removed += Number(statements.pruneRows.run(rootId).changes);
+        }
+        return removed;
+      });
+    },
+    close() {
+      try {
+        db.close();
+      } catch {
+        // A second close, or a database Windows already released, is done.
+      }
+    },
+  };
+}
