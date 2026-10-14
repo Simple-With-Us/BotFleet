@@ -295,6 +295,10 @@ export function createMicCapture(platform: MicPlatform | null = browserMicPlatfo
       const live = platform.createAudioGraph();
       graph = live;
       if (live.suspended) await live.resume();
+      // A stop() that landed while resume() was in flight has already closed
+      // this graph and released the stream, so capturing on it now would throw
+      // against a context nobody will ever tear down.
+      if (stopping) return;
       tap = live.capture(stream, (frame) => {
         if (stopping) return;
         const pcm = pcm16FromFloat32(frame, live.sampleRate, STS_INPUT_SAMPLE_RATE);
@@ -399,9 +403,9 @@ export interface StsLineView {
  * Fold one provider line into the call view's transcript.
  *
  * A user turn arrives twice — a running transcript and then the final text for
- * the same turn — so any user line that follows an open one replaces it.  A bot
- * line arrives once, already final, and may carry the `engineBypassed` mark the
- * provider sets when the engine failed or hit its deadline.
+ * the same turn — so a user line replaces the open one directly above it.  A
+ * bot line arrives once, already final, and may carry the `engineBypassed` mark
+ * the provider sets when the engine failed or hit its deadline.
  */
 export function appendStsLine(
   lines: readonly StsLineView[],
@@ -413,12 +417,14 @@ export function appendStsLine(
   if (!text) return next;
   const bypassed = line.engineBypassed === true;
   if (line.from === "user") {
-    for (let index = next.length - 1; index >= 0; index -= 1) {
-      const open = next[index];
-      if (open?.from === "user" && !open.final) {
-        next[index] = { ...open, text, final: line.final, engineBypassed: bypassed };
-        return next;
-      }
+    // Only the line directly above can be the running transcript of this same
+    // turn.  Scanning the whole array let a new partial overwrite an earlier
+    // one the bot had already spoken past, silently deleting what the caller
+    // said before the bot replied.
+    const open = next[next.length - 1];
+    if (open?.from === "user" && !open.final) {
+      next[next.length - 1] = { ...open, text, final: line.final, engineBypassed: bypassed };
+      return next;
     }
   }
   next.push({ key, from: line.from, text, final: line.final, engineBypassed: bypassed });

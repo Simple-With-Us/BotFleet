@@ -2027,6 +2027,11 @@ ipcMain.handle("sts:gemini-token", () =>
 const CREDENTIAL_PATCH = {
   composioApiKey: (value) => ({ composio: { apiKey: value } }),
   xaiApiKey: (value) => ({ xai: { key: value } }),
+  // The STS panel offers Gemini beside xAI, so its key has to be settable
+  // through the same path.  Without this entry `credential:set` rejected the
+  // name with "Unsupported credential", so the panel named a key it could
+  // never be given and a fresh install was stuck with no Gemini calls at all.
+  geminiApiKey: (value) => ({ gemini: { key: value } }),
   openaiCompatApiKey: (value) => ({ openaiCompat: { key: value } }),
   minimaxApiKey: (value) => ({ minimax: { key: value } }),
   deepseekApiKey: (value) => ({ deepseek: { key: value } }),

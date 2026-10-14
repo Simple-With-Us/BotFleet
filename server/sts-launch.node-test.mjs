@@ -15,8 +15,17 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// Both bodies this route answers with, as schemas rather than as string
+// matching.  The assertions below used to reach into a bare JSON.parse result,
+// so a route that answered 200 with the wrong shape still passed as long as the
+// keys happened to be present — a harness that parsed at all was never actually
+// being proved.  Parsing here fails loudly on drift instead.
+const StsStatusSchema = z.object({ xai: z.boolean(), gemini: z.boolean() }).strict();
+const StsRefusalSchema = z.object({ error: z.string() }).passthrough();
 
 function freePort() {
   // Reserve a free port by listening on 0 and capturing the assigned one,
@@ -127,13 +136,22 @@ test("the harness boots under --experimental-strip-types and serves /api/sts/sta
   const parsed = JSON.parse(response.body);
   assert.equal(typeof parsed, "object");
   if (response.status === 503) {
+    const refused = StsRefusalSchema.safeParse(parsed);
+    assert.ok(
+      refused.success,
+      `503 from /api/sts/status must be { error: string }, got ${response.body}`,
+    );
     assert.match(
-      String(parsed.error ?? ""),
+      refused.data.error,
       /voice provider keys/,
       "503 from /api/sts/status must say the keys could not be read",
     );
   } else {
-    assert.ok("xai" in parsed && "gemini" in parsed, "200 must carry xai and gemini booleans");
+    const ready = StsStatusSchema.safeParse(parsed);
+    assert.ok(
+      ready.success,
+      `200 from /api/sts/status must be { xai: boolean, gemini: boolean }, got ${response.body}`,
+    );
   }
 
   child.kill("SIGTERM");

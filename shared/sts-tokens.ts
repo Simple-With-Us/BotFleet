@@ -102,20 +102,27 @@ export function geminiCredential(
 // on one and failing closed on a valid token.  A missing token is still an
 // error -- we never fall back to handing back anything else.
 
-/** One layout xAI is known to answer with. */
-const xaiEnvelope = z.object({ value: z.string().optional(), token: z.string().optional() });
+/** One layout xAI is known to answer with.  `.passthrough()` rather than strict
+ *  because this is a vendor body: xAI adds fields without notice, and an extra
+ *  field must not fail an otherwise valid token.  Stated here so the tolerance
+ *  reads as a decision rather than an omission. */
+const xaiEnvelope = z
+  .object({ value: z.string().optional(), token: z.string().optional() })
+  .passthrough();
 
 // The third shape matters: the body itself is a candidate, so a top-level
 // `{ value }` is accepted as well as the nested ones.
-const xaiMintBody = z.object({
-  client_secret: xaiEnvelope.optional(),
-  clientSecret: xaiEnvelope.optional(),
-  value: z.string().optional(),
-  token: z.string().optional(),
-});
+const xaiMintBody = z
+  .object({
+    client_secret: xaiEnvelope.optional(),
+    clientSecret: xaiEnvelope.optional(),
+    value: z.string().optional(),
+    token: z.string().optional(),
+  })
+  .passthrough();
 
 /** Gemini returns the token itself in `name`, and nothing else we need. */
-const geminiMintBody = z.object({ name: z.string().optional() });
+const geminiMintBody = z.object({ name: z.string().optional() }).passthrough();
 
 /** POST to a vendor mint endpoint, translating transport failures into
  *  sentences a person can act on.  Without this, a dead network surfaces as

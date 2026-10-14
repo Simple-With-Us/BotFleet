@@ -308,7 +308,15 @@ describe("StsSettings save path", () => {
 
   it("drops a second save while one is in flight", () => {
     const save = between("const save = async", "const saveProvider");
-    expect(save).toContain("if (saving) return false;");
+    // A ref, not the `saving` state: React does not re-render until the next
+    // tick, so a second click inside that window still read `false` and put a
+    // second PUT to the same config slice into flight.  Pinning the ref here is
+    // what keeps that from coming back — a state-based guard is the bug.
+    expect(save).toContain("if (savingRef.current) return false;");
+    expect(save).toContain("savingRef.current = true;");
+    // And the ref is released on every path out, or the panel would wedge
+    // permanently after one failed save.
+    expect(save).toContain("savingRef.current = false;");
   });
 });
 
