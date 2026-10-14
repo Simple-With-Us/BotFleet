@@ -159,4 +159,47 @@ struct StsCallTests {
     func denialMessageMatchesDesktop() {
         #expect(stsVoiceDenialMessage == "Denied by the user, on a call.")
     }
+
+    // MARK: - barge-in
+
+    @Test("a barge-in truncates to what the caller actually heard")
+    func bargeInTruncatesToHeard() {
+        // The caller interrupts 250ms into a 400ms reply.  Telling the model
+        // 400 would have it believe they heard the whole sentence; telling it
+        // 0 would have it believe they heard none of one they were listening
+        // to.  Its transcript has to land exactly where the room did.
+        #expect(StsInterrupt.frames(itemId: "item_9", playedMs: 250) == [
+            .truncate(itemId: "item_9", contentIndex: 0, audioEndMs: 250),
+            .cancel,
+        ])
+    }
+
+    @Test("a barge-in still cancels when no reply is in flight")
+    func bargeInCancelsWithoutItem() {
+        // Interrupting during silence, or just after a reply finished, still
+        // means stop.  With no item there is nothing to truncate, and skipping
+        // the cancel because of that would leave a response free to start at us
+        // after the caller had already spoken over it.
+        #expect(StsInterrupt.frames(itemId: "", playedMs: 900) == [.cancel])
+    }
+
+    @Test("the cancel is always last")
+    func cancelIsAlwaysLast() {
+        for played in [0, 120, 4000] {
+            let frames = StsInterrupt.frames(itemId: "item_1", playedMs: played)
+            #expect(frames.last == .cancel)
+        }
+    }
+
+    @Test("a barge-in never claims more audio than was heard")
+    func bargeInFloorsNegativePlayback() {
+        // The playback clock is read across an actor hop, so it can come back
+        // nonsensical.  A truncate claiming audio the caller did not hear
+        // corrupts the model's transcript more durably than one that
+        // under-claims, so it is floored.
+        #expect(StsInterrupt.frames(itemId: "item_2", playedMs: -40) == [
+            .truncate(itemId: "item_2", contentIndex: 0, audioEndMs: 0),
+            .cancel,
+        ])
+    }
 }

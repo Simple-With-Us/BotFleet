@@ -246,14 +246,12 @@ public final class VoiceCall: ObservableObject {
     /// VAD usually beats a finger here; this is the manual path for when it
     /// does not (or for providers whose VAD lags).
     public func interrupt() {
-        Task { @MainActor [weak self] in
-            self?.playback?.stopPlayback()
-        }
-        // The provider sessions also truncate server-side on speech_started;
-        // a manual interrupt without a truncate would leave the model
-        // finishing a turn nobody hears.  Both sessions expose this through
-        // their speech_started path, so a manual cut reuses it by ending the
-        // current response.
+        // The session, not the view, knows how to stop a reply: it is the only
+        // thing that can say how much of the reply was actually heard and tell
+        // the vendor to drop the rest, and it holds the same playback object
+        // this call does.  Stopping the speaker here alone left the model
+        // finishing a turn nobody heard.
+        sts?.interrupt()
         setPhase(.listening)
     }
 

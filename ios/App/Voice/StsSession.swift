@@ -39,6 +39,17 @@ public protocol StsSession: AnyObject, Sendable {
     /// One 16 kHz mono PCM16 chunk.  Dropped before ready; never throws into
     /// the capture loop.
     func sendAudio(_ pcm: Data)
+    /// Cut the bot off mid-reply and hand the floor to the caller.
+    ///
+    /// The providers already do this by themselves when their voice activity
+    /// detection reports speech; this is the same action, on the seam, for the
+    /// call's Interrupt control and for any provider whose detection lags.  It
+    /// lives here rather than on the call because only the session knows what
+    /// to tell the vendor: how much of the reply was actually heard, and how to
+    /// stop the turn it is still generating.  Silencing the speaker alone leaves
+    /// the model finishing an utterance nobody hears, which is the failure the
+    /// truncate exists to prevent.
+    func interrupt()
     /// Tear everything down.  Safe to call twice and safe to call before
     /// start resolves.
     func stop() async

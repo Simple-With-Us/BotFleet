@@ -47,6 +47,10 @@ final class FixtureStsSession: StsSession, @unchecked Sendable {
         }
     }
 
+    /// Nothing to interrupt: there is no socket, no vendor turn and no playback
+    /// queue behind this fixture, so a barge-in against it is already true.
+    func interrupt() {}
+
     func sendAudio(_ pcm: Data) {
         // Dropped: there is no socket and no VAD.  A fixture that echoed
         // would pretend at interactivity it does not have.

@@ -399,35 +399,48 @@ public final class XaiRealtimeSession: StsSession, @unchecked Sendable {
 
     // MARK: - Barge-in
 
-    /// The caller spoke over the bot: stop what they have not heard and tell
-    /// the session to drop the tail, or the model talks over itself.
-    private func interrupt() {
-        let played: Int
-        // MainActor hop for the playback clock; the truncate carries it.
-        if Thread.isMainThread {
-            played = MainActor.assumeIsolated { playback.playedMs }
-            MainActor.assumeIsolated { playback.stopPlayback() }
-        } else {
-            played = 0
-            Task { @MainActor [playback] in
-                playback.stopPlayback()
-            }
+    /// The caller spoke over the bot -- or pressed Interrupt: stop what they have
+    /// not heard and tell the session to drop the tail, or the model talks over
+    /// itself.  Public because the call's Interrupt control asks for exactly
+    /// this and the seam is where that request belongs; the VAD path below is
+    /// the same method, reached from `input_audio_buffer.speech_started`.
+    public func interrupt() {
+        // The playback clock is MainActor-isolated, and this arrives on the
+        // socket's receive task, which is not the main thread.  Reading it
+        // inline reported zero for every voice-activity barge-in -- so the
+        // truncate told the model the caller heard none of a reply they had
+        // interrupted two seconds into, and its transcript drifted out of step
+        // with the room.  Hop to the actor that owns the clock first, then send.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let played = playback.playedMs
+            playback.stopPlayback()
+            cutResponse(afterHeardMs: played)
         }
+    }
+
+    /// Clear the transcript of a reply that was cut, and tell the vendor how
+    /// much of it the caller actually heard.
+    private func cutResponse(afterHeardMs heard: Int) {
         lock.lock()
         // The truncated utterance never finished, so its transcript would be
         // a sentence the caller did not hear.
         botText = ""
         let itemId = currentItemId
         lock.unlock()
-        if !itemId.isEmpty {
-            send([
-                "type": "conversation.item.truncate",
-                "item_id": itemId,
-                "content_index": 0,
-                "audio_end_ms": played,
-            ])
+        for frame in StsInterrupt.frames(itemId: itemId, playedMs: heard) {
+            switch frame {
+            case let .truncate(itemId, contentIndex, audioEndMs):
+                send([
+                    "type": "conversation.item.truncate",
+                    "item_id": itemId,
+                    "content_index": contentIndex,
+                    "audio_end_ms": audioEndMs,
+                ])
+            case .cancel:
+                send(["type": "response.cancel"])
+            }
         }
-        send(["type": "response.cancel"])
     }
 
     // MARK: - Engine tool

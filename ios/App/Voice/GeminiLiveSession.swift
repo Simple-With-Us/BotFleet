@@ -137,6 +137,22 @@ public final class GeminiLiveSession: StsSession, @unchecked Sendable {
         ])
     }
 
+    /// The caller pressed Interrupt.
+    ///
+    /// Gemini's interruption is server-owned: there is no client cancel frame,
+    /// the vendor decides the turn is over and then says so with
+    /// `serverContent.interrupted`.  What this side can do is everything that
+    /// makes that instant land -- silence the speaker, which is usually still
+    /// queued ahead of it, and close the transcript on the reply that was cut.
+    /// Deliberately identical to the server-initiated path below: one barge-in,
+    /// one behaviour, whichever side started it.
+    public func interrupt() {
+        Task { @MainActor [playback] in
+            playback.stopPlayback()
+        }
+        flushBotTurn(consumeBypass: false)
+    }
+
     public func stop() async {
         lock.lock()
         stopped = true
