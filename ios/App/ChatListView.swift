@@ -177,6 +177,7 @@ struct ChatListView: View {
     /// The roster column, shared by the phone stack and the iPad sidebar.
     private var roster: some View {
         GeometryReader { geo in
+            let waiting = waitingChats
             VStack(spacing: 0) {
                 header
                 StatusBanner()
@@ -198,7 +199,7 @@ struct ChatListView: View {
                                             preview: summary.preview,
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
-                                            waiting: waitingChats.contains(summary.chat.id),
+                                            waiting: waiting.contains(summary.chat.id),
                                             last: index == roomSummaries.count - 1 && !botsExpanded && customSectionNames.isEmpty && !showingBotChats
                                         )
                                     }
@@ -253,7 +254,7 @@ struct ChatListView: View {
                                     preview: summary.preview,
                                     at: summary.lastActivity,
                                     state: BotState.forChat(summary.chat, in: session.state),
-                                    waiting: waitingChats.contains(summary.chat.id),
+                                    waiting: waiting.contains(summary.chat.id),
                                     last: index == rows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (query.isEmpty ? customSectionNames.isEmpty && !showingBotChats : true)
                                 )
                             }
@@ -289,7 +290,7 @@ struct ChatListView: View {
                                                     preview: summary.preview,
                                                     at: summary.lastActivity,
                                                     state: BotState.forChat(summary.chat, in: session.state),
-                                                    waiting: waitingChats.contains(summary.chat.id),
+                                                    waiting: waiting.contains(summary.chat.id),
                                                     last: index == sectionRows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (section == customSectionNames.last ? !showingBotChats : false)
                                                 )
                                             }
@@ -324,7 +325,7 @@ struct ChatListView: View {
                                             preview: summary.preview,
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
-                                            waiting: waitingChats.contains(summary.chat.id),
+                                            waiting: waiting.contains(summary.chat.id),
                                             last: index == botChatSummaries.count - 1
                                         )
                                     }
@@ -683,8 +684,17 @@ struct ChatListView: View {
         if let live = session.state.bot(bot.id) { open(Chat.bot(live)) }
     }
 
+    /// Chats with an unanswered approval. Whole-fleet work: read it once per
+    /// render (see `roster`), never once per row — per-row reads hung the
+    /// main thread past the watchdog on large fleets (BOTFLEET-30).
     private var waitingChats: Set<String> {
-        Set(session.state.pendingApprovals.compactMap { session.state.chat(forThread: $0.threadId)?.id })
+        let state = session.state
+        let threads = Set(state.pendingApprovals.map(\.threadId))
+        guard !threads.isEmpty else { return [] }
+        var ids = Set<String>()
+        for bot in state.bots where threads.contains(bot.threadId) { ids.insert(bot.id) }
+        for room in state.rooms where threads.contains(room.threadId) { ids.insert(room.id) }
+        return ids
     }
 
     private func sectionLabel(_ text: String) -> some View {
