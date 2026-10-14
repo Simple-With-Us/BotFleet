@@ -6205,8 +6205,9 @@ async function startTurn(
       // Zulip tools (docs/zulip.md): offered only to a bot whose own Zulip
       // identity is connected right now (never in a dry run), and only to a
       // turn that may speak for it: a Zulip turn (or a continuation of one),
-      // or a turn the owner is attending.  Never a peer's ask_bot turn, and
-      // never a webhook, iMessage, Linq, routine or job turn
+      // a turn the owner is attending, or an owner-authored scheduled
+      // routine.  Never a peer's ask_bot turn, and never a webhook, manual
+      // routine replay, iMessage, Linq, resource or job turn
       // (server/zulip/mount.ts).  One read, fed to both lanes and to the
       // comms grant.
       const zulipMounted = zulipToolsMounted({
@@ -6455,7 +6456,9 @@ async function startTurn(
                       zulipPeerScreenRules(zulipHub?.ownerUserId()) +
                       // Name the tool only when this turn can call it.
                       (zulipMounted ? "  Answer with zulip_reply." : "")
-                    : "",
+                    : opts?.automationSource === "schedule" && zulipMounted
+                      ? " This task was started from an owner-saved routine.  If the saved instructions ask you to post an update to Zulip, use zulip_post; outbound channel policy and the secret scan still apply."
+                      : "",
         },
         {
           id: "mentions",

@@ -5,6 +5,7 @@ import {
   calendarDayLabel,
   calendarMinuteOfDay,
   editedDailySchedule,
+  groupOverlappingCalendarItems,
   nextCalendarRunLabel,
   projectedRoutineItems,
   routineScheduleLabel,
@@ -135,5 +136,36 @@ describe("scheduleFireDays", () => {
       Date.parse("2026-09-14T05:00:00.000Z"),
     );
     expect(days).toEqual(new Set([startOfDayInTimeZone(Date.parse("2026-09-13T15:30:00.000Z"), "Asia/Tokyo")]));
+  });
+});
+
+describe("groupOverlappingCalendarItems", () => {
+  const item = (id: string, minute: number, durationMinutes = 30) => ({
+    id,
+    at: Date.parse("2026-10-13T13:00:00.000Z") + minute * 60_000,
+    routine: { ...routine({ type: "once", at: Date.parse("2026-10-13T13:00:00.000Z") }), id, durationMinutes },
+    run: null,
+  });
+
+  it("keeps distinct appointments as separate cards", () => {
+    expect(groupOverlappingCalendarItems([item("a", 0), item("b", 45)]).map((group) => group.items.map((entry) => entry.id)))
+      .toEqual([["a"], ["b"]]);
+  });
+
+  it("collapses a transitive collision chain into one stack", () => {
+    const groups = groupOverlappingCalendarItems([
+      item("late", 40),
+      item("first", 0),
+      item("middle", 20),
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0].items.map((entry) => entry.id)).toEqual(["first", "middle", "late"]);
+    expect(groups[0].endAt).toBe(groups[0].items[2].at + 45 * 60_000);
+  });
+
+  it("uses a routine's longer duration for collision detection", () => {
+    expect(groupOverlappingCalendarItems([item("long", 0, 90), item("inside", 70)]).map((group) => group.items.length))
+      .toEqual([2]);
   });
 });
