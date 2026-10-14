@@ -30,6 +30,7 @@ struct ChatView: View {
     @State private var showingTasks = false
     @State private var showingRoutines = false
     @State private var showingComputer = false
+    @State private var showingVoiceCall = false
     @State private var showingPlus = false
     @State private var showingCompose = false
     @State private var showingProfile = false
@@ -291,11 +292,18 @@ struct ChatView: View {
         .navigationDestination(isPresented: $showingComputer) {
             if case let .bot(bot) = current { ComputerView(bot: bot) }
         }
+        .navigationDestination(isPresented: $showingVoiceCall) {
+            VoiceCallView(call: VoiceCall(chat: current, botName: current.name, session: session))
+        }
         .task(id: threadId) {
             if current.unread { await session.markRead(current) }
 #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("-open-plus") { showingPlus = true }
             if ProcessInfo.processInfo.arguments.contains("-open-profile") { showingProfile = true }
+            // Opens the voice call screen directly (with -voice-fixture, on
+            // the scripted session) for layout verification without tapping
+            // through chat.
+            if ProcessInfo.processInfo.arguments.contains("-open-voice-call") { showingVoiceCall = true }
             // Raises the keyboard on open, for checking that the composer
             // clears it: the transcript has to stay visible above the
             // keyboard rather than behind it.
@@ -811,6 +819,14 @@ struct ChatView: View {
                             }
                             .accessibilityLabel("New task")
                         }
+                        // A voice call talks to the same bot, hands-free.
+                        // The call screen owns its lifecycle: appearing
+                        // starts it, leaving ends it.
+                        GlassButton(systemImage: "phone.fill", size: 44, weight: .medium) {
+                            showingVoiceCall = true
+                        }
+                        .accessibilityLabel("Call \(current.name)")
+                        .accessibilityHint("Start a voice conversation")
                         GlassButton(systemImage: "display", size: 44, weight: .medium) {
                             showingComputer = true
                         }

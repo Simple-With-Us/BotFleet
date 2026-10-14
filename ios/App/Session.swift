@@ -1217,6 +1217,23 @@ final class Session: ObservableObject {
         )
     }
 
+    /// What this computer can do for a voice call: which providers hold a
+    /// key and which one a call would take.  Booleans and a choice, never a
+    /// key -- the permanent credentials stay on the computer.  Throws so a
+    /// voice call can tell "unreachable" from "no provider" and say so.
+    func voiceCallStatus() async throws -> StsStatus {
+        guard let client else { throw APIError.transport("Not connected to your computer.") }
+        return try await client.stsStatus()
+    }
+
+    /// One short-lived call token.  Spent opening a single realtime session;
+    /// it is not the provider's permanent key and it is not a credential for
+    /// anything else.
+    func voiceCallToken(provider: String) async throws -> StsSessionToken {
+        guard let client else { throw APIError.transport("Not connected to your computer.") }
+        return try await client.stsToken(provider: provider)
+    }
+
     /// Allow every permission request waiting in this conversation (the
     /// desktop's "Approve All").  The cards settle through the stream as the
     /// harness answers each one, so nothing is folded in here.
