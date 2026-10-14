@@ -885,6 +885,65 @@ public struct ConfigRooms: Codable, Hashable, Sendable {
     public var turnTimeoutMinutes: Int?
 }
 
+/// Which speech-to-speech providers a computer can reach.
+///
+/// Booleans and a choice, never a key: the permanent provider credentials
+/// stay on the computer, which mints a short-lived token instead.  Every
+/// field is optional because every one of them is absent on a computer too
+/// old to have the route, and "I do not know" has to stay distinguishable
+/// from "no key" — the first sends you to Settings, the second does not.
+public struct StsStatus: Codable, Sendable {
+    public var xai: Bool?
+    public var gemini: Bool?
+    /// The provider a call would actually use, after the user's preference
+    /// and the auto fallback have both been applied on the computer.
+    public var provider: String?
+
+    public init(xai: Bool? = nil, gemini: Bool? = nil, provider: String? = nil) {
+        self.xai = xai
+        self.gemini = gemini
+        self.provider = provider
+    }
+
+    /// False only when the computer said so.  `nil` is "unknown", and an
+    /// unknown must not be drawn as "no" — that would tell someone to add a
+    /// key they already have.
+    public func isConfigured(_ candidate: String) -> Bool? {
+        switch candidate {
+        case "xai": return xai
+        case "gemini": return gemini
+        default: return nil
+        }
+    }
+
+    /// Whether the computer told us anything at all.
+    public var isKnown: Bool { xai != nil || gemini != nil }
+
+    /// The provider to use, or nil when none is configured.  Mirrors the
+    /// computer's own `pickStsProvider` so the phone's idea and the computer's
+    /// cannot disagree about which one a call would take.
+    public var usableProvider: String? {
+        guard isKnown else { return nil }
+        if let provider, isConfigured(provider) == true { return provider }
+        if xai == true { return "xai" }
+        if gemini == true { return "gemini" }
+        return nil
+    }
+}
+
+/// One short-lived, single-session call token.  Spent opening a realtime
+/// session; it is not a credential for anything else, and it is not the
+/// provider's permanent key.
+public struct StsSessionToken: Codable, Sendable {
+    public var token: String
+    public var expiresInSeconds: Int
+
+    public init(token: String, expiresInSeconds: Int) {
+        self.token = token
+        self.expiresInSeconds = expiresInSeconds
+    }
+}
+
 public struct ConfigStatus: Codable, Sendable {
     public var composio: ConfigFlag?
     public var box: ConfigFlag?

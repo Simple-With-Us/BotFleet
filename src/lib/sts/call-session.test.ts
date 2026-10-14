@@ -382,6 +382,23 @@ describe("appendStsLine", () => {
     expect(stsLineText(lines[0]!)).toBe("You: what is the build status");
   });
 
+  it("does not overwrite an earlier user turn once the bot has spoken past it", () => {
+    // The regression that mattered.  A provisional user line that never
+    // finalized stays open, and the open-partial search used to scan the whole
+    // transcript for it: so the next user turn replaced that older line instead
+    // of appending, and everything said before the bot replied vanished.  Both
+    // user lines are non-final on purpose — a finalized line was never at risk,
+    // which is why this state is the only one that could lose text.
+    let lines = appendStsLine([], { text: "first question", from: "user", final: false }, 1);
+    lines = appendStsLine(lines, { text: "the first answer", from: "bot", final: true }, 2);
+    lines = appendStsLine(lines, { text: "second question", from: "user", final: false }, 3);
+    expect(lines.map(stsLineText)).toEqual([
+      "You: first question",
+      "the first answer",
+      "You: second question",
+    ]);
+  });
+
   it("appends each finished turn", () => {
     let lines = appendStsLine([], userFinal, 1);
     lines = appendStsLine(lines, { text: "it passed", from: "bot", final: true }, 2);

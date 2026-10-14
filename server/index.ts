@@ -452,6 +452,14 @@ import {
   resolveVoiceSummaryMode,
 } from "../shared/voice-summary.ts";
 import { isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
+import { mintStsToken, type StsProvider } from "../shared/sts-tokens.ts";
+import {
+  StsMintThrottle,
+  stsKeyStatus,
+  stsStatusBody,
+  stsTokenRequest,
+  stsUnavailableReason,
+} from "./sts-access.ts";
 import { checkPronunciations, PronunciationDraftListSchema } from "../shared/pronunciations.ts";
 import { deterministicSpokenText, summarizeForVoiceDetailed, voiceSummaryWorthStoring } from "./tts/speech-summary.ts";
 import { isWrittenScript, MessageAudio, type SummarizedSpeech } from "./tts/message-audio.ts";
@@ -852,6 +860,20 @@ const cfg = loadConfig();
 // bootComplete is declared above createUpdateControl (BOTFLEET-2M). Flipped
 // once at the end of this file when everything a secret change might rebuild
 // exists; a snapshot that lands before then is applied to `cfg` only.
+
+/** The speech-to-speech provider key, read out of the config this process
+ *  already holds.  Returns `undefined` rather than throwing so an absent key
+ *  reads as "not configured"; the caller turns a thrown read into "could not
+ *  tell", which is a different message and must not be conflated. */
+function stsProviderCredential(provider: StsProvider): string | undefined {
+  const value = provider === "xai" ? cfg.xai?.key : cfg.gemini?.key;
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+/** One token per provider per window.  Each mint is a billed call to a vendor
+ *  endpoint, so an unthrottled loop from a paired device spends someone's
+ *  quota for them. */
+const stsMints = new StsMintThrottle();
 // The secret store resolves before anything reads `cfg`.  `loadConfig()` above
 // ran while the snapshot was still empty, so the whole config is read again
 // once the preload lands — that second read is what puts a stored value in
@@ -16365,6 +16387,52 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);
+    }
+    // Speech-to-speech call tokens.  The desktop app mints these over IPC
+    // (electron/main.mjs `sts:*`); a paired phone cannot reach an IPC channel,
+    // so it gets the same two answers over HTTP.  The permanent provider keys
+    // stay in this process: a client receives one short-lived, single-session
+    // token and nothing else.  The policy -- which provider, why not, how
+    // often -- lives in server/sts-access.ts and the minting itself in
+    // shared/sts-tokens.ts, so a phone and the desktop cannot disagree.
+    if (method === "GET" && path === "/api/sts/status") {
+      // Booleans only.  Reading that a provider is set up is not reading its
+      // key, which is the same line /api/config draws.
+      const keys = stsKeyStatus((provider) => stsProviderCredential(provider));
+      if (keys === null) {
+        return json(res, 503, { error: "Could not read the voice provider keys on this computer." });
+      }
+      // The stored preference is parsed the same way a request would be, so
+      // a stale or hand-edited config value cannot name a provider this
+      // build does not mint for.
+      const stored = stsTokenRequest.safeParse({ provider: cfg.sts?.provider });
+      const preference = stored.success ? stored.data.provider : null;
+      return json(res, 200, stsStatusBody(keys, preference));
+    }
+    if (method === "POST" && path === "/api/sts/token") {
+      // Parsed here, at the door: everything below works on a provider, not
+      // on whatever a device put in the body.
+      const parsed = stsTokenRequest.safeParse(await readBody(req));
+      if (!parsed.success) return json(res, 400, { error: "Unknown speech-to-speech provider." });
+      const provider = parsed.data.provider;
+      const keys = stsKeyStatus((candidate) => stsProviderCredential(candidate));
+      const refusal = stsUnavailableReason(provider, keys);
+      if (refusal) return json(res, refusal.status, { error: refusal.error });
+      const apiKey = stsProviderCredential(provider);
+      // SAFETY: `stsUnavailableReason` returned null, which only happens when
+      // `keys[provider]` was true, so this read is a non-empty string.
+      if (!apiKey) return json(res, 503, { error: "Could not read the voice provider key on this computer." });
+      // Each mint is a real call to a paid vendor endpoint.  An unthrottled
+      // loop from a paired device would spend someone's quota.
+      if (!stsMints.take(provider)) {
+        return json(res, 429, { error: "Wait a moment before asking for another call token." });
+      }
+      try {
+        return json(res, 200, await mintStsToken(provider, apiKey));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Could not start a voice call.";
+        return json(res, 502, { error: message });
+      }
     }
     // Check For Updates Automatically.  One boolean that lives in /api/config
     // beside the API keys, so it gets its own route and the paired phone never

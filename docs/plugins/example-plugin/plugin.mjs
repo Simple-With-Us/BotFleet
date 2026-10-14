@@ -27,8 +27,12 @@ export function getCardData({ cardId, host }) {
 
 const HELLO_NAME_MAX = 64;
 
+function isString(value) {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
 export function runCommand({ command: _command, args, host }) {
-  const raw = typeof args === "string" ? args.trim() : "";
+  const raw = isString(args) ? args.trim() : "";
   if (raw.length > HELLO_NAME_MAX) {
     host.log("info", "hello command rejected");
     return "That name is too long for this example.";
