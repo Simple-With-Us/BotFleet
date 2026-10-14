@@ -190,7 +190,7 @@ describe("what is watched", () => {
   });
 
   it("reviews a message to another bot, which is classed as a delegation, but not a helper launch", () => {
-    for (const tool of ["mcp__agents__ask_bot", "ask_bot", "mcp__agents__delegate_bot"]) {
+    for (const tool of ["mcp__agents__coordinate_bots", "coordinate_bots"]) {
       expect(watchesStep({ tool, toolKind: "task" })).toBe(true);
     }
     for (const tool of ["Task", "mcp__agents__list_bots", "ask_bot_later"]) {
@@ -207,8 +207,7 @@ describe("what is watched", () => {
   // even though claude.ts and the PR said they were.
   describe("the harness's own writing tools", () => {
     const WRITING = [
-      "ask_bot",
-      "delegate_bot",
+      "coordinate_bots",
       "create_bot",
       "request_credential",
       "request_sign_in",
@@ -251,7 +250,7 @@ describe("what is watched", () => {
     });
 
     it("are watched however the server and tool are joined", () => {
-      for (const name of ["ask_bot", "job_start", "create_bot"]) {
+      for (const name of ["coordinate_bots", "job_start", "create_bot"]) {
         for (const tool of [
           `agents.${name}`,
           `agents/${name}`,

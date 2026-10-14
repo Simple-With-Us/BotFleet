@@ -37,27 +37,24 @@ import { harnessReady } from "./testing/harness-ready.ts";
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const posixOnly = describe.skipIf(process.platform === "win32");
 
-/** One round that asks for `ask_bot` — the registry's only write tool with
- *  an `approval` record before PR 7 added a second one. */
+/** One round that asks for `coordinate_bots`, the peer write tool. */
 const asksToDelegate = (task: string) => ({
   kind: "sse" as const,
   frames: [
-    `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"ask_bot","arguments":${JSON.stringify(
-      JSON.stringify({ bot_id: "@peer", task }),
+    `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"coordinate_bots","arguments":${JSON.stringify(
+      JSON.stringify({ bot_ids: ["@peer"], message: task }),
     )}}}]}}]}`,
     '{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}',
     "[DONE]",
   ],
 });
 
-/** PR 7's second approval-gated write tool: same shape as `asksToDelegate`,
- *  a different tool name and argument (`message`, not `task` — delegate_bot
- *  has no declared wire deviation). */
+/** Same tool, with an optional reason, so the card can be checked for length. */
 const asksToDelegateBot = (message: string, reason?: string) => ({
   kind: "sse" as const,
   frames: [
-    `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_delegate","function":{"name":"delegate_bot","arguments":${JSON.stringify(
-      JSON.stringify({ bot_id: "@peer", message, ...(reason ? { reason } : {}) }),
+    `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_delegate","function":{"name":"coordinate_bots","arguments":${JSON.stringify(
+      JSON.stringify(reason ? { bot_ids: ["@peer"], message, reason } : { bot_ids: ["@peer"], message }),
     )}}}]}}]}`,
     '{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}',
     "[DONE]",
@@ -243,7 +240,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
 
       const card = await waitForCard(bot.id);
       expect(card, `no approval card appeared. stderr:\n${stderr}`).not.toBeNull();
-      expect(card.card.tool).toBe("ask_bot");
+      expect(card.card.tool).toBe("coordinate_bots");
       // the registry's own summary, not a tool name on its own
       expect(card.card.subtitle).toContain("summarise the deploy log");
 
@@ -256,7 +253,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
       // adapter that would have said "unavailable"
       expect(answered.body.outcome).toBe("rejected");
 
-      const row = await waitForDecision((r) => r.tool === "ask_bot" && r.decision === "user-denied");
+      const row = await waitForDecision((r) => r.tool === "coordinate_bots" && r.decision === "user-denied");
       expect(row, "the decision log never recorded the deny").not.toBeNull();
       expect(row!.source).toBe("user");
 
@@ -283,7 +280,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
       engine.queueCompletion({
         kind: "sse",
         frames: [
-          '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"ask_bot","arguments":"{\\"bot_id\\":\\"bot-nobody\\",\\"task\\":\\"check the queue\\"}"}}]}}]}',
+          '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"coordinate_bots","arguments":"{\\"bot_ids\\":[\\"bot-nobody\\"],\\"message\\":\\"check the queue\\"}"}}]}}]}',
           "[DONE]",
         ],
       });
@@ -291,7 +288,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "go" })).status).toBe(202);
 
       const row = await waitForDecision(
-        (r) => r.tool === "ask_bot" && r.decision === "auto-approved" && r.botId === bot.id,
+        (r) => r.tool === "coordinate_bots" && r.decision === "auto-approved" && r.botId === bot.id,
       );
       expect(row, `auto mode never answered the ask. stderr:\n${stderr}`).not.toBeNull();
       expect(row!.source).toBe("auto-mode");
@@ -309,12 +306,11 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
     90_000,
   );
 
-  // PR 7: delegate_bot is the second registry tool to carry an `approval`
-  // record.  Its summary has to name the target and the first 120 chars —
+  // The handoff summary has to name the target and the first 120 chars —
   // that is what a person approving it actually reads — and a deny must
-  // leave the async handoff genuinely unqueued, not merely refused.
+  // leave the handoff genuinely unqueued, not merely refused.
   it(
-    "cards delegate_bot with the target and the first 120 chars, and a deny queues nothing",
+    "cards coordinate_bots with the target and the first 120 chars, and a deny queues nothing",
     async () => {
       const peer = await makeBot({ name: "delegate-peer" });
       const bot = await makeBot({ name: "delegator", autoApprove: false });
@@ -327,7 +323,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
 
       const card = await waitForCard(bot.id);
       expect(card, `no approval card appeared. stderr:\n${stderr}`).not.toBeNull();
-      expect(card.card.tool).toBe("delegate_bot");
+      expect(card.card.tool).toBe("coordinate_bots");
       expect(card.card.subtitle).toContain("@peer");
       expect(card.card.subtitle).toContain(longTask.slice(0, 100).trim());
       // The full 200-char task must not have been copied verbatim onto the
@@ -341,7 +337,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
       expect(answered.status).toBe(200);
       expect(answered.body.outcome).toBe("rejected");
 
-      const row = await waitForDecision((r) => r.tool === "delegate_bot" && r.decision === "user-denied");
+      const row = await waitForDecision((r) => r.tool === "coordinate_bots" && r.decision === "user-denied");
       expect(row, "the decision log never recorded the deny").not.toBeNull();
 
       // The side effect never ran: nothing was queued for the peer to pick up.
@@ -442,9 +438,9 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
       // the same rule the CLI lane has always had.
       const card = await waitForThreadCard(threadId!);
       expect(card, `a webhook turn auto-approved on the HTTP lane. stderr:\n${stderr}`).not.toBeNull();
-      expect(card.card.tool).toBe("ask_bot");
+      expect(card.card.tool).toBe("coordinate_bots");
 
-      const row = await waitForDecision((r) => r.tool === "ask_bot" && r.source === "unattended-block");
+      const row = await waitForDecision((r) => r.tool === "coordinate_bots" && r.source === "unattended-block");
       expect(row, "the unattended block wrote no audit row").not.toBeNull();
       expect(row!.decision).toBe("card-shown");
       expect(row!.unattended).toBe(true);

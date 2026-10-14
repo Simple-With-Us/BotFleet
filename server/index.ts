@@ -340,11 +340,11 @@ import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { loadLocalMiniMaxConfig } from "./drivers/minimax.ts";
 import { fetchProviderModels, providerModelIds } from "./drivers/model-discovery.ts";
 import { flushNativeTee } from "./drivers/native.ts";
-import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
+import { mirrorActivity, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
 import { exportMessageSpeaker, promptWithReply, transcriptText } from "./replies.ts";
 import { lastInterruptedChatStarter, resumedDelegationChannel } from "./update-turn-starter.ts";
-import { _loadPending, discardDelegations, drainDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
+import { createJobHost, type JobHost, type JobHostBody } from "./job-host.ts";
 import {
   cancelSteeredMessage,
   drainJobNotices,
@@ -428,7 +428,7 @@ import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
 import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
 import { ProviderRegistry, type DescribedInstance } from "./harness/registry.ts";
-import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
+import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import {
   mentionedBots,
   normalizeGroupDefaultResponder,
@@ -5214,6 +5214,7 @@ async function autoFallbackChain(
 // turn's TERMINAL state into the A⇄B channel when it completes — the
 // channel stays the full record of the handoff, not just its request.
 const delegationWatch = new Map<string, { channelId?: string; toBotId: string }>();
+let jobHost: JobHost | undefined;
 
 /** Consume one delegated-turn watch and mirror exactly one terminal state.
  * Some harness paths settle a busy bot without a provider turn.completed
@@ -5264,77 +5265,22 @@ bus.subscribe((event: RuntimeEvent) => {
   });
 });
 
-// Drain queued delegations for a source thread after its turn settles.
-// Run as a separate subscriber so the drain logic stays out of the main
-// fold (which has its own switch/case noise) and its approval + startTurn
-// calls never have to share locals with the fold's state machine.
-/** How a drained delegation becomes a real turn on the target. Shared by
- * the settle-time drain and the boot-time drain of what a previous process
- * left queued. */
-const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text, commsDepth, sourceThreadId, channel, options) => {
-    // startTurn REJECTS on an ordinary condition — busy target, deleted bot,
-    // unavailable provider. Unhandled, that rejection is fatal to the
-    // harness (Node's default), which in the packaged app kills the server
-    // child. Every delegation failure has to land as a chip instead.
-    const targetThreadId = store.bot(toBotId)?.threadId;
-    if (targetThreadId) delegationWatch.set(targetThreadId, { channelId: channel?.id, toBotId });
-    let failureReported = false;
-    const reportStartFailure = (error: unknown) => {
-      if (failureReported) return;
-      failureReported = true;
-      const bot = store.bot(toBotId);
-      const why = error instanceof Error ? error.message : String(error);
-      if (targetThreadId) {
-        finalizeDelegationWatch(
-          targetThreadId,
-          false,
-          "",
-          `Delegated turn could not start — ${why.slice(0, 120)}`,
-        );
-      }
-      const source = store.botByThread(sourceThreadId);
-      if (!source) return;
-      store.appendMessage(sourceThreadId, {
-        role: "bot",
-        kind: "activity",
-        tool: { name: `error: delegation to @${bot?.name ?? toBotId} could not start — ${why.slice(0, 120)}`, ok: false },
-      });
-    };
-    const sender = options?.sender;
-    const comm = channel && sender ? {
-      groupId: channel.id,
-      withBotId: sender.botId,
-      withName: sender.name,
-      withColor: sender.color,
-    } : undefined;
-    return startTurn(toBotId, text, {
-      commsDepth,
-      unattended: isUnattended(store.botByThread(sourceThreadId)?.id),
-      automationSource: "delegation",
-      from: sender,
-      comm,
-      // startTurn schedules provider/integration setup after marking the bot
-      // busy. Those asynchronous setup failures do not emit turn.completed,
-      // so clear the watch and report them through this callback too.
-      onDispatchError: reportStartFailure,
-    }).catch((err) => {
-      reportStartFailure(err);
-    });
-};
-
 const providerReloadDelegationDrains = new Set<string>();
 
+// A requesting turn that recorded handoffs settles them here.  A turn that
+// failed or was stopped cancels work that has not started.  Work is not
+// dispatched while a provider reload has the fleet detached.
 bus.subscribe((event: RuntimeEvent) => {
   if (event.type !== "turn.completed") return;
-  // A turn that failed or was interrupted drops its queue rather than
-  // firing it later: the user who hit Stop does not expect the delegations
-  // that turn queued to run anyway, minutes later, on an unrelated turn.
-  if (!event.ok) return void discardDelegations(commsBus, event.threadId);
+  if (!event.ok) {
+    jobHost?.onTurnSettled(event.threadId, false, "");
+    return;
+  }
   if (providerReloadInProgress) {
     providerReloadDelegationDrains.add(event.threadId);
     return;
   }
-  drainDelegations(commsBus, approvalBus, event.threadId, runDelegatedTurn);
+  jobHost?.onTurnSettled(event.threadId, true, "");
 });
 
 // ── steer-queue drain: messages sent while the bot was busy ────────────
@@ -6323,15 +6269,11 @@ async function startTurn(
           )
         : integrations.agents && sectionPeers.length > 0
           ? [
-              "You can work with the other bots in your section through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply" +
-                (availableAgentTools.includes("delegate_bot")
-                  ? ", and delegate_bot assigns an asynchronous task to a specialist peer."
+              "You can work with the other bots in your section through the agents tools — list_bots shows who's available, coordinate_bots records a handoff and returns immediately" +
+                (availableAgentTools.includes("assignment_status")
+                  ? ", and assignment_status reads a handoff without waiting."
                   : "."),
-              "Never dismiss incoming alerts, webhook notifications, or tasks by merely claiming 'not my problem'.  When an issue, error, or notification falls outside your domain or expertise, identify the specialist bot best suited to solve it (e.g. Compiler for build/typecheck errors, Deployer for PRs/merges, Fixer for bug fixes/tests, Plumber for infra/secrets/health, Housekeeper for disk/workspace maintenance, Builder for features) and forward the alert with a clear summary using " +
-                (availableAgentTools.includes("delegate_bot")
-                  ? "delegate_bot (preferred) or ask_bot"
-                  : "ask_bot") +
-                " rather than stopping without action.",
+              "Never dismiss incoming alerts, webhook notifications, or tasks by merely claiming 'not my problem'.  When an issue, error, or notification falls outside your domain or expertise, identify the specialist bot best suited to solve it (e.g. Compiler for build/typecheck errors, Deployer for PRs/merges, Fixer for bug fixes/tests, Plumber for infra/secrets/health, Housekeeper for disk/workspace maintenance, Builder for features) and forward the alert with a clear summary using coordinate_bots rather than stopping without action.",
             ].join(" ")
           : "";
       const credentialPrompt = credentialPromptFor(availableAgentTools) + signInPromptFor(availableAgentTools);
@@ -6512,8 +6454,8 @@ async function startTurn(
           label: "Mentions",
           text: tagged.length
             ? ` The user tagged ${tagged
-                .map((t) => `@${t.name} (ask_bot bot_id ${t.id})`)
-                .join(" and ")} in their message — bring them in with ask_bot and fold their reply into your answer.`
+                .map((t) => `@${t.name} (coordinate_bots bot_ids ["${t.id}"])`)
+                .join(" and ")} in their message — bring them in with coordinate_bots and fold their result into your answer once it comes back.`
             : "",
         },
       ]);
@@ -6654,9 +6596,9 @@ async function startTurn(
                 // of them.  A MiniMax bot and a Claude bot run the same code
                 // with the same guards; only the transport differs.
                 executeListAgentsRequest,
-                executeAskBotRequest,
+                executeCoordinateBotsRequest,
                 executeListRoutinesRequest,
-                executeDelegateBotRequest,
+                executeAssignmentStatusRequest,
                 executeCreateBotRequest,
                 executeRequestCredentialRequest,
                 executeRequestSignInRequest,
@@ -7491,138 +7433,89 @@ export function executeListRoutinesRequest(input: {
   };
 }
 
-/** What ask_bot and delegate_bot answer for a peer that is switched Off.  One
- *  value rather than two literals, so the two paths cannot drift apart. */
+/** What coordinate_bots answers for a peer that is switched Off. */
 const BOT_OFF_PEER_REFUSAL = Object.freeze({ status: 403, body: Object.freeze({ error: "that bot is off" }) });
 
-/** Guarded ask_bot path used by MCP proxy and the HTTP tool host.
- * Section, hidden, approval, mirroring, and depth all live here so a
- * driver that guessed an id cannot skip the gate. */
-export async function executeAskBotRequest(input: {
-  fromBotId: string;
-  toBotId: string;
-  message: string;
-  depth: number;
-  fromThreadId?: string;
-}): Promise<{ status: number; body: Record<string, unknown> }> {
-  const fromBotId = input.fromBotId;
-  const toBotId = input.toBotId;
-  const message = input.message;
-  const depth = input.depth;
-  if (!toBotId || !message) return { status: 400, body: { error: "toBotId and message required" } };
-  if (toBotId === fromBotId) return { status: 400, body: { error: "a bot cannot message itself" } };
-  if (depth >= MAX_COMMS_DEPTH) return { status: 200, body: { error: "message chains are limited to one hop" } };
-  const target = store.bot(toBotId);
-  if (!target) return { status: 404, body: { error: "no such bot" } };
-  if (target.hidden) return { status: 403, body: { error: "that bot is hidden" } };
-  // An Off bot is not a peer anyone can hand work to; say so plainly rather
-  // than let askBotAndWait fail after the exchange was mirrored into a channel.
-  if (botIsOff(target)) return BOT_OFF_PEER_REFUSAL;
-  if (target.busy) return { status: 200, body: { busy: true } };
-  const from = store.bot(fromBotId);
-  if (!from) return { status: 403, body: { error: "unknown sender" } };
-  if (sectionKey(from.section) !== sectionKey(target.section)) {
-    return { status: 403, body: { error: "that bot belongs to a different section" } };
-  }
-  const fromThreadId = String(input.fromThreadId ?? from.threadId);
-  if (!store.threadBelongsToBot(from.id, fromThreadId)) {
-    return { status: 403, body: { error: "source thread does not belong to sender" } };
-  }
-  let currentFrom = from;
-  let currentTarget = target;
-  if (from.approvePeerComms) {
-    const verdict = await requestPeerApproval(
-      approvalBus,
-      from,
-      target,
-      message,
-      "ask_bot",
-      fromThreadId,
-    );
-    if (verdict !== "allow") return { status: 200, body: { error: "denied by user" } };
-    const freshFrom = store.bot(fromBotId);
-    const freshTarget = store.bot(toBotId);
-    if (!freshFrom || !freshTarget) return { status: 404, body: { error: "no such bot" } };
-    if (sectionKey(freshFrom.section) !== sectionKey(freshTarget.section)) {
-      return { status: 200, body: { error: "that bot moved to a different section" } };
-    }
-    if (!store.taskByThread(freshFrom.id, fromThreadId)) {
-      return { status: 404, body: { error: "source task no longer exists" } };
-    }
-    if (freshTarget.busy) return { status: 200, body: { busy: true } };
-    currentFrom = freshFrom;
-    currentTarget = freshTarget;
-  }
-  const channel = getOrCreateChannel(store, currentFrom, currentTarget);
-  mirrorExchange(commsBus, currentFrom, currentTarget, message, channel, fromThreadId);
-  const prefixed = `[Message from @${currentFrom.name}, another bot in this BotFleet workspace. Reply to them.]\n\n${message}`;
-  const reply = await askBotAndWait(toBotId, prefixed, depth, fromBotId);
-  mirrorReply(commsBus, currentTarget, reply, channel);
-  return { status: 200, body: { botName: currentTarget.name, text: reply } };
+/** The HTTP body for coordinate_bots.  Unknown keys are refused. */
+const coordinateBotsBodySchema = z.object({
+  fromBotId: z.string().optional(),
+  depth: z.number().optional(),
+  botIds: z.array(z.string()).optional(),
+  bot_ids: z.array(z.string()).optional(),
+  toBotId: z.string().optional(),
+  bot_id: z.string().optional(),
+  message: z.string().optional(),
+  fromThreadId: z.string().optional(),
+  reason: z.string().optional(),
+  rework: z.boolean().optional(),
+  thread: z.enum(["standing", "new"]).optional(),
+  reply: z.enum(["resume", "none"]).optional(),
+  consult: z.boolean().optional(),
+  doneWhen: z.string().optional(),
+}).strict();
+
+/** The HTTP body for assignment_status.  Unknown keys are refused. */
+const assignmentStatusBodySchema = z.object({
+  fromBotId: z.string().optional(),
+  fromThreadId: z.string().optional(),
+  id: z.string().optional(),
+}).strict();
+
+function peerByToken(token: string) {
+  const trimmed = token.trim();
+  return store.bots.find((bot) => bot.id === trimmed || `@${bot.name}` === trimmed || bot.name === trimmed.replace(/^@/, ""));
 }
 
-/** The `POST /api/internal/delegate-bot` body, factored the same way as
- * `executeAskBotRequest`: the MCP proxy reaches it over the loopback hop,
- * the HTTP lane's tool host calls it directly.  Async handoff — queues the
- * message and returns immediately; the peer's own turn runs after the
- * caller's current turn finishes. */
-export function executeDelegateBotRequest(input: {
+/** Guarded coordinate_bots path used by the MCP proxy and the HTTP tool host.
+ *  An Off peer is refused here, before the handoff is recorded. */
+export function executeCoordinateBotsRequest(input: {
   fromBotId: string;
-  toBotId: string;
+  botIds: string[];
   message: string;
   depth: number;
   fromThreadId?: string;
   reason?: string;
-}): { status: number; body: Record<string, unknown> } {
-  const fromBotId = input.fromBotId;
-  const toBotId = input.toBotId;
-  const message = input.message;
-  const reason = input.reason;
-  const depth = input.depth;
-  if (!toBotId || !message) return { status: 400, body: { error: "toBotId and message required" } };
-  const from = store.bot(fromBotId);
+  rework?: boolean;
+  thread?: "standing" | "new";
+  reply?: "resume" | "none";
+  consult?: boolean;
+  doneWhen?: string;
+}): { status: number; body: JobHostBody } {
+  if (!jobHost) return { status: 503, body: { error: "the job runtime is not ready" } };
+  const from = store.bot(input.fromBotId);
   if (!from) return { status: 404, body: { error: "no such bot" } };
-  const target = store.bot(toBotId);
-  if (!target) return { status: 404, body: { error: "no such bot" } };
-  if (sectionKey(from.section) !== sectionKey(target.section)) {
-    return { status: 403, body: { error: "that bot belongs to a different section" } };
+  for (const rawId of input.botIds) {
+    const target = peerByToken(rawId);
+    if (target && botIsOff(target)) return BOT_OFF_PEER_REFUSAL;
   }
-  // Refused at the door, before anything is queued or persisted: a delegation
-  // is a promise that the peer will pick the work up, and an Off bot will not.
-  if (botIsOff(target)) return BOT_OFF_PEER_REFUSAL;
   const fromThreadId = String(input.fromThreadId ?? from.threadId);
-  if (!store.threadBelongsToBot(from.id, fromThreadId)) {
-    return { status: 403, body: { error: "source thread does not belong to sender" } };
-  }
-  const result = queueDelegation(
-    commsBus,
-    from,
-    { toBotId, message, reason, depth },
-    MAX_COMMS_DEPTH,
+  return jobHost.coordinate({
+    fromBotId: from.id,
     fromThreadId,
-  );
-  if (result !== "ok") {
-    // the agent reads this string — a bare enum ("too_deep") tells it
-    // nothing about what to do instead
-    const said: Record<Exclude<QueueResult, "ok">, string> = {
-      self: "a bot cannot delegate to itself",
-      too_deep: "delegation chains are limited to one hop — do this one yourself",
-      no_target: "no such bot",
-      too_many: "too many delegations queued on this turn — finish some first",
-    };
-    return { status: 200, body: { error: said[result] } };
-  }
-  const targetName = store.bot(toBotId)?.name ?? toBotId;
-  return {
-    status: 200,
-    body: {
-      queued: true,
-      message: from.approvePeerComms
-        ? `Queued for review — @${targetName} will only pick it up if the user approves after your turn finishes.`
-        : `Delegation queued — @${targetName} will pick it up after your current turn finishes.`,
-    },
-  };
+    botIds: input.botIds,
+    message: input.message,
+    depth: input.depth,
+    reason: input.reason,
+    rework: input.rework,
+    thread: input.thread,
+    reply: input.reply,
+    consult: input.consult,
+    doneWhen: input.doneWhen,
+  });
 }
+
+/** Read-only status of durable handoffs.  Nothing is started or stopped. */
+export function executeAssignmentStatusRequest(input: {
+  fromBotId: string;
+  fromThreadId?: string;
+  id?: string;
+}): { status: number; body: JobHostBody } {
+  if (!jobHost) return { status: 503, body: { error: "the job runtime is not ready" } };
+  const from = store.bot(input.fromBotId);
+  if (!from) return { status: 404, body: { error: "no such bot" } };
+  return jobHost.status(from.id, String(input.fromThreadId ?? from.threadId), input.id);
+}
+
 
 /** The `POST /api/internal/create-bot` body, factored the same way.  The
  * chiefOfStaff gate and `MAX_WORKSPACE_BOTS` live here, unchanged; the
@@ -7850,16 +7743,34 @@ export async function executeRoutineRequestRequest(input: {
   if (stale) console.log(`peer approvals: dismissed ${stale} card(s) left by a previous run`);
 }
 
-// Handoffs a previous process queued but never ran: the source turn is
-// dead (no turn survives a restart) so they would otherwise wait forever.
-// Run them now, through the same drain — target and approvePeerComms are
-// re-checked there as always; a source bot that no longer exists is skipped.
-_loadPending();
-{
-  const leftover = pendingThreads();
-  if (leftover.length) console.log(`delegations: ${leftover.length} thread(s) with queued handoffs from a previous run — draining`);
-  for (const threadId of leftover) drainDelegations(commsBus, approvalBus, threadId, runDelegatedTurn);
-}
+// Handoffs a previous process queued, and turns a restart cut, live in
+// runtime.db.  Open reconciles them, then the legacy queue is imported once.
+jobHost = createJobHost({
+  store,
+  commsBus,
+  approvalBus,
+  startTurn,
+  subscribe: (listener) => bus.subscribe((event) => {
+    if (event.type === "turn.completed") {
+      listener({ type: event.type, threadId: event.threadId, ok: event.ok });
+      return;
+    }
+    if (event.type === "item.completed" && event.itemType === "assistant_text") {
+      listener({ type: event.type, threadId: event.threadId, itemType: event.itemType, text: event.text });
+      return;
+    }
+    listener({ type: event.type, threadId: event.threadId });
+  }),
+  snoozed: (botId) => routines?.isBotSnoozed(botId) === true,
+  unattended: (botId) => isUnattended(botId),
+  watchDelegation: (threadId, channelId, botId) => {
+    delegationWatch.set(threadId, { channelId, toBotId: botId });
+  },
+  abandonDelegation: (threadId, failureName) => {
+    finalizeDelegationWatch(threadId, false, "", failureName);
+  },
+});
+jobHost.boot();
 
 // Auto-resume only when a previous process died mid-turn.  An external-only
 // custom credential can arrive after the standalone harness starts; keep that
@@ -8828,9 +8739,9 @@ async function runGroupMemberTurn(
             // would give the same bot a smaller toolset in a room than in a
             // direct message.
             executeListAgentsRequest,
-            executeAskBotRequest,
+            executeCoordinateBotsRequest,
             executeListRoutinesRequest,
-            executeDelegateBotRequest,
+            executeAssignmentStatusRequest,
             executeCreateBotRequest,
             executeRequestCredentialRequest,
             executeRequestSignInRequest,
@@ -10248,7 +10159,7 @@ function drainProviderReloadContinuations(): void {
   // fleet is live.
   for (const threadId of providerReloadDelegationDrains) {
     providerReloadDelegationDrains.delete(threadId);
-    drainDelegations(commsBus, approvalBus, threadId, runDelegatedTurn);
+    jobHost?.onTurnSettled(threadId, true, "");
   }
   drainQueuedSends();
   drainRoomQueue();
@@ -10838,7 +10749,7 @@ function runtimeWorkCounts(ownAdmissionActive = false, allowCredentialQueues = f
     // (`turns` above) still counts: that work is real and is not interrupted.
     queuedSends: queuedMessageCount(botIsOffId),
     queuedRooms: Math.max(0, _queuedRoomCount(botIsOffId) - (allowCredentialQueues ? pendingRoundCount : 0)),
-    delegations: pendingDelegationSnapshot().filter((item) => !botIsOffId(item.toBotId)).length,
+    delegations: (jobHost?.edges() ?? []).filter((item) => (item.state === "queued" || item.state === "waiting") && !botIsOffId(item.targetBotId)).length,
     connectors: [...pendingConnectorResumes.values()].filter((entry) => !botIsOffId(entry.botId)).length,
     secrets: [...pendingSecretResumes.values()].filter((entry) => !botIsOffId(entry.botId)).length,
     vps: activeVpsThreads.size,
@@ -11726,24 +11637,47 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         );
         return json(res, result.status, result.body);
       }
-      if (method === "POST" && path === "/api/internal/ask-bot") {
+      if (method === "POST" && path === "/api/internal/coordinate-bots") {
         const body = await readBody(req);
         const fromBotId = String(body.fromBotId ?? "");
         const depth = Number(body.depth ?? 0) || 0;
         const refused = authorizeCommsIdentity(req.headers.authorization, { botId: fromBotId, depth });
         if (refused) return json(res, refused.status, refused.body);
-        const result = await executeAskBotRequest({
+        const parsed = coordinateBotsBodySchema.safeParse(body);
+        if (!parsed.success) return json(res, 400, { error: "invalid coordinate request" });
+        const data = parsed.data;
+        const botIds = [...(data.botIds ?? []), ...(data.bot_ids ?? [])].map((item) => item.trim()).filter(Boolean);
+        const named = (data.toBotId ?? data.bot_id ?? "").trim();
+        if (named) botIds.push(named);
+        const result = executeCoordinateBotsRequest({
           fromBotId,
-          toBotId: String(body.toBotId ?? ""),
-          message: String(body.message ?? "").trim(),
+          botIds,
+          message: (data.message ?? "").trim(),
           depth,
-          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
+          fromThreadId: data.fromThreadId,
+          reason: data.reason?.trim() || undefined,
+          rework: data.rework,
+          thread: data.thread,
+          reply: data.reply,
+          consult: data.consult,
+          doneWhen: data.doneWhen?.trim() || undefined,
         });
         return json(res, result.status, result.body);
       }
-      // Async handoff: the source bot queues a task for a peer and goes
-      // back to the user; the peer turn runs after the source's
-      // turn.completed. Returns immediately (the caller does not wait).
+      if (method === "POST" && path === "/api/internal/assignment-status") {
+        const body = await readBody(req);
+        const fromBotId = String(body.fromBotId ?? "");
+        const refused = authorizeCommsIdentity(req.headers.authorization, { botId: fromBotId });
+        if (refused) return json(res, refused.status, refused.body);
+        const parsed = assignmentStatusBodySchema.safeParse(body);
+        if (!parsed.success) return json(res, 400, { error: "invalid assignment status request" });
+        const result = executeAssignmentStatusRequest({
+          fromBotId,
+          fromThreadId: parsed.data.fromThreadId,
+          id: parsed.data.id?.trim() || undefined,
+        });
+        return json(res, result.status, result.body);
+      }
       // The Box gateway is NOT a comms route.  It authenticates a per-mount,
       // per-box grant minted for one turn, and it holds the account-wide Box
       // key on this side of the socket so no bot process ever holds it.  It
@@ -11761,22 +11695,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           { cfg },
         );
         return json(res, gateway.status, gateway.body);
-      }
-      if (method === "POST" && path === "/api/internal/delegate-bot") {
-        const body = await readBody(req);
-        const fromBotId = String(body.fromBotId ?? "");
-        const depth = Number(body.depth ?? 0) || 0;
-        const refused = authorizeCommsIdentity(req.headers.authorization, { botId: fromBotId, depth });
-        if (refused) return json(res, refused.status, refused.body);
-        const result = executeDelegateBotRequest({
-          fromBotId,
-          toBotId: String(body.toBotId ?? ""),
-          message: String(body.message ?? "").trim(),
-          reason: typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : undefined,
-          depth,
-          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
-        });
-        return json(res, result.status, result.body);
       }
       if (method === "POST" && path === "/api/internal/create-bot") {
         const body = await readBody(req);
@@ -12154,17 +12072,27 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           lastAt: store.messagesFor(group.threadId).at(-1)?.at ?? group.createdAt,
         }))
         .sort((a, b) => b.lastAt - a.lastAt);
-      const queued = pendingDelegationSnapshot().flatMap((item) => {
-        const source = store.botByThread(item.sourceThreadId);
-        if (!source || !visible.has(source.id) || !visible.has(item.toBotId)) return [];
-        return [{ sourceBotId: source.id, targetBotId: item.toBotId, reason: item.reason }];
+      const edges = jobHost?.edges() ?? [];
+      const queued = edges.flatMap((edge) => {
+        if (edge.state === "running") return [];
+        if (!visible.has(edge.sourceBotId) || !visible.has(edge.targetBotId)) return [];
+        const queuedEdge: { sourceBotId: string; targetBotId: string; reason?: string } = {
+          sourceBotId: edge.sourceBotId,
+          targetBotId: edge.targetBotId,
+        };
+        if (edge.reason) queuedEdge.reason = edge.reason;
+        return [queuedEdge];
       });
-      const running = [...delegationWatch.entries()].flatMap(([threadId, watch]) => {
-        if (!visible.has(watch.toBotId)) return [];
-        const channel = watch.channelId ? store.group(watch.channelId) : undefined;
-        const sourceBotId = channel?.memberIds.find((botId) => botId !== watch.toBotId);
-        if (!sourceBotId || !visible.has(sourceBotId)) return [];
-        return [{ sourceBotId, targetBotId: watch.toBotId, threadId, groupId: channel?.id }];
+      const running = edges.flatMap((edge) => {
+        if (edge.state !== "running") return [];
+        if (!visible.has(edge.sourceBotId) || !visible.has(edge.targetBotId)) return [];
+        const runningEdge: { sourceBotId: string; targetBotId: string; threadId: string; groupId?: string } = {
+          sourceBotId: edge.sourceBotId,
+          targetBotId: edge.targetBotId,
+          threadId: edge.threadId,
+        };
+        if (edge.groupId) runningEdge.groupId = edge.groupId;
+        return [runningEdge];
       });
       return json(res, 200, { collaborations, queued, running });
     }
@@ -14067,7 +13995,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // a peer approval naming this bot can never be meaningfully answered
         // now, and its caller would otherwise wait out the 15-minute timeout
         cancelPeerApprovalsFor(bot.id);
-        discardDelegations(commsBus, bot.threadId);
+        jobHost?.releaseBot(bot.id);
         computerControl.forget(bot.id);
         // The snapshot above was taken before soft-cleanup awaits.  A task
         // created while they ran has a record the delete below removes and a
@@ -14774,12 +14702,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         // Cancel all active and queued routine runs for this bot and snooze automated triggers
         // so background webhooks and scheduled routines do not restart it.
+        // Recorded handoffs that have not started are cancelled with the
+        // conversation.  A teammate already running keeps its turn.
+        jobHost?.stopThread(bot.id, interruptLiveThreadId);
         const cancelledRuns = await routines.cancelAllRunsForBot(bot.id);
         routines.snoozeBot(bot.id);
         if (cancelledRuns.length > 0) {
           stopped = true;
         }
       }
+      if (!routines) jobHost?.stopThread(bot.id, interruptLiveThreadId);
       // Latch the stop before anything is awaited.  The driver may settle the
       // turn the instant it is killed, so the turn.completed fold can run
       // before this handler resumes — if the latch were set after the await,
