@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 
@@ -33,6 +34,21 @@ interface Msg {
   /** steer-queue: waiting to auto-send when the live turn settles */
   queued?: boolean;
 }
+
+// One line of native/<threadId>.ndjson.  appendNative writes at, dir, source
+// and msg; msg is the ACP JSON-RPC object.  The envelope is closed.  Extra
+// keys on msg (jsonrpc, id) are stripped, and method plus params stay.
+const NativeEventSchema = z
+  .object({
+    at: z.string(),
+    dir: z.enum(["in", "out"]),
+    source: z.string(),
+    msg: z.object({
+      method: z.string(),
+      params: z.unknown(),
+    }),
+  })
+  .strict();
 
 /** Client-side view of the active branch: walk parentId links from the leaf. */
 function activePath(messages: Msg[], leafId: string | null): Msg[] {
@@ -302,14 +318,16 @@ posixOnly("conversation branching e2e (fake ACP fleet)", () => {
         for (const line of log.split("\n")) {
           if (!line) continue;
           // a line still being appended is not valid JSON yet
-          let event: { dir?: string; msg?: { method?: string; params?: unknown } };
+          let event: unknown;
           try {
             event = JSON.parse(line);
           } catch {
             continue;
           }
-          if (event.dir === "out" && event.msg?.method === "session/prompt") {
-            prompts.push(JSON.stringify(event.msg.params));
+          const parsed = NativeEventSchema.safeParse(event);
+          if (!parsed.success) continue;
+          if (parsed.data.dir === "out" && parsed.data.msg.method === "session/prompt") {
+            prompts.push(JSON.stringify(parsed.data.msg.params));
           }
         }
         return prompts;
