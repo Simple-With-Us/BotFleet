@@ -208,7 +208,7 @@ private struct CodeBlockView: View {
             }
         } label: {
             Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                .font(.caption.weight(.semibold))
+                .font(.scaled(12, weight: .semibold, relativeTo: .caption))
                 .foregroundStyle(copied ? Color.green : Color.secondary)
                 .padding(.horizontal, 10)
                 .frame(height: 28)
@@ -228,7 +228,7 @@ private struct CodeBlockView: View {
     private func codeScroll(_ source: String, showCaret: Bool) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             (Text(source) + streamingCaret(showCaret))
-                .font(.system(.footnote, design: .monospaced))
+                .font(.scaled(14, design: .monospaced, relativeTo: .footnote))
                 .textSelection(.enabled)
         }
     }
@@ -258,12 +258,12 @@ private struct CodeBlockReader: View {
                 ScrollView {
                     ScrollView(.horizontal, showsIndicators: false) {
                         Text(page.text)
-                            .font(.system(.footnote, design: .monospaced))
+                            .font(.scaled(14, design: .monospaced, relativeTo: .footnote))
                             .textSelection(.enabled)
                     }
                 }
                 Text(page.caption)
-                    .font(.caption)
+                    .font(.scaled(12, relativeTo: .caption))
                     .foregroundStyle(Color.secondary)
                 HStack {
                     Button("Earlier Lines") {
@@ -278,7 +278,7 @@ private struct CodeBlockReader: View {
                     }
                     .disabled(!page.hasLater)
                 }
-                .font(.body.weight(.semibold))
+                .font(.scaled(15, weight: .semibold, relativeTo: .body))
             }
             .padding(16)
             .navigationTitle("Full Code")
