@@ -15,6 +15,9 @@
 // ignored everywhere below — the turn's own identity is the only one that
 // reaches an endpoint function.
 
+import { z } from "zod";
+
+import { inboundText, signInReason, signInSite } from "../../shared/sign-in-request.ts";
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
 import { sectionKey } from "../store.ts";
 import { MAX_CREATED_BOTS_PER_TURN } from "./registry.ts";
@@ -177,6 +180,12 @@ export interface AgentToolDeps {
   executeRequestCredentialRequest(
     input: RequestCredentialRequestInput,
   ): AgentRequestResult | Promise<AgentRequestResult>;
+  executeRequestSignInRequest(input: {
+    fromBotId: string;
+    fromThreadId?: string;
+    site: unknown;
+    reason?: unknown;
+  }): AgentRequestResult | Promise<AgentRequestResult>;
   executeRoutineRequestRequest(input: RoutineRequestInput): AgentRequestResult | Promise<AgentRequestResult>;
 }
 
@@ -203,6 +212,7 @@ export type AgentToolName =
   | "assignment_status"
   | "create_bot"
   | "request_credential"
+  | "request_sign_in"
   | "list_routines"
   | "propose_routine"
   | "propose_routine_action";
@@ -225,6 +235,21 @@ const ok = (content: string, detail?: string): TurnToolOutcome =>
 
 const failed = (content: string, detail?: string): TurnToolOutcome =>
   detail ? { kind: "error", content, detail } : { kind: "error", content };
+
+/** Model arguments for request_sign_in.  Strict, so a password, code, or
+ * any other extra field is refused.  The refusal text is fixed and never
+ * includes the rejected value. */
+export const SIGN_IN_CALL = z
+  .object({
+    site: z.string().min(1),
+    reason: z.string().optional(),
+  })
+  .strict();
+
+export type SignInCall = z.infer<typeof SIGN_IN_CALL>;
+
+const SIGN_IN_CALL_REFUSAL =
+  "request_sign_in accepts only a site and an optional reason.\u00A0 Never send a password or one-time code.";
 
 const errorText = (body: Record<string, unknown>, fallback: string): string =>
   typeof body.error === "string" && body.error ? body.error : fallback;
@@ -426,6 +451,35 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       return {
         kind: "suspend",
         content: `A secure ${label} card is now visible to the user. End this turn; BotFleet will resume the task after they save or decline. Never ask them to paste the key into chat.`,
+        stopReason: "awaiting_human",
+      };
+    },
+
+    async request_sign_in(call, ctx): Promise<TurnToolOutcome> {
+      const parsed = SIGN_IN_CALL.safeParse(call.arguments);
+      if (!parsed.success) {
+        return failed(JSON.stringify({ error: SIGN_IN_CALL_REFUSAL }), "bad arguments");
+      }
+      const site = signInSite(parsed.data.site);
+      if (!site) {
+        return failed(JSON.stringify({ error: "request_sign_in needs a site, like example.com" }), "bad arguments");
+      }
+      const reason = signInReason(parsed.data.reason ?? "");
+      const result = await deps.executeRequestSignInRequest({
+        fromBotId: ctx.botId,
+        fromThreadId: ctx.threadId,
+        site,
+        reason,
+      });
+      if (result.status >= 400) {
+        const message = errorText(result.body, "that sign-in could not be requested");
+        return failed(JSON.stringify({ error: message }), message);
+      }
+      const named = inboundText(result.body.site) || site;
+      return {
+        kind: "suspend",
+        content:
+          `A Sign in needed card for ${named} is now visible. End this turn. The person signs in on the computer where you work. Never ask them to paste a password or one-time code into chat.`,
         stopReason: "awaiting_human",
       };
     },

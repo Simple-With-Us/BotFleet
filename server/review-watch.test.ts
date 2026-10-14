@@ -210,6 +210,7 @@ describe("what is watched", () => {
       "coordinate_bots",
       "create_bot",
       "request_credential",
+      "request_sign_in",
       "propose_routine",
       "propose_routine_action",
       "zulip_reply",

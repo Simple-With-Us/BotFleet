@@ -22,6 +22,7 @@ let lastDelegateBody: any = null;
 let delegateResponse: unknown = { queued: true, message: "Delegation queued." };
 let lastCreateBody: any = null;
 let lastCredentialBody: any = null;
+let lastSignInBody: any = null;
 let lastRoutineQuery = "";
 let routinesResponse: unknown = {
   now: "2026-08-28T10:30:00.000Z",
@@ -99,6 +100,16 @@ beforeAll(async () => {
       });
       return;
     }
+    if (req.method === "POST" && req.url === "/api/internal/request-sign-in") {
+      let data = "";
+      req.on("data", (c) => (data += c));
+      req.on("end", () => {
+        lastSignInBody = JSON.parse(data);
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ messageId: "msg-sign", site: "example.com" }));
+      });
+      return;
+    }
     if (req.method === "POST" && req.url === "/api/internal/request-credential") {
       let data = "";
       req.on("data", (c) => (data += c));
@@ -162,7 +173,7 @@ afterAll(async () => {
 });
 
 describe("agents-proxy MCP surface", () => {
-  it("answers the MCP handshake and lists all eight tools", async () => {
+  it("answers the MCP handshake and lists all nine tools", async () => {
     const init = await rpc("initialize", { protocolVersion: "2024-11-05" });
     expect(init.result.serverInfo.name).toContain("agents");
     const list = await rpc("tools/list");
@@ -172,6 +183,7 @@ describe("agents-proxy MCP surface", () => {
       "assignment_status",
       "create_bot",
       "request_credential",
+      "request_sign_in",
       "list_routines",
       "propose_routine",
       "propose_routine_action",
@@ -294,6 +306,25 @@ describe("agents-proxy MCP surface", () => {
       reason: "The selected model needs it.",
     });
     expect(JSON.stringify(lastCredentialBody)).not.toContain("secret");
+  });
+
+  it("asks for a site sign-in without sending a password", async () => {
+    lastSignInBody = null;
+    const res = await callTool("request_sign_in", {
+      site: "example.com",
+      reason: "the inbox",
+      password: "hunter2",
+    });
+    expect(res.result.isError).toBe(false);
+    expect(res.result.content[0].text).toContain("Sign in needed");
+    expect(res.result.content[0].text).toContain("Never ask them to paste a password");
+    expect(lastSignInBody).toEqual({
+      fromBotId: "bot-asker",
+      fromThreadId: "thread-asker-routine",
+      site: "example.com",
+      reason: "the inbox",
+    });
+    expect(JSON.stringify(lastSignInBody)).not.toContain("hunter2");
   });
 
   it("rejects credential ids outside the fixed allowlist locally", async () => {

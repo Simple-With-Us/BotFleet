@@ -46,6 +46,9 @@ function deps(over: Partial<TurnToolHostDeps> = {}): TurnToolHostDeps {
     executeRequestCredentialRequest: vi.fn(
       async (): Promise<AgentRequestResult> => ({ status: 201, body: { messageId: "msg-1", label: "OpenCode API key" } }),
     ),
+    executeRequestSignInRequest: vi.fn(
+      async (): Promise<AgentRequestResult> => ({ status: 201, body: { messageId: "msg-sign", site: "example.com" } }),
+    ),
     executeRoutineRequestRequest: vi.fn(
       async (): Promise<AgentRequestResult> => ({ status: 201, body: { summary: "Weekdays at 09:00" } }),
     ),
