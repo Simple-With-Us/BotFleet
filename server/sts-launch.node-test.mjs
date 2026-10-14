@@ -24,7 +24,13 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // so a route that answered 200 with the wrong shape still passed as long as the
 // keys happened to be present — a harness that parsed at all was never actually
 // being proved.  Parsing here fails loudly on drift instead.
-const StsStatusSchema = z.object({ xai: z.boolean(), gemini: z.boolean() }).strict();
+//
+// `provider` is part of the route's answer and not an extra: the renderer bridge
+// (`sts:status` in main.mjs) answers with the two key booleans alone, while the
+// HTTP route also reports which provider those keys resolve to.
+const StsStatusSchema = z
+  .object({ xai: z.boolean(), gemini: z.boolean(), provider: z.string().nullable() })
+  .strict();
 const StsRefusalSchema = z.object({ error: z.string() }).passthrough();
 
 function freePort() {
