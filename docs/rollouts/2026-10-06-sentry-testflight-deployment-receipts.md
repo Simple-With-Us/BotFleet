@@ -53,7 +53,7 @@ BotFleet verification trio (npm rule names mapped to this repo; outcomes tied to
 
 ```
 pnpm run lint -> ok (Node CI lint on PR #880 run 38384737101, head 0814ccc3)
-pnpm typecheck -> ok (CI macOS/ubuntu typecheck + test on the same run)
+pnpm typecheck -> ok (CI macOS/ubuntu/windows typecheck + test on the same run)
 pnpm test -> ok (CI typecheck + test jobs on the same run; receipt fixtures above are the isolated proof for ios-ship-only paths)
 pnpm build -> ok (CI package + smoke on the same run)
 ```
