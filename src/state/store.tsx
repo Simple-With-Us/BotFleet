@@ -2508,8 +2508,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return result.bot;
         },
         reconcile: async (botId, signal) => {
-          const result: { bots: BotAnnouncement[] } = await api("/api/bots", { signal });
-          return result.bots.find((candidate) => candidate.id === botId) ?? null;
+          // `?messages=0` — this only needs the bot row to roll the optimistic
+          // patch back, never the transcript. Unpaged, the server answered with
+          // every bot's and group's full history, so one rejected PATCH
+          // serialized megabytes of transcript per conflict (BF-2424).
+          const result: { bots: BotAnnouncement[] } = await api("/api/bots?messages=0", { signal });
+          const found = result.bots.find((candidate) => candidate.id === botId) ?? null;
+          if (!found) return null;
+          // messages=0 answers with `messages: []`, and the reducer treats an
+          // incoming transcript sharing no ids with the screen as a full
+          // snapshot — vacuously true for an empty array, so handing that back
+          // would blank the conversation on every rejected save. This re-read
+          // is for the bot ROW; carry the transcript already on screen.
+          const current = stateRef.current.bots.find((candidate) => candidate.id === botId);
+          return { ...found, messages: current?.messages ?? found.messages };
         },
         onAuthoritative: (bot, optimisticOverlay) => {
           rawDispatch({ type: "botPatched", bot: applyBotPatch(bot, optimisticOverlay) });

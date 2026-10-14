@@ -2710,7 +2710,12 @@ function slimMessage(message: Message): Message | Record<string, unknown> {
 
 /** `limit === undefined` is the original, unpaginated shape. */
 function messagePage(threadId: string, limit: number | undefined, before?: string | null) {
-  if (limit === undefined) return { messages: store.messagesFor(threadId) };
+  // The legacy unpaginated shape still answers with the whole transcript, but
+  // it must not be served from the caching read: this route runs for EVERY bot
+  // and EVERY group at once, so caching each full thread pinned the entire
+  // database in the heap for the life of the process (BF-2424). Read it
+  // transiently — same bytes out, nothing retained.
+  if (limit === undefined) return { messages: store.messagesForTransient(threadId) };
   // The common case — GET /api/bots hydrating every bot and group's newest
   // page at once — never needs the rest of the transcript. Read just this
   // page at the SQL boundary instead of materializing and caching the

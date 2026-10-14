@@ -900,17 +900,30 @@ interface ThreadState {
  * the next read just re-hydrates from sqlite. */
 const DEFAULT_THREAD_CACHE_LIMIT = 64;
 
+/** …and how many messages, in total, those warm threads may retain. The
+ * count alone is NOT a memory bound: it bounds how many threads are warm,
+ * never how big one is. A long bot thread carries inline base64 screen
+ * captures, so 64 fully-hydrated threads measured 74 GB RSS over one
+ * working day — which on a 16 GB Mac drove swap until the disk was full
+ * (BF-2424). Bounding retained messages bounds the heap, whatever route
+ * or call site did the hydrating. */
+const DEFAULT_THREAD_CACHE_MAX_MESSAGES = 20_000;
+
 /** A bounded LRU over per-thread message caches. `get` touches (moves the
  * entry to the most-recently-used end); `set` evicts the least-recently-
- * used entries past `limit`. Backed by a plain Map: insertion order is
- * Map's own iteration order, so "delete then re-set" is enough to move a
- * key to the MRU end, and `.keys().next()` is always the LRU key. */
+ * used entries past `limit` OR until the retained message count is back
+ * under `maxMessages`. Backed by a plain Map: insertion order is Map's own
+ * iteration order, so "delete then re-set" is enough to move a key to the
+ * MRU end, and `.keys().next()` is always the LRU key. */
 class ThreadCache {
   private map = new Map<string, ThreadState>();
   private limit: number;
+  private maxMessages: number;
+  private retained = 0;
 
-  constructor(limit: number) {
+  constructor(limit: number, maxMessages: number = DEFAULT_THREAD_CACHE_MAX_MESSAGES) {
     this.limit = limit;
+    this.maxMessages = maxMessages;
   }
 
   get(threadId: string): ThreadState | undefined {
@@ -923,17 +936,37 @@ class ThreadCache {
   }
 
   set(threadId: string, state: ThreadState): void {
+    const previous = this.map.get(threadId);
+    if (previous) this.retained -= previous.messages.length;
     this.map.delete(threadId);
     this.map.set(threadId, state);
-    while (this.map.size > this.limit) {
+    this.retained += state.messages.length;
+    this.evict();
+  }
+
+  /** Drop the least-recently-used threads until BOTH bounds hold. A single
+   * thread larger than the whole budget still gets cached — evicting it
+   * inside `set` would return `undefined` to a caller expecting the state
+   * it just wrote — but it is the first thing the next `set` evicts. */
+  private evict(): void {
+    while (this.map.size > this.limit || this.retained > this.maxMessages) {
       const oldest = this.map.keys().next().value;
       if (oldest === undefined) break;
+      const victim = this.map.get(oldest);
+      if (victim) this.retained -= victim.messages.length;
       this.map.delete(oldest);
     }
   }
 
   delete(threadId: string): void {
+    const existing = this.map.get(threadId);
+    if (existing) this.retained -= existing.messages.length;
     this.map.delete(threadId);
+  }
+
+  clear(): void {
+    this.map.clear();
+    this.retained = 0;
   }
 
   /** Membership only — deliberately does not touch LRU order, so a test
@@ -975,10 +1008,19 @@ export class Store {
 
   /** `opts.threadCacheLimit` only exists so tests can force evictions
    * without creating dozens of real threads; production always takes the
-   * default. */
-  constructor(defaultSelection: () => ModelSelection, opts: { threadCacheLimit?: number } = {}) {
+   * default. `opts.threadCacheMaxMessages` is the same idea for the size
+   * bound: the thread-COUNT limit alone lets 64 huge threads sit resident
+   * (BF-2424), so tests that need to prove the size bound holds can shrink
+   * it instead of writing tens of thousands of messages. */
+  constructor(
+    defaultSelection: () => ModelSelection,
+    opts: { threadCacheLimit?: number; threadCacheMaxMessages?: number } = {},
+  ) {
     this.defaultSelection = defaultSelection;
-    this.threads = new ThreadCache(opts.threadCacheLimit ?? DEFAULT_THREAD_CACHE_LIMIT);
+    this.threads = new ThreadCache(
+      opts.threadCacheLimit ?? DEFAULT_THREAD_CACHE_LIMIT,
+      opts.threadCacheMaxMessages ?? DEFAULT_THREAD_CACHE_MAX_MESSAGES,
+    );
     mkdirSync(DATA_DIR, { recursive: true });
     // Only a missing bots.json is a first run.  A file that exists but cannot be used is moved aside
     // (never deleted) and reported; see store-guard.ts.  Wrong-typed JSON used to throw out of this
@@ -1761,6 +1803,32 @@ export class Store {
 
   messagesFor(threadId: string): Message[] {
     return this.thread(threadId).messages;
+  }
+
+  /** The full transcript for a read-only response, WITHOUT pinning the thread
+   *  in the LRU. `messagesFor` caches every thread it hydrates, and
+   *  GET /api/bots without `?messages=` calls it for every bot AND every
+   *  group in one request — so a single unpaginated poll pulled the whole
+   *  database into the heap and kept it there. The LRU bounds the thread
+   *  COUNT, not a thread's size: 64 fully-hydrated threads with inline
+   *  base64 captures measured 74 GB RSS over one working day, which on this
+   *  16 GB Mac drove swap until the disk was full (BF-2424).
+   *
+   *  An already-warm thread serves straight from memory; a cold one is read,
+   *  returned, and left to the GC — the response is byte-identical either
+   *  way. Mutating callers keep using `messagesFor`, which must stay cached. */
+  messagesForTransient(threadId: string): Message[] {
+    const warm = this.threads.get(threadId);
+    if (warm) return warm.messages;
+    const { messages } = mdb.readThread(threadId, messagesFile(threadId));
+    // legacy rows carry no parentId — chain them in array order, the same
+    // fixup cacheThread() applies, so the response matches a cached read
+    let prev: string | null = null;
+    for (const m of messages) {
+      if (m.parentId === undefined) m.parentId = prev;
+      prev = m.id;
+    }
+    return messages;
   }
 
   /** A bounded page of a thread's newest messages, for callers that only

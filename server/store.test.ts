@@ -1357,6 +1357,72 @@ describe("Store thread cache", () => {
     expect(store.threadIsCachedForTests(b.threadId)).toBe(false);
   });
 
+  // BF-2424 follow-up: a thread-COUNT bound is not a memory bound. 64 fully
+  // hydrated threads carrying inline base64 captures measured 74 GB RSS,
+  // because nothing capped how MANY MESSAGES those 64 threads retained. The
+  // size bound has to bite while the thread count is nowhere near its own
+  // limit — that is exactly the case the count limit missed.
+  it("evicts on retained message count while the thread count stays under its limit", () => {
+    const setup = new Store(selection);
+    const fat = setup.createBot({ name: "Fat" }, { seedMessages: false });
+    for (let i = 0; i < 6; i++) {
+      setup.appendMessage(fat.threadId, { role: "user", kind: "text", text: `m${i}` });
+    }
+    // room for 10 retained messages across 8 threads: the size bound is the
+    // only one that can be reached here
+    const store = new Store(selection, { threadCacheLimit: 8, threadCacheMaxMessages: 10 });
+
+    store.messagesFor(fat.threadId); // 6 retained — under the bound
+    expect(store.threadIsCachedForTests(fat.threadId)).toBe(true);
+
+    const rest = ["s", "a", "b", "c", "d", "e"].map((name) => {
+      const bot = setup.createBot({ name }, { seedMessages: false });
+      setup.appendMessage(bot.threadId, { role: "user", kind: "text", text: name });
+      return bot;
+    });
+
+    // 6 + 5 = 11 retained, over the bound of 10, while only 6 of the 8 slots
+    // are in use — the thread-COUNT limit alone would have kept all of them
+    store.messagesFor(rest[0]!.threadId); // 7
+    store.messagesFor(rest[1]!.threadId); // 8
+    store.messagesFor(rest[2]!.threadId); // 9
+    store.messagesFor(rest[3]!.threadId); // 10 — at the bound
+    store.messagesFor(rest[4]!.threadId); // 11 — over it, evict the LRU end
+    expect(store.threadIsCachedForTests(fat.threadId)).toBe(false);
+    expect(store.threadIsCachedForTests(rest[4]!.threadId)).toBe(true);
+
+    // eviction stays invisible to callers: the thread re-hydrates correctly
+    expect(store.messagesFor(fat.threadId).map((m) => m.text)).toEqual([
+      "m0", "m1", "m2", "m3", "m4", "m5",
+    ]);
+  });
+
+  // BF-2424: the unpaginated GET /api/bots path answers with a thread's whole
+  // transcript for every bot AND every group in one request. It must not cache
+  // them — messagesFor pins a thread for the life of the process, and the LRU
+  // bounds the thread COUNT rather than a thread's size, so a single
+  // unpaginated poll was enough to hold the entire database in the heap.
+  it("messagesForTransient returns the whole transcript without pinning it in the LRU", () => {
+    const setup = new Store(selection);
+    const target = setup.createBot({ name: "Transient" }, { seedMessages: false });
+    setup.appendMessage(target.threadId, { role: "user", kind: "text", text: "one" });
+    setup.appendMessage(target.threadId, { role: "bot", kind: "text", text: "two" });
+
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(false);
+
+    // same bytes out as the caching read...
+    expect(store.messagesForTransient(target.threadId).map((m) => m.text)).toEqual(["one", "two"]);
+    // ...and nothing retained for the life of the process
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(false);
+
+    // an already-warm thread still serves from memory, and stays warm: the
+    // transient read must not evict what other work legitimately cached
+    store.messagesFor(target.threadId);
+    expect(store.messagesForTransient(target.threadId).map((m) => m.text)).toEqual(["one", "two"]);
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(true);
+  });
+
   it("appendMessage after eviction stays consistent with what is durable on disk", () => {
     const setup = new Store(selection);
     const target = setup.createBot({ name: "Target" }, { seedMessages: false });
