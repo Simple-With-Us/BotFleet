@@ -16,22 +16,13 @@
 import Foundation
 import CompanionCore
 
-public enum StsProviderKind: String, Hashable, Sendable {
-    case xai
-    case gemini
-
-    /// The realtime model each provider documents for this path.
-    public var realtimeModel: String {
-        switch self {
-        case .xai: return "grok-voice-latest"
-        case .gemini: return "gemini-3.8-live"
-        }
-    }
-}
-
 /// One duplex speech session with a provider.  Implementations own their
 /// socket, their playback queue, and their engine-tool calls; the call
 /// orchestrator owns capture, the transcript fold, and approvals.
+///
+/// `StsProviderKind` used to be declared here, but the call-mode rule in
+/// CompanionCore needs it to decide whether a call runs at all, and this
+/// target sits above that one.  It lives in CompanionCore now.
 public protocol StsSession: AnyObject, Sendable {
     var provider: StsProviderKind { get }
     /// Open the transport and complete the vendor handshake.
