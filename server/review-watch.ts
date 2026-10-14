@@ -99,8 +99,8 @@ export function watchesKind(kind: ToolKind | undefined): boolean {
 }
 
 /** The harness's own tools that change something or reach someone, by the
- *  names the registry gives them: a message to a peer (`ask_bot`,
- *  `delegate_bot`), a new bot, a credential request, a routine, a Zulip post
+ *  names the registry gives them: a handoff to a peer (`coordinate_bots`),
+ *  a new bot, a credential request, a routine, a Zulip post
  *  or reply, a job start or kill.  They are what a bot calls on the `agents`
  *  MCP server.  Their reads (`list_bots`, `job_output`) are not here, for the
  *  same reason no other read is reviewed.  Derived from the registry, so a new

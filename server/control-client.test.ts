@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { createControlClient } from "./control-client.ts";
+import {
+  CONTROL_REFUSAL_PLAIN,
+  CONTROL_UNCONFIRMED,
+  controlRefusal,
+  createControlClient,
+} from "./control-client.ts";
 
 describe("createControlClient", () => {
   it("stays disengaged when URL or token is missing", async () => {
@@ -15,7 +20,7 @@ describe("createControlClient", () => {
     await expect(client.state(true)).resolves.toEqual({ held: false, helpOpen: false });
   });
 
-  it("fails closed when configured and the harness fetch throws", async () => {
+  it("fails closed as unconfirmed when the harness fetch throws", async () => {
     const client = createControlClient({
       url: "http://127.0.0.1:9/control",
       token: "test-token",
@@ -23,26 +28,66 @@ describe("createControlClient", () => {
         throw new Error("harness down");
       },
     });
-    expect(client.configured).toBe(true);
-    await expect(client.state(true)).resolves.toEqual({ held: true, helpOpen: false });
+    const state = await client.state(true);
+    expect(state).toEqual({ held: true, helpOpen: false, blockedReason: CONTROL_UNCONFIRMED });
+    expect(controlRefusal(state)).toBe(CONTROL_UNCONFIRMED);
+    expect(controlRefusal(state)).not.toBe(CONTROL_REFUSAL_PLAIN);
   });
 
-  it("fails closed when configured and the harness returns non-ok", async () => {
+  it("fails closed as unconfirmed when the harness returns non-ok", async () => {
     const client = createControlClient({
       url: "http://127.0.0.1:9/control",
       token: "test-token",
       fetchImpl: async () => new Response("nope", { status: 503 }),
     });
-    await expect(client.state(true)).resolves.toEqual({ held: true, helpOpen: false });
+    await expect(client.state(true)).resolves.toEqual({
+      held: true,
+      helpOpen: false,
+      blockedReason: CONTROL_UNCONFIRMED,
+    });
   });
 
-  it("fails closed when configured and the body is not JSON", async () => {
+  it("fails closed as unconfirmed when the body is not a hold", async () => {
     const client = createControlClient({
       url: "http://127.0.0.1:9/control",
       token: "test-token",
       fetchImpl: async () => new Response("not-json", { status: 200 }),
     });
-    await expect(client.state(true)).resolves.toEqual({ held: true, helpOpen: false });
+    await expect(client.state(true)).resolves.toEqual({
+      held: true,
+      helpOpen: false,
+      blockedReason: CONTROL_UNCONFIRMED,
+    });
+  });
+
+  it("does not call a hold a person unless the harness says so", async () => {
+    const client = createControlClient({
+      url: "http://127.0.0.1:9/control",
+      token: "test-token",
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ held: true, helpOpen: false }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    const state = await client.state(true);
+    expect(state.reason).toBeUndefined();
+    expect(controlRefusal(state)).toBe(CONTROL_UNCONFIRMED);
+  });
+
+  it("keeps a person's hold in the harness's own words", async () => {
+    const client = createControlClient({
+      url: "http://127.0.0.1:9/control",
+      token: "test-token",
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ held: true, helpOpen: true, reason: "person" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    const state = await client.state(true);
+    expect(state).toEqual({ held: true, helpOpen: true, reason: "person" });
+    expect(controlRefusal(state)).toBe(CONTROL_REFUSAL_PLAIN);
   });
 
   it("returns the harness hold when the read succeeds", async () => {
@@ -56,5 +101,42 @@ describe("createControlClient", () => {
         }),
     });
     await expect(client.state(true)).resolves.toEqual({ held: false, helpOpen: true });
+  });
+
+  it("waits out a slow honest answer instead of calling it a person", async () => {
+    const client = createControlClient({
+      url: "http://127.0.0.1:9/control",
+      token: "test-token",
+      timeoutMs: 1_000,
+      fetchImpl: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return new Response(JSON.stringify({ held: false, helpOpen: false, blockedReason: "busy" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const state = await client.state(true);
+    expect(state).toEqual({ held: false, helpOpen: false, blockedReason: "busy" });
+    expect(controlRefusal(state)).not.toBe(CONTROL_REFUSAL_PLAIN);
+  });
+
+  it("asks for an immediate read when a help poll must not wait out a hold", async () => {
+    const seen: string[] = [];
+    const client = createControlClient({
+      url: "http://127.0.0.1:9/api/internal/computer-control?botId=b1",
+      token: "test-token",
+      fetchImpl: async (input) => {
+        seen.push(String(input));
+        return new Response(JSON.stringify({ held: true, helpOpen: false, reason: "person" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    await client.state(true, false);
+    await client.state(true);
+    expect(seen[0]).toContain("immediate=1");
+    expect(seen[1]).not.toContain("immediate=1");
   });
 });

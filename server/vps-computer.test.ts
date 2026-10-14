@@ -41,6 +41,7 @@ import {
   vpsSyncCliCredentials,
   resetVpsCliSyncThrottle,
   reuseVps,
+  inspectVpsForAuto,
   resetVpsImageBuildState,
   vpsImageBuildState,
   vpsPrepareImageAhead,
@@ -555,6 +556,34 @@ describe("VPS computer", () => {
 
   it("fails cleanly when no VPS alias is configured", async () => {
     await expect(vpsComputerAction("provision", {}, BOT_ID, fixture().runner)).rejects.toThrow(/not configured/);
+  });
+
+  it("shares one Auto inspection among turns that ask while it runs, never jumping a stop queued behind it", async () => {
+    const fake = fixture();
+    let release!: () => void;
+    let gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const runner: VpsCommandRunner = async (args, options) => {
+      if (args[2] === "image") await gate;
+      return fake.runner(args, options);
+    };
+    const inspections = () => fake.calls.filter(({ args }) => args[2] === "image").length;
+    const burst = [1, 2, 3].map(() => inspectVpsForAuto(CONFIG, BOT_ID, runner));
+    release();
+    expect((await Promise.all(burst)).map((status) => status.ready)).toEqual([true, true, true]);
+    expect(inspections()).toBe(1);
+
+    gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const running = inspectVpsForAuto(CONFIG, BOT_ID, runner);
+    const stop = vpsComputerAction("stop", CONFIG, BOT_ID, runner);
+    const after = inspectVpsForAuto(CONFIG, BOT_ID, runner);
+    release();
+    expect((await running).ready).toBe(true);
+    expect((await stop).container).toBe("stopped");
+    expect(await after).toMatchObject({ ready: false, container: "stopped" });
   });
 
   it("attributes a transport failure to the link, never to a missing container", async () => {
