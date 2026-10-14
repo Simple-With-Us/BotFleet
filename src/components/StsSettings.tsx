@@ -67,6 +67,7 @@ export const StsConfigResponseSchema = z
   // `tts`, `vps`, `composio` and the rest.  A bare z.object strips unknown
   // keys, which is not the same thing as tolerating them, so say so.
   .passthrough();
+export type StsConfigResponse = z.infer<typeof StsConfigResponseSchema>;
 
 /**
  * The trust boundary for `window.ogb.sts.status()`.
@@ -84,6 +85,7 @@ export const StsConfigResponseSchema = z
  * larger document: an extra field means the bridge is not what we think it is.
  */
 export const StsKeyStatusSchema = z.object({ xai: z.boolean(), gemini: z.boolean() }).strict();
+export type StsKeyStatusPayload = z.infer<typeof StsKeyStatusSchema>;
 
 /**
  * One line the panel can show for a body the schema refused.

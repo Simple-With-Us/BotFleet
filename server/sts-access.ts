@@ -50,6 +50,28 @@ export interface StsRefusal {
 const STS_PROVIDER_TUPLE: [StsProvider, StsProvider] = [STS_PROVIDERS[0], STS_PROVIDERS[1]];
 
 export const stsTokenRequest = z.object({ provider: z.enum(STS_PROVIDER_TUPLE) });
+export type StsTokenRequest = z.infer<typeof stsTokenRequest>;
+
+/** GET /api/sts/status when the keys could be read.
+ *
+ *  The two booleans, plus the provider a call would use.  Strict, because
+ *  this object is the whole answer: an extra field would be a key or a
+ *  token, and neither may cross this route.  The type is inferred from the
+ *  schema so a hand-written mirror cannot drift from the parser. */
+export const StsStatusSchema = z
+  .object({
+    xai: z.boolean(),
+    gemini: z.boolean(),
+    provider: z.enum(STS_PROVIDER_TUPLE).nullable(),
+  })
+  .strict();
+export type StsStatus = z.infer<typeof StsStatusSchema>;
+
+/** Error JSON the STS routes answer with.  `.passthrough()` because a
+ *  failure may carry fields beyond `error` without changing the sentence
+ *  the caller reads. */
+export const StsErrorBodySchema = z.object({ error: z.string() }).passthrough();
+export type StsErrorBody = z.infer<typeof StsErrorBodySchema>;
 
 /** Which provider a call would use, and why.  Mirrors the desktop's
  *  `pickStsProvider` so a phone and the web client degrade identically. */
@@ -78,6 +100,17 @@ export function stsUnavailableReason(requested: StsProvider | null, keys: StsKey
 export function resolveStsProvider(keys: StsKeyStatus | null, preference: StsProvider | null): StsResolution {
   if (keys === null) return { provider: null, reason: "unknown" };
   return pickStsProvider(keys, preference);
+}
+
+/** The 200 body of GET /api/sts/status.  Built from the policy above and
+ *  parsed through `StsStatusSchema`, so the route cannot publish a shape
+ *  the schema would refuse. */
+export function stsStatusBody(keys: StsKeyStatus, preference: StsProvider | null): StsStatus {
+  return StsStatusSchema.parse({
+    xai: keys.xai,
+    gemini: keys.gemini,
+    provider: resolveStsProvider(keys, preference).provider,
+  });
 }
 
 /** A client may not mint tokens back to back.  Each mint is a real request to

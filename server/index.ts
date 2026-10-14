@@ -454,9 +454,9 @@ import {
 import { isPersonalVoiceId, MAX_DEFAULT_VOICE_ID_LENGTH, PERSONAL_VOICE_NOT_DEFAULT } from "../shared/bot-voice.ts";
 import { mintStsToken, type StsProvider } from "../shared/sts-tokens.ts";
 import {
-  resolveStsProvider,
   StsMintThrottle,
   stsKeyStatus,
+  stsStatusBody,
   stsTokenRequest,
   stsUnavailableReason,
 } from "./sts-access.ts";
@@ -16404,7 +16404,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // build does not mint for.
       const stored = stsTokenRequest.safeParse({ provider: cfg.sts?.provider });
       const preference = stored.success ? stored.data.provider : null;
-      return json(res, 200, { ...keys, provider: resolveStsProvider(keys, preference).provider });
+      return json(res, 200, stsStatusBody(keys, preference));
     }
     if (method === "POST" && path === "/api/sts/token") {
       // Parsed here, at the door: everything below works on a provider, not

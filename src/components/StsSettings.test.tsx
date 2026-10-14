@@ -11,16 +11,19 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { z } from "zod";
 
 import {
   StsConfigResponseSchema,
+  StsKeyStatusSchema,
   StsSettings,
   describeStsConfigFailure,
   stsEffectiveFrontEngine,
   stsEffectiveProvider,
   stsKeyNotice,
+  type StsConfigResponse,
+  type StsKeyStatusPayload,
 } from "./StsSettings";
 import { STS_PROVIDERS } from "@/lib/sts";
 
@@ -155,6 +158,13 @@ describe("StsSettings", () => {
     const html = render();
     expect(html).not.toContain("&nbsp;");
     expect(html).toContain("\u00A0");
+  });
+});
+
+describe("panel schemas export their inferred types", () => {
+  it("derives the config and key-status types from the parsers", () => {
+    expectTypeOf<StsConfigResponse>().toEqualTypeOf<z.infer<typeof StsConfigResponseSchema>>();
+    expectTypeOf<StsKeyStatusPayload>().toEqualTypeOf<z.infer<typeof StsKeyStatusSchema>>();
   });
 });
 

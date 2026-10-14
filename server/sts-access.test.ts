@@ -1,13 +1,21 @@
 // The policy a paired phone depends on when it asks this computer for a voice
 // token.  The invariant under test: the phone learns whether a provider is
 // set up and receives a short-lived token, and never a permanent key.
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
+import type { z } from "zod";
+
 import {
   resolveStsProvider,
+  StsErrorBodySchema,
   StsMintThrottle,
+  StsStatusSchema,
   stsKeyStatus,
+  stsStatusBody,
   stsTokenRequest,
   stsUnavailableReason,
+  type StsErrorBody,
+  type StsStatus,
+  type StsTokenRequest,
 } from "./sts-access.ts";
 
 describe("key status", () => {
@@ -71,6 +79,32 @@ describe("provider resolution matches the desktop", () => {
       provider: "xai",
       reason: "auto-only-key",
     });
+  });
+});
+
+describe("the status schema is the type the route publishes", () => {
+  it("infers each added schema instead of a hand-written mirror", () => {
+    expectTypeOf<StsStatus>().toEqualTypeOf<z.infer<typeof StsStatusSchema>>();
+    expectTypeOf<StsTokenRequest>().toEqualTypeOf<z.infer<typeof stsTokenRequest>>();
+    expectTypeOf<StsErrorBody>().toEqualTypeOf<z.infer<typeof StsErrorBodySchema>>();
+  });
+
+  it("publishes the key booleans and the provider a call would use", () => {
+    // Preference has no key, so Auto takes Gemini.  The body is that
+    // decision, not a second copy of the preference.
+    expect(stsStatusBody({ xai: false, gemini: true }, "xai")).toEqual({
+      xai: false,
+      gemini: true,
+      provider: "gemini",
+    });
+  });
+
+  it("refuses a body that drops the provider or smuggles another field", () => {
+    expect(StsStatusSchema.safeParse({ xai: true, gemini: false }).success).toBe(false);
+    expect(
+      StsStatusSchema.safeParse({ xai: true, gemini: false, provider: null, token: "secret" }).success,
+    ).toBe(false);
+    expect(StsStatusSchema.safeParse({ xai: true, gemini: false, provider: "openai" }).success).toBe(false);
   });
 });
 

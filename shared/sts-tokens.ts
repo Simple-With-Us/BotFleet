@@ -106,13 +106,14 @@ export function geminiCredential(
  *  because this is a vendor body: xAI adds fields without notice, and an extra
  *  field must not fail an otherwise valid token.  Stated here so the tolerance
  *  reads as a decision rather than an omission. */
-const xaiEnvelope = z
+export const xaiEnvelope = z
   .object({ value: z.string().optional(), token: z.string().optional() })
   .passthrough();
+export type XaiEnvelope = z.infer<typeof xaiEnvelope>;
 
 // The third shape matters: the body itself is a candidate, so a top-level
 // `{ value }` is accepted as well as the nested ones.
-const xaiMintBody = z
+export const xaiMintBody = z
   .object({
     client_secret: xaiEnvelope.optional(),
     clientSecret: xaiEnvelope.optional(),
@@ -120,9 +121,11 @@ const xaiMintBody = z
     token: z.string().optional(),
   })
   .passthrough();
+export type XaiMintBody = z.infer<typeof xaiMintBody>;
 
 /** Gemini returns the token itself in `name`, and nothing else we need. */
-const geminiMintBody = z.object({ name: z.string().optional() }).passthrough();
+export const geminiMintBody = z.object({ name: z.string().optional() }).passthrough();
+export type GeminiMintBody = z.infer<typeof geminiMintBody>;
 
 /** POST to a vendor mint endpoint, translating transport failures into
  *  sentences a person can act on.  Without this, a dead network surfaces as
