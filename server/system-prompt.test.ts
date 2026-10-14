@@ -47,7 +47,7 @@ function oldDirectLanePrompt(f: DirectLaneFixture): string {
     f.playbooks +
     f.automation +
     (f.tagged.length
-      ? ` The user tagged ${f.tagged.map((t) => `@${t.name} (ask_bot bot_id ${t.id})`).join(" and ")} in their message — bring them in with ask_bot and fold their reply into your answer.`
+      ? ` The user tagged ${f.tagged.map((t) => `@${t.name} (coordinate_bots bot_ids ["${t.id}"])`).join(" and ")} in their message — bring them in with coordinate_bots and fold their result into your answer once it comes back.`
       : "")
   );
 }
@@ -71,7 +71,7 @@ function directLaneParts(f: DirectLaneFixture): PromptPart[] {
       id: "mentions",
       label: "Mentions",
       text: f.tagged.length
-        ? ` The user tagged ${f.tagged.map((t) => `@${t.name} (ask_bot bot_id ${t.id})`).join(" and ")} in their message — bring them in with ask_bot and fold their reply into your answer.`
+        ? ` The user tagged ${f.tagged.map((t) => `@${t.name} (coordinate_bots bot_ids ["${t.id}"])`).join(" and ")} in their message — bring them in with coordinate_bots and fold their result into your answer once it comes back.`
         : "",
     },
   ];

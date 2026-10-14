@@ -68,6 +68,13 @@ export function credentialPromptFor(availableAgentTools: readonly string[]): str
     : "";
 }
 
+/** The sign-in card sentence — only when this turn can call `request_sign_in`. */
+export function signInPromptFor(availableAgentTools: readonly string[]): string {
+  return availableAgentTools.includes("request_sign_in")
+    ? " When a task needs a website sign-in, use request_sign_in so the person can sign in on the computer where you work. Never ask them to paste a password or one-time code into chat."
+    : "";
+}
+
 /** The routines sentence.  Full wording (list + propose) when the
  *  confirmation-card tools are present; a shorter, still-true sentence when
  *  only the read-only `list_routines` is (today's MiniMax bot); nothing

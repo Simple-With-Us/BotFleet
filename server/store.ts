@@ -22,6 +22,7 @@ import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
 import { withoutNestedFallbacks } from "../shared/model-limits.ts";
 import type { BotVoices } from "../shared/bot-voice.ts";
+import type { SignInRequestCardData } from "../shared/sign-in-request.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
@@ -81,6 +82,8 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** When true, always-allow on this card needs an extra write-tool warning. */
+  allowKeyWarnWrite?: boolean;
   /** Local actions never share remembered grants with cloud/tool approvals. */
   approvalScope?: "local-computer" | "disposable-computer";
   /** A durable chat-created routine proposal. The scheduler only applies it
@@ -131,7 +134,7 @@ export interface Message {
   /** On a routine's prompt message:  the routine's command allowlist
    *  (server/tool-policy.ts), so a re-dispatch of this message is held to it. */
   toolPolicy?: ToolPolicy;
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "sign-in";
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
@@ -160,6 +163,8 @@ export interface Message {
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  /** A website sign-in the person completes on the computer.  Never a password. */
+  signIn?: SignInRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the same chip as
    * a phrase a voice can read ("reading a file") — computed once here so
    * call mode never has to re-derive it from the raw tool name, and absent
@@ -552,6 +557,13 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
       error: out.secret.error ? redactSecretsInText(out.secret.error) : undefined,
     };
   }
+  if (out.signIn) {
+    out.signIn = {
+      ...out.signIn,
+      reason: redactSecretsInText(out.signIn.reason),
+      error: out.signIn.error ? redactSecretsInText(out.signIn.error) : undefined,
+    };
+  }
   return out;
 }
 
@@ -638,6 +650,8 @@ export interface BotRecord {
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
+  /** Optional subset of config `mcpServers` this bot may mount; absent = all enabled. */
+  mcpServers?: string[];
   /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
    * HTTP / openai-compat). Unset = DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts),
    * which DEFAULT_TURN_LOOP_BUDGET.maxRounds is derived from.

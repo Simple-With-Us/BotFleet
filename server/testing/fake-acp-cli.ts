@@ -91,7 +91,8 @@
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { z } from "zod";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
 const LINGERING_CHILD_MODES = new Set(["cancel-exits-with-child", "exit-with-lingering-child", "happy-with-lingering-child"]);
@@ -177,7 +178,7 @@ const configOptions = () => {
 // (`auto`). Off unless FAKE_ACP_SESSION_MODELS is set, so every existing mode
 // stays byte-identical. Format: "id|Name,id|Name" — the name is optional.
 const acpModels = (process.env.FAKE_ACP_SESSION_MODELS ?? "")
-  .split(",")
+  .split(/,(?![^[]*\])/)
   .filter(Boolean)
   .map((entry) => {
     const [modelId, name] = entry.split("|");
@@ -301,6 +302,16 @@ const rpcMethods: string[] = [];
 const recordMethod = (method: string) => {
   rpcMethods.push(method);
   if (process.env.FAKE_ACP_RPC_DUMP) writeFileSync(process.env.FAKE_ACP_RPC_DUMP, JSON.stringify(rpcMethods));
+  if (process.env.FAKE_ACP_RPC_APPEND_FILE) {
+    try {
+      appendFileSync(
+        process.env.FAKE_ACP_RPC_APPEND_FILE,
+        JSON.stringify({ pid: process.pid, method, cwd: process.cwd() }) + "\n",
+      );
+    } catch {
+      // test-only
+    }
+  }
 };
 if (mode === "hang-exit-gated") {
   process.on("SIGTERM", () => {
@@ -313,8 +324,22 @@ if (mode === "hang-exit-gated") {
   });
 }
 
-// session/set_mode + session/set_model calls seen this run
+// session/set_mode + session/set_model calls seen this run (and prior runs when
+// FAKE_ACP_DUMP is set — each turn spawns a fresh child, so tests that assert
+// multi-turn wiring read accumulated calls from the dump sidecar).
+const configCallFile = z.array(z.object({ method: z.string(), params: z.unknown() }).strict());
 const configCalls: Array<{ method: string; params: unknown }> = [];
+if (process.env.FAKE_ACP_DUMP) {
+  const priorConfig = `${process.env.FAKE_ACP_DUMP}.config.json`;
+  if (existsSync(priorConfig)) {
+    try {
+      const parsed = configCallFile.safeParse(JSON.parse(readFileSync(priorConfig, "utf8")));
+      if (parsed.success) configCalls.push(...parsed.data);
+    } catch {
+      // test-only
+    }
+  }
+}
 
 // pending server→client permission request id → resolver
 let pendingPermissionId: number | null = null;
@@ -425,7 +450,7 @@ function handle(msg: any, resumed = false) {
         process.stderr.write("fake-acp: simulated crash before result\n");
         process.exit(3);
       }
-      const authMethods = mode === "no-auth" ? [] : [{ id: "cached_token" }];
+      const authMethods = mode === "no-auth" ? [] : [{ id: process.env.FAKE_ACP_AUTH_METHOD ?? "cached_token" }];
       const reply = () =>
         result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
       const initDelayMs = Number(process.env.FAKE_ACP_INIT_DELAY_MS ?? "0");
@@ -480,15 +505,18 @@ function handle(msg: any, resumed = false) {
     }
     // per-session settings (droid sets model/autonomy here, not via argv).
     // Recorded next to FAKE_ACP_DUMP so a test can assert what was applied.
-    // NOTE: last writer wins — each turn spawns a fresh child, so a two-turn
-    // test would only ever see the final turn's calls.
+    // Prior calls are loaded at process start so multi-turn tests accumulate.
     case "session/set_mode":
     case "session/set_model": {
       if (mode === "no-session-config") {
         // an older agent that predates these methods
         return out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
       }
-      if (mode === "set-model-invalid-params" && msg.method === "session/set_model") {
+      if (
+        msg.method === "session/set_model" &&
+        (mode === "set-model-invalid-params" ||
+          (mode === "set-model-invalid-after-first" && configCalls.some((call) => call.method === "session/set_model")))
+      ) {
         // an agent whose ACP model namespace does not contain the id it was
         // sent — Cursor's answer when handed an argv slug like `auto`.
         // The reason rides in `data`, as grok 1.0.46 sends it for a model its
@@ -740,7 +768,7 @@ function handle(msg: any, resumed = false) {
         void driveMcp(agentsMcp, [
           { name: "list_bots", args: () => ({}) },
           {
-            name: "ask_bot",
+            name: "coordinate_bots",
             args: (list) => ({ bot_id: /id: ([\w-]+)/.exec(list)?.[1] ?? "", message: "ping from fake" }),
           },
         ])
@@ -765,9 +793,9 @@ function handle(msg: any, resumed = false) {
             }),
           },
           {
-            name: "delegate_bot",
+            name: "coordinate_bots",
             args: (created) => ({
-              bot_id: /id: ([\w-]+)/.exec(created)?.[1] ?? "",
+              bot_ids: [/id: ([\w-]+)/.exec(created)?.[1] ?? ""],
               message: "Review the new onboarding flow.",
               reason: "design review",
             }),
@@ -813,9 +841,9 @@ function handle(msg: any, resumed = false) {
         void driveMcp(agentsMcp, [
           { name: "list_bots", args: () => ({}) },
           {
-            name: "delegate_bot",
+            name: "coordinate_bots",
             args: (list) => ({
-              bot_id: /id: ([\w-]+)/.exec(list)?.[1] ?? "",
+              bot_ids: [/id: ([\w-]+)/.exec(list)?.[1] ?? ""],
               message: "delegated task",
               reason: "followup",
             }),

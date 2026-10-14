@@ -52,13 +52,12 @@ const calls = (id: string, name: string, args: Record<string, unknown> = {}) => 
   ],
 });
 
-/** One round that asks for `ask_bot` — the registry's only write tool
- *  today, and so the only one carrying an `approval` record. */
+/** One round that asks for `coordinate_bots`, the peer write tool. */
 const asksToDelegate = (task: string) => ({
   kind: "sse" as const,
   frames: [
-    `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ask","function":{"name":"ask_bot","arguments":${JSON.stringify(
-      JSON.stringify({ bot_id: "@scout", task }),
+    `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ask","function":{"name":"coordinate_bots","arguments":${JSON.stringify(
+      JSON.stringify({ bot_ids: ["@scout"], message: task }),
     )}}}]}}]}`,
     "[DONE]",
   ],
@@ -317,7 +316,7 @@ posixOnly("room turns run on the HTTP lane", () => {
       // change.  It is the SAME `buildTurnTools(integrations)` the 1:1 path
       // builds, so the two surfaces cannot drift apart again.
       expect(offered).toContain("list_bots");
-      expect(offered).toContain("ask_bot");
+      expect(offered).toContain("coordinate_bots");
 
       // and the host actually ran it: the peer roster came back into round 2
       const fed = (rounds[1].body as { messages?: Array<{ role: string; content: string }> }).messages?.find(
@@ -463,7 +462,7 @@ posixOnly("room turns run on the HTTP lane", () => {
         return open ?? null;
       }, 30_000);
       expect(card, `no approval card opened on the room thread. stderr:\n${stderr}`).toBeTruthy();
-      expect(card!.card!.tool).toBe("ask_bot");
+      expect(card!.card!.tool).toBe("coordinate_bots");
 
       // Sit on it for longer than the whole room budget.  Waiting on a
       // person is not turn work: the deadline holds, so a slow decision
