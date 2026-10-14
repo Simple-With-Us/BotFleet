@@ -15,9 +15,9 @@
 //     zero; it carries another bot's words and nobody is watching it, so it
 //     never gets an uncarded way to post as this bot.
 //
-// Webhook, iMessage, Linq, resource and job turns carry outside text with
-// nobody watching, so they get nothing.  And nothing is mounted unless the
-// bot's own Zulip session is connected and not in a dry run.
+// Webhook, manual replay, iMessage, Linq, resource and job turns carry
+// outside text with nobody watching, so they get nothing.  And nothing is
+// mounted unless the bot's own Zulip session is connected and not in a dry run.
 
 export interface ZulipMountInput {
   /** The turn's automation source, when an automation started it. */

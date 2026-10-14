@@ -75,12 +75,28 @@ const routineScheduleResponse = z.discriminatedUnion("type", [
   z.object({ type: z.literal("once"), at: z.number() }).strict(),
   z.object({ type: z.literal("daily"), time: z.string(), weekdays: z.array(z.number()), timeZone: z.string().optional() }).strict(),
 ]);
+// Mirrors server/tool-policy.ts's allowlist.  The routine object is strict, so
+// a command allowlist has to be named here or a successful PATCH of a routine
+// that has one throws and the panel shows a schema trace.
+const routineToolPolicyResponse = z.object({
+  mode: z.literal("allowlist"),
+  commands: z.array(z.object({
+    argv0: z.string(),
+    sub: z.array(z.string()).optional(),
+    flags: z.record(z.string(), z.object({ value: z.string() }).catchall(z.unknown())).optional(),
+    args: z.array(z.object({ value: z.string() }).catchall(z.unknown())).optional(),
+    positionals: z.number().optional(),
+  }).strict()),
+  writePaths: z.array(z.string()),
+  readPaths: z.array(z.string()),
+}).strict();
 const routineResponse = z.object({
   routine: z.object({
     id: z.string(), name: z.string(), prompt: z.string(), botId: z.string(),
     runOn: z.enum(["bot", "cloud"]), enabled: z.boolean(), schedule: routineScheduleResponse,
     scheduleTimeZoneSource: z.enum(["stored", "host"]).optional(), durationMinutes: z.number(),
-    oneShotWake: z.boolean().optional(), nextRunAt: z.number().nullable(), createdAt: z.number(), updatedAt: z.number(),
+    oneShotWake: z.boolean().optional(), toolPolicy: routineToolPolicyResponse.optional(),
+    nextRunAt: z.number().nullable(), createdAt: z.number(), updatedAt: z.number(),
   }).strict(),
 }).strict();
 const webhookResponse = z.object({
