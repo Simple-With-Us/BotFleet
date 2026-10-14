@@ -309,6 +309,28 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "pending-approval-write-always") {
+  // Visual-spec harness (tests/e2e/pending-approval-write-always.visual.spec.ts):
+  // write-shaped MCP always-allow confirm dialog and approval action strip.
+  void import("./components/PendingApprovalWriteAlwaysVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "settings-always-allow") {
+  // Visual-spec harness (tests/e2e/settings-always-allow.visual.spec.ts):
+  // Agent settings Always allowed empty and populated revoke list.
+  void import("./components/SettingsAlwaysAllowVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else {
   createRoot(rootElement).render(
     <StrictMode>

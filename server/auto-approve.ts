@@ -426,6 +426,8 @@ export function autoVerdict(
      *  path its driver carried (server/path-containment.ts).  Absent for
      *  every tool whose driver carries no path; nothing is guessed then. */
     fileWrite?: FileWriteCheck;
+    /** Exact configured MCP tool grant key when this ask is eligible. */
+    mcpToolAllowKey?: string | null;
   },
 ): AutoVerdict {
   // Permission bypass is still an auto-approval grant, so the local-computer
@@ -484,14 +486,20 @@ export function autoVerdict(
   // too long for the card before any card is shown, so this is what keeps a
   // lookalike tool's cut summary from riding an Auto grant.)
   const unsafeCommand = jobTool ? truncatedJobSummary(summary) : unsafeCommandSummary(tool, summary);
+  const mcpKey = context?.mcpToolAllowKey ?? null;
+  const mcpGrant =
+    !destructive && !sensitive && !systemChange && !unsafeCommand && !jobTool && mcpKey && bot.alwaysAllow?.includes(mcpKey)
+      ? { approve: `auto-approved ${tool} (always allowed)`, source: "always-allow" as const, rule: mcpKey }
+      : null;
   const grant =
     destructive || sensitive || systemChange || unsafeCommand
       ? null
-      : !jobTool && bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
-        ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
-        : bot.autoApprove
-          ? { approve: `auto-approved ${jobTool ? key : tool}`, source: "auto-mode" as const, rule: jobTool ? key : undefined }
-          : null;
+      : mcpGrant
+        ?? (!jobTool && bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
+          ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
+          : bot.autoApprove
+            ? { approve: `auto-approved ${jobTool ? key : tool}`, source: "auto-mode" as const, rule: jobTool ? key : undefined }
+            : null);
   if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
   if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
   if (systemChange) return { approve: null, source: "system-guard", rule: systemChange };
