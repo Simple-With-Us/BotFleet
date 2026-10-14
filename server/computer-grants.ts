@@ -439,6 +439,40 @@ interface RemoteComputerStatus {
   sshAlias?: string | null;
   container_id?: string | null;
   problem?: string | null;
+  /** True when SSH and Docker answered.  A stopped desktop that answered
+   * is a switch the person can flip; a check that never answered is the
+   * connection. */
+  daemonUp?: boolean;
+}
+
+/** The one way on an Auto turn names when this bot's VPS is unavailable,
+ * fitted to what its check found.  `reachable` is true when SSH and Docker
+ * answered and the desktop is down, false when the VPS never answered, and
+ * undefined when the check threw. */
+export function vpsUnavailableHint(input: {
+  automationSource?: string;
+  autoStartVps?: boolean;
+  reachable?: boolean;
+}): string {
+  if (input.automationSource) {
+    const kind = input.automationSource === "schedule" ? "scheduled run" : "automation run";
+    return `This ${kind} tried to start the VPS computer and could not reach it.  Check the VPS connection in App Settings → Connections.`;
+  }
+  if (input.autoStartVps || input.reachable === false) {
+    return "Check the VPS connection in App Settings → Connections.";
+  }
+  return input.reachable
+    ? "Open Computer and enable Start VPS automatically, or choose Cloud to start it manually."
+    : "";
+}
+
+/** Scheduled and other unattended automation still fail when the VPS is
+ * unreachable: nobody is there to read a reply, and the work is the screen.
+ * A person chatting, a delegated turn, and a live iMessage or Zulip thread
+ * run, and the model is told why no computer is mounted. */
+export function autoVpsOutageFailsTurn(automationSource?: string): boolean {
+  if (!automationSource) return false;
+  return automationSource !== "delegation" && automationSource !== "imessage" && automationSource !== "zulip";
 }
 
 /** What the resolver needs from the running harness.  `Lease` is the VPS turn
@@ -509,6 +543,10 @@ export interface TurnComputerMounts<Lease = unknown> {
    * Deliberately independent of `mounts`: a toolLoop engine has host tools
    * through the harness executor whether or not CUA Driver is running. */
   hasHostComputer: boolean;
+  /** Set when Auto's VPS is unreachable and this turn still runs.  Empty
+   * when a computer mounted, the turn was cancelled, or the outage failed
+   * the turn instead.  The dispatcher appends it to the computer prompt. */
+  unavailableNote: string;
 }
 
 /** Resolve every computer this bot may hold for this turn.
@@ -527,6 +565,10 @@ export interface ResolveTurnComputerMountsInput<Lease> {
   runOn?: string;
   /** Whether this turn is running unattended (e.g. routine or webhook). */
   unattended?: boolean;
+  /** What started a turn nobody typed.  Scheduled and other automation
+   * still fail when Auto's VPS cannot be reached.  A chat, a delegation,
+   * and a live message run with `unavailableNote` instead. */
+  automationSource?: string;
   /** The operator-level allowlist, already read off the config. */
   allowed: ComputerDestination[] | null;
   deps: TurnComputerDeps<Lease>;
@@ -607,18 +649,22 @@ export async function resolveTurnComputerMounts<Lease>(
 async function resolveMounts<Lease>(
   input: ResolveTurnComputerMountsInput<Lease>,
 ): Promise<TurnComputerMounts<Lease>> {
-  const { bot, cfg, engine, threadId, dispatchId, runOn, allowed, deps } = input;
+  const { bot, cfg, engine, threadId, dispatchId, runOn, allowed, deps, automationSource } = input;
   const hostPlatform = deps.hostPlatform;
   let previewCapture: (() => Promise<{ png: string; format: string }>) | null = null;
   let vpsLease: Lease | undefined;
   const mounts: ComputerMount[] = [];
   let autoVpsProblem: string | null = null;
+  /** Whether Auto's VPS check reached SSH and Docker.  Undefined when the
+   * check threw: the problem already says what happened. */
+  let autoVpsReachable: boolean | undefined;
   const stopped = (): TurnComputerMounts<Lease> => ({
     mounts: [],
     previewCapture,
     vpsLease,
     cancelled: true,
     hasHostComputer: false,
+    unavailableNote: "",
   });
 
   // Every destination the person granted, not just the first.  A grant is a
@@ -786,6 +832,7 @@ async function resolveMounts<Lease>(
         autoVpsProblem = msg;
       }
       if (!(await deps.checkpoint())) return stopped();
+      if (remote) autoVpsReachable = remote.daemonUp === true;
       if (remote?.ready && remote.sshAlias) {
         const targetCfg = { ...cfg, vps: { sshAlias: remote.sshAlias } };
         const vpsMcp = deps.vps.vpsComputerMcp(targetCfg, bot.id, remote.container_id ?? undefined);
@@ -897,11 +944,19 @@ async function resolveMounts<Lease>(
       mounts.push({ name: "", label: computerLabel("local", hostPlatform), kind: "local", stdio: cua });
     }
   }
+  let unavailableNote = "";
   if (autoCloud && cloudBackend === "vps" && mounts.length === 0 && autoVpsProblem) {
-    const hint = bot.autoStartVps
-      ? "Check the VPS connection in App Settings → Connections."
-      : "Open Computer and enable Start VPS automatically, or choose Cloud to start it manually.";
-    throw new Error(`${autoVpsProblem}. ${hint}`);
+    const fails = autoVpsOutageFailsTurn(automationSource);
+    const hint = vpsUnavailableHint({
+      automationSource: fails ? automationSource : undefined,
+      autoStartVps: bot.autoStartVps,
+      reachable: autoVpsReachable,
+    });
+    if (fails) throw new Error(`${autoVpsProblem}.  ${hint}`);
+    unavailableNote =
+      `This bot's VPS computer is unavailable this turn (${autoVpsProblem}), so no computer is mounted.  ` +
+      "Work that needs no screen can go ahead.  If the request needs the VPS desktop, do not claim to have used it: " +
+      `say it is unavailable${hint ? ` and what the person can do: ${hint}` : "."}`;
   }
 
   // The Local VM degraded but no other granted computer actually resolved:
@@ -912,7 +967,7 @@ async function resolveMounts<Lease>(
 
   // Name the servers once, here, so a room turn and a direct turn hand the
   // driver byte-identical mounts.
-  return { mounts: nameMounts(mounts), previewCapture, vpsLease, cancelled: false, hasHostComputer };
+  return { mounts: nameMounts(mounts), previewCapture, vpsLease, cancelled: false, hasHostComputer, unavailableNote };
 }
 
 /** Hand every grant to the driver, on whichever lane resolved it.

@@ -62,6 +62,7 @@ import { ChatFindBar } from "./ChatFindBar";
 import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
+import { SignInRequestCard } from "./SignInRequestCard";
 import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { ModelPicker } from "./ModelPicker";
 import { RenameTitle } from "./RenameTitle";
@@ -556,6 +557,12 @@ function Bubble({
         {alignRight && !humanTyped && botChrome}
         <div
           onClick={handleBubbleClick}
+          /* Per-bubble identity for assistive tech.  Without this the bubble is
+           * an anonymous div and a screen reader announces only the prose — no
+           * indication of who spoke or when.  `article` plus a speaker/time
+           * label keeps the transcript navigable by message, not by fragment. */
+          role="article"
+          aria-label={`${humanTyped ? "You" : (message.from?.name ?? bot.name)}, ${formatTime(message.at)}`}
           className={cn(
             BUBBLE_WIDTH,
             "rounded-2xl text-[15px] leading-relaxed cursor-pointer select-text relative",
@@ -865,6 +872,8 @@ const MessagesList = memo(function MessagesList({
           switch (m.kind) {
             case "secret":
               return m.secret ? <SecretRequestCard botId={bot.id} threadId={bot.threadId} message={m} /> : null;
+            case "sign-in":
+              return m.signIn ? <SignInRequestCard botId={bot.id} threadId={bot.threadId} message={m} /> : null;
             case "connector":
               return m.connector ? <ConnectorCard botId={bot.id} threadId={bot.threadId} message={m} /> : null;
             case "options":
@@ -1762,7 +1771,20 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
              * settled `popping` message arrives it takes over and animates
              * into place, so we never render both at once. */}
             {!popping && streaming ? (
-              <div className={cn(BUBBLE_WIDTH, "rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink")}>
+              /* `aria-live="off"` is load-bearing, not decoration.  This whole
+               * transcript sits inside a `role="log" aria-live="polite"`
+               * region, so by default every token frame rewrites a live node
+               * and a screen reader re-announces the entire bubble on each
+               * one — a 30-second turn becomes hundreds of interruptions.
+               * Nesting an off-region here stops that; the SETTLED bubble
+               * below carries the real text and is announced once, when it
+               * lands. `aria-busy` conveys "still generating" to AT that
+               * understands it. */
+              <div
+                aria-live="off"
+                aria-busy="true"
+                className={cn(BUBBLE_WIDTH, "rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink")}
+              >
                 <MessageBoundary fallbackText={streaming}>
                   <ChatMarkdown text={streaming} streaming />
                 </MessageBoundary>

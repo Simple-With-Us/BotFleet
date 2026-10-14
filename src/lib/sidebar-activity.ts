@@ -34,7 +34,7 @@ export type BotLocation =
   | { kind: "task"; threadId: string; title: string };
 
 const MESSAGED_PREFIX = "Messaged @";
-const DELEGATED_PREFIX = "Delegated to @";
+const HANDOFF_PREFIXES = ["Delegated to @", "Handed to @"];
 
 /** The still-open card at the tail of a thread, if any. Answered/dismissed
  * cards are not open — the harness only ever pauses a bot for a LIVE ask. */
@@ -48,7 +48,7 @@ function openCardOf(last: Message | undefined): OptionCardData | undefined {
  * — never parsed out of the card's prose title, which is copy and may
  * change under it. */
 function peerApprovalTeammate(card: OptionCardData | undefined, bots: Bot[]): string | undefined {
-  if (card?.tool !== "ask_bot" && card?.tool !== "delegate_bot") return undefined;
+  if (card?.tool !== "ask_bot" && card?.tool !== "delegate_bot" && card?.tool !== "coordinate_bots") return undefined;
   const targetId = card.allowKey?.split(":")[1];
   return targetId ? bots.find((bot) => bot.id === targetId)?.name : undefined;
 }
@@ -61,8 +61,9 @@ function outboundTeammate(last: Message | undefined, bots: Bot[]): string | unde
   const name = last.tool?.name;
   if (!name) return undefined;
   if (last.comm && name.startsWith(MESSAGED_PREFIX)) return last.comm.withName;
-  if (name.startsWith(DELEGATED_PREFIX)) {
-    const label = name.slice(DELEGATED_PREFIX.length).split(/[:\n]/, 1)[0]?.trim();
+  const prefix = HANDOFF_PREFIXES.find((item) => name.startsWith(item));
+  if (prefix) {
+    const label = name.slice(prefix.length).split(/[:\n]/, 1)[0]?.trim();
     return label && bots.some((bot) => bot.name === label) ? label : undefined;
   }
   return undefined;

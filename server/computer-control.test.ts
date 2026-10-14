@@ -65,6 +65,17 @@ describe("computer control", () => {
     expect(changes.map((change) => change.snapshot.held)).toEqual([true]);
   });
 
+  it("a sign-in Done releases a plain hold and leaves a workspace lease", () => {
+    const { control } = tracked();
+    control.take("b1");
+    expect(control.releasePlainHold("b1").held).toBe(false);
+
+    const leaseId = "5b6bbbd2-b88b-4c50-a748-ec87f332662f";
+    control.acquireLease("b1", leaseId);
+    expect(control.releasePlainHold("b1").held).toBe(true);
+    expect(control.snapshot("b1").held).toBe(true);
+  });
+
   it("conditionally releases only the matching workspace lease", () => {
     const { control, changes } = tracked();
     const owner = "33e62f3a-89d9-4117-b48a-15f7deae3252";
