@@ -347,5 +347,50 @@ reset_fail_ledger
 # this point can still exit without ever touching the log file.
 rotate_log_if_large
 
+# ── the Infisical machine identity ──────────────────────────────────────
+# Read out of the fleet's own secret file, and nothing else out of it.
+#
+# This one credential is deliberately not in the vault -- a lock cannot hold
+# its own key -- and not in config.json, which is plaintext, because it can
+# read every name in the project.  That leaves exactly one place a
+# launchd-started harness can get it, and without it the harness comes up
+# "Infisical is not configured" and silently drops every vault-backed
+# credential: the speech-to-speech keys, Zulip's per-role keys, the lot.
+#
+# The desktop app can also replay the identity into a running harness, but
+# only while it is attached -- `before-quit` stops the replay on purpose,
+# because the always-on harness outlives it.  A crash, an update, or a manual
+# restart therefore leaves nothing to restore it, which is exactly when it
+# is most needed.
+#
+# The values are extracted rather than sourced: `ps eww` prints a process
+# environment and that file holds every fleet secret, so only the identity
+# belongs in this process.  A missing or unreadable file is not fatal -- the
+# harness still starts, and the desktop app can still supply it in memory.
+global_secret() {
+  local name="$1" file="$HOME/.secrets/global-api-keys" line
+  [ -r "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$name="*)
+        line="${line#"$name="}"
+        # Strip one layer of wrapping quotes if the file uses them.
+        case "$line" in
+          \"*\") line="${line#\"}"; line="${line%\"}" ;;
+          \'*\') line="${line#\'}"; line="${line%\'}" ;;
+        esac
+        printf '%s' "$line"
+        return 0
+        ;;
+    esac
+  done < "$file"
+}
+
+if [ -r "$HOME/.secrets/global-api-keys" ]; then
+  : "${INFISICAL_CLIENT_ID:=$(global_secret INFISICAL_AUTOMATION_CLIENT_ID)}"
+  : "${INFISICAL_CLIENT_SECRET:=$(global_secret INFISICAL_AUTOMATION_CLIENT_SECRET)}"
+  export INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
+fi
+
 cd "$ROOT"
 exec "$NODE" --experimental-strip-types server/index.ts
