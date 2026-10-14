@@ -35,12 +35,15 @@ export const FINISHED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
-/** One saved handoff.  Extra legacy fields, such as depth, are ignored. */
+/** One saved handoff.  The old queue also stored depth and other fields.
+ *  Passthrough keeps those keys on the parsed object and the import never
+ *  reads them, so a valid handoff still comes in.  Strict would skip the
+ *  row and drop the work. */
 const legacyItemSchema = z.object({
   toBotId: z.string().min(1),
   message: z.string().min(1),
   reason: z.string().optional(),
-});
+}).passthrough();
 
 const legacyQueueSchema = z.record(z.string(), z.unknown());
 const legacyListSchema = z.array(z.unknown());
