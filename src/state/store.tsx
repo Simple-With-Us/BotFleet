@@ -2508,7 +2508,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return result.bot;
         },
         reconcile: async (botId, signal) => {
-          const result: { bots: BotAnnouncement[] } = await api("/api/bots", { signal });
+          // `?messages=0` — this only needs the bot row to roll the optimistic
+          // patch back, never the transcript. Unpaged, the server answered with
+          // every bot's and group's full history, so one rejected PATCH
+          // serialized megabytes of transcript per conflict (BF-2424).
+          const result: { bots: BotAnnouncement[] } = await api("/api/bots?messages=0", { signal });
           return result.bots.find((candidate) => candidate.id === botId) ?? null;
         },
         onAuthoritative: (bot, optimisticOverlay) => {

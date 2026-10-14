@@ -1357,6 +1357,32 @@ describe("Store thread cache", () => {
     expect(store.threadIsCachedForTests(b.threadId)).toBe(false);
   });
 
+  // BF-2424: the unpaginated GET /api/bots path answers with a thread's whole
+  // transcript for every bot AND every group in one request. It must not cache
+  // them — messagesFor pins a thread for the life of the process, and the LRU
+  // bounds the thread COUNT rather than a thread's size, so a single
+  // unpaginated poll was enough to hold the entire database in the heap.
+  it("messagesForTransient returns the whole transcript without pinning it in the LRU", () => {
+    const setup = new Store(selection);
+    const target = setup.createBot({ name: "Transient" }, { seedMessages: false });
+    setup.appendMessage(target.threadId, { role: "user", kind: "text", text: "one" });
+    setup.appendMessage(target.threadId, { role: "bot", kind: "text", text: "two" });
+
+    const store = new Store(selection);
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(false);
+
+    // same bytes out as the caching read...
+    expect(store.messagesForTransient(target.threadId).map((m) => m.text)).toEqual(["one", "two"]);
+    // ...and nothing retained for the life of the process
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(false);
+
+    // an already-warm thread still serves from memory, and stays warm: the
+    // transient read must not evict what other work legitimately cached
+    store.messagesFor(target.threadId);
+    expect(store.messagesForTransient(target.threadId).map((m) => m.text)).toEqual(["one", "two"]);
+    expect(store.threadIsCachedForTests(target.threadId)).toBe(true);
+  });
+
   it("appendMessage after eviction stays consistent with what is durable on disk", () => {
     const setup = new Store(selection);
     const target = setup.createBot({ name: "Target" }, { seedMessages: false });

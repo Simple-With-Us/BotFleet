@@ -1763,6 +1763,32 @@ export class Store {
     return this.thread(threadId).messages;
   }
 
+  /** The full transcript for a read-only response, WITHOUT pinning the thread
+   *  in the LRU. `messagesFor` caches every thread it hydrates, and
+   *  GET /api/bots without `?messages=` calls it for every bot AND every
+   *  group in one request — so a single unpaginated poll pulled the whole
+   *  database into the heap and kept it there. The LRU bounds the thread
+   *  COUNT, not a thread's size: 64 fully-hydrated threads with inline
+   *  base64 captures measured 74 GB RSS over one working day, which on this
+   *  16 GB Mac drove swap until the disk was full (BF-2424).
+   *
+   *  An already-warm thread serves straight from memory; a cold one is read,
+   *  returned, and left to the GC — the response is byte-identical either
+   *  way. Mutating callers keep using `messagesFor`, which must stay cached. */
+  messagesForTransient(threadId: string): Message[] {
+    const warm = this.threads.get(threadId);
+    if (warm) return warm.messages;
+    const { messages } = mdb.readThread(threadId, messagesFile(threadId));
+    // legacy rows carry no parentId — chain them in array order, the same
+    // fixup cacheThread() applies, so the response matches a cached read
+    let prev: string | null = null;
+    for (const m of messages) {
+      if (m.parentId === undefined) m.parentId = prev;
+      prev = m.id;
+    }
+    return messages;
+  }
+
   /** A bounded page of a thread's newest messages, for callers that only
    * need a display page — the GET /api/bots hydrate and a fresh
    * scrollback view. Reads just `limit` rows at the SQL boundary instead
