@@ -69,6 +69,8 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
+  /** Extra confirmation before always-allow on a write-shaped MCP tool. */
+  allowKeyWarnWrite?: boolean;
   approvalScope?: "local-computer" | "disposable-computer";
   /** Persisted proposal used by the server when the user confirms it. */
   routineRequest?: RoutineRequestCardData;

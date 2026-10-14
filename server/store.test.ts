@@ -371,6 +371,17 @@ describe("Store", () => {
     );
   });
 
+  it("persists provider-tool always-allow grants on the bot across restart", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchBot(bot.id, {
+      alwaysAllow: ["provider-tool:claude:linear:list_issues:abc", "Bash:git"],
+    });
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.alwaysAllow).toEqual(["provider-tool:claude:linear:list_issues:abc", "Bash:git"]);
+  });
+
   it("persists a bot's effort level across a restart, defaulting to unset", () => {
     const store = new Store(selection);
     const bot = store.createBot();
