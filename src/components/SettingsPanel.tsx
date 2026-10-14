@@ -336,7 +336,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const { capabilities } = useDesktopCapabilities();
   const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
   const localSelectable = localComputerSelectable({ capabilities, providerSupportsLocal });
-  const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | null>(null);
+  const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | "bypassLocal" | null>(null);
   const localDisabledReason = localComputerDisabledReason({ capabilities, providerSupportsLocal });
   const autoWouldUseLocal = requiresLocalAutoConsent(
     bot.computers,
@@ -378,6 +378,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "autoApprove"
         | "autoReview"
         | "bypassPermissions"
+        | "bypassLocalComputer"
         | "speakReplies"
         | "speechDevices"
         | "voice"
@@ -854,7 +855,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 </div>
                 <div className="mt-0.5 text-[13px] text-ink-secondary">
                   {bot.bypassPermissions
-                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards.  Requests that control This Mac still ask."
+                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards.  Requests that control This Mac still ask, unless Bypass Including This Mac is on."
                     : "Automatically approve all tool, command, and routine requests without stopping for manual approval cards.  Requests that control This Mac still ask."}
                 </div>
               </div>
@@ -882,6 +883,48 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 />
               </button>
             </div>
+            <div className="mt-4 flex items-center justify-between gap-4 border-t border-line pt-4">
+              <div>
+                <div className="text-[15px] font-medium text-ink">
+                  Bypass Including This Mac
+                </div>
+                <div className="mt-0.5 text-[13px] text-ink-secondary">
+                  {bot.bypassLocalComputer
+                    ? "Nothing this bot does on this Mac asks.  Including destructive actions, and including while a webhook or alert runs it with nobody watching."
+                    : "Off.  Bypass still stops before anything that controls this Mac."}
+                </div>
+              </div>
+              <button
+                role="switch"
+                aria-checked={Boolean(bot.bypassLocalComputer)}
+                aria-label="Bypass Including This Mac"
+                disabled={!bot.bypassPermissions}
+                onClick={() => {
+                  if (bot.bypassLocalComputer) {
+                    patch({ bypassLocalComputer: false });
+                  } else {
+                    setLocalAutoWarning("bypassLocal");
+                  }
+                }}
+                className={cn(
+                  "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
+                  !bot.bypassPermissions && "cursor-not-allowed opacity-50",
+                  bot.bypassLocalComputer ? "bg-danger" : "bg-control",
+                )}
+              >
+                <span
+                  className={cn(
+                    "absolute top-[3px] size-5 rounded-full bg-white transition-all",
+                    bot.bypassLocalComputer ? "left-[21px]" : "left-[3px]",
+                  )}
+                />
+              </button>
+            </div>
+            {!bot.bypassPermissions && (
+              <div className="mt-2 text-[12px] text-ink-secondary">
+                Turn on Bypass Permissions first — this only extends what Bypass already skips.
+              </div>
+            )}
             {bypassNote && (
               <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{bypassNote}</div>
             )}
@@ -959,10 +1002,19 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
     </aside>
     <LocalComputerAutoWarning
       open={localAutoWarning !== null}
+      title={localAutoWarning === "bypassLocal" ? "Allow Bypass Including This Mac?" : undefined}
+      body={
+        localAutoWarning === "bypassLocal"
+          ? "Nothing this bot does on this Mac will ask again \u2014 including destructive actions and credential files, and including while a webhook or alert runs it with nobody watching.\u00a0 Continue only if you would trust it with the machine itself."
+          : undefined
+      }
       onCancel={() => setLocalAutoWarning(null)}
       onConfirm={() => {
         if (localAutoWarning === "auto") patch({ autoApprove: true, acknowledgeLocalAuto: true });
         if (localAutoWarning === "local") patch({ computers: [...(bot.computers ?? []), "local"], acknowledgeLocalAuto: true });
+        // The same warning stands in front of the second switch: both give
+        // up the asking for the real desktop, so neither gets a quieter path.
+        if (localAutoWarning === "bypassLocal") patch({ bypassLocalComputer: true, acknowledgeLocalAuto: true });
         setLocalAutoWarning(null);
       }}
     />

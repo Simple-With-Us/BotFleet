@@ -1913,6 +1913,7 @@ type ComputerGrantSubject = {
   computer?: unknown;
   autoApprove?: boolean;
   bypassPermissions?: boolean;
+  bypassLocalComputer?: boolean;
   modelSelection?: ModelSelection;
 };
 
@@ -2049,12 +2050,17 @@ function localAutoAcknowledgementError(
     nextDefault?: Array<"cloud" | "vm" | "local">;
     currentAllowed?: Array<"cloud" | "vm" | "local"> | null;
     nextAllowed?: Array<"cloud" | "vm" | "local"> | null;
+    /** Whether the save also turns on `bypassLocalComputer`, the owner's
+     *  second switch.  It asks for the same act Auto Mode does — unattended
+     *  control of the real desktop — so it stands behind the same warning
+     *  rather than inventing a quieter path around it. */
+    nextBypassLocalComputer?: boolean;
   } = {},
 ): string | null {
   // A bot that ALREADY holds the pair keeps it: the warning was answered
   // once, and re-saving an unrelated field must not demand it again.
   const capability = botLocalAutoCapability(existing);
-  const alreadyGranted = (existing?.autoApprove === true || existing?.bypassPermissions === true) && requiresLocalAutoConsent(
+  const alreadyGranted = (existing?.autoApprove === true || existing?.bypassPermissions === true || existing?.bypassLocalComputer === true) && requiresLocalAutoConsent(
     storedComputerGrants(existing),
     context.currentDefault,
     context.currentAllowed,
@@ -2066,7 +2072,7 @@ function localAutoAcknowledgementError(
     context.nextAllowed === undefined ? context.currentAllowed : context.nextAllowed,
     capability,
   );
-  if (nextGranted && nextAutoApprove && !alreadyGranted && !acknowledged) {
+  if (nextGranted && (nextAutoApprove || context.nextBypassLocalComputer === true) && !alreadyGranted && !acknowledged) {
     return LOCAL_AUTO_ACK_ERROR;
   }
   return null;
@@ -2115,6 +2121,13 @@ const PAIRED_LOCAL_COMPUTER_ERROR =
 const PAIRED_AUTO_ON_THIS_MAC_ERROR =
   "Auto Mode can only be turned on in BotFleet on your computer for a bot that can use This Mac";
 
+/** What a paired phone is told when its save would turn Bypass Including This
+ *  Mac ON for a bot that can use This Mac.  Same act as Auto Mode and the same
+ *  reason it is refused: both leave the person's real desktop unattended, so
+ *  the warning belongs on the Mac. */
+const PAIRED_LOCAL_BYPASS_ERROR =
+  "Bypass Including This Mac can only be turned on in BotFleet on your computer for a bot that can use This Mac";
+
 /** A bot as the Auto Mode consent check should see it: its Bypass Permissions
  * left out, because bypass never answers a request that controls This Mac and
  * so is not what that warning is about (see `pairedProfileRefusal`). */
@@ -2153,11 +2166,28 @@ function withoutBypass<T extends { bypassPermissions?: boolean }>(bot: T): Omit<
  * the Auto Mode acknowledgement. */
 function pairedProfileRefusal(
   existing: ComputerGrantSubject | null | undefined,
-  patch: { computers?: Array<"cloud" | "vm" | "local">; autoApprove?: boolean },
+  patch: {
+    computers?: Array<"cloud" | "vm" | "local">;
+    autoApprove?: boolean;
+    bypassLocalComputer?: boolean;
+  },
 ): { status: number; error: string } | null {
   if (patch.computers !== undefined) {
     const heldLocal = currentComputerGrants(existing).includes("local");
     if (patch.computers.includes("local") !== heldLocal) return { status: 403, error: PAIRED_LOCAL_COMPUTER_ERROR };
+  }
+  // `bypassLocalComputer` is refused where Auto Mode is, and for the same
+  // reason: both hand a bot unattended control of the person's real desktop,
+  // and the warning in front of that is the Mac's.  Plain Bypass stays the
+  // phone's to set, per the 2026-10-09 ruling, because on its own it never
+  // reaches the desktop.
+  if (patch.bypassLocalComputer === true && requiresLocalAutoConsent(
+    patch.computers ?? storedComputerGrants(existing),
+    cfg.botDefaults?.computers,
+    consentAllowedComputers(cfg),
+    botLocalAutoCapability(existing ? withoutBypass(existing) : existing),
+  )) {
+    return { status: 403, error: PAIRED_LOCAL_BYPASS_ERROR };
   }
   const ackError = localAutoAcknowledgementError(
     existing ? withoutBypass(existing) : existing,
@@ -13901,13 +13931,22 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const wantsAuto =
         (body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true) ||
         (body.bypassPermissions !== undefined ? body.bypassPermissions : existingBot?.bypassPermissions === true);
+      // `bypassLocalComputer` asks for the same act Auto Mode does, so it is
+      // judged as Auto Mode: turning it ON for a bot that can use This Mac is
+      // the Mac's, and the warning has to stand in front of it.
+      const wantsLocalBypass =
+        body.bypassLocalComputer !== undefined
+          ? body.bypassLocalComputer
+          : existingBot?.bypassLocalComputer === true;
       // Turning Auto Mode ON is judged as Auto Mode alone.  A paired phone may
       // put a bot in Bypass Permissions without the Mac's warning (the profile
       // route, `pairedProfileRefusal`), so a bypass that was never
       // acknowledged cannot count as "already granted" here, or a request
       // without `acknowledgeLocalAuto` would slip Auto Mode in behind it.  The
       // desktop's own dialog always sends the acknowledgement in this case.
-      const turningAutoOn = body.autoApprove === true && existingBot?.autoApprove !== true;
+      const turningAutoOn =
+        (body.autoApprove === true && existingBot?.autoApprove !== true) ||
+        (body.bypassLocalComputer === true && existingBot?.bypassLocalComputer !== true);
       const ackError = localAutoAcknowledgementError(
         turningAutoOn && existingBot ? withoutBypass(existingBot) : existingBot,
         wantsComputers,
@@ -13918,6 +13957,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           nextDefault: cfg.botDefaults?.computers,
           currentAllowed: consentAllowedComputers(cfg),
           nextAllowed: consentAllowedComputers(cfg),
+          nextBypassLocalComputer: wantsLocalBypass === true,
         },
       );
       if (ackError) return json(res, 400, { error: ackError });
@@ -16664,6 +16704,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               nextDefault: cfg.botDefaults?.computers,
               currentAllowed: consentAllowedComputers(cfg),
               nextAllowed: consentAllowedComputers(cfg),
+              nextBypassLocalComputer: bot.bypassLocalComputer === true,
             }) !== null,
         )
         .map((bot) => ({ id: bot.id, name: bot.name }));
@@ -17045,6 +17086,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             nextDefault: nextDefaultComputers,
             currentAllowed: currentAllowedComputers,
             nextAllowed: nextAllowedComputers,
+            nextBypassLocalComputer: bot.bypassLocalComputer === true,
           },
         ) !== null)
         .map((bot) => ({ id: bot.id, name: bot.name }));
