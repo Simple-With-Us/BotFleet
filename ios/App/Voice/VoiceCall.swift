@@ -72,6 +72,9 @@ public final class VoiceCall: ObservableObject {
     private var capture: VoiceCapture?
     private var playback: VoicePlayback?
     private var sts: (any StsSession)?
+    /// The chained path, when no speech-to-speech provider is available.
+    /// Exactly one of `sts` and `chained` is ever live.
+    private var chained: ChainedVoiceEngine?
     private var cancellations: [() -> Void] = []
     private var lineKeys = 0
     private var decided = Set<String>()
@@ -86,6 +89,13 @@ public final class VoiceCall: ObservableObject {
     /// engine and lost it, not for a call that never offered it.
     public static let noEngineNote =
         "On this call I answer from my own knowledge -- I can't reach my tools here. Anything needing them belongs in text."
+
+    /// Said once when the call runs on the chained path.  It does not name the
+    /// reason: a missing key sends you to the Mac, and a microphone does not
+    /// matter here, so the one useful thing to say is that the call still
+    /// works and the tools do not come with it.
+    public static let chainedFallbackNote =
+        "This call has no live speech model, so I answer a little slower: you talk, I listen, I write back, and I read it aloud."
 
     init(chat: Chat, botName: String, session: Session) {
         self.chat = chat
@@ -119,6 +129,30 @@ public final class VoiceCall: ObservableObject {
                 self.setPhase(.listening)
             }
         }
+    }
+
+    /// Run the call the way the desktop does when there is no provider key:
+    /// dictation in, the bot's ordinary reply out, spoken, then listening
+    /// again.  No socket, no token, and no key — which is the point.
+    private func runChained(status: StsStatus, reason: CallModeReason) {
+        let engine = ChainedVoiceEngine(session: session, chat: chat, botName: botName, voiceId: "")
+        chained = engine
+        engine.onLine = { [weak self] line in
+            Task { @MainActor [weak self] in
+                self?.receive(line: line)
+            }
+        }
+        engine.onFailure = { [weak self] text, recovery in
+            Task { @MainActor [weak self] in
+                self?.fail(text, recovery: recovery)
+            }
+        }
+        // Said once, then never again.  The fallback reasons are deliberately
+        // quiet on the desktop, and a call that opens by explaining why it
+        // could not be better is worse than one that simply works.
+        emitSystemLine(Self.chainedFallbackNote)
+        engine.start()
+        setPhase(.listening)
     }
 
     private func attachFixture(session fixture: FixtureStsSession) {
@@ -155,18 +189,20 @@ public final class VoiceCall: ObservableObject {
                 recovery: .backToText
             )
         }
-        guard let provider = status.usableProvider, let kind = StsProviderKind(rawValue: provider) else {
-            let missing = status.xai == true || status.gemini == true ? nil : "Add an xAI or Gemini API key in Voice settings on your Mac."
-            return fail(
-                missing ?? "No voice provider is ready on this computer.",
-                recovery: .backToText
-            )
+        // The mode is a property of the computer, not of this phone, so it is
+        // decided by the same rule the desktop uses.  Without a provider key
+        // the call used to fail here and offer to go back to text; that is the
+        // one thing the desktop never does, because it always has the chained
+        // path to fall back to.
+        let decision = decideCallMode(keyStatus: status, microphoneAvailable: true)
+        guard decision.mode == .sts, let kind = decision.provider else {
+            return runChained(status: status, reason: decision.reason)
         }
         self.provider = kind
         // 2. One short-lived token.  The permanent key never leaves the Mac.
         let token: StsSessionToken
         do {
-            token = try await session.voiceCallToken(provider: provider)
+            token = try await session.voiceCallToken(provider: kind.rawValue)
         } catch {
             return fail(
                 "Could not start a voice call (\(friendlyError(error))).",
@@ -230,6 +266,10 @@ public final class VoiceCall: ObservableObject {
     /// frames leave the phone while muted.
     public func setMuted(_ muted: Bool) {
         self.muted = muted
+        if let chained {
+            chained.setMuted(muted)
+            return
+        }
         capture?.setMuted(muted)
     }
 
@@ -237,6 +277,10 @@ public final class VoiceCall: ObservableObject {
     /// gates the mic) and from End (which tears everything down): this is
     /// "stop talking", for when the bot is reading something long.
     public func stopPlayback() {
+        if let chained {
+            Task { @MainActor in PersonalVoiceService.shared.stop() }
+            return
+        }
         Task { @MainActor [weak self] in
             self?.playback?.stopPlayback()
         }
@@ -246,6 +290,11 @@ public final class VoiceCall: ObservableObject {
     /// VAD usually beats a finger here; this is the manual path for when it
     /// does not (or for providers whose VAD lags).
     public func interrupt() {
+        if let chained {
+            chained.interrupt()
+            setPhase(.listening)
+            return
+        }
         // The session, not the view, knows how to stop a reply: it is the only
         // thing that can say how much of the reply was actually heard and tell
         // the vendor to drop the rest, and it holds the same playback object
@@ -408,10 +457,13 @@ public final class VoiceCall: ObservableObject {
     private func teardown() async {
         cancellations.forEach { $0() }
         cancellations.removeAll()
+        chained?.stop()
+        chained = nil
         capture?.stop()
         capture = nil
         await sts?.stop()
         sts = nil
+        PersonalVoiceService.shared.stop()
         playback?.stop()
         playback = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
