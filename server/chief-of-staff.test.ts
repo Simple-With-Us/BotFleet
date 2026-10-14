@@ -11,6 +11,7 @@ const CLI_AGENT_TOOLS = [
   "create_bot",
   "delegate_bot",
   "request_credential",
+  "request_sign_in",
   "propose_routine",
   "propose_routine_action",
 ];

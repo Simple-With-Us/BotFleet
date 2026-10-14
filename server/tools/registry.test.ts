@@ -296,6 +296,7 @@ describe("gating", () => {
     expect(names).toContain("list_routines");
     expect(names).toContain("create_bot");
     expect(names).toContain("request_credential");
+    expect(names).toContain("request_sign_in");
     expect(names).toContain("propose_routine");
     expect(names).toContain("propose_routine_action");
   });
@@ -316,6 +317,7 @@ describe("gating", () => {
       "delegate_bot",
       "create_bot",
       "request_credential",
+      "request_sign_in",
       "list_routines",
       "propose_routine",
       "propose_routine_action",
@@ -328,6 +330,7 @@ describe("gating", () => {
       "ask_bot",
       "delegate_bot",
       "request_credential",
+      "request_sign_in",
       "list_routines",
       "propose_routine",
       "propose_routine_action",

@@ -15,6 +15,7 @@ import {
   type ReactNode,
 } from "react";
 import { z } from "zod";
+import type { SignInRequestCardData } from "../../shared/sign-in-request.ts";
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { AccessTokenState } from "../../server/recall-access.ts";
 import type { ComputerReach } from "../../server/computer-capability.ts";
@@ -108,7 +109,7 @@ export interface Message {
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
   automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job" | "zulip";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "sign-in";
   /** A "Job Finished" row: a background job of the bot's ended. */
   job?: import("../../shared/jobs").JobRowData;
   text?: string;
@@ -123,6 +124,7 @@ export interface Message {
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  signIn?: SignInRequestCardData;
   /** activity messages: tool name + outcome. `spoken` is the server's
    * narration of the same chip ("reading a file"), used by call mode. */
   /** `setup` marks an error fixed by installing something, not by retrying. */

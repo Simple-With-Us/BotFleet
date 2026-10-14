@@ -211,6 +211,7 @@ describe("what is watched", () => {
       "delegate_bot",
       "create_bot",
       "request_credential",
+      "request_sign_in",
       "propose_routine",
       "propose_routine_action",
       "zulip_reply",

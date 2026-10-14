@@ -49,7 +49,13 @@ describe("buildTurnTools", () => {
     expect(names).not.toContain("list_bots");
     expect(names).not.toContain("ask_bot");
     expect(names).not.toContain("delegate_bot");
-    expect(names).toEqual(["request_credential", "list_routines", "propose_routine", "propose_routine_action"]);
+    expect(names).toEqual([
+      "request_credential",
+      "request_sign_in",
+      "list_routines",
+      "propose_routine",
+      "propose_routine_action",
+    ]);
   });
 
   it("does not expose Composio or computer-use tools on the HTTP lane", () => {
