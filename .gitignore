@@ -7,6 +7,10 @@ dist-native
 # which package:prepare runs before electron-builder stages it
 dist-companion
 dist-server
+# the shared STS bundle for the packaged Electron main process — regenerated
+# by `pnpm build:shared`, which package:prepare runs before electron-builder
+dist-shared
+dist-shared-types
 *.local
 .DS_Store
 *.tsbuildinfo

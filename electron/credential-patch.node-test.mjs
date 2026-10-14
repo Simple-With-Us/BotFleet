@@ -74,6 +74,21 @@ describe("desktop credential:set patches (CREDENTIAL_PATCH)", () => {
     assert.deepEqual(patch.infisicalClientSecret("shh"), { infisical: { clientSecret: "shh" } });
   });
 
+  it("can store a key for every provider the voice panels offer", () => {
+    // The STS settings panel names Gemini beside xAI and tells the user to add
+    // the key when one is missing.  That is only true if the panel's providers
+    // and this table agree: a provider with no CREDENTIAL_PATCH row was rejected
+    // by `credential:set` with "Unsupported credential", so the panel named a
+    // key the app could never accept.
+    for (const [name, section] of [
+      ["xaiApiKey", "xai"],
+      ["geminiApiKey", "gemini"],
+    ]) {
+      assert.ok(Object.hasOwn(patch, name), `CREDENTIAL_PATCH is missing ${name}`);
+      assert.deepEqual(patch[name](`${section}-key`), { [section]: { key: `${section}-key` } });
+    }
+  });
+
   it("pins the selected voice engine on each key save, including new installations", () => {
     // A fresh MiniMax save must carry the explicit provider field so the
     // config reader always knows which voice engine to use without guessing.

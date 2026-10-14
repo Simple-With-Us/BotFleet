@@ -555,6 +555,8 @@ const appConfigSchema = z.object({
     })
     .optional(),
   instances: instanceConfigMapSchema.optional(),
+  /** Owner-managed MCP servers (Claude/Cursor `mcpServers` shape). */
+  mcpServers: z.record(z.string(), z.json()).optional(),
 });
 // `deleteInstance` also lives on the base schema (saveConfig's internal
 // callers use appConfigSchema.partial() directly, not this schema) but must
@@ -784,6 +786,8 @@ export interface AppConfig {
    * `terminology` is "custom"; resolved for clients by `resolveRoomLabels`. */
   terminologyCustom?: CustomRoomLabels;
   instances?: InstanceConfigMap;
+  /** Owner-managed MCP servers (Claude/Cursor `mcpServers` shape). */
+  mcpServers?: Record<string, JsonValue>;
 }
 export type ConfigPatch = Omit<z.output<typeof appConfigPatchSchema>, "conversationMode"> & {
   conversationMode?: ConversationMode;
@@ -1819,7 +1823,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);

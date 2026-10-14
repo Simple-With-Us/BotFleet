@@ -312,6 +312,7 @@ final class Session: ObservableObject {
             status = .live
             TranscriptScrollDemo.startIfRequested(self)
             KaraokeDemo.startIfRequested(self)
+            ChatFixture.startIfRequested(self)
             return
         }
 #endif

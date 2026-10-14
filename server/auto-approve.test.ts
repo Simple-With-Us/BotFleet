@@ -199,6 +199,15 @@ describe("autoDecision", () => {
     expect(autoDecision(bot, "Bash", "ls")).toBeNull();
   });
 
+  it("honours a saved configured MCP tool grant without auto mode", () => {
+    const key = "provider-tool:claude:linear:list_issues:abc123";
+    const bot = { alwaysAllow: [key] };
+    expect(autoVerdict(bot, "mcp__linear__list_issues", "list KAT issues", { mcpToolAllowKey: key }).approve).toBe(
+      "auto-approved mcp__linear__list_issues (always allowed)",
+    );
+    expect(autoVerdict(bot, "mcp__linear__create_issue", "create KAT issue", { mcpToolAllowKey: null }).approve).toBeNull();
+  });
+
   it("never lets always-allow override the destructive guard", () => {
     expect(autoDecision({ alwaysAllow: ["Bash"] }, "Bash", "sudo rm -rf /var")).toBeNull();
   });

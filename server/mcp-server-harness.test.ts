@@ -98,7 +98,7 @@ beforeAll(async () => {
     ].join("\n"),
   );
 
-  child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
+  child = spawnDetached(process.execPath, ["--experimental-strip-types", "--no-warnings", join(SERVER_DIR, "index.ts")], {
     cwd: ROOT,
     env: {
       ...(process.env.PATH ? { PATH: process.env.PATH } : {}),

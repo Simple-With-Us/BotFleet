@@ -36,6 +36,18 @@ afterPack: ./scripts/after-pack.mjs
 # ELECTRON_RUN_AS_NODE (the agentcal-hq pattern).
 files:
   - electron/**
+  # The shared STS token module, compiled by `pnpm build:shared` (esbuild
+  # bundle, zod inlined -- the asar carries no node_modules).  Mapped to
+  # `shared/` so the asar layout matches the `../shared/sts-tokens.js`
+  # import in electron/sts-tokens.mjs exactly; a `dist-shared/**` glob
+  # would preserve the build-dir name and land the bundle where nothing
+  # imports it from.  The packaged Electron main process is launched by
+  # Electron itself, never with --experimental-strip-types, so only the
+  # compiled .js ships -- the .ts source would be dead weight no runtime
+  # can load.  dist-shared holds only sts-tokens.js, so no filter is
+  # needed; the .d.ts lives in dist-shared-types and never ships.
+  - from: dist-shared
+    to: shared
   - "!electron/**/*.test.*"
   - "!electron/resources/speech-helper"
   - "!electron/resources/speech-helper.swift"

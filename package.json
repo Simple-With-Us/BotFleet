@@ -18,7 +18,7 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@12.10.1",
+  "packageManager": "pnpm@12.11.1",
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "lint": "node scripts/check-lint-baseline.mjs",
@@ -49,9 +49,9 @@
     "test:config-lock": "node --test electron/config-file-lock.node-test.mjs",
     "test:credential-patch": "node --test electron/credential-patch.node-test.mjs",
     "test:desktop-viewer": "node --test electron/desktop-viewer.node-test.mjs electron/desktop-workspace.node-test.mjs electron/sentry-desktop.node-test.mjs",
-    "test:package-link": "node --test electron/package-link.node-test.mjs",
+    "test:package-link": "pnpm build:shared && node --test electron/package-link.node-test.mjs electron/sts-packaging.node-test.mjs",
     "test:save-file": "node --test electron/save-file.node-test.mjs electron/open-file.node-test.mjs",
-    "test:server-boot-probe": "node --test electron/server-boot-probe.node-test.mjs electron/attached-ui-shim.node-test.mjs electron/harness-ownership.node-test.mjs electron/runtime-identity.node-test.mjs",
+    "test:server-boot-probe": "node --test electron/server-boot-probe.node-test.mjs electron/attached-ui-shim.node-test.mjs electron/harness-ownership.node-test.mjs electron/runtime-identity.node-test.mjs server/sts-launch.node-test.mjs",
     "bench:observation": "node --experimental-strip-types scripts/bench-observation.ts",
     "test:watch": "vitest",
     "test:cua": "pnpm build:cua && node scripts/smoke-cua.mjs",
@@ -69,7 +69,7 @@
     "build:cua:linux": "node scripts/prepare-cua-linux.mjs",
     "build:cua:linux:offline": "node scripts/prepare-cua-linux.mjs --offline",
     "build:updater": "node scripts/bundle-updater.mjs",
-    "package:prepare": "pnpm build && pnpm build:server && pnpm build:companion && pnpm build:updater && pnpm build:android-tools && pnpm build:cloudflared",
+    "package:prepare": "pnpm build:shared && pnpm build && pnpm build:server && pnpm build:companion && pnpm build:updater && pnpm build:android-tools && pnpm build:cloudflared",
     "package:mac": "pnpm package:prepare && pnpm build:speech && pnpm build:recorder && pnpm build:cua && electron-builder --mac --arm64 --publish never",
     "package:mac:arm64:release": "pnpm package:prepare && pnpm build:speech && pnpm build:recorder && pnpm build:cua && electron-builder --mac --arm64 --publish never",
     "package:mac:x64:release": "pnpm package:prepare && pnpm build:speech && pnpm build:recorder && pnpm build:cua && electron-builder --mac --x64 --publish never",
@@ -82,7 +82,7 @@
     "smoke:cua-x11-input": "node scripts/smoke-cua-x11-input.mjs",
     "package:linux:dir": "pnpm package:prepare && pnpm build:cua:linux && electron-builder --linux dir --x64 --publish never",
     "package": "pnpm package:mac",
-    "test:packaged-server": "pnpm build:server && node scripts/smoke-packaged-server.mjs",
+    "test:packaged-server": "pnpm build:shared && pnpm build:server && node scripts/smoke-packaged-server.mjs",
     "broker:types": "wrangler types --config cloudflare/composio-broker/wrangler.jsonc cloudflare/composio-broker/worker-configuration.d.ts",
     "broker:check": "pnpm broker:types && tsc -p cloudflare/composio-broker/tsconfig.json",
     "broker:test": "vitest run --config cloudflare/composio-broker/vitest.config.ts",
@@ -95,7 +95,8 @@
     "test:server-start": "node --test scripts/botfleet-server-start.node-test.mjs",
     "postinstall": "node scripts/compile-clutch-dep.mjs",
     "test:cred-sync": "node --test scripts/sync-cli-credentials.node-test.mjs",
-    "test:kody-autofix": "node --test .github/autofix/kody-pilot.node-test.mjs"
+    "test:kody-autofix": "node --test .github/autofix/kody-pilot.node-test.mjs",
+    "build:shared": "tsc -p tsconfig.shared.build.json --emitDeclarationOnly --outDir dist-shared-types && node scripts/bundle-shared.mjs"
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",
@@ -121,6 +122,8 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
     "@assistant-ui/react": "^0.15.27",
     "@assistant-ui/react-markdown": "^0.14.20",
     "@assistant-ui/react-ui": "^0.2.1",
@@ -143,6 +146,6 @@
     "typescript": "^7.0.0",
     "vite": "^8.0.0",
     "vitest": "^5.0.0",
-    "wrangler": "4.148.0"
+    "wrangler": "4.149.0"
   }
 }

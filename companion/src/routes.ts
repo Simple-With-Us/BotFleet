@@ -281,6 +281,17 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // and Apple's own status strings only — never anything about the key.
   { method: "GET", path: /^\/api\/companion\/push-health$/ },
 
+  // Speech-to-speech call tokens.  The phone gets the *token*, never the key:
+  // the harness mints a short-lived single-session token from a credential
+  // only it holds, exactly as the desktop does over IPC.  Two doors rather
+  // than one query parameter, so neither call can be widened into the other —
+  // GET learns only which providers exist (booleans), POST is the only thing
+  // that mints.  This is the one place a paired phone may cause a call to a
+  // paid provider, which is why the harness throttles it; a stolen phone
+  // token buys a rate-limited short-lived token, never a key.
+  { method: "GET", path: /^\/api\/sts\/status$/ },
+  { method: "POST", path: /^\/api\/sts\/token$/ },
+
   // the fleet, and making a bot
   { method: "GET", path: /^\/api\/bots$/ },
   { method: "POST", path: /^\/api\/bots$/ },

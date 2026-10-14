@@ -77,6 +77,12 @@ test.describe('model rows stay readable in a narrow picker', () => {
     await page.clock.setFixedTime(new Date('2026-10-11T15:00:00Z'));
     await page.goto('/?fixture=model-rows');
     await pinFonts(page);
+    // goto resolves on load, but the fixture route mounts after -- under CI
+    // load, geometry() can run against an empty column and fail at the tags
+    // assertion with "0 tagged rows", which reads as a layout defect in a
+    // component that never rendered.  Wait for the mount instead.
+    await page.waitForSelector('[data-testid="model-rows-narrow"] [data-testid="model-row-label"]');
+    await page.waitForSelector('[data-testid="model-rows-wide"] [data-testid="model-row-label"]');
   });
 
   test('every slug renders on one line, at both widths', async ({ page }) => {
@@ -97,6 +103,9 @@ test.describe('model rows stay readable in a narrow picker', () => {
 
   test('a narrow pane stacks the tags only for the names that need it', async ({ page }) => {
     const narrow = await geometry(page, '[data-testid="model-rows-narrow"]');
+    // A precondition, not the assertion: if the column never mounted, the
+    // failure below would blame the tags for rows that do not exist.
+    expect(narrow.length, 'narrow column rendered no rows').toBeGreaterThan(0);
     const tagged = narrow.filter((row) => row.tagsWidth > 0);
     expect(tagged.length).toBeGreaterThan(0);
 

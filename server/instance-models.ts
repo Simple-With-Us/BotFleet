@@ -6,7 +6,7 @@ const modelText = z.string().trim().min(1).max(200).regex(/^[^\r\n]+$/);
 export const instanceModelsSchema = z.array(z.object({
   id: modelText,
   label: modelText,
-}).strip()).max(100).superRefine((models, context) => {
+}).strict()).max(100).superRefine((models, context) => {
   const seen = new Set<string>();
   for (const [index, model] of models.entries()) {
     if (seen.has(model.id)) {
