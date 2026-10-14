@@ -259,3 +259,21 @@ export function stsKeyNotice(provider: StsProvider, keys: StsKeyStatus | null): 
     reason: `No ${label}.  Calls stay on Auto until you add one.`,
   };
 }
+
+/**
+ * The WebSocket subprotocol that carries the xAI ephemeral token.
+ *
+ * A browser WebSocket cannot set an `Authorization` header, and xAI's Node
+ * examples use exactly that.  A renderer that copies the Node example connects,
+ * completes the handshake, accepts audio, and silently receives nothing back --
+ * which is what shipped, and why no test caught it: the mock socket never
+ * asserted what it was constructed with.
+ *
+ * Lives beside the mint it belongs to so the two cannot drift, and is shared by
+ * desktop and the phone companion rather than re-derived per client.
+ */
+export function xaiRealtimeSubprotocol(token: string): string {
+  const value = String(token ?? "").trim();
+  if (!value) throw new Error("Missing xAI session token.");
+  return `xai-client-secret.${value}`;
+}
