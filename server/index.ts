@@ -1678,7 +1678,11 @@ async function defaultSelection(excludeInstanceId?: string) {
     try {
       const snap = await liveInstance.snapshot();
       if (snap.state === "available") {
-        return { instanceId: pick.instanceId, model: pick.models.default };
+        // The registry catalog is the full static list.  A new bot must
+        // start on a model the detected CLI can run (Sonnet 5 on Claude
+        // Code older than 2.1.284, not the ungated Sonnet 5.5 default).
+        const runnable = withoutModelsTooNewForCli(pick.driverKind, pick.models, snap.version);
+        return { instanceId: pick.instanceId, model: runnable.default };
       }
     } catch {
       continue;
@@ -5300,7 +5304,15 @@ async function autoFallbackChain(
 ): Promise<ModelSelection[]> {
   try {
     const described = await registry.describe({ maxAgeMs: DEFAULT_SELECTION_DESCRIBE_MAX_AGE_MS });
-    return eligibleAutoFallbackChain(described, {
+    const runnable = described.map((instance) => ({
+      ...instance,
+      models: withoutModelsTooNewForCli(
+        instance.driverKind,
+        instance.models,
+        instance.snapshot?.version,
+      ),
+    }));
+    return eligibleAutoFallbackChain(runnable, {
       botId,
       currentInstanceId,
       effort,
