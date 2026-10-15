@@ -1,5 +1,7 @@
 import type { IncomingMessage } from "node:http";
 
+type HarnessRequestHeaders = Pick<IncomingMessage, "headers">;
+
 /** Header names Cloudflare adds when a request reached the harness through the
  * named tunnel or Access edge rather than a local desktop or sidecar hop. */
 const CLOUDFLARE_TUNNEL_MARKERS = [
@@ -14,7 +16,7 @@ const CLOUDFLARE_TUNNEL_MARKERS = [
 /** True when the request carries Cloudflare edge markers cloudflared forwards to
  * the loopback harness.  Local callers (renderer, CLIs, companion replay) do
  * not send these headers. */
-export function arrivedViaCloudflareTunnel(req: IncomingMessage): boolean {
+export function arrivedViaCloudflareTunnel(req: HarnessRequestHeaders): boolean {
   for (const name of CLOUDFLARE_TUNNEL_MARKERS) {
     const raw = req.headers[name];
     if (raw === undefined) continue;

@@ -12164,7 +12164,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 403, { error: "forbidden: cross-site request" });
     }
     const mutatingApiRequest = isMutatingHarnessApiRequest(method, path);
-    // The named tunnel (botfleet.jays.services) forwards with a loopback Host,
+    // The named Remote Access tunnel forwards with a loopback Host,
     // so the Host gate alone cannot distinguish a remote Access caller from the
     // owner.  Block mutating API traffic that carries Cloudflare edge markers
     // until a dedicated remote-auth seam lands (BF-2129).

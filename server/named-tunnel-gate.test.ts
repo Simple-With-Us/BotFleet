@@ -1,4 +1,3 @@
-import type { IncomingMessage } from "node:http";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -7,8 +6,7 @@ import {
   NAMED_TUNNEL_MUTATION_FORBIDDEN,
 } from "./named-tunnel-gate.ts";
 
-const req = (headers: Record<string, string | string[]>): IncomingMessage =>
-  ({ headers } as IncomingMessage);
+const req = (headers: Record<string, string | string[]>) => ({ headers });
 
 describe("named-tunnel-gate", () => {
   it("detects Cloudflare tunnel markers on the request", () => {
