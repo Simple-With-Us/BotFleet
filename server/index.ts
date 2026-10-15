@@ -268,6 +268,7 @@ import {
 import {
   appendBounded,
   describeSweep,
+  startIdleLiveTranscriptSweeps,
   startOrphanTranscriptSweeps,
   startTranscriptRetentionSweeps,
   sweepTranscriptRetention,
@@ -1677,7 +1678,11 @@ async function defaultSelection(excludeInstanceId?: string) {
     try {
       const snap = await liveInstance.snapshot();
       if (snap.state === "available") {
-        return { instanceId: pick.instanceId, model: pick.models.default };
+        // The registry catalog is the full static list.  A new bot must
+        // start on a model the detected CLI can run (Sonnet 5 on Claude
+        // Code older than 2.1.284, not the ungated Sonnet 5.5 default).
+        const runnable = withoutModelsTooNewForCli(pick.driverKind, pick.models, snap.version);
+        return { instanceId: pick.instanceId, model: runnable.default };
       }
     } catch {
       continue;
@@ -2496,16 +2501,41 @@ function liveThreadIds(): Set<string> {
     ...store.groups.flatMap((g) => [g.threadId, ...(g.tasks ?? []).map((t) => t.threadId)]),
   ]);
 }
-// One flag covers all three sweeps: a preview before trusting a brand-new
-// class of delete against real data.
+// The thread a turn is actually on.  `busy` is memory-only and `inflightThreadId`
+// is the marker that survives a restart, so a boot sweep still sees the turn
+// that was open when the process died.  A deferred recovery is about to
+// resume that same thread.
+function inFlightThreadIds(): Set<string> {
+  const ids = new Set<string>();
+  for (const bot of store.bots) {
+    if (!(bot.busy || bot.inflightThreadId || deferredBootRecoveries.has(bot.id))) continue;
+    ids.add(bot.inflightThreadId || bot.threadId);
+  }
+  return ids;
+}
+// One flag covers the retention sweeps: a preview before trusting a
+// brand-new delete or trim against real data.
 const retentionDryRun = process.env.OMB_RETENTION_DRY_RUN === "1";
 // While a set-aside bots.json or groups.json is waiting in the data folder, the roster cannot say
-// which bots and threads still exist, so none of the three sweeps below may call anything an orphan.
+// which bots and threads still exist, so the sweeps below stay off until that file is restored or removed.
 // `cleanupHoldReason` reads the folder on every call, so this holds across restarts.
 const stopOrphanTranscriptSweeps = startOrphanTranscriptSweeps(transcriptDirs, liveThreadIds, console.log, {
   dryRun: retentionDryRun,
   hold: () => cleanupHoldReason(DATA_DIR),
 });
+// HS1 residual (C10): a thread still on a bot or room used to keep both
+// generations at the full cap forever.  The idle sweep trims one that has
+// been quiet, and skips a turn that is open right now.
+const stopIdleLiveTranscriptSweeps = startIdleLiveTranscriptSweeps(
+  transcriptDirs,
+  liveThreadIds,
+  inFlightThreadIds,
+  console.log,
+  {
+    dryRun: retentionDryRun,
+    hold: () => cleanupHoldReason(DATA_DIR),
+  },
+);
 // Workspaces and messages.db are swept once, shortly after boot, off the
 // request path — no recurring timer to unref, because a harness restart (29
 // in two days per the audit) already re-runs this often enough on its own.
@@ -5274,7 +5304,15 @@ async function autoFallbackChain(
 ): Promise<ModelSelection[]> {
   try {
     const described = await registry.describe({ maxAgeMs: DEFAULT_SELECTION_DESCRIBE_MAX_AGE_MS });
-    return eligibleAutoFallbackChain(described, {
+    const runnable = described.map((instance) => ({
+      ...instance,
+      models: withoutModelsTooNewForCli(
+        instance.driverKind,
+        instance.models,
+        instance.snapshot?.version,
+      ),
+    }));
+    return eligibleAutoFallbackChain(runnable, {
       botId,
       currentInstanceId,
       effort,
@@ -18380,6 +18418,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     watchdog.stop();
     stopTranscriptSweeps();
     stopOrphanTranscriptSweeps();
+    stopIdleLiveTranscriptSweeps();
     // A flush that throws (disk full, data dir gone) must not skip the rest
     // of shutdown — above all bus.flush() below — so each one is guarded.
     const flushOnShutdown = (label: string, flush: () => void) => {

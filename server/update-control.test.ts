@@ -27,6 +27,7 @@ import {
   type RuntimeReadiness,
   type UpdateCapabilities,
   type UpdateControl,
+  type UpdateControlDeps,
   type UpdateDrainView,
   type UpdateStatus,
 } from "./update-control.ts";
@@ -105,13 +106,14 @@ function build(
     installedCommit?: string;
     launcher?: "launchd" | "detached";
     exec?: (command: string, args: string[]) => CommandResult;
+    appPath?: string;
   } = {},
 ): Harness {
   const launched: LaunchPlan[] = [];
   const emitted: UpdateStatus[] = [];
   const git: string[][] = [];
   const ran: { command: string; args: string[] }[] = [];
-  const control = createUpdateControl({
+  const controlDeps: Partial<UpdateControlDeps> = {
     installed: {
       version: "1.0.30",
       sourceCommit: options.installedCommit ?? INSTALLED_COMMIT,
@@ -145,7 +147,9 @@ function build(
     newRunId: () => "run_one",
     emit: (status) => emitted.push(status),
     pollIntervalMs: 50,
-  });
+  };
+  if (options.appPath) controlDeps.appPath = options.appPath;
+  const control = createUpdateControl(controlDeps);
   controls.push(control);
   return { control, launched, emitted, git, ran };
 }
@@ -1291,6 +1295,26 @@ describe("sweeping what failed runs leave on disk", () => {
     const paths = rig();
     expect(() => build(paths)).not.toThrow();
     expect(pruneUpdateStages(join(paths.root, "nowhere"))).toEqual([]);
+  });
+
+  it("removes expired failed-install bundles beside the app on boot", () => {
+    const paths = rig();
+    const applications = join(paths.root, "Applications");
+    mkdirSync(applications, { recursive: true });
+    const appPath = join(applications, "BotFleet.app");
+    mkdirSync(appPath);
+    const old = [
+      "BotFleet.app.failed-1000",
+      "BotFleet.app.failed-2000",
+      "BotFleet.app.failed-3000",
+      "BotFleet.app.failed-4000",
+    ];
+    for (const name of old) mkdirSync(join(applications, name));
+    build(paths, { appPath });
+    expect(existsSync(join(applications, "BotFleet.app.failed-1000"))).toBe(false);
+    expect(existsSync(join(applications, "BotFleet.app.failed-2000"))).toBe(true);
+    expect(existsSync(join(applications, "BotFleet.app.failed-3000"))).toBe(true);
+    expect(existsSync(join(applications, "BotFleet.app.failed-4000"))).toBe(true);
   });
 
   it("keeps the newest run logs and forgets the rest, run by run", () => {
