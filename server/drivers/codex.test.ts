@@ -194,9 +194,11 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
     expect(done).toMatchObject({ turnId, ok: true, usage: { input: 7, output: 3, cachedInput: 4 } });
     const text = JSON.stringify(recorder.events);
-    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED", "9999"]) {
+    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED"]) {
       expect(text).not.toContain(marker);
     }
+    // Helper fixture uses inputTokens 9999; a random main-thread turnId must not trip this.
+    expect(text).not.toContain('"inputTokens":9999');
     // the main thread's own turn is intact, in order, with the helper's one
     // host step nested under the spawn_agent row
     expect(recorder.events.map((e) => e.type)).toEqual([
