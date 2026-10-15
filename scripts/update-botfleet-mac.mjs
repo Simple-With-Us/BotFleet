@@ -2309,11 +2309,20 @@ function pidsFromFieldLsof(stdout) {
   return pids;
 }
 
-/** `lsof -Fn +D` on a directory that does not itself contain directories.
- * That is the command the release-store probe uses, and hosted macOS 14
- * answers it for an ordinary open file.  `lsof -t +D` and `lsof -t +d` on
- * the same image returned exit 1 and an empty pid list.  A subdirectory is
- * skipped so this cannot walk `Resources/server`. */
+function lsofFieldPids(args) {
+  return run("lsof", ["-Fn", ...args], { allowFailure: true }).then((result) => ({
+    ok: [0, 1].includes(result.code),
+    pids: pidsFromFieldLsof(result.stdout),
+  }));
+}
+
+/** Open-file pids under one directory, without walking into children.
+ * A flat directory uses `lsof -Fn +D`, the command the release-store probe
+ * uses.  Hosted macOS 14 answers that for an ordinary open file.  `lsof -t`
+ * on the same image returned exit 1 and an empty pid list.  A directory that
+ * contains a subdirectory, such as `Contents/Resources/server`, is not given
+ * to `+D`.  `+D` would walk that tree.  Its top-level files are named
+ * instead, so `cua-driver` is still visible. */
 async function scanOpenDirectory(directory) {
   let names;
   try {
@@ -2322,12 +2331,12 @@ async function scanOpenDirectory(directory) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
-  if (names.length > 64 || names.some((entry) => entry.isDirectory())) return null;
-  const result = await run("lsof", ["-Fn", "+D", directory], { allowFailure: true });
-  return {
-    ok: [0, 1].includes(result.code),
-    pids: pidsFromFieldLsof(result.stdout),
-  };
+  const files = names.filter((entry) => entry.isFile());
+  if (!names.some((entry) => entry.isDirectory()) && names.length <= 64) {
+    return lsofFieldPids(["+D", directory]);
+  }
+  if (!files.length) return null;
+  return lsofFieldPids(files.slice(0, 64).map((entry) => join(directory, entry.name)));
 }
 
 /**
@@ -2351,18 +2360,16 @@ export async function bundleHolderPids(bundlePath) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
-  const scans = [
+  const resourcesDir = join(root, "Contents", "Resources");
+  const [textScan, macosScan, resourcesScan] = await Promise.all([
     (async () => {
       const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
       return { ok: [0, 1].includes(result.code), pids: txtHolderPids(result.stdout, root) };
     })(),
-  ];
-  const macosScan = await scanOpenDirectory(join(root, "Contents", "MacOS"));
-  if (macosScan) scans.push(macosScan);
-  const resourcesDir = join(root, "Contents", "Resources");
-  const resourcesScan = await scanOpenDirectory(resourcesDir);
-  if (resourcesScan) scans.push(resourcesScan);
-  const results = await Promise.all(scans);
+    scanOpenDirectory(join(root, "Contents", "MacOS")),
+    scanOpenDirectory(resourcesDir),
+  ]);
+  const results = [textScan, macosScan, resourcesScan].filter((result) => result);
   const usable = results.filter((result) => result.ok);
   if (!usable.length) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
   const pids = new Set();
