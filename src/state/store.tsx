@@ -28,6 +28,7 @@ import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { HelperTranscript } from "../../shared/helpers";
 import type { ToolKind } from "../../shared/tool-activity";
 import type { ReviewHook } from "../../shared/auto-review";
+import type { BusySendDefault } from "../../shared/busy-send-default.ts";
 import type { ContextInjectionRef } from "../../shared/context-injection";
 import { taskWorkspaceContextsMatch, type TaskAppRef, type TaskWorkspaceContext } from "../../shared/task-workspace-context";
 import { eligibleTaskApps } from "@/lib/task-app-context";
@@ -594,6 +595,8 @@ export interface ConfigStatus {
   /** Simple (Grok-style bots + group threads) or Projects (categories of
    * threads).  Absent means simple. */
   conversationMode?: ConversationMode;
+  /** Default delivery while a bot turn is busy.  Absent means steer-first. */
+  busySendDefault?: BusySendDefault;
   /** Shared Qdrant Bot RAG vector database status. `url` and `collection`
    * are empty until the operator sets them — BotFleet ships no endpoint. */
   qdrant?: {
@@ -1118,6 +1121,8 @@ export type Action =
        * reason, after the error banner is set, so a caller that cleared its
        * input can put it back. */
       onError?: (message: string) => void;
+      /** Per-send override while the bot is busy.  Omitted uses the workspace default. */
+      busyDelivery?: BusySendDefault;
     }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string; rawText?: string; at?: number; reply?: Message; attachments?: Attachment[] }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
@@ -2686,13 +2691,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // the server then 409s instead of delivering. Omitting it lets the
           // server use the active thread.
           const postMessage = (threadId?: string) => {
+            const body: {
+              text: string;
+              replyToId?: string;
+              threadId?: string;
+              busyDelivery?: BusySendDefault;
+            } = {
+              text: action.text,
+              replyToId: action.replyToId,
+            };
+            if (threadId) body.threadId = threadId;
+            if (action.busyDelivery) body.busyDelivery = action.busyDelivery;
             void api(`/api/bots/${action.botId}/messages`, {
               method: "POST",
-              body: JSON.stringify({
-                text: action.text,
-                replyToId: action.replyToId,
-                ...(threadId ? { threadId } : {}),
-              }),
+              body: JSON.stringify(body),
             })
               .then((body: unknown) => {
                 const parsed = MessagePostResponseSchema.safeParse(body);

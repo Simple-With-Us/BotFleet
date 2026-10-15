@@ -37,6 +37,10 @@ import {
   parseConversationMode,
 } from "../shared/conversation-mode.ts";
 import {
+  parseBusyDeliveryOverride,
+  parseBusySendDefault,
+} from "../shared/busy-send-default.ts";
+import {
   IMESSAGE_PERSONA_RULE,
   isImessageInboundSource,
   outboundImessageText,
@@ -124,6 +128,8 @@ import {
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
 import { checkBotOrganizeBody, parseAutoUpdateBody } from "./companion-writes.ts";
 import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
+import { isMcodeLockContentionMessage } from "./mcode-lock-contention.ts";
+import { ThreadWedgeGuard, type ThreadWedgeFailureInput } from "./thread-wedge-guard.ts";
 import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
@@ -1087,6 +1093,96 @@ const COMMS_TOKEN = randomBytes(24).toString("hex");
  *  tracker only sees threads that have a run attached, and it resolves
  *  `engineId` from the event it is handed rather than from the live instance,
  *  so a breaker fed from there would miss turns and key on a stale engine. */
+const threadWedgeGuard = new ThreadWedgeGuard();
+/** Turns that saw a lock-contention runtime.error; counted once on turn.completed. */
+const mcodeLockContentionTurns = new Set<string>();
+
+function threadWedgeTurnToken(botId: string, threadId: string, turnId: string | undefined): string | null {
+  return turnId ? `${botId}:${threadId}:${turnId}` : null;
+}
+
+function rotateWedgedThread(
+  bot: { id: string; threadId: string },
+  wedgedThreadId: string,
+  instanceId: string,
+  streak: number,
+  detail: string,
+): void {
+  const wedgedTask = store.taskByThread(bot.id, wedgedThreadId);
+  const wasActive = bot.threadId === wedgedThreadId;
+  const wedgeKey = { botId: bot.id, threadId: wedgedThreadId, instanceId };
+  if (!wasActive) {
+    store.setResumeCursor(bot.id, instanceId, undefined, wedgedThreadId);
+    threadWedgeGuard.recordSuccess(wedgeKey);
+    console.warn(
+      `thread wedge: cleared resume cursor on inactive wedged thread ${wedgedThreadId} for bot ${bot.id} (${instanceId})`,
+    );
+    return;
+  }
+  const title = `Recovered after ${streak} wedged turns`;
+  const task = wedgedTask?.automationKey
+    ? store.rolloverAutomationTask(bot.id, wedgedTask.automationKey, {
+        title,
+        activate: true,
+        previousThreadId: wedgedThreadId,
+      })
+    : store.createTask(bot.id, title, true);
+  if (!task) {
+    console.error(`thread wedge: could not rotate task for bot ${bot.id} thread ${wedgedThreadId} (${detail})`);
+    return;
+  }
+  store.setResumeCursor(bot.id, instanceId, undefined, wedgedThreadId);
+  store.appendMessage(task.threadId, {
+    role: "bot",
+    kind: "activity",
+    tool: {
+      name: `Opened a fresh task after ${streak} consecutive turns on ${wedgedThreadId} failed without output (${detail.slice(0, 160)}). Continue here.`,
+      ok: false,
+    },
+  });
+  const updated = store.bot(bot.id);
+  if (updated) broadcast({ kind: "bot", bot: publicBot(updated) });
+  threadWedgeGuard.recordSuccess(wedgeKey);
+  console.warn(
+    `thread wedge: rotated bot ${bot.id} from ${wedgedThreadId} to ${task.threadId} after ${streak} wedge failures on ${instanceId}`,
+  );
+}
+
+function noteThreadWedge(bot: { id: string; threadId: string } | null, event: RuntimeEvent): void {
+  if (!bot) return;
+  const instanceId = event.providerInstanceId ?? (event.type === "runtime.error" ? event.provider : undefined);
+  if (!instanceId) return;
+  const key = { botId: bot.id, threadId: event.threadId, instanceId };
+  const turnToken = threadWedgeTurnToken(bot.id, event.threadId, event.turnId);
+  if (event.type === "runtime.error") {
+    if (!isMcodeLockContentionMessage(event.message)) return;
+    if (turnToken) mcodeLockContentionTurns.add(turnToken);
+    return;
+  }
+  if (event.type !== "turn.completed") return;
+  if (event.ok) {
+    if (turnToken) mcodeLockContentionTurns.delete(turnToken);
+    threadWedgeGuard.recordSuccess(key);
+    return;
+  }
+  if (stoppedTurns.has(`${bot.id}:${event.threadId}`)) {
+    if (turnToken) mcodeLockContentionTurns.delete(turnToken);
+    threadWedgeGuard.recordSuccess(key);
+    return;
+  }
+  const hadLockContention = turnToken ? mcodeLockContentionTurns.delete(turnToken) : false;
+  const failure: ThreadWedgeFailureInput = hadLockContention
+    ? { runtimeMessage: "Lock file is already being held" }
+    : { stopReason: event.stopReason };
+  const { shouldRotate, streak } = threadWedgeGuard.recordFailure(key, failure);
+  if (shouldRotate) {
+    const detail = hadLockContention
+      ? "Lock file is already being held"
+      : (event.stopReason ?? "turn failed");
+    rotateWedgedThread(bot, event.threadId, instanceId, streak, detail);
+  }
+}
+
 function noteDoomedDispatch(bot: { id: string } | null, event: RuntimeEvent): void {
   if (!bot) return;
   const instanceId = event.providerInstanceId ?? (event.type === "runtime.error" ? event.provider : undefined);
@@ -4239,6 +4335,7 @@ bus.subscribe((event: RuntimeEvent) => {
   }
   broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
   const bot = store.botByThread(event.threadId);
+  noteThreadWedge(bot ?? null, event);
   noteDoomedDispatch(bot ?? null, event);
   const group = bot ? undefined : store.groupByThread(event.threadId);
   // A turn.completed receipts only after the failover pick below: a turn a
@@ -10050,6 +10147,7 @@ function configStatus() {
     // without each re-deriving them from the key and drifting apart.
     roomLabels: resolveRoomLabels(cfg.terminology, cfg.terminologyCustom),
     conversationMode: parseConversationMode(cfg.conversationMode),
+    busySendDefault: parseBusySendDefault(cfg.busySendDefault),
     features: {
       skillRecorder: skillRecorderEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
@@ -14554,6 +14652,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // (`commitHeldSends`).  A recording has no queue to wait in, so it
         // runs now and the drain waits for it.
         const holdForUpdate = !bot.busy && !recording && updateDrain.active;
+        const busyDelivery =
+          parseBusyDeliveryOverride(body.busyDelivery) ?? parseBusySendDefault(cfg.busySendDefault);
         // Claude can accept the message inside its live turn. If the write
         // loses a race with turn settlement, or the engine cannot steer, the
         // existing server-side queue records it atomically for the next turn.
@@ -14562,7 +14662,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // A reload can dispose the live adapter after steer accepts this
           // message.  Hold it in the server queue until the replacement
           // fleet is attached, then dispatch it as a fresh turn.
-          if (bot.busy && !providerReloadInProgress && instance?.adapter.capabilities.queueing && instance.adapter.steer) {
+          if (
+            busyDelivery === "steer" &&
+            bot.busy &&
+            !providerReloadInProgress &&
+            instance?.adapter.capabilities.queueing &&
+            instance.adapter.steer
+          ) {
             const steered = await instance.adapter
               .steer(bot.threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
               .catch(() => false);
@@ -16528,6 +16634,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (mergeThreads) store.mergeAllExtraThreads();
       cfg.conversationMode = nextMode;
       saveConfig({ conversationMode: cfg.conversationMode });
+      const status = configStatus();
+      broadcast({ kind: "config", ...status });
+      return json(res, 200, status);
+    }
+    if (method === "PATCH" && path === "/api/busy-send-default") {
+      const body = await readBody(req);
+      const patch = parseConfigPatch({ busySendDefault: body.busySendDefault });
+      if (patch.busySendDefault === undefined) {
+        return json(res, 400, { error: "nothing to save" });
+      }
+      cfg.busySendDefault = patch.busySendDefault;
+      saveConfig({ busySendDefault: cfg.busySendDefault });
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);

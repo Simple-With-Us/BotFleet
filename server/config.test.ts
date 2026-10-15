@@ -192,6 +192,11 @@ describe("configuration boundaries", () => {
     );
   });
 
+  it("accepts busySendDefault queue or steer", () => {
+    expect(parseConfigPatch({ busySendDefault: "queue" })).toEqual({ busySendDefault: "queue" });
+    expect(() => parseConfigPatch({ busySendDefault: "hold" })).toThrow("busySendDefault");
+  });
+
   it("shows tool steps by default and accepts an explicit opt-out", () => {
     // they carry the file, the command and the duration now — see
     // shared/tool-activity.ts for why that flipped the default
