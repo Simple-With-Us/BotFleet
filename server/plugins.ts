@@ -814,13 +814,52 @@ export async function emitPluginEvent(
 
 /** Emit one envelope and capture the first valid wake request from the
  *  first attempts, for callers that must act on the decision now (the
- *  Zulip hub).  Late retry decisions still reach the registered
- *  decision handler. */
+ *  Zulip hub).  When first attempts land in `retry`, this waits up to
+ *  `settleMs` for the backoff retries to settle so a transient sandbox
+ *  crash does not fork into both a late plugin wake and a legacy wake.
+ *  Late retry decisions still reach the registered decision handler. */
 export async function decidePluginWake(
   event: PluginEventEnvelope,
   baseDir: string = PLUGINS_DIR,
+  opts: { settleMs?: number } = {},
 ): Promise<{ plugin: string; decision: PluginRoutingDecision } | null> {
-  return (await pluginEventBus(baseDir).emitAndDecide(event)).decision;
+  const bus = pluginEventBus(baseDir);
+  const first = await bus.emitAndDecide(event);
+  if (first.decision) return first.decision;
+  let pending = [...new Set(first.outcomes.filter((o) => o.result === "retry").map((o) => o.plugin))];
+  if (!pending.length) return null;
+  const settleMs = opts.settleMs ?? 15_000;
+  const deadline = Date.now() + settleMs;
+  let won: { plugin: string; decision: PluginRoutingDecision } | null = null;
+  while (pending.length && Date.now() < deadline && !won) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const next: string[] = [];
+    for (const plugin of pending) {
+      const outcomes = await bus.drainPending(plugin, (candidate) => {
+        if (!won && candidate.action === "requestWake") won = { plugin, decision: candidate };
+      });
+      for (const outcome of outcomes) {
+        if (outcome.result === "retry" && outcome.eventId === event.eventId) next.push(plugin);
+      }
+    }
+    pending = [...new Set(next)];
+  }
+  return won;
+}
+
+/** Enabled plugins subscribed to one platform's messages.  The Zulip hub
+ *  uses this to decide whether a message routes through the platform. */
+export function pluginEventSubscribers(platform: string, baseDir: string = PLUGINS_DIR): string[] {
+  const registry = readRegistry(baseDir);
+  const out: string[] = [];
+  for (const name of Object.keys(registry.plugins).sort()) {
+    if (!registry.plugins[name]?.enabled) continue;
+    const manifest = readManifestForEvents(name, baseDir);
+    if (!manifest) continue;
+    if (!manifest.capabilities.includes("events.subscribe")) continue;
+    if (manifest.subscriptions.some((sub) => sub.source === platform)) out.push(name);
+  }
+  return out;
 }
 
 /** Health for one plugin: ledger depths plus recent outcomes (reason
@@ -839,7 +878,8 @@ export async function getPluginHealth(
     const loaded_ = await liveSandbox(listing, baseDir);
     if (!("error" in loaded_) && loaded_.sandbox.exports.getHealth) {
       try {
-        const result = await fetchPluginHealth(loaded_, inputsOrThrow());
+        const settings = readPluginSettings(baseDir, name).values;
+        const result = await fetchPluginHealth(loaded_, inputsOrThrow(), settings);
         if (result.ok) {
           const parsed = PluginHealthResultSchema.safeParse(result.value);
           if (parsed.success) plugin = { ...parsed.data };

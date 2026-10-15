@@ -604,6 +604,7 @@ export function invokePluginEvent(
 export function fetchPluginHealth(
   plugin: LoadedPlugin,
   inputs: PluginHostInputs,
+  settings: Record<string, JsonValue> = {},
 ): Promise<PluginSandboxResult> {
-  return plugin.sandbox.call({ handler: "getHealth" }, buildHostSnapshot(inputs, plugin.capabilities));
+  return plugin.sandbox.call({ handler: "getHealth" }, buildHostSnapshot(inputs, plugin.capabilities, settings));
 }

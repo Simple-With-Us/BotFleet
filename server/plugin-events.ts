@@ -197,7 +197,7 @@ export class PluginEventBus {
   }
 
   /** Drain due pending retries for one plugin (host tick + tests). */
-  async drainPending(pluginName: string): Promise<PluginDeliveryOutcome[]> {
+  async drainPending(pluginName: string, onWakeRequest?: (decision: PluginRoutingDecision) => void): Promise<PluginDeliveryOutcome[]> {
     if (this.draining.has(pluginName)) return [];
     this.draining.add(pluginName);
     try {
@@ -212,7 +212,7 @@ export class PluginEventBus {
           saveLedger(this.baseDir, pluginName, ledger);
           continue;
         }
-        outcomes.push(await this.attempt(pluginName, parsed.data, ledger, row.attempts));
+        outcomes.push(await this.attempt(pluginName, parsed.data, ledger, row.attempts, onWakeRequest));
       }
       return outcomes;
     } finally {

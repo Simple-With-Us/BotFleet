@@ -53,6 +53,7 @@ import {
 } from "./outbound.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeReason, type WakeVerdict } from "./router.ts";
 import { HANDLED_RING_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
+import type { PluginEventEnvelope } from "../../shared/plugin-events.ts";
 import type { ZulipIdentity, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
 
 /** Zulip roles a BF bot may hold: moderator (300) and member (400).  An
@@ -87,8 +88,8 @@ const BINDING_MAX_AGE_MS = 2 * 3600_000;
 const STORED_ITEMS_PER_UNIT = ZULIP_INBOUND_UNIT_MAX_ITEMS * 2;
 /** How long one plugin-routing decision may take before the hub falls
  *  back to the legacy direct wake.  Covers the sandbox call deadline
- *  with room for ledger writes. */
-const PLUGIN_DECIDE_TIMEOUT_MS = 8_000;
+ *  plus the bus's bounded backoff settle. */
+const PLUGIN_DECIDE_TIMEOUT_MS = 25_000;
 /** Message ids one connection remembers for de-duplication above its floor:
  *  every id it classified, wake-worthy or not, so it must be bounded. */
 const SEEN_LIMIT = 5_000;
@@ -1032,7 +1033,9 @@ export class ZulipHub {
     } else {
       this.log(`[zulip] ${session.role}: message ${id} no plugin decision, legacy wake`);
     }
-    this.queueClassified(session, message, c, verdict);
+    // A late retry decision may have owned the message while the settle
+    // wait ran: holds() true means someone owns it, so skip the fallback.
+    if (!session.holds(id)) this.queueClassified(session, message, c, verdict);
   }
 
   /** Enqueue a plugin-routed wake on the dispatcher's session, reusing
@@ -1056,6 +1059,9 @@ export class ZulipHub {
       this.log(`[zulip] ${session.role}: message ${message.id} plugin target unknown (${targetBotId})`);
       return false;
     }
+    // Already owned (a late decision racing the settle wait): do not queue
+    // twice.  True means "owned", so the caller takes no fallback.
+    if (target.holds(message.id)) return true;
     // Re-derive the wake from the source classification: the target
     // session would classify differently (it was not mentioned), so the
     // plugin's routing carries the wake kind, not a fresh verdict.
@@ -1072,6 +1078,49 @@ export class ZulipHub {
         (decision.rationale ? ` (${decision.rationale.slice(0, 120)})` : ""),
     );
     return true;
+  }
+
+  /** Apply a routing decision that arrived after the message's settle
+   *  window (a background retry, or a restart-recovered pending row).
+   *  Re-fetches the canonical message through the owning bot's client —
+   *  never trusts decision-carried text — and queues exactly once: anything
+   *  the hub already owns (legacy fallback included) is left alone. */
+  async applyLatePluginDecision(event: PluginEventEnvelope, decision: ZulipPluginDecision): Promise<void> {
+    try {
+      if (event.type !== "zulip.message" || event.source.platform !== "zulip") return;
+      const role = event.source.accountId;
+      const botId = Object.entries(this.settings()?.bots ?? {}).find(
+        ([id, binding]) => binding.role === role && (binding.enabled ?? true) && this.deps.botExists(id),
+      )?.[0];
+      if (!botId) return;
+      const session = this.sessions.get(botId);
+      if (!session?.me || !session.client) {
+        this.log(`[zulip] ${role}: late plugin decision dropped (no session) for message ${event.refs.messageId}`);
+        return;
+      }
+      if (session.holds(event.refs.messageId)) return;
+      let found: ZulipMessage | undefined;
+      try {
+        const page = await session.client.messages(
+          [{ operator: "id", operand: event.refs.messageId }],
+          { anchor: event.refs.messageId, numAfter: 0, includeAnchor: true },
+        );
+        found = page.messages.find((candidate) => candidate.id === event.refs.messageId);
+      } catch {
+        found = undefined;
+      }
+      if (!found) {
+        this.log(`[zulip] ${role}: late plugin decision dropped (message ${event.refs.messageId} not found)`);
+        return;
+      }
+      const c = classify(found, this.routerContext(session));
+      const verdict = wakeVerdict(c);
+      if (verdict.wake === null) return;
+      if (this.applyPluginDecision(session, found, c, decision)) return;
+      if (!session.holds(found.id)) this.queueClassified(session, found, c, verdict);
+    } catch (error) {
+      this.log(`[zulip] late plugin decision failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /** The queueing half of handleMessage: verdict logging, budget and loop
