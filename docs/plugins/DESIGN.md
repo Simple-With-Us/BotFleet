@@ -93,6 +93,9 @@ Every plugin has a `botfleet-plugin.json` at its top level.  Schema
     "read.bots",
     "read.status"
   ],
+  "needs": {                       // optional, denied when omitted
+    "network": ["api.example.com:443"]
+  },
 
   "contributes": {                 // optional, declarative only
     "cards": [
@@ -130,6 +133,12 @@ Every plugin has a `botfleet-plugin.json` at its top level.  Schema
 *   `capabilities`: each entry is one of a fixed allowlist.  v1 only:
     `read.bots`, `read.status`, `read.config`.  Unknown capabilities
     fail validation with the field name.
+*   `needs.network`: optional list of outbound TCP destinations, each
+    `host:port` (a hostname or IP, and a port from 1 to 65535).  No
+    schemes, wildcards, or paths.  Omitted or empty means the sandbox
+    denies every outbound connection.  A declared entry is the only
+    destination that plugin may open, and the manager shows the list
+    before a person enables the plugin.
 *   `contributes.cards[].id`: unique per plugin.  The host prefixes the
     `id` with the plugin name to keep it unique fleet-wide.
 *   `contributes.commands[].name`: 1 to 32 chars, lowercase alphanumerics
@@ -304,8 +313,9 @@ export async function runCommand({ args, host }) {
     read access to the plugin's own directory and nothing else, and no
     write access at all.
 *   Spawn processes, start worker threads, or load native addons.
-*   Open network sockets.  This is an authoring rule, not yet an
-    enforced one: see open question 1.
+*   Open a network socket to anywhere but a `host:port` declared in
+    `needs.network`.  With no declaration, every outbound connection
+    is denied.
 *   Register hooks, listeners, or timers that outlive the command
     invocation.  Commands are synchronous, awaited in line.
 *   Read secrets, tokens, or credentials from the host.
@@ -406,7 +416,9 @@ The plugin model mirrors skills:
     manifest.
 2.  Capabilities are declared in the manifest and surfaced in the UI.
     A plugin that tries to read something it did not declare gets an
-    empty result and a warning.
+    empty result and a warning.  Outbound network works the same way:
+    `needs.network` is shown before enable, and an undeclared
+    destination is denied.
 3.  The host API is read-only and frozen.  A plugin cannot smuggle a
     reference back into BotFleet through reassignment.
 4.  The plugin module never runs in the server process.  The loader
@@ -414,8 +426,9 @@ The plugin model mirrors skills:
     (`server/plugin-sandbox-child.ts`) with an empty environment, the
     Node permission model (read access to the child script and the
     plugin's own directory only; no filesystem writes, no child
-    processes, no worker threads, no native addons), a capped heap, and
-    a per-call deadline that kills the child when a handler overruns.
+    processes, no worker threads, no native addons), outbound network
+    denied unless `needs.network` names the destination, a capped heap,
+    and a per-call deadline that kills the child when a handler overruns.
     The child imports the plugin, reports which handlers it exports,
     and answers host calls from the per-call snapshot.  Every message
     the child sends back is parsed with a strict zod schema; anything
@@ -439,13 +452,13 @@ The plugin model mirrors skills:
 
 ## Open Questions For The Owner
 
-1.  **Outbound network from the sandbox.**  Node's permission model
-    does not restrict outbound sockets, so a plugin can still open a
-    connection.  It has no credentials, no environment, and nothing
-    readable outside its own directory to send, but blocking egress
-    needs an OS-level mechanism (a network namespace on Linux, a
-    sandbox profile on macOS).  Should v1 ship with that, or should v1
-    be declarative-only (manifest contributions, no JS at all)?
+1.  **Outbound network from the sandbox.**  Decided (BF-2417): deny
+    by default.  A plugin opens a TCP connection only to a `host:port`
+    it declared in `needs.network`.  The child seals that list before
+    importing the plugin and locks the raw binding escape hatch.  Linux
+    also puts a plugin with an empty list in a network namespace, and
+    macOS applies a seatbelt profile that allows only the declared
+    destinations.
 2.  **Plugin UI ceiling.**  Is host-rendered cards + slash commands
     the permanent ceiling, or will plugins eventually contribute raw
     UI (their own React)?

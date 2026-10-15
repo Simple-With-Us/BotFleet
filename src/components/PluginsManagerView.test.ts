@@ -1,5 +1,9 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type { z } from "zod";
+
+import { PluginRow } from "./PluginsManagerView";
 
 import {
   PluginListingSchema,
@@ -52,5 +56,30 @@ describe("plugins manager schemas", () => {
     expect(PluginListingSourceSchema.safeParse({ kind: "folder" }).success).toBe(false);
     expect(PluginListingSourceSchema.safeParse({ kind: "git" }).success).toBe(false);
     expect(PluginsResponseSchema.safeParse({ plugins: [{ ...listing, source: { kind: "git" } }] }).success).toBe(false);
+  });
+
+  it("shows the outbound network allowlist on the plugin row", () => {
+    const noop = () => {};
+    const denied = renderToStaticMarkup(createElement(PluginRow, {
+      plugin: listing,
+      busy: false,
+      onEnable: noop,
+      onDisable: noop,
+      onUpdate: noop,
+      onReload: noop,
+      onRemove: noop,
+    }));
+    expect(denied).toContain("Outbound network: none");
+
+    const allowed = renderToStaticMarkup(createElement(PluginRow, {
+      plugin: { ...listing, needs: { network: ["api.example.com:443"] } },
+      busy: false,
+      onEnable: noop,
+      onDisable: noop,
+      onUpdate: noop,
+      onReload: noop,
+      onRemove: noop,
+    }));
+    expect(allowed).toContain("Outbound network: api.example.com:443");
   });
 });

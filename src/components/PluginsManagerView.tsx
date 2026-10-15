@@ -5,9 +5,9 @@
 //
 // Validation errors render one row per issue.  Each installed plugin is
 // shown as a row that lists its name, version, enabled state, source,
-// declared capabilities, and the titles of any cards or commands it
-// contributes from its manifest — text summaries only, the host does
-// not render plugin-supplied UI here.
+// declared capabilities, the outbound network allowlist, and the titles
+// of any cards or commands it contributes from its manifest — text
+// summaries only, the host does not render plugin-supplied UI here.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowUpCircle, Loader2, Power, PowerOff, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 
@@ -348,7 +348,7 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
   );
 }
 
-function PluginRow({
+export function PluginRow({
   plugin,
   busy,
   onEnable,
@@ -389,6 +389,9 @@ function PluginRow({
           </div>
           <p className="mt-1 text-[13px] text-ink-secondary">{plugin.description}</p>
           <p className="mt-1 text-[12px] text-ink-secondary">Source: {sourceLabel}</p>
+          <p className="mt-1 text-[12px] text-ink-secondary">
+            Outbound network: {plugin.needs?.network.length ? plugin.needs.network.join(", ") : "none"}
+          </p>
           {plugin.capabilities.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-1.5">
               {plugin.capabilities.map((cap) => (

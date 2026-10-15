@@ -8,6 +8,13 @@
 //   * the Node permission model: read access to the child script and the
 //     plugin's own folder only, no filesystem writes, no child processes,
 //     no worker threads, no native addons, no WASI, no inspector,
+//   * outbound network denied by default.  A plugin reaches a destination
+//     only when its manifest declares that exact host:port in
+//     `needs.network`.  The child seals that list before importing the
+//     plugin.  On Linux an empty list also enters a network namespace;
+//     on macOS a seatbelt profile denies the network and allows only the
+//     declared destinations.  Node 25 and later also withhold `--allow-net`
+//     unless the list is non-empty.
 //   * a capped V8 heap, a start deadline, and a per-call deadline.  A call
 //     that overruns kills the child; the next call respawns it.
 //   * stdio closed, so nothing the plugin prints reaches the server log.
@@ -19,16 +26,10 @@
 // parsed with ChildToParentMessageSchema; an unparseable message kills the
 // child.
 //
-// Residual risk: Node's permission model (as shipped in the Node versions
-// BotFleet runs on) does not restrict outbound network access.  A plugin
-// can still open sockets, but it has no credentials, no environment, and
-// no readable files outside its own folder to send.  Network isolation
-// needs an OS-level mechanism and is tracked in docs/plugins/DESIGN.md §
-// Open Questions.
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { z } from "zod";
@@ -38,6 +39,8 @@ import {
   MIN_ROOM_TURN_TIMEOUT_MINUTES,
 } from "./config.ts";
 import { HOST_API_VERSION, satisfiesBotfleetVersion, type JsonValue } from "../shared/plugin-manifest.ts";
+import { normalizePluginNetworkAllow } from "../shared/plugin-net-allow.ts";
+import { killPluginProcess, spawnPluginProcess } from "./plugin-net-isolate.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { PLUGINS_DIR } from "./plugin-registry.ts";
 import {
@@ -237,6 +240,8 @@ export interface PluginSandboxOptions {
   entryPath: string;
   /** The plugin's own folder: the only plugin path the child may read. */
   pluginDir: string;
+  /** Canonical `host:port` tokens.  Empty denies every outbound connection. */
+  networkAllow?: readonly string[];
   pluginId: string;
   logger: (event: PluginLogEvent) => void;
   startTimeoutMs?: number;
@@ -294,10 +299,12 @@ class ChildPluginSandbox implements PluginSandbox {
 
   private readonly child: ChildProcess;
   private readonly options: PluginSandboxOptions;
+  private readonly wrapped: boolean;
 
-  constructor(child: ChildProcess, options: PluginSandboxOptions) {
+  constructor(child: ChildProcess, options: PluginSandboxOptions, wrapped: boolean) {
     this.child = child;
     this.options = options;
+    this.wrapped = wrapped;
     this.exitPromise = new Promise<void>((resolve) => {
       this.resolveExit = resolve;
     });
@@ -319,7 +326,11 @@ class ChildPluginSandbox implements PluginSandbox {
         this.onStart = null;
         resolveStart(result);
       };
-      this.send({ type: "load", entryUrl: pathToFileURL(this.options.entryPath).href });
+      this.send({
+        type: "load",
+        entryUrl: pathToFileURL(this.options.entryPath).href,
+        networkAllow: [...(this.options.networkAllow ?? [])],
+      });
     });
   }
 
@@ -379,7 +390,7 @@ class ChildPluginSandbox implements PluginSandbox {
     if (!this.alive) return;
     this.alive = false;
     if (reason) this.log(reason);
-    this.child.kill("SIGKILL");
+    killPluginProcess(this.child, this.wrapped);
     for (const id of this.pending.keys()) this.settle(id, { ok: false, reason: "sandbox_exited" });
     this.onStart?.(reason ?? "sandbox_exited");
   }
@@ -459,31 +470,51 @@ export async function startPluginSandbox(
     options.logger({ event: "plugin.sandbox", pluginId: options.pluginId, level: "warn", reason: "start_failed" });
     return { reason: "start_failed" };
   }
-  const sandboxOptions: PluginSandboxOptions = { ...options, pluginDir, entryPath };
+  const networkAllow = normalizePluginNetworkAllow(options.networkAllow ?? []);
+  const sandboxOptions: PluginSandboxOptions = { ...options, pluginDir, entryPath, networkAllow };
   const args = [
     flag,
     `--allow-fs-read=${childScript}`,
     `--allow-fs-read=${pluginDir}`,
     `--max-old-space-size=${sandboxOptions.heapMb ?? DEFAULT_HEAP_MB}`,
   ];
-  // The dev tree runs the .ts source; the packaged tree runs the bundled .js.
-  if (childScript.endsWith(".ts")) args.push("--experimental-strip-types", "--no-warnings");
+  // Node 25 and later deny the network under `--permission` unless this
+  // flag is present.  It is all-or-nothing, so it is passed only when the
+  // plugin declared destinations; the child guard then keeps the list.
+  // Older Node builds reject the flag, and their permission model does
+  // not cover the network.
+  if (networkAllow.length > 0 && process.allowedNodeEnvironmentFlags.has("--allow-net")) {
+    args.push("--allow-net");
+  }
+  // The dev tree runs the .ts source, which imports the guard.  The
+  // packaged tree bundles that graph into the child script.
+  if (childScript.endsWith(".ts")) {
+    const serverDir = dirname(childScript);
+    args.push(`--allow-fs-read=${realPath(join(serverDir, "plugin-net-guard.ts"))}`);
+    args.push(`--allow-fs-read=${realPath(join(serverDir, "..", "shared", "plugin-net-allow.ts"))}`);
+    args.push("--experimental-strip-types", "--no-warnings");
+  }
   args.push(childScript);
 
-  let child: ChildProcess;
+  let spawned: ReturnType<typeof spawnPluginProcess>;
   try {
-    child = spawn(process.execPath, args, {
-      cwd: pluginDir,
-      env: sandboxEnv(),
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
-      serialization: "json",
-      windowsHide: true,
+    spawned = spawnPluginProcess({
+      execPath: process.execPath,
+      args,
+      networkAllow,
+      options: {
+        cwd: pluginDir,
+        env: sandboxEnv(),
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+        serialization: "json",
+        windowsHide: true,
+      },
     });
   } catch {
     options.logger({ event: "plugin.sandbox", pluginId: options.pluginId, level: "warn", reason: "start_failed" });
     return { reason: "start_failed" };
   }
-  const sandbox = new ChildPluginSandbox(child, sandboxOptions);
+  const sandbox = new ChildPluginSandbox(spawned.child, sandboxOptions, spawned.wrapped);
   const failure = await sandbox.start();
   if (failure) {
     await sandbox.dispose();
@@ -543,6 +574,7 @@ export async function loadPlugin(
     pluginDir,
     pluginId: pluginLogId(listing.name),
     logger: inputs.logger,
+    networkAllow: normalizePluginNetworkAllow(listing.needs?.network ?? []),
   });
   if ("reason" in started) {
     return { error: `plugin "${listing.name}" failed to load (${started.reason})` };

@@ -3,6 +3,7 @@
 // plugin can and cannot reach.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -43,7 +44,11 @@ function inputs(): PluginHostInputs {
   };
 }
 
-function listing(name: string, capabilities: string[] = ["read.bots", "read.status"]): PluginListing {
+function listing(
+  name: string,
+  capabilities: string[] = ["read.bots", "read.status"],
+  needs?: PluginListing["needs"],
+): PluginListing {
   return {
     name,
     version: "1.0.0",
@@ -56,6 +61,7 @@ function listing(name: string, capabilities: string[] = ["read.bots", "read.stat
     source: { kind: "folder", path: "<test>" },
     warnings: [],
     capabilities,
+    ...(needs ? { needs } : {}),
   };
 }
 
@@ -64,8 +70,13 @@ function writePlugin(name: string, source: string): void {
   writeFileSync(join(baseDir, name, "plugin.mjs"), source);
 }
 
-async function load(name: string, capabilities?: string[], callTimeoutMs?: number): Promise<LoadedPlugin> {
-  const result = await loadPlugin(listing(name, capabilities), inputs(), baseDir, { callTimeoutMs });
+async function load(
+  name: string,
+  capabilities?: string[],
+  callTimeoutMs?: number,
+  needs?: PluginListing["needs"],
+): Promise<LoadedPlugin> {
+  const result = await loadPlugin(listing(name, capabilities, needs), inputs(), baseDir, { callTimeoutMs });
   if ("error" in result) throw new Error(result.error);
   started.push(result);
   return result;
@@ -215,6 +226,235 @@ describe("plugin sandbox isolation", () => {
       await removeDirSafe(linkRoot);
       await removeDirSafe(dirname(linkRoot));
       await removeDirSafe(realRoot);
+    }
+  });
+});
+
+async function listenLocal(onHit: () => void): Promise<{ server: Server; port: number }> {
+  const server = createServer((_req, res) => {
+    onHit();
+    res.end("yes");
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("test server has no port");
+  return { server, port: address.port };
+}
+
+describe("plugin sandbox egress", () => {
+  it("blocks outbound connect, fetch, udp, dns, and raw tcp bindings", async () => {
+    let hits = 0;
+    const local = await listenLocal(() => {
+      hits += 1;
+    });
+    try {
+      const url = JSON.stringify(`http://127.0.0.1:${local.port}/`);
+      writePlugin("egress", `
+        import net from "node:net";
+        import dgram from "node:dgram";
+        import dns from "node:dns/promises";
+        function tcp(host, port) {
+          return new Promise((resolve) => {
+            let socket;
+            try {
+              socket = net.connect({ host, port, timeout: 500 });
+            } catch (error) {
+              resolve(error.code || "error");
+              return;
+            }
+            const finish = (value) => { socket.destroy(); resolve(value); };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+        }
+        export async function getCardData() {
+          let binding = "open";
+          try { process.binding("tcp_wrap"); }
+          catch (error) { binding = error.code || "error"; }
+          let udp = "open";
+          try {
+            const sock = dgram.createSocket("udp4");
+            udp = await new Promise((resolve) => {
+              try {
+                sock.send(Buffer.from("x"), 53, "1.1.1.1", (error) => {
+                  sock.close();
+                  resolve(error ? (error.code || "error") : "sent");
+                });
+              } catch (error) {
+                sock.close();
+                resolve(error.code || "error");
+              }
+            });
+          } catch (error) {
+            udp = error.code || "error";
+          }
+          let looked = "open";
+          try { await dns.lookup("example.com"); }
+          catch (error) { looked = error.code || "error"; }
+          let fetched = "open";
+          try {
+            const response = await fetch(${url}, { signal: AbortSignal.timeout(800) });
+            fetched = "status " + response.status;
+          } catch (error) {
+            fetched = (error.cause && error.cause.code) || error.code || error.name || "error";
+          }
+          return { result: {
+            binding,
+            udp,
+            looked,
+            fetched,
+            local: await tcp("127.0.0.1", ${local.port}),
+            remote: await tcp("203.0.113.1", 80),
+          } };
+        }
+      `);
+      const plugin = await load("egress", []);
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({
+        binding: "ERR_ACCESS_DENIED",
+        udp: "ERR_ACCESS_DENIED",
+        looked: "ERR_ACCESS_DENIED",
+        fetched: "ERR_ACCESS_DENIED",
+        local: "ERR_ACCESS_DENIED",
+        remote: "ERR_ACCESS_DENIED",
+      });
+      expect(hits).toBe(0);
+    } finally {
+      await new Promise((resolve) => local.server.close(resolve));
+    }
+  });
+
+  it("does not let plugin code widen an empty allowlist", async () => {
+    let hits = 0;
+    const local = await listenLocal(() => {
+      hits += 1;
+    });
+    try {
+      writePlugin("widen", `
+        import net from "node:net";
+        process.emit("message", {
+          type: "load",
+          entryUrl: import.meta.url,
+          networkAllow: ["127.0.0.1:${local.port}"],
+        });
+        export async function getCardData() {
+          return await new Promise((resolve) => {
+            let socket;
+            try {
+              socket = net.connect({ host: "127.0.0.1", port: ${local.port}, timeout: 500 });
+            } catch (error) {
+              resolve({ result: { local: error.code || "error" } });
+              return;
+            }
+            const finish = (local) => { socket.destroy(); resolve({ result: { local } }); };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+        }
+      `);
+      const plugin = await load("widen", []);
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({ local: "ERR_ACCESS_DENIED" });
+      expect(hits).toBe(0);
+    } finally {
+      await new Promise((resolve) => local.server.close(resolve));
+    }
+  });
+
+  it("allows only the declared host and port", async () => {
+    let allowedHits = 0;
+    let blockedHits = 0;
+    const allowed = await listenLocal(() => {
+      allowedHits += 1;
+    });
+    const blocked = await listenLocal(() => {
+      blockedHits += 1;
+    });
+    try {
+      const url = JSON.stringify(`http://127.0.0.1:${allowed.port}/`);
+      writePlugin("allow", `
+        import net from "node:net";
+        function tcp(port) {
+          return new Promise((resolve) => {
+            let socket;
+            try {
+              socket = net.connect({ host: "127.0.0.1", port, timeout: 500 });
+            } catch (error) {
+              resolve(error.code || "error");
+              return;
+            }
+            const finish = (value) => { socket.destroy(); resolve(value); };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+        }
+        export async function getCardData() {
+          let binding = "open";
+          try { process.binding("udp_wrap"); }
+          catch (error) { binding = error.code || "error"; }
+          let body = "";
+          try {
+            const response = await fetch(${url});
+            body = await response.text();
+          } catch (error) {
+            body = error.code || "error";
+          }
+          return { result: {
+            binding,
+            body,
+            allowed: await tcp(${allowed.port}),
+            blocked: await tcp(${blocked.port}),
+          } };
+        }
+      `);
+      const plugin = await load("allow", [], undefined, { network: [`127.0.0.1:${allowed.port}`] });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({
+        binding: "ERR_ACCESS_DENIED",
+        body: "yes",
+        allowed: "connected",
+        blocked: "ERR_ACCESS_DENIED",
+      });
+      expect(allowedHits).toBeGreaterThan(0);
+      expect(blockedHits).toBe(0);
+    } finally {
+      await new Promise((resolve) => allowed.server.close(resolve));
+      await new Promise((resolve) => blocked.server.close(resolve));
+    }
+  });
+
+  it("drops an invalid needs entry instead of granting it", async () => {
+    let hits = 0;
+    const local = await listenLocal(() => {
+      hits += 1;
+    });
+    try {
+      writePlugin("bogus-needs", `
+        import net from "node:net";
+        export function getCardData() {
+          try {
+            net.connect({ host: "127.0.0.1", port: ${local.port} });
+            return { result: { local: "started" } };
+          } catch (error) {
+            return { result: { local: error.code || "error" } };
+          }
+        }
+      `);
+      const plugin = await load("bogus-needs", [], undefined, { network: ["*", "https://evil.test/x"] });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({ local: "ERR_ACCESS_DENIED" });
+      expect(hits).toBe(0);
+    } finally {
+      await new Promise((resolve) => local.server.close(resolve));
     }
   });
 });

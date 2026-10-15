@@ -26,6 +26,7 @@ describe("parsePluginManifest", () => {
       expect(result.manifest.botfleet).toBe(">=1");
       expect(result.manifest.entry).toBe("plugin.mjs");
       expect(result.manifest.capabilities).toEqual([]);
+      expect(result.manifest.needs.network).toEqual([]);
     }
   });
 
@@ -83,6 +84,34 @@ describe("parsePluginManifest", () => {
       expect(issue).toBeTruthy();
       expect(issue!.message).toMatch(/semver/);
     }
+  });
+
+  it("accepts an explicit network allowlist and rejects everything else", () => {
+    const allowed = parsePluginManifest({
+      ...valid,
+      needs: { network: ["API.Example.com:443", "[::1]:9"] },
+    });
+    expect(allowed.ok).toBe(true);
+    if (allowed.ok) {
+      expect(allowed.manifest.needs.network).toEqual(["API.Example.com:443", "[::1]:9"]);
+    }
+    for (const entry of ["*", "https://example.com/a", "example.com", "127.0.0.1:0", "127.0.0.1:99999", "::1:443"]) {
+      const result = parsePluginManifest({ ...valid, needs: { network: [entry] } });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.issues.some((issue) => issue.field.startsWith("needs.network"))).toBe(true);
+      }
+    }
+    const duplicate = parsePluginManifest({
+      ...valid,
+      needs: { network: ["example.com:443", "Example.com:443"] },
+    });
+    expect(duplicate.ok).toBe(false);
+    if (!duplicate.ok) {
+      expect(duplicate.issues.some((issue) => issue.field === "needs.network")).toBe(true);
+    }
+    const extra = parsePluginManifest({ ...valid, needs: { network: [], shell: true } });
+    expect(extra.ok).toBe(false);
   });
 
   it("rejects unknown capabilities", () => {
