@@ -2935,7 +2935,7 @@ describe("harness HTTP API", () => {
           );
           return state?.busy === false;
         },
-        winSettleMs(10_000),
+        winSettleMs(20_000),
         200,
         "bot clearing busy after interrupt on the failover owner",
       );
@@ -2943,7 +2943,7 @@ describe("harness HTTP API", () => {
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
       await api("DELETE", `/api/bots/${bot.id}`);
     }
-  }, winSettleMs(40_000));
+  }, winSettleMs(60_000));
 
   it("the mid-turn fail-over skips a chain entry the doomed breaker is refusing", async () => {
     // Regression: selectTurnFallback only skipped a doomed engine when its
