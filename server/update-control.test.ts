@@ -105,6 +105,7 @@ function build(
     installedCommit?: string;
     launcher?: "launchd" | "detached";
     exec?: (command: string, args: string[]) => CommandResult;
+    appPath?: string;
   } = {},
 ): Harness {
   const launched: LaunchPlan[] = [];
@@ -121,6 +122,7 @@ function build(
     stateDirectory: paths.stateDirectory,
     updatesDirectory: paths.updatesDirectory,
     scriptPath: paths.scriptPath,
+    ...(options.appPath ? { appPath: options.appPath } : {}),
     platform: options.platform ?? "darwin",
     nodeDirectory: "/opt/homebrew/bin",
     now: options.now ?? (() => new Date("2026-09-13T12:00:00.000Z")),
@@ -1291,6 +1293,26 @@ describe("sweeping what failed runs leave on disk", () => {
     const paths = rig();
     expect(() => build(paths)).not.toThrow();
     expect(pruneUpdateStages(join(paths.root, "nowhere"))).toEqual([]);
+  });
+
+  it("removes expired failed-install bundles beside the app on boot", () => {
+    const paths = rig();
+    const applications = join(paths.root, "Applications");
+    mkdirSync(applications, { recursive: true });
+    const appPath = join(applications, "BotFleet.app");
+    mkdirSync(appPath);
+    const old = [
+      "BotFleet.app.failed-1000",
+      "BotFleet.app.failed-2000",
+      "BotFleet.app.failed-3000",
+      "BotFleet.app.failed-4000",
+    ];
+    for (const name of old) mkdirSync(join(applications, name));
+    build(paths, { appPath });
+    expect(existsSync(join(applications, "BotFleet.app.failed-1000"))).toBe(false);
+    expect(existsSync(join(applications, "BotFleet.app.failed-2000"))).toBe(true);
+    expect(existsSync(join(applications, "BotFleet.app.failed-3000"))).toBe(true);
+    expect(existsSync(join(applications, "BotFleet.app.failed-4000"))).toBe(true);
   });
 
   it("keeps the newest run logs and forgets the rest, run by run", () => {
