@@ -9,6 +9,16 @@ export interface ThreadWedgeKey {
   instanceId: string;
 }
 
+export interface ThreadWedgeFailureResult {
+  streak: number;
+  shouldRotate: boolean;
+}
+
+export interface ThreadWedgeFailureInput {
+  stopReason?: string | null;
+  runtimeMessage?: string;
+}
+
 const NO_OUTPUT_STOPS = new Set([
   "prompt_stall",
   "prompt_timeout",
@@ -26,7 +36,7 @@ function wedgeKey(key: ThreadWedgeKey): string {
   return `${key.botId}:${key.threadId}:${key.instanceId}`;
 }
 
-/** Tracks consecutive wedge-shaped failures per bot/thread/engine instance. */
+/** Tracks consecutive wedge failures per bot/thread/engine instance. */
 export class ThreadWedgeGuard {
   private readonly streaks = new Map<string, number>();
 
@@ -34,10 +44,7 @@ export class ThreadWedgeGuard {
     this.streaks.delete(wedgeKey(key));
   }
 
-  recordFailure(
-    key: ThreadWedgeKey,
-    input: { stopReason?: string | null; runtimeMessage?: string },
-  ): { streak: number; shouldRotate: boolean } {
+  recordFailure(key: ThreadWedgeKey, input: ThreadWedgeFailureInput): ThreadWedgeFailureResult {
     const wedge =
       isNoOutputWedgeStop(input.stopReason) ||
       (input.runtimeMessage ? isMcodeLockContentionMessage(input.runtimeMessage) : false);
