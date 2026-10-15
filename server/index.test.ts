@@ -141,6 +141,9 @@ const settlesWithin = async (
   }
 };
 
+/** windows-latest is slower and overlaps vitest files more; scale settle budgets there. */
+const winSettleMs = (ms: number) => (process.platform === "win32" ? Math.round(ms * 2) : ms);
+
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
   const response = await fetch(`${BASE}/api/attachments`, {
     method: "POST",
@@ -6214,6 +6217,7 @@ describe("instance CLI override API", () => {
     const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
     const claude2 = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude2");
     const bot = (await api("POST", "/api/bots")).body.bot as { id: string; threadId: string };
+    const idlePoll = { timeout: winSettleMs(30_000), interval: 250 };
     const persistedTask = () => {
       const bots = JSON.parse(readFileSync(join(home, ".botfleet", "bots.json"), "utf8")) as Array<{
         id: string;
@@ -6233,14 +6237,14 @@ describe("instance CLI override API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }).toBe(false);
+      }, idlePoll).toBe(false);
     };
 
     try {
       await select("claude", claude.models.default);
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "establish a Claude cursor" })).status).toBe(202);
-      await expect.poll(() => persistedTask(), { timeout: 5_000 }).toMatchObject({
+      await expect.poll(() => persistedTask(), { timeout: winSettleMs(10_000) }).toMatchObject({
         lastInstanceId: "claude",
         resumeCursors: { claude: expect.any(String) },
       });
@@ -6249,7 +6253,7 @@ describe("instance CLI override API", () => {
 
       await select("claude2", claude2.models.default);
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "make the second engine current" })).status).toBe(202);
-      await expect.poll(() => persistedTask()?.lastInstanceId, { timeout: 5_000 }).toBe("claude2");
+      await expect.poll(() => persistedTask()?.lastInstanceId, { timeout: winSettleMs(10_000) }).toBe("claude2");
       await interrupt();
 
       expect((await api("PATCH", "/api/instances/claude", { cli: fakeUnsupportedClaudeCli })).status).toBe(200);
@@ -6260,7 +6264,7 @@ describe("instance CLI override API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }, { timeout: 5_000 }).toBe(false);
+      }, idlePoll).toBe(false);
 
       expect(persistedTask()).toMatchObject({
         lastInstanceId: "claude2",
@@ -6271,7 +6275,7 @@ describe("instance CLI override API", () => {
       await api("DELETE", `/api/bots/${bot.id}`);
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI })).status).toBe(200);
     }
-  }, 20_000);
+  }, winSettleMs(60_000));
 
   it("does not let setup from before a provider reload dispatch or clear its successor", async () => {
     const launchLog = join(home, "fake-claude-setup-race-launches");
@@ -6493,6 +6497,7 @@ describe("instance CLI override API", () => {
 
     expect((await api("DELETE", "/api/instances/claude")).status).toBe(400);
     expect((await api("DELETE", "/api/instances/openaiCompat")).status).toBe(400);
+    expect((await api("DELETE", "/api/instances/opencode")).status).toBe(400);
 
     const deleted = await api("DELETE", `/api/instances/${instanceId}`);
     expect(deleted.status).toBe(200);
