@@ -480,8 +480,22 @@ export function reconcilableGenerations(generations, { appPath, installedCommit 
  * follow it: the running binary and everything it maps stay open as `txt`
  * descriptors, and lsof prints their current paths.
  */
+/**
+ * `/var` is a symlink to `/private/var`.  lsof prints one of them and
+ * `realpath` returns the other, so both have to count as the same bundle.
+ */
+function bundlePathPrefixes(bundleRealPath) {
+  const prefixes = [`${bundleRealPath}${sep}`];
+  if (bundleRealPath.startsWith("/private/var/")) {
+    prefixes.push(`${bundleRealPath.slice("/private".length)}${sep}`);
+  } else if (bundleRealPath.startsWith("/var/")) {
+    prefixes.push(`/private${bundleRealPath}${sep}`);
+  }
+  return prefixes;
+}
+
 export function txtHolderPids(lsofOutput, bundleRealPath) {
-  const prefix = `${bundleRealPath}${sep}`;
+  const prefixes = bundlePathPrefixes(bundleRealPath);
   const pids = new Set();
   let pid = null;
   for (const line of lsofOutput.split("\n")) {
@@ -491,7 +505,8 @@ export function txtHolderPids(lsofOutput, bundleRealPath) {
       continue;
     }
     if (pid === null || !line.startsWith("n")) continue;
-    if (line.slice(1).startsWith(prefix)) pids.add(pid);
+    const name = line.slice(1);
+    if (prefixes.some((prefix) => name.startsWith(prefix))) pids.add(pid);
   }
   return [...pids];
 }
@@ -2285,6 +2300,39 @@ async function exactAppPids(appPath) {
 }
 
 /**
+ * Executables whose open references identify the bundle: the main binary, and
+ * the embedded driver.  A full `+D` walk is the wrong tool here.  The app
+ * bundle is large, and that walk stats every file inside it.
+ */
+async function bundleExecutablePaths(root) {
+  const paths = [];
+  const macosDir = join(root, "Contents", "MacOS");
+  let names = [];
+  try {
+    names = await readdir(macosDir);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  for (const name of names) {
+    const path = join(macosDir, name);
+    try {
+      const info = await lstat(path);
+      if (info.isFile() && !info.isSymbolicLink()) paths.push(path);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  const driver = join(root, "Contents", "Resources", "cua-driver");
+  try {
+    const info = await lstat(driver);
+    if (info.isFile() && !info.isSymbolicLink()) paths.push(driver);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return paths;
+}
+
+/**
  * Every process holding any executable or mapped library inside the bundle, by
  * the kernel's open reference rather than by recorded arguments.  This is what
  * finds a bundle this updater has already renamed, and it is also what finds
@@ -2292,8 +2340,13 @@ async function exactAppPids(appPath) {
  * embedded computer-use driver at `Contents/Resources/cua-driver` and the
  * `BotFleet Speech.app` / `BotFleet Recorder.app` helpers.  Renaming the
  * bundle while any of them runs is the thing to avoid.
+ *
+ * Two lsof questions, because each macOS build answers a different one.  The
+ * system-wide text scan sees mapped binaries on a developer Mac.  The hosted
+ * macOS 14 image often prints nothing for that mapping, while a lookup of the
+ * executable path still lists a process that has the file open.
  */
-async function bundleHolderPids(bundlePath) {
+export async function bundleHolderPids(bundlePath) {
   let root;
   try {
     root = await realpath(bundlePath);
@@ -2301,9 +2354,17 @@ async function bundleHolderPids(bundlePath) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
-  const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
-  if (![0, 1].includes(result.code)) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
-  return withoutExitedPids(txtHolderPids(result.stdout, root));
+  const executables = await bundleExecutablePaths(root);
+  const scans = [run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true })];
+  if (executables.length) scans.push(run("lsof", ["-F", "pn", "--", ...executables], { allowFailure: true }));
+  const results = await Promise.all(scans);
+  const usable = results.filter((result) => [0, 1].includes(result.code));
+  if (!usable.length) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
+  const pids = new Set();
+  for (const result of usable) {
+    for (const pid of txtHolderPids(result.stdout, root)) pids.add(pid);
+  }
+  return withoutExitedPids([...pids]);
 }
 
 /**

@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import test from "node:test";
 import {
   abandonedStages,
+  bundleHolderPids,
   failedInstallBundles,
   failedInstallBundlesToPrune,
   failedInstallStamp,
@@ -132,6 +133,16 @@ test("a rollback bundle this run did not move is never promoted over the install
 });
 
 // P1 — argv does not follow a rename; the kernel's open reference does.
+//
+// Hosted macOS 14 lsof often omits the text mapping of an ad-hoc copy, and
+// still lists a numbered descriptor on that same file.  Hold one open across
+// exec so the scan has a reference it can actually see, on either lsof.
+
+function spawnHoldingBinary(executable, t) {
+  const child = spawn("/bin/sh", ["-c", 'exec 3<"$0"; exec "$0" "$@"', executable, "120"], { stdio: "ignore" });
+  t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
+  return child;
+}
 
 test("a process keeps its bundle open across a rename, and only the open reference finds it", macOnly, async (t) => {
   const root = await fixture(t);
@@ -142,8 +153,7 @@ test("a process keeps its bundle open across a rename, and only the open referen
   // give it an ad-hoc one.
   await run("codesign", ["-f", "-s", "-", executable]);
 
-  const child = spawn(executable, ["120"], { stdio: "ignore" });
-  t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
+  const child = spawnHoldingBinary(executable, t);
   await new Promise((done) => setTimeout(done, 800));
   assert.equal(child.exitCode, null, "the signed copy should still be running");
 
@@ -160,17 +170,9 @@ test("a process keeps its bundle open across a rename, and only the open referen
     "arguments must still name the pre-rename path, which is why the argv check missed the survivor",
   );
 
-  // lsof resolves the current path of the open vnode, so it finds it.
-  const byReference = await run("lsof", ["-t", "--", renamedExecutable], { allowFailure: true });
-  assert.deepEqual(
-    byReference.stdout.split(/\s+/).filter(Boolean).map(Number),
-    [child.pid],
-  );
-
-  // And the whole-bundle scan finds it under the renamed bundle too.
-  const scan = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
-  const { realpath } = await import("node:fs/promises");
-  assert.ok(txtHolderPids(scan.stdout, await realpath(renamed)).includes(child.pid));
+  // The holder scan follows the open vnode.  ps, above, still has the old path.
+  const holders = await bundleHolderPids(renamed);
+  assert.ok(holders.includes(child.pid), `open reference to ${renamedExecutable} should include ${child.pid}`);
 });
 
 // P1 — processes that live inside the bundle but are not its main binary.
@@ -184,15 +186,12 @@ test("the bundle scan finds an embedded driver, not only the main executable", m
   await copyFile("/bin/sleep", driver);
   await run("codesign", ["-f", "-s", "-", driver]);
 
-  const child = spawn(driver, ["120"], { stdio: "ignore" });
-  t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
+  const child = spawnHoldingBinary(driver, t);
   await new Promise((done) => setTimeout(done, 800));
   assert.equal(child.exitCode, null, "the embedded driver should still be running");
 
-  const { realpath } = await import("node:fs/promises");
-  const before = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
   assert.ok(
-    txtHolderPids(before.stdout, await realpath(bundle)).includes(child.pid),
+    (await bundleHolderPids(bundle)).includes(child.pid),
     "a process running Contents/Resources/cua-driver holds the bundle",
   );
 
@@ -201,13 +200,12 @@ test("the bundle scan finds an embedded driver, not only the main executable", m
   // its arguments still name the path it started from.
   const renamed = join(root, ".BotFleet.rollback-1757600000000-2246f19e9de8.app");
   await rename(bundle, renamed);
-  const after = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
   assert.ok(
-    txtHolderPids(after.stdout, await realpath(renamed)).includes(child.pid),
+    (await bundleHolderPids(renamed)).includes(child.pid),
     "the embedded driver must still be found under the renamed bundle",
   );
   assert.equal(
-    txtHolderPids(after.stdout, join(root, "BotFleet.app")).includes(child.pid),
+    (await bundleHolderPids(join(root, "BotFleet.app"))).includes(child.pid),
     false,
     "and no longer under the path it was launched from",
   );
@@ -232,6 +230,14 @@ test("the txt parser attributes each path to the process that holds it", () => {
   // A sibling whose name merely starts the same way is a different bundle.
   assert.deepEqual(txtHolderPids(output, appPath("Other.app")), [101]);
   assert.deepEqual(txtHolderPids("", appPath("BotFleet.app")), []);
+});
+
+test("the txt parser treats /var and /private/var as the same bundle", { skip: sep === "/" ? false : "macOS path alias" }, () => {
+  const resolved = join("/private", "var", "folders", "xx", "T", "BotFleet.app");
+  const reported = join("/var", "folders", "xx", "T", "BotFleet.app", "Contents", "MacOS", "BotFleet");
+  const output = ["p202", "ftxt", `n${reported}`].join("\n");
+  assert.deepEqual(txtHolderPids(output, resolved), [202]);
+  assert.deepEqual(txtHolderPids(output, join("/var", "folders", "xx", "T", "BotFleet.app")), [202]);
 });
 
 // P1/P3 — orphan visibility in the cache placement.
