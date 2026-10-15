@@ -154,11 +154,13 @@ export function VoiceSettings({
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [cloneSuccess, setCloneSuccess] = useState<string | null>(null);
   const [cloneRecording, setCloneRecording] = useState(false);
+  const [cloneRecordPending, setCloneRecordPending] = useState(false);
   const [cloneRecordElapsed, setCloneRecordElapsed] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const micRecorderRef = useRef<MicRecorder | null>(null);
+  const cloneRecordIntentRef = useRef(false);
   const recordStartedAtRef = useRef(0);
-  const recordTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordTickRef = useRef<number | null>(null);
 
   const configured = Boolean(tts?.configured);
   const cloneRecordSupported =
@@ -319,26 +321,50 @@ export function VoiceSettings({
     }
   };
 
+  const cancelCloneRecording = () => {
+    cloneRecordIntentRef.current = false;
+    clearCloneRecordTick();
+    const session = micRecorderRef.current;
+    micRecorderRef.current = null;
+    setCloneRecording(false);
+    setCloneRecordPending(false);
+    setCloneRecordElapsed(0);
+    session?.cancel();
+  };
+
+  const closeClonePanel = () => {
+    if (cloneRecording || cloneRecordPending) cancelCloneRecording();
+    setCloneOpen(false);
+  };
+
   const startCloneRecording = async () => {
-    if (!cloneRecordSupported || cloneRecording) return;
+    if (!cloneRecordSupported || cloneRecording || cloneRecordPending) return;
+    cloneRecordIntentRef.current = true;
+    setCloneRecordPending(true);
     setCloneError(null);
     setCloneSuccess(null);
     setCloneFile(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
     try {
       const session = await startMicRecorder();
+      if (!cloneRecordIntentRef.current) {
+        session.cancel();
+        return;
+      }
       micRecorderRef.current = session;
       recordStartedAtRef.current = Date.now();
       setCloneRecordElapsed(0);
       setCloneRecording(true);
       clearCloneRecordTick();
-      recordTickRef.current = setInterval(() => {
+      recordTickRef.current = window.setInterval(() => {
         const elapsed = Math.floor((Date.now() - recordStartedAtRef.current) / 1000);
         setCloneRecordElapsed(elapsed);
         if (elapsed >= VOICE_CLONE_MAX_SECONDS) void stopCloneRecording();
       }, 500);
     } catch (e) {
       setCloneError(e instanceof Error ? e.message : "Could not start recording.");
+    } finally {
+      setCloneRecordPending(false);
     }
   };
 
@@ -706,7 +732,7 @@ export function VoiceSettings({
               type="button"
               onClick={() => {
                 setCustomOpen((o) => !o);
-                setCloneOpen(false);
+                closeClonePanel();
               }}
               className="flex items-center gap-1 text-[12px] text-accent hover:underline"
             >
@@ -716,8 +742,11 @@ export function VoiceSettings({
             <button
               type="button"
               onClick={() => {
-                setCloneOpen((o) => !o);
-                setCustomOpen(false);
+                if (cloneOpen) closeClonePanel();
+                else {
+                  setCloneOpen(true);
+                  setCustomOpen(false);
+                }
               }}
               className="flex items-center gap-1 text-[12px] text-accent hover:underline"
             >
@@ -787,7 +816,7 @@ export function VoiceSettings({
                   <button
                     type="button"
                     onClick={() => void startCloneRecording()}
-                    disabled={cloneCloning}
+                    disabled={cloneCloning || cloneRecordPending}
                     className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-card px-3 py-1.5 text-[12.5px] font-medium text-ink hover:bg-inset disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <Mic size={13} />
@@ -849,7 +878,7 @@ export function VoiceSettings({
               </button>
               <button
                 type="button"
-                onClick={() => setCloneOpen(false)}
+                onClick={() => closeClonePanel()}
                 className="rounded-lg px-2.5 py-1.5 text-[12.5px] text-ink-secondary hover:text-ink"
               >
                 Cancel

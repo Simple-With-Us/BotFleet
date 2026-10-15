@@ -6,6 +6,7 @@ describe("voice-clone-recording", () => {
   it("encodes a short mono buffer as a WAV blob", () => {
     const samples = new Float32Array(800);
     for (let i = 0; i < samples.length; i += 1) samples[i] = Math.sin(i / 40);
+    // SAFETY: test stub implements only encodeWavFromAudioBuffer's mono read contract.
     const buffer = {
       numberOfChannels: 1,
       length: samples.length,
