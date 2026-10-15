@@ -2299,22 +2299,21 @@ async function exactAppPids(appPath) {
   return exactAppPidsFromPs(result.stdout, join(appPath, "Contents/MacOS/BotFleet"));
 }
 
-function pidsFromTerseLsof(stdout) {
-  return stdout.split(/\s+/).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0);
+function pidsFromFieldLsof(stdout) {
+  const pids = [];
+  for (const line of stdout.split("\n")) {
+    if (!line.startsWith("p")) continue;
+    const pid = Number(line.slice(1));
+    if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+  }
+  return pids;
 }
 
-async function lsofTersePids(args) {
-  const result = await run("lsof", ["-t", ...args], { allowFailure: true });
-  return {
-    ok: [0, 1].includes(result.code),
-    pids: pidsFromTerseLsof(result.stdout),
-  };
-}
-
-/** `lsof -t +D` on a directory that does not itself contain directories.
- * Hosted macOS 14 answers this for an ordinary open file.  The same image
- * returned an empty pid list for `+d` and for a named-file lookup.  A
- * subdirectory is skipped so this cannot walk `Resources/server`. */
+/** `lsof -Fn +D` on a directory that does not itself contain directories.
+ * That is the command the release-store probe uses, and hosted macOS 14
+ * answers it for an ordinary open file.  `lsof -t +D` and `lsof -t +d` on
+ * the same image returned exit 1 and an empty pid list.  A subdirectory is
+ * skipped so this cannot walk `Resources/server`. */
 async function scanOpenDirectory(directory) {
   let names;
   try {
@@ -2324,7 +2323,11 @@ async function scanOpenDirectory(directory) {
     throw error;
   }
   if (names.length > 64 || names.some((entry) => entry.isDirectory())) return null;
-  return lsofTersePids(["+D", directory]);
+  const result = await run("lsof", ["-Fn", "+D", directory], { allowFailure: true });
+  return {
+    ok: [0, 1].includes(result.code),
+    pids: pidsFromFieldLsof(result.stdout),
+  };
 }
 
 /**
@@ -2337,7 +2340,7 @@ async function scanOpenDirectory(directory) {
  * bundle while any of them runs is the thing to avoid.
  *
  * The text scan is what a developer Mac reports for a mapped binary.  Hosted
- * macOS 14 often prints nothing for that mapping.  `lsof -t +D` on a flat
+ * macOS 14 often prints nothing for that mapping.  `lsof -Fn +D` on a flat
  * directory is the form that image already answers for an open file.
  */
 export async function bundleHolderPids(bundlePath) {
@@ -2359,8 +2362,6 @@ export async function bundleHolderPids(bundlePath) {
   const resourcesDir = join(root, "Contents", "Resources");
   const resourcesScan = await scanOpenDirectory(resourcesDir);
   if (resourcesScan) scans.push(resourcesScan);
-  const driver = join(resourcesDir, "cua-driver");
-  if (await exists(driver)) scans.push(lsofTersePids([driver]));
   const results = await Promise.all(scans);
   const usable = results.filter((result) => result.ok);
   if (!usable.length) throw new Error("Could not inspect BotFleet bundle ownership with lsof");

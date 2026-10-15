@@ -135,20 +135,35 @@ test("a rollback bundle this run did not move is never promoted over the install
 // P1 — argv does not follow a rename; the kernel's open reference does.
 //
 // Hosted macOS 14 lsof lists an ordinary open file and omits the text mapping
-// of an ad-hoc binary.  Hold a marker file open across exec.  `lsof +D` is
-// the form that image already answers.  `+d` returned an empty pid list.
+// of an ad-hoc binary.  Hold a marker the way the release-store probe does,
+// then exec system sleep so the descriptor survives.  `lsof -Fn +D` is the
+// command that probe uses.  `lsof -t +D` returned an empty pid list.
 
-function spawnHoldingBinary(executable, marker, t) {
-  const child = spawn("/bin/sh", ["-c", 'exec 3<"$1"; shift; exec "$0" "$@"', executable, marker, "120"], { stdio: "ignore" });
+async function spawnHoldingMarker(marker, t) {
+  const child = spawn("/bin/sh", ["-c", 'exec 3<"$1"; printf r; exec /bin/sleep 120', "_", marker], { stdio: ["ignore", "pipe", "ignore"] });
   t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
-  return child;
+  const opened = await new Promise((resolve) => {
+    let text = "";
+    const timer = setTimeout(() => resolve(false), 5_000);
+    child.stdout.on("data", (chunk) => {
+      text += chunk;
+      if (!text.includes("r")) return;
+      clearTimeout(timer);
+      resolve(true);
+    });
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+  return { child, opened };
 }
 
 async function assertHolds(bundle, directory, child, label) {
   const holders = await bundleHolderPids(bundle);
   if (holders.includes(child.pid)) return;
-  const probe = await run("lsof", ["-t", "+D", directory], { allowFailure: true });
-  assert.fail(`${label}: holders=${holders.join(",") || "(none)"} lsof +D code=${probe.code} stdout=${JSON.stringify(probe.stdout)} stderr=${JSON.stringify(probe.stderr)}`);
+  const probe = await run("lsof", ["-Fn", "+D", directory], { allowFailure: true });
+  assert.fail(`${label}: holders=${holders.join(",") || "(none)"} lsof -Fn +D code=${probe.code} stdout=${JSON.stringify(probe.stdout)} stderr=${JSON.stringify(probe.stderr)}`);
 }
 
 test("a process keeps its bundle open across a rename, and only the open reference finds it", macOnly, async (t) => {
@@ -156,15 +171,12 @@ test("a process keeps its bundle open across a rename, and only the open referen
   const executable = join(root, "App.app", "Contents", "MacOS", "BotFleet");
   await mkdir(dirname(executable), { recursive: true });
   await copyFile("/bin/sleep", executable);
-  // A copied Apple binary loses its signature and is killed on launch, so
-  // give it an ad-hoc one.
-  await run("codesign", ["-f", "-s", "-", executable]);
   const marker = join(dirname(executable), "open-marker");
   await writeFile(marker, "open");
 
-  const child = spawnHoldingBinary(executable, marker, t);
-  await new Promise((done) => setTimeout(done, 800));
-  assert.equal(child.exitCode, null, "the signed copy should still be running");
+  const { child, opened } = await spawnHoldingMarker(marker, t);
+  assert.equal(opened, true, "the child never signalled that it had the marker open");
+  assert.equal(child.exitCode, null, "sleep should still be running");
 
   const renamed = join(root, ".App.rollback.app");
   await rename(join(root, "App.app"), renamed);
@@ -192,13 +204,12 @@ test("the bundle scan finds an embedded driver, not only the main executable", m
   await mkdir(dirname(driver), { recursive: true });
   await mkdir(join(bundle, "Contents", "MacOS"), { recursive: true });
   await copyFile("/bin/sleep", driver);
-  await run("codesign", ["-f", "-s", "-", driver]);
   const marker = join(dirname(driver), "open-marker");
   await writeFile(marker, "open");
 
-  const child = spawnHoldingBinary(driver, marker, t);
-  await new Promise((done) => setTimeout(done, 800));
-  assert.equal(child.exitCode, null, "the embedded driver should still be running");
+  const { child, opened } = await spawnHoldingMarker(marker, t);
+  assert.equal(opened, true, "the child never signalled that it had the marker open");
+  assert.equal(child.exitCode, null, "sleep should still be running");
 
   await assertHolds(bundle, dirname(driver), child, "embedded driver");
 
