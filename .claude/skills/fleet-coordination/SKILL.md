@@ -69,7 +69,7 @@ Every agent session must start with systematic orientation before touching code:
    board stats
    board list --status open,in_progress --limit 25
    ```
-   Effort logs are archived — use Linear, not `~/apps/*EFFORT-LOG.md` or `docs/EFFORT-LOG.md`, for open work.
+   Effort logs are archived — use Linear (`board` or agent-sync `linear_list` when mounted), not `~/apps/*EFFORT-LOG.md` or `docs/EFFORT-LOG.md`, for open work.
 
 ---
 

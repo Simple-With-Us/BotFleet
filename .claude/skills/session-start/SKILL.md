@@ -50,15 +50,16 @@ Skim Slack headers for `MONET` or a `repo:` you are about to touch.  `FLEET` as 
 
 The shared checkout is the human/fleet review base.  Mid-task branch flips there have landed one seat's commits on another seat's branch.
 
-| App | Slack `repo:` | Acronym | Monet worktree | Live board |
-|-----|---------------|---------|----------------|------------|
-| Socratic.Trade | `Socratic.Trade` | ST | `~/apps/trading-monet` | `~/apps/TRADING-EFFORT-LOG.md` |
-| Congress.Trade | `Congress.Trade` | CT | `~/apps/congress-monet` | `~/apps/CONGRESS-TRADE-EFFORT-LOG.md` |
-| Usage Monitor | `API-usage-monitor` | UM | `~/apps/usage-monet` | `~/apps/API-USAGE-MONITOR-EFFORT-LOG.md` |
-| congress-trading-shared | `congress-trading-shared` | CTS | `~/apps/cts-monet` | `~/apps/CONGRESS-SHARED-EFFORT-LOG.md` |
-| DealDex | `DealDex` | DD | `~/apps/dealdex-monet` | `~/apps/DEALDEX-EFFORT-LOG.md` |
-| Personal-Site | `Personal-Site` | PS | `~/apps/personal-monet` | `~/apps/PERSONAL-SITE-EFFORT-LOG.md` |
-| ai-fleet-coordinator / machine infra | `ai-fleet-coordinator` or `fleet-infra` | AFL | `~/apps/fleet-monet` (or a `~/apps/fleet-monet-<lane>` worktree) | `~/apps/FLEET-INFRA-EFFORT-LOG.md` |
+| App | Slack `repo:` | Acronym | Monet worktree | Linear team |
+|-----|---------------|---------|----------------|-------------|
+| Socratic.Trade | `Socratic.Trade` | ST | `~/apps/trading-monet` | `ST` |
+| Congress.Trade | `Congress.Trade` | CT | `~/apps/congress-monet` | `CT` |
+| Usage Monitor | `API-usage-monitor` | UM | `~/apps/usage-monet` | `UM` |
+| congress-trading-shared | `congress-trading-shared` | CTS | `~/apps/cts-monet` | `CTS` |
+| DealDex | `DealDex` | DD | `~/apps/dealdex-monet` | `DD` |
+| Personal-Site | `Personal-Site` | PS | `~/apps/personal-monet` | `PS` |
+| ai-fleet-coordinator / machine infra | `ai-fleet-coordinator` or `fleet-infra` | AFL | `~/apps/fleet-monet` (or a `~/apps/fleet-monet-<lane>` worktree) | `AFL` |
+| BotFleet | `BotFleet` | BF | `~/apps/botfleet-monet` | `BF` |
 
 As of 2026-08-20 only `~/apps/trading-monet` is guaranteed to exist.  Create a missing standing lane before editing:
 
