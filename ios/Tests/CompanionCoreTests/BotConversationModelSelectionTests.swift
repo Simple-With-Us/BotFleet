@@ -4,10 +4,7 @@ import XCTest
 final class BotConversationModelSelectionTests: XCTestCase {
     func testTaskOverrideWinsOverBotWideActiveSelection() throws {
         let bot = try decodeBot(
-            #","modelSelection":{"instanceId":"claude","model":"sonnet"},
-            "activeModelSelection":{"instanceId":"grok","model":"grok-4"},
-            "tasks":[{"threadId":"task-a","title":"A","createdAt":1,
-              "modelSelection":{"instanceId":"gemini","model":"gemini-2.5"}}]"#
+            #","modelSelection":{"instanceId":"claude","model":"sonnet"},"activeModelSelection":{"instanceId":"grok","model":"grok-4"},"tasks":[{"threadId":"task-a","title":"A","createdAt":1,"modelSelection":{"instanceId":"gemini","model":"gemini-2.5"}}]"#
         )
         let selection = BotConversationModelSelection.selection(for: bot, inThread: "task-a")
         XCTAssertEqual(selection?.instanceId, "gemini")
@@ -16,9 +13,7 @@ final class BotConversationModelSelectionTests: XCTestCase {
 
     func testInheritingTaskDoesNotReadBotWideActiveSelection() throws {
         let bot = try decodeBot(
-            #","modelSelection":{"instanceId":"claude","model":"sonnet"},
-            "activeModelSelection":{"instanceId":"grok","model":"grok-4"},
-            "tasks":[{"threadId":"task-a","title":"A","createdAt":1}]"#
+            #","modelSelection":{"instanceId":"claude","model":"sonnet"},"activeModelSelection":{"instanceId":"grok","model":"grok-4"},"tasks":[{"threadId":"task-a","title":"A","createdAt":1}]"#
         )
         let selection = BotConversationModelSelection.selection(for: bot, inThread: "task-a")
         XCTAssertEqual(selection?.instanceId, "claude")
