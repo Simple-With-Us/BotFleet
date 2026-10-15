@@ -9,7 +9,19 @@ import {
 import type { AutocompleteChoice } from "./composer-autocomplete";
 
 const KNOWN_CLIENT_ACTIONS = new Set<string>(COMMAND_CLIENT_ACTIONS);
-const KNOWN_GROUP_IDS = new Set(["botfleet", "engine"]);
+
+function parseClientAction(value: string | null): CommandClientAction | null {
+  if (value === null) return null;
+  switch (value) {
+    case "model-picker":
+    case "effort-picker":
+    case "tasks":
+    case "computer":
+      return value;
+    default:
+      return null;
+  }
+}
 const COMMAND_ID = /^(botfleet|engine):[a-z][a-z0-9-]*$/;
 const COMMAND_NAME = /^[a-z][a-z0-9-]*$/;
 const COMMAND_LABEL = /^\/[a-z][a-z0-9-]*$/;
@@ -81,6 +93,8 @@ function normalizeCommand(raw: z.infer<typeof looseCommandSchema>): BotCommand |
   }
   if (raw.description.length > 90) return null;
   if (raw.clientAction !== null && !KNOWN_CLIENT_ACTIONS.has(raw.clientAction)) return null;
+  const clientAction = parseClientAction(raw.clientAction);
+  if (raw.clientAction !== null && clientAction === null) return null;
 
   let args: BotCommand["args"] = null;
   if (raw.args) {
@@ -101,7 +115,7 @@ function normalizeCommand(raw: z.infer<typeof looseCommandSchema>): BotCommand |
     description: raw.description,
     source: raw.source,
     invoke: raw.invoke,
-    clientAction: raw.clientAction as CommandClientAction | null,
+    clientAction,
     args,
     availability: raw.availability,
     enabled: raw.enabled,
@@ -112,39 +126,43 @@ function normalizeCommand(raw: z.infer<typeof looseCommandSchema>): BotCommand |
 }
 
 function normalizeGroup(raw: z.infer<typeof looseGroupSchema>): BotCommandGroup | null {
-  if (!KNOWN_GROUP_IDS.has(raw.id)) return null;
+  if (raw.id !== "botfleet" && raw.id !== "engine") return null;
   if (raw.state !== "ready" && raw.state !== "pending") return null;
-  const commands = raw.commands.map(normalizeCommand).filter((cmd): cmd is BotCommand => cmd !== null);
+  const commands = raw.commands.map(normalizeCommand).filter((cmd) => cmd !== null);
   if (commands.length === 0) return null;
   return {
-    id: raw.id as BotCommandGroup["id"],
+    id: raw.id,
     label: raw.label,
-    state: raw.state as BotCommandGroup["state"],
+    state: raw.state,
     note: raw.note,
     commands,
   };
 }
 
 /** Client-side parse: ignore unknown fields and hide items with unknown enums. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- GET /api/bots/:id/commands returns untyped JSON; loose Zod is the client gate.
 export function parseBotCommandsResponseForClient(body: unknown): BotCommandsResponse | null {
   const parsed = looseResponseSchema.safeParse(body);
   if (!parsed.success) return null;
   const data = parsed.data;
   if (data.surface !== "desktop" && data.surface !== "ios") return null;
+  const surface = data.surface;
 
   const commandSupport =
     data.engine.commandSupport === "announced" || data.engine.commandSupport === "none"
       ? data.engine.commandSupport
       : "none";
 
-  const groups = data.groups.map(normalizeGroup).filter((group): group is BotCommandGroup => group !== null);
+  const groups = data.groups
+    .map(normalizeGroup)
+    .filter((group): group is BotCommandGroup => group !== null);
   if (groups.length === 0) return null;
 
   return {
     schemaVersion: 1,
     botId: data.botId,
     threadId: data.threadId,
-    surface: data.surface as BotCommandsResponse["surface"],
+    surface,
     busy: data.busy,
     engine: {
       instanceId: data.engine.instanceId,

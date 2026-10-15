@@ -139,12 +139,16 @@ export function parseOpenCodeModelsOutput(stdout: string): ModelCatalog | null {
       ? Math.floor(limit.context)
       : undefined;
     seen.add(slug);
-    options.push({
+    const option: ModelCatalog["options"][number] = {
       id: slug,
       label: `${providerLabel(provider)} · ${name}`,
-      ...(localModelRecord(record) ? { custom: true, loaded: true } : {}),
-      ...(contextWindow ? { contextWindow } : {}),
-    });
+    };
+    if (localModelRecord(record)) {
+      option.custom = true;
+      option.loaded = true;
+    }
+    if (contextWindow) option.contextWindow = contextWindow;
+    options.push(option);
   };
 
   for (const line of stdout.split(/\r?\n/u)) {

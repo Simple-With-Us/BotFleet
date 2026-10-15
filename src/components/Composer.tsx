@@ -621,7 +621,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
     let session: STTSession | null = sttSessionRef.current;
 
     const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
-      if (acceptComposerTranscript(detached, finalizing, Boolean(currentCall())) && typeof line.text === "string") {
+      if (acceptComposerTranscript(detached, finalizing, Boolean(currentCall())) && line.text) {
         const base = baseText.current;
         setText(base ? `${base} ${line.text}` : line.text);
       }

@@ -41,18 +41,15 @@ describe("parseBotCommandsResponseForClient", () => {
   });
 
   it("ignores extra fields and a bumped schemaVersion", () => {
-    const raw = JSON.parse(readFileSync(fixturePath, "utf8")) as Record<string, unknown>;
-    raw.schemaVersion = 2;
-    raw.futureField = { nested: true };
+    const base = JSON.parse(readFileSync(fixturePath, "utf8"));
+    const raw = { ...base, schemaVersion: 2, futureField: { nested: true } };
     const menu = parseBotCommandsResponseForClient(raw);
     expect(menu).not.toBeNull();
     expect(menu?.schemaVersion).toBe(1);
   });
 
   it("drops commands with unknown clientAction but keeps the rest", () => {
-    const raw = JSON.parse(readFileSync(fixturePath, "utf8")) as {
-      groups: Array<{ commands: Array<Record<string, unknown>> }>;
-    };
+    const raw = JSON.parse(readFileSync(fixturePath, "utf8"));
     const before = raw.groups[0].commands.length;
     raw.groups[0].commands.push({
       id: "botfleet:future",
