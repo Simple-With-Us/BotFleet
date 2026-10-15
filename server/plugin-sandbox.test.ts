@@ -3,6 +3,7 @@
 // plugin can and cannot reach.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -14,6 +15,7 @@ import {
   type PluginHostInputs,
   type PluginLogEvent,
 } from "./plugin-loader.ts";
+import { pluginNetworkIsolationAvailable } from "./plugin-sandbox-egress.ts";
 import { PluginCardResultSchema } from "./plugin-sandbox-protocol.ts";
 import { removeDirSafe } from "./plugin-registry.ts";
 import type { PluginListing } from "./plugin-types.ts";
@@ -116,6 +118,56 @@ describe("plugin sandbox isolation", () => {
     const { result } = PluginCardResultSchema.parse(card.value);
     expect(result).toMatchObject({ secret: null });
   });
+
+  it.skipIf(!pluginNetworkIsolationAvailable())(
+    "denies outbound TCP to loopback and external hosts",
+    async () => {
+      const loopbackServer = await new Promise<{ server: Server; port: number }>((resolve, reject) => {
+        const server = createServer();
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+          const address = server.address();
+          if (!address || typeof address === "string") {
+            reject(new Error("expected TCP port"));
+            return;
+          }
+          resolve({ server, port: address.port });
+        });
+      });
+      try {
+        writePlugin("net", `
+          import net from "node:net";
+          const attempt = (host, port) => new Promise((resolve) => {
+            const socket = net.connect(port, host);
+            socket.on("connect", () => resolve("connected"));
+            socket.on("error", (error) => resolve(error.code ?? "error"));
+            socket.setTimeout(2_000, () => {
+              socket.destroy();
+              resolve("timeout");
+            });
+          });
+          export async function getCardData() {
+            return {
+              result: {
+                loopback: await attempt("127.0.0.1", ${loopbackServer.port}),
+                external: await attempt("1.1.1.1", 53),
+              },
+            };
+          }
+        `);
+        const plugin = await load("net");
+        const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+        if (!card.ok) throw new Error(card.reason);
+        const { result } = PluginCardResultSchema.parse(card.value);
+        expect(result).toEqual({
+          loopback: "ENETUNREACH",
+          external: "ENETUNREACH",
+        });
+      } finally {
+        loopbackServer.server.close();
+      }
+    },
+  );
 
   it("denies filesystem reads outside the plugin folder, writes, and subprocesses", async () => {
     const outside = JSON.stringify(join(outsideDir, "secret.txt"));

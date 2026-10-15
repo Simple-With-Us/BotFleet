@@ -19,12 +19,9 @@
 // parsed with ChildToParentMessageSchema; an unparseable message kills the
 // child.
 //
-// Residual risk: Node's permission model (as shipped in the Node versions
-// BotFleet runs on) does not restrict outbound network access.  A plugin
-// can still open sockets, but it has no credentials, no environment, and
-// no readable files outside its own folder to send.  Network isolation
-// needs an OS-level mechanism and is tracked in docs/plugins/DESIGN.md §
-// Open Questions.
+// Outbound sockets are blocked by an OS-level wrapper around the child
+// (server/plugin-sandbox-egress.ts).  If that wrapper is unavailable on
+// this host, the loader refuses to run plugin code at all.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
@@ -38,6 +35,7 @@ import {
   MIN_ROOM_TURN_TIMEOUT_MINUTES,
 } from "./config.ts";
 import { HOST_API_VERSION, satisfiesBotfleetVersion, type JsonValue } from "../shared/plugin-manifest.ts";
+import { buildPluginSandboxSpawnPlan, pluginNetworkIsolationAvailable } from "./plugin-sandbox-egress.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { PLUGINS_DIR } from "./plugin-registry.ts";
 import {
@@ -437,7 +435,7 @@ export async function startPluginSandbox(
   options: PluginSandboxOptions,
 ): Promise<PluginSandbox | { reason: PluginSandboxReason | "import_failed" | "invalid_exports" | "bad_request" }> {
   const flag = permissionFlag();
-  if (!flag) {
+  if (!flag || !pluginNetworkIsolationAvailable()) {
     options.logger({ event: "plugin.sandbox", pluginId: options.pluginId, level: "warn", reason: "sandbox_unavailable" });
     return { reason: "sandbox_unavailable" };
   }
@@ -472,7 +470,8 @@ export async function startPluginSandbox(
 
   let child: ChildProcess;
   try {
-    child = spawn(process.execPath, args, {
+    const { command, args: wrappedArgs } = buildPluginSandboxSpawnPlan(process.execPath, args);
+    child = spawn(command, wrappedArgs, {
       cwd: pluginDir,
       env: sandboxEnv(),
       stdio: ["ignore", "ignore", "ignore", "ipc"],

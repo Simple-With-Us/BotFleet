@@ -109,6 +109,11 @@ await build({
 // it verbatim as .ts so the packaged app has it too — never bundle it, or
 // esbuild would inline pi's packages and the extension would stop loading.
 const piMcpExtSrc = join(server, "drivers", "pi-mcp-extension.ts");
+copyFileSync(
+  join(server, "plugin-sandbox-netwrap.sh"),
+  join(root, "dist-server", "plugin-sandbox-netwrap.sh"),
+);
+
 const piMcpExtDest = join(root, "dist-server", "drivers", "pi-mcp-extension.ts");
 mkdirSync(dirname(piMcpExtDest), { recursive: true });
 copyFileSync(piMcpExtSrc, piMcpExtDest);
