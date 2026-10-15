@@ -988,6 +988,30 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
         });
         break;
       }
+      case "subagent.updated": {
+        const turn = turnFor(e, at, false);
+        if (turn) turn.lastAt = Math.max(turn.lastAt, at);
+        const bits = [`${e.subagent.toolCount} tools`];
+        if (e.subagent.tokens) bits.push(`${e.subagent.tokens.toLocaleString("en-US")} tokens`);
+        pushRow({
+          id: `context:${e.eventId}`,
+          kind: "context",
+          at,
+          turnId: turn?.id,
+          turnIndex: turn?.index,
+          title: "Helper",
+          args: e.subagent.status,
+          text: clipLine(`${e.subagent.label} · ${bits.join(" · ")}`, ROW_TEXT_LIMIT),
+          detail: {
+            text: e.subagent.lastActivity,
+            meta: [
+              ["Status", e.subagent.status],
+              ["Tools", String(e.subagent.toolCount)],
+            ],
+          },
+        });
+        break;
+      }
       case "session.started":
       case "session.exited":
       case "session.invalidated": {

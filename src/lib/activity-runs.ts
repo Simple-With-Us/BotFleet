@@ -6,6 +6,7 @@
 // text between two stretches breaks the run, so the bot's words always
 // separate one run from the next.
 import type { Message } from "@/state/store";
+import { isHelperToolName } from "../../shared/helpers";
 import { classifyTool, toolVerb } from "../../shared/tool-activity";
 
 export type TranscriptItem =
@@ -22,6 +23,8 @@ function foldable(message: Message): boolean {
   if (message.comm) return false;
   // a job's "Job Finished" row is news, not a step: never folded away
   if (message.job) return false;
+  // a helper card replaces the Task or Agent row, so a fold must not hide it
+  if (message.helper || isHelperToolName(tool.name)) return false;
   if (tool.ok !== true) return false;
   return !tool.name.startsWith("error:");
 }

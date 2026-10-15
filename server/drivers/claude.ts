@@ -264,8 +264,9 @@ export function claudeSignedIn(
  * - `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (default 20) asks for at most 3
  *   helpers at once.  It is ADVISORY: 2.1.284 skips the check when a
  *   server-side feature gate (`tengu_amber_kestrel`) or ultracode mode is
- *   on, and nothing outside the CLI can turn either off.  A hard bound
- *   belongs with the typed Helper cards (P3).
+ *   on, and nothing outside the CLI can turn either off.  The helper card
+ *   (P3) shows the ones that did start.  It does not add a second cap:
+ *   the CLI's own check is still the only one, and it stays advisory.
  *
  * Forced over any inherited value: these are a safety floor, not defaults. */
 export const CLAUDE_CONTAINMENT_ENV = {
@@ -1746,6 +1747,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemId: b.id,
                   title: b.name,
                   parentItemId: helperOf,
+                  // The helper card keys on this.  The bot's own steps leave
+                  // it unset, so a missing parent is not a helper.
+                  subagentId: helperOf,
                   ...toolFields(b.name, b.input, { cwd: turn.cwd }),
                   ...captureInput(b.input),
                 });
@@ -1764,6 +1768,23 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   ? { cachedInput: msg.usage.cache_read_input_tokens }
                   : {}),
               });
+            } else if (msg.usage && helperOf) {
+              // The helper's own bill, for its card.  It is not the bot's
+              // context meter: that path is the branch above.
+              const tokens =
+                (msg.usage.input_tokens || 0) +
+                (msg.usage.cache_read_input_tokens || 0) +
+                (msg.usage.output_tokens || 0);
+              if (tokens > 0) {
+                emit({
+                  ...base(threadId, currentTurnId()),
+                  type: "item.updated",
+                  itemType: "tool",
+                  itemId: helperOf,
+                  subagentId: helperOf,
+                  tokens,
+                });
+              }
             }
             break;
           }
@@ -1778,6 +1799,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemId: b.tool_use_id,
                   ok: !b.is_error,
                   detail: describeResult(b.content),
+                  subagentId: helperOf,
                   ...captureOutput(b.content),
                 });
               }

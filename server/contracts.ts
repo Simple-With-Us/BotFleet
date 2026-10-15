@@ -7,6 +7,7 @@
 
 import type { ComputerMount } from "./computer-grants.ts";
 import type { ToolPolicy } from "./tool-policy.ts";
+import type { SubagentSnapshot } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
@@ -183,12 +184,17 @@ export type RuntimeEvent = RuntimeEventBase &
          * steps.  The transcript nests the row under its parent instead of
          * interleaving parallel helpers' steps with the bot's. */
         parentItemId?: string;
+        /** Set when this step belongs to a helper.  The same id as
+         * `parentItemId` for a typed engine.  A named engine has none. */
+        subagentId?: string;
       }
-    | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null }
+    | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null; subagentId?: string }
     | {
         type: "item.completed";
         itemType: "tool";
         ok: boolean;
+        /** The helper this step ran inside, when the engine named one. */
+        subagentId?: string;
         /** One line of what came back — rows read, the failure's message.
          * A failure's detail is the whole reason the row is worth reading. */
         detail?: string;
@@ -197,7 +203,7 @@ export type RuntimeEvent = RuntimeEventBase &
         arguments?: string;
       }
     | { type: "item.completed"; itemType: "assistant_text"; text: string }
-    | { type: "content.delta"; streamKind: "assistant_text" | "reasoning_text"; delta: string }
+    | { type: "content.delta"; streamKind: "assistant_text" | "reasoning_text"; delta: string; subagentId?: string }
     | {
         type: "request.opened";
         requestType: "permission" | "question";
@@ -236,6 +242,9 @@ export type RuntimeEvent = RuntimeEventBase &
      * type (`shared/context-injection.ts`).  `itemId` keys the full text in the
      * side store; `preview` is one redacted, clipped line. */
     | { type: "context.injected"; source: ContextSource; preview: string; bytes: number }
+    /** A helper's card changed.  At most once a second while it runs, and
+     * again the moment it finishes.  Output stays off this frame. */
+    | { type: "subagent.updated"; subagent: SubagentSnapshot }
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;

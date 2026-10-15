@@ -40,6 +40,8 @@ import { ApprovalCard } from "./ApprovalCard";
 import { ManageMembersPanel } from "./ManageMembersPanel";
 import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
+import { HelperCard } from "./HelperCard";
+import { isHelperRow, runningHelperCount } from "../../shared/helpers";
 import { ToolLine } from "./ToolLine";
 import { JobFinishedRow, JobsMenu } from "./JobsMenu";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
@@ -77,6 +79,7 @@ function dayLabel(at: number): string {
  * The sender is already named by the cluster label above it. */
 function RoomToolChip({ message }: { message: Message }) {
   if (!message.tool) return null;
+  if (isHelperRow(message)) return <HelperCard message={message} />;
   return <ToolLine message={message} actor={message.from?.name} />;
 }
 
@@ -353,6 +356,8 @@ const Transcript = memo(function Transcript({
             </div>
           ) : m.kind === "activity" && m.job ? (
             <JobFinishedRow job={m.job} />
+          ) : m.kind === "activity" && isHelperRow(m) ? (
+            <HelperCard message={m} />
           ) : m.kind === "activity" && m.tool ? (
             m.tool.name.startsWith("error:") ? (
               <div className="flex justify-start max-w-full">
@@ -1363,7 +1368,7 @@ export function GroupView({ group }: { group: Group }) {
             <Search size={18} />
           </button>
           {/* Members' background jobs on this room's thread: notices only, never a wake. */}
-          <JobsMenu threadId={group.threadId} room />
+          <JobsMenu threadId={group.threadId} room helperCount={runningHelperCount(group.messages)} />
           <GroupCallButton group={group} members={members} />
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}

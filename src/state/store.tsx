@@ -25,6 +25,7 @@ import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { Attachment } from "@/lib/composer-attachments";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
+import type { HelperTranscript } from "../../shared/helpers";
 import type { ToolKind } from "../../shared/tool-activity";
 import type { ReviewHook } from "../../shared/auto-review";
 import type { ContextInjectionRef } from "../../shared/context-injection";
@@ -155,6 +156,9 @@ export interface Message {
      * interleaving parallel helpers' steps with the bot's own. */
     parentItemId?: string;
   };
+  /** The helper card for the row that started an engine-native helper
+   * (jobs P3).  Absent on an ordinary step. */
+  helper?: HelperTranscript;
   /** What the harness put in front of the model for THIS turn that the person
    * did not type — memory, selected skills, a quoted reply, a replayed
    * conversation (shared/context-injection.ts).  One short record each: a
@@ -3347,6 +3351,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // the Trajectory tab's door: free unless that thread's tab is open
           publishRuntimeEvent(event);
           if (event.type === "content.delta") {
+            // A helper's prose belongs on its card, not in the bot's bubble.
+            if (event.subagentId) break;
             // Batch token deltas per animation frame (t3code-style): a fast
             // stream dispatches once per frame instead of once per token, so
             // the app tree re-renders at most ~60x/s while streaming.

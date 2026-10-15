@@ -2030,9 +2030,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // jobs arrive over MCP (jobs P2) through the `agents` mount this
             // engine already builds in `acpMcpServers`.  Truthful per engine:
             // an engine that declares no MCP support mounts no job tools, and
-            // says so.  Named helper rows come in P3.
+            // says so.  A tool named invoke_subagent or spawn_subagent is a
+            // helper card (jobs P3).  This engine does not stamp a parent
+            // id, so the card is the row itself.
             backgroundJobs: mountsMcpServers ? "emulated" : "none",
-            helpers: "none",
+            helpers: "named",
             // `session/request_permission` becomes request.opened; a
             // full-auto instance answers it itself unless the turn is held
             reviewHook: config.fullAuto ? "after" : "before",

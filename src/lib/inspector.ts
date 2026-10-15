@@ -98,6 +98,11 @@ export function summarizeRuntime(e: RuntimeEvent): { summary: string; tone: Insp
       return { summary: `${e.setup ? "setup: " : ""}${clip(oneLine(e.message))}`, tone: "error" };
     case "context.injected":
       return { summary: `context injected: ${e.source} · ${formatContextBytes(e.bytes)}${e.preview ? ` · ${clip(oneLine(e.preview))}` : ""}`, tone: "plain" };
+    case "subagent.updated":
+      return {
+        summary: `helper ${e.subagent.status}: ${clip(oneLine(e.subagent.label))}${e.subagent.toolCount ? ` · ${e.subagent.toolCount} tools` : ""}`,
+        tone: e.subagent.status === "failed" ? "error" : "plain",
+      };
     default:
       return { summary: (e as { type: string }).type, tone: "plain" };
   }

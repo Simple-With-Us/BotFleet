@@ -25,6 +25,7 @@ import type { BotVoices } from "../shared/bot-voice.ts";
 import type { SignInRequestCardData } from "../shared/sign-in-request.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
+import type { HelperTranscript } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextInjectionRef } from "../shared/context-injection.ts";
 import { taskWorkspaceContextsMatch, type TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
@@ -198,6 +199,9 @@ export interface Message {
      * interleaving parallel helpers' steps with the bot's own. */
     parentItemId?: string;
   };
+  /** The helper card for the row that started an engine-native helper
+   * (jobs P3).  Absent on an ordinary step. */
+  helper?: HelperTranscript;
   /** What the harness put in front of the model for THIS turn that the person
    * did not type — memory, selected skills, a quoted reply, a replayed
    * conversation (shared/context-injection.ts).  One short record each: a

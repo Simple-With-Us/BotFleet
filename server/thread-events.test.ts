@@ -577,6 +577,36 @@ describe("readThreadEvents", () => {
     });
   });
 
+  it("reads a subagent.updated record back, and drops one whose snapshot is not a helper", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const helper = runtime({
+      eventId: "h1",
+      type: "subagent.updated",
+      createdAt: "000001",
+      itemId: "task-1",
+      subagent: {
+        id: "task-1",
+        threadId: "t1",
+        parentItemId: "task-1",
+        depth: 1,
+        fidelity: "typed",
+        label: "Survey files",
+        toolCount: 2,
+        tokens: 10,
+        startedAt: 1,
+        endedAt: null,
+        status: "running",
+      },
+    });
+    writeFileSync(
+      join(eventsDir, "t1.ndjson"),
+      line(helper) + line({ ...helper, eventId: "bad", subagent: { id: "task-1" }, createdAt: "000002" }),
+    );
+    const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true });
+    expect(page.entries.map((entry) => (entry.data as { eventId: string }).eventId)).toEqual(["h1"]);
+  });
+
   it("reads a context.injected record back in both the Trajectory and the Inspector reads", () => {
     // the guard is a closed switch over the record type, so a type it was never
     // taught is dropped silently and its history never reaches either view

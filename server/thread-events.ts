@@ -509,6 +509,22 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
         typeof value.bytes === "number" &&
         Number.isFinite(value.bytes)
       );
+    case "subagent.updated":
+      return (
+        isRecord(value.subagent) &&
+        typeof value.subagent.id === "string" &&
+        typeof value.subagent.threadId === "string" &&
+        typeof value.subagent.parentItemId === "string" &&
+        typeof value.subagent.depth === "number" &&
+        (value.subagent.fidelity === "typed" || value.subagent.fidelity === "named") &&
+        typeof value.subagent.label === "string" &&
+        (value.subagent.lastActivity === undefined || typeof value.subagent.lastActivity === "string") &&
+        typeof value.subagent.toolCount === "number" &&
+        (value.subagent.tokens === undefined || typeof value.subagent.tokens === "number") &&
+        typeof value.subagent.startedAt === "number" &&
+        (value.subagent.endedAt === null || typeof value.subagent.endedAt === "number") &&
+        (value.subagent.status === "running" || value.subagent.status === "completed" || value.subagent.status === "failed")
+      );
     default:
       return false;
   }

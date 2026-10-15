@@ -510,6 +510,8 @@ import {
   localVmSharedBotSession,
 } from "./local-vm-shared-session.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
+import { HelperTracker, type HelperPublication } from "./helpers/tracker.ts";
+import { helperSnapshotForWire, helperTranscript } from "../shared/helpers.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { stripAnsi } from "./desktop-probe.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
@@ -2868,6 +2870,11 @@ function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
       // built redacted already; the wire never has to trust that
       const preview = redactSecretsInText(event.preview);
       return preview === event.preview ? event : { ...event, preview };
+    }
+    case "subagent.updated": {
+      const subagent = helperSnapshotForWire(event.subagent, redactSecretsInText);
+      if (subagent.label === event.subagent.label && subagent.lastActivity === event.subagent.lastActivity) return event;
+      return { ...event, subagent };
     }
     default:
       return event;
@@ -5332,6 +5339,60 @@ bus.subscribe((event: RuntimeEvent) => {
     kind: "activity",
     tool: { name: `Same call repeated ${threshold}× — ${tool}: ${args.slice(0, 80)}${args.length > 80 ? "…" : ""} — it may be stuck`, ok: false },
   });
+});
+
+// Helper cards (jobs P3).  Registered after the transcript fold, so the
+// row exists before the first snapshot patches it.  A running helper is
+// published at once and then at most once a second; finishing publishes
+// immediately.  The fold broadcasts every bus event, including these.
+const helperTracker = new HelperTracker();
+let helperFlush: ReturnType<typeof setTimeout> | undefined;
+
+function publishHelperUpdate(publication: HelperPublication): void {
+  const subagent = helperSnapshotForWire(publication.subagent, redactSecretsInText);
+  bus.publish({
+    type: "subagent.updated",
+    eventId: randomUUID(),
+    provider: publication.provider,
+    ...(publication.providerInstanceId ? { providerInstanceId: publication.providerInstanceId } : {}),
+    threadId: subagent.threadId,
+    createdAt: new Date(publication.at).toISOString(),
+    ...(publication.turnId ? { turnId: publication.turnId } : {}),
+    itemId: subagent.parentItemId,
+    subagent,
+  });
+}
+
+function rememberHelper(event: Extract<RuntimeEvent, { type: "subagent.updated" }>): void {
+  const itemId = event.subagent.parentItemId;
+  const messages = store.messagesFor(event.threadId);
+  const mapped = toolMessageByItem.get(`${event.threadId}:${itemId}`);
+  const message =
+    (mapped ? messages.find((row) => row.id === mapped) : undefined) ??
+    messages.find((row) => row.tool?.itemId === itemId);
+  if (!message) return;
+  store.patchMessage(event.threadId, message.id, { helper: helperTranscript(event.subagent) });
+}
+
+function armHelperFlush(): void {
+  if (helperFlush) return;
+  const wait = helperTracker.nextWait(Date.now());
+  if (wait === null) return;
+  helperFlush = setTimeout(() => {
+    helperFlush = undefined;
+    for (const publication of helperTracker.due(Date.now())) publishHelperUpdate(publication);
+    armHelperFlush();
+  }, wait);
+  helperFlush.unref?.();
+}
+
+bus.subscribe((event: RuntimeEvent) => {
+  if (event.type === "subagent.updated") {
+    rememberHelper(event);
+    return;
+  }
+  for (const publication of helperTracker.observe(event, Date.now())) publishHelperUpdate(publication);
+  armHelperFlush();
 });
 
 const providerReloadDelegationDrains = new Set<string>();
