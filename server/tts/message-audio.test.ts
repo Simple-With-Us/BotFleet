@@ -730,6 +730,17 @@ describe("the spoken script: distilled by default (owner correction, 2026-10-08)
     }
   });
 
+  it("strips MiniMax sound tags from Personal Voice utterances", async () => {
+    const withSound =
+      "The deploy finished. (breath) <#0.3#> Bumped the API timeout to 3.5 seconds. (chuckle)";
+    const fixture = setup({ text: REPLY, summary: () => withSound });
+    const result = await post(fixture, { voice: "personal:x" }, { device: "mac", progressive: true });
+    expect(result.status).toBe(200);
+    const spoken = (result.body.utterances ?? []).join(" ");
+    expect(spoken).not.toMatch(/\(breath\)|\(chuckle\)/);
+    expect(spoken).toContain("3.5 seconds");
+  });
+
   it("labels the distiller's deterministic fallback as written, with spans for karaoke", async () => {
     // No key, a timeout, or a cut-off rewrite: the stand-in is the
     // span-aligned deterministic script (speech-summary.ts).

@@ -234,6 +234,20 @@ describe("summarizeForVoice", () => {
     expect(sanitizeForTTS(res)).toBe("Quick check, looks good, done. ready");
   });
 
+  it("preserves newlines through distiller cleanup so lists can split into utterances", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "## Deploy\n\n- Step one\n- Step two", finish_reason: "stop" } }],
+      }),
+    });
+    const input =
+      "This is a longer message that describes the deployment of multiple services and contains details about commit hashes and technical jargon that needs summarization for voice playback.";
+    const result = await summarizeForVoice(input, "test-key");
+    expect(result).toContain("\n");
+    expect(result).toContain("## Deploy");
+  });
+
   it("sanitizes em-dashes and ellipses returned by model", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
@@ -281,7 +295,7 @@ describe("summarizeForVoice", () => {
       }),
     });
     const res = await summarizeForVoice(LONG, "test-key");
-    expect(res).toBe("Done. ```typescript console.log(1); ``` All clear.");
+    expect(res).toBe("Done. ```typescript\nconsole.log(1);\n``` All clear.");
   });
 
   it("handles malformed model responses by falling back to deterministic speech", async () => {

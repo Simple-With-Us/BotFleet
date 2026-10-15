@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { Pronunciation } from "../../shared/pronunciations.ts";
 import { utterancesWithSpans } from "../../shared/speech-spans.ts";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
-import { sanitizeForTTS } from "./minimax.ts";
+import { sanitizeForTTSByLine } from "./minimax.ts";
 
 export const DeepSeekChatMessageSchema = z.object({
   role: z.string().optional(),
@@ -189,7 +189,8 @@ function cleanSummaryForTTS(summary: string): string {
   const withoutTags = summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "");
   const stripped = stripUnclosedFences(withoutTags);
   // Personal Voice distillation keeps the reply's words; acoustic cleanup only.
-  return sanitizeForTTS(stripped.trim());
+  // Preserve newlines so downstream speakable() can split headings and lists.
+  return sanitizeForTTSByLine(stripped.trim());
 }
 
 /**

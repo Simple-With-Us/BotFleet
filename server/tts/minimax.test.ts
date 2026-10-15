@@ -234,6 +234,14 @@ describe("synthesize", () => {
     expect((err as Error).message.toLowerCase()).toContain("couldn't reach");
   });
 
+  describe("sanitizeForTTSByLine", () => {
+    it("preserves newlines while cleaning each line", async () => {
+      const { sanitizeForTTSByLine } = await driver();
+      expect(sanitizeForTTSByLine("## Status\n\n- First\n- Second")).toBe("## Status\n\n- First\n- Second");
+      expect(sanitizeForTTSByLine("Line one—pause\nLine two")).toBe("Line one, pause\nLine two");
+    });
+  });
+
   describe("sanitizeForTTS", () => {
     it("converts em-dashes and en-dashes into pauses with comma-space", async () => {
       const { sanitizeForTTS } = await driver();
