@@ -213,6 +213,7 @@ import {
   computerSystemPrompt,
   resolveCloudBackend,
   cloudRunUsesBoxAgent,
+  filterGrantedByProviders,
   resolveGrants,
   resolveTurnComputerMounts,
   hostShellGranted,
@@ -233,8 +234,10 @@ import {
   evaluateCapabilityGate,
   formatExecutionHints,
   profileFor,
+  promptNeedsImages,
   wisdomInspectPayload,
   worksInWorkspace as engineWorksInWorkspace,
+  type TaskClass,
 } from "./capability-profile.ts";
 import { waitForComputerCall } from "./computer-call-gate.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
@@ -1198,7 +1201,9 @@ function noteCapabilitySkip(
   lane: "dispatch" | "routine",
 ): void {
   try {
-    const key = `${botId}:${instanceId}:${taskClass}:${lane}`;
+    // Model is part of the key.  A later turn on another model must not reuse
+    // the first turn's model and reason attributes.
+    const key = `${botId}:${instanceId}:${model}:${taskClass}:${lane}`;
     const tally = capabilitySkipTotals.get(key);
     if (tally) tally.count += 1;
     else capabilitySkipTotals.set(key, { botId, instanceId, model, taskClass, reason, lane, count: 1 });
@@ -1234,11 +1239,35 @@ setInterval(drainCapabilitySkips, DOOMED_SKIP_DRAIN_MS).unref?.();
 
 function capabilityHostContext(
   bot: { computers?: Array<"cloud" | "vm" | "local">; cloudBackend?: "box" | "vps" | null },
-): { hostShellGranted: boolean } {
+) {
   const shellBot = { computers: bot.computers, cloudBackend: bot.cloudBackend ?? undefined };
-  return {
-    hostShellGranted: hostShellGranted(shellBot, cfg, allowedBotComputers(cfg)),
-  };
+  const hostShellGrantedNow = hostShellGranted(shellBot, cfg, allowedBotComputers(cfg));
+  return { hostShellGranted: hostShellGrantedNow };
+}
+
+/** Stored computer grants the provider switches still allow.  A cloud routine
+ *  named its destination, so that is the only computer the gate requires.
+ *  The workspace default is not copied in: an unset bot must stay a chat,
+ *  and the mount path is what applies Auto. */
+function computersForCapabilityGate(
+  bot: { computers?: Array<"cloud" | "vm" | "local">; cloudBackend?: "box" | "vps" | null },
+  runOn: RoutineRunOn | undefined,
+) {
+  const cloudBackend = resolveCloudBackend(bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend);
+  if (runOn === "cloud") return filterGrantedByProviders(["cloud"], cfg, cloudBackend);
+  return filterGrantedByProviders(bot.computers ?? [], cfg, cloudBackend);
+}
+
+class IncapableDispatch extends Error {
+  readonly code = "incapable";
+  readonly status = 409;
+  readonly pickUnusable = true;
+  readonly taskClass: TaskClass;
+  constructor(message: string, taskClass: TaskClass) {
+    super(message);
+    this.name = "IncapableDispatch";
+    this.taskClass = taskClass;
+  }
 }
 
 function enforceTurnCapabilityGate(input: {
@@ -1260,7 +1289,7 @@ function enforceTurnCapabilityGate(input: {
     },
     {
       text: input.text,
-      computers: input.bot.computers,
+      computers: computersForCapabilityGate(input.bot, input.runOn),
       runOn: input.runOn,
       routineNeeds: input.routineNeeds,
       hostShellGranted: hostCtx.hostShellGranted,
@@ -1270,7 +1299,6 @@ function enforceTurnCapabilityGate(input: {
   if (gate.action === "ok") return undefined;
   const taskClass = gate.taskClass ?? "chat";
   const reason = gate.reason ?? "This engine cannot run that task";
-  noteCapabilitySkip(input.bot.id, input.instance.instanceId, input.model, taskClass, reason, input.lane);
   if (gate.action === "warn") {
     try {
       getSentry()?.metrics.count("botfleet.dispatcher.capability_degraded", 1, {
@@ -1285,12 +1313,8 @@ function enforceTurnCapabilityGate(input: {
     }
     return reason;
   }
-  throw Object.assign(new Error(reason), {
-    status: 409,
-    code: "incapable",
-    taskClass,
-    pickUnusable: true,
-  });
+  noteCapabilitySkip(input.bot.id, input.instance.instanceId, input.model, taskClass, reason, input.lane);
+  throw new IncapableDispatch(reason, taskClass);
 }
 
 function routineIncapableForRun(run: import("./routines.ts").RoutineRun): { reason: string } | undefined {
@@ -1299,8 +1323,10 @@ function routineIncapableForRun(run: import("./routines.ts").RoutineRun): { reas
   const task = run.threadId ? store.taskByThread(bot.id, run.threadId) : undefined;
   const policy = task?.modelSelection ?? bot.modelSelection;
   const instanceId = executionInstanceFor(bot, policy, run.runOn);
-  const instance = registry.get(instanceId as never);
-  if (!instance) return undefined;
+  const instance = registry.get(instanceId);
+  if (!instance) {
+    return { reason: `The engine for this routine is not available, so the run was skipped.` };
+  }
   const model = instance.models.default;
   const prompt = run.prompt ?? "";
   try {
@@ -1314,9 +1340,7 @@ function routineIncapableForRun(run: import("./routines.ts").RoutineRun): { reas
     });
     return undefined;
   } catch (error) {
-    if (error && typeof error === "object" && (error as { code?: string }).code === "incapable") {
-      return { reason: error instanceof Error ? error.message : String(error) };
-    }
+    if (error instanceof IncapableDispatch) return { reason: error.message };
     throw error;
   }
 }
@@ -6093,20 +6117,17 @@ async function startTurn(
     }
   }
 
-  // The DSH Pro row lacks vision; visual data sharing automatically routes to
-  // the Flash row and updates the stored selection so the switch persists.
-  // `isDshVisionlessModel` is the same answer the chain rewrite below gives, so
-  // this path and that one cannot disagree about which ids count as Pro.
-  if (instanceId === "dsh" && isDshVisionlessModel(model) && text.includes("<attached-image ")) {
+  // The DSH Pro row lacks vision.  Visual data sharing routes to the Flash
+  // row, and the stored selection is updated only after the capability gate
+  // allows the turn, so a refusal does not pin Flash onto a turn that never
+  // started.  `isDshVisionlessModel` is the same answer the chain rewrite
+  // below gives, so this path and that one cannot disagree about which ids
+  // count as Pro.
+  let persistDshVision = false;
+  if (instanceId === "dsh" && isDshVisionlessModel(model) && promptNeedsImages(text)) {
     model = DSH_DEEPSEEK_FLASH_MODEL;
-    // Persist against the selection that owns this thread, and keep the
-    // dispatch fallback policy aligned with the new primary and its chain.
     fallbackPolicy = dshVisionSelection(fallbackPolicy);
-    if (task.modelSelection) {
-      store.patchTask(bot.id, threadId, { modelSelection: fallbackPolicy });
-    } else {
-      store.patchBot(bot.id, { modelSelection: fallbackPolicy });
-    }
+    persistDshVision = true;
   }
   const capabilityWarn = enforceTurnCapabilityGate({
     bot,
@@ -6116,6 +6137,13 @@ async function startTurn(
     runOn: opts?.runOn,
     lane: "dispatch",
   });
+  if (persistDshVision) {
+    if (task.modelSelection) {
+      store.patchTask(bot.id, threadId, { modelSelection: fallbackPolicy });
+    } else {
+      store.patchBot(bot.id, { modelSelection: fallbackPolicy });
+    }
+  }
   // Auto-delivered instructions are stored as role=system so iOS/desktop
   // never paint a blue user bubble.  The model still receives them as the
   // turn prompt via transcriptPromptRole.

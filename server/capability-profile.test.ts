@@ -71,6 +71,24 @@ describe("requiredFor", () => {
     const required = requiredFor({ text: "x", computers: [], routineNeeds: ["desktop_gui"] });
     expect(required.has("desktop_gui")).toBe(true);
   });
+
+  it("treats an empty prompt as chat", () => {
+    const required = requiredFor({ text: "" });
+    expect(required.has("chat")).toBe(true);
+    expect(required.size).toBe(1);
+  });
+
+  it("ignores a mention of the image marker that is not a real attachment tag", () => {
+    const required = requiredFor({ text: "docs mention <attached-image without a path" });
+    expect(required.has("images")).toBe(false);
+    expect(required.has("chat")).toBe(true);
+  });
+
+  it("does not treat a computer grant as a coding task", () => {
+    const required = requiredFor({ text: "hello", computers: ["local"] });
+    expect(required.has("desktop_gui")).toBe(true);
+    expect(required.has("coding")).toBe(false);
+  });
 });
 
 describe("doomedReason", () => {
@@ -139,10 +157,49 @@ describe("evaluateCapabilityGate", () => {
       capabilities: { toolLoop: true },
       model: "default",
     });
-    const required = requiredFor({ text: "<attached-image path=a>", computers: [] });
+    const required = requiredFor({ text: '<attached-image path="/tmp/a.png" />', computers: [] });
     const verdict = doomedReason(profile, required);
     expect(verdict?.verdict).toBe("refuse");
     expect(verdict?.taskClass).toBe("images");
+  });
+
+  it("lets a box agent code on the machine it is already running on", () => {
+    const box = engineFixture("ASCII.dev Box");
+    const profile = profileFor({
+      instanceId: "box",
+      driverKind: box.driverKind,
+      capabilities: box.capabilities,
+      model: "box",
+    });
+    const required = requiredFor({ text: "edit the file", routineNeeds: ["coding"] });
+    expect(doomedReason(profile, required)).toBeNull();
+  });
+
+  it("warns when connected apps are required and the engine cannot mount them", () => {
+    const claude = engineFixture("Claude");
+    const profile = profileFor({
+      instanceId: "claude",
+      driverKind: claude.driverKind,
+      capabilities: { ...claude.capabilities, composioMcp: false },
+      model: "claude-sonnet",
+    });
+    const required = requiredFor({ text: "call", skillCaps: ["phoneMcp"] });
+    const doomed = doomedReason(profile, required);
+    expect(doomed?.taskClass).toBe("connected_apps");
+    expect(doomed?.verdict).toBe("warn");
+  });
+
+  it("refuses grok coding without a host grant when coding is required", () => {
+    const profile = profileFor({
+      instanceId: "grok",
+      driverKind: engineFixture("Grok").driverKind,
+      capabilities: engineFixture("Grok").capabilities,
+      model: "grok-4.7",
+    });
+    const required = requiredFor({ text: "edit", routineNeeds: ["coding"] });
+    const doomed = doomedReason(profile, required, DOOMED_POLICY, { hostShellGranted: false });
+    expect(doomed?.taskClass).toBe("coding");
+    expect(doomed?.verdict).toBe("refuse");
   });
 
   it("refuses image attachments on grok API", () => {

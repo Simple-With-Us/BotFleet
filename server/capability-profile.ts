@@ -51,13 +51,16 @@ export type DoomedVerdict = "refuse" | "warn";
 
 export type DriverKind = string;
 
+export type DoomedPolicy = Record<string, Partial<Record<TaskClass, DoomedVerdict>>>;
+
 /** Per-engine overrides for deliberate degradation (antigravity desktop) or
- *  hard refusals seeded from the engine audit. */
-export const DOOMED_POLICY: Record<string, Partial<Record<TaskClass, DoomedVerdict>>> = {
+ *  hard refusals seeded from the engine audit.  `satisfies` checks the
+ *  policy without annotating the binding as an open dictionary. */
+export const DOOMED_POLICY = {
   antigravityAgent: { desktop_gui: "warn" },
   grok: { coding: "refuse" },
   dshAgent: { connected_apps: "warn" },
-};
+} satisfies DoomedPolicy;
 
 export interface WisdomEntry {
   engine: string;
@@ -230,10 +233,18 @@ export function profileFor(input: ProfileForInput): CapabilityProfile {
   return base;
 }
 
+/** The composer writes this exact tag.  A bare mention of the words does not
+ *  count: webhook text that talks about the marker must not skip a routine. */
+const ATTACHED_IMAGE_TAG = /<attached-image\s+path="[^"]*"\s*\/>/;
+
+export function promptNeedsImages(text: string): boolean {
+  return ATTACHED_IMAGE_TAG.test(text);
+}
+
 export function requiredFor(input: RequiredForInput): Set<TaskClass> {
   const required = new Set<TaskClass>();
-  const text = input.text ?? "";
-  if (text.includes("<attached-image ")) required.add("images");
+  const text = input.text;
+  if (promptNeedsImages(text)) required.add("images");
   if (input.routineNeeds?.length) {
     for (const need of input.routineNeeds) required.add(need);
   }
@@ -242,11 +253,6 @@ export function requiredFor(input: RequiredForInput): Set<TaskClass> {
   if (computers.includes("local")) required.add("desktop_gui");
   if (computers.includes("vm")) required.add("vm");
   if (computers.includes("cloud") || input.runOn === "cloud") required.add("cloud");
-  if (computers.length > 0 || input.runOn === "cloud") {
-    // File/shell work in a workspace-backed bot implies coding unless it is
-    // only chat — grants narrow this later at mount time.
-    if (!required.has("images")) required.add("coding");
-  }
   if (!required.size) required.add("chat");
   return required;
 }
@@ -268,7 +274,16 @@ function satisfies(profile: CapabilityProfile, taskClass: TaskClass, ctx: Capabi
       if (profile.shell === "with_host_grant") return ctx.hostShellGranted;
       return true;
     case "coding":
-      return profile.workspaceTools || profile.transport === "mcpClient" || profile.transport === "harnessToolLoop";
+      // boxAgent edits files on the machine it is already running on.  A
+      // tool-loop engine whose shell needs a host grant (Grok HTTP) cannot
+      // code until that grant exists; otherwise the policy refuse never fires.
+      if (profile.transport === "remoteAgent") return true;
+      if (profile.workspaceTools || profile.transport === "mcpClient") return true;
+      if (profile.transport === "harnessToolLoop") {
+        if (profile.shell === "with_host_grant") return ctx.hostShellGranted;
+        return true;
+      }
+      return false;
     case "connected_apps":
       return profile.composioMcp;
     case "peer_comms":
@@ -307,22 +322,38 @@ function missingReason(profile: CapabilityProfile, taskClass: TaskClass): string
   }
 }
 
-function policyVerdict(
-  engine: string,
-  taskClass: TaskClass,
-  policy: Record<string, Partial<Record<TaskClass, DoomedVerdict>>>,
-): DoomedVerdict {
+function hardRefusal(taskClass: TaskClass): boolean {
+  switch (taskClass) {
+    case "images":
+    case "vm":
+    case "cloud":
+    case "desktop_gui":
+    case "shell":
+    case "coding":
+      return true;
+    case "connected_apps":
+    case "peer_comms":
+    case "chat":
+      return false;
+    default: {
+      const _exhaustive: never = taskClass;
+      return _exhaustive;
+    }
+  }
+}
+
+function policyVerdict(engine: string, taskClass: TaskClass, policy: DoomedPolicy): DoomedVerdict {
   const enginePolicy = policy[engine]?.[taskClass];
   if (enginePolicy) return enginePolicy;
-  if (taskClass === "images" && engine !== "minimax") return "refuse";
-  if (taskClass === "vm") return "refuse";
-  return "refuse";
+  // A missing hard class cannot succeed, so the turn is not spent.  Connected
+  // apps and peer comms warn: the turn can still run with that surface absent.
+  return hardRefusal(taskClass) ? "refuse" : "warn";
 }
 
 export function doomedReason(
   profile: CapabilityProfile,
   required: Set<TaskClass>,
-  policy: Record<string, Partial<Record<TaskClass, DoomedVerdict>>> = DOOMED_POLICY,
+  policy: DoomedPolicy = DOOMED_POLICY,
   ctx: CapabilityGateContext = { hostShellGranted: true },
 ): { taskClass: TaskClass; verdict: DoomedVerdict; reason: string } | null {
   for (const taskClass of TASK_CLASS_ORDER) {
@@ -359,19 +390,16 @@ export function formatExecutionHints(profile: CapabilityProfile): string {
   return `[Engine capability hints for ${profile.engine}]\n${profile.executionHints.map((hint) => `- ${hint}`).join("\n")}`;
 }
 
-export function wisdomInspectPayload(engine?: string): {
-  wisdom: WisdomEntry[];
-  executionHintsByEngine: Record<string, string[]>;
-} {
+export function wisdomInspectPayload(engine?: string) {
   const entries = engine ? WISDOM.filter((row) => row.engine === engine) : WISDOM;
-  const executionHintsByEngine: Record<string, string[]> = {};
-  for (const entry of entries) {
-    executionHintsByEngine[entry.engine] = profileFor({
+  const pairs = entries.map((entry) => {
+    const hints = profileFor({
       instanceId: entry.engine,
       driverKind: entry.engine,
       capabilities: {},
       model: "default",
     }).executionHints;
-  }
-  return { wisdom: entries, executionHintsByEngine };
+    return [entry.engine, hints] as const;
+  });
+  return { wisdom: entries, executionHintsByEngine: Object.fromEntries(pairs) };
 }
