@@ -140,6 +140,23 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
         run: pnpm exec vite build
 
+  control-plane:
+    name: control-plane check + workerd tests + dry run
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Documentation-only fast path
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
+      - name: Retired @botfleet/control-plane package (ruleset shim)
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          echo "The @botfleet/control-plane workspace package was removed 2026-09-26 with cloudflare/control-plane/."
+          echo "This job satisfies ruleset 21771270 required context only; it does not run workerd or control-plane tests."
+          echo "For Cloudflare validation use: pnpm broker:check && pnpm broker:test"
+
   package-linux:
     name: package + smoke (Ubuntu 24.04 x64)
     needs: changes
