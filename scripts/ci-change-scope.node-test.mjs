@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -45,6 +46,8 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
   );
   assert.equal(isIosPath("scripts/ios-fleet/ship-testflight.sh"), true);
   assert.equal(isIosPath(".github/workflows/ci.yml"), true);
+  assert.equal(isIosPath("scripts/ci-ios-gate.mjs"), true);
+  assert.equal(isIosPath("scripts/ci-change-scope.mjs"), true);
   assert.equal(isIosPath("server/index.ts"), false);
 
   for (const path of ["electron/main.mjs", "electron-builder.yml", "third_party/cloudflared/README.md",
@@ -103,7 +106,7 @@ test("the CLI emits only GitHub outputs for a NUL-delimited path list", () => {
 
 test("every protected check stays present and takes the same fail-closed scope output", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
-  const requiredJobs = ["test", "control-plane", "package-linux", "ios"];
+  const requiredJobs = ["test", "control-plane", "package-linux"];
 
   assert.equal(Object.hasOwn(workflow.on, "workflow_dispatch"), true);
   assert.equal(Object.hasOwn(workflow.on, "schedule"), true);
@@ -132,10 +135,9 @@ test("every protected check stays present and takes the same fail-closed scope o
   assert.doesNotMatch(source, /paths-ignore:/);
 });
 
-test("the three expensive jobs also gate on their own area, the same way docs_only does", () => {
+test("packaging and control-plane jobs gate on their own area, the same way docs_only does", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const areaJobs = [
-    { jobId: "ios", output: "ios_changed", fastPathName: "iOS-unrelated fast path" },
     { jobId: "package-linux", output: "packaging_changed", fastPathName: "Packaging-unrelated fast path" },
     { jobId: "control-plane", output: "control_plane_changed", fastPathName: "Control-plane-unrelated fast path" },
   ];
@@ -173,6 +175,150 @@ test("the three expensive jobs also gate on their own area, the same way docs_on
     // to the full gate -- every area reported changed, not skipped.
     const occurrences = classifier.run.match(new RegExp(`echo "${output}=true"`, "g")) ?? [];
     assert.equal(occurrences.length, 2, `${output} fallback branches`);
+  }
+});
+
+function runIosGate(paths, env, summaryFile) {
+  const childEnv = { ...process.env, ...env };
+  if (summaryFile) childEnv.GITHUB_STEP_SUMMARY = summaryFile;
+  return spawnSync(process.execPath, [join(ROOT, "scripts/ci-ios-gate.mjs")], {
+    cwd: ROOT,
+    input: Buffer.from(paths.join("\0")),
+    encoding: "utf8",
+    env: childEnv,
+  });
+}
+
+test("the required iOS check is a diff replay, not an echo, and the build job has no skip step", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const source = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
+  assert.doesNotMatch(source, /iOS-unrelated fast path/);
+
+  const iosBuild = workflow.jobs["ios-build"];
+  assert.ok(iosBuild, "ios-build job");
+  assert.equal(iosBuild.needs, "changes");
+  assert.match(
+    iosBuild.if,
+    /needs\.changes\.outputs\.docs_only != 'true' && needs\.changes\.outputs\.ios_changed == 'true'/,
+  );
+  assert.equal(iosBuild["runs-on"], "xcode-27");
+  assert.equal(iosBuild.steps.some((step) => /echo /.test(step.run ?? "")), false);
+  assert.equal(iosBuild.steps.some((step) => step.name === "Swift package tests"), true);
+  assert.equal(iosBuild.steps.some((step) => step.name === "Build the iOS app (unsigned)"), true);
+
+  const gate = workflow.jobs.ios;
+  // Ruleset 21771270 requires this context string.  A rename here would
+  // report a different check and leave the required one missing.
+  assert.equal(gate.name, "Swift tests + iOS build");
+  assert.deepEqual(gate.needs, ["changes", "ios-build"]);
+  assert.match(gate.if, /always\(\)/);
+  assert.match(gate.if, /needs\.changes\.result == 'success'/);
+  assert.equal(gate["runs-on"], "ubuntu-latest");
+  const checkout = gate.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
+  assert.equal(checkout.with["fetch-depth"], 0);
+  const verify = gate.steps.find((step) => step.name === "Prove the iOS build ran or that no iOS paths changed");
+  assert.ok(verify);
+  assert.match(verify.run, /ci-ios-gate\.mjs/);
+  assert.match(verify.run, /git diff --no-renames --name-only -z/);
+  assert.doesNotMatch(verify.run, /^echo /m);
+});
+
+test("the iOS required gate accepts a skip only when the replay proves no iOS work", () => {
+  const skip = runIosGate(["server/index.ts"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "false",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.equal(skip.status, 0, skip.stderr);
+  assert.match(skip.stdout, /gate_verdict: skipped_no_ios_relevant_paths/);
+  assert.match(skip.stdout, /outcome: skipped_no_ios_relevant_paths/);
+  assert.doesNotMatch(skip.stdout, /server\/index\.ts/);
+
+  const docs = runIosGate(["docs/EFFORT-LOG.md"], {
+    DOCS_ONLY: "true",
+    IOS_CHANGED: "false",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.equal(docs.status, 0, docs.stderr);
+  assert.match(docs.stdout, /gate_verdict: skipped_docs_only/);
+
+  const built = runIosGate(["ios/project.yml"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "success",
+    EVENT_NAME: "pull_request",
+  });
+  assert.equal(built.status, 0, built.stderr);
+  assert.match(built.stdout, /gate_verdict: build_required/);
+  assert.match(built.stdout, /outcome: swift_tests_and_ios_build_ran/);
+
+  const missingBuild = runIosGate(["ios/project.yml"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.notEqual(missingBuild.status, 0);
+  assert.match(missingBuild.stderr, /require a successful ios-build/);
+
+  const mismatch = runIosGate(["server/index.ts"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.notEqual(mismatch.status, 0);
+  assert.match(mismatch.stderr, /do not match a fresh diff replay/);
+
+  const echoBypass = runIosGate(["scripts/ci-ios-gate.mjs"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "false",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.notEqual(echoBypass.status, 0);
+  assert.match(echoBypass.stderr, /do not match a fresh diff replay/);
+
+  const scheduled = runIosGate([], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "success",
+    EVENT_NAME: "schedule",
+  });
+  assert.equal(scheduled.status, 0, scheduled.stderr);
+  assert.match(scheduled.stdout, /outcome: swift_tests_and_ios_build_ran/);
+
+  const scheduledSkip = runIosGate([], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "workflow_dispatch",
+  });
+  assert.notEqual(scheduledSkip.status, 0);
+  assert.match(scheduledSkip.stderr, /require a successful ios-build/);
+});
+
+test("the iOS gate keeps changed paths out of workflow-command stdout", () => {
+  // The Windows runner has no /tmp, so a hardcoded path becomes D:\tmp and
+  // the summary write throws ENOENT.  Use the process temp directory.
+  const dir = mkdtempSync(join(tmpdir(), "ci-ios-gate-"));
+  const summaryFile = join(dir, "summary.md");
+  try {
+    const hostile = runIosGate(["::error::pwned"], {
+      DOCS_ONLY: "false",
+      IOS_CHANGED: "false",
+      IOS_BUILD_RESULT: "skipped",
+      EVENT_NAME: "pull_request",
+    }, summaryFile);
+    assert.equal(hostile.status, 0, hostile.stderr);
+    assert.doesNotMatch(hostile.stdout, /^::error::pwned/m);
+    const summary = readFileSync(summaryFile, "utf8");
+    assert.match(summary, /No iOS build ran/);
+    assert.match(summary, /- ::error::pwned/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

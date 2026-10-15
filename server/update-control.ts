@@ -1093,14 +1093,16 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
     if (!raw || typeof raw !== "object") return;
     const record = raw as Record<string, unknown>;
     if (typeof record.runId !== "string" || !isOutcome(record.outcome)) return;
-    lastRun = {
+    const parsed: typeof lastRun = {
       runId: record.runId,
       startedAt: typeof record.startedAt === "string" ? record.startedAt : "",
       finishedAt: typeof record.finishedAt === "string" ? record.finishedAt : "",
       outcome: record.outcome,
       message: typeof record.message === "string" ? record.message : "",
-      ...(typeof record.receiptPath === "string" ? { receiptPath: record.receiptPath } : {}),
     };
+    const receiptPath = optionalString.safeParse(record.receiptPath);
+    if (receiptPath.success && receiptPath.data) parsed.receiptPath = receiptPath.data;
+    lastRun = parsed;
   };
 
   const loadCurrent = () => {
