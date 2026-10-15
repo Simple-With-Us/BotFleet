@@ -297,7 +297,8 @@ export function infisicalCredentialSource(
       if (missing.length) throw new ZulipCredentialError(`Infisical ${where} has no ${missing.join(" or ")}`, "missing");
       const source = `infisical ${where}`;
       const site = normalizeSite(values.get(names.site)?.trim() || opts.realm);
-      const outgoingWebhookToken = values.get(names.outgoingToken)?.trim() || undefined;
+      const outgoingWebhookToken = z.string().regex(/^[\x21-\x7e]+$/).optional()
+        .parse(values.get(names.outgoingToken)?.trim() || undefined);
       return {
         ...checkCredentialFields({ email: email!, key: key!, site }, source),
         source,

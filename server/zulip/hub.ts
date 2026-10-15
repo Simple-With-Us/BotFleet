@@ -159,6 +159,7 @@ export interface ZulipHubDeps {
     eventsTimeoutMs?: number;
     postSpacingMs?: number;
     retryBaseMs?: number;
+    drainBatchSize?: number;
   };
 }
 
@@ -701,6 +702,7 @@ export class ZulipHub {
   private readonly stopping = new Map<string, Promise<void>>();
   private readonly outgoingSpool: ZulipOutgoingSpool;
   private readonly outgoingRetry = new Map<string, number>();
+  private outgoingDraining = false;
   private drainTimer?: ReturnType<typeof setInterval>;
   private reconcileTimer?: ReturnType<typeof setInterval>;
   private draining = false;
@@ -1089,7 +1091,9 @@ export class ZulipHub {
     try {
       do {
         this.redrain = false;
-        await this.drainOutgoingWebhook();
+        void this.drainOutgoingWebhook().catch((error) => {
+          this.log(`[zulip] outgoing webhook drain failed: ${describe(error)}`);
+        });
         await this.finalizeSettled();
         for (const session of this.sessions.values()) {
           if (this.stopped) return;
@@ -1101,9 +1105,20 @@ export class ZulipHub {
     }
   }
 
-  /** Process at most one durable webhook row per tick.  Native event queues
-   *  remain independent, and both paths converge on handleMessage's dedup. */
+  /** Drain a bounded batch, serially per bot and concurrently across bots.
+   *  Native event queues remain independent, and both paths converge on
+   *  handleMessage's dedup. */
   private async drainOutgoingWebhook(): Promise<void> {
+    if (this.outgoingDraining) return;
+    this.outgoingDraining = true;
+    try {
+      await this.drainOutgoingWebhookBatch();
+    } finally {
+      this.outgoingDraining = false;
+    }
+  }
+
+  private async drainOutgoingWebhookBatch(): Promise<void> {
     let rows;
     try {
       rows = this.outgoingSpool.pending();
@@ -1112,51 +1127,76 @@ export class ZulipHub {
       return;
     }
     const now = this.now();
+    const budgetPerSession = Math.max(1, this.deps.timings?.drainBatchSize ?? 16);
+    const groups = new Map<string, typeof rows>();
     for (const row of rows) {
+      const session = this.sessions.get(row.botId);
+      if (!session) {
+        try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
+        this.outgoingRetry.delete(`${row.botId}:${row.messageId}`);
+        continue;
+      }
       const key = `${row.botId}:${row.messageId}`;
       if ((this.outgoingRetry.get(key) ?? 0) > now) continue;
-      const session = this.sessions.get(row.botId);
-      if (!session?.ready || !session.client) continue;
-      try {
-        const message = await session.client.message(row.messageId, {
-          signal: AbortSignal.timeout(8_000),
-          timeoutMs: 4_000,
-        });
-        if (message.id !== row.messageId) throw new Error("Zulip returned a mismatched message id");
-        this.handleMessage(session, message, "webhook");
-        if (!session.save(true)) throw new Error("Zulip state could not be persisted");
-        this.outgoingSpool.remove(row);
-        this.outgoingRetry.delete(key);
-        return;
-      } catch (error) {
-        const status = statusOf(error);
-        // A missing or explicitly inaccessible message can never be routed;
-        // authentication and rate-limit failures remain durable for retry.
-        if (status === 400 || status === 403 || status === 404) {
-          this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} unavailable (${status})`);
-          try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
-          return;
-        }
-        let attempts: number;
-        try {
-          attempts = this.outgoingSpool.recordFailure(row);
-        } catch {
-          this.log(`[zulip] ${session.role}: outgoing webhook retry state could not be persisted`);
-          return;
-        }
-        if (attempts >= ZULIP_OUTGOING_MAX_ATTEMPTS) {
-          this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} abandoned after repeated failures`);
+      if (!session.ready || !session.client) {
+        this.outgoingRetry.set(key, now + (this.deps.timings?.retryBaseMs ?? 5_000));
+        continue;
+      }
+      const group = groups.get(row.botId) ?? [];
+      if (group.length >= budgetPerSession) continue;
+      group.push(row);
+      groups.set(row.botId, group);
+    }
+
+    await Promise.all([...groups].map(async ([botId, botRows]) => {
+      const session = this.sessions.get(botId);
+      if (!session?.ready || !session.client) return;
+      for (const row of botRows) {
+        const key = `${row.botId}:${row.messageId}`;
+        if (!this.outgoingSpool.has(row)) {
           try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
           this.outgoingRetry.delete(key);
-          return;
+          continue;
         }
-        const retryBase = this.deps.timings?.retryBaseMs ?? 5_000;
-        const retryDelay = Math.min(retryBase * (2 ** (attempts - 1)), 5 * 60_000);
-        this.outgoingRetry.set(key, now + retryDelay);
-        this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} deferred`);
-        return;
+        try {
+          const message = await session.client.message(row.messageId, {
+            signal: AbortSignal.timeout(8_000),
+            timeoutMs: 4_000,
+          });
+          if (message.id !== row.messageId) throw new Error("Zulip returned a mismatched message id");
+          this.handleMessage(session, message, "webhook");
+          if (!session.save(true)) throw new Error("Zulip state could not be persisted");
+          this.outgoingSpool.remove(row);
+          this.outgoingRetry.delete(key);
+        } catch (error) {
+          const status = statusOf(error);
+          // A missing or explicitly inaccessible message can never be routed;
+          // authentication and rate-limit failures remain durable for retry.
+          if (status === 400 || status === 403 || status === 404) {
+            this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} unavailable (${status})`);
+            try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
+            continue;
+          }
+          let attempts: number;
+          try {
+            attempts = this.outgoingSpool.recordFailure(row);
+          } catch {
+            this.log(`[zulip] ${session.role}: outgoing webhook retry state could not be persisted`);
+            continue;
+          }
+          if (attempts >= ZULIP_OUTGOING_MAX_ATTEMPTS) {
+            this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} abandoned after repeated failures`);
+            try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
+            this.outgoingRetry.delete(key);
+            continue;
+          }
+          const retryBase = this.deps.timings?.retryBaseMs ?? 5_000;
+          const retryDelay = Math.min(retryBase * (2 ** (attempts - 1)), 5 * 60_000);
+          this.outgoingRetry.set(key, this.now() + retryDelay);
+          this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} deferred`);
+        }
       }
-    }
+    }));
   }
 
   /** Let go of every binding whose turn is over: its own turn completed and

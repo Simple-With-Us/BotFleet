@@ -28,6 +28,7 @@ export interface ZulipOutgoingSpoolItem {
 
 export class ZulipOutgoingSpool {
   readonly directory: string;
+  private pendingCache?: { items: ZulipOutgoingSpoolItem[]; loadedAt: number };
 
   constructor(dataDir: string) {
     this.directory = join(dataDir, "zulip", "outgoing");
@@ -61,10 +62,15 @@ export class ZulipOutgoingSpool {
     // final directory fsync makes the new name durable before HTTP 200.
     writeFileAtomic(path, `${JSON.stringify(expected)}\n`, { mode: 0o600 });
     this.fsyncDirectory();
+    this.invalidatePending();
     return true;
   }
 
   pending(): ZulipOutgoingSpoolItem[] {
+    const now = Date.now();
+    if (this.pendingCache && now - this.pendingCache.loadedAt < 500) {
+      return this.pendingCache.items.slice();
+    }
     const rows: ZulipOutgoingSpoolItem[] = [];
     for (const entry of readdirSync(this.directory)) {
       const match = FILE_NAME.exec(entry);
@@ -75,7 +81,16 @@ export class ZulipOutgoingSpool {
       const row = { botId: botId!, messageId };
       if (this.valid(join(this.directory, entry), row)) rows.push(row);
     }
-    return rows.sort((a, b) => a.messageId - b.messageId || a.botId.localeCompare(b.botId));
+    const items = rows.sort((a, b) => a.messageId - b.messageId || a.botId.localeCompare(b.botId));
+    this.pendingCache = { items, loadedAt: now };
+    return items.slice();
+  }
+
+  /** Re-read the selected row before draining so cached directory listings
+   *  cannot deliver a row removed or replaced by another process. */
+  has(item: ZulipOutgoingSpoolItem): boolean {
+    const path = join(this.directory, this.name(item.botId, item.messageId));
+    return this.valid(path, item);
   }
 
   remove(item: ZulipOutgoingSpoolItem): void {
@@ -87,6 +102,7 @@ export class ZulipOutgoingSpool {
       throw error;
     }
     this.fsyncDirectory();
+    this.invalidatePending();
   }
 
   recordFailure(item: ZulipOutgoingSpoolItem): number {
@@ -98,7 +114,12 @@ export class ZulipOutgoingSpool {
     const attempts = (parsed.data.attempts ?? 0) + 1;
     writeFileAtomic(path, `${JSON.stringify({ botId: item.botId, messageId: item.messageId, attempts })}\n`, { mode: 0o600 });
     this.fsyncDirectory();
+    this.invalidatePending();
     return attempts;
+  }
+
+  private invalidatePending(): void {
+    this.pendingCache = undefined;
   }
 
   private valid(path: string, expected: ZulipOutgoingSpoolItem): boolean {
