@@ -16229,7 +16229,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const instanceId = instanceDelete[1];
       const protectedEngines = new Set([
         "grok", "dsh", "droid", "cursor", "claude", "codex", "antigravity",
-        "minimax", "opencodeGo", "computer", "openaiCompat", "qwen", "hermes", "pi",
+        "minimax", "opencode", "opencodeGo", "computer", "openaiCompat", "qwen", "hermes", "pi",
       ]);
       if (protectedEngines.has(instanceId)) {
         return json(res, 400, { error: `cannot delete default fleet engine "${instanceId}"` });

@@ -6444,6 +6444,7 @@ describe("instance CLI override API", () => {
 
     expect((await api("DELETE", "/api/instances/claude")).status).toBe(400);
     expect((await api("DELETE", "/api/instances/openaiCompat")).status).toBe(400);
+    expect((await api("DELETE", "/api/instances/opencode")).status).toBe(400);
 
     const deleted = await api("DELETE", `/api/instances/${instanceId}`);
     expect(deleted.status).toBe(200);
