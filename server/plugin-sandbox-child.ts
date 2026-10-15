@@ -214,7 +214,6 @@ function isHostSnapshot(value: unknown): value is SandboxHostSnapshot {
   return true;
 }
 
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- parser for the untrusted IPC message
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- shape check for the load message's allowlist
 function parseNetworkAllow(value: unknown): string[] | null {
   if (value === undefined) return [];
@@ -229,6 +228,7 @@ function parseNetworkAllow(value: unknown): string[] | null {
   return entries;
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- parser for the untrusted IPC message
 function parseParentMessage(raw: unknown): ParentToChildMessage | null {
   if (!isPlainObject(raw) || typeof raw.type !== "string") return null;
   if (raw.type === "load") {

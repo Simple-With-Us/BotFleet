@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -62,8 +63,8 @@ function listing(
     source: { kind: "folder", path: "<test>" },
     warnings: [],
     capabilities,
-    ...(needs ? { needs } : {}),
   };
+  if (needs) row.needs = needs;
   if (hostTrust) row.hostTrust = hostTrust;
   return row;
 }
@@ -239,6 +240,10 @@ describe("plugin sandbox isolation", () => {
   });
 });
 
+function isListenAddress(address: ReturnType<Server["address"]>): address is AddressInfo {
+  return address !== null && Object.prototype.toString.call(address) === "[object Object]";
+}
+
 async function listenLocal(onHit: () => void): Promise<{ server: Server; port: number }> {
   const server = createServer((_req, res) => {
     onHit();
@@ -248,7 +253,7 @@ async function listenLocal(onHit: () => void): Promise<{ server: Server; port: n
     server.listen(0, "127.0.0.1", () => resolve());
   });
   const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("test server has no port");
+  if (!isListenAddress(address)) throw new Error("test server has no port");
   return { server, port: address.port };
 }
 

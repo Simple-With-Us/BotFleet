@@ -106,7 +106,7 @@ describe("plugin network OS boundary", () => {
     const pid = spawned.child.pid;
     killPluginProcess(spawned.child, true);
     await new Promise((resolve) => spawned.child.on("exit", resolve));
-    if (typeof pid === "number" && process.platform === "linux") {
+    if (pid !== undefined && process.platform === "linux") {
       const leftover = spawn("ps", ["-p", String(pid)]);
       const status = await new Promise<number | null>((resolve) => leftover.on("exit", resolve));
       expect(status).not.toBe(0);

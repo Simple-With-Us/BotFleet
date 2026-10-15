@@ -52,7 +52,7 @@ import { startUiShim } from "./attached-ui-shim.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
-import { mayOpenBotFile, resolveOpenablePath } from "./open-file.mjs";
+import { mayOpenBotFile, resolveLocalRevealPath, resolveOpenablePath } from "./open-file.mjs";
 import { installTrustedIpcGuard, isTrustedRendererUrl } from "./renderer-trust.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
@@ -1786,6 +1786,20 @@ ipcMain.handle("desktop:open-file", async (_event, rawPath) => {
 ipcMain.handle("desktop:show-in-folder", async (_event, rawPath) => {
   const filePath = await resolveOpenablePath(rawPath, { home: os.homedir() });
   shell.showItemInFolder(filePath);
+  return true;
+});
+
+// Plugin install sources may be folders outside ~/.botfleet; reveal them in
+// the file manager without the bot-file confinement used for chat attachments.
+ipcMain.handle("desktop:reveal-local-path", async (_event, rawPath) => {
+  const resolved = await resolveLocalRevealPath(rawPath);
+  const stats = await fs.promises.stat(resolved);
+  if (stats.isDirectory()) {
+    const openError = await shell.openPath(resolved);
+    if (openError) throw new Error(openError);
+  } else {
+    shell.showItemInFolder(resolved);
+  }
   return true;
 });
 

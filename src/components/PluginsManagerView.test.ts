@@ -68,6 +68,7 @@ describe("plugins manager schemas", () => {
       onUpdate: noop,
       onReload: noop,
       onRemove: noop,
+      onOpen: noop,
     }));
     expect(denied).toContain("Outbound network: none");
 
@@ -79,6 +80,7 @@ describe("plugins manager schemas", () => {
       onUpdate: noop,
       onReload: noop,
       onRemove: noop,
+      onOpen: noop,
     }));
     expect(hidden).toContain("Outbound network: none");
 
@@ -90,6 +92,7 @@ describe("plugins manager schemas", () => {
       onUpdate: noop,
       onReload: noop,
       onRemove: noop,
+      onOpen: noop,
     }));
     expect(allowed).toContain("Outbound network: api.example.com:443");
   });

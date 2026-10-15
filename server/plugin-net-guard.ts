@@ -252,7 +252,11 @@ function denyBinding(): never {
 
 /** Install the guard.  Call `seal` once with the parent's allowlist
  *  before importing the plugin.  Further seals do nothing. */
-export function installPluginNetworkGuard(): { seal(entries: readonly string[]): void } {
+export interface PluginNetworkGuard {
+  seal(entries: readonly string[]): void;
+}
+
+export function installPluginNetworkGuard(): PluginNetworkGuard {
   let allow: readonly string[] = [];
   let sealed = false;
   const current = (): readonly string[] => allow;

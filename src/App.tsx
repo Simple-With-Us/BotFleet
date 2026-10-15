@@ -299,7 +299,7 @@ function Shell() {
   // drawer whenever an action opens something over the chat.
   useEffect(() => {
     setDrawerOpen(false);
-  }, [state.selectedId, state.activeView, state.pluginsOpen, state.settingsOpen]);
+  }, [state.selectedId, state.activeView, state.pluginsOpen, state.pluginsManagerOpen, state.settingsOpen]);
 
   useEffect(() => {
     if (
@@ -328,7 +328,8 @@ function Shell() {
     state.computerOpen ||
     state.inspectorOpen ||
     state.appSettingsOpen ||
-    state.pluginsOpen;
+    state.pluginsOpen ||
+    state.pluginsManagerOpen;
 
   // The viewer outlives ComputerPanel and can target any bot, so release control
   // here (always mounted) when a bot's viewer closes. release() is idempotent.
@@ -523,7 +524,7 @@ function Shell() {
           )}
         </div>
       </div>
-      {(state.settingsOpen || state.computerOpen || state.inspectorOpen) && (
+      {(state.settingsOpen || state.computerOpen || state.inspectorOpen || state.pluginsManagerOpen) && (
         <div
           aria-hidden
           onMouseDown={(event) => {
@@ -531,6 +532,7 @@ function Shell() {
             if (state.settingsOpen) dispatch({ type: "toggleSettings", open: false });
             else if (state.computerOpen) dispatch({ type: "toggleComputer", open: false });
             else if (state.inspectorOpen) dispatch({ type: "toggleInspector", open: false });
+            else if (state.pluginsManagerOpen) dispatch({ type: "togglePluginsManager", open: false });
           }}
           className="absolute inset-0 z-10 hidden bg-black/40 max-[1099px]:block"
         />
