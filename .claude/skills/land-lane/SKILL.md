@@ -28,7 +28,7 @@ git config user.email "12656028+jaywedgeworth22@users.noreply.github.com"
 
 ## Docs before the PR
 
-1. Live effort board → In Progress with honest status; mirror `docs/EFFORT-LOG.md` in the same commit (fleet-infra has no mirror).
+1. Linear issue claimed and kept accurate (`board comment` when status shifts).
 2. `STATUS.md` stanza: what landed, next action.
 3. `docs/rollouts/YYYY-MM-DD-slug.md` — summary, why, files, verification commands actually run, follow-ups.
 4. Substantial owner-facing work: living Apple Note via the `apple-notes` skill, title `[APP, Monet] …`.

@@ -12,7 +12,7 @@ description: Finish a Monet work unit — THE BOARD, effort log, GitHub issue, S
 > Cursor, Grok, Grok Bot, Codex, AG, DeepSeek, Kimi, and Fx have their own skill dirs and must not take identity from here.
 
 
-Start-of-work is a triple claim.  End-of-work is the same three surfaces plus Notes when the owner might ask "what happened?"
+Start-of-work is a Linear claim plus a Zulip claim post.  End-of-work closes both plus Notes when the owner might ask "what happened?"
 
 ## 1. Truth check
 
@@ -20,26 +20,22 @@ Start-of-work is a triple claim.  End-of-work is the same three surfaces plus No
 - Production verified?  (`deploy-verify`)  Completed ≠ Deployed.
 - Uncommitted files?  Commit or explicitly report why not (failing tests, secrets, owner hold).
 
-## 2. THE BOARD
+## 2. Linear
 
 ```bash
 board status <id> completed --resolution "Landed in #<PR>.  <one line>."
 # or: deployed — only after health verify
 ```
 
-If the item is an `effort-row` / `github-issue`, writeback copies that status to the live effort log and GitHub within ~10 min.  Still land `docs/EFFORT-LOG.md` in the app PR.  A comment is useful context; the 15-min grace window keeps sync from clobbering the status you just set.
+Use the Linear issue id (`BF-123`, or a legacy eight-character board id for imported rows).  A comment is useful context for peers reviewing the fix.
 
-## 3. Effort board + issues
+## 3. GitHub linkage
 
-Live board first, then `docs/EFFORT-LOG.md` in the landing commit.
-
-- **Completed** = merged to main.
+- **Completed** = merged to `main`.
 - **Deployed** = released and verified (say how).
-- Never delete another row.  Correct in place with `(Monet): …` and the date.
+- PR body uses `Fixes <ID>` when the PR finishes the Linear issue and `Refs <ID>` for partial work.
 
-Board and GitHub issues must match.  Prefer landing the mirror so `effort-issues-sync` closes the issue.  If you executed a numbered issue, comment/close it so it is not abandoned.
-
-Cross-app work gets a row on each affected board.
+Cross-app work gets its own Linear issue per team when scope spans apps.
 
 ## 4. Slack
 
@@ -75,7 +71,6 @@ If you stop without merge: board stays accurate (`open` or a comment "parked bec
 ## Canon
 
 - `/Users/jay/apps/AGENT-SYNC.md` — triple closeout; Apple Notes; Mac local processes; always-commit
-- `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`
 - Skills: `board-ops`, `apple-notes`, `deploy-verify`, `land-lane`
 
 ## Living Handoff Morphing to Closeout

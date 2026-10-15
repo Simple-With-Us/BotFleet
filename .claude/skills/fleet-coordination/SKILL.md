@@ -1,6 +1,6 @@
 ---
 name: fleet-coordination
-description: Comprehensive master skill for multi-agent fleet operations across all apps and platforms (Antigravity/Gemini, Monet, Claude, Cursor, Grok, Codex, DeepSeek). Use at session start, when claiming work on effort boards, managing pull requests, handling secrets safely, writing owner-facing Apple Notes, ensuring sentence gap compliance, and deploying to production.
+description: Comprehensive master skill for multi-agent fleet operations across all apps and platforms (Antigravity/Gemini, Monet, Claude, Cursor, Grok, Codex, DeepSeek). Use at session start, when claiming work in Linear, managing pull requests, handling secrets safely, writing owner-facing Apple Notes, ensuring sentence gap compliance, and deploying to production.
 ---
 
 # Fleet Coordination Protocol (Universal)
@@ -12,7 +12,7 @@ description: Comprehensive master skill for multi-agent fleet operations across 
 > Cursor, Grok, Grok Bot, Codex, AG, DeepSeek, Kimi, and Fx have their own skill dirs and must not take identity from here.
 
 
-Canonical reference: `/Users/jay/apps/AGENT-SYNC.md` and `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`.  
+Canonical reference: `/Users/jay/apps/AGENT-SYNC.md` § Linear and the Claim Lifecycle.  
 Slack Coordination Channel: `#agent-sync` (`C0BEZDJDNKV`).
 
 This skill governs how autonomous AI agents collaborate across the entire application fleet (Socratic.Trade, Congress.Trade, Usage-Monitor, congress-trading-shared, DealDex, Personal-Site, Autorotate, ContactLogo, and ai-fleet-coordinator).
@@ -64,12 +64,12 @@ Every agent session must start with systematic orientation before touching code:
    ```
    Skim for your agent tag or repositories you plan to touch.  Grok Bot seats also full-read `[SENDER->FLEET]` (every GB seat must spend time).  Coordinator self-id is `AFL`, not `FLEET`.
 
-3. **Check Live Effort Boards & Work Items:**
+3. **Check Linear & Work Items:**
    ```bash
    board stats
    board list --status open,in_progress --limit 25
    ```
-   Or inspect live board files directly: `rg -n "In Progress" /Users/jay/apps/*EFFORT-LOG.md`.
+   Or use agent-sync `linear_list` when mounted.  Effort-log files under `~/apps/*-EFFORT-LOG.md` are archived history only.
 
 ---
 
@@ -84,17 +84,15 @@ git -C /Users/jay/Code/<Repo> worktree add -b <seat>/<feature-slug> ~/apps/<app>
 
 ---
 
-## 3. Triple-Claim & Task Lifecycle
+## 3. Claim & Task Lifecycle
 
-Before starting substantial work, reserve your lane across three durable surfaces:
+Before starting substantial work, reserve your lane on Linear and in Zulip:
 
-1. **Live Effort Board (`/Users/jay/apps/<APP>-EFFORT-LOG.md`):**
-   - Add/move your row to **In Progress** with your tag, branch, worktree, and concise objective.
-   - Live boards are branch-neutral and canonical.  Mirror your update to `docs/EFFORT-LOG.md` in the repo before committing.
-2. **GitHub Issue:**
-   - Link your branch to the corresponding GitHub Issue or create one.
-3. **Slack Channel `#agent-sync`:**
-   Post a standardized claim header:
+1. **Linear (`board` or `linear_*` tools):**
+   - `board list` for the team you are touching, then `board claim` (or `board file` then claim).
+   - Keep `--by`, `--env`, and `--where` accurate while you work.
+2. **Zulip `#agent-sync`:**
+   Open topic `<ID> <subject>` and post a standardized claim header:
    ```text
    [<YOUR_TAG>] sync-1
    repo: <RepositoryName>
