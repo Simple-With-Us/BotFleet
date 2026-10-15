@@ -52,6 +52,13 @@ final class ChainedVoiceEngine: ObservableObject {
     private var speakTask: Task<Void, Never>?
     private var priorUserMessageIDs: Set<String> = []
     private var stopped = false
+    /// Bumped when a turn is cancelled.  speakReply only opens the mic if
+    /// it is still the turn that started it, so Stop cannot fall through
+    /// into a second handoff.
+    private var turnGeneration = 0
+    /// Bumped when speech is silenced.  A queued chunk whose generation
+    /// no longer matches does not start another utterance.
+    private var speakGeneration = 0
 
     /// Called with each settled turn, so the call screen can draw the same
     /// transcript the duplex path produces.
@@ -76,16 +83,23 @@ final class ChainedVoiceEngine: ObservableObject {
         openMic()
     }
 
-    func stop() {
+    func stop(haltSharedSpeech: Bool = true) {
         guard !stopped else { return }
         stopped = true
+        turnGeneration += 1
+        speakGeneration += 1
         turnTask?.cancel()
         turnTask = nil
         speakTask?.cancel()
         speakTask = nil
         dictation?.stop()
+        dictation?.discardRecording()
         dictation = nil
-        PersonalVoiceService.shared.stop()
+        // A newer call may already be the one speaking.  Stopping the
+        // shared synthesizer then would cut that call off.
+        if haltSharedSpeech {
+            PersonalVoiceService.shared.stop()
+        }
         state = .idle
     }
 
@@ -94,19 +108,33 @@ final class ChainedVoiceEngine: ObservableObject {
     /// Talking over the bot is the interrupt.  There is no socket here to
     /// truncate, so it is exactly two things: stop saying it, and listen.
     func interrupt() {
-        speakTask?.cancel()
-        speakTask = nil
-        PersonalVoiceService.shared.stop()
+        guard !stopped else { return }
+        // Cancel the turn before opening the mic, or speakReply finishes
+        // the reply and opens the mic a second time.
+        turnGeneration += 1
+        silenceSpeech()
+        turnTask?.cancel()
+        turnTask = nil
         state = .listening
         openMic()
+    }
+
+    /// Stop is the manual barge-in on this path.  Duplex capture is already
+    /// hot while the bot speaks.  This path closed the mic in order to
+    /// speak, so silence alone would leave nobody listening.  The in-flight
+    /// speakReply must not also open the mic when it notices the cancel.
+    func stopPlayback() {
+        interrupt()
     }
 
     func setMuted(_ muted: Bool) {
         guard !stopped else { return }
         if muted {
+            turnGeneration += 1
             turnTask?.cancel()
             turnTask = nil
             dictation?.stop()
+            dictation?.discardRecording()
         } else {
             openMic()
         }
@@ -124,16 +152,23 @@ final class ChainedVoiceEngine: ObservableObject {
     private func openMic() {
         guard !stopped, let dictation else { return }
         if !dictation.isListening && !dictation.isStarting {
+            // stop() keeps the WAV, and start() refuses to run while one
+            // is saved.  The call never surfaces that clip.  The transcript
+            // is the whole artifact, so discard before every capture or the
+            // second utterance never opens the microphone.
+            dictation.discardRecording()
             dictation.startCapturing(base: "")
         }
+        turnGeneration += 1
+        let generation = turnGeneration
         turnTask?.cancel()
         turnTask = Task { @MainActor [weak self] in
             guard let self else { return }
             var last = ""
             var stableFor = 0
-            while !Task.isCancelled, !stopped {
+            while !Task.isCancelled, !self.stopped, self.turnGeneration == generation {
                 try? await Task.sleep(for: .milliseconds(350))
-                guard !Task.isCancelled, !stopped else { return }
+                guard !Task.isCancelled, !self.stopped, self.turnGeneration == generation else { return }
                 let said = dictation.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
                 // Two consecutive identical reads means the recognizer has
                 // stopped revising and is telling us the whole sentence.
@@ -141,7 +176,8 @@ final class ChainedVoiceEngine: ObservableObject {
                     stableFor += 1
                     if stableFor >= 2 {
                         dictation.stop()
-                        await self.deliver(said)
+                        dictation.discardRecording()
+                        await self.deliver(said, generation: generation)
                         return
                     }
                 } else {
@@ -158,8 +194,8 @@ final class ChainedVoiceEngine: ObservableObject {
     // MARK: - A turn
 
     /// Send what was said, wait for the reply, and read it aloud.
-    private func deliver(_ text: String) async {
-        guard !stopped else { return }
+    private func deliver(_ text: String, generation: Int) async {
+        guard !stopped, turnGeneration == generation else { return }
         onLine?(StsTranscriptLine(text: text, from: .user, final: true))
         state = .thinking
         priorUserMessageIDs = Set(
@@ -168,7 +204,7 @@ final class ChainedVoiceEngine: ObservableObject {
                 .map(\.id)
         )
         let outcome = await session.send(text, to: chat)
-        guard !stopped else { return }
+        guard !stopped, turnGeneration == generation else { return }
         guard outcome.ok else {
             // The call keeps going: a failed turn is this turn's problem, not
             // the call's.  The desktop behaves the same way.
@@ -176,7 +212,7 @@ final class ChainedVoiceEngine: ObservableObject {
             openMic()
             return
         }
-        await speakReply()
+        await speakReply(generation: generation)
     }
 
     /// Read the reply as it is written, then open the mic again.
@@ -185,29 +221,26 @@ final class ChainedVoiceEngine: ObservableObject {
     /// final text is whatever the transcript holds at that point, which is why
     /// this reads the settled message rather than the stream: a stream read
     /// once would only ever say the first few words.
-    private func speakReply() async {
-        guard !stopped else { return }
+    private func speakReply(generation: Int) async {
+        guard !stopped, turnGeneration == generation else { return }
         var spoken = ""
         var lastLength = 0
         var stableFor = 0
-        while !Task.isCancelled, !stopped {
+        while !Task.isCancelled, !stopped, turnGeneration == generation {
             try? await Task.sleep(for: .milliseconds(400))
-            guard !Task.isCancelled, !stopped else { return }
+            guard !Task.isCancelled, !stopped, turnGeneration == generation else { return }
             let streaming = session.state.streaming[threadId] ?? ""
             if streaming.count != lastLength {
                 // Something new arrived.  Speak it now rather than at the end:
                 // the caller should not wait for a whole paragraph before
-                // hearing the first sentence of it.
+                // hearing the first sentence of it.  Chunks are queued, not
+                // cancelled: speak() stops whatever is already playing, so
+                // two of them at once would drop the beginning.
                 let fresh = streaming.count > spoken.count
                     ? String(streaming.dropFirst(spoken.count))
                     : ""
                 if !fresh.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    speakTask = Task { @MainActor in
-                        try? await PersonalVoiceService.shared.speak(
-                            segments: SpeechProjection.segments(fromReply: fresh),
-                            voiceId: voiceId
-                        )
-                    }
+                    enqueueSpeech(fresh)
                 }
                 spoken = streaming
                 lastLength = streaming.count
@@ -217,16 +250,20 @@ final class ChainedVoiceEngine: ObservableObject {
                 stableFor += 1
             }
             let busy = BotState.forChat(chat, in: session.state).showsActivity
-            if streaming.isEmpty, !busy, stableFor >= 2 { break }
-            if spoken.isEmpty, stableFor >= 6 { break }
+            if chainedSpeakShouldStop(ChainedSpeakTick(
+                streamingEmpty: streaming.isEmpty,
+                spokenEmpty: spoken.isEmpty,
+                busy: busy,
+                stableFor: stableFor
+            )) { break }
         }
-        guard !stopped else { return }
+        guard !stopped, turnGeneration == generation else { return }
         // Let the last utterance finish before handing the floor back, or the
         // caller talks into the tail of the sentence they interrupted.
-        while PersonalVoiceService.shared.isSpeaking, !Task.isCancelled, !stopped {
+        while PersonalVoiceService.shared.isSpeaking, !Task.isCancelled, !stopped, turnGeneration == generation {
             try? await Task.sleep(for: .milliseconds(120))
         }
-        guard !stopped else { return }
+        guard !stopped, turnGeneration == generation else { return }
         let settled = session.state.transcript(forThread: threadId)
             .filter { $0.role == .bot }
             .last(where: { !priorUserMessageIDs.contains($0.id) && $0.text?.isEmpty == false })
@@ -235,5 +272,28 @@ final class ChainedVoiceEngine: ObservableObject {
         }
         state = .listening
         openMic()
+    }
+
+    /// Speak the next slice after the previous slice finishes.  Cancelling
+    /// the previous task would drop the words the caller has not heard yet,
+    /// because each speak() replaces the synthesizer's current utterance.
+    private func enqueueSpeech(_ fresh: String) {
+        let previous = speakTask
+        let generation = speakGeneration
+        speakTask = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, !Task.isCancelled, !self.stopped, self.speakGeneration == generation else { return }
+            try? await PersonalVoiceService.shared.speak(
+                segments: SpeechProjection.segments(fromReply: fresh),
+                voiceId: self.voiceId
+            )
+        }
+    }
+
+    private func silenceSpeech() {
+        speakGeneration += 1
+        speakTask?.cancel()
+        speakTask = nil
+        PersonalVoiceService.shared.stop()
     }
 }

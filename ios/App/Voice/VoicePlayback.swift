@@ -36,6 +36,11 @@ public final class VoicePlayback: ObservableObject {
     /// what the caller heard before the cut.
     private var frozenHeard: Double = 0
     private var running = false
+    /// Buffers scheduled and not yet rendered.  Hitting zero is the natural
+    /// end of an utterance.  stopPlayback bumps the generation so a late
+    /// callback cannot clear the utterance that replaced it.
+    private var pendingBuffers = 0
+    private var scheduleGeneration = 0
 
     public init?() {
         guard let format = AVAudioFormat(
@@ -79,20 +84,31 @@ public final class VoicePlayback: ObservableObject {
             guard let src = raw.baseAddress, let dst = buffer.int16ChannelData?[0] else { return }
             memcpy(dst, src, pcm.count)
         }
-        let at: AVAudioTime?
-        if !hasUtterance {
-            // Nothing queued: play now and anchor the utterance clock.
-            hasUtterance = true
-            utteranceStart = playerSampleNow ?? 0
-            nextSample = utteranceStart
-            at = nil
-        } else {
-            at = AVAudioTime(sampleTime: nextSample, atRate: Self.sampleRate)
+        let now = playerSampleNow ?? 0
+        let anchor = nextPlaybackAnchor(
+            hasUtterance: hasUtterance,
+            nextSample: nextSample,
+            utteranceStart: utteranceStart,
+            now: now,
+            frames: Int64(frames)
+        )
+        if anchor.utteranceStart != utteranceStart || !hasUtterance {
+            // A new utterance.  The previous heard-time must not leak into it.
+            frozenHeard = 0
         }
-        nextSample += AVAudioFramePosition(frames)
+        hasUtterance = anchor.hasUtterance
+        utteranceStart = anchor.utteranceStart
+        nextSample = anchor.nextSample
+        let at = anchor.scheduleAt.map {
+            AVAudioTime(sampleTime: AVAudioFramePosition($0), atRate: Self.sampleRate)
+        }
+        pendingBuffers += 1
+        let generation = scheduleGeneration
+        // The completion runs on an engine queue, not the main actor.
+        // assumeIsolated traps on the first buffer that finishes.
         player.scheduleBuffer(buffer, at: at, completionCallbackType: .dataPlayedBack) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.notePlayedThrough()
+            Task { @MainActor [weak self] in
+                self?.notePlayedThrough(generation: generation)
             }
         }
     }
@@ -101,6 +117,8 @@ public final class VoicePlayback: ObservableObject {
     /// utterance anchor freezes where playback stopped, so `playedMs()`
     /// still reports what the caller heard before the interruption.
     public func stopPlayback() {
+        scheduleGeneration += 1
+        pendingBuffers = 0
         frozenHeard = playedSeconds
         player.stop()
         // Re-play to leave the node usable: a stopped player node needs
@@ -112,6 +130,8 @@ public final class VoicePlayback: ObservableObject {
     }
 
     public func stop() {
+        scheduleGeneration += 1
+        pendingBuffers = 0
         player.stop()
         engine.stop()
         running = false
@@ -137,8 +157,26 @@ public final class VoicePlayback: ObservableObject {
         return max(0, Double(now - utteranceStart) / Self.sampleRate)
     }
 
-    /// A buffer finished rendering: nothing to do (the anchor math in
-    /// playedSeconds already accounts for it).  Kept as the hook where a
-    /// future level meter or end-of-utterance signal would live.
-    private func notePlayedThrough() {}
+    /// A buffer finished rendering.  When the queue is empty the utterance
+    /// is over: freeze what was heard and drop the anchor, or the next
+    /// reply is scheduled on a timeline that has already passed.
+    private func notePlayedThrough(generation: Int) {
+        guard generation == scheduleGeneration else { return }
+        let wasLive = hasUtterance
+        let next = playbackAfterBufferFinished(
+            PlaybackUtterance(
+                hasUtterance: hasUtterance,
+                nextSample: nextSample,
+                utteranceStart: utteranceStart,
+                pendingBuffers: pendingBuffers
+            )
+        )
+        if wasLive, !next.hasUtterance {
+            frozenHeard = playedSeconds
+        }
+        pendingBuffers = next.pendingBuffers
+        hasUtterance = next.hasUtterance
+        nextSample = next.nextSample
+        utteranceStart = next.utteranceStart
+    }
 }

@@ -91,9 +91,14 @@ public final class VoiceCapture: ObservableObject {
         self.converter = converter
         // 4096 frames per tap, matching the desktop's CAPTURE_FRAME: small
         // enough to feel live, large enough not to drown the socket.
+        // The tap runs on the audio thread.  assumeIsolated traps there,
+        // and the buffer is only valid until this callback returns, so the
+        // conversion happens here and only the bytes hop to the main actor.
         input.installTap(onBus: 0, bufferSize: 4096, format: input.inputFormat(forBus: 0)) { [weak self] buffer, _ in
-            MainActor.assumeIsolated {
-                self?.convert(buffer: buffer, outputFormat: outputFormat)
+            guard let data = VoiceCapture.pcm16(from: buffer, converter: converter, outputFormat: outputFormat) else { return }
+            Task { @MainActor [weak self] in
+                guard let self, !self.muted, !self.stopped else { return }
+                self.onFrame?(data)
             }
         }
         engine.prepare()
@@ -113,20 +118,29 @@ public final class VoiceCapture: ObservableObject {
         self.muted = muted
     }
 
-    public func stop() {
+    public func stop(deactivateSession: Bool = true) {
         stopped = true
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
         converter = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // A replacement capture may already own the session.  Deactivating
+        // here would silence that call.
+        if deactivateSession {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 
-    private func convert(buffer: AVAudioPCMBuffer, outputFormat: AVAudioFormat) {
-        guard !muted, !stopped, let converter, let onFrame else { return }
+    /// 16 kHz mono PCM16 from one tap buffer.  Nonisolated on purpose: the
+    /// audio thread calls it, and it touches no main-actor state.
+    nonisolated static func pcm16(
+        from buffer: AVAudioPCMBuffer,
+        converter: AVAudioConverter,
+        outputFormat: AVAudioFormat
+    ) -> Data? {
         let ratio = VoiceCaptureFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
-        guard let out = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else { return }
+        guard let out = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else { return nil }
         var error: NSError?
         // A tap buffer converts in one call: input block supplies the buffer
         // once, then nil.  Anything else is a converter failure, not audio.
@@ -142,8 +156,7 @@ public final class VoiceCapture: ObservableObject {
         })
         guard error == nil, out.frameLength > 0,
               let bytes = out.int16ChannelData
-        else { return }
-        let data = Data(bytes: bytes[0], count: Int(out.frameLength) * MemoryLayout<Int16>.size)
-        onFrame(data)
+        else { return nil }
+        return Data(bytes: bytes[0], count: Int(out.frameLength) * MemoryLayout<Int16>.size)
     }
 }

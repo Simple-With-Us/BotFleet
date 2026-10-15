@@ -85,13 +85,19 @@ public final class GeminiLiveSession: StsSession, @unchecked Sendable {
         handledCalls.removeAll()
         lock.unlock()
 
+        // Gemini's bidi socket authenticates with the access token in the
+        // query string.  That is the protocol (the same URL the desktop
+        // opens in src/lib/sts/gemini-live.ts).  A subprotocol header or a
+        // setup field is not accepted, so the token stays here.  The
+        // session below does not cache that URL or keep a cookie for it,
+        // and the errors this file emits never include the request URL.
         var components = URLComponents(string: Self.endpoint)
         components?.queryItems = [URLQueryItem(name: "access_token", value: token)]
         guard let url = components?.url else {
             failStart()
             throw StsSessionError.startFailed("Could not open the Gemini live session.")
         }
-        let session = URLSession(configuration: .ephemeral)
+        let session = Self.makeSocketSession()
         self.session = session
         let task = session.webSocketTask(with: URLRequest(url: url))
         self.task = task
@@ -147,10 +153,12 @@ public final class GeminiLiveSession: StsSession, @unchecked Sendable {
     /// Deliberately identical to the server-initiated path below: one barge-in,
     /// one behaviour, whichever side started it.
     public func interrupt() {
-        Task { @MainActor [playback] in
+        // Silence first, transcript second.  The two used to be separate
+        // tasks, so the cut-off line could land while audio was still queued.
+        Task { @MainActor [weak self, playback] in
             playback.stopPlayback()
+            self?.flushBotTurn(consumeBypass: false)
         }
-        flushBotTurn(consumeBypass: false)
     }
 
     public func stop() async {
@@ -327,11 +335,11 @@ public final class GeminiLiveSession: StsSession, @unchecked Sendable {
             if content["interrupted"] as? Bool == true {
                 // The caller talked over the bot.  Silence first, transcript
                 // second: queued audio is what they are interrupting, and it
-                // is often ahead of the speaker.
-                Task { @MainActor [playback] in
+                // is often ahead of the speaker.  Same order as interrupt().
+                Task { @MainActor [weak self, playback] in
                     playback.stopPlayback()
+                    self?.flushBotTurn(consumeBypass: false)
                 }
-                flushBotTurn(consumeBypass: false)
             }
             if let turn = content["modelTurn"] as? [String: Any] {
                 for part in turn["parts"] as? [[String: Any]] ?? [] {
@@ -474,6 +482,18 @@ public final class GeminiLiveSession: StsSession, @unchecked Sendable {
     }
 
     // MARK: - Helpers
+
+    /// Ephemeral, and also uncached.  The access token is in the URL
+    /// because Gemini requires it there.  Nothing in this session should
+    /// write that URL to a cookie jar or an HTTP cache.
+    private static func makeSocketSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
+        return URLSession(configuration: configuration)
+    }
 
     private func resolveSetup() {
         lock.lock()

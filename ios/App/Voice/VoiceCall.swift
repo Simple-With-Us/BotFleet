@@ -14,10 +14,10 @@
 //    line bypassed.  Spoken approvals still dispatch through the real
 //    respond route -- that is the tool execution with a permission boundary,
 //    and it works.
-//  * No chained fallback.  The desktop degrades STS-to-chained when the mic
-//    or bridge is missing; on the phone the chained path is a different
-//    screen (dictation in the composer), not a mode of this one.  A call
-//    that cannot start says why and offers the way back to text.
+//  * The chained path is the fallback when no speech-to-speech provider is
+//    available: dictation, an ordinary send, and Personal Voice, sequenced
+//    as a call.  A call that cannot start either way says why and offers
+//    the way back to text.
 import AVFoundation
 import Combine
 import Foundation
@@ -82,6 +82,12 @@ public final class VoiceCall: ObservableObject {
     private var reconnectAttempt = 0
     private var reconnectTask: Task<Void, Never>?
     private var endTask: Task<Void, Never>?
+    private var runTask: Task<Void, Never>?
+    /// Bumped on start, on end, and when a start fails.  A teardown
+    /// scheduled by an older attempt must not tear down, or re-phase, the
+    /// attempt that replaced it, and a start still awaiting the socket
+    /// cannot land on listening after the failure was decided.
+    private var generation = 0
 
     /// Announced once per call: without the engine tool, the model answers
     /// from its own knowledge.  Said on the screen, not stamped on every
@@ -107,7 +113,23 @@ public final class VoiceCall: ObservableObject {
 
     public func start() {
         guard !stopped else { return }
-        Task { await self.run() }
+        generation += 1
+        let gen = generation
+        // Try Again is a new call.  Reconnect calls run() directly and must
+        // keep the transcript and the attempt count, so the reset lives here
+        // and not at the top of run().
+        let failed = { if case .failed = self.phase { return true } else { return false } }()
+        let restart = callTryAgain(fromFailedPhase: failed, reconnectAttempt: reconnectAttempt)
+        if restart.clearTranscript {
+            lines.removeAll(keepingCapacity: true)
+            lineKeys = 0
+            decided.removeAll()
+        }
+        reconnectAttempt = restart.reconnectAttempt
+        runTask?.cancel()
+        runTask = Task { [weak self] in
+            await self?.run(generation: gen)
+        }
     }
 
 #if DEBUG
@@ -131,20 +153,48 @@ public final class VoiceCall: ObservableObject {
         }
     }
 
+    private func attachFixture(session fixture: FixtureStsSession) {
+        cancellations.forEach { $0() }
+        cancellations.removeAll()
+        let gen = generation
+        cancellations.append(fixture.onLine { [weak self] line in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == gen else { return }
+                self.receive(line: line)
+            }
+        })
+        cancellations.append(fixture.onClosed { [weak self] reason in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == gen else { return }
+                self.vendorClosed(reason: reason)
+            }
+        })
+    }
+#endif
+
     /// Run the call the way the desktop does when there is no provider key:
     /// dictation in, the bot's ordinary reply out, spoken, then listening
     /// again.  No socket, no token, and no key — which is the point.
-    private func runChained(status: StsStatus, reason: CallModeReason) {
-        let engine = ChainedVoiceEngine(session: session, chat: chat, botName: botName, voiceId: "")
+    /// Outside the debug fixture on purpose: a Release archive is what ships,
+    /// and this is the fallback that archive has to be able to compile.
+    private func runChained(generation gen: Int, status _: StsStatus, reason _: CallModeReason) {
+        guard owns(gen) else { return }
+        let voiceId: String = {
+            guard case let .bot(bot) = chat else { return "" }
+            return bot.voice(for: .iphone) ?? ""
+        }()
+        let engine = ChainedVoiceEngine(session: session, chat: chat, botName: botName, voiceId: voiceId)
         chained = engine
         engine.onLine = { [weak self] line in
             Task { @MainActor [weak self] in
-                self?.receive(line: line)
+                guard let self, self.generation == gen else { return }
+                self.receive(line: line)
             }
         }
         engine.onFailure = { [weak self] text, recovery in
             Task { @MainActor [weak self] in
-                self?.fail(text, recovery: recovery)
+                guard let self, self.generation == gen else { return }
+                self.fail(text, recovery: recovery)
             }
         }
         // Said once, then never again.  The fallback reasons are deliberately
@@ -155,34 +205,27 @@ public final class VoiceCall: ObservableObject {
         setPhase(.listening)
     }
 
-    private func attachFixture(session fixture: FixtureStsSession) {
-        cancellations.forEach { $0() }
-        cancellations.removeAll()
-        cancellations.append(fixture.onLine { [weak self] line in
-            Task { @MainActor [weak self] in
-                self?.receive(line: line)
-            }
-        })
-        cancellations.append(fixture.onClosed { [weak self] reason in
-            Task { @MainActor [weak self] in
-                self?.vendorClosed(reason: reason)
-            }
-        })
-    }
-#endif
-
-    private func run() async {
+    private func run(generation gen: Int) async {
+        guard owns(gen) else { return }
+        // A reconnect used to leave the previous microphone and socket
+        // running and open a second pair on top.  Drop them first.
+        if capture != nil || playback != nil || sts != nil || chained != nil || !cancellations.isEmpty {
+            await teardown(generation: gen)
+            guard owns(gen) else { return }
+        }
         setPhase(.connecting)
         // 1. What can this computer actually do?
         let status: StsStatus
         do {
             status = try await session.voiceCallStatus()
         } catch {
+            guard owns(gen) else { return }
             return fail(
                 "Could not reach your computer. Check that it is awake and try again.",
                 recovery: .retry
             )
         }
+        guard owns(gen) else { return }
         guard status.isKnown else {
             return fail(
                 "This computer does not offer voice calls. It may need an update.",
@@ -196,7 +239,7 @@ public final class VoiceCall: ObservableObject {
         // path to fall back to.
         let decision = decideCallMode(keyStatus: status, microphoneAvailable: true)
         guard decision.mode == .sts, let kind = decision.provider else {
-            return runChained(status: status, reason: decision.reason)
+            return runChained(generation: gen, status: status, reason: decision.reason)
         }
         self.provider = kind
         // 2. One short-lived token.  The permanent key never leaves the Mac.
@@ -204,31 +247,42 @@ public final class VoiceCall: ObservableObject {
         do {
             token = try await session.voiceCallToken(provider: kind.rawValue)
         } catch {
+            guard owns(gen) else { return }
             return fail(
                 "Could not start a voice call (\(friendlyError(error))).",
                 recovery: .retry
             )
         }
+        guard owns(gen) else { return }
         guard !token.token.isEmpty else {
             return fail("The computer would not issue a call token.", recovery: .retry)
         }
         // 3. Playback first (no permission gate), then capture (permission
         // gate).  A denied mic fails here, before any socket opens, so there
-        // is never a live call with no way to speak.
+        // is never a live call with no way to speak.  Objects stay local
+        // until they are actually started, so End during an await cannot
+        // miss them and also cannot be overwritten by a later assignment.
         guard let playback = VoicePlayback() else {
             return fail("This phone cannot play call audio.", recovery: .backToText)
         }
-        self.playback = playback
         do {
             try playback.start()
         } catch {
+            playback.stop()
+            guard owns(gen) else { return }
             return fail("Could not start call audio. Try again.", recovery: .retry)
         }
+        guard owns(gen) else {
+            playback.stop()
+            return
+        }
+        self.playback = playback
         let capture = VoiceCapture()
-        self.capture = capture
         do {
             try await capture.start()
         } catch let failure as VoiceCapture.Failure {
+            capture.stop()
+            guard owns(gen) else { return }
             switch failure {
             case .permissionDenied:
                 return fail(failure.localizedDescription, recovery: .openSettings)
@@ -236,8 +290,18 @@ public final class VoiceCall: ObservableObject {
                 return fail(failure.localizedDescription, recovery: .retry)
             }
         } catch {
+            capture.stop()
+            guard owns(gen) else { return }
             return fail("Could not start the microphone.", recovery: .retry)
         }
+        guard owns(gen) else {
+            capture.stop()
+            return
+        }
+        // Mute is the call's, not the capture object's.  A reconnect builds
+        // a new capture, and it used to come back unmuted.
+        if muted { capture.setMuted(true) }
+        self.capture = capture
         // 4. The provider session.  No engine tool (see the file header).
         let sts: any StsSession =
             kind == .xai
@@ -252,12 +316,17 @@ public final class VoiceCall: ObservableObject {
                 engineTimeoutMs: 10_000
             ))
         } catch {
-            await teardown()
+            guard owns(gen) else { return }
             return fail("Could not open the speech session (\(friendlyError(error))).", recovery: .retry)
         }
+        guard owns(gen) else { return }
         reconnectAttempt = 0
         setPhase(.listening)
-        emitSystemLine(Self.noEngineNote)
+        // Reconnect runs this again.  The note is once per call, not once
+        // per socket.
+        if !lines.contains(where: { $0.text == Self.noEngineNote }) {
+            emitSystemLine(Self.noEngineNote)
+        }
     }
 
     // MARK: - Controls
@@ -278,12 +347,15 @@ public final class VoiceCall: ObservableObject {
     /// "stop talking", for when the bot is reading something long.
     public func stopPlayback() {
         if let chained {
-            Task { @MainActor in PersonalVoiceService.shared.stop() }
+            // Cancels the speak chain and the turn that would otherwise
+            // finish the reply and open the mic on its own.  The engine
+            // opens the mic once, which is this screen's "tap Stop, then
+            // speak": duplex capture was already hot, and this path had
+            // closed it in order to talk.
+            chained.stopPlayback()
             return
         }
-        Task { @MainActor [weak self] in
-            self?.playback?.stopPlayback()
-        }
+        playback?.stopPlayback()
     }
 
     /// Barge in: cut playback and let the caller speak.  The session's own
@@ -310,12 +382,17 @@ public final class VoiceCall: ObservableObject {
     public func end() {
         guard !stopped else { return }
         stopped = true
+        generation += 1
+        let gen = generation
+        runTask?.cancel()
+        runTask = nil
         reconnectTask?.cancel()
         reconnectTask = nil
         endTask?.cancel()
+        let held = detach()
         endTask = Task { [weak self] in
             guard let self else { return }
-            await self.teardown()
+            await self.finish(held, generation: gen)
             self.writeContinuity()
             self.setPhase(.ended(reason: nil))
         }
@@ -326,29 +403,35 @@ public final class VoiceCall: ObservableObject {
     private func attach(session sts: any StsSession, capture: VoiceCapture) {
         cancellations.forEach { $0() }
         cancellations.removeAll()
+        let gen = generation
         capture.onFrame = { [weak self] data in
             Task { @MainActor [weak self] in
-                self?.sts?.sendAudio(data)
+                guard let self, self.generation == gen else { return }
+                self.sts?.sendAudio(data)
             }
         }
         capture.onError = { [weak self] error in
             Task { @MainActor [weak self] in
-                self?.fail("The microphone stopped (\(error.localizedDescription)).", recovery: .retry)
+                guard let self, self.generation == gen else { return }
+                self.fail("The microphone stopped (\(error.localizedDescription)).", recovery: .retry)
             }
         }
         cancellations.append(sts.onLine { [weak self] line in
             Task { @MainActor [weak self] in
-                self?.receive(line: line)
+                guard let self, self.generation == gen else { return }
+                self.receive(line: line)
             }
         })
         cancellations.append(sts.onError { [weak self] error in
             Task { @MainActor [weak self] in
-                self?.fail("\(error.localizedDescription)", recovery: .retry)
+                guard let self, self.generation == gen else { return }
+                self.fail("\(error.localizedDescription)", recovery: .retry)
             }
         })
         cancellations.append(sts.onClosed { [weak self] reason in
             Task { @MainActor [weak self] in
-                self?.vendorClosed(reason: reason)
+                guard let self, self.generation == gen else { return }
+                self.vendorClosed(reason: reason)
             }
         })
         // Route changes (headphones in/out) and interruptions pause the call
@@ -441,41 +524,88 @@ public final class VoiceCall: ObservableObject {
             // it failed.
             guard let self else { return }
             if attempt > 4 {
-                await self.teardown()
+                let gen = self.generation
+                await self.teardown(generation: gen)
+                // A newer start or an End owns the phase now.
+                guard self.generation == gen, !self.stopped else { return }
                 self.writeContinuity()
                 self.setPhase(.ended(reason: "The call dropped and could not reconnect. \(reason)"))
                 return
             }
             try? await Task.sleep(for: .seconds(min(8, 1 << min(attempt, 3))))
             guard !Task.isCancelled, !self.stopped else { return }
-            await self.run()
+            await self.run(generation: self.generation)
         }
     }
 
     // MARK: - Teardown
 
-    private func teardown() async {
-        cancellations.forEach { $0() }
-        cancellations.removeAll()
-        chained?.stop()
+    /// Resources a teardown owns.  Detached synchronously so a newer start
+    /// can install its own without the older task destroying them.
+    private struct HeldResources {
+        var cancellations: [() -> Void] = []
+        var chained: ChainedVoiceEngine?
+        var capture: VoiceCapture?
+        var sts: (any StsSession)?
+        var playback: VoicePlayback?
+    }
+
+    private func owns(_ gen: Int) -> Bool {
+        generation == gen && !stopped && !Task.isCancelled
+    }
+
+    private func detach() -> HeldResources {
+        let held = HeldResources(
+            cancellations: cancellations,
+            chained: chained,
+            capture: capture,
+            sts: sts,
+            playback: playback
+        )
+        cancellations = []
         chained = nil
-        capture?.stop()
         capture = nil
-        await sts?.stop()
         sts = nil
-        PersonalVoiceService.shared.stop()
-        playback?.stop()
         playback = nil
+        return held
+    }
+
+    private func teardown(generation gen: Int) async {
+        await finish(detach(), generation: gen)
+    }
+
+    private func finish(_ held: HeldResources, generation gen: Int) async {
+        held.cancellations.forEach { $0() }
+        // Only the attempt that still owns the call may silence the shared
+        // synthesizer or deactivate the session.  A newer attempt may
+        // already be using both.
+        let stillOurs = generation == gen && capture == nil && chained == nil
+        held.chained?.stop(haltSharedSpeech: stillOurs)
+        held.capture?.stop(deactivateSession: false)
+        await held.sts?.stop()
+        held.playback?.stop()
+        guard generation == gen, capture == nil, playback == nil, chained == nil else { return }
+        PersonalVoiceService.shared.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     private func fail(_ reason: String, recovery: VoiceCallRecovery) {
+        // Invalidate the in-flight run first.  Otherwise a start() that is
+        // still awaiting the socket can land on .listening after this
+        // teardown has already decided the call failed.
+        generation += 1
+        let gen = generation
+        runTask?.cancel()
+        let held = detach()
         endTask?.cancel()
-        let task = Task { [weak self] in
-            await self?.teardown()
-            self?.setPhase(.failed(reason: reason, recovery: recovery))
+        endTask = Task { [weak self] in
+            guard let self else { return }
+            await self.finish(held, generation: gen)
+            // A Try Again or an End that landed during teardown owns the
+            // phase now.  Writing .failed here would clobber it.
+            guard self.generation == gen, !self.stopped else { return }
+            self.setPhase(.failed(reason: reason, recovery: recovery))
         }
-        endTask = task
     }
 
     /// Text continuity: the call's final lines land in the chat as one
@@ -524,9 +654,18 @@ public final class VoiceCall: ObservableObject {
                 guard let self, !self.stopped else { return }
                 let type = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? NSNumber)?.uintValue
                 if type == AVAudioSession.InterruptionType.began.rawValue {
-                    self.capture?.stop()
+                    self.capture?.stop(deactivateSession: false)
                 } else if type == AVAudioSession.InterruptionType.ended.rawValue {
-                    try? await self.capture?.start()
+                    let capture = self.capture
+                    try? await capture?.start()
+                    // End may have detached this capture while permission
+                    // or the engine start was in flight.  Restarting it
+                    // then would leave a microphone nobody owns.
+                    guard self.capture === capture, !self.stopped else {
+                        capture?.stop(deactivateSession: false)
+                        return
+                    }
+                    if self.muted { capture?.setMuted(true) }
                 }
             }
         })
@@ -535,8 +674,14 @@ public final class VoiceCall: ObservableObject {
                 guard let self, !self.stopped else { return }
                 // Restart capture so the new route (speaker vs headphones)
                 // actually carries the mic.
-                self.capture?.stop()
-                try? await self.capture?.start()
+                let capture = self.capture
+                capture?.stop(deactivateSession: false)
+                try? await capture?.start()
+                guard self.capture === capture, !self.stopped else {
+                    capture?.stop(deactivateSession: false)
+                    return
+                }
+                if self.muted { capture?.setMuted(true) }
             }
         })
         return {
