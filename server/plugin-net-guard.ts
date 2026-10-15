@@ -144,10 +144,18 @@ function asList(value: Hostile): readonly Hostile[] | null {
   return value as readonly Hostile[];
 }
 
-function asFields(value: Hostile): ConnectFields | null {
+/** Copy connect options once.  The plugin may pass a proxy whose getters
+ *  change between reads; the guard must not re-touch the original object. */
+function snapshotConnectFields(value: Hostile): ConnectFields | null {
   if (tagOf(value) !== "[object Object]") return null;
-  // SAFETY: the `[object Object]` tag means a plain object.  host, hostname, address, port, and path are decoded with asString and asPort before the allowlist sees them.
-  return value as ConnectFields;
+  const source = value as Record<string, Hostile>;
+  return {
+    host: source.host,
+    hostname: source.hostname,
+    address: source.address,
+    port: source.port,
+    path: source.path,
+  };
 }
 
 function asCallback(value: Hostile): NodeCallback | null {
@@ -208,10 +216,8 @@ function describeConnect(args: readonly Hostile[], unwrapped = false): ConnectDe
     return { kind: "tcp", host, port: numericPort };
   }
   if (asString(first) !== null) return { kind: "denied" };
-  const fields = asFields(first);
+  const fields = snapshotConnectFields(first);
   if (!fields) return { kind: "denied" };
-  // Read each property once.  A getter can return a different value on
-  // the next access, so a second read must not decide the allowlist.
   const pathValue = fields.path;
   const portValue = fields.port;
   const hostValue = fields.host;

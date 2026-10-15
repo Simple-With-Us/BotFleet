@@ -239,6 +239,15 @@ describe("plugin sandbox isolation", () => {
   });
 });
 
+function tcpListenPort(address: ReturnType<Server["address"]>): number {
+  if (address === null) throw new Error("test server has no port");
+  if (Object.prototype.toString.call(address) === "[object String]") {
+    throw new Error("test server has no port");
+  }
+  // SAFETY: listen(0, "127.0.0.1") returns AddressInfo.  A string address is a Unix pipe name, which this helper does not open.
+  return (address as AddressInfo).port;
+}
+
 async function listenLocal(onHit: () => void): Promise<{ server: Server; port: number }> {
   const server = createServer((_req, res) => {
     onHit();
@@ -247,11 +256,7 @@ async function listenLocal(onHit: () => void): Promise<{ server: Server; port: n
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", () => resolve());
   });
-  const address = server.address();
-  if (address === null || Object(address) !== address) throw new Error("test server has no port");
-  // SAFETY: listen(0, "127.0.0.1") returns AddressInfo.  A string address is a pipe, which this helper does not open.
-  const info = address as AddressInfo;
-  return { server, port: info.port };
+  return { server, port: tcpListenPort(server.address()) };
 }
 
 describe("plugin sandbox egress", () => {
