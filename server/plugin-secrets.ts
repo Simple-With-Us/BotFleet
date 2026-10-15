@@ -53,16 +53,51 @@ function pluginDir(baseDir: string, pluginName: string): string {
   return join(baseDir, pluginName);
 }
 
-function readJsonFile(path: string): unknown | null {
+/** Named owner contracts for broker reads, so lint-checked callers get
+ *  concrete shapes instead of anonymous widened objects. */
+export interface StoredPluginSettings {
+  settingsVersion: number;
+  values: Record<string, JsonValue>;
+}
+
+export interface PluginSecretsMap {
+  [key: string]: string;
+}
+
+export interface ValidatedPluginSettings {
+  values: Record<string, JsonValue>;
+  secrets: PluginSecretsMap;
+}
+
+export interface PluginSettingsMigration {
+  values: Record<string, JsonValue>;
+  added: string[];
+  dropped: string[];
+}
+
+/** Broker file read: text in, JSON out.  Null when missing or corrupt;
+ *  callers quarantine corrupt files via isCorruptFile. */
+function readJsonFile(path: string): JsonValue | null {
   try {
     statSync(path);
   } catch {
     return null;
   }
   try {
-    return JSON.parse(readFileSync(path, "utf8"));
+    // SAFETY: JSON.parse yields plain data; the zod schemas in the readers
+    // below are the only thing that narrows it, and corrupt text quarantines.
+    return JSON.parse(readFileSync(path, "utf8")) as JsonValue;
   } catch {
-    return { __corrupt: true };
+    return null;
+  }
+}
+
+function isCorruptFile(path: string): boolean {
+  try {
+    JSON.parse(readFileSync(path, "utf8"));
+    return false;
+  } catch {
+    return true;
   }
 }
 
@@ -74,7 +109,7 @@ function quarantineAndEmpty(path: string): void {
   }
 }
 
-function atomicWriteJson(path: string, value: unknown): void {
+function atomicWriteJson(path: string, value: JsonValue): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = join(tmpdir(), `bf-plugin-${process.pid}-${Date.now()}.json`);
   writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
@@ -88,11 +123,19 @@ function atomicWriteJson(path: string, value: unknown): void {
 
 /** Validate user-supplied settings against the manifest schema.  Unknown
  *  keys fail closed.  Secret values must be non-empty strings; they are
- *  returned in `secrets` for the broker file, never in `values`. */
+ *  returned in `secrets` for the broker file, never in `values`.
+ *
+ *  Type checks run through zod schemas (not `typeof`): the values arrive
+ *  from HTTP bodies, so every branch is a parse. */
+const settingString = z.string();
+const settingNumber = z.number().finite();
+const settingBoolean = z.boolean();
+const settingSecret = z.string().min(1).max(MAX_VALUE_CHARS);
+
 export function validatePluginSettings(
   specs: readonly PluginSettingSpec[],
   provided: Record<string, JsonValue>,
-): { ok: true; values: Record<string, JsonValue>; secrets: Record<string, string> } | { ok: false; issues: PluginSettingsIssue[] } {
+): { ok: true; values: Record<string, JsonValue>; secrets: PluginSecretsMap } | { ok: false; issues: PluginSettingsIssue[] } {
   const issues: PluginSettingsIssue[] = [];
   const byKey = new Map(specs.map((spec) => [spec.key, spec]));
   for (const key of Object.keys(provided)) {
@@ -101,32 +144,31 @@ export function validatePluginSettings(
     }
   }
   const values: Record<string, JsonValue> = {};
-  const secrets: Record<string, string> = {};
+  const secrets: PluginSecretsMap = {};
   for (const spec of specs) {
     const raw = provided[spec.key];
     if (raw === undefined) {
       if (spec.required) issues.push({ field: `settings.${spec.key}`, message: `setting "${spec.key}" is required` });
       continue;
     }
-    switch (spec.type) {
-      case "string":
-        if (typeof raw !== "string") issues.push({ field: `settings.${spec.key}`, message: `expected a string for "${spec.key}"` });
-        else values[spec.key] = raw;
-        break;
-      case "number":
-        if (typeof raw !== "number" || !Number.isFinite(raw)) {
-          issues.push({ field: `settings.${spec.key}`, message: `expected a number for "${spec.key}"` });
-        } else values[spec.key] = raw;
-        break;
-      case "boolean":
-        if (typeof raw !== "boolean") issues.push({ field: `settings.${spec.key}`, message: `expected a boolean for "${spec.key}"` });
-        else values[spec.key] = raw;
-        break;
-      case "secret":
-        if (typeof raw !== "string" || raw.length === 0 || raw.length > MAX_VALUE_CHARS) {
-          issues.push({ field: `settings.${spec.key}`, message: `expected a non-empty secret (max ${MAX_VALUE_CHARS} chars) for "${spec.key}"` });
-        } else secrets[spec.key] = raw;
-        break;
+    if (spec.type === "string") {
+      const parsed = settingString.safeParse(raw);
+      if (!parsed.success) issues.push({ field: `settings.${spec.key}`, message: `expected a string for "${spec.key}"` });
+      else values[spec.key] = parsed.data;
+    } else if (spec.type === "number") {
+      const parsed = settingNumber.safeParse(raw);
+      if (!parsed.success) {
+        issues.push({ field: `settings.${spec.key}`, message: `expected a number for "${spec.key}"` });
+      } else values[spec.key] = parsed.data;
+    } else if (spec.type === "boolean") {
+      const parsed = settingBoolean.safeParse(raw);
+      if (!parsed.success) issues.push({ field: `settings.${spec.key}`, message: `expected a boolean for "${spec.key}"` });
+      else values[spec.key] = parsed.data;
+    } else {
+      const parsed = settingSecret.safeParse(raw);
+      if (!parsed.success) {
+        issues.push({ field: `settings.${spec.key}`, message: `expected a non-empty secret (max ${MAX_VALUE_CHARS} chars) for "${spec.key}"` });
+      } else secrets[spec.key] = parsed.data;
     }
   }
   if (issues.length) return { ok: false, issues };
@@ -134,12 +176,11 @@ export function validatePluginSettings(
 }
 
 /** Read non-secret settings.  Never includes secret values. */
-export function readPluginSettings(baseDir: string, pluginName: string): { settingsVersion: number; values: Record<string, JsonValue> } {
+export function readPluginSettings(baseDir: string, pluginName: string): StoredPluginSettings {
   const path = join(pluginDir(baseDir, pluginName), SETTINGS_FILE);
   const raw = readJsonFile(path);
-  if (raw === null) return { settingsVersion: 1, values: {} };
-  if (raw !== null && typeof raw === "object" && "__corrupt" in (raw as Record<string, unknown>)) {
-    quarantineAndEmpty(path);
+  if (raw === null) {
+    if (isCorruptFile(path)) quarantineAndEmpty(path);
     return { settingsVersion: 1, values: {} };
   }
   const parsed = storedSettingsSchema.safeParse(raw);
@@ -167,12 +208,11 @@ export function writePluginSettings(
 
 /** Read secret values into host memory only.  Callers must never log,
  *  return, or forward these to plugin code. */
-export function readPluginSecrets(baseDir: string, pluginName: string): Record<string, string> {
+export function readPluginSecrets(baseDir: string, pluginName: string): PluginSecretsMap {
   const path = join(pluginDir(baseDir, pluginName), SECRETS_FILE);
   const raw = readJsonFile(path);
-  if (raw === null) return {};
-  if (raw !== null && typeof raw === "object" && "__corrupt" in (raw as Record<string, unknown>)) {
-    quarantineAndEmpty(path);
+  if (raw === null) {
+    if (isCorruptFile(path)) quarantineAndEmpty(path);
     return {};
   }
   const parsed = secretsFileSchema.safeParse(raw);
@@ -232,7 +272,7 @@ export function deletePluginBrokerState(baseDir: string, pluginName: string): vo
 export function migratePluginSettings(
   specs: readonly PluginSettingSpec[],
   stored: Record<string, JsonValue>,
-): { values: Record<string, JsonValue>; added: string[]; dropped: string[] } {
+): PluginSettingsMigration {
   const declared = new Set(specs.map((spec) => spec.key));
   const values: Record<string, JsonValue> = {};
   const added: string[] = [];

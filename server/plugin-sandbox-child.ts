@@ -177,6 +177,8 @@ async function runHandler(message: Extract<ParentToChildMessage, { type: "invoke
   }
   if (message.handler === "onEvent") {
     if (!handlers?.onEvent) return "not_implemented";
+    // SAFETY: the event crossed as JSON and was shape-checked on receipt;
+    // the host re-validates the plugin's return, never this input.
     return handlers.onEvent({ event: message.event as JsonValue, host });
   }
   if (message.handler === "getHealth") {
@@ -269,6 +271,9 @@ function parseParentMessage(raw: unknown): ParentToChildMessage | null {
     if (!isPlainObject(raw.event) || typeof raw.event.eventId !== "string" || typeof raw.event.type !== "string") {
       return null;
     }
+    // SAFETY: parseParentMessage checked eventId and type are strings above;
+    // the parent built this event from the shared envelope schema, and the
+    // child's return is what gets strict validation.
     return { type: "invoke", id: raw.id, handler: "onEvent", event: raw.event as { eventId: string; type: string }, host: raw.host };
   }
   if (raw.handler === "getHealth") {

@@ -51,10 +51,10 @@ import {
   zulipToolArgsSchema,
   type ZulipTarget,
 } from "./outbound.ts";
-import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeReason, type WakeVerdict } from "./router.ts";
+import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type Classification, type RouterContext, type WakeVerdict } from "./router.ts";
 import { HANDLED_RING_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
 import type { PluginEventEnvelope } from "../../shared/plugin-events.ts";
-import type { ZulipIdentity, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
+import type { ZulipIdentity, ZulipInboundItem, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
 
 /** Zulip roles a BF bot may hold: moderator (300) and member (400).  An
  *  owner (100) or admin (200) key is refused outright: a bot that can change
@@ -984,7 +984,7 @@ export class ZulipHub {
    *  legacy direct wake — events are never silently dropped. */
   async routeMessage(session: ZulipSession, message: ZulipMessage): Promise<void> {
     const plugin = this.deps.pluginEvents;
-    if (!session.me || typeof message?.id !== "number" || !plugin || !plugin.isActive(session.role)) {
+    if (!session.me || !Number.isInteger(message?.id) || !plugin || !plugin.isActive(session.role)) {
       this.handleMessage(session, message);
       return;
     }
@@ -1159,19 +1159,7 @@ export class ZulipHub {
         return;
       }
     }
-    const item: {
-      id: number;
-      senderId: number;
-      senderName: string;
-      senderIsBot: boolean;
-      owner: boolean;
-      ownerViaApi: boolean;
-      content: string;
-      timestamp: number;
-      via: WakeReason | undefined;
-      pluginHint?: string;
-      routedFrom?: string;
-    } = {
+    const item: ZulipInboundItem = {
       id,
       senderId: message.sender_id,
       senderName: String(message.sender_full_name ?? message.sender_email ?? message.sender_id),

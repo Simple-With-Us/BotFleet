@@ -34,32 +34,29 @@ interface Stub {
 }
 
 function stub(): Stub {
-  const s: Stub = {
-    decisions: [],
-    results: new Map(),
-    caps: new Map([["demo", ["events.subscribe", "dispatch.wake", "chat.read"]]]),
-    subs: new Map([["demo", [SUB]]]),
-    transport: null as unknown as PluginEventTransport,
-  };
-  s.transport = {
+  const decisions: Array<{ plugin: string; decision: unknown }> = [];
+  const results = new Map<string, PluginSandboxResult[]>();
+  const caps = new Map([["demo", ["events.subscribe", "dispatch.wake", "chat.read"]]]);
+  const subs = new Map<string, PluginEventSubscription[]>([["demo", [SUB]]]);
+  const transport: PluginEventTransport = {
     subscribers: (_event) => {
       // Return every known plugin; the bus owns matching and the
       // capability gate so tests can observe refused/noSubscription.
       void _event;
-      return [...new Set([...s.subs.keys(), ...s.caps.keys()])];
+      return [...new Set([...subs.keys(), ...caps.keys()])];
     },
-    capabilities: (name) => s.caps.get(name) ?? null,
-    subscriptions: (name) => s.subs.get(name) ?? [],
+    capabilities: (name) => caps.get(name) ?? null,
+    subscriptions: (name) => subs.get(name) ?? [],
     scope: (_name, _sub, event) => event,
-    deliver: async (name) => s.results.get(name)?.shift() ?? {
+    deliver: async (name) => results.get(name)?.shift() ?? {
       ok: true,
       value: { action: "none", rationale: "nothing to do" },
     },
     onDecision: (plugin, _event, decision) => {
-      s.decisions.push({ plugin, decision });
+      decisions.push({ plugin, decision });
     },
   };
-  return s;
+  return { transport, decisions, results, caps, subs };
 }
 
 let baseDir = "";

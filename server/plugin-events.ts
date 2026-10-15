@@ -29,6 +29,7 @@ import {
   type PluginEventSubscription,
   type PluginRoutingDecision,
 } from "../shared/plugin-events.ts";
+import type { JsonValue } from "../shared/plugin-manifest.ts";
 import type { PluginSandboxResult } from "./plugin-loader.ts";
 
 const LEDGER_FILE = "plugin-events.json";
@@ -56,9 +57,16 @@ const ledgerSchema = z.object({
   recent: z.array(pluginDeliveryOutcomeSchema).max(RECENT_LIMIT * 2),
 }).strict();
 
+/** Named health shape for views: depths plus reason-code-only recents. */
+export interface PluginEventHealth {
+  pending: number;
+  deadLetter: number;
+  recent: PluginDeliveryOutcome[];
+}
+
 interface Ledger {
   seen: string[];
-  pending: Array<{ event: Record<string, unknown>; attempts: number; notBefore: number }>;
+  pending: Array<{ event: Record<string, JsonValue>; attempts: number; notBefore: number }>;
   deadLetter: Array<{ eventId: string; at: string; attempts: number; reason: string }>;
   recent: PluginDeliveryOutcome[];
 }
@@ -159,6 +167,7 @@ export class PluginEventBus {
   /** Emit one envelope to every enabled subscriber.  Resolves after the
    *  first attempt per plugin; retries continue in the background and
    *  valid decisions reach `transport.onDecision` whenever they land. */
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- I/O boundary: the envelope is schema-parsed on the next line, and invalid input drops to no outcomes.
   async emit(rawEvent: unknown): Promise<PluginDeliveryOutcome[]> {
     return (await this.emitAndDecide(rawEvent)).outcomes;
   }
@@ -166,6 +175,7 @@ export class PluginEventBus {
   /** Like emit, but also captures the first valid wake request from the
    *  first attempts so a caller (the Zulip hub) can act on it now.
    *  Later retry decisions still flow to `transport.onDecision`. */
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- I/O boundary: same schema parse as emit, same drop-on-invalid contract.
   async emitAndDecide(rawEvent: unknown): Promise<{
     outcomes: PluginDeliveryOutcome[];
     decision: { plugin: string; decision: PluginRoutingDecision } | null;
@@ -221,11 +231,7 @@ export class PluginEventBus {
   }
 
   /** Recent outcomes plus queue depths for health views.  No event text. */
-  health(pluginName: string): {
-    pending: number;
-    deadLetter: number;
-    recent: PluginDeliveryOutcome[];
-  } {
+  health(pluginName: string): PluginEventHealth {
     const ledger = loadLedger(this.baseDir, pluginName);
     return { pending: ledger.pending.length, deadLetter: ledger.deadLetter.length, recent: [...ledger.recent].reverse() };
   }

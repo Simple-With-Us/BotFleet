@@ -24,7 +24,7 @@ import {
 } from "./plugins.ts";
 import { pluginEventEnvelopeSchema } from "../shared/plugin-events.ts";
 import { FakeZulip } from "./testing/fake-zulip-server.ts";
-import { ZulipHub, type ZulipHubDeps, type ZulipSession } from "./zulip/hub.ts";
+import { ZulipHub, type ZulipHubDeps } from "./zulip/hub.ts";
 import type { ZulipMessage, ZulipSettings } from "./zulip/types.ts";
 
 const ZULIP_PLUGIN = join(process.cwd(), "docs", "plugins", "zulip-plugin");
@@ -114,6 +114,12 @@ function makeHub(): ZulipHub {
   return hub;
 }
 
+const sessionOf = (hub: ZulipHub) => {
+  const session = hub.sessionFor("bot-plumber");
+  if (!session) throw new Error("no session for bot-plumber");
+  return session;
+};
+
 function mention(id: number): ZulipMessage {
   return {
     id,
@@ -128,7 +134,7 @@ function mention(id: number): ZulipMessage {
     content: "@**BF-Plumber** deploy is stuck, please look",
     timestamp: Math.floor(Date.now() / 1000),
     flags: ["mentioned"],
-  } as ZulipMessage;
+  };
 }
 
 beforeEach(async () => {
@@ -193,7 +199,7 @@ describe("zulip-wake plugin end to end", () => {
     const hub = makeHub();
     await waitFor(() => hub.status().bots.find((b) => b.botId === "bot-plumber")?.state === "connected", "plumber connected");
     await waitFor(() => hub.status().bots.find((b) => b.botId === "bot-director")?.state === "connected", "director connected");
-    const session = hub.sessionFor("bot-plumber") as ZulipSession;
+    const session = sessionOf(hub);
     await hub.routeMessage(session, mention(701));
     await hub.drain();
     await waitFor(() => turns.length === 1, "one dispatcher turn");
@@ -209,7 +215,7 @@ describe("zulip-wake plugin end to end", () => {
     expect(pluginEventSubscribers("zulip", pluginDir)).toEqual([]);
     const hub = makeHub();
     await waitFor(() => hub.status().bots.find((b) => b.botId === "bot-plumber")?.state === "connected", "plumber connected");
-    const session = hub.sessionFor("bot-plumber") as ZulipSession;
+    const session = sessionOf(hub);
     await hub.routeMessage(session, mention(702));
     await hub.drain();
     await waitFor(() => turns.length === 1, "one legacy turn");

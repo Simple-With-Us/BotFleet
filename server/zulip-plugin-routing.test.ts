@@ -107,7 +107,7 @@ function mention(id: number): ZulipMessage {
     content: "@**BF-Plumber** please check this",
     timestamp: Math.floor(Date.now() / 1000),
     flags: ["mentioned"],
-  } as ZulipMessage;
+  };
 }
 
 beforeEach(async () => {

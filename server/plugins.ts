@@ -806,6 +806,7 @@ export function pluginEventBus(baseDir: string = PLUGINS_DIR): PluginEventBus {
 /** Emit one envelope to every enabled subscriber.  Invalid envelopes
  *  are dropped (no subscriber, no outcome). */
 export async function emitPluginEvent(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- I/O boundary: the bus schema-parses before any subscriber sees the value.
   rawEvent: unknown,
   baseDir: string = PLUGINS_DIR,
 ): Promise<PluginDeliveryOutcome[]> {
@@ -963,6 +964,12 @@ export function getPluginSettings(
   return readPluginSettings(baseDir, name);
 }
 
+/** Named migration result for update warnings. */
+export interface PluginSettingsMigrationResult {
+  added: string[];
+  dropped: string[];
+}
+
 /** Migrate stored settings after an upgrade whose manifest bumped
  *  settingsVersion: carry declared keys, apply new defaults, drop
  *  removed keys, and report the diff for the caller to surface. */
@@ -971,7 +978,7 @@ export function migratePluginSettingsOnUpdate(
   baseDir: string,
   name: string,
   nextSettingsVersion: number,
-): { added: string[]; dropped: string[] } {
+): PluginSettingsMigrationResult {
   const stored = readPluginSettings(baseDir, name);
   if (stored.settingsVersion >= nextSettingsVersion) return { added: [], dropped: [] };
   const { values, added, dropped } = migratePluginSettings(specs, stored.values);
