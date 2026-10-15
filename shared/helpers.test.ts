@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  HELPER_RESTART_NOTE,
   helperCardModel,
   helperSnapshotForWire,
+  interruptedHelper,
   helperStatsLine,
   helperToolFidelity,
   isHelperRow,
@@ -43,6 +45,16 @@ describe("helper snapshots on the wire", () => {
     expect(wired.label).toBe("Survey files");
     expect(wired.lastActivity).toBeUndefined();
     expect("lastActivity" in wired).toBe(false);
+  });
+});
+
+describe("a helper cut off by a restart", () => {
+  it("settles a running card and leaves a finished one alone", () => {
+    const settled = interruptedHelper(running, 9_000);
+    expect(settled).toMatchObject({ status: "failed", endedAt: 9_000, lastActivity: "Read notes.md" });
+    const bare = interruptedHelper({ ...running, lastActivity: undefined }, 9_000);
+    expect(bare?.lastActivity).toBe(HELPER_RESTART_NOTE);
+    expect(interruptedHelper({ ...running, status: "completed", endedAt: 2_000 }, 9_000)).toBeNull();
   });
 });
 

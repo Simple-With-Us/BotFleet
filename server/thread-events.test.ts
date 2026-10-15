@@ -604,7 +604,7 @@ describe("readThreadEvents", () => {
       line(helper) + line({ ...helper, eventId: "bad", subagent: { id: "task-1" }, createdAt: "000002" }),
     );
     const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true });
-    expect(page.entries.map((entry) => (entry.data as { eventId: string }).eventId)).toEqual(["h1"]);
+    expect(page.entries.flatMap((entry) => (entry.kind === "runtime" ? [entry.data.eventId] : []))).toEqual(["h1"]);
   });
 
   it("reads a context.injected record back in both the Trajectory and the Inspector reads", () => {

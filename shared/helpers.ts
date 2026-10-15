@@ -100,16 +100,34 @@ export function helperSnapshotForWire(
 }
 
 export function helperTranscript(snapshot: SubagentSnapshot): HelperTranscript {
-  return {
+  const transcript: HelperTranscript = {
     fidelity: snapshot.fidelity,
     depth: snapshot.depth,
     label: snapshot.label,
-    ...(snapshot.lastActivity ? { lastActivity: snapshot.lastActivity } : {}),
     toolCount: snapshot.toolCount,
-    ...(snapshot.tokens !== undefined ? { tokens: snapshot.tokens } : {}),
     status: snapshot.status,
     startedAt: snapshot.startedAt,
     endedAt: snapshot.endedAt,
+  };
+  if (snapshot.lastActivity) transcript.lastActivity = snapshot.lastActivity;
+  if (snapshot.tokens !== undefined) transcript.tokens = snapshot.tokens;
+  return transcript;
+}
+
+/** What a helper card says when a restart cut it off.  The tracker that
+ * would have published the finish is gone with the process. */
+export const HELPER_RESTART_NOTE = "Stopped when BotFleet restarted";
+
+/** A helper still marked running has no live tracker after a restart, so
+ * the card would tick forever.  Returns the settled snapshot, or null when
+ * the row had already finished. */
+export function interruptedHelper(helper: HelperTranscript, endedAt: number): HelperTranscript | null {
+  if (helper.status !== "running") return null;
+  return {
+    ...helper,
+    status: "failed",
+    endedAt,
+    lastActivity: helper.lastActivity ?? HELPER_RESTART_NOTE,
   };
 }
 

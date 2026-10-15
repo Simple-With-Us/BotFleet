@@ -23,6 +23,7 @@ import {
   CLAUDE_CONTAINMENT_SETTINGS,
   ClaudeDriver,
   claudeDisallowedTools,
+  helperUsageDelta,
   claudeUnsolicitedFrameStats,
   permissionSocketPath,
   withVolatileNote,
@@ -92,6 +93,18 @@ function answerQueue(conn: ReturnType<typeof connect>) {
   });
   return () => new Promise<any>((resolve) => waiters.push(resolve));
 }
+
+describe("helper usage", () => {
+  it("counts one assistant message once, and a later increase only as the difference", () => {
+    const seen = new Map<string, number>();
+    expect(helperUsageDelta(seen, "msg-1", 1098)).toBe(1098);
+    expect(helperUsageDelta(seen, "msg-1", 1098)).toBe(0);
+    expect(helperUsageDelta(seen, "msg-1", 1108)).toBe(10);
+    expect(helperUsageDelta(seen, "msg-2", 4)).toBe(4);
+    expect(helperUsageDelta(seen, undefined, 7)).toBe(7);
+    expect(helperUsageDelta(undefined, "msg-3", 3)).toBe(3);
+  });
+});
 
 describe("ClaudeDriver.decodeConfig", () => {
   it("defaults to the claude binary with acceptEdits", () => {
@@ -2254,8 +2267,12 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       // nor is the helper's context the bot's: no usage report carries it
       const usage = recorder.events.filter((e) => e.type === "thread.token-usage.updated");
       expect(usage.some((e) => (e as { input: number }).input === 999)).toBe(false);
-      // the helper's own bill lands on its card, not on the bot's meter
-      expect(recorder.events.find((e) => e.type === "item.updated" && e.itemId === "task-1")).toMatchObject({
+      // the helper's own bill lands on its card, not on the bot's meter.
+      // the fake repeats the assistant frame, and both carry message id
+      // msg-helper-1, so the card is billed once
+      const billed = recorder.events.filter((e) => e.type === "item.updated" && e.itemId === "task-1");
+      expect(billed).toHaveLength(1);
+      expect(billed[0]).toMatchObject({
         subagentId: "task-1",
         tokens: 1098,
       });

@@ -5350,17 +5350,18 @@ let helperFlush: ReturnType<typeof setTimeout> | undefined;
 
 function publishHelperUpdate(publication: HelperPublication): void {
   const subagent = helperSnapshotForWire(publication.subagent, redactSecretsInText);
-  bus.publish({
+  const event: RuntimeEvent = {
     type: "subagent.updated",
     eventId: randomUUID(),
     provider: publication.provider,
-    ...(publication.providerInstanceId ? { providerInstanceId: publication.providerInstanceId } : {}),
     threadId: subagent.threadId,
     createdAt: new Date(publication.at).toISOString(),
-    ...(publication.turnId ? { turnId: publication.turnId } : {}),
     itemId: subagent.parentItemId,
     subagent,
-  });
+  };
+  if (publication.providerInstanceId) event.providerInstanceId = publication.providerInstanceId;
+  if (publication.turnId) event.turnId = publication.turnId;
+  bus.publish(event);
 }
 
 function rememberHelper(event: Extract<RuntimeEvent, { type: "subagent.updated" }>): void {
@@ -18228,6 +18229,12 @@ await localVmStartupProbe.catch(() => {});
 await jobRegistry.adopt().catch((error) => {
   console.error(`[jobs] could not settle earlier jobs: ${error instanceof Error ? error.message : String(error)}`);
 });
+try {
+  const interrupted = store.settleInterruptedHelpers(Date.now());
+  if (interrupted > 0) console.log(`[helpers] boot: ${interrupted} helper(s) stopped by the restart`);
+} catch (error) {
+  console.error(`[helpers] could not settle interrupted helpers: ${error instanceof Error ? error.message : String(error)}`);
+}
 jobRegistry.startTimers();
 // Boot is done: the socket has been open since the top of this file, and the
 // full route table takes over from the boot-phase handler on the very next

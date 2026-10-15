@@ -94,6 +94,50 @@ describe("message-db", () => {
     }
   });
 
+  it("settles a helper left running when the harness boots again", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-1" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Survey files",
+        toolCount: 1,
+        status: "running",
+        startedAt: 1_000,
+        endedAt: null,
+      },
+    });
+    store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-2" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Done already",
+        toolCount: 1,
+        status: "completed",
+        startedAt: 1_000,
+        endedAt: 2_000,
+      },
+    });
+    store.flushBotsNow();
+    const next = new Store(selection);
+    expect(next.settleInterruptedHelpers(5_000)).toBe(1);
+    const rows = next.messagesFor(bot.threadId);
+    expect(rows.find((row) => row.tool?.itemId === "task-1")?.helper).toMatchObject({
+      status: "failed",
+      endedAt: 5_000,
+      lastActivity: "Stopped when BotFleet restarted",
+    });
+    expect(rows.find((row) => row.tool?.itemId === "task-2")?.helper?.status).toBe("completed");
+    expect(next.settleInterruptedHelpers(6_000)).toBe(0);
+  });
+
   it("deleteThread removes rows and state", () => {
     insertMessage("t4", msg("m1", "gone soon"));
     setActiveLeaf("t4", "m1");

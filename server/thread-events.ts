@@ -509,22 +509,27 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
         typeof value.bytes === "number" &&
         Number.isFinite(value.bytes)
       );
-    case "subagent.updated":
+    case "subagent.updated": {
+      const subagent = value.subagent;
+      if (!isRecord(subagent)) return false;
+      const requiredString = (item: unknown) => item !== undefined && stringOrMissing(item);
+      const requiredNumber = (item: unknown) =>
+        item !== undefined && item !== null && numberOrNullOrMissing(item) && Number.isFinite(item);
       return (
-        isRecord(value.subagent) &&
-        typeof value.subagent.id === "string" &&
-        typeof value.subagent.threadId === "string" &&
-        typeof value.subagent.parentItemId === "string" &&
-        typeof value.subagent.depth === "number" &&
-        (value.subagent.fidelity === "typed" || value.subagent.fidelity === "named") &&
-        typeof value.subagent.label === "string" &&
-        (value.subagent.lastActivity === undefined || typeof value.subagent.lastActivity === "string") &&
-        typeof value.subagent.toolCount === "number" &&
-        (value.subagent.tokens === undefined || typeof value.subagent.tokens === "number") &&
-        typeof value.subagent.startedAt === "number" &&
-        (value.subagent.endedAt === null || typeof value.subagent.endedAt === "number") &&
-        (value.subagent.status === "running" || value.subagent.status === "completed" || value.subagent.status === "failed")
+        requiredString(subagent.id) &&
+        requiredString(subagent.threadId) &&
+        requiredString(subagent.parentItemId) &&
+        requiredNumber(subagent.depth) &&
+        (subagent.fidelity === "typed" || subagent.fidelity === "named") &&
+        requiredString(subagent.label) &&
+        stringOrMissing(subagent.lastActivity) &&
+        requiredNumber(subagent.toolCount) &&
+        (subagent.tokens === undefined || requiredNumber(subagent.tokens)) &&
+        requiredNumber(subagent.startedAt) &&
+        (subagent.endedAt === null || requiredNumber(subagent.endedAt)) &&
+        (subagent.status === "running" || subagent.status === "completed" || subagent.status === "failed")
       );
+    }
     default:
       return false;
   }

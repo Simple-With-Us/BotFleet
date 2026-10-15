@@ -332,3 +332,7 @@ phase is the helper card.
   "Done · N tools".
 - **Not in this phase.**  P4 (the iOS pill and sheet, Mac notifications,
   swimlanes, and the All Jobs panel) is unchanged.  Background helpers stay off.
+- **A restart settles a running card.**  The tracker lives in memory.  At boot
+  a helper still marked running is stored as failed, with its end at the boot
+  time, so the card stops ticking.  A turn ending settles only the helpers
+  that turn started.  Claude counts each assistant message's usage once.

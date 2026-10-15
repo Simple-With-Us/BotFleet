@@ -421,6 +421,26 @@ const FrameMeta = z
   // a frame that is not an object at all carries none of them
   .catch({});
 
+const assistantMessageShape = z.object({ id: z.string().min(1) });
+
+function assistantMessageId(message: unknown): string | undefined {
+  const parsed = assistantMessageShape.safeParse(message);
+  return parsed.success ? parsed.data.id : undefined;
+}
+
+/** How many helper tokens this frame adds.  Frames of one assistant message
+ * repeat a running total, so a later frame with the same id contributes only
+ * the increase.  A frame with no id has nothing to dedupe against. */
+export function helperUsageDelta(seen: Map<string, number> | undefined, messageId: string | undefined, total: number): number {
+  if (total <= 0) return 0;
+  if (!seen || !messageId) return total;
+  const prior = seen.get(messageId) ?? 0;
+  const delta = total - prior;
+  if (delta <= 0) return 0;
+  seen.set(messageId, total);
+  return delta;
+}
+
 /** Lifecycle states after which a command will never run (it may have run
  * already, for `completed`). */
 const COMMAND_ENDED_STATES = new Set(["completed", "cancelled", "discarded", "refused"]);
@@ -955,6 +975,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         /** Usage summed over this turn's own CLI results (each result's
          *  usage is that CLI turn's alone). */
         usage?: TurnUsage;
+        /** Highest helper-token total already counted for one assistant
+         *  message id.  Streamed frames repeat that message's usage. */
+        helperUsage: Map<string, number>;
         /** How this turn's latest own CLI turn ended: what the settle
          *  reports, once nothing more of the turn is still to run. */
         outcome?: { ok: boolean; stopReason: string | null };
@@ -1329,7 +1352,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const live = sessions.get(threadId);
       if (live && !live.turn && !live.unsolicited && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
-        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), input: turn, retry, retryAbort };
+        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), input: turn, retry, retryAbort };
         live.engaged = false;
         live.foreignRunning = false;
         // stderr feeds the crash message; a warm process still holds turn
@@ -1437,7 +1460,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         argsKey,
         sessionId: sessionId ?? newSessionId,
         pendingReceipt: null,
-        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), input: turn, retry, retryAbort },
+        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), helperUsage: new Map(), input: turn, retry, retryAbort },
         idleTimer: null,
         closing: false,
         stderr: "",
@@ -1770,19 +1793,23 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               });
             } else if (msg.usage && helperOf) {
               // The helper's own bill, for its card.  It is not the bot's
-              // context meter: that path is the branch above.
+              // context meter: that path is the branch above.  One assistant
+              // message is streamed as several frames that repeat the same
+              // usage, so only the increase since the last frame of that
+              // message id is new.
               const tokens =
                 (msg.usage.input_tokens || 0) +
                 (msg.usage.cache_read_input_tokens || 0) +
                 (msg.usage.output_tokens || 0);
-              if (tokens > 0) {
+              const delta = helperUsageDelta(session.turn?.helperUsage, assistantMessageId(msg), tokens);
+              if (delta > 0) {
                 emit({
                   ...base(threadId, currentTurnId()),
                   type: "item.updated",
                   itemType: "tool",
                   itemId: helperOf,
                   subagentId: helperOf,
-                  tokens,
+                  tokens: delta,
                 });
               }
             }

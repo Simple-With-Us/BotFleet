@@ -117,8 +117,9 @@ export class HelperTracker {
       case "content.delta":
         return this.onDelta(event);
       case "turn.completed":
+        return this.settleMatching(event, event.ok, now);
       case "session.exited":
-        return this.settleThread(event.threadId, event.type === "turn.completed" ? event.ok : false, now);
+        return this.settleMatching(event, false, now);
       case "session.started":
       case "session.invalidated":
       case "turn.started":
@@ -217,7 +218,7 @@ export class HelperTracker {
   }
 
   private onUpdated(event: Extract<RuntimeEvent, { type: "item.updated" }>): string[] {
-    if (event.itemType !== "tool" || typeof event.tokens !== "number" || event.tokens <= 0) return [];
+    if (event.itemType !== "tool" || event.tokens == null || event.tokens <= 0) return [];
     const helperId = event.subagentId ?? event.itemId;
     if (!helperId) return [];
     const key = this.key(event.threadId, helperId);
@@ -242,19 +243,43 @@ export class HelperTracker {
     return [key];
   }
 
-  private settleThread(threadId: string, ok: boolean, now: number): string[] {
+  /** A room thread can host two turns at once.  Ending one settles the
+   * helpers that turn started, and a process exit settles the helpers of
+   * that engine instance.  A helper with no turn id, or an exit with no
+   * instance id, still settles with the thread: that is the single-turn
+   * shape. */
+  private settleMatching(
+    event: Extract<RuntimeEvent, { type: "turn.completed" | "session.exited" }>,
+    ok: boolean,
+    now: number,
+  ): string[] {
     const status: HelperStatus = ok ? "completed" : "failed";
     const touched: string[] = [];
+    const settledIds = new Set<string>();
     for (const [key, live] of this.lives) {
-      if (live.snapshot.threadId !== threadId || live.snapshot.status !== "running") continue;
+      if (live.snapshot.threadId !== event.threadId || live.snapshot.status !== "running") continue;
+      if (!this.belongsToSettlement(live, event)) continue;
       this.finish(live, status, now);
       touched.push(key);
+      settledIds.add(live.snapshot.id);
     }
-    const prefix = `${threadId}:`;
-    for (const child of this.childOf.keys()) {
-      if (child.startsWith(prefix)) this.childOf.delete(child);
+    const prefix = `${event.threadId}:`;
+    for (const [child, helperId] of this.childOf) {
+      if (child.startsWith(prefix) && settledIds.has(helperId)) this.childOf.delete(child);
     }
     return touched;
+  }
+
+  private belongsToSettlement(
+    live: LiveHelper,
+    event: Extract<RuntimeEvent, { type: "turn.completed" | "session.exited" }>,
+  ): boolean {
+    if (event.type === "session.exited") {
+      if (event.providerInstanceId && live.providerInstanceId) return live.providerInstanceId === event.providerInstanceId;
+      return true;
+    }
+    if (event.turnId && live.turnId) return live.turnId === event.turnId;
+    return true;
   }
 
   private finish(live: LiveHelper, status: HelperStatus, now: number): void {
@@ -265,7 +290,7 @@ export class HelperTracker {
 
   private noteSource(live: LiveHelper, event: RuntimeEvent): void {
     live.provider = event.provider;
-    live.providerInstanceId = event.providerInstanceId;
+    if (event.providerInstanceId) live.providerInstanceId = event.providerInstanceId;
     if (event.turnId) live.turnId = event.turnId;
   }
 

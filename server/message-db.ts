@@ -203,6 +203,30 @@ export function appendMessage(threadId: string, message: Message): void {
   }
 }
 
+/** Rows whose stored helper is still running.  The LIKE pass is a candidate
+ * filter; the helper status is what decides.  A restart has no live tracker,
+ * so these are the cards that would otherwise tick forever. */
+export function runningHelperRows(): Array<{ threadId: string; message: Message }> {
+  // SAFETY: the query selects thread_id and json, both TEXT columns on messages.
+  const rows = db()
+    .prepare("SELECT thread_id, json FROM messages WHERE json LIKE ?")
+    .all('%"status":"running"%') as Array<{ thread_id: string; json: string }>;
+  const found: Array<{ threadId: string; message: Message }> = [];
+  for (const row of rows) {
+    let message: Message;
+    try {
+      // SAFETY: this column is JSON.stringify of a Message, the same cast
+      // rowToMessage uses.  A value that is not one has no helper and is skipped.
+      message = JSON.parse(row.json) as Message;
+    } catch {
+      continue;
+    }
+    if (message.helper?.status !== "running") continue;
+    found.push({ threadId: row.thread_id, message });
+  }
+  return found;
+}
+
 export function updateMessage(threadId: string, message: Message): void {
   db()
     .prepare("UPDATE messages SET at = ?, role = ?, kind = ?, text = ?, json = ? WHERE thread_id = ? AND id = ?")

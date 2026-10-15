@@ -12,16 +12,16 @@ const base = {
   turnId: "turn-1",
 };
 
-function started(over: Record<string, unknown>): RuntimeEvent {
-  return { ...base, type: "item.started", itemType: "tool", ...over } as RuntimeEvent;
+function started(over: Partial<Extract<RuntimeEvent, { type: "item.started" }>>): RuntimeEvent {
+  return { ...base, type: "item.started", itemType: "tool", ...over };
 }
 
-function updated(over: Record<string, unknown>): RuntimeEvent {
-  return { ...base, type: "item.updated", itemType: "tool", ...over } as RuntimeEvent;
+function updated(over: Partial<Extract<RuntimeEvent, { type: "item.updated" }>>): RuntimeEvent {
+  return { ...base, type: "item.updated", itemType: "tool", ...over };
 }
 
-function completed(over: Record<string, unknown>): RuntimeEvent {
-  return { ...base, type: "item.completed", itemType: "tool", ok: true, ...over } as RuntimeEvent;
+function completed(over: Partial<Extract<RuntimeEvent, { type: "item.completed"; itemType: "tool" }>>): RuntimeEvent {
+  return { ...base, type: "item.completed", itemType: "tool", ok: true, ...over };
 }
 
 describe("HelperTracker", () => {
@@ -67,13 +67,13 @@ describe("HelperTracker", () => {
     const done = tracker.observe(completed({ itemId: "task-1", ok: false, detail: "no such file" }), 20);
     expect(done).toHaveLength(1);
     expect(done[0]!.subagent).toMatchObject({ status: "failed", toolCount: 1, endedAt: 20 });
-    expect(tracker.observe({ ...base, type: "turn.completed", ok: true } as RuntimeEvent, 30)).toEqual([]);
+    expect(tracker.observe({ ...base, type: "turn.completed", ok: true }, 30)).toEqual([]);
   });
 
   it("settles a helper the turn ends before its own tool result", () => {
     const tracker = new HelperTracker();
     tracker.observe(started({ itemId: "spawn-1", title: "spawn_agent", target: "list files" }), 0);
-    const settled = tracker.observe({ ...base, type: "turn.completed", ok: true } as RuntimeEvent, 50);
+    const settled = tracker.observe({ ...base, type: "turn.completed", ok: true }, 50);
     expect(settled.map((row) => row.subagent.status)).toEqual(["completed"]);
     expect(settled[0]!.subagent.endedAt).toBe(50);
   });
@@ -94,5 +94,42 @@ describe("HelperTracker", () => {
     );
     const inner = nested.find((row) => row.subagent.id === "task-2");
     expect(inner?.subagent).toMatchObject({ depth: 2, fidelity: "typed", label: "inner" });
+  });
+
+  it("leaves a helper from another turn on the same thread running", () => {
+    const tracker = new HelperTracker();
+    tracker.observe(started({ itemId: "spawn-1", title: "spawn_agent", turnId: "turn-a" }), 0);
+    tracker.observe(started({ itemId: "spawn-2", title: "spawn_agent", turnId: "turn-b" }), 0);
+    const settled = tracker.observe({ ...base, type: "turn.completed", ok: true, turnId: "turn-a" }, 40);
+    expect(settled.map((row) => row.subagent.id)).toEqual(["spawn-1"]);
+    const step = tracker.observe(
+      started({ itemId: "read-2", title: "Read", target: "notes.md", parentItemId: "spawn-2", subagentId: "spawn-2", turnId: "turn-b" }),
+      50,
+    );
+    expect(step).toEqual([]);
+    const flushed = tracker.due(HELPER_UPDATE_MIN_MS);
+    expect(flushed.map((row) => row.subagent.id)).toEqual(["spawn-2"]);
+    expect(flushed[0]?.subagent).toMatchObject({ status: "running", toolCount: 1, lastActivity: "Read · notes.md" });
+  });
+
+  it("an engine exit settles that instance's helpers and leaves another instance's running", () => {
+    const tracker = new HelperTracker();
+    tracker.observe(started({ itemId: "task-a", title: "Task", providerInstanceId: "inst-a" }), 0);
+    tracker.observe(started({ itemId: "task-b", title: "Task", providerInstanceId: "inst-b", turnId: "turn-b" }), 0);
+    const settled = tracker.observe({ ...base, type: "session.exited", providerInstanceId: "inst-a" }, 10);
+    expect(settled.map((row) => row.subagent.id)).toEqual(["task-a"]);
+    expect(settled[0]?.subagent.status).toBe("failed");
+    const still = tracker.observe({ ...base, type: "turn.completed", ok: true, turnId: "turn-b", providerInstanceId: "inst-b" }, 20);
+    expect(still.map((row) => row.subagent.id)).toEqual(["task-b"]);
+  });
+
+  it("keeps the instance id when a later frame leaves it off", () => {
+    const tracker = new HelperTracker();
+    tracker.observe(started({ itemId: "task-a", title: "Task", providerInstanceId: "inst-a", turnId: "turn-a" }), 0);
+    tracker.observe(updated({ itemId: "task-a", subagentId: "task-a", tokens: 10, turnId: "turn-a" }), 5);
+    const other = tracker.observe({ ...base, type: "session.exited", providerInstanceId: "inst-b" }, 10);
+    expect(other).toEqual([]);
+    const own = tracker.observe({ ...base, type: "session.exited", providerInstanceId: "inst-a" }, 20);
+    expect(own.map((row) => row.subagent.id)).toEqual(["task-a"]);
   });
 });

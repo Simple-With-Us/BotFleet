@@ -504,15 +504,28 @@ const playTurn = (prompt: JsonValue) => {
         usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 4 },
       },
     });
+    const helperUsage = { input_tokens: 999, cache_read_input_tokens: 0, output_tokens: 99 };
     out({
       type: "assistant",
       parent_tool_use_id: "task-1",
       message: {
+        id: "msg-helper-1",
         content: [
           { type: "text", text: "HELPER NARRATION" },
           { type: "tool_use", id: "helper-read-1", name: "Read", input: { file_path: "/tmp/helper-target.txt" } },
         ],
-        usage: { input_tokens: 999, cache_read_input_tokens: 0, output_tokens: 99 },
+        usage: helperUsage,
+      },
+    });
+    // The CLI streams one assistant message as more than one frame, and the
+    // later frame repeats that message's usage.  The driver must count it once.
+    out({
+      type: "assistant",
+      parent_tool_use_id: "task-1",
+      message: {
+        id: "msg-helper-1",
+        content: [{ type: "text", text: "HELPER NARRATION" }],
+        usage: helperUsage,
       },
     });
     out({
