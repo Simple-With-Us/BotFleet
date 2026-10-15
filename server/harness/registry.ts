@@ -208,14 +208,18 @@ function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
   if (!Array.isArray(aliases)) return [];
   // A path or a newline is not a command name; findCliCandidates drops those
   // too, but keeping the list clean here keeps the cache key honest.
-  const out: string[] = [];
-  for (const entry of aliases) {
-    if (Object.prototype.toString.call(entry) !== "[object String]") continue;
-    const name = String(entry);
-    if (!name || /[\n\r/\\]/.test(name)) continue;
-    out.push(name);
-  }
-  return [...new Set(out)];
+  return [
+    ...new Set(
+      aliases.filter((alias): alias is string => {
+        // cliAliases is typed as string[], and a hand-built driver can still
+        // break that.  This is the decode that keeps a non-string out of the
+        // candidate cache key.
+        // oxlint-disable-next-line anti-slop/no-runtime-typeof
+        if (typeof alias !== "string" || !alias) return false;
+        return !/[\n\r/\\]/.test(alias);
+      }),
+    ),
+  ];
 }
 
 /** Every name that runs this driver: the default first, then its aliases. */
