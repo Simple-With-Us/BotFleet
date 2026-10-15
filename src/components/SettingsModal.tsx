@@ -789,7 +789,10 @@ export function BusySendDefaultRow() {
               disabled={saving}
               aria-pressed={selected}
               onClick={() => void save(mode)}
-              className={`rounded-lg border px-3 py-2.5 text-left ${selected ? "border-accent bg-accent/10" : "border-hairline/40 hover:bg-raised/60"}`}
+              className={cn(
+                "rounded-lg border px-3 py-2.5 text-left",
+                selected ? "border-accent bg-accent/10" : "border-hairline/40 hover:bg-raised/60",
+              )}
             >
               <div className="text-[14px] font-medium text-ink">{copy.title}</div>
               <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{copy.subtitle}</div>

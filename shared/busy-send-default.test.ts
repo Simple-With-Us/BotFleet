@@ -21,5 +21,9 @@ describe("busy-send-default", () => {
     expect(parseBusyDeliveryOverride("steer")).toBe("steer");
     expect(parseBusyDeliveryOverride(undefined)).toBeUndefined();
     expect(parseBusyDeliveryOverride("")).toBeUndefined();
+    expect(parseBusyDeliveryOverride(1)).toBeUndefined();
+    expect(parseBusyDeliveryOverride({})).toBeUndefined();
+    expect(parseBusyDeliveryOverride(null)).toBeUndefined();
+    expect(parseBusyDeliveryOverride(false)).toBeUndefined();
   });
 });
