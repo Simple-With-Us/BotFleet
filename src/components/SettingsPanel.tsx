@@ -19,6 +19,11 @@ import { BotSkillsPanel } from "./BotSkillsPanel";
 import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
 import { BypassPermissionsWarning } from "./BypassPermissionsWarning";
+import {
+  BYPASS_LOCAL_COMPUTER_WARNING_BODY,
+  BYPASS_LOCAL_COMPUTER_WARNING_TITLE,
+  BypassLocalComputerControl,
+} from "./BypassLocalComputerControl";
 import { evaluateModelRiskForBypass } from "../../shared/model-safety";
 import { bypassCoverageNote } from "../../shared/bypass-coverage";
 import { VoiceSettings } from "./VoiceSettings";
@@ -336,7 +341,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const { capabilities } = useDesktopCapabilities();
   const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
   const localSelectable = localComputerSelectable({ capabilities, providerSupportsLocal });
-  const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | null>(null);
+  const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | "bypassLocal" | null>(null);
   const localDisabledReason = localComputerDisabledReason({ capabilities, providerSupportsLocal });
   const autoWouldUseLocal = requiresLocalAutoConsent(
     bot.computers,
@@ -378,6 +383,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "autoApprove"
         | "autoReview"
         | "bypassPermissions"
+        | "bypassLocalComputer"
         | "speakReplies"
         | "speechDevices"
         | "voice"
@@ -854,7 +860,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 </div>
                 <div className="mt-0.5 text-[13px] text-ink-secondary">
                   {bot.bypassPermissions
-                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards.  Requests that control This Mac still ask."
+                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards.  Requests that control This Mac still ask, unless Bypass Including This Mac is on."
                     : "Automatically approve all tool, command, and routine requests without stopping for manual approval cards.  Requests that control This Mac still ask."}
                 </div>
               </div>
@@ -882,6 +888,12 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 />
               </button>
             </div>
+            <BypassLocalComputerControl
+              bypassPermissions={Boolean(bot.bypassPermissions)}
+              bypassLocalComputer={Boolean(bot.bypassLocalComputer)}
+              onTurnOff={() => patch({ bypassLocalComputer: false })}
+              onRequestOn={() => setLocalAutoWarning("bypassLocal")}
+            />
             {bypassNote && (
               <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{bypassNote}</div>
             )}
@@ -959,10 +971,15 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
     </aside>
     <LocalComputerAutoWarning
       open={localAutoWarning !== null}
+      title={localAutoWarning === "bypassLocal" ? BYPASS_LOCAL_COMPUTER_WARNING_TITLE : undefined}
+      body={localAutoWarning === "bypassLocal" ? BYPASS_LOCAL_COMPUTER_WARNING_BODY : undefined}
       onCancel={() => setLocalAutoWarning(null)}
       onConfirm={() => {
         if (localAutoWarning === "auto") patch({ autoApprove: true, acknowledgeLocalAuto: true });
         if (localAutoWarning === "local") patch({ computers: [...(bot.computers ?? []), "local"], acknowledgeLocalAuto: true });
+        // The same warning stands in front of the second switch: both give
+        // up the asking for the real desktop, so neither gets a quieter path.
+        if (localAutoWarning === "bypassLocal") patch({ bypassLocalComputer: true, acknowledgeLocalAuto: true });
         setLocalAutoWarning(null);
       }}
     />

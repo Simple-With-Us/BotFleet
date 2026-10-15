@@ -357,6 +357,9 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     /// ones that control This Mac (`server/auto-approve.ts`).  Nil on a
     /// harness that predates it, which reads as off.
     public var bypassPermissions: Bool?
+    /// Bypass, extended to the requests that control This Mac.  Nil on a
+    /// harness that predates it, which reads as off.
+    public var bypassLocalComputer: Bool?
     public var alwaysAllow: [String]?
     public var composio: Bool?
     /// Which computers this bot may run on: "local", "cloud", and/or "vm".
@@ -1111,6 +1114,11 @@ public struct BotProfilePatch: Encodable, Sendable {
     public var autoReview: AutoReviewMode?
     public var approvePeerComms: Bool?
     public var bypassPermissions: Bool?
+    /// The owner's second switch, 2026-10-14.  Bypass alone stops at the edge
+    /// of the real desktop, which made it weaker than Auto Mode.  The computer
+    /// refuses to turn THIS one on from the phone for a bot that can use This
+    /// Mac, exactly as it refuses Auto Mode, so the sheet does not offer it.
+    public var bypassLocalComputer: Bool?
     /// `BotComputers.updated` builds this: the sandboxed destinations only,
     /// with This Mac carried through as the computer has it.
     public var computers: [String]?
@@ -1179,6 +1187,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         autoReview: AutoReviewMode? = nil,
         approvePeerComms: Bool? = nil,
         bypassPermissions: Bool? = nil,
+        bypassLocalComputer: Bool? = nil,
         computers: [String]? = nil,
         cwd: CwdString? = nil,
         off: Bool? = nil
@@ -1200,13 +1209,14 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.autoReview = autoReview
         self.approvePeerComms = approvePeerComms
         self.bypassPermissions = bypassPermissions
+        self.bypassLocalComputer = bypassLocalComputer
         self.computers = computers
         self.cwd = cwd
         self.off = off
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, bypassPermissions, computers, cwd, off
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, voices, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, bypassPermissions, bypassLocalComputer, computers, cwd, off
     }
 
     private enum DeviceKeys: String, CodingKey { case mac, iphone }
@@ -1254,6 +1264,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         try values.encodeIfPresent(autoReview?.rawValue, forKey: .autoReview)
         try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
         try values.encodeIfPresent(bypassPermissions, forKey: .bypassPermissions)
+        try values.encodeIfPresent(bypassLocalComputer, forKey: .bypassLocalComputer)
         try values.encodeIfPresent(computers, forKey: .computers)
         try values.encodeIfPresent(off, forKey: .off)
         if let cwd {

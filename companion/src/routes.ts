@@ -83,6 +83,12 @@ export function isCloudDesktopJoin(method: string, path: string): boolean {
  *     (server/auto-approve.ts excludes `scope === "local-computer"`), so host
  *     control still asks even on a bot the phone put in bypass, and the phone
  *     may switch it on for any bot.
+ *   - `bypassLocalComputer` is the owner's second switch (2026-10-14): it buys
+ *     that last edge for a bot that does NOT hold This Mac.  Where the bot CAN
+ *     use This Mac it is refused, exactly as `autoApprove` is, because both
+ *     name the same act — unattended control of the real desktop — and the
+ *     warning in front of that is the Mac's.  That per-bot refusal needs the
+ *     stored bot and lives in the harness profile route, not here.
  *   - The This Mac grant itself is still the Mac's alone (see `computers`). */
 export const COMPANION_PROFILE_PATCH_FIELDS = [
   "name",
@@ -109,6 +115,13 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "autoReview",
   "approvePeerComms",
   "bypassPermissions",
+  // Bypass, extended to the requests that control This Mac.  On the list so the
+  // phone can save it for a bot that does NOT hold This Mac, which is the same
+  // shape as `autoApprove` above: allowed here, refused by the harness route
+  // when the value would grant host control.  Turning it back off is always the
+  // phone's, so it has to be here or the person could switch it on from the
+  // desktop and never be able to undo it from their pocket.
+  "bypassLocalComputer",
   // The bot's On/Off switch (shared/bot-power.ts).  It only ever stops or
   // resumes work the person could already start by messaging the bot, grants
   // no capability, and the phone has to be able to turn a bot back On: the

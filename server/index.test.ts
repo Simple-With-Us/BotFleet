@@ -8005,6 +8005,86 @@ describe("workspace voice settings", () => {
   });
 });
 
+describe("paired profile Bypass Including This Mac", () => {
+  const refusal =
+    "Bypass Including This Mac can only be turned on in BotFleet on your computer for a bot that can use This Mac";
+
+  it("refuses a phone that sets only bypassLocalComputer on a bot that can use This Mac", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Phone Bypass Local" })).body.bot;
+    const stored = async () =>
+      (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id);
+    try {
+      // Explicit This Mac, with Auto off, so the refusal does not depend on
+      // the host being Darwin.  Adding the destination alone is not the pair
+      // the acknowledgement gates.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { computers: ["vm", "local"] })).status).toBe(200);
+
+      // The hole: a patch that names only this field used to skip
+      // pairedProfileRefusal and persist the switch.
+      const onlySwitch = await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassLocalComputer: true });
+      expect(onlySwitch.status).toBe(403);
+      expect(onlySwitch.body.error).toBe(refusal);
+      expect((await stored()).bypassLocalComputer).not.toBe(true);
+
+      // A field riding along is not written either.
+      const withTitle = await api("PATCH", `/api/bots/${bot.id}/profile`, {
+        title: "must not apply",
+        bypassLocalComputer: true,
+      });
+      expect(withTitle.status).toBe(403);
+      expect(withTitle.body.error).toBe(refusal);
+      const afterRefusal = await stored();
+      expect(afterRefusal.title).not.toBe("must not apply");
+      expect(afterRefusal.bypassLocalComputer).not.toBe(true);
+
+      // Plain Bypass stays the phone's.  It never answers a This Mac request,
+      // and it must not become a stand-in that lets Auto Mode through.
+      const plain = await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassPermissions: true });
+      expect(plain.status).toBe(200);
+      expect((await stored()).bypassPermissions).toBe(true);
+      const auto = await api("PATCH", `/api/bots/${bot.id}/profile`, { autoApprove: true });
+      expect(auto.status).toBe(403);
+      expect((await stored()).autoApprove).not.toBe(true);
+
+      // Turning the switch off is the phone's, including when it was never on.
+      expect((await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassLocalComputer: false })).status).toBe(200);
+
+      // The desktop still demands the warning before the switch covers This Mac.
+      const quiet = await api("PATCH", `/api/bots/${bot.id}`, { bypassLocalComputer: true });
+      expect(quiet.status).toBe(400);
+      expect(quiet.body.error).toMatch(/acknowledgeLocalAuto/);
+      expect((await stored()).bypassLocalComputer).not.toBe(true);
+      const acked = await api("PATCH", `/api/bots/${bot.id}`, {
+        bypassLocalComputer: true,
+        acknowledgeLocalAuto: true,
+      });
+      expect(acked.status).toBe(200);
+      expect((await stored()).bypassLocalComputer).toBe(true);
+
+      // Off again, from the phone, then a bot that cannot use This Mac may
+      // take the switch.  Widening that bot onto This Mac afterwards is a new
+      // grant and still stops for the warning.
+      expect((await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassLocalComputer: false })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { computers: ["vm"] })).status).toBe(200);
+      const allowed = await api("PATCH", `/api/bots/${bot.id}/profile`, { bypassLocalComputer: true });
+      expect(allowed.status).toBe(200);
+      expect((await stored()).bypassLocalComputer).toBe(true);
+      const widen = await api("PATCH", `/api/bots/${bot.id}`, { computers: ["vm", "local"] });
+      expect(widen.status).toBe(400);
+      expect((await stored()).computers).toEqual(["vm"]);
+      const widened = await api("PATCH", `/api/bots/${bot.id}`, {
+        computers: ["vm", "local"],
+        acknowledgeLocalAuto: true,
+      });
+      expect(widened.status).toBe(200);
+      expect((await stored()).computers).toEqual(["vm", "local"]);
+      expect((await stored()).bypassLocalComputer).toBe(true);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+});
+
 describe("local Auto consent for inherited and discovered computers", () => {
   it("guards config defaults and per-bot Auto while preserving explicit Off", async () => {
     expect((await api("PUT", "/api/config", {

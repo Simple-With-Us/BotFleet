@@ -128,6 +128,40 @@ final class BotExecutionPolicyTests: XCTestCase {
         XCTAssertTrue(BotExecutionPolicy.mayTurnOnAuto(computers: nil))
     }
 
+    /// The second switch asks for the same act Auto Mode does, so it is the
+    /// Mac's to turn on wherever Auto Mode's is.  Plain Bypass stays the
+    /// phone's, because on its own it never reaches the desktop.
+    func testLocalBypassIsTheMacsToTurnOnExactlyWhereAutoModeIs() {
+        XCTAssertFalse(BotExecutionPolicy.mayTurnOnLocalBypass(computers: ["local"]))
+        XCTAssertFalse(BotExecutionPolicy.mayTurnOnLocalBypass(computers: ["cloud", "local"]))
+        XCTAssertTrue(BotExecutionPolicy.mayTurnOnLocalBypass(computers: ["cloud", "vm"]))
+        XCTAssertTrue(BotExecutionPolicy.mayTurnOnLocalBypass(computers: []))
+        XCTAssertTrue(BotExecutionPolicy.mayTurnOnLocalBypass(computers: nil))
+
+        // The two answers are the same answer, deliberately.
+        for list in [["local"] as [String], ["cloud", "vm"], [], [String]()] {
+            XCTAssertEqual(
+                BotExecutionPolicy.mayTurnOnLocalBypass(computers: list),
+                BotExecutionPolicy.mayTurnOnAuto(computers: list)
+            )
+        }
+    }
+
+    func testLocalBypassCopyNeverClaimsItIsASettingOnItsOwn() {
+        XCTAssertTrue(BotExecutionPolicy.localBypassNeedsBypass.contains("Bypass Permissions first"))
+        let off = BotExecutionPolicy.localBypassSummary(isOn: false)
+        XCTAssertTrue(off.contains("Bypass still stops"))
+        let on = BotExecutionPolicy.localBypassSummary(isOn: true)
+        XCTAssertTrue(on.contains("includes this Mac"))
+        // The warning has to say what is actually being given up: the asking,
+        // not merely "auto approve".
+        let warning = BotExecutionPolicy.localBypassWarning(botName: "Forge")
+        XCTAssertTrue(warning.contains("Forge"))
+        XCTAssertTrue(warning.contains("destructive actions"))
+        XCTAssertTrue(warning.contains("nobody watching"))
+        XCTAssertEqual(BotExecutionPolicy.localBypassConfirmButton, "Enable Bypass Including This Mac")
+    }
+
     // MARK: - What the phone says
 
     private let gap = "\u{00A0} "

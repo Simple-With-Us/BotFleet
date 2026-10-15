@@ -644,6 +644,10 @@ export interface BotRecord {
   /** Permission bypass mode: automatically approve all tools, commands,
    * and routines without halting for approval cards or unattended blocks. */
   bypassPermissions?: boolean;
+  /** Bypass, including the requests that control the person's real desktop.
+   * Off by default, so bypass alone keeps stopping at that edge.  Means
+   * nothing without `bypassPermissions`. */
+  bypassLocalComputer?: boolean;
   /** Optional model review of otherwise undecided, attended approval cards.
    * Unknown persisted values are treated as off by the review boundary. */
   autoReview?: "off" | "shadow" | "enforce";

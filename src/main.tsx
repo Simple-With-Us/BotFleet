@@ -342,6 +342,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "bypass-local-computer") {
+  // Visual-spec harness (tests/e2e/bypass-local-computer.visual.spec.ts):
+  // Bypass Including This Mac, off, on, disabled, and its warning.
+  void import("./components/BypassLocalComputerVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else {
   createRoot(rootElement).render(
     <StrictMode>
