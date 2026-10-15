@@ -28,13 +28,15 @@ export interface ZulipOutgoingSpoolItem {
 
 export class ZulipOutgoingSpool {
   readonly directory: string;
+  private readonly readDirectory: (directory: string) => string[];
   private pendingCache?: { items: ZulipOutgoingSpoolItem[]; loadedAt: number };
   private pendingCountCache?: { count: number; loadedAt: number };
 
   constructor(
     dataDir: string,
-    private readonly readDirectory: (directory: string) => string[] = (directory) => readdirSync(directory),
+    readDirectory: (directory: string) => string[] = (directory) => readdirSync(directory),
   ) {
+    this.readDirectory = readDirectory;
     this.directory = join(dataDir, "zulip", "outgoing");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     if (process.platform !== "win32") chmodSync(this.directory, 0o700);
