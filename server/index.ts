@@ -37,6 +37,10 @@ import {
   parseConversationMode,
 } from "../shared/conversation-mode.ts";
 import {
+  parseBusyDeliveryOverride,
+  parseBusySendDefault,
+} from "../shared/busy-send-default.ts";
+import {
   IMESSAGE_PERSONA_RULE,
   isImessageInboundSource,
   outboundImessageText,
@@ -10050,6 +10054,7 @@ function configStatus() {
     // without each re-deriving them from the key and drifting apart.
     roomLabels: resolveRoomLabels(cfg.terminology, cfg.terminologyCustom),
     conversationMode: parseConversationMode(cfg.conversationMode),
+    busySendDefault: parseBusySendDefault(cfg.busySendDefault),
     features: {
       skillRecorder: skillRecorderEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
@@ -14554,6 +14559,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // (`commitHeldSends`).  A recording has no queue to wait in, so it
         // runs now and the drain waits for it.
         const holdForUpdate = !bot.busy && !recording && updateDrain.active;
+        const busyDelivery =
+          parseBusyDeliveryOverride(body.busyDelivery) ?? parseBusySendDefault(cfg.busySendDefault);
         // Claude can accept the message inside its live turn. If the write
         // loses a race with turn settlement, or the engine cannot steer, the
         // existing server-side queue records it atomically for the next turn.
@@ -14562,7 +14569,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // A reload can dispose the live adapter after steer accepts this
           // message.  Hold it in the server queue until the replacement
           // fleet is attached, then dispatch it as a fresh turn.
-          if (bot.busy && !providerReloadInProgress && instance?.adapter.capabilities.queueing && instance.adapter.steer) {
+          if (
+            busyDelivery === "steer" &&
+            bot.busy &&
+            !providerReloadInProgress &&
+            instance?.adapter.capabilities.queueing &&
+            instance.adapter.steer
+          ) {
             const steered = await instance.adapter
               .steer(bot.threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
               .catch(() => false);
@@ -16528,6 +16541,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (mergeThreads) store.mergeAllExtraThreads();
       cfg.conversationMode = nextMode;
       saveConfig({ conversationMode: cfg.conversationMode });
+      const status = configStatus();
+      broadcast({ kind: "config", ...status });
+      return json(res, 200, status);
+    }
+    if (method === "PATCH" && path === "/api/busy-send-default") {
+      const body = await readBody(req);
+      const patch = parseConfigPatch({ busySendDefault: body.busySendDefault });
+      if (patch.busySendDefault === undefined) {
+        return json(res, 400, { error: "nothing to save" });
+      }
+      cfg.busySendDefault = patch.busySendDefault;
+      saveConfig({ busySendDefault: cfg.busySendDefault });
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);
