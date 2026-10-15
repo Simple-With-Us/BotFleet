@@ -104,6 +104,7 @@ describe("autoSource matches the precedence the panel shipped with", () => {
   // them changes, a bot silently starts using a different computer than it
   // always has — which is exactly the kind of change that has no symptom until
   // a bot posts from the wrong machine.
+  // SAFETY: frozen tuples pin the auto-precedence table the panel shipped with.
   it.each([
     [["cloud", "local"], "cloud"],
     [["local", "cloud"], "cloud"],

@@ -30,11 +30,11 @@ export function previewChoiceLabel(
   }
 }
 
-const ICONS: Record<ComputerKind, typeof Monitor> = {
+const ICONS = {
   vm: Server,
   local: Laptop,
   cloud: Monitor,
-};
+} satisfies Record<ComputerKind, typeof Monitor>;
 
 /**
  * Switch which of the bot's computers the preview shows.

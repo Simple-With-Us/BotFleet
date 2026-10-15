@@ -171,7 +171,13 @@ export function ComputerPanel({
   useEffect(() => {
     setPreviewChoice("auto");
   }, [bot.id]);
-  const heldComputers = (bot.computers ?? []) as ComputerKind[];
+  const heldComputers = (bot.computers ?? []).filter(
+    (c): c is ComputerKind => c !== "off",
+  );
+  const platformIsMac =
+    capabilities.host.platform === "darwin" ||
+    (capabilities.host.platform === "other" &&
+      globalThis.navigator?.userAgent.includes("Mac") === true);
   const previewSource = resolvePreviewSource(heldComputers, previewChoice);
   const androidStatus = useAndroidUsbDevices();
   const androidConnected = androidStatus.devices.length > 0;
@@ -1018,7 +1024,7 @@ export function ComputerPanel({
                 computers={heldComputers}
                 choice={choiceSurvives(previewChoice, heldComputers)}
                 cloudBackend={cloudBackend}
-                platformIsMac={!isLinux}
+                platformIsMac={platformIsMac}
                 onChange={setPreviewChoice}
               />
             ) : (
