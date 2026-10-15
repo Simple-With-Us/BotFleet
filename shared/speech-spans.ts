@@ -2,7 +2,7 @@
 // came from.
 //
 // server/tts/speech-text.ts `speakable()` turns a reply's markdown into the
-// line a voice reads: fences become "(a code block)", links become their
+// line a voice reads: fences become "A code block.", links become their
 // label, paths become their file name, scaffolding disappears.  Karaoke on the
 // main message needs to know, for each spoken word, which part of the message
 // produced it.  This module re-runs exactly the same ordered rules, but every
@@ -278,7 +278,7 @@ const SPOKEN_LANGUAGES = new Map<string, string>([
 function describeCodeBlock(fence: string): string {
   const lang = fence.trim().split(/\s+/)[0]?.replace(/[^a-z0-9+#]/gi, "") ?? "";
   const name = SPOKEN_LANGUAGES.get(lang.toLowerCase());
-  return name ? `. (a ${name} code block) ` : ". (a code block) ";
+  return name ? `. A ${name} code block. ` : ". A code block. ";
 }
 
 const ENDS_SENTENCE = /[.!?:;]\s*$/;
@@ -326,7 +326,7 @@ function speakableTracked(input: string): Tracked {
   t = replaceTracked(t, /~~~([^\n]*)\n[\s\S]*?(?:~~~|$)/dg, (m) => [describeCodeBlock(m[1] ?? "")]);
 
   t = replaceTracked(t, /!\[([^\]]*)\]\([^)]*\)/dg, (m) =>
-    m[1] ? [". (image: ", ...group(m, 1), ") "] : [". (an image) "],
+    m[1] ? [". Image: ", ...group(m, 1), ". "] : [". An image. "],
   );
   t = replaceTracked(t, /\[([^\]]+)\]\([^)]*\)/dg, (m) => group(m, 1));
   t = replaceTracked(t, /<https?:\/\/[^>\s]+>/dg, () => [" a link "]);
