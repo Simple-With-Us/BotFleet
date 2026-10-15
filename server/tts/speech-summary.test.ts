@@ -281,7 +281,7 @@ describe("summarizeForVoice", () => {
       }),
     });
     const res = await summarizeForVoice(LONG, "test-key");
-    expect(res).toBe("Done. (a code block) All clear.");
+    expect(res).toBe("Done. A code block. All clear.");
   });
 
   it("handles malformed model responses by falling back to deterministic speech", async () => {
