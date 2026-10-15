@@ -5,11 +5,21 @@
   "minimumReleaseAge": "5 days",
   "packageRules": [
     {
+      "description": [
+        "Grouped non-major bumps share one pnpm-lock.yaml.",
+        "PR #919 showed Renovate can collapse a 0.x root importer and a 1.x fumadocs entry into a single 1.x resolution that breaks `pnpm install --frozen-lockfile` on CI.",
+        "Run the same frozen install CI uses after the lockfile is regenerated so a bad graph fails the bot update instead of every required context."
+      ],
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "groupName": "non-major dependencies",
       "automerge": true,
       "automergeType": "pr",
-      "platformAutomerge": true
+      "platformAutomerge": true,
+      "postUpgradeTasks": {
+        "commands": ["pnpm install --frozen-lockfile"],
+        "fileFilters": ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "**/package.json"],
+        "executionMode": "branch"
+      }
     },
     {
       "description": [
