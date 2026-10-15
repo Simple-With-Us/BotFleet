@@ -195,12 +195,14 @@ function trimQuotes(value: string): string {
 }
 
 /** YAML-style frontmatter at the top of a command or skill file. */
-export function parseCursorCommandFrontmatter(content: string): Record<string, string> {
+export type CursorCommandFrontmatter = Readonly<Record<string, string>>;
+
+export function parseCursorCommandFrontmatter(content: string): CursorCommandFrontmatter {
   if (!content.startsWith("---")) return {};
   const end = content.indexOf("\n---", 3);
   if (end === -1) return {};
   const block = content.slice(4, end);
-  const fields: Record<string, string> = {};
+  const fields: { [key: string]: string } = {};
   for (const line of block.split("\n")) {
     const trimmed = line.trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
@@ -287,11 +289,13 @@ function scanMarkdownCommands(root: string): CursorDiscoveredCommand[] {
   return out;
 }
 
-/** Project, user, and skill command definitions with optional frontmatter copy. */
-export function discoverCursorCommandCatalog(ctx: EngineCommandDiscoveryContext = {}): {
+export interface CursorCommandCatalog {
   names: readonly string[];
   byName: ReadonlyMap<string, CursorDiscoveredCommand>;
-} {
+}
+
+/** Project, user, and skill command definitions with optional frontmatter copy. */
+export function discoverCursorCommandCatalog(ctx: EngineCommandDiscoveryContext = {}): CursorCommandCatalog {
   const home = homeDir(ctx);
   const collected: CursorDiscoveredCommand[] = [];
   if (ctx.cwd) {

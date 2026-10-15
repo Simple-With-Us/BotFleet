@@ -33,35 +33,28 @@ function commandNameFromMarkdown(fileName: string): string | null {
   return normalizeEngineCommandName(stem);
 }
 
-/** Walk `root` and every immediate subdirectory for `*.md` command files. */
+/** Read `*.md` command files directly under `root` (no subdirectory flattening). */
 function scanCommandsTree(root: string): string[] {
   if (!existsSync(root)) return [];
   const names: string[] = [];
-  const visit = (dir: string) => {
-    let entries: string[];
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return [];
+  }
+  for (const entry of entries) {
+    const path = join(root, entry);
+    let stat;
     try {
-      entries = readdirSync(dir);
+      stat = statSync(path);
     } catch {
-      return;
+      continue;
     }
-    for (const entry of entries) {
-      const path = join(dir, entry);
-      let stat;
-      try {
-        stat = statSync(path);
-      } catch {
-        continue;
-      }
-      if (stat.isDirectory()) {
-        visit(path);
-        continue;
-      }
-      if (!stat.isFile()) continue;
-      const name = commandNameFromMarkdown(basename(path));
-      if (name) names.push(name);
-    }
-  };
-  visit(root);
+    if (!stat.isFile()) continue;
+    const name = commandNameFromMarkdown(entry);
+    if (name) names.push(name);
+  }
   return names;
 }
 

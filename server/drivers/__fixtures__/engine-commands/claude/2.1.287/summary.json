@@ -1,5 +1,5 @@
 {
-  "cli": "/Users/jay/.local/bin/claude",
+  "cli": "claude",
   "recordedAt": "2026-10-02T08:09:57.454Z",
   "throwawaySettingsExists": false,
   "throwawayAdvisorModelWritten": false,

@@ -20,6 +20,15 @@ describe("discoverStaticEngineCommands", () => {
     await removeTempDir(scratch);
   });
 
+  it("does not flatten nested markdown into a top-level command name", () => {
+    const project = join(scratch, "nested");
+    mkdirSync(join(project, ".claude", "commands", "scoped"), { recursive: true });
+    writeFileSync(join(project, ".claude", "commands", "scoped", "compact.md"), "# compact\n");
+    writeFileSync(join(project, ".claude", "commands", "review.md"), "# review\n");
+
+    expect(discoverStaticEngineCommands("claudeAgent", { cwd: project, home: scratch })).toEqual(["review"]);
+  });
+
   it("reads Claude project and user command markdown files", () => {
     const home = join(scratch, "home");
     const project = join(scratch, "project");

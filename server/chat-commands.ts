@@ -23,6 +23,7 @@ import {
   type CommandOrigin,
   type MessagingCommandName,
 } from "../shared/bot-commands.ts";
+import { hasControlCharacter } from "./drivers/engine-commands.ts";
 import { parseImessageInbound } from "../shared/imessage-message.ts";
 import { redactSecretsInText } from "./redact.ts";
 
@@ -121,6 +122,15 @@ export function validateCommandArgs(
     return {
       ok: false,
       error: joinSentences([`The argument is too long.`, `Use at most ${spec.maxLength} characters.`]),
+    };
+  }
+  if (value.length > 0 && (value.startsWith("/") || hasControlCharacter(value))) {
+    return {
+      ok: false,
+      error: joinSentences([
+        `The argument must be one line of plain text.`,
+        `It cannot start with a slash or contain line breaks.`,
+      ]),
     };
   }
   return { ok: true, value: value.length > 0 ? value : undefined };

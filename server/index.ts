@@ -3862,8 +3862,13 @@ async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface
   try {
     await startTurn(bot.id, engineCommandText(run), { command: run });
   } catch (error) {
-    const status = error instanceof Error && "status" in error ? Number(error.status) : 500;
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof Error && !("status" in error)) {
+      if (message.includes("not a command BotFleet can send") || message.includes("arguments for /")) {
+        return commandFailure(400, "invalid_args", message);
+      }
+    }
+    const status = error instanceof Error && "status" in error ? Number(error.status) : 500;
     if (status === 503) return commandFailure(503, "engine_unavailable", message);
     if (status === 409) return commandFailure(409, "bot_busy", message);
     throw error;
