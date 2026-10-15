@@ -2299,37 +2299,33 @@ async function exactAppPids(appPath) {
   return exactAppPidsFromPs(result.stdout, join(appPath, "Contents/MacOS/BotFleet"));
 }
 
-/**
- * Executables whose open references identify the bundle: the main binary, and
- * the embedded driver.  A full `+D` walk is the wrong tool here.  The app
- * bundle is large, and that walk stats every file inside it.
- */
-async function bundleExecutablePaths(root) {
-  const paths = [];
-  const macosDir = join(root, "Contents", "MacOS");
-  let names = [];
+function pidsFromTerseLsof(stdout) {
+  return stdout.split(/\s+/).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0);
+}
+
+async function lsofTersePids(args) {
+  const result = await run("lsof", ["-t", ...args], { allowFailure: true });
+  return {
+    ok: [0, 1].includes(result.code),
+    pids: pidsFromTerseLsof(result.stdout),
+  };
+}
+
+/** One directory level, and only when that level is small.  `+D` would walk
+ * the whole app bundle.  Hosted macOS 14 answers `lsof +D` for an open
+ * descriptor, which is what the release-store probe uses, and it returned
+ * no pid for a named-file lookup of a live binary.  `+d` is that same
+ * question without the recursion. */
+async function scanOpenDirectory(directory) {
+  let names;
   try {
-    names = await readdir(macosDir);
+    names = await readdir(directory);
   } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+    if (error?.code === "ENOENT") return null;
+    throw error;
   }
-  for (const name of names) {
-    const path = join(macosDir, name);
-    try {
-      const info = await lstat(path);
-      if (info.isFile() && !info.isSymbolicLink()) paths.push(path);
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-  }
-  const driver = join(root, "Contents", "Resources", "cua-driver");
-  try {
-    const info = await lstat(driver);
-    if (info.isFile() && !info.isSymbolicLink()) paths.push(driver);
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  return paths;
+  if (names.length > 64) return null;
+  return lsofTersePids(["+d", directory]);
 }
 
 /**
@@ -2341,10 +2337,10 @@ async function bundleExecutablePaths(root) {
  * `BotFleet Speech.app` / `BotFleet Recorder.app` helpers.  Renaming the
  * bundle while any of them runs is the thing to avoid.
  *
- * Two lsof questions, because each macOS build answers a different one.  The
- * system-wide text scan sees mapped binaries on a developer Mac.  The hosted
- * macOS 14 image often prints nothing for that mapping, while a lookup of the
- * executable path still lists a process that has the file open.
+ * The text scan is what a developer Mac reports for a mapped binary.  Hosted
+ * macOS 14 often prints nothing for that mapping, including when the same
+ * process has the file open.  `lsof -t +d` on the binary's directory is the
+ * form that image already answers for the release store.
  */
 export async function bundleHolderPids(bundlePath) {
   let root;
@@ -2354,15 +2350,25 @@ export async function bundleHolderPids(bundlePath) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
-  const executables = await bundleExecutablePaths(root);
-  const scans = [run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true })];
-  if (executables.length) scans.push(run("lsof", ["-F", "pn", "--", ...executables], { allowFailure: true }));
+  const scans = [
+    (async () => {
+      const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
+      return { ok: [0, 1].includes(result.code), pids: txtHolderPids(result.stdout, root) };
+    })(),
+  ];
+  const macosScan = await scanOpenDirectory(join(root, "Contents", "MacOS"));
+  if (macosScan) scans.push(macosScan);
+  const resourcesDir = join(root, "Contents", "Resources");
+  const resourcesScan = await scanOpenDirectory(resourcesDir);
+  if (resourcesScan) scans.push(resourcesScan);
+  const driver = join(resourcesDir, "cua-driver");
+  if (await exists(driver)) scans.push(lsofTersePids([driver]));
   const results = await Promise.all(scans);
-  const usable = results.filter((result) => [0, 1].includes(result.code));
+  const usable = results.filter((result) => result.ok);
   if (!usable.length) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
   const pids = new Set();
   for (const result of usable) {
-    for (const pid of txtHolderPids(result.stdout, root)) pids.add(pid);
+    for (const pid of result.pids) pids.add(pid);
   }
   return withoutExitedPids([...pids]);
 }

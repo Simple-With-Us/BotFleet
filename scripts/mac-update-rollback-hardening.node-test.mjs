@@ -144,6 +144,13 @@ function spawnHoldingBinary(executable, t) {
   return child;
 }
 
+async function assertHolds(bundle, directory, child, label) {
+  const holders = await bundleHolderPids(bundle);
+  if (holders.includes(child.pid)) return;
+  const probe = await run("lsof", ["-t", "+d", directory], { allowFailure: true });
+  assert.fail(`${label}: holders=${holders.join(",") || "(none)"} lsof +d code=${probe.code} stdout=${JSON.stringify(probe.stdout)} stderr=${JSON.stringify(probe.stderr)}`);
+}
+
 test("a process keeps its bundle open across a rename, and only the open reference finds it", macOnly, async (t) => {
   const root = await fixture(t);
   const executable = join(root, "App.app", "Contents", "MacOS", "BotFleet");
@@ -171,8 +178,7 @@ test("a process keeps its bundle open across a rename, and only the open referen
   );
 
   // The holder scan follows the open vnode.  ps, above, still has the old path.
-  const holders = await bundleHolderPids(renamed);
-  assert.ok(holders.includes(child.pid), `open reference to ${renamedExecutable} should include ${child.pid}`);
+  await assertHolds(renamed, dirname(renamedExecutable), child, "renamed main binary");
 });
 
 // P1 — processes that live inside the bundle but are not its main binary.
@@ -190,20 +196,14 @@ test("the bundle scan finds an embedded driver, not only the main executable", m
   await new Promise((done) => setTimeout(done, 800));
   assert.equal(child.exitCode, null, "the embedded driver should still be running");
 
-  assert.ok(
-    (await bundleHolderPids(bundle)).includes(child.pid),
-    "a process running Contents/Resources/cua-driver holds the bundle",
-  );
+  await assertHolds(bundle, dirname(driver), child, "embedded driver");
 
   // The case that matters is after the swap has renamed the bundle: a helper
   // that outlived quiescence has to be findable in the rollback bundle, and
   // its arguments still name the path it started from.
   const renamed = join(root, ".BotFleet.rollback-1757600000000-2246f19e9de8.app");
   await rename(bundle, renamed);
-  assert.ok(
-    (await bundleHolderPids(renamed)).includes(child.pid),
-    "the embedded driver must still be found under the renamed bundle",
-  );
+  await assertHolds(renamed, join(renamed, "Contents", "Resources"), child, "renamed embedded driver");
   assert.equal(
     (await bundleHolderPids(join(root, "BotFleet.app"))).includes(child.pid),
     false,
