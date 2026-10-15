@@ -12,7 +12,11 @@ struct ComposerMultilineField: UIViewRepresentable {
     var onHideKeyboard: () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
+        Coordinator(
+            text: $text,
+            isFocused: $isFocused,
+            onHideKeyboard: onHideKeyboard
+        )
     }
 
     func makeUIView(context: Context) -> UITextView {
@@ -27,18 +31,19 @@ struct ComposerMultilineField: UIViewRepresentable {
         view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         view.accessibilityLabel = placeholder
         context.coordinator.textView = view
-        context.coordinator.applyAccessory(to: view)
+        context.coordinator.applyAccessory(to: view, enabled: usesKeyboardAccessory)
         return view
     }
 
     func updateUIView(_ uiView: UITextView, context: Context) {
-        context.coordinator.parent = self
-        context.coordinator.applyAccessory(to: uiView)
+        context.coordinator.onHideKeyboard = onHideKeyboard
+        context.coordinator.applyAccessory(to: uiView, enabled: usesKeyboardAccessory)
         if uiView.text != text {
             uiView.text = text
         }
         uiView.isEditable = isEditable
         uiView.isSelectable = isEditable
+        uiView.accessibilityLabel = placeholder
         if isEditable {
             if isFocused, !uiView.isFirstResponder {
                 uiView.becomeFirstResponder()
@@ -46,24 +51,30 @@ struct ComposerMultilineField: UIViewRepresentable {
                 uiView.resignFirstResponder()
             }
         }
-        context.coordinator.refreshPlaceholder(on: uiView)
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
-        var parent: ComposerMultilineField
+        var text: Binding<String>
+        var isFocused: Binding<Bool>
+        var onHideKeyboard: () -> Void
         weak var textView: UITextView?
         private var accessoryView: ComposerKeyboardAccessoryView?
 
-        init(parent: ComposerMultilineField) {
-            self.parent = parent
+        init(text: Binding<String>, isFocused: Binding<Bool>, onHideKeyboard: @escaping () -> Void) {
+            self.text = text
+            self.isFocused = isFocused
+            self.onHideKeyboard = onHideKeyboard
         }
 
-        func applyAccessory(to textView: UITextView) {
-            if parent.usesKeyboardAccessory {
+        func applyAccessory(to textView: UITextView, enabled: Bool) {
+            if enabled {
                 if accessoryView == nil {
                     let bar = ComposerKeyboardAccessoryView()
                     bar.onHide = { [weak self] in
-                        self?.parent.onHideKeyboard()
+                        guard let self else { return }
+                        self.isFocused.wrappedValue = false
+                        self.textView?.resignFirstResponder()
+                        self.onHideKeyboard()
                     }
                     accessoryView = bar
                 }
@@ -73,26 +84,22 @@ struct ComposerMultilineField: UIViewRepresentable {
             }
         }
 
-        func refreshPlaceholder(on textView: UITextView) {
-            // UITextView has no placeholder; SwiftUI overlay handles empty state.
-        }
-
         func textViewDidChange(_ textView: UITextView) {
             let value = textView.text ?? ""
-            if parent.text != value {
-                parent.text = value
+            if text.wrappedValue != value {
+                text.wrappedValue = value
             }
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
-            if !parent.isFocused {
-                parent.isFocused = true
+            if !isFocused.wrappedValue {
+                isFocused.wrappedValue = true
             }
         }
 
         func textViewDidEndEditing(_ textView: UITextView) {
-            if parent.isFocused {
-                parent.isFocused = false
+            if isFocused.wrappedValue {
+                isFocused.wrappedValue = false
             }
         }
     }
@@ -106,14 +113,15 @@ private final class ComposerKeyboardAccessoryView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         autoresizingMask = .flexibleHeight
-        backgroundColor = .secondarySystemGroupedBackground
+        backgroundColor = UIColor.secondarySystemGroupedBackground
 
         let hide = UIButton(type: .system)
         var config = UIButton.Configuration.plain()
         config.image = UIImage(systemName: ComposerInputChrome.hideKeyboardSymbolName)
         config.title = ComposerInputChrome.hideKeyboardTitle
         config.imagePadding = 4
-        config.baseForegroundColor = .secondaryLabel
+        config.imagePlacement = .leading
+        config.baseForegroundColor = UIColor.secondaryLabel
         config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
             var out = incoming
             out.font = UIFont.preferredFont(forTextStyle: .subheadline)

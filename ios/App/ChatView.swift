@@ -1226,6 +1226,10 @@ struct ChatView: View {
         .padding(.horizontal, 4)
     }
 
+    private var composerPrompt: String {
+        dictation.isListening ? "Listening…" : "Ask \(current.name)"
+    }
+
     /// A round + and a glass pill with dictation and send inside it.
     private var composer: some View {
         VStack(spacing: 6) {
@@ -1410,9 +1414,8 @@ struct ChatView: View {
                     .accessibilityLabel(showingPlus ? "Close" : "More")
 
                     ZStack(alignment: .topLeading) {
-                        let prompt = dictation.isListening ? "Listening…" : "Ask \(current.name)"
                         if draft.isEmpty {
-                            Text(prompt)
+                            Text(composerPrompt)
                                 .font(.body)
                                 .foregroundStyle(Color.secondary)
                                 .padding(.leading, 14)
@@ -1423,7 +1426,7 @@ struct ChatView: View {
                         ComposerMultilineField(
                             text: $draft,
                             isFocused: $composerFocused,
-                            placeholder: prompt,
+                            placeholder: composerPrompt,
                             isEditable: !dictation.isListening && !dictation.isStarting,
                             usesKeyboardAccessory: composerKeyboardAccessoryAvailable,
                             onHideKeyboard: { composerFocused = false }
