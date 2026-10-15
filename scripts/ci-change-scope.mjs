@@ -26,7 +26,16 @@ export function isIosPath(path) {
   // ci.yml is the only place the `ios` job is defined -- there is no
   // separate ios-ci.yml the way packaging has package-linux.yml -- so a
   // workflow edit here can change the job itself, not just build scripts.
-  return path === ".github/workflows/ci.yml" || path.startsWith("ios/") || path.startsWith("scripts/ios-");
+  // The required check replays this classifier and scripts/ci-ios-gate.mjs.
+  // Those two files are iOS paths so a change to the proof cannot take the
+  // skip path and approve itself.
+  return (
+    path === ".github/workflows/ci.yml" ||
+    path === "scripts/ci-change-scope.mjs" ||
+    path === "scripts/ci-ios-gate.mjs" ||
+    path.startsWith("ios/") ||
+    path.startsWith("scripts/ios-")
+  );
 }
 
 export function isPackagingPath(path) {
