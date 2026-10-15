@@ -8,6 +8,15 @@ import { parse } from "yaml";
 
 import { classifyCIPaths, isControlPlanePath, isIosPath, isPackagingPath } from "./ci-change-scope.mjs";
 
+function runIosGate(paths, env) {
+  return spawnSync(process.execPath, [join(ROOT, "scripts/ci-ios-gate.mjs")], {
+    cwd: ROOT,
+    input: Buffer.from(paths.join("\0")),
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+}
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 test("only the explicit non-executable documentation paths take the fast path", () => {
@@ -114,7 +123,7 @@ test("every protected check stays present and takes the same fail-closed scope o
   assert.match(classifier.run, /echo "docs_only=false"/);
   assert.match(classifier.run, /BASE_SHA.*\^\[0-9a-f\]\{40\}\$/);
 
-  for (const jobId of requiredJobs) {
+  for (const jobId of requiredJobs.filter((id) => id !== "ios")) {
     const job = workflow.jobs[jobId];
     assert.equal(job.needs, "changes", jobId);
     assert.equal(job.if, "${{ !cancelled() }}", jobId);
@@ -127,6 +136,15 @@ test("every protected check stays present and takes the same fail-closed scope o
     }
   }
 
+  const iosGate = workflow.jobs.ios;
+  assert.deepEqual(iosGate.needs, ["changes", "ios-build"]);
+  assert.match(iosGate.if, /always\(\)/);
+  assert.equal(
+    iosGate.steps.some((step) => step.name === "Documentation-only fast path"),
+    false,
+    "ios gate must not be a single echo fast path",
+  );
+
   const source = readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8");
   assert.match(source, /git diff --no-renames --name-only -z/);
   assert.doesNotMatch(source, /paths-ignore:/);
@@ -135,7 +153,6 @@ test("every protected check stays present and takes the same fail-closed scope o
 test("the three expensive jobs also gate on their own area, the same way docs_only does", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const areaJobs = [
-    { jobId: "ios", output: "ios_changed", fastPathName: "iOS-unrelated fast path" },
     { jobId: "package-linux", output: "packaging_changed", fastPathName: "Packaging-unrelated fast path" },
     { jobId: "control-plane", output: "control_plane_changed", fastPathName: "Control-plane-unrelated fast path" },
   ];
@@ -174,6 +191,78 @@ test("the three expensive jobs also gate on their own area, the same way docs_on
     const occurrences = classifier.run.match(new RegExp(`echo "${output}=true"`, "g")) ?? [];
     assert.equal(occurrences.length, 2, `${output} fallback branches`);
   }
+});
+
+test("ios-build runs only when iOS-relevant paths changed, and the required gate is auditable", () => {
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  const iosBuild = workflow.jobs["ios-build"];
+  assert.ok(iosBuild, "ios-build job");
+  assert.equal(iosBuild.needs, "changes");
+  assert.match(
+    iosBuild.if,
+    /needs\.changes\.outputs\.docs_only != 'true'.*needs\.changes\.outputs\.ios_changed == 'true'/s,
+  );
+  assert.equal(iosBuild["runs-on"], "xcode-27");
+  assert.equal(iosBuild.steps.some((step) => /echo /.test(step.run ?? "")), false);
+
+  const gate = workflow.jobs.ios;
+  assert.equal(gate.name, "Swift tests + iOS build");
+  assert.deepEqual(gate.needs, ["changes", "ios-build"]);
+  assert.match(gate.if, /always\(\)/);
+  assert.match(gate.if, /needs\.changes\.result == 'success'/);
+  const verify = gate.steps.find((step) => step.name === "Verify scope and iOS build outcome");
+  assert.ok(verify);
+  assert.match(verify.run, /ci-ios-gate\.mjs/);
+  assert.match(verify.run, /git diff --no-renames --name-only -z/);
+});
+
+test("the iOS required gate accepts skip only when the classifier proves no iOS work", () => {
+  const skip = runIosGate(["server/index.ts"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "false",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.equal(skip.status, 0, skip.stderr);
+  assert.match(skip.stdout, /gate_verdict: skipped_no_ios_relevant_paths/);
+  assert.match(skip.stdout, /changed_paths:\n  - server\/index\.ts/);
+
+  const docs = runIosGate(["docs/EFFORT-LOG.md"], {
+    DOCS_ONLY: "true",
+    IOS_CHANGED: "false",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.equal(docs.status, 0, docs.stderr);
+  assert.match(docs.stdout, /gate_verdict: skipped_docs_only/);
+
+  const built = runIosGate(["ios/project.yml"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "success",
+    EVENT_NAME: "pull_request",
+  });
+  assert.equal(built.status, 0, built.stderr);
+  assert.match(built.stdout, /gate_verdict: build_required/);
+  assert.match(built.stdout, /outcome: swift_tests_and_ios_build_ran/);
+
+  const missingBuild = runIosGate(["ios/project.yml"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.notEqual(missingBuild.status, 0);
+  assert.match(missingBuild.stderr, /require a successful ios-build/);
+
+  const mismatch = runIosGate(["server/index.ts"], {
+    DOCS_ONLY: "false",
+    IOS_CHANGED: "true",
+    IOS_BUILD_RESULT: "skipped",
+    EVENT_NAME: "pull_request",
+  });
+  assert.notEqual(mismatch.status, 0);
+  assert.match(mismatch.stderr, /do not match a fresh diff replay/);
 });
 
 test("the weekly full run is registered with the Sentry cron reporter", () => {
