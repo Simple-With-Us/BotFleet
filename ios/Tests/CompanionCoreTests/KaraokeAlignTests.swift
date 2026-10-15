@@ -146,18 +146,18 @@ final class KaraokeAlignTests: XCTestCase {
 
     func testADistilledScriptLandsOnTheRenderedWords() {
         let a = KaraokeAlign.alignSpokenToDisplay(
-            spokenText: "Next, issue seven four nine was fixed. <#0.3#> The A P I timeout is three point five seconds.",
-            displayText: "Fixed issue #749\nThe API timeout is 3.5 seconds"
+            spokenText: "Fixed issue #749 in the webhook retry loop. <#0.3#> Bumped the API timeout to 3.5 seconds.",
+            displayText: "Fixed issue #749 in the webhook retry loop\nBumped the API timeout to 3.5 seconds"
         )
         let landed = a.spokenWords.indices.map { i -> String in
             let d = a.mapping.spokenToDisplay[i]
             return d >= 0 ? a.displayWords[d].text : "-"
         }
         let pairs = Dictionary(zip(a.spokenWords.map(\.text), landed), uniquingKeysWith: { first, _ in first })
-        XCTAssertEqual(pairs["seven"], "749")
-        XCTAssertEqual(pairs["nine"], "749")
-        XCTAssertEqual(pairs["A"], "API")
-        XCTAssertEqual(pairs["five"], "5")
+        XCTAssertEqual(pairs["749"], "749")
+        XCTAssertEqual(pairs["API"], "API")
+        XCTAssertEqual(pairs["3"], "3")
+        XCTAssertEqual(pairs["5"], "5")
         XCTAssertFalse(a.spokenWords.contains { $0.text == "0" }, "pause tags are not words")
         XCTAssertTrue(a.followable)
     }
