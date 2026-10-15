@@ -158,7 +158,7 @@ public enum SpeechProjection {
         // images before links: the syntax differs by one character
         text = replace(#"!\[([^\]]*)\]\([^)]*\)"#, in: text) { groups in
             let alt = groups[1] ?? ""
-            return alt.isEmpty ? ". (an image) " : ". (image: \(alt)) "
+            return alt.isEmpty ? ". An image. " : ". Image: \(alt). "
         }
         text = replace(#"\[([^\]]+)\]\([^)]*\)"#, in: text, template: "$1")
         text = replace(#"<https?://[^>\s]+>"#, in: text, template: " a link ")
@@ -242,13 +242,13 @@ public enum SpeechProjection {
         "swift": "Swift", "diff": "diff",
     ]
 
-    /// "(a Swift code block)" from a fence's info string.
+    /// "A Swift code block." from a fence's info string.
     static func describeCodeBlock(_ info: String) -> String {
         let first = info.trimmingCharacters(in: .whitespaces)
             .split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init) ?? ""
         let lang = first.filter { $0.isLetter || $0.isNumber || $0 == "+" || $0 == "#" }.lowercased()
-        if let name = spokenLanguages[lang] { return "(a \(name) code block)" }
-        return "(a code block)"
+        if let name = spokenLanguages[lang] { return "A \(name) code block." }
+        return "A code block."
     }
 
     private static func replacingFences(in text: String, with describe: (String) -> String) -> String {
