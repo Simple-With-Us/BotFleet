@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   appendBounded,
+  appendBoundedAsync,
   removeTranscriptLogs,
   EVENTS_LOG_MAX_BYTES,
   NATIVE_LOG_MAX_BYTES,
@@ -731,18 +732,63 @@ describe("idle live transcript retention", () => {
     expect(result.inventory[0]?.reason).toBe("in-flight");
   });
 
-  it("never trims a log this process is still appending, even when the mtime is old", () => {
+  it("trims a log whose size is still cached after the append finished, once the file is old", () => {
     const eventsDir = tmp();
     const nativeDir = tmp();
-    const file = join(nativeDir, "writing.ndjson");
+    const file = join(nativeDir, "cached.ndjson");
+    const width = Buffer.byteLength(record(1));
     appendBounded(file, record(1), 1024 * 1024);
     const text = body(10);
     writeFileSync(file, text);
     age(file, OLD);
+    const result = sweep({ eventsDir, nativeDir }, ["cached"], {
+      tailBytes: tails(width * 3 + Math.floor(width / 2)),
+    });
+    expect(result.inventory.find((item) => item.threadId === "cached")?.reason).toBe("idle-live");
+    expect(ns(readFileSync(file, "utf8"))).toEqual([8, 9, 10]);
+    expect(result.bytesReclaimed).toBe(width * 7);
+  });
+
+  it("does not trim a log while an async append is still writing it", async () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(nativeDir, "writing.ndjson");
+    const text = body(10);
+    writeFileSync(file, text);
+    age(file, OLD);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const pending = appendBoundedAsync(file, record(11), 1024 * 1024, {}, async () => {
+      await gate;
+    });
     const result = sweep({ eventsDir, nativeDir }, ["writing"], { tailBytes: tails(Buffer.byteLength(record(1))) });
     expect(result.inventory.find((item) => item.threadId === "writing")?.reason).toBe("in-flight");
     expect(readFileSync(file, "utf8")).toBe(text);
     expect(result.bytesReclaimed).toBe(0);
+    release();
+    await pending;
+  });
+
+  it("a failed append does not leave the log looking in flight", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(nativeDir, "failed.ndjson");
+    const width = Buffer.byteLength(record(1));
+    const text = body(10);
+    writeFileSync(file, text);
+    age(file, OLD);
+    expect(() =>
+      appendBounded(file, record(11), 1024 * 1024, {}, () => {
+        throw new Error("disk");
+      }),
+    ).toThrow("disk");
+    const result = sweep({ eventsDir, nativeDir }, ["failed"], {
+      tailBytes: tails(width * 3 + Math.floor(width / 2)),
+    });
+    expect(result.inventory.find((item) => item.threadId === "failed")?.reason).toBe("idle-live");
+    expect(ns(readFileSync(file, "utf8"))).toEqual([8, 9, 10]);
   });
 
   it("leaves a recently touched live thread at the full cap", () => {

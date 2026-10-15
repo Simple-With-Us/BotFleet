@@ -89,6 +89,10 @@ const STALE_TEMP_MS = 60 * 60 * 1000;
  * costs one extra stat, never correctness. */
 const liveSizes = new Map<string, number>();
 const SIZE_CACHE_MAX = 512;
+/** Paths with an append that has entered and not yet finished.  Distinct from
+ * `liveSizes`: that map keeps a byte count for the life of the process, and
+ * a finished write must not look like a turn that is still in flight. */
+const appendsInFlight = new Set<string>();
 
 function rememberSize(file: string, size: number): void {
   liveSizes.delete(file);
@@ -202,11 +206,16 @@ export function appendBounded(
   options: { mode?: number } = {},
   append: typeof appendFileSync = appendFileSync,
 ): void {
-  const bytes = Buffer.byteLength(data);
-  let size = currentSize(file);
-  if (size > 0 && size + bytes > maxBytes && rotate(file)) size = 0;
-  append(file, data, options);
-  rememberSize(file, size + bytes);
+  appendsInFlight.add(file);
+  try {
+    const bytes = Buffer.byteLength(data);
+    let size = currentSize(file);
+    if (size > 0 && size + bytes > maxBytes && rotate(file)) size = 0;
+    append(file, data, options);
+    rememberSize(file, size + bytes);
+  } finally {
+    appendsInFlight.delete(file);
+  }
 }
 
 /** The one call that touches disk in `appendBoundedAsync`, named so the seam
@@ -253,11 +262,16 @@ export async function appendBoundedAsync(
   options: { mode?: number } = {},
   append: AppendWriter = appendFile,
 ): Promise<void> {
-  const bytes = Buffer.byteLength(data);
-  let size = await currentSizeAsync(file);
-  if (size > 0 && size + bytes > maxBytes && (await rotateAsync(file))) size = 0;
-  await append(file, data, options);
-  rememberSize(file, size + bytes);
+  appendsInFlight.add(file);
+  try {
+    const bytes = Buffer.byteLength(data);
+    let size = await currentSizeAsync(file);
+    if (size > 0 && size + bytes > maxBytes && (await rotateAsync(file))) size = 0;
+    await append(file, data, options);
+    rememberSize(file, size + bytes);
+  } finally {
+    appendsInFlight.delete(file);
+  }
 }
 
 /** Offset of the first byte after the first newline at or after `from`, or
@@ -848,7 +862,11 @@ function scanTranscriptThreads(dirs: TranscriptDirs, now: number): ScannedThread
       row.bytes += stat.size;
       row.files += 1;
       row.newestMtime = Math.max(row.newestMtime, stat.mtimeMs);
-      if (liveSizes.has(path)) row.appending = true;
+      // A cached size is not an open write.  `liveSizes` keeps every path this
+      // process has appended to, and a harness that stays up would otherwise
+      // skip the idle trim forever.  Only a write that has not returned yet
+      // counts, which is the await gap inside `appendBoundedAsync`.
+      if (appendsInFlight.has(path)) row.appending = true;
     }
   }
   return [...byId.values()].sort((a, b) => (a.threadId < b.threadId ? -1 : a.threadId > b.threadId ? 1 : 0));
