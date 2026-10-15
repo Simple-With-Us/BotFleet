@@ -28,4 +28,10 @@ describe("named-tunnel-gate", () => {
   it("exports stable mutation refusal copy", () => {
     expect(NAMED_TUNNEL_MUTATION_FORBIDDEN).toContain("named tunnel");
   });
+
+  it("treats mutating API plus tunnel markers as blocked at the gate", () => {
+    const mutating = isMutatingHarnessApiRequest("POST", "/api/bots");
+    const tunneled = arrivedViaCloudflareTunnel({ headers: { "cf-ray": "fixture-ray" } });
+    expect(mutating && tunneled).toBe(true);
+  });
 });
