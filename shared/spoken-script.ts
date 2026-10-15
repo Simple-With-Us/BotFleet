@@ -2,9 +2,9 @@
 // client for karaoke.
 //
 // The harness projects a reply into utterances (server/tts/message-audio.ts).
-// By default that is the distilled rewrite (server/tts/speech-summary.ts, the
-// owner's choice: numbers, codes, acronyms and links spelled out, code
-// skipped), answered as `script: "summary"` with no spans.  The highlight
+// By default that is the distilled script (server/tts/speech-summary.ts, the
+// owner's choice: same words as the reply, punctuation and pause tags only),
+// answered as `script: "summary"` with no spans.  The highlight
 // still follows the main message: clients align the distilled words to the
 // rendered words without spans (shared/karaoke-align.ts), which tolerates
 // skipped, added and spelled-out words.

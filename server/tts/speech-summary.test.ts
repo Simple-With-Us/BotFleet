@@ -211,17 +211,17 @@ describe("summarizeForVoice", () => {
     expect(res).toContain("deployment of multiple services");
   });
 
-  it("prompt contains expected negative constraints and XML tags", () => {
+  it("prompt targets Apple Personal Voice with span-aligned, punctuation-only rules", () => {
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("Apple Personal Voice");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<core_directive>");
-    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<rules_for_spoken_prose>");
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<allowed_changes>");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<pacing_and_punctuation>");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("NO DASHES");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("NO ELLIPSES");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<#0.3#>");
-    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<text_normalization>");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<negative_constraints>");
-    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT read out raw git commit hashes");
-    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT use em-dashes");
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("Do not paraphrase");
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("Do not spell out numbers");
   });
 
   it("keeps a short reply's deterministic script, and MiniMax still gets the acoustic pass", async () => {
@@ -267,7 +267,7 @@ describe("summarizeForVoice", () => {
     expect(res).toBe("Here is the summary of what changed.");
   });
 
-  it("preserves closed code fences while handling speech normalization", async () => {
+  it("keeps a closed code fence body when the model leaves it in place", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -281,7 +281,7 @@ describe("summarizeForVoice", () => {
       }),
     });
     const res = await summarizeForVoice(LONG, "test-key");
-    expect(res).toBe("Done. (a code block) All clear.");
+    expect(res).toBe("Done. ```typescript console.log(1); ``` All clear.");
   });
 
   it("handles malformed model responses by falling back to deterministic speech", async () => {
@@ -377,8 +377,7 @@ describe("summarizeForVoiceDetailed: long replies are never cut short", () => {
   });
 
   it("uses a finished rewrite however much shorter than the reply it is", async () => {
-    // The prompt tells the model to drop hashes, code and links, so a
-    // condensed rewrite is the point, not lost content.
+    // Markdown delimiters may shrink the string without changing words.
     const fetchSpy = vi.fn().mockResolvedValue(answer("The deploy has thirty steps.", "stop"));
     globalThis.fetch = fetchSpy;
     const result = await summarizeForVoiceDetailed(longReply, "fake-key");
