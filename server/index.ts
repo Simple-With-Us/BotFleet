@@ -6495,7 +6495,7 @@ async function startTurn(
           id: "botfleet-status",
           label: "BotFleet status",
           volatile: true,
-          text: chiefStatusPrompt ? ` ${chiefStatusPrompt}` : "",
+          text: chiefStatusPrompt ? `\n${chiefStatusPrompt}` : "",
         },
         { id: "credential", label: "Credentials", text: credentialPrompt },
         { id: "routine", label: "Routines", text: routinePrompt },
