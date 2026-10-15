@@ -112,7 +112,14 @@ function CustomPicker({
   useEffect(() => {
     if (fetchedRef.current) return;
     fetchedRef.current = true;
-    api(`/api/cli-candidates?name=${encodeURIComponent(cliDefault ?? "")}`)
+    api(
+      `/api/cli-candidates?name=${encodeURIComponent(cliDefault ?? "")}` +
+        // The engine may run under more than one command (Clutch ships as
+        // `clutch` while its driver default is `dsh`), so the refresh asks for
+        // the same name set describe() used — otherwise a binary the panel
+        // already lists vanishes the moment the picker is opened.
+        `&aliases=${encodeURIComponent((instance.cliAliases ?? []).join(","))}`,
+    )
       .then(({ candidates: found }: { candidates: string[] }) => {
         setCandidates(found);
         if (!instance.cli) return;

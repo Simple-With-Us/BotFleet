@@ -200,6 +200,24 @@ function cliDefaultOf(driver: AnyProviderDriver | undefined): string | undefined
   }
 }
 
+/** Other command names that run this driver, beyond its default binary.
+ * Empty for every engine whose CLI is named exactly one way, so this stays a
+ * no-op for everything but the engines that actually ship two names. */
+function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
+  const aliases = driver?.cliAliases;
+  if (!Array.isArray(aliases)) return [];
+  // A path or a newline is not a command name; findCliCandidates drops those
+  // too, but keeping the list clean here keeps the cache key honest.
+  return [...new Set(aliases.filter((a): a is string => typeof a === "string" && Boolean(a) && !/[\n\r/\\]/.test(a)))];
+}
+
+/** Every name that runs this driver: the default first, then its aliases. */
+function cliSearchNamesOf(driver: AnyProviderDriver | undefined): string[] {
+  const name = cliDefaultOf(driver);
+  if (!name) return [];
+  return [name, ...cliAliasesOf(driver)];
+}
+
 /** Whether an instance's own `cli` override names something that is there: an
  * absolute path that exists, or a bare name found on the augmented PATH.  The
  * default binary's candidates (`cliCandidates`) say nothing about it: a custom
@@ -270,6 +288,7 @@ export interface DescribedInstance {
   install: unknown;
   cli: string | undefined;
   cliDefault: string | undefined;
+  cliAliases: string[];
   cliCandidates: string[];
   fullAuto: boolean;
   iconUrl?: string;
@@ -1132,12 +1151,15 @@ export class ProviderRegistry {
   ): DescribedInstance {
     const driver = this.driversByKind.get(entry.shadow?.driverKind ?? entry.live!.driverKind);
     const candidatesFor = (d: AnyProviderDriver | undefined): string[] => {
-      const name = cliDefaultOf(d);
-      if (!name) return [];
-      const cached = candidatesByName.get(name);
+      const names = cliSearchNamesOf(d);
+      if (names.length === 0) return [];
+      // Keyed by the whole set, not the default name: two drivers that share a
+      // default but declare different aliases must not share a cache entry.
+      const key = names.join(" ");
+      const cached = candidatesByName.get(key);
       if (cached) return cached;
-      const found = findCliCandidates(name);
-      candidatesByName.set(name, found);
+      const found = findCliCandidates(names);
+      candidatesByName.set(key, found);
       return found;
     };
     if (entry.shadow) {
@@ -1169,6 +1191,7 @@ export class ProviderRegistry {
         install: driver?.install,
         cli: entry.shadow.cli,
         cliDefault: cliDefaultOf(driver),
+        cliAliases: cliAliasesOf(driver),
         // a shadow is exactly the "your CLI is broken, pick another"
         // case where the detected-path dropdown matters most
         cliCandidates: candidatesFor(driver),
@@ -1212,9 +1235,11 @@ export class ProviderRegistry {
       install: driver?.install,
       cli: this.cliByInstance.get(inst.instanceId),
       cliDefault: cliDefaultOf(driver),
-      // every copy of the driver's default binary on the augmented PATH —
-      // the dropdown's "detected" entries. Snapshotted per describe() so a
-      // newly installed CLI shows up on the next refresh.
+      cliAliases: cliAliasesOf(driver),
+      // every copy of the driver's default binary — or of one of its aliases —
+      // on the augmented PATH, which is the dropdown's "detected" entries.
+      // Snapshotted per describe() so a newly installed CLI shows up on the
+      // next refresh.
       cliCandidates: candidatesFor(driver),
       fullAuto: this.fullAutoByInstance.get(inst.instanceId) ?? false,
       iconUrl: inst.iconUrl,

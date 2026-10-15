@@ -620,7 +620,8 @@ describe("limits", () => {
     const fixture = setup({ text: `Here is the change. ${code} That is all.` });
     const result = await post(fixture, { voice: "vA", voiceSummaryMode: "off" });
     expect(result.status).toBe(200);
-    expect(result.body.utterances).toHaveLength(2);
+    expect(result.body.utterances).toHaveLength(3);
+    expect((result.body.utterances ?? []).join(" ").length).toBeLessThan(MAX_SPEAKABLE_CHARS);
   });
 
   it("refuses projected speech over the character cap for every voice", async () => {
