@@ -27,6 +27,7 @@ import {
   type RuntimeReadiness,
   type UpdateCapabilities,
   type UpdateControl,
+  type UpdateControlDeps,
   type UpdateDrainView,
   type UpdateStatus,
 } from "./update-control.ts";
@@ -112,7 +113,7 @@ function build(
   const emitted: UpdateStatus[] = [];
   const git: string[][] = [];
   const ran: { command: string; args: string[] }[] = [];
-  const control = createUpdateControl({
+  const controlDeps: Partial<UpdateControlDeps> = {
     installed: {
       version: "1.0.30",
       sourceCommit: options.installedCommit ?? INSTALLED_COMMIT,
@@ -122,7 +123,6 @@ function build(
     stateDirectory: paths.stateDirectory,
     updatesDirectory: paths.updatesDirectory,
     scriptPath: paths.scriptPath,
-    ...(options.appPath ? { appPath: options.appPath } : {}),
     platform: options.platform ?? "darwin",
     nodeDirectory: "/opt/homebrew/bin",
     now: options.now ?? (() => new Date("2026-09-13T12:00:00.000Z")),
@@ -147,7 +147,9 @@ function build(
     newRunId: () => "run_one",
     emit: (status) => emitted.push(status),
     pollIntervalMs: 50,
-  });
+  };
+  if (options.appPath) controlDeps.appPath = options.appPath;
+  const control = createUpdateControl(controlDeps);
   controls.push(control);
   return { control, launched, emitted, git, ran };
 }
