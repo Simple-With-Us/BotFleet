@@ -19,6 +19,7 @@ import {
   companionOriginHealth,
   createCompanionOriginEndpoint,
 } from "./companion-origin-gateway.mjs";
+import { adoptableCompanionTarget } from "./managed-companion-runtime.mjs";
 
 // Passed to the fork rather than left to the sidecar's own defaults, so the
 // port this file fetches the control API on cannot drift from the port the
@@ -29,6 +30,7 @@ const CONTROL_PORT = 8811;
 const COMPANION_PORT = 8810;
 
 let proc = null;
+let supervised = null;
 let lastError = null;
 let advertisedHostedUrl = null;
 let originTarget = null;
@@ -123,27 +125,38 @@ async function control(method, urlPath, body) {
     options.body = JSON.stringify(body);
     options.headers = { "content-type": "application/json" };
   }
-  const res = await fetch(`http://127.0.0.1:${CONTROL_PORT}${urlPath}`, options);
+  const res = await fetch(`http://127.0.0.1:${activeControlPort()}${urlPath}`, options);
   if (!res.ok && res.status !== 404) throw new Error(`companion control ${res.status}`);
   return res.json();
 }
 
-/** Whether this process owns a running sidecar. */
+const activeControlPort = () => supervised?.controlPort ?? CONTROL_PORT;
+
+/** Whether this process owns a running sidecar — either the fork below, or a
+ * sidecar the launchd supervisor owns that this app has adopted. */
 export function companionRunning() {
-  return proc !== null;
+  return proc !== null || supervised !== null;
 }
 
 /** The hosted route the owned sidecar is currently advertising. This is
  * process-local public state only; the connector credential never enters
  * this module. */
 export function companionAdvertisedHostedUrl() {
-  return proc ? advertisedHostedUrl : null;
+  return companionRunning() ? advertisedHostedUrl : null;
 }
 
 /** Exact private origin belonging to the currently owned sidecar. This value
- * is main-process-only and must never cross IPC into the renderer. */
+ * is main-process-only and must never cross IPC into the renderer.
+ *
+ * A supervised sidecar's origin is only ever returned after `adopt()` proved
+ * that socket answers with the companion identity for that exact pid. The
+ * guardian downstream re-checks liveness on every request, so a sidecar that
+ * dies after adoption fails closed instead of forwarding to whatever else binds
+ * the socket later. */
 export function companionOriginTarget() {
-  return proc && originTarget ? { ...originTarget } : null;
+  if (proc && originTarget) return { ...originTarget };
+  if (supervised) return { pid: supervised.sidecarPid, socketPath: supervised.socketPath };
+  return null;
 }
 
 /** Main installs one synchronous exit observer. It invalidates the guardian
@@ -186,10 +199,36 @@ export function stopCompanion() {
   return serialize(() => stop());
 }
 
+/** Adopt the launchd-supervised sidecar, if there is one we can prove.
+ *
+ * This is the whole of BF-1339 from the app's side. The sidecar is no longer a
+ * child of this process, so the old "I forked it, so it is mine" reasoning no
+ * longer holds — and it must not, or the app would fork a second sidecar onto a
+ * port the first one already owns and leave the phone talking to whichever
+ * process won the race.
+ *
+ * The runtime file is a claim, not a capability: it can be stale, hand-edited
+ * or left behind by a crashed supervisor. So it is treated as a *candidate*
+ * until `companionOriginHealth` answers on that exact socket with the companion
+ * identity for that exact pid. Unproven means "not ours", and the app falls
+ * through to forking a sidecar it does own. */
+async function adopt(log) {
+  const claim = await adoptableCompanionTarget({ probeOwnership: companionOriginHealth });
+  if (!claim) return false;
+  supervised = claim;
+  advertisedHostedUrl = null;
+  originTarget = claim.target;
+  log?.(`companion adopted supervised sidecar pid=${claim.sidecarPid}`);
+  return true;
+}
+
 /** startCompanion's body, run inside the transition queue. */
 async function start({ resourcesPath, harnessPort, hostedUrl = null, log }) {
-  if (proc) return companionState();
+  if (companionRunning()) return companionState();
   lastError = null;
+  // Adoption comes first: when the LaunchAgent is loaded, the supervised
+  // sidecar is the steady state and forking would be the bug.
+  if (await adopt(log)) return companionState();
   const resolved = entryPoint(resourcesPath);
   if (!resolved) {
     // In dev this now means even companion/src is gone — a broken checkout,
@@ -321,6 +360,19 @@ async function stop() {
   advertisedHostedUrl = null;
   originTarget = null;
   lastError = null;
+  // A supervised sidecar is launchd's, not this app's. Quitting the app must
+  // not take it down — that is the entire point of the fix — and neither must
+  // the Settings toggle, because killing it here would stop a service other
+  // sessions (a paired phone, the hosted route) are using. Say how to stop it
+  // instead of pretending the toggle owns it.
+  if (supervised) {
+    supervised = null;
+    const state = await companionState();
+    return {
+      ...state,
+      error: "The companion runs as a background service. To stop it, unload its LaunchAgent.",
+    };
+  }
   if (!child) return companionState();
   expectedStops.add(child);
   try {
@@ -350,7 +402,7 @@ async function stop() {
  * Callers publish only after public health verification succeeds. */
 export function setCompanionHostedUrl(endpoint) {
   return serialize(async () => {
-    if (!proc) return companionState();
+    if (!companionRunning()) return companionState();
     const state = await control("PUT", "/hosted-endpoint", { url: endpoint || null });
     advertisedHostedUrl = endpoint || null;
     return state;
@@ -361,7 +413,7 @@ export function setCompanionHostedUrl(endpoint) {
  * than an absence — the panel should never have to guess. */
 export async function companionState() {
   const keepAwake = companionKeepAwakeAtRest();
-  if (!proc) {
+  if (!companionRunning()) {
     const state = {
       enabled: false,
       keepAwake,
@@ -375,12 +427,18 @@ export async function companionState() {
   }
   try {
     const state = await control("GET", "/state");
-    return { enabled: true, keepAwake, ...state };
+    return {
+      enabled: true,
+      keepAwake,
+      supervised: supervised !== null,
+      ...state,
+    };
   } catch {
     // running but unreachable: report it rather than claiming health
     return {
       enabled: true,
       keepAwake,
+      supervised: supervised !== null,
       port: COMPANION_PORT,
       devices: [],
       connectedDeviceIds: [],
@@ -393,7 +451,7 @@ export async function companionState() {
 /** Open or close a pairing window on the running sidecar. A conditional close
  * cannot erase a newer code created after the renderer began cancelling. */
 export async function companionPairing(open, expectedToken) {
-  if (!proc) return companionState();
+  if (!companionRunning()) return companionState();
   const conditionalClose = !open && expectedToken !== undefined;
   const candidate = String(expectedToken ?? "");
   const token = /^omb_pair_[A-Za-z0-9_-]{43}$/.test(candidate)
@@ -407,6 +465,7 @@ export async function companionPairing(open, expectedToken) {
     return {
       enabled: true,
       keepAwake: companionKeepAwakeAtRest(),
+      supervised: supervised !== null,
       ...state,
     };
   } catch {
@@ -420,7 +479,7 @@ export async function companionPairing(open, expectedToken) {
 
 /** Unpair one device. Ignores an id the renderer should not have sent. */
 export async function companionRevoke(deviceId) {
-  if (!proc) return companionState();
+  if (!companionRunning()) return companionState();
   // the id came from the renderer, so it does not get to shape a path
   if (!/^[\w-]{1,64}$/.test(String(deviceId ?? ""))) return companionState();
   await control("DELETE", `/devices/${deviceId}`).catch(() => {});
@@ -429,7 +488,7 @@ export async function companionRevoke(deviceId) {
 
 /** Enable or remove interactive cloud-desktop access for one paired phone. */
 export async function companionCloudDesktopAccess(deviceId, allowed) {
-  if (!proc) return companionState();
+  if (!companionRunning()) return companionState();
   if (!/^[\w-]{1,64}$/.test(String(deviceId ?? ""))) return companionState();
   await control(allowed ? "POST" : "DELETE", `/devices/${deviceId}/cloud-desktop`).catch(() => {});
   return companionState();
