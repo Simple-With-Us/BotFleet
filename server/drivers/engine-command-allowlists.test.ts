@@ -36,6 +36,11 @@ describe("ENGINE_COMMAND_ALLOWLIST_BY_DRIVER", () => {
     expect(offered.map((entry) => entry.name)).toEqual(["compact"]);
   });
 
+  it("offers Cursor /compress when announced on the 1.0.0 line", () => {
+    const offered = offeredEngineCommands("cursorAgent", ["compress", "config"], "1.0.0 (Cursor Agent)");
+    expect(offered.map((entry) => entry.name)).toEqual(["compress"]);
+  });
+
   it("offers Kimi built-ins on the verified 0.29.1 line", () => {
     const offered = offeredEngineCommands("kimiAgent", ["compact", "context"], "0.29.1");
     expect(offered.map((entry) => entry.name)).toEqual(["compact", "context"]);

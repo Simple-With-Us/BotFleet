@@ -20,7 +20,7 @@ Shared fake-agent coverage: `server/drivers/acp/commands.test.ts` (`FAKE_ACP_COM
 | Driver kind      | Allowlist source                                      |
 | ---------------- | ----------------------------------------------------- |
 | `grokAgent`      | `grokAgent/1.0.0/announced.json` + upstream `/compact` |
-| `cursorAgent`    | fake-acp `compact`/`context`                          |
+| `cursorAgent`    | `cursorAgent/1.0.0/builtins.json` + fake-acp `/compress` |
 | `opencodeGo`     | fake-acp `compact`/`context`                          |
 | `kimiAgent`      | fake-acp `compact`/`context`                          |
 | `qwenAgent`      | fake-acp `compact`/`context`                          |
@@ -42,8 +42,10 @@ Live per-binary probes on macOS CI remain the authority before expanding allowli
 | `claudeAgent`        | `.claude/commands`, `$CLAUDE_CONFIG_DIR/commands`  |
 | `codex`              | `.codex/prompts`, `$CODEX_HOME/prompts`            |
 | `antigravityAgent`   | `.gemini/commands`, `~/.gemini/commands`           |
-| `cursorAgent`        | `.cursor/commands`, `~/.cursor/commands`           |
+| `cursorAgent`        | `.cursor/commands`, `~/.cursor/commands`, `.cursor/skills/*/SKILL.md` |
 | `opencodeGo`         | same as Cursor tree                                |
 | `grokAgent`          | `.grok/workflows`, `$GROK_HOME/workflows` (names)  |
 
 Discovered names merge with cached runtime announcements; the allowlist still gates what the menu may offer.
+
+For `cursorAgent`, built-in CLI commands are always merged into the announced catalog, and project or user custom commands gain dynamic allowlist rows when their names are discovered or announced (`server/drivers/cursor-engine-commands.ts`).

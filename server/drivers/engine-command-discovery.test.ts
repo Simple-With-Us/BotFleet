@@ -53,6 +53,30 @@ describe("discoverStaticEngineCommands", () => {
     ).toEqual(["ship", "triage"]);
   });
 
+  it("reads Cursor project and user commands plus skill names", () => {
+    const home = join(scratch, "home");
+    const project = join(scratch, "repo");
+    mkdirSync(join(project, ".cursor", "commands"), { recursive: true });
+    mkdirSync(join(home, ".cursor", "commands"), { recursive: true });
+    mkdirSync(join(project, ".cursor", "skills", "review"), { recursive: true });
+    writeFileSync(join(project, ".cursor", "commands", "ship.md"), "ship");
+    writeFileSync(join(home, ".cursor", "commands", "triage.md"), "triage");
+    writeFileSync(join(project, ".cursor", "skills", "review", "SKILL.md"), "# review skill\n");
+
+    expect(
+      discoverStaticEngineCommands("cursorAgent", {
+        cwd: project,
+        home,
+      }),
+    ).toEqual(expect.arrayContaining(["ship", "triage", "review"]));
+    expect(
+      discoverStaticEngineCommands("cursorAgent", {
+        cwd: project,
+        home,
+      }).length,
+    ).toBe(3);
+  });
+
   it("returns nothing for engines without a static scanner", () => {
     expect(discoverStaticEngineCommands("minimax", { cwd: scratch, home: scratch })).toEqual([]);
   });

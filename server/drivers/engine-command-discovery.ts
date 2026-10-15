@@ -91,10 +91,40 @@ const scanGemini: Scanner = (ctx) => {
   return names;
 };
 
+function scanCursorSkills(root: string): string[] {
+  if (!existsSync(root)) return [];
+  const names: string[] = [];
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return [];
+  }
+  for (const entry of entries) {
+    const skillDir = join(root, entry);
+    let stat;
+    try {
+      stat = statSync(skillDir);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    if (!existsSync(join(skillDir, "SKILL.md"))) continue;
+    const name = normalizeEngineCommandName(entry);
+    if (name) names.push(name);
+  }
+  return names;
+}
+
 const scanCursor: Scanner = (ctx) => {
   const names: string[] = [];
-  if (ctx.cwd) names.push(...scanCommandsTree(join(ctx.cwd, ".cursor", "commands")));
-  names.push(...scanCommandsTree(join(homeDir(ctx), ".cursor", "commands")));
+  if (ctx.cwd) {
+    names.push(...scanCommandsTree(join(ctx.cwd, ".cursor", "commands")));
+    names.push(...scanCursorSkills(join(ctx.cwd, ".cursor", "skills")));
+  }
+  const home = homeDir(ctx);
+  names.push(...scanCommandsTree(join(home, ".cursor", "commands")));
+  names.push(...scanCursorSkills(join(home, ".cursor", "skills")));
   return names;
 };
 

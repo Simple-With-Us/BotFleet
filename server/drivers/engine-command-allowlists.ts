@@ -4,6 +4,7 @@
 // server/drivers/__fixtures__/engine-commands/ proves the command is safe
 // to forward.  Titles and descriptions are BotFleet copy, never engine text.
 
+import { CURSOR_AGENT_BUILTIN_COMMANDS } from "./cursor-engine-commands.ts";
 import type { EngineCommandSpec } from "./engine-commands.ts";
 
 type ProvenOn = EngineCommandSpec["provenOn"];
@@ -52,7 +53,7 @@ const ACP_CLAUDE_LIKE = (provenOn: ProvenOn) => cloneCommands(provenOn, CLAUDE_B
 export const ENGINE_COMMAND_ALLOWLIST_BY_DRIVER: Readonly<Record<string, readonly EngineCommandSpec[]>> = {
   claudeAgent: CLAUDE_BUILTIN_COMMANDS,
   grokAgent: GROK_AGENT_COMMANDS,
-  cursorAgent: ACP_CLAUDE_LIKE({ cliVersion: "1.0.0", date: "2026-10-15" }),
+  cursorAgent: CURSOR_AGENT_BUILTIN_COMMANDS,
   opencodeGo: ACP_CLAUDE_LIKE({ cliVersion: "1.0.0", date: "2026-10-15" }),
   kimiAgent: ACP_CLAUDE_LIKE({ cliVersion: "0.29.1", date: "2026-10-15" }),
   deepseekAgent: ACP_CLAUDE_LIKE({ cliVersion: "0.29.1", date: "2026-10-15" }),

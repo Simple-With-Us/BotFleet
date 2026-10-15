@@ -592,7 +592,17 @@ import {
   discoverStaticEngineCommands,
   mergeAnnouncedEngineCommands,
 } from "./drivers/engine-command-discovery.ts";
-import { engineCommandText, offeredEngineCommands } from "./drivers/engine-commands.ts";
+import {
+  buildCursorAgentAllowlist,
+  CURSOR_BUILTIN_COMMAND_NAMES,
+  discoverCursorCommandCatalog,
+} from "./drivers/cursor-engine-commands.ts";
+import {
+  ENGINE_COMMAND_ALLOWLIST,
+  engineCommandText,
+  offeredEngineCommands,
+  type EngineCommandSpec,
+} from "./drivers/engine-commands.ts";
 import {
   botCommandRequestSchema,
   COMMAND_SURFACES,
@@ -3645,14 +3655,35 @@ function commandEngineFor(bot: BotRecord): CommandEngine {
   };
 }
 
-function announcedEngineCommands(bot: BotRecord, engine: CommandEngine): readonly string[] | null {
+function engineCommandDiscoveryContext(bot: BotRecord): { cwd: string | null; env: NodeJS.ProcessEnv } {
   const task = store.taskByThread(bot.id, bot.threadId);
+  return { cwd: task?.cwd ?? bot.cwd ?? null, env: process.env };
+}
+
+function announcedEngineCommands(bot: BotRecord, engine: CommandEngine): readonly string[] | null {
+  const ctx = engineCommandDiscoveryContext(bot);
   const cached = engineCommandCache.get(engine.instanceId, engine.cliVersion);
-  const discovered = discoverStaticEngineCommands(engine.driverKind, {
-    cwd: task?.cwd ?? bot.cwd ?? null,
-    env: process.env,
-  });
-  return mergeAnnouncedEngineCommands(cached, discovered);
+  const discovered = discoverStaticEngineCommands(engine.driverKind, ctx);
+  let merged = mergeAnnouncedEngineCommands(cached, discovered);
+  if (engine.driverKind === "cursorAgent") {
+    const catalog = discoverCursorCommandCatalog(ctx);
+    merged = mergeAnnouncedEngineCommands(merged, [...catalog.names, ...CURSOR_BUILTIN_COMMAND_NAMES]);
+  }
+  return merged;
+}
+
+function engineCommandAllowlistFor(
+  bot: BotRecord,
+  engine: CommandEngine,
+): Readonly<Record<string, readonly EngineCommandSpec[]>> {
+  if (engine.driverKind !== "cursorAgent") return ENGINE_COMMAND_ALLOWLIST;
+  const ctx = engineCommandDiscoveryContext(bot);
+  const catalog = discoverCursorCommandCatalog(ctx);
+  const announced = announcedEngineCommands(bot, engine) ?? [];
+  return {
+    ...ENGINE_COMMAND_ALLOWLIST,
+    cursorAgent: buildCursorAgentAllowlist(announced, catalog),
+  };
 }
 
 /** The answer GET /api/bots/:id/commands gives for a bot on a surface. */
@@ -3668,6 +3699,7 @@ function commandsFor(bot: BotRecord, surface: CommandSurface) {
     allowsMultipleThreads: allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode)),
     hasSession: Boolean(task?.resumeCursors[engine.instanceId]),
     announced: announcedEngineCommands(bot, engine),
+    allowlist: engineCommandAllowlistFor(bot, engine),
   });
 }
 
@@ -3818,8 +3850,13 @@ async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface
     return commandFailure(409, "command_disabled", reason);
   }
   const engine = commandEngineFor(bot);
-  const spec = offeredEngineCommands(engine.driverKind, announcedEngineCommands(bot, engine) ?? [], engine.cliVersion)
-    .find((candidate) => candidate.name === command.name);
+  const allowlist = engineCommandAllowlistFor(bot, engine);
+  const spec = offeredEngineCommands(
+    engine.driverKind,
+    announcedEngineCommands(bot, engine) ?? [],
+    engine.cliVersion,
+    allowlist,
+  ).find((candidate) => candidate.name === command.name);
   const commandId = randomUUID();
   const run: EngineCommandRun = { id: commandId, name: command.name, args: args.value, surface, output: spec?.output ?? "local" };
   try {
