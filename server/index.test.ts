@@ -6154,6 +6154,19 @@ describe("instance CLI override API", () => {
     expect(await candidates("name=dsh&aliases=%20,%20")).toEqual(bare);
   });
 
+  it("rejects an oversized cli-candidates query instead of searching it", async () => {
+    // Kody review: the boundary value used to be split and spread straight into
+    // the search.  It is schema-bounded now, and an over-long value is a client
+    // error rather than a few thousand existsSync calls.
+    const tooLong = await api("GET", `/api/cli-candidates?name=dsh&aliases=${"c".repeat(5000)}`);
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.body).toMatchObject({ ok: false, error: "invalid_cli_candidates_query" });
+    // A name long enough to be a path still fits: the head is length-bounded,
+    // not shape-restricted, because a configured override IS a path.
+    expect((await api("GET", `/api/cli-candidates?name=${"x".repeat(600)}`)).status).toBe(400);
+    expect((await api("GET", `/api/cli-candidates?name=${"/opt/"}${"y".repeat(200)}`)).status).toBe(200);
+  });
+
   it("reports a missing binary as a failed probe with install info", async () => {
     const res = await api("POST", "/api/cli-test", { cli: "/no/such/binary-anywhere", driver: "claudeAgent" });
     expect(res.status).toBe(200);

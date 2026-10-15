@@ -667,14 +667,16 @@ describe("findCliCandidates", () => {
       process.env.PATH = bin;
       resetPathCacheForTests();
       writeFileSync(join(bin, "clutch"), "#!/bin/sh\n");
-      // A path in the list is not a command name to search for, and echoing it
-      // back would put a row in the picker the user cannot re-pick.
-      expect(findCliCandidates(["/opt/not/a/command", "", "clutch", "dsh\nclutch"])).toEqual([join(bin, "clutch")]);
+      // The head keeps the echo-back contract, an empty entry and a name
+      // carrying a newline are dropped, and the real alias is still searched.
+      expect(findCliCandidates(["/opt/not/a/command", "", "clutch", "dsh\nclutch"])).toEqual([
+        "/opt/not/a/command",
+        join(bin, "clutch"),
+      ]);
       expect(findCliCandidates([])).toEqual([]);
-      // …but a one-element list is still the scalar contract, so a lone path
-      // comes back rather than being searched for.  Dropping it here would
-      // break /api/cli-candidates?name=/some/path, which hands the caller's
-      // own path straight back.
+      // A newline in the head is never emitted at all — it is neither a bare
+      // name to search for nor a location to hand back.
+      expect(findCliCandidates(["dsh\nclutch"])).toEqual([]);
       expect(findCliCandidates(["/opt/not/a/command"])).toEqual(["/opt/not/a/command"]);
     } finally {
       if (previous === undefined) delete process.env.PATH;
@@ -698,6 +700,51 @@ describe("findCliCandidates", () => {
       writeFileSync(bin, "#!/bin/sh\n");
       symlinkSync(bin, join(link, "dsh"));
       expect(findCliCandidates(["dsh", "dsh"])).toEqual([bin]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("keeps a path-shaped head when an alias widens the list", () => {
+    // Kody review: routing every entry through isBareName dropped the head, so
+    // ?name=/opt/dsh&aliases=clutch answered differently from ?name=/opt/dsh.
+    // The head is the caller's default binary and may be a configured path, so
+    // it keeps the echo-back contract the scalar form has always had.
+    const bin = join(homedir(), "alias-head-bin");
+    fresh(bin);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = bin;
+      resetPathCacheForTests();
+      const clutch = join(bin, "clutch");
+      writeFileSync(clutch, "#!/bin/sh\n");
+      expect(findCliCandidates(["/opt/custom/dsh", "clutch"])).toEqual(["/opt/custom/dsh", clutch]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("caps how many alias names one call will search", () => {
+    // Kody review: every alias is a full PATH walk, so an unbounded list turned
+    // one request into thousands of existsSync calls.  Real engines declare one
+    // or two aliases; the cap is far above any legitimate use.
+    const bin = join(homedir(), "alias-cap-bin");
+    fresh(bin);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = bin;
+      resetPathCacheForTests();
+      const planted = Array.from({ length: 70 }, (_, i) => {
+        const p = join(bin, `cap${i}`);
+        writeFileSync(p, "#!/bin/sh\n");
+        return p;
+      });
+      // Head is absent, so only the cap decides how many rows come back.
+      expect(findCliCandidates(["", ...planted.map((_, i) => `cap${i}`)])).toHaveLength(64);
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;

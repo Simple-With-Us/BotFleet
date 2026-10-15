@@ -236,40 +236,24 @@ function isBareName(name: string): boolean {
   return Boolean(name) && !/[\n\r]/.test(name) && !/[/\\]/.test(name) && !/^[a-zA-Z]:/.test(name);
 }
 
-/** Absolute paths of every `name` binary on the augmented PATH, used by the
- * Engines panel's "detected" dropdown and the /api/cli-candidates endpoint.
- *
- * A list of names searches the default first and its aliases after it, each in
- * PATH order, and the union is deduped by inode — so one engine can offer every
- * binary that runs it even when they do not share a name.  Clutch is the case
- * that forced this: its driver default is `dsh`, but the Clutch-branded build
- * is installed as `clutch` and is the one carrying Clutch's own profiles, so a
- * single-name search made it invisible to the picker.
- *
- * Within one name the order is PATH order (first = what a bare invocation
- * would run), and multiple PATH entries resolving to the same file (symlinks,
- * copies installed by different package managers that share an upstream
- * tarball) collapse to one row: the picker shows one row for the actual binary
- * the user has.
- *
- * A lone path-ish name is echoed back as-is — it already IS a location.  A
- * path inside a LIST is dropped instead of echoed: the caller asked about
- * command names, and a row the user cannot re-pick is worse than no row. */
-export function findCliCandidates(name: string | string[]): string[] {
-  if (Array.isArray(name)) {
-    // A one-element list IS the scalar case, so a lone path-ish name keeps its
-    // "echo it back, it already IS a location" behaviour.  Only a real list
-    // treats its entries as command names.
-    if (name.length === 1) return findCliCandidates(name[0]);
-    const wanted = [...new Set(name.filter(isBareName))];
-    if (wanted.length === 0) return [];
-    const out: string[] = [];
-    for (const wantedName of wanted) out.push(...findCliCandidates(wantedName));
-    return dedupeByInode(out);
-  }
-  if (!name || /[\n\r]/.test(name)) return [];
-  if (/[/\\]/.test(name) || /^[a-zA-Z]:/.test(name)) return [name];
-  const exts = process.platform === "win32" ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];
+/** A name that is already a location: it is handed back, never searched for.
+ * A newline disqualifies it — that value is never emitted at all. */
+function isPathShaped(name: string): boolean {
+  return Boolean(name) && !/[\n\r]/.test(name) && (/[/\\]/.test(name) || /^[a-zA-Z]:/.test(name));
+}
+
+/** Executable suffixes this platform will resolve for a bare command. */
+function candidateExts(): string[] {
+  return process.platform === "win32"
+    ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+    : [""];
+}
+
+/** Every PATH entry holding `name`, in PATH order.  Deliberately does NOT
+ * dedupe: one search per name, then ONE dedupe across the union, so an alias
+ * that is a symlink to the default's binary still costs a single walk rather
+ * than a stat pass per name. */
+function searchNameOnPath(name: string, exts: string[]): string[] {
   const out: string[] = [];
   for (const dir of augmentedPath().split(delimiter)) {
     if (!dir) continue;
@@ -281,7 +265,50 @@ export function findCliCandidates(name: string | string[]): string[] {
       }
     }
   }
-  return dedupeByInode(out);
+  return out;
+}
+
+/** How many alias names one call will search.  Each name is a full PATH walk,
+ * so an unbounded list turns a single request into thousands of existsSync
+ * calls.  Real engines declare one or two aliases, so this sits far above any
+ * legitimate use while keeping the worst case bounded. */
+const CLI_ALIAS_LIMIT = 64;
+
+/** Absolute paths of every `name` binary on the augmented PATH, used by the
+ * Engines panel's "detected" dropdown and the /api/cli-candidates endpoint.
+ *
+ * A list searches the head (the driver's default binary) first and its aliases
+ * after it, each in PATH order, then dedupes by inode across the WHOLE union —
+ * so one engine offers every binary that runs it even when they do not share a
+ * name.  Clutch is the case that forced this: its driver default is `dsh`, but
+ * the Clutch-branded build is installed as `clutch` and is the one carrying
+ * Clutch's own profiles, so a single-name search made it invisible.
+ *
+ * Within one name the order is PATH order (first = what a bare invocation
+ * would run), and multiple PATH entries resolving to the same file (symlinks,
+ * copies installed by different package managers that share an upstream
+ * tarball) collapse to one row: the picker shows one row for the actual binary
+ * the user has.
+ *
+ * A path-shaped HEAD is echoed back exactly as the scalar form has always
+ * echoed it, list or no list — `?name=/opt/dsh` must answer with that path
+ * whether or not an alias widened the query.  Later path-shaped entries are
+ * dropped instead: the caller asked about command names, and a row the user
+ * cannot re-pick is worse than no row. */
+export function findCliCandidates(name: string | string[]): string[] {
+  const exts = candidateExts();
+  if (Array.isArray(name)) {
+    const [head, ...rest] = name;
+    const out: string[] = [];
+    if (isPathShaped(head)) out.push(head);
+    else if (isBareName(head)) out.push(...searchNameOnPath(head, exts));
+    const aliases = [...new Set(rest.filter(isBareName))].slice(0, CLI_ALIAS_LIMIT);
+    for (const alias of aliases) out.push(...searchNameOnPath(alias, exts));
+    return dedupeByInode(out);
+  }
+  if (isPathShaped(name)) return [name];
+  if (!isBareName(name)) return [];
+  return dedupeByInode(searchNameOnPath(name, exts));
 }
 
 /** Keep the first occurrence of each unique target file. Symlinks, npm-global
