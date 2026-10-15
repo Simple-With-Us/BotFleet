@@ -208,7 +208,14 @@ function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
   if (!Array.isArray(aliases)) return [];
   // A path or a newline is not a command name; findCliCandidates drops those
   // too, but keeping the list clean here keeps the cache key honest.
-  return [...new Set(aliases.filter((a): a is string => typeof a === "string" && Boolean(a) && !/[\n\r/\\]/.test(a)))];
+  const out: string[] = [];
+  for (const entry of aliases) {
+    if (Object.prototype.toString.call(entry) !== "[object String]") continue;
+    const name = String(entry);
+    if (!name || /[\n\r/\\]/.test(name)) continue;
+    out.push(name);
+  }
+  return [...new Set(out)];
 }
 
 /** Every name that runs this driver: the default first, then its aliases. */
