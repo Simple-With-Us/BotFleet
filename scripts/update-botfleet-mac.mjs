@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, realpathSync } from "node:fs";
+import { createReadStream, realpathSync, rmSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -32,7 +32,6 @@ import {
   FAILED_INSTALL_KEEP,
   failedInstallBundles,
   failedInstallBundlesToPrune,
-  failedInstallStamp,
   pruneFailedInstallBundles,
 } from "./failed-install-retention.mjs";
 
@@ -3363,7 +3362,7 @@ async function sweepExpiredFailedInstallBundles(config, { reportKept = false } =
   }
   for (const path of pruneFailedInstallBundles(config.appPath, {
     listNames: () => present,
-    remove: (target) => rm(target, { recursive: true, force: true }),
+    remove: (target) => rmSync(target, { recursive: true, force: true }),
   })) {
     console.log(`Removed ${basename(path)}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
   }

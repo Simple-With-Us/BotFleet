@@ -29,7 +29,7 @@ test("pruneFailedInstallBundles removes only names this updater owns", () => {
     remove: (path) => rmSync(path, { recursive: true, force: true }),
   });
   assert.deepEqual(
-    [...removed.map((path) => path.split("/").at(-1))].sort(),
+    removed.map((path) => path.split("/").at(-1)).sort(),
     ["BotFleet.app.failed-1000", "BotFleet.app.failed-2000"].sort(),
   );
   assert.equal(FAILED_INSTALL_KEEP, 3);
