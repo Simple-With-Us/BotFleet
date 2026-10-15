@@ -7,7 +7,7 @@ import { useTranscriptionAvailability } from "@/lib/use-transcription-availabili
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { currentCall, useOnCall } from "@/lib/call";
-import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, Zap, Hash, AppWindow, MessageSquare, Pencil, Trash2 } from "lucide-react";
+import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, Zap, Hash, AppWindow, MessageSquare, Pencil, Trash2, Terminal } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
@@ -43,6 +43,11 @@ import {
   applyAutocomplete,
   type AutocompleteChoice,
 } from "@/lib/composer-autocomplete";
+import {
+  botCommandAutocompleteChoices,
+  fetchBotCommands,
+} from "@/lib/bot-commands-client";
+import type { BotCommandsResponse } from "../../shared/bot-commands.ts";
 
 function PermissionModeSelector({ bot, onSetAuto }: { bot: Bot; onSetAuto: (auto: boolean) => void }) {
   const [open, setOpen] = useState(false);
@@ -285,10 +290,29 @@ function ComposerInner({
   };
   const engineSupportsImages = imageTargetsSupport(text);
 
-  // ── Autocomplete picker (@ for bots, # for apps/channels/etc) ──
+  // ── Autocomplete picker (@ bots, # apps/channels, / slash commands) ──
+  const [botCommands, setBotCommands] = useState<BotCommandsResponse | null>(null);
+  useEffect(() => {
+    if (!bot || group) {
+      setBotCommands(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchBotCommands(bot.id, bot.threadId).then((menu) => {
+      if (!cancelled) setBotCommands(menu);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [bot?.id, bot?.threadId, bot?.busy, group]);
+
   const triggerInfo = autocompleteQueryAt(text, caret);
   const candidates = useMemo(() => {
     if (!triggerInfo || triggerInfo.start === dismissedAt) return [];
+    if (triggerInfo.trigger === "/") {
+      if (!bot || group || !botCommands) return [];
+      return botCommandAutocompleteChoices(botCommands, triggerInfo.query);
+    }
     const connectedApps = readCachedInventory()?.services;
     const terminology = resolveRoomLabels(state.config?.terminology);
     return getAutocompleteCandidates(triggerInfo, {
@@ -301,8 +325,31 @@ function ComposerInner({
       members,
       terminologySingular: terminology.singular,
     });
-  }, [triggerInfo, dismissedAt, state.bots, state.groups, state.routines, state.config?.terminology, bot?.id, group, members]);
+  }, [
+    triggerInfo,
+    dismissedAt,
+    state.bots,
+    state.groups,
+    state.routines,
+    state.config?.terminology,
+    bot?.id,
+    group,
+    members,
+    botCommands,
+  ]);
   const pickerOpen = candidates.length > 0;
+  const pickerLabel =
+    triggerInfo?.trigger === "@"
+      ? "Tag a Bot"
+      : triggerInfo?.trigger === "/"
+        ? "Slash Commands"
+        : "Link an App or Channel";
+  const pickerHeading =
+    triggerInfo?.trigger === "@"
+      ? "Bots"
+      : triggerInfo?.trigger === "/"
+        ? "Commands"
+        : "Apps & Channels";
 
   useEffect(() => setHighlight(0), [triggerInfo?.start, triggerInfo?.query]);
 
@@ -317,7 +364,7 @@ function ComposerInner({
   }, [text]);
 
   const pickCandidate = (choice: AutocompleteChoice) => {
-    if (!triggerInfo) return;
+    if (!triggerInfo || choice.disabled) return;
     const { text: nextText, caret: newCaret } = applyAutocomplete(text, caret, triggerInfo, choice);
     setText(nextText);
     setCaret(newCaret);
@@ -795,22 +842,24 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
         {pickerOpen && (
           <div
             role="listbox"
-            aria-label={triggerInfo?.trigger === "@" ? "Tag a Bot" : "Link an App or Channel"}
+            aria-label={pickerLabel}
             className="absolute bottom-full left-2 z-20 mb-2 w-80 max-h-72 overflow-y-auto rounded-xl border border-hairline/40 bg-raised shadow-lg"
           >
             <div className="border-b border-hairline/20 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-ink-secondary">
-              {triggerInfo?.trigger === "@" ? "Bots" : "Apps & Channels"}
+              {pickerHeading}
             </div>
             {candidates.map((item, i) => (
               <button
                 key={item.id}
                 role="option"
                 aria-selected={i === highlight}
+                disabled={item.disabled}
                 onClick={() => pickCandidate(item)}
                 onMouseEnter={() => setHighlight(i)}
                 className={cn(
                   "flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors",
                   i === highlight ? "bg-raised-hover" : "",
+                  item.disabled ? "cursor-not-allowed opacity-50" : "",
                 )}
               >
                 {item.kind === "bot" ? (
@@ -833,6 +882,10 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                   <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
                     <Zap size={14} aria-hidden="true" />
                   </span>
+                ) : item.kind === "command" ? (
+                  <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
+                    <Terminal size={14} aria-hidden="true" />
+                  </span>
                 ) : (
                   <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-raised text-accent">
                     <AppWindow size={14} aria-hidden="true" />
@@ -841,7 +894,9 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <span className="truncate text-[14px] font-medium text-ink" title={item.name}>
-                      {triggerInfo?.trigger}{item.name}
+                      {item.kind === "command" && item.command
+                        ? item.command.label
+                        : `${triggerInfo?.trigger ?? ""}${item.name}`}
                     </span>
                   </div>
                   {item.description && (
