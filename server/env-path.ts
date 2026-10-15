@@ -290,11 +290,11 @@ const CLI_ALIAS_LIMIT = 64;
  * tarball) collapse to one row: the picker shows one row for the actual binary
  * the user has.
  *
- * A path-shaped HEAD is echoed back exactly as the scalar form has always
- * echoed it, list or no list — `?name=/opt/dsh` must answer with that path
- * whether or not an alias widened the query.  Later path-shaped entries are
- * dropped instead: the caller asked about command names, and a row the user
- * cannot re-pick is worse than no row. */
+ * A head that is already a location is echoed back exactly as the scalar form
+ * has always echoed it, list or no list — `?name=/opt/dsh` must answer with
+ * that path whether or not an alias widened the query.  Later entries that
+ * are already locations are dropped instead: the caller asked about command
+ * names, and a row the user cannot re-pick is worse than no row. */
 export function findCliCandidates(name: string | string[]): string[] {
   const exts = candidateExts();
   if (Array.isArray(name)) {
