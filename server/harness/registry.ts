@@ -14,6 +14,7 @@ import { windowHeadlines, windowsLabelFromHeadlines } from "../../src/lib/quota-
 import { lastAntigravityQuotaSnapshot, quotaModelsFromSnapshot } from "../antigravity-quota.ts";
 import { decodeMinimaxConfig, resolveMinimaxCredentials, type MinimaxConfig } from "../drivers/minimax.ts";
 import { findCliCandidates } from "../env-path.ts";
+import { isJsonString } from "../schema.ts";
 import { clockReadingAt, elapsedSince, KNOWN_VERSION_MAX_AGE_MS, readClock, type ClockReading } from "../procs.ts";
 import { applyMiniMaxBalanceToRegistry, getCachedLocalMiniMaxConfig, getMiniMaxBalance } from "../minimax-balance.ts";
 import { quotaCooldowns } from "../model-fallback.ts";
@@ -208,7 +209,7 @@ function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
   if (!Array.isArray(aliases)) return [];
   // A path or a newline is not a command name; findCliCandidates drops those
   // too, but keeping the list clean here keeps the cache key honest.
-  return [...new Set(aliases.filter((a): a is string => typeof a === "string" && Boolean(a) && !/[\n\r/\\]/.test(a)))];
+  return [...new Set(aliases.filter((a): a is string => isJsonString(a) && Boolean(a) && !/[\n\r/\\]/.test(a)))];
 }
 
 /** Every name that runs this driver: the default first, then its aliases. */
@@ -1134,7 +1135,7 @@ export class ProviderRegistry {
       curr.snapshot.state === "available" &&
       curr.snapshot.authenticated === undefined &&
       prev.snapshot.state === "available" &&
-      typeof prev.snapshot.authenticated === "boolean" &&
+      (prev.snapshot.authenticated === true || prev.snapshot.authenticated === false) &&
       authFresh
     ) {
       return { ...curr, snapshot: { ...curr.snapshot, authenticated: prev.snapshot.authenticated } };
