@@ -36,6 +36,11 @@ import { instanceSupportsLocalComputer } from "@/lib/local-computer";
 import { queuedChipLabel, useUpdateDrain } from "@/lib/update-control";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { resolveRoomLabels } from "../../shared/terminology";
+import {
+  parseBusySendDefault,
+  shouldInterruptForBusySteer,
+  type BusySendDefault,
+} from "../../shared/busy-send-default.ts";
 import { readCachedInventory } from "@/lib/connected-apps-cache";
 import {
   autocompleteQueryAt,
@@ -470,7 +475,8 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
   };
 
   const hasContent = Boolean(text.trim()) || attachments.length > 0;
-  const send = (opts?: { steerNow?: boolean }) => {
+  const busySendDefault = parseBusySendDefault(state.config?.busySendDefault);
+  const send = (opts?: { steerNow?: boolean; queueOnly?: boolean }) => {
     if (locked) return;
     if (attachments.some((attachment) => attachment.kind === "image")) {
       if (!imageTargetsSupport(text)) {
@@ -505,6 +511,11 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
       dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       track("message_sent", { room: true });
     } else if (bot) {
+      let busyDelivery: BusySendDefault | undefined;
+      if (opts?.queueOnly) busyDelivery = "queue";
+      else if (opts?.steerNow) busyDelivery = "steer";
+      else if (busy) busyDelivery = busySendDefault;
+      const interruptForSteer = shouldInterruptForBusySteer(busy, busyDelivery, canSteer);
       dispatch({
         type: "send",
         botId: bot.id,
@@ -515,11 +526,16 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
         reply: replyTo ?? undefined,
         attachments,
         onError,
+        busyDelivery,
       });
-      if (busy && opts?.steerNow) {
+      if (interruptForSteer) {
         dispatch({ type: "interrupt", botId: bot.id });
       }
-      track("message_sent", { driver: bot.modelSelection?.instanceId, queued: busy && !canSteer, steerNow: opts?.steerNow });
+      track("message_sent", {
+        driver: bot.modelSelection?.instanceId,
+        queued: busy && busyDelivery === "queue",
+        steerNow: busyDelivery === "steer" && interruptForSteer,
+      });
     }
     setText("");
     setAttachments([]);
@@ -992,8 +1008,9 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             // Shift+Enter inserts a newline; plain Enter sends; Alt/Cmd+Enter steers immediately when busy
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
-              if (busy && !canSteer && (e.altKey || e.metaKey)) {
-                send({ steerNow: true });
+              if (busy && (e.altKey || e.metaKey)) {
+                if (group) send({ steerNow: true });
+                else send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
               } else {
                 send();
               }
@@ -1010,12 +1027,14 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
               ? "Listening…"
               : pendingItems.length > 0
               ? "Cmd/Ctrl+Enter steers all queued messages"
-              : busy && canSteer
+              : busy && busySendDefault === "steer" && canSteer
                 ? `${busyName} is working — Enter sends this into the running turn`
               : busy
                 ? group
                   ? `${busyName} is working — Enter queues your message`
-                  : `${busyName} is working — sends when this turn finishes`
+                  : busySendDefault === "steer"
+                    ? `${busyName} is working — Enter steers after stopping the turn`
+                    : `${busyName} is working — sends when this turn finishes`
                 : group
                   ? `Message ${group.name} — ${groupComposerHint(group, members ?? [])}`
                   : `Message ${bot?.name ?? ""}`
@@ -1052,7 +1071,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             <Mic size={18} />
           </button>
         )}
-        {hasContent && !locked && busy && !canSteer && (
+        {hasContent && !locked && busy && busySendDefault === "queue" && (
           <button
             type="button"
             onClick={() => send({ steerNow: true })}
@@ -1068,20 +1087,37 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
           <button
             type="button"
             onClick={(e) => {
-              if (busy && !canSteer && e.altKey) {
-                send({ steerNow: true });
+              if (busy && e.altKey) {
+                if (group) send({ steerNow: true });
+                else send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
               } else {
                 send();
               }
             }}
-            aria-label={busy && canSteer ? "Send into the running turn" : busy ? "Queue Message (Alt+Click to Steer Now)" : "Send Message"}
-            title={busy && canSteer ? "Send into the running turn" : busy ? "Sends when the current turn finishes (Alt+Click to Steer Now)" : "Send"}
+            aria-label={
+              busy && busySendDefault === "steer" && canSteer
+                ? "Send into the running turn"
+                : busy
+                  ? busySendDefault === "queue"
+                    ? "Queue Message (Alt+Click to Steer Now)"
+                    : "Steer after stopping the turn (Alt+Click to queue)"
+                  : "Send Message"
+            }
+            title={
+              busy && busySendDefault === "steer" && canSteer
+                ? "Send into the running turn"
+                : busy
+                  ? busySendDefault === "queue"
+                    ? "Sends when the current turn finishes (Alt+Click to Steer Now)"
+                    : "Stops the turn and sends now (Alt+Click to queue)"
+                  : "Send"
+            }
             className={cn(
               "flex size-8 shrink-0 items-center justify-center rounded-full text-white",
-              busy && !canSteer ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
+              busy && busySendDefault === "queue" ? "bg-raised text-ink-secondary hover:bg-raised-hover" : "bg-accent hover:brightness-110",
             )}
           >
-            {busy && !canSteer ? <Clock size={15} /> : <ArrowUp size={17} />}
+            {busy && busySendDefault === "queue" ? <Clock size={15} /> : <ArrowUp size={17} />}
           </button>
         )}
           </div>

@@ -135,21 +135,7 @@ struct ChatView: View {
     /// `Session` rather than parsing `instanceId`, which is operator-named
     private var currentModelSelection: ModelSelection? {
         guard case let .bot(bot) = current else { return nil }
-        guard let currentTask = bot.tasks?.first(where: { $0.threadId == bot.threadId }) else {
-            // Older harnesses send no task list; the bot-level record is all
-            // there is.
-            return bot.activeModelSelection ?? bot.modelSelection
-        }
-        if let taskSelection = currentTask.modelSelection {
-            return currentTask.activeModelSelection ?? taskSelection
-        }
-        // An inheriting task reads its own last-turn selection, never
-        // `bot.activeModelSelection`: that is the bot's latest turn across
-        // every task, so a fallback on another task would leak into this
-        // header.  The server clears an inheriting task's
-        // `activeModelSelection` when the bot's model changes (`patchBot`
-        // in server/store.ts), so a stale fallback does not outlive it.
-        return currentTask.activeModelSelection ?? bot.modelSelection
+        return BotConversationModelSelection.selection(for: bot, inThread: threadId)
     }
 
     private var currentDriverKind: String? {
@@ -768,12 +754,7 @@ struct ChatView: View {
                             state: BotState.forChat(current, in: session.state),
                             animated: BotState.forChat(current, in: session.state).showsActivity
                         )
-                        .overlay(alignment: .bottomTrailing) {
-                            if let currentDriverKind {
-                                ProviderMarkView(driverKind: currentDriverKind, model: currentModelSelection?.model, size: 21)
-                                    .offset(x: 3, y: 3)
-                            }
-                        }
+                        .providerBadge(for: current, avatarSize: 36)
                         VStack(alignment: .leading, spacing: 1) {
                             HStack(spacing: 6) {
                                 Text(current.name)
@@ -1058,8 +1039,13 @@ struct ChatView: View {
     /// Returns the task carrying the send, so a caller that has to act on
     /// the server's answer (Steer Now) can wait for it instead of guessing
     /// with a sleep.  Callers that do not care discard it.
+    private func busySendDefaultMode() -> String {
+        let raw = session.config?.busySendDefault?.lowercased() ?? "steer"
+        return raw == "queue" ? "queue" : "steer"
+    }
+
     @discardableResult
-    private func submit(_ explicitText: String? = nil) -> Task<Void, Never>? {
+    private func submit(_ explicitText: String? = nil, busyDelivery: String? = nil) -> Task<Void, Never>? {
         // This also cancels an in-flight permission prompt before it can
         // open the microphone after the message has already been sent.
         dictation.stop()
@@ -1091,8 +1077,18 @@ struct ChatView: View {
         )
         let sentText = text
         sending = true
+        var delivery = busyDelivery
+        if delivery == nil, current.busy, case .bot = current, busySendDefaultMode() == "queue" {
+            delivery = "queue"
+        }
         let task = Task {
-            let outcome = await session.send(sentText, to: current, attachments: outgoing, recording: recording)
+            let outcome = await session.send(
+                sentText,
+                to: current,
+                attachments: outgoing,
+                recording: recording,
+                busyDelivery: delivery
+            )
             sending = false
             let transcript = session.state.transcript(forThread: threadId)
             guard ComposerSendRecovery.shouldRestoreClearedDraft(
@@ -1504,7 +1500,7 @@ struct ChatView: View {
                     Label("Steer Now", systemImage: "bolt.fill")
                 }
                 Button {
-                    submit()
+                    submit(busyDelivery: "queue")
                 } label: {
                     Label("Queue Message", systemImage: "clock")
                 }
@@ -1755,13 +1751,7 @@ struct MessageRow: View {
     /// mark on its avatar.  Shared with the live reply row so the mark is
     /// already there while the reply is typed.
     static func modelSelection(of bot: Bot, inThread threadId: String) -> ModelSelection? {
-        if let currentTask = bot.tasks?.first(where: { $0.threadId == threadId }) {
-            if let taskSelection = currentTask.modelSelection {
-                return currentTask.activeModelSelection ?? taskSelection
-            }
-            return currentTask.activeModelSelection ?? bot.activeModelSelection ?? bot.modelSelection
-        }
-        return bot.activeModelSelection ?? bot.modelSelection
+        BotConversationModelSelection.selection(for: bot, inThread: threadId)
     }
 
     /// Whether a settled reply from `bot` carries the Read Aloud capsule.
@@ -1774,13 +1764,6 @@ struct MessageRow: View {
         return hasAudio
             || PersonalVoiceContract.isPersonalVoice(voice)
             || config?.canSpeak(agentVoice: voice) == true
-    }
-
-    private var senderDriverKind: String? {
-        guard let selection = senderModelSelection else { return nil }
-        // A cold registry cannot tell whether a named instance runs this model's
-        // native driver or a different one. Do not mislabel the sender's mark.
-        return session.instanceDriverKinds[selection.instanceId]
     }
 
     /// Who this message reads as coming from, in the reader's own words.  The
@@ -1831,13 +1814,7 @@ struct MessageRow: View {
         } else if message.role != .user {
             if let bot = senderBot {
                 if endsRun {
-                    BotAvatarView(bot: bot, size: 28, state: .idle, animated: false)
-                        .overlay(alignment: .bottomTrailing) {
-                            if let senderDriverKind {
-                                ProviderMarkView(driverKind: senderDriverKind, model: senderModelSelection?.model, size: 16)
-                                    .offset(x: 3, y: 3)
-                            }
-                        }
+                    BotAvatarWithProviderBadge(bot: bot, conversationThreadId: chat.threadId, size: 28, state: .idle, animated: false)
                 } else {
                     Color.clear.frame(width: 28, height: 28)
                 }
@@ -2873,14 +2850,7 @@ struct LiveReplyRow: View {
     @ViewBuilder
     private var avatar: some View {
         if let sender {
-            BotAvatarView(bot: sender, size: 28, state: .idle, animated: false)
-                .overlay(alignment: .bottomTrailing) {
-                    if let selection = MessageRow.modelSelection(of: sender, inThread: chat.threadId),
-                       let driverKind = session.instanceDriverKinds[selection.instanceId] {
-                        ProviderMarkView(driverKind: driverKind, model: selection.model, size: 16)
-                            .offset(x: 3, y: 3)
-                    }
-                }
+            BotAvatarWithProviderBadge(bot: sender, conversationThreadId: chat.threadId, size: 28, state: .idle, animated: false)
         } else if case let .room(room) = chat {
             RoomAvatarView(room: room, size: 28, state: .idle, animated: false)
         }

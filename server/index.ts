@@ -37,6 +37,10 @@ import {
   parseConversationMode,
 } from "../shared/conversation-mode.ts";
 import {
+  parseBusyDeliveryOverride,
+  parseBusySendDefault,
+} from "../shared/busy-send-default.ts";
+import {
   IMESSAGE_PERSONA_RULE,
   isImessageInboundSource,
   outboundImessageText,
@@ -124,6 +128,8 @@ import {
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
 import { checkBotOrganizeBody, parseAutoUpdateBody } from "./companion-writes.ts";
 import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
+import { isMcodeLockContentionMessage } from "./mcode-lock-contention.ts";
+import { ThreadWedgeGuard, type ThreadWedgeFailureInput } from "./thread-wedge-guard.ts";
 import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
@@ -314,6 +320,7 @@ import {
   credentialPromptFor,
   signInPromptFor,
   hasFileTools,
+  httpCatalogPromptFor,
   routinePromptFor,
 } from "./tools/prompts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
@@ -511,6 +518,8 @@ import {
   localVmSharedBotSession,
 } from "./local-vm-shared-session.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
+import { HelperTracker, type HelperPublication } from "./helpers/tracker.ts";
+import { helperSnapshotForWire, helperTranscript } from "../shared/helpers.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { stripAnsi } from "./desktop-probe.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
@@ -1085,6 +1094,96 @@ const COMMS_TOKEN = randomBytes(24).toString("hex");
  *  tracker only sees threads that have a run attached, and it resolves
  *  `engineId` from the event it is handed rather than from the live instance,
  *  so a breaker fed from there would miss turns and key on a stale engine. */
+const threadWedgeGuard = new ThreadWedgeGuard();
+/** Turns that saw a lock-contention runtime.error; counted once on turn.completed. */
+const mcodeLockContentionTurns = new Set<string>();
+
+function threadWedgeTurnToken(botId: string, threadId: string, turnId: string | undefined): string | null {
+  return turnId ? `${botId}:${threadId}:${turnId}` : null;
+}
+
+function rotateWedgedThread(
+  bot: { id: string; threadId: string },
+  wedgedThreadId: string,
+  instanceId: string,
+  streak: number,
+  detail: string,
+): void {
+  const wedgedTask = store.taskByThread(bot.id, wedgedThreadId);
+  const wasActive = bot.threadId === wedgedThreadId;
+  const wedgeKey = { botId: bot.id, threadId: wedgedThreadId, instanceId };
+  if (!wasActive) {
+    store.setResumeCursor(bot.id, instanceId, undefined, wedgedThreadId);
+    threadWedgeGuard.recordSuccess(wedgeKey);
+    console.warn(
+      `thread wedge: cleared resume cursor on inactive wedged thread ${wedgedThreadId} for bot ${bot.id} (${instanceId})`,
+    );
+    return;
+  }
+  const title = `Recovered after ${streak} wedged turns`;
+  const task = wedgedTask?.automationKey
+    ? store.rolloverAutomationTask(bot.id, wedgedTask.automationKey, {
+        title,
+        activate: true,
+        previousThreadId: wedgedThreadId,
+      })
+    : store.createTask(bot.id, title, true);
+  if (!task) {
+    console.error(`thread wedge: could not rotate task for bot ${bot.id} thread ${wedgedThreadId} (${detail})`);
+    return;
+  }
+  store.setResumeCursor(bot.id, instanceId, undefined, wedgedThreadId);
+  store.appendMessage(task.threadId, {
+    role: "bot",
+    kind: "activity",
+    tool: {
+      name: `Opened a fresh task after ${streak} consecutive turns on ${wedgedThreadId} failed without output (${detail.slice(0, 160)}). Continue here.`,
+      ok: false,
+    },
+  });
+  const updated = store.bot(bot.id);
+  if (updated) broadcast({ kind: "bot", bot: publicBot(updated) });
+  threadWedgeGuard.recordSuccess(wedgeKey);
+  console.warn(
+    `thread wedge: rotated bot ${bot.id} from ${wedgedThreadId} to ${task.threadId} after ${streak} wedge failures on ${instanceId}`,
+  );
+}
+
+function noteThreadWedge(bot: { id: string; threadId: string } | null, event: RuntimeEvent): void {
+  if (!bot) return;
+  const instanceId = event.providerInstanceId ?? (event.type === "runtime.error" ? event.provider : undefined);
+  if (!instanceId) return;
+  const key = { botId: bot.id, threadId: event.threadId, instanceId };
+  const turnToken = threadWedgeTurnToken(bot.id, event.threadId, event.turnId);
+  if (event.type === "runtime.error") {
+    if (!isMcodeLockContentionMessage(event.message)) return;
+    if (turnToken) mcodeLockContentionTurns.add(turnToken);
+    return;
+  }
+  if (event.type !== "turn.completed") return;
+  if (event.ok) {
+    if (turnToken) mcodeLockContentionTurns.delete(turnToken);
+    threadWedgeGuard.recordSuccess(key);
+    return;
+  }
+  if (stoppedTurns.has(`${bot.id}:${event.threadId}`)) {
+    if (turnToken) mcodeLockContentionTurns.delete(turnToken);
+    threadWedgeGuard.recordSuccess(key);
+    return;
+  }
+  const hadLockContention = turnToken ? mcodeLockContentionTurns.delete(turnToken) : false;
+  const failure: ThreadWedgeFailureInput = hadLockContention
+    ? { runtimeMessage: "Lock file is already being held" }
+    : { stopReason: event.stopReason };
+  const { shouldRotate, streak } = threadWedgeGuard.recordFailure(key, failure);
+  if (shouldRotate) {
+    const detail = hadLockContention
+      ? "Lock file is already being held"
+      : (event.stopReason ?? "turn failed");
+    rotateWedgedThread(bot, event.threadId, instanceId, streak, detail);
+  }
+}
+
 function noteDoomedDispatch(bot: { id: string } | null, event: RuntimeEvent): void {
   if (!bot) return;
   const instanceId = event.providerInstanceId ?? (event.type === "runtime.error" ? event.provider : undefined);
@@ -2915,6 +3014,11 @@ function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
       const preview = redactSecretsInText(event.preview);
       return preview === event.preview ? event : { ...event, preview };
     }
+    case "subagent.updated": {
+      const subagent = helperSnapshotForWire(event.subagent, redactSecretsInText);
+      if (subagent.label === event.subagent.label && subagent.lastActivity === event.subagent.lastActivity) return event;
+      return { ...event, subagent };
+    }
     default:
       return event;
   }
@@ -4232,6 +4336,7 @@ bus.subscribe((event: RuntimeEvent) => {
   }
   broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
   const bot = store.botByThread(event.threadId);
+  noteThreadWedge(bot ?? null, event);
   noteDoomedDispatch(bot ?? null, event);
   const group = bot ? undefined : store.groupByThread(event.threadId);
   // A turn.completed receipts only after the failover pick below: a turn a
@@ -5388,6 +5493,61 @@ bus.subscribe((event: RuntimeEvent) => {
   });
 });
 
+// Helper cards (jobs P3).  Registered after the transcript fold, so the
+// row exists before the first snapshot patches it.  A running helper is
+// published at once and then at most once a second; finishing publishes
+// immediately.  The fold broadcasts every bus event, including these.
+const helperTracker = new HelperTracker();
+let helperFlush: ReturnType<typeof setTimeout> | undefined;
+
+function publishHelperUpdate(publication: HelperPublication): void {
+  const subagent = helperSnapshotForWire(publication.subagent, redactSecretsInText);
+  const event: RuntimeEvent = {
+    type: "subagent.updated",
+    eventId: randomUUID(),
+    provider: publication.provider,
+    threadId: subagent.threadId,
+    createdAt: new Date(publication.at).toISOString(),
+    itemId: subagent.parentItemId,
+    subagent,
+  };
+  if (publication.providerInstanceId) event.providerInstanceId = publication.providerInstanceId;
+  if (publication.turnId) event.turnId = publication.turnId;
+  bus.publish(event);
+}
+
+function rememberHelper(event: Extract<RuntimeEvent, { type: "subagent.updated" }>): void {
+  const itemId = event.subagent.parentItemId;
+  const messages = store.messagesFor(event.threadId);
+  const mapped = toolMessageByItem.get(`${event.threadId}:${itemId}`);
+  const message =
+    (mapped ? messages.find((row) => row.id === mapped) : undefined) ??
+    messages.find((row) => row.tool?.itemId === itemId);
+  if (!message) return;
+  store.patchMessage(event.threadId, message.id, { helper: helperTranscript(event.subagent) });
+}
+
+function armHelperFlush(): void {
+  if (helperFlush) return;
+  const wait = helperTracker.nextWait(Date.now());
+  if (wait === null) return;
+  helperFlush = setTimeout(() => {
+    helperFlush = undefined;
+    for (const publication of helperTracker.due(Date.now())) publishHelperUpdate(publication);
+    armHelperFlush();
+  }, wait);
+  helperFlush.unref?.();
+}
+
+bus.subscribe((event: RuntimeEvent) => {
+  if (event.type === "subagent.updated") {
+    rememberHelper(event);
+    return;
+  }
+  for (const publication of helperTracker.observe(event, Date.now())) publishHelperUpdate(publication);
+  armHelperFlush();
+});
+
 const providerReloadDelegationDrains = new Set<string>();
 
 // A requesting turn that recorded handoffs settles them here.  A turn that
@@ -6483,6 +6643,25 @@ async function startTurn(
         { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace, recall: hasRecall, phone: hasPhone, linq: hasLinq, jobs: jobsForTurn, zulip: zulipMounted },
         { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq },
       );
+      const httpToolPrompt = usesDriverToolLoop
+        ? httpCatalogPromptFor(
+            {
+              agents: Boolean(integrations.agents),
+              localComputer: hasHostComputer,
+              workspace: worksInWorkspace,
+              recall: hasRecall,
+              phone: hasPhone,
+              github: hasHostComputer,
+              linq: hasLinq,
+              jobs: jobsForTurn,
+              zulip: zulipMounted,
+              commsDepth,
+              maxCommsDepth: MAX_COMMS_DEPTH,
+              chiefOfStaff: Boolean(bot.chiefOfStaff),
+            },
+            { omitHostFileToolFragments: hasHostComputer },
+          )
+        : "";
       // One builder, tagged parts, and the joined text is byte-identical to
       // the string this lane concatenated by hand before the split
       // (server/system-prompt.test.ts pins it).  Memory and mentions are
@@ -6523,6 +6702,11 @@ async function startTurn(
         // recall lane mounted by PR #465 (MiniMax, OpenAI-compat, Grok
         // HTTP) without those engines setting `integrations.qdrant`.
         { id: "recall", label: "Recall", text: recallPromptFor({ ...integrations, recall: hasRecall }) },
+        {
+          id: "tool-catalog",
+          label: "Tool catalog",
+          text: httpToolPrompt,
+        },
         // Only an HTTP tool-loop engine has a round ceiling at all — a CLI or
         // ACP engine runs one process per turn and is not bounded this way, so
         // telling those models about rounds would be a lie.
@@ -8771,6 +8955,25 @@ async function runGroupMemberTurn(
     hasHostComputer &&
     instance.adapter.capabilities.backgroundJobs === "emulated" &&
     jobSettings().enabled;
+  const roomHttpToolPrompt = httpOnlyToolSurface
+    ? httpCatalogPromptFor(
+        {
+          agents: Boolean(integrations.agents),
+          localComputer: hasHostComputer,
+          workspace: Boolean(workspace),
+          recall: hasRoomRecall,
+          phone: hasRoomPhone,
+          github: hasHostComputer,
+          linq: false,
+          jobs: Boolean(roomJobs),
+          zulip: false,
+          commsDepth: hop,
+          maxCommsDepth: MAX_COMMS_DEPTH,
+          chiefOfStaff: Boolean(bot.chiefOfStaff),
+        },
+        { omitHostFileToolFragments: hasHostComputer },
+      )
+    : "";
   const fleetSeat = fleetSeatPromptPart(bot);
   const roomSystem = buildSystemPrompt([
     { id: "persona", label: "Identity", text: system },
@@ -8796,6 +8999,7 @@ async function runGroupMemberTurn(
     // extends the same prompt to the in-process HTTP recall lane mounted
     // by PR #465 (MiniMax, OpenAI-compat, Grok HTTP), matching the 1:1 lane.
     { id: "recall", label: "Recall", text: recallPromptFor({ ...integrations, recall: hasRoomRecall }) },
+    { id: "tool-catalog", label: "Tool catalog", text: roomHttpToolPrompt },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
     { id: "memory", label: "Memory", text: roomFileTools ? `\n${memorySystemPrompt(bot.id).trim()}` : "" },
     { id: "owner-notes", label: "Owner notes", text: ownerNotesPrompt(bot.userNotes) },
@@ -9988,6 +10192,7 @@ function configStatus() {
     // without each re-deriving them from the key and drifting apart.
     roomLabels: resolveRoomLabels(cfg.terminology, cfg.terminologyCustom),
     conversationMode: parseConversationMode(cfg.conversationMode),
+    busySendDefault: parseBusySendDefault(cfg.busySendDefault),
     features: {
       skillRecorder: skillRecorderEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
@@ -14492,6 +14697,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // (`commitHeldSends`).  A recording has no queue to wait in, so it
         // runs now and the drain waits for it.
         const holdForUpdate = !bot.busy && !recording && updateDrain.active;
+        const busyDelivery =
+          parseBusyDeliveryOverride(body.busyDelivery) ?? parseBusySendDefault(cfg.busySendDefault);
         // Claude can accept the message inside its live turn. If the write
         // loses a race with turn settlement, or the engine cannot steer, the
         // existing server-side queue records it atomically for the next turn.
@@ -14500,7 +14707,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // A reload can dispose the live adapter after steer accepts this
           // message.  Hold it in the server queue until the replacement
           // fleet is attached, then dispatch it as a fresh turn.
-          if (bot.busy && !providerReloadInProgress && instance?.adapter.capabilities.queueing && instance.adapter.steer) {
+          if (
+            busyDelivery === "steer" &&
+            bot.busy &&
+            !providerReloadInProgress &&
+            instance?.adapter.capabilities.queueing &&
+            instance.adapter.steer
+          ) {
             const steered = await instance.adapter
               .steer(bot.threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
               .catch(() => false);
@@ -16470,6 +16683,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);
     }
+    if (method === "PATCH" && path === "/api/busy-send-default") {
+      const body = await readBody(req);
+      const patch = parseConfigPatch({ busySendDefault: body.busySendDefault });
+      if (patch.busySendDefault === undefined) {
+        return json(res, 400, { error: "nothing to save" });
+      }
+      cfg.busySendDefault = patch.busySendDefault;
+      saveConfig({ busySendDefault: cfg.busySendDefault });
+      const status = configStatus();
+      broadcast({ kind: "config", ...status });
+      return json(res, 200, status);
+    }
     // Feature toggles are not credentials, so the phone gets a narrow route
     // rather than write access to /api/config (which carries API keys).
     if (method === "PATCH" && path === "/api/features") {
@@ -18241,6 +18466,12 @@ await localVmStartupProbe.catch(() => {});
 await jobRegistry.adopt().catch((error) => {
   console.error(`[jobs] could not settle earlier jobs: ${error instanceof Error ? error.message : String(error)}`);
 });
+try {
+  const interrupted = store.settleInterruptedHelpers(Date.now());
+  if (interrupted > 0) console.log(`[helpers] boot: ${interrupted} helper(s) stopped by the restart`);
+} catch (error) {
+  console.error(`[helpers] could not settle interrupted helpers: ${error instanceof Error ? error.message : String(error)}`);
+}
 jobRegistry.startTimers();
 // Boot is done: the socket has been open since the top of this file, and the
 // full route table takes over from the boot-phase handler on the very next
