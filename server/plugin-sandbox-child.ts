@@ -119,6 +119,15 @@ function createHost(snapshot: SandboxHostSnapshot): PluginHost {
       return snapshot.bots.map((bot) => ({ ...bot }));
     },
     config,
+    settings: Object.freeze({
+      get: <T = unknown>(key: string): T | undefined => {
+        const value = snapshot.settings[key];
+        // SAFETY: same contract as config.get above; these are the
+        // plugin's own validated non-secret settings.
+        return (value === undefined ? undefined : cloneJson(value)) as T | undefined;
+      },
+      listKeys: () => Object.keys(snapshot.settings),
+    }),
   };
   return Object.freeze(host);
 }
@@ -231,6 +240,7 @@ function isHostSnapshot(value: unknown): value is SandboxHostSnapshot {
     if (!Array.isArray(value.configKeys) || value.configKeys.some((k) => typeof k !== "string")) return false;
   }
   if (!isPlainObject(value.config)) return false;
+  if (!isPlainObject(value.settings)) return false;
   return true;
 }
 

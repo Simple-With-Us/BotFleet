@@ -779,7 +779,9 @@ function busTransport(baseDir: string): PluginEventTransport {
       const plugin = await liveSandbox(listing, baseDir);
       if ("error" in plugin) return { ok: false, reason: "sandbox_exited" };
       if (!plugin.sandbox.exports.onEvent) return { ok: false, reason: "not_implemented" };
-      return invokePluginEvent(plugin, event, inputsOrThrow());
+      // The plugin's own non-secret settings ride along; secrets never do.
+      const settings = readPluginSettings(baseDir, pluginName).values;
+      return invokePluginEvent(plugin, event, inputsOrThrow(), settings);
     },
     onDecision: (pluginName, event, decision) => {
       try {

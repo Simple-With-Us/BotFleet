@@ -72,6 +72,12 @@ export interface PluginHost {
     get<T = unknown>(key: string): T | undefined;
     listKeys(): readonly string[];
   };
+  /** The plugin's own non-secret settings, validated against its
+   *  manifest.  Always visible; secret settings stay in the host. */
+  settings: {
+    get<T = unknown>(key: string): T | undefined;
+    listKeys(): readonly string[];
+  };
 }
 
 /** What a plugin module exports, as reported by the sandbox child after

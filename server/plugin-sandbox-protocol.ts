@@ -94,12 +94,17 @@ export type SandboxBotSummary = z.infer<typeof SandboxBotSummarySchema>;
  *  gates and the secret redaction have run.  The child answers the
  *  plugin's synchronous host calls from this snapshot, so the host API
  *  keeps its synchronous shape without the child ever reaching back into
- *  the server.  `null` means the capability was not declared. */
+ *  the server.  `null` means the capability was not declared.
+ *
+ *  `settings` is always present: these are the plugin's own non-secret
+ *  settings, validated against its manifest.  Secret values never appear
+ *  here; they stay in the host broker. */
 export const SandboxHostSnapshotSchema = z.object({
   bots: z.array(SandboxBotSummarySchema).nullable(),
   statusAllowed: z.boolean(),
   configKeys: z.array(z.string()).nullable(),
   config: z.record(z.string(), z.json()),
+  settings: z.record(z.string(), z.json()),
 }).strict();
 export type SandboxHostSnapshot = z.infer<typeof SandboxHostSnapshotSchema>;
 

@@ -192,8 +192,13 @@ function redactedConfigValue(inputs: PluginHostInputs, key: string): JsonValue |
 /** Capture the host data one call may see.  Capabilities the manifest did
  *  not declare are `null`, and the child reports the refusal when the
  *  plugin reaches for them.  Config values are redacted copies of
- *  allow-listed, non-secret keys only. */
-export function buildHostSnapshot(inputs: PluginHostInputs, capabilities: readonly string[]): SandboxHostSnapshot {
+ *  allow-listed, non-secret keys only.  `settings` are the plugin's own
+ *  validated non-secret settings; secret values never appear here. */
+export function buildHostSnapshot(
+  inputs: PluginHostInputs,
+  capabilities: readonly string[],
+  settings: Record<string, JsonValue> = {},
+): SandboxHostSnapshot {
   const allowed = new Set(capabilities);
   const statusAllowed = allowed.has("read.status");
   const bots = allowed.has("read.bots")
@@ -204,14 +209,14 @@ export function buildHostSnapshot(inputs: PluginHostInputs, capabilities: readon
       driver: String(bot.driver),
     }))
     : null;
-  if (!allowed.has("read.config")) return { bots, statusAllowed, configKeys: null, config: {} };
+  if (!allowed.has("read.config")) return { bots, statusAllowed, configKeys: null, config: {}, settings: { ...settings } };
   const configKeys = inputs.listConfigKeys().filter((key) => isPluginConfigKey(key) && !isSecretConfigKey(key));
   const config: Record<string, JsonValue> = {};
   for (const key of configKeys) {
     const value = redactedConfigValue(inputs, key);
     if (value !== undefined) config[key] = value;
   }
-  return { bots, statusAllowed, configKeys: [...configKeys], config };
+  return { bots, statusAllowed, configKeys: [...configKeys], config, settings: { ...settings } };
 }
 
 /** One handler call into the sandbox.  `onEvent` and `getHealth`
@@ -586,11 +591,12 @@ export function invokePluginEvent(
   plugin: LoadedPlugin,
   event: PluginEventEnvelope,
   inputs: PluginHostInputs,
+  settings: Record<string, JsonValue> = {},
 ): Promise<PluginSandboxResult> {
   // SAFETY: the envelope parsed against pluginEventEnvelopeSchema before
   // this call, so re-serializing it is JSON by construction.
   const payload = JSON.parse(JSON.stringify(event)) as JsonValue;
-  return plugin.sandbox.call({ handler: "onEvent", event: payload }, buildHostSnapshot(inputs, plugin.capabilities));
+  return plugin.sandbox.call({ handler: "onEvent", event: payload }, buildHostSnapshot(inputs, plugin.capabilities, settings));
 }
 
 /** Ask a loaded plugin for its health snapshot.  Best-effort: any

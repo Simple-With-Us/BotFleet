@@ -15,6 +15,7 @@ import {
   type PluginLogEvent,
 } from "./plugin-loader.ts";
 import { PluginCardResultSchema } from "./plugin-sandbox-protocol.ts";
+import type { PluginEventEnvelope } from "../shared/plugin-events.ts";
 import { removeDirSafe } from "./plugin-registry.ts";
 import type { PluginListing } from "./plugin-types.ts";
 
@@ -258,7 +259,7 @@ describe("plugin result schemas", () => {
 });
 
 describe("plugin sandbox event delivery", () => {
-  const EVENT = {
+  const EVENT: PluginEventEnvelope = {
     eventId: "zulip:BF-Plumber:42",
     type: "zulip.message",
     source: { platform: "zulip", accountId: "BF-Plumber" },
