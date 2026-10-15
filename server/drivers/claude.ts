@@ -421,7 +421,7 @@ const FrameMeta = z
   // a frame that is not an object at all carries none of them
   .catch({});
 
-const assistantMessageIdSchema = z.object({ id: z.string().min(1) });
+const assistantMessageIdSchema = z.object({ id: z.string().min(1) }).passthrough();
 
 /** How many helper tokens this frame adds.  Frames of one assistant message
  * repeat a running total, so a later frame with the same id contributes only
@@ -430,10 +430,15 @@ export function helperUsageDelta(seen: Map<string, number> | undefined, messageI
   if (total <= 0) return 0;
   if (!seen || !messageId) return total;
   const prior = seen.get(messageId) ?? 0;
-  const delta = total - prior;
-  if (delta <= 0) return 0;
+  if (total < prior) {
+    // Engine reset: accept the new floor so the next non-decreasing frame
+    // is compared against the post-reset value, not the pre-reset peak.
+    seen.set(messageId, total);
+    return 0;
+  }
+  if (total === prior) return 0;
   seen.set(messageId, total);
-  return delta;
+  return total - prior;
 }
 
 /** Lifecycle states after which a command will never run (it may have run

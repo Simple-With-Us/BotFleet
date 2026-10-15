@@ -12,6 +12,7 @@ import {
   pruneDeadThreads,
   readThread,
   readThreadTail,
+  runningHelperRows,
   searchMessages,
   setActiveLeaf,
   updateMessage,
@@ -35,6 +36,42 @@ describe("message-db", () => {
     closeMessageDb();
     rmSync(DATA_DIR, { recursive: true, force: true });
     mkdirSync(DATA_DIR, { recursive: true });
+  });
+
+  it("indexes running helpers without scanning every message row", () => {
+    insertMessage("t-run", {
+      ...msg("m-running", "helper"),
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-1" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Survey",
+        toolCount: 0,
+        status: "running",
+        startedAt: 1_000,
+        endedAt: null,
+      },
+    });
+    insertMessage("t-run", msg("m-done", "plain user line"));
+    expect(runningHelperRows()).toHaveLength(1);
+    updateMessage("t-run", {
+      ...msg("m-running", "helper"),
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-1" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Survey",
+        toolCount: 1,
+        status: "completed",
+        startedAt: 1_000,
+        endedAt: 2_000,
+      },
+    });
+    expect(runningHelperRows()).toEqual([]);
   });
 
   it("persists inserts, updates, and the active leaf across a reopen", () => {

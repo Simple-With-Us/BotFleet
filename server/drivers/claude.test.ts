@@ -104,6 +104,13 @@ describe("helper usage", () => {
     expect(helperUsageDelta(seen, undefined, 7)).toBe(7);
     expect(helperUsageDelta(undefined, "msg-3", 3)).toBe(3);
   });
+
+  it("accepts an engine reset floor before counting the next increase", () => {
+    const seen = new Map<string, number>();
+    expect(helperUsageDelta(seen, "msg-1", 500)).toBe(500);
+    expect(helperUsageDelta(seen, "msg-1", 100)).toBe(0);
+    expect(helperUsageDelta(seen, "msg-1", 150)).toBe(50);
+  });
 });
 
 describe("ClaudeDriver.decodeConfig", () => {

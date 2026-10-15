@@ -31,10 +31,20 @@ interface LiveHelper {
   dirty: boolean;
 }
 
+interface PendingStep {
+  title?: string;
+  target?: string;
+}
+
 export class HelperTracker {
   private readonly lives = new Map<string, LiveHelper>();
   /** `threadId:itemId` of a step, to the helper it ran inside. */
   private readonly childOf = new Map<string, string>();
+  /** Steps whose parent helper had not opened yet. */
+  private readonly pendingSteps = new Map<string, PendingStep[]>();
+  /** Running helpers per thread, innermost last — for named engines that
+   * do not stamp a parent id on inner steps. */
+  private readonly activeHelpers = new Map<string, string[]>();
 
   /** Snapshots that should go out now.  A change inside the one-second
    * cap is remembered for `due`. */
@@ -162,32 +172,77 @@ export class HelperTracker {
           endedAt: null,
           status: "running",
         };
-        this.lives.set(key, {
+        const live: LiveHelper = {
           snapshot,
           provider: event.provider,
           providerInstanceId: event.providerInstanceId,
           turnId: event.turnId,
           lastPublishedAt: Number.NEGATIVE_INFINITY,
           dirty: true,
-        });
+        };
+        this.lives.set(key, live);
+        this.pushActiveHelper(event.threadId, id);
+        this.replayPendingSteps(key, live);
       }
       touched.push(key);
     }
-    const helperId = event.subagentId ?? event.parentItemId;
-    if (helperId && helperId !== itemId) {
+    const helperId = event.subagentId ?? event.parentItemId ?? this.topActiveHelper(event.threadId);
+    if (helperId && helperId !== itemId && !fidelity) {
       this.childOf.set(this.key(event.threadId, itemId), helperId);
       const parentKey = this.key(event.threadId, helperId);
       const parent = this.lives.get(parentKey);
       if (parent && parent.snapshot.status === "running") {
-        parent.snapshot.toolCount += 1;
-        const line = helperActivityLine(event.title, event.target);
-        if (line) parent.snapshot.lastActivity = line;
-        parent.dirty = true;
-        this.noteSource(parent, event);
+        this.countStep(parent, event);
         touched.push(parentKey);
+      } else {
+        const pending = this.pendingSteps.get(parentKey) ?? [];
+        pending.push({ title: event.title, target: event.target });
+        this.pendingSteps.set(parentKey, pending);
       }
     }
     return touched;
+  }
+
+  private countStep(
+    parent: LiveHelper,
+    event: Extract<RuntimeEvent, { type: "item.started" }>,
+  ): void {
+    parent.snapshot.toolCount += 1;
+    const line = helperActivityLine(event.title, event.target);
+    if (line) parent.snapshot.lastActivity = line;
+    parent.dirty = true;
+    this.noteSource(parent, event);
+  }
+
+  private replayPendingSteps(parentKey: string, parent: LiveHelper): void {
+    const pending = this.pendingSteps.get(parentKey);
+    if (!pending?.length) return;
+    this.pendingSteps.delete(parentKey);
+    for (const step of pending) {
+      parent.snapshot.toolCount += 1;
+      const line = helperActivityLine(step.title, step.target);
+      if (line) parent.snapshot.lastActivity = line;
+    }
+    parent.dirty = true;
+  }
+
+  private pushActiveHelper(threadId: string, id: string): void {
+    const stack = this.activeHelpers.get(threadId) ?? [];
+    stack.push(id);
+    this.activeHelpers.set(threadId, stack);
+  }
+
+  private removeActiveHelper(threadId: string, id: string): void {
+    const stack = this.activeHelpers.get(threadId);
+    if (!stack) return;
+    const index = stack.lastIndexOf(id);
+    if (index >= 0) stack.splice(index, 1);
+    if (!stack.length) this.activeHelpers.delete(threadId);
+  }
+
+  private topActiveHelper(threadId: string): string | undefined {
+    const stack = this.activeHelpers.get(threadId);
+    return stack?.[stack.length - 1];
   }
 
   private onCompleted(
@@ -286,6 +341,8 @@ export class HelperTracker {
     live.snapshot.status = status;
     live.snapshot.endedAt = now;
     live.dirty = true;
+    this.removeActiveHelper(live.snapshot.threadId, live.snapshot.id);
+    this.pendingSteps.delete(this.key(live.snapshot.threadId, live.snapshot.id));
   }
 
   private noteSource(live: LiveHelper, event: RuntimeEvent): void {

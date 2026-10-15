@@ -1046,6 +1046,7 @@ export function GroupView({ group }: { group: Group }) {
   );
   const speaker = members.find((b) => b.id === group.busyBotId);
   const setupPending = roomNeedsSetup(group);
+  const helperCount = useMemo(() => runningHelperCount(group.messages), [group.messages]);
 
   // Mascot stays while a member works; the finished reply pops in above it.
   const lastGroupMessage = group.messages.at(-1);
@@ -1368,7 +1369,7 @@ export function GroupView({ group }: { group: Group }) {
             <Search size={18} />
           </button>
           {/* Members' background jobs on this room's thread: notices only, never a wake. */}
-          <JobsMenu threadId={group.threadId} room helperCount={runningHelperCount(group.messages)} />
+          <JobsMenu threadId={group.threadId} room helperCount={helperCount} />
           <GroupCallButton group={group} members={members} />
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}

@@ -85,6 +85,28 @@ describe("HelperTracker", () => {
     expect(named[0]!.subagent).toMatchObject({ fidelity: "named", label: "look around", depth: 1 });
   });
 
+  it("counts inner steps for a named helper that never stamps a parent id", () => {
+    const tracker = new HelperTracker();
+    tracker.observe(started({ itemId: "sub-1", title: "invoke_subagent", target: "look around" }), 0);
+    tracker.observe(started({ itemId: "read-1", title: "Read", target: "notes.md" }), 10);
+    const flushed = tracker.due(HELPER_UPDATE_MIN_MS);
+    expect(flushed[0]!.subagent).toMatchObject({
+      toolCount: 1,
+      lastActivity: "Read · notes.md",
+      status: "running",
+    });
+  });
+
+  it("replays a step that arrived before its helper opened", () => {
+    const tracker = new HelperTracker();
+    tracker.observe(
+      started({ itemId: "read-1", title: "Read", target: "notes.md", parentItemId: "task-1", subagentId: "task-1" }),
+      0,
+    );
+    const opened = tracker.observe(started({ itemId: "task-1", title: "Task", target: "Survey files" }), 10);
+    expect(opened[0]!.subagent).toMatchObject({ toolCount: 1, lastActivity: "Read · notes.md" });
+  });
+
   it("nests a helper that a helper started", () => {
     const tracker = new HelperTracker();
     tracker.observe(started({ itemId: "task-1", title: "Task" }), 0);

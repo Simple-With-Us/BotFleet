@@ -827,6 +827,16 @@ const MessagesList = memo(function MessagesList({
     const ordered = nestHelperSteps(messages);
     return summarizeToolCalls ? groupActivityRuns(ordered) : ordered.map((m) => ({ kind: "message" as const, message: m }));
   }, [messages, summarizeToolCalls]);
+  const delegationProgressById = useMemo(() => {
+    const busy = Boolean(bot.busy);
+    const map = new Map<string, string | undefined>();
+    for (let index = 0; index < messages.length; index++) {
+      const row = messages[index];
+      if (!isDelegationMessage(row)) continue;
+      map.set(row.id, delegationLiveLine(messages, index, busy));
+    }
+    return map;
+  }, [messages, bot.busy]);
   // A search hit inside a folded run has to open it: the fold keeps the
   // row out of the DOM, and there is nothing for the scroll to land on.
   const focus = state.focusMessage;
@@ -991,7 +1001,7 @@ const MessagesList = memo(function MessagesList({
                 );
               };
               if (delegationView) {
-                const progress = delegationLiveLine(messages, messages.findIndex((row) => row.id === m.id), Boolean(bot.busy));
+                const progress = delegationProgressById.get(m.id);
                 return withSystemChrome(
                   <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} progress={progress} />,
                 );
@@ -1226,6 +1236,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
     }));
     return [...serverMessages, ...queued];
   }, [serverMessages, pendingQueued]);
+  const helperCount = useMemo(() => runningHelperCount(messages), [messages]);
   const latestServerError = useMemo(() => latestTurnErrorMessage(serverMessages), [serverMessages]);
   const errorBranchKey = useMemo(() => turnErrorBranchKey(bot.messages, serverMessages), [bot.messages, serverMessages]);
   // Windowed transcript: only a tail of the thread mounts (screenshots make
@@ -1561,7 +1572,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
             <Search size={18} />
           </button>
           {/* Background jobs, left of Stop.  Stop ends the turn, never a job. */}
-          <JobsMenu threadId={bot.threadId} helperCount={runningHelperCount(messages)} />
+          <JobsMenu threadId={bot.threadId} helperCount={helperCount} />
           {bot.busy && (
             <button
               onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
