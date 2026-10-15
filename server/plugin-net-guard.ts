@@ -148,6 +148,7 @@ function asList(value: Hostile): readonly Hostile[] | null {
  *  change between reads; the guard must not re-touch the original object. */
 function snapshotConnectFields(value: Hostile): ConnectFields | null {
   if (tagOf(value) !== "[object Object]") return null;
+  // SAFETY: the `[object Object]` tag means a plain object.  Each field is copied once into ConnectFields so later reads cannot invoke hostile getters.
   const source = value as Record<string, Hostile>;
   return {
     host: source.host,
