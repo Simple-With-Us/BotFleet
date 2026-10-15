@@ -211,17 +211,10 @@ function cliDefaultOf(driver: AnyProviderDriver | undefined): string | undefined
  * no-op for everything but the engines that actually ship two names. */
 function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
   const aliases = driver?.cliAliases;
-  if (!Array.isArray(aliases)) return [];
+  if (!aliases?.length) return [];
   // A path or a newline is not a command name; findCliCandidates drops those
   // too, but keeping the list clean here keeps the cache key honest.
-  const out: string[] = [];
-  for (const entry of aliases) {
-    if (Object.prototype.toString.call(entry) !== "[object String]") continue;
-    const name = String(entry);
-    if (!name || /[\n\r/\\]/.test(name)) continue;
-    out.push(name);
-  }
-  return [...new Set(out)];
+  return [...new Set(aliases.filter((a) => Boolean(a) && !/[\n\r/\\]/.test(a)))];
 }
 
 /** Every name that runs this driver: the default first, then its aliases. */
@@ -1457,7 +1450,7 @@ export class ProviderRegistry {
         const allCatalogCapped =
           catalogIds.length > 0 && catalogIds.every((id) => mergedModels[id]?.capped === true);
         if (wildcard || Object.keys(mergedModels).length > 0 || windowsLabel || minimaxSummary) {
-          snapshot.quota = {
+          const quota = {
             ...driverQuota,
             capped: Boolean(wildcard)
               || allCatalogCapped
@@ -1467,10 +1460,11 @@ export class ProviderRegistry {
             // signal; the driver's is carried over when there is none.
             resetsAt: wildcard?.resetsAt ?? driverQuota?.resetsAt,
             error: wildcard?.error ?? driverQuota?.error,
-            ...(windowsLabel ? { windowsLabel } : {}),
-            ...(Object.keys(mergedModels).length > 0 ? { models: mergedModels } : {}),
-            ...(minimaxSummary ? { minimax: minimaxSummary } : {}),
           };
+          if (windowsLabel) quota.windowsLabel = windowsLabel;
+          if (Object.keys(mergedModels).length > 0) quota.models = mergedModels;
+          if (minimaxSummary) quota.minimax = minimaxSummary;
+          snapshot.quota = quota;
         }
       } catch (e) {
         snapshot = { state: "unavailable", reason: e instanceof Error ? e.message : String(e) };

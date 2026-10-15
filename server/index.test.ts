@@ -6300,7 +6300,8 @@ describe("instance CLI override API", () => {
       await api("DELETE", `/api/bots/${bot.id}`);
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI })).status).toBe(200);
     }
-  }, winSettleMs(60_000));
+    // Three interrupt idle polls (each up to winSettleMs(30_000)) plus setup polls must fit inside the case budget.
+  }, winSettleMs(120_000));
 
   it("does not let setup from before a provider reload dispatch or clear its successor", async () => {
     const launchLog = join(home, "fake-claude-setup-race-launches");

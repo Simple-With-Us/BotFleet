@@ -64,12 +64,12 @@ Every agent session must start with systematic orientation before touching code:
    ```
    Skim for your agent tag or repositories you plan to touch.  Grok Bot seats also full-read `[SENDER->FLEET]` (every GB seat must spend time).  Coordinator self-id is `AFL`, not `FLEET`.
 
-3. **Check Live Effort Boards & Work Items:**
+3. **Check Linear & Work Items:**
    ```bash
    board stats
    board list --status open,in_progress --limit 25
    ```
-   Or inspect live board files directly: `rg -n "In Progress" /Users/jay/apps/*EFFORT-LOG.md`.
+   Effort logs are archived — use Linear (`board` or agent-sync `linear_list` when mounted), not `~/apps/*EFFORT-LOG.md` or `docs/EFFORT-LOG.md`, for open work.
 
 ---
 
@@ -84,14 +84,14 @@ git -C /Users/jay/Code/<Repo> worktree add -b <seat>/<feature-slug> ~/apps/<app>
 
 ---
 
-## 3. Triple-Claim & Task Lifecycle
+## 3. Claim & Task Lifecycle
 
-Before starting substantial work, reserve your lane across three durable surfaces:
+Before starting substantial work, reserve your lane on Linear and Zulip:
 
-1. **Live Effort Board (`/Users/jay/apps/<APP>-EFFORT-LOG.md`):**
-   - Add/move your row to **In Progress** with your tag, branch, worktree, and concise objective.
-   - Live boards are branch-neutral and canonical.  Mirror your update to `docs/EFFORT-LOG.md` in the repo before committing.
-2. **GitHub Issue:**
+1. **Linear (`board claim` / `board file`):**
+   - Claim or file the issue In Progress with your tag, branch, worktree, and concise objective.
+   - Do not edit archived effort logs (`~/apps/*-EFFORT-LOG.md` or repo `docs/EFFORT-LOG.md`).
+2. **GitHub Issue (when applicable):**
    - Link your branch to the corresponding GitHub Issue or create one.
 3. **Slack Channel `#agent-sync`:**
    Post a standardized claim header:
