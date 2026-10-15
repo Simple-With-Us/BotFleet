@@ -5,6 +5,8 @@ import {
   ephemeralPromptSections,
   formatEphemeralResultMessage,
   isClassifyOrUiPassWake,
+  SCHEDULE_ZULIP_POST_NOTE,
+  scheduleAutomationNote,
   stripEphemeralToolPrefix,
   wantsEphemeralDispatch,
 } from "./ephemeral-dispatch.ts";
@@ -118,6 +120,23 @@ describe("wantsEphemeralDispatch", () => {
       name: "Compile gates",
       instructions: "classify this",
     })).toBe(false);
+  });
+});
+
+describe("scheduleAutomationNote", () => {
+  it("names zulip_post only when the turn mounts Zulip and is not one-shot", () => {
+    expect(scheduleAutomationNote(true, false)).toBe(SCHEDULE_ZULIP_POST_NOTE);
+    expect(scheduleAutomationNote(true, false)).toContain("zulip_post");
+  });
+
+  it("does not name zulip_post on a one-shot wake or when Zulip is absent", () => {
+    expect(scheduleAutomationNote(true, true)).toBe("");
+    expect(scheduleAutomationNote(false, false)).toBe("");
+    const built = buildSystemPrompt(ephemeralPromptSections({
+      persona: "You are Pixel, a bot in BotFleet.",
+      automationNote: scheduleAutomationNote(true, true),
+    }));
+    expect(built.text).not.toContain("zulip_post");
   });
 });
 

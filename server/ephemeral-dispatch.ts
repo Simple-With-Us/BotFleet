@@ -54,6 +54,18 @@ export function wantsEphemeralDispatch(input: {
   return isClassifyOrUiPassWake(input);
 }
 
+/** What a normal scheduled turn is told when Zulip tools are mounted.  A
+ *  one-shot turn does not mount them, so it must not name `zulip_post`. */
+export const SCHEDULE_ZULIP_POST_NOTE =
+  " This task was started from an owner-saved routine.  If the saved instructions ask you to post an update to Zulip, use zulip_post; outbound channel policy and the secret scan still apply.";
+
+/** The schedule sentence for this turn.  Empty when Zulip is not mounted,
+ *  and empty on a one-shot wake, which leaves Zulip out of the tool catalog. */
+export function scheduleAutomationNote(zulipMounted: boolean, oneShot: boolean): string {
+  if (!zulipMounted || oneShot) return "";
+  return SCHEDULE_ZULIP_POST_NOTE;
+}
+
 /** Standing line for a one-shot wake.  Stable across deliveries so a warm
  *  prefix can cache it. */
 export const EPHEMERAL_DISPATCH_NOTE =

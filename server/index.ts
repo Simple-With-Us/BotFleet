@@ -528,6 +528,7 @@ import {
 import {
   ephemeralPromptSections,
   formatEphemeralResultMessage,
+  scheduleAutomationNote,
   stripEphemeralToolPrefix,
   wantsEphemeralDispatch,
 } from "./ephemeral-dispatch.ts";
@@ -6467,10 +6468,11 @@ async function startTurn(
                   // The same screen the inbound wrapper states, from one
                   // function (server/zulip/format.ts).
                   zulipPeerScreenRules(zulipHub?.ownerUserId()) +
-                  // Name the tool only when this turn can call it.
-                  (zulipMounted ? "  Answer with zulip_reply." : "")
-                : opts?.automationSource === "schedule" && zulipMounted
-                  ? " This task was started from an owner-saved routine.  If the saved instructions ask you to post an update to Zulip, use zulip_post; outbound channel policy and the secret scan still apply."
+                  // Name the tool only when this turn can call it.  A one-shot
+                  // wake does not mount Zulip.
+                  (zulipMounted && !oneShot ? "  Answer with zulip_reply." : "")
+                : opts?.automationSource === "schedule"
+                  ? scheduleAutomationNote(zulipMounted, oneShot)
                   : "";
       const prompt = buildSystemPrompt(oneShot ? ephemeralPromptSections({ persona, automationNote }) : [
         { id: "persona", label: "Identity", text: persona },
