@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ import {
   prunablePath,
   quiescedPortError,
   reconcilableGenerations,
+  reconcileFailedInstallBundles,
   resolveRollbackPlacement,
   rollbackGenerations,
   rollbackGenerationsToPrune,
@@ -455,6 +456,36 @@ test("another bundle's failures are never pruned by this updater", () => {
     "BotFleet Beta.app.failed-1787000000000",
   ];
   assert.deepEqual(failedInstallBundlesToPrune(names, "BotFleet.app", 1), []);
+});
+
+test("reconcileFailedInstallBundles prunes expired bundles beside the managed app", async (t) => {
+  const root = await fixture(t);
+  const appPath = join(root, "BotFleet.app");
+  await mkdir(appPath);
+  const prune = [
+    "BotFleet.app.failed-1788000000000",
+    "BotFleet.app.failed-1787000000000",
+  ];
+  const keep = [
+    "BotFleet.app.failed-1789260170446",
+    "BotFleet.app.failed-1789111111111",
+    "BotFleet.app.failed-1789000000000",
+  ];
+  for (const name of [...prune, ...keep]) {
+    await mkdir(join(root, name));
+  }
+  await reconcileFailedInstallBundles(appPath);
+  for (const name of prune) {
+    await assert.rejects(() => access(join(root, name)));
+  }
+  for (const name of keep) {
+    await access(join(root, name));
+  }
+});
+
+test("failed-install reconciliation runs at the start of every apply, not only after success", async () => {
+  const source = await readFile(new URL("./update-botfleet-mac.mjs", import.meta.url), "utf8");
+  assert.match(source, /sweepLeftovers:[\s\S]*?reconcileFailedInstallBundles\(config\.appPath\)/);
 });
 
 test("bundles left behind by a failed install are reported, never silently deleted", () => {

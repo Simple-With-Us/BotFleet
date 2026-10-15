@@ -542,6 +542,35 @@ export function failedInstallBundlesToPrune(names, bundleName, keep = FAILED_INS
   return stamped.slice(Math.max(0, keep)).map((entry) => entry.name);
 }
 
+/**
+ * Report recent failed-install evidence and prune bundles past the retention cap.
+ *
+ * Called at the start of every apply so a streak of failed updates cannot pile
+ * up whole app copies until one finally succeeds, and again after a verified
+ * install when superseded rollback copies are swept.
+ */
+export async function reconcileFailedInstallBundles(appPath) {
+  const appDir = dirname(appPath);
+  const bundleName = basename(appPath);
+  const present = await listDirectory(appDir);
+  const kept = present.filter(
+    (name) => failedInstallBundles([name], bundleName).length === 1 && !failedInstallBundlesToPrune(present, bundleName).includes(name),
+  );
+  for (const name of kept) {
+    console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
+  }
+  for (const name of failedInstallBundlesToPrune(present, bundleName)) {
+    const path = join(appDir, name);
+    if (dirname(path) !== appDir) continue;
+    try {
+      await rm(path, { recursive: true, force: true });
+      console.log(`Removed ${name}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
+    } catch (error) {
+      console.error(`Could not remove the expired failed-install bundle ${path}: ${error.message}`);
+    }
+  }
+}
+
 export function survivingRollbackProcessError(pids, rollbackPath) {
   if (!pids.length) return null;
   return `BotFleet process ${pids.join(", ")} still runs from the prior bundle ${rollbackPath}; it would keep showing that bundle's name until relaunch`;
@@ -3484,29 +3513,7 @@ function createOperations(config) {
     for (const item of unclaimedGenerations(generations)) {
       console.error(`Rollback receipt ${item.receiptPath} names no installed application; it was left in place for manual review.`);
     }
-    const appDir = dirname(config.appPath);
-    const bundleName = basename(config.appPath);
-    const present = await listDirectory(appDir);
-    const kept = present.filter(
-      (name) => failedInstallBundles([name], bundleName).length === 1 && !failedInstallBundlesToPrune(present, bundleName).includes(name),
-    );
-    for (const name of kept) {
-      console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
-    }
-    // Past the retention cap these are not evidence any more, just disk.  Each
-    // one is a whole second copy of the app.
-    for (const name of failedInstallBundlesToPrune(present, bundleName)) {
-      const path = join(appDir, name);
-      // Only ever something this updater itself named, sitting beside the app
-      // it manages.  A same-named bundle anywhere else is not ours to remove.
-      if (dirname(path) !== appDir) continue;
-      try {
-        await rm(path, { recursive: true, force: true });
-        console.log(`Removed ${name}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
-      } catch (error) {
-        console.error(`Could not remove the expired failed-install bundle ${path}: ${error.message}`);
-      }
-    }
+    await reconcileFailedInstallBundles(config.appPath);
   };
 
   return {
@@ -3743,6 +3750,13 @@ function createOperations(config) {
       await sweepCandidates(dirname(config.appPath), CANDIDATE_BUNDLE_PREFIX, ".app", [], roots);
       await sweepCandidates(dirname(config.checkout), CANDIDATE_DEPENDENCY_PREFIX, "", [], roots);
       await sweepCandidates(dirname(config.checkout), FAILED_DEPENDENCY_PREFIX, "", [], roots);
+      // Failed-install bundles used to be pruned only after a verified install,
+      // so a run of failures could leave one full copy per failure forever.
+      try {
+        await reconcileFailedInstallBundles(config.appPath);
+      } catch (error) {
+        console.error(`Could not reconcile failed-install bundles: ${error instanceof Error ? error.message : String(error)}`);
+      }
       for (const name of await listDirectory(config.updatesDirectory)) {
         const receipt = join(config.updatesDirectory, name, "pending-recovery.json");
         if (await exists(receipt)) {
