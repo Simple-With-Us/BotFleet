@@ -205,10 +205,10 @@ function cliDefaultOf(driver: AnyProviderDriver | undefined): string | undefined
  * no-op for everything but the engines that actually ship two names. */
 function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
   const aliases = driver?.cliAliases;
-  if (!Array.isArray(aliases)) return [];
+  if (!aliases?.length) return [];
   // A path or a newline is not a command name; findCliCandidates drops those
   // too, but keeping the list clean here keeps the cache key honest.
-  return [...new Set(aliases.filter((a): a is string => typeof a === "string" && Boolean(a) && !/[\n\r/\\]/.test(a)))];
+  return [...new Set(aliases.filter((a) => Boolean(a) && !/[\n\r/\\]/.test(a)))];
 }
 
 /** Every name that runs this driver: the default first, then its aliases. */
