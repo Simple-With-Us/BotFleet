@@ -200,6 +200,8 @@ function cliDefaultOf(driver: AnyProviderDriver | undefined): string | undefined
   }
 }
 
+const bareAliasName = z.string().min(1).refine((name) => !/[\n\r/\\]/.test(name));
+
 /** Other command names that run this driver, beyond its default binary.
  * Empty for every engine whose CLI is named exactly one way, so this stays a
  * no-op for everything but the engines that actually ship two names. */
@@ -208,7 +210,12 @@ function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
   if (!Array.isArray(aliases)) return [];
   // A path or a newline is not a command name; findCliCandidates drops those
   // too, but keeping the list clean here keeps the cache key honest.
-  return [...new Set(aliases.filter((a): a is string => typeof a === "string" && Boolean(a) && !/[\n\r/\\]/.test(a)))];
+  const names: string[] = [];
+  for (const alias of aliases) {
+    const parsed = bareAliasName.safeParse(alias);
+    if (parsed.success) names.push(parsed.data);
+  }
+  return [...new Set(names)];
 }
 
 /** Every name that runs this driver: the default first, then its aliases. */
