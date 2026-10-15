@@ -1,0 +1,322 @@
+diff --git a/docs/dsh-model-ids.md b/docs/dsh-model-ids.md
+index 6287d80183d216a1e83d701b1d93356b68486a81..286b50934c88b3cf4195c131d5fc959808765768 100644
+--- a/docs/dsh-model-ids.md
++++ b/docs/dsh-model-ids.md
+@@ -20,7 +20,8 @@ ids an install declares:
+ | `DeepSeek-V4.1-Flash` | `deepseek-flash` (display name "DeepSeek-V4.1-Flash") | `deepseek-v4.1-flash` |
+ | `deepseek-flash` (nice alias / stock wire id) | `deepseek-flash` | `deepseek-v4.1-flash` (via alias fold) |
+ | `deepseek-v4.1-flash` (Jay's settings.yaml spelling) | `deepseek-flash` (via alias fold) | `deepseek-v4.1-flash` |
+-| `DeepSeek-V4.1-Pro` | `deepseek-v4-pro` (display name "DeepSeek-V4.1-Pro") | `deepseek-v4-pro` |
++| `DeepSeek-V4-Pro` | `deepseek-v4-pro` (display name "DeepSeek-V4-Pro") | `deepseek-v4-pro` |
++| `DeepSeek-V4.1-Pro` (retired picker spelling) | `deepseek-v4-pro` (via alias fold) | `deepseek-v4-pro` |
+ | `deepseek-pro` (nice alias) | `deepseek-v4-pro` (via alias fold) | `deepseek-v4-pro` |
+ | `deepseek-v4-flash` (saved before the V4.1 rename) | nothing (folds onto Flash) | nothing (folds onto Flash) |
+ | `deepseek-v4-pro` (saved before the V4.1 rename) | `deepseek-v4-pro` | `deepseek-v4-pro` |
+@@ -38,8 +39,8 @@ within the model's own provider namespace.  First hit wins, strongest first:
+ 2. **id**: the declared id, ignoring case
+ 3. **name**: the declared display name, ignoring case
+ 4. **alias**: another spelling of the same DeepSeek model (Flash: `DeepSeek-V4.1-Flash`,
+-   `deepseek-flash`, `deepseek-v4-flash`, `deepseek-v4.1-flash`; Pro: `DeepSeek-V4.1-Pro`,
+-   `deepseek-v4-pro`, `deepseek-pro`)
++   `deepseek-flash`, `deepseek-v4-flash`, `deepseek-v4.1-flash`; Pro: `DeepSeek-V4-Pro`,
++   `DeepSeek-V4.1-Pro`, `deepseek-v4-pro`, `deepseek-pro`)
+ 
+ The declared value is what gets sent.  The picker id is never rewritten, so saved
+ selections keep their id and only the wire value is translated.
+diff --git a/src/dsh/acp/driver.ts b/src/dsh/acp/driver.ts
+index 13184df4d893bfba075e90aea7dff3799bd80c85..d727b01c66321242371789647d615128677a317f 100644
+--- a/src/dsh/acp/driver.ts
++++ b/src/dsh/acp/driver.ts
+@@ -310,18 +310,41 @@ function currentConfigValue(result: unknown, configId: string): unknown {
+  *
+  * The vision variant is deliberately
+  * absent: `images: false` disables image attachment for the whole engine, so
+- * shipping a vision model here offered a capability the composer refused. */
++ * shipping a vision model here offered a capability the composer refused.
++ *
++ * Each row's `images` agrees with the modality the route actually declares, so
++ * a consumer that reads the catalog never offers an attachment the model would
++ * refuse.  `deepseek-flash` declares `inputModalities: [text, image]` and the
++ * three MiniMax rows on the `minimax` route are pinned by
++ * {@link DSH_PER_MODEL_IMAGES}; `deepseek-v4-pro` and M2.7 are text-only. */
+ export const STATIC_DSH_MODELS: ModelCatalog = {
+   default: "DeepSeek-V4.1-Flash",
+   options: [
+     { id: "DeepSeek-V4.1-Flash", label: "DeepSeek-V4.1-Flash", images: true },
+-    { id: "DeepSeek-V4.1-Pro", label: "DeepSeek-V4.1-Pro", images: false },
++    { id: "DeepSeek-V4-Pro", label: "DeepSeek-V4-Pro", images: false },
+     { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax-M3.1-Flash-Preview", contextWindow: 1_000_000, images: true },
+-    { id: "MiniMax-M3", label: "MiniMax-M3", contextWindow: 1_000_000, images: true },
+-    { id: "MiniMax-M2.7-highspeed", label: "MiniMax-M2.7-highspeed", contextWindow: 204_800, images: true },
++    { id: "MiniMax-M3", label: "MiniMax-M3", contextWindow: 1_048_576, images: true },
++    { id: "MiniMax-M2.7-highspeed", label: "MiniMax-M2.7-highspeed", contextWindow: 204_800, images: false },
+   ],
+ };
+ 
++/** Per-model image support, keyed by picker id, for rows whose route-level
++ *  `images` answer would be wrong.
++ *
++ *  These are facts about the provider, not preferences: the installed pi-ai
++ *  catalog declares MiniMax-M3 and the M3.1 Flash preview as text+image and
++ *  the M2.7 family as text-only, and DeepSeek's own catalog declares Flash
++ *  text+image and Pro text-only.  A consumer that resolves one model reads its
++ *  own row here rather than the engine-wide {@link dshSupport.images} gate,
++ *  which stays closed until that consumer lands. */
++export const DSH_PER_MODEL_IMAGES: Readonly<Record<string, boolean>> = {
++  "DeepSeek-V4.1-Flash": true,
++  "DeepSeek-V4-Pro": false,
++  "MiniMax-M3.1-Flash-Preview": true,
++  "MiniMax-M3": true,
++  "MiniMax-M2.7-highspeed": false,
++};
++
+ /** Which state home a configured engine CLI uses: `clutch` (the Clutch
+  * wrapper, engine home $CLUTCH_HOME/dsh) or `dsh` (vanilla, $DSH_HOME or
+  * ~/.dsh).  Anything else is treated as vanilla `dsh`. */
+@@ -396,6 +419,7 @@ export const dshSupport: AcpSupport = {
+   images: false,
+   models: STATIC_DSH_MODELS,
+   resolveModels: () => STATIC_DSH_MODELS,
++  perModelImages: DSH_PER_MODEL_IMAGES,
+   effortLevels: DSH_EFFORT_LEVELS,
+   perModelEffortLevels: DSH_PER_MODEL_EFFORT_LEVELS,
+   mcpServers: true,
+diff --git a/src/dsh/acp/model-options.ts b/src/dsh/acp/model-options.ts
+index b28054eb8c0325f69d3c9ca49093cc596d43c259..b7e77e2bf29e2c243772fa03bc571fd1d9fe131c 100644
+--- a/src/dsh/acp/model-options.ts
++++ b/src/dsh/acp/model-options.ts
+@@ -14,7 +14,7 @@
+  *
+  *   - Stock `dsh` 0.1.5-rc.x declares `deepseek-flash` (display name
+  *     "DeepSeek-V4.1-Flash") and `deepseek-v4-pro` (display name
+- *     "DeepSeek-V4.1-Pro").  The picker's `DeepSeek-V4.1-Flash` is the
++ *     "DeepSeek-V4-Pro").  The picker's `DeepSeek-V4.1-Flash` is the
+  *     *display name*, not an id.
+  *   - An owner `settings.yaml` in the engine home can replace that list outright
+  *     (`llm-deepseek.models`), for example with `deepseek-v4.1-flash`.
+@@ -86,7 +86,7 @@ export class DshModelNotOfferedError extends Error {
+  *  it keep working.  `deepseek-v4.1-flash` is Jay's settings.yaml spelling. */
+ const DSH_MODEL_FAMILIES: readonly (readonly string[])[] = [
+   ["deepseek-flash", "DeepSeek-V4.1-Flash", "deepseek-v4-flash", "deepseek-v4.1-flash"],
+-  ["deepseek-v4-pro", "DeepSeek-V4.1-Pro", "deepseek-pro"],
++  ["deepseek-v4-pro", "DeepSeek-V4-Pro", "DeepSeek-V4.1-Pro", "deepseek-pro"],
+ ];
+ 
+ const DSH_MODEL_FAMILY_KEYS: readonly (readonly string[])[] = DSH_MODEL_FAMILIES.map((family) =>
+diff --git a/src/web/dock-app/ClutchWindow.swift b/src/web/dock-app/ClutchWindow.swift
+index e20083b3a1d108dca901284d322d66597b25f944..229df1e1993f3eaa53ddf46d98cc161eba791970 100644
+--- a/src/web/dock-app/ClutchWindow.swift
++++ b/src/web/dock-app/ClutchWindow.swift
+@@ -25,7 +25,34 @@ private func clutchHomePath() -> String {
+     return (home as NSString).appendingPathComponent(".clutch")
+ }
+ 
++private let miniMaxRemoteModeKey = "codes.clutch.minimax_code_remote"
++
++/// The direct MiniMax Code remote rides Clutch's authenticated chat sidecar.
++/// Its token stays in the owner-only token file; the page immediately removes
++/// the query from browser history and sends it only as a Bearer credential.
++private func miniMaxRemoteURLString() -> String {
++    let env = ProcessInfo.processInfo.environment
++    let port = env["CLUTCH_CHAT_PORT"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "3181"
++    let tokenPath = (clutchHomePath() as NSString).appendingPathComponent("chat-token")
++    let token = (try? String(contentsOfFile: tokenPath, encoding: .utf8))?
++        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
++    var parts = URLComponents()
++    parts.scheme = "http"
++    parts.host = "127.0.0.1"
++    parts.port = Int(port) ?? 3181
++    parts.path = "/minimax-code/"
++    if !token.isEmpty { parts.queryItems = [URLQueryItem(name: "token", value: token)] }
++    return parts.url?.absoluteString ?? "http://127.0.0.1:3181/minimax-code/"
++}
++
+ private var clutchURLString: String {
++    if UserDefaults.standard.bool(forKey: miniMaxRemoteModeKey) {
++        return miniMaxRemoteURLString()
++    }
++    if let saved = UserDefaults.standard.string(forKey: "codes.clutch.active_host_url"),
++       !saved.isEmpty {
++        return saved
++    }
+     if let envURL = ProcessInfo.processInfo.environment["CLUTCH_WEB_URL"],
+        !envURL.isEmpty {
+         return envURL
+@@ -87,6 +114,10 @@ private func pingClutch() async -> Bool {
+ }
+ 
+ private func ensureServer() async {
++    if let saved = UserDefaults.standard.string(forKey: "codes.clutch.active_host_url"),
++       let url = URL(string: saved), let host = url.host, host != "127.0.0.1" && host != "localhost" {
++        return
++    }
+     if await pingClutch() { return }
+     let script = NSHomeDirectory() + "/apps/clutch-runtime/scripts/ensure-web.sh"
+     guard FileManager.default.isExecutableFile(atPath: script) else { return }
+@@ -113,6 +144,33 @@ private func ensureServer() async {
+     }
+ }
+ 
++/// Start the existing on-demand chat sidecar when the always-on Clutch web
++/// process has not already done so.  This does not create a LaunchAgent or a
++/// new pm2 job; the sidecar exits with the Mac session like its normal launch.
++private func ensureMiniMaxRemote() async {
++    func responds() async -> Bool {
++        guard let url = URL(string: miniMaxRemoteURLString()) else { return false }
++        var req = URLRequest(url: url, timeoutInterval: 3)
++        req.httpMethod = "GET"
++        guard let (_, response) = try? await URLSession.shared.data(for: req),
++              let http = response as? HTTPURLResponse else { return false }
++        return (200..<500).contains(http.statusCode)
++    }
++
++    if await responds() { return }
++    let script = NSHomeDirectory() + "/apps/clutch-runtime/scripts/chat-bridge.sh"
++    guard FileManager.default.isExecutableFile(atPath: script) else { return }
++    let proc = Process()
++    proc.executableURL = URL(fileURLWithPath: script)
++    proc.standardOutput = FileHandle.nullDevice
++    proc.standardError = FileHandle.nullDevice
++    do { try proc.run() } catch { return }
++    for _ in 0..<30 {
++        if await responds() { return }
++        try? await Task.sleep(nanoseconds: 200_000_000)
++    }
++}
++
+ // MARK: - DeepSeek Model Discovery (Settings)
+ 
+ /// Lists the models the DeepSeek account can call, for the Settings > Models
+@@ -253,7 +311,7 @@ final class DeepSeekModelsMessageHandler: NSObject, WKScriptMessageHandler {
+ final class ClutchAppUpdater: NSObject {
+     static let shared = ClutchAppUpdater()
+ 
+-    private let repoOwner = "jaywedgeworth22"
++    private let repoOwner = "Simple-With-Us"
+     private let repoName = "Clutch"
+     private(set) var latestVersionFound: String?
+     private(set) var isChecking: Bool = false
+@@ -441,6 +499,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
+         ClutchAppUpdater.shared.promptUserForUpdateCheck(window: window)
+     }
+ 
++    @objc func connectLocalClutch(_ sender: Any?) {
++        UserDefaults.standard.removeObject(forKey: miniMaxRemoteModeKey)
++        UserDefaults.standard.removeObject(forKey: "codes.clutch.active_host_url")
++        loadClutch()
++    }
++
++    @objc func connectMiniMaxRemote(_ sender: Any?) {
++        UserDefaults.standard.set(true, forKey: miniMaxRemoteModeKey)
++        UserDefaults.standard.removeObject(forKey: "codes.clutch.active_host_url")
++        Task { [weak self] in
++            await ensureMiniMaxRemote()
++            await MainActor.run {
++                self?.loadHost(urlString: miniMaxRemoteURLString())
++            }
++        }
++    }
++
++    @objc func connectCustomHost(_ sender: Any?) {
++        let alert = NSAlert()
++        alert.messageText = "Connect to Remote Host"
++        alert.informativeText = "Enter the URL of the remote Clutch host:"
++        alert.addButton(withTitle: "Connect")
++        alert.addButton(withTitle: "Cancel")
++        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
++        input.stringValue = UserDefaults.standard.string(forKey: "codes.clutch.active_host_url") ?? "http://127.0.0.1:3180/"
++        alert.accessoryView = input
++        if alert.runModal() == .alertFirstButtonReturn {
++            let entered = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
++            if !entered.isEmpty {
++                UserDefaults.standard.removeObject(forKey: miniMaxRemoteModeKey)
++                UserDefaults.standard.set(entered, forKey: "codes.clutch.active_host_url")
++                loadHost(urlString: entered)
++            }
++        }
++    }
++
++    @objc func reloadCurrentHost(_ sender: Any?) {
++        webView?.reload()
++    }
++
++    func loadHost(urlString: String) {
++        guard let url = URL(string: urlString) else { return }
++        loadFailed = false
++        webView?.load(URLRequest(url: url))
++    }
++
++    func application(_ application: NSApplication, open urls: [URL]) {
++        for url in urls {
++            handleOpenURL(url)
++        }
++    }
++
++    private func handleOpenURL(_ url: URL) {
++        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: true) else { return }
++        if comps.host == "pair" {
++            if let targetURL = comps.queryItems?.first(where: { $0.name == "url" })?.value {
++                UserDefaults.standard.removeObject(forKey: miniMaxRemoteModeKey)
++                UserDefaults.standard.set(targetURL, forKey: "codes.clutch.active_host_url")
++                loadHost(urlString: targetURL)
++                return
++            }
++            if let h = comps.queryItems?.first(where: { $0.name == "h" || $0.name == "host" })?.value {
++                let p = comps.queryItems?.first(where: { $0.name == "p" || $0.name == "port" })?.value ?? "3180"
++                let tls = comps.queryItems?.first(where: { $0.name == "tls" })?.value == "1"
++                let scheme = tls ? "https" : "http"
++                let target = "\(scheme)://\(h):\(p)/"
++                UserDefaults.standard.removeObject(forKey: miniMaxRemoteModeKey)
++                UserDefaults.standard.set(target, forKey: "codes.clutch.active_host_url")
++                loadHost(urlString: target)
++            }
++        }
++    }
++
+     private func setupMainMenu() {
+         let mainMenu = NSMenu()
+ 
+@@ -475,6 +606,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
+         editMenuItem.submenu = editMenu
+         mainMenu.addItem(editMenuItem)
+ 
++        // Host Menu (local Clutch, direct MiniMax Code ACP, or custom Clutch)
++        let hostMenuItem = NSMenuItem()
++        let hostMenu = NSMenu(title: "Host")
++        let localItem = hostMenu.addItem(withTitle: "Local Clutch (3180)", action: #selector(connectLocalClutch(_:)), keyEquivalent: "1")
++        localItem.target = self
++        let mmItem = hostMenu.addItem(withTitle: "MiniMax Code Remote", action: #selector(connectMiniMaxRemote(_:)), keyEquivalent: "2")
++        mmItem.target = self
++        hostMenu.addItem(NSMenuItem.separator())
++        let customItem = hostMenu.addItem(withTitle: "Connect to Custom Host...", action: #selector(connectCustomHost(_:)), keyEquivalent: "k")
++        customItem.target = self
++        let reloadItem = hostMenu.addItem(withTitle: "Reload Page", action: #selector(reloadCurrentHost(_:)), keyEquivalent: "r")
++        reloadItem.target = self
++        hostMenuItem.submenu = hostMenu
++        mainMenu.addItem(hostMenuItem)
++
+         // Window Menu
+         let windowMenuItem = NSMenuItem()
+         let windowMenu = NSMenu(title: "Window")
+@@ -497,7 +643,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
+         // first page load raced a server (re)start and failed, reload
+         // once the server answers.
+         Task { [weak self] in
+-            await ensureServer()
++            if UserDefaults.standard.bool(forKey: miniMaxRemoteModeKey) {
++                await ensureMiniMaxRemote()
++            } else {
++                await ensureServer()
++            }
+             await MainActor.run {
+                 guard let self, self.loadFailed else { return }
+                 self.loadClutch()
+@@ -759,7 +909,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
+             },
+             {
+               ids: ['deepseek-v4-pro', 'DeepSeek-V4-Pro', 'DeepSeek-V4.1-Pro', 'DeepSeek V4.1 Pro', 'DeepSeek V4 Pro'],
+-              label: 'DeepSeek-V4.1-Pro',
++              label: 'DeepSeek-V4-Pro',
+             },
+             {
+               ids: ['MiniMax-M3.1-Flash-Preview', 'MiniMax M3.1 Flash Preview'],

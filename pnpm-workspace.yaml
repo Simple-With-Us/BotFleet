@@ -25,6 +25,8 @@ overrides:
   "lodash-es": "4.18.1"
   "sharp@0.35.2": "0.35.5"
   "sharp@0.35.3": "0.35.5"
+patchedDependencies:
+  clutch@0.4.0: patches/clutch@0.4.0.patch
 supportedArchitectures:
   cpu:
     - "arm64"

@@ -877,6 +877,12 @@ export interface ProviderDriver<Config = unknown> {
   /** How to get this engine installed. Omit for engines that need no local
    * binary (API-key drivers), which is what makes it optional. */
   readonly install?: EngineInstall;
+  /** Other command names that run THIS engine, beyond the default binary name.
+   * The Engines picker searches these alongside the default so a correctly
+   * installed engine is never reported missing because it ships under a
+   * different command — Clutch's driver default is `dsh` while the Clutch build
+   * is installed as `clutch`.  Bare names only; a path here is ignored. */
+  readonly cliAliases?: string[];
   /** Decode the opaque config envelope; throw on invalid (→ shadow). */
   decodeConfig(raw: unknown): Config;
   defaultConfig(): Config;
