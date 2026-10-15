@@ -92,6 +92,8 @@ posixOnly("permission proxy", () => {
             const line = buffered.slice(0, newline);
             buffered = buffered.slice(newline + 1);
             if (!line.trim()) continue;
+            // SAFETY: this broker only receives the proxy's single JSON ask; the test
+            // asserts the Write `input.content` round-trips without replacement chars.
             const message = JSON.parse(line) as Record<string, unknown>;
             conn.write(JSON.stringify({ t: "answer", id: message.id, behavior: "allow", updatedInput: message.input }) + "\n");
             conn.end();
@@ -117,6 +119,7 @@ posixOnly("permission proxy", () => {
       else stdin.once("drain", () => resolve());
     });
     const frame = await ask;
+    // SAFETY: the test payload is a Write call; `frame` is that ask object from the broker.
     const received = (frame.input as { content: string }).content;
     expect(received.includes("\uFFFD")).toBe(false);
     expect(received === content).toBe(true);

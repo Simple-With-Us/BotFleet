@@ -12,8 +12,13 @@ on:
 permissions:
   contents: read
 
+# Pull requests share one group per ref and cancel the superseded head.
+# Every other event is its own commit.  GitHub keeps one running run and
+# one pending run per group, and cancels any older pending run before it
+# dispatches a job.  A shared ref therefore lands the middle main commit
+# with zero required-check verdicts (board 098d00c7, audit ENG-4).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: "${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.ref) || format('ci-{0}-{1}', github.event_name, github.sha) }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
