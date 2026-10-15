@@ -247,7 +247,7 @@ export async function previewableImageFile(file: {
   const globals = globalThis as typeof globalThis & ImageTranscodeGlobals;
   const createBitmap = globals.createImageBitmap;
   const doc = globals.document;
-  if (!createBitmap || !doc) return file;
+  if (typeof createBitmap !== "function" || !doc) return file;
   try {
     const blob = new Blob([await file.arrayBuffer()], { type: mime || "application/octet-stream" });
     const bitmap = await createBitmap(blob);
@@ -287,9 +287,11 @@ export async function imageAttachmentFromFile(file: {
   if (!isImageFile(prepared)) return null;
   if (prepared.size > IMAGE_MAX_BYTES) throw Object.assign(new Error(`${attachmentLabel(file)} exceeds 10 MB`), { status: 413 });
   const bytes = new Uint8Array(await prepared.arrayBuffer());
+  const contentType =
+    prepared.type || file.type || guessImageMime(file) || "application/octet-stream";
   const response = await fetch("/api/attachments", {
     method: "POST",
-    headers: { "content-type": prepared.type || file.type },
+    headers: { "content-type": contentType },
     body: bytes,
   });
   if (!response.ok) {
@@ -353,9 +355,10 @@ export type DroppedFile = Pick<File, "name" | "size" | "type" | "text"> & {
 export async function attachmentsFromDroppedFiles<T extends DroppedFile>(
   files: readonly T[],
   getPath: (file: T) => string,
-  opts: { allowImages?: boolean } = {},
+  opts: { allowImages?: boolean; onUploadError?: (err: unknown) => void } = {},
 ): Promise<{ attachments: Attachment[]; rejectedNames: string[] }> {
   const allowImages = opts.allowImages !== false;
+  const onUploadError = opts.onUploadError;
   const results = await Promise.all(
     files.map(async (file) => {
       let path = "";
@@ -374,8 +377,8 @@ export async function attachmentsFromDroppedFiles<T extends DroppedFile>(
             arrayBuffer: file.arrayBuffer,
           });
           if (image) return { attachment: image };
-        } catch {
-          // Fall through to generic upload or reject.
+        } catch (err) {
+          onUploadError?.(err);
         }
       }
       if (isInlineText(file) && file.size <= INLINE_DROP_LIMIT) {
@@ -399,8 +402,8 @@ export async function attachmentsFromDroppedFiles<T extends DroppedFile>(
             }
             return { attachment: uploaded };
           }
-        } catch {
-          // Named below as rejected.
+        } catch (err) {
+          onUploadError?.(err);
         }
       }
       return { rejectedName: attachmentLabel(file) };
@@ -539,6 +542,12 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
   const attachments: Attachment[] = [];
   const rejectedNames: string[] = [];
   const imageErrors: string[] = [];
+  const uploadErrors: string[] = [];
+  const recordUploadError = (file: T, err: unknown) => {
+    uploadErrors.push(
+      `${attachmentLabel(file)}: ${err instanceof Error ? err.message : "upload failed"}`,
+    );
+  };
   // Finish each selected file in sequence so the chips retain the order in
   // which the user chose or dropped them.
   for (const file of files) {
@@ -546,12 +555,16 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
       try {
         const attachment = await uploadImage(file);
         if (attachment) attachments.push(attachment);
+        else imageErrors.push(`${attachmentLabel(file)}: could not be uploaded`);
       } catch (err) {
         imageErrors.push(`${attachmentLabel(file)}: ${err instanceof Error ? err.message : "upload failed"}`);
       }
       continue;
     }
-    const result = await attachmentsFromDroppedFiles([file], getPath, { allowImages });
+    const result = await attachmentsFromDroppedFiles([file], getPath, {
+      allowImages,
+      onUploadError: (err) => recordUploadError(file, err),
+    });
     attachments.push(...result.attachments);
     rejectedNames.push(...result.rejectedNames);
   }
@@ -559,8 +572,10 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
     ? `${rejectedNames.join(", ")} could not be attached.  Paste, drop, or pick a supported file (images, PDF, Office, zip, audio, video, or text).`
     : null;
   const failed = imageErrors.length ? imageErrors.join("; ") : null;
+  const uploaded = uploadErrors.length ? uploadErrors.join("; ") : null;
+  const detail = [failed, uploaded].filter(Boolean).join("; ") || null;
   return {
     attachments,
-    notice: pathless && failed ? `${pathless} (${failed})` : (pathless ?? failed),
+    notice: pathless && detail ? `${pathless} (${detail})` : (pathless ?? detail),
   };
 }
