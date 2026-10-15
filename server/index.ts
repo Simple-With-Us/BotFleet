@@ -1102,21 +1102,30 @@ function rotateWedgedThread(
   streak: number,
   detail: string,
 ): void {
-  store.setResumeCursor(bot.id, instanceId, undefined, wedgedThreadId);
   const wedgedTask = store.taskByThread(bot.id, wedgedThreadId);
   const wasActive = bot.threadId === wedgedThreadId;
+  const wedgeKey = { botId: bot.id, threadId: wedgedThreadId, instanceId };
+  if (!wasActive) {
+    store.setResumeCursor(bot.id, instanceId, undefined, wedgedThreadId);
+    threadWedgeGuard.recordSuccess(wedgeKey);
+    console.warn(
+      `thread wedge: cleared resume cursor on inactive wedged thread ${wedgedThreadId} for bot ${bot.id} (${instanceId})`,
+    );
+    return;
+  }
   const title = `Recovered after ${streak} wedged turns`;
   const task = wedgedTask?.automationKey
     ? store.rolloverAutomationTask(bot.id, wedgedTask.automationKey, {
         title,
-        activate: wasActive,
+        activate: true,
         previousThreadId: wedgedThreadId,
       })
-    : store.createTask(bot.id, title, wasActive);
+    : store.createTask(bot.id, title, true);
   if (!task) {
     console.error(`thread wedge: could not rotate task for bot ${bot.id} thread ${wedgedThreadId} (${detail})`);
     return;
   }
+  store.setResumeCursor(bot.id, instanceId, undefined, wedgedThreadId);
   store.appendMessage(task.threadId, {
     role: "bot",
     kind: "activity",
@@ -1127,7 +1136,7 @@ function rotateWedgedThread(
   });
   const updated = store.bot(bot.id);
   if (updated) broadcast({ kind: "bot", bot: publicBot(updated) });
-  threadWedgeGuard.recordSuccess({ botId: bot.id, threadId: wedgedThreadId, instanceId });
+  threadWedgeGuard.recordSuccess(wedgeKey);
   console.warn(
     `thread wedge: rotated bot ${bot.id} from ${wedgedThreadId} to ${task.threadId} after ${streak} wedge failures on ${instanceId}`,
   );
@@ -1152,6 +1161,7 @@ function noteThreadWedge(bot: { id: string; threadId: string } | null, event: Ru
   }
   if (stoppedTurns.has(`${bot.id}:${event.threadId}`)) {
     if (turnToken) mcodeLockContentionTurns.delete(turnToken);
+    threadWedgeGuard.recordSuccess(key);
     return;
   }
   const hadLockContention = turnToken ? mcodeLockContentionTurns.delete(turnToken) : false;
