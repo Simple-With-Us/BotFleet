@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, realpathSync } from "node:fs";
+import { createReadStream, realpathSync, rmSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -28,6 +28,19 @@ import {
 } from "./update-progress.mjs";
 import { validUpdateCredentialReceipt } from "../electron/update-credential-preparation.mjs";
 import { stageIsPrunable } from "./stage-entries.mjs";
+import {
+  FAILED_INSTALL_KEEP,
+  failedInstallBundles,
+  failedInstallBundlesToPrune,
+  pruneFailedInstallBundles,
+} from "./failed-install-retention.mjs";
+
+export {
+  FAILED_INSTALL_KEEP,
+  failedInstallBundles,
+  failedInstallBundlesToPrune,
+  failedInstallStamp,
+} from "./failed-install-retention.mjs";
 import {
   downloadBuiltBundle,
   ResolutionError,
@@ -488,60 +501,6 @@ export function txtHolderPids(lsofOutput, bundleRealPath) {
  * process that survives the swap keeps running out of the renamed bundle and
  * shows that name in the Dock and menu bar until it is relaunched.
  */
-/**
- * A failed install leaves the replacement behind as `<name>.failed-<stamp>`
- * so it can be examined.  They are evidence of a failed update, so they are
- * reported rather than deleted.
- *
- * Evidence is worth keeping for a while and worthless forever, though, and
- * this used to have no end: every failed update left a whole second copy of
- * the app in /Applications forever.  Four of them held 2.5 GB on a disk that
- * was 99% full.  So they are now capped -- see `FAILED_INSTALL_KEEP`.  The
- * newest few stay as evidence; the rest go.
- */
-export function failedInstallBundles(names, bundleName) {
-  return names.filter((name) => name.startsWith(`${bundleName}.failed-`));
-}
-
-/**
- * How many failed-install bundles to keep.
- *
- * Three is enough to diagnose a bad update (the one you just hit, plus the
- * couple before it that might share a cause) without letting a flapping
- * updater fill the disk.  Each one is a full copy of the app, so on a 600 MB
- * bundle the difference between three and unlimited is the whole disk.
- */
-export const FAILED_INSTALL_KEEP = 3;
-
-/**
- * The millisecond stamp a failed-install bundle carries, or null when the name
- * is not one.  The stamp is written by the failed install itself, so it is the
- * only age signal available without stat'ing every bundle.
- */
-export function failedInstallStamp(name, bundleName) {
-  const prefix = `${bundleName}.failed-`;
-  if (!name.startsWith(prefix)) return null;
-  const stamp = Number(name.slice(prefix.length));
-  return Number.isSafeInteger(stamp) && stamp > 0 ? stamp : null;
-}
-
-/**
- * Which failed-install bundles are past the retention cap: the oldest ones,
- * keeping the `keep` newest.  Pure, so the policy is testable without a disk.
- *
- * A bundle whose stamp does not parse is never pruned.  It is not ours to age
- * out, and guessing could delete the wrong thing.
- */
-export function failedInstallBundlesToPrune(names, bundleName, keep = FAILED_INSTALL_KEEP) {
-  const stamped = [];
-  for (const name of names) {
-    const stamp = failedInstallStamp(name, bundleName);
-    if (stamp !== null) stamped.push({ name, stamp });
-  }
-  stamped.sort((a, b) => b.stamp - a.stamp);
-  return stamped.slice(Math.max(0, keep)).map((entry) => entry.name);
-}
-
 export function survivingRollbackProcessError(pids, rollbackPath) {
   if (!pids.length) return null;
   return `BotFleet process ${pids.join(", ")} still runs from the prior bundle ${rollbackPath}; it would keep showing that bundle's name until relaunch`;
@@ -3388,6 +3347,43 @@ function environmentMs(name, fallback) {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
+async function sweepExpiredFailedInstallBundles(config, { reportKept = false } = {}) {
+  const appDir = dirname(config.appPath);
+  const bundleName = basename(config.appPath);
+  const present = await listDirectory(appDir);
+  const kept = present.filter(
+    (name) => failedInstallBundles([name], bundleName).length === 1
+      && !failedInstallBundlesToPrune(present, bundleName).includes(name),
+  );
+  if (reportKept) {
+    for (const name of kept) {
+      console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
+    }
+  }
+  for (const path of pruneFailedInstallBundles(config.appPath, {
+    listNames: () => present,
+    remove: (target) => rmSync(target, { recursive: true, force: true }),
+  })) {
+    console.log(`Removed ${basename(path)}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
+  }
+}
+
+async function sweepAbandonedStageDirectories(config, stageDirectories = []) {
+  const { generations } = await rollbackGenerations(config, { stageDirectories });
+  const { entries, referenced } = await stageEntries(config, generations);
+  const stages = abandonedStages(entries, {
+    referenced: [...referenced, ...stageDirectories.map((path) => resolve(path))],
+  });
+  for (const path of stages.prune) {
+    if (!prunablePath(path, [config.updatesDirectory])) continue;
+    await rm(path, { recursive: true, force: true });
+    console.log(`Removed the leftover update stage ${path}`);
+  }
+  for (const path of stages.report) {
+    console.error(`Update stage ${path} has no prepared manifest and no rollback generation, and holds files this updater did not write; it was left in place for manual review.`);
+  }
+}
+
 function createOperations(config) {
   let lastPreflight;
   const git = (cwd, args, options) => run("git", ["-C", cwd, ...args], options);
@@ -3467,16 +3463,7 @@ function createOperations(config) {
     // nothing in one to examine.
     await sweepCandidates(dirname(config.checkout), FAILED_DEPENDENCY_PREFIX, "", [], roots);
 
-    const { entries, referenced } = await stageEntries(config, generations);
-    const stages = abandonedStages(entries, { referenced: [...referenced, ...stageDirectories.map((path) => resolve(path))] });
-    for (const path of stages.prune) {
-      if (!prunablePath(path, [config.updatesDirectory])) continue;
-      await rm(path, { recursive: true, force: true });
-      console.log(`Removed the leftover update stage ${path}`);
-    }
-    for (const path of stages.report) {
-      console.error(`Update stage ${path} has no prepared manifest and no rollback generation, and holds files this updater did not write; it was left in place for manual review.`);
-    }
+    await sweepAbandonedStageDirectories(config, stageDirectories);
 
     for (const orphan of orphans) {
       console.error(`Rollback bundle ${orphan} has no receipt; it was left in place for manual review.`);
@@ -3484,29 +3471,7 @@ function createOperations(config) {
     for (const item of unclaimedGenerations(generations)) {
       console.error(`Rollback receipt ${item.receiptPath} names no installed application; it was left in place for manual review.`);
     }
-    const appDir = dirname(config.appPath);
-    const bundleName = basename(config.appPath);
-    const present = await listDirectory(appDir);
-    const kept = present.filter(
-      (name) => failedInstallBundles([name], bundleName).length === 1 && !failedInstallBundlesToPrune(present, bundleName).includes(name),
-    );
-    for (const name of kept) {
-      console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
-    }
-    // Past the retention cap these are not evidence any more, just disk.  Each
-    // one is a whole second copy of the app.
-    for (const name of failedInstallBundlesToPrune(present, bundleName)) {
-      const path = join(appDir, name);
-      // Only ever something this updater itself named, sitting beside the app
-      // it manages.  A same-named bundle anywhere else is not ours to remove.
-      if (dirname(path) !== appDir) continue;
-      try {
-        await rm(path, { recursive: true, force: true });
-        console.log(`Removed ${name}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
-      } catch (error) {
-        console.error(`Could not remove the expired failed-install bundle ${path}: ${error.message}`);
-      }
-    }
+    await sweepExpiredFailedInstallBundles(config, { reportKept: true });
   };
 
   return {
@@ -3743,6 +3708,8 @@ function createOperations(config) {
       await sweepCandidates(dirname(config.appPath), CANDIDATE_BUNDLE_PREFIX, ".app", [], roots);
       await sweepCandidates(dirname(config.checkout), CANDIDATE_DEPENDENCY_PREFIX, "", [], roots);
       await sweepCandidates(dirname(config.checkout), FAILED_DEPENDENCY_PREFIX, "", [], roots);
+      await sweepAbandonedStageDirectories(config);
+      await sweepExpiredFailedInstallBundles(config);
       for (const name of await listDirectory(config.updatesDirectory)) {
         const receipt = join(config.updatesDirectory, name, "pending-recovery.json");
         if (await exists(receipt)) {
@@ -4231,9 +4198,17 @@ function createOperations(config) {
       });
       await record(async () => {
         if (previous.swap?.rollbackAppHolds && await exists(previous.rollbackPath)) {
-          if (await exists(config.appPath)) await rename(config.appPath, `${config.appPath}.failed-${Date.now()}`);
+          let failedReplacementPath = null;
+          if (await exists(config.appPath)) {
+            failedReplacementPath = `${config.appPath}.failed-${Date.now()}`;
+            await rename(config.appPath, failedReplacementPath);
+          }
           await rename(previous.rollbackPath, config.appPath);
           previous.swap.rollbackAppHolds = false;
+          if (failedReplacementPath && await exists(failedReplacementPath)) {
+            await rm(failedReplacementPath, { recursive: true, force: true });
+            console.log(`Removed the failed replacement bundle ${failedReplacementPath}`);
+          }
         }
       });
       await record(async () => { await git(config.checkout, ["checkout", "--detach", previous.checkoutCommit]); });
