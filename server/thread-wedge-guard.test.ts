@@ -24,6 +24,7 @@ describe("isNoOutputWedgeStop", () => {
     expect(isNoOutputWedgeStop("prompt_stall")).toBe(true);
     expect(isNoOutputWedgeStop("exit_before_result")).toBe(true);
     expect(isNoOutputWedgeStop("interrupted")).toBe(false);
+    expect(isNoOutputWedgeStop("cancelled")).toBe(false);
   });
 });
 
@@ -40,6 +41,13 @@ describe("ThreadWedgeGuard", () => {
     const last = guard.recordFailure(key, { stopReason: "prompt_stall" });
     expect(last.streak).toBe(THREAD_WEDGE_NO_OUTPUT_THRESHOLD);
     expect(last.shouldRotate).toBe(true);
+  });
+
+  it("does not count user-policy stop reasons even when they look like no-output exits", () => {
+    const guard = new ThreadWedgeGuard();
+    expect(guard.recordFailure(key, { stopReason: "interrupted" }).streak).toBe(0);
+    expect(guard.recordFailure(key, { stopReason: "cancelled" }).streak).toBe(0);
+    expect(guard.peek(key)).toBe(0);
   });
 
   it("counts lock contention runtime errors toward the same streak", () => {

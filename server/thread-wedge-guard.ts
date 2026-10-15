@@ -27,8 +27,17 @@ const NO_OUTPUT_STOPS = new Set([
   "rpc_error",
 ]);
 
+/** Benign stop reasons: a person stopped the turn or policy blocked it — not an engine wedge. */
+const USER_OR_POLICY_STOPS = new Set([
+  "interrupted",
+  "cancelled",
+  "auth_required",
+  "host_control_policy",
+]);
+
 export function isNoOutputWedgeStop(stopReason: string | null | undefined): boolean {
   if (!stopReason) return false;
+  if (USER_OR_POLICY_STOPS.has(stopReason)) return false;
   return NO_OUTPUT_STOPS.has(stopReason);
 }
 

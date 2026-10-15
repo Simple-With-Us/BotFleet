@@ -125,7 +125,7 @@ import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
 import { checkBotOrganizeBody, parseAutoUpdateBody } from "./companion-writes.ts";
 import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
 import { isMcodeLockContentionMessage } from "./mcode-lock-contention.ts";
-import { ThreadWedgeGuard } from "./thread-wedge-guard.ts";
+import { ThreadWedgeGuard, type ThreadWedgeFailureInput } from "./thread-wedge-guard.ts";
 import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
@@ -1087,6 +1087,12 @@ const COMMS_TOKEN = randomBytes(24).toString("hex");
  *  `engineId` from the event it is handed rather than from the live instance,
  *  so a breaker fed from there would miss turns and key on a stale engine. */
 const threadWedgeGuard = new ThreadWedgeGuard();
+/** Turns that saw a lock-contention runtime.error; counted once on turn.completed. */
+const mcodeLockContentionTurns = new Set<string>();
+
+function threadWedgeTurnToken(botId: string, threadId: string, turnId: string | undefined): string | null {
+  return turnId ? `${botId}:${threadId}:${turnId}` : null;
+}
 
 function rotateWedgedThread(
   bot: { id: string; threadId: string },
@@ -1096,8 +1102,16 @@ function rotateWedgedThread(
   detail: string,
 ): void {
   store.setResumeCursor(bot.id, instanceId, undefined, wedgedThreadId);
+  const wedgedTask = store.taskByThread(bot.id, wedgedThreadId);
   const wasActive = bot.threadId === wedgedThreadId;
-  const task = store.createTask(bot.id, `Recovered after ${streak} wedged turns`, wasActive);
+  const title = `Recovered after ${streak} wedged turns`;
+  const task = wedgedTask?.automationKey
+    ? store.rolloverAutomationTask(bot.id, wedgedTask.automationKey, {
+        title,
+        activate: wasActive,
+        previousThreadId: wedgedThreadId,
+      })
+    : store.createTask(bot.id, title, wasActive);
   if (!task) {
     console.error(`thread wedge: could not rotate task for bot ${bot.id} thread ${wedgedThreadId} (${detail})`);
     return;
@@ -1123,20 +1137,32 @@ function noteThreadWedge(bot: { id: string; threadId: string } | null, event: Ru
   const instanceId = event.providerInstanceId ?? (event.type === "runtime.error" ? event.provider : undefined);
   if (!instanceId) return;
   const key = { botId: bot.id, threadId: event.threadId, instanceId };
+  const turnToken = threadWedgeTurnToken(bot.id, event.threadId, event.turnId);
   if (event.type === "runtime.error") {
     if (!isMcodeLockContentionMessage(event.message)) return;
-    const { shouldRotate, streak } = threadWedgeGuard.recordFailure(key, { runtimeMessage: event.message });
-    if (shouldRotate) rotateWedgedThread(bot, event.threadId, instanceId, streak, event.message);
+    if (turnToken) mcodeLockContentionTurns.add(turnToken);
     return;
   }
   if (event.type !== "turn.completed") return;
   if (event.ok) {
+    if (turnToken) mcodeLockContentionTurns.delete(turnToken);
     threadWedgeGuard.recordSuccess(key);
     return;
   }
-  const { shouldRotate, streak } = threadWedgeGuard.recordFailure(key, { stopReason: event.stopReason });
+  if (stoppedTurns.has(`${bot.id}:${event.threadId}`)) {
+    if (turnToken) mcodeLockContentionTurns.delete(turnToken);
+    return;
+  }
+  const hadLockContention = turnToken ? mcodeLockContentionTurns.delete(turnToken) : false;
+  const failure: ThreadWedgeFailureInput = hadLockContention
+    ? { runtimeMessage: "Lock file is already being held" }
+    : { stopReason: event.stopReason };
+  const { shouldRotate, streak } = threadWedgeGuard.recordFailure(key, failure);
   if (shouldRotate) {
-    rotateWedgedThread(bot, event.threadId, instanceId, streak, event.stopReason ?? "turn failed");
+    const detail = hadLockContention
+      ? "Lock file is already being held"
+      : (event.stopReason ?? "turn failed");
+    rotateWedgedThread(bot, event.threadId, instanceId, streak, detail);
   }
 }
 
