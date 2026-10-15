@@ -17,6 +17,8 @@ import { NoEngines } from "@/components/NoEngines";
 import { noEngineCanRun } from "@/lib/engine-status";
 import { resolveAppContext, shownThreadId, threadIdForApp } from "@/lib/task-app-thread";
 import { useDismissOnSelection } from "@/lib/use-dismiss-on-selection";
+import { pathForFile } from "@/components/ComposerAttachments";
+import { PluginsManagerDrawer } from "@/components/PluginsManagerDrawer";
 
 // UI2: every one of these is already conditionally rendered — near-modal
 // panels/pages that most sessions never open in a given launch — so they
@@ -102,7 +104,38 @@ function Shell() {
   const taskCreationBot = state.bots.find((entry) => entry.id === state.taskCreationBotId);
   const [selectedAppId, setSelectedAppId] = useState<string | null>(() => (group && !group.dm ? group.id : null));
   const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
+  const [droppedPluginFolder, setDroppedPluginFolder] = useState<string | null>(null);
   const hasApps = state.groups.some((g) => !g.dm);
+
+  // While the Plugins screen is open, a dropped folder fills the install field
+  // instead of attaching to the composer (capture phase wins over bubble handlers).
+  useEffect(() => {
+    if (!state.pluginsManagerOpen) return;
+    const carriesFiles = (event: DragEvent) =>
+      Array.from(event.dataTransfer?.types ?? []).includes("Files");
+
+    const onDragOver = (event: DragEvent) => {
+      if (carriesFiles(event)) event.preventDefault();
+    };
+
+    const onDrop = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      const files = Array.from(event.dataTransfer?.files ?? []);
+      if (!files.length) return;
+      const folderPath = pathForFile(files[0]);
+      if (!folderPath) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setDroppedPluginFolder(folderPath);
+    };
+
+    window.addEventListener("dragover", onDragOver, true);
+    window.addEventListener("drop", onDrop, true);
+    return () => {
+      window.removeEventListener("dragover", onDragOver, true);
+      window.removeEventListener("drop", onDrop, true);
+    };
+  }, [state.pluginsManagerOpen]);
 
   // The task-switch ack clears the pin, so a null pin means "the bot's active
   // thread", not "left the App" (see resolveAppContext).
@@ -582,9 +615,17 @@ function Shell() {
         </Suspense>
       )}
       {state.pluginsManagerOpen && (
-        <Suspense fallback={<PanelFallback />}>
-          <PluginsManagerView onClose={() => dispatch({ type: "togglePluginsManager", open: false })} />
-        </Suspense>
+        <PluginsManagerDrawer>
+          <Suspense fallback={<PanelFallback />}>
+            <PluginsManagerView
+              droppedFolderPath={droppedPluginFolder}
+              onClose={() => {
+                setDroppedPluginFolder(null);
+                dispatch({ type: "togglePluginsManager", open: false });
+              }}
+            />
+          </Suspense>
+        </PluginsManagerDrawer>
       )}
       {/* mounted after the modals: same z-50 tier, so DOM order keeps the
           palette on top when one of them is open underneath. Always

@@ -9,7 +9,18 @@
 // contributes from its manifest — text summaries only, the host does
 // not render plugin-supplied UI here.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowUpCircle, Loader2, Power, PowerOff, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
+import {
+  ArrowUpCircle,
+  ExternalLink,
+  FolderOpen,
+  Loader2,
+  Power,
+  PowerOff,
+  RefreshCw,
+  Trash2,
+  TriangleAlert,
+} from "lucide-react";
+import { PLUGINS_HELP_URL } from "@/lib/plugins-help";
 
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -116,7 +127,14 @@ function asObject(value: unknown): ErrorLike {
 
 /** The view's main surface.  Mounted from App.tsx next to PluginsPanel
  *  (which is the Composio connectors surface, kept untouched). */
-export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
+export function PluginsManagerView({
+  onClose,
+  droppedFolderPath,
+}: {
+  onClose?: () => void;
+  /** Set when the user drops a folder onto BotFleet while this view is open. */
+  droppedFolderPath?: string | null;
+}) {
   const [plugins, setPlugins] = useState<PluginListing[]>([]);
   const [state, setState] = useState<AsyncState>({ kind: "loading" });
   const [installSource, setInstallSource] = useState("");
@@ -132,11 +150,11 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
       const response = await fetch("/api/plugins");
       if (!response.ok) {
         const body = await response.text();
-        throw new Error(body || `GET /api/plugins failed (${response.status})`);
+        throw new Error(body || `Could not load plugins (${response.status})`);
       }
       const parsed = await readPluginsResponse(response);
       if (!parsed) {
-        throw new Error("GET /api/plugins returned a body the manager cannot read");
+        throw new Error("BotFleet returned an unexpected plugins list.");
       }
       setPlugins(parsed.plugins);
       setState({ kind: "idle" });
@@ -148,6 +166,25 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (droppedFolderPath) setInstallSource(droppedFolderPath);
+  }, [droppedFolderPath]);
+
+  const canPickFolder = Boolean(window.ogb?.pickFolder);
+
+  const openFolderPicker = useCallback(async () => {
+    const chosen = await window.ogb?.pickFolder?.(installSource || undefined, "Choose a plugin folder");
+    if (chosen) setInstallSource(chosen);
+  }, [installSource]);
+
+  const openHelp = useCallback(() => {
+    if (window.ogb?.openExternal) {
+      void window.ogb.openExternal(PLUGINS_HELP_URL);
+      return;
+    }
+    window.open(PLUGINS_HELP_URL, "_blank", "noopener,noreferrer");
+  }, []);
 
   const handleInstall = useCallback(async () => {
     setInstalling(true);
@@ -222,13 +259,20 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto bg-app p-6 text-ink">
-      <header className="flex items-center justify-between">
+      <header className="flex items-start justify-between gap-3">
         <div>
           <h1 className="text-[20px] font-semibold">Plugins</h1>
           <p className="text-[13px] text-ink-secondary">
-            Drop-in extensions you can install, enable, and remove without a BotFleet update.{"\u00a0 "}
-            Imports land disabled until you enable them.
+            Add cards and commands from folders you trust.{"\u00a0 "}
+            New installs stay off until you turn them on.
           </p>
+          <button
+            type="button"
+            onClick={openHelp}
+            className="mt-2 inline-flex items-center gap-1.5 text-[12px] font-medium text-accent hover:underline"
+          >
+            How plugins work <ExternalLink size={12} aria-hidden="true" />
+          </button>
         </div>
         {onClose ? (
           <button
@@ -242,21 +286,31 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
       </header>
 
       <section className="rounded-lg border border-border bg-panel p-4">
-        <h2 className="mb-2 text-[14px] font-medium">Install Plugin</h2>
+        <h2 className="mb-2 text-[14px] font-medium">Install a Plugin</h2>
         <p className="mb-3 text-[12px] text-ink-secondary">
-          Paste a folder path on this computer, a GitHub repository (<code className="rounded bg-raised px-1">owner/repo</code>),
-          or a full URL.{"\u00a0 "}
-          The plugin is downloaded and validated against the manifest schema before anything is written.
+          Choose a folder on this Mac, drag one here, or paste a path or GitHub link.{"\u00a0 "}
+          BotFleet checks the plugin before it is saved.
         </p>
-        <div className="flex flex-col gap-2 sm:flex-row">
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
           <input
             type="text"
             value={installSource}
-            placeholder="…/my-plugin or acme/widget"
+            placeholder="Plugin folder or GitHub link"
             onChange={(event) => setInstallSource(event.target.value)}
             disabled={installing}
-            className="flex-1 rounded-md border border-border bg-raised px-3 py-2 text-[13px] focus:border-accent focus:outline-none"
+            className="min-w-[12rem] flex-1 rounded-md border border-border bg-raised px-3 py-2 text-[13px] focus:border-accent focus:outline-none"
           />
+          {canPickFolder ? (
+            <button
+              type="button"
+              onClick={() => void openFolderPicker()}
+              disabled={installing}
+              className="inline-flex items-center justify-center gap-2 rounded-md border border-border bg-raised px-4 py-2 text-[13px] font-medium hover:bg-app disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <FolderOpen size={14} aria-hidden="true" />
+              Open
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={handleInstall}
@@ -366,9 +420,9 @@ function PluginRow({
   onRemove: () => void;
 }) {
   const sourceLabel = useMemo(() => {
-    if (plugin.source.kind === "folder") return `folder: ${plugin.source.path}`;
-    const ref = plugin.source.ref ? `@${plugin.source.ref}` : "";
-    return `git: ${plugin.source.url}${ref}`;
+    if (plugin.source.kind === "folder") return plugin.source.path;
+    const ref = plugin.source.ref ? ` (${plugin.source.ref})` : "";
+    return `${plugin.source.url}${ref}`;
   }, [plugin.source]);
 
   return (
@@ -388,7 +442,7 @@ function PluginRow({
             </span>
           </div>
           <p className="mt-1 text-[13px] text-ink-secondary">{plugin.description}</p>
-          <p className="mt-1 text-[12px] text-ink-secondary">Source: {sourceLabel}</p>
+          <p className="mt-1 text-[12px] text-ink-secondary">From {sourceLabel}</p>
           {plugin.capabilities.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-1.5">
               {plugin.capabilities.map((cap) => (
