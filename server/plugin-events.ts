@@ -160,14 +160,30 @@ export class PluginEventBus {
    *  first attempt per plugin; retries continue in the background and
    *  valid decisions reach `transport.onDecision` whenever they land. */
   async emit(rawEvent: unknown): Promise<PluginDeliveryOutcome[]> {
+    return (await this.emitAndDecide(rawEvent)).outcomes;
+  }
+
+  /** Like emit, but also captures the first valid wake request from the
+   *  first attempts so a caller (the Zulip hub) can act on it now.
+   *  Later retry decisions still flow to `transport.onDecision`. */
+  async emitAndDecide(rawEvent: unknown): Promise<{
+    outcomes: PluginDeliveryOutcome[];
+    decision: { plugin: string; decision: PluginRoutingDecision } | null;
+  }> {
     const parsed = pluginEventEnvelopeSchema.safeParse(rawEvent);
-    if (!parsed.success) return [];
+    if (!parsed.success) return { outcomes: [], decision: null };
     const event = parsed.data;
     const outcomes: PluginDeliveryOutcome[] = [];
+    let decision: { plugin: string; decision: PluginRoutingDecision } | null = null;
     for (const pluginName of this.transport.subscribers(event)) {
-      outcomes.push(await this.deliverFirstAttempt(pluginName, event));
+      const first = await this.deliverFirstAttempt(pluginName, event, (candidate) => {
+        if (!decision && candidate.action === "requestWake") {
+          decision = { plugin: pluginName, decision: candidate };
+        }
+      });
+      outcomes.push(first);
     }
-    return outcomes;
+    return { outcomes, decision };
   }
 
   /** Requeue persisted pending retries after a restart.  Content was
@@ -255,7 +271,11 @@ export class PluginEventBus {
     }, Math.min(delay, 2_147_483_647)));
   }
 
-  private async deliverFirstAttempt(pluginName: string, event: PluginEventEnvelope): Promise<PluginDeliveryOutcome> {
+  private async deliverFirstAttempt(
+    pluginName: string,
+    event: PluginEventEnvelope,
+    onWakeRequest?: (decision: PluginRoutingDecision) => void,
+  ): Promise<PluginDeliveryOutcome> {
     const ledger = loadLedger(this.baseDir, pluginName);
     if (ledger.seen.includes(event.eventId)) {
       return this.record(pluginName, ledger, {
@@ -276,7 +296,7 @@ export class PluginEventBus {
     }
     ledger.seen.push(event.eventId);
     const scoped = this.transport.scope(pluginName, subscription, event);
-    return this.attempt(pluginName, scoped, ledger, 1);
+    return this.attempt(pluginName, scoped, ledger, 1, onWakeRequest);
   }
 
   private async attempt(
@@ -284,6 +304,7 @@ export class PluginEventBus {
     event: PluginEventEnvelope,
     ledger: Ledger,
     attempts: number,
+    onWakeRequest?: (decision: PluginRoutingDecision) => void,
   ): Promise<PluginDeliveryOutcome> {
     let result: PluginSandboxResult;
     try {
@@ -331,6 +352,7 @@ export class PluginEventBus {
     }
     try {
       this.transport.onDecision(pluginName, event, decision.data);
+      if (decision.data.action === "requestWake") onWakeRequest?.(decision.data);
     } catch {
       // A host-side decision failure must not fail the delivery record.
     }

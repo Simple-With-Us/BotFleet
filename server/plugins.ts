@@ -812,6 +812,17 @@ export async function emitPluginEvent(
   return pluginEventBus(baseDir).emit(rawEvent);
 }
 
+/** Emit one envelope and capture the first valid wake request from the
+ *  first attempts, for callers that must act on the decision now (the
+ *  Zulip hub).  Late retry decisions still reach the registered
+ *  decision handler. */
+export async function decidePluginWake(
+  event: PluginEventEnvelope,
+  baseDir: string = PLUGINS_DIR,
+): Promise<{ plugin: string; decision: PluginRoutingDecision } | null> {
+  return (await pluginEventBus(baseDir).emitAndDecide(event)).decision;
+}
+
 /** Health for one plugin: ledger depths plus recent outcomes (reason
  *  codes only, never event text) plus the plugin's own report when it
  *  implements getHealth. */
