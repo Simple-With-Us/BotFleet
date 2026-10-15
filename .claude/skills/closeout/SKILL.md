@@ -12,7 +12,7 @@ description: Finish a Monet work unit — THE BOARD, effort log, GitHub issue, S
 > Cursor, Grok, Grok Bot, Codex, AG, DeepSeek, Kimi, and Fx have their own skill dirs and must not take identity from here.
 
 
-Start-of-work is a triple claim.  End-of-work is the same three surfaces plus Notes when the owner might ask "what happened?"
+Start-of-work is a Linear claim plus Zulip post.  End-of-work closes Linear and Zulip plus Notes when the owner might ask "what happened?"
 
 ## 1. Truth check
 
@@ -20,7 +20,7 @@ Start-of-work is a triple claim.  End-of-work is the same three surfaces plus No
 - Production verified?  (`deploy-verify`)  Completed ≠ Deployed.
 - Uncommitted files?  Commit or explicitly report why not (failing tests, secrets, owner hold).
 
-## 2. THE BOARD
+## 2. Linear
 
 ```bash
 board status <id> completed --resolution "Landed in #<PR>.  <one line>."

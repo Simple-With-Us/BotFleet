@@ -68,13 +68,12 @@ git -C /Users/jay/Code/<Repo> worktree add -b <monet|claude|renoir>/<slug> ~/app
 
 Per-lane isolation is also fine: `~/apps/<prefix>-monet-<lane>`.  Inventory is `~/Code/ai-fleet-coordinator/fleet-apps.json`.  `scripts/setup-agent-lanes.sh` uses a different naming scheme (`Socratic.Trade-monet` / `agent/monet`) — do not run it for this seat.
 
-Then read that app's `AGENTS.md`, `STATUS.md`, latest `docs/rollouts/`, and `docs/EFFORT-LOG.md`.  Personal-Site `AGENTS.md` can lag `README.md` (the live source is `site/`); believe README + current tree over a stale "static snapshot" paragraph.
+Then read that app's `AGENTS.md`, `STATUS.md`, and latest `docs/rollouts/`.  `docs/EFFORT-LOG.md` is archived — read only for history, never add or edit rows.  Personal-Site `AGENTS.md` can lag `README.md` (the live source is `site/`); believe README + current tree over a stale "static snapshot" paragraph.
 
-## 4. Triple-claim before substantial edits
+## 4. Claim before substantial edits
 
-1. **THE BOARD** — `board list --app <app>` then `board claim <id> --by "$AGENT_SEAT" --env Mac --where "~/apps/<lane> @ <monet|claude|renoir>/<slug>"`.  If nothing exists: `board file --title "..." --app <app> --severity P1 --by "$AGENT_SEAT" --env Mac --where "..." --desc "..."`.
-2. **Effort board** — In Progress on the live file **and** `docs/EFFORT-LOG.md` (fleet-infra has no repo mirror).  Never delete another seat's row.
-3. **Slack** — then GitHub issue if you are executing a numbered one.
+1. **Linear** — `board list --app <app>` then `board claim <id> --by "$AGENT_SEAT" --env Mac --where "~/apps/<lane> @ <monet|claude|renoir>/<slug>"`.  If nothing exists: `board file --title "..." --app <app> --severity P1 --by "$AGENT_SEAT" --env Mac --where "..." --desc "..."`.
+2. **Zulip** — post in the work topic (`<ID> <subject>`).  GitHub issue if you are executing a numbered one.
 
 Post (prefer this over Slack MCP):
 
