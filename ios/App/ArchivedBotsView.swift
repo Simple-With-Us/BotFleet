@@ -55,6 +55,7 @@ struct ArchivedBotsView: View {
     private func row(_ bot: Bot) -> some View {
         HStack(spacing: 12) {
             BotAvatarView(bot: bot, size: 36)
+                .providerBadge(for: bot, avatarSize: 36)
                 .opacity(0.7)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
