@@ -332,7 +332,7 @@ export class ZulipClient {
 
   async messages(
     narrow: Array<{ operator: string; operand: string | number }>,
-    opts: { anchor: number | "newest" | "oldest"; numBefore?: number; numAfter?: number; includeAnchor?: boolean },
+    opts: { anchor: number | "newest" | "oldest"; numBefore?: number; numAfter?: number; includeAnchor?: boolean; timeoutMs?: number },
     signal?: AbortSignal,
   ): Promise<ZulipMessagePage> {
     const result = await this.request(
@@ -347,7 +347,7 @@ export class ZulipClient {
         include_anchor: opts.includeAnchor ?? false,
         apply_markdown: false,
       },
-      { signal },
+      { signal, timeoutMs: opts.timeoutMs },
     );
     const messages: ZulipMessage[] = [];
     let newestId: number | null = null;
@@ -379,7 +379,7 @@ export class ZulipClient {
     // callback-supplied flags or text are never used as authority.
     const mentioned = await this.messages(
       [{ operator: "is", operand: "mentioned" }],
-      { anchor: messageId, numAfter: 1, includeAnchor: true },
+      { anchor: messageId, numAfter: 1, includeAnchor: true, timeoutMs: opts.timeoutMs },
       opts.signal,
     );
     return mentioned.messages.find((candidate) => candidate.id === messageId) ?? result.message;

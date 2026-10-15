@@ -8,9 +8,14 @@ import { z } from "zod";
 import { writeFileAtomic } from "../atomic.ts";
 
 export const ZULIP_OUTGOING_MAX_PENDING = 10_000;
+export const ZULIP_OUTGOING_MAX_ATTEMPTS = 12;
 const BOT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/;
 const FILE_NAME = /^([A-Za-z0-9][A-Za-z0-9_-]{0,95})-(\d{1,20})\.json$/;
-const spoolItemSchema = z.object({ botId: z.string(), messageId: z.number().int().safe() });
+const spoolItemSchema = z.object({
+  botId: z.string(),
+  messageId: z.number().int().safe(),
+  attempts: z.number().int().safe().nonnegative().optional(),
+});
 
 export function supportsDirectoryFsync(platform: NodeJS.Platform = process.platform): boolean {
   return platform !== "win32";
@@ -82,6 +87,18 @@ export class ZulipOutgoingSpool {
       throw error;
     }
     this.fsyncDirectory();
+  }
+
+  recordFailure(item: ZulipOutgoingSpoolItem): number {
+    const path = join(this.directory, this.name(item.botId, item.messageId));
+    const parsed = spoolItemSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
+    if (!parsed.success || parsed.data.botId !== item.botId || parsed.data.messageId !== item.messageId) {
+      throw new Error("invalid Zulip outgoing webhook spool row");
+    }
+    const attempts = (parsed.data.attempts ?? 0) + 1;
+    writeFileAtomic(path, `${JSON.stringify({ botId: item.botId, messageId: item.messageId, attempts })}\n`, { mode: 0o600 });
+    this.fsyncDirectory();
+    return attempts;
   }
 
   private valid(path: string, expected: ZulipOutgoingSpoolItem): boolean {

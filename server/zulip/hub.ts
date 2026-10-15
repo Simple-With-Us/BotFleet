@@ -53,7 +53,7 @@ import {
 } from "./outbound.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type RouterContext } from "./router.ts";
 import { HANDLED_RING_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
-import { ZulipOutgoingSpool } from "./outgoing-spool.ts";
+import { ZULIP_OUTGOING_MAX_ATTEMPTS, ZulipOutgoingSpool } from "./outgoing-spool.ts";
 import type { ZulipIdentity, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
 
 /** Zulip roles a BF bot may hold: moderator (300) and member (400).  An
@@ -1118,7 +1118,10 @@ export class ZulipHub {
       const session = this.sessions.get(row.botId);
       if (!session?.ready || !session.client) continue;
       try {
-        const message = await session.client.message(row.messageId);
+        const message = await session.client.message(row.messageId, {
+          signal: AbortSignal.timeout(8_000),
+          timeoutMs: 4_000,
+        });
         if (message.id !== row.messageId) throw new Error("Zulip returned a mismatched message id");
         this.handleMessage(session, message, "webhook");
         if (!session.save(true)) throw new Error("Zulip state could not be persisted");
@@ -1129,12 +1132,27 @@ export class ZulipHub {
         const status = statusOf(error);
         // A missing or explicitly inaccessible message can never be routed;
         // authentication and rate-limit failures remain durable for retry.
-        if (status === 403 || status === 404) {
+        if (status === 400 || status === 403 || status === 404) {
           this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} unavailable (${status})`);
           try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
           return;
         }
-        this.outgoingRetry.set(key, now + (this.deps.timings?.retryBaseMs ?? 5_000));
+        let attempts: number;
+        try {
+          attempts = this.outgoingSpool.recordFailure(row);
+        } catch {
+          this.log(`[zulip] ${session.role}: outgoing webhook retry state could not be persisted`);
+          return;
+        }
+        if (attempts >= ZULIP_OUTGOING_MAX_ATTEMPTS) {
+          this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} abandoned after repeated failures`);
+          try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
+          this.outgoingRetry.delete(key);
+          return;
+        }
+        const retryBase = this.deps.timings?.retryBaseMs ?? 5_000;
+        const retryDelay = Math.min(retryBase * (2 ** (attempts - 1)), 5 * 60_000);
+        this.outgoingRetry.set(key, now + retryDelay);
         this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} deferred`);
         return;
       }
