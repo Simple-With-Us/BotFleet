@@ -772,7 +772,7 @@ export const CliCandidatesQuerySchema = z.object({
     .max(4096)
     .default("")
     .transform((raw) => raw.split(",").map((alias) => alias.trim()).filter(Boolean)),
-});
+}).strict();
 
 /** `<streamId>:<seq>` — opaque to clients, and the only thing they need to
  * remember to resume.  Returns null when it belongs to another run. */

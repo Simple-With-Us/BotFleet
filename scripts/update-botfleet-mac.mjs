@@ -3438,11 +3438,17 @@ async function sweepExpiredFailedInstallBundles(config, { reportKept = false } =
       console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
     }
   }
-  for (const path of pruneFailedInstallBundles(config.appPath, {
+  const { removed, failures } = pruneFailedInstallBundles(config.appPath, {
     listNames: () => present,
     remove: (target) => rmSync(target, { recursive: true, force: true }),
-  })) {
+  });
+  for (const path of removed) {
     console.log(`Removed ${basename(path)}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
+  }
+  for (const { path, error } of failures) {
+    console.error(
+      `Could not remove expired failed-install bundle ${path}: ${error?.message ?? error}; it will be cleaned up on a later sweep`,
+    );
   }
 }
 
@@ -4284,8 +4290,14 @@ function createOperations(config) {
           await rename(previous.rollbackPath, config.appPath);
           previous.swap.rollbackAppHolds = false;
           if (failedReplacementPath && await exists(failedReplacementPath)) {
-            await rm(failedReplacementPath, { recursive: true, force: true });
-            console.log(`Removed the failed replacement bundle ${failedReplacementPath}`);
+            try {
+              await rm(failedReplacementPath, { recursive: true, force: true });
+              console.log(`Removed the failed replacement bundle ${failedReplacementPath}`);
+            } catch (cleanupError) {
+              console.error(
+                `Could not remove the failed replacement bundle ${failedReplacementPath}: ${cleanupError.message}; it will be cleaned up by the next sweep`,
+              );
+            }
           }
         }
       });

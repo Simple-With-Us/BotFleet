@@ -1169,7 +1169,7 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       if (pruned.length) {
         console.log(`BotFleet removed ${pruned.length} abandoned update stage(s) under ${deps.updatesDirectory}.`);
       }
-      const failedBundles = pruneFailedInstallBundles(deps.appPath, {
+      const { removed: failedBundles, failures: failedBundleRemovals } = pruneFailedInstallBundles(deps.appPath, {
         listNames: (directory) => {
           try {
             return readdirSync(directory);
@@ -1181,6 +1181,11 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       });
       if (failedBundles.length) {
         console.log(`BotFleet removed ${failedBundles.length} expired failed-install bundle(s) beside ${deps.appPath}.`);
+      }
+      for (const { path, error } of failedBundleRemovals) {
+        console.warn(
+          `BotFleet could not remove expired failed-install bundle ${path}: ${(error as Error)?.message ?? error}`,
+        );
       }
       pruneRunArtifacts(runsDirectory, { protect: lastRun ? [lastRun.runId] : [] });
     } catch (error) {
