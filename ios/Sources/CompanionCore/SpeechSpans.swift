@@ -474,8 +474,8 @@ private func describeCodeBlock(_ fence: [UInt16]) -> String {
         "sh": "shell", "bash": "shell", "zsh": "shell", "json": "JSON", "yml": "YAML", "yaml": "YAML",
         "sql": "SQL", "rs": "Rust", "go": "Go", "swift": "Swift", "diff": "diff",
     ]
-    if let name = spoken[lang.lowercased()] { return ". (a \(name) code block) " }
-    return ". (a code block) "
+    if let name = spoken[lang.lowercased()] { return ". A \(name) code block. " }
+    return ". A code block. "
 }
 
 private func matches(_ regex: NSRegularExpression, _ units: [UInt16]) -> Bool {
@@ -492,7 +492,7 @@ func speakableTracked(_ input: String) -> Tracked {
 
     t = replace(t, Rules.image) { m, t in
         let alt = groupText(m, 1, t) ?? []
-        return alt.isEmpty ? [.literal(". (an image) ")] : [.literal(". (image: ")] + group(m, 1) + [.literal(") ")]
+        return alt.isEmpty ? [.literal(". An image. ")] : [.literal(". Image: ")] + group(m, 1) + [.literal(". ")]
     }
     t = replace(t, Rules.link) { m, _ in group(m, 1) }
     t = replace(t, Rules.angleUrl) { _, _ in [.literal(" a link ")] }

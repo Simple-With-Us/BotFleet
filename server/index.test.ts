@@ -141,6 +141,9 @@ const settlesWithin = async (
   }
 };
 
+/** windows-latest is slower and overlaps vitest files more; scale settle budgets there. */
+const winSettleMs = (ms: number) => (process.platform === "win32" ? Math.round(ms * 2) : ms);
+
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
   const response = await fetch(`${BASE}/api/attachments`, {
     method: "POST",
@@ -2693,13 +2696,17 @@ describe("harness HTTP API", () => {
   });
 
   it("judges a strict write against the catalog the detected CLI can run, not the registry's full one", async () => {
-    // The fixture Claude CLI reports 2.1.232, older than the 2.1.280 that
-    // Opus 5.5 needs: the picker does not list it, so an MCP-style strict
-    // write must not persist it either, on the primary or on a fallback.
+    // The fixture Claude CLI reports 2.1.232, older than 2.1.280 (Opus 5.5)
+    // and 2.1.284 (Sonnet 5.5): the picker does not list either, so an
+    // MCP-style strict write must not persist them, on the primary or on a
+    // fallback.
     const instances = (await api("GET", "/api/instances")).body.instances;
     const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
     expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
-    expect(claude.models.options.map((option: { id: string }) => option.id)).not.toContain("claude-opus-5-5");
+    expect(claude.models.default).toBe("claude-sonnet-5");
+    const ids = claude.models.options.map((option: { id: string }) => option.id);
+    expect(ids).not.toContain("claude-opus-5-5");
+    expect(ids).not.toContain("claude-sonnet-5-5");
     const bot = (await api("POST", "/api/bots")).body.bot;
     try {
       const primary = await api("PATCH", `/api/bots/${bot.id}`, {
@@ -2708,6 +2715,13 @@ describe("harness HTTP API", () => {
       });
       expect(primary.status).toBe(400);
       expect(primary.body.error).toMatch(/"claude-opus-5-5" is not offered by instance "claude"/);
+
+      const sonnet = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5" },
+        requireAvailableModel: true,
+      });
+      expect(sonnet.status).toBe(400);
+      expect(sonnet.body.error).toMatch(/"claude-sonnet-5-5" is not offered by instance "claude"/);
 
       const fallback = await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: {
@@ -6203,6 +6217,7 @@ describe("instance CLI override API", () => {
     const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
     const claude2 = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude2");
     const bot = (await api("POST", "/api/bots")).body.bot as { id: string; threadId: string };
+    const idlePoll = { timeout: winSettleMs(30_000), interval: 250 };
     const persistedTask = () => {
       const bots = JSON.parse(readFileSync(join(home, ".botfleet", "bots.json"), "utf8")) as Array<{
         id: string;
@@ -6222,14 +6237,14 @@ describe("instance CLI override API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }).toBe(false);
+      }, idlePoll).toBe(false);
     };
 
     try {
       await select("claude", claude.models.default);
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "establish a Claude cursor" })).status).toBe(202);
-      await expect.poll(() => persistedTask(), { timeout: 5_000 }).toMatchObject({
+      await expect.poll(() => persistedTask(), { timeout: winSettleMs(10_000) }).toMatchObject({
         lastInstanceId: "claude",
         resumeCursors: { claude: expect.any(String) },
       });
@@ -6238,7 +6253,7 @@ describe("instance CLI override API", () => {
 
       await select("claude2", claude2.models.default);
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "make the second engine current" })).status).toBe(202);
-      await expect.poll(() => persistedTask()?.lastInstanceId, { timeout: 5_000 }).toBe("claude2");
+      await expect.poll(() => persistedTask()?.lastInstanceId, { timeout: winSettleMs(10_000) }).toBe("claude2");
       await interrupt();
 
       expect((await api("PATCH", "/api/instances/claude", { cli: fakeUnsupportedClaudeCli })).status).toBe(200);
@@ -6249,7 +6264,7 @@ describe("instance CLI override API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }, { timeout: 5_000 }).toBe(false);
+      }, idlePoll).toBe(false);
 
       expect(persistedTask()).toMatchObject({
         lastInstanceId: "claude2",
@@ -6260,7 +6275,7 @@ describe("instance CLI override API", () => {
       await api("DELETE", `/api/bots/${bot.id}`);
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI })).status).toBe(200);
     }
-  }, 20_000);
+  }, winSettleMs(60_000));
 
   it("does not let setup from before a provider reload dispatch or clear its successor", async () => {
     const launchLog = join(home, "fake-claude-setup-race-launches");
@@ -6482,6 +6497,7 @@ describe("instance CLI override API", () => {
 
     expect((await api("DELETE", "/api/instances/claude")).status).toBe(400);
     expect((await api("DELETE", "/api/instances/openaiCompat")).status).toBe(400);
+    expect((await api("DELETE", "/api/instances/opencode")).status).toBe(400);
 
     const deleted = await api("DELETE", `/api/instances/${instanceId}`);
     expect(deleted.status).toBe(200);
@@ -8883,7 +8899,8 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
   type Saved = { instanceId: string; model: string; latest?: string; fallbacks?: Saved[] };
   // A describe records each engine's CLI version; until the Claude CLI has
   // reported one, nothing on a Claude engine is moved.  The fixture CLI
-  // reports 2.1.232, older than the 2.1.280 that Opus 5.5 needs.
+  // reports 2.1.232, older than 2.1.280 (Opus 5.5) and 2.1.284 (Sonnet 5.5),
+  // so the runnable Sonnet on it is Sonnet 5.
   beforeAll(async () => {
     await api("GET", "/api/instances");
   });
@@ -8904,9 +8921,16 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
     );
     expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
     const ids = claude.models.options.map((option: { id: string }) => option.id);
-    expect(ids).toEqual(expect.arrayContaining(["claude-sonnet-5-5", "claude-opus-5"]));
-    expect(ids).not.toContain("claude-sonnet-5");
+    expect(ids).toEqual(expect.arrayContaining(["claude-sonnet-5", "claude-opus-5"]));
+    expect(ids).not.toContain("claude-sonnet-5-5");
     expect(ids).not.toContain("claude-opus-5-5");
+    expect(claude.models.default).toBe("claude-sonnet-5");
+  });
+
+  it("starts a new bot on Sonnet 5 when the CLI cannot run Sonnet 5.5", async () => {
+    await withBot("Lineage Default Sonnet", async (bot) => {
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5" });
+    });
   });
 
   it("never moves a pinned Opus 5 onto Opus 5.5 for a CLI too old to run it", async () => {
@@ -8962,7 +8986,7 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
         modelSelection: { instanceId: "claude", model: "claude-3-7-sonnet" },
       });
       expect(saved.status).toBe(200);
-      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" });
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" });
     });
   });
 
@@ -8971,13 +8995,13 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       expect((await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: { instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" },
       })).status).toBe(200);
-      expect(await selectionOf(bot.id)).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+      expect(await selectionOf(bot.id)).toMatchObject({ model: "claude-sonnet-5", latest: "sonnet" });
 
       expect((await api("PATCH", `/api/bots/${bot.id}`, {
-        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: null },
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", latest: null },
       })).status).toBe(200);
       const pinned = await selectionOf(bot.id);
-      expect(pinned?.model).toBe("claude-sonnet-5-5");
+      expect(pinned?.model).toBe("claude-sonnet-5");
       expect(pinned?.latest).toBeUndefined();
 
       const bad = await api("PATCH", `/api/bots/${bot.id}`, {
@@ -9027,24 +9051,44 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
   });
 
   it("keeps a float when an older client writes back the slug it read before the float moved on", async () => {
-    await withBot("Lineage Stale Write", async (bot) => {
-      expect((await api("PATCH", `/api/bots/${bot.id}`, {
-        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
-      })).status).toBe(200);
-      // The shipped iOS app read `claude-sonnet-5` while the float pointed
-      // there, the harness has since moved it to 5.5, and the app writes its
-      // copy back with no `latest`.
-      const stale = await api("PATCH", `/api/bots/${bot.id}`, {
-        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", effort: "high" },
+    // The fixture CLI is too old to list Sonnet 5.5, so this story runs on a
+    // CLI that reports 2.1.284, where Latest Sonnet resolves to 5.5.
+    const newerCli = join(home, "fake-claude-newer-sonnet");
+    writeFileSync(
+      newerCli,
+      [
+        "#!/usr/bin/env node",
+        'process.env.FAKE_CLAUDE_VERSION = "2.1.284 (Claude Code)";',
+        "delete process.env.FAKE_CLAUDE_DUMP;",
+        `await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    try {
+      await withBot("Lineage Stale Write", async (bot) => {
+        expect((await api("PATCH", "/api/instances/claude2", { cli: newerCli })).status).toBe(200);
+        expect((await api("PATCH", `/api/bots/${bot.id}`, {
+          modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
+        })).status).toBe(200);
+        expect(await selectionOf(bot.id)).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+        // The shipped iOS app read `claude-sonnet-5` while the float pointed
+        // there, the harness has since moved it to 5.5, and the app writes its
+        // copy back with no `latest`.
+        const stale = await api("PATCH", `/api/bots/${bot.id}`, {
+          modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", effort: "high" },
+        });
+        expect(stale.status).toBe(200);
+        expect(await selectionOf(bot.id)).toMatchObject({
+          instanceId: "claude2",
+          model: "claude-sonnet-5-5",
+          latest: "sonnet",
+          effort: "high",
+        });
       });
-      expect(stale.status).toBe(200);
-      expect(await selectionOf(bot.id)).toMatchObject({
-        instanceId: "claude",
-        model: "claude-sonnet-5-5",
-        latest: "sonnet",
-        effort: "high",
-      });
-    });
+    } finally {
+      await api("PATCH", "/api/instances/claude2", { cli: FAKE_CLAUDE_CLI });
+    }
   });
 
   it("refuses a retired id with no successor that the write introduces", async () => {
@@ -9068,11 +9112,11 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       expect((await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: {
           instanceId: "claude",
-          model: "claude-sonnet-5-5",
+          model: "claude-sonnet-5",
           latest: "sonnet",
           fallbacks: [
-            { instanceId: "claude2", model: "claude-opus-5-5" },
-            { instanceId: "claude2", model: "claude-sonnet-5-5", latest: "sonnet" },
+            { instanceId: "claude2", model: "claude-opus-5" },
+            { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
           ],
         },
       })).status).toBe(200);
@@ -9081,13 +9125,13 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       expect((await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: {
           instanceId: "claude",
-          model: "claude-sonnet-5-5",
-          fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5-5" }],
+          model: "claude-sonnet-5",
+          fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5" }],
         },
       })).status).toBe(200);
       expect(await selectionOf(bot.id)).toMatchObject({
         latest: "sonnet",
-        fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5-5", latest: "sonnet" }],
+        fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" }],
       });
 
       const taskPath = `/api/bots/${bot.id}/tasks/${bot.threadId}`;
@@ -9095,12 +9139,12 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
         modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
       });
       expect(floated.status).toBe(200);
-      expect(floated.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+      expect(floated.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5", latest: "sonnet" });
       const resent = await api("PATCH", taskPath, {
-        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5-5" },
+        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5" },
       });
       expect(resent.status).toBe(200);
-      expect(resent.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+      expect(resent.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5", latest: "sonnet" });
     });
   });
 
@@ -9108,20 +9152,20 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
     await withBot("Lineage Apply", async (bot) => {
       const floating = await api("POST", "/api/bots/apply-model-defaults", {
         slots: {
-          primary: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
+          primary: { instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" },
           fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }, null, null],
         },
       });
       expect(floating.status).toBe(200);
       expect(await selectionOf(bot.id)).toMatchObject({
         instanceId: "claude",
-        model: "claude-sonnet-5-5",
+        model: "claude-sonnet-5",
         latest: "sonnet",
         fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }],
       });
 
       const pinned = await api("POST", "/api/bots/apply-model-defaults", {
-        slots: { primary: { instanceId: "claude", model: "claude-sonnet-5-5" } },
+        slots: { primary: { instanceId: "claude", model: "claude-sonnet-5" } },
       });
       expect(pinned.status).toBe(200);
       const after = await selectionOf(bot.id);
