@@ -13,9 +13,11 @@
 //     names that exact host:port in `needs.network`.  The shipped Zulip
 //     plugin also receives the configured realm host.  The child seals
 //     the list before importing the plugin.  On Linux an empty list also
-//     enters a network namespace; on macOS a seatbelt profile denies the
-//     network and allows only the sealed destinations.  Node 25 and later
-//     also withhold `--allow-net` unless the list is non-empty.
+//     enters a network namespace.  On macOS a seatbelt profile denies
+//     the network for that empty list only; a declared destination is
+//     not expressible in a seatbelt remote filter, so the guard enforces
+//     it.  Node 25 and later also withhold `--allow-net` unless the list
+//     is non-empty.
 //   * a capped V8 heap, a start deadline, and a per-call deadline.  A call
 //     that overruns kills the child; the next call respawns it.
 //   * stdio closed, so nothing the plugin prints reaches the server log.
@@ -46,8 +48,10 @@ import { killPluginProcess, spawnPluginProcess } from "./plugin-net-isolate.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { PLUGINS_DIR } from "./plugin-registry.ts";
 
-/** Host-owned directory.  A plugin installed anywhere else is not the
- *  shipped Zulip plugin, even when its manifest name is `zulip`. */
+/** Host-owned directory.  A plugin is the shipped Zulip plugin only
+ *  when the registry recorded `<this>/zulip` as the folder it was
+ *  installed from.  The copy under the data directory is not enough,
+ *  and neither is a manifest named `zulip`. */
 export const FIRST_PARTY_PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "plugins", "first-party");
 import {
   ChildToParentMessageSchema,
@@ -580,7 +584,11 @@ export async function loadPlugin(
   const networkAllow = pluginNetworkAllow({
     capabilities: listing.capabilities,
     declared: listing.needs?.network ?? [],
-    shippedZulip: isShippedZulipPlugin(listing.name, pluginDir, options.firstPartyRoot ?? FIRST_PARTY_PLUGIN_ROOT),
+    shippedZulip: isShippedZulipPlugin(
+      listing.name,
+      listing.source.kind === "folder" ? listing.source.path : null,
+      options.firstPartyRoot ?? FIRST_PARTY_PLUGIN_ROOT,
+    ),
     zulipRealm: options.zulipRealm,
   });
   const started = await startPluginSandbox({

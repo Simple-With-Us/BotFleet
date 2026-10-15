@@ -27,8 +27,14 @@ describe("plugin network allow policy", () => {
     const elsewhere = mkdtempSync(join(tmpdir(), "botfleet-third-party-"));
     mkdirSync(join(elsewhere, "zulip"));
 
+    const installed = mkdtempSync(join(tmpdir(), "botfleet-installed-zulip-"));
+    mkdirSync(join(installed, "zulip"));
+
     expect(isShippedZulipPlugin("zulip", shipped, root)).toBe(true);
+    expect(isShippedZulipPlugin("zulip", join(installed, "zulip"), root)).toBe(false);
     expect(isShippedZulipPlugin("zulip", join(elsewhere, "zulip"), root)).toBe(false);
+    expect(isShippedZulipPlugin("zulip", null, root)).toBe(false);
+    expect(isShippedZulipPlugin("zulip", "", root)).toBe(false);
     expect(isShippedZulipPlugin("other", shipped, root)).toBe(false);
     expect(isShippedZulipPlugin("zulip", join(root, "missing"), root)).toBe(false);
 

@@ -147,8 +147,11 @@ Every plugin has a `botfleet-plugin.json` at its top level.  Schema
 
     The shipped Zulip plugin (`plugins/first-party/zulip`) is the
     host-side exception.  A manifest cannot claim that trust by naming
-    itself `zulip`.  When that directory is the one being loaded, the
-    sandbox also allows the configured Zulip realm host.
+    itself `zulip`.  Trust is the folder path the host recorded when
+    the plugin was installed.  The copy under the data directory is a
+    different path and does not grant the exception.  When the recorded
+    source is that shipped directory, the sandbox also allows the
+    configured Zulip realm host.
 *   `contributes.cards[].id`: unique per plugin.  The host prefixes the
     `id` with the plugin name to keep it unique fleet-wide.
 *   `contributes.commands[].name`: 1 to 32 chars, lowercase alphanumerics
@@ -469,9 +472,10 @@ The plugin model mirrors skills:
     The shipped Zulip plugin additionally reaches the configured realm.
     The child seals that list before
     importing the plugin and locks the raw binding escape hatch.  Linux
-    also puts a plugin with an empty list in a network namespace, and
-    macOS applies a seatbelt profile that allows only the declared
-    destinations.
+    puts a plugin with an empty list in a network namespace.  macOS
+    applies a seatbelt profile that denies the network for that empty
+    list.  Seatbelt cannot name a remote host, so a declared
+    destination is enforced by the in-process guard on macOS.
 2.  **Plugin UI ceiling.**  Is host-rendered cards + slash commands
     the permanent ceiling, or will plugins eventually contribute raw
     UI (their own React)?

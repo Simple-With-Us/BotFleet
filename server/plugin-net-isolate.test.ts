@@ -16,19 +16,19 @@ afterEach(() => {
 });
 
 describe("plugin network OS boundary", () => {
-  it("builds a seatbelt profile that quotes only canonical destinations", () => {
+  it("uses seatbelt only for a total deny", () => {
     const empty = darwinNetworkProfile([]);
     expect(empty).toContain("(deny network*)");
     expect(empty).not.toContain("network-outbound");
+    expect(empty).not.toContain("localhost");
 
-    const named = darwinNetworkProfile(["api.example.com:443", 'evil"); (allow network*)']);
-    expect(named).toContain('(remote tcp "api.example.com:443")');
-    expect(named).toContain('(remote udp "*:53")');
-    expect(named).not.toContain("evil");
-
-    const literal = darwinNetworkProfile(["127.0.0.1:9"]);
-    expect(literal).toContain('(remote tcp "127.0.0.1:9")');
-    expect(literal).not.toContain(":53");
+    // A hostname, an IP literal, or a quote-breaking token cannot go
+    // into the profile.  sandbox-exec rejects every host other than
+    // * or localhost, and the child would exit before the plugin loads.
+    expect(darwinNetworkProfile(["api.example.com:443"])).toBeNull();
+    expect(darwinNetworkProfile(["127.0.0.1:9"])).toBeNull();
+    expect(darwinNetworkProfile(["localhost:443"])).toBeNull();
+    expect(darwinNetworkProfile(['evil"); (allow network*)'])).toBeNull();
   });
 
   it("refuses a raw connect when this host has an OS network boundary", async () => {

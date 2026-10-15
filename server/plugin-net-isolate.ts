@@ -10,18 +10,19 @@
 //     bypassed.  A declared allowlist cannot use this namespace,
 //     because a namespace with no interfaces cannot reach an allowed
 //     host either.  The guard enforces that list.
-//   * macOS: `sandbox-exec` denies network by default and adds one
-//     outbound TCP allow per declared destination.  Hostnames also
-//     allow DNS on port 53, because name resolution has to leave the
-//     process.  IP literals do not open DNS.
+//   * macOS, and only when the plugin declared no destinations:
+//     `sandbox-exec` with `(deny network*)`.  Seatbelt's remote filter
+//     accepts `*` or `localhost` and rejects every hostname and IP
+//     literal, so a declared destination cannot be written into the
+//     profile.  A profile that fails to compile makes the child exit
+//     before the plugin loads.  A non-empty list therefore skips the
+//     wrapper, and the in-process guard enforces it.
 //
 // Windows has no equivalent tool in the base system.  The guard is the
 // boundary there, and on a Node build that supports `--allow-net` the
 // loader withholds that flag unless the plugin declared destinations.
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { readFileSync } from "node:fs";
-
-import { isPluginNetworkIp, parsePluginNetworkAllow } from "../shared/plugin-net-allow.ts";
 
 export interface PluginSpawnRequest {
   execPath: string;
@@ -68,23 +69,16 @@ function darwinSandboxAvailable(): boolean {
   return darwinSandbox;
 }
 
-/** Seatbelt profile for one plugin.  Only canonical allowlist tokens are
- *  interpolated, and each token's alphabet cannot close the quote.  An
- *  entry the parser rejects is skipped, which denies it. */
-export function darwinNetworkProfile(allow: readonly string[]): string {
-  const rules = ["(version 1)", "(allow default)", "(deny network*)"];
-  let dns = false;
-  for (const entry of allow) {
-    const parsed = parsePluginNetworkAllow(entry);
-    if (!parsed) continue;
-    rules.push(`(allow network-outbound (remote tcp "${parsed.token}"))`);
-    if (!isPluginNetworkIp(parsed.host)) dns = true;
-  }
-  if (dns) {
-    rules.push('(allow network-outbound (remote udp "*:53"))');
-    rules.push('(allow network-outbound (remote tcp "*:53"))');
-  }
-  return rules.join("");
+/** Seatbelt profile for a plugin that declared no destinations.
+ *  Returns null when the list is non-empty.  Apple's profile compiler
+ *  accepts only `*` or `localhost` in a remote filter and rejects a
+ *  hostname or an IP literal (`host must be * or localhost`).  Putting
+ *  either into the profile makes `sandbox-exec` exit and the plugin
+ *  never starts.  The in-process guard is the boundary for a declared
+ *  list, on macOS and on Windows. */
+export function darwinNetworkProfile(allow: readonly string[]): string | null {
+  if (allow.length > 0) return null;
+  return "(version 1)(allow default)(deny network*)";
 }
 
 /** Spawn the sandbox child, wrapped in an OS network boundary when this
@@ -101,12 +95,13 @@ export function spawnPluginProcess(request: PluginSpawnRequest): PluginSpawn {
       ),
     };
   }
-  if (darwinSandboxAvailable()) {
+  const profile = darwinNetworkProfile(request.networkAllow);
+  if (profile !== null && darwinSandboxAvailable()) {
     return {
       wrapped: true,
       child: spawn(
         "sandbox-exec",
-        ["-p", darwinNetworkProfile(request.networkAllow), request.execPath, ...request.args],
+        ["-p", profile, request.execPath, ...request.args],
         { ...options, detached: true },
       ),
     };

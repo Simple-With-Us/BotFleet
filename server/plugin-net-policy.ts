@@ -6,10 +6,12 @@
 // manifest cannot mark itself trusted.
 //
 // The shipped Zulip plugin is the one first-party exception.  Trust is
-// the directory the host owns (`plugins/first-party/zulip`), not the
-// name in the manifest.  That plugin also receives the configured Zulip
-// realm host, because the realm is chosen on this Mac and cannot be
-// written into the manifest ahead of time.
+// the folder path the host recorded at install time, and that path has
+// to be `plugins/first-party/zulip`.  The copy under the data directory
+// is a different path, and a manifest that names itself `zulip` is not
+// enough.  That plugin also receives the configured Zulip realm host,
+// because the realm is chosen on this Mac and cannot be written into
+// the manifest ahead of time.
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
 
@@ -21,7 +23,7 @@ export const ZULIP_PLUGIN_NAME = "zulip";
 export interface PluginNetworkAllowInput {
   capabilities: readonly string[];
   declared: readonly string[];
-  /** True only when this directory is the host's shipped Zulip plugin. */
+  /** True only when the registry source is the host's shipped Zulip directory. */
   shippedZulip: boolean;
   /** Configured realm origin, for example `https://chat.example.com`. */
   zulipRealm?: string;
@@ -43,12 +45,16 @@ export function httpUrlToNetworkAllow(site: string): string | null {
   return canonicalNetworkToken(url.hostname, port);
 }
 
-/** True when `pluginDir` is exactly `<firstPartyRoot>/zulip` and the
- *  plugin's name is `zulip`.  A missing directory is not trusted. */
-export function isShippedZulipPlugin(name: string, pluginDir: string, firstPartyRoot: string): boolean {
-  if (name !== ZULIP_PLUGIN_NAME) return false;
+/** True when this plugin was installed from `<firstPartyRoot>/zulip`.
+ *  `sourcePath` is the folder path stored on the registry entry, not
+ *  the installed copy.  Install writes a copy under the data directory,
+ *  so comparing that copy to the shipped tree never matches.  A git
+ *  install has no folder source and passes null.  A missing directory
+ *  is not trusted. */
+export function isShippedZulipPlugin(name: string, sourcePath: string | null, firstPartyRoot: string): boolean {
+  if (name !== ZULIP_PLUGIN_NAME || sourcePath === null || sourcePath === "") return false;
   try {
-    return realpathSync(pluginDir) === realpathSync(join(firstPartyRoot, ZULIP_PLUGIN_NAME));
+    return realpathSync(sourcePath) === realpathSync(join(firstPartyRoot, ZULIP_PLUGIN_NAME));
   } catch {
     return false;
   }

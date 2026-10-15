@@ -48,6 +48,7 @@ function listing(
   name: string,
   capabilities: string[] = ["read.bots", "read.status"],
   needs?: PluginListing["needs"],
+  sourcePath = "<test>",
 ): PluginListing {
   return {
     name,
@@ -58,7 +59,7 @@ function listing(
     enabled: true,
     installedAt: "2026-10-05T00:00:00.000Z",
     updatedAt: "2026-10-05T00:00:00.000Z",
-    source: { kind: "folder", path: "<test>" },
+    source: { kind: "folder", path: sourcePath },
     warnings: [],
     capabilities,
     ...(needs ? { needs } : {}),
@@ -75,9 +76,14 @@ async function load(
   capabilities?: string[],
   callTimeoutMs?: number,
   needs?: PluginListing["needs"],
-  extra?: { firstPartyRoot?: string; zulipRealm?: string },
+  extra?: { firstPartyRoot?: string; zulipRealm?: string; sourcePath?: string },
 ): Promise<LoadedPlugin> {
-  const result = await loadPlugin(listing(name, capabilities, needs), inputs(), baseDir, { callTimeoutMs, ...extra });
+  const result = await loadPlugin(
+    listing(name, capabilities, needs, extra?.sourcePath),
+    inputs(),
+    baseDir,
+    { callTimeoutMs, firstPartyRoot: extra?.firstPartyRoot, zulipRealm: extra?.zulipRealm },
+  );
   if ("error" in result) throw new Error(result.error);
   started.push(result);
   return result;
@@ -495,6 +501,8 @@ describe("plugin sandbox egress", () => {
     const other = await listenLocal(() => {
       otherHits += 1;
     });
+    const shippedRoot = mkdtempSync(join(tmpdir(), "botfleet-shipped-zulip-"));
+    mkdirSync(join(shippedRoot, "zulip"));
     try {
       const realmUrl = JSON.stringify(`http://127.0.0.1:${realm.port}/`);
       writePlugin("zulip", `
@@ -524,7 +532,8 @@ describe("plugin sandbox egress", () => {
         }
       `);
       const plugin = await load("zulip", [], undefined, undefined, {
-        firstPartyRoot: baseDir,
+        firstPartyRoot: shippedRoot,
+        sourcePath: join(shippedRoot, "zulip"),
         zulipRealm: `http://127.0.0.1:${realm.port}`,
       });
       const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
@@ -538,6 +547,7 @@ describe("plugin sandbox egress", () => {
     } finally {
       await new Promise((resolve) => realm.server.close(resolve));
       await new Promise((resolve) => other.server.close(resolve));
+      await removeDirSafe(shippedRoot);
     }
   });
 });
