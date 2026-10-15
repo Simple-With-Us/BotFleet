@@ -230,16 +230,43 @@ export function resetPathCacheForTests(): void {
   loginShellPath = null;
 }
 
-/** Every `name` binary on the augmented PATH as absolute paths, in PATH
- * order (first = what a bare name would run). Used by the Engines panel's
- * "detected" dropdown and the /api/cli-candidates endpoint. A path-ish
- * name is echoed back as-is — it already IS a location.  Multiple PATH
- * entries that resolve to the same file (symlinks, copies installed by
- * different package managers that share an upstream tarball) are deduped
- * by inode after symlink resolution, keeping PATH order: a bare `grok`
- * invocation still hits the first match, and the picker only shows one
- * row for the actual binary the user has. */
-export function findCliCandidates(name: string): string[] {
+/** A command name is searchable when it is a bare name: a path is already a
+ * location, and a newline would let one name smuggle a second into the join. */
+function isBareName(name: string): boolean {
+  return Boolean(name) && !/[\n\r]/.test(name) && !/[/\\]/.test(name) && !/^[a-zA-Z]:/.test(name);
+}
+
+/** Absolute paths of every `name` binary on the augmented PATH, used by the
+ * Engines panel's "detected" dropdown and the /api/cli-candidates endpoint.
+ *
+ * A list of names searches the default first and its aliases after it, each in
+ * PATH order, and the union is deduped by inode — so one engine can offer every
+ * binary that runs it even when they do not share a name.  Clutch is the case
+ * that forced this: its driver default is `dsh`, but the Clutch-branded build
+ * is installed as `clutch` and is the one carrying Clutch's own profiles, so a
+ * single-name search made it invisible to the picker.
+ *
+ * Within one name the order is PATH order (first = what a bare invocation
+ * would run), and multiple PATH entries resolving to the same file (symlinks,
+ * copies installed by different package managers that share an upstream
+ * tarball) collapse to one row: the picker shows one row for the actual binary
+ * the user has.
+ *
+ * A lone path-ish name is echoed back as-is — it already IS a location.  A
+ * path inside a LIST is dropped instead of echoed: the caller asked about
+ * command names, and a row the user cannot re-pick is worse than no row. */
+export function findCliCandidates(name: string | string[]): string[] {
+  if (Array.isArray(name)) {
+    // A one-element list IS the scalar case, so a lone path-ish name keeps its
+    // "echo it back, it already IS a location" behaviour.  Only a real list
+    // treats its entries as command names.
+    if (name.length === 1) return findCliCandidates(name[0]);
+    const wanted = [...new Set(name.filter(isBareName))];
+    if (wanted.length === 0) return [];
+    const out: string[] = [];
+    for (const wantedName of wanted) out.push(...findCliCandidates(wantedName));
+    return dedupeByInode(out);
+  }
   if (!name || /[\n\r]/.test(name)) return [];
   if (/[/\\]/.test(name) || /^[a-zA-Z]:/.test(name)) return [name];
   const exts = process.platform === "win32" ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];

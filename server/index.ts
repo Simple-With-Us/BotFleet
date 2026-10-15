@@ -15840,10 +15840,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // ?name=claude → absolute paths of every `claude` on the augmented PATH,
     // in PATH order (first = what a bare name runs). Polled when the user
     // opens the Custom picker so a just-installed CLI appears without a restart.
+    // `aliases` carries the engine's other command names (comma-separated), so
+    // an engine whose binary ships under more than one name answers with all of
+    // them — ?name=dsh&aliases=clutch is what makes Clutch's own build
+    // selectable, because `clutch` is the command carrying Clutch's profiles.
     if (method === "GET" && path === "/api/cli-candidates") {
       const name = url.searchParams.get("name") ?? "";
+      const aliases = (url.searchParams.get("aliases") ?? "")
+        .split(",")
+        .map((a) => a.trim())
+        .filter(Boolean);
       resetPathCache();
-      return json(res, 200, { candidates: findCliCandidates(name) });
+      return json(res, 200, { candidates: findCliCandidates([name, ...aliases]) });
     }
 
     // ── pre-save CLI probe: does this path actually run? ──

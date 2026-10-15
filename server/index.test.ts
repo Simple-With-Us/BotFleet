@@ -5,7 +5,7 @@
 // the shadow-instance behavior end to end while it's at it.
 import type { ChildProcess } from "node:child_process";
 import { createServer, request, type Server } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -6127,6 +6127,39 @@ describe("instance CLI override API", () => {
     expect(res.status).toBe(200);
     expect(res.body.candidates).toEqual(["/opt/definitely/not/here"]);
     expect((await api("GET", "/api/cli-candidates?name=")).body.candidates).toEqual([]);
+  });
+
+  it("searches an engine's alias names alongside its default", async () => {
+    // Clutch's driver default is `dsh` but its own build installs as `clutch`,
+    // so the Engines dropdown could only ever offer the binary that runs
+    // against ~/.dsh — never the one carrying Clutch's own profiles.
+    const bin = join(home, "cli-candidates-bin");
+    mkdirSync(bin, { recursive: true });
+    const plant = (name: string): string => {
+      const p = join(bin, name);
+      writeFileSync(p, "#!/bin/sh\nexit 0\n");
+      chmodSync(p, 0o755);
+      return p;
+    };
+    const dsh = plant("dsh");
+    const clutch = plant("clutch");
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = bin;
+      const res = await api("GET", "/api/cli-candidates?name=dsh&aliases=clutch");
+      expect(res.status).toBe(200);
+      expect(res.body.candidates).toEqual([dsh, clutch]);
+      // Without the alias parameter the endpoint answers exactly as it always
+      // did, which is what keeps every other engine's dropdown unchanged.
+      expect((await api("GET", "/api/cli-candidates?name=dsh")).body.candidates).toEqual([dsh]);
+      // A blank or padded aliases list is not a name and must not widen the search.
+      expect((await api("GET", "/api/cli-candidates?name=dsh&aliases=")).body.candidates).toEqual([dsh]);
+      expect((await api("GET", "/api/cli-candidates?name=dsh&aliases=%20,%20")).body.candidates).toEqual([dsh]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it("reports a missing binary as a failed probe with install info", async () => {
