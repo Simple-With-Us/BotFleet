@@ -111,6 +111,11 @@ import {
   type HeldWork,
   type DrainWindowInput,
 } from "./update-drain.ts";
+import {
+  arrivedViaCloudflareTunnel,
+  isMutatingHarnessApiRequest,
+  NAMED_TUNNEL_MUTATION_FORBIDDEN,
+} from "./named-tunnel-gate.ts";
 import { botOffError, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import {
   BOT_OFF_CODE,
@@ -12158,12 +12163,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (secFetchSite === "cross-site") {
       return json(res, 403, { error: "forbidden: cross-site request" });
     }
+    const mutatingApiRequest = isMutatingHarnessApiRequest(method, path);
+    // The named tunnel (botfleet.jays.services) forwards with a loopback Host,
+    // so the Host gate alone cannot distinguish a remote Access caller from the
+    // owner.  Block mutating API traffic that carries Cloudflare edge markers
+    // until a dedicated remote-auth seam lands (BF-2129).
+    if (mutatingApiRequest && arrivedViaCloudflareTunnel(req)) {
+      return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
+    }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: "BotFleet is quiescing for an update" });
     }
-    const mutatingApiRequest = path.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(method) &&
-      path !== "/api/runtime/quiesce";
     if (mutatingApiRequest && !NON_JSON_BODY_ROUTES.has(path) && hasRequestBody(req) && !isJsonContentType(req)) {
       return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
     }
