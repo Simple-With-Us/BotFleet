@@ -32,38 +32,36 @@ async function pinFonts(page: Page): Promise<void> {
 }
 
 async function stubVoiceCloneMic(page: Page): Promise<void> {
-  await page.addInitScript(() => {
+  await page.addInitScript(`
     const tracks = [{ stop: () => {} }];
-    const stream = { getTracks: () => tracks } as MediaStream;
+    const stream = { getTracks: () => tracks };
     navigator.mediaDevices.getUserMedia = async () => stream;
 
     class MockMediaRecorder {
-      static isTypeSupported(): boolean {
+      static isTypeSupported() {
         return true;
       }
 
       mimeType = 'audio/webm;codecs=opus';
-      state: RecordingState = 'inactive';
-      ondataavailable: ((event: BlobEvent) => void) | null = null;
+      state = 'inactive';
+      ondataavailable = null;
 
-      constructor(_stream: MediaStream, _options?: MediaRecorderOptions) {}
-
-      start(): void {
+      start() {
         this.state = 'recording';
       }
 
-      stop(): void {
+      stop() {
         this.state = 'inactive';
-        this.ondataavailable?.({ data: new Blob(['fixture'], { type: 'audio/webm' }) } as BlobEvent);
+        this.ondataavailable?.({ data: new Blob(['fixture'], { type: 'audio/webm' }) });
       }
 
-      addEventListener(type: string, listener: () => void): void {
+      addEventListener(type, listener) {
         if (type === 'stop') setTimeout(listener, 0);
       }
     }
 
-    window.MediaRecorder = MockMediaRecorder as typeof MediaRecorder;
-  });
+    window.MediaRecorder = MockMediaRecorder;
+  `);
 }
 
 async function routeVoiceApis(page: Page): Promise<void> {
