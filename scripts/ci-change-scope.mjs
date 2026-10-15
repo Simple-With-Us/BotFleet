@@ -50,10 +50,6 @@ export function isPackagingPath(path) {
   );
 }
 
-export function isControlPlanePath(path) {
-  return path.startsWith("cloudflare/");
-}
-
 /** The Mac pre-merge packaging gate (scripts/mac-package-gate.mjs) reuses
  * `isPackagingPath` and widens it.  Kept separate from `isPackagingPath` so the
  * Linux package job's existing scope in ci.yml is unchanged — widening a
@@ -89,7 +85,6 @@ export function classifyCIPaths(paths) {
     docsOnly: hasChanges && changedPaths.every(isDocumentationPath),
     iosChanged: !hasChanges || changedPaths.some(isIosPath),
     packagingChanged: !hasChanges || changedPaths.some(isPackagingPath),
-    controlPlaneChanged: !hasChanges || changedPaths.some(isControlPlanePath),
   };
 }
 
@@ -106,8 +101,7 @@ function main() {
     `docs_only=${result.docsOnly}\n` +
       `changed_count=${result.changedCount}\n` +
       `ios_changed=${result.iosChanged}\n` +
-      `packaging_changed=${result.packagingChanged}\n` +
-      `control_plane_changed=${result.controlPlaneChanged}\n`,
+      `packaging_changed=${result.packagingChanged}\n`,
   );
 }
 
