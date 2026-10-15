@@ -527,6 +527,7 @@ import { createTeamManifest, importedMemberProfile, parseTeamManifest } from "./
 import { readThreadEvents } from "./thread-events.ts";
 import { listenWebhookIngress, webhookCredential, type WebhookIngress } from "./webhook-ingress.ts";
 import { readLinqWebhook } from "./routes/linq-webhook.ts";
+import { createZulipOutgoingWebhookRoute } from "./zulip/webhook.ts";
 import { resolveLinqBinding } from "./linq/dispatch.ts";
 import { bindLinqChatToTurn, deliverLinqOutboundIfNeeded, releaseLinqChat, stopLinqTypingForThread } from "./linq/outbound.ts";
 import { memberTurnSelection } from "./member-turn.ts";
@@ -7136,6 +7137,7 @@ try {
     // on the webhook-only listener (8800) because that is what the public
     // tunnel forwards to; the app server (8799) stays loopback-only.
     routes: {
+      "/zulip/outgoing/*": createZulipOutgoingWebhookRoute(() => zulipHub, beginUpdateAdmission),
       "/api/webhooks/linq": {
         // Auth-first: the route verifies the HMAC before acquiring update
         // admission (see readLinqWebhook), so the ingress handler must not

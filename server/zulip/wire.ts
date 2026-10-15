@@ -96,6 +96,9 @@ export const zulipMessageSchema = z.object({
 });
 export type ZulipMessage = z.infer<typeof zulipMessageSchema>;
 
+/** GET /messages/{id}: the authoritative message envelope for webhook ingress. */
+export const zulipMessageResponseSchema = successEnvelope.extend({ message: zulipMessageSchema });
+
 /** One row of the bot's topic visibility settings: register's
  *  `user_topics`, and the body of a `user_topic` event. */
 export const zulipUserTopicSchema = z.object({

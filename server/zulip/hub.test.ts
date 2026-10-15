@@ -138,6 +138,55 @@ afterEach(async () => {
   await fake.stop();
 });
 
+describe("outgoing webhook convergence", () => {
+  it("fetches the authoritative message and deduplicates against the native queue", async () => {
+    const hub = makeHub();
+    await connected(hub);
+    const session = sessionOf(hub);
+    session.creds!.outgoingWebhookToken = "test-outgoing-token";
+    busy.add("bot-plumber");
+    const id = fake.postStream(JAY, "builds", "Outgoing webhook", "@**BF-Plumber** please check this", "website");
+
+    expect(hub.enqueueOutgoingWebhook("BF-Plumber", id)).toBe("accepted");
+    await hub.drain();
+    const authoritative = await session.client!.message(id);
+    hub.handleMessage(session, authoritative); // Native queue can race the webhook fetch.
+    expect(session.state.pending.flatMap((unit) => unit.items.map((item) => item.id))).toEqual([id]);
+    expect(fake.requests.some((request) => request.path === `messages/${id}`)).toBe(true);
+
+    busy.delete("bot-plumber");
+    await hub.drain();
+    await waitFor(() => turns.length === 1, "one turn from converged deliveries");
+    expect(turns[0]?.text).toContain("please check this");
+  });
+
+  it("does not advance the native cursor past lower message IDs when a high webhook ID arrives", async () => {
+    let hub = makeHub();
+    await connected(hub);
+    let session = sessionOf(hub);
+    session.creds!.outgoingWebhookToken = "test-outgoing-token";
+    const initialCursor = session.state.cursor;
+    const highWebhookId = 1300;
+    const higher = {
+      id: highWebhookId, sender_id: JAY, sender_email: "jay@zulip.test", sender_full_name: "Jay Wedgeworth",
+      client: "website", type: "stream", display_recipient: "builds", subject: "Webhook cursor",
+      stream_id: 7, content: "@**BF-Plumber** higher id", timestamp: fake.clock, flags: ["mentioned"],
+    } as ZulipMessage;
+
+    busy.add("bot-plumber");
+    hub.handleMessage(session, higher, "webhook");
+    expect(session.state.cursor).toBe(initialCursor);
+    expect(session.state.pending.flatMap((unit) => unit.items.map((item) => item.id))).toEqual([highWebhookId]);
+    await hub.stop(); // Simulate a restart after accepting the webhook row.
+    hub = makeHub();
+    await connected(hub);
+    session = sessionOf(hub);
+    const lowerId = 1200;
+    hub.handleMessage(session, { ...higher, id: lowerId, content: "@**BF-Plumber** lower native id" }, "native");
+    expect(session.state.pending.flatMap((unit) => unit.items.map((item) => item.id))).toEqual([highWebhookId, lowerId]);
+  });
+});
+
 describe("waking", () => {
   it("wakes the mentioned bot with an untrusted wrapper, and its reply lands in the origin topic", async () => {
     const hub = makeHub();
@@ -302,7 +351,7 @@ describe("credentials and identity", () => {
       secretPath: "/zulip",
       projectId: "afc-project-id",
       environment: "prod",
-      names: ["ZULIP_BF_PLUMBER_API_KEY", "ZULIP_BF_PLUMBER_EMAIL", "ZULIP_BF_PLUMBER_SITE"],
+      names: ["ZULIP_BF_PLUMBER_API_KEY", "ZULIP_BF_PLUMBER_EMAIL", "ZULIP_BF_PLUMBER_SITE", "ZULIP_OUTGOING_BF_PLUMBER_TOKEN"],
     });
     expect(botStatus(hub, "bot-plumber")?.userId).toBe(PLUMBER);
   });

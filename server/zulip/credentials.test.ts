@@ -160,6 +160,7 @@ describe("the Infisical source", () => {
       email: "ZULIP_BF_PLUMBER_EMAIL",
       key: "ZULIP_BF_PLUMBER_API_KEY",
       site: "ZULIP_BF_PLUMBER_SITE",
+      outgoingToken: "ZULIP_OUTGOING_BF_PLUMBER_TOKEN",
     });
     const { read, calls } = vault({ ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test", ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY });
     const creds = await infisicalCredentialSource(read, { realm: REALM }).load("BF-Plumber");
@@ -167,6 +168,18 @@ describe("the Infisical source", () => {
     expect(calls).toEqual(["/zulip"]);
     // the key never lands in the environment
     expect(Object.values(process.env)).not.toContain(FAKE_KEY);
+  });
+
+  it("keeps the outgoing webhook token in the filtered Infisical credential result", async () => {
+    const token = "WebhookToken0123456789";
+    const { read, locations } = vault({
+      ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test",
+      ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY,
+      ZULIP_OUTGOING_BF_PLUMBER_TOKEN: token,
+    });
+    const creds = await infisicalCredentialSource(read, { realm: REALM, roles: ["BF-Plumber"] }).load("BF-Plumber");
+    expect(creds.outgoingWebhookToken).toBe(token);
+    expect(locations[0]?.names).toContain("ZULIP_OUTGOING_BF_PLUMBER_TOKEN");
   });
 
   it("refuses a malformed email, key or site from the vault by field name, never by value", async () => {
@@ -265,6 +278,7 @@ describe("the Infisical source", () => {
       "ZULIP_BF_PLUMBER_API_KEY",
       "ZULIP_BF_PLUMBER_EMAIL",
       "ZULIP_BF_PLUMBER_SITE",
+      "ZULIP_OUTGOING_BF_PLUMBER_TOKEN",
     ]);
     // empty means the harness's own project and environment
     const own = credentialSourceFor({ credentialSource: "infisical", infisicalProjectId: "", infisicalEnv: " " }, {}, { vault: read });

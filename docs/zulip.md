@@ -4,6 +4,12 @@ BotFleet's role bots can live on the fleet's Zulip realm (`https://simplewithus.
 
 The code is `server/zulip/` (client, router, state, outbound rules, the tool mount rule, hub), `server/tools/zulip.ts` (the HTTP-lane tool executors) and the `zulip_reply`, `zulip_post` and `zulip_follow_topic` records in `server/tools/registry.ts`.
 
+## Native Outgoing Webhook Wake
+
+Zulip may also POST a configured bot's direct-message or direct-mention event to the public webhook listener at `/zulip/outgoing/<ROLE>` (for example `/zulip/outgoing/BF-PLUMBER`).  The route requires the role's `ZULIP_OUTGOING_<ROLE>_TOKEN` and the exact configured `bot_email`; it is served by the existing webhook listener on port 8800.  Keep the native event queue enabled as well: Zulip does not send outgoing-webhook callbacks for messages sent by bots, and the queue remains the coverage path for those messages and other events.
+
+The callback is only a wake hint.  BotFleet discards callback message text, durably queues the authenticated bot and message ID, promptly returns `response_not_required: true`, then fetches that message through the bot's own Zulip REST client and sends it through the same router and message-ID deduplication as the native listener.  Queue state is stored under the existing data directory at `zulip/outgoing`; no message body or webhook token is written there or logged.  The token is optional in Infisical so native listening continues before webhook setup.  Put each role's outgoing token beside its existing Zulip credentials in the linked AI Fleet Coordinator `prod` `/zulip` folder; the receiver is deny-by-default until that secret is present.
+
 ## What Happens
 
 1. On boot (after `booting = false`), the hub starts one session per bot listed in `zulip.bots`.  A session loads that bot's key, checks `GET /users/me` (the email must match the credentials, and only member or moderator roles are accepted: an admin or owner key is refused), registers an unnarrowed event queue and long-polls it.  Nothing is dispatched until boot recovery has claimed the turns the last stop interrupted, and a bot that still holds an interrupted turn's marker takes no Zulip work, so a wake can never bury a turn that was promised a resume.
@@ -149,4 +155,4 @@ All three are offered only to a bot whose Zulip session is connected, never in a
 - **Owner messages and stopped bots.**  Jay's Zulip messages run unattended and do not wake a bot he stopped in BotFleet.  Lifting either needs an owner ruling.
 - **Routine posts (owner).**  Scheduled and manual routine runs do not get the Zulip tools, even though their prompt is Jay's own.  If a routine should post to Zulip (a daily digest), that needs a ruling: mount them for `schedule` and `manual` runs, or card any post that does not go to an origin.
 - **Not built yet.**  Rollover for long-lived Zulip conversation tasks (routine tasks have it), topic re-keying on resolve, a Settings panel, `zulip_read_topic`, ack reactions, Zulip knobs in `server/knob-map.ts` (the budgets are config-file settings today), and keeping a reply binding across a harness restart (a turn recovered after a restart does not auto-reply).
-- **Director** has no Zulip bot, so it cannot be bound.
+- **Director** has a Zulip identity (`BF-Director`) and may be bound like the other configured roles.

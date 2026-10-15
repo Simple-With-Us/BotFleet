@@ -26,6 +26,7 @@ import {
   zulipAckSchema,
   zulipEventSchema,
   zulipEventsSchema,
+  zulipMessageResponseSchema,
   zulipMessageSchema,
   zulipMessagesSchema,
   zulipRegisterSchema,
@@ -357,6 +358,31 @@ export class ZulipClient {
     }
     this.invalid(result.messages.length - messages.length, "message(s) from messages");
     return { messages, received: result.messages.length, newestId };
+  }
+
+  /** Fetch one authoritative message after an outgoing-webhook callback. */
+  async message(
+    messageId: number,
+    opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<ZulipMessage> {
+    if (!Number.isSafeInteger(messageId) || messageId <= 0) throw new TypeError("invalid Zulip message id");
+    const result = await this.request(
+      "GET",
+      `messages/${messageId}`,
+      zulipMessageResponseSchema,
+      { apply_markdown: false },
+      opts,
+    );
+    if (result.message.flags !== undefined) return result.message;
+    // Some realms omit per-user flags on GET /messages/{id}.  Recover the
+    // direct-mention classification from the authenticated messages API;
+    // callback-supplied flags or text are never used as authority.
+    const mentioned = await this.messages(
+      [{ operator: "is", operand: "mentioned" }],
+      { anchor: messageId, numAfter: 1, includeAnchor: true },
+      opts.signal,
+    );
+    return mentioned.messages.find((candidate) => candidate.id === messageId) ?? result.message;
   }
 
   /** The channels this bot is subscribed to, by id and name. */
