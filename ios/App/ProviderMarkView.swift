@@ -160,14 +160,14 @@ extension View {
     /// chat header and message rows use, for a bot answering in its own
     /// thread.  Draws nothing when the engine is unknown (a cold roster), so
     /// the avatar is left as it was.  Apply it to every bot avatar.
-    func providerBadge(for bot: Bot, avatarSize: CGFloat) -> some View {
-        modifier(ProviderBadge(bot: bot, avatarSize: avatarSize))
+    func providerBadge(for bot: Bot, inThread threadId: String? = nil, avatarSize: CGFloat) -> some View {
+        modifier(ProviderBadge(bot: bot, threadId: threadId ?? bot.threadId, avatarSize: avatarSize))
     }
 
     /// A chat's avatar: a bot gets the mark, a room (many bots, no single
     /// model) gets nothing.
     func providerBadge(for chat: Chat?, avatarSize: CGFloat) -> some View {
-        modifier(ProviderBadge(bot: chat?.bot, avatarSize: avatarSize))
+        modifier(ProviderBadge(bot: chat?.bot, threadId: chat?.threadId, avatarSize: avatarSize))
     }
 }
 
@@ -180,6 +180,9 @@ private extension Chat {
 
 private struct ProviderBadge: ViewModifier {
     let bot: Bot?
+    /// The conversation thread whose task override applies, not always
+    /// `bot.threadId` when navigation holds a task thread open.
+    let threadId: String?
     let avatarSize: CGFloat
     @EnvironmentObject private var session: Session
 
@@ -191,7 +194,8 @@ private struct ProviderBadge: ViewModifier {
     func body(content: Content) -> some View {
         content.overlay(alignment: .bottomTrailing) {
             if let bot,
-               let selection = MessageRow.modelSelection(of: bot, inThread: bot.threadId),
+               let threadId,
+               let selection = MessageRow.modelSelection(of: bot, inThread: threadId),
                let driverKind = session.instanceDriverKinds[selection.instanceId] {
                 ProviderMarkView(driverKind: driverKind, model: selection.model, size: diameter)
                     .offset(x: 3, y: 3)

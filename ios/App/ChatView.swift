@@ -135,21 +135,7 @@ struct ChatView: View {
     /// `Session` rather than parsing `instanceId`, which is operator-named
     private var currentModelSelection: ModelSelection? {
         guard case let .bot(bot) = current else { return nil }
-        guard let currentTask = bot.tasks?.first(where: { $0.threadId == bot.threadId }) else {
-            // Older harnesses send no task list; the bot-level record is all
-            // there is.
-            return bot.activeModelSelection ?? bot.modelSelection
-        }
-        if let taskSelection = currentTask.modelSelection {
-            return currentTask.activeModelSelection ?? taskSelection
-        }
-        // An inheriting task reads its own last-turn selection, never
-        // `bot.activeModelSelection`: that is the bot's latest turn across
-        // every task, so a fallback on another task would leak into this
-        // header.  The server clears an inheriting task's
-        // `activeModelSelection` when the bot's model changes (`patchBot`
-        // in server/store.ts), so a stale fallback does not outlive it.
-        return currentTask.activeModelSelection ?? bot.modelSelection
+        return BotConversationModelSelection.selection(for: bot, inThread: threadId)
     }
 
     private var currentDriverKind: String? {
@@ -1750,13 +1736,7 @@ struct MessageRow: View {
     /// mark on its avatar.  Shared with the live reply row so the mark is
     /// already there while the reply is typed.
     static func modelSelection(of bot: Bot, inThread threadId: String) -> ModelSelection? {
-        if let currentTask = bot.tasks?.first(where: { $0.threadId == threadId }) {
-            if let taskSelection = currentTask.modelSelection {
-                return currentTask.activeModelSelection ?? taskSelection
-            }
-            return currentTask.activeModelSelection ?? bot.activeModelSelection ?? bot.modelSelection
-        }
-        return bot.activeModelSelection ?? bot.modelSelection
+        BotConversationModelSelection.selection(for: bot, inThread: threadId)
     }
 
     /// Whether a settled reply from `bot` carries the Read Aloud capsule.
@@ -1819,7 +1799,7 @@ struct MessageRow: View {
         } else if message.role != .user {
             if let bot = senderBot {
                 if endsRun {
-                    BotAvatarWithProviderBadge(bot: bot, size: 28, state: .idle, animated: false)
+                    BotAvatarWithProviderBadge(bot: bot, conversationThreadId: chat.threadId, size: 28, state: .idle, animated: false)
                 } else {
                     Color.clear.frame(width: 28, height: 28)
                 }
@@ -2855,7 +2835,7 @@ struct LiveReplyRow: View {
     @ViewBuilder
     private var avatar: some View {
         if let sender {
-            BotAvatarWithProviderBadge(bot: sender, size: 28, state: .idle, animated: false)
+            BotAvatarWithProviderBadge(bot: sender, conversationThreadId: chat.threadId, size: 28, state: .idle, animated: false)
         } else if case let .room(room) = chat {
             RoomAvatarView(room: room, size: 28, state: .idle, animated: false)
         }

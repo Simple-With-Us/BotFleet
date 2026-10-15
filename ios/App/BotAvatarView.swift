@@ -10,6 +10,9 @@ import CompanionCore
 /// position, scale, and the unknown-engine empty state stay consistent.
 struct BotAvatarWithProviderBadge: View {
     let bot: Bot
+    /// When the avatar sits in a task (or other) thread, pass that thread id
+    /// so the mark follows the task override instead of the bot's primary id.
+    var conversationThreadId: String? = nil
     let size: CGFloat
     var state: BotState = .idle
     var animated = false
@@ -17,7 +20,7 @@ struct BotAvatarWithProviderBadge: View {
 
     var body: some View {
         BotAvatarView(bot: bot, size: size, state: state, animated: animated, comets: comets)
-            .providerBadge(for: bot, avatarSize: size)
+            .providerBadge(for: bot, inThread: conversationThreadId, avatarSize: size)
     }
 }
 
