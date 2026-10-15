@@ -65,8 +65,55 @@ function open(): DatabaseSync {
       thread_id TEXT PRIMARY KEY,
       active_leaf_id TEXT
     );
+    CREATE TABLE IF NOT EXISTS running_helpers (
+      thread_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      PRIMARY KEY (thread_id, message_id)
+    );
   `);
+  backfillRunningHelpers(db);
   return db;
+}
+
+/** One-time import for databases that predated the side table. */
+function backfillRunningHelpers(database: DatabaseSync): void {
+  // SAFETY: `COUNT(*)` on `running_helpers` always returns one numeric row.
+  const count = database.prepare("SELECT COUNT(*) AS n FROM running_helpers").get() as { n: number };
+  if (count.n > 0) return;
+  // SAFETY: the query selects `thread_id`, `id`, and `json`, all TEXT columns on `messages`.
+  const rows = database
+    .prepare("SELECT thread_id, id, json FROM messages WHERE json LIKE ?")
+    .all('%"status":"running"%') as Array<{ thread_id: string; id: string; json: string }>;
+  const insert = database.prepare(
+    "INSERT OR IGNORE INTO running_helpers (thread_id, message_id, started_at) VALUES (?, ?, ?)",
+  );
+  for (const row of rows) {
+    let message: Message;
+    try {
+      // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
+      message = JSON.parse(row.json) as Message;
+    } catch {
+      continue;
+    }
+    if (message.helper?.status !== "running") continue;
+    insert.run(row.thread_id, row.id, message.helper.startedAt ?? message.at ?? 0);
+  }
+}
+
+function syncRunningHelper(threadId: string, message: Message): void {
+  const database = db();
+  if (message.helper?.status === "running") {
+    database
+      .prepare(
+        "INSERT OR REPLACE INTO running_helpers (thread_id, message_id, started_at) VALUES (?, ?, ?)",
+      )
+      .run(threadId, message.id, message.helper.startedAt ?? message.at ?? 0);
+    return;
+  }
+  database
+    .prepare("DELETE FROM running_helpers WHERE thread_id = ? AND message_id = ?")
+    .run(threadId, message.id);
 }
 
 /** The live handle — reopened when the file was removed out from under us
@@ -187,6 +234,7 @@ export function insertMessage(threadId: string, message: Message): void {
   db()
     .prepare("INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message));
+  syncRunningHelper(threadId, message);
 }
 
 /** Persist a new message and the branch head as one crash-safe mutation. */
@@ -203,10 +251,42 @@ export function appendMessage(threadId: string, message: Message): void {
   }
 }
 
+/** Rows whose stored helper is still running.  The LIKE pass is a candidate
+ * filter; the helper status is what decides.  A restart has no live tracker,
+ * so these are the cards that would otherwise tick forever. */
+export function runningHelperRows(): Array<{ threadId: string; message: Message }> {
+  // SAFETY: `running_helpers` stores `thread_id` and `message_id`, both TEXT columns.
+  const ids = db()
+    .prepare("SELECT thread_id, message_id FROM running_helpers")
+    .all() as Array<{ thread_id: string; message_id: string }>;
+  const found: Array<{ threadId: string; message: Message }> = [];
+  for (const { thread_id, message_id } of ids) {
+    // SAFETY: the lookup selects `json`, a TEXT column on `messages`.
+    const row = db()
+      .prepare("SELECT json FROM messages WHERE thread_id = ? AND id = ?")
+      .get(thread_id, message_id) as { json: string } | undefined;
+    if (!row) continue;
+    let message: Message;
+    try {
+      // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
+      message = JSON.parse(row.json) as Message;
+    } catch {
+      continue;
+    }
+    if (message.helper?.status !== "running") {
+      syncRunningHelper(thread_id, message);
+      continue;
+    }
+    found.push({ threadId: thread_id, message });
+  }
+  return found;
+}
+
 export function updateMessage(threadId: string, message: Message): void {
   db()
     .prepare("UPDATE messages SET at = ?, role = ?, kind = ?, text = ?, json = ? WHERE thread_id = ? AND id = ?")
     .run(message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message), threadId, message.id);
+  syncRunningHelper(threadId, message);
 }
 
 export function setActiveLeaf(threadId: string, leafId: string | null): void {
@@ -221,6 +301,7 @@ export function setActiveLeaf(threadId: string, leafId: string | null): void {
 export function deleteThread(threadId: string): void {
   db().prepare("DELETE FROM messages WHERE thread_id = ?").run(threadId);
   db().prepare("DELETE FROM thread_state WHERE thread_id = ?").run(threadId);
+  db().prepare("DELETE FROM running_helpers WHERE thread_id = ?").run(threadId);
 }
 
 /** Freelist bytes above which `pruneDeadThreads` runs a full `VACUUM`

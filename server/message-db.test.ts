@@ -12,6 +12,7 @@ import {
   pruneDeadThreads,
   readThread,
   readThreadTail,
+  runningHelperRows,
   searchMessages,
   setActiveLeaf,
   updateMessage,
@@ -35,6 +36,42 @@ describe("message-db", () => {
     closeMessageDb();
     rmSync(DATA_DIR, { recursive: true, force: true });
     mkdirSync(DATA_DIR, { recursive: true });
+  });
+
+  it("indexes running helpers without scanning every message row", () => {
+    insertMessage("t-run", {
+      ...msg("m-running", "helper"),
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-1" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Survey",
+        toolCount: 0,
+        status: "running",
+        startedAt: 1_000,
+        endedAt: null,
+      },
+    });
+    insertMessage("t-run", msg("m-done", "plain user line"));
+    expect(runningHelperRows()).toHaveLength(1);
+    updateMessage("t-run", {
+      ...msg("m-running", "helper"),
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-1" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Survey",
+        toolCount: 1,
+        status: "completed",
+        startedAt: 1_000,
+        endedAt: 2_000,
+      },
+    });
+    expect(runningHelperRows()).toEqual([]);
   });
 
   it("persists inserts, updates, and the active leaf across a reopen", () => {
@@ -92,6 +129,50 @@ describe("message-db", () => {
     if (process.platform !== "win32") {
       expect(statSync(join(DATA_DIR, "messages.db")).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it("settles a helper left running when the harness boots again", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-1" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Survey files",
+        toolCount: 1,
+        status: "running",
+        startedAt: 1_000,
+        endedAt: null,
+      },
+    });
+    store.appendMessage(bot.threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: "Task", itemId: "task-2" },
+      helper: {
+        fidelity: "typed",
+        depth: 1,
+        label: "Done already",
+        toolCount: 1,
+        status: "completed",
+        startedAt: 1_000,
+        endedAt: 2_000,
+      },
+    });
+    store.flushBotsNow();
+    const next = new Store(selection);
+    expect(next.settleInterruptedHelpers(5_000)).toBe(1);
+    const rows = next.messagesFor(bot.threadId);
+    expect(rows.find((row) => row.tool?.itemId === "task-1")?.helper).toMatchObject({
+      status: "failed",
+      endedAt: 5_000,
+      lastActivity: "Stopped when BotFleet restarted",
+    });
+    expect(rows.find((row) => row.tool?.itemId === "task-2")?.helper?.status).toBe("completed");
+    expect(next.settleInterruptedHelpers(6_000)).toBe(0);
   });
 
   it("deleteThread removes rows and state", () => {
