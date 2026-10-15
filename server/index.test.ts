@@ -3564,12 +3564,11 @@ describe("harness HTTP API", () => {
           // Poll for the queued response in one step: wait for busy, POST once,
           // and stop — never spin on busy alone while the bot is already idle.
           type MessageSendResult = { status: number; body: unknown };
-          const isQueuedSend = (result: MessageSendResult | undefined): boolean => {
-            if (!result || result.status !== 202) return false;
-            if (typeof result.body !== "object" || result.body === null) return false;
-            const body = result.body as { queued?: unknown };
-            return body.queued === true;
-          };
+          const queuedSendBodySchema = z.object({ queued: z.literal(true) }).passthrough();
+          const isQueuedSend = (result: MessageSendResult | undefined): boolean =>
+            !!result
+            && result.status === 202
+            && queuedSendBodySchema.safeParse(result.body).success;
           let successorSend: MessageSendResult | undefined;
           await expect
             .poll(
