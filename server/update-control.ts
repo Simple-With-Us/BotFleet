@@ -1099,8 +1099,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       finishedAt: typeof record.finishedAt === "string" ? record.finishedAt : "",
       outcome: record.outcome,
       message: typeof record.message === "string" ? record.message : "",
-      ...(typeof record.receiptPath === "string" ? { receiptPath: record.receiptPath } : {}),
     };
+    if (typeof record.receiptPath === "string") lastRun.receiptPath = record.receiptPath;
   };
 
   const loadCurrent = () => {
