@@ -50,6 +50,10 @@ async function openExternalUrl(url: string): Promise<void> {
 async function openPluginSource(source: PluginListingSource): Promise<void> {
   if (source.kind === "folder") {
     const path = folderPluginRevealPath(source);
+    if (window.ogb?.revealLocalPath) {
+      await window.ogb.revealLocalPath(path);
+      return;
+    }
     if (window.ogb?.showInFolder) {
       await window.ogb.showInFolder(path);
       return;

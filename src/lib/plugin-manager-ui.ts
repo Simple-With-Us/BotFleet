@@ -7,8 +7,12 @@ export const PLUGINS_HELP_URL =
 /** Turn a git install source into a browser URL for Open. */
 export function gitPluginBrowseUrl(source: Extract<PluginListingSource, { kind: "git" }>): string {
   const raw = source.url.trim();
-  if (/^https?:\/\//i.test(raw)) return raw;
-  const slug = raw.replace(/^\/+/, "");
+  if (/^https?:\/\//i.test(raw)) {
+    if (source.ref && !raw.includes("/tree/")) return `${raw.replace(/\/$/, "")}/tree/${source.ref}`;
+    return raw;
+  }
+  let slug = raw.replace(/^\/+/, "");
+  slug = slug.replace(/^github\.com\//i, "");
   const base = `https://github.com/${slug}`;
   if (source.ref) return `${base}/tree/${source.ref}`;
   return base;

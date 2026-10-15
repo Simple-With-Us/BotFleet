@@ -16,6 +16,9 @@ describe("plugin-manager-ui", () => {
     expect(gitPluginBrowseUrl({ kind: "git", url: "acme/widget", ref: "main", path: "" })).toBe(
       "https://github.com/acme/widget/tree/main",
     );
+    expect(gitPluginBrowseUrl({ kind: "git", url: "github.com/acme/widget", ref: "main", path: "" })).toBe(
+      "https://github.com/acme/widget/tree/main",
+    );
     expect(gitPluginBrowseUrl({ kind: "git", url: "https://example.com/repo.git", ref: null, path: "" })).toBe(
       "https://example.com/repo.git",
     );
