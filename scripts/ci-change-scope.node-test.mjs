@@ -224,6 +224,22 @@ test("the test job checks out full history so the effort ledger guard can find i
   assert.equal(checkout.with?.["fetch-depth"], 0);
 });
 
+test("a later push cannot cancel an earlier main run before it dispatches jobs", () => {
+  // GitHub cancels the older pending run in a shared group.  On
+  // `ci-${{ github.ref }}` that cancellation happens with zero jobs, so
+  // the commit has no required-check verdict.  Pushes, schedules and
+  // dispatches therefore key off the event and the commit.  A pull
+  // request still shares one ref group and cancels only its own
+  // superseded head.
+  const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
+  assert.equal(
+    workflow.concurrency.group,
+    "${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.ref) || format('ci-{0}-{1}', github.event_name, github.sha) }}",
+  );
+  assert.equal(workflow.concurrency["cancel-in-progress"], "${{ github.event_name == 'pull_request' }}");
+  assert.doesNotMatch(workflow.concurrency.group, /ci-\$\{\{\s*github\.ref\s*\}\}/);
+});
+
 test("a documentation-only change still runs the effort ledger guard", () => {
   // docs/EFFORT-LOG.md is documentation, so a ledger-only pull request skips the test job's
   // full chain.  The classify job already has full history, so it carries the guard.

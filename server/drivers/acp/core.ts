@@ -207,6 +207,11 @@ export interface AcpSupport {
   loginNote: string;
   /** How a user installs this harness's CLI; surfaced by the setup UI. */
   install?: EngineInstall;
+  /** Other command names that run this harness, beyond `defaultCli`.  The
+   * Engines picker searches them alongside the default so an installed engine
+   * is never hidden behind a differently-named binary — Clutch's default is
+   * `dsh` but its own build installs as `clutch`. */
+  cliAliases?: string[];
   /** CLI argv AFTER the binary name to enter ACP stdio mode. */
   spawnArgs(config: AcpConfig, turn: SendTurnInput): string[];
   /** Optional rewrite of the spawned CLI.  DSH sits a stdio bridge in front
@@ -566,6 +571,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       },
     },
     install: support.install,
+    cliAliases: support.cliAliases,
     models: withModelCapabilities(support.models, support),
     decodeConfig,
     defaultConfig: () => decodeConfig({}),

@@ -726,6 +726,22 @@ export const SseCursorSchema = z
   .trim()
   .regex(/^[a-zA-Z0-9_-]+:\d+$/, "Cursor must be in <streamId>:<seq> format");
 
+/** Query schema for the Engines panel's binary-discovery endpoint.
+ *
+ * `name` is the engine's default binary and may legitimately be an absolute
+ * path, so it is length-bounded rather than shape-restricted.  `aliases` is a
+ * comma-separated list of that engine's OTHER command names — Clutch's default
+ * is `dsh` while its own build installs as `clutch` — and is bounded here so
+ * one request cannot ask for an unbounded number of PATH walks. */
+export const CliCandidatesQuerySchema = z.object({
+  name: z.string().max(512).default(""),
+  aliases: z
+    .string()
+    .max(4096)
+    .default("")
+    .transform((raw) => raw.split(",").map((alias) => alias.trim()).filter(Boolean)),
+});
+
 /** `<streamId>:<seq>` — opaque to clients, and the only thing they need to
  * remember to resume.  Returns null when it belongs to another run. */
 export function cursorSeq(validCursor: string | null | undefined): number | null {
@@ -15902,10 +15918,24 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // ?name=claude → absolute paths of every `claude` on the augmented PATH,
     // in PATH order (first = what a bare name runs). Polled when the user
     // opens the Custom picker so a just-installed CLI appears without a restart.
+    // `aliases` carries the engine's other command names (comma-separated), so
+    // an engine whose binary ships under more than one name answers with all of
+    // them — ?name=dsh&aliases=clutch is what makes Clutch's own build
+    // selectable, because `clutch` is the command carrying Clutch's profiles.
     if (method === "GET" && path === "/api/cli-candidates") {
-      const name = url.searchParams.get("name") ?? "";
+      const parsedQuery = CliCandidatesQuerySchema.safeParse({
+        name: url.searchParams.get("name") ?? "",
+        aliases: url.searchParams.get("aliases") ?? "",
+      });
+      if (!parsedQuery.success) {
+        return json(res, 400, {
+          ok: false,
+          error: "invalid_cli_candidates_query",
+          message: parsedQuery.error.issues[0]?.message ?? "Invalid CLI candidates query",
+        });
+      }
       resetPathCache();
-      return json(res, 200, { candidates: findCliCandidates(name) });
+      return json(res, 200, { candidates: findCliCandidates([parsedQuery.data.name, ...parsedQuery.data.aliases]) });
     }
 
     // ── pre-save CLI probe: does this path actually run? ──
