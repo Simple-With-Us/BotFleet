@@ -231,21 +231,21 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(spawn).toMatchObject({ title: "spawn_agent", toolKind: "task" });
     expect((spawn as { parentItemId?: string }).parentItemId).toBeUndefined();
     const helperStep = recorder.events.find((e) => e.type === "item.started" && e.itemId === "h1");
-    expect(helperStep).toMatchObject({ title: "HELPER COMMAND", parentItemId: "spawn-1" });
+    expect(helperStep).toMatchObject({ title: "HELPER COMMAND", parentItemId: "spawn-1", subagentId: "spawn-1" });
     expect(recorder.events.some((e) => e.type === "item.completed" && e.itemId === "h1")).toBe(true);
     // the main thread's own steps stay at the margin
     const own = recorder.events.find((e) => e.type === "item.started" && e.itemId === "i1");
     expect((own as { parentItemId?: string }).parentItemId).toBeUndefined();
   });
 
-  it("reports emulated background jobs and no helpers", async () => {
+  it("reports emulated background jobs and typed helpers", async () => {
     await create();
     // jobs P2: the job tools ride the MCP server Codex already mounts.  The
     // job process is spawned by the harness, not by Codex, so it is NOT inside
     // the codex sandbox — the approval card is what stands between a Codex bot
     // and a job, and a full-auto Codex bot is under ruling (c) instead.
     expect(instance.adapter.capabilities.backgroundJobs).toBe("emulated");
-    expect(instance.adapter.capabilities.helpers).toBe("none");
+    expect(instance.adapter.capabilities.helpers).toBe("typed");
   });
 
   it("files a step's own input (not its outcome fields) for the side store", async () => {
