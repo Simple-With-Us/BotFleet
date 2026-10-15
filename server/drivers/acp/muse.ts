@@ -193,36 +193,6 @@ function museCredentialStorage(env: Record<string, string | undefined>): string 
 
 /** Is Muse Code signed in *for this driver*?
  *
- *  Three tiers, and the distinction is the whole point.
- *
- *  **An API key, or a file-backed stored credential, is signed in.**  Muse Code
- *  resolves credentials as `META_API_KEY` first, then a stored key, and only
- *  then a stored browser session — so `META_API_KEY` and a file-backed
- *  `storage` are both credentials a client can read.  On Linux and Windows
- *  there is no macOS Keychain, so a file-backed credential is the normal case
- *  there and treating it as "not signed in" would strand every user on those
- *  platforms.
- *
- *  **A keychain-backed session is signed in too, and this used to be wrong.**
- *  That was the case that produced the original bug:  the old check reported
- *  "unproven" for keychain storage, on the theory that the community adapter
- *  we spawn bundles `@muse-code/sdk@1.3.0`, which predates the Keychain move
- *  and would answer "not logged in".  **That theory was measured and refuted** —
- *  see below.  It is recorded here because the refutation is the load-bearing
- *  part:  anyone tempted to reintroduce that tier needs to know it was tested.
- *
- *  Why this distinction has to be a real answer rather than an aside:  the live
- *  consumers of this value are the setup card and the failover chain at
- *  `server/safety/turn-safety.ts`, which skips an instance whose
- *  `authenticated` is `false`.  `muse` sets neither
- *  `requireAuthenticationBeforeSpawn` nor `authFailure: "fail"`, so nothing
- *  blocks a turn on it — which means a wrong `false` is not cosmetic.  It
- *  strands the card and the failover chain for a user who did everything right,
- *  so `loginNote` and `signInCommand` name the API key as the path, and a test
- *  holds them to this function so the two cannot drift apart again.
- */
-/** Is Muse Code signed in *for this driver*?
- *
  *  This used to answer `false` for a keychain-backed session, on the theory
  *  that the community adapter's bundled `@muse-code/sdk@1.3.0` predates the
  *  keychain move and would answer "not logged in" while the credential was in
