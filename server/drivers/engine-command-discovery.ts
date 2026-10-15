@@ -137,14 +137,20 @@ export const STATIC_ENGINE_COMMAND_SCANNERS = {
   antigravityAgent: [scanGemini],
   codex: [scanCodex],
   opencodeGo: [scanCursor],
-} as const satisfies Readonly<Record<string, readonly Scanner[]>>;
+} satisfies Readonly<Record<string, readonly Scanner[]>>;
 
 /** Names found on disk for this driver, normalized and deduped. */
 export function discoverStaticEngineCommands(
   driverKind: string,
   ctx: EngineCommandDiscoveryContext = {},
 ): readonly string[] {
-  const scanners = STATIC_ENGINE_COMMAND_SCANNERS[driverKind];
+  let scanners: readonly Scanner[] | undefined;
+  for (const [kind, entries] of Object.entries(STATIC_ENGINE_COMMAND_SCANNERS)) {
+    if (kind === driverKind) {
+      scanners = entries;
+      break;
+    }
+  }
   if (!scanners || scanners.length === 0) return [];
   const raw: string[] = [];
   for (const scan of scanners) raw.push(...scan(ctx));

@@ -91,12 +91,12 @@ describe("Linq turn-scoped chat binding", () => {
     expect(result).toEqual({ sent: true });
     expect(linqSendMessage).toHaveBeenCalledWith(
       "chat-a",
-      expect.objectContaining({
-        text: expect.stringContaining("The key is"),
-      }),
+      expect.objectContaining({ text: expect.stringContaining("The key is") }),
     );
-    const sentText = String(linqSendMessage.mock.calls[0]?.[1]?.text ?? "");
-    expect(sentText).not.toContain("TESTONLY");
+    expect(linqSendMessage).toHaveBeenCalledWith(
+      "chat-a",
+      expect.objectContaining({ text: expect.not.stringContaining("TESTONLY") }),
+    );
   });
 });
 

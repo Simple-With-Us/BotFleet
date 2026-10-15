@@ -63,4 +63,4 @@ export const ENGINE_COMMAND_ALLOWLIST_BY_DRIVER = {
   dshAgent: ACP_CLAUDE_LIKE({ cliVersion: "1.0.0", date: "2026-10-15" }),
   hermesAgent: ACP_CLAUDE_LIKE({ cliVersion: "1.0.0", date: "2026-10-15" }),
   museAgent: ACP_CLAUDE_LIKE({ cliVersion: "1.0.0", date: "2026-10-15" }),
-} as const satisfies Readonly<Record<string, readonly EngineCommandSpec[]>>;
+} satisfies Readonly<Record<string, readonly EngineCommandSpec[]>>;
