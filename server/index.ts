@@ -467,7 +467,6 @@ import {
   type GroupRecord,
   type GroupTaskRecord,
   type Message,
-  type BotRecord,
   type TaskRecord,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
@@ -3650,7 +3649,7 @@ function commandsFor(bot: BotRecord, surface: CommandSurface) {
     botId: bot.id,
     threadId: bot.threadId,
     surface,
-    busy: bot.busy,
+    busy: bot.busy === true,
     engine,
     allowsMultipleThreads: allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode)),
     hasSession: Boolean(task?.resumeCursors[engine.instanceId]),
@@ -3680,7 +3679,7 @@ function statusInputFor(bot: BotRecord): StatusInput {
   const described = registry.lastDescribed(selection.instanceId);
   const room = store.groups.find((group) => group.busyBotId === bot.id);
   return {
-    busy: bot.busy,
+    busy: bot.busy === true,
     busySince: turnStats.startedAt(bot.inflightThreadId ?? bot.threadId),
     busyInChannel: room ? room.name : null,
     now: Date.now(),
@@ -3700,7 +3699,7 @@ function statusInputFor(bot: BotRecord): StatusInput {
 function commandContextFor(bot: BotRecord, origin: CommandOrigin): CommandContext {
   return {
     origin,
-    bot: { id: bot.id, name: bot.name, busy: bot.busy },
+    bot: { id: bot.id, name: bot.name, busy: bot.busy === true },
     simpleMode: !allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode)),
     stop: async () => {
       const outcome = await interruptBot(bot);
