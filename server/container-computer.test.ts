@@ -65,6 +65,7 @@ import {
   perBotLocalVmTarget,
   podmanSecurityIsHardened,
   setupCommands,
+  shellWord,
   workspaceSources,
   type CommandRunner,
   type LocalVmTarget,
@@ -1375,14 +1376,14 @@ describe("setupCommands", () => {
     expect(command).toContain(`--label ${WORKSPACE_LABEL}=1`);
     expect(command).toContain(`--hostname ${CONTAINER}`);
     expect(command).toContain(
-      `--mount type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST}`,
+      `--mount ${shellWord(`type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST}`)}`,
     );
   });
 
   it("asks rootless Podman to map and privately relabel the durable workspace", () => {
     const command = setupCommands("podman", "linux").run!;
     expect(command).toContain(
-      `--mount type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST},relabel=private,U=true`,
+      `--mount ${shellWord(`type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST},relabel=private,U=true`)}`,
     );
   });
 

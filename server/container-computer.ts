@@ -1891,6 +1891,16 @@ export function containerComputerMcp(
   };
 }
 
+/** Display text a person may paste into a shell.  Any word that is not a bare
+ * shell token (letters, digits, and a small punctuation set) is single-quoted
+ * so whitespace, `!`, or a Windows path separator cannot be split or
+ * history-expanded when the string is pasted into cmd or bash. */
+export function shellWord(word: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(word)
+    ? word
+    : `'${word.replace(/'/g, `'\\''`)}'`;
+}
+
 /** Commands shown as a transparent fallback. Normal setup builds the pinned
  * derivative through the API, so users do not need to author a Dockerfile. */
 export function setupCommands(
@@ -1927,13 +1937,6 @@ export function setupCommands(
       view: target.viewerPort ? `http://127.0.0.1:${target.viewerPort}/vnc.html` : "",
     };
   }
-  // Display text a person may paste into a shell, so an argument with whitespace
-  // or a shell metacharacter (the git credential helper, `!gh auth git-credential`)
-  // is single-quoted rather than left to be split or history-expanded.  A
-  // backslash or `~` alone is left bare: those are ordinary in a Windows path,
-  // which has always been printed as-is here.
-  const shellWord = (word: string) =>
-    /[\s!"'`$&;|<>()*?{}#]/.test(word) ? `'${word.replace(/'/g, `'\\''`)}'` : word;
   const command = (args: string[]) => [runtime, ...args].map(shellWord).join(" ");
   return {
     install,
