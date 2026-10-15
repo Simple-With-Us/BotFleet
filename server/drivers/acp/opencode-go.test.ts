@@ -234,7 +234,6 @@ describe("OpenCode catalog", () => {
     ].join("\n"));
 
     expect(models?.options.map((option) => option.id)).toEqual([
-      "opencode/x-preview-f-free",
       "openrouter/anthropic/claude-sonnet-5",
     ]);
   });

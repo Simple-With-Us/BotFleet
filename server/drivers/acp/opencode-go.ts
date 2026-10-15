@@ -138,7 +138,7 @@ export function parseOpenCodeModelsOutput(stdout: string): ModelCatalog | null {
         // A header-only/older CLI remains useful; fall back to the model id.
       }
     }
-    if (record.status === "deprecated") return;
+    if (record.status === "deprecated" || DEPRECATED_OPENCODE_MODEL_SLUGS.has(slug)) return;
     const name = typeof record.name === "string" && record.name.trim()
       ? record.name.trim()
       : labelForModel(model);
