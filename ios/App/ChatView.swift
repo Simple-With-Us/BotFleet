@@ -1181,6 +1181,51 @@ struct ChatView: View {
 
     // MARK: - Composer
 
+#if DEBUG
+    private var composerKeyboardAccessoryAvailable: Bool {
+        !ProcessInfo.processInfo.arguments.contains("-no-keyboard-accessory")
+    }
+#else
+    private var composerKeyboardAccessoryAvailable: Bool { true }
+#endif
+
+    /// Leading `/` and trailing Hide when `inputAccessoryView` is unavailable.
+    private var composerFallbackKeyboardBar: some View {
+        HStack(spacing: 8) {
+            Button {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.75)) {
+                    showCommandHUD = true
+                }
+                draft = ComposerSendRecovery.slashCommandDraft(from: draft)
+            } label: {
+                Image(systemName: "command")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(Color.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(Color.secondary.opacity(0.14)))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Slash commands")
+
+            Spacer(minLength: 0)
+
+            Button {
+                composerFocused = false
+            } label: {
+                Label(ComposerInputChrome.hideKeyboardTitle, systemImage: ComposerInputChrome.hideKeyboardSymbolName)
+                    .font(.subheadline)
+                    .foregroundStyle(Color.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(Color.secondary.opacity(0.14)))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(ComposerInputChrome.hideKeyboardTitle)
+        }
+        .padding(.horizontal, 4)
+    }
+
     /// A round + and a glass pill with dictation and send inside it.
     private var composer: some View {
         VStack(spacing: 6) {
@@ -1233,24 +1278,13 @@ struct ChatView: View {
                     draft = "\(prefix)\(mention.trigger)\(selected.name) "
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else if composerFocused {
-                HStack(spacing: 8) {
-                    Button {
-                        composerFocused = false
-                    } label: {
-                        Image(systemName: "keyboard.chevron.compact.down")
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(Color.secondary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Capsule().fill(Color.secondary.opacity(0.14)))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Hide Keyboard")
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 4)
-                .transition(.opacity)
+            } else if ComposerInputChrome.showsFallbackKeyboardBar(
+                composerFocused: composerFocused,
+                slashBarVisible: showCommandHUD,
+                keyboardAccessoryAvailable: composerKeyboardAccessoryAvailable
+            ) {
+                composerFallbackKeyboardBar
+                    .transition(.opacity)
             } else if draft.isEmpty && !hasPendingApproval && !current.busy {
                 PredictiveActionChipsView(accentColor: BotPalette.color(current.color)) { chip in
                     draft = chip.prompt
@@ -1375,28 +1409,33 @@ struct ChatView: View {
                     .glassCapsule()
                     .accessibilityLabel(showingPlus ? "Close" : "More")
 
-                    TextField(
-                        dictation.isListening ? "Listening…" : "Ask \(current.name)",
-                        text: $draft,
-                        axis: .vertical
-                    )
-                        .lineLimit(1...8)
-                        .font(.body)
-                        .padding(.leading, 14)
-                        .padding(.trailing, 14)
-                        .padding(.vertical, 11)
-                        .focused($composerFocused)
-                        .submitLabel(.return)
-                        // Partial transcripts rebuild from a frozen base;
-                        // prevent competing edits without dimming the text.
-                        .allowsHitTesting(!dictation.isListening && !dictation.isStarting)
+                    ZStack(alignment: .topLeading) {
+                        let prompt = dictation.isListening ? "Listening…" : "Ask \(current.name)"
+                        if draft.isEmpty {
+                            Text(prompt)
+                                .font(.body)
+                                .foregroundStyle(Color.secondary)
+                                .padding(.leading, 14)
+                                .padding(.trailing, 14)
+                                .padding(.vertical, 11)
+                                .allowsHitTesting(false)
+                        }
+                        ComposerMultilineField(
+                            text: $draft,
+                            isFocused: $composerFocused,
+                            placeholder: prompt,
+                            isEditable: !dictation.isListening && !dictation.isStarting,
+                            usesKeyboardAccessory: composerKeyboardAccessoryAvailable,
+                            onHideKeyboard: { composerFocused = false }
+                        )
+                        .frame(minHeight: 44)
                         .onChange(of: draft) { _, value in
                             withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
-                                showCommandHUD = value.hasPrefix("/")
+                                showCommandHUD = ComposerInputChrome.showsSlashCommandBar(draft: value)
                             }
                         }
-                        .frame(minHeight: 44)
-                        .glassRounded(cornerRadius: 18, interactive: false)
+                    }
+                    .glassRounded(cornerRadius: 18, interactive: false)
 
                     // Mic, Stop and Send live outside the text pill.  Inside
                     // it, a draft that grows past a few lines pushed them

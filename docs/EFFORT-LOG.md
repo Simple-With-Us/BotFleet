@@ -510,6 +510,7 @@ Protocol: /Users/jay/apps/EFFORT-LOG-PROTOCOL.md (canonical). Live board: this f
 - **2026-10-02 - CLAUDE - IN_PROGRESS - [BF][CLAUDE] Quarantine corrupt bots, groups and routines stores and salvage config.json sections instead of dropping to defaults.** <!-- wb-agent-report:230ef988eb2540d980ddd159cd7ee185 -->
 - **2026-10-01 - MINIMAX - IN_PROGRESS - [BF][MINIMAX] Owner ruling: build macOS updates on GitHub runners, always, with a local-build bypass.** <!-- wb-agent-report:34c834f17ebc454aad761ae3351569c1 -->
 - **2026-10-01 - CLAUDE - IN_PROGRESS - BotFleet: committed scripts/__pycache__/sentry-ci-report.cpython-314.pyc dirties every worktree after pnpm test.** <!-- wb-agent-report:c51b66a0af404fe599b001c432edb222 -->
+- **2026-10-15 - CURSOR - IN PR - BF-1652 iOS: keyboard accessory Hide + slash-bar gating (CompanionCore/InputView.swift, ComposerMultilineField).** <!-- linear:BF-1652 -->
 - **2026-09-30 - BF-DESIGNER - IN_PROGRESS - iOS: hide-keyboard button (chevron.down + 'Hide') under keyboard, slash bar hidden until '/' typed.** <!-- wb-agent-report:f1234e19b4714375ac4cc0300c05757c -->
 - **2026-09-30 - BF-Director - IN_PROGRESS - Shared VPS + Local VM concurrency: let several engines share one desktop at once.** <!-- wb-agent-report:1b5edd91291a43acac98a79598313876 -->
 - **2026-09-30 - CLAUDE - PLANNED - [BF][CLAUDE] Settings sidebar polish: search spacing/tone, bold tabs, Remote Access into Phone or renamed Remote.** <!-- wb-agent-report:b917886441634ac39ceaeba17dcb0a5a -->
