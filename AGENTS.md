@@ -49,6 +49,8 @@ Fleet-wide Kody review rules live in **`Simple-With-Us/Kodus-Config`**, not in t
 
 This repository keeps only **`kodus-config.yml`** at the root: per-repo review toggles for BotFleet pull requests (for example suggestion filters and request-changes behavior).  Do not recreate a `.kody-rules/` tree here; it was a stale duplicate of the centralized config.
 
+**Review loop (BF-1997).**  Kody findings are **advisory**; a human must judge money-path, release-path, and ruleset-sensitive items.  Kody re-reviews the full diff on every push, so **zero-unresolved threads is not a merge bar that converges on its own**.  Fleet agents use the per-PR stop rule: triage and fix real findings in **rounds 1–2** (`codex-triage` skill), then record any remainder as **accepted risk** with a written rationale and stop chasing ping-pong.  Canonical write-up: `docs/decisions/2026-10-15-kody-review-stop-rule.md`.
+
 ## Prior Messages Stay In Scope (owner preference — ALL agents, ALL platforms)
 
 **Never assume a new user message means prior questions or tasks are dropped.**  Treat the full conversation as still active unless the owner explicitly contradicts, cancels, or redirects.
