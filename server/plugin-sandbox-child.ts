@@ -5,6 +5,8 @@
 //   * the Node permission model: read access to this script and the
 //     plugin's own folder only, no filesystem writes, no child processes,
 //     no worker threads, no native addons, no WASI, no inspector,
+//   * outbound network blocked by plugin-sandbox-egress-deny.mjs (--import)
+//     and, on Linux when available, an unshare -n network namespace,
 //   * a small V8 heap cap, and a per-call deadline enforced by the parent,
 //     which kills this process when a handler overruns.
 //

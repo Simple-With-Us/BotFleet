@@ -414,7 +414,9 @@ The plugin model mirrors skills:
     (`server/plugin-sandbox-child.ts`) with an empty environment, the
     Node permission model (read access to the child script and the
     plugin's own directory only; no filesystem writes, no child
-    processes, no worker threads, no native addons), a capped heap, and
+    processes, no worker threads, no native addons), outbound network
+    denied (`server/plugin-sandbox-egress-deny.mjs` via `--import`, plus
+    `unshare -n` on Linux when the host allows it), a capped heap, and
     a per-call deadline that kills the child when a handler overruns.
     The child imports the plugin, reports which handlers it exports,
     and answers host calls from the per-call snapshot.  Every message
@@ -439,17 +441,10 @@ The plugin model mirrors skills:
 
 ## Open Questions For The Owner
 
-1.  **Outbound network from the sandbox.**  Node's permission model
-    does not restrict outbound sockets, so a plugin can still open a
-    connection.  It has no credentials, no environment, and nothing
-    readable outside its own directory to send, but blocking egress
-    needs an OS-level mechanism (a network namespace on Linux, a
-    sandbox profile on macOS).  Should v1 ship with that, or should v1
-    be declarative-only (manifest contributions, no JS at all)?
-2.  **Plugin UI ceiling.**  Is host-rendered cards + slash commands
+1.  **Plugin UI ceiling.**  Is host-rendered cards + slash commands
     the permanent ceiling, or will plugins eventually contribute raw
     UI (their own React)?
-3.  **Distribution and signing.**  v1 records source URL + ref only.
+2.  **Distribution and signing.**  v1 records source URL + ref only.
     Is a checksum pin or a git-host allowlist wanted?  Are signed
     releases in scope?
 

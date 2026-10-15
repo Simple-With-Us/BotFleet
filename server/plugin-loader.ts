@@ -8,6 +8,8 @@
 //   * the Node permission model: read access to the child script and the
 //     plugin's own folder only, no filesystem writes, no child processes,
 //     no worker threads, no native addons, no WASI, no inspector,
+//   * outbound network denied (plugin-sandbox-egress-deny.mjs via --import,
+//     plus unshare -n on Linux when the host allows it),
 //   * a capped V8 heap, a start deadline, and a per-call deadline.  A call
 //     that overruns kills the child; the next call respawns it.
 //   * stdio closed, so nothing the plugin prints reaches the server log.
@@ -19,12 +21,9 @@
 // parsed with ChildToParentMessageSchema; an unparseable message kills the
 // child.
 //
-// Residual risk: Node's permission model (as shipped in the Node versions
-// BotFleet runs on) does not restrict outbound network access.  A plugin
-// can still open sockets, but it has no credentials, no environment, and
-// no readable files outside its own folder to send.  Network isolation
-// needs an OS-level mechanism and is tracked in docs/plugins/DESIGN.md §
-// Open Questions.
+// Outbound sockets are blocked by server/plugin-sandbox-egress-deny.mjs
+// (loaded with --import before the child starts) and, on Linux when the
+// host allows it, an unshare -n network namespace around the child.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
@@ -38,6 +37,7 @@ import {
   MIN_ROOM_TURN_TIMEOUT_MINUTES,
 } from "./config.ts";
 import { HOST_API_VERSION, satisfiesBotfleetVersion, type JsonValue } from "../shared/plugin-manifest.ts";
+import { pluginSandboxEgressDenyScript, pluginSandboxSpawnTarget } from "./plugin-sandbox-egress.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { PLUGINS_DIR } from "./plugin-registry.ts";
 import {
@@ -442,6 +442,7 @@ export async function startPluginSandbox(
     return { reason: "sandbox_unavailable" };
   }
   let childScript: string;
+  let egressDenyScript: string;
   let pluginDir: string;
   let entryPath: string;
   try {
@@ -449,6 +450,7 @@ export async function startPluginSandbox(
     // does not cover the kernel path (`/private/var/...`), and a logical
     // `file://` URL fails the same way even when the grant is already real.
     childScript = realPath(SPAWNED_PROXIES.pluginSandbox);
+    egressDenyScript = realPath(pluginSandboxEgressDenyScript());
     pluginDir = realPath(resolve(options.pluginDir));
     entryPath = realPath(resolve(options.entryPath));
   } catch {
@@ -460,19 +462,23 @@ export async function startPluginSandbox(
     return { reason: "start_failed" };
   }
   const sandboxOptions: PluginSandboxOptions = { ...options, pluginDir, entryPath };
-  const args = [
+  const nodeArgs = [
+    `--import=${egressDenyScript}`,
     flag,
     `--allow-fs-read=${childScript}`,
+    `--allow-fs-read=${egressDenyScript}`,
     `--allow-fs-read=${pluginDir}`,
     `--max-old-space-size=${sandboxOptions.heapMb ?? DEFAULT_HEAP_MB}`,
   ];
   // The dev tree runs the .ts source; the packaged tree runs the bundled .js.
-  if (childScript.endsWith(".ts")) args.push("--experimental-strip-types", "--no-warnings");
-  args.push(childScript);
+  if (childScript.endsWith(".ts")) nodeArgs.push("--experimental-strip-types", "--no-warnings");
+  nodeArgs.push(childScript);
+
+  const { command, args } = pluginSandboxSpawnTarget(process.execPath, nodeArgs);
 
   let child: ChildProcess;
   try {
-    child = spawn(process.execPath, args, {
+    child = spawn(command, args, {
       cwd: pluginDir,
       env: sandboxEnv(),
       stdio: ["ignore", "ignore", "ignore", "ipc"],

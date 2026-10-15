@@ -3,8 +3,11 @@
 // plugin can and cannot reach.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
+import { PLUGIN_EGRESS_DENIED } from "./plugin-sandbox-egress.ts";
 
 import {
   buildHostSnapshot,
@@ -115,6 +118,63 @@ describe("plugin sandbox isolation", () => {
     expect(JSON.stringify(card.value)).not.toContain(SECRET_VALUE);
     const { result } = PluginCardResultSchema.parse(card.value);
     expect(result).toMatchObject({ secret: null });
+  });
+
+  it("denies outbound TCP to loopback and to the public internet", async () => {
+    const server = createServer((_req, res) => {
+      res.end("leaked");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind");
+    const loopbackPort = address.port;
+    writePlugin("net", `
+      import net from "node:net";
+      const probe = (host, port) => new Promise((resolve) => {
+        const socket = net.createConnection({ host, port }, () => resolve({ host, ok: true }));
+        socket.on("error", (error) => resolve({ host, code: error.code }));
+      });
+      export async function getCardData() {
+        return { result: {
+          loopback: await probe("127.0.0.1", ${loopbackPort}),
+          external: await probe("1.1.1.1", 53),
+        } };
+      }
+    `);
+    const plugin = await load("net");
+    const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+    if (!card.ok) throw new Error(card.reason);
+    const { result } = PluginCardResultSchema.parse(card.value);
+    expect(result).toEqual({
+      loopback: { host: "127.0.0.1", code: PLUGIN_EGRESS_DENIED },
+      external: { host: "1.1.1.1", code: PLUGIN_EGRESS_DENIED },
+    });
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  });
+
+  it("denies fetch to loopback", async () => {
+    const server = createServer((_req, res) => {
+      res.end("leaked");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("server did not bind");
+    const loopbackPort = address.port;
+    writePlugin("fetch", `
+      export async function getCardData() {
+        try {
+          await fetch("http://127.0.0.1:${loopbackPort}/");
+          return { result: { ok: true } };
+        } catch (error) {
+          return { result: { code: error?.code ?? error?.cause?.code ?? "unknown" } };
+        }
+      }
+    `);
+    const plugin = await load("fetch");
+    const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+    if (!card.ok) throw new Error(card.reason);
+    expect(PluginCardResultSchema.parse(card.value).result).toEqual({ code: PLUGIN_EGRESS_DENIED });
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
   });
 
   it("denies filesystem reads outside the plugin folder, writes, and subprocesses", async () => {
