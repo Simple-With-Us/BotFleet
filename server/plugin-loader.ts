@@ -290,7 +290,7 @@ function sandboxEnv(): NodeJS.ProcessEnv {
 }
 
 class ChildPluginSandbox implements PluginSandbox {
-  exports: PluginExports = { getCardData: false, runCommand: false };
+  exports: PluginExports = { getCardData: false, runCommand: false, onEvent: false, getHealth: false };
   private alive = true;
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (result: PluginSandboxResult) => void; timer: NodeJS.Timeout }>();

@@ -93,7 +93,7 @@ describe("plugin sandbox isolation", () => {
       export function runCommand({ args }) { return "echo:" + args; }
     `);
     const plugin = await load("ok");
-    expect(plugin.sandbox.exports).toEqual({ getCardData: true, runCommand: true });
+    expect(plugin.sandbox.exports).toEqual({ getCardData: true, runCommand: true, onEvent: false, getHealth: false });
     const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
     if (!card.ok) throw new Error(card.reason);
     const parsed = PluginCardResultSchema.parse(card.value);

@@ -233,12 +233,12 @@ describe("host API version gate", () => {
       manifestPath,
       JSON.stringify({
         ...manifestRaw,
-        botfleet: ">=2",
+        botfleet: ">=3",
       }),
     );
     const result = await enablePlugin("fleet-overview", baseDir);
     if (!("error" in result)) throw new Error("expected enable to fail");
-    expect(result.error).toMatch(/requires botfleet ">=2" but the host API is \d/);
+    expect(result.error).toMatch(/requires botfleet ">=3" but the host API is \d/);
     // The plugin must remain disabled after the refused enable.
     const after = readRegistry(baseDir).plugins["fleet-overview"];
     expect(after?.enabled).toBe(false);
@@ -431,10 +431,10 @@ describe("install failures the UI can render", () => {
     await enablePlugin("fleet-overview", baseDir);
     const manifestPath = join(baseDir, "fleet-overview", "botfleet-plugin.json");
     const manifest = readManifest(manifestPath);
-    writeFileSync(manifestPath, JSON.stringify({ ...manifest, botfleet: ">=2" }));
+    writeFileSync(manifestPath, JSON.stringify({ ...manifest, botfleet: ">=3" }));
     const result = await runPluginCommand("fleet-overview", "fleet", "", baseDir);
     if (!("error" in result)) throw new Error("expected the command to fail");
-    expect(result.error).toMatch(/requires botfleet ">=2"/);
+    expect(result.error).toMatch(/requires botfleet ">=3"/);
     // Request-time mismatch must persist enabled=false like bootPluginRuntime.
     expect(readRegistry(baseDir).plugins["fleet-overview"]?.enabled).toBe(false);
   });
