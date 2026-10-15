@@ -313,6 +313,7 @@ import {
   credentialPromptFor,
   signInPromptFor,
   hasFileTools,
+  httpCatalogPromptFor,
   routinePromptFor,
 } from "./tools/prompts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
@@ -6430,6 +6431,25 @@ async function startTurn(
         { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace, recall: hasRecall, phone: hasPhone, linq: hasLinq, jobs: jobsForTurn, zulip: zulipMounted },
         { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq },
       );
+      const httpToolPrompt = usesDriverToolLoop
+        ? httpCatalogPromptFor(
+            {
+              agents: Boolean(integrations.agents),
+              localComputer: hasHostComputer,
+              workspace: worksInWorkspace,
+              recall: hasRecall,
+              phone: hasPhone,
+              github: hasHostComputer,
+              linq: hasLinq,
+              jobs: jobsForTurn,
+              zulip: zulipMounted,
+              commsDepth,
+              maxCommsDepth: MAX_COMMS_DEPTH,
+              chiefOfStaff: Boolean(bot.chiefOfStaff),
+            },
+            { omitHostFileToolFragments: hasHostComputer },
+          )
+        : "";
       // One builder, tagged parts, and the joined text is byte-identical to
       // the string this lane concatenated by hand before the split
       // (server/system-prompt.test.ts pins it).  Memory and mentions are
@@ -6470,6 +6490,11 @@ async function startTurn(
         // recall lane mounted by PR #465 (MiniMax, OpenAI-compat, Grok
         // HTTP) without those engines setting `integrations.qdrant`.
         { id: "recall", label: "Recall", text: recallPromptFor({ ...integrations, recall: hasRecall }) },
+        {
+          id: "tool-catalog",
+          label: "Tool catalog",
+          text: httpToolPrompt,
+        },
         // Only an HTTP tool-loop engine has a round ceiling at all — a CLI or
         // ACP engine runs one process per turn and is not bounded this way, so
         // telling those models about rounds would be a lie.
@@ -8711,6 +8736,25 @@ async function runGroupMemberTurn(
     hasHostComputer &&
     instance.adapter.capabilities.backgroundJobs === "emulated" &&
     jobSettings().enabled;
+  const roomHttpToolPrompt = httpOnlyToolSurface
+    ? httpCatalogPromptFor(
+        {
+          agents: Boolean(integrations.agents),
+          localComputer: hasHostComputer,
+          workspace: Boolean(workspace),
+          recall: hasRoomRecall,
+          phone: hasRoomPhone,
+          github: hasHostComputer,
+          linq: false,
+          jobs: Boolean(roomJobs),
+          zulip: false,
+          commsDepth: hop,
+          maxCommsDepth: MAX_COMMS_DEPTH,
+          chiefOfStaff: Boolean(bot.chiefOfStaff),
+        },
+        { omitHostFileToolFragments: hasHostComputer },
+      )
+    : "";
   const fleetSeat = fleetSeatPromptPart(bot);
   const roomSystem = buildSystemPrompt([
     { id: "persona", label: "Identity", text: system },
@@ -8736,6 +8780,7 @@ async function runGroupMemberTurn(
     // extends the same prompt to the in-process HTTP recall lane mounted
     // by PR #465 (MiniMax, OpenAI-compat, Grok HTTP), matching the 1:1 lane.
     { id: "recall", label: "Recall", text: recallPromptFor({ ...integrations, recall: hasRoomRecall }) },
+    { id: "tool-catalog", label: "Tool catalog", text: roomHttpToolPrompt },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
     { id: "memory", label: "Memory", text: roomFileTools ? `\n${memorySystemPrompt(bot.id).trim()}` : "" },
     { id: "owner-notes", label: "Owner notes", text: ownerNotesPrompt(bot.userNotes) },

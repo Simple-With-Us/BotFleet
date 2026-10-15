@@ -19,7 +19,28 @@
 // pure functions over plain data, so every one of them is testable without
 // a harness.
 
-import type { HarnessTool } from "./registry.ts";
+import { toolsFor, type HarnessTool, type ToolGateContext } from "./registry.ts";
+
+/** Tools whose prompt copy already lives in another system-prompt section, so
+ *  catalog fragments must not repeat them. */
+const AGENTS_TOOL_NAMES = new Set([
+  "list_bots",
+  "coordinate_bots",
+  "assignment_status",
+  "delegate_bot",
+  "create_bot",
+  "request_credential",
+  "request_sign_in",
+  "propose_routine",
+  "propose_routine_action",
+  "list_routines",
+]);
+
+const RECALL_TOOL_NAMES = new Set(["recall_search", "recall_contribute", "recall_stats"]);
+
+const JOB_TOOL_NAMES = new Set(["job_start", "job_output", "job_list", "job_kill"]);
+
+const HOST_FILE_TOOL_NAMES = new Set(["bash", "read_file", "write_file", "edit_file"]);
 
 /** One sentence per tool that declares a `promptFragment`, in catalog
  *  order, each prefixed with a space so a caller can concatenate the
@@ -101,4 +122,38 @@ export function hasFileTools(
 ): boolean {
   if (worksInWorkspace) return true;
   return Boolean(hasLocalComputer);
+}
+
+/** Sentence for the harness github_* tools on the HTTP lane (no stdio MCP). */
+export function githubToolPromptFor(hasGithub: boolean): string {
+  if (!hasGithub) return "";
+  return (
+    " Use github_clone to bring a repository into your workspace, then github_status, github_commit, github_push," +
+    " and the github_pr_* and github_issue_* tools for git and pull-request work — a narrower, carded alternative to" +
+    " running git and gh through bash."
+  );
+}
+
+/** Sentence for the in-process phone_* tools on the HTTP lane. */
+export function phoneToolPromptFor(hasPhone: boolean): string {
+  if (!hasPhone) return "";
+  return (
+    " Use phone_status to confirm a USB Android device is connected, phone_read_screen after every action to verify the UI," +
+    " and phone_open_app, phone_tap_text, phone_swipe, phone_type_text, and phone_press to drive it. Never enter passwords" +
+    " or one-time codes."
+  );
+}
+
+/** Registry `promptFragment` sentences for HTTP tools this turn actually offers,
+ *  minus tools whose copy already has a dedicated system-prompt section. */
+export function httpCatalogPromptFor(
+  ctx: ToolGateContext,
+  opts: { omitHostFileToolFragments?: boolean } = {},
+): string {
+  const exclude = new Set<string>([...AGENTS_TOOL_NAMES, ...RECALL_TOOL_NAMES, ...JOB_TOOL_NAMES]);
+  if (opts.omitHostFileToolFragments) {
+    for (const name of HOST_FILE_TOOL_NAMES) exclude.add(name);
+  }
+  const fragments = promptFragmentsFor(toolsFor("http", ctx).filter((tool) => !exclude.has(tool.name)));
+  return fragments + githubToolPromptFor(Boolean(ctx.github)) + phoneToolPromptFor(Boolean(ctx.phone));
 }
