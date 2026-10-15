@@ -230,6 +230,8 @@ import {
 } from "./config-reload-keys.ts";
 import { computerReach } from "./computer-capability.ts";
 import {
+  type CapabilityGateContext,
+  type CapabilityProfile,
   DOOMED_POLICY,
   evaluateCapabilityGate,
   formatExecutionHints,
@@ -894,7 +896,8 @@ const cfg = loadConfig();
  *  tell", which is a different message and must not be conflated. */
 function stsProviderCredential(provider: StsProvider): string | undefined {
   const value = provider === "xai" ? cfg.xai?.key : cfg.gemini?.key;
-  return typeof value === "string" && value.trim() ? value : undefined;
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 /** One token per provider per window.  Each mint is a billed call to a vendor
@@ -1205,8 +1208,10 @@ function noteCapabilitySkip(
     // the first turn's model and reason attributes.
     const key = `${botId}:${instanceId}:${model}:${taskClass}:${lane}`;
     const tally = capabilitySkipTotals.get(key);
-    if (tally) tally.count += 1;
-    else capabilitySkipTotals.set(key, { botId, instanceId, model, taskClass, reason, lane, count: 1 });
+    if (tally) {
+      tally.count += 1;
+      tally.reason = reason;
+    } else capabilitySkipTotals.set(key, { botId, instanceId, model, taskClass, reason, lane, count: 1 });
   } catch {
     // Counting must not block a gate decision.
   }
@@ -1239,7 +1244,7 @@ setInterval(drainCapabilitySkips, DOOMED_SKIP_DRAIN_MS).unref?.();
 
 function capabilityHostContext(
   bot: { computers?: Array<"cloud" | "vm" | "local">; cloudBackend?: "box" | "vps" | null },
-) {
+): CapabilityGateContext {
   const shellBot = { computers: bot.computers, cloudBackend: bot.cloudBackend ?? undefined };
   const hostShellGrantedNow = hostShellGranted(shellBot, cfg, allowedBotComputers(cfg));
   return { hostShellGranted: hostShellGrantedNow };
@@ -1276,8 +1281,9 @@ function enforceTurnCapabilityGate(input: {
   model: string;
   text: string;
   runOn?: RoutineRunOn;
-  routineNeeds?: import("./capability-profile.ts").TaskClass[];
+  routineNeeds?: TaskClass[];
   lane: "dispatch" | "routine";
+  ignorePromptImageMarkers?: boolean;
 }): string | undefined {
   const hostCtx = capabilityHostContext(input.bot);
   const gate = evaluateCapabilityGate(
@@ -1293,6 +1299,7 @@ function enforceTurnCapabilityGate(input: {
       runOn: input.runOn,
       routineNeeds: input.routineNeeds,
       hostShellGranted: hostCtx.hostShellGranted,
+      ignorePromptImageMarkers: input.ignorePromptImageMarkers,
     },
     hostCtx,
   );
@@ -1317,7 +1324,7 @@ function enforceTurnCapabilityGate(input: {
   throw new IncapableDispatch(reason, taskClass);
 }
 
-function routineIncapableForRun(run: import("./routines.ts").RoutineRun): { reason: string } | undefined {
+function routineIncapableForRun(run: RoutineRun): { reason: string } | undefined {
   const bot = store.bot(run.botId);
   if (!bot) return undefined;
   const task = run.threadId ? store.taskByThread(bot.id, run.threadId) : undefined;
@@ -1337,6 +1344,7 @@ function routineIncapableForRun(run: import("./routines.ts").RoutineRun): { reas
       text: prompt,
       runOn: run.runOn,
       lane: "routine",
+      ignorePromptImageMarkers: true,
     });
     return undefined;
   } catch (error) {
@@ -6169,7 +6177,7 @@ async function startTurn(
       role: "bot",
       kind: "activity",
       from: { botId: bot.id, name: bot.name, color: bot.color },
-      tool: { name: capabilityWarn, ok: true, kind: "notice" },
+      tool: { name: "Capability degraded", ok: true, kind: "notice", detail: capabilityWarn },
     });
   }
 
@@ -16033,7 +16041,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
 
     if (method === "GET" && path === "/api/inspect/capabilities") {
-      const profiles: ReturnType<typeof profileFor>[] = [];
+      const profiles: CapabilityProfile[] = [];
       for (const instance of registry.instances()) {
         for (const option of instance.models.options) {
           profiles.push(

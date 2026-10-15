@@ -89,6 +89,16 @@ describe("requiredFor", () => {
     expect(required.has("desktop_gui")).toBe(true);
     expect(required.has("coding")).toBe(false);
   });
+
+  it("ignores echoed image markers when requested", () => {
+    const required = requiredFor({
+      text: '<attached-image path="/tmp/x.png" />',
+      computers: [],
+      ignorePromptImageMarkers: true,
+    });
+    expect(required.has("images")).toBe(false);
+    expect(required.has("chat")).toBe(true);
+  });
 });
 
 describe("doomedReason", () => {
@@ -115,6 +125,19 @@ describe("doomedReason", () => {
     const required = requiredFor({ text: "vm task", computers: ["vm"] });
     const doomed = doomedReason(grok, required);
     expect(doomed?.taskClass).toBe("vm");
+  });
+
+  it("allows boxAgent coding on cloud via remoteAgent transport", () => {
+    const box = engineFixture("ASCII.dev Box");
+    const profile = profileFor({
+      instanceId: "box",
+      driverKind: box.driverKind,
+      capabilities: box.capabilities,
+      model: "default",
+    });
+    expect(profile.transport).toBe("remoteAgent");
+    const required = requiredFor({ text: "edit workspace file", computers: ["cloud"], runOn: "cloud" });
+    expect(doomedReason(profile, required, DOOMED_POLICY, { hostShellGranted: true })).toBeNull();
   });
 
   it("warns on antigravity desktop_gui per policy", () => {
@@ -150,12 +173,13 @@ describe("evaluateCapabilityGate", () => {
     expect(result.action).toBe("ok");
   });
 
-  it("refuses image turns on non-image engines", () => {
+  it("refuses image turns on engines that cannot read attachments", () => {
+    const grok = engineFixture("Grok");
     const profile = profileFor({
-      instanceId: "minimax",
-      driverKind: "minimax",
-      capabilities: { toolLoop: true },
-      model: "default",
+      instanceId: "grok",
+      driverKind: grok.driverKind,
+      capabilities: grok.capabilities,
+      model: "grok-4.7",
     });
     const required = requiredFor({ text: '<attached-image path="/tmp/a.png" />', computers: [] });
     const verdict = doomedReason(profile, required);

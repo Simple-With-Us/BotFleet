@@ -138,10 +138,17 @@ export interface RequiredForInput {
   skillCaps?: string[];
   runOn?: "bot" | "cloud";
   hostShellGranted?: boolean;
+  /** Routine prompts may echo user markup; do not treat that as an image turn. */
+  ignorePromptImageMarkers?: boolean;
 }
 
 export interface CapabilityGateContext {
   hostShellGranted: boolean;
+}
+
+export interface WisdomInspectPayload {
+  wisdom: WisdomEntry[];
+  executionHintsByEngine: Record<string, string[]>;
 }
 
 export interface CapabilityGateResult {
@@ -243,8 +250,8 @@ export function promptNeedsImages(text: string): boolean {
 
 export function requiredFor(input: RequiredForInput): Set<TaskClass> {
   const required = new Set<TaskClass>();
-  const text = input.text;
-  if (promptNeedsImages(text)) required.add("images");
+  const text = input.text ?? "";
+  if (!input.ignorePromptImageMarkers && promptNeedsImages(text)) required.add("images");
   if (input.routineNeeds?.length) {
     for (const need of input.routineNeeds) required.add(need);
   }
