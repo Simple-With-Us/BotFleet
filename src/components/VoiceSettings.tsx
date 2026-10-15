@@ -40,6 +40,13 @@ import {
 } from "../../shared/cross-platform-profile-settings";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
 import { defaultVoiceOptionLabel, isPersonalVoiceId, voiceForDevice } from "../../shared/bot-voice";
+import {
+  canRecordVoiceCloneOnDevice,
+  startMicRecorder,
+  VOICE_CLONE_MAX_SECONDS,
+  VOICE_CLONE_MIN_SECONDS,
+  type MicRecorder,
+} from "@/lib/voice-clone-recording";
 import { DefaultVoicePicker, PronunciationSettings } from "./WorkspaceVoiceSettings";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
@@ -146,9 +153,16 @@ export function VoiceSettings({
   const [cloneFile, setCloneFile] = useState<File | null>(null);
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [cloneSuccess, setCloneSuccess] = useState<string | null>(null);
+  const [cloneRecording, setCloneRecording] = useState(false);
+  const [cloneRecordElapsed, setCloneRecordElapsed] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const micRecorderRef = useRef<MicRecorder | null>(null);
+  const recordStartedAtRef = useRef(0);
+  const recordTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const configured = Boolean(tts?.configured);
+  const cloneRecordSupported =
+    clientPlatform() === "mac" && canRecordVoiceCloneOnDevice();
 
   // Personal Voice is only a real choice when the desktop gate says so.
   // Listing it on every Mac (appleSpeech) and saving it anyway is a picker
@@ -292,6 +306,69 @@ export function VoiceSettings({
     if (personalVoiceAllowed) setPersonalVoiceDenied(false);
   }, [personalVoiceAllowed]);
 
+  useEffect(() => () => {
+    if (recordTickRef.current) clearInterval(recordTickRef.current);
+    micRecorderRef.current?.cancel();
+    micRecorderRef.current = null;
+  }, []);
+
+  const clearCloneRecordTick = () => {
+    if (recordTickRef.current) {
+      clearInterval(recordTickRef.current);
+      recordTickRef.current = null;
+    }
+  };
+
+  const startCloneRecording = async () => {
+    if (!cloneRecordSupported || cloneRecording) return;
+    setCloneError(null);
+    setCloneSuccess(null);
+    setCloneFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    try {
+      const session = await startMicRecorder();
+      micRecorderRef.current = session;
+      recordStartedAtRef.current = Date.now();
+      setCloneRecordElapsed(0);
+      setCloneRecording(true);
+      clearCloneRecordTick();
+      recordTickRef.current = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - recordStartedAtRef.current) / 1000);
+        setCloneRecordElapsed(elapsed);
+        if (elapsed >= VOICE_CLONE_MAX_SECONDS) void stopCloneRecording();
+      }, 500);
+    } catch (e) {
+      setCloneError(e instanceof Error ? e.message : "Could not start recording.");
+    }
+  };
+
+  const stopCloneRecording = async () => {
+    const session = micRecorderRef.current;
+    if (!session) return;
+    micRecorderRef.current = null;
+    clearCloneRecordTick();
+    setCloneRecording(false);
+    const elapsed = Math.floor((Date.now() - recordStartedAtRef.current) / 1000);
+    setCloneRecordElapsed(elapsed);
+    try {
+      if (elapsed < VOICE_CLONE_MIN_SECONDS) {
+        session.cancel();
+        setCloneError(`Record at least ${VOICE_CLONE_MIN_SECONDS} seconds of speech (you captured ${elapsed}s).`);
+        return;
+      }
+      const file = await session.stop();
+      if (file.size > 20 * 1024 * 1024) {
+        setCloneError("Recording is over 20 MB — try a shorter clip.");
+        return;
+      }
+      setCloneFile(file);
+      setCloneError(null);
+    } catch (e) {
+      session.cancel();
+      setCloneError(e instanceof Error ? e.message : "Recording failed.");
+    }
+  };
+
   const saveKey = () => {
     const nextKey = key.trim();
     if (!nextKey) return Promise.resolve();
@@ -413,6 +490,7 @@ export function VoiceSettings({
 
   const handleCloneFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
+    if (cloneRecording) void stopCloneRecording();
     setCloneFile(file);
     setCloneError(null);
     setCloneSuccess(null);
@@ -701,16 +779,45 @@ export function VoiceSettings({
           <div className="mb-3 rounded-lg border border-hairline/40 bg-inset p-3">
             <div className="text-[12.5px] font-medium text-ink">Clone Voice From Audio</div>
             <p className="mt-0.5 mb-2 text-[12px] text-ink-secondary">
-              Upload a short audio clip (10 seconds to 5 minutes, MP3/M4A/WAV, under 20 MB) to create a voice clone.{"\u00A0 "}The clone appears in the voice list below.
+              Record on this Mac or upload a short clip (10 seconds to 5 minutes, MP3/M4A/WAV, under 20 MB) to create a voice clone.{"\u00A0 "}The clone appears in the voice list below.
             </p>
+            {cloneRecordSupported && (
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                {!cloneRecording ? (
+                  <button
+                    type="button"
+                    onClick={() => void startCloneRecording()}
+                    disabled={cloneCloning}
+                    className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-card px-3 py-1.5 text-[12.5px] font-medium text-ink hover:bg-inset disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Mic size={13} />
+                    Record on This Mac
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void stopCloneRecording()}
+                    className="flex items-center gap-1.5 rounded-lg bg-danger px-3 py-1.5 text-[12.5px] font-medium text-white hover:opacity-90"
+                  >
+                    Stop Recording ({cloneRecordElapsed}s)
+                  </button>
+                )}
+                {cloneFile && !cloneRecording && (
+                  <span className="text-[12px] text-ink-secondary">
+                    Ready: {cloneFile.name}
+                  </span>
+                )}
+              </div>
+            )}
             <div className="mb-2 flex gap-2">
               <input
                 ref={fileInputRef}
                 type="file"
                 accept="audio/mpeg,audio/mp4,audio/wav,.mp3,.m4a,.wav"
                 onChange={handleCloneFile}
+                disabled={cloneRecording}
                 aria-label="Audio file for voice clone"
-                className="w-full rounded-lg border border-hairline/40 bg-card px-3 py-2 text-[13px] text-ink file:mr-2 file:rounded file:border-0 file:bg-control file:px-2 file:py-1 file:text-[12px] file:text-ink file:shadow-none"
+                className="w-full rounded-lg border border-hairline/40 bg-card px-3 py-2 text-[13px] text-ink file:mr-2 file:rounded file:border-0 file:bg-control file:px-2 file:py-1 file:text-[12px] file:text-ink file:shadow-none disabled:opacity-50"
               />
             </div>
             <div className="mb-2">

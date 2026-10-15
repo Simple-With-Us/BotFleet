@@ -302,6 +302,8 @@ describe("VoiceSettings personal voice selection guard", () => {
     expect(del).toContain("setPersonalVoiceDenied(false)");
     expect(clone).toContain("commitVoice(result.voiceId)");
     expect(clone).not.toContain("onPatch(");
+    expect(SRC).toContain("startMicRecorder");
+    expect(SRC).toContain("Record on This Mac");
     expect(SRC).toContain("commitVoice(e.target.value)");
 
     // The iPhone picker never saves a Personal Voice from this Mac.
