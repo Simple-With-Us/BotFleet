@@ -238,7 +238,7 @@ function isBareName(name: string): boolean {
 
 /** A name that is already a location: it is handed back, never searched for.
  * A newline disqualifies it — that value is never emitted at all. */
-function nameLooksLikePath(name: string): boolean {
+function isExplicitPath(name: string): boolean {
   return Boolean(name) && !/[\n\r]/.test(name) && (/[/\\]/.test(name) || /^[a-zA-Z]:/.test(name));
 }
 
@@ -300,13 +300,13 @@ export function findCliCandidates(name: string | string[]): string[] {
   if (Array.isArray(name)) {
     const [head, ...rest] = name;
     const out: string[] = [];
-    if (nameLooksLikePath(head)) out.push(head);
+    if (isExplicitPath(head)) out.push(head);
     else if (isBareName(head)) out.push(...searchNameOnPath(head, exts));
     const aliases = [...new Set(rest.filter(isBareName))].slice(0, CLI_ALIAS_LIMIT);
     for (const alias of aliases) out.push(...searchNameOnPath(alias, exts));
     return dedupeByInode(out);
   }
-  if (nameLooksLikePath(name)) return [name];
+  if (isExplicitPath(name)) return [name];
   if (!isBareName(name)) return [];
   return dedupeByInode(searchNameOnPath(name, exts));
 }
