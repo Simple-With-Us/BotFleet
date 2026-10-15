@@ -160,7 +160,7 @@ export function VoiceSettings({
   const micRecorderRef = useRef<MicRecorder | null>(null);
   const cloneRecordIntentRef = useRef(0);
   const recordStartedAtRef = useRef(0);
-  const recordTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordTickRef = useRef<number | null>(null);
 
   const configured = Boolean(tts?.configured);
   const cloneRecordSupported =
@@ -353,7 +353,7 @@ export function VoiceSettings({
       setCloneRecordElapsed(0);
       setCloneRecording(true);
       clearCloneRecordTick();
-      recordTickRef.current = setInterval(() => {
+      recordTickRef.current = window.setInterval(() => {
         const elapsed = Math.floor((Date.now() - recordStartedAtRef.current) / 1000);
         setCloneRecordElapsed(elapsed);
         if (elapsed >= VOICE_CLONE_MAX_SECONDS) void stopCloneRecording();

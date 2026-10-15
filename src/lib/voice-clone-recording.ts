@@ -4,13 +4,14 @@ export const VOICE_CLONE_MIN_SECONDS = 10;
 export const VOICE_CLONE_MAX_SECONDS = 5 * 60;
 
 export function canRecordVoiceCloneOnDevice(): boolean {
-  return typeof navigator !== "undefined" && Boolean(navigator.mediaDevices?.getUserMedia);
+  return Boolean(globalThis.navigator?.mediaDevices?.getUserMedia);
 }
 
 function preferredRecorderMime(): string | undefined {
-  if (typeof MediaRecorder === "undefined") return undefined;
+  const Recorder = globalThis.MediaRecorder;
+  if (!Recorder) return undefined;
   const candidates = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"];
-  return candidates.find((mime) => MediaRecorder.isTypeSupported(mime));
+  return candidates.find((mime) => Recorder.isTypeSupported(mime));
 }
 
 function extensionForMime(mime: string): "m4a" | "wav" | "webm" {
