@@ -63,7 +63,13 @@ const RESERVED_INSTANCE_ID = new Map<string, InstanceId>([
   ["opencodeGo", "opencode"],
 ]);
 
+/** Historical ids this driver kind may have shipped with before the rename.
+ *  Both are reserved: an instance on either id is the default fleet, not
+ *  operator-added, and gets no delete button. */
+const RESERVED_OPENCODE_IDS: ReadonlySet<InstanceId> = new Set(["opencode", "opencodeGo"]);
+
 export function isCustomInstance(driverKind: string, instanceId: InstanceId): boolean {
+  if (driverKind === "opencodeGo") return !RESERVED_OPENCODE_IDS.has(instanceId);
   return instanceId !== (RESERVED_INSTANCE_ID.get(driverKind) ?? driverKind);
 }
 
@@ -208,18 +214,14 @@ function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
   if (!Array.isArray(aliases)) return [];
   // A path or a newline is not a command name; findCliCandidates drops those
   // too, but keeping the list clean here keeps the cache key honest.
-  return [
-    ...new Set(
-      aliases.filter((alias): alias is string => {
-        // cliAliases is typed as string[], and a hand-built driver can still
-        // break that.  This is the decode that keeps a non-string out of the
-        // candidate cache key.
-        // oxlint-disable-next-line anti-slop/no-runtime-typeof
-        if (typeof alias !== "string" || !alias) return false;
-        return !/[\n\r/\\]/.test(alias);
-      }),
-    ),
-  ];
+  const out: string[] = [];
+  for (const entry of aliases) {
+    if (Object.prototype.toString.call(entry) !== "[object String]") continue;
+    const name = String(entry);
+    if (!name || /[\n\r/\\]/.test(name)) continue;
+    out.push(name);
+  }
+  return [...new Set(out)];
 }
 
 /** Every name that runs this driver: the default first, then its aliases. */

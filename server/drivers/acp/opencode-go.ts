@@ -24,6 +24,16 @@ import { execCli } from "../../procs.ts";
  *  CLI too old to answer, or one mid-upgrade).  `resolveModels` merges the
  *  live catalog over this, and `resolveTurnModel` follows the bot's saved id
  *  when it has one. */
+/** Slugs the CLI may still list even though the engine no longer honours them.
+ *  The verbose catalog path drops `status: "deprecated"` records; the plain
+ *  `models` fallback must apply the same denylist or it hands a poisoned id
+ *  back as the only choice. */
+const DEPRECATED_OPENCODE_MODEL_SLUGS = new Set([
+  "opencode/x-preview-f-free",
+  "opencode-go/exo-free",
+  "opencode-go/x-preview-f-free",
+]);
+
 const STATIC_MODELS: ModelCatalog = {
   // Left empty on purpose: an empty `options` list cannot present a
   // deprecated id to a user as if it were a choice.  A bot with no saved
@@ -47,7 +57,7 @@ async function firstLiveModel(
     const stdout = await runOpenCodeModels(cli, env, false);
     for (const line of stdout.split(/\r?\n/u)) {
       const candidate = line.trim();
-      if (validModelSlug(candidate)) return candidate;
+      if (validModelSlug(candidate) && !DEPRECATED_OPENCODE_MODEL_SLUGS.has(candidate)) return candidate;
     }
   } catch {
     // An unreadable catalog is not an error here: the caller falls back to
@@ -128,7 +138,7 @@ export function parseOpenCodeModelsOutput(stdout: string): ModelCatalog | null {
         // A header-only/older CLI remains useful; fall back to the model id.
       }
     }
-    if (record.status === "deprecated") return;
+    if (record.status === "deprecated" || DEPRECATED_OPENCODE_MODEL_SLUGS.has(slug)) return;
     const name = typeof record.name === "string" && record.name.trim()
       ? record.name.trim()
       : labelForModel(model);
@@ -484,7 +494,17 @@ const support = (loadCatalog: OpenCodeCatalogLoader): AcpSupport => ({
     const merged = await mergeLocalInject(
       live ?? {
         default: fallback ?? "",
-        options: fallback ? [{ id: fallback, label: providerLabel(fallback.split("/")[0]!) }] : [],
+        options: fallback
+          ? [{
+            id: fallback,
+            label: (() => {
+              const separator = fallback.indexOf("/");
+              const provider = fallback.slice(0, separator);
+              const model = fallback.slice(separator + 1);
+              return `${providerLabel(provider)} · ${labelForModel(model)}`;
+            })(),
+          }]
+          : [],
       },
       environment,
     );
