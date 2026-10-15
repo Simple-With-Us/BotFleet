@@ -225,6 +225,22 @@ describe("buildSystemPrompt", () => {
     expect(built.bytes.volatile).toBe(0);
   });
 
+  it("keeps the Chief roster stable when only BotFleet status freshness moves", () => {
+    const roster = " You are the Chief of Staff.\nCurrent team:\n- Quill — Writer";
+    const fresh = " TRUSTED BOTFLEET STATUS\nfreshness=fresh";
+    const stale = " TRUSTED BOTFLEET STATUS\nfreshness=stale";
+    const before = buildSystemPrompt([
+      { id: "coordination", label: "Team", text: roster },
+      { id: "botfleet-status", label: "BotFleet status", volatile: true, text: fresh },
+    ]);
+    const after = buildSystemPrompt([
+      { id: "coordination", label: "Team", text: roster },
+      { id: "botfleet-status", label: "BotFleet status", volatile: true, text: stale },
+    ]);
+    expect(after.stable).toBe(before.stable);
+    expect(after.volatile).not.toBe(before.volatile);
+  });
+
   it("drops empty parts and lets a part force the volatile half", () => {
     const built = buildSystemPrompt([
       { id: "persona", label: "Identity", text: "Kiwi." },
