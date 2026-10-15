@@ -10,6 +10,7 @@ export const QueuedSendBodySchema = z
     text: z.string().optional(),
     replyToId: z.string().nullish(),
     threadId: z.string().optional(),
+    busyDelivery: z.enum(["queue", "steer"]).optional(),
   })
   .strict();
 // Inferred from the schema so the runtime check and the static type cannot

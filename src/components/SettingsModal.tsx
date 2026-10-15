@@ -744,7 +744,7 @@ export function ConversationModeRow() {
   );
 }
 
-const BUSY_SEND_COPY: Record<BusySendDefault, { title: string; subtitle: string }> = {
+const BUSY_SEND_COPY = {
   queue: {
     title: "Queue",
     subtitle: "While a bot is working, Enter holds your message until the turn finishes.  Use Steer Now when you need to interrupt.",
@@ -753,7 +753,7 @@ const BUSY_SEND_COPY: Record<BusySendDefault, { title: string; subtitle: string 
     title: "Steer",
     subtitle: "While a bot is working, Enter sends into the running turn when the engine supports it, or stops the turn and sends when it does not.",
   },
-};
+} satisfies Record<BusySendDefault, { title: string; subtitle: string }>;
 
 export function BusySendDefaultRow() {
   const { state, dispatch } = useStore();

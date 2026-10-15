@@ -157,9 +157,10 @@ describe("DshAgentDriver config", () => {
     //
     // DeepSeek picker ids translate to preferred stock wire ids on encode
     // (wire-only; picker ids stay stable).  MiniMax stays an identity round trip.
-    const expectedWire: Record<string, string> = {
-      "DeepSeek-V4.1-Flash": "deepseek-flash",
-      "DeepSeek-V4-Pro": "deepseek-v4-pro",
+    const expectedDshWireId = (optionId: string): string => {
+      if (optionId === "DeepSeek-V4.1-Flash") return "deepseek-flash";
+      if (optionId === "DeepSeek-V4-Pro") return "deepseek-v4-pro";
+      return optionId;
     };
     for (const option of STATIC_DSH_MODELS.options) {
       const encoded = dshModelOptionValue(option.id);
@@ -167,7 +168,7 @@ describe("DshAgentDriver config", () => {
       expect(
         dshModelIdFromOptionValue(encoded!),
         `${option.id} must survive the encode/decode round trip`,
-      ).toBe(expectedWire[option.id] ?? option.id);
+      ).toBe(expectedDshWireId(option.id));
     }
   });
 

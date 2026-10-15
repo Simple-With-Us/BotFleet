@@ -511,8 +511,8 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
       if (opts?.queueOnly) busyDelivery = "queue";
       else if (opts?.steerNow) busyDelivery = "steer";
       else if (busy) busyDelivery = busySendDefault;
-      const interruptForSteer =
-        busy && busyDelivery === "steer" && (!canSteer || opts?.steerNow);
+      // Steer-capable engines inject mid-turn; interrupting after steer drops the message.
+      const interruptForSteer = busy && busyDelivery === "steer" && !canSteer;
       dispatch({
         type: "send",
         botId: bot.id,
@@ -1006,7 +1006,8 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
               if (busy && (e.altKey || e.metaKey)) {
-                send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
+                if (group) send({ steerNow: true });
+                else send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
               } else {
                 send();
               }
@@ -1084,7 +1085,8 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
             type="button"
             onClick={(e) => {
               if (busy && e.altKey) {
-                send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
+                if (group) send({ steerNow: true });
+                else send(busySendDefault === "queue" ? { steerNow: true } : { queueOnly: true });
               } else {
                 send();
               }
