@@ -197,10 +197,14 @@ public final class VoiceCall: ObservableObject {
                 self.fail(text, recovery: recovery)
             }
         }
-        // Said once, then never again.  The fallback reasons are deliberately
-        // quiet on the desktop, and a call that opens by explaining why it
+        // Said once per call, not once per entry.  Reconnect runs `run`
+        // again and keeps the transcript, so a second landing here must
+        // not stack another copy of the same sentence.  The fallback
+        // reasons stay quiet: a call that opens by explaining why it
         // could not be better is worse than one that simply works.
-        emitSystemLine(Self.chainedFallbackNote)
+        if shouldEmitCallNote(Self.chainedFallbackNote, alreadyShown: lines.map(\.text)) {
+            emitSystemLine(Self.chainedFallbackNote)
+        }
         engine.start()
         setPhase(.listening)
     }
@@ -324,7 +328,7 @@ public final class VoiceCall: ObservableObject {
         setPhase(.listening)
         // Reconnect runs this again.  The note is once per call, not once
         // per socket.
-        if !lines.contains(where: { $0.text == Self.noEngineNote }) {
+        if shouldEmitCallNote(Self.noEngineNote, alreadyShown: lines.map(\.text)) {
             emitSystemLine(Self.noEngineNote)
         }
     }

@@ -130,3 +130,12 @@ public func callTryAgain(fromFailedPhase: Bool, reconnectAttempt: Int) -> CallTr
     }
     return CallTryAgain(clearTranscript: true, reconnectAttempt: 0)
 }
+
+/// Whether a call-screen note still needs to be said.
+///
+/// Reconnect runs the start path again and keeps the transcript.  The
+/// note is once per call, so a second landing must not stack another
+/// copy of the same sentence.  A different note still belongs on screen.
+public func shouldEmitCallNote(_ note: String, alreadyShown texts: [String]) -> Bool {
+    !texts.contains(note)
+}

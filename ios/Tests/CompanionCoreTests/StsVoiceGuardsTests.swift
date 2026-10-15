@@ -84,4 +84,14 @@ struct StsVoiceGuardsTests {
         #expect(!reconnect.clearTranscript)
         #expect(reconnect.reconnectAttempt == 3)
     }
+
+    @Test("a call note is said once, and a different note still gets said")
+    func callNoteIsSaidOnce() {
+        let chained = "chained fallback"
+        let engine = "no engine"
+        #expect(shouldEmitCallNote(chained, alreadyShown: []))
+        #expect(!shouldEmitCallNote(chained, alreadyShown: [chained]))
+        #expect(shouldEmitCallNote(chained, alreadyShown: [engine]))
+        #expect(!shouldEmitCallNote(chained, alreadyShown: [engine, chained]))
+    }
 }
