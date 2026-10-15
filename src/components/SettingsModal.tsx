@@ -24,6 +24,11 @@ import {
   parseConversationMode,
   type ConversationMode,
 } from "../../shared/conversation-mode";
+import {
+  BUSY_SEND_DEFAULTS,
+  parseBusySendDefault,
+  type BusySendDefault,
+} from "../../shared/busy-send-default.ts";
 import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { showToolCallsEnabled, skillRecorderEnabled, summarizeToolCallsEnabled } from "@/lib/feature-flags";
 import { ApiKeyRow, EngineKeyRow, VpsConnection } from "./ApiKeys";
@@ -739,6 +744,63 @@ export function ConversationModeRow() {
   );
 }
 
+const BUSY_SEND_COPY: Record<BusySendDefault, { title: string; subtitle: string }> = {
+  queue: {
+    title: "Queue",
+    subtitle: "While a bot is working, Enter holds your message until the turn finishes.  Use Steer Now when you need to interrupt.",
+  },
+  steer: {
+    title: "Steer",
+    subtitle: "While a bot is working, Enter sends into the running turn when the engine supports it, or stops the turn and sends when it does not.",
+  },
+};
+
+export function BusySendDefaultRow() {
+  const { state, dispatch } = useStore();
+  const current = parseBusySendDefault(state.config?.busySendDefault);
+  const [saving, setSaving] = useState(false);
+  const save = async (busySendDefault: BusySendDefault) => {
+    if (saving || busySendDefault === current) return;
+    setSaving(true);
+    try {
+      const config: ConfigStatus = await api("/api/busy-send-default", {
+        method: "PATCH",
+        body: JSON.stringify({ busySendDefault }),
+      });
+      dispatch({ type: "configStatus", config });
+    } catch {
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Card
+      title="Busy Sends"
+      subtitle="Choose what happens when you send while a bot is already working.  Each send can still override this from the composer."
+    >
+      <div className="flex flex-col gap-2">
+        {BUSY_SEND_DEFAULTS.map((mode) => {
+          const copy = BUSY_SEND_COPY[mode];
+          const selected = current === mode;
+          return (
+            <button
+              key={mode}
+              type="button"
+              disabled={saving}
+              aria-pressed={selected}
+              onClick={() => void save(mode)}
+              className={`rounded-lg border px-3 py-2.5 text-left ${selected ? "border-accent bg-accent/10" : "border-hairline/40 hover:bg-raised/60"}`}
+            >
+              <div className="text-[14px] font-medium text-ink">{copy.title}</div>
+              <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{copy.subtitle}</div>
+            </button>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
 /** Usage analytics, on by default and switchable here. Naming what is sent
  * matters more than the switch: people who cannot see the scope assume the
  * worst, and the worst — conversation text — is exactly what this never
@@ -1382,6 +1444,9 @@ export function SettingsModal() {
                   </div>
                   <div id="setting-general-conversation-mode" className={highlightClass("setting-general-conversation-mode")}>
                     <ConversationModeRow />
+                  </div>
+                  <div id="setting-general-busy-send" className={highlightClass("setting-general-busy-send")}>
+                    <BusySendDefaultRow />
                   </div>
                   <Card
                     id="setting-general-room-turn-timeout"

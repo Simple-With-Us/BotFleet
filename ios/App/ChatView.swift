@@ -1058,8 +1058,13 @@ struct ChatView: View {
     /// Returns the task carrying the send, so a caller that has to act on
     /// the server's answer (Steer Now) can wait for it instead of guessing
     /// with a sleep.  Callers that do not care discard it.
+    private func busySendDefaultMode() -> String {
+        let raw = session.config?.busySendDefault?.lowercased() ?? "steer"
+        return raw == "queue" ? "queue" : "steer"
+    }
+
     @discardableResult
-    private func submit(_ explicitText: String? = nil) -> Task<Void, Never>? {
+    private func submit(_ explicitText: String? = nil, busyDelivery: String? = nil) -> Task<Void, Never>? {
         // This also cancels an in-flight permission prompt before it can
         // open the microphone after the message has already been sent.
         dictation.stop()
@@ -1091,8 +1096,18 @@ struct ChatView: View {
         )
         let sentText = text
         sending = true
+        var delivery = busyDelivery
+        if delivery == nil, current.busy, case .bot = current, busySendDefaultMode() == "queue" {
+            delivery = "queue"
+        }
         let task = Task {
-            let outcome = await session.send(sentText, to: current, attachments: outgoing, recording: recording)
+            let outcome = await session.send(
+                sentText,
+                to: current,
+                attachments: outgoing,
+                recording: recording,
+                busyDelivery: delivery
+            )
             sending = false
             let transcript = session.state.transcript(forThread: threadId)
             guard ComposerSendRecovery.shouldRestoreClearedDraft(
@@ -1504,7 +1519,7 @@ struct ChatView: View {
                     Label("Steer Now", systemImage: "bolt.fill")
                 }
                 Button {
-                    submit()
+                    submit(busyDelivery: "queue")
                 } label: {
                     Label("Queue Message", systemImage: "clock")
                 }
