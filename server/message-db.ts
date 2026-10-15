@@ -78,8 +78,10 @@ function open(): DatabaseSync {
 
 /** One-time import for databases that predated the side table. */
 function backfillRunningHelpers(database: DatabaseSync): void {
+  // SAFETY: `COUNT(*)` on `running_helpers` always returns one numeric row.
   const count = database.prepare("SELECT COUNT(*) AS n FROM running_helpers").get() as { n: number };
   if (count.n > 0) return;
+  // SAFETY: the query selects `thread_id`, `id`, and `json`, all TEXT columns on `messages`.
   const rows = database
     .prepare("SELECT thread_id, id, json FROM messages WHERE json LIKE ?")
     .all('%"status":"running"%') as Array<{ thread_id: string; id: string; json: string }>;
@@ -89,6 +91,7 @@ function backfillRunningHelpers(database: DatabaseSync): void {
   for (const row of rows) {
     let message: Message;
     try {
+      // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
       message = JSON.parse(row.json) as Message;
     } catch {
       continue;
@@ -252,17 +255,20 @@ export function appendMessage(threadId: string, message: Message): void {
  * filter; the helper status is what decides.  A restart has no live tracker,
  * so these are the cards that would otherwise tick forever. */
 export function runningHelperRows(): Array<{ threadId: string; message: Message }> {
+  // SAFETY: `running_helpers` stores `thread_id` and `message_id`, both TEXT columns.
   const ids = db()
     .prepare("SELECT thread_id, message_id FROM running_helpers")
     .all() as Array<{ thread_id: string; message_id: string }>;
   const found: Array<{ threadId: string; message: Message }> = [];
   for (const { thread_id, message_id } of ids) {
+    // SAFETY: the lookup selects `json`, a TEXT column on `messages`.
     const row = db()
       .prepare("SELECT json FROM messages WHERE thread_id = ? AND id = ?")
       .get(thread_id, message_id) as { json: string } | undefined;
     if (!row) continue;
     let message: Message;
     try {
+      // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
       message = JSON.parse(row.json) as Message;
     } catch {
       continue;

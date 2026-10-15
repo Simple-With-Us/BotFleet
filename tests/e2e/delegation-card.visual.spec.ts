@@ -35,6 +35,6 @@ test('visual: delegation card shows the progress row', async ({ page }) => {
   await expect(fixture.getByTestId('delegation-progress')).toContainText('Working');
   await expect(fixture).toHaveScreenshot('delegation-card.png', {
     ...stableShot,
-    mask: [page.locator('[data-testid="delegation-progress"]')],
+    maxDiffPixels: 0,
   });
 });
