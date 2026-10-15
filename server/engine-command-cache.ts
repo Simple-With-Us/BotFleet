@@ -79,10 +79,15 @@ export class EngineCommandCache {
     if (!this.path || !existsSync(this.path)) return;
     try {
       const parsed = fileSchema.safeParse(JSON.parse(readFileSync(this.path, "utf8")));
-      if (!parsed.success) return;
+      if (!parsed.success) {
+        console.warn(`[engine-commands] could not load the command cache: ${parsed.error.message}`);
+        return;
+      }
       for (const [instanceId, entry] of Object.entries(parsed.data.instances)) this.entries.set(instanceId, entry);
-    } catch {
-      // an unreadable mirror costs only a menu that fills again after the next turn
+    } catch (error) {
+      console.warn(
+        `[engine-commands] could not load the command cache: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
