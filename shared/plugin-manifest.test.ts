@@ -200,12 +200,16 @@ describe("satisfiesBotfleetVersion", () => {
 
   it("honors <=", () => {
     expect(satisfiesBotfleetVersion("<=1", 1)).toBe(true);
-    expect(satisfiesBotfleetVersion("<=1", 2)).toBe(false);
+    // Host 2 retains the v1 surface, so a "<=1" plugin still loads.
+    expect(satisfiesBotfleetVersion("<=1", 2)).toBe(true);
+    expect(satisfiesBotfleetVersion(">=3", 2)).toBe(false);
   });
 
   it("honors caret", () => {
     expect(satisfiesBotfleetVersion("^1.2.0", 1)).toBe(true);
-    expect(satisfiesBotfleetVersion("^1.2.0", 2)).toBe(false);
+    // Same v1-surface retention as above.
+    expect(satisfiesBotfleetVersion("^1.2.0", 2)).toBe(true);
+    expect(satisfiesBotfleetVersion("^2.0.0", 1)).toBe(false);
   });
 
   it("honors tilde", () => {
@@ -213,11 +217,132 @@ describe("satisfiesBotfleetVersion", () => {
   });
 
   it("honors bare version", () => {
+    expect(satisfiesBotfleetVersion("1", 1)).toBe(true);
+    // Host 2 retains the v1 surface: a "1" plugin loads on host 2.
+    expect(satisfiesBotfleetVersion("1", 2)).toBe(true);
+    expect(satisfiesBotfleetVersion("2", 1)).toBe(false);
+    expect(satisfiesBotfleetVersion("2", 2)).toBe(true);
     expect(satisfiesBotfleetVersion("1", HOST_API_VERSION)).toBe(true);
-    expect(satisfiesBotfleetVersion("2", HOST_API_VERSION)).toBe(false);
   });
 
   it("fails closed on garbage", () => {
     expect(satisfiesBotfleetVersion("anything", 1)).toBe(false);
+  });
+});
+describe("v2 event subscriptions and settings", () => {
+  const base = {
+    name: "zulip-bridge",
+    version: "1.0.0",
+    description: "Zulip wake routing.",
+    botfleet: ">=1",
+    entry: "plugin.mjs",
+  };
+
+  it("accepts the new event capabilities", () => {
+    const result = parsePluginManifest({
+      ...base,
+      capabilities: ["events.subscribe", "chat.read", "dispatch.wake", "connector.reply"],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts event subscriptions with the matching capability", () => {
+    const result = parsePluginManifest({
+      ...base,
+      capabilities: ["events.subscribe"],
+      contributes: {
+        eventSubscriptions: [{ id: "zulip-inbox", source: "zulip", kinds: ["message"] }],
+      },
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.manifest.contributes?.eventSubscriptions?.length).toBe(1);
+    }
+  });
+
+  it("rejects subscriptions without the events.subscribe capability", () => {
+    const result = parsePluginManifest({
+      ...base,
+      contributes: {
+        eventSubscriptions: [{ id: "zulip-inbox", source: "zulip", kinds: ["message"] }],
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((i) => i.field === "capabilities")).toBe(true);
+    }
+  });
+
+  it("rejects includeChats without chat.read", () => {
+    const result = parsePluginManifest({
+      ...base,
+      capabilities: ["events.subscribe"],
+      contributes: {
+        eventSubscriptions: [{ id: "s", source: "zulip", kinds: ["message"], includeChats: true }],
+      },
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects duplicate subscription ids", () => {
+    const result = parsePluginManifest({
+      ...base,
+      capabilities: ["events.subscribe"],
+      contributes: {
+        eventSubscriptions: [
+          { id: "dup", source: "zulip", kinds: ["message"] },
+          { id: "dup", source: "zulip", kinds: ["message"] },
+        ],
+      },
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("accepts plain and secret settings", () => {
+    const result = parsePluginManifest({
+      ...base,
+      settings: [
+        { key: "dispatcherBotId", label: "Dispatcher bot", type: "string", required: true },
+        { key: "bridgeSecret", label: "Bridge secret", type: "secret" },
+      ],
+      settingsVersion: 2,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects credential-looking keys on non-secret settings", () => {
+    const result = parsePluginManifest({
+      ...base,
+      settings: [{ key: "apiToken", label: "Token", type: "string" }],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects defaults on secret settings", () => {
+    const result = parsePluginManifest({
+      ...base,
+      settings: [{ key: "hookSecret", label: "Secret", type: "secret", default: "x" }],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects duplicate setting keys", () => {
+    const result = parsePluginManifest({
+      ...base,
+      settings: [
+        { key: "same", label: "A", type: "string" },
+        { key: "same", label: "B", type: "string" },
+      ],
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("v1 manifests parse unchanged with empty settings", () => {
+    const result = parsePluginManifest(base);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.manifest.settings).toEqual([]);
+      expect(result.manifest.settingsVersion).toBe(1);
+    }
   });
 });

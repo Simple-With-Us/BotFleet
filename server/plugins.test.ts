@@ -217,7 +217,7 @@ describe("enable failure cleanup", () => {
 describe("host API version gate", () => {
   it("satisfiesBotfleetVersion recognizes >=1 against the host version", () => {
     expect(satisfiesBotfleetVersion(">=1", HOST_API_VERSION)).toBe(true);
-    expect(satisfiesBotfleetVersion(">=2", HOST_API_VERSION)).toBe(false);
+    expect(satisfiesBotfleetVersion(">=3", HOST_API_VERSION)).toBe(false);
   });
 
   it("enablePlugin refuses when the listing declares a higher host version", async () => {
