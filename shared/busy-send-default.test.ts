@@ -3,6 +3,7 @@ import {
   DEFAULT_BUSY_SEND_DEFAULT,
   parseBusyDeliveryOverride,
   parseBusySendDefault,
+  shouldInterruptForBusySteer,
 } from "./busy-send-default.ts";
 
 describe("busy-send-default", () => {
@@ -25,5 +26,12 @@ describe("busy-send-default", () => {
     expect(parseBusyDeliveryOverride({})).toBeUndefined();
     expect(parseBusyDeliveryOverride(null)).toBeUndefined();
     expect(parseBusyDeliveryOverride(false)).toBeUndefined();
+  });
+
+  it("interrupts steer delivery only when the engine cannot mid-turn steer", () => {
+    expect(shouldInterruptForBusySteer(true, "steer", true)).toBe(false);
+    expect(shouldInterruptForBusySteer(true, "steer", false)).toBe(true);
+    expect(shouldInterruptForBusySteer(true, "queue", false)).toBe(false);
+    expect(shouldInterruptForBusySteer(false, "steer", false)).toBe(false);
   });
 });

@@ -36,7 +36,11 @@ import { instanceSupportsLocalComputer } from "@/lib/local-computer";
 import { queuedChipLabel, useUpdateDrain } from "@/lib/update-control";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { resolveRoomLabels } from "../../shared/terminology";
-import { parseBusySendDefault, type BusySendDefault } from "../../shared/busy-send-default.ts";
+import {
+  parseBusySendDefault,
+  shouldInterruptForBusySteer,
+  type BusySendDefault,
+} from "../../shared/busy-send-default.ts";
 import { readCachedInventory } from "@/lib/connected-apps-cache";
 import {
   autocompleteQueryAt,
@@ -511,8 +515,7 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
       if (opts?.queueOnly) busyDelivery = "queue";
       else if (opts?.steerNow) busyDelivery = "steer";
       else if (busy) busyDelivery = busySendDefault;
-      // Steer-capable engines inject mid-turn; interrupting after steer drops the message.
-      const interruptForSteer = busy && busyDelivery === "steer" && !canSteer;
+      const interruptForSteer = shouldInterruptForBusySteer(busy, busyDelivery, canSteer);
       dispatch({
         type: "send",
         botId: bot.id,

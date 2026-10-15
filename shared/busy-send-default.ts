@@ -23,3 +23,12 @@ export function parseBusySendDefault(value: BusySendDefaultInput): BusySendDefau
 export function parseBusyDeliveryOverride(value: BusySendDefaultInput): BusySendDefault | undefined {
   return isBusySendDefault(value) ? value : undefined;
 }
+
+/** Client-side: interrupt only when steer delivery needs to stop a non-steer-capable turn. */
+export function shouldInterruptForBusySteer(
+  busy: boolean,
+  busyDelivery: BusySendDefault | undefined,
+  canSteer: boolean,
+): boolean {
+  return busy && busyDelivery === "steer" && !canSteer;
+}
