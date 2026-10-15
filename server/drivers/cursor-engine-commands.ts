@@ -197,12 +197,12 @@ function trimQuotes(value: string): string {
 /** YAML-style frontmatter at the top of a command or skill file. */
 export type CursorCommandFrontmatter = Readonly<Record<string, string>>;
 
-export function parseCursorCommandFrontmatter(content: string): CursorCommandFrontmatter {
+export function parseCursorCommandFrontmatter(content: string) {
   if (!content.startsWith("---")) return {};
   const end = content.indexOf("\n---", 3);
   if (end === -1) return {};
   const block = content.slice(4, end);
-  const fields: { [key: string]: string } = {};
+  const fields: Record<string, string> = {};
   for (const line of block.split("\n")) {
     const trimmed = line.trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;

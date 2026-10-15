@@ -20,16 +20,20 @@ import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
 
-const entrySchema = z.object({
-  /** the engine's version banner when it announced, or null if unknown */
-  version: z.string().nullable(),
-  names: z.array(z.string()),
-  /** when it announced, in epoch milliseconds */
-  at: z.number(),
-});
+const entrySchema = z
+  .object({
+    /** the engine's version banner when it announced, or null if unknown */
+    version: z.string().nullable(),
+    names: z.array(z.string()),
+    /** when it announced, in epoch milliseconds */
+    at: z.number(),
+  })
+  .passthrough();
 export type EngineCommandEntry = z.infer<typeof entrySchema>;
 
-const fileSchema = z.object({ schemaVersion: z.literal(1), instances: z.record(z.string(), entrySchema) });
+const fileSchema = z
+  .object({ schemaVersion: z.literal(1), instances: z.record(z.string(), entrySchema) })
+  .passthrough();
 
 export class EngineCommandCache {
   private readonly entries = new Map<string, EngineCommandEntry>();

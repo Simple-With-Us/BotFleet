@@ -1392,7 +1392,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // session is still replaying, so this reads ahead of the gate below.
           // It never becomes a transcript item.
           if (u.sessionUpdate === "available_commands_update") {
-            const names = z.array(z.object({ name: z.string() })).safeParse(u.availableCommands);
+            const names = z.array(z.object({ name: z.string() }).passthrough()).safeParse(u.availableCommands);
             if (names.success) announceCommands(threadId, turnId, names.data.map((command) => command.name));
             return;
           }
