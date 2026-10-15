@@ -255,21 +255,19 @@ export function appendMessage(threadId: string, message: Message): void {
  * filter; the helper status is what decides.  A restart has no live tracker,
  * so these are the cards that would otherwise tick forever. */
 export function runningHelperRows(): Array<{ threadId: string; message: Message }> {
-  // SAFETY: `running_helpers` stores `thread_id` and `message_id`, both TEXT columns.
-  const ids = db()
-    .prepare("SELECT thread_id, message_id FROM running_helpers")
-    .all() as Array<{ thread_id: string; message_id: string }>;
+  // SAFETY: the join selects `thread_id` and `json`, both TEXT columns on their tables.
+  const rows = db()
+    .prepare(
+      "SELECT rh.thread_id, m.json FROM running_helpers rh " +
+        "INNER JOIN messages m ON m.thread_id = rh.thread_id AND m.id = rh.message_id",
+    )
+    .all() as Array<{ thread_id: string; json: string }>;
   const found: Array<{ threadId: string; message: Message }> = [];
-  for (const { thread_id, message_id } of ids) {
-    // SAFETY: the lookup selects `json`, a TEXT column on `messages`.
-    const row = db()
-      .prepare("SELECT json FROM messages WHERE thread_id = ? AND id = ?")
-      .get(thread_id, message_id) as { json: string } | undefined;
-    if (!row) continue;
+  for (const { thread_id, json } of rows) {
     let message: Message;
     try {
       // SAFETY: `json` is `JSON.stringify` of a `Message`, the same cast `rowToMessage` uses.
-      message = JSON.parse(row.json) as Message;
+      message = JSON.parse(json) as Message;
     } catch {
       continue;
     }

@@ -97,6 +97,18 @@ describe("HelperTracker", () => {
     });
   });
 
+  it("drops a late step when its helper already settled", () => {
+    const tracker = new HelperTracker();
+    tracker.observe(started({ itemId: "task-1", title: "Task" }), 0);
+    tracker.observe(completed({ itemId: "task-1" }), 10);
+    expect(
+      tracker.observe(
+        started({ itemId: "read-late", title: "Read", parentItemId: "task-1", subagentId: "task-1" }),
+        20,
+      ),
+    ).toEqual([]);
+  });
+
   it("replays a step that arrived before its helper opened", () => {
     const tracker = new HelperTracker();
     tracker.observe(

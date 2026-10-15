@@ -42,6 +42,8 @@ export class HelperTracker {
   private readonly childOf = new Map<string, string>();
   /** Steps whose parent helper had not opened yet. */
   private readonly pendingSteps = new Map<string, PendingStep[]>();
+  /** Helpers that already settled — late steps must not buffer forever. */
+  private readonly settledKeys = new Set<string>();
   /** Running helpers per thread, innermost last — for named engines that
    * do not stamp a parent id on inner steps. */
   private readonly activeHelpers = new Map<string, string[]>();
@@ -180,6 +182,7 @@ export class HelperTracker {
           lastPublishedAt: Number.NEGATIVE_INFINITY,
           dirty: true,
         };
+        this.settledKeys.delete(key);
         this.lives.set(key, live);
         this.pushActiveHelper(event.threadId, id);
         this.replayPendingSteps(key, live);
@@ -194,7 +197,7 @@ export class HelperTracker {
       if (parent && parent.snapshot.status === "running") {
         this.countStep(parent, event);
         touched.push(parentKey);
-      } else {
+      } else if (!this.settledKeys.has(parentKey)) {
         const pending = this.pendingSteps.get(parentKey) ?? [];
         pending.push({ title: event.title, target: event.target });
         this.pendingSteps.set(parentKey, pending);
@@ -341,8 +344,14 @@ export class HelperTracker {
     live.snapshot.status = status;
     live.snapshot.endedAt = now;
     live.dirty = true;
+    const helperKey = this.key(live.snapshot.threadId, live.snapshot.id);
     this.removeActiveHelper(live.snapshot.threadId, live.snapshot.id);
-    this.pendingSteps.delete(this.key(live.snapshot.threadId, live.snapshot.id));
+    this.pendingSteps.delete(helperKey);
+    this.settledKeys.add(helperKey);
+    const threadPrefix = `${live.snapshot.threadId}:`;
+    for (const [child, parentId] of this.childOf) {
+      if (child.startsWith(threadPrefix) && parentId === live.snapshot.id) this.childOf.delete(child);
+    }
   }
 
   private noteSource(live: LiveHelper, event: RuntimeEvent): void {
