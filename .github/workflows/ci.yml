@@ -252,42 +252,31 @@ jobs:
           include-hidden-files: true
           retention-days: 7
 
-  ios:
-    name: Swift tests + iOS build
+  ios-build:
+    name: iOS Swift tests and unsigned build (xcode-27)
     needs: changes
-    if: ${{ !cancelled() }}
-    # Fast-path (docs-only or no ios/ changes) reports the required check on
-    # ubuntu-latest so we do not burn a macOS concurrent slot for an echo.
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true' }}
     # iOS 27 deployment floor needs the iOS 27 SDK.  macos-latest ships Xcode
     # 26.x only, so the full path runs on GitHub's hosted `xcode-27` image
     # (actions/runner-images#14404) pinned to stable Xcode 27.0, never a beta.
-    runs-on: ${{ (needs.changes.outputs.docs_only == 'true' || needs.changes.outputs.ios_changed != 'true') && 'ubuntu-latest' || 'xcode-27' }}
+    # This job is not a ruleset context.  It runs only when the classifier
+    # says iOS work is in scope, and every step is the real build.
+    runs-on: xcode-27
     timeout-minutes: 20
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
-      - name: Documentation-only fast path
-        if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
-      - name: iOS-unrelated fast path
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed != 'true'
-        run: echo "No ios/, ios script, or CI workflow paths changed; the iOS build was skipped."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
       - name: Assert stable Xcode 27.0
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: bash scripts/ios-assert-xcode.sh 27.0
       - name: Swift package tests
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: swift test --package-path ios
       - name: Generate the Xcode project
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: |
           bash scripts/ios-install-xcodegen.sh
           cd ios
           xcodegen generate
       - name: Build the iOS app (unsigned)
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: |
           cd ios
           xcodebuild \
@@ -297,3 +286,46 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
+
+  ios:
+    name: Swift tests + iOS build
+    needs: [changes, ios-build]
+    # The ruleset context name stays.  Renaming it here would leave the
+    # required check unreported and block every merge until ruleset 21771270
+    # changed with it.  Success is no longer an echo: the step replays the
+    # diff and fails unless the unsigned build succeeded, or the replay
+    # proves the build was correctly skipped.  always() so a failed build
+    # still produces a failed required check instead of a skip.
+    if: ${{ always() && !cancelled() && needs.changes.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Literal 0.  An expression like `&& 0 || 1` collapses to 1 because
+          # GitHub treats 0 as false, and a depth-1 checkout does not contain
+          # the pull request base commit the replay has to diff.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prove the iOS build ran or that no iOS paths changed
+        shell: bash
+        env:
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          IOS_CHANGED: ${{ needs.changes.outputs.ios_changed }}
+          IOS_BUILD_RESULT: ${{ needs.ios-build.result }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "push" && "$EVENT_NAME" != "pull_request" ]]; then
+            # Scheduled and manual runs have no base to replay.  The changes
+            # job already fail-opened every area, so this only accepts a
+            # successful ios-build.
+            printf '' | node scripts/ci-ios-gate.mjs
+            exit $?
+          fi
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            echo "ERROR: Cannot replay changed paths for an auditable gate (missing base SHA)." >&2
+            exit 1
+          fi
+          git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" | node scripts/ci-ios-gate.mjs
