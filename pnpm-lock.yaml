@@ -169,6 +169,9 @@ overrides:
   sharp@0.35.2: 0.35.5
   sharp@0.35.3: 0.35.5
 
+patchedDependencies:
+  clutch@0.4.0: c773a632d8b7e5761f3cb1c686bd7f66e0be2e3c4f49a453e71ce694c82a7fe6
+
 importers:
 
   .:
@@ -196,7 +199,7 @@ importers:
         version: 2.1.1
       clutch:
         specifier: github:Simple-With-Us/Clutch#7fbd88d89625402a8b47631dd207045482236837
-        version: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837(56fe5fd52cd991223a212b4d7fe01a79)
+        version: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837(patch_hash=c773a632d8b7e5761f3cb1c686bd7f66e0be2e3c4f49a453e71ce694c82a7fe6)(56fe5fd52cd991223a212b4d7fe01a79)
       harness:
         specifier: github:Simple-With-Us/Clutch#93bbbfdb26a84970dc9083a887dad93ca3eee0cf
         version: https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/93bbbfdb26a84970dc9083a887dad93ca3eee0cf(56fe5fd52cd991223a212b4d7fe01a79)
@@ -14971,7 +14974,7 @@ snapshots:
 
   clsx@2.1.1: {}
 
-  clutch@https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837(56fe5fd52cd991223a212b4d7fe01a79):
+  clutch@https://codeload.github.com/Simple-With-Us/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837(patch_hash=c773a632d8b7e5761f3cb1c686bd7f66e0be2e3c4f49a453e71ce694c82a7fe6)(56fe5fd52cd991223a212b4d7fe01a79):
     optionalDependencies:
       '@deepseek-ai/dsh': 0.1.5-rc.2(56fe5fd52cd991223a212b4d7fe01a79)
     transitivePeerDependencies:

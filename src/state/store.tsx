@@ -867,6 +867,9 @@ export interface InstanceInfo {
   cli?: string;
   /** Driver's default binary name (e.g. "claude"). */
   cliDefault?: string;
+  /** Other command names that run this engine (e.g. Clutch's "clutch" beside
+   * the default "dsh").  The picker searches them alongside the default. */
+  cliAliases?: string[];
   /** Absolute paths of every default binary found on PATH, PATH order. */
   cliCandidates?: string[];
   /** YOLO full access bypass permissions */
@@ -1786,6 +1789,7 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: open ? false : state.computerOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "togglePlugins":
@@ -1823,6 +1827,7 @@ export function reducer(state: AppState, action: Action): AppState {
         settingsOpen: open ? false : state.settingsOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "toggleInspector": {
@@ -1833,6 +1838,7 @@ export function reducer(state: AppState, action: Action): AppState {
         settingsOpen: open ? false : state.settingsOpen,
         computerOpen: open ? false : state.computerOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "toggleAppSettings": {
@@ -1845,6 +1851,7 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: open ? false : state.computerOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         pluginsOpen: open ? false : state.pluginsOpen,
+        pluginsManagerOpen: open ? false : state.pluginsManagerOpen,
       };
     }
     case "updateBot": {
