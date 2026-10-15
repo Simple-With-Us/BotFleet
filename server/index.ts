@@ -219,6 +219,7 @@ import {
   computerSystemPrompt,
   resolveCloudBackend,
   cloudRunUsesBoxAgent,
+  filterGrantedByProviders,
   resolveGrants,
   resolveTurnComputerMounts,
   hostShellGranted,
@@ -234,6 +235,18 @@ import {
   revokedTurnProviders,
 } from "./config-reload-keys.ts";
 import { computerReach } from "./computer-capability.ts";
+import {
+  type CapabilityGateContext,
+  type CapabilityProfile,
+  DOOMED_POLICY,
+  evaluateCapabilityGate,
+  formatExecutionHints,
+  profileFor,
+  promptNeedsImages,
+  wisdomInspectPayload,
+  worksInWorkspace as engineWorksInWorkspace,
+  type TaskClass,
+} from "./capability-profile.ts";
 import { waitForComputerCall } from "./computer-call-gate.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
 import {
@@ -899,7 +912,8 @@ const cfg = loadConfig();
  *  tell", which is a different message and must not be conflated. */
 function stsProviderCredential(provider: StsProvider): string | undefined {
   const value = provider === "xai" ? cfg.xai?.key : cfg.gemini?.key;
-  return typeof value === "string" && value.trim() ? value : undefined;
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 /** One token per provider per window.  Each mint is a billed call to a vendor
@@ -1279,6 +1293,168 @@ function noteDoomedSkip(botId: string, instanceId: string): void {
     else doomedSkipTotals.set(key, { botId, instanceId, count: 1 });
   } catch {
     // A counter must never be the reason a dispatch does not happen.
+  }
+}
+
+const capabilitySkipTotals = new Map<
+  string,
+  { botId: string; instanceId: string; model: string; taskClass: string; reason: string; lane: string; count: number }
+>();
+
+function noteCapabilitySkip(
+  botId: string,
+  instanceId: string,
+  model: string,
+  taskClass: string,
+  reason: string,
+  lane: "dispatch" | "routine",
+): void {
+  try {
+    // Model is part of the key.  A later turn on another model must not reuse
+    // the first turn's model and reason attributes.
+    const key = `${botId}:${instanceId}:${model}:${taskClass}:${lane}`;
+    const tally = capabilitySkipTotals.get(key);
+    if (tally) {
+      tally.count += 1;
+      tally.reason = reason;
+    } else capabilitySkipTotals.set(key, { botId, instanceId, model, taskClass, reason, lane, count: 1 });
+  } catch {
+    // Counting must not block a gate decision.
+  }
+}
+
+function drainCapabilitySkips(): void {
+  if (!capabilitySkipTotals.size || !isSentryActive()) return;
+  const sentry = getSentry();
+  if (!sentry) return;
+  for (const [key, tally] of capabilitySkipTotals) {
+    try {
+      sentry.metrics.count("botfleet.dispatcher.doomed_skipped", tally.count, {
+        attributes: {
+          "botfleet.bot.id": tally.botId,
+          "botfleet.instance.id": tally.instanceId,
+          "botfleet.model": tally.model,
+          "botfleet.task_class": tally.taskClass,
+          "botfleet.reason": tally.reason,
+          "botfleet.lane": tally.lane,
+        },
+      });
+      capabilitySkipTotals.delete(key);
+    } catch {
+      // Leave tally for the next drain.
+    }
+  }
+}
+
+setInterval(drainCapabilitySkips, DOOMED_SKIP_DRAIN_MS).unref?.();
+
+function capabilityHostContext(
+  bot: { computers?: Array<"cloud" | "vm" | "local">; cloudBackend?: "box" | "vps" | null },
+): CapabilityGateContext {
+  const shellBot = { computers: bot.computers, cloudBackend: bot.cloudBackend ?? undefined };
+  const hostShellGrantedNow = hostShellGranted(shellBot, cfg, allowedBotComputers(cfg));
+  return { hostShellGranted: hostShellGrantedNow };
+}
+
+/** Stored computer grants the provider switches still allow.  A cloud routine
+ *  named its destination, so that is the only computer the gate requires.
+ *  The workspace default is not copied in: an unset bot must stay a chat,
+ *  and the mount path is what applies Auto. */
+function computersForCapabilityGate(
+  bot: { computers?: Array<"cloud" | "vm" | "local">; cloudBackend?: "box" | "vps" | null },
+  runOn: RoutineRunOn | undefined,
+) {
+  const cloudBackend = resolveCloudBackend(bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend);
+  if (runOn === "cloud") return filterGrantedByProviders(["cloud"], cfg, cloudBackend);
+  return filterGrantedByProviders(bot.computers ?? [], cfg, cloudBackend);
+}
+
+class IncapableDispatch extends Error {
+  readonly code = "incapable";
+  readonly status = 409;
+  readonly pickUnusable = true;
+  readonly taskClass: TaskClass;
+  constructor(message: string, taskClass: TaskClass) {
+    super(message);
+    this.name = "IncapableDispatch";
+    this.taskClass = taskClass;
+  }
+}
+
+function enforceTurnCapabilityGate(input: {
+  bot: { id: string; computers?: Array<"cloud" | "vm" | "local">; cloudBackend?: "box" | "vps" | null };
+  instance: ProviderInstance;
+  model: string;
+  text: string;
+  runOn?: RoutineRunOn;
+  routineNeeds?: TaskClass[];
+  lane: "dispatch" | "routine";
+  ignorePromptImageMarkers?: boolean;
+}): string | undefined {
+  const hostCtx = capabilityHostContext(input.bot);
+  const gate = evaluateCapabilityGate(
+    {
+      instanceId: input.instance.instanceId,
+      driverKind: input.instance.driverKind,
+      capabilities: input.instance.adapter.capabilities,
+      model: input.model,
+    },
+    {
+      text: input.text,
+      computers: computersForCapabilityGate(input.bot, input.runOn),
+      runOn: input.runOn,
+      routineNeeds: input.routineNeeds,
+      ignorePromptImageMarkers: input.ignorePromptImageMarkers,
+    },
+    hostCtx,
+  );
+  if (gate.action === "ok") return undefined;
+  const taskClass = gate.taskClass ?? "chat";
+  const reason = gate.reason ?? "This engine cannot run that task";
+  if (gate.action === "warn") {
+    try {
+      getSentry()?.metrics.count("botfleet.dispatcher.capability_degraded", 1, {
+        attributes: {
+          "botfleet.bot.id": input.bot.id,
+          "botfleet.instance.id": input.instance.instanceId,
+          "botfleet.task_class": taskClass,
+        },
+      });
+    } catch {
+      // Telemetry must not block dispatch.
+    }
+    return reason;
+  }
+  noteCapabilitySkip(input.bot.id, input.instance.instanceId, input.model, taskClass, reason, input.lane);
+  throw new IncapableDispatch(reason, taskClass);
+}
+
+function routineIncapableForRun(run: RoutineRun): { reason: string } | undefined {
+  const bot = store.bot(run.botId);
+  if (!bot) return undefined;
+  const task = run.threadId ? store.taskByThread(bot.id, run.threadId) : undefined;
+  const policy = task?.modelSelection ?? bot.modelSelection;
+  const instanceId = executionInstanceFor(bot, policy, run.runOn);
+  const instance = registry.get(instanceId);
+  if (!instance) {
+    return { reason: `The engine for this routine is not available, so the run was skipped.` };
+  }
+  const model = instance.models.default;
+  const prompt = run.prompt ?? "";
+  try {
+    enforceTurnCapabilityGate({
+      bot,
+      instance,
+      model,
+      text: prompt,
+      runOn: run.runOn,
+      lane: "routine",
+      ignorePromptImageMarkers: true,
+    });
+    return undefined;
+  } catch (error) {
+    if (error instanceof IncapableDispatch) return { reason: error.message };
+    throw error;
   }
 }
 
@@ -6152,15 +6328,27 @@ async function startTurn(
     }
   }
 
-  // The DSH Pro row lacks vision; visual data sharing automatically routes to
-  // the Flash row and updates the stored selection so the switch persists.
-  // `isDshVisionlessModel` is the same answer the chain rewrite below gives, so
-  // this path and that one cannot disagree about which ids count as Pro.
-  if (instanceId === "dsh" && isDshVisionlessModel(model) && text.includes("<attached-image ")) {
+  // The DSH Pro row lacks vision.  Visual data sharing routes to the Flash
+  // row, and the stored selection is updated only after the capability gate
+  // allows the turn, so a refusal does not pin Flash onto a turn that never
+  // started.  `isDshVisionlessModel` is the same answer the chain rewrite
+  // below gives, so this path and that one cannot disagree about which ids
+  // count as Pro.
+  let persistDshVision = false;
+  if (instanceId === "dsh" && isDshVisionlessModel(model) && promptNeedsImages(text)) {
     model = DSH_DEEPSEEK_FLASH_MODEL;
-    // Persist against the selection that owns this thread, and keep the
-    // dispatch fallback policy aligned with the new primary and its chain.
     fallbackPolicy = dshVisionSelection(fallbackPolicy);
+    persistDshVision = true;
+  }
+  const capabilityWarn = enforceTurnCapabilityGate({
+    bot,
+    instance,
+    model,
+    text,
+    runOn: opts?.runOn,
+    lane: "dispatch",
+  });
+  if (persistDshVision) {
     if (task.modelSelection) {
       store.patchTask(bot.id, threadId, { modelSelection: fallbackPolicy });
     } else {
@@ -6186,6 +6374,23 @@ async function startTurn(
           comm: opts?.comm,
           toolPolicy: turnToolPolicy,
         });
+  }
+  if (capabilityWarn) {
+    // A notice row's headline is tool.target (the verb for this kind is
+    // empty).  The reason has to sit there or the thread only says
+    // "Capability degraded" until someone opens the row.
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: {
+        name: "Capability degraded",
+        ok: true,
+        kind: "notice",
+        target: capabilityWarn,
+        detail: capabilityWarn,
+      },
+    });
   }
 
   // transcript for API-backed drivers: settled text turns on the ACTIVE
@@ -6258,6 +6463,16 @@ async function startTurn(
     : undefined;
 
   const isImessageTask = store.tasks(bot.id)?.find((t) => t.threadId === threadId)?.title?.toLowerCase() === "imessage";
+  const capabilityProfileForHints = profileFor({
+    instanceId: instance.instanceId,
+    driverKind: instance.driverKind,
+    capabilities: instance.adapter.capabilities,
+    model,
+  });
+  const capabilityHints =
+    fresh && capabilityProfileForHints.executionHints.length
+      ? formatExecutionHints(capabilityProfileForHints)
+      : "";
   const persona = [
     `You are ${bot.name} (display: ${bot.name}), a bot in BotFleet.`,
     bot.title && `Role: ${bot.title}.`,
@@ -6265,6 +6480,7 @@ async function startTurn(
     `Posting rules: post only what another person needs in order to act, and never post unprompted status updates or routine commentary.`,
     isImessageTask && IMESSAGE_PERSONA_RULE,
     isImessageTask && `iMessage communication rule: When replying in this iMessage thread, be concise, direct, and action-oriented. Do not leave out key details, but avoid verbose fluff, unnecessary conversational padding, or multi-paragraph meta commentary. Provide clear, direct summaries.`,
+    capabilityHints,
   ]
     .filter(Boolean)
     .join(" ");
@@ -6373,7 +6589,7 @@ async function startTurn(
       // OpenAI-compat (board row 9998f9a9, P0).  Handing it to one more
       // engine widens a known P0; Grok joins the others only once those
       // tools are confined to the workspace real path.
-      const worksInWorkspace = instance.driverKind !== "grok" && instance.driverKind !== "boxAgent";
+      const worksInWorkspace = engineWorksInWorkspace(instance.driverKind);
       const privateWorkspace = worksInWorkspace ? ensureWorkspace(bot.id) : undefined;
       const skillInstructions = renderSkillInstructions(selectedSkills, {
         includeRoot: worksInWorkspace && opts?.runOn !== "cloud",
@@ -7096,6 +7312,7 @@ let webhookEphemeralSource: ((webhookId: string) => {
 routines = new RoutineManager({
   emit: broadcast,
   timeZone: routineTimeZone,
+  incapableRun: routineIncapableForRun,
   // A restore route sets providerConfigBusy before its first await.  Keep
   // queued routine receipts durable while the registry is being rebuilt,
   // then tick them after the authenticated credential has landed.
@@ -8819,7 +9036,7 @@ async function runGroupMemberTurn(
   // conversation, not a different bot.  The exclusions match the 1:1 lane's
   // exactly, `grok` included; see the comment there for why widening it is
   // held behind confining the workspace file tools.
-  const worksInWorkspace = instance.driverKind !== "grok" && instance.driverKind !== "boxAgent";
+  const worksInWorkspace = engineWorksInWorkspace(instance.driverKind);
   const workspace = worksInWorkspace ? ensureWorkspace(bot.id) : undefined;
   // The room's folder pins here — on the first turn that actually
   // dispatches, not at PATCH time — so a folder set on a never-used room
@@ -16129,6 +16346,28 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         (row) => (botId === null || row.botId === botId) && (threadId === null || row.threadId === threadId),
       );
       return json(res, 200, { decisions: matching.slice(-limit) });
+    }
+
+    if (method === "GET" && path === "/api/inspect/capabilities") {
+      const profiles: CapabilityProfile[] = [];
+      for (const instance of registry.instances()) {
+        for (const option of instance.models.options) {
+          profiles.push(
+            profileFor({
+              instanceId: instance.instanceId,
+              driverKind: instance.driverKind,
+              capabilities: instance.adapter.capabilities,
+              model: option.id,
+            }),
+          );
+        }
+      }
+      return json(res, 200, { profiles, policy: DOOMED_POLICY });
+    }
+
+    if (method === "GET" && path === "/api/inspect/wisdom") {
+      const engine = url.searchParams.get("engine")?.trim() || undefined;
+      return json(res, 200, wisdomInspectPayload(engine));
     }
 
     // ── provider instances (model picker) ──
