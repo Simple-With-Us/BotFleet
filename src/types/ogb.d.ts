@@ -246,6 +246,8 @@ type SkillRecordingPayload = {
       openFile?(filePath: string): Promise<boolean>;
       /** Reveal a file in Finder / file manager with the file selected. */
       showInFolder?(filePath: string): Promise<boolean>;
+      /** Reveal a user-chosen absolute file or folder outside ~/.botfleet. */
+      revealLocalPath?(filePath: string): Promise<boolean>;
       /** Asks where to save a bot-created file (inside ~/.botfleet), copies
        * it there and reveals it. Resolves the chosen path, or null if the
        * user cancelled the dialog. */

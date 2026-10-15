@@ -77,6 +77,19 @@ export async function resolveSavablePath(
   return (await resolveSource(rawPath, { home, fsp, platform, outsideMessage })).filePath;
 }
 
+/** Resolve an absolute file or folder path the user chose at plugin install
+ *  time.  Unlike bot-created files, plugin sources may live outside
+ *  ~/.botfleet; the path must exist on disk. */
+export async function resolveLocalRevealPath(rawPath, { fsp = fs.promises } = {}) {
+  const target = normalizeSourcePath(rawPath);
+  const resolved = await canonicalPath(target, fsp, "That path no longer exists");
+  const stats = await fsp.stat(resolved, { bigint: true });
+  if (!stats.isFile() && !stats.isDirectory()) {
+    throw new Error("That path is not a file or folder");
+  }
+  return resolved;
+}
+
 async function openSavableFile(rawPath, { home, fsp, platform }) {
   const source = await resolveSource(rawPath, { home, fsp, platform });
   const noFollow = platform === "win32" ? 0 : fs.constants.O_NOFOLLOW ?? 0;

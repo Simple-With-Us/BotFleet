@@ -6,7 +6,7 @@ import { after, before, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
-import { mayOpenBotFile, resolveOpenablePath } from "./open-file.mjs";
+import { mayOpenBotFile, resolveLocalRevealPath, resolveOpenablePath } from "./open-file.mjs";
 
 let home;
 let botHome;
@@ -73,6 +73,15 @@ describe("open-file / show-in-folder path confinement", () => {
     await assert.rejects(resolveOpenablePath(path.join(botHome, "missing.docx"), { home }), {
       message: "That file no longer exists",
     });
+  });
+});
+
+describe("plugin source reveal paths", () => {
+  it("accepts an existing folder outside ~/.botfleet", async () => {
+    const outsideDir = path.join(home, "my-plugin");
+    fs.mkdirSync(outsideDir, { recursive: true });
+    const expected = await fs.promises.realpath(outsideDir);
+    assert.equal(await resolveLocalRevealPath(outsideDir), expected);
   });
 });
 
