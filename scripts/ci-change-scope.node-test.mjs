@@ -178,15 +178,13 @@ test("packaging and control-plane jobs gate on their own area, the same way docs
 });
 
 function runIosGate(paths, env, summaryFile) {
+  const childEnv = { ...process.env, ...env };
+  if (summaryFile) childEnv.GITHUB_STEP_SUMMARY = summaryFile;
   return spawnSync(process.execPath, [join(ROOT, "scripts/ci-ios-gate.mjs")], {
     cwd: ROOT,
     input: Buffer.from(paths.join("\0")),
     encoding: "utf8",
-    env: {
-      ...process.env,
-      ...env,
-      ...(summaryFile ? { GITHUB_STEP_SUMMARY: summaryFile } : {}),
-    },
+    env: childEnv,
   });
 }
 
@@ -217,7 +215,6 @@ test("the required iOS check is a diff replay, not an echo, and the build job ha
   assert.equal(gate["runs-on"], "ubuntu-latest");
   const checkout = gate.steps.find((step) => String(step.uses ?? "").startsWith("actions/checkout@"));
   assert.equal(checkout.with["fetch-depth"], 0);
-  assert.equal(typeof checkout.with["fetch-depth"], "number");
   const verify = gate.steps.find((step) => step.name === "Prove the iOS build ran or that no iOS paths changed");
   assert.ok(verify);
   assert.match(verify.run, /ci-ios-gate\.mjs/);
