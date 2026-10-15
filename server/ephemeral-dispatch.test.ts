@@ -65,13 +65,17 @@ describe("isClassifyOrUiPassWake", () => {
       name: "Admission gate",
       instructions: "Classify the event and stop when it is out of scope.",
     })).toBe(true);
-  });
-
-  it("does not treat a delivery payload or a compile-gates prompt as a classify wake", () => {
+    expect(isClassifyOrUiPassWake({
+      name: "Ticket routing",
+      instructions: "Please classify these events",
+    })).toBe(true);
     expect(isClassifyOrUiPassWake({
       name: "Compile gates",
       instructions: "classify this",
-    })).toBe(false);
+    })).toBe(true);
+  });
+
+  it("does not treat an ordinary compile-gates prompt as a classify wake", () => {
     expect(isClassifyOrUiPassWake({
       name: "Compile gates",
       instructions: "Watch check runs",
@@ -118,7 +122,7 @@ describe("wantsEphemeralDispatch", () => {
     expect(wantsEphemeralDispatch({
       triggerSource: "webhook",
       name: "Compile gates",
-      instructions: "classify this",
+      instructions: "Watch check runs",
     })).toBe(false);
   });
 });

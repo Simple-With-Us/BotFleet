@@ -17,13 +17,13 @@ export interface EphemeralResultDelivery {
 }
 
 const UI_PASS = /\bui[\s-]*pass\b/i;
-const CLASSIFY_GATE = /\bclassify(?:\s*\/\s*|\s+)gate\b/i;
 const CLASSIFY_WORD = /\bclassify\b/i;
-const GATE_WORD = /\bgate\b/i;
 
-/** True when this trigger's own name or saved instructions are a classify,
- *  gate, or Designer UI-pass wake.  Delivery payloads are not an input:
- *  a PR title that says "UI pass" must not flip an unrelated webhook. */
+/** True when this trigger's own name, id, or saved instructions are a
+ *  classify, gate, or Designer UI-pass wake.  The saved instructions are the
+ *  operator's prompt, so the word "classify" there is the wake.  Delivery
+ *  payloads are not an input: a PR title that says "UI pass" must not flip
+ *  an unrelated webhook. */
 export function isClassifyOrUiPassWake(input: {
   name?: string;
   instructions?: string;
@@ -33,9 +33,7 @@ export function isClassifyOrUiPassWake(input: {
   const instructions = input.instructions ?? "";
   const id = input.id ?? "";
   if (UI_PASS.test(name) || UI_PASS.test(instructions) || UI_PASS.test(id)) return true;
-  if (CLASSIFY_GATE.test(name) || CLASSIFY_GATE.test(instructions) || CLASSIFY_GATE.test(id)) return true;
-  if (CLASSIFY_WORD.test(name) || CLASSIFY_WORD.test(id)) return true;
-  if (GATE_WORD.test(name) && CLASSIFY_WORD.test(instructions)) return true;
+  if (CLASSIFY_WORD.test(name) || CLASSIFY_WORD.test(instructions) || CLASSIFY_WORD.test(id)) return true;
   return false;
 }
 
