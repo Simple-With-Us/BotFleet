@@ -6211,11 +6211,20 @@ async function startTurn(
         });
   }
   if (capabilityWarn) {
+    // A notice row's headline is tool.target (the verb for this kind is
+    // empty).  The reason has to sit there or the thread only says
+    // "Capability degraded" until someone opens the row.
     store.appendMessage(threadId, {
       role: "bot",
       kind: "activity",
       from: { botId: bot.id, name: bot.name, color: bot.color },
-      tool: { name: "Capability degraded", ok: true, kind: "notice", detail: capabilityWarn },
+      tool: {
+        name: "Capability degraded",
+        ok: true,
+        kind: "notice",
+        target: capabilityWarn,
+        detail: capabilityWarn,
+      },
     });
   }
 
