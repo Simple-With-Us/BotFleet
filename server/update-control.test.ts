@@ -122,7 +122,7 @@ function build(
     stateDirectory: paths.stateDirectory,
     updatesDirectory: paths.updatesDirectory,
     scriptPath: paths.scriptPath,
-    ...(options.appPath ? { appPath: options.appPath } : {}),
+    appPath: options.appPath,
     platform: options.platform ?? "darwin",
     nodeDirectory: "/opt/homebrew/bin",
     now: options.now ?? (() => new Date("2026-09-13T12:00:00.000Z")),
