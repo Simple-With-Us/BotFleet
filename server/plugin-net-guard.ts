@@ -210,13 +210,20 @@ function describeConnect(args: readonly Hostile[], unwrapped = false): ConnectDe
   if (asString(first) !== null) return { kind: "denied" };
   const fields = asFields(first);
   if (!fields) return { kind: "denied" };
-  const path = fields.path === undefined ? null : asString(fields.path);
-  if (path !== null && (fields.port === undefined || fields.port === null)) return { kind: "denied" };
-  const port = fields.port === undefined || fields.port === null ? null : asPort(fields.port);
+  // Read each property once.  A getter can return a different value on
+  // the next access, so a second read must not decide the allowlist.
+  const pathValue = fields.path;
+  const portValue = fields.port;
+  const hostValue = fields.host;
+  const hostnameValue = fields.hostname;
+  const addressValue = fields.address;
+  const path = pathValue === undefined ? null : asString(pathValue);
+  if (path !== null && (portValue === undefined || portValue === null)) return { kind: "denied" };
+  const port = portValue === undefined || portValue === null ? null : asPort(portValue);
   if (port === null) return { kind: "denied" };
-  const host = (fields.host === undefined ? null : asString(fields.host))
-    ?? (fields.hostname === undefined ? null : asString(fields.hostname))
-    ?? (fields.address === undefined ? null : asString(fields.address))
+  const host = (hostValue === undefined ? null : asString(hostValue))
+    ?? (hostnameValue === undefined ? null : asString(hostnameValue))
+    ?? (addressValue === undefined ? null : asString(addressValue))
     ?? "localhost";
   return { kind: "tcp", host, port };
 }
@@ -277,15 +284,19 @@ export function installPluginNetworkGuard(): { seal(entries: readonly string[]):
     patchDnsMethods(dnsPromises.Resolver.prototype as DnsApi);
   }
 
-  // SAFETY: Socket.prototype.connect is an overloaded method.  The wrapper forwards the original argument list only after describeConnect has accepted an allowlisted TCP destination.  Unix-socket connects are denied.
+  // SAFETY: Socket.prototype.connect is an overloaded method.  The wrapper forwards a new object whose host and port are the strings describeConnect already read.  The plugin's object is not passed through, so a getter cannot change the destination after the allowlist check.  Unix-socket connects are denied.
   const forward = net.Socket.prototype.connect as ConnectForward;
   lock(net.Socket.prototype, "connect", function guardedConnect(this: net.Socket, ...args: Hostile[]): net.Socket {
     if (!(this instanceof net.Socket)) throw denied();
     const dest = describeConnect(args);
-    if (dest.kind === "tcp" && networkAllowMatches(current(), dest.host, dest.port)) {
-      return forward.call(this, ...args);
+    if (dest.kind !== "tcp" || !networkAllowMatches(current(), dest.host, dest.port)) {
+      throw denied();
     }
-    throw denied();
+    const clean = { host: dest.host, port: dest.port };
+    const last = args[args.length - 1];
+    const callback = last === undefined ? null : asCallback(last);
+    if (callback) return forward.call(this, clean, callback);
+    return forward.call(this, clean);
   });
 
   function denyUdp(this: dgram.Socket, ...args: Hostile[]): undefined {

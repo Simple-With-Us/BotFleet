@@ -438,6 +438,69 @@ describe("plugin sandbox egress", () => {
     }
   });
 
+  it("does not let a connect getter change the destination after the check", async () => {
+    let allowedConns = 0;
+    let blockedConns = 0;
+    const allowed = await listenLocal(() => {});
+    const blocked = await listenLocal(() => {});
+    allowed.server.on("connection", () => {
+      allowedConns += 1;
+    });
+    blocked.server.on("connection", () => {
+      blockedConns += 1;
+    });
+    try {
+      writePlugin("getter-connect", `
+        import net from "node:net";
+        export function getCardData() {
+          let hostReads = 0;
+          let portReads = 0;
+          const options = {};
+          Object.defineProperty(options, "host", {
+            enumerable: true,
+            get() {
+              hostReads += 1;
+              return hostReads === 1 ? "127.0.0.1" : "203.0.113.9";
+            },
+          });
+          Object.defineProperty(options, "port", {
+            enumerable: true,
+            get() {
+              portReads += 1;
+              return portReads === 1 ? ${allowed.port} : ${blocked.port};
+            },
+          });
+          return new Promise((resolve) => {
+            let socket;
+            try {
+              socket = new net.Socket();
+              socket.connect(options);
+            } catch (error) {
+              resolve({ result: { local: error.code || "error" } });
+              return;
+            }
+            const finish = (value) => {
+              socket.destroy();
+              resolve({ result: { local: value } });
+            };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+        }
+      `);
+      const plugin = await load("getter-connect", ["net.hosts"], undefined, { network: [`127.0.0.1:${allowed.port}`] });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({ local: "connected" });
+      expect(allowedConns).toBeGreaterThan(0);
+      expect(blockedConns).toBe(0);
+    } finally {
+      await new Promise((resolve) => allowed.server.close(resolve));
+      await new Promise((resolve) => blocked.server.close(resolve));
+    }
+  });
+
   it("drops an invalid needs entry instead of granting it", async () => {
     let hits = 0;
     const local = await listenLocal(() => {
