@@ -207,12 +207,24 @@ test("the weekly full run is registered with the Sentry cron reporter", () => {
 test("every host runs the canonical complete test chain without masking failures", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const job = workflow.jobs.test;
-  assert.deepEqual(job.strategy.matrix.os, ["macos-latest", "ubuntu-latest", "windows-latest"]);
+  // The required context stays "typecheck + test (macos-latest)".  Hosted
+  // macos-latest does not allocate a runner (BF-2066), so the mac leg runs
+  // on macos-14.  Ubuntu and Windows keep their own labels.
+  assert.equal(job.name, "typecheck + test (${{ matrix.check }})");
+  assert.deepEqual(job.strategy.matrix.include, [
+    { os: "macos-14", check: "macos-latest" },
+    { os: "ubuntu-latest", check: "ubuntu-latest" },
+    { os: "windows-latest", check: "windows-latest" },
+  ]);
+  assert.match(String(job["runs-on"]), /matrix\.os/);
+  assert.doesNotMatch(String(job["runs-on"]), /macos-latest/);
   assert.notEqual(job["continue-on-error"], true);
   const gates = job.steps.filter((step) => step.run?.trim() === "pnpm test");
   assert.equal(gates.length, 1, "CI must call the package test chain, not a copied subset");
   assert.equal(gates[0].if, "needs.changes.outputs.docs_only != 'true'");
   assert.notEqual(gates[0]["continue-on-error"], true);
+  const vite = job.steps.find((step) => step.run?.includes("vite build"));
+  assert.equal(vite.if, "needs.changes.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'");
 });
 
 test("the test job checks out full history so the effort ledger guard can find its merge base", () => {
