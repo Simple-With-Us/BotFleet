@@ -25,6 +25,7 @@ import type { BotVoices } from "../shared/bot-voice.ts";
 import type { SignInRequestCardData } from "../shared/sign-in-request.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
+import { interruptedHelper, type HelperTranscript } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextInjectionRef } from "../shared/context-injection.ts";
 import { taskWorkspaceContextsMatch, type TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
@@ -198,6 +199,9 @@ export interface Message {
      * interleaving parallel helpers' steps with the bot's own. */
     parentItemId?: string;
   };
+  /** The helper card for the row that started an engine-native helper
+   * (jobs P3).  Absent on an ordinary step. */
+  helper?: HelperTranscript;
   /** What the harness put in front of the model for THIS turn that the person
    * did not type — memory, selected skills, a quoted reply, a replayed
    * conversation (shared/context-injection.ts).  One short record each: a
@@ -2001,6 +2005,20 @@ export class Store {
     mdb.setActiveLeaf(threadId, cur);
     this.emit({ type: "thread", threadId, activeLeafId: cur });
     return cur;
+  }
+
+  /** A restart drops the in-memory helper tracker.  Any card still marked
+   * running is settled failed, so the header stops counting it and the
+   * duration stops ticking. */
+  settleInterruptedHelpers(now = Date.now()): number {
+    let settled = 0;
+    for (const row of mdb.runningHelperRows()) {
+      if (!row.message.helper) continue;
+      const helper = interruptedHelper(row.message.helper, now);
+      if (!helper) continue;
+      if (this.patchMessage(row.threadId, row.message.id, { helper })) settled += 1;
+    }
+    return settled;
   }
 
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null {

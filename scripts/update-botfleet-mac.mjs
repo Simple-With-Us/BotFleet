@@ -3174,7 +3174,7 @@ export async function swapPreparedFiles({
  * whether the install has been verified yet.
  */
 function rollbackReceipt(prepared, previous, config, extra) {
-  return {
+  const receipt = {
     schemaVersion: 1,
     previousCommit: previous.checkoutCommit,
     // The checkout commit and the installed build can disagree: `ubf --force`
@@ -3191,11 +3191,14 @@ function rollbackReceipt(prepared, previous, config, extra) {
     stageDirectory: prepared.stageDirectory,
     rollbackPlacement: previous.rollbackPlacement,
     crossVolume: previous.crossVolume === true,
-    ...(previous.crossVolumeReason ? { crossVolumeReason: previous.crossVolumeReason } : {}),
     candidateBundle: previous.candidatePath,
     candidateDependencies: previous.candidateDependencies,
     ...extra,
   };
+  if (previous.crossVolumeReason) {
+    receipt.crossVolumeReason = previous.crossVolumeReason;
+  }
+  return receipt;
 }
 
 async function readRollbackReceipt(receiptPath) {
@@ -3205,7 +3208,8 @@ async function readRollbackReceipt(receiptPath) {
   } catch {
     return null;
   }
-  if (!receipt || typeof receipt.rollbackBundle !== "string") return null;
+  const rollbackBundle = receipt?.rollbackBundle;
+  if (!receipt || rollbackBundle == null || rollbackBundle !== `${rollbackBundle}`) return null;
   return { receiptPath, receipt };
 }
 

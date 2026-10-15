@@ -62,7 +62,7 @@ posixOnly("mid-turn steering e2e", () => {
     );
     child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
-      env: { ...(process.env.PATH ? { PATH: process.env.PATH } : {}), HOME: home, USERPROFILE: home, OMB_PORT: String(PORT) },
+      env: { PATH: process.env.PATH ?? "", HOME: home, USERPROFILE: home, OMB_PORT: String(PORT) },
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr!.on("data", (c) => (stderr += c));
@@ -118,6 +118,28 @@ posixOnly("mid-turn steering e2e", () => {
     },
     40_000,
   );
+
+  it("busyDelivery queue skips mid-turn steer even when the engine could steer", async () => {
+    const created = (await api("POST", "/api/bots")).body.bot;
+    await api("PATCH", `/api/bots/${created.id}`, { modelSelection: { instanceId: "claude", model: "claude-fake" } });
+    expect((await api("POST", `/api/bots/${created.id}/messages`, { text: "first" })).status).toBe(202);
+    await waitFor(async () => (await getBot(created.id)).busy === true, "the turn to start");
+    await waitFor(async () => (await getBot(created.id)).messages.some((m: any) => m.kind === "activity"), "the tool chip");
+    const queued = await api("POST", `/api/bots/${created.id}/messages`, {
+      text: "hold this",
+      busyDelivery: "queue",
+    });
+    expect(queued.status).toBe(202);
+    expect(queued.body.queued).toBe(true);
+    expect((await getBot(created.id)).messages.some((m: any) => m.text === "hold this")).toBe(false);
+    await api("POST", `/api/bots/${created.id}/interrupt`);
+    await waitFor(
+      async () => (await getBot(created.id)).messages.some((m: any) => m.text === "hold this"),
+      "the queued message to begin its turn",
+    );
+    await api("POST", `/api/bots/${created.id}/interrupt`);
+    await waitFor(async () => (await getBot(created.id)).busy === false, "the queued turn to settle");
+  }, 40_000);
 
   it("an engine without a live session preserves the message in the server-side queue", async () => {
     const created = (await api("POST", "/api/bots")).body.bot;

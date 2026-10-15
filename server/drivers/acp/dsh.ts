@@ -24,6 +24,7 @@ import {
 } from "clutch/dsh/acp";
 
 import type { ModelCatalog, ProviderErrorCode, SendTurnInput } from "../../contracts.ts";
+import { isJsonString } from "../../schema.ts";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -218,7 +219,7 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
         // The declared entry type is a promise the hand-edited file may break,
         // so the id is re-checked as a string here: a numeric or object id
         // would otherwise reach the picker and fail at turn time instead.
-        if (typeof id !== "string" || !id) continue;
+        if (!isJsonString(id) || !id) continue;
         if (seen.has(id)) continue;
         seen.add(id);
         if (isExcludedModelId(id)) continue;

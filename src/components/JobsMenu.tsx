@@ -23,6 +23,7 @@ import { cn } from "@/lib/cn";
 import { COMPACT_BUBBLE } from "@/lib/compact-chip";
 import { api, useStore } from "@/state/store";
 import { POPOVER_VIEWPORT_MARGIN } from "./ui/Popover";
+import { workPillLabel } from "../../shared/helpers";
 import {
   formatJobDuration,
   isJobActive,
@@ -192,11 +193,18 @@ function useNow(jobs: readonly JobSnapshot[], live: boolean, fixed?: number): nu
  *  not re-run on every store update. */
 const NO_JOBS: readonly JobSnapshot[] = [];
 
-export function JobsMenu({ threadId, room = false }: { threadId: string; room?: boolean }) {
+export function JobsMenu({ threadId, room = false, helperCount = 0 }: { threadId: string; room?: boolean; helperCount?: number }) {
   const { state } = useStore();
   const botNames: Record<string, string> = {};
   if (room) for (const bot of state.bots) botNames[bot.id] = bot.name;
-  return <JobsMenuView threadId={threadId} jobs={state.jobsByThread[threadId] ?? NO_JOBS} botNames={room ? botNames : undefined} />;
+  return (
+    <JobsMenuView
+      threadId={threadId}
+      jobs={state.jobsByThread[threadId] ?? NO_JOBS}
+      botNames={room ? botNames : undefined}
+      helperCount={helperCount}
+    />
+  );
 }
 
 interface OutputState {
@@ -213,6 +221,8 @@ export interface JobsMenuViewProps {
   jobs: readonly JobSnapshot[];
   /** In a room, each row names the member whose job it is. */
   botNames?: Record<string, string>;
+  /** Helpers still running in this thread.  The pill counts them beside jobs. */
+  helperCount?: number;
   /** Tests: a fixed clock, a dropdown already open, an output sheet shown. */
   now?: number;
   defaultOpen?: boolean;
@@ -223,7 +233,7 @@ export interface JobsMenuViewProps {
 /** How much of the log View Output shows: the route's default. */
 const OUTPUT_LIMIT_LABEL = "64 KB";
 
-export function JobsMenuView({ threadId, jobs, botNames, now: fixedNow, defaultOpen = false, initialOutput, initialStopError }: JobsMenuViewProps) {
+export function JobsMenuView({ threadId, jobs, botNames, helperCount = 0, now: fixedNow, defaultOpen = false, initialOutput, initialStopError }: JobsMenuViewProps) {
   const [open, setOpen] = useState(defaultOpen);
   const [output, setOutput] = useState<OutputState | null>(initialOutput ?? null);
   /** Stops asked for that no frame has confirmed yet. */
@@ -359,11 +369,15 @@ export function JobsMenuView({ threadId, jobs, botNames, now: fixedNow, defaultO
     }
   }, [shown, threadId]);
 
-  if (shown.length === 0) return null;
-  const tone = jobsPillTone(shown, now);
-  const label = jobsPillLabel(shown);
-  const description = jobsPillDescription(shown, now);
-  const count = jobsPillCount(shown);
+  const helpers = Math.max(0, helperCount);
+  if (shown.length === 0 && helpers === 0) return null;
+  const jobCount = shown.length === 0 ? 0 : jobsPillCount(shown);
+  const tone = helpers > 0 && jobsPillTone(shown, now) !== "failed" ? "running" : jobsPillTone(shown, now);
+  const label = workPillLabel(jobCount, helpers);
+  const helperWords = helpers > 0 ? `${helpers} ${helpers === 1 ? "helper" : "helpers"} running` : "";
+  const description = [shown.length > 0 ? jobsPillDescription(shown, now) : "", helperWords].filter(Boolean).join(", ");
+  const count = jobCount + helpers;
+  const pillName = shown.length > 0 ? `Background Jobs: ${description}` : `Helpers: ${description}`;
   const anyRunning = shown.some((job) => job.status === "running");
   const viewed = output ? (shown.find((job) => job.id === output.jobId) ?? jobs.find((job) => job.id === output.jobId)) : undefined;
   const isStopping = (job: JobSnapshot) => job.status === "stopping" || (job.status === "running" && stopping.has(job.id));
@@ -373,11 +387,15 @@ export function JobsMenuView({ threadId, jobs, botNames, now: fixedNow, defaultO
       <button
         ref={pillRef}
         type="button"
-        onClick={() => (open ? close(false) : setOpen(true))}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-label={`Background Jobs: ${description}`}
-        title={`Background Jobs: ${description}`}
+        onClick={() => {
+          if (shown.length === 0) return;
+          if (open) close(false);
+          else setOpen(true);
+        }}
+        aria-haspopup={shown.length > 0 ? "dialog" : undefined}
+        aria-expanded={shown.length > 0 ? open : undefined}
+        aria-label={pillName}
+        title={pillName}
         data-testid="jobs-pill"
         className={cn(
           "relative flex items-center gap-1.5 rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink",
@@ -400,7 +418,7 @@ export function JobsMenuView({ threadId, jobs, botNames, now: fixedNow, defaultO
         </span>
       </button>
 
-      {open && (
+      {open && shown.length > 0 && (
         <div
           ref={panelRef}
           role="dialog"

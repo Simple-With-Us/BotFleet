@@ -555,6 +555,21 @@ describe("failed turns become Issues", () => {
     expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
   });
 
+  it("breadcrumbs MiniMax Code lock contention instead of paging an Issue", () => {
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "mcodeAgent" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "runtime.error",
+        provider: "mcodeAgent",
+        message: "MiniMax Code Runtime failed: Lock file is already being held",
+      }),
+      sink,
+    );
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.some((b) => b.message.includes("Lock file is already being held"))).toBe(true);
+  });
+
   it("does not Issue an rpc_error completion after an ACP init-timeout breadcrumb", () => {
     // An ACP "initialize timed out" is breadcrumbed as expected, then the
     // turn completes as a generic rpc_error — that completion must not page

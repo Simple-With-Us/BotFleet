@@ -309,6 +309,17 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "delegation-card") {
+  // Visual-spec harness (tests/e2e/delegation-card.visual.spec.ts): bot-to-bot
+  // delegation card with the live progress row.
+  void import("./components/DelegationCardVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "sign-in-card") {
   // Visual-spec harness (tests/e2e/sign-in-card.visual.spec.ts): the Sign in
   // needed card, open, with a persistent error, and after Done.
