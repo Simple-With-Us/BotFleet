@@ -8,7 +8,7 @@
 
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 
 import { normalizeAnnouncedCommands, normalizeEngineCommandName } from "./engine-commands.ts";
 
