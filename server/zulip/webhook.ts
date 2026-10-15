@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { z } from "zod";
 
 import type { DeferredAdmissionRoute } from "../webhook-ingress.ts";
 import type { ZulipHub } from "./hub.ts";
@@ -8,7 +9,7 @@ const TOKEN_MAX = 512;
 const MAX_ACTIVE_REQUESTS = 64;
 const BODY_DEADLINE_MS = 5_000;
 
-function respond(res: ServerResponse, status: number, body: Record<string, unknown>): void {
+function respond(res: ServerResponse, status: number, body: { error: string } | { response_not_required: true }): void {
   res.writeHead(status, {
     "content-type": "application/json",
     "cache-control": "no-store",
@@ -28,7 +29,7 @@ function readBody(req: IncomingMessage): Promise<string> {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      reject(Object.assign(new Error("invalid request body"), { status }));
+      reject(new WebhookBodyError(status));
     };
     req.on("data", (chunk: Buffer | string) => {
       if (done) return;
@@ -48,11 +49,27 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+class WebhookBodyError extends Error {
+  readonly status: number;
+  constructor(status: number) {
+    super("invalid request body");
+    this.status = status;
+  }
+}
+
+const outgoingWebhookPayload = z.object({
+  token: z.string().min(1).max(TOKEN_MAX),
+  bot_email: z.string().max(320),
+  message: z.object({ id: z.number().int().safe().positive() }).passthrough(),
+}).passthrough();
+
 /** Zulip's native outgoing hook is only a wake hint.  The body text is
  *  deliberately discarded; the hub fetches the message using the bound
  *  bot's REST key before routing it. */
+export type OutgoingWebhookHub = Pick<ZulipHub, "outgoingWebhookAvailability" | "authorizeOutgoingWebhook" | "enqueueOutgoingWebhook">;
+
 export function createZulipOutgoingWebhookRoute(
-  getHub: () => ZulipHub | undefined,
+  getHub: () => OutgoingWebhookHub | undefined,
   beginAdmission: () => (() => void) | null,
 ): DeferredAdmissionRoute {
   let activeRequests = 0;
@@ -88,35 +105,31 @@ export function createZulipOutgoingWebhookRoute(
       activeRequests += 1;
 
       try {
-        let payload: unknown;
+        let rawBody: string;
         try {
-          payload = JSON.parse(await readBody(req));
+          rawBody = await readBody(req);
         } catch (error) {
-          const status = (error as { status?: unknown } | null)?.status;
-          return respond(res, typeof status === "number" ? status : 400, { error: "Invalid webhook payload" });
+          const status = error instanceof WebhookBodyError ? error.status : 400;
+          return respond(res, status, { error: "Invalid webhook payload" });
         }
-        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        let json: unknown;
+        try {
+          json = JSON.parse(rawBody);
+        } catch {
           return respond(res, 400, { error: "Invalid webhook payload" });
         }
-        const body = payload as Record<string, unknown>;
-        const token = body.token;
-        const email = body.bot_email;
-        const message = body.message;
-        const messageId = message && typeof message === "object" && !Array.isArray(message)
-          ? (message as Record<string, unknown>).id
-          : undefined;
-        if (typeof token !== "string" || !token || token.length > TOKEN_MAX ||
-            typeof email !== "string" || email.length > 320 ||
-            !Number.isSafeInteger(messageId) || (messageId as number) <= 0) {
+        const parsed = outgoingWebhookPayload.safeParse(json);
+        if (!parsed.success) {
           return respond(res, 400, { error: "Invalid webhook payload" });
         }
+        const { token, bot_email: email, message: { id: messageId } } = parsed.data;
         const auth = hub.authorizeOutgoingWebhook(match[1]!, email, token);
         if (auth !== "ok") return respond(res, auth === "unknown" ? 404 : auth === "unavailable" ? 503 : 401,
           { error: auth === "unauthorized" ? "Invalid webhook credentials" : "Webhook identity is not ready" });
         const release = beginAdmission();
         if (!release) return respond(res, 503, { error: "BotFleet is quiescing for an update" });
         try {
-          const accepted = hub.enqueueOutgoingWebhook(match[1]!, messageId as number);
+          const accepted = hub.enqueueOutgoingWebhook(match[1]!, messageId);
           if (accepted === "unknown") return respond(res, 404, { error: "Unknown webhook endpoint" });
           if (accepted === "unavailable") return respond(res, 503, { error: "Webhook identity is not ready" });
           return respond(res, 200, { response_not_required: true });

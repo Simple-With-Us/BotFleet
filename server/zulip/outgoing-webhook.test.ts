@@ -1,15 +1,22 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 
-import type { ZulipHub } from "./hub.ts";
 import { supportsDirectoryFsync, ZulipOutgoingSpool } from "./outgoing-spool.ts";
-import { createZulipOutgoingWebhookRoute } from "./webhook.ts";
+import { createZulipOutgoingWebhookRoute, type OutgoingWebhookHub } from "./webhook.ts";
 
 const dirs: string[] = [];
 const servers: Server[] = [];
+function portOf(address: AddressInfo | string | null): number {
+  const parsed = z.object({ port: z.number() }).passthrough().safeParse(address);
+  if (!parsed.success) throw new Error("missing test server address");
+  return parsed.data.port;
+}
+
 function tempDir(): string {
   const path = mkdtempSync(join(tmpdir(), "bf-zulip-outgoing-"));
   dirs.push(path);
@@ -55,21 +62,20 @@ describe("Zulip outgoing webhook receiver", () => {
         accepted.push({ role, id });
         return accepted.length === 1 ? "accepted" : "duplicate";
       },
-    } as unknown as ZulipHub;
+    } satisfies OutgoingWebhookHub;
     const route = createZulipOutgoingWebhookRoute(() => fake, () => () => {});
     const server = createServer((req, res) => void route.handler(req, res));
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("missing test server address");
-    const url = `http://127.0.0.1:${address.port}/zulip/outgoing/BF-PLUMBER`;
+    const port = portOf(server.address());
+    const url = `http://127.0.0.1:${port}/zulip/outgoing/BF-PLUMBER`;
     const payload = {
       token: "secret-token",
       bot_email: "plumber@zulip.test",
       trigger: "mention",
       message: { id: 42, content: "untrusted webhook text must not be routed" },
     };
-    const send = (body: unknown) => fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const send = (body: typeof payload) => fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
     expect((await send({ ...payload, token: "wrong" })).status).toBe(401);
     expect((await send({ ...payload, bot_email: "other@zulip.test" })).status).toBe(401);
@@ -89,14 +95,13 @@ describe("Zulip outgoing webhook receiver", () => {
       outgoingWebhookAvailability: () => "ready",
       authorizeOutgoingWebhook: () => "ok",
       enqueueOutgoingWebhook: () => "accepted",
-    } as unknown as ZulipHub;
+    } satisfies OutgoingWebhookHub;
     const route = createZulipOutgoingWebhookRoute(() => fake, () => { admissions += 1; return () => {}; });
     const server = createServer((req, res) => void route.handler(req, res));
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("missing test server address");
-    const url = `http://127.0.0.1:${address.port}/zulip/outgoing/BF-PLUMBER`;
+    const port = portOf(server.address());
+    const url = `http://127.0.0.1:${port}/zulip/outgoing/BF-PLUMBER`;
     const malformed = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{" });
     expect(malformed.status).toBe(400);
     const large = await fetch(url, {
@@ -117,15 +122,14 @@ describe("Zulip outgoing webhook receiver", () => {
       outgoingWebhookAvailability: () => "ready",
       authorizeOutgoingWebhook: () => "ok",
       enqueueOutgoingWebhook: () => "accepted",
-    } as unknown as ZulipHub;
+    } satisfies OutgoingWebhookHub;
     const route = createZulipOutgoingWebhookRoute(() => fake, () => () => {});
     const server = createServer((req, res) => void route.handler(req, res));
     servers.push(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("missing test server address");
+    const port = portOf(server.address());
     const response = await new Promise<number>((resolve, reject) => {
-      const req = request({ hostname: "127.0.0.1", port: address.port, path: "/zulip/outgoing/BF-PLUMBER", method: "POST", headers: { "content-type": "application/json" } }, (res) => {
+      const req = request({ hostname: "127.0.0.1", port, path: "/zulip/outgoing/BF-PLUMBER", method: "POST", headers: { "content-type": "application/json" } }, (res) => {
         res.resume();
         res.on("end", () => { req.destroy(); resolve(res.statusCode ?? 0); });
       });

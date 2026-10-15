@@ -171,6 +171,7 @@ describe("outgoing webhook convergence", () => {
       id: highWebhookId, sender_id: JAY, sender_email: "jay@zulip.test", sender_full_name: "Jay Wedgeworth",
       client: "website", type: "stream", display_recipient: "builds", subject: "Webhook cursor",
       stream_id: 7, content: "@**BF-Plumber** higher id", timestamp: fake.clock, flags: ["mentioned"],
+    // SAFETY: `higher` supplies every required message field, and this test only varies its known fixture values.
     } as ZulipMessage;
 
     busy.add("bot-plumber");

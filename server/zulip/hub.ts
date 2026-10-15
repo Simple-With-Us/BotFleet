@@ -1126,7 +1126,7 @@ export class ZulipHub {
         this.outgoingRetry.delete(key);
         return;
       } catch (error) {
-        const status = (error as { status?: unknown } | null)?.status;
+        const status = statusOf(error);
         // A missing or explicitly inaccessible message can never be routed;
         // authentication and rate-limit failures remain durable for retry.
         if (status === 403 || status === 404) {

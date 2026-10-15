@@ -3,12 +3,14 @@
 // Zulip through that bot's authenticated REST client before it is routed.
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 
 import { writeFileAtomic } from "../atomic.ts";
 
 export const ZULIP_OUTGOING_MAX_PENDING = 10_000;
 const BOT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/;
 const FILE_NAME = /^([A-Za-z0-9][A-Za-z0-9_-]{0,95})-(\d{1,20})\.json$/;
+const spoolItemSchema = z.object({ botId: z.string(), messageId: z.number().int().safe() });
 
 export function supportsDirectoryFsync(platform: NodeJS.Platform = process.platform): boolean {
   return platform !== "win32";
@@ -76,7 +78,7 @@ export class ZulipOutgoingSpool {
     try {
       unlinkSync(path);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
       throw error;
     }
     this.fsyncDirectory();
@@ -84,10 +86,9 @@ export class ZulipOutgoingSpool {
 
   private valid(path: string, expected: ZulipOutgoingSpoolItem): boolean {
     try {
-      const row = JSON.parse(readFileSync(path, "utf8")) as unknown;
-      return typeof row === "object" && row !== null &&
-        (row as ZulipOutgoingSpoolItem).botId === expected.botId &&
-        (row as ZulipOutgoingSpoolItem).messageId === expected.messageId;
+      const parsed = spoolItemSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
+      return parsed.success && parsed.data.botId === expected.botId &&
+        parsed.data.messageId === expected.messageId;
     } catch {
       return false;
     }
