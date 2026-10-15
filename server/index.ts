@@ -1299,7 +1299,6 @@ function enforceTurnCapabilityGate(input: {
       computers: computersForCapabilityGate(input.bot, input.runOn),
       runOn: input.runOn,
       routineNeeds: input.routineNeeds,
-      hostShellGranted: hostCtx.hostShellGranted,
       ignorePromptImageMarkers: input.ignorePromptImageMarkers,
     },
     hostCtx,

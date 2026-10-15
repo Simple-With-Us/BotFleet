@@ -137,7 +137,6 @@ export interface RequiredForInput {
   routineNeeds?: TaskClass[];
   skillCaps?: string[];
   runOn?: "bot" | "cloud";
-  hostShellGranted?: boolean;
   /** Routine prompts may echo user markup; do not treat that as an image turn. */
   ignorePromptImageMarkers?: boolean;
 }
