@@ -229,6 +229,7 @@ function parseNetworkAllow(value: unknown): string[] | null {
   return entries;
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- IPC parent messages are untyped; every field is validated before use.
 function parseParentMessage(raw: unknown): ParentToChildMessage | null {
   if (!isPlainObject(raw) || typeof raw.type !== "string") return null;
   if (raw.type === "load") {

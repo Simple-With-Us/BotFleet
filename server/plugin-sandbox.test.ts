@@ -50,7 +50,7 @@ function listing(
   needs?: PluginListing["needs"],
   sourcePath = "<test>",
 ): PluginListing {
-  return {
+  const base: PluginListing = {
     name,
     version: "1.0.0",
     description: "sandbox test plugin",
@@ -62,8 +62,9 @@ function listing(
     source: { kind: "folder", path: sourcePath },
     warnings: [],
     capabilities,
-    ...(needs ? { needs } : {}),
   };
+  if (needs) return { ...base, needs };
+  return base;
 }
 
 function writePlugin(name: string, source: string): void {
@@ -246,7 +247,7 @@ async function listenLocal(onHit: () => void): Promise<{ server: Server; port: n
     server.listen(0, "127.0.0.1", () => resolve());
   });
   const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("test server has no port");
+  if (address === null || !("port" in address)) throw new Error("test server has no port");
   return { server, port: address.port };
 }
 
