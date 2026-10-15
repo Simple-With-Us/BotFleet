@@ -31,6 +31,7 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "autoReview",
   "approvePeerComms",
   "bypassPermissions",
+  "bypassLocalComputer",
   "off",
 ] as const;
 

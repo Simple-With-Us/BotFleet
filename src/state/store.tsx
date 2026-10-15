@@ -373,6 +373,8 @@ export interface Bot {
   autoApprove?: boolean;
   /** permission bypass mode: automatically approve all tools, commands, and routines without halting */
   bypassPermissions?: boolean;
+  /** bypass mode extended to the requests that control this Mac; means nothing without bypassPermissions */
+  bypassLocalComputer?: boolean;
   /** optional model review for otherwise undecided, attended approvals */
   autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */

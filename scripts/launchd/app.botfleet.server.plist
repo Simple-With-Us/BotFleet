@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  app.botfleet.server — the always-on BotFleet harness.
+
+  Install to ~/Library/LaunchAgents/app.botfleet.server.plist, then
+      launchctl bootout gui/$(id -u)/app.botfleet.server
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/app.botfleet.server.plist
+
+  Kept in the repo so the always-on config is reviewable and restorable
+  rather than living only on one Mac.  It tracks the deployed copy.
+
+  StartInterval is the whole point of this file's presence in git.
+  Without it the agent is NOT a watchdog: KeepAlive.SuccessfulExit=false
+  restarts the harness only after it dies unsuccessfully, so a clean
+  SIGTERM leaves the Mac with no harness and nothing to bring it back.
+  That is reachable in normal use — the desktop app forks its own harness
+  when nothing answers on 8799, and kills that fork on quit, which is a
+  clean exit.  launchd then does nothing, the harness stays gone, and
+  every paired phone fails to send.
+
+  With StartInterval the agent is invoked periodically, and
+  scripts/botfleet-server-start.sh already does the right thing on that
+  path: it probes :8799 and, when healthy, logs and exits 0 without
+  starting a second harness.  So the periodic run is a cheap health
+  check, not a restart loop, and the two settings compose safely.
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/jay</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/jay/.grok/bin:/Users/jay/.local/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>Label</key>
+	<string>app.botfleet.server</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/jay/apps/botfleet-server-start.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Five minutes. Long enough that a healthy probe is nothing, short
+	     enough that a phone paired to this Mac is never left talking to
+	     nothing for long. -->
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>StandardErrorPath</key>
+	<string>/Users/jay/Library/Logs/botfleet/server.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/jay/Library/Logs/botfleet/server.log</string>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/jay/apps/botfleet-server</string>
+</dict>
+</plist>

@@ -48,6 +48,8 @@ struct AgentProfileView: View {
     @State private var autoReview: AutoReviewMode
     @State private var approvePeerComms: Bool
     @State private var bypassPermissions: Bool
+    @State private var bypassLocalComputer: Bool
+    @State private var confirmingLocalBypass = false
     @State private var confirmingBypass = false
     @State private var baseline: ProfileFormSnapshot
     /// Set while the Delete Bot confirmation is up.
@@ -78,6 +80,7 @@ struct AgentProfileView: View {
         _autoReview = State(initialValue: AutoReviewMode(stored: bot.autoReview))
         _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
         _bypassPermissions = State(initialValue: bot.bypassPermissions ?? false)
+        _bypassLocalComputer = State(initialValue: bot.bypassLocalComputer ?? false)
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
     }
 
@@ -454,6 +457,11 @@ struct AgentProfileView: View {
                 model: modelId,
                 confirm: { bypassPermissions = true }
             ))
+            .modifier(LocalBypassConfirmation(
+                isPresented: $confirmingLocalBypass,
+                botName: current.name,
+                confirm: { bypassLocalComputer = true }
+            ))
             .modifier(DeleteChatAlert(target: $deleteTarget, roomTerm: "", onConfirm: { _ in
                 Task { await deleteBot() }
             }))
@@ -621,6 +629,7 @@ struct AgentProfileView: View {
             autoReview: autoReview == baseline.autoReview ? nil : autoReview,
             approvePeerComms: approvePeerComms == baseline.approvePeerComms ? nil : approvePeerComms,
             bypassPermissions: bypassPermissions == baseline.bypassPermissions ? nil : bypassPermissions,
+            bypassLocalComputer: bypassLocalComputer == baseline.bypassLocalComputer ? nil : bypassLocalComputer,
             // The bot as it is now, with only the person's two switches applied,
             // so This Mac is never part of what this phone asks to change.
             computers: BotComputers.updated(
@@ -708,16 +717,49 @@ struct AgentProfileView: View {
     private var bypassPermissionsSection: some View {
         Section {
             Toggle("Bypass Permissions", isOn: bypassBinding)
+            if mayTurnOnLocalBypass {
+                Toggle("Bypass Including This Mac", isOn: localBypassBinding)
+            } else {
+                Label(BotExecutionPolicy.localBypassNeedsBypass, systemImage: "lock")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
         } header: {
             Text("Bypass Permissions")
         } footer: {
             VStack(alignment: .leading, spacing: 8) {
                 Text(BotExecutionPolicy.bypassSummary(isOn: bypassPermissions))
+                if mayTurnOnLocalBypass {
+                    Text(BotExecutionPolicy.localBypassSummary(isOn: bypassLocalComputer))
+                }
                 if let note = BypassCoverage(engine: policyEngine).note {
                     Text(note)
                 }
             }
         }
+    }
+
+    /// The second switch is the Mac's to turn on for a bot that holds This
+    /// Mac, so the phone offers a line that says so rather than a control that
+    /// would come back 403.
+    private var mayTurnOnLocalBypass: Bool {
+        BotExecutionPolicy.mayTurnOnLocalBypass(computers: current.computers)
+    }
+
+    /// Switching on asks first, and does nothing at all while Bypass itself is
+    /// off — otherwise it would be a switch over nothing.
+    private var localBypassBinding: Binding<Bool> {
+        Binding(
+            get: { bypassLocalComputer },
+            set: { wantsOn in
+                guard bypassPermissions else { return }
+                if wantsOn {
+                    confirmingLocalBypass = true
+                } else {
+                    bypassLocalComputer = false
+                }
+            }
+        )
     }
 
     /// Switching on asks first; the toggle stays where it was until the person
@@ -1124,6 +1166,8 @@ struct AgentProfileView: View {
         baseline.approvePeerComms = approvePeerComms
         bypassPermissions = held.bypassPermissions ?? false
         baseline.bypassPermissions = bypassPermissions
+        bypassLocalComputer = held.bypassLocalComputer ?? false
+        baseline.bypassLocalComputer = bypassLocalComputer
     }
 
     /// The same save for a computer that predates per-device voices and so
@@ -1285,6 +1329,7 @@ struct AgentProfileView: View {
         autoReview = AutoReviewMode(stored: bot.autoReview)
         approvePeerComms = bot.approvePeerComms ?? false
         bypassPermissions = bot.bypassPermissions ?? false
+        bypassLocalComputer = bot.bypassLocalComputer ?? false
         baseline = ProfileFormSnapshot(bot: bot)
     }
 }
@@ -1313,6 +1358,24 @@ private struct BypassConfirmation: ViewModifier {
     }
 }
 
+/// The second switch is the same kind of decision as the first, one step
+/// further: it gives up the asking for the person's real machine.  It asks
+/// before it takes effect, and turning it back off does not.
+private struct LocalBypassConfirmation: ViewModifier {
+    @Binding var isPresented: Bool
+    let botName: String
+    let confirm: () -> Void
+
+    func body(content: Content) -> some View {
+        content.alert(BotExecutionPolicy.localBypassTitle, isPresented: $isPresented) {
+            Button("Cancel", role: .cancel) {}
+            Button(BotExecutionPolicy.localBypassConfirmButton, role: .destructive, action: confirm)
+        } message: {
+            Text(BotExecutionPolicy.localBypassWarning(botName: botName))
+        }
+    }
+}
+
 private struct ProfileFormSnapshot {
     var name: String
     var title: String
@@ -1332,6 +1395,7 @@ private struct ProfileFormSnapshot {
     var autoReview: AutoReviewMode
     var approvePeerComms: Bool
     var bypassPermissions: Bool
+    var bypassLocalComputer: Bool
 
     init(bot: Bot) {
         name = bot.name
@@ -1351,6 +1415,7 @@ private struct ProfileFormSnapshot {
         autoReview = AutoReviewMode(stored: bot.autoReview)
         approvePeerComms = bot.approvePeerComms ?? false
         bypassPermissions = bot.bypassPermissions ?? false
+        bypassLocalComputer = bot.bypassLocalComputer ?? false
     }
 }
 

@@ -29,6 +29,7 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "approvePeerComms",
   "autoApprove",
   "bypassPermissions",
+  "bypassLocalComputer",
   "autoReview",
   "composio",
   "off",
@@ -142,6 +143,12 @@ const profilePatchSchema = z.object({
   approvePeerComms: z.boolean({ error: "approvePeerComms must be true or false" }).optional(),
   autoApprove: z.boolean({ error: "autoApprove must be true or false" }).optional(),
   bypassPermissions: z.boolean({ error: "bypassPermissions must be true or false" }).optional(),
+  // Owner's second switch, 2026-10-14.  Bypass alone deliberately stops at the
+  // edge of the person's real desktop, which made it *weaker* than Auto Mode,
+  // since Auto already answers those requests.  This is the named, opt-in way
+  // to say so, so the default boundary keeps standing rather than being
+  // quietly removed.  It means nothing without `bypassPermissions`.
+  bypassLocalComputer: z.boolean({ error: "bypassLocalComputer must be true or false" }).optional(),
   autoReview: z.enum(["off", "shadow", "enforce"], { error: "autoReview must be off, shadow, or enforce" }).optional(),
   composio: z.boolean({ error: "composio must be true or false" }).optional(),
   // The bot's On/Off switch (shared/bot-power.ts).  Writable from a paired
@@ -181,6 +188,7 @@ export type BotProfilePatch = Partial<
     | "approvePeerComms"
     | "autoApprove"
     | "bypassPermissions"
+    | "bypassLocalComputer"
     | "autoReview"
     | "composio"
     | "off"
@@ -207,9 +215,11 @@ export type BotProfilePatchResult =
  * The execution-policy fields (`autoApprove`, `autoReview`,
  * `approvePeerComms`, `bypassPermissions`) pass in both modes since the
  * owner's 2026-10-09 ruling that a paired phone may set them.  Validating the
- * VALUE is all this file does; whether a particular bot may have Auto or
- * Bypass switched on from a phone (never when it can use This Mac) is decided
- * where the stored bot is, in the profile route of server/index.ts.
+ * VALUE is all this file does.  Which switches a particular bot may have
+ * turned on from a phone is decided where the stored bot is, in the profile
+ * route of server/index.ts:  Auto Mode never for a bot that can use This Mac,
+ * and `bypassLocalComputer` follows Auto rather than plain Bypass, because
+ * both name the same act — unattended control of the real desktop.
  *
  * avatarUrl deliberately uses `undefined` as the normalized clear value.
  * Store persistence already omits undefined fields, while wireBot sends null
