@@ -8,12 +8,64 @@
 // declared capabilities, and the titles of any cards or commands it
 // contributes from its manifest — text summaries only, the host does
 // not render plugin-supplied UI here.
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowUpCircle, Loader2, Power, PowerOff, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowUpCircle,
+  ExternalLink,
+  FolderOpen,
+  Loader2,
+  Power,
+  PowerOff,
+  RefreshCw,
+  Trash2,
+  TriangleAlert,
+  UploadCloud,
+  X,
+} from "lucide-react";
 
 import { cn } from "@/lib/cn";
+import { railAsideClass } from "@/lib/layout-rails";
+import {
+  PLUGINS_HELP_URL,
+  folderPluginRevealPath,
+  gitPluginBrowseUrl,
+  installSourceFromDrop,
+} from "@/lib/plugin-manager-ui";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { PluginsResponseSchema, type PluginListing, type PluginsResponse } from "../../server/plugin-types";
+import {
+  PluginsResponseSchema,
+  type PluginListing,
+  type PluginListingSource,
+  type PluginsResponse,
+} from "../../server/plugin-types";
+
+async function openExternalUrl(url: string): Promise<void> {
+  if (window.ogb?.openExternal) {
+    await window.ogb.openExternal(url);
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+async function openPluginSource(source: PluginListingSource): Promise<void> {
+  if (source.kind === "folder") {
+    const path = folderPluginRevealPath(source);
+    if (window.ogb?.showInFolder) {
+      await window.ogb.showInFolder(path);
+      return;
+    }
+    if (window.ogb?.openFile) {
+      await window.ogb.openFile(path);
+      return;
+    }
+    throw new Error("Open is only available in the BotFleet desktop app.");
+  }
+  await openExternalUrl(gitPluginBrowseUrl(source));
+}
+
+function pathForDroppedFile(file: File): string {
+  return window.ogb?.getPathForFile?.(file) ?? "";
+}
 
 interface PluginInstallIssue {
   field: string;
@@ -117,14 +169,17 @@ function asObject(value: unknown): ErrorLike {
 /** The view's main surface.  Mounted from App.tsx next to PluginsPanel
  *  (which is the Composio connectors surface, kept untouched). */
 export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
+  const asideRef = useRef<HTMLElement>(null);
   const [plugins, setPlugins] = useState<PluginListing[]>([]);
   const [state, setState] = useState<AsyncState>({ kind: "loading" });
   const [installSource, setInstallSource] = useState("");
   const [installing, setInstalling] = useState(false);
+  const [installDragging, setInstallDragging] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [installIssues, setInstallIssues] = useState<PluginInstallIssue[]>([]);
   const [busyName, setBusyName] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<PluginListing | null>(null);
+  const [openError, setOpenError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setState({ kind: "loading" });
@@ -149,33 +204,70 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    if (!onClose) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  const runInstall = useCallback(
+    async (source: string) => {
+      const trimmed = source.trim();
+      if (!trimmed) return;
+      setInstalling(true);
+      setInstallError(null);
+      setInstallIssues([]);
+      try {
+        const response = await fetch("/api/plugins/install", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ source: trimmed }),
+        });
+        if (!response.ok) {
+          const parsed = await readApiError(response);
+          const message = parsed?.error || `install failed (${response.status})`;
+          const issues = parsed?.issues ?? [];
+          setInstallError(message);
+          setInstallIssues(issues);
+          return;
+        }
+        setInstallSource("");
+        await refresh();
+      } catch (error) {
+        setInstallError(errorMessage(asObject(error)));
+        setInstallIssues([]);
+      } finally {
+        setInstalling(false);
+      }
+    },
+    [refresh],
+  );
+
   const handleInstall = useCallback(async () => {
-    setInstalling(true);
-    setInstallError(null);
-    setInstallIssues([]);
-    try {
-      const response = await fetch("/api/plugins/install", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ source: installSource }),
-      });
-      if (!response.ok) {
-        const parsed = await readApiError(response);
-        const message = parsed?.error || `install failed (${response.status})`;
-        const issues = parsed?.issues ?? [];
-        setInstallError(message);
-        setInstallIssues(issues);
+    await runInstall(installSource);
+  }, [installSource, runInstall]);
+
+  const handleInstallDrop = useCallback(
+    async (files: FileList | readonly File[]) => {
+      const path = installSourceFromDrop(files, pathForDroppedFile);
+      if (!path) {
+        setInstallError(
+          "Drop a plugin folder from Finder or Explorer, or paste a folder path or Git URL above.",
+        );
+        setInstallIssues([]);
         return;
       }
-      setInstallSource("");
-      await refresh();
-    } catch (error) {
-      setInstallError(errorMessage(asObject(error)));
-      setInstallIssues([]);
-    } finally {
-      setInstalling(false);
-    }
-  }, [installSource, refresh]);
+      setInstallSource(path);
+      await runInstall(path);
+    },
+    [runInstall],
+  );
 
   const callAction = useCallback(
     async (name: string, action: "enable" | "disable" | "update" | "reload") => {
@@ -221,45 +313,94 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
   );
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto bg-app p-6 text-ink">
-      <header className="flex items-center justify-between">
-        <div>
-          <h1 className="text-[20px] font-semibold">Plugins</h1>
-          <p className="text-[13px] text-ink-secondary">
-            Drop-in extensions you can install, enable, and remove without a BotFleet update.{"\u00a0 "}
+    <aside ref={asideRef} className={railAsideClass("w-[400px]")}>
+      <div className="flex items-start justify-between gap-2 border-b border-hairline/40 px-4 py-3">
+        <div className="min-w-0">
+          <h1 className="text-[15px] font-semibold text-ink">Plugins</h1>
+          <p className="mt-0.5 text-[12px] leading-snug text-ink-secondary">
+            Drop-in extensions you can install without a BotFleet update.{"\u00a0 "}
             Imports land disabled until you enable them.
           </p>
         </div>
-        {onClose ? (
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-md border border-border bg-panel px-3 py-1.5 text-[13px] hover:bg-raised"
+        <div className="flex shrink-0 items-center gap-0.5">
+          <a
+            href={PLUGINS_HELP_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(event) => {
+              event.preventDefault();
+              void openExternalUrl(PLUGINS_HELP_URL);
+            }}
+            className="rounded-md p-1.5 text-ink-secondary hover:bg-raised hover:text-ink"
+            title="Plugin Help"
+            aria-label="Plugin Help"
           >
-            Close
-          </button>
-        ) : null}
-      </header>
+            <ExternalLink size={16} aria-hidden="true" />
+          </a>
+          {onClose ? (
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close Plugins"
+              title="Close Plugins"
+              className="rounded-md p-1.5 text-ink-secondary hover:bg-raised hover:text-ink"
+            >
+              <X size={18} />
+            </button>
+          ) : null}
+        </div>
+      </div>
 
-      <section className="rounded-lg border border-border bg-panel p-4">
-        <h2 className="mb-2 text-[14px] font-medium">Install Plugin</h2>
-        <p className="mb-3 text-[12px] text-ink-secondary">
-          Paste a folder path on this computer, a GitHub repository (<code className="rounded bg-raised px-1">owner/repo</code>),
-          or a full URL.{"\u00a0 "}
-          The plugin is downloaded and validated against the manifest schema before anything is written.
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4 text-ink">
+      {openError ? (
+        <div role="alert" className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+          {openError}
+        </div>
+      ) : null}
+
+      <section className="rounded-lg border border-border bg-panel p-3">
+        <h2 className="mb-2 text-[13px] font-medium">Install Plugin</h2>
+        <div
+          onDragEnter={(event) => {
+            event.preventDefault();
+            setInstallDragging(true);
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+          }}
+          onDragLeave={() => setInstallDragging(false)}
+          onDrop={(event) => {
+            event.preventDefault();
+            setInstallDragging(false);
+            void handleInstallDrop(Array.from(event.dataTransfer.files));
+          }}
+          className={cn(
+            "mb-3 flex flex-col items-center rounded-xl border border-dashed px-3 py-4 text-center transition-colors",
+            installDragging ? "border-accent bg-accent/5" : "border-hairline/60 bg-raised/20",
+          )}
+        >
+          <UploadCloud size={22} className="text-accent" aria-hidden="true" />
+          <span className="mt-2 text-[12px] font-medium text-ink">Drop a Plugin Folder</span>
+          <span className="mt-0.5 text-[11px] text-ink-secondary">or paste a path or Git URL below</span>
+        </div>
+        <p className="mb-2 text-[11px] text-ink-secondary">
+          Folder on this computer, GitHub repo (<code className="rounded bg-raised px-1">owner/repo</code>),
+          or full URL.{"\u00a0 "}
+          Validated before install.
         </p>
-        <div className="flex flex-col gap-2 sm:flex-row">
+        <div className="flex flex-col gap-2">
           <input
             type="text"
             value={installSource}
             placeholder="…/my-plugin or acme/widget"
             onChange={(event) => setInstallSource(event.target.value)}
             disabled={installing}
-            className="flex-1 rounded-md border border-border bg-raised px-3 py-2 text-[13px] focus:border-accent focus:outline-none"
+            className="w-full rounded-md border border-border bg-raised px-3 py-2 text-[13px] focus:border-accent focus:outline-none"
           />
           <button
             type="button"
-            onClick={handleInstall}
+            onClick={() => void handleInstall()}
             disabled={installing || !installSource.trim()}
             className="inline-flex items-center justify-center gap-2 rounded-md bg-accent px-4 py-2 text-[13px] font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -286,9 +427,9 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
         ) : null}
       </section>
 
-      <section className="rounded-lg border border-border bg-panel">
-        <header className="flex items-center justify-between border-b border-border px-4 py-3">
-          <h2 className="text-[14px] font-medium">Installed Plugins</h2>
+      <section className="min-h-0 flex-1 rounded-lg border border-border bg-panel">
+        <header className="flex items-center justify-between border-b border-border px-3 py-2.5">
+          <h2 className="text-[13px] font-medium">Installed Plugins</h2>
           <button
             type="button"
             onClick={refresh}
@@ -322,6 +463,12 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
                 onUpdate={() => callAction(plugin.name, "update")}
                 onReload={() => callAction(plugin.name, "reload")}
                 onRemove={() => setConfirmRemove(plugin)}
+                onOpen={() => {
+                  setOpenError(null);
+                  void openPluginSource(plugin.source).catch((error) => {
+                    setOpenError(errorMessage(asObject(error)));
+                  });
+                }}
               />
             ))}
           </ul>
@@ -344,7 +491,8 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
         }}
         onCancel={() => setConfirmRemove(null)}
       />
-    </div>
+      </div>
+    </aside>
   );
 }
 
@@ -356,6 +504,7 @@ function PluginRow({
   onUpdate,
   onReload,
   onRemove,
+  onOpen,
 }: {
   plugin: PluginListing;
   busy: boolean;
@@ -364,6 +513,7 @@ function PluginRow({
   onUpdate: () => void;
   onReload: () => void;
   onRemove: () => void;
+  onOpen: () => void;
 }) {
   const sourceLabel = useMemo(() => {
     if (plugin.source.kind === "folder") return `folder: ${plugin.source.path}`;
@@ -372,9 +522,9 @@ function PluginRow({
   }, [plugin.source]);
 
   return (
-    <li className={cn("px-4 py-4", busy && "opacity-60")}>
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 flex-1">
+    <li className={cn("px-3 py-3", busy && "opacity-60")}>
+      <div className="flex flex-col gap-3">
+        <div className="min-w-0">
           <div className="flex items-baseline gap-2">
             <h3 className="truncate text-[14px] font-medium">{plugin.name}</h3>
             <span className="text-[12px] text-ink-secondary">v{plugin.version}</span>
@@ -412,13 +562,21 @@ function PluginRow({
             </p>
           ) : null}
         </div>
-        <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            type="button"
+            onClick={onOpen}
+            disabled={busy}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-raised px-2.5 py-1.5 text-[12px] hover:bg-app disabled:cursor-not-allowed"
+          >
+            <FolderOpen size={12} /> Open
+          </button>
           {plugin.enabled ? (
             <button
               type="button"
               onClick={onDisable}
               disabled={busy}
-              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-raised px-3 py-1.5 text-[12px] hover:bg-app disabled:cursor-not-allowed"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-raised px-2.5 py-1.5 text-[12px] hover:bg-app disabled:cursor-not-allowed"
             >
               <PowerOff size={12} /> Disable
             </button>
@@ -427,7 +585,7 @@ function PluginRow({
               type="button"
               onClick={onEnable}
               disabled={busy}
-              className="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent/10 px-3 py-1.5 text-[12px] text-accent hover:bg-accent/15 disabled:cursor-not-allowed"
+              className="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent/10 px-2.5 py-1.5 text-[12px] text-accent hover:bg-accent/15 disabled:cursor-not-allowed"
             >
               <Power size={12} /> Enable
             </button>
@@ -436,7 +594,7 @@ function PluginRow({
             type="button"
             onClick={onUpdate}
             disabled={busy}
-            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-raised px-3 py-1.5 text-[12px] hover:bg-app disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-raised px-2.5 py-1.5 text-[12px] hover:bg-app disabled:cursor-not-allowed"
           >
             <ArrowUpCircle size={12} /> Update
           </button>
@@ -444,7 +602,7 @@ function PluginRow({
             type="button"
             onClick={onReload}
             disabled={busy}
-            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-raised px-3 py-1.5 text-[12px] hover:bg-app disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-1.5 rounded-md border border-border bg-raised px-2.5 py-1.5 text-[12px] hover:bg-app disabled:cursor-not-allowed"
           >
             <RefreshCw size={12} /> Reload
           </button>
@@ -452,7 +610,7 @@ function PluginRow({
             type="button"
             onClick={onRemove}
             disabled={busy}
-            className="inline-flex items-center gap-1.5 rounded-md border border-danger/40 bg-danger/10 px-3 py-1.5 text-[12px] text-danger hover:bg-danger/15 disabled:cursor-not-allowed"
+            className="inline-flex items-center gap-1.5 rounded-md border border-danger/40 bg-danger/10 px-2.5 py-1.5 text-[12px] text-danger hover:bg-danger/15 disabled:cursor-not-allowed"
           >
             <Trash2 size={12} /> Remove
           </button>
