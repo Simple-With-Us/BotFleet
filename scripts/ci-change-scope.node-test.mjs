@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -300,7 +301,10 @@ test("the iOS required gate accepts a skip only when the replay proves no iOS wo
 });
 
 test("the iOS gate keeps changed paths out of workflow-command stdout", () => {
-  const summaryFile = "/tmp/ci-ios-gate-summary.md";
+  // The Windows runner has no /tmp, so a hardcoded path becomes D:\tmp and
+  // the summary write throws ENOENT.  Use the process temp directory.
+  const dir = mkdtempSync(join(tmpdir(), "ci-ios-gate-"));
+  const summaryFile = join(dir, "summary.md");
   try {
     const hostile = runIosGate(["::error::pwned"], {
       DOCS_ONLY: "false",
@@ -314,7 +318,7 @@ test("the iOS gate keeps changed paths out of workflow-command stdout", () => {
     assert.match(summary, /No iOS build ran/);
     assert.match(summary, /- ::error::pwned/);
   } finally {
-    spawnSync("rm", ["-f", summaryFile]);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
