@@ -42,14 +42,10 @@ describe("OpenCode catalog", () => {
       JSON.stringify({ name: "Retired", status: "deprecated" }, null, 2),
     ].join("\n"));
 
-    expect(models?.default).toBe("opencode/x-preview-f-free");
+    // Deprecated Zen slugs stay out of the catalog even when the CLI still lists them.
+    expect(models?.default).toBe("opencode-go/minimax-m3");
     expect(models?.options).toEqual([
       expect.objectContaining({ id: "openrouter/vendor/model-v2", label: "OpenRouter · Vendor Model" }),
-      expect.objectContaining({
-        id: "opencode/x-preview-f-free",
-        label: "Zen · Ox Alpha Free",
-        contextWindow: 1_000_000,
-      }),
       expect.objectContaining({ id: "opencode-go/minimax-m3", label: "Go · MiniMax M3" }),
       expect.objectContaining({ id: "ollama/qwen3", custom: true, loaded: true }),
       expect.objectContaining({ id: "lmstudio/qwen3-ipv6", custom: true, loaded: true }),
@@ -193,6 +189,38 @@ describe("OpenCode catalog", () => {
     }
   });
 
+  it.skipIf(process.platform === "win32")(
+    "does not resurrect a deprecated slug when the plain models list only has retired ids",
+    async () => {
+      const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-deprecated-only-"));
+      const cli = join(scratch, "opencode");
+      writeFileSync(cli, [
+        "#!/bin/sh",
+        'echo "opencode/x-preview-f-free"',
+        'echo "opencode-go/exo-free"',
+        "",
+      ].join("\n"));
+      chmodSync(cli, 0o755);
+      resetOpenCodeModelCache();
+      const driver = createOpenCodeDriver(async () => ({ default: "", options: [] }));
+      try {
+        const instance = await driver.create({
+          instanceId: "opencode-deprecated-fallback",
+          displayName: "OpenCode",
+          environment: {},
+          enabled: true,
+          config: { cli, fullAuto: false },
+        });
+        expect(instance.models.options).toEqual([]);
+        expect(instance.models.default).toBe("");
+        await instance.dispose();
+      } finally {
+        resetOpenCodeModelCache();
+        await removeTempDir(scratch);
+      }
+    },
+  );
+
   it("accepts header-only output from older CLIs and rejects malformed lines", () => {
     const models = parseOpenCodeModelsOutput([
       "Available models",
@@ -202,7 +230,6 @@ describe("OpenCode catalog", () => {
     ].join("\n"));
 
     expect(models?.options.map((option) => option.id)).toEqual([
-      "opencode/x-preview-f-free",
       "openrouter/anthropic/claude-sonnet-5",
     ]);
   });
@@ -212,7 +239,7 @@ describe("OpenCode catalog", () => {
     const driver = createOpenCodeDriver(async () => {
       calls += 1;
       const id = calls === 1
-        ? "opencode/x-preview-f-free"
+        ? "opencode/some-live-free"
         : calls === 2
           ? "opencode-go/extra-two"
           : "openrouter/vendor/extra-three";
@@ -226,7 +253,7 @@ describe("OpenCode catalog", () => {
       config: driver.defaultConfig(),
     });
 
-    expect(instance.models.default).toBe("opencode/x-preview-f-free");
+    expect(instance.models.default).toBe("opencode/some-live-free");
     expect(instance.models.options.some((option) => option.custom)).toBe(false);
     await instance.refreshModels?.();
     expect(instance.models.options.some((option) => option.id === "opencode-go/extra-two" && !option.custom)).toBe(true);

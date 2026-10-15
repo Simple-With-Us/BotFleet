@@ -271,6 +271,10 @@ describe("VoiceSettings personal voice selection guard", () => {
   it("routes add and clone through the select guard", () => {
     const guard = between("const commitVoice", "const commitIphoneVoice");
     const add = between("const handleAddCustomVoice", "const handleDeleteVoice");
+    const stop = between("const stopCloneRecording", "const saveKey");
+    expect(stop).toContain("const stopIntent = cloneRecordIntentRef.current");
+    expect(stop).toContain("if (stopIntent !== cloneRecordIntentRef.current) return");
+
     const clone = between("const handleClone =", "if (!tts) return null");
 
     expect(guard).toContain("personalVoiceAllowedRef.current");
@@ -302,6 +306,12 @@ describe("VoiceSettings personal voice selection guard", () => {
     expect(del).toContain("setPersonalVoiceDenied(false)");
     expect(clone).toContain("commitVoice(result.voiceId)");
     expect(clone).not.toContain("onPatch(");
+    expect(SRC).toContain("startMicRecorder");
+    expect(SRC).toContain("cloneRecordPending");
+    expect(SRC).toContain("cloneRecordIntentRef");
+    expect(SRC).toContain("closeClonePanel");
+    expect(SRC).toContain("cancelActiveCloneRecording");
+    expect(SRC).toContain("Record on This Mac");
     expect(SRC).toContain("commitVoice(e.target.value)");
 
     // The iPhone picker never saves a Personal Voice from this Mac.
