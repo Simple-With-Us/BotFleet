@@ -31,7 +31,7 @@
 // - srcStart/srcEnd are UTF-16 offsets into the source text, end exclusive.
 // - kind is 0 for a copy (spoken text equals the source slice) and 1 for an
 //   insert (literal text the rules wrote in place of the source slice, such as
-//   "(a code block)").
+//   "A code block.").
 // All offsets are JavaScript string indices.  The Swift client converts them
 // with SpeechSpans.stringRange(utf16:_:in:).
 
