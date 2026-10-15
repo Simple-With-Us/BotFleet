@@ -3543,13 +3543,30 @@ describe("harness HTTP API", () => {
         if (queueSuccessor) {
           // The POST must land while the bot is still busy; on windows-latest a
           // fast reload can clear busy between the reload tool frame and here.
-          await expect.poll(async () => {
-            const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
-              (candidate: { id: string }) => candidate.id === bot.id,
-            );
-            return state?.busy;
-          }, { timeout: 15_000, interval: 100 }).toBe(true);
-          expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" }))).toEqual({
+          // Poll for the queued response in one step: wait for busy, POST once,
+          // and stop — never spin on busy alone while the bot is already idle.
+          let successorSend: { status: number; body: any } | undefined;
+          await expect
+            .poll(
+              async () => {
+                if (successorSend?.body?.queued) return true;
+                if (successorSend) return false;
+                const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+                  (candidate: { id: string }) => candidate.id === bot.id,
+                );
+                if (!state?.busy) return false;
+                successorSend = await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" });
+                return successorSend.status === 202 && successorSend.body?.queued === true;
+              },
+              {
+                timeout: winSettleMs(15_000),
+                interval: 100,
+                message:
+                  "queued successor send while the reload-held bot is busy (idle here means the reload window closed early)",
+              },
+            )
+            .toBe(true);
+          expect(successorSend).toEqual({
             status: 202,
             body: expect.objectContaining({ ok: true, queued: true }),
           });
