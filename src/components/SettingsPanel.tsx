@@ -19,6 +19,11 @@ import { BotSkillsPanel } from "./BotSkillsPanel";
 import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
 import { BypassPermissionsWarning } from "./BypassPermissionsWarning";
+import {
+  BYPASS_LOCAL_COMPUTER_WARNING_BODY,
+  BYPASS_LOCAL_COMPUTER_WARNING_TITLE,
+  BypassLocalComputerControl,
+} from "./BypassLocalComputerControl";
 import { evaluateModelRiskForBypass } from "../../shared/model-safety";
 import { bypassCoverageNote } from "../../shared/bypass-coverage";
 import { VoiceSettings } from "./VoiceSettings";
@@ -883,48 +888,12 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                 />
               </button>
             </div>
-            <div className="mt-4 flex items-center justify-between gap-4 border-t border-line pt-4">
-              <div>
-                <div className="text-[15px] font-medium text-ink">
-                  Bypass Including This Mac
-                </div>
-                <div className="mt-0.5 text-[13px] text-ink-secondary">
-                  {bot.bypassLocalComputer
-                    ? "Nothing this bot does on this Mac asks.  Including destructive actions, and including while a webhook or alert runs it with nobody watching."
-                    : "Off.  Bypass still stops before anything that controls this Mac."}
-                </div>
-              </div>
-              <button
-                role="switch"
-                aria-checked={Boolean(bot.bypassLocalComputer)}
-                aria-label="Bypass Including This Mac"
-                disabled={!bot.bypassPermissions}
-                onClick={() => {
-                  if (bot.bypassLocalComputer) {
-                    patch({ bypassLocalComputer: false });
-                  } else {
-                    setLocalAutoWarning("bypassLocal");
-                  }
-                }}
-                className={cn(
-                  "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
-                  !bot.bypassPermissions && "cursor-not-allowed opacity-50",
-                  bot.bypassLocalComputer ? "bg-danger" : "bg-control",
-                )}
-              >
-                <span
-                  className={cn(
-                    "absolute top-[3px] size-5 rounded-full bg-white transition-all",
-                    bot.bypassLocalComputer ? "left-[21px]" : "left-[3px]",
-                  )}
-                />
-              </button>
-            </div>
-            {!bot.bypassPermissions && (
-              <div className="mt-2 text-[12px] text-ink-secondary">
-                Turn on Bypass Permissions first — this only extends what Bypass already skips.
-              </div>
-            )}
+            <BypassLocalComputerControl
+              bypassPermissions={Boolean(bot.bypassPermissions)}
+              bypassLocalComputer={Boolean(bot.bypassLocalComputer)}
+              onTurnOff={() => patch({ bypassLocalComputer: false })}
+              onRequestOn={() => setLocalAutoWarning("bypassLocal")}
+            />
             {bypassNote && (
               <div className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{bypassNote}</div>
             )}
@@ -1002,12 +971,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
     </aside>
     <LocalComputerAutoWarning
       open={localAutoWarning !== null}
-      title={localAutoWarning === "bypassLocal" ? "Allow Bypass Including This Mac?" : undefined}
-      body={
-        localAutoWarning === "bypassLocal"
-          ? "Nothing this bot does on this Mac will ask again \u2014 including destructive actions and credential files, and including while a webhook or alert runs it with nobody watching.\u00a0 Continue only if you would trust it with the machine itself."
-          : undefined
-      }
+      title={localAutoWarning === "bypassLocal" ? BYPASS_LOCAL_COMPUTER_WARNING_TITLE : undefined}
+      body={localAutoWarning === "bypassLocal" ? BYPASS_LOCAL_COMPUTER_WARNING_BODY : undefined}
       onCancel={() => setLocalAutoWarning(null)}
       onConfirm={() => {
         if (localAutoWarning === "auto") patch({ autoApprove: true, acknowledgeLocalAuto: true });

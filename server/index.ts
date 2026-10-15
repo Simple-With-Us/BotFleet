@@ -2129,17 +2129,21 @@ const PAIRED_LOCAL_BYPASS_ERROR =
   "Bypass Including This Mac can only be turned on in BotFleet on your computer for a bot that can use This Mac";
 
 /** A bot as the Auto Mode consent check should see it: its Bypass Permissions
- * left out, because bypass never answers a request that controls This Mac and
- * so is not what that warning is about (see `pairedProfileRefusal`). */
+ * left out, because plain bypass never answers a request that controls This
+ * Mac and so is not what that warning is about (see `pairedProfileRefusal`).
+ * `bypassLocalComputer` stays.  It is the same act as Auto Mode, so a Mac
+ * that already confirmed it counts as the warning having been answered.  A
+ * phone cannot create that state for a bot that can use This Mac. */
 function withoutBypass<T extends { bypassPermissions?: boolean }>(bot: T): Omit<T, "bypassPermissions"> {
   const { bypassPermissions: _bypass, ...rest } = bot;
   return rest;
 }
 
-/** The paired-device rules for a profile write that touches `computers` or
- * `autoApprove`: a refusal with the status to send, or null when it may go
- * ahead.  Called by the profile route, which is the one a phone reaches
- * through the sidecar (the desktop uses the broad bot PATCH).  The sidecar
+/** The paired-device rules for a profile write that touches `computers`,
+ * `autoApprove`, or `bypassLocalComputer`: a refusal with the status to send,
+ * or null when it may go ahead.  Called by the profile route, which is the
+ * one a phone reaches through the sidecar (the desktop uses the broad bot
+ * PATCH).  The sidecar
  * cannot make this call: telling "kept This Mac" from "added This Mac", or
  * "already Auto on this Mac" from "newly Auto", needs the stored bot, so the
  * check lives where the bot does, and a loopback caller of the same route gets
@@ -13639,7 +13643,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // De-duplicated the way the broad PATCH stores it.
         parsed.patch.computers = [...new Set(parsed.patch.computers)];
       }
-      if (parsed.patch.computers !== undefined || parsed.patch.autoApprove !== undefined) {
+      // `bypassLocalComputer` has to be in this guard.  The refusal lives in
+      // `pairedProfileRefusal`, and a patch that names only that field used
+      // to skip the call and persist the switch with no Mac warning.
+      if (
+        parsed.patch.computers !== undefined ||
+        parsed.patch.autoApprove !== undefined ||
+        parsed.patch.bypassLocalComputer !== undefined
+      ) {
         const refused = pairedProfileRefusal(existingBot, parsed.patch);
         if (refused) return json(res, refused.status, { error: refused.error });
       }
