@@ -1134,7 +1134,7 @@ export class ProviderRegistry {
       curr.snapshot.state === "available" &&
       curr.snapshot.authenticated === undefined &&
       prev.snapshot.state === "available" &&
-      typeof prev.snapshot.authenticated === "boolean" &&
+      (prev.snapshot.authenticated === true || prev.snapshot.authenticated === false) &&
       authFresh
     ) {
       return { ...curr, snapshot: { ...curr.snapshot, authenticated: prev.snapshot.authenticated } };

@@ -3298,6 +3298,13 @@ export async function swapDependencyTree({
  * bundle, dependency tree, and commit; the added keys describe placement and
  * whether the install has been verified yet.
  */
+/** Receipt path for this run: beside the bundle rollback or the dependency rollback. */
+export function rollbackReceiptPathForPrevious(previous) {
+  return previous.rollbackPath
+    ? `${previous.rollbackPath}.json`
+    : `${previous.rollbackDependencies}.json`;
+}
+
 function rollbackReceipt(prepared, previous, config, extra) {
   return {
     schemaVersion: 1,
@@ -3363,6 +3370,17 @@ export async function rollbackGenerations(config, { stageDirectories = [] } = {}
   for (const name of await listDirectory(applicationsDirectory)) {
     if (!name.startsWith(".BotFleet.rollback-") || !name.endsWith(".app")) continue;
     await consider(join(applicationsDirectory, name));
+  }
+  if (config.checkout) {
+    const checkoutParent = dirname(config.checkout);
+    for (const name of await listDirectory(checkoutParent)) {
+      if (!name.startsWith(".botfleet-server.node_modules.rollback-")) continue;
+      const dependencyPath = join(checkoutParent, name);
+      const receiptPath = `${dependencyPath}.json`;
+      const [hasTree, hasReceipt] = await Promise.all([exists(dependencyPath), exists(receiptPath)]);
+      if (hasReceipt) receiptPaths.push(receiptPath);
+      else if (hasTree) orphans.push(dependencyPath);
+    }
   }
   // A stage named with `--stage` need not sit under the updates root, so the
   // caller passes the stages it knows about as well.  Each stage's rollback
@@ -4013,11 +4031,11 @@ function createOperations(config) {
       // non-BotFleet process holding BotFleet state is waited out and never
       // signalled, and a refusal names it.
       await waitOutUnrecognizedHolders(async () => {
-        const [currentHolders, currentBundlePids, health] = await Promise.all([
+        const [currentHolders, health] = await Promise.all([
           sqliteHolders(config.dataDirectory),
-          bundleProcessPids(config.appPath),
           Promise.all(config.ports.map(probeHealth)),
         ]);
+        const currentBundlePids = updateApp ? await bundleProcessPids(config.appPath) : [];
         const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
         const shutdownPids = updateApp
           ? [...previous.runtimePids, ...previous.appPids, ...current]
@@ -4078,9 +4096,7 @@ function createOperations(config) {
         throw new Error(`Dependency rollback path already exists: ${previous.rollbackDependencies}`);
       }
       previous.installedAt = new Date().toISOString();
-      const receiptPath = updateApp
-        ? `${previous.rollbackPath}.json`
-        : `${previous.rollbackDependencies}.json`;
+      const receiptPath = rollbackReceiptPathForPrevious(previous);
       if (updateApp) {
         // The renamed executable cannot decrypt the Keychain item Electron
         // safeStorage created under com.botfleet.app.  The still-authorized
@@ -4225,9 +4241,7 @@ function createOperations(config) {
 
     finish: async (prepared, previous) => {
       const { updateApp, mode } = componentFlags();
-      const receiptPath = updateApp
-        ? `${previous.rollbackPath}.json`
-        : `${previous.rollbackDependencies}.json`;
+      const receiptPath = rollbackReceiptPathForPrevious(previous);
       await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, {
         status: "verified",
         verifiedAt: new Date().toISOString(),
@@ -4406,7 +4420,7 @@ function createOperations(config) {
       // its place, which the provisional receipt cannot know when it is written.
       await record(async () => {
         if (previous.swap?.rollbackAppHolds || previous.swap?.rollbackDependenciesHold) return;
-        await rm(`${previous.rollbackPath}.json`, { force: true });
+        await rm(rollbackReceiptPathForPrevious(previous), { force: true });
       });
       await record(async () => {
         const head = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);

@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  generationBelongsToApp,
   prunablePath,
   resolveRollbackPlacement,
   rollbackGenerationStatus,
@@ -197,7 +196,7 @@ test("the updater writes the rollback receipt beside whichever bundle it produce
     readFile(new URL("./update-botfleet-mac.mjs", import.meta.url), "utf8"));
   // The receipt path is derived from what this run rolled back: the bundle path
   // when the app moved, otherwise the dependency rollback path for server-only.
-  assert.match(source, /const receiptPath = updateApp\s*\?\s*`\$\{previous\.rollbackPath\}\.json`\s*:\s*`\$\{previous\.rollbackDependencies\}\.json`/);
+  assert.match(source, /rollbackReceiptPathForPrevious\(previous\)/);
   assert.match(source, /status: "installing"/);
   assert.match(source, /status: "verified"/);
   // The prior bundle must never be parked in the installed application's folder
