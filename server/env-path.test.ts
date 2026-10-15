@@ -375,18 +375,16 @@ describe("augmentedPath", () => {
     const farmShim = join(symlinkFarm, "mcode");
     const previous = process.env.PATH;
     try {
-      process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      // GUI-launch shape only: the farm dir, no host PATH tail.  Spreading
+      // process.env.PATH leaked a developer Mac's real `mcode` into
+      // augmentedPath(), so execFile below ran the host binary and failed even
+      // when candidates[0] was already the canonical path we planted.
+      process.env.PATH = symlinkFarm;
       resetPathCacheForTests();
       const candidates = findCliCandidates("mcode");
       expect(candidates[0]).toBe(canonical);
-      // Count only what this test planted.  The inherited PATH on a developer
-      // machine can carry its own real `mcode` — this Mac ships one — and
-      // those are legitimately separate candidates, so asserting a global
-      // total of 1 tested the machine rather than the dedupe.  What this test
-      // actually claims is that the farm symlink and the canonical binary are
-      // one inode and collapse to the canonical path.
-      const planted = candidates.filter((candidate) => candidate === canonical || candidate === farmShim);
-      expect(planted).toEqual([canonical]);
+      expect(candidates).toHaveLength(1);
+      expect(candidates).not.toContain(farmShim);
       const stdout = await new Promise<string>((resolve, reject) => {
         execFile("mcode", [], { env: { PATH: augmentedPath() } }, (err, out) => (err ? reject(err) : resolve(out)));
       });
