@@ -1183,9 +1183,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
         console.log(`BotFleet removed ${failedBundles.length} expired failed-install bundle(s) beside ${deps.appPath}.`);
       }
       for (const { path, error } of failedBundleRemovals) {
-        console.warn(
-          `BotFleet could not remove expired failed-install bundle ${path}: ${(error as Error)?.message ?? error}`,
-        );
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`BotFleet could not remove expired failed-install bundle ${path}: ${detail}`);
       }
       pruneRunArtifacts(runsDirectory, { protect: lastRun ? [lastRun.runId] : [] });
     } catch (error) {
