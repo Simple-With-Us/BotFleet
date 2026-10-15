@@ -2,7 +2,8 @@ export type RoutineOutcomeCode =
   | "completed" | "cancelled" | "capability_denied" | "auth_required"
   | "quota_exhausted" | "timeout" | "runtime_restart" | "runtime_reconfigured" | "bot_stopped" | "bot_off"
   | "bot_missing" | "thread_missing" | "dispatch_failed" | "engine_unavailable" | "resume_failed"
-  | "budget_exhausted" | "execution_failed" | "missed_offline" | "combined_unverified";
+  | "budget_exhausted" | "execution_failed" | "missed_offline" | "combined_unverified"
+  | "skipped_incapable";
 
 export type RoutineFailurePhase = "schedule" | "dispatch" | "execution" | "approval" | "lifecycle";
 
@@ -53,7 +54,7 @@ export function routineFailureCode(reason?: string | null, setup = false, denied
 
 export function routineFailurePhase(code: RoutineOutcomeCode): RoutineFailurePhase {
   if (["runtime_restart", "runtime_reconfigured", "bot_stopped", "bot_off", "cancelled"].includes(code)) return "lifecycle";
-  if (["bot_missing", "thread_missing", "dispatch_failed", "auth_required", "engine_unavailable", "resume_failed"].includes(code)) return "dispatch";
+  if (["bot_missing", "thread_missing", "dispatch_failed", "auth_required", "engine_unavailable", "resume_failed", "skipped_incapable"].includes(code)) return "dispatch";
   if (code === "capability_denied") return "approval";
   if (code === "missed_offline") return "schedule";
   return "execution";
@@ -67,6 +68,7 @@ export const ROUTINE_OUTCOME_LABELS: Record<RoutineOutcomeCode, string> = {
   resume_failed: "Could not resume",
   budget_exhausted: "Round budget reached",
   execution_failed: "Execution failed", missed_offline: "Missed while offline", combined_unverified: "Combined; outcome unavailable",
+  skipped_incapable: "Skipped — engine cannot run this task",
 };
 
 export interface RoutineOutcomeRecord {

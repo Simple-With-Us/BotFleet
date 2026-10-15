@@ -228,6 +228,12 @@ import {
   revokedTurnProviders,
 } from "./config-reload-keys.ts";
 import { computerReach } from "./computer-capability.ts";
+import {
+  DOOMED_POLICY,
+  WISDOM,
+  evaluateCapabilityGate,
+  profileFor,
+} from "./capability-profile.ts";
 import { waitForComputerCall } from "./computer-call-gate.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
 import {
@@ -1157,6 +1163,143 @@ function noteDoomedSkip(botId: string, instanceId: string): void {
     else doomedSkipTotals.set(key, { botId, instanceId, count: 1 });
   } catch {
     // A counter must never be the reason a dispatch does not happen.
+  }
+}
+
+const capabilitySkipTotals = new Map<
+  string,
+  { botId: string; instanceId: string; model: string; taskClass: string; reason: string; lane: string; count: number }
+>();
+
+function noteCapabilitySkip(
+  botId: string,
+  instanceId: string,
+  model: string,
+  taskClass: string,
+  reason: string,
+  lane: "dispatch" | "routine",
+): void {
+  try {
+    const key = `${botId}:${instanceId}:${taskClass}:${lane}`;
+    const tally = capabilitySkipTotals.get(key);
+    if (tally) tally.count += 1;
+    else capabilitySkipTotals.set(key, { botId, instanceId, model, taskClass, reason, lane, count: 1 });
+  } catch {
+    // Counting must not block a gate decision.
+  }
+}
+
+function drainCapabilitySkips(): void {
+  if (!capabilitySkipTotals.size || !isSentryActive()) return;
+  const sentry = getSentry();
+  if (!sentry) return;
+  for (const [key, tally] of capabilitySkipTotals) {
+    try {
+      sentry.metrics.count("botfleet.dispatcher.doomed_skipped", tally.count, {
+        attributes: {
+          "botfleet.bot.id": tally.botId,
+          "botfleet.instance.id": tally.instanceId,
+          "botfleet.model": tally.model,
+          "botfleet.task_class": tally.taskClass,
+          "botfleet.reason": tally.reason,
+          "botfleet.lane": tally.lane,
+        },
+      });
+      capabilitySkipTotals.delete(key);
+    } catch {
+      // Leave tally for the next drain.
+    }
+  }
+}
+
+setInterval(drainCapabilitySkips, DOOMED_SKIP_DRAIN_MS).unref?.();
+
+function capabilityHostContext(
+  bot: { computers?: Array<"cloud" | "vm" | "local">; cloudBackend?: "box" | "vps" | null },
+): { hostShellGranted: boolean } {
+  const shellBot = { computers: bot.computers, cloudBackend: bot.cloudBackend ?? undefined };
+  return {
+    hostShellGranted: hostShellGranted(shellBot, cfg, allowedBotComputers(cfg)),
+  };
+}
+
+function enforceTurnCapabilityGate(input: {
+  bot: { id: string; computers?: Array<"cloud" | "vm" | "local">; cloudBackend?: "box" | "vps" | null };
+  instance: ProviderInstance;
+  model: string;
+  text: string;
+  runOn?: RoutineRunOn;
+  routineNeeds?: import("./capability-profile.ts").TaskClass[];
+  lane: "dispatch" | "routine";
+}): string | undefined {
+  const hostCtx = capabilityHostContext(input.bot);
+  const gate = evaluateCapabilityGate(
+    {
+      instanceId: input.instance.instanceId,
+      driverKind: input.instance.driverKind,
+      capabilities: input.instance.adapter.capabilities,
+      model: input.model,
+    },
+    {
+      text: input.text,
+      computers: input.bot.computers,
+      runOn: input.runOn,
+      routineNeeds: input.routineNeeds,
+      hostShellGranted: hostCtx.hostShellGranted,
+    },
+    hostCtx,
+  );
+  if (gate.action === "ok") return undefined;
+  const taskClass = gate.taskClass ?? "chat";
+  const reason = gate.reason ?? "This engine cannot run that task";
+  noteCapabilitySkip(input.bot.id, input.instance.instanceId, input.model, taskClass, reason, input.lane);
+  if (gate.action === "warn") {
+    try {
+      getSentry()?.metrics.count("botfleet.dispatcher.capability_degraded", 1, {
+        attributes: {
+          "botfleet.bot.id": input.bot.id,
+          "botfleet.instance.id": input.instance.instanceId,
+          "botfleet.task_class": taskClass,
+        },
+      });
+    } catch {
+      // Telemetry must not block dispatch.
+    }
+    return reason;
+  }
+  throw Object.assign(new Error(reason), {
+    status: 409,
+    code: "incapable",
+    taskClass,
+    pickUnusable: true,
+  });
+}
+
+function routineIncapableForRun(run: import("./routines.ts").RoutineRun): { reason: string } | undefined {
+  const bot = store.bot(run.botId);
+  if (!bot) return undefined;
+  const task = run.threadId ? store.taskByThread(bot.id, run.threadId) : undefined;
+  const policy = task?.modelSelection ?? bot.modelSelection;
+  const instanceId = executionInstanceFor(bot, policy, run.runOn);
+  const instance = registry.get(instanceId as never);
+  if (!instance) return undefined;
+  const model = instance.models.default;
+  const prompt = run.prompt ?? "";
+  try {
+    enforceTurnCapabilityGate({
+      bot,
+      instance,
+      model,
+      text: prompt,
+      runOn: run.runOn,
+      lane: "routine",
+    });
+    return undefined;
+  } catch (error) {
+    if (error && typeof error === "object" && (error as { code?: string }).code === "incapable") {
+      return { reason: error instanceof Error ? error.message : String(error) };
+    }
+    throw error;
   }
 }
 
@@ -5947,6 +6090,14 @@ async function startTurn(
       store.patchBot(bot.id, { modelSelection: fallbackPolicy });
     }
   }
+  const capabilityWarn = enforceTurnCapabilityGate({
+    bot,
+    instance,
+    model,
+    text,
+    runOn: opts?.runOn,
+    lane: "dispatch",
+  });
   // Auto-delivered instructions are stored as role=system so iOS/desktop
   // never paint a blue user bubble.  The model still receives them as the
   // turn prompt via transcriptPromptRole.
@@ -5966,6 +6117,14 @@ async function startTurn(
           comm: opts?.comm,
           toolPolicy: turnToolPolicy,
         });
+  }
+  if (capabilityWarn) {
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: capabilityWarn, ok: true, kind: "notice" },
+    });
   }
 
   // transcript for API-backed drivers: settled text turns on the ACTIVE
@@ -6829,6 +6988,7 @@ let webhookOneShotWakeLookup: ((webhookId: string) => boolean) | undefined;
 routines = new RoutineManager({
   emit: broadcast,
   timeZone: routineTimeZone,
+  incapableRun: routineIncapableForRun,
   // A restore route sets providerConfigBusy before its first await.  Keep
   // queued routine receipts durable while the registry is being rebuilt,
   // then tick them after the authenticated credential has landed.
@@ -15813,6 +15973,37 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         (row) => (botId === null || row.botId === botId) && (threadId === null || row.threadId === threadId),
       );
       return json(res, 200, { decisions: matching.slice(-limit) });
+    }
+
+    if (method === "GET" && path === "/api/inspect/capabilities") {
+      const profiles: ReturnType<typeof profileFor>[] = [];
+      for (const instance of registry.instances()) {
+        for (const option of instance.models.options) {
+          profiles.push(
+            profileFor({
+              instanceId: instance.instanceId,
+              driverKind: instance.driverKind,
+              capabilities: instance.adapter.capabilities,
+              model: option.id,
+            }),
+          );
+        }
+      }
+      return json(res, 200, { profiles, policy: DOOMED_POLICY });
+    }
+
+    if (method === "GET" && path === "/api/inspect/wisdom") {
+      const hints: Record<string, string[]> = {};
+      for (const instance of registry.instances()) {
+        const profile = profileFor({
+          instanceId: instance.instanceId,
+          driverKind: instance.driverKind,
+          capabilities: instance.adapter.capabilities,
+          model: instance.models.default,
+        });
+        if (profile.executionHints.length) hints[instance.instanceId] = profile.executionHints;
+      }
+      return json(res, 200, { wisdom: WISDOM, executionHints: hints });
     }
 
     // ── provider instances (model picker) ──
