@@ -141,6 +141,9 @@ const settlesWithin = async (
   }
 };
 
+/** windows-latest is slower and overlaps vitest files more; scale settle budgets there. */
+const winSettleMs = (ms: number) => (process.platform === "win32" ? Math.round(ms * 2) : ms);
+
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
   const response = await fetch(`${BASE}/api/attachments`, {
     method: "POST",
@@ -3538,6 +3541,14 @@ describe("harness HTTP API", () => {
         }
 
         if (queueSuccessor) {
+          // The POST must land while the bot is still busy; on windows-latest a
+          // fast reload can clear busy between the reload tool frame and here.
+          await expect.poll(async () => {
+            const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+              (candidate: { id: string }) => candidate.id === bot.id,
+            );
+            return state?.busy;
+          }, { timeout: 15_000, interval: 100 }).toBe(true);
           expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" }))).toEqual({
             status: 202,
             body: expect.objectContaining({ ok: true, queued: true }),
@@ -3576,7 +3587,7 @@ describe("harness HTTP API", () => {
                 (message: { text?: string }) => message.text?.includes("You've hit your session limit"),
               ).length,
             };
-          }, { timeout: 10_000 }).toEqual({
+          }, { timeout: winSettleMs(10_000) }).toEqual({
             launchedQueuedPrompt: true,
             queuedUserVisible: true,
             quotaReplies: 2,
@@ -3592,7 +3603,7 @@ describe("harness HTTP API", () => {
                 message.tool?.name?.startsWith("Fell over to"),
               ),
             };
-          }, { timeout: 10_000 }).toEqual({ busy: true, fellOver: true });
+          }, { timeout: winSettleMs(10_000) }).toEqual({ busy: true, fellOver: true });
         }
 
         const beforeStop = (await api("GET", "/api/bots?messages=0")).body.bots.find(
@@ -3638,12 +3649,12 @@ describe("harness HTTP API", () => {
           }
           return true;
         },
-        6_000,
+        winSettleMs(6_000),
         200,
         "instance cleanup writes",
       );
     }
-  }, 40_000);
+  }, winSettleMs(40_000));
 
   it("reports stopped:false when the stop matched no live turn", async () => {
     // An idle bot has no session on any instance. The old endpoint answered a
@@ -6295,7 +6306,7 @@ describe("instance CLI override API", () => {
           );
           return live?.busy === true;
         },
-        10_000,
+        winSettleMs(10_000),
         200,
         "successor dispatch persisting lastInstanceId and claude resume cursor without a stale launch",
       );
@@ -6320,7 +6331,7 @@ describe("instance CLI override API", () => {
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI, fullAuto: false })).status).toBe(200);
       expect((await api("PUT", "/api/config", { box: { token: "" } })).status).toBe(200);
     }
-  }, 30_000);
+  }, winSettleMs(30_000));
 
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
