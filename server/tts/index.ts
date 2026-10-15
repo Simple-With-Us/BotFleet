@@ -5,6 +5,7 @@
 // is a voice at all.
 import { isPersonalVoiceId, readableVoiceId } from "../../shared/bot-voice.ts";
 import { applyPronunciations, effectivePronunciations, type Pronunciation } from "../../shared/pronunciations.ts";
+import { stripPauseTags } from "../../shared/spoken-script.ts";
 import type { AppConfig } from "../config.ts";
 import * as azure from "./azure.ts";
 import * as minimax from "./minimax.ts";
@@ -148,13 +149,16 @@ export function listCustomVoices() {
  * idempotent (shared/pronunciations.ts), so text that already says "sequel"
  * is left as it is. */
 export function speak(cfg: AppConfig, rawText: string, voiceId?: string, run?: systemVoices.Runner) {
-  const text = applyPronunciations(rawText, pronunciations(cfg));
+  const provider = voiceProvider(cfg);
+  let text = applyPronunciations(rawText, pronunciations(cfg));
+  // MiniMax pause tags are for that engine only; macOS `say` reads them aloud
+  // or truncates the utterance after the first marker.
+  if (provider === "system") text = stripPauseTags(text);
   // The workspace default can be a Personal Voice too; it must never reach
   // a hosted engine as if it were one of that engine's ids.
   if (isPersonalVoice(voiceId || cfg.tts?.voice)) {
     throw new Error("Apple Personal Voices speak on-device on authorized Apple devices (macOS and iOS) and cannot be synthesized on the server.");
   }
-  const provider = voiceProvider(cfg);
   if (provider === "system") {
     const voice = voiceId || cfg.tts?.voice;
     if (!systemVoices.systemVoicesAvailable() && !run) throw new NoVoiceConfigured("key", "system");

@@ -268,6 +268,7 @@ import {
 import {
   appendBounded,
   describeSweep,
+  startIdleLiveTranscriptSweeps,
   startOrphanTranscriptSweeps,
   startTranscriptRetentionSweeps,
   sweepTranscriptRetention,
@@ -724,6 +725,22 @@ export const SseCursorSchema = z
   .string()
   .trim()
   .regex(/^[a-zA-Z0-9_-]+:\d+$/, "Cursor must be in <streamId>:<seq> format");
+
+/** Query schema for the Engines panel's binary-discovery endpoint.
+ *
+ * `name` is the engine's default binary and may legitimately be an absolute
+ * path, so it is length-bounded rather than shape-restricted.  `aliases` is a
+ * comma-separated list of that engine's OTHER command names — Clutch's default
+ * is `dsh` while its own build installs as `clutch` — and is bounded here so
+ * one request cannot ask for an unbounded number of PATH walks. */
+export const CliCandidatesQuerySchema = z.object({
+  name: z.string().max(512).default(""),
+  aliases: z
+    .string()
+    .max(4096)
+    .default("")
+    .transform((raw) => raw.split(",").map((alias) => alias.trim()).filter(Boolean)),
+});
 
 /** `<streamId>:<seq>` — opaque to clients, and the only thing they need to
  * remember to resume.  Returns null when it belongs to another run. */
@@ -1662,7 +1679,11 @@ async function defaultSelection(excludeInstanceId?: string) {
     try {
       const snap = await liveInstance.snapshot();
       if (snap.state === "available") {
-        return { instanceId: pick.instanceId, model: pick.models.default };
+        // The registry catalog is the full static list.  A new bot must
+        // start on a model the detected CLI can run (Sonnet 5 on Claude
+        // Code older than 2.1.284, not the ungated Sonnet 5.5 default).
+        const runnable = withoutModelsTooNewForCli(pick.driverKind, pick.models, snap.version);
+        return { instanceId: pick.instanceId, model: runnable.default };
       }
     } catch {
       continue;
@@ -2481,16 +2502,41 @@ function liveThreadIds(): Set<string> {
     ...store.groups.flatMap((g) => [g.threadId, ...(g.tasks ?? []).map((t) => t.threadId)]),
   ]);
 }
-// One flag covers all three sweeps: a preview before trusting a brand-new
-// class of delete against real data.
+// The thread a turn is actually on.  `busy` is memory-only and `inflightThreadId`
+// is the marker that survives a restart, so a boot sweep still sees the turn
+// that was open when the process died.  A deferred recovery is about to
+// resume that same thread.
+function inFlightThreadIds(): Set<string> {
+  const ids = new Set<string>();
+  for (const bot of store.bots) {
+    if (!(bot.busy || bot.inflightThreadId || deferredBootRecoveries.has(bot.id))) continue;
+    ids.add(bot.inflightThreadId || bot.threadId);
+  }
+  return ids;
+}
+// One flag covers the retention sweeps: a preview before trusting a
+// brand-new delete or trim against real data.
 const retentionDryRun = process.env.OMB_RETENTION_DRY_RUN === "1";
 // While a set-aside bots.json or groups.json is waiting in the data folder, the roster cannot say
-// which bots and threads still exist, so none of the three sweeps below may call anything an orphan.
+// which bots and threads still exist, so the sweeps below stay off until that file is restored or removed.
 // `cleanupHoldReason` reads the folder on every call, so this holds across restarts.
 const stopOrphanTranscriptSweeps = startOrphanTranscriptSweeps(transcriptDirs, liveThreadIds, console.log, {
   dryRun: retentionDryRun,
   hold: () => cleanupHoldReason(DATA_DIR),
 });
+// HS1 residual (C10): a thread still on a bot or room used to keep both
+// generations at the full cap forever.  The idle sweep trims one that has
+// been quiet, and skips a turn that is open right now.
+const stopIdleLiveTranscriptSweeps = startIdleLiveTranscriptSweeps(
+  transcriptDirs,
+  liveThreadIds,
+  inFlightThreadIds,
+  console.log,
+  {
+    dryRun: retentionDryRun,
+    hold: () => cleanupHoldReason(DATA_DIR),
+  },
+);
 // Workspaces and messages.db are swept once, shortly after boot, off the
 // request path — no recurring timer to unref, because a harness restart (29
 // in two days per the audit) already re-runs this often enough on its own.
@@ -5259,7 +5305,15 @@ async function autoFallbackChain(
 ): Promise<ModelSelection[]> {
   try {
     const described = await registry.describe({ maxAgeMs: DEFAULT_SELECTION_DESCRIBE_MAX_AGE_MS });
-    return eligibleAutoFallbackChain(described, {
+    const runnable = described.map((instance) => ({
+      ...instance,
+      models: withoutModelsTooNewForCli(
+        instance.driverKind,
+        instance.models,
+        instance.snapshot?.version,
+      ),
+    }));
+    return eligibleAutoFallbackChain(runnable, {
       botId,
       currentInstanceId,
       effort,
@@ -15885,10 +15939,24 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // ?name=claude → absolute paths of every `claude` on the augmented PATH,
     // in PATH order (first = what a bare name runs). Polled when the user
     // opens the Custom picker so a just-installed CLI appears without a restart.
+    // `aliases` carries the engine's other command names (comma-separated), so
+    // an engine whose binary ships under more than one name answers with all of
+    // them — ?name=dsh&aliases=clutch is what makes Clutch's own build
+    // selectable, because `clutch` is the command carrying Clutch's profiles.
     if (method === "GET" && path === "/api/cli-candidates") {
-      const name = url.searchParams.get("name") ?? "";
+      const parsedQuery = CliCandidatesQuerySchema.safeParse({
+        name: url.searchParams.get("name") ?? "",
+        aliases: url.searchParams.get("aliases") ?? "",
+      });
+      if (!parsedQuery.success) {
+        return json(res, 400, {
+          ok: false,
+          error: "invalid_cli_candidates_query",
+          message: parsedQuery.error.issues[0]?.message ?? "Invalid CLI candidates query",
+        });
+      }
       resetPathCache();
-      return json(res, 200, { candidates: findCliCandidates(name) });
+      return json(res, 200, { candidates: findCliCandidates([parsedQuery.data.name, ...parsedQuery.data.aliases]) });
     }
 
     // ── pre-save CLI probe: does this path actually run? ──
@@ -18395,6 +18463,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     watchdog.stop();
     stopTranscriptSweeps();
     stopOrphanTranscriptSweeps();
+    stopIdleLiveTranscriptSweeps();
     // A flush that throws (disk full, data dir gone) must not skip the rest
     // of shutdown — above all bus.flush() below — so each one is guarded.
     const flushOnShutdown = (label: string, flush: () => void) => {
