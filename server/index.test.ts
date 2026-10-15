@@ -3552,7 +3552,32 @@ describe("harness HTTP API", () => {
         }
 
         if (queueSuccessor) {
-          expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" }))).toEqual({
+          // The POST must land while the bot is still busy; on windows-latest a
+          // fast reload can clear busy between the reload tool frame and here.
+          // Poll for the queued response in one step: wait for busy, POST once,
+          // and stop — never spin on busy alone while the bot is already idle.
+          let successorSend: { status: number; body: any } | undefined;
+          await expect
+            .poll(
+              async () => {
+                if (successorSend?.body?.queued) return true;
+                if (successorSend) return false;
+                const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+                  (candidate: { id: string }) => candidate.id === bot.id,
+                );
+                if (!state?.busy) return false;
+                successorSend = await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" });
+                return successorSend.status === 202 && successorSend.body?.queued === true;
+              },
+              {
+                timeout: winSettleMs(15_000),
+                interval: 100,
+                message:
+                  "queued successor send while the reload-held bot is busy (idle here means the reload window closed early)",
+              },
+            )
+            .toBe(true);
+          expect(successorSend).toEqual({
             status: 202,
             body: expect.objectContaining({ ok: true, queued: true }),
           });
@@ -3590,7 +3615,7 @@ describe("harness HTTP API", () => {
                 (message: { text?: string }) => message.text?.includes("You've hit your session limit"),
               ).length,
             };
-          }, { timeout: 10_000 }).toEqual({
+          }, { timeout: winSettleMs(10_000) }).toEqual({
             launchedQueuedPrompt: true,
             queuedUserVisible: true,
             quotaReplies: 2,
@@ -3606,7 +3631,7 @@ describe("harness HTTP API", () => {
                 message.tool?.name?.startsWith("Fell over to"),
               ),
             };
-          }, { timeout: 10_000 }).toEqual({ busy: true, fellOver: true });
+          }, { timeout: winSettleMs(10_000) }).toEqual({ busy: true, fellOver: true });
         }
 
         const beforeStop = (await api("GET", "/api/bots?messages=0")).body.bots.find(
@@ -3652,12 +3677,12 @@ describe("harness HTTP API", () => {
           }
           return true;
         },
-        6_000,
+        winSettleMs(6_000),
         200,
         "instance cleanup writes",
       );
     }
-  }, 40_000);
+  }, winSettleMs(40_000));
 
   it("reports stopped:false when the stop matched no live turn", async () => {
     // An idle bot has no session on any instance. The old endpoint answered a
@@ -6348,7 +6373,7 @@ describe("instance CLI override API", () => {
           );
           return live?.busy === true;
         },
-        10_000,
+        winSettleMs(10_000),
         200,
         "successor dispatch persisting lastInstanceId and claude resume cursor without a stale launch",
       );
@@ -6373,7 +6398,7 @@ describe("instance CLI override API", () => {
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI, fullAuto: false })).status).toBe(200);
       expect((await api("PUT", "/api/config", { box: { token: "" } })).status).toBe(200);
     }
-  }, 30_000);
+  }, winSettleMs(30_000));
 
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
