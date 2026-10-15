@@ -588,6 +588,10 @@ import {
   type CommandEngine,
 } from "./command-registry.ts";
 import { EngineCommandCache } from "./engine-command-cache.ts";
+import {
+  discoverStaticEngineCommands,
+  mergeAnnouncedEngineCommands,
+} from "./drivers/engine-command-discovery.ts";
 import { engineCommandText, offeredEngineCommands } from "./drivers/engine-commands.ts";
 import {
   botCommandRequestSchema,
@@ -3641,6 +3645,16 @@ function commandEngineFor(bot: BotRecord): CommandEngine {
   };
 }
 
+function announcedEngineCommands(bot: BotRecord, engine: CommandEngine): readonly string[] | null {
+  const task = store.taskByThread(bot.id, bot.threadId);
+  const cached = engineCommandCache.get(engine.instanceId, engine.cliVersion);
+  const discovered = discoverStaticEngineCommands(engine.driverKind, {
+    cwd: task?.cwd ?? bot.cwd ?? null,
+    env: process.env,
+  });
+  return mergeAnnouncedEngineCommands(cached, discovered);
+}
+
 /** The answer GET /api/bots/:id/commands gives for a bot on a surface. */
 function commandsFor(bot: BotRecord, surface: CommandSurface) {
   const engine = commandEngineFor(bot);
@@ -3653,7 +3667,7 @@ function commandsFor(bot: BotRecord, surface: CommandSurface) {
     engine,
     allowsMultipleThreads: allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode)),
     hasSession: Boolean(task?.resumeCursors[engine.instanceId]),
-    announced: engineCommandCache.get(engine.instanceId, engine.cliVersion),
+    announced: announcedEngineCommands(bot, engine),
   });
 }
 
@@ -3804,7 +3818,7 @@ async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface
     return commandFailure(409, "command_disabled", reason);
   }
   const engine = commandEngineFor(bot);
-  const spec = offeredEngineCommands(engine.driverKind, engineCommandCache.get(engine.instanceId, engine.cliVersion) ?? [], engine.cliVersion)
+  const spec = offeredEngineCommands(engine.driverKind, announcedEngineCommands(bot, engine) ?? [], engine.cliVersion)
     .find((candidate) => candidate.name === command.name);
   const commandId = randomUUID();
   const run: EngineCommandRun = { id: commandId, name: command.name, args: args.value, surface, output: spec?.output ?? "local" };

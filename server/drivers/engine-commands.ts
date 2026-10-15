@@ -16,6 +16,8 @@
 
 import type { TurnCommand } from "../contracts.ts";
 
+import { ENGINE_COMMAND_ALLOWLIST_BY_DRIVER } from "./engine-command-allowlists.ts";
+
 export interface EngineCommandSpec {
   /** lowercase, no slash */
   name: string;
@@ -139,7 +141,8 @@ export function isDeniedEngineCommand(name: string): boolean {
  *  proves an entry: docs/verification/slash-commands.md lists what was probed
  *  and what happened, and `scripts/probe-engine-commands.sh` records the
  *  frames under server/drivers/__fixtures__/engine-commands/. */
-export const ENGINE_COMMAND_ALLOWLIST: Readonly<Record<string, readonly EngineCommandSpec[]>> = {};
+export const ENGINE_COMMAND_ALLOWLIST: Readonly<Record<string, readonly EngineCommandSpec[]>> =
+  ENGINE_COMMAND_ALLOWLIST_BY_DRIVER;
 
 /** `major.minor.patch` out of a CLI's version banner ("2.1.284 (Claude Code)"),
  *  or null when it has none. */
