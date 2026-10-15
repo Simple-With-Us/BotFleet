@@ -3807,7 +3807,8 @@ async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface
   const spec = offeredEngineCommands(engine.driverKind, engineCommandCache.get(engine.instanceId, engine.cliVersion) ?? [], engine.cliVersion)
     .find((candidate) => candidate.name === command.name);
   const commandId = randomUUID();
-  const run: EngineCommandRun = { id: commandId, name: command.name, args: args.value, surface, output: spec?.output ?? "local" };
+  const output = spec && spec.output === "model" ? "model" : "local";
+  const run: EngineCommandRun = { id: commandId, name: command.name, args: args.value, surface, output };
   try {
     await startTurn(bot.id, engineCommandText(run), { command: run });
   } catch (error) {
@@ -3820,7 +3821,13 @@ async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface
   const invocation = store.messagesFor(bot.threadId).findLast((message) => message.command?.id === commandId);
   return {
     status: 202,
-    body: { ok: true, id: command.id, kind: "turn", threadId: bot.threadId, invocationMessageId: invocation?.id ?? "" },
+    body: {
+      ok: true,
+      id: command.id,
+      kind: "turn",
+      threadId: bot.threadId,
+      invocationMessageId: invocation ? invocation.id : "",
+    },
   };
 }
 
