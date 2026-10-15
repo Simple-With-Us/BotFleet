@@ -5262,7 +5262,15 @@ async function autoFallbackChain(
 ): Promise<ModelSelection[]> {
   try {
     const described = await registry.describe({ maxAgeMs: DEFAULT_SELECTION_DESCRIBE_MAX_AGE_MS });
-    return eligibleAutoFallbackChain(described, {
+    const runnable = described.map((instance) => ({
+      ...instance,
+      models: withoutModelsTooNewForCli(
+        instance.driverKind,
+        instance.models,
+        instance.snapshot?.version,
+      ),
+    }));
+    return eligibleAutoFallbackChain(runnable, {
       botId,
       currentInstanceId,
       effort,
