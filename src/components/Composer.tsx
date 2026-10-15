@@ -297,10 +297,18 @@ function ComposerInner({
       setBotCommands(null);
       return;
     }
+    const botId = bot.id;
+    const threadId = bot.threadId;
+    setBotCommands(null);
     let cancelled = false;
-    void fetchBotCommands(bot.id, bot.threadId).then((menu) => {
-      if (!cancelled) setBotCommands(menu);
-    });
+    void fetchBotCommands(botId, threadId)
+      .then((menu) => {
+        if (cancelled) return;
+        setBotCommands(menu);
+      })
+      .catch(() => {
+        if (!cancelled) setBotCommands(null);
+      });
     return () => {
       cancelled = true;
     };
@@ -351,7 +359,10 @@ function ComposerInner({
         ? "Commands"
         : "Apps & Channels";
 
-  useEffect(() => setHighlight(0), [triggerInfo?.start, triggerInfo?.query]);
+  useEffect(() => {
+    const firstPickable = candidates.findIndex((candidate) => !candidate.disabled);
+    setHighlight(firstPickable >= 0 ? firstPickable : 0);
+  }, [triggerInfo?.start, triggerInfo?.query, candidates]);
 
   // one line at rest, then grow with the draft — hard cap at six lines
   useEffect(() => {
@@ -1018,13 +1029,24 @@ const handleEditQueued = useCallback((entry: { queueId: string; text: string; ra
               if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                 e.preventDefault();
                 const delta = e.key === "ArrowDown" ? 1 : -1;
-                setHighlight((h) => (h + delta + candidates.length) % candidates.length);
+                if (candidates.length === 0) return;
+                let next = highlight;
+                for (let step = 0; step < candidates.length; step += 1) {
+                  next = (next + delta + candidates.length) % candidates.length;
+                  if (!candidates[next]?.disabled) {
+                    setHighlight(next);
+                    break;
+                  }
+                }
                 return;
               }
               if (e.key === "Enter" || e.key === "Tab") {
-                e.preventDefault();
-                pickCandidate(candidates[highlight]);
-                return;
+                const choice = candidates[highlight];
+                if (choice && !choice.disabled) {
+                  e.preventDefault();
+                  pickCandidate(choice);
+                  return;
+                }
               }
               if (e.key === "Escape") {
                 e.preventDefault();
