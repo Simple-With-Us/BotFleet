@@ -77,6 +77,47 @@ describe("plugin lifecycle", () => {
     expect(installed.name).toBe("fleet-overview");
     expect(installed.capabilities.length).toBe(2);
     expect(existsSync(join(baseDir, "fleet-overview", "botfleet-plugin.json"))).toBe(true);
+    expect(installed.hostTrust).toBeUndefined();
+  });
+
+  it("records Zulip realm trust only when the source folder is the shipped tree", async () => {
+    const root = mkdtempSync(join(tmpdir(), "botfleet-first-party-"));
+    const copyRoot = mkdtempSync(join(tmpdir(), "botfleet-zulip-copy-"));
+    try {
+      const shipped = join(root, "zulip");
+      const copied = join(copyRoot, "zulip");
+      const manifest = JSON.stringify({
+        name: "zulip",
+        version: "1.0.0",
+        description: "Zulip.",
+        botfleet: ">=1",
+        entry: "plugin.mjs",
+      });
+      const source = "export function getCardData() { return { result: {} }; }\n";
+      mkdirSync(shipped);
+      writeFileSync(join(shipped, "botfleet-plugin.json"), manifest);
+      writeFileSync(join(shipped, "plugin.mjs"), source);
+
+      const installed = await installPlugin(shipped, baseDir, fetch, root);
+      if ("error" in installed) throw new Error(installed.error);
+      expect(installed.hostTrust).toBe("zulip-realm");
+      expect(readRegistry(baseDir).plugins.zulip?.hostTrust).toBe("zulip-realm");
+      expect(existsSync(join(baseDir, "zulip", "plugin.mjs"))).toBe(true);
+
+      const removed = await removePlugin("zulip", baseDir);
+      expect(removed).toEqual({ removed: true });
+
+      mkdirSync(copied);
+      writeFileSync(join(copied, "botfleet-plugin.json"), manifest);
+      writeFileSync(join(copied, "plugin.mjs"), source);
+      const thirdParty = await installPlugin(copied, baseDir, fetch, root);
+      if ("error" in thirdParty) throw new Error(thirdParty.error);
+      expect(thirdParty.hostTrust).toBeUndefined();
+      expect(readRegistry(baseDir).plugins.zulip?.hostTrust).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(copyRoot, { recursive: true, force: true });
+    }
   });
 
   it("install rejects when the manifest is invalid", async () => {

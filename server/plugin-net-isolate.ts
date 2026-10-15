@@ -10,18 +10,18 @@
 //     bypassed.  A declared allowlist cannot use this namespace,
 //     because a namespace with no interfaces cannot reach an allowed
 //     host either.  The guard enforces that list.
-//   * macOS: `sandbox-exec` denies network by default and adds one
-//     outbound TCP allow per declared destination.  Hostnames also
-//     allow DNS on port 53, because name resolution has to leave the
-//     process.  IP literals do not open DNS.
+//   * macOS, and only when the plugin declared no destinations:
+//     `sandbox-exec` with a deny-all network profile.  Seatbelt's
+//     remote-host filter accepts only `*` or `localhost`, so a
+//     hostname or IP literal makes `sandbox-exec` refuse to start.
+//     A declared allowlist is not wrapped.  The guard enforces that
+//     list, the same way a Linux allowlist skips the network namespace.
 //
 // Windows has no equivalent tool in the base system.  The guard is the
 // boundary there, and on a Node build that supports `--allow-net` the
 // loader withholds that flag unless the plugin declared destinations.
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { readFileSync } from "node:fs";
-
-import { isPluginNetworkIp, parsePluginNetworkAllow } from "../shared/plugin-net-allow.ts";
 
 export interface PluginSpawnRequest {
   execPath: string;
@@ -68,48 +68,71 @@ function darwinSandboxAvailable(): boolean {
   return darwinSandbox;
 }
 
-/** Seatbelt profile for one plugin.  Only canonical allowlist tokens are
- *  interpolated, and each token's alphabet cannot close the quote.  An
- *  entry the parser rejects is skipped, which denies it. */
-export function darwinNetworkProfile(allow: readonly string[]): string {
-  const rules = ["(version 1)", "(allow default)", "(deny network*)"];
-  let dns = false;
-  for (const entry of allow) {
-    const parsed = parsePluginNetworkAllow(entry);
-    if (!parsed) continue;
-    rules.push(`(allow network-outbound (remote tcp "${parsed.token}"))`);
-    if (!isPluginNetworkIp(parsed.host)) dns = true;
-  }
-  if (dns) {
-    rules.push('(allow network-outbound (remote udp "*:53"))');
-    rules.push('(allow network-outbound (remote tcp "*:53"))');
-  }
-  return rules.join("");
+export type PluginOsNetworkWrap = "netns" | "seatbelt" | "none";
+
+/** Which kernel wrapper this host can apply.  A non-empty allowlist is
+ *  always `none`: a network namespace cannot reach an allowed host, and
+ *  seatbelt cannot name one. */
+export function pluginOsNetworkWrap(input: {
+  platform: NodeJS.Platform;
+  networkAllow: readonly string[];
+  linuxNetns: boolean;
+  darwinSandbox: boolean;
+}): PluginOsNetworkWrap {
+  if (input.networkAllow.length > 0) return "none";
+  if (input.platform === "linux" && input.linuxNetns) return "netns";
+  if (input.platform === "darwin" && input.darwinSandbox) return "seatbelt";
+  return "none";
+}
+
+/** Deny-all seatbelt profile.  Null when the allowlist is non-empty,
+ *  because a `(remote tcp "host:port")` filter with a real host or IP
+ *  is not valid seatbelt and `sandbox-exec` exits before the child
+ *  runs.  Nothing from the allowlist is interpolated. */
+export function darwinNetworkProfile(allow: readonly string[]): string | null {
+  if (allow.length > 0) return null;
+  return "(version 1)(allow default)(deny network*)";
 }
 
 /** Spawn the sandbox child, wrapped in an OS network boundary when this
- *  host has one.  The Node argument list is unchanged either way. */
+ *  host has one that can express the allowlist.  The Node argument list
+ *  is unchanged either way. */
 export function spawnPluginProcess(request: PluginSpawnRequest): PluginSpawn {
   const options = request.options;
-  if (request.networkAllow.length === 0 && linuxNetnsAvailable()) {
-    return {
-      wrapped: true,
-      child: spawn(
-        "unshare",
-        ["--fork", "--kill-child", "--user", "--map-root-user", "--net", "--", request.execPath, ...request.args],
-        { ...options, detached: true },
-      ),
-    };
-  }
-  if (darwinSandboxAvailable()) {
-    return {
-      wrapped: true,
-      child: spawn(
-        "sandbox-exec",
-        ["-p", darwinNetworkProfile(request.networkAllow), request.execPath, ...request.args],
-        { ...options, detached: true },
-      ),
-    };
+  const wrap = pluginOsNetworkWrap({
+    platform: process.platform,
+    networkAllow: request.networkAllow,
+    linuxNetns: linuxNetnsAvailable(),
+    darwinSandbox: darwinSandboxAvailable(),
+  });
+  switch (wrap) {
+    case "netns":
+      return {
+        wrapped: true,
+        child: spawn(
+          "unshare",
+          ["--fork", "--kill-child", "--user", "--map-root-user", "--net", "--", request.execPath, ...request.args],
+          { ...options, detached: true },
+        ),
+      };
+    case "seatbelt": {
+      const profile = darwinNetworkProfile(request.networkAllow);
+      if (profile === null) break;
+      return {
+        wrapped: true,
+        child: spawn(
+          "sandbox-exec",
+          ["-p", profile, request.execPath, ...request.args],
+          { ...options, detached: true },
+        ),
+      };
+    }
+    case "none":
+      break;
+    default: {
+      const unreachable: never = wrap;
+      return unreachable;
+    }
   }
   return {
     wrapped: false,

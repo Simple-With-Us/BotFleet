@@ -13,9 +13,10 @@
 //     names that exact host:port in `needs.network`.  The shipped Zulip
 //     plugin also receives the configured realm host.  The child seals
 //     the list before importing the plugin.  On Linux an empty list also
-//     enters a network namespace; on macOS a seatbelt profile denies the
-//     network and allows only the sealed destinations.  Node 25 and later
-//     also withhold `--allow-net` unless the list is non-empty.
+//     enters a network namespace; on macOS an empty list gets a seatbelt
+//     profile that denies the network.  A non-empty list is not wrapped,
+//     because neither boundary can name an allowed host.  Node 25 and
+//     later also withhold `--allow-net` unless the list is non-empty.
 //   * a capped V8 heap, a start deadline, and a per-call deadline.  A call
 //     that overruns kills the child; the next call respawns it.
 //   * stdio closed, so nothing the plugin prints reaches the server log.
@@ -31,7 +32,7 @@ import { type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
 import { z } from "zod";
 
@@ -41,14 +42,10 @@ import {
 } from "./config.ts";
 import { HOST_API_VERSION, satisfiesBotfleetVersion, type JsonValue } from "../shared/plugin-manifest.ts";
 import { normalizePluginNetworkAllow } from "../shared/plugin-net-allow.ts";
-import { isShippedZulipPlugin, pluginNetworkAllow } from "./plugin-net-policy.ts";
+import { ZULIP_PLUGIN_NAME, ZULIP_REALM_HOST_TRUST, pluginNetworkAllow } from "./plugin-net-policy.ts";
 import { killPluginProcess, spawnPluginProcess } from "./plugin-net-isolate.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { PLUGINS_DIR } from "./plugin-registry.ts";
-
-/** Host-owned directory.  A plugin installed anywhere else is not the
- *  shipped Zulip plugin, even when its manifest name is `zulip`. */
-export const FIRST_PARTY_PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "plugins", "first-party");
 import {
   ChildToParentMessageSchema,
   MAX_PLUGIN_RESULT_BYTES,
@@ -549,7 +546,6 @@ export async function loadPlugin(
   inputs: PluginHostInputs,
   baseDir: string = PLUGINS_DIR,
   options: Pick<PluginSandboxOptions, "callTimeoutMs" | "startTimeoutMs" | "heapMb"> & {
-    firstPartyRoot?: string;
     zulipRealm?: string;
   } = {},
 ): Promise<LoadedPlugin | { error: string }> {
@@ -580,7 +576,7 @@ export async function loadPlugin(
   const networkAllow = pluginNetworkAllow({
     capabilities: listing.capabilities,
     declared: listing.needs?.network ?? [],
-    shippedZulip: isShippedZulipPlugin(listing.name, pluginDir, options.firstPartyRoot ?? FIRST_PARTY_PLUGIN_ROOT),
+    shippedZulip: listing.name === ZULIP_PLUGIN_NAME && listing.hostTrust === ZULIP_REALM_HOST_TRUST,
     zulipRealm: options.zulipRealm,
   });
   const started = await startPluginSandbox({

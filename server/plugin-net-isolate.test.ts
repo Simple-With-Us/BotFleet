@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { darwinNetworkProfile, killPluginProcess, spawnPluginProcess } from "./plugin-net-isolate.ts";
+import { darwinNetworkProfile, killPluginProcess, pluginOsNetworkWrap, spawnPluginProcess } from "./plugin-net-isolate.ts";
 
 const children: Array<{ pid: number | undefined; wrapped: boolean; kill: () => void }> = [];
 
@@ -16,19 +16,50 @@ afterEach(() => {
 });
 
 describe("plugin network OS boundary", () => {
-  it("builds a seatbelt profile that quotes only canonical destinations", () => {
+  it("does not ask seatbelt to name a host it cannot express", () => {
     const empty = darwinNetworkProfile([]);
     expect(empty).toContain("(deny network*)");
     expect(empty).not.toContain("network-outbound");
+    expect(empty).not.toContain("api.example.com");
+    expect(empty).not.toContain("127.0.0.1");
 
-    const named = darwinNetworkProfile(["api.example.com:443", 'evil"); (allow network*)']);
-    expect(named).toContain('(remote tcp "api.example.com:443")');
-    expect(named).toContain('(remote udp "*:53")');
-    expect(named).not.toContain("evil");
+    // A hostname, an IP, and a quote-breaking token are all non-empty
+    // lists.  Seatbelt would reject the first two and could be escaped
+    // by the third, so none of them is turned into a profile.
+    expect(darwinNetworkProfile(["api.example.com:443"])).toBeNull();
+    expect(darwinNetworkProfile(["127.0.0.1:9"])).toBeNull();
+    expect(darwinNetworkProfile(['evil"); (allow network*)'])).toBeNull();
 
-    const literal = darwinNetworkProfile(["127.0.0.1:9"]);
-    expect(literal).toContain('(remote tcp "127.0.0.1:9")');
-    expect(literal).not.toContain(":53");
+    expect(pluginOsNetworkWrap({
+      platform: "darwin",
+      networkAllow: [],
+      linuxNetns: false,
+      darwinSandbox: true,
+    })).toBe("seatbelt");
+    expect(pluginOsNetworkWrap({
+      platform: "darwin",
+      networkAllow: ["api.example.com:443"],
+      linuxNetns: false,
+      darwinSandbox: true,
+    })).toBe("none");
+    expect(pluginOsNetworkWrap({
+      platform: "darwin",
+      networkAllow: ["127.0.0.1:9"],
+      linuxNetns: false,
+      darwinSandbox: true,
+    })).toBe("none");
+    expect(pluginOsNetworkWrap({
+      platform: "linux",
+      networkAllow: ["api.example.com:443"],
+      linuxNetns: true,
+      darwinSandbox: false,
+    })).toBe("none");
+    expect(pluginOsNetworkWrap({
+      platform: "linux",
+      networkAllow: [],
+      linuxNetns: true,
+      darwinSandbox: false,
+    })).toBe("netns");
   });
 
   it("refuses a raw connect when this host has an OS network boundary", async () => {

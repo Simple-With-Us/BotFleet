@@ -16,6 +16,7 @@ import { DATA_DIR } from "./config.ts";
 import { parsePluginManifest } from "../shared/plugin-manifest.ts";
 import {
   PluginRegistrySchema,
+  type PluginHostTrust,
   type PluginRegistry,
   type PluginRegistryEntry,
   type PluginSource,
@@ -270,7 +271,7 @@ export function listingFor(
     };
   }
 
-  return {
+  const listing: PluginListing = {
     name: entry.name,
     version: parsed.manifest.version,
     description: parsed.manifest.description,
@@ -287,6 +288,8 @@ export function listingFor(
     contributes: parsed.manifest.contributes,
     needs: { network: [...parsed.manifest.needs.network] },
   };
+  if (entry.hostTrust) listing.hostTrust = entry.hostTrust;
+  return listing;
 }
 
 /** Build listings for every plugin in the registry.  Plugins with
@@ -315,9 +318,10 @@ export function buildEntry(args: {
   version: string;
   source: PluginSource;
   warnings: string[];
+  hostTrust?: PluginHostTrust;
 }): PluginRegistryEntry {
   const now = new Date().toISOString();
-  return {
+  const entry: PluginRegistryEntry = {
     name: args.name,
     version: args.version,
     enabled: false,
@@ -326,6 +330,8 @@ export function buildEntry(args: {
     source: args.source,
     warnings: args.warnings,
   };
+  if (args.hostTrust) entry.hostTrust = args.hostTrust;
+  return entry;
 }
 
 /** When the user clicks update, build a refreshed entry keeping the
@@ -335,14 +341,20 @@ export function rebuildEntryForUpdate(args: {
   version: string;
   source: PluginSource;
   warnings?: string[];
+  /** Recomputed from the install source.  Omitted drops a stale flag. */
+  hostTrust?: PluginHostTrust;
 }): PluginRegistryEntry {
-  return {
-    ...args.existing,
+  const entry: PluginRegistryEntry = {
+    name: args.existing.name,
     version: args.version,
+    enabled: args.existing.enabled,
+    installedAt: args.existing.installedAt,
     updatedAt: new Date().toISOString(),
     source: args.source,
     warnings: args.warnings ?? args.existing.warnings,
   };
+  if (args.hostTrust) entry.hostTrust = args.hostTrust;
+  return entry;
 }
 
 /** Used by tests to fully reset a base directory. */

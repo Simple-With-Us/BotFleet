@@ -35,7 +35,9 @@ The manifest declares:
 
     Anything else is blocked.  The manager shows the list before a
     person enables the plugin.  The shipped Zulip plugin is the
-    exception: the host also allows that install's configured realm.
+    exception: when it is installed from `plugins/first-party/zulip`,
+    the host records that on the registry and also allows the
+    configured realm.
 *   **No files outside the plugin directory.**  Your plugin runs in its
     own sandboxed process that can read only its own directory and
     cannot write anywhere.

@@ -30,6 +30,12 @@ export const PluginSourceSchema = z.discriminatedUnion("kind", [
 ]);
 export type PluginSource = z.infer<typeof PluginSourceSchema>;
 
+/** Host-owned install provenance.  A manifest cannot set this.  The
+ *  only value today lets the shipped Zulip plugin reach the configured
+ *  realm.  Optional so a registry written before the field still parses. */
+export const PluginHostTrustSchema = z.enum(["zulip-realm"]);
+export type PluginHostTrust = z.infer<typeof PluginHostTrustSchema>;
+
 /** One entry in `registry.json`.  Everything the host needs to load,
  *  enable, disable, update, or remove the plugin. */
 export const PluginRegistryEntrySchema = z.object({
@@ -40,6 +46,7 @@ export const PluginRegistryEntrySchema = z.object({
   updatedAt: ISO_TIMESTAMP,
   source: PluginSourceSchema,
   warnings: z.array(z.string().max(1024)).max(64),
+  hostTrust: PluginHostTrustSchema.optional(),
 }).strict();
 export type PluginRegistryEntry = z.infer<typeof PluginRegistryEntrySchema>;
 
@@ -117,6 +124,8 @@ export const PluginListingSchema = z.object({
   updatedAt: z.string().min(1),
   source: PluginListingSourceSchema,
   warnings: z.array(z.string()),
+  /** Copied from the registry.  Absent for every install that is not the shipped Zulip folder. */
+  hostTrust: PluginHostTrustSchema.optional(),
   capabilities: z.array(z.string()),
   /** Outbound destinations the plugin declared.  Omitted means none. */
   needs: z.object({

@@ -65,6 +65,9 @@ describe("plugin registry", () => {
     const entry = buildEntry({ name: "demo", version: "1.0.0", source: { kind: "folder", path: "/tmp/demo" }, warnings: [] });
     expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { demo: { ...entry, extra: 1 } } }).success).toBe(false);
     expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { demo: { ...entry, source: { kind: "ftp", path: "x" } } } }).success).toBe(false);
+    expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { demo: { ...entry, hostTrust: "admin" } } }).success).toBe(false);
+    expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { demo: { ...entry, hostTrust: "zulip-realm" } } }).success).toBe(true);
+    expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { demo: entry } }).success).toBe(true);
   });
 
   it("writes the plugin tree and reads it back through listingFor", async () => {
@@ -96,6 +99,35 @@ describe("plugin registry", () => {
     expect(listing.description).toBe("Demo plugin.");
     expect(listing.capabilities.length).toBe(0);
     expect(listing.needs).toEqual({ network: [] });
+    expect(listing.hostTrust).toBeUndefined();
+  });
+
+  it("copies host trust onto the listing and leaves it off when unset", async () => {
+    const manifest = JSON.stringify({
+      name: "zulip",
+      version: "1.0.0",
+      description: "Zulip.",
+      botfleet: ">=1",
+      entry: "plugin.mjs",
+    });
+    await writePluginTree("zulip", {
+      source: "/tmp/zulip",
+      manifestText: manifest,
+      files: [{ path: "plugin.mjs", content: "export const hello = 'world';\n" }],
+    }, baseDir);
+    const trusted = buildEntry({
+      name: "zulip",
+      version: "1.0.0",
+      source: { kind: "folder", path: "/tmp/zulip" },
+      warnings: [],
+      hostTrust: "zulip-realm",
+    });
+    setPluginEntry(trusted, baseDir);
+    const listing = listingFor("zulip", baseDir);
+    if ("error" in listing) throw new Error(listing.error);
+    expect(listing.hostTrust).toBe("zulip-realm");
+    const reread = readRegistry(baseDir);
+    expect(reread.plugins.zulip?.hostTrust).toBe("zulip-realm");
   });
 
   it("does not touch another install's staging dir for the same plugin", async () => {

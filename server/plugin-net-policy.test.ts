@@ -1,9 +1,9 @@
-import { mkdtempSync, mkdirSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { httpUrlToNetworkAllow, isShippedZulipPlugin, pluginNetworkAllow } from "./plugin-net-policy.ts";
+import { httpUrlToNetworkAllow, pluginNetworkAllow, shippedZulipHostTrust } from "./plugin-net-policy.ts";
 
 describe("plugin network allow policy", () => {
   it("grants declared hosts only when net.hosts is declared", () => {
@@ -20,17 +20,24 @@ describe("plugin network allow policy", () => {
     })).toEqual(["api.example.com:443", "203.0.113.5:80"]);
   });
 
-  it("adds the configured Zulip realm only for the shipped plugin directory", () => {
+  it("records Zulip realm trust only for the shipped source folder", () => {
     const root = mkdtempSync(join(tmpdir(), "botfleet-first-party-"));
     const shipped = join(root, "zulip");
     mkdirSync(shipped);
     const elsewhere = mkdtempSync(join(tmpdir(), "botfleet-third-party-"));
-    mkdirSync(join(elsewhere, "zulip"));
+    const copy = join(elsewhere, "zulip");
+    mkdirSync(copy);
 
-    expect(isShippedZulipPlugin("zulip", shipped, root)).toBe(true);
-    expect(isShippedZulipPlugin("zulip", join(elsewhere, "zulip"), root)).toBe(false);
-    expect(isShippedZulipPlugin("other", shipped, root)).toBe(false);
-    expect(isShippedZulipPlugin("zulip", join(root, "missing"), root)).toBe(false);
+    expect(shippedZulipHostTrust("zulip", { kind: "folder", path: shipped }, root)).toBe("zulip-realm");
+    expect(shippedZulipHostTrust("zulip", { kind: "folder", path: copy }, root)).toBeUndefined();
+    expect(shippedZulipHostTrust("other", { kind: "folder", path: shipped }, root)).toBeUndefined();
+    expect(shippedZulipHostTrust("zulip", { kind: "folder", path: join(root, "missing") }, root)).toBeUndefined();
+    expect(shippedZulipHostTrust("zulip", {
+      kind: "git",
+      url: "https://example.com/zulip.git",
+      ref: null,
+      path: "",
+    }, root)).toBeUndefined();
 
     const realm = "https://chat.example.com/realm/";
     expect(httpUrlToNetworkAllow(realm)).toBe("chat.example.com:443");
@@ -49,7 +56,7 @@ describe("plugin network allow policy", () => {
     expect(pluginNetworkAllow({
       capabilities: ["net.hosts"],
       declared: ["203.0.113.9:443"],
-      shippedZulip: isShippedZulipPlugin("zulip", realpathSync(shipped), root),
+      shippedZulip: shippedZulipHostTrust("zulip", { kind: "folder", path: shipped }, root) === "zulip-realm",
       zulipRealm: "http://127.0.0.1:9",
     })).toEqual(["203.0.113.9:443", "127.0.0.1:9"]);
   });

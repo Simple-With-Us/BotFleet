@@ -6,17 +6,27 @@
 // manifest cannot mark itself trusted.
 //
 // The shipped Zulip plugin is the one first-party exception.  Trust is
-// the directory the host owns (`plugins/first-party/zulip`), not the
-// name in the manifest.  That plugin also receives the configured Zulip
+// recorded on the registry entry at install, and only when the source
+// folder's real path is `plugins/first-party/zulip`.  Install copies
+// the tree into the data directory, so comparing the running directory
+// to the shipped folder never matches.  A git install does not receive
+// the record.  The plugin then also receives the configured Zulip
 // realm host, because the realm is chosen on this Mac and cannot be
 // written into the manifest ahead of time.
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { NET_HOSTS_CAPABILITY } from "../shared/plugin-manifest.ts";
 import { MAX_PLUGIN_NETWORK_ALLOWS, canonicalNetworkToken, normalizePluginNetworkAllow } from "../shared/plugin-net-allow.ts";
+import type { PluginHostTrust, PluginSource } from "./plugin-types.ts";
 
 export const ZULIP_PLUGIN_NAME = "zulip";
+export const ZULIP_REALM_HOST_TRUST = "zulip-realm" satisfies PluginHostTrust;
+
+/** Directory the host ships first-party plugins from.  Compared to the
+ *  install source path, never to the copy under the data directory. */
+export const FIRST_PARTY_PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "plugins", "first-party");
 
 export interface PluginNetworkAllowInput {
   capabilities: readonly string[];
@@ -43,15 +53,23 @@ export function httpUrlToNetworkAllow(site: string): string | null {
   return canonicalNetworkToken(url.hostname, port);
 }
 
-/** True when `pluginDir` is exactly `<firstPartyRoot>/zulip` and the
- *  plugin's name is `zulip`.  A missing directory is not trusted. */
-export function isShippedZulipPlugin(name: string, pluginDir: string, firstPartyRoot: string): boolean {
-  if (name !== ZULIP_PLUGIN_NAME) return false;
+/** Registry provenance for the shipped Zulip plugin.  True only when
+ *  the install source is a folder whose real path is
+ *  `<firstPartyRoot>/zulip` and the manifest name is `zulip`.  A copy
+ *  installed from anywhere else, a git source, and a missing directory
+ *  get nothing. */
+export function shippedZulipHostTrust(
+  name: string,
+  source: PluginSource,
+  firstPartyRoot: string,
+): PluginHostTrust | undefined {
+  if (name !== ZULIP_PLUGIN_NAME || source.kind !== "folder") return undefined;
   try {
-    return realpathSync(pluginDir) === realpathSync(join(firstPartyRoot, ZULIP_PLUGIN_NAME));
+    if (realpathSync(source.path) !== realpathSync(join(firstPartyRoot, ZULIP_PLUGIN_NAME))) return undefined;
   } catch {
-    return false;
+    return undefined;
   }
+  return ZULIP_REALM_HOST_TRUST;
 }
 
 /** The sealed allowlist for one plugin.  Invalid declared entries are

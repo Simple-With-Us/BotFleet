@@ -43,6 +43,7 @@ import {
   writePluginTree,
 } from "./plugin-registry.ts";
 
+import { FIRST_PARTY_PLUGIN_ROOT, shippedZulipHostTrust } from "./plugin-net-policy.ts";
 import { readPluginFolder } from "./plugin-folder.ts";
 import { fetchPluginFromGit, parseGitPluginSource, PluginFetchError } from "./plugin-fetch.ts";
 import {
@@ -235,6 +236,7 @@ async function installFromFetched(
   pluginSource: PluginSource,
   baseDir: string,
   warnings: string[] = [],
+  firstPartyRoot: string = FIRST_PARTY_PLUGIN_ROOT,
 ): Promise<{ entry: PluginRegistryEntry } | PluginError> {
   const parsed = parsePluginManifestJson(fetched.manifestText);
   if (!parsed.ok) {
@@ -274,6 +276,7 @@ async function installFromFetched(
     version: manifest.version,
     source: pluginSource,
     warnings,
+    hostTrust: shippedZulipHostTrust(manifest.name, pluginSource, firstPartyRoot),
   });
   const writeError = trySetPluginEntry(entry, baseDir);
   if (writeError) return writeError;
@@ -290,6 +293,7 @@ export async function installPlugin(
   sourceInput: string,
   baseDir: string = PLUGINS_DIR,
   fetcher: typeof fetch = fetch,
+  firstPartyRoot: string = FIRST_PARTY_PLUGIN_ROOT,
 ): Promise<PluginListing | PluginError> {
   const trimmed = sourceInput.trim();
   if (!trimmed) return { error: "paste a folder path or a GitHub URL" };
@@ -298,7 +302,7 @@ export async function installPlugin(
   if (folder) {
     const parsedFolder = z.string().min(1).max(4096).safeParse(folder);
     if (!parsedFolder.success) return { error: "invalid folder path" };
-    return installFromFolder(parsedFolder.data, baseDir);
+    return installFromFolder(parsedFolder.data, baseDir, firstPartyRoot);
   }
 
   const parsed = parseGitPluginSource(trimmed);
@@ -317,7 +321,7 @@ export async function installPlugin(
     ref: parsed.source.ref,
     path: parsed.source.path,
   };
-  const result = await installFromFetched(fetched.source, fetched, pluginSource, baseDir);
+  const result = await installFromFetched(fetched.source, fetched, pluginSource, baseDir, [], firstPartyRoot);
   if ("error" in result) return result;
   return listingOrError(result.entry.name, baseDir);
 }
@@ -325,12 +329,13 @@ export async function installPlugin(
 async function installFromFolder(
   folder: string,
   baseDir: string,
+  firstPartyRoot: string,
 ): Promise<PluginListing | PluginError> {
   const read = readPluginFolder(folder);
   if ("error" in read) return { error: read.error };
   const pluginSource: PluginSource = { kind: "folder", path: folder };
   const warnings = read.skipped.map((name) => `skipped ${name}`);
-  const result = await installFromFetched(read.source, read.fetched, pluginSource, baseDir, warnings);
+  const result = await installFromFetched(read.source, read.fetched, pluginSource, baseDir, warnings, firstPartyRoot);
   if ("error" in result) return result;
   return listingOrError(result.entry.name, baseDir);
 }
@@ -397,6 +402,7 @@ export async function updatePlugin(
   name: string,
   baseDir: string = PLUGINS_DIR,
   fetcher: typeof fetch = fetch,
+  firstPartyRoot: string = FIRST_PARTY_PLUGIN_ROOT,
 ): Promise<PluginListing | PluginError> {
   const registry = readRegistry(baseDir);
   const entry = registry.plugins[name];
@@ -474,6 +480,7 @@ export async function updatePlugin(
     version: parsed.manifest.version,
     source: entry.source,
     warnings,
+    hostTrust: shippedZulipHostTrust(name, entry.source, firstPartyRoot),
   });
   const writeError = trySetPluginEntry(next, baseDir);
   if (writeError) return writeError;
