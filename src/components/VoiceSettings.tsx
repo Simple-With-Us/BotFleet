@@ -372,6 +372,7 @@ export function VoiceSettings({
   const stopCloneRecording = async () => {
     const session = micRecorderRef.current;
     if (!session) return;
+    const stopIntent = cloneRecordIntentRef.current;
     micRecorderRef.current = null;
     clearCloneRecordTick();
     setCloneRecording(false);
@@ -380,10 +381,13 @@ export function VoiceSettings({
     try {
       if (elapsed < VOICE_CLONE_MIN_SECONDS) {
         session.cancel();
-        setCloneError(`Record at least ${VOICE_CLONE_MIN_SECONDS} seconds of speech (you captured ${elapsed}s).`);
+        if (stopIntent === cloneRecordIntentRef.current) {
+          setCloneError(`Record at least ${VOICE_CLONE_MIN_SECONDS} seconds of speech (you captured ${elapsed}s).`);
+        }
         return;
       }
       const file = await session.stop();
+      if (stopIntent !== cloneRecordIntentRef.current) return;
       if (file.size > 20 * 1024 * 1024) {
         setCloneError("Recording is over 20 MB — try a shorter clip.");
         return;
@@ -392,7 +396,9 @@ export function VoiceSettings({
       setCloneError(null);
     } catch (e) {
       session.cancel();
-      setCloneError(e instanceof Error ? e.message : "Recording failed.");
+      if (stopIntent === cloneRecordIntentRef.current) {
+        setCloneError(e instanceof Error ? e.message : "Recording failed.");
+      }
     }
   };
 
@@ -829,11 +835,13 @@ export function VoiceSettings({
                     onClick={() => void stopCloneRecording()}
                     className="flex items-center gap-1.5 rounded-lg bg-danger px-3 py-1.5 text-[12.5px] font-medium text-white hover:opacity-90"
                   >
-                    Stop Recording ({cloneRecordElapsed}s)
+                    Stop Recording (
+                    <span data-testid="clone-record-elapsed">{cloneRecordElapsed}</span>
+                    s)
                   </button>
                 )}
                 {cloneFile && !cloneRecording && (
-                  <span className="text-[12px] text-ink-secondary">
+                  <span className="text-[12px] text-ink-secondary" data-testid="clone-record-ready">
                     Ready: {cloneFile.name}
                   </span>
                 )}

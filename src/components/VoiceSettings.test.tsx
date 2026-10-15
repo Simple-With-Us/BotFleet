@@ -271,6 +271,10 @@ describe("VoiceSettings personal voice selection guard", () => {
   it("routes add and clone through the select guard", () => {
     const guard = between("const commitVoice", "const commitIphoneVoice");
     const add = between("const handleAddCustomVoice", "const handleDeleteVoice");
+    const stop = between("const stopCloneRecording", "const saveKey");
+    expect(stop).toContain("const stopIntent = cloneRecordIntentRef.current");
+    expect(stop).toContain("if (stopIntent !== cloneRecordIntentRef.current) return");
+
     const clone = between("const handleClone =", "if (!tts) return null");
 
     expect(guard).toContain("personalVoiceAllowedRef.current");
