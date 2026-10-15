@@ -1396,8 +1396,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             if (names.success) announceCommands(threadId, turnId, names.data.map((command) => command.name));
             return;
           }
-          const replayMeta = z.object({ isReplay: z.boolean().optional() }).safeParse(Reflect.get(p, "_meta"));
-          if (!state.promptSent || (replayMeta.success && replayMeta.data.isReplay === true)) return;
+          const replayParams = z
+            .object({
+              _meta: z.object({ isReplay: z.boolean().optional() }).strict().optional(),
+            })
+            .safeParse(p);
+          if (!state.promptSent || (replayParams.success && replayParams.data._meta?.isReplay === true)) return;
           switch (u.sessionUpdate) {
             case "agent_message_chunk": {
               const delta = u.content?.text;
