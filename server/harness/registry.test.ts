@@ -1505,6 +1505,9 @@ describe("isCustomInstance", () => {
     expect(isCustomInstance("boxAgent", "computer")).toBe(false);
     expect(isCustomInstance("cursorAgent", "cursor")).toBe(false);
     expect(isCustomInstance("codex", "codex")).toBe(false);
+    expect(isCustomInstance("opencodeGo", "opencode")).toBe(false);
+    expect(isCustomInstance("opencodeGo", "opencodeGo")).toBe(false);
+    expect(isCustomInstance("opencodeGo", "custom-opencode")).toBe(true);
   });
 
   it("fails SAFE for a driver nobody remembered to list", () => {

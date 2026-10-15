@@ -193,6 +193,38 @@ describe("OpenCode catalog", () => {
     }
   });
 
+  it.skipIf(process.platform === "win32")(
+    "does not resurrect a deprecated slug when the plain models list only has retired ids",
+    async () => {
+      const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-deprecated-only-"));
+      const cli = join(scratch, "opencode");
+      writeFileSync(cli, [
+        "#!/bin/sh",
+        'echo "opencode/x-preview-f-free"',
+        'echo "opencode-go/exo-free"',
+        "",
+      ].join("\n"));
+      chmodSync(cli, 0o755);
+      resetOpenCodeModelCache();
+      const driver = createOpenCodeDriver(async () => ({ default: "", options: [] }));
+      try {
+        const instance = await driver.create({
+          instanceId: "opencode-deprecated-fallback",
+          displayName: "OpenCode",
+          environment: {},
+          enabled: true,
+          config: { cli, fullAuto: false },
+        });
+        expect(instance.models.options).toEqual([]);
+        expect(instance.models.default).toBe("");
+        await instance.dispose();
+      } finally {
+        resetOpenCodeModelCache();
+        await removeTempDir(scratch);
+      }
+    },
+  );
+
   it("accepts header-only output from older CLIs and rejects malformed lines", () => {
     const models = parseOpenCodeModelsOutput([
       "Available models",

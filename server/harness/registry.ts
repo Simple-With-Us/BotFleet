@@ -63,7 +63,13 @@ const RESERVED_INSTANCE_ID = new Map<string, InstanceId>([
   ["opencodeGo", "opencode"],
 ]);
 
+/** Historical ids this driver kind may have shipped with before the rename.
+ *  Both are reserved: an instance on either id is the default fleet, not
+ *  operator-added, and gets no delete button. */
+const RESERVED_OPENCODE_IDS: ReadonlySet<InstanceId> = new Set(["opencode", "opencodeGo"]);
+
 export function isCustomInstance(driverKind: string, instanceId: InstanceId): boolean {
+  if (driverKind === "opencodeGo") return !RESERVED_OPENCODE_IDS.has(instanceId);
   return instanceId !== (RESERVED_INSTANCE_ID.get(driverKind) ?? driverKind);
 }
 
