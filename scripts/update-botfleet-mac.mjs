@@ -2322,7 +2322,8 @@ function lsofFieldPids(args) {
  * on the same image returned exit 1 and an empty pid list.  A directory that
  * contains a subdirectory, such as `Contents/Resources/server`, is not given
  * to `+D`.  `+D` would walk that tree.  Its top-level files are named
- * instead, so `cua-driver` is still visible. */
+ * instead, including a symlink, so `cua-driver` is still visible.
+ * `Dirent.isFile()` is false for a symlink, so the filter is "not a directory". */
 async function scanOpenDirectory(directory) {
   let names;
   try {
@@ -2331,7 +2332,7 @@ async function scanOpenDirectory(directory) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
-  const files = names.filter((entry) => entry.isFile());
+  const files = names.filter((entry) => !entry.isDirectory());
   if (!names.some((entry) => entry.isDirectory()) && names.length <= 64) {
     return lsofFieldPids(["+D", directory]);
   }
