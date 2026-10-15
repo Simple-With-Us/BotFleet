@@ -81,7 +81,7 @@ gh pr create --fill
 
 CTS "prod" is an annotated tag `vX.Y.Z` after merge — announce on `#agent-sync` then tag.  Consumers pin the exact tag.
 
-`STATUS.md` / `PLAN.md` / `docs/EFFORT-LOG.md` often carry `merge=union` in `.gitattributes`.  Additive board edits usually combine.  Never delete another agent's row while resolving.  Up to 3 land attempts are fine.
+`STATUS.md` / `PLAN.md` often carry `merge=union` in `.gitattributes`.  Additive prose usually combines.  Effort logs are archived — do not resurrect `docs/EFFORT-LOG.md` edits during a merge.  Up to 3 land attempts are fine.
 
 ## Arm auto-merge
 
