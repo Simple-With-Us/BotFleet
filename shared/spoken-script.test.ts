@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { toUtterances } from "../server/tts/speech-text.ts";
 import { utterancesWithSpans } from "./speech-spans.ts";
-import { encodeSpokenSpans, karaokeScriptFromWire, localKaraokeScript, SPOKEN_SPANS_FORMAT } from "./spoken-script.ts";
+import { encodeSpokenSpans, karaokeScriptFromWire, localKaraokeScript, stripPauseTags, SPOKEN_SPANS_FORMAT } from "./spoken-script.ts";
 
 const SOURCE = [
   "## Status",
@@ -16,6 +16,13 @@ const SOURCE = [
   "- First item here",
   "- Second item, with [a link](https://example.com)",
 ].join("\n");
+
+describe("stripPauseTags", () => {
+  it("removes MiniMax pause tags for captions and non-MiniMax voices", () => {
+    expect(stripPauseTags("Done. <#0.3#> Next.")).toBe("Done. Next.");
+    expect(stripPauseTags("no markers")).toBe("no markers");
+  });
+});
 
 describe("spoken spans on the wire", () => {
   it("round-trips: every copied span is the source text, at offsets in the joined utterances", () => {
