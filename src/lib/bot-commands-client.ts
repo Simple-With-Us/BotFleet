@@ -190,13 +190,6 @@ export async function fetchBotCommands(
   return menu;
 }
 
-function commandVisible(command: BotCommand): boolean {
-  if (command.clientAction !== null && !KNOWN_CLIENT_ACTIONS.has(command.clientAction)) {
-    return false;
-  }
-  return true;
-}
-
 /** Flatten a commands response into autocomplete rows the composer can show. */
 export function botCommandAutocompleteChoices(
   response: BotCommandsResponse,
@@ -209,7 +202,6 @@ export function botCommandAutocompleteChoices(
   const pool: AutocompleteChoice[] = [];
   for (const group of response.groups) {
     for (const command of group.commands) {
-      if (!commandVisible(command)) continue;
       pool.push({
         id: command.id,
         name: command.name,

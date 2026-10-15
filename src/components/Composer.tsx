@@ -312,7 +312,7 @@ function ComposerInner({
     return () => {
       cancelled = true;
     };
-  }, [bot?.id, bot?.threadId, bot?.busy, group]);
+  }, [bot?.id, bot?.threadId, group]);
 
   const triggerInfo = autocompleteQueryAt(text, caret);
   const candidates = useMemo(() => {
