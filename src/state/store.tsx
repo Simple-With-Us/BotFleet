@@ -867,6 +867,9 @@ export interface InstanceInfo {
   cli?: string;
   /** Driver's default binary name (e.g. "claude"). */
   cliDefault?: string;
+  /** Other command names that run this engine (e.g. Clutch's "clutch" beside
+   * the default "dsh").  The picker searches them alongside the default. */
+  cliAliases?: string[];
   /** Absolute paths of every default binary found on PATH, PATH order. */
   cliCandidates?: string[];
   /** YOLO full access bypass permissions */
