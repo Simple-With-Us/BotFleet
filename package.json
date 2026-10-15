@@ -92,7 +92,7 @@
     "control-plane:test": "pnpm --filter @botfleet/control-plane test",
     "control-plane:dry-run": "pnpm --filter @botfleet/control-plane dry-run",
     "test:board-audit": "node --test scripts/audit-effort-board.node-test.mjs",
-    "test:server-start": "node --test scripts/botfleet-server-start.node-test.mjs",
+    "test:server-start": "node --test scripts/botfleet-server-start.node-test.mjs scripts/launchd/harness-watchdog.node-test.mjs",
     "postinstall": "node scripts/compile-clutch-dep.mjs",
     "test:cred-sync": "node --test scripts/sync-cli-credentials.node-test.mjs",
     "test:kody-autofix": "node --test .github/autofix/kody-pilot.node-test.mjs",
