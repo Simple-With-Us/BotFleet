@@ -111,7 +111,7 @@ describe("alignSpokenToDisplay", () => {
 
   it("attaches words the voice added to the word before them", () => {
     const a = alignSpokenToDisplay({
-      spokenText: "Fixed it. (a TypeScript code block) That's it.",
+      spokenText: "Fixed it. A TypeScript code block. That's it.",
       displayText: "Fixed it:\nThat's it.",
     });
     expect(landed(a)).toEqual(["Fixed", "it", "it", "it", "it", "it", "That's", "it"]);
@@ -661,7 +661,7 @@ describe("pronunciations", () => {
 const ALIGN_CASES: Array<{ name: string; spoken?: string; display: string; source?: string; pronunciations?: readonly Pronunciation[] }> = [
   { name: "identical", spoken: "The tests pass now.", display: "The tests pass now." },
   { name: "skipped path", spoken: "I changed core.ts today", display: "I changed server/drivers/acp/core.ts today" },
-  { name: "inserted code block", spoken: "Fixed it. (a TypeScript code block) That's it.", display: "Fixed it:\nThat's it." },
+  { name: "inserted code block", spoken: "Fixed it. A TypeScript code block. That's it.", display: "Fixed it:\nThat's it." },
   { name: "digits", spoken: "Flight seven four nine leaves at twenty-three hundred", display: "Flight 749 leaves at 2300" },
   { name: "cardinal", spoken: "version seven hundred and forty nine ships", display: "version 749 ships" },
   { name: "years", spoken: "in twenty twenty six and nineteen eighty four or twenty oh five", display: "in 2026 and 1984 or 2005" },

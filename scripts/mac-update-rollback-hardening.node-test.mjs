@@ -457,7 +457,7 @@ test("another bundle's failures are never pruned by this updater", () => {
   assert.deepEqual(failedInstallBundlesToPrune(names, "BotFleet.app", 1), []);
 });
 
-test("bundles left behind by a failed install are reported, never silently deleted", () => {
+test("failed-install bundles are not mistaken for update candidates", () => {
   const names = [
     "BotFleet.app",
     "BotFleet.app.failed-1789260170446",
@@ -470,11 +470,22 @@ test("bundles left behind by a failed install are reported, never silently delet
     "BotFleet.app.failed-1789111111111",
   ]);
   assert.deepEqual(failedInstallBundles(names, "BotFleet Beta.app"), ["BotFleet Beta.app.failed-1789260170446"]);
-  // They are evidence, so they must not be reachable by the candidate sweep.
   assert.deepEqual(
     staleCandidateNames(names, { prefix: ".BotFleet.update-", suffix: ".app", isAlive: () => false }).stale,
     [".BotFleet.update-4242-1757000000000.app"],
   );
+});
+
+test("a successful rollback deletes the failed replacement instead of keeping it", async () => {
+  const source = await readFile(new URL("./update-botfleet-mac.mjs", import.meta.url), "utf8");
+  assert.match(source, /Removed the failed replacement bundle/);
+  assert.match(source, /await rm\(failedReplacementPath, \{ recursive: true, force: true \}\)/);
+});
+
+test("sweepLeftovers prunes expired failed-install bundles and abandoned stages", async () => {
+  const source = await readFile(new URL("./update-botfleet-mac.mjs", import.meta.url), "utf8");
+  assert.match(source, /sweepLeftovers: async \(\) => \{[\s\S]*sweepAbandonedStageDirectories/);
+  assert.match(source, /sweepLeftovers: async \(\) => \{[\s\S]*sweepExpiredFailedInstallBundles/);
 });
 
 // Second review round.
