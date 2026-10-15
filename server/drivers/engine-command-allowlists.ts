@@ -50,7 +50,7 @@ export const GROK_AGENT_COMMANDS = cloneCommands(GROK_PROBE, [CLAUDE_BUILTIN_SPE
 const ACP_CLAUDE_LIKE = (provenOn: ProvenOn) => cloneCommands(provenOn, CLAUDE_BUILTIN_SPECS);
 
 /** Per driverKind allowlist merged into ENGINE_COMMAND_ALLOWLIST. */
-export const ENGINE_COMMAND_ALLOWLIST_BY_DRIVER: Readonly<Record<string, readonly EngineCommandSpec[]>> = {
+export const ENGINE_COMMAND_ALLOWLIST_BY_DRIVER = {
   claudeAgent: CLAUDE_BUILTIN_COMMANDS,
   grokAgent: GROK_AGENT_COMMANDS,
   cursorAgent: CURSOR_AGENT_BUILTIN_COMMANDS,
@@ -63,4 +63,4 @@ export const ENGINE_COMMAND_ALLOWLIST_BY_DRIVER: Readonly<Record<string, readonl
   dshAgent: ACP_CLAUDE_LIKE({ cliVersion: "1.0.0", date: "2026-10-15" }),
   hermesAgent: ACP_CLAUDE_LIKE({ cliVersion: "1.0.0", date: "2026-10-15" }),
   museAgent: ACP_CLAUDE_LIKE({ cliVersion: "1.0.0", date: "2026-10-15" }),
-};
+} as const satisfies Readonly<Record<string, readonly EngineCommandSpec[]>>;

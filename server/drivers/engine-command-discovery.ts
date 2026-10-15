@@ -130,14 +130,14 @@ const scanGrokWorkflows: Scanner = (ctx) => {
 };
 
 /** Which drivers consult static discovery before the allowlist filter. */
-export const STATIC_ENGINE_COMMAND_SCANNERS: Readonly<Record<string, readonly Scanner[]>> = {
+export const STATIC_ENGINE_COMMAND_SCANNERS = {
   claudeAgent: [scanClaude],
   grokAgent: [scanGrokWorkflows],
   cursorAgent: [scanCursor],
   antigravityAgent: [scanGemini],
   codex: [scanCodex],
   opencodeGo: [scanCursor],
-};
+} as const satisfies Readonly<Record<string, readonly Scanner[]>>;
 
 /** Names found on disk for this driver, normalized and deduped. */
 export function discoverStaticEngineCommands(
