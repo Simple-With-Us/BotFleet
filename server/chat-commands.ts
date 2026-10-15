@@ -17,6 +17,7 @@
 import { effortLabel } from "../src/lib/model-effort.ts";
 import {
   parseMessagingCommand,
+  type BotCommand,
   type BotCommandErrorCode,
   type BotCommandReplyLine,
   type CommandOrigin,
@@ -92,6 +93,37 @@ export class CommandRateLimiter {
 /** Two sentences read as one paragraph only when joined by two spaces. */
 export function joinSentences(sentences: readonly string[]): string {
   return sentences.join("  ");
+}
+
+/** Check POST args against the command's schema before running it. */
+export function validateCommandArgs(
+  command: BotCommand,
+  raw: string | undefined,
+): { ok: true; value: string | undefined } | { ok: false; error: string } {
+  const spec = command.args;
+  if (!spec) {
+    if (raw !== undefined && raw.trim().length > 0) {
+      return {
+        ok: false,
+        error: joinSentences([`/${command.name} does not take an argument.`, "Drop the extra text and try again."]),
+      };
+    }
+    return { ok: true, value: undefined };
+  }
+  const value = raw?.trim() ?? "";
+  if (spec.required && value.length === 0) {
+    return {
+      ok: false,
+      error: joinSentences([`/${command.name} needs ${spec.hint.toLowerCase()}.`, "Add it after the command name."]),
+    };
+  }
+  if (value.length > spec.maxLength) {
+    return {
+      ok: false,
+      error: joinSentences([`The argument is too long.`, `Use at most ${spec.maxLength} characters.`]),
+    };
+  }
+  return { ok: true, value: value.length > 0 ? value : undefined };
 }
 
 function plural(count: number, one: string, many: string): string {
