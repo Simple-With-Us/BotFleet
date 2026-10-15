@@ -154,9 +154,11 @@ export function VoiceSettings({
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [cloneSuccess, setCloneSuccess] = useState<string | null>(null);
   const [cloneRecording, setCloneRecording] = useState(false);
+  const [cloneRecordPending, setCloneRecordPending] = useState(false);
   const [cloneRecordElapsed, setCloneRecordElapsed] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const micRecorderRef = useRef<MicRecorder | null>(null);
+  const cloneRecordIntentRef = useRef(0);
   const recordStartedAtRef = useRef(0);
   const recordTickRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -306,12 +308,6 @@ export function VoiceSettings({
     if (personalVoiceAllowed) setPersonalVoiceDenied(false);
   }, [personalVoiceAllowed]);
 
-  useEffect(() => () => {
-    if (recordTickRef.current) clearInterval(recordTickRef.current);
-    micRecorderRef.current?.cancel();
-    micRecorderRef.current = null;
-  }, []);
-
   const clearCloneRecordTick = () => {
     if (recordTickRef.current) {
       clearInterval(recordTickRef.current);
@@ -319,14 +315,39 @@ export function VoiceSettings({
     }
   };
 
+  const cancelActiveCloneRecording = () => {
+    cloneRecordIntentRef.current += 1;
+    micRecorderRef.current?.cancel();
+    micRecorderRef.current = null;
+    clearCloneRecordTick();
+    setCloneRecording(false);
+    setCloneRecordPending(false);
+    setCloneRecordElapsed(0);
+  };
+
+  const closeClonePanel = () => {
+    cancelActiveCloneRecording();
+    setCloneOpen(false);
+  };
+
+  useEffect(() => () => {
+    cancelActiveCloneRecording();
+  }, []);
+
   const startCloneRecording = async () => {
-    if (!cloneRecordSupported || cloneRecording) return;
+    if (!cloneRecordSupported || cloneRecording || cloneRecordPending) return;
+    const startIntent = cloneRecordIntentRef.current;
+    setCloneRecordPending(true);
     setCloneError(null);
     setCloneSuccess(null);
     setCloneFile(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
     try {
       const session = await startMicRecorder();
+      if (startIntent !== cloneRecordIntentRef.current) {
+        session.cancel();
+        return;
+      }
       micRecorderRef.current = session;
       recordStartedAtRef.current = Date.now();
       setCloneRecordElapsed(0);
@@ -338,7 +359,13 @@ export function VoiceSettings({
         if (elapsed >= VOICE_CLONE_MAX_SECONDS) void stopCloneRecording();
       }, 500);
     } catch (e) {
-      setCloneError(e instanceof Error ? e.message : "Could not start recording.");
+      if (startIntent === cloneRecordIntentRef.current) {
+        setCloneError(e instanceof Error ? e.message : "Could not start recording.");
+      }
+    } finally {
+      if (startIntent === cloneRecordIntentRef.current) {
+        setCloneRecordPending(false);
+      }
     }
   };
 
@@ -706,7 +733,7 @@ export function VoiceSettings({
               type="button"
               onClick={() => {
                 setCustomOpen((o) => !o);
-                setCloneOpen(false);
+                if (cloneOpen) closeClonePanel();
               }}
               className="flex items-center gap-1 text-[12px] text-accent hover:underline"
             >
@@ -716,8 +743,11 @@ export function VoiceSettings({
             <button
               type="button"
               onClick={() => {
-                setCloneOpen((o) => !o);
-                setCustomOpen(false);
+                if (cloneOpen) closeClonePanel();
+                else {
+                  setCloneOpen(true);
+                  setCustomOpen(false);
+                }
               }}
               className="flex items-center gap-1 text-[12px] text-accent hover:underline"
             >
@@ -787,7 +817,7 @@ export function VoiceSettings({
                   <button
                     type="button"
                     onClick={() => void startCloneRecording()}
-                    disabled={cloneCloning}
+                    disabled={cloneCloning || cloneRecordPending}
                     className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-card px-3 py-1.5 text-[12.5px] font-medium text-ink hover:bg-inset disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <Mic size={13} />
@@ -849,7 +879,7 @@ export function VoiceSettings({
               </button>
               <button
                 type="button"
-                onClick={() => setCloneOpen(false)}
+                onClick={() => closeClonePanel()}
                 className="rounded-lg px-2.5 py-1.5 text-[12.5px] text-ink-secondary hover:text-ink"
               >
                 Cancel

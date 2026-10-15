@@ -303,6 +303,10 @@ describe("VoiceSettings personal voice selection guard", () => {
     expect(clone).toContain("commitVoice(result.voiceId)");
     expect(clone).not.toContain("onPatch(");
     expect(SRC).toContain("startMicRecorder");
+    expect(SRC).toContain("cloneRecordPending");
+    expect(SRC).toContain("cloneRecordIntentRef");
+    expect(SRC).toContain("closeClonePanel");
+    expect(SRC).toContain("cancelActiveCloneRecording");
     expect(SRC).toContain("Record on This Mac");
     expect(SRC).toContain("commitVoice(e.target.value)");
 
