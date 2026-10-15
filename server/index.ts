@@ -228,6 +228,15 @@ import {
   revokedTurnProviders,
 } from "./config-reload-keys.ts";
 import { computerReach } from "./computer-capability.ts";
+import {
+  DOOMED_POLICY,
+  doomedReason,
+  formatExecutionHints,
+  profileFor,
+  requiredFor,
+  wisdomInspectPayload,
+  worksInWorkspace as engineWorksInWorkspace,
+} from "./capability-profile.ts";
 import { waitForComputerCall } from "./computer-call-gate.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
 import {
@@ -5880,6 +5889,33 @@ async function startTurn(
   }
   const workspaceError = taskWorkspaceExecutionError(task.workspaceContext, instance.driverKind, opts?.runOn, task.cwd);
   if (workspaceError) throw Object.assign(new Error(workspaceError), { status: 409 });
+  const capabilityProfile = profileFor({
+    driverKind: instance.driverKind,
+    model: boxCloud ? instance.models.default : selection.model,
+    capabilities: instance.adapter.capabilities,
+  });
+  const capabilityRequired = requiredFor({
+    computers: bot.computers,
+    text,
+    runOn: opts?.runOn,
+  });
+  const capabilityHostShell = hostShellGranted(
+    { computers: bot.computers, cloudBackend: bot.cloudBackend },
+    cfg,
+    allowedBotComputers(cfg),
+  );
+  const capabilityDoomed = doomedReason(capabilityProfile, capabilityRequired, {
+    hasHostComputer: capabilityHostShell,
+  });
+  if (capabilityDoomed?.verdict === "refuse") {
+    noteDoomedSkip(bot.id, instance.instanceId);
+    throw Object.assign(new Error(capabilityDoomed.reason), {
+      status: 409,
+      code: "incapable",
+      taskClass: capabilityDoomed.taskClass,
+      pickUnusable: true,
+    });
+  }
   const instanceId = instance.instanceId;
   // Box-backed cloud borrows the boxAgent default model (and no per-bot effort).
   // VPS-backed cloud keeps the bot's modelSelection — that is the engine that
@@ -6038,6 +6074,8 @@ async function startTurn(
     : undefined;
 
   const isImessageTask = store.tasks(bot.id)?.find((t) => t.threadId === threadId)?.title?.toLowerCase() === "imessage";
+  const capabilityHints =
+    fresh && capabilityProfile.executionHints.length ? formatExecutionHints(capabilityProfile) : "";
   const persona = [
     `You are ${bot.name} (display: ${bot.name}), a bot in BotFleet.`,
     bot.title && `Role: ${bot.title}.`,
@@ -6045,6 +6083,7 @@ async function startTurn(
     `Posting rules: post only what another person needs in order to act, and never post unprompted status updates or routine commentary.`,
     isImessageTask && IMESSAGE_PERSONA_RULE,
     isImessageTask && `iMessage communication rule: When replying in this iMessage thread, be concise, direct, and action-oriented. Do not leave out key details, but avoid verbose fluff, unnecessary conversational padding, or multi-paragraph meta commentary. Provide clear, direct summaries.`,
+    capabilityHints,
   ]
     .filter(Boolean)
     .join(" ");
@@ -6153,7 +6192,7 @@ async function startTurn(
       // OpenAI-compat (board row 9998f9a9, P0).  Handing it to one more
       // engine widens a known P0; Grok joins the others only once those
       // tools are confined to the workspace real path.
-      const worksInWorkspace = instance.driverKind !== "grok" && instance.driverKind !== "boxAgent";
+      const worksInWorkspace = engineWorksInWorkspace(instance.driverKind);
       const privateWorkspace = worksInWorkspace ? ensureWorkspace(bot.id) : undefined;
       const skillInstructions = renderSkillInstructions(selectedSkills, {
         includeRoot: worksInWorkspace && opts?.runOn !== "cloud",
@@ -8532,7 +8571,7 @@ async function runGroupMemberTurn(
   // conversation, not a different bot.  The exclusions match the 1:1 lane's
   // exactly, `grok` included; see the comment there for why widening it is
   // held behind confining the workspace file tools.
-  const worksInWorkspace = instance.driverKind !== "grok" && instance.driverKind !== "boxAgent";
+  const worksInWorkspace = engineWorksInWorkspace(instance.driverKind);
   const workspace = worksInWorkspace ? ensureWorkspace(bot.id) : undefined;
   // The room's folder pins here — on the first turn that actually
   // dispatches, not at PATCH time — so a folder set on a never-used room
@@ -15834,6 +15873,24 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         fresh ? { force: true } : { maxAgeMs: 15_000, staleWhileRevalidate: true },
       );
       return json(res, 200, instancesPayload(described));
+    }
+
+    if (method === "GET" && path === "/api/inspect/capabilities") {
+      const profiles = registry.instances().flatMap((inst) =>
+        inst.models.options.map((opt) =>
+          profileFor({
+            driverKind: inst.driverKind,
+            model: opt.id,
+            capabilities: inst.adapter.capabilities,
+          }),
+        ),
+      );
+      return json(res, 200, { profiles, policy: DOOMED_POLICY });
+    }
+
+    if (method === "GET" && path === "/api/inspect/wisdom") {
+      const engine = url.searchParams.get("engine")?.trim() || undefined;
+      return json(res, 200, wisdomInspectPayload(engine));
     }
 
     // ── CLI binary discovery for the Engines "detected" dropdown ──
