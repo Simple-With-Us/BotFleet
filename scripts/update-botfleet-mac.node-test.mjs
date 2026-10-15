@@ -42,6 +42,10 @@ import {
   loadPrepared,
   main,
   parseArguments,
+  normalizeUpdateComponents,
+  resolveUpdateComponentFlags,
+  swapApplicationBundle,
+  swapDependencyTree,
   parseHealthBody,
   pendingRecoveryReceiptPath,
   quiesceBootoutLabels,
@@ -109,6 +113,7 @@ test("prepare and apply expose an explicit reusable stage", () => {
       bundle: undefined,
       dependencies: undefined,
       openApplication: true,
+      components: "both",
       progress: undefined,
       runId: undefined,
     },
@@ -120,10 +125,15 @@ test("prepare and apply expose an explicit reusable stage", () => {
     stage: resolve("/tmp/stage"),
     bundle: undefined,
     dependencies: undefined,
+    components: "both",
     openApplication: false,
     progress: undefined,
     runId: undefined,
   });
+  assert.equal(parseArguments(["update", "--server-only"]).components, "server");
+  assert.equal(parseArguments(["update", "--components", "server"]).components, "server");
+  assert.throws(() => parseArguments(["update", "--components", "app"]), /--components app/);
+  assert.deepEqual(resolveUpdateComponentFlags("server"), { mode: "server", updateServer: true, updateApp: false });
   assert.throws(() => parseArguments(["apply"]), /requires --stage/);
   assert.throws(() => parseArguments(["update", "--unknown"]), /Unknown option/);
   assert.throws(() => parseArguments(["prepare", "--bundle", "/tmp/app"]), /supplied together/);
@@ -2030,6 +2040,18 @@ test("the app and dependency tree swap together while retaining both prior copie
   assert.equal(await readFile(join(paths.appPath, "marker"), "utf8"), "new-app");
   assert.equal(await readFile(join(paths.liveDependencies, "marker"), "utf8"), "new-deps");
   assert.equal(await readFile(join(paths.rollbackApp, "marker"), "utf8"), "old-app");
+  assert.equal(await readFile(join(paths.rollbackDependencies, "marker"), "utf8"), "old-deps");
+});
+
+test("a server-only run swaps only the dependency tree and keeps the installed app", async (t) => {
+  const paths = await swapFixture(t);
+  await swapDependencyTree({
+    liveDependencies: paths.liveDependencies,
+    candidateDependencies: paths.candidateDependencies,
+    rollbackDependencies: paths.rollbackDependencies,
+  });
+  assert.equal(await readFile(join(paths.appPath, "marker"), "utf8"), "old-app");
+  assert.equal(await readFile(join(paths.liveDependencies, "marker"), "utf8"), "new-deps");
   assert.equal(await readFile(join(paths.rollbackDependencies, "marker"), "utf8"), "old-deps");
 });
 
