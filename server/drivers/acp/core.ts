@@ -1396,9 +1396,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             if (names.success) announceCommands(threadId, turnId, names.data.map((command) => command.name));
             return;
           }
+          // `p` always carries `update` (and vendor keys); outer strict() would fail every
+          // notification.  `_meta` is looseObject like grok/allowlist — read isReplay only.
           const replayParams = z
             .object({
-              _meta: z.object({ isReplay: z.boolean().optional() }).strict().optional(),
+              _meta: z
+                .looseObject({ isReplay: z.boolean().optional().catch(undefined) })
+                .optional()
+                .catch(undefined),
             })
             .safeParse(p);
           if (!state.promptSent || (replayParams.success && replayParams.data._meta?.isReplay === true)) return;
