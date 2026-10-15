@@ -98,13 +98,15 @@ describe("intakeFiles", () => {
   });
 
   it("surfaces the underlying error when a pathless image upload to a non-image engine fails", async () => {
-    const fakeResponse = {
-      ok: false,
-      statusText: "Bad Request",
-      json: async () => ({ error: "content-type must be a supported file type" }),
-    };
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (() => Promise.resolve(fakeResponse)) as unknown as typeof fetch;
+    // SAFETY: intakeFiles is the only caller under test and it only needs a
+    // fetch that returns a JSON error body for the attachment upload route.
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "content-type must be a supported file type" }), {
+        status: 400,
+        statusText: "Bad Request",
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
     try {
       const out = await intakeFiles([file("", "image/png", 3)], {
         allowImages: false,
@@ -120,13 +122,15 @@ describe("intakeFiles", () => {
   });
 
   it("attaches a pathless screenshot as a file when the engine cannot read images", async () => {
-    const fakeResponse = {
-      ok: true,
-      statusText: "Created",
-      json: async () => ({ path: "/api/attachments/abc.png", mime: "image/png", bytes: 3 }),
-    };
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (() => Promise.resolve(fakeResponse)) as unknown as typeof fetch;
+    // SAFETY: intakeFiles is the only caller under test and it only needs a
+    // fetch that returns the saved attachment JSON for the upload route.
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ path: "/api/attachments/abc.png", mime: "image/png", bytes: 3 }), {
+        status: 201,
+        statusText: "Created",
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
     try {
       const out = await intakeFiles([file("", "image/png", 3)], {
         allowImages: false,
