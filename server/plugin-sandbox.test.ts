@@ -256,3 +256,67 @@ describe("plugin result schemas", () => {
     expect(PluginCardResultSchema.safeParse({ result: { a: [1, null] } }).success).toBe(true);
   });
 });
+
+describe("plugin sandbox event delivery", () => {
+  const EVENT = {
+    eventId: "zulip:BF-Plumber:42",
+    type: "zulip.message",
+    source: { platform: "zulip", accountId: "BF-Plumber" },
+    occurredAt: "2026-10-15T12:00:00.000Z",
+    receivedAt: "2026-10-15T12:00:01.000Z",
+    refs: { messageId: 42, conversationKey: "dm:7" },
+    mentions: [],
+    context: { botId: "bot-plumber", wakeReason: "dm", senderKind: "owner" },
+  };
+
+  it("delivers events to onEvent and validates the routing decision", async () => {
+    writePlugin("events", `
+      export function onEvent({ event, host }) {
+        host.log("info", "saw " + event.eventId);
+        return { action: "requestWake", targetBotId: "bot-director", rationale: "owner DM" };
+      }
+      export function getHealth() { return { status: "ok", detail: "ready" }; }
+    `);
+    const plugin = await load("events", ["events.subscribe", "dispatch.wake"]);
+    expect(plugin.sandbox.exports.onEvent).toBe(true);
+    expect(plugin.sandbox.exports.getHealth).toBe(true);
+    const { invokePluginEvent, fetchPluginHealth } = await import("./plugin-loader.ts");
+    const { PluginEventDecisionSchema, PluginHealthResultSchema } = await import("./plugin-sandbox-protocol.ts");
+    const delivered = await invokePluginEvent(plugin, EVENT, inputs());
+    if (!delivered.ok) throw new Error(delivered.reason);
+    const decision = PluginEventDecisionSchema.safeParse(delivered.value);
+    expect(decision.success).toBe(true);
+    const health = await fetchPluginHealth(plugin, inputs());
+    if (!health.ok) throw new Error(health.reason);
+    expect(PluginHealthResultSchema.safeParse(health.value).success).toBe(true);
+    // Log text stays in the child; the parent sees level and length only.
+    expect(events.some((e) => e.event === "plugin.log" && e.level === "info")).toBe(true);
+    expect(JSON.stringify(events).includes("saw zulip")).toBe(false);
+  });
+
+  it("reports not_implemented when onEvent is absent", async () => {
+    writePlugin("noevents", `
+      export function runCommand() { return "hi"; }
+    `);
+    const plugin = await load("noevents", ["events.subscribe"]);
+    expect(plugin.sandbox.exports.onEvent).toBe(false);
+    const { invokePluginEvent } = await import("./plugin-loader.ts");
+    const delivered = await invokePluginEvent(plugin, EVENT, inputs());
+    expect(delivered.ok).toBe(false);
+    if (delivered.ok) return;
+    expect(delivered.reason).toBe("not_implemented");
+  });
+
+  it("kills a hanging onEvent on the call deadline without killing the host", async () => {
+    writePlugin("hang", `
+      export async function onEvent() { await new Promise(() => {}); }
+    `);
+    const plugin = await load("hang", ["events.subscribe"], 200);
+    const { invokePluginEvent } = await import("./plugin-loader.ts");
+    const delivered = await invokePluginEvent(plugin, EVENT, inputs());
+    expect(delivered.ok).toBe(false);
+    if (delivered.ok) return;
+    expect(delivered.reason).toBe("timeout");
+    expect(plugin.sandbox.isAlive()).toBe(false);
+  });
+});
