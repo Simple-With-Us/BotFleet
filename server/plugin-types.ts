@@ -60,9 +60,12 @@ export const PluginRegistrySchema = z.object({
 export type PluginRegistry = z.infer<typeof PluginRegistrySchema>;
 
 /** What the host API hands to a plugin's exports.  Frozen so a plugin
- *  cannot reassign to smuggle references back into BotFleet. */
+ *  cannot reassign to smuggle references back into BotFleet.
+ *
+ *  `version` is the host API major the snapshot was built for.  v2
+ *  retains every v1 call, so v1 plugins run unmodified. */
 export interface PluginHost {
-  readonly version: 1;
+  readonly version: 1 | 2;
   log(level: "info" | "warn" | "error", message: string): void;
   getBots(): ReadonlyArray<{ id: string; name: string; status: string; driver: string }>;
   config: {
@@ -75,10 +78,16 @@ export interface PluginHost {
  *  it imports the entry file.  The module namespace itself never crosses
  *  into the trusted server process: the child reports which handlers
  *  exist, and the parent accepts that report only when this strict
- *  schema parses it.  See server/plugin-sandbox-protocol.ts. */
+ *  schema parses it.  See server/plugin-sandbox-protocol.ts.
+ *
+ *  `onEvent` and `getHealth` arrived with host API v2.  Both default to
+ *  false so a v1 child reporting only the original two fields still
+ *  parses. */
 export const PluginExportsSchema = z.object({
   getCardData: z.boolean(),
   runCommand: z.boolean(),
+  onEvent: z.boolean().optional().default(false),
+  getHealth: z.boolean().optional().default(false),
 }).strict();
 export type PluginExports = z.infer<typeof PluginExportsSchema>;
 
@@ -131,7 +140,27 @@ export const PluginListingSchema = z.object({
       description: z.string(),
       args: z.array(z.string()).optional(),
     }).strict()).optional(),
+    eventSubscriptions: z.array(z.object({
+      id: z.string(),
+      source: z.string(),
+      kinds: z.array(z.string()),
+      includeContent: z.boolean().optional(),
+      includeChats: z.boolean().optional(),
+      maxChats: z.number().optional(),
+    }).strict()).optional(),
   }).strict().optional(),
+  /** User settings schema (no values).  Secret values are never listed;
+   *  `configuredKeys` names only which keys hold a value. */
+  settings: z.array(z.object({
+    key: z.string(),
+    label: z.string(),
+    type: z.string(),
+    required: z.boolean().optional(),
+    hasDefault: z.boolean().optional(),
+    description: z.string().optional(),
+  }).strict()).optional(),
+  settingsVersion: z.number().optional(),
+  configuredKeys: z.array(z.string()).optional(),
 }).strict();
 
 /** The full response body of `GET /api/plugins`. */

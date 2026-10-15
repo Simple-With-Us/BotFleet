@@ -38,6 +38,7 @@ import {
   MIN_ROOM_TURN_TIMEOUT_MINUTES,
 } from "./config.ts";
 import { HOST_API_VERSION, satisfiesBotfleetVersion, type JsonValue } from "../shared/plugin-manifest.ts";
+import type { PluginEventEnvelope } from "../shared/plugin-events.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { PLUGINS_DIR } from "./plugin-registry.ts";
 import {
@@ -213,10 +214,15 @@ export function buildHostSnapshot(inputs: PluginHostInputs, capabilities: readon
   return { bots, statusAllowed, configKeys: [...configKeys], config };
 }
 
-/** One handler call into the sandbox. */
+/** One handler call into the sandbox.  `onEvent` and `getHealth`
+ *  arrived with host API v2; the event travels as plain JSON and the
+ *  parent validates the plugin's return against the shared envelope
+ *  contract. */
 export type PluginSandboxCall =
   | { handler: "getCardData"; cardId: string }
-  | { handler: "runCommand"; command: string; args: string };
+  | { handler: "runCommand"; command: string; args: string }
+  | { handler: "onEvent"; event: JsonValue }
+  | { handler: "getHealth" };
 
 export type PluginSandboxResult =
   | { ok: true; value: JsonValue }
@@ -336,7 +342,10 @@ class ChildPluginSandbox implements PluginSandbox {
         this.terminate("timeout");
       }, this.options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS);
       this.pending.set(id, { resolve: resolveCall, timer });
-      this.send({ type: "invoke", id, host, ...request });
+      // SAFETY: each PluginSandboxCall variant carries exactly the fields
+      // its ParentToChildMessage invoke variant requires; the event payload
+      // is schema-built by the parent and the child re-checks its shape.
+      this.send({ type: "invoke", id, host, ...request } as ParentToChildMessage);
     });
   }
 
@@ -565,4 +574,30 @@ export function invokePlugin(
   inputs: PluginHostInputs,
 ): Promise<PluginSandboxResult> {
   return plugin.sandbox.call(request, buildHostSnapshot(inputs, plugin.capabilities));
+}
+
+/** Deliver one typed host event to a loaded plugin's `onEvent` export.
+ *  The caller owns subscription matching, capability gating, content
+ *  scoping, retries, and the ledger; this only runs the sandbox call
+ *  with a fresh snapshot.  A crash or timeout fails this delivery
+ *  alone — the bus in server/plugin-events.ts records it and moves on,
+ *  so one plugin never stops the listener or other plugins. */
+export function invokePluginEvent(
+  plugin: LoadedPlugin,
+  event: PluginEventEnvelope,
+  inputs: PluginHostInputs,
+): Promise<PluginSandboxResult> {
+  // SAFETY: the envelope parsed against pluginEventEnvelopeSchema before
+  // this call, so re-serializing it is JSON by construction.
+  const payload = JSON.parse(JSON.stringify(event)) as JsonValue;
+  return plugin.sandbox.call({ handler: "onEvent", event: payload }, buildHostSnapshot(inputs, plugin.capabilities));
+}
+
+/** Ask a loaded plugin for its health snapshot.  Best-effort: any
+ *  failure means "unknown", never an exception to the caller. */
+export function fetchPluginHealth(
+  plugin: LoadedPlugin,
+  inputs: PluginHostInputs,
+): Promise<PluginSandboxResult> {
+  return plugin.sandbox.call({ handler: "getHealth" }, buildHostSnapshot(inputs, plugin.capabilities));
 }

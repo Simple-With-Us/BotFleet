@@ -17,6 +17,7 @@
 // length, and a failed handler as a stable reason code.
 import { z } from "zod";
 
+import { pluginRoutingDecisionSchema } from "../shared/plugin-events.ts";
 import { PluginExportsSchema } from "./plugin-types.ts";
 
 /** Upper bound on one handler result, measured as JSON text.  A plugin
@@ -66,6 +67,20 @@ export const PluginCardResultSchema = z.object({ result: z.json() }).strict();
 /** A plugin's runCommand result.  Must be text. */
 export const PluginCommandResultSchema = z.string().max(MAX_PLUGIN_RESULT_BYTES);
 
+/** A plugin's onEvent result: the routing decision the host validates
+ *  and executes.  Reuses the shared envelope contract so the wire and
+ *  the bus cannot drift apart. */
+export const PluginEventDecisionSchema = pluginRoutingDecisionSchema;
+export type PluginEventDecision = z.infer<typeof PluginEventDecisionSchema>;
+
+/** A plugin's getHealth result.  Status plus a short detail line; both
+ *  cross into health views, so both are bounded and carry no secrets. */
+export const PluginHealthResultSchema = z.object({
+  status: z.enum(["ok", "degraded", "error"]),
+  detail: z.string().max(500),
+}).strict();
+export type PluginHealthResult = z.infer<typeof PluginHealthResultSchema>;
+
 /** The bot summary a plugin may see.  Narrow on purpose. */
 export const SandboxBotSummarySchema = z.object({
   id: z.string(),
@@ -91,7 +106,12 @@ export type SandboxHostSnapshot = z.infer<typeof SandboxHostSnapshotSchema>;
 /** Parent -> child wire messages.  Exported so tests and the parent can
  *  parse; the sandbox child uses an equivalent hand-rolled check because
  *  it cannot import zod under the permission model (dev runs the .ts
- *  entry with --experimental-strip-types and no node_modules read). */
+ *  entry with --experimental-strip-types and no node_modules read).
+ *
+ *  The `event` payload on onEvent is validated loosely here (plain
+ *  object with an eventId and type): the parent builds it from the
+ *  shared envelope schema, and the child's return is what gets strict
+ *  validation. */
 export const ParentToChildMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("load"),
@@ -110,6 +130,19 @@ export const ParentToChildMessageSchema = z.discriminatedUnion("type", [
     handler: z.literal("runCommand"),
     command: z.string(),
     args: z.string(),
+    host: SandboxHostSnapshotSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("invoke"),
+    id: callId,
+    handler: z.literal("onEvent"),
+    event: z.object({ eventId: z.string(), type: z.string() }).passthrough(),
+    host: SandboxHostSnapshotSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("invoke"),
+    id: callId,
+    handler: z.literal("getHealth"),
     host: SandboxHostSnapshotSchema,
   }).strict(),
 ]);
