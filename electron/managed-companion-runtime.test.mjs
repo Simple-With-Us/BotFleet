@@ -342,6 +342,61 @@ describe("managed companion supervisor", () => {
   });
 });
 
+describe("the supervisor's harness pre-check", () => {
+  /** Stop the loop by raising SIGTERM on the fake signal source after `after`
+   * probe calls, so these tests exercise the real loop rather than a stub. */
+  function fakeSignals() {
+    const handlers = new Map();
+    return {
+      once: (name, fn) => handlers.set(name, fn),
+      fire: (name) => handlers.get(name)?.(),
+    };
+  }
+
+  it("does not spend a sidecar generation while the harness is absent", async () => {
+    const { superviseCompanion } = await import("./managed-companion-supervisor.mjs");
+    const signalSource = fakeSignals();
+    let probes = 0;
+    const runOne = vi.fn(async () => ({ status: "exited", code: 0 }));
+    const allocateEndpoint = vi.fn(() => ({ pid: 1, socketPath: SOCKET, directory: null }));
+
+    const supervised = superviseCompanion({
+      // The repo root, so the dev ladder really resolves companion/src/index.ts
+      // and this exercises the loop rather than the missing-entry guard.
+      appPath: process.cwd(),
+      resourcesPath: path.join(process.cwd(), "electron"),
+      probeHarness: async () => {
+        probes += 1;
+        if (probes >= 4) signalSource.fire("SIGTERM");
+        return false;
+      },
+      allocateEndpoint,
+      runOne,
+      signalSource,
+      log: () => {},
+    });
+
+    const result = await supervised;
+    expect(result.status).toBe("stopped");
+    expect(probes).toBeGreaterThanOrEqual(4);
+    // No socket was allocated and no sidecar was spawned for a harness that
+    // was not there: waiting is strictly cheaper than spawn-then-discard.
+    expect(allocateEndpoint).not.toHaveBeenCalled();
+    expect(runOne).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing companion entry instead of supervising nothing", async () => {
+    const { superviseCompanion } = await import("./managed-companion-supervisor.mjs");
+    const result = await superviseCompanion({
+      appPath: "/nonexistent",
+      resourcesPath: "/nonexistent",
+      probeHarness: async () => true,
+      log: () => {},
+    });
+    expect(result.status).toBe("missing");
+  });
+});
+
 describe("managed companion supervisor arguments", () => {
   it("defaults the harness port and accepts an explicit one", async () => {
     const { supervisorArguments } = await import("./managed-companion-supervisor.mjs");

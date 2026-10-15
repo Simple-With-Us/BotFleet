@@ -76,6 +76,9 @@ export function supervisedCompanionEnvironment(
   child.OMB_PORT = String(harnessPort);
   child.OMB_COMPANION_PORT = String(companionPort);
   child.OMB_CONTROL_PORT = String(controlPort);
+  // The sidecar watches this pipe and shuts itself down when it closes. Without
+  // it a SIGKILLed supervisor leaves an orphan still holding the device port.
+  child.OMB_COMPANION_PARENT_STDIN = "1";
   if (platform === "win32") {
     delete child.ELECTRON_RUN_AS_NODE;
   }
@@ -158,12 +161,19 @@ export async function runSupervisedCompanion({
       execArgv,
       shell: false,
       windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
+      // stdin is the parent-death pipe and must stay open for this sidecar's
+      // whole life: closing it early is exactly the signal that makes the
+      // sidecar stop.
+      stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (error) {
     cleanupCompanionOriginEndpoint(endpoint);
     throw error;
   }
+  child.stdin?.on?.("error", () => {
+    // A sidecar that already exited takes the read end with it; the exit
+    // handler owns the restart, so this only has to not crash the supervisor.
+  });
   child.stdout?.on("data", (data) => log(`[companion] ${String(data).trimEnd()}`));
   child.stderr?.on("data", (data) => log(`[companion err] ${String(data).trimEnd()}`));
 
@@ -272,6 +282,29 @@ function isEntryModule() {
   }
 }
 
+/** Is the harness this sidecar will talk to actually serving?
+ *
+ * The sidecar's private origin answers `/api/health` by asking the harness, so
+ * an absent harness makes the ownership probe fail even though the sidecar is
+ * perfectly healthy. Checking first means the supervisor waits instead of
+ * spawning a sidecar it would immediately give up on — and it converges fast
+ * after a desktop quit, when the app's own harness releases the data lease and
+ * the always-on harness takes over.
+ */
+async function harnessIsReady(harnessPort, { timeoutMs = 2_000 } = {}) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${harnessPort}/api/health`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return false;
+    const text = await response.text();
+    return Buffer.byteLength(text) <= 4096;
+  } catch {
+    return false;
+  }
+}
+
 /** Supervise the sidecar until launchd stops us, restarting it with backoff.
  * One socket per sidecar generation, because the guardian's target is immutable
  * for its lifetime and a reused path with a new pid would keep answering with a
@@ -286,6 +319,7 @@ export async function superviseCompanion({
   log = (line) => console.log(line),
   runOne = runSupervisedCompanion,
   allocateEndpoint = createCompanionOriginEndpoint,
+  probeHarness = harnessIsReady,
   signalSource = process,
 } = {}) {
   const resolved = resolveCompanionEntry({
@@ -307,8 +341,26 @@ export async function superviseCompanion({
     stopping = true;
   });
 
+  // A previous supervisor may have been killed without running its cleanup, so
+  // drop its claim before starting. Left in place it would name a supervisor
+  // that no longer exists, and the app would refuse to adopt a perfectly good
+  // sidecar purely because of a stale number in a file.
+  clearManagedCompanionRuntime({ home });
+
   let attempt = 0;
   while (!stopping) {
+    // Wait for the harness before spending a sidecar generation on it. The
+    // first attempt after a desktop quit usually loses this race, because the
+    // app's own harness has to release the data lease first.
+    if (!(await probeHarness(harnessPort))) {
+      if (attempt === 0) {
+        log(`companion supervisor: waiting for the harness on :${harnessPort}`);
+        attempt = 1;
+      }
+      await delay(RESTART_BASE_MS);
+      continue;
+    }
+
     let endpoint;
     try {
       endpoint = allocateEndpoint();
