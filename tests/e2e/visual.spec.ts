@@ -133,8 +133,12 @@ test('visual: plugins manager with installed plugins', async ({ page }) => {
   await page.getByRole('button', { name: 'Plugins', exact: true }).click();
   const heading = page.getByRole('heading', { name: 'Plugins', level: 1 });
   await expect(heading).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'fleet-overview' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'example-widget' })).toBeVisible();
+  const fleetHeading = page.getByRole('heading', { name: 'fleet-overview', level: 3 });
+  const widgetHeading = page.getByRole('heading', { name: 'example-widget', level: 3 });
+  await fleetHeading.scrollIntoViewIfNeeded();
+  await widgetHeading.scrollIntoViewIfNeeded();
+  await expect(fleetHeading).toBeVisible();
+  await expect(widgetHeading).toBeVisible();
   const view = page.locator('div.bg-app.p-6').filter({ has: heading });
   await expect(view).toHaveScreenshot('plugins-manager.png', {
     ...stableShot,

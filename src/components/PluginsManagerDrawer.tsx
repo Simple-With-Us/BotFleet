@@ -101,7 +101,7 @@ export function PluginsManagerDrawer({ children }: { children: ReactNode }) {
       >
         <div className="absolute inset-y-0 -left-2.5 -right-2.5" />
       </div>
-      <div className="min-h-0 min-w-0 flex-1 overflow-hidden">{children}</div>
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">{children}</div>
     </aside>
   );
 }

@@ -258,7 +258,7 @@ export function PluginsManagerView({
   );
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto bg-app p-6 text-ink">
+    <div className="flex min-h-0 flex-1 flex-col gap-4 bg-app p-6 text-ink">
       <header className="flex items-start justify-between gap-3">
         <div>
           <h1 className="text-[20px] font-semibold">Plugins</h1>
@@ -427,8 +427,8 @@ function PluginRow({
 
   return (
     <li className={cn("px-4 py-4", busy && "opacity-60")}>
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 flex-1">
+      <div className="flex flex-col gap-3">
+        <div className="min-w-0">
           <div className="flex items-baseline gap-2">
             <h3 className="truncate text-[14px] font-medium">{plugin.name}</h3>
             <span className="text-[12px] text-ink-secondary">v{plugin.version}</span>
@@ -466,7 +466,7 @@ function PluginRow({
             </p>
           ) : null}
         </div>
-        <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+        <div className="flex flex-wrap gap-2">
           {plugin.enabled ? (
             <button
               type="button"
