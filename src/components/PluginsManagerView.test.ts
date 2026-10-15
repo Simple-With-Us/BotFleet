@@ -71,8 +71,19 @@ describe("plugins manager schemas", () => {
     }));
     expect(denied).toContain("Outbound network: none");
 
-    const allowed = renderToStaticMarkup(createElement(PluginRow, {
+    const hidden = renderToStaticMarkup(createElement(PluginRow, {
       plugin: { ...listing, needs: { network: ["api.example.com:443"] } },
+      busy: false,
+      onEnable: noop,
+      onDisable: noop,
+      onUpdate: noop,
+      onReload: noop,
+      onRemove: noop,
+    }));
+    expect(hidden).toContain("Outbound network: none");
+
+    const allowed = renderToStaticMarkup(createElement(PluginRow, {
+      plugin: { ...listing, capabilities: ["net.hosts"], needs: { network: ["api.example.com:443"] } },
       busy: false,
       onEnable: noop,
       onDisable: noop,

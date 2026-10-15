@@ -8,13 +8,14 @@
 //   * the Node permission model: read access to the child script and the
 //     plugin's own folder only, no filesystem writes, no child processes,
 //     no worker threads, no native addons, no WASI, no inspector,
-//   * outbound network denied by default.  A plugin reaches a destination
-//     only when its manifest declares that exact host:port in
-//     `needs.network`.  The child seals that list before importing the
-//     plugin.  On Linux an empty list also enters a network namespace;
-//     on macOS a seatbelt profile denies the network and allows only the
-//     declared destinations.  Node 25 and later also withhold `--allow-net`
-//     unless the list is non-empty.
+//   * outbound network denied by default.  A third-party plugin reaches a
+//     destination only when it declares the `net.hosts` capability and
+//     names that exact host:port in `needs.network`.  The shipped Zulip
+//     plugin also receives the configured realm host.  The child seals
+//     the list before importing the plugin.  On Linux an empty list also
+//     enters a network namespace; on macOS a seatbelt profile denies the
+//     network and allows only the sealed destinations.  Node 25 and later
+//     also withhold `--allow-net` unless the list is non-empty.
 //   * a capped V8 heap, a start deadline, and a per-call deadline.  A call
 //     that overruns kills the child; the next call respawns it.
 //   * stdio closed, so nothing the plugin prints reaches the server log.
@@ -30,7 +31,7 @@ import { type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { z } from "zod";
 
@@ -40,9 +41,14 @@ import {
 } from "./config.ts";
 import { HOST_API_VERSION, satisfiesBotfleetVersion, type JsonValue } from "../shared/plugin-manifest.ts";
 import { normalizePluginNetworkAllow } from "../shared/plugin-net-allow.ts";
+import { isShippedZulipPlugin, pluginNetworkAllow } from "./plugin-net-policy.ts";
 import { killPluginProcess, spawnPluginProcess } from "./plugin-net-isolate.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { PLUGINS_DIR } from "./plugin-registry.ts";
+
+/** Host-owned directory.  A plugin installed anywhere else is not the
+ *  shipped Zulip plugin, even when its manifest name is `zulip`. */
+export const FIRST_PARTY_PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "plugins", "first-party");
 import {
   ChildToParentMessageSchema,
   MAX_PLUGIN_RESULT_BYTES,
@@ -542,7 +548,10 @@ export async function loadPlugin(
   listing: PluginListing,
   inputs: PluginHostInputs,
   baseDir: string = PLUGINS_DIR,
-  options: Pick<PluginSandboxOptions, "callTimeoutMs" | "startTimeoutMs" | "heapMb"> = {},
+  options: Pick<PluginSandboxOptions, "callTimeoutMs" | "startTimeoutMs" | "heapMb"> & {
+    firstPartyRoot?: string;
+    zulipRealm?: string;
+  } = {},
 ): Promise<LoadedPlugin | { error: string }> {
   if (!satisfiesBotfleetVersion(listing.botfleet, HOST_API_VERSION)) {
     return {
@@ -568,13 +577,19 @@ export async function loadPlugin(
     return { error: `plugin "${listing.name}" failed to load (entry_outside_plugin)` };
   }
 
+  const networkAllow = pluginNetworkAllow({
+    capabilities: listing.capabilities,
+    declared: listing.needs?.network ?? [],
+    shippedZulip: isShippedZulipPlugin(listing.name, pluginDir, options.firstPartyRoot ?? FIRST_PARTY_PLUGIN_ROOT),
+    zulipRealm: options.zulipRealm,
+  });
   const started = await startPluginSandbox({
     ...options,
     entryPath,
     pluginDir,
     pluginId: pluginLogId(listing.name),
     logger: inputs.logger,
-    networkAllow: normalizePluginNetworkAllow(listing.needs?.network ?? []),
+    networkAllow,
   });
   if ("reason" in started) {
     return { error: `plugin "${listing.name}" failed to load (${started.reason})` };

@@ -25,9 +25,17 @@ The manifest declares:
 ## Authoring Rules
 
 *   **No network unless you declare it.**  The sandbox denies every
-    outbound connection.  If the plugin must reach a host, list each
-    `host:port` in `needs.network`.  Anything else is blocked, and the
-    manager shows the list before a person enables the plugin.
+    outbound connection.  To open a destination, add the `net.hosts`
+    capability and list each `host:port` in `needs.network`:
+
+    ```json
+    "capabilities": ["net.hosts"],
+    "needs": { "network": ["chat.example.com:443"] }
+    ```
+
+    Anything else is blocked.  The manager shows the list before a
+    person enables the plugin.  The shipped Zulip plugin is the
+    exception: the host also allows that install's configured realm.
 *   **No files outside the plugin directory.**  Your plugin runs in its
     own sandboxed process that can read only its own directory and
     cannot write anywhere.

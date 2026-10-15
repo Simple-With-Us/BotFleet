@@ -89,10 +89,12 @@ describe("parsePluginManifest", () => {
   it("accepts an explicit network allowlist and rejects everything else", () => {
     const allowed = parsePluginManifest({
       ...valid,
+      capabilities: ["net.hosts"],
       needs: { network: ["API.Example.com:443", "[::1]:9"] },
     });
     expect(allowed.ok).toBe(true);
     if (allowed.ok) {
+      expect(allowed.manifest.capabilities).toEqual(["net.hosts"]);
       expect(allowed.manifest.needs.network).toEqual(["API.Example.com:443", "[::1]:9"]);
     }
     for (const entry of ["*", "https://example.com/a", "example.com", "127.0.0.1:0", "127.0.0.1:99999", "::1:443"]) {

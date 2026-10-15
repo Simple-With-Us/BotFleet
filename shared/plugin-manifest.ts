@@ -65,10 +65,14 @@ const SUPPORTED_BOTFLEET_RANGE =
 /** Capability allowlist for v1.  Adding a new capability is a breaking
  *  change because plugins render this without a fallback.  Unknown
  *  capabilities fail validation with the field name. */
+/** Declared with `needs.network`.  Without it, a host list is not granted. */
+export const NET_HOSTS_CAPABILITY = "net.hosts";
+
 export const PLUGIN_CAPABILITIES = [
   "read.bots",
   "read.status",
   "read.config",
+  NET_HOSTS_CAPABILITY,
 ] as const;
 export type PluginCapability = typeof PLUGIN_CAPABILITIES[number];
 

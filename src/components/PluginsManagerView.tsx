@@ -14,6 +14,7 @@ import { ArrowUpCircle, Loader2, Power, PowerOff, RefreshCw, Trash2, TriangleAle
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { PluginsResponseSchema, type PluginListing, type PluginsResponse } from "../../server/plugin-types";
+import { NET_HOSTS_CAPABILITY } from "../../shared/plugin-manifest";
 
 interface PluginInstallIssue {
   field: string;
@@ -390,7 +391,9 @@ export function PluginRow({
           <p className="mt-1 text-[13px] text-ink-secondary">{plugin.description}</p>
           <p className="mt-1 text-[12px] text-ink-secondary">Source: {sourceLabel}</p>
           <p className="mt-1 text-[12px] text-ink-secondary">
-            Outbound network: {plugin.needs?.network.length ? plugin.needs.network.join(", ") : "none"}
+            Outbound network: {plugin.capabilities.includes(NET_HOSTS_CAPABILITY) && plugin.needs?.network.length
+              ? plugin.needs.network.join(", ")
+              : "none"}
           </p>
           {plugin.capabilities.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-1.5">

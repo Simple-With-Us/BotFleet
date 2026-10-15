@@ -75,8 +75,9 @@ async function load(
   capabilities?: string[],
   callTimeoutMs?: number,
   needs?: PluginListing["needs"],
+  extra?: { firstPartyRoot?: string; zulipRealm?: string },
 ): Promise<LoadedPlugin> {
-  const result = await loadPlugin(listing(name, capabilities, needs), inputs(), baseDir, { callTimeoutMs });
+  const result = await loadPlugin(listing(name, capabilities, needs), inputs(), baseDir, { callTimeoutMs, ...extra });
   if ("error" in result) throw new Error(result.error);
   started.push(result);
   return result;
@@ -414,7 +415,7 @@ describe("plugin sandbox egress", () => {
           } };
         }
       `);
-      const plugin = await load("allow", [], undefined, { network: [`127.0.0.1:${allowed.port}`] });
+      const plugin = await load("allow", ["net.hosts"], undefined, { network: [`127.0.0.1:${allowed.port}`] });
       const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
       if (!card.ok) throw new Error(card.reason);
       expect(PluginCardResultSchema.parse(card.value).result).toEqual({
@@ -448,13 +449,95 @@ describe("plugin sandbox egress", () => {
           }
         }
       `);
-      const plugin = await load("bogus-needs", [], undefined, { network: ["*", "https://evil.test/x"] });
+      const plugin = await load("bogus-needs", ["net.hosts"], undefined, { network: ["*", "https://evil.test/x"] });
       const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
       if (!card.ok) throw new Error(card.reason);
       expect(PluginCardResultSchema.parse(card.value).result).toEqual({ local: "ERR_ACCESS_DENIED" });
       expect(hits).toBe(0);
     } finally {
       await new Promise((resolve) => local.server.close(resolve));
+    }
+  });
+
+  it("ignores a declared host list when net.hosts is absent", async () => {
+    let hits = 0;
+    const local = await listenLocal(() => {
+      hits += 1;
+    });
+    try {
+      writePlugin("undeclared-cap", `
+        import net from "node:net";
+        export function getCardData() {
+          try {
+            net.connect({ host: "127.0.0.1", port: ${local.port} });
+            return { result: { local: "started" } };
+          } catch (error) {
+            return { result: { local: error.code || "error" } };
+          }
+        }
+      `);
+      const plugin = await load("undeclared-cap", ["read.bots"], undefined, { network: [`127.0.0.1:${local.port}`] });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({ local: "ERR_ACCESS_DENIED" });
+      expect(hits).toBe(0);
+    } finally {
+      await new Promise((resolve) => local.server.close(resolve));
+    }
+  });
+
+  it("allows the shipped Zulip plugin to reach the configured realm host", async () => {
+    let realmHits = 0;
+    let otherHits = 0;
+    const realm = await listenLocal(() => {
+      realmHits += 1;
+    });
+    const other = await listenLocal(() => {
+      otherHits += 1;
+    });
+    try {
+      const realmUrl = JSON.stringify(`http://127.0.0.1:${realm.port}/`);
+      writePlugin("zulip", `
+        import net from "node:net";
+        export async function getCardData() {
+          let body = "";
+          try {
+            const response = await fetch(${realmUrl});
+            body = await response.text();
+          } catch (error) {
+            body = error.code || "error";
+          }
+          const other = await new Promise((resolve) => {
+            let socket;
+            try {
+              socket = net.connect({ host: "127.0.0.1", port: ${other.port}, timeout: 500 });
+            } catch (error) {
+              resolve(error.code || "error");
+              return;
+            }
+            const finish = (value) => { socket.destroy(); resolve(value); };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+          return { result: { body, other } };
+        }
+      `);
+      const plugin = await load("zulip", [], undefined, undefined, {
+        firstPartyRoot: baseDir,
+        zulipRealm: `http://127.0.0.1:${realm.port}`,
+      });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({
+        body: "yes",
+        other: "ERR_ACCESS_DENIED",
+      });
+      expect(realmHits).toBeGreaterThan(0);
+      expect(otherHits).toBe(0);
+    } finally {
+      await new Promise((resolve) => realm.server.close(resolve));
+      await new Promise((resolve) => other.server.close(resolve));
     }
   });
 });
