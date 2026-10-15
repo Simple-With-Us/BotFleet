@@ -2311,21 +2311,20 @@ async function lsofTersePids(args) {
   };
 }
 
-/** One directory level, and only when that level is small.  `+D` would walk
- * the whole app bundle.  Hosted macOS 14 answers `lsof +D` for an open
- * descriptor, which is what the release-store probe uses, and it returned
- * no pid for a named-file lookup of a live binary.  `+d` is that same
- * question without the recursion. */
+/** `lsof -t +D` on a directory that does not itself contain directories.
+ * Hosted macOS 14 answers this for an ordinary open file.  The same image
+ * returned an empty pid list for `+d` and for a named-file lookup.  A
+ * subdirectory is skipped so this cannot walk `Resources/server`. */
 async function scanOpenDirectory(directory) {
   let names;
   try {
-    names = await readdir(directory);
+    names = await readdir(directory, { withFileTypes: true });
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
-  if (names.length > 64) return null;
-  return lsofTersePids(["+d", directory]);
+  if (names.length > 64 || names.some((entry) => entry.isDirectory())) return null;
+  return lsofTersePids(["+D", directory]);
 }
 
 /**
@@ -2338,9 +2337,8 @@ async function scanOpenDirectory(directory) {
  * bundle while any of them runs is the thing to avoid.
  *
  * The text scan is what a developer Mac reports for a mapped binary.  Hosted
- * macOS 14 often prints nothing for that mapping, including when the same
- * process has the file open.  `lsof -t +d` on the binary's directory is the
- * form that image already answers for the release store.
+ * macOS 14 often prints nothing for that mapping.  `lsof -t +D` on a flat
+ * directory is the form that image already answers for an open file.
  */
 export async function bundleHolderPids(bundlePath) {
   let root;

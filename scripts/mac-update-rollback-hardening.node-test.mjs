@@ -134,12 +134,12 @@ test("a rollback bundle this run did not move is never promoted over the install
 
 // P1 — argv does not follow a rename; the kernel's open reference does.
 //
-// Hosted macOS 14 lsof often omits the text mapping of an ad-hoc copy, and
-// still lists a numbered descriptor on that same file.  Hold one open across
-// exec so the scan has a reference it can actually see, on either lsof.
+// Hosted macOS 14 lsof lists an ordinary open file and omits the text mapping
+// of an ad-hoc binary.  Hold a marker file open across exec.  `lsof +D` is
+// the form that image already answers.  `+d` returned an empty pid list.
 
-function spawnHoldingBinary(executable, t) {
-  const child = spawn("/bin/sh", ["-c", 'exec 3<"$0"; exec "$0" "$@"', executable, "120"], { stdio: "ignore" });
+function spawnHoldingBinary(executable, marker, t) {
+  const child = spawn("/bin/sh", ["-c", 'exec 3<"$1"; shift; exec "$0" "$@"', executable, marker, "120"], { stdio: "ignore" });
   t.after(() => { try { child.kill("SIGKILL"); } catch { /* already gone */ } });
   return child;
 }
@@ -147,8 +147,8 @@ function spawnHoldingBinary(executable, t) {
 async function assertHolds(bundle, directory, child, label) {
   const holders = await bundleHolderPids(bundle);
   if (holders.includes(child.pid)) return;
-  const probe = await run("lsof", ["-t", "+d", directory], { allowFailure: true });
-  assert.fail(`${label}: holders=${holders.join(",") || "(none)"} lsof +d code=${probe.code} stdout=${JSON.stringify(probe.stdout)} stderr=${JSON.stringify(probe.stderr)}`);
+  const probe = await run("lsof", ["-t", "+D", directory], { allowFailure: true });
+  assert.fail(`${label}: holders=${holders.join(",") || "(none)"} lsof +D code=${probe.code} stdout=${JSON.stringify(probe.stdout)} stderr=${JSON.stringify(probe.stderr)}`);
 }
 
 test("a process keeps its bundle open across a rename, and only the open reference finds it", macOnly, async (t) => {
@@ -159,8 +159,10 @@ test("a process keeps its bundle open across a rename, and only the open referen
   // A copied Apple binary loses its signature and is killed on launch, so
   // give it an ad-hoc one.
   await run("codesign", ["-f", "-s", "-", executable]);
+  const marker = join(dirname(executable), "open-marker");
+  await writeFile(marker, "open");
 
-  const child = spawnHoldingBinary(executable, t);
+  const child = spawnHoldingBinary(executable, marker, t);
   await new Promise((done) => setTimeout(done, 800));
   assert.equal(child.exitCode, null, "the signed copy should still be running");
 
@@ -191,8 +193,10 @@ test("the bundle scan finds an embedded driver, not only the main executable", m
   await mkdir(join(bundle, "Contents", "MacOS"), { recursive: true });
   await copyFile("/bin/sleep", driver);
   await run("codesign", ["-f", "-s", "-", driver]);
+  const marker = join(dirname(driver), "open-marker");
+  await writeFile(marker, "open");
 
-  const child = spawnHoldingBinary(driver, t);
+  const child = spawnHoldingBinary(driver, marker, t);
   await new Promise((done) => setTimeout(done, 800));
   assert.equal(child.exitCode, null, "the embedded driver should still be running");
 
