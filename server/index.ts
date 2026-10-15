@@ -124,6 +124,8 @@ import {
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
 import { checkBotOrganizeBody, parseAutoUpdateBody } from "./companion-writes.ts";
 import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
+import { isMcodeLockContentionMessage } from "./mcode-lock-contention.ts";
+import { ThreadWedgeGuard } from "./thread-wedge-guard.ts";
 import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
@@ -1084,6 +1086,60 @@ const COMMS_TOKEN = randomBytes(24).toString("hex");
  *  tracker only sees threads that have a run attached, and it resolves
  *  `engineId` from the event it is handed rather than from the live instance,
  *  so a breaker fed from there would miss turns and key on a stale engine. */
+const threadWedgeGuard = new ThreadWedgeGuard();
+
+function rotateWedgedThread(
+  bot: { id: string; threadId: string },
+  wedgedThreadId: string,
+  instanceId: string,
+  streak: number,
+  detail: string,
+): void {
+  store.setResumeCursor(bot.id, instanceId, undefined, wedgedThreadId);
+  const wasActive = bot.threadId === wedgedThreadId;
+  const task = store.createTask(bot.id, `Recovered after ${streak} wedged turns`, wasActive);
+  if (!task) {
+    console.error(`thread wedge: could not rotate task for bot ${bot.id} thread ${wedgedThreadId} (${detail})`);
+    return;
+  }
+  store.appendMessage(task.threadId, {
+    role: "bot",
+    kind: "activity",
+    tool: {
+      name: `Opened a fresh task after ${streak} consecutive turns on ${wedgedThreadId} failed without output (${detail.slice(0, 160)}). Continue here.`,
+      ok: false,
+    },
+  });
+  const updated = store.bot(bot.id);
+  if (updated) broadcast({ kind: "bot", bot: publicBot(updated) });
+  threadWedgeGuard.recordSuccess({ botId: bot.id, threadId: wedgedThreadId, instanceId });
+  console.warn(
+    `thread wedge: rotated bot ${bot.id} from ${wedgedThreadId} to ${task.threadId} after ${streak} wedge failures on ${instanceId}`,
+  );
+}
+
+function noteThreadWedge(bot: { id: string; threadId: string } | null, event: RuntimeEvent): void {
+  if (!bot) return;
+  const instanceId = event.providerInstanceId ?? (event.type === "runtime.error" ? event.provider : undefined);
+  if (!instanceId) return;
+  const key = { botId: bot.id, threadId: event.threadId, instanceId };
+  if (event.type === "runtime.error") {
+    if (!isMcodeLockContentionMessage(event.message)) return;
+    const { shouldRotate, streak } = threadWedgeGuard.recordFailure(key, { runtimeMessage: event.message });
+    if (shouldRotate) rotateWedgedThread(bot, event.threadId, instanceId, streak, event.message);
+    return;
+  }
+  if (event.type !== "turn.completed") return;
+  if (event.ok) {
+    threadWedgeGuard.recordSuccess(key);
+    return;
+  }
+  const { shouldRotate, streak } = threadWedgeGuard.recordFailure(key, { stopReason: event.stopReason });
+  if (shouldRotate) {
+    rotateWedgedThread(bot, event.threadId, instanceId, streak, event.stopReason ?? "turn failed");
+  }
+}
+
 function noteDoomedDispatch(bot: { id: string } | null, event: RuntimeEvent): void {
   if (!bot) return;
   const instanceId = event.providerInstanceId ?? (event.type === "runtime.error" ? event.provider : undefined);
@@ -4202,6 +4258,7 @@ bus.subscribe((event: RuntimeEvent) => {
   }
   broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
   const bot = store.botByThread(event.threadId);
+  noteThreadWedge(bot ?? null, event);
   noteDoomedDispatch(bot ?? null, event);
   const group = bot ? undefined : store.groupByThread(event.threadId);
   // A turn.completed receipts only after the failover pick below: a turn a
