@@ -48,4 +48,4 @@ Manual deploy fallback: `vercel deploy --prod` from `apps/site`.  The project na
 
 ## Coordination
 
-Fleet coordination happens on THE BOARD and #agent-sync per the maintainer's `AGENT-SYNC.md`.  This directory mirrors its effort rows in `docs/EFFORT-LOG.md`.
+Fleet coordination happens on Linear (team PS) and Zulip `#agent-sync` per the maintainer's `AGENT-SYNC.md`.  Historical effort rows live in archived `docs/EFFORT-LOG.md` only.

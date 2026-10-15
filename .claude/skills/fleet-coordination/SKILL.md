@@ -12,7 +12,8 @@ description: Comprehensive master skill for multi-agent fleet operations across 
 > Cursor, Grok, Grok Bot, Codex, AG, DeepSeek, Kimi, and Fx have their own skill dirs and must not take identity from here.
 
 
-Canonical reference: `/Users/jay/apps/AGENT-SYNC.md` and `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`.  
+Canonical reference: `/Users/jay/apps/AGENT-SYNC.md` and `docs/launch-identity.md` (Linear board access).
+
 Slack Coordination Channel: `#agent-sync` (`C0BEZDJDNKV`).
 
 This skill governs how autonomous AI agents collaborate across the entire application fleet (Socratic.Trade, Congress.Trade, Usage-Monitor, congress-trading-shared, DealDex, Personal-Site, Autorotate, ContactLogo, and ai-fleet-coordinator).
@@ -64,12 +65,12 @@ Every agent session must start with systematic orientation before touching code:
    ```
    Skim for your agent tag or repositories you plan to touch.  Grok Bot seats also full-read `[SENDER->FLEET]` (every GB seat must spend time).  Coordinator self-id is `AFL`, not `FLEET`.
 
-3. **Check Live Effort Boards & Work Items:**
+3. **Check Linear (THE BOARD):**
    ```bash
    board stats
    board list --status open,in_progress --limit 25
    ```
-   Or inspect live board files directly: `rg -n "In Progress" /Users/jay/apps/*EFFORT-LOG.md`.
+   Use `~/.local/bin/board` only — never prepend `~/apps/mac-collab` to `PATH`.
 
 ---
 
@@ -88,12 +89,12 @@ git -C /Users/jay/Code/<Repo> worktree add -b <seat>/<feature-slug> ~/apps/<app>
 
 Before starting substantial work, reserve your lane across three durable surfaces:
 
-1. **Live Effort Board (`/Users/jay/apps/<APP>-EFFORT-LOG.md`):**
-   - Add/move your row to **In Progress** with your tag, branch, worktree, and concise objective.
-   - Live boards are branch-neutral and canonical.  Mirror your update to `docs/EFFORT-LOG.md` in the repo before committing.
+1. **Linear (THE BOARD):**
+   - `board list` for the app/team, then `board claim <issue-id>` (or `board file` then claim).
+   - Keep status and comments current through the lane.
 2. **GitHub Issue:**
-   - Link your branch to the corresponding GitHub Issue or create one.
-3. **Slack Channel `#agent-sync`:**
+   - Link your branch to the corresponding GitHub Issue or create one when the app uses issues.
+3. **Zulip `#agent-sync`:**
    Post a standardized claim header:
    ```text
    [<YOUR_TAG>] sync-1

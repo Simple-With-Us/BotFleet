@@ -1,6 +1,6 @@
 ---
 name: closeout
-description: Finish a Monet work unit — THE BOARD, effort log, GitHub issue, Slack, Apple Notes, PR merge state, and Mac-process inventory. Use when a lane is merged, deployed, parked, or handed off. Never silently walk away from In Progress.
+description: Finish a Monet work unit — Linear (THE BOARD), GitHub issue, Zulip, Apple Notes, PR merge state, and Mac-process inventory. Use when a lane is merged, deployed, parked, or handed off. Never silently walk away from In Progress.
 ---
 
 # Closeout (MONET)
@@ -20,26 +20,22 @@ Start-of-work is a triple claim.  End-of-work is the same three surfaces plus No
 - Production verified?  (`deploy-verify`)  Completed ≠ Deployed.
 - Uncommitted files?  Commit or explicitly report why not (failing tests, secrets, owner hold).
 
-## 2. THE BOARD
+## 2. Linear (THE BOARD)
 
 ```bash
-board status <id> completed --resolution "Landed in #<PR>.  <one line>."
+board status BF-1234 completed --resolution "Landed in #<PR>.  <one line>."
 # or: deployed — only after health verify
 ```
 
-If the item is an `effort-row` / `github-issue`, writeback copies that status to the live effort log and GitHub within ~10 min.  Still land `docs/EFFORT-LOG.md` in the app PR.  A comment is useful context; the 15-min grace window keeps sync from clobbering the status you just set.
+Use the team-prefixed issue id (`BF-1234`, `CT-567`, …).  A `board comment` is useful context.  Cloud seats may use Agent-Sync `linear_status` / `linear_comment` when `board` is unavailable.
 
-## 3. Effort board + issues
+## 3. GitHub issues
 
-Live board first, then `docs/EFFORT-LOG.md` in the landing commit.
+- **Completed** on Linear = merged to `main` unless you parked or wontfixed.
+- **Deployed** on Linear = released and verified (say how).
+- Linear and GitHub must match when both exist.  If you executed a numbered issue, comment/close it so it is not abandoned.
 
-- **Completed** = merged to main.
-- **Deployed** = released and verified (say how).
-- Never delete another row.  Correct in place with `(Monet): …` and the date.
-
-Board and GitHub issues must match.  Prefer landing the mirror so `effort-issues-sync` closes the issue.  If you executed a numbered issue, comment/close it so it is not abandoned.
-
-Cross-app work gets a row on each affected board.
+Do not add rows to archived `docs/EFFORT-LOG.md` files.  Cross-app work gets a Linear issue (or comment trail) on each affected app/team.
 
 ## 4. Slack
 
@@ -75,7 +71,7 @@ If you stop without merge: board stays accurate (`open` or a comment "parked bec
 ## Canon
 
 - `/Users/jay/apps/AGENT-SYNC.md` — triple closeout; Apple Notes; Mac local processes; always-commit
-- `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`
+- `docs/launch-identity.md` § Linear Board Access
 - Skills: `board-ops`, `apple-notes`, `deploy-verify`, `land-lane`
 
 ## Living Handoff Morphing to Closeout

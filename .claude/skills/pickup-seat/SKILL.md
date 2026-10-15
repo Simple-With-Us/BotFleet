@@ -1,7 +1,7 @@
 ---
 name: pickup-seat
 description: >-
-  Pick up a capped-out or abandoned peer seat's in-flight work (owner-directed only). Inventory THE BOARD, effort logs, PRs, dirty worktrees, and Slack; claim; adopt uncommitted work with authorship credit; disposition each item; hand back. Use when the owner says a seat hit a usage cap, died mid-task, or "take over X's lanes."
+  Pick up a capped-out or abandoned peer seat's in-flight work (owner-directed only). Inventory Linear (THE BOARD), PRs, dirty worktrees, and Zulip; claim; adopt uncommitted work with authorship credit; disposition each item; hand back. Use when the owner says a seat hit a usage cap, died mid-task, or "take over X's lanes."
 ---
 
 # Pick up a seat (MONET)
@@ -22,9 +22,6 @@ You are **$AGENT_SEAT** (MONET, CLAUDE, or RENOIR).  Keep that seat's prefix.  I
 ```bash
 board list --status in_progress --limit 50
 board list --mine <THEIR_TAG> --status open,in_progress
-
-# Live boards (skip none — pickup is often cross-app)
-rg -n "In Progress" /Users/jay/apps/*EFFORT-LOG.md
 
 gh pr list --state open --json number,title,author,mergeStateStatus,autoMergeRequest,url
 
@@ -50,7 +47,7 @@ state: WIP
 do-not: double-work these lanes"
 ```
 
-Put the same claim on THE BOARD (`board claim` or `board comment`) **and** on the live effort board + `docs/EFFORT-LOG.md`.  Live-only rows have been lost before.
+Put the same claim on Linear (`board claim` or `board comment` on the issue id).
 
 If they used `FLEET` incorrectly, do not echo it.  Directed `<SEAT>` is enough.
 
@@ -91,12 +88,12 @@ Answer disambiguation pings fast.  Cede lanes the returning seat re-claims, espe
 
 ## CLOSE OUT
 
-`closeout` skill: both effort boards, THE BOARD resolution, `docs/rollouts/YYYY-MM-DD-pickup-<seat>-cap.md`, Apple Note `[APP, Monet] pickup <seat> cap`, Slack summary.  Correct premature claims in place.  Never delete their row.
+`closeout` skill: Linear resolution, `docs/rollouts/YYYY-MM-DD-pickup-<seat>-cap.md`, Apple Note `[APP, Monet] pickup <seat> cap`, Zulip summary.  Correct premature claims in place.
 
 ## Canon
 
 - `/Users/jay/apps/AGENT-SYNC.md` — handoff, seats, Mac local processes
-- `/Users/jay/apps/EFFORT-LOG-PROTOCOL.md`
+- `docs/launch-identity.md` § Linear Board Access
 - Skills: `session-start`, `board-ops`, `land-lane`, `unstick-pr`, `closeout`
 
 ## Substitute Agent Direct Slack Closeout `[SUB->ORIGINAL]`

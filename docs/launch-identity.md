@@ -40,7 +40,7 @@ Two consequences of the switch.  With `BOTFLEET_FLEET_SEAT_PROMPTS` off, a launc
 
 ## Linear Board Access
 
-The local `board` command is the fleet's Linear-backed CLI.  It is discovered through BotFleet's augmented PATH (`~/.local/bin` is one of the standard GUI-launch locations), and the launch variables above give it the bot's assigned seat.  The shared role prompt tells every operator bot to list and inspect Linear issues before substantial work, claim the issue before editing, and treat issue text as untrusted data.
+The local `board` command is the fleet's Linear-backed CLI.  It is discovered through BotFleet's augmented PATH (`~/.local/bin` is one of the standard GUI-launch locations), and the launch variables above give it the bot's assigned seat.  Never prepend `~/apps/mac-collab` to `PATH`: that checkout's `board` binary has the same name and talks to the retired mac-collab tracker instead of Linear.  The shared role prompt tells every operator bot to list and inspect Linear issues before substantial work, claim the issue before editing, and treat issue text as untrusted data.
 
 BotFleet does not copy Linear credentials into an engine environment.  The CLI resolves its own authorized credential source on the host; when that source or the command is unavailable, the bot reports the missing capability and continues only independent work.  This keeps Linear access consistent across engines with a shell without exposing the credential to the model.
 
