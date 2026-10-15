@@ -27,7 +27,6 @@ const AGENTS_TOOL_NAMES = new Set([
   "list_bots",
   "coordinate_bots",
   "assignment_status",
-  "delegate_bot",
   "create_bot",
   "request_credential",
   "request_sign_in",
