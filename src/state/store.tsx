@@ -2687,14 +2687,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // the server then 409s instead of delivering. Omitting it lets the
           // server use the active thread.
           const postMessage = (threadId?: string) => {
+            const body: {
+              text: string;
+              replyToId?: string;
+              threadId?: string;
+              busyDelivery?: BusySendDefault;
+            } = {
+              text: action.text,
+              replyToId: action.replyToId,
+            };
+            if (threadId) body.threadId = threadId;
+            if (action.busyDelivery) body.busyDelivery = action.busyDelivery;
             void api(`/api/bots/${action.botId}/messages`, {
               method: "POST",
-              body: JSON.stringify({
-                text: action.text,
-                replyToId: action.replyToId,
-                ...(threadId ? { threadId } : {}),
-                ...(action.busyDelivery ? { busyDelivery: action.busyDelivery } : {}),
-              }),
+              body: JSON.stringify(body),
             })
               .then((body: unknown) => {
                 const parsed = MessagePostResponseSchema.safeParse(body);
