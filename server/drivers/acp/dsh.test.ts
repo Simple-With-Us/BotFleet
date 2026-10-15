@@ -64,6 +64,17 @@ describe("DshAgentDriver config", () => {
     });
   });
 
+  it("offers the Clutch command as an alias without changing the spawn default", () => {
+    // `clutch` runs this engine with CLUTCH_HOME set and Clutch's own profiles
+    // (~/.clutch/dsh), which a bare `dsh` does not — it uses ~/.dsh and an
+    // unrelated profile set.  The picker searched the default name alone, so
+    // the binary that actually runs Clutch could never be chosen.
+    expect(DshAgentDriver.cliAliases).toEqual(["clutch"]);
+    // Still the declared default: nothing about what gets spawned changes, the
+    // alias only widens what the Engines dropdown can offer.
+    expect(DshAgentDriver.defaultConfig().cli).toBe("dsh");
+  });
+
   it("carries the owner-facing DSH model list", () => {
     // Owner 2026-09-27.  DeepSeek's catalog is only two models: `deepseek-flash`
     // IS the image/video model, and its image tokens bill at the same rate as
