@@ -6477,13 +6477,12 @@ async function startTurn(
             }).map((registryTool) => registryTool.name)
           : [],
       });
-      const coordinationPrompt = bot.chiefOfStaff
-        ? chiefOfStaffSystemPrompt(
-            bot.id,
-            store.bots,
-            availableAgentTools,
-            botFleetStatusSystemPrompt(),
-          )
+      const chiefRosterPrompt = bot.chiefOfStaff
+        ? chiefOfStaffSystemPrompt(bot.id, store.bots, availableAgentTools)
+        : "";
+      const chiefStatusPrompt = bot.chiefOfStaff ? botFleetStatusSystemPrompt() : "";
+      const coordinationPrompt = chiefRosterPrompt
+        ? chiefRosterPrompt
         : integrations.agents && sectionPeers.length > 0
           ? [
               "You can work with the other bots in your section through the agents tools — list_bots shows who's available, coordinate_bots records a handoff and returns immediately" +
@@ -6634,10 +6633,17 @@ async function startTurn(
         // `jobs.wake: false` changes the promise: told on the next turn, not
         // woken, so the bot does not end its turn waiting for a wake.
         { id: "jobs", label: "Background jobs", text: jobsMounted ? jobsPrompt(jobSettings().wake, jobSettings()) : "" },
-        // The Chief roster and the status capsule are byte-stable across a
-        // teammate's busy flip (PR #617), which is what lets them stay on
-        // the stable half.
+        // Chief roster text is membership-only (PR #617 / DR1) and stays on the
+        // stable half.  The trusted status capsule can move on its own clock
+        // (freshness, slot readiness) without tearing down the warm CLI — it
+        // rides the volatile half like memory and mentions (BF-1358 / E24).
         { id: "coordination", label: "Team", text: coordinationPrompt ? ` ${coordinationPrompt}` : "" },
+        {
+          id: "botfleet-status",
+          label: "BotFleet status",
+          volatile: true,
+          text: chiefStatusPrompt ? `\n${chiefStatusPrompt}` : "",
+        },
         { id: "credential", label: "Credentials", text: credentialPrompt },
         { id: "routine", label: "Routines", text: routinePrompt },
         { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
@@ -16390,7 +16396,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const instanceId = instanceDelete[1];
       const protectedEngines = new Set([
         "grok", "dsh", "droid", "cursor", "claude", "codex", "antigravity",
-        "minimax", "opencodeGo", "computer", "openaiCompat", "qwen", "hermes", "pi",
+        "minimax", "opencode", "opencodeGo", "computer", "openaiCompat", "qwen", "hermes", "pi",
       ]);
       if (protectedEngines.has(instanceId)) {
         return json(res, 400, { error: `cannot delete default fleet engine "${instanceId}"` });
