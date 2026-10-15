@@ -3,10 +3,12 @@ import { describe, expect, it } from "vitest";
 import { ALL_FIXTURES, engineFixture } from "./computer-capability.fixtures.ts";
 import {
   DOOMED_POLICY,
+  WISDOM,
   doomedReason,
   evaluateCapabilityGate,
   profileFor,
   requiredFor,
+  worksInWorkspace,
   type CapabilityProfile,
 } from "./capability-profile.ts";
 
@@ -130,6 +132,19 @@ describe("evaluateCapabilityGate", () => {
     expect(result.action).toBe("ok");
   });
 
+  it("refuses image turns on non-image engines", () => {
+    const profile = profileFor({
+      instanceId: "minimax",
+      driverKind: "minimax",
+      capabilities: { toolLoop: true },
+      model: "default",
+    });
+    const required = requiredFor({ text: "<attached-image path=a>", computers: [] });
+    const verdict = doomedReason(profile, required);
+    expect(verdict?.verdict).toBe("refuse");
+    expect(verdict?.taskClass).toBe("images");
+  });
+
   it("refuses image attachments on grok API", () => {
     const grok = engineFixture("Grok");
     const result = evaluateCapabilityGate(
@@ -144,5 +159,21 @@ describe("evaluateCapabilityGate", () => {
     );
     expect(result.action).toBe("refuse");
     expect(result.taskClass).toBe("images");
+  });
+});
+
+describe("worksInWorkspace", () => {
+  it("matches the historical grok/box exclusion", () => {
+    expect(worksInWorkspace("claudeAgent")).toBe(true);
+    expect(worksInWorkspace("grok")).toBe(false);
+    expect(worksInWorkspace("boxAgent")).toBe(false);
+  });
+});
+
+describe("WISDOM", () => {
+  it("ships director seeds including DSH rows", () => {
+    expect(WISDOM.length).toBeGreaterThanOrEqual(4);
+    expect(WISDOM.some((row) => row.engine === "dshAgent")).toBe(true);
+    expect(WISDOM.some((row) => row.engine === "dsh")).toBe(true);
   });
 });

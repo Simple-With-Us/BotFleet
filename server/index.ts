@@ -230,9 +230,11 @@ import {
 import { computerReach } from "./computer-capability.ts";
 import {
   DOOMED_POLICY,
-  WISDOM,
   evaluateCapabilityGate,
+  formatExecutionHints,
   profileFor,
+  wisdomInspectPayload,
+  worksInWorkspace as engineWorksInWorkspace,
 } from "./capability-profile.ts";
 import { waitForComputerCall } from "./computer-call-gate.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
@@ -6197,6 +6199,16 @@ async function startTurn(
     : undefined;
 
   const isImessageTask = store.tasks(bot.id)?.find((t) => t.threadId === threadId)?.title?.toLowerCase() === "imessage";
+  const capabilityProfileForHints = profileFor({
+    instanceId: instance.instanceId,
+    driverKind: instance.driverKind,
+    capabilities: instance.adapter.capabilities,
+    model,
+  });
+  const capabilityHints =
+    fresh && capabilityProfileForHints.executionHints.length
+      ? formatExecutionHints(capabilityProfileForHints)
+      : "";
   const persona = [
     `You are ${bot.name} (display: ${bot.name}), a bot in BotFleet.`,
     bot.title && `Role: ${bot.title}.`,
@@ -6204,6 +6216,7 @@ async function startTurn(
     `Posting rules: post only what another person needs in order to act, and never post unprompted status updates or routine commentary.`,
     isImessageTask && IMESSAGE_PERSONA_RULE,
     isImessageTask && `iMessage communication rule: When replying in this iMessage thread, be concise, direct, and action-oriented. Do not leave out key details, but avoid verbose fluff, unnecessary conversational padding, or multi-paragraph meta commentary. Provide clear, direct summaries.`,
+    capabilityHints,
   ]
     .filter(Boolean)
     .join(" ");
@@ -6312,7 +6325,7 @@ async function startTurn(
       // OpenAI-compat (board row 9998f9a9, P0).  Handing it to one more
       // engine widens a known P0; Grok joins the others only once those
       // tools are confined to the workspace real path.
-      const worksInWorkspace = instance.driverKind !== "grok" && instance.driverKind !== "boxAgent";
+      const worksInWorkspace = engineWorksInWorkspace(instance.driverKind);
       const privateWorkspace = worksInWorkspace ? ensureWorkspace(bot.id) : undefined;
       const skillInstructions = renderSkillInstructions(selectedSkills, {
         includeRoot: worksInWorkspace && opts?.runOn !== "cloud",
@@ -8692,7 +8705,7 @@ async function runGroupMemberTurn(
   // conversation, not a different bot.  The exclusions match the 1:1 lane's
   // exactly, `grok` included; see the comment there for why widening it is
   // held behind confining the workspace file tools.
-  const worksInWorkspace = instance.driverKind !== "grok" && instance.driverKind !== "boxAgent";
+  const worksInWorkspace = engineWorksInWorkspace(instance.driverKind);
   const workspace = worksInWorkspace ? ensureWorkspace(bot.id) : undefined;
   // The room's folder pins here — on the first turn that actually
   // dispatches, not at PATCH time — so a folder set on a never-used room
@@ -15993,17 +16006,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
 
     if (method === "GET" && path === "/api/inspect/wisdom") {
-      const hints: Record<string, string[]> = {};
-      for (const instance of registry.instances()) {
-        const profile = profileFor({
-          instanceId: instance.instanceId,
-          driverKind: instance.driverKind,
-          capabilities: instance.adapter.capabilities,
-          model: instance.models.default,
-        });
-        if (profile.executionHints.length) hints[instance.instanceId] = profile.executionHints;
-      }
-      return json(res, 200, { wisdom: WISDOM, executionHints: hints });
+      const engine = url.searchParams.get("engine")?.trim() || undefined;
+      return json(res, 200, wisdomInspectPayload(engine));
     }
 
     // ── provider instances (model picker) ──

@@ -73,22 +73,42 @@ export interface WisdomEntry {
 export const WISDOM: WisdomEntry[] = [
   {
     engine: "antigravityAgent",
-    best_for: ["long autonomous coding with MCP computers"],
-    avoid_for: ["host approval cards", "unattended desktop control"],
-    setup_required: ["agy CLI installed and signed in"],
-    anti_pattern: ["dispatching desktop_gui without warning — approvals are auto-denied"],
-    last_confirmed_by: "engine-audit",
-    last_confirmed_at: "2026-09-25",
+    best_for: ["long autonomous coding sessions with MCP tools"],
+    avoid_for: ["unattended This Computer desktop control — approvals are auto-denied"],
+    setup_required: ["Antigravity CLI logged in", "This Computer grant only when a person is at the keyboard"],
+    anti_pattern: ["Scheduling GUI routines on Antigravity while unattended"],
+    last_confirmed_by: "BF-DIRECTOR",
+    last_confirmed_at: "2026-09-22",
     confidence: 0.9,
   },
   {
     engine: "grok",
-    best_for: ["fast API chat", "tool-loop tasks with host grant"],
-    avoid_for: ["workspace file edits without host shell grant"],
-    setup_required: ["XAI_API_KEY"],
-    anti_pattern: ["coding turns on API Grok when the bot has no host terminal grant"],
-    last_confirmed_by: "engine-audit",
-    last_confirmed_at: "2026-09-25",
+    best_for: ["fast tool-loop turns on the host with a This Computer grant"],
+    avoid_for: ["workspace file tools without host grant", "image attachments", "failover target for coding/file work"],
+    setup_required: ["xAI credentials", "This Computer grant for shell/file tools"],
+    anti_pattern: ["Failing over a Claude coding turn to Grok HTTP"],
+    last_confirmed_by: "BF-DIRECTOR",
+    last_confirmed_at: "2026-09-22",
+    confidence: 0.9,
+  },
+  {
+    engine: "dshAgent",
+    best_for: ["DeepSeek via DSH with standard MCP coding tools"],
+    avoid_for: ["connected-apps workflows before MCP verification lands"],
+    setup_required: ["DSH CLI", "dsh login"],
+    anti_pattern: ["Assuming Composio mounts are verified on DSH"],
+    last_confirmed_by: "BF-DIRECTOR",
+    last_confirmed_at: "2026-09-22",
+    confidence: 0.75,
+  },
+  {
+    engine: "dsh",
+    best_for: ["harness DeepSeek with vision-aware model routing"],
+    avoid_for: ["image turns on visionless Pro row — route to Flash first"],
+    setup_required: ["DeepSeek Harness configured"],
+    anti_pattern: ["Leaving <attached-image> on a visionless DSH model"],
+    last_confirmed_by: "CURSOR",
+    last_confirmed_at: "2026-10-15",
     confidence: 0.85,
   },
 ];
@@ -163,12 +183,20 @@ function defaultImages(cap: ProfileForInput["capabilities"], driverKind: string)
   return cap.images === true;
 }
 
-function driverExecutionHints(driverKind: string): string[] {
-  const row = WISDOM.find((entry) => entry.engine === driverKind);
+function wisdomForEngine(engine: string): WisdomEntry | undefined {
+  return WISDOM.find((entry) => entry.engine === engine);
+}
+
+function driverExecutionHints(driverKind: string, model: string): string[] {
+  const row = wisdomForEngine(driverKind);
   if (!row) return [];
   const hints: string[] = [];
   if (row.best_for.length) hints.push(`Best for: ${row.best_for.join("; ")}.`);
-  if (row.avoid_for.length) hints.push(`Avoid for: ${row.avoid_for.join("; ")}.`);
+  if (row.avoid_for.length) hints.push(`Avoid: ${row.avoid_for.join("; ")}.`);
+  if (row.anti_pattern.length) hints.push(`Anti-patterns: ${row.anti_pattern.join("; ")}.`);
+  if (driverKind === "dsh" && model.includes("pro") && !model.toLowerCase().includes("flash")) {
+    hints.push("Visionless DSH models: switch to Flash before image attachments.");
+  }
   return hints;
 }
 
@@ -193,8 +221,8 @@ export function profileFor(input: ProfileForInput): CapabilityProfile {
     workspaceTools: defaultWorkspaceTools(input.driverKind),
     shell: defaultShell(input.driverKind),
     effortLevels: caps.effortLevels ?? [],
-    setupRequirements: [],
-    executionHints: driverExecutionHints(input.driverKind),
+    setupRequirements: wisdomForEngine(input.driverKind)?.setup_required ?? [],
+    executionHints: driverExecutionHints(input.driverKind, input.model),
     composioMcp: caps.composioMcp === true,
     agentsMcp: caps.agentsMcp === true,
     ...patch,
@@ -319,4 +347,31 @@ export function evaluateCapabilityGate(
     return { action: "warn", profile, required, taskClass: doomed.taskClass, verdict: doomed.verdict, reason: doomed.reason };
   }
   return { action: "refuse", profile, required, taskClass: doomed.taskClass, verdict: doomed.verdict, reason: doomed.reason };
+}
+
+/** True when the bot may use per-bot workspace file tools (not grok/box). */
+export function worksInWorkspace(driverKind: string): boolean {
+  return defaultWorkspaceTools(driverKind);
+}
+
+export function formatExecutionHints(profile: CapabilityProfile): string {
+  if (!profile.executionHints.length) return "";
+  return `[Engine capability hints for ${profile.engine}]\n${profile.executionHints.map((hint) => `- ${hint}`).join("\n")}`;
+}
+
+export function wisdomInspectPayload(engine?: string): {
+  wisdom: WisdomEntry[];
+  executionHintsByEngine: Record<string, string[]>;
+} {
+  const entries = engine ? WISDOM.filter((row) => row.engine === engine) : WISDOM;
+  const executionHintsByEngine: Record<string, string[]> = {};
+  for (const entry of entries) {
+    executionHintsByEngine[entry.engine] = profileFor({
+      instanceId: entry.engine,
+      driverKind: entry.engine,
+      capabilities: {},
+      model: "default",
+    }).executionHints;
+  }
+  return { wisdom: entries, executionHintsByEngine };
 }
