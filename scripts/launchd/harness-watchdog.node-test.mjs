@@ -65,3 +65,15 @@ test("the script the agent runs does exit cleanly when a harness is healthy", ()
   assert.match(script, /if \[ "\$HEAL_ONLY" != true \] && health; then/);
   assert.match(script, /already healthy; not starting a second harness/);
 });
+
+test("CI runs this file, because node --test is opt-in", () => {
+  // vitest's include glob is scripts/**/*.test.mjs, which does not match
+  // *.node-test.mjs.  Hosted CI runs `pnpm test`, and that chain only
+  // reaches a node:test file that package.json names explicitly.
+  const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+  assert.match(
+    pkg.scripts["test:server-start"],
+    /scripts\/launchd\/harness-watchdog\.node-test\.mjs/,
+  );
+  assert.match(pkg.scripts.test, /(?:^|&& )pnpm test:server-start(?: &&|$)/);
+});
