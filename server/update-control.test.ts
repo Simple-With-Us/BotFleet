@@ -27,8 +27,8 @@ import {
   type RuntimeReadiness,
   type UpdateCapabilities,
   type UpdateControl,
-  type UpdateDrainView,
   type UpdateControlDeps,
+  type UpdateDrainView,
   type UpdateStatus,
 } from "./update-control.ts";
 // Test-only import of the updater's own step list.  It keeps the two files
@@ -113,7 +113,7 @@ function build(
   const emitted: UpdateStatus[] = [];
   const git: string[][] = [];
   const ran: { command: string; args: string[] }[] = [];
-  const deps: Partial<UpdateControlDeps> = {
+  const controlDeps: Partial<UpdateControlDeps> = {
     installed: {
       version: "1.0.30",
       sourceCommit: options.installedCommit ?? INSTALLED_COMMIT,
@@ -148,8 +148,8 @@ function build(
     emit: (status) => emitted.push(status),
     pollIntervalMs: 50,
   };
-  if (options.appPath) deps.appPath = options.appPath;
-  const control = createUpdateControl(deps);
+  if (options.appPath) controlDeps.appPath = options.appPath;
+  const control = createUpdateControl(controlDeps);
   controls.push(control);
   return { control, launched, emitted, git, ran };
 }

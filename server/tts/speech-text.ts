@@ -39,7 +39,7 @@ function describeCodeBlock(fence: string): string {
     diff: "diff",
   };
   const name = spoken[lang.toLowerCase()];
-  return name ? `. (a ${name} code block) ` : ". (a code block) ";
+  return name ? `. A ${name} code block. ` : ". A code block. ";
 }
 
 /** `a/b/c/file.ts` → `file.ts`. A path's directories are for the eye. */
@@ -66,7 +66,7 @@ export function speakable(input: string): string {
   text = text.replace(/~~~([^\n]*)\n[\s\S]*?(?:~~~|$)/g, (_m, fence: string) => describeCodeBlock(fence));
 
   // images before links — the syntax differs by one character
-  text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m, alt: string) => (alt ? `. (image: ${alt}) ` : ". (an image) "));
+  text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m, alt: string) => (alt ? `. Image: ${alt}. ` : ". An image. "));
   // [label](url) → label; a bare url becomes a noun rather than an alphabet soup
   text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
   text = text.replace(/<https?:\/\/[^>\s]+>/g, " a link ");
