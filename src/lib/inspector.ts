@@ -62,7 +62,12 @@ function appendPreview(previous: FoldPreview | undefined, delta: string): FoldPr
 
 const previewText = (preview: FoldPreview) => `${preview.text}${preview.overflow ? "…" : ""}`;
 
-export function summarizeRuntime(e: RuntimeEvent): { summary: string; tone: InspectorRow["tone"] } {
+interface RuntimeSummary {
+  summary: string;
+  tone: InspectorRow["tone"];
+}
+
+export function summarizeRuntime(e: RuntimeEvent): RuntimeSummary {
   switch (e.type) {
     case "session.started":
       return { summary: `session ${e.sessionId ?? "(none)"}${e.model ? ` · ${e.model}` : ""}`, tone: "plain" };

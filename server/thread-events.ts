@@ -512,21 +512,17 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
     case "subagent.updated": {
       const subagent = value.subagent;
       if (!isRecord(subagent)) return false;
-      const requiredString = (item: unknown) => item !== undefined && stringOrMissing(item);
-      const requiredNumber = (item: unknown) =>
+      const text = [subagent.id, subagent.threadId, subagent.parentItemId, subagent.label];
+      const counts = [subagent.depth, subagent.toolCount, subagent.startedAt];
+      const finite = (item: typeof counts[number]) =>
         item !== undefined && item !== null && numberOrNullOrMissing(item) && Number.isFinite(item);
       return (
-        requiredString(subagent.id) &&
-        requiredString(subagent.threadId) &&
-        requiredString(subagent.parentItemId) &&
-        requiredNumber(subagent.depth) &&
+        text.every((item) => item !== undefined && stringOrMissing(item)) &&
+        counts.every((item) => finite(item)) &&
         (subagent.fidelity === "typed" || subagent.fidelity === "named") &&
-        requiredString(subagent.label) &&
         stringOrMissing(subagent.lastActivity) &&
-        requiredNumber(subagent.toolCount) &&
-        (subagent.tokens === undefined || requiredNumber(subagent.tokens)) &&
-        requiredNumber(subagent.startedAt) &&
-        (subagent.endedAt === null || requiredNumber(subagent.endedAt)) &&
+        (subagent.tokens === undefined || finite(subagent.tokens)) &&
+        (subagent.endedAt === null || finite(subagent.endedAt)) &&
         (subagent.status === "running" || subagent.status === "completed" || subagent.status === "failed")
       );
     }

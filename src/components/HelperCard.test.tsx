@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import type { Message } from "@/state/store";
 import { HelperCard } from "./HelperCard";
 
+// SAFETY: the fixture sets every field HelperCard reads, then applies the
+// test's override.  The spread is what makes the object a Message.
 const message = (over: Partial<Message> = {}): Message =>
   ({
     id: "m1",

@@ -53,7 +53,7 @@ export class HelperTracker {
   /** Snapshots whose held update has waited out the cap. */
   due(now: number): HelperPublication[] {
     const out: HelperPublication[] = [];
-    for (const key of [...this.lives.keys()]) {
+    for (const key of this.lives.keys()) {
       const live = this.lives.get(key);
       if (!live?.dirty) continue;
       if (live.snapshot.status === "running" && now - live.lastPublishedAt < HELPER_UPDATE_MIN_MS) continue;

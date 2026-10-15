@@ -421,12 +421,7 @@ const FrameMeta = z
   // a frame that is not an object at all carries none of them
   .catch({});
 
-const assistantMessageShape = z.object({ id: z.string().min(1) });
-
-function assistantMessageId(message: unknown): string | undefined {
-  const parsed = assistantMessageShape.safeParse(message);
-  return parsed.success ? parsed.data.id : undefined;
-}
+const assistantMessageIdSchema = z.object({ id: z.string().min(1) });
 
 /** How many helper tokens this frame adds.  Frames of one assistant message
  * repeat a running total, so a later frame with the same id contributes only
@@ -1801,7 +1796,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                 (msg.usage.input_tokens || 0) +
                 (msg.usage.cache_read_input_tokens || 0) +
                 (msg.usage.output_tokens || 0);
-              const delta = helperUsageDelta(session.turn?.helperUsage, assistantMessageId(msg), tokens);
+              const parsedMessage = assistantMessageIdSchema.safeParse(msg);
+              const messageId = parsedMessage.success ? parsedMessage.data.id : undefined;
+              const delta = helperUsageDelta(session.turn?.helperUsage, messageId, tokens);
               if (delta > 0) {
                 emit({
                   ...base(threadId, currentTurnId()),

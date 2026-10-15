@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ensureDirs } from "../config.ts";
-import type { ProviderInstance } from "../contracts.ts";
+import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../testing/launch-identity.ts";
 import {
@@ -2253,10 +2253,13 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       await instance.adapter.sendTurn({ threadId: "t-helpers", text: "survey" });
       await recorder.until((e) => e.type === "turn.completed");
 
-      const started = recorder.events.filter((e) => e.type === "item.started" && e.itemType === "tool");
-      expect(started.map((e) => (e as { itemId?: string }).itemId)).toEqual(["task-1", "helper-read-1"]);
-      expect((started[0] as { parentItemId?: string }).parentItemId).toBeUndefined();
-      expect((started[0] as { subagentId?: string }).subagentId).toBeUndefined();
+      const started = recorder.events.filter(
+        (e): e is Extract<RuntimeEvent, { type: "item.started" }> =>
+          e.type === "item.started" && e.itemType === "tool",
+      );
+      expect(started.map((e) => e.itemId)).toEqual(["task-1", "helper-read-1"]);
+      expect(started[0]?.parentItemId).toBeUndefined();
+      expect(started[0]?.subagentId).toBeUndefined();
       expect(started[1]).toMatchObject({ title: "Read", parentItemId: "task-1", subagentId: "task-1" });
       // the helper's step still completes like any other
       expect(recorder.events.some((e) => e.type === "item.completed" && e.itemType === "tool" && e.itemId === "helper-read-1")).toBe(true);

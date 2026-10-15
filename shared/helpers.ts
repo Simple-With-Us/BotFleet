@@ -43,23 +43,24 @@ export const HELPER_UPDATE_MIN_MS = 1000;
 const LABEL_LIMIT = 80;
 const ACTIVITY_LIMIT = 120;
 
-/** Tool names that start a helper, after case and separators are folded.
- * `task_list` does not match `task`. */
-const HELPER_TOOLS: Readonly<Record<string, HelperFidelity>> = {
-  task: "typed",
-  agent: "typed",
-  spawnagent: "typed",
-  invokesubagent: "named",
-  spawnsubagent: "named",
-};
-
 export function normalizeToolName(name: string | undefined): string {
   return (name ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-/** The fidelity of a tool that starts a helper, or null when it does not. */
+/** The fidelity of a tool that starts a helper, or null when it does not.
+ * Names are folded first, so `task_list` does not match `task`. */
 export function helperToolFidelity(name: string | undefined): HelperFidelity | null {
-  return HELPER_TOOLS[normalizeToolName(name)] ?? null;
+  switch (normalizeToolName(name)) {
+    case "task":
+    case "agent":
+    case "spawnagent":
+      return "typed";
+    case "invokesubagent":
+    case "spawnsubagent":
+      return "named";
+    default:
+      return null;
+  }
 }
 
 export function isHelperToolName(name: string | undefined): boolean {
