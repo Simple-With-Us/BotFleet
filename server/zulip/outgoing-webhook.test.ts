@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -48,6 +48,23 @@ describe("Zulip outgoing webhook spool", () => {
     expect(restarted.add("bot-1", 18)).toBe(true);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ botId: "bot-1", messageId: 18 });
     expect(restarted.pending()).toHaveLength(2);
+  });
+
+  it("scans the directory once for a burst of adds and invalidates the count after removal", () => {
+    const dir = tempDir();
+    let scans = 0;
+    const spool = new ZulipOutgoingSpool(dir, (path) => {
+      scans += 1;
+      return readdirSync(path);
+    });
+    expect(spool.add("bot-1", 17)).toBe(true);
+    expect(spool.add("bot-1", 18)).toBe(true);
+    expect(spool.add("bot-1", 19)).toBe(true);
+    expect(scans).toBe(1);
+
+    spool.remove({ botId: "bot-1", messageId: 18 });
+    expect(spool.add("bot-1", 20)).toBe(true);
+    expect(scans).toBe(2);
   });
 });
 

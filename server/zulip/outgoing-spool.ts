@@ -29,8 +29,9 @@ export interface ZulipOutgoingSpoolItem {
 export class ZulipOutgoingSpool {
   readonly directory: string;
   private pendingCache?: { items: ZulipOutgoingSpoolItem[]; loadedAt: number };
+  private pendingCountCache?: { count: number; loadedAt: number };
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, private readonly readDirectory = readdirSync) {
     this.directory = join(dataDir, "zulip", "outgoing");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     if (process.platform !== "win32") chmodSync(this.directory, 0o700);
@@ -48,21 +49,22 @@ export class ZulipOutgoingSpool {
     const name = this.name(botId, messageId);
     const path = join(this.directory, name);
     const expected = { botId, messageId };
-    const names = readdirSync(this.directory);
-    const count = names.filter((entry) => FILE_NAME.test(entry)).length;
-    if (existsSync(path) && this.valid(path, expected)) {
+    const pathExists = existsSync(path);
+    const count = this.pendingCount();
+    if (pathExists && this.valid(path, expected)) {
       // A prior attempt may have installed the name and then failed the
       // directory fsync.  A retry must establish durability before acking.
       this.fsyncDirectory();
       return false;
     }
-    if (count >= ZULIP_OUTGOING_MAX_PENDING && !existsSync(path)) throw new Error("Zulip outgoing webhook queue is full");
+    if (count >= ZULIP_OUTGOING_MAX_PENDING && !pathExists) throw new Error("Zulip outgoing webhook queue is full");
 
     // writeFileAtomic fsyncs the complete temporary file before rename.  The
     // final directory fsync makes the new name durable before HTTP 200.
     writeFileAtomic(path, `${JSON.stringify(expected)}\n`, { mode: 0o600 });
+    this.pendingCountCache = { count: count + (pathExists ? 0 : 1), loadedAt: Date.now() };
     this.fsyncDirectory();
-    this.invalidatePending();
+    this.invalidatePending(false);
     return true;
   }
 
@@ -118,8 +120,19 @@ export class ZulipOutgoingSpool {
     return attempts;
   }
 
-  private invalidatePending(): void {
+  private invalidatePending(invalidateCount = true): void {
     this.pendingCache = undefined;
+    if (invalidateCount) this.pendingCountCache = undefined;
+  }
+
+  private pendingCount(): number {
+    const now = Date.now();
+    if (this.pendingCountCache && now - this.pendingCountCache.loadedAt < 500) {
+      return this.pendingCountCache.count;
+    }
+    const count = this.readDirectory(this.directory).filter((entry) => FILE_NAME.test(entry)).length;
+    this.pendingCountCache = { count, loadedAt: now };
+    return count;
   }
 
   private valid(path: string, expected: ZulipOutgoingSpoolItem): boolean {
