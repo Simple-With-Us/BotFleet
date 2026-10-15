@@ -3563,18 +3563,25 @@ describe("harness HTTP API", () => {
           // fast reload can clear busy between the reload tool frame and here.
           // Poll for the queued response in one step: wait for busy, POST once,
           // and stop — never spin on busy alone while the bot is already idle.
-          let successorSend: { status: number; body: any } | undefined;
+          type MessageSendResult = { status: number; body: unknown };
+          const isQueuedSend = (result: MessageSendResult | undefined): boolean => {
+            if (!result || result.status !== 202) return false;
+            if (typeof result.body !== "object" || result.body === null) return false;
+            const body = result.body as { queued?: unknown };
+            return body.queued === true;
+          };
+          let successorSend: MessageSendResult | undefined;
           await expect
             .poll(
               async () => {
-                if (successorSend?.body?.queued) return true;
+                if (isQueuedSend(successorSend)) return true;
                 if (successorSend) return false;
                 const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
                   (candidate: { id: string }) => candidate.id === bot.id,
                 );
                 if (!state?.busy) return false;
                 successorSend = await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" });
-                return successorSend.status === 202 && successorSend.body?.queued === true;
+                return isQueuedSend(successorSend);
               },
               {
                 timeout: winSettleMs(15_000),
