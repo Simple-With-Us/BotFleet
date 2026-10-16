@@ -29,6 +29,7 @@ import type {
   ProviderInstance,
   ProviderSnapshot,
 } from "../contracts.ts";
+import { isJsonString } from "../schema.ts";
 
 /** The instance id the default fleet reserves for each driver whose reserved
  * id is not simply its own kind.  `isCustom` — which drives the delete button,
@@ -214,7 +215,7 @@ function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
   if (!aliases?.length) return [];
   // A path or a newline is not a command name; findCliCandidates drops those
   // too, but keeping the list clean here keeps the cache key honest.
-  return [...new Set(aliases.filter((a) => Boolean(a) && !/[\n\r/\\]/.test(a)))];
+  return [...new Set(aliases.filter((a): a is string => isJsonString(a) && Boolean(a) && !/[\n\r/\\]/.test(a)))];
 }
 
 /** Every name that runs this driver: the default first, then its aliases. */
