@@ -439,6 +439,20 @@ describe("ACP turns (fake CLI)", () => {
     }
   });
 
+  it("refuses a turn whose untrimmable text is over the hard ceiling, with a visible error", async () => {
+    const dump = join(scratch, "ceiling-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 512 });
+    await instance.adapter.sendTurn({ threadId: "t-ceiling", text: `HUGE ${"z".repeat(2000)}`, system: "SYS" });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_too_large" });
+    const error = recorder.events.find((event) => event.type === "runtime.error");
+    expect(error?.type === "runtime.error" ? error.message : "").toMatch(/was not sent.*hard limit/);
+    expect(JSON.stringify(error)).not.toContain("zzzz");
+    const methods = JSON.parse(readFileSync(dump, "utf8")) as string[];
+    expect(methods).not.toContain("session/prompt");
+  });
+
   it("emits no Compressing Context row when the prompt fits", async () => {
     await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 0 });
     await instance.adapter.sendTurn({ threadId: "t-fits", text: "hi", system: "SYS" });
