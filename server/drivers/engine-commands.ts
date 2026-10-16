@@ -207,11 +207,17 @@ export function neutralizeLeadingSlash(text: string): string {
 export const ENGINE_COMMAND_ARGS_MAX = 500;
 
 /** True when `text` holds a control character or a line separator, which is
- *  what would turn one stdin line into two. */
+ *  what would turn one stdin line into two.
+ *
+ *  U+0085 (NEL) is in the list for the same reason U+2028 and U+2029 are: it is
+ *  a line terminator to a parser that splits on the Unicode line-break set, so
+ *  `/compact x<U+0085>/model y` would reach a CLI as two commands.  Iterating
+ *  with `for...of` gives whole code points, so a surrogate pair is judged once
+ *  rather than as two halves. */
 export function hasControlCharacter(text: string): boolean {
   for (const char of text) {
     const code = char.codePointAt(0) ?? 0;
-    if (code < 0x20 || code === 0x7f || code === 0x2028 || code === 0x2029) return true;
+    if (code < 0x20 || code === 0x7f || code === 0x85 || code === 0x2028 || code === 0x2029) return true;
   }
   return false;
 }

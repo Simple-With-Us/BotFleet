@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   ENGINE_COMMAND_ALLOWLIST,
   engineCommandText,
+  hasControlCharacter,
   hasEngineCommandAllowlist,
   isDeniedEngineCommand,
   neutralizeLeadingSlash,
@@ -215,5 +216,22 @@ describe("engineCommandText", () => {
     expect(() => engineCommandText({ name: "compact", args: "/model x" })).toThrow();
     expect(() => engineCommandText({ name: "compact", args: "x".repeat(501) })).toThrow();
     expect(engineCommandText({ name: "compact", args: "x".repeat(500) })).toHaveLength("/compact ".length + 500);
+  });
+});
+
+describe("hasControlCharacter", () => {
+  it("flags every character a parser could read as a line break", () => {
+    // Each of these turns one stdin line into two for some parser, which is
+    // the whole point of the guard.  U+0085 (NEL) joined the list because a
+    // CLI that splits on the Unicode line-break set treats it as a newline,
+    // so `/compact x\u0085/model y` would arrive as two commands.
+    for (const ch of ["\n", "\r", "\u000b", "\u001c", "\u007f", "\u0085", "\u2028", "\u2029"]) {
+      expect(hasControlCharacter(`compact x${ch}/model y`)).toBe(true);
+    }
+  });
+
+  it("passes ordinary single-line text through", () => {
+    expect(hasControlCharacter("focus on the tests")).toBe(false);
+    expect(hasControlCharacter("")).toBe(false);
   });
 });

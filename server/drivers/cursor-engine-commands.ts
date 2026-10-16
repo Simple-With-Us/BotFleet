@@ -10,6 +10,8 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { z } from "zod";
+
 import type { EngineCommandDiscoveryContext } from "./engine-command-discovery.ts";
 import { discoverStaticEngineCommands } from "./engine-command-discovery.ts";
 import {
@@ -213,6 +215,28 @@ export function parseCursorCommandFrontmatter(content: string) {
   return fields;
 }
 
+/** The frontmatter fields this reader acts on, validated at the trust boundary.
+ *
+ *  A command file on disk is untrusted input, and its `description` and
+ *  `argument-hint` go straight into the announced catalog the UI renders, so
+ *  the hand-written parse is confirmed with a schema before anything reads a
+ *  field.
+ *
+ *  Deliberately NOT `.strict()`: Cursor command and skill files carry keys this
+ *  reader does not use — `model`, `allowed-tools`, `description` variants and
+ *  vendor additions — and a strict object would drop the whole command over a
+ *  key it never looks at.  The same reasoning as the `looseObject` on the ACP
+ *  `_meta` envelope.  What matters here is that the fields actually read are
+ *  strings, which is what `safeParse` below enforces. */
+const cursorFrontmatterSchema = z
+  .object({
+    name: z.string().optional(),
+    description: z.string().optional(),
+    "argument-hint": z.string().optional(),
+    argument_hint: z.string().optional(),
+  })
+  .passthrough();
+
 function readDiscoveredFile(path: string, fallbackName: string): CursorDiscoveredCommand | null {
   let content: string;
   try {
@@ -220,7 +244,11 @@ function readDiscoveredFile(path: string, fallbackName: string): CursorDiscovere
   } catch {
     return null;
   }
-  const fields = parseCursorCommandFrontmatter(content);
+  const parsed = cursorFrontmatterSchema.safeParse(parseCursorCommandFrontmatter(content));
+  // A file whose frontmatter does not parse is not a command BotFleet can
+  // offer; dropping it is the same answer as a denied name.
+  if (!parsed.success) return null;
+  const fields = parsed.data;
   const rawName = fields.name ?? fallbackName;
   const name = normalizeEngineCommandName(rawName);
   if (name === null || isDeniedEngineCommand(name)) return null;
