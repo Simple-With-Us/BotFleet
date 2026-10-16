@@ -635,7 +635,14 @@ class ZulipSession {
     }
     const ordered = [...found.keys()].sort((a, b) => a - b);
     if (ordered.length) this.hub.log(`[zulip] ${this.role}: backfilled ${ordered.length} message(s) above ${floor}`);
-    for (const id of ordered) void this.hub.routeMessage(this, found.get(id)!);
+    for (const id of ordered) {
+      // routeMessage owns expected failures internally; the catch is a
+      // backstop so an unexpected throw cannot surface as an unhandled
+      // rejection from this fire-and-forget loop.
+      void this.hub.routeMessage(this, found.get(id)!).catch((error: unknown) => {
+        this.hub.log(`[zulip] ${this.role}: backfill route failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
     this.save();
   }
 
@@ -680,7 +687,14 @@ class ZulipSession {
       for (const event of events) {
         if (typeof event.id === "number" && event.id > this.lastEventId) this.lastEventId = event.id;
         if (event.type === "message" && event.message) {
-          void this.hub.routeMessage(this, { ...event.message, flags: event.flags ?? event.message.flags ?? [] });
+          // Fire-and-forget with a backstop: routeMessage owns expected
+          // failures internally, but an unexpected throw must not surface
+          // as an unhandled rejection out of the poll loop.
+          void this.hub
+            .routeMessage(this, { ...event.message, flags: event.flags ?? event.message.flags ?? [] })
+            .catch((error: unknown) => {
+              this.hub.log(`[zulip] ${this.role}: poll route failed: ${error instanceof Error ? error.message : String(error)}`);
+            });
         } else if (event.type === "realm_user") {
           this.applyRealmUser(event.op, event.person);
         } else if (event.type === "user_topic") {

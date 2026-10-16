@@ -1,12 +1,13 @@
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   deletePluginBrokerState,
   migratePluginSettings,
   pluginSecretKeys,
+  pluginSecretsPath,
   readPluginSecrets,
   readPluginSettings,
   validatePluginSettings,
@@ -84,7 +85,8 @@ describe("settings and secret persistence", () => {
   });
 
   it("quarantines corrupt files and reads empty", () => {
-    writeFileSync(join(baseDir, "demo", "plugin-secrets.json"), "{nope");
+    mkdirSync(dirname(pluginSecretsPath(baseDir, "demo")), { recursive: true });
+    writeFileSync(pluginSecretsPath(baseDir, "demo"), "{nope");
     writeFileSync(join(baseDir, "demo", "plugin-settings.json"), "[bad");
     expect(readPluginSecrets(baseDir, "demo")).toEqual({});
     expect(readPluginSettings(baseDir, "demo")).toEqual({ settingsVersion: 1, values: {} });
@@ -95,7 +97,22 @@ describe("settings and secret persistence", () => {
     writePluginSecret(baseDir, "demo", "k", "v");
     if (process.platform === "win32") return;
     expect(statSync(join(baseDir, "demo", "plugin-settings.json")).mode & 0o777).toBe(0o600);
-    expect(statSync(join(baseDir, "demo", "plugin-secrets.json")).mode & 0o777).toBe(0o600);
+    expect(statSync(pluginSecretsPath(baseDir, "demo")).mode & 0o777).toBe(0o600);
+  });
+
+  it("keeps secrets outside the sandbox-readable plugin directory", () => {
+    writePluginSecret(baseDir, "demo", "hookSecret", "s3cr3t");
+    expect(pluginSecretsPath(baseDir, "demo").startsWith(join(baseDir, "demo") + "/")).toBe(false);
+    // No secret material under the plugin dir the sandbox can read.
+    expect(statSync(join(baseDir, "demo", "plugin-secrets.json"), { throwIfNoEntry: false })).toBe(undefined);
+    expect(readPluginSecrets(baseDir, "demo")).toEqual({ hookSecret: "s3cr3t" });
+  });
+
+  it("migrates a legacy in-plugin secrets file to the host-only store", () => {
+    writeFileSync(join(baseDir, "demo", "plugin-secrets.json"), JSON.stringify({ version: 1, values: { hookSecret: "s3cr3t" } }));
+    expect(readPluginSecrets(baseDir, "demo")).toEqual({ hookSecret: "s3cr3t" });
+    expect(pluginSecretsPath(baseDir, "demo")).not.toBe(join(baseDir, "demo", "plugin-secrets.json"));
+    expect(statSync(join(baseDir, "demo", "plugin-secrets.json"), { throwIfNoEntry: false })).toBe(undefined);
   });
 
   it("deletePluginBrokerState clears everything", () => {

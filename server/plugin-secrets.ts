@@ -1,7 +1,11 @@
 // Host-managed secret and settings broker for plugins.
 //
-// Credentials never enter plugin code, plugin files (other than this
-// broker's own 0600 store), logs, event payloads, or the sandbox.
+// Credentials never enter plugin code, plugin files, logs, event
+// payloads, or the sandbox.  Non-secret settings live beside the
+// plugin; secret values live in a host-only `.broker` directory the
+// sandbox has no read grant for (the child can read only its own
+// plugin directory, and 0600 does not help against the same uid), with
+// 0o700 dirs and 0o600 files.
 // Plugins declare settings in their manifest; the UI writes values
 // through host-validated routes; this module persists them.  Secret
 // settings are write-only: reads report only which keys hold a value.
@@ -51,6 +55,52 @@ export interface PluginSettingsIssue {
 
 function pluginDir(baseDir: string, pluginName: string): string {
   return join(baseDir, pluginName);
+}
+
+/** Host-only secrets location.  Deliberately outside the per-plugin
+ *  directory: the sandbox child receives `--allow-fs-read` for its own
+ *  plugin directory, so anything under `<plugin>/` is readable by
+ *  untrusted plugin code.  Secrets must never live there. */
+export function pluginSecretsPath(baseDir: string, pluginName: string): string {
+  return join(baseDir, ".broker", pluginName, SECRETS_FILE);
+}
+
+/** Pre-fix location, inside the plugin directory and therefore
+ *  sandbox-readable.  Anything found here moves to the host-only path
+ *  on next access so no secret is left where plugin code can read it. */
+function legacySecretsPath(baseDir: string, pluginName: string): string {
+  return join(pluginDir(baseDir, pluginName), SECRETS_FILE);
+}
+
+function pathExists(path: string): boolean {
+  try {
+    statSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Move a legacy in-plugin secrets file to the host-only store.  When
+ *  both exist the legacy copy is stale, so drop it. */
+function migrateLegacySecrets(baseDir: string, pluginName: string): void {
+  const legacy = legacySecretsPath(baseDir, pluginName);
+  if (!pathExists(legacy)) return;
+  const next = pluginSecretsPath(baseDir, pluginName);
+  if (pathExists(next)) {
+    try {
+      unlinkSync(legacy);
+    } catch {
+      // Best effort; a stale readable copy is retried on next access.
+    }
+    return;
+  }
+  try {
+    mkdirSync(dirname(next), { recursive: true, mode: 0o700 });
+    renameSync(legacy, next);
+  } catch {
+    // Best effort: the legacy file stays until the next access.
+  }
 }
 
 /** Named owner contracts for broker reads, so lint-checked callers get
@@ -209,7 +259,8 @@ export function writePluginSettings(
 /** Read secret values into host memory only.  Callers must never log,
  *  return, or forward these to plugin code. */
 export function readPluginSecrets(baseDir: string, pluginName: string): PluginSecretsMap {
-  const path = join(pluginDir(baseDir, pluginName), SECRETS_FILE);
+  migrateLegacySecrets(baseDir, pluginName);
+  const path = pluginSecretsPath(baseDir, pluginName);
   const raw = readJsonFile(path);
   if (raw === null) {
     if (isCorruptFile(path)) quarantineAndEmpty(path);
@@ -238,30 +289,42 @@ export function writePluginSecret(baseDir: string, pluginName: string, key: stri
     if (Object.keys(current).length >= MAX_KEYS && !(key in current)) throw new Error("too many secrets");
     current[key] = value;
   }
-  atomicWriteJson(join(pluginDir(baseDir, pluginName), SECRETS_FILE), { version: 1, values: current });
+  atomicWriteJson(pluginSecretsPath(baseDir, pluginName), { version: 1, values: current });
 }
 
 /** Remove all broker state for a plugin.  Called on remove. */
 export function deletePluginBrokerState(baseDir: string, pluginName: string): void {
-  for (const file of [SETTINGS_FILE, SECRETS_FILE]) {
+  try {
+    unlinkSync(join(pluginDir(baseDir, pluginName), SETTINGS_FILE));
+  } catch {
+    // Missing is fine; remove is idempotent.
+  }
+  for (const path of [pluginSecretsPath(baseDir, pluginName), legacySecretsPath(baseDir, pluginName)]) {
     try {
-      unlinkSync(join(pluginDir(baseDir, pluginName), file));
+      unlinkSync(path);
     } catch {
       // Missing is fine; remove is idempotent.
     }
   }
-  try {
-    for (const entry of readdirSync(pluginDir(baseDir, pluginName))) {
-      if (entry.startsWith(`${SETTINGS_FILE}.invalid-`) || entry.startsWith(`${SECRETS_FILE}.invalid-`)) {
-        try {
-          unlinkSync(join(pluginDir(baseDir, pluginName), entry));
-        } catch {
-          // Best effort.
+  const sweeps: Array<{ dir: string; prefix: string }> = [
+    { dir: pluginDir(baseDir, pluginName), prefix: SETTINGS_FILE },
+    { dir: dirname(pluginSecretsPath(baseDir, pluginName)), prefix: SECRETS_FILE },
+    { dir: pluginDir(baseDir, pluginName), prefix: SECRETS_FILE },
+  ];
+  for (const { dir, prefix } of sweeps) {
+    try {
+      for (const entry of readdirSync(dir)) {
+        if (entry.startsWith(`${prefix}.invalid-`)) {
+          try {
+            unlinkSync(join(dir, entry));
+          } catch {
+            // Best effort.
+          }
         }
       }
+    } catch {
+      // Dir may already be gone.
     }
-  } catch {
-    // Plugin dir may already be gone.
   }
 }
 

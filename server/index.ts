@@ -18830,9 +18830,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       return json(res, 200, result);
     }
-    const settingsPath = PLUGIN_SLUG.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/settings$/)?.slice(1));
+    const settingsPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/settings$/)?.slice(1));
     if (settingsPath.success && method === "GET") {
-      const result = pluginsModule.getPluginSettings(settingsPath.data);
+      const result = pluginsModule.getPluginSettings(settingsPath.data[0]);
       if ("error" in result) return json(res, 404, { error: result.error });
       return json(res, 200, result);
     }
@@ -18842,31 +18842,31 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // configuredKeys.
       const body = PLUGIN_SETTINGS_BODY.safeParse(await readBody(req));
       if (!body.success) return json(res, 400, { error: "expected a JSON object with a `settings` map" });
-      const result = await pluginsModule.setPluginSettings(settingsPath.data, body.data.settings);
+      const result = await pluginsModule.setPluginSettings(settingsPath.data[0], body.data.settings);
       if ("error" in result) {
         const status = result.error.startsWith("no plugin named") ? 404 : 400;
         return json(res, status, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
       }
       return json(res, 200, result);
     }
-    const healthPath = PLUGIN_SLUG.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/health$/)?.slice(1));
+    const healthPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/health$/)?.slice(1));
     if (healthPath.success && method === "GET") {
-      const result = await pluginsModule.getPluginHealth(healthPath.data);
+      const result = await pluginsModule.getPluginHealth(healthPath.data[0]);
       if ("error" in result) return json(res, 404, { error: result.error });
       return json(res, 200, result);
     }
-    const testEventPath = PLUGIN_SLUG.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/test-event$/)?.slice(1));
+    const testEventPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/test-event$/)?.slice(1));
     if (testEventPath.success && method === "POST") {
-      const result = await pluginsModule.emitPluginTestEvent(testEventPath.data);
+      const result = await pluginsModule.emitPluginTestEvent(testEventPath.data[0]);
       if ("error" in result) {
         const status = result.error.startsWith("no plugin named") ? 404 : 409;
         return json(res, status, { error: result.error });
       }
       return json(res, 200, { outcomes: result });
     }
-    const drainPath = PLUGIN_SLUG.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/drain$/)?.slice(1));
+    const drainPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/drain$/)?.slice(1));
     if (drainPath.success && method === "POST") {
-      const outcomes = await pluginsModule.drainPluginRetries(drainPath.data);
+      const outcomes = await pluginsModule.drainPluginRetries(drainPath.data[0]);
       return json(res, 200, { outcomes });
     }
 
