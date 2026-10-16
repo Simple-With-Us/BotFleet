@@ -227,12 +227,15 @@ struct AgentProfileView: View {
                     // stop the turn now, or stop it starting from now — and a
                     // switch cannot tell which one was meant.  Hold the flip
                     // until they answer, and only ask when there is a turn to
-                    // decide about.
-                    if !turnedOn, current.busy == true {
+                    // decide about.  The decision lives in CompanionCore so it
+                    // is tested rather than eyeballed: `get` reads `!isOff`,
+                    // so `set` must apply the inverse of what the switch says.
+                    switch botPowerToggleAction(turnedOn: turnedOn, isOff: isOff, isBusy: current.busy == true) {
+                    case .askAboutRunningTurn:
                         powerOffWhileRunning = true
-                        return
+                    case .setOff(let next):
+                        isOff = next
                     }
-                    isOff = turnedOn
                 }))
                 } header: {
                     Text("Power")

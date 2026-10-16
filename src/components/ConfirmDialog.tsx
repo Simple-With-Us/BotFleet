@@ -40,6 +40,13 @@ export function ConfirmDialog({
   // Three ways out means Enter should do the reversible one.  Without an alt
   // this is the confirm button, so every two-button caller is unchanged.
   const initialFocus = hasAlt ? altRef : confirmRef;
+  // Callers pass an inline `onCancel`, so its identity changes every render.
+  // Held in a ref so the key handler always calls the current one while the
+  // focus effect below stays keyed to the dialog, not to the callback: this
+  // dialog opens over a working bot, so its parent re-renders continuously
+  // and a bare `onCancel` dependency would pull focus back mid-keystroke.
+  const onCancelRef = useRef(onCancel);
+  onCancelRef.current = onCancel;
 
   useEffect(() => {
     if (!open || busy) return;
@@ -47,12 +54,12 @@ export function ConfirmDialog({
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onCancel();
+        onCancelRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onCancel, busy, initialFocus]);
+  }, [open, busy, initialFocus]);
 
   if (!open) return null;
 
