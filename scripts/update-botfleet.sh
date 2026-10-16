@@ -10,6 +10,8 @@ CACHE="${BOTFLEET_HELPER_CACHE:-$HOME/Library/Caches/BotFleet/helper}"
 NODE="$(command -v node || true)"
 if [[ -z "$NODE" ]]; then echo 'BotFleet bootstrap: Node.js is missing.' >&2; exit 127; fi
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/botfleet-loader.XXXXXX")"
+COMMAND=update
+case "${1:-}" in prepare|apply|unquiesce|update) COMMAND="$1" ;; esac
 PROGRESS=""; RUN_ID=""; EXPECT=""
 for arg in "$@"; do
   if [[ "$EXPECT" == progress ]]; then PROGRESS="$arg"; EXPECT=""; continue; fi
@@ -24,9 +26,9 @@ finish() {
   trap - EXIT
   [[ ! -f "$TMP/error.log" ]] || cat "$TMP/error.log" >&3
   if [[ "$code" != 0 && -n "$PROGRESS" && -n "$RUN_ID" ]]; then
-    "$NODE" - "$PROGRESS" "$RUN_ID" "$TMP/error.log" 2>&3 <<'JS'
+    "$NODE" - "$PROGRESS" "$RUN_ID" "$TMP/error.log" "$COMMAND" 2>&3 <<'JS'
 const fs = require('node:fs'), path = require('node:path');
-const [file, runId, log] = process.argv.slice(2);
+const [file, runId, log, command] = process.argv.slice(2);
 try {
  let old; try { old = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
  if (!(old?.runId === runId && old.finishedAt && old.outcome)) {
@@ -35,7 +37,7 @@ try {
   const detail = tail.split('\n').find(line => /Error|failed|fatal:|refusing/i.test(line)) || tail.trim().split('\n').pop() || 'See the updater log.';
   fs.mkdirSync(path.dirname(file), {recursive:true, mode:0o700});
   const temporary = file+'.'+process.pid+'.tmp';
-  fs.writeFileSync(temporary, JSON.stringify({schemaVersion:1,runId,command:'update',pid:process.pid,startedAt:old?.startedAt || now,updatedAt:now,finishedAt:now,outcome:'failed',step:'bootstrap',message:'Updater bootstrap failed: '+detail.slice(0,800)})+'\n',{mode:0o600});
+  fs.writeFileSync(temporary, JSON.stringify({schemaVersion:1,runId,command,pid:process.pid,startedAt:old?.startedAt || now,updatedAt:now,finishedAt:now,outcome:'failed',step:'bootstrap',message:'Updater bootstrap failed: '+detail.slice(0,800)})+'\n',{mode:0o600});
   fs.renameSync(temporary,file);
  }
 } catch (error) { console.error('Could not record bootstrap failure: '+error.message); }

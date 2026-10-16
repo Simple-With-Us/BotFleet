@@ -99,6 +99,7 @@ export function verifyBundle(directory, commit) {
 }
 export function publishHelper(checkout, commit, cache) {
   mkdirSync(cache, { recursive: true, mode: 0o700 });
+  cache = realpathSync(cache);
   assertMainCommit(checkout, commit);
   // Reuse a verified immutable generation, so a check/retry at the same main
   // commit cannot fill the cache with one helper tree per attempt.
@@ -114,7 +115,7 @@ export function publishHelper(checkout, commit, cache) {
   const staging = `${generation}.tmp`;
   mkdirSync(staging, { mode: 0o700 });
   try {
-    const manifest = assembleBundle(checkout, commit, staging, ['scripts/update-botfleet-policy.sh', 'scripts/update-botfleet-bootstrap.mjs', 'scripts/update-botfleet-mac.mjs', 'scripts/ci-build-resolver.mjs']);
+    const manifest = assembleBundle(checkout, commit, staging, ['scripts/update-botfleet-policy.sh', 'scripts/update-botfleet-bootstrap.mjs', 'scripts/update-botfleet-mac.mjs', 'scripts/ci-build-resolver.mjs', 'scripts/update-botfleet-runtime-commit.mjs']);
     renameSync(staging, generation);
     const temporary = join(cache, `.current-${randomUUID()}.json`);
     writeFileSync(temporary, JSON.stringify({ schemaVersion: 1, commit, directory: generation, manifestSha256: digest(JSON.stringify(manifest)), publishedAt: new Date().toISOString() })+'\n', { mode: 0o600 });

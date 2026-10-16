@@ -24,8 +24,10 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 node "$BOTFLEET_BOOTSTRAP_DRIVER" --assemble "$BOTFLEET_CHECKOUT" "$commit" "$stage" scripts/update-botfleet-mac.mjs
 node "$stage/scripts/update-botfleet-mac.mjs"
+node "$(dirname "$BOTFLEET_BOOTSTRAP_DRIVER")/update-botfleet-runtime-commit.mjs"
 `);
   put('scripts/update-botfleet-mac.mjs', 'console.log("first graph");\n');
+  put('scripts/update-botfleet-runtime-commit.mjs', 'console.log("runtime helper present");\n');
   put('scripts/ci-build-resolver.mjs','export const fixture = true;\n');
   const commit = () => { g('add','.'); g('commit','-m','fixture'); g('push','origin','main'); g('fetch','origin','main'); return g('rev-parse','HEAD'); };
   const first = commit();
@@ -41,6 +43,8 @@ const message="import './fake2.mjs'";
 import './one.mjs'; export {x} from '../shared/two.mjs';
 const p=import('./three.mjs'); import {x} from 'node:fs';`), ['./one.mjs','../shared/two.mjs','./three.mjs','node:fs']);
   assert.throws(() => localSpecifiers('const p=import(path);'), /Computed import/);
+  assert.throws(() => localSpecifiers('const p=import(`./template.mjs`);'), /Computed import/);
+  assert.throws(() => localSpecifiers("const p=import('./data.json', {with:{type:'json'}});"), /Computed import/);
 });
 
 test('OLD installed stable wrapper runs NEW updater transitive graph without refreshing the machine helper', {skip:process.platform==='win32'}, (t) => {
@@ -53,6 +57,7 @@ test('OLD installed stable wrapper runs NEW updater transitive graph without ref
   const result=spawnSync('/bin/bash',[f.installed],{encoding:'utf8',env:f.env,timeout:60_000});
   assert.equal(result.status,0,result.stderr);
   assert.match(result.stdout,/new graph loaded/);
+  assert.match(result.stdout,/runtime helper present/);
   assert.equal(readFileSync(f.installed,'utf8'),original,'installed entrypoint remains unchanged');
   const receipt=JSON.parse(readFileSync(join(f.env.BOTFLEET_HELPER_CACHE,'current.json')));
   assert.equal(receipt.commit,next);
@@ -65,7 +70,7 @@ test('publishing is atomic and corrupted/missing modules never replace the curre
   const f=fixture(t),cache=join(f.root,'cache');
   const directory=publishHelper(f.checkout,f.first,cache);
   const before=readFileSync(join(cache,'current.json'),'utf8');
-  assert.equal(publishHelper(f.checkout,f.first,cache),directory,'verified same-commit helpers are reused');
+  assert.equal(publishHelper(f.checkout,f.first,cache+'/'),directory,'verified same-commit helpers are reused');
   writeFileSync(join(directory,'scripts/update-botfleet-mac.mjs'),'tampered');
   assert.throws(()=>verifyBundle(directory,f.first),/hash mismatch/);
   f.put('scripts/update-botfleet-mac.mjs',`import './missing.mjs';`);
@@ -85,9 +90,10 @@ test('pre-progress import/bootstrap failure reports its real error and exits onc
   const f=fixture(t);
   f.put('scripts/update-botfleet-mac.mjs',`import './not-present.mjs';`);f.commit();
   const progress=join(f.root,'runs','failure.json');
-  const result=spawnSync('/bin/bash',[f.installed,'--progress',progress,'--run-id','fixture_failure'],{encoding:'utf8',env:f.env,timeout:60_000});
+  const result=spawnSync('/bin/bash',[f.installed,'prepare','--progress',progress,'--run-id','fixture_failure'],{encoding:'utf8',env:f.env,timeout:60_000});
   assert.equal(result.status,0,'managed launcher must not trigger keep-alive-on-failure');
   const record=JSON.parse(readFileSync(progress));
+  assert.equal(record.command,'prepare');
   assert.equal(record.runId,'fixture_failure');assert.equal(record.outcome,'failed');
   assert.ok(record.finishedAt);assert.match(record.message,/not-present\.mjs/);
   assert.match(result.stderr,/not-present\.mjs/);
