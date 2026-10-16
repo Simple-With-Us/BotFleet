@@ -86,15 +86,18 @@ test('unmerged code cannot supply any updater module', (t) => {
   assert.throws(()=>assembleBundle(f.checkout,f.g('rev-parse','HEAD'),join(f.root,'stage'),['scripts/update-botfleet-mac.mjs']));
 });
 
-test('pre-progress import/bootstrap failure reports its real error and exits once under old launchd submit', {skip:process.platform==='win32'}, (t) => {
+for (const command of ['update', 'prepare']) {
+test(`pre-progress ${command} failure reports its real error and exits once under old launchd submit`, {skip:process.platform==='win32'}, (t) => {
   const f=fixture(t);
   f.put('scripts/update-botfleet-mac.mjs',`import './not-present.mjs';`);f.commit();
   const progress=join(f.root,'runs','failure.json');
-  const result=spawnSync('/bin/bash',[f.installed,'prepare','--progress',progress,'--run-id','fixture_failure'],{encoding:'utf8',env:f.env,timeout:60_000});
+  const result=spawnSync('/bin/bash',[f.installed,...(command === 'update' ? [] : [command]),'--progress',progress,'--run-id','fixture_failure'],{encoding:'utf8',env:f.env,timeout:60_000});
   assert.equal(result.status,0,'managed launcher must not trigger keep-alive-on-failure');
   const record=JSON.parse(readFileSync(progress));
-  assert.equal(record.command,'prepare');
+  assert.equal(record.command,command);
   assert.equal(record.runId,'fixture_failure');assert.equal(record.outcome,'failed');
   assert.ok(record.finishedAt);assert.match(record.message,/not-present\.mjs/);
   assert.match(result.stderr,/not-present\.mjs/);
 });
+
+}
