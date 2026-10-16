@@ -4460,6 +4460,8 @@ async function launchFallbackTurn(input: {
         instanceId: following.instanceId,
         model: following.model,
         effort: following.effort,
+        ...(following.contextCap !== undefined ? { contextCap: following.contextCap } : {}),
+        ...(following.maxOutputTokens !== undefined ? { maxOutputTokens: following.maxOutputTokens } : {}),
       };
       fallbackAttemptByTurn.set(key, following.nextUsed);
       store.patchBot(botId, { activeModelSelection: nextSelection });
