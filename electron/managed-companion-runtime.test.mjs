@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, statSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,7 +15,10 @@ import {
   writeManagedCompanionRuntime,
 } from "./managed-companion-runtime.mjs";
 
-const SOCKET = "/tmp/omb-companion-origin-runtime/origin.sock";
+const SOCKET =
+  process.platform === "win32"
+    ? "\\\\.\\pipe\\botfleet-companion-origin-501-123e4567-e89b-12d3-a456-426614174000"
+    : "/tmp/omb-companion-origin-runtime/origin.sock";
 
 const claim = (overrides = {}) => ({
   version: 1,
@@ -47,7 +49,9 @@ describe("managed companion runtime state", () => {
     expect(Object.isFrozen(read)).toBe(true);
   });
 
-  it("writes the file 0600 inside a private directory", () => {
+  // POSIX-only: Windows chmod is neutered to the read-only flag and the
+  // reader deliberately skips the mode check there, so mode bits prove nothing.
+  it.skipIf(process.platform === "win32")("writes the file 0600 inside a private directory", () => {
     writeManagedCompanionRuntime(claim(), { home });
     const file = statSync(managedCompanionRuntimePath(home));
     const directory = statSync(managedCompanionRuntimeDirectory(home));
@@ -82,7 +86,9 @@ describe("managed companion runtime state", () => {
     expect(readManagedCompanionRuntime({ home })).toBeNull();
   });
 
-  it("rejects a world-readable file rather than adopting it", () => {
+  // POSIX-only: the reader skips the group/other mode check on Windows by
+  // design, so a chmoded file stays adoptable there and this would invert.
+  it.skipIf(process.platform === "win32")("rejects a world-readable file rather than adopting it", () => {
     writeManagedCompanionRuntime(claim(), { home });
     chmodSync(managedCompanionRuntimePath(home), 0o644);
     expect(readManagedCompanionRuntime({ home })).toBeNull();
@@ -319,7 +325,6 @@ describe("managed companion supervisor", () => {
     const { supervisedCompanionEnvironment } = await import("./managed-companion-supervisor.mjs");
     const child = supervisedCompanionEnvironment(
       {
-        entry: "/x/companion.js",
         harnessPort: 8799,
         companionPort: 8810,
         controlPort: 8811,

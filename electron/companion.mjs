@@ -19,7 +19,7 @@ import {
   companionOriginHealth,
   createCompanionOriginEndpoint,
 } from "./companion-origin-gateway.mjs";
-import { adoptableCompanionTarget } from "./managed-companion-runtime.mjs";
+import { adoptableCompanionTarget, readManagedCompanionRuntime } from "./managed-companion-runtime.mjs";
 
 // Passed to the fork rather than left to the sidecar's own defaults, so the
 // port this file fetches the control API on cannot drift from the port the
@@ -222,8 +222,24 @@ async function adopt(log) {
   return true;
 }
 
+/** True when the supervisor has published a newer generation than the one this
+ * process adopted: a restarted sidecar has a new pid and socket path, and the
+ * cached claim would point the guardian at a socket nothing answers on. Only a
+ * *different valid claim* rotates the cache — a missing or unreadable file is
+ * not proof of anything, so the cache is kept and the next probe decides. */
+function supervisedClaimRotated() {
+  if (!supervised) return false;
+  const current = readManagedCompanionRuntime();
+  if (!current) return false;
+  return current.sidecarPid !== supervised.sidecarPid || current.socketPath !== supervised.socketPath;
+}
+
 /** startCompanion's body, run inside the transition queue. */
 async function start({ resourcesPath, harnessPort, hostedUrl = null, log }) {
+  if (supervisedClaimRotated()) {
+    supervised = null;
+    originTarget = null;
+  }
   if (companionRunning()) return companionState();
   lastError = null;
   // Adoption comes first: when the LaunchAgent is loaded, the supervised

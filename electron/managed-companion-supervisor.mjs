@@ -50,6 +50,10 @@ const READY_TIMEOUT_MS = 30_000;
 const READY_INTERVAL_MS = 150;
 const RESTART_BASE_MS = 1_000;
 const RESTART_MAX_MS = 30_000;
+// A sidecar generation that stayed up this long proved the last crash was an
+// isolated event, so the next failure backs off from the floor again instead
+// of inheriting the ceiling from crashes long past.
+const HEALTHY_GENERATION_MS = 60_000;
 const TERMINATE_GRACE_MS = 5_000;
 
 const delay = (milliseconds) =>
@@ -65,7 +69,7 @@ const delay = (milliseconds) =>
  * inherited value would bypass this supervisor's own allocation and point the
  * sidecar at an endpoint it did not create. */
 export function supervisedCompanionEnvironment(
-  { entry, harnessPort, companionPort, controlPort, socketPath, hostedUrl = null },
+  { harnessPort, companionPort, controlPort, socketPath, hostedUrl = null },
   { environment = process.env, platform = process.platform } = {},
 ) {
   const child = { ...environment };
@@ -150,15 +154,17 @@ export async function runSupervisedCompanion({
     throw new Error("The companion entry is not an absolute path");
   }
   const childEnvironment = supervisedCompanionEnvironment(
-    { entry, harnessPort, companionPort, controlPort, socketPath: endpoint.socketPath, hostedUrl },
+    { harnessPort, companionPort, controlPort, socketPath: endpoint.socketPath, hostedUrl },
     { environment },
   );
 
   let child;
   try {
-    child = spawnProcess(entry, [], {
+    // spawn() has no execArgv option (that belongs to fork()), and entry is a
+    // JS/TS script path rather than an executable, so the Node binary carries
+    // the strip-types flags as leading arguments instead.
+    child = spawnProcess(process.execPath, [...execArgv, entry], {
       env: childEnvironment,
-      execArgv,
       shell: false,
       windowsHide: true,
       // stdin is the parent-death pipe and must stay open for this sidecar's
@@ -236,7 +242,7 @@ export async function runSupervisedCompanion({
       },
       { home },
     );
-  } catch (error) {
+  } catch {
     // Without a published identity the app cannot adopt this sidecar, so it
     // would fork a second one against the same port.  Stop rather than run
     // unsupervised.
@@ -368,6 +374,7 @@ export async function superviseCompanion({
       log(`companion supervisor: private origin could not be allocated — ${error.message}`);
       return { status: "unavailable" };
     }
+    const generationStartedAt = Date.now();
     const outcome = await runOne({
       ...resolved,
       harnessPort,
@@ -378,6 +385,7 @@ export async function superviseCompanion({
     });
     if (stopping) return { status: "stopped" };
     if (outcome.status !== "exited") log(`companion supervisor: ${outcome.reason}`);
+    if (Date.now() - generationStartedAt >= HEALTHY_GENERATION_MS) attempt = 0;
     attempt += 1;
     await delay(Math.min(RESTART_BASE_MS * 2 ** (attempt - 1), RESTART_MAX_MS));
   }

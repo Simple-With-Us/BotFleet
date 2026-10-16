@@ -9,8 +9,8 @@
 # Why this is a separate job from app.botfleet.server: the harness is
 # loopback-only and deliberately unpatched, while the companion is the one
 # process here that listens off-machine. Keeping the companion out of the
-# harness is a security property, and the reverse — letting the companion die
-# with a GUI — is BF-1339.
+# harness is a security property, and the reverse -- letting the companion die
+# with a GUI -- is BF-1339.
 #
 # A companion process is also the opt-in for the hosted surface (see
 # companion/src/index.ts), so this script treats "already healthy" as success
