@@ -298,11 +298,15 @@ export function infisicalCredentialSource(
       const source = `infisical ${where}`;
       const site = normalizeSite(values.get(names.site)?.trim() || opts.realm);
       const outgoingWebhookToken = z.string().regex(/^[\x21-\x7e]+$/).optional()
-        .parse(values.get(names.outgoingToken)?.trim() || undefined);
+        .safeParse(values.get(names.outgoingToken)?.trim() || undefined);
+      // A present-but-malformed webhook token must not take down the bot's own
+      // credentials: drop just the token (the webhook route answers 503
+      // without it) and keep the email/key/site load working.
+      const webhookToken = outgoingWebhookToken.success ? outgoingWebhookToken.data : undefined;
       return {
         ...checkCredentialFields({ email: email!, key: key!, site }, source),
         source,
-        ...(outgoingWebhookToken ? { outgoingWebhookToken } : {}),
+        ...(webhookToken ? { outgoingWebhookToken: webhookToken } : {}),
       };
     },
   };

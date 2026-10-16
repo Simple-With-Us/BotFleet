@@ -1118,6 +1118,17 @@ export class ZulipHub {
     }
   }
 
+  /** A bot with no session may still come back: reconcile rebuilds sessions
+   *  after a restart, on a settings save, and on a slow timer.  Only a bot
+   *  that settings no longer want is gone for good. */
+  private outgoingBotWanted(botId: string): boolean {
+    if (!this.enabled()) return false;
+    const entry = this.settings()?.bots?.[botId];
+    if (!entry || entry.enabled === false) return false;
+    const role = typeof entry.role === "string" ? entry.role.trim() : "";
+    return Boolean(role && validZulipRole(role) && this.deps.botExists(botId));
+  }
+
   private async drainOutgoingWebhookBatch(): Promise<void> {
     let rows;
     try {
@@ -1130,13 +1141,20 @@ export class ZulipHub {
     const budgetPerSession = Math.max(1, this.deps.timings?.drainBatchSize ?? 16);
     const groups = new Map<string, typeof rows>();
     for (const row of rows) {
+      const key = `${row.botId}:${row.messageId}`;
       const session = this.sessions.get(row.botId);
       if (!session) {
-        try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
-        this.outgoingRetry.delete(`${row.botId}:${row.messageId}`);
+        if (!this.outgoingBotWanted(row.botId)) {
+          // The bot is gone from settings for good; its row can never route.
+          try { this.outgoingSpool.remove(row); } catch { /* already gone */ }
+          this.outgoingRetry.delete(key);
+        } else {
+          // Sessions rebuild after a restart, and Zulip already answered 200
+          // so it will not resend: retain the row and retry once ready.
+          this.outgoingRetry.set(key, now + (this.deps.timings?.retryBaseMs ?? 5_000));
+        }
         continue;
       }
-      const key = `${row.botId}:${row.messageId}`;
       if ((this.outgoingRetry.get(key) ?? 0) > now) continue;
       if (!session.ready || !session.client) {
         this.outgoingRetry.set(key, now + (this.deps.timings?.retryBaseMs ?? 5_000));

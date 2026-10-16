@@ -1,7 +1,7 @@
 // The Zulip source end to end against a fake Zulip server: real HTTP, real
 // event queues, real files on disk, and a fake `startTurn` standing in for
 // the harness.  Each test boots its own fake realm and its own data folder.
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -185,6 +185,77 @@ describe("outgoing webhook convergence", () => {
     const lowerId = 1200;
     hub.handleMessage(session, { ...higher, id: lowerId, content: "@**BF-Plumber** lower native id" }, "native");
     expect(session.state.pending.flatMap((unit) => unit.items.map((item) => item.id))).toEqual([highWebhookId, lowerId]);
+  });
+
+  it("retains a spooled row while its session is missing and routes it once the session rebuilds", async () => {
+    // Quiet intervals: only manual drains run, so each drain below is exact.
+    // The row file itself is the assertion: turns can also arrive over the
+    // native event queue, so only the spool file proves the drain kept it.
+    const hub = makeHub({
+      timings: {
+        coalesceMs: 30,
+        drainIntervalMs: 3_600_000,
+        reconcileIntervalMs: 3_600_000,
+        backoffMs: [30, 60],
+        postSpacingMs: 0,
+        retryBaseMs: 30,
+        eventsTimeoutMs: 5_000,
+      },
+    });
+    await connected(hub);
+    sessionOf(hub).creds!.outgoingWebhookToken = "test-outgoing-token";
+    const id = fake.postStream(JAY, "builds", "Outgoing webhook", "@**BF-Plumber** retained row", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-Plumber", id)).toBe("accepted");
+    const rowFile = join(dataDir, "zulip", "outgoing", `bot-plumber-${id}.json`);
+    expect(existsSync(rowFile)).toBe(true);
+    // Simulate the restart window: the durable row is on disk but no session
+    // exists yet, while settings still want the bot.
+    settings.bots = {};
+    hub.reconcile();
+    expect(hub.sessionFor("bot-plumber")).toBeUndefined();
+    settings.bots = { "bot-plumber": { role: "BF-Plumber" } };
+    await hub.drain();
+    // Zulip already answered 200 so it will not resend: the row must survive
+    // a drain with no session instead of being dropped as unroutable.
+    expect(existsSync(rowFile)).toBe(true);
+    // Once the session rebuilds, the retained row still routes into a turn.
+    await waitFor(() => {
+      hub.reconcile();
+      return hub.sessionFor("bot-plumber") !== undefined;
+    }, "session rebuilt");
+    await connected(hub);
+    sessionOf(hub).creds!.outgoingWebhookToken = "test-outgoing-token";
+    await hub.drain();
+    await waitFor(() => turns.length === 1, "retained row routed after rebuild");
+    expect(turns[0]?.text).toContain("retained row");
+    expect(existsSync(rowFile)).toBe(false);
+  });
+
+  it("drops a spooled row for a bot removed from settings", async () => {
+    // Quiet intervals: only manual drains run, so each drain below is exact.
+    const hub = makeHub({
+      timings: {
+        coalesceMs: 30,
+        drainIntervalMs: 3_600_000,
+        reconcileIntervalMs: 3_600_000,
+        backoffMs: [30, 60],
+        postSpacingMs: 0,
+        retryBaseMs: 30,
+        eventsTimeoutMs: 5_000,
+      },
+    });
+    await connected(hub);
+    sessionOf(hub).creds!.outgoingWebhookToken = "test-outgoing-token";
+    const id = fake.postStream(JAY, "builds", "Outgoing webhook", "@**BF-Plumber** removed bot", "website");
+    expect(hub.enqueueOutgoingWebhook("BF-Plumber", id)).toBe("accepted");
+    const rowFile = join(dataDir, "zulip", "outgoing", `bot-plumber-${id}.json`);
+    expect(existsSync(rowFile)).toBe(true);
+    // The bot is gone from settings for good: its row can never route.
+    settings.bots = {};
+    hub.reconcile();
+    expect(hub.sessionFor("bot-plumber")).toBeUndefined();
+    await hub.drain();
+    expect(existsSync(rowFile)).toBe(false);
   });
 });
 

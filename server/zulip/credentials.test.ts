@@ -182,6 +182,18 @@ describe("the Infisical source", () => {
     expect(locations[0]?.names).toContain("ZULIP_OUTGOING_BF_PLUMBER_TOKEN");
   });
 
+  it("drops a malformed outgoing webhook token instead of failing the credential load", async () => {
+    const { read } = vault({
+      ZULIP_BF_PLUMBER_EMAIL: "bf-plumber-bot@z.test",
+      ZULIP_BF_PLUMBER_API_KEY: FAKE_KEY,
+      ZULIP_OUTGOING_BF_PLUMBER_TOKEN: "not printable\nascii",
+    });
+    const creds = await infisicalCredentialSource(read, { realm: REALM, roles: ["BF-Plumber"] }).load("BF-Plumber");
+    expect(creds.outgoingWebhookToken).toBeUndefined();
+    expect(creds.email).toBe("bf-plumber-bot@z.test");
+    expect(creds.key).toBe(FAKE_KEY);
+  });
+
   it("refuses a malformed email, key or site from the vault by field name, never by value", async () => {
     const refusal = async (rows: Record<string, string>): Promise<ZulipCredentialError> => {
       try {

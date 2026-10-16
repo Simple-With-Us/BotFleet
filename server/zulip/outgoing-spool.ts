@@ -108,8 +108,11 @@ export class ZulipOutgoingSpool {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
       throw error;
     }
-    this.fsyncDirectory();
+    // Clear the caches before the directory fsync: if the fsync throws, the
+    // unlink already happened, and a stale count would falsely report the
+    // queue as full until the cache TTL expires.
     this.invalidatePending();
+    this.fsyncDirectory();
   }
 
   recordFailure(item: ZulipOutgoingSpoolItem): number {
