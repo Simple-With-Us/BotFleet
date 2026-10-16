@@ -880,22 +880,17 @@ struct ChatView: View {
         let run: () -> Void
     }
 
+    /// The rows an Off bot loses.  Only the ones that exist to start a turn:
+    /// an Off bot refuses every new turn, so each of these would be a row that
+    /// does nothing.  Everything whose liveness does not depend on Off is
+    /// absent from this set on purpose and survives the filter below.
+    private static let offBotComposingActionIds: Set<String> = [
+        "photo", "file", "dictate", "commands", "paste",
+        "task", "tasks", "routines",
+    ]
+
     private var plusActions: [PlusAction] {
         var out: [PlusAction] = []
-
-        // An Off bot refuses every new turn, so everything in this sheet that
-        // exists to compose one — attachments, dictation, slash commands, a
-        // new task — is dead while it stays Off, and offering it would be a row
-        // that does nothing.  Looking is not composing: Off gates STARTING
-        // work (`shared/bot-power.ts`), and a turn already running is never
-        // interrupted, so the computer is still live.  That is the whole sheet
-        // while the bot is Off, and the + below is the only way to it.
-        if case let .bot(bot) = current, current.isOff {
-            return [PlusAction(
-                id: "computer", systemImage: "display", title: "Watch computer",
-                subtitle: "Live view of what \(bot.name) is doing"
-            ) { showingComputer = true }]
-        }
 
         out.append(PlusAction(
             id: "photo", systemImage: "photo", title: "Photo",
@@ -1005,6 +1000,19 @@ struct ChatView: View {
                     }
                 }
             })
+        }
+
+        // An Off bot refuses every new turn, so the rows above that only exist
+        // to start one would each be a row that does nothing.  Off gates
+        // STARTING work and never interrupts what is already running
+        // (`shared/bot-power.ts`), so the rows whose liveness does not depend
+        // on Off are deliberately left in: Interrupt is the only control left
+        // that can end a turn — the composer's own Stop sits in the row this
+        // state replaces whole — and a transcript can be read and exported
+        // from a bot that is Off.  Filtering the built list keeps one
+        // definition of each row instead of hand-copying the survivors.
+        if case .bot = current, current.isOff {
+            return out.filter { !Self.offBotComposingActionIds.contains($0.id) }
         }
         return out
     }
