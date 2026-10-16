@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
-import { classifyCIPaths, isControlPlanePath, isIosPath, isPackagingPath } from "./ci-change-scope.mjs";
+import { classifyCIPaths, isIosPath, isPackagingPath } from "./ci-change-scope.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -17,7 +17,6 @@ test("only the explicit non-executable documentation paths take the fast path", 
     docsOnly: true,
     iosChanged: false,
     packagingChanged: false,
-    controlPlaneChanged: false,
   });
   assert.equal(classifyCIPaths(["README.md", "SECURITY.md"]).docsOnly, true);
 
@@ -41,8 +40,8 @@ test("only the explicit non-executable documentation paths take the fast path", 
 
 test("per-area outputs gate the expensive jobs on the paths that actually affect them", () => {
   assert.deepEqual(
-    { ios: isIosPath("ios/App/BotFleetApp.swift"), pkg: isPackagingPath("ios/App/BotFleetApp.swift"), cp: isControlPlanePath("ios/App/BotFleetApp.swift") },
-    { ios: true, pkg: false, cp: false },
+    { ios: isIosPath("ios/App/BotFleetApp.swift"), pkg: isPackagingPath("ios/App/BotFleetApp.swift") },
+    { ios: true, pkg: false },
   );
   assert.equal(isIosPath("scripts/ios-fleet/ship-testflight.sh"), true);
   assert.equal(isIosPath(".github/workflows/ci.yml"), true);
@@ -57,24 +56,19 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
   assert.equal(isPackagingPath(".github/workflows/ci.yml"), false);
   assert.equal(isPackagingPath("server/index.ts"), false);
 
-  assert.equal(isControlPlanePath("cloudflare/control-plane/wrangler.jsonc"), true);
-  assert.equal(isControlPlanePath("server/index.ts"), false);
-
   // A real diff picks exactly one area, and an unrelated change (like this
-  // WP-K PR touching a shell script) leaves the other two areas untouched.
+  // WP-K PR touching a shell script) leaves the other area untouched.
   assert.deepEqual(classifyCIPaths(["server/index.ts"]), {
     changedCount: 1,
     docsOnly: false,
     iosChanged: false,
     packagingChanged: false,
-    controlPlaneChanged: false,
   });
   assert.deepEqual(classifyCIPaths(["ios/App/BotFleetApp.swift", "server/index.ts"]), {
     changedCount: 2,
     docsOnly: false,
     iosChanged: true,
     packagingChanged: false,
-    controlPlaneChanged: false,
   });
 
   // No signal (an empty list, the same fallback the workflow's schedule,
@@ -85,7 +79,6 @@ test("per-area outputs gate the expensive jobs on the paths that actually affect
     docsOnly: false,
     iosChanged: true,
     packagingChanged: true,
-    controlPlaneChanged: true,
   });
 });
 
@@ -100,13 +93,13 @@ test("the CLI emits only GitHub outputs for a NUL-delimited path list", () => {
   assert.equal(result.stderr, "");
   assert.equal(
     result.stdout,
-    "docs_only=true\nchanged_count=2\nios_changed=false\npackaging_changed=false\ncontrol_plane_changed=false\n",
+    "docs_only=true\nchanged_count=2\nios_changed=false\npackaging_changed=false\n",
   );
 });
 
 test("every protected check stays present and takes the same fail-closed scope output", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
-  const requiredJobs = ["test", "control-plane", "package-linux"];
+  const requiredJobs = ["test", "package-linux"];
 
   assert.equal(Object.hasOwn(workflow.on, "workflow_dispatch"), true);
   assert.equal(Object.hasOwn(workflow.on, "schedule"), true);
@@ -135,11 +128,10 @@ test("every protected check stays present and takes the same fail-closed scope o
   assert.doesNotMatch(source, /paths-ignore:/);
 });
 
-test("packaging and control-plane jobs gate on their own area, the same way docs_only does", () => {
+test("packaging job gates on its own area, the same way docs_only does", () => {
   const workflow = parse(readFileSync(join(ROOT, ".github/workflows/ci.yml"), "utf8"));
   const areaJobs = [
     { jobId: "package-linux", output: "packaging_changed", fastPathName: "Packaging-unrelated fast path" },
-    { jobId: "control-plane", output: "control_plane_changed", fastPathName: "Control-plane-unrelated fast path" },
   ];
 
   for (const { jobId, output, fastPathName } of areaJobs) {
@@ -165,11 +157,11 @@ test("packaging and control-plane jobs gate on their own area, the same way docs
   }
 
   // Neither the docs_only-only "test" job nor the changes job itself gained
-  // one of these three gates by accident.
+  // one of these area gates by accident.
   assert.equal(workflow.jobs.test.steps.some((step) => /_changed/.test(step.if ?? "")), false);
 
   const classifier = workflow.jobs.changes.steps.find((step) => step.id === "scope");
-  for (const output of ["ios_changed", "packaging_changed", "control_plane_changed"]) {
+  for (const output of ["ios_changed", "packaging_changed"]) {
     assert.equal(workflow.jobs.changes.outputs[output], `\${{ steps.scope.outputs.${output} }}`);
     // Scheduled/dispatched runs and an unresolvable base SHA both fall back
     // to the full gate -- every area reported changed, not skipped.

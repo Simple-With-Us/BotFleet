@@ -118,6 +118,10 @@ export const PluginListingSchema = z.object({
   source: PluginListingSourceSchema,
   warnings: z.array(z.string()),
   capabilities: z.array(z.string()),
+  /** Outbound destinations the plugin declared.  Omitted means none. */
+  needs: z.object({
+    network: z.array(z.string().min(1).max(300)).max(32),
+  }).strict().optional(),
   contributes: z.object({
     cards: z.array(z.object({
       id: z.string(),

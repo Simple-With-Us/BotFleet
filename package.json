@@ -18,7 +18,7 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@12.11.2",
+  "packageManager": "pnpm@12.12.1",
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "lint": "node scripts/check-lint-baseline.mjs",
@@ -34,7 +34,7 @@
     "dev:desktop": "node scripts/prepare-cloudflared.mjs --current && electron .",
     "build": "tsc -b && tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
-    "test": "node scripts/test-floor.mjs && pnpm broker:test && pnpm test:updater && pnpm test:mac-updater && pnpm test:config-lock && pnpm test:credential-patch && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:server-boot-probe && pnpm test:packaged-server && pnpm test:ios-ship && pnpm test:ci-scope && pnpm test:mac-package-gate && pnpm test:lint-gate && pnpm test:infisical-fetch && pnpm test:release-workflow && pnpm test:board-audit && pnpm test:cred-sync && pnpm test:server-start && pnpm test:vm-cli && pnpm test:kody-autofix",
+    "test": "node scripts/test-floor.mjs && node --test scripts/probe-path-scrub.node-test.mjs && pnpm broker:test && pnpm test:updater && pnpm test:mac-updater && pnpm test:config-lock && pnpm test:credential-patch && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:server-boot-probe && pnpm test:packaged-server && pnpm test:ios-ship && pnpm test:ci-scope && pnpm test:mac-package-gate && pnpm test:lint-gate && pnpm test:infisical-fetch && pnpm test:release-workflow && pnpm test:board-audit && pnpm test:cred-sync && pnpm test:server-start && pnpm test:vm-cli && pnpm test:kody-autofix",
     "test:ci-scope": "node --test scripts/ci-change-scope.node-test.mjs",
     "test:mac-package-gate": "node --test scripts/mac-package-gate.node-test.mjs",
     "test:lint-gate": "node --test scripts/lint-pr-gate.node-test.mjs scripts/check-lint-baseline.node-test.mjs",
@@ -87,10 +87,6 @@
     "broker:check": "pnpm broker:types && tsc -p cloudflare/composio-broker/tsconfig.json",
     "broker:test": "vitest run --config cloudflare/composio-broker/vitest.config.ts",
     "broker:deploy": "wrangler deploy --config cloudflare/composio-broker/wrangler.jsonc",
-    "control-plane:types": "pnpm --filter @botfleet/control-plane types",
-    "control-plane:check": "pnpm --filter @botfleet/control-plane check",
-    "control-plane:test": "pnpm --filter @botfleet/control-plane test",
-    "control-plane:dry-run": "pnpm --filter @botfleet/control-plane dry-run",
     "test:board-audit": "node --test scripts/audit-effort-board.node-test.mjs",
     "test:server-start": "node --test scripts/botfleet-server-start.node-test.mjs scripts/launchd/harness-watchdog.node-test.mjs",
     "postinstall": "node scripts/compile-clutch-dep.mjs",
@@ -119,7 +115,7 @@
     "shiki": "^4.4.3",
     "tailwind-merge": "^3.3.1",
     "yaml": "^2.9.0",
-    "zod": "4.6.5"
+    "zod": "4.6.6"
   },
   "devDependencies": {
     "ajv": "8.20.0",

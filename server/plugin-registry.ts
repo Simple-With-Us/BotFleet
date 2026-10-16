@@ -285,6 +285,7 @@ export function listingFor(
     warnings: entry.warnings,
     capabilities: parsed.manifest.capabilities,
     contributes: parsed.manifest.contributes,
+    needs: { network: [...parsed.manifest.needs.network] },
   };
 }
 

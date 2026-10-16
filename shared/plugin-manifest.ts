@@ -12,6 +12,12 @@
 // silent contract that means broken things.
 import { z } from "zod";
 
+import {
+  MAX_PLUGIN_NETWORK_ALLOWS,
+  MAX_PLUGIN_NETWORK_ENTRY,
+  parsePluginNetworkAllow,
+} from "./plugin-net-allow.ts";
+
 export const HOST_API_VERSION = 1;
 
 /** Recursive JSON value type.  Mirrors server/schema.ts § JsonValue.
@@ -59,10 +65,14 @@ const SUPPORTED_BOTFLEET_RANGE =
 /** Capability allowlist for v1.  Adding a new capability is a breaking
  *  change because plugins render this without a fallback.  Unknown
  *  capabilities fail validation with the field name. */
+/** Declared with `needs.network`.  Without it, a host list is not granted. */
+export const NET_HOSTS_CAPABILITY = "net.hosts";
+
 export const PLUGIN_CAPABILITIES = [
   "read.bots",
   "read.status",
   "read.config",
+  NET_HOSTS_CAPABILITY,
 ] as const;
 export type PluginCapability = typeof PLUGIN_CAPABILITIES[number];
 
@@ -133,6 +143,37 @@ const contributes = z
   })
   .optional();
 
+/** One `needs.network` entry: `host:port`, no scheme, path, or wildcard. */
+const networkAllowEntry = z.string().min(1).max(MAX_PLUGIN_NETWORK_ENTRY).refine(
+  (value) => parsePluginNetworkAllow(value) !== null,
+  { message: 'expected host:port, for example "api.example.com:443"' },
+);
+
+/** Declared needs.  v1 has one: outbound TCP destinations.  An absent
+ *  object means the plugin needs nothing, and the sandbox denies the
+ *  network. */
+const needs = z
+  .object({
+    network: z.array(networkAllowEntry).max(MAX_PLUGIN_NETWORK_ALLOWS).optional().default(() => []),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const seen = new Set<string>();
+    for (const entry of value.network) {
+      const token = parsePluginNetworkAllow(entry)?.token ?? entry;
+      if (seen.has(token)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["network"],
+          message: `duplicate network allow "${token}"`,
+        });
+      }
+      seen.add(token);
+    }
+  })
+  .optional()
+  .default(() => ({ network: [] }));
+
 /** Each capability must be one of PLUGIN_CAPABILITIES.  The enum is the
  *  validator, so the parsed array is already typed as PluginCapability[]
  *  with no cast.  An absent list parses as []. */
@@ -166,6 +207,7 @@ export const pluginManifestSchema = z
       }),
     capabilities,
     contributes,
+    needs,
   })
   .strict();
 

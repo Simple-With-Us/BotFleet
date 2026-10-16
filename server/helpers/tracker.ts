@@ -142,6 +142,7 @@ export class HelperTracker {
       case "runtime.error":
       case "runtime.notice":
       case "context.injected":
+      case "engine.commands":
       case "subagent.updated":
         return [];
       default: {

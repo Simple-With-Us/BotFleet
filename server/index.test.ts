@@ -2913,7 +2913,7 @@ describe("harness HTTP API", () => {
           (candidate: { id: string }) => candidate.id === bot.id,
         );
         return state?.busy;
-      }).toBe(true);
+      }, { timeout: winSettleMs(10_000) }).toBe(true);
 
       // the record still names the engine that is NOT running the turn
       const midFlight = (await api("GET", "/api/bots?messages=0")).body.bots.find(
@@ -2926,17 +2926,24 @@ describe("harness HTTP API", () => {
       // hasSession found claude, the real owner; a modelSelection lookup would
       // have asked crasher, which owns nothing, and reported success anyway
       expect(stop.body).toMatchObject({ ok: true, stopped: true });
-      await expect.poll(async () => {
-        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
-          (candidate: { id: string }) => candidate.id === bot.id,
-        );
-        return state?.busy;
-      }).toBe(false);
+      // On windows-latest the failover owner can take longer to clear busy after
+      // interrupt; the default expect.poll window is a coin flip there (#867).
+      await settlesWithin(
+        async ({ signal }) => {
+          const state = (await api("GET", "/api/bots?messages=0", undefined, { signal })).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          );
+          return state?.busy === false;
+        },
+        winSettleMs(20_000),
+        200,
+        "bot clearing busy after interrupt on the failover owner",
+      );
     } finally {
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
       await api("DELETE", `/api/bots/${bot.id}`);
     }
-  });
+  }, winSettleMs(60_000));
 
   it("the mid-turn fail-over skips a chain entry the doomed breaker is refusing", async () => {
     // Regression: selectTurnFallback only skipped a doomed engine when its
@@ -3556,18 +3563,24 @@ describe("harness HTTP API", () => {
           // fast reload can clear busy between the reload tool frame and here.
           // Poll for the queued response in one step: wait for busy, POST once,
           // and stop — never spin on busy alone while the bot is already idle.
-          let successorSend: { status: number; body: any } | undefined;
+          type MessageSendResult = { status: number; body: unknown };
+          const queuedSendBodySchema = z.object({ queued: z.literal(true) }).passthrough();
+          const isQueuedSend = (result: MessageSendResult | undefined): boolean =>
+            !!result
+            && result.status === 202
+            && queuedSendBodySchema.safeParse(result.body).success;
+          let successorSend: MessageSendResult | undefined;
           await expect
             .poll(
               async () => {
-                if (successorSend?.body?.queued) return true;
+                if (isQueuedSend(successorSend)) return true;
                 if (successorSend) return false;
                 const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
                   (candidate: { id: string }) => candidate.id === bot.id,
                 );
                 if (!state?.busy) return false;
                 successorSend = await api("POST", `/api/bots/${bot.id}/messages`, { text: "run after reload" });
-                return successorSend.status === 202 && successorSend.body?.queued === true;
+                return isQueuedSend(successorSend);
               },
               {
                 timeout: winSettleMs(15_000),

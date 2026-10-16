@@ -453,6 +453,30 @@ describe("ACP turns (fake CLI)", () => {
     expect(methods).not.toContain("session/prompt");
   });
 
+  it("refuses without a Compressing Context row when trimming still leaves the prompt over the hard ceiling", async () => {
+    const dump = join(scratch, "ceiling-trimmed-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 512 });
+    // Protected text alone (1.5 KiB) is over the 1 KiB hard ceiling, and a
+    // droppable volatile section is present so trimming fires too.  The turn
+    // was not sent, so no trim row may claim context was cut for it.
+    const stable = `STABLE ${"S".repeat(1500)}`;
+    await instance.adapter.sendTurn({
+      threadId: "t-ceiling-trimmed",
+      text: "CURRENT USER MESSAGE",
+      system: `${stable}VOLATILE-OLD ${"alpha ".repeat(400)}`,
+      systemSections: [
+        { id: "persona", text: stable, volatile: false },
+        { id: "memory", text: `VOLATILE-OLD ${"alpha ".repeat(400)}`, volatile: true },
+      ],
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_too_large" });
+    expect(recorder.events.some((event) => event.type === "context.injected" && event.source === "compression")).toBe(false);
+    const methods = JSON.parse(readFileSync(dump, "utf8")) as string[];
+    expect(methods).not.toContain("session/prompt");
+  });
+
   it("emits no Compressing Context row when the prompt fits", async () => {
     await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 0 });
     await instance.adapter.sendTurn({ threadId: "t-fits", text: "hi", system: "SYS" });

@@ -258,3 +258,270 @@ test("the root is resolved physically so a pointer is not mistaken for a path", 
   const source = readFileSync(SCRIPT, "utf8");
   assert.match(source, /cd -P "\$ROOT"/, "the root must be resolved with a physical cd");
 });
+
+// --- Infisical machine identity ----------------------------------------------
+//
+// launchd does not inherit a desktop session, so the only identity the harness
+// can recover after a restart is the pair in the fleet handoff file.  These
+// tests use a private HOME and a node stub that records only fixture-prefixed
+// values (anything else is reported as "other") so a real secret can never
+// land in the assertion output.
+
+function writeIdentityNode(dir) {
+  const recorder = join(dir, "record-env.mjs");
+  const stub = join(dir, "node-stub");
+  const names = [
+    "INFISICAL_CLIENT_ID",
+    "INFISICAL_CLIENT_SECRET",
+    "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
+    "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+  ];
+  // The launcher execs `$NODE --experimental-strip-types -e ...` for the import
+  // probe and `$NODE --experimental-strip-types server/index.ts` to boot.  The
+  // probe must succeed without importing the fixture.  The boot must record
+  // only fixture-prefixed identity values, never an arbitrary environment value.
+  writeFileSync(
+    recorder,
+    [
+      "import { writeFileSync } from 'node:fs';",
+      "const args = process.argv.slice(2);",
+      "if (args.includes('-e')) process.exit(0);",
+      "const report = process.env.BOTFLEET_ENV_REPORT;",
+      "if (!report) { console.error('BOTFLEET_ENV_REPORT missing'); process.exit(1); }",
+      "const names = " + JSON.stringify(names) + ";",
+      "const lines = names.map((name) => {",
+      "  if (!Object.hasOwn(process.env, name)) return name + '=unset';",
+      "  const value = process.env[name];",
+      "  if (value === '') return name + '=empty';",
+      "  if (value.startsWith('fixture-')) return name + '=' + value;",
+      "  return name + '=other';",
+      "});",
+      "writeFileSync(report, lines.join('\\n') + '\\n');",
+    ].join("\n"),
+  );
+  writeFileSync(stub, "#!/bin/sh\nexec " + JSON.stringify(process.execPath) + " " + JSON.stringify(recorder) + ' "$@"\n');
+  chmodSync(stub, 0o755);
+  return stub;
+}
+
+function identityFixture() {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-identity-"));
+  const serverRoot = join(dir, "root");
+  mkdirSync(join(serverRoot, "server"), { recursive: true });
+  mkdirSync(join(serverRoot, "node_modules", "yaml"), { recursive: true });
+  writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
+  const home = join(dir, "home");
+  mkdirSync(join(home, ".secrets"), { recursive: true });
+  return {
+    dir,
+    serverRoot,
+    home,
+    keys: join(home, ".secrets", "global-api-keys"),
+    report: join(dir, "env-report"),
+    node: writeIdentityNode(dir),
+    ledger: join(dir, "ledger"),
+    port: 20000 + Math.floor(Math.random() * 20000),
+  };
+}
+
+function writeKeys(fixture, body) {
+  writeFileSync(fixture.keys, body.endsWith("\n") ? body : `${body}\n`, { mode: 0o600 });
+}
+
+function runIdentity(fixture, extraEnv = {}) {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("INFISICAL_")) delete env[key];
+  }
+  return spawnSync("bash", [SCRIPT], {
+    encoding: "utf8",
+    env: {
+      ...env,
+      ...extraEnv,
+      HOME: fixture.home,
+      BOTFLEET_ENV_REPORT: fixture.report,
+      BOTFLEET_SERVER_ROOT: fixture.serverRoot,
+      BOTFLEET_PORT: String(fixture.port),
+      BOTFLEET_NODE: fixture.node,
+      BOTFLEET_PNPM: join(fixture.dir, "pnpm-does-not-exist"),
+      BOTFLEET_HEAL_STAMP: join(fixture.dir, "heal-stamp"),
+      BOTFLEET_SERVER_LOG: join(fixture.dir, "server.log"),
+      BOTFLEET_FAIL_LEDGER: fixture.ledger,
+      BOTFLEET_FAIL_STORM_THRESHOLD: "20",
+      BOTFLEET_FAIL_WINDOW_SECONDS: "3600",
+    },
+  });
+}
+
+function identityReport(fixture, result) {
+  assert.equal(result.status, 0, `launcher failed\nstdout=${result.stdout}\nstderr=${result.stderr}`);
+  const said = `${result.stdout || ""}${result.stderr || ""}`;
+  assert.doesNotMatch(said, /fixture-/, "the launcher must not print identity values");
+  assert.equal(existsSync(fixture.report), true, "the node stub did not record the environment");
+  return Object.fromEntries(
+    readFileSync(fixture.report, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => {
+        const eq = line.indexOf("=");
+        return [line.slice(0, eq), line.slice(eq + 1)];
+      }),
+  );
+}
+
+test("the Infisical identity banner is 7-bit ASCII", () => {
+  const line = readFileSync(SCRIPT, "utf8")
+    .split("\n")
+    .find((row) => row.includes("the Infisical machine identity"));
+  assert.ok(line, "the identity section banner is missing");
+  assert.match(line, /^# --- the Infisical machine identity/);
+  assert.equal([...line].some((ch) => ch.charCodeAt(0) > 127), false);
+});
+
+test("documented handoff names are exported and wrapping quotes are stripped", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      [
+        'INFISICAL_CLIENT_ID="fixture-canonical-id"',
+        "INFISICAL_CLIENT_SECRET='fixture-canonical-secret'",
+        "UNRELATED_TOKEN=fixture-should-not-leak",
+      ].join("\n"),
+    );
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+    assert.equal(got.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("automation file names map onto the env names the harness already resolves", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      ["INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id", "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto-secret"].join("\n"),
+    );
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-auto-id");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-auto-secret");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a documented key wins over the automation name when both are present", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      [
+        "INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id",
+        "INFISICAL_CLIENT_ID=fixture-canonical-id",
+        "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto-secret",
+        "INFISICAL_CLIENT_SECRET=fixture-canonical-secret",
+      ].join("\n"),
+    );
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-canonical-id");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-canonical-secret");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a blank documented line falls through to the automation name", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      [
+        "INFISICAL_CLIENT_ID=",
+        "INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id",
+        'INFISICAL_CLIENT_SECRET=""',
+        "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto-secret",
+      ].join("\n"),
+    );
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-auto-id");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-auto-secret");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a handoff file with no identity does not export empty strings", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(fixture, "OTHER_TOKEN=fixture-unrelated\n");
+    const got = identityReport(fixture, runIdentity(fixture, {
+      INFISICAL_UNIVERSAL_AUTH_CLIENT_ID: "fixture-alias-id",
+      INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET: "fixture-alias-secret",
+    }));
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
+    assert.equal(got.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID, "fixture-alias-id");
+    assert.equal(got.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET, "fixture-alias-secret");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a half pair in the handoff file is not exported", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(fixture, "INFISICAL_CLIENT_ID=fixture-only-id\n");
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("an identity already in the environment is not replaced by the handoff file", () => {
+  const fixture = identityFixture();
+  try {
+    writeKeys(
+      fixture,
+      ["INFISICAL_CLIENT_ID=fixture-file-id", "INFISICAL_CLIENT_SECRET=fixture-file-secret"].join("\n"),
+    );
+    const got = identityReport(fixture, runIdentity(fixture, {
+      INFISICAL_CLIENT_ID: "fixture-env-id",
+      INFISICAL_CLIENT_SECRET: "fixture-env-secret",
+    }));
+    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-env-id");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-env-secret");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a missing handoff file still forwards an identity the environment already holds", () => {
+  const fixture = identityFixture();
+  try {
+    const got = identityReport(fixture, runIdentity(fixture, {
+      INFISICAL_CLIENT_ID: "fixture-env-id",
+      INFISICAL_CLIENT_SECRET: "fixture-env-secret",
+    }));
+    assert.equal(got.INFISICAL_CLIENT_ID, "fixture-env-id");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "fixture-env-secret");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a directory where the handoff file should be does not stop the harness", () => {
+  const fixture = identityFixture();
+  try {
+    mkdirSync(fixture.keys);
+    const got = identityReport(fixture, runIdentity(fixture));
+    assert.equal(got.INFISICAL_CLIENT_ID, "unset");
+    assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
