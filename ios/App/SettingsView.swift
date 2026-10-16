@@ -193,6 +193,26 @@ struct SettingsView: View {
                     .disabled(!settingsLoaded)
 
                     Picker(selection: Binding(
+                        get: {
+                            let raw = session.config?.busySendDefault?.lowercased() ?? "steer"
+                            return raw == "queue" ? "queue" : "steer"
+                        },
+                        set: { mode in
+                            Task { _ = await session.updateBusySendDefault(mode) }
+                        }
+                    )) {
+                        Text("Steer").tag("steer")
+                        Text("Queue").tag("queue")
+                    } label: {
+                        Label {
+                            Text("Busy Sends")
+                        } icon: {
+                            SettingsIcon(symbol: "arrow.triangle.branch", color: .orange)
+                        }
+                    }
+                    .disabled(!settingsLoaded)
+
+                    Picker(selection: Binding(
                         get: { session.config?.terminology ?? "channels" },
                         set: { newTerm in
                             Task {

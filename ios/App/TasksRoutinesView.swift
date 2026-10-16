@@ -162,8 +162,7 @@ private struct RoutineRow: View {
         let canToggle = routine.canToggle()
         HStack(spacing: 12) {
             if let bot {
-                BotAvatarView(bot: bot, size: 42, state: routine.enabled ? .idle : .sleeping, animated: false)
-                    .providerBadge(for: bot, avatarSize: 42)
+                BotAvatarWithProviderBadge(bot: bot, size: 42, state: routine.enabled ? .idle : .sleeping, animated: false)
             }
             else { Image(systemName: "calendar.badge.exclamationmark").frame(width: 42, height: 42) }
             VStack(alignment: .leading, spacing: 3) {

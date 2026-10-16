@@ -190,8 +190,12 @@ describe("Local Models panel", () => {
   });
 
   it("opens on the engine itself for a bot on a cloud model, even with local models configured", () => {
+    // The pane header was the discriminator before: the hosted pane said
+    // "Choose a model for this bot" and the local pane said "Runs On <engine>".
+    // That line is gone — it only restated the list underneath it — so the
+    // engine's own name in the heading is what separates the two panes now.
     const text = words(menu(render([claude([QWEN])])));
-    expect(text).toContain("Choose a model for this bot");
+    expect(text).toContain("Claude");
     expect(text).not.toContain("Runs On Claude");
   });
 

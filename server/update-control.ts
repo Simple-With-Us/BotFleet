@@ -35,6 +35,7 @@ import { dirname, join, resolve, sep } from "node:path";
 // One definition, shared with the updater's own sweeper.  Two copies of this
 // allowlist existed and drifted, and the drift was a multi-gigabyte disk leak
 // rather than a cosmetic bug — see scripts/stage-entries.mjs.
+import { pruneFailedInstallBundles } from "../scripts/failed-install-retention.mjs";
 import { stageIsPrunable } from "../scripts/stage-entries.mjs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -235,6 +236,9 @@ export interface UpdateControlDeps {
   /** Where the updater stages the source it builds from.  Read here only to
    * sweep the stages that failed runs left behind. */
   updatesDirectory: string;
+  /** Installed application path — used to sweep failed-install bundles this
+   * updater left beside it.  Same default as scripts/update-botfleet-mac.mjs. */
+  appPath: string;
   scriptPath: string;
   label: string;
   platform: string;
@@ -856,11 +860,15 @@ function defaultDeps(overrides: Partial<UpdateControlDeps>): UpdateControlDeps {
   const updatesDirectory = overrides.updatesDirectory
     ?? process.env.BOTFLEET_UPDATE_ROOT
     ?? join(homedir(), "Library", "Caches", "BotFleet", "updates");
+  const appPath = overrides.appPath
+    ?? process.env.BOTFLEET_APP_PATH
+    ?? join("/Applications", "BotFleet.app");
   return {
     installed: overrides.installed ?? { version: "0.0.0", sourceCommit: "0".repeat(40) },
     checkout,
     stateDirectory,
     updatesDirectory,
+    appPath,
     scriptPath,
     label: overrides.label ?? UPDATE_LAUNCH_LABEL,
     platform: overrides.platform ?? process.platform,
@@ -1085,14 +1093,16 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
     if (!raw || typeof raw !== "object") return;
     const record = raw as Record<string, unknown>;
     if (typeof record.runId !== "string" || !isOutcome(record.outcome)) return;
-    lastRun = {
+    const parsed: typeof lastRun = {
       runId: record.runId,
       startedAt: typeof record.startedAt === "string" ? record.startedAt : "",
       finishedAt: typeof record.finishedAt === "string" ? record.finishedAt : "",
       outcome: record.outcome,
       message: typeof record.message === "string" ? record.message : "",
-      ...(typeof record.receiptPath === "string" ? { receiptPath: record.receiptPath } : {}),
     };
+    const receiptPath = optionalString.safeParse(record.receiptPath);
+    if (receiptPath.success && receiptPath.data) parsed.receiptPath = receiptPath.data;
+    lastRun = parsed;
   };
 
   const loadCurrent = () => {
@@ -1158,6 +1168,19 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       const pruned = pruneUpdateStages(deps.updatesDirectory, { now: deps.now().getTime() });
       if (pruned.length) {
         console.log(`BotFleet removed ${pruned.length} abandoned update stage(s) under ${deps.updatesDirectory}.`);
+      }
+      const failedBundles = pruneFailedInstallBundles(deps.appPath, {
+        listNames: (directory) => {
+          try {
+            return readdirSync(directory);
+          } catch {
+            return [];
+          }
+        },
+        remove: (path) => rmSync(path, { recursive: true, force: true }),
+      });
+      if (failedBundles.length) {
+        console.log(`BotFleet removed ${failedBundles.length} expired failed-install bundle(s) beside ${deps.appPath}.`);
       }
       pruneRunArtifacts(runsDirectory, { protect: lastRun ? [lastRun.runId] : [] });
     } catch (error) {

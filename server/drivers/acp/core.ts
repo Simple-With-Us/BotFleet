@@ -81,6 +81,7 @@ import { augmentedPath } from "../../env-path.ts";
 // packaged server dir entirely. See server/proxy-paths.ts.
 import { appendNative } from "../native.ts";
 import { turnStdioMcpServers } from "../turn-mcp.ts";
+import { engineCommandText, neutralizeLeadingSlash, normalizeAnnouncedCommands } from "../engine-commands.ts";
 import { getBool } from "../../feature-flags.ts";
 import type { JsonValue } from "../../schema.ts";
 import {
@@ -207,6 +208,11 @@ export interface AcpSupport {
   loginNote: string;
   /** How a user installs this harness's CLI; surfaced by the setup UI. */
   install?: EngineInstall;
+  /** Other command names that run this harness, beyond `defaultCli`.  The
+   * Engines picker searches them alongside the default so an installed engine
+   * is never hidden behind a differently-named binary — Clutch's default is
+   * `dsh` but its own build installs as `clutch`. */
+  cliAliases?: string[];
   /** CLI argv AFTER the binary name to enter ACP stdio mode. */
   spawnArgs(config: AcpConfig, turn: SendTurnInput): string[];
   /** Optional rewrite of the spawned CLI.  DSH sits a stdio bridge in front
@@ -566,6 +572,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       },
     },
     install: support.install,
+    cliAliases: support.cliAliases,
     models: withModelCapabilities(support.models, support),
     decodeConfig,
     defaultConfig: () => decodeConfig({}),
@@ -676,6 +683,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         turnId,
         createdAt: new Date().toISOString(),
       });
+      /** The agent's slash-command catalog (`available_commands_update`), kept
+       *  per instance so the same list is announced once, not once a turn. */
+      let announcedCommands = "";
+      const announceCommands = (threadId: string, turnId: string, raw: readonly string[]) => {
+        const names = normalizeAnnouncedCommands(raw);
+        const key = names.join(",");
+        if (key === announcedCommands) return;
+        announcedCommands = key;
+        emit({ ...base(threadId, turnId), type: "engine.commands", names, origin: "acp-available-commands" });
+      };
 
       const sendTurn = async (turn: SendTurnInput) => {
         const { threadId } = turn;
@@ -1136,6 +1153,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (state.settled || state.retrying || state.deadlineTerminating) return false;
           if (retry.cancelled || preflightCancelled || disposed) return false;
           if (state.sawOutput) return false;
+          // a command turn is never replayed: a relaunch could run it twice
+          if (turn.command) return false;
           if (retry.attempt >= RETRY_MAX_ATTEMPTS - 1) return false;
           const verdict = classifyError(failure);
           if (!verdict.transient) return false;
@@ -1367,8 +1386,27 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // native log but never normalized: the prompt result is the settle.
           if (msg.method !== "session/update") return;
           const p = msg.params ?? {};
-          if (!state.promptSent || p._meta?.isReplay === true) return;
           const u = p.update ?? {};
+          // Agents announce their commands right after session/new or
+          // session/load, before the prompt goes out and while a resumed
+          // session is still replaying, so this reads ahead of the gate below.
+          // It never becomes a transcript item.
+          if (u.sessionUpdate === "available_commands_update") {
+            const names = z.array(z.object({ name: z.string() })).safeParse(u.availableCommands);
+            if (names.success) announceCommands(threadId, turnId, names.data.map((command) => command.name));
+            return;
+          }
+          // `p` always carries `update` (and vendor keys); outer strict() would fail every
+          // notification.  `_meta` is looseObject like grok/allowlist — read isReplay only.
+          const replayParams = z
+            .object({
+              _meta: z
+                .looseObject({ isReplay: z.boolean().optional().catch(undefined) })
+                .optional()
+                .catch(undefined),
+            })
+            .safeParse(p);
+          if (!state.promptSent || (replayParams.success && replayParams.data._meta?.isReplay === true)) return;
           switch (u.sessionUpdate) {
             case "agent_message_chunk": {
               const delta = u.content?.text;
@@ -1808,20 +1846,29 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // Budget the prompt about to be sent.  This does not decide
             // whether the system prompt is inlined on resume.  Under the
             // ceiling the composed text is unchanged.
+            // A command turn is written as the agent parses it: the bare
+            // "/name args" with no persona in front.  Every other turn is
+            // shielded so a leading slash in the composed text cannot run as a
+            // command (the persona normally leads, so this is a second lock).
             const composed = support.buildPromptText
               ? support.buildPromptText(turn)
               : turn.system
                 ? `${turn.system}\n\n${turn.text}`
                 : turn.text;
-            const budgeted = applyAcpPromptBudget({
-              composed,
-              sections: turn.systemSections,
-              userText: turn.text,
-              budgetBytes: resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes),
-            });
-            annotatePromptBudget(threadId, turnId, budgeted);
-            captureTurnPrompt(threadId, turnId, budgeted.text);
-            const text = budgeted.text;
+            let text: string;
+            if (turn.command) {
+              text = engineCommandText(turn.command);
+            } else {
+              const budgeted = applyAcpPromptBudget({
+                composed,
+                sections: turn.systemSections,
+                userText: turn.text,
+                budgetBytes: resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes),
+              });
+              annotatePromptBudget(threadId, turnId, budgeted);
+              text = neutralizeLeadingSlash(budgeted.text);
+              captureTurnPrompt(threadId, turnId, text);
+            }
             const result = await request(
               "session/prompt",
               {
@@ -2030,15 +2077,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // jobs arrive over MCP (jobs P2) through the `agents` mount this
             // engine already builds in `acpMcpServers`.  Truthful per engine:
             // an engine that declares no MCP support mounts no job tools, and
-            // says so.  Named helper rows come in P3.
+            // says so.  A tool named invoke_subagent or spawn_subagent is a
+            // helper card (jobs P3).  This engine does not stamp a parent
+            // id, so the card is the row itself.
             backgroundJobs: mountsMcpServers ? "emulated" : "none",
-            helpers: "none",
+            helpers: "named",
             // `session/request_permission` becomes request.opened; a
             // full-auto instance answers it itself unless the turn is held
             reviewHook: config.fullAuto ? "after" : "before",
             asksWhenHeld: true,
             // Holds a routine's command allowlist (allowlist.ts), or refuses it.
             toolPolicy: Boolean(support.allowlist),
+            // Explicit engine commands run directly, outside the ordinary prompt budget.
+            engineCommands: true,
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

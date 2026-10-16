@@ -33,7 +33,7 @@ const claude: InstanceInfo = {
   capabilities: { computerMcp: true },
 };
 
-function visualBot(mode: "default" | "unconfigured" | "vps-incompatible"): Bot {
+function visualBot(mode: "default" | "unconfigured" | "vps-incompatible" | "source-picker"): Bot {
   return {
     id: BOT_ID,
     threadId: "visual-thread",
@@ -47,7 +47,11 @@ function visualBot(mode: "default" | "unconfigured" | "vps-incompatible"): Bot {
     // Unset computers is the Auto/Off state that shows the auto-start sentence.
     // ["cloud"] is what lets the panel ask for VPS status and reach
     // vps-unconfigured. [] would skip that fetch and also hide the sentence.
-    ...(mode === "unconfigured" || mode === "vps-incompatible" ? { computers: ["cloud" as const] } : {}),
+    ...(mode === "source-picker"
+      ? { computers: ["cloud" as const, "local" as const] }
+      : mode === "unconfigured" || mode === "vps-incompatible"
+        ? { computers: ["cloud" as const] }
+        : {}),
     cloudBackend: "vps",
     autoStartVps: mode === "vps-incompatible",
     messages: [],
@@ -60,7 +64,8 @@ export default function ComputerPanelVisualFixture() {
     const mode =
       warning === "unconfigured" ? "unconfigured"
         : warning === "vps-incompatible" ? "vps-incompatible"
-          : "default";
+          : warning === "source-picker" ? "source-picker"
+            : "default";
     const bot = visualBot(mode);
     return {
       state: {

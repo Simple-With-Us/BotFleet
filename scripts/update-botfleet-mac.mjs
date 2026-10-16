@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, realpathSync } from "node:fs";
+import { createReadStream, realpathSync, rmSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -28,6 +28,19 @@ import {
 } from "./update-progress.mjs";
 import { validUpdateCredentialReceipt } from "../electron/update-credential-preparation.mjs";
 import { stageIsPrunable } from "./stage-entries.mjs";
+import {
+  FAILED_INSTALL_KEEP,
+  failedInstallBundles,
+  failedInstallBundlesToPrune,
+  pruneFailedInstallBundles,
+} from "./failed-install-retention.mjs";
+
+export {
+  FAILED_INSTALL_KEEP,
+  failedInstallBundles,
+  failedInstallBundlesToPrune,
+  failedInstallStamp,
+} from "./failed-install-retention.mjs";
 import {
   downloadBuiltBundle,
   ResolutionError,
@@ -69,6 +82,27 @@ export class CommandError extends Error {
   }
 }
 
+export const UPDATE_COMPONENT_MODES = Object.freeze(["both", "server", "app"]);
+
+export function normalizeUpdateComponents(value) {
+  const raw = String(value ?? "both").trim().toLowerCase();
+  if (raw === "server-only") return "server";
+  if (!UPDATE_COMPONENT_MODES.includes(raw)) {
+    throw new Error(`--components must be one of: ${UPDATE_COMPONENT_MODES.join(", ")} (or --server-only)`);
+  }
+  return raw;
+}
+
+/** Which halves of an install this run owns.  The parsed CLI is the source of truth. */
+export function resolveUpdateComponentFlags(components) {
+  const mode = normalizeUpdateComponents(components);
+  return {
+    mode,
+    updateServer: mode === "both" || mode === "server",
+    updateApp: mode === "both" || mode === "app",
+  };
+}
+
 export function parseArguments(argv) {
   const args = [...argv];
   const command = ["prepare", "apply", "update", "unquiesce"].includes(args[0]) ? args.shift() : "update";
@@ -79,6 +113,7 @@ export function parseArguments(argv) {
     stage: undefined,
     bundle: undefined,
     dependencies: undefined,
+    components: "both",
     openApplication: true,
     progress: undefined,
     runId: undefined,
@@ -91,6 +126,11 @@ export function parseArguments(argv) {
     else if (arg === "--stage") parsed.stage = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--bundle") parsed.bundle = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--dependencies") parsed.dependencies = resolve(requiredValue(arg, args.shift()));
+    else if (arg === "--components") parsed.components = normalizeUpdateComponents(requiredValue(arg, args.shift()));
+    else if (arg.startsWith("--components=")) {
+      parsed.components = normalizeUpdateComponents(requiredValue("--components", arg.slice("--components=".length)));
+    }
+    else if (arg === "--server-only") parsed.components = "server";
     else if (arg === "--progress") parsed.progress = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--run-id") parsed.runId = requiredValue(arg, args.shift());
     else if (arg === "--no-open") parsed.openApplication = false;
@@ -109,8 +149,8 @@ export function parseArguments(argv) {
   }
   if (command === "apply" && !parsed.stage) throw new Error("apply requires --stage <directory>");
   if (command === "unquiesce" && (parsed.target !== "origin/main" || parsed.source || parsed.stage || parsed.bundle ||
-      parsed.dependencies || parsed.openApplication === false || parsed.progress || parsed.runId ||
-      parsed.graceMs !== undefined || parsed.waitForIdleMs !== undefined)) {
+      parsed.dependencies || parsed.components !== "both" || parsed.openApplication === false || parsed.progress ||
+      parsed.runId || parsed.graceMs !== undefined || parsed.waitForIdleMs !== undefined)) {
     throw new Error("unquiesce accepts no options");
   }
   if (parsed.force && parsed.waitForIdleMs !== undefined) {
@@ -124,6 +164,9 @@ export function parseArguments(argv) {
   }
   if (parsed.bundle && !parsed.source) {
     throw new Error("importing a built bundle requires its exact --source checkout");
+  }
+  if (parsed.components === "app" && !(parsed.bundle && parsed.dependencies)) {
+    throw new Error("--components app is only supported when importing a built bundle with --bundle and --dependencies");
   }
   if (parsed.runId !== undefined) {
     if (!parsed.progress) throw new Error("--run-id requires --progress <path>");
@@ -164,6 +207,12 @@ function usage() {
   update-botfleet-mac.mjs apply   --stage PATH [--no-open]
                               [--grace SECONDS | --wait-for-idle [MINUTES] | --force]
   update-botfleet-mac.mjs unquiesce
+
+--components both|server|app (or --server-only) states which halves a run owns, defaulting to both.
+A server-only run stops the harness, swaps the dependency tree, restarts it, and proves it is the
+single authenticated data owner, without quitting the desktop app, renaming its bundle, preparing
+its credentials, reopening it, or sampling its processes.  --components app is refused unless the
+caller imports a built bundle with --bundle and --dependencies.
 
 With no --target, update and prepare (run through scripts/update-botfleet.sh) install the newest
 commit on origin/main whose hosted Mac build succeeded and that is newer than the installed build,
@@ -467,8 +516,22 @@ export function reconcilableGenerations(generations, { appPath, installedCommit 
  * follow it: the running binary and everything it maps stay open as `txt`
  * descriptors, and lsof prints their current paths.
  */
+/**
+ * `/var` is a symlink to `/private/var`.  lsof prints one of them and
+ * `realpath` returns the other, so both have to count as the same bundle.
+ */
+function bundlePathPrefixes(bundleRealPath) {
+  const prefixes = [`${bundleRealPath}${sep}`];
+  if (bundleRealPath.startsWith("/private/var/")) {
+    prefixes.push(`${bundleRealPath.slice("/private".length)}${sep}`);
+  } else if (bundleRealPath.startsWith("/var/")) {
+    prefixes.push(`/private${bundleRealPath}${sep}`);
+  }
+  return prefixes;
+}
+
 export function txtHolderPids(lsofOutput, bundleRealPath) {
-  const prefix = `${bundleRealPath}${sep}`;
+  const prefixes = bundlePathPrefixes(bundleRealPath);
   const pids = new Set();
   let pid = null;
   for (const line of lsofOutput.split("\n")) {
@@ -478,7 +541,8 @@ export function txtHolderPids(lsofOutput, bundleRealPath) {
       continue;
     }
     if (pid === null || !line.startsWith("n")) continue;
-    if (line.slice(1).startsWith(prefix)) pids.add(pid);
+    const name = line.slice(1);
+    if (prefixes.some((prefix) => name.startsWith(prefix))) pids.add(pid);
   }
   return [...pids];
 }
@@ -488,60 +552,6 @@ export function txtHolderPids(lsofOutput, bundleRealPath) {
  * process that survives the swap keeps running out of the renamed bundle and
  * shows that name in the Dock and menu bar until it is relaunched.
  */
-/**
- * A failed install leaves the replacement behind as `<name>.failed-<stamp>`
- * so it can be examined.  They are evidence of a failed update, so they are
- * reported rather than deleted.
- *
- * Evidence is worth keeping for a while and worthless forever, though, and
- * this used to have no end: every failed update left a whole second copy of
- * the app in /Applications forever.  Four of them held 2.5 GB on a disk that
- * was 99% full.  So they are now capped -- see `FAILED_INSTALL_KEEP`.  The
- * newest few stay as evidence; the rest go.
- */
-export function failedInstallBundles(names, bundleName) {
-  return names.filter((name) => name.startsWith(`${bundleName}.failed-`));
-}
-
-/**
- * How many failed-install bundles to keep.
- *
- * Three is enough to diagnose a bad update (the one you just hit, plus the
- * couple before it that might share a cause) without letting a flapping
- * updater fill the disk.  Each one is a full copy of the app, so on a 600 MB
- * bundle the difference between three and unlimited is the whole disk.
- */
-export const FAILED_INSTALL_KEEP = 3;
-
-/**
- * The millisecond stamp a failed-install bundle carries, or null when the name
- * is not one.  The stamp is written by the failed install itself, so it is the
- * only age signal available without stat'ing every bundle.
- */
-export function failedInstallStamp(name, bundleName) {
-  const prefix = `${bundleName}.failed-`;
-  if (!name.startsWith(prefix)) return null;
-  const stamp = Number(name.slice(prefix.length));
-  return Number.isSafeInteger(stamp) && stamp > 0 ? stamp : null;
-}
-
-/**
- * Which failed-install bundles are past the retention cap: the oldest ones,
- * keeping the `keep` newest.  Pure, so the policy is testable without a disk.
- *
- * A bundle whose stamp does not parse is never pruned.  It is not ours to age
- * out, and guessing could delete the wrong thing.
- */
-export function failedInstallBundlesToPrune(names, bundleName, keep = FAILED_INSTALL_KEEP) {
-  const stamped = [];
-  for (const name of names) {
-    const stamp = failedInstallStamp(name, bundleName);
-    if (stamp !== null) stamped.push({ name, stamp });
-  }
-  stamped.sort((a, b) => b.stamp - a.stamp);
-  return stamped.slice(Math.max(0, keep)).map((entry) => entry.name);
-}
-
 export function survivingRollbackProcessError(pids, rollbackPath) {
   if (!pids.length) return null;
   return `BotFleet process ${pids.join(", ")} still runs from the prior bundle ${rollbackPath}; it would keep showing that bundle's name until relaunch`;
@@ -2325,6 +2335,47 @@ async function exactAppPids(appPath) {
   return exactAppPidsFromPs(result.stdout, join(appPath, "Contents/MacOS/BotFleet"));
 }
 
+function pidsFromFieldLsof(stdout) {
+  const pids = [];
+  for (const line of stdout.split("\n")) {
+    if (!line.startsWith("p")) continue;
+    const pid = Number(line.slice(1));
+    if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+  }
+  return pids;
+}
+
+function lsofFieldPids(args) {
+  return run("lsof", ["-Fn", ...args], { allowFailure: true }).then((result) => ({
+    ok: [0, 1].includes(result.code),
+    pids: pidsFromFieldLsof(result.stdout),
+  }));
+}
+
+/** Open-file pids under one directory, without walking into children.
+ * A flat directory uses `lsof -Fn +D`, the command the release-store probe
+ * uses.  Hosted macOS 14 answers that for an ordinary open file.  `lsof -t`
+ * on the same image returned exit 1 and an empty pid list.  A directory that
+ * contains a subdirectory, such as `Contents/Resources/server`, is not given
+ * to `+D`.  `+D` would walk that tree.  Its top-level files are named
+ * instead, including a symlink, so `cua-driver` is still visible.
+ * `Dirent.isFile()` is false for a symlink, so the filter is "not a directory". */
+async function scanOpenDirectory(directory) {
+  let names;
+  try {
+    names = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  const files = names.filter((entry) => !entry.isDirectory());
+  if (!names.some((entry) => entry.isDirectory()) && names.length <= 64) {
+    return lsofFieldPids(["+D", directory]);
+  }
+  if (!files.length) return null;
+  return lsofFieldPids(files.slice(0, 64).map((entry) => join(directory, entry.name)));
+}
+
 /**
  * Every process holding any executable or mapped library inside the bundle, by
  * the kernel's open reference rather than by recorded arguments.  This is what
@@ -2333,8 +2384,12 @@ async function exactAppPids(appPath) {
  * embedded computer-use driver at `Contents/Resources/cua-driver` and the
  * `BotFleet Speech.app` / `BotFleet Recorder.app` helpers.  Renaming the
  * bundle while any of them runs is the thing to avoid.
+ *
+ * The text scan is what a developer Mac reports for a mapped binary.  Hosted
+ * macOS 14 often prints nothing for that mapping.  `lsof -Fn +D` on a flat
+ * directory is the form that image already answers for an open file.
  */
-async function bundleHolderPids(bundlePath) {
+export async function bundleHolderPids(bundlePath) {
   let root;
   try {
     root = await realpath(bundlePath);
@@ -2342,9 +2397,23 @@ async function bundleHolderPids(bundlePath) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
-  const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
-  if (![0, 1].includes(result.code)) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
-  return withoutExitedPids(txtHolderPids(result.stdout, root));
+  const resourcesDir = join(root, "Contents", "Resources");
+  const [textScan, macosScan, resourcesScan] = await Promise.all([
+    (async () => {
+      const result = await run("lsof", ["-F", "pn", "-d", "txt"], { allowFailure: true });
+      return { ok: [0, 1].includes(result.code), pids: txtHolderPids(result.stdout, root) };
+    })(),
+    scanOpenDirectory(join(root, "Contents", "MacOS")),
+    scanOpenDirectory(resourcesDir),
+  ]);
+  const results = [textScan, macosScan, resourcesScan].filter((result) => result);
+  const usable = results.filter((result) => result.ok);
+  if (!usable.length) throw new Error("Could not inspect BotFleet bundle ownership with lsof");
+  const pids = new Set();
+  for (const result of usable) {
+    for (const pid of result.pids) pids.add(pid);
+  }
+  return withoutExitedPids([...pids]);
 }
 
 /**
@@ -3208,14 +3277,69 @@ export async function swapPreparedFiles({
   }
 }
 
+/** Application bundle half of swapPreparedFiles — same progress flags and restore-on-failure behaviour. */
+export async function swapApplicationBundle({
+  appPath,
+  candidateApp,
+  rollbackApp,
+  progress = {},
+}, renamePath = rename) {
+  progress.rollbackAppHolds = false;
+  let newAppMoved = false;
+  try {
+    await renamePath(appPath, rollbackApp);
+    progress.rollbackAppHolds = true;
+    await renamePath(candidateApp, appPath);
+    newAppMoved = true;
+  } catch (error) {
+    if (newAppMoved) await renamePath(appPath, candidateApp);
+    if (progress.rollbackAppHolds) {
+      await renamePath(rollbackApp, appPath);
+      progress.rollbackAppHolds = false;
+    }
+    throw error;
+  }
+}
+
+/** Dependency half of swapPreparedFiles — same progress flags and restore-on-failure behaviour. */
+export async function swapDependencyTree({
+  liveDependencies,
+  candidateDependencies,
+  rollbackDependencies,
+  progress = {},
+}, renamePath = rename) {
+  progress.rollbackDependenciesHold = false;
+  let newDependenciesMoved = false;
+  try {
+    await renamePath(liveDependencies, rollbackDependencies);
+    progress.rollbackDependenciesHold = true;
+    await renamePath(candidateDependencies, liveDependencies);
+    newDependenciesMoved = true;
+  } catch (error) {
+    if (newDependenciesMoved) await renamePath(liveDependencies, candidateDependencies);
+    if (progress.rollbackDependenciesHold) {
+      await renamePath(rollbackDependencies, liveDependencies);
+      progress.rollbackDependenciesHold = false;
+    }
+    throw error;
+  }
+}
+
 /**
  * One receipt shape for both writes.  Every key the first schema carried stays
  * in place and keeps its meaning, so an older reader still resolves the prior
  * bundle, dependency tree, and commit; the added keys describe placement and
  * whether the install has been verified yet.
  */
+/** Receipt path for this run: beside the bundle rollback or the dependency rollback. */
+export function rollbackReceiptPathForPrevious(previous) {
+  return previous.rollbackPath
+    ? `${previous.rollbackPath}.json`
+    : `${previous.rollbackDependencies}.json`;
+}
+
 function rollbackReceipt(prepared, previous, config, extra) {
-  return {
+  const receipt = {
     schemaVersion: 1,
     previousCommit: previous.checkoutCommit,
     // The checkout commit and the installed build can disagree: `ubf --force`
@@ -3225,18 +3349,21 @@ function rollbackReceipt(prepared, previous, config, extra) {
     // actually is — the build anyone recovering from it would get.
     previousInstalledCommit: previous.installedCommit ?? null,
     replacementCommit: prepared.targetCommit,
-    rollbackBundle: previous.rollbackPath,
+    rollbackBundle: previous.rollbackPath ?? config.appPath,
     rollbackDependencies: previous.rollbackDependencies,
     installedAt: previous.installedAt,
     appPath: config.appPath,
     stageDirectory: prepared.stageDirectory,
     rollbackPlacement: previous.rollbackPlacement,
     crossVolume: previous.crossVolume === true,
-    ...(previous.crossVolumeReason ? { crossVolumeReason: previous.crossVolumeReason } : {}),
     candidateBundle: previous.candidatePath,
     candidateDependencies: previous.candidateDependencies,
     ...extra,
   };
+  if (previous.crossVolumeReason) {
+    receipt.crossVolumeReason = previous.crossVolumeReason;
+  }
+  return receipt;
 }
 
 async function readRollbackReceipt(receiptPath) {
@@ -3246,7 +3373,8 @@ async function readRollbackReceipt(receiptPath) {
   } catch {
     return null;
   }
-  if (!receipt || typeof receipt.rollbackBundle !== "string") return null;
+  const rollbackBundle = receipt?.rollbackBundle;
+  if (!receipt || rollbackBundle == null || rollbackBundle !== `${rollbackBundle}`) return null;
   return { receiptPath, receipt };
 }
 
@@ -3279,6 +3407,17 @@ export async function rollbackGenerations(config, { stageDirectories = [] } = {}
   for (const name of await listDirectory(applicationsDirectory)) {
     if (!name.startsWith(".BotFleet.rollback-") || !name.endsWith(".app")) continue;
     await consider(join(applicationsDirectory, name));
+  }
+  if (config.checkout) {
+    const checkoutParent = dirname(config.checkout);
+    for (const name of await listDirectory(checkoutParent)) {
+      if (!name.startsWith(".botfleet-server.node_modules.rollback-")) continue;
+      const dependencyPath = join(checkoutParent, name);
+      const receiptPath = `${dependencyPath}.json`;
+      const [hasTree, hasReceipt] = await Promise.all([exists(dependencyPath), exists(receiptPath)]);
+      if (hasReceipt) receiptPaths.push(receiptPath);
+      else if (hasTree) orphans.push(dependencyPath);
+    }
   }
   // A stage named with `--stage` need not sit under the updates root, so the
   // caller passes the stages it knows about as well.  Each stage's rollback
@@ -3388,8 +3527,46 @@ function environmentMs(name, fallback) {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
+async function sweepExpiredFailedInstallBundles(config, { reportKept = false } = {}) {
+  const appDir = dirname(config.appPath);
+  const bundleName = basename(config.appPath);
+  const present = await listDirectory(appDir);
+  const kept = present.filter(
+    (name) => failedInstallBundles([name], bundleName).length === 1
+      && !failedInstallBundlesToPrune(present, bundleName).includes(name),
+  );
+  if (reportKept) {
+    for (const name of kept) {
+      console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
+    }
+  }
+  for (const path of pruneFailedInstallBundles(config.appPath, {
+    listNames: () => present,
+    remove: (target) => rmSync(target, { recursive: true, force: true }),
+  })) {
+    console.log(`Removed ${basename(path)}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
+  }
+}
+
+async function sweepAbandonedStageDirectories(config, stageDirectories = []) {
+  const { generations } = await rollbackGenerations(config, { stageDirectories });
+  const { entries, referenced } = await stageEntries(config, generations);
+  const stages = abandonedStages(entries, {
+    referenced: [...referenced, ...stageDirectories.map((path) => resolve(path))],
+  });
+  for (const path of stages.prune) {
+    if (!prunablePath(path, [config.updatesDirectory])) continue;
+    await rm(path, { recursive: true, force: true });
+    console.log(`Removed the leftover update stage ${path}`);
+  }
+  for (const path of stages.report) {
+    console.error(`Update stage ${path} has no prepared manifest and no rollback generation, and holds files this updater did not write; it was left in place for manual review.`);
+  }
+}
+
 function createOperations(config) {
   let lastPreflight;
+  const componentFlags = () => resolveUpdateComponentFlags(config.parsed.components);
   const git = (cwd, args, options) => run("git", ["-C", cwd, ...args], options);
   const gitOutput = (cwd, args, options) => output("git", ["-C", cwd, ...args], options);
 
@@ -3467,16 +3644,7 @@ function createOperations(config) {
     // nothing in one to examine.
     await sweepCandidates(dirname(config.checkout), FAILED_DEPENDENCY_PREFIX, "", [], roots);
 
-    const { entries, referenced } = await stageEntries(config, generations);
-    const stages = abandonedStages(entries, { referenced: [...referenced, ...stageDirectories.map((path) => resolve(path))] });
-    for (const path of stages.prune) {
-      if (!prunablePath(path, [config.updatesDirectory])) continue;
-      await rm(path, { recursive: true, force: true });
-      console.log(`Removed the leftover update stage ${path}`);
-    }
-    for (const path of stages.report) {
-      console.error(`Update stage ${path} has no prepared manifest and no rollback generation, and holds files this updater did not write; it was left in place for manual review.`);
-    }
+    await sweepAbandonedStageDirectories(config, stageDirectories);
 
     for (const orphan of orphans) {
       console.error(`Rollback bundle ${orphan} has no receipt; it was left in place for manual review.`);
@@ -3484,29 +3652,7 @@ function createOperations(config) {
     for (const item of unclaimedGenerations(generations)) {
       console.error(`Rollback receipt ${item.receiptPath} names no installed application; it was left in place for manual review.`);
     }
-    const appDir = dirname(config.appPath);
-    const bundleName = basename(config.appPath);
-    const present = await listDirectory(appDir);
-    const kept = present.filter(
-      (name) => failedInstallBundles([name], bundleName).length === 1 && !failedInstallBundlesToPrune(present, bundleName).includes(name),
-    );
-    for (const name of kept) {
-      console.error(`A previous update left ${join(appDir, name)} behind; it is recent enough to keep as evidence of that failure.`);
-    }
-    // Past the retention cap these are not evidence any more, just disk.  Each
-    // one is a whole second copy of the app.
-    for (const name of failedInstallBundlesToPrune(present, bundleName)) {
-      const path = join(appDir, name);
-      // Only ever something this updater itself named, sitting beside the app
-      // it manages.  A same-named bundle anywhere else is not ours to remove.
-      if (dirname(path) !== appDir) continue;
-      try {
-        await rm(path, { recursive: true, force: true });
-        console.log(`Removed ${name}, past the ${FAILED_INSTALL_KEEP}-bundle retention limit for failed installs.`);
-      } catch (error) {
-        console.error(`Could not remove the expired failed-install bundle ${path}: ${error.message}`);
-      }
-    }
+    await sweepExpiredFailedInstallBundles(config, { reportKept: true });
   };
 
   return {
@@ -3743,6 +3889,8 @@ function createOperations(config) {
       await sweepCandidates(dirname(config.appPath), CANDIDATE_BUNDLE_PREFIX, ".app", [], roots);
       await sweepCandidates(dirname(config.checkout), CANDIDATE_DEPENDENCY_PREFIX, "", [], roots);
       await sweepCandidates(dirname(config.checkout), FAILED_DEPENDENCY_PREFIX, "", [], roots);
+      await sweepAbandonedStageDirectories(config);
+      await sweepExpiredFailedInstallBundles(config);
       for (const name of await listDirectory(config.updatesDirectory)) {
         const receipt = join(config.updatesDirectory, name, "pending-recovery.json");
         if (await exists(receipt)) {
@@ -3793,6 +3941,7 @@ function createOperations(config) {
     fence: async () => fenceRuntimeAdmission(config),
 
     capturePrevious: async (prepared) => {
+      const { updateApp } = componentFlags();
       const checkoutCommit = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);
       const dirty = await gitOutput(config.checkout, ["status", "--porcelain"]);
       if (dirty) {
@@ -3834,21 +3983,30 @@ function createOperations(config) {
       const appPids = bundlePids.filter((pid) => livePids.includes(pid));
       const stamp = Date.now();
       const generation = `${stamp}-${checkoutCommit.slice(0, 12)}`;
-      const rollback = await resolveRollbackPlacement({
-        livePath: config.appPath,
-        stageDirectory: prepared.stageDirectory,
-        stageName: basename(config.appPath),
-        generation,
-        adjacentPath: join(dirname(config.appPath), `.BotFleet.rollback-${generation}.app`),
-      });
-      const rollbackDependencies = join(dirname(config.checkout), `.botfleet-server.node_modules.rollback-${generation}`);
-      // Refuse here, before the interruption boundary, rather than at the
-      // install step: after the boundary this refusal would run rollback(),
-      // and rollback() restores whatever sits at the rollback path — which in
-      // that case is an older generation, not this run's prior bundle.
-      if (await exists(rollback.path)) {
-        throw new Error(`Rollback path already exists before install: ${rollback.path}`);
+      let rollback = {
+        path: null,
+        directory: null,
+        placement: null,
+        crossVolume: false,
+        crossVolumeReason: undefined,
+      };
+      if (updateApp) {
+        rollback = await resolveRollbackPlacement({
+          livePath: config.appPath,
+          stageDirectory: prepared.stageDirectory,
+          stageName: basename(config.appPath),
+          generation,
+          adjacentPath: join(dirname(config.appPath), `.BotFleet.rollback-${generation}.app`),
+        });
+        // Refuse here, before the interruption boundary, rather than at the
+        // install step: after the boundary this refusal would run rollback(),
+        // and rollback() restores whatever sits at the rollback path — which in
+        // that case is an older generation, not this run's prior bundle.
+        if (await exists(rollback.path)) {
+          throw new Error(`Rollback path already exists before install: ${rollback.path}`);
+        }
       }
+      const rollbackDependencies = join(dirname(config.checkout), `.botfleet-server.node_modules.rollback-${generation}`);
       if (await exists(rollbackDependencies)) {
         throw new Error(`Dependency rollback path already exists before install: ${rollbackDependencies}`);
       }
@@ -3877,17 +4035,22 @@ function createOperations(config) {
     },
 
     materializeCandidate: async (prepared, previous) => {
-      await rm(previous.candidatePath, { recursive: true, force: true });
-      await run("ditto", [prepared.bundlePath, previous.candidatePath]);
-      const identity = await validateBuiltBundle(previous.candidatePath, prepared.targetCommit);
-      if (identity.designatedRequirement !== prepared.designatedRequirement ||
-          !applicationIdentitiesCanTransition(previous.installedIdentity, identity)) {
-        throw new Error("Candidate and installed app do not share an accepted signing identity");
+      const { updateApp, updateServer } = componentFlags();
+      if (updateApp) {
+        await rm(previous.candidatePath, { recursive: true, force: true });
+        await run("ditto", [prepared.bundlePath, previous.candidatePath]);
+        const identity = await validateBuiltBundle(previous.candidatePath, prepared.targetCommit);
+        if (identity.designatedRequirement !== prepared.designatedRequirement ||
+            !applicationIdentitiesCanTransition(previous.installedIdentity, identity)) {
+          throw new Error("Candidate and installed app do not share an accepted signing identity");
+        }
       }
-      await rm(previous.candidateDependencies, { recursive: true, force: true });
-      await run("/bin/cp", ["-cR", prepared.dependenciesPath, previous.candidateDependencies]);
-      if (await dependencyFingerprint(previous.candidateDependencies) !== prepared.dependencyFingerprint) {
-        throw new Error("Materialized dependency candidate does not match the prepared tree");
+      if (updateServer) {
+        await rm(previous.candidateDependencies, { recursive: true, force: true });
+        await run("/bin/cp", ["-cR", prepared.dependenciesPath, previous.candidateDependencies]);
+        if (await dependencyFingerprint(previous.candidateDependencies) !== prepared.dependencyFingerprint) {
+          throw new Error("Materialized dependency candidate does not match the prepared tree");
+        }
       }
     },
 
@@ -3897,8 +4060,11 @@ function createOperations(config) {
     },
 
     quiesce: async (previous) => {
+      const { updateApp } = componentFlags();
       await bootOutHarnessForQuiesce(config, previous);
-      await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true });
+      if (updateApp) {
+        await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true });
+      }
       // Re-resolve what holds BotFleet state now rather than trusting the
       // capture.  The embedded driver and the helper apps start on demand, so
       // one can appear between the capture and the shutdown; and the harness
@@ -3910,14 +4076,17 @@ function createOperations(config) {
       // non-BotFleet process holding BotFleet state is waited out and never
       // signalled, and a refusal names it.
       await waitOutUnrecognizedHolders(async () => {
-        const [currentHolders, currentBundlePids, health] = await Promise.all([
+        const [currentHolders, health] = await Promise.all([
           sqliteHolders(config.dataDirectory),
-          bundleProcessPids(config.appPath),
           Promise.all(config.ports.map(probeHealth)),
         ]);
+        const currentBundlePids = updateApp ? await bundleProcessPids(config.appPath) : [];
         const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
+        const shutdownPids = updateApp
+          ? [...previous.runtimePids, ...previous.appPids, ...current]
+          : [...previous.runtimePids, ...current];
         await terminateVerified(
-          [...previous.runtimePids, ...previous.appPids, ...current],
+          shutdownPids,
           previous,
           config,
           { current },
@@ -3926,6 +4095,7 @@ function createOperations(config) {
     },
 
     assertQuiesced: async (previous) => {
+      const { updateApp } = componentFlags();
       // Waited for, not checked once: on a loaded Mac the app's own verified
       // processes can take minutes to quit (2026-10-09, "BotFleet process
       // 11736 still runs from inside /Applications/BotFleet.app after
@@ -3936,15 +4106,17 @@ function createOperations(config) {
         if (holders.length) {
           return { reason: `BotFleet database still has ${holders.length} live holders after graceful shutdown`, pids: holders };
         }
-        // A process can hold no database handle and answer no port while still
-        // running out of the installed bundle.  Renaming that bundle under it is
-        // exactly what leaves the owner looking at a rollback name, so the swap
-        // waits for the bundle to be empty of processes, not only for its state
-        // — and that means the whole bundle: the main binary, the embedded
-        // computer-use driver, and the speech and recorder helper apps.
-        const appPids = await bundleProcessPids(config.appPath);
-        if (appPids.length) {
-          return { reason: `BotFleet process ${appPids.join(", ")} still runs from inside ${config.appPath} after graceful shutdown`, pids: appPids };
+        if (updateApp) {
+          // A process can hold no database handle and answer no port while still
+          // running out of the installed bundle.  Renaming that bundle under it is
+          // exactly what leaves the owner looking at a rollback name, so the swap
+          // waits for the bundle to be empty of processes, not only for its state
+          // — and that means the whole bundle: the main binary, the embedded
+          // computer-use driver, and the speech and recorder helper apps.
+          const appPids = await bundleProcessPids(config.appPath);
+          if (appPids.length) {
+            return { reason: `BotFleet process ${appPids.join(", ")} still runs from inside ${config.appPath} after graceful shutdown`, pids: appPids };
+          }
         }
         const health = await Promise.all(config.ports.map((port) => probeHealthWithRetry(port)));
         const portError = quiescedPortError(health);
@@ -3963,45 +4135,69 @@ function createOperations(config) {
     },
 
     installCandidate: async (prepared, previous) => {
-      // The renamed executable cannot decrypt the Keychain item Electron
-      // safeStorage created under com.botfleet.app.  The still-authorized
-      // predecessor writes credentials.migration.json before the swap.
-      if (shouldExportSafeStorageBeforeRename(
-        previous.installedIdentity.bundleIdentifier,
-        prepared.bundleIdentifier,
-      )) {
-        const executable = join(config.appPath, "Contents/MacOS/BotFleet");
-        await run(executable, [SAFE_STORAGE_EXPORT_FLAG]);
+      const { updateApp, updateServer, mode } = componentFlags();
+      const liveDependencies = join(config.checkout, "node_modules");
+      if (await exists(previous.rollbackDependencies)) {
+        throw new Error(`Dependency rollback path already exists: ${previous.rollbackDependencies}`);
       }
-      // capturePrevious already refused a pre-existing rollback path before the
-      // boundary; this repeats the check because the window between them is
-      // where a concurrent run would have to have raced the updater lock.
-      if (await exists(previous.rollbackPath)) throw new Error(`Rollback path already exists: ${previous.rollbackPath}`);
-      if (await exists(previous.rollbackDependencies)) throw new Error(`Dependency rollback path already exists: ${previous.rollbackDependencies}`);
-      await mkdir(previous.rollbackDirectory, { recursive: true, mode: 0o700 });
+      previous.installedAt = new Date().toISOString();
+      const receiptPath = rollbackReceiptPathForPrevious(previous);
+      if (updateApp) {
+        // The renamed executable cannot decrypt the Keychain item Electron
+        // safeStorage created under com.botfleet.app.  The still-authorized
+        // predecessor writes credentials.migration.json before the swap.
+        if (shouldExportSafeStorageBeforeRename(
+          previous.installedIdentity.bundleIdentifier,
+          prepared.bundleIdentifier,
+        )) {
+          const executable = join(config.appPath, "Contents/MacOS/BotFleet");
+          await run(executable, [SAFE_STORAGE_EXPORT_FLAG]);
+        }
+        // capturePrevious already refused a pre-existing rollback path before the
+        // boundary; this repeats the check because the window between them is
+        // where a concurrent run would have to have raced the updater lock.
+        if (await exists(previous.rollbackPath)) throw new Error(`Rollback path already exists: ${previous.rollbackPath}`);
+        await mkdir(previous.rollbackDirectory, { recursive: true, mode: 0o700 });
+      }
       // Written before the first rename, so a run killed mid-swap leaves a
       // record naming which application the displaced bundle came from and
       // what commit it is, not just a directory somebody has to identify.
-      previous.installedAt = new Date().toISOString();
-      const receiptPath = `${previous.rollbackPath}.json`;
-      await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing" }));
-      const liveDependencies = join(config.checkout, "node_modules");
-      await swapPreparedFiles({
-        appPath: config.appPath,
-        candidateApp: previous.candidatePath,
-        rollbackApp: previous.rollbackPath,
-        liveDependencies,
-        candidateDependencies: previous.candidateDependencies,
-        rollbackDependencies: previous.rollbackDependencies,
-        progress: previous.swap,
-      });
-      await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing" }));
-      await run("touch", [config.appPath]);
-      const register = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister";
-      await run(register, ["-f", config.appPath], { allowFailure: true });
+      await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing", components: mode }));
+      if (updateApp && updateServer) {
+        await swapPreparedFiles({
+          appPath: config.appPath,
+          candidateApp: previous.candidatePath,
+          rollbackApp: previous.rollbackPath,
+          liveDependencies,
+          candidateDependencies: previous.candidateDependencies,
+          rollbackDependencies: previous.rollbackDependencies,
+          progress: previous.swap,
+        });
+      } else if (updateServer) {
+        await swapDependencyTree({
+          liveDependencies,
+          candidateDependencies: previous.candidateDependencies,
+          rollbackDependencies: previous.rollbackDependencies,
+          progress: previous.swap,
+        });
+      } else {
+        await swapApplicationBundle({
+          appPath: config.appPath,
+          candidateApp: previous.candidatePath,
+          rollbackApp: previous.rollbackPath,
+          progress: previous.swap,
+        });
+      }
+      await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing", components: mode }));
+      if (updateApp) {
+        await run("touch", [config.appPath]);
+        const register = "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister";
+        await run(register, ["-f", config.appPath], { allowFailure: true });
+      }
     },
 
     prepareCredentials: async (prepared) => {
+      if (!componentFlags().updateApp) return;
       const receiptPath = credentialPreparationReceiptPath(prepared);
       await rm(receiptPath, { force: true });
       const executable = join(config.appPath, "Contents/MacOS/BotFleet");
@@ -4044,6 +4240,7 @@ function createOperations(config) {
     },
 
     startApplication: async (_prepared, previous, options) => {
+      if (!componentFlags().updateApp) return;
       // open(1) activates an already-running instance of the bundle identifier
       // instead of launching a second one, so a survivor from the renamed
       // bundle would simply come forward under the rollback name.  Refuse
@@ -4055,6 +4252,14 @@ function createOperations(config) {
     },
 
     verifySingleOwner: async (prepared, previous) => {
+      const { updateApp } = componentFlags();
+      if (!updateApp) {
+        const snapshot = await runtimeIdentityPreflight(config, prepared);
+        if (!snapshot.safe || snapshot.mode !== "authenticated") {
+          throw new Error(snapshot.reason || "Updated harness did not prove authenticated single ownership");
+        }
+        return;
+      }
       if (config.parsed.openApplication !== false) {
         await waitForStableApplication({
           samplePids: () => exactAppPids(config.appPath),
@@ -4080,13 +4285,15 @@ function createOperations(config) {
     },
 
     finish: async (prepared, previous) => {
-      const receiptPath = `${previous.rollbackPath}.json`;
+      const { updateApp, mode } = componentFlags();
+      const receiptPath = rollbackReceiptPathForPrevious(previous);
       await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, {
         status: "verified",
         verifiedAt: new Date().toISOString(),
+        components: mode,
       }));
-      console.log(`Updated BotFleet to ${prepared.targetCommit.slice(0, 12)}.`);
-      console.log(`Recoverable prior bundle: ${previous.rollbackPath}`);
+      console.log(`Updated BotFleet to ${prepared.targetCommit.slice(0, 12)} (${mode} components).`);
+      if (updateApp) console.log(`Recoverable prior bundle: ${previous.rollbackPath}`);
       console.log(`Recoverable prior dependency tree: ${previous.rollbackDependencies}`);
       console.log(`Recoverable prior checkout commit: ${previous.checkoutCommit}`);
       if (previous.rollbackPlacement === "adjacent") {
@@ -4103,9 +4310,10 @@ function createOperations(config) {
     },
 
     rollback: async (prepared, previous, originalError) => {
+      const { updateApp } = componentFlags();
       const [holders, appPids, health] = await Promise.all([
         sqliteHolders(config.dataDirectory),
-        bundleProcessPids(config.appPath),
+        updateApp ? bundleProcessPids(config.appPath) : Promise.resolve([]),
         Promise.all(config.ports.map(probeHealth)),
       ]);
       const runtimePids = health.filter((item) => item.kind === "botfleet").map((item) => item.pid);
@@ -4171,11 +4379,19 @@ function createOperations(config) {
           }
         });
       }
-      await recordStop(async () => { await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true }); });
+      if (updateApp) {
+        await recordStop(async () => {
+          await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true });
+        });
+      }
       await recordStop(async () => {
         const holders = await sqliteHolders(config.dataDirectory);
-        const appPids = await bundleProcessPids(config.appPath);
-        await terminateVerified([...holders, ...appPids], { ...previous, runtimePids: [...new Set([...previous.runtimePids, ...holders])] }, config);
+        const bundlePids = updateApp ? await bundleProcessPids(config.appPath) : [];
+        await terminateVerified(
+          [...holders, ...bundlePids],
+          { ...previous, runtimePids: [...new Set([...previous.runtimePids, ...holders])] },
+          config,
+        );
       });
       await recordStop(async () => {
         let strangerSaid = false;
@@ -4184,7 +4400,7 @@ function createOperations(config) {
         await waitForBotFleetExit(async () => {
           const [holders, bundlePids, health, owner] = await Promise.all([
             sqliteHolders(config.dataDirectory),
-            bundleProcessPids(config.appPath),
+            updateApp ? bundleProcessPids(config.appPath) : Promise.resolve([]),
             Promise.all(config.ports.map((port) => probeHealthWithRetry(port))),
             readOwner(config.dataDirectory).catch(() => null),
           ]);
@@ -4231,9 +4447,17 @@ function createOperations(config) {
       });
       await record(async () => {
         if (previous.swap?.rollbackAppHolds && await exists(previous.rollbackPath)) {
-          if (await exists(config.appPath)) await rename(config.appPath, `${config.appPath}.failed-${Date.now()}`);
+          let failedReplacementPath = null;
+          if (await exists(config.appPath)) {
+            failedReplacementPath = `${config.appPath}.failed-${Date.now()}`;
+            await rename(config.appPath, failedReplacementPath);
+          }
           await rename(previous.rollbackPath, config.appPath);
           previous.swap.rollbackAppHolds = false;
+          if (failedReplacementPath && await exists(failedReplacementPath)) {
+            await rm(failedReplacementPath, { recursive: true, force: true });
+            console.log(`Removed the failed replacement bundle ${failedReplacementPath}`);
+          }
         }
       });
       await record(async () => { await git(config.checkout, ["checkout", "--detach", previous.checkoutCommit]); });
@@ -4249,7 +4473,7 @@ function createOperations(config) {
       // its place, which the provisional receipt cannot know when it is written.
       await record(async () => {
         if (previous.swap?.rollbackAppHolds || previous.swap?.rollbackDependenciesHold) return;
-        await rm(`${previous.rollbackPath}.json`, { force: true });
+        await rm(rollbackReceiptPathForPrevious(previous), { force: true });
       });
       await record(async () => {
         const head = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);

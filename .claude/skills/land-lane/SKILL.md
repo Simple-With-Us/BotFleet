@@ -28,7 +28,7 @@ git config user.email "12656028+jaywedgeworth22@users.noreply.github.com"
 
 ## Docs before the PR
 
-1. Live effort board → In Progress with honest status; mirror `docs/EFFORT-LOG.md` in the same commit (fleet-infra has no mirror).
+1. Linear issue In Progress (`board claim` / `board comment`) and `STATUS.md` with honest status.  Effort logs are archived — do not edit `docs/EFFORT-LOG.md` or live `~/apps/*-EFFORT-LOG.md`.
 2. `STATUS.md` stanza: what landed, next action.
 3. `docs/rollouts/YYYY-MM-DD-slug.md` — summary, why, files, verification commands actually run, follow-ups.
 4. Substantial owner-facing work: living Apple Note via the `apple-notes` skill, title `[APP, Monet] …`.
@@ -81,7 +81,7 @@ gh pr create --fill
 
 CTS "prod" is an annotated tag `vX.Y.Z` after merge — announce on `#agent-sync` then tag.  Consumers pin the exact tag.
 
-`STATUS.md` / `PLAN.md` / `docs/EFFORT-LOG.md` often carry `merge=union` in `.gitattributes`.  Additive board edits usually combine.  Never delete another agent's row while resolving.  Up to 3 land attempts are fine.
+`STATUS.md` / `PLAN.md` often carry `merge=union` in `.gitattributes`.  Additive prose usually combines.  Effort logs are archived — do not resurrect `docs/EFFORT-LOG.md` edits during a merge.  Up to 3 land attempts are fine.
 
 ## Arm auto-merge
 
