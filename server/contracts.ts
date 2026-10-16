@@ -245,6 +245,10 @@ export type RuntimeEvent = RuntimeEventBase &
     /** A helper's card changed.  At most once a second while it runs, and
      * again the moment it finishes.  Output stays off this frame. */
     | { type: "subagent.updated"; subagent: SubagentSnapshot }
+    /** The slash commands the engine says it has, as it announced them: names
+     *  only, lowercase, no slash, deduped.  The bus hands it to the command
+     *  cache and nowhere else, so it never reaches a transcript or a client. */
+    | { type: "engine.commands"; names: string[]; origin: "claude-init" | "acp-available-commands" }
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;
@@ -272,6 +276,15 @@ export interface LaunchIdentity {
 // becomes onEvent(listener) → unsubscribe; sessions start implicitly on
 // the first turn (the agentcal per-turn-process model) with resumeCursor
 // carrying the provider-native continuation (e.g. a claude session id).
+/** A slash command of the engine's own that BotFleet runs as a turn: `/compact`,
+ *  `/context`.  The name is lowercase, has no slash, and is already
+ *  allowlisted (server/drivers/engine-commands.ts).  `args` is one line of at
+ *  most 500 characters and never starts with a slash. */
+export interface TurnCommand {
+  name: string;
+  args?: string;
+}
+
 export interface SendTurnInput {
   threadId: ThreadId;
   text: string;
@@ -348,6 +361,12 @@ export interface SendTurnInput {
    *  from the previous turn, so digest-based delivery must not suppress the
    *  note. */
   mentionTurn?: boolean;
+  /** Set only for a turn that runs one of the engine's own slash commands.
+   *  The driver writes exactly `/name args` and nothing else: no persona, no
+   *  volatile note, no replayed conversation.  Every other turn leaves it
+   *  unset, and its text is shielded so a leading slash cannot become a
+   *  command (`neutralizeLeadingSlash`). */
+  command?: TurnCommand;
   /** Tool definitions the agent may call this turn, in OpenAI function-calling
    * shape.  An HTTP driver (MiniMax, OpenAI-compatible) hands these to the
    * model verbatim; a CLI driver that mounts MCP servers is free to ignore
@@ -665,6 +684,12 @@ export interface ProviderAdapter {
      *  refuses it when the engine instance cannot be held).  Absent: the
      *  harness never sends this driver an allowlist turn. */
     toolPolicy?: boolean;
+    /** True when the engine announces its own slash commands (the Claude init
+     *  frame's `slash_commands`, ACP's `available_commands_update`) and runs
+     *  an allowlisted one when a turn carries `command`.  Absent reads as
+     *  false, and such an engine never gets an engine group in the command
+     *  menu. */
+    engineCommands?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
