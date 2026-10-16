@@ -1,5 +1,13 @@
 import { test, expect, type Page } from '@playwright/test';
 
+// Baselines are rendered on the Linux CI runner, so a shot taken here on macOS
+// must present the same UA CI will compare against, or the layout can differ
+// before a single pixel is compared.  Same pin bypass-warning.visual.spec.ts uses.
+const LINUX_CHROME_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+const stableShot = { animations: 'disabled' as const, caret: 'hide' as const };
+
 // Coverage for the power-off-while-running dialog (src/components/ConfirmDialog.tsx,
 // driven by shared/bot-power.ts copy through tests/fixture=power-off-confirm).
 // This is the only dialog in the app that asks a question with THREE answers —
@@ -9,14 +17,29 @@ import { test, expect, type Page } from '@playwright/test';
 // three-answer shape needed a spec of its own rather than more assertions on
 // an existing screenshot.
 //
-// The assertions are GEOMETRY, not a screenshot, and for the reason
-// model-rows.visual.spec.ts gives: the failure mode is width arithmetic inside
-// a wrapping flex row, and a picture of it is only as good as whoever looks
-// at it.  Reading the rendered boxes also keeps this spec off the baseline
-// treadmill — toHaveScreenshot baselines are per-platform and CI runs this
-// leg on Linux, so a new screenshot here would ship a baseline only the
-// machine that wrote it can pass.  settings-model-picker.visual.spec.ts is the
-// precedent for a visual spec that asserts without one.
+// Most of this spec is GEOMETRY, for the reason model-rows.visual.spec.ts
+// gives: the failure mode is width arithmetic inside a wrapping flex row, and
+// a picture of it is only as good as whoever looks at it.  Reading the
+// rendered boxes catches a squeeze no pixel diff would notice — flex items
+// shrink rather than overflow, so three squeezed buttons still draw perfectly
+// on one row.
+//
+// The last test is a real toHaveScreenshot, and it is here on purpose: geometry
+// cannot see colour, border, padding or stray-style drift, and every other
+// dialog in this tree carries a baseline (pending-approval-write-confirm-
+// dialog.png, bypass-warning-*.png, bypass-local-computer-warning.png,
+// runtime-cards-shared-vps-switch-confirm.png, team-map-shared-context.png).
+// This dialog is static and DejaVu is pinned below, so the shot is stable, and
+// delegation-card.visual.spec.ts is the precedent for an exact match
+// (maxDiffPixels: 0) on a component with nothing dynamic in it.
+//
+// The baseline is per-platform and CI runs this leg on Linux, so it comes from
+// the Linux CI artifact rather than from a Mac render: commit the spec, let CI
+// report "A snapshot doesn't exist", then `gh run download <run> -n
+// playwright-visual-failures` and copy <name>-actual.png to
+// <name>-chromium-linux.png.  No `mask:` is used, and none should be added —
+// the bot name is a hardcoded fixture literal, so there is no dynamic region
+// left to mask and a mask would only pin down less of the frame.
 //
 // The component-level half of this coverage is src/components/ConfirmDialog.test.tsx,
 // which pins the three labels, their order and the focus target in SSR and DOM.
@@ -195,5 +218,40 @@ test.describe('the power-off dialog asks three answers without clipping any of t
       box.dialogScrollHeight,
       'the dialog is taller than it can show, so a button is clipped',
     ).toBeLessThanOrEqual(box.dialogClientHeight + 1);
+  });
+});
+
+// The geometry above catches the squeeze.  This catches the drift geometry is
+// blind to: colour, border, padding, spacing and any stray style someone adds
+// later that renders fine but changes the way the dialog looks.
+//
+// It is scoped in its own describe so `test.use` cannot change the viewport the
+// eight geometry assertions above were validated at — the narrow case reaches
+// for setViewportSize explicitly and a default here would move it out from
+// under those tests.
+test.describe('the power-off dialog looks like this', () => {
+  test.use({
+    viewport: { width: 640, height: 640 },
+    locale: 'en-US',
+    timezoneId: 'UTC',
+    userAgent: LINUX_CHROME_UA,
+  });
+
+  test('visual: the three answers, with the destructive one last', async ({ page }) => {
+    await page.goto('/?fixture=power-off-confirm');
+    await pinFonts(page);
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+    // ConfirmDialog focuses its initial button on mount (ConfirmDialog.tsx:53),
+    // so the focus ring is blurred first — otherwise it can render differently
+    // between machines and the baseline never matches.
+    await page.evaluate(() => {
+      const focused = document.activeElement;
+      if (focused instanceof HTMLElement) focused.blur();
+    });
+    await expect(dialog).toHaveScreenshot('power-off-while-running.png', {
+      ...stableShot,
+      maxDiffPixels: 0,
+    });
   });
 });
