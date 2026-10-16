@@ -599,6 +599,7 @@ import {
 } from "./drivers/cursor-engine-commands.ts";
 import {
   ENGINE_COMMAND_ALLOWLIST,
+  EngineCommandTextError,
   engineCommandText,
   offeredEngineCommands,
   type EngineCommandSpec,
@@ -3864,13 +3865,15 @@ async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface
   try {
     await startTurn(bot.id, engineCommandText(run), { command: run });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (error instanceof Error && !("status" in error)) {
-      if (message.includes("not a command BotFleet can send") || message.includes("arguments for /")) {
-        return commandFailure(400, "invalid_args", message);
-      }
+    // engineCommandText refuses a name or argument that is not safe to send —
+    // a leading slash, a second line, an over-long argument.  Those are the
+    // caller's mistake, not the engine's, and they throw a bare Error, so the
+    // generic status mapping below would read them as a 500 and re-throw.
+    if (error instanceof EngineCommandTextError) {
+      return commandFailure(400, "invalid_args", error.message);
     }
     const status = error instanceof Error && "status" in error ? Number(error.status) : 500;
+    const message = error instanceof Error ? error.message : String(error);
     if (status === 503) return commandFailure(503, "engine_unavailable", message);
     if (status === 409) return commandFailure(409, "bot_busy", message);
     throw error;

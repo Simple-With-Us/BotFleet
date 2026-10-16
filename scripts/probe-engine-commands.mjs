@@ -34,6 +34,7 @@ import { z } from "zod";
 
 import { CLAUDE_CONTAINMENT_SETTINGS, claudeDisallowedTools } from "../server/drivers/claude.ts";
 import { redactSecretsInText } from "../server/redact.ts";
+import { createPathScrubber } from "./probe-path-scrub.mjs";
 
 const [cli, fixtureDir, cwd] = process.argv.slice(2);
 if (!cli || !fixtureDir || !cwd) {
@@ -65,16 +66,19 @@ const Frame = z
   .passthrough();
 
 mkdirSync(fixtureDir, { recursive: true });
-const tmpRoot = process.env.HOME ?? "";
+// These are siblings in the wrapper, not prefixes of one another.
+const scrubPaths = createPathScrubber([
+  [process.env.CLAUDE_CONFIG_DIR, "<CONFIG>"],
+  [process.env.XDG_CONFIG_HOME, "<XDG>"],
+  [process.env.HOME, "<HOME>"],
+  [cwd, "<CWD>"],
+]);
 const mcpConfig = join(cwd, "mcp.json");
 writeFileSync(mcpConfig, JSON.stringify({ mcpServers: {} }));
 
 /** a recorded line with credentials and the throwaway paths taken out */
 function scrub(line) {
-  let text = redactSecretsInText(line);
-  if (tmpRoot) text = text.split(tmpRoot).join("<HOME>");
-  text = text.split(cwd).join("<CWD>");
-  return text;
+  return scrubPaths(redactSecretsInText(line));
 }
 
 function runCase({ name, texts }) {

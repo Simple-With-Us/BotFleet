@@ -28,6 +28,9 @@ const entrySchema = z
     /** when it announced, in epoch milliseconds */
     at: z.number(),
   })
+  // This lane merges announced command records from per-engine discovery, which
+  // carry vendor keys the cache writer here never produces, so the entry
+  // schema stays passthrough rather than the strict form on main.
   .passthrough();
 export type EngineCommandEntry = z.infer<typeof entrySchema>;
 

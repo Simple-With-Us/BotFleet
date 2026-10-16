@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ENGINE_COMMAND_ALLOWLIST,
+  EngineCommandTextError,
   engineCommandText,
   hasControlCharacter,
   hasEngineCommandAllowlist,
@@ -216,6 +217,16 @@ describe("engineCommandText", () => {
     expect(() => engineCommandText({ name: "compact", args: "/model x" })).toThrow();
     expect(() => engineCommandText({ name: "compact", args: "x".repeat(501) })).toThrow();
     expect(engineCommandText({ name: "compact", args: "x".repeat(500) })).toHaveLength("/compact ".length + 500);
+  });
+
+  it("raises the refusal as its own type, so a caller can map it to a 400", () => {
+    // The distinction the commands route depends on: a refusal is the caller's
+    // mistake and answers 400 invalid_args, while an engine failure carries a
+    // status and answers 503 or 409.  Both are Errors, so only the type
+    // separates them.
+    for (const bad of [{ name: "model" }, { name: "compact", args: "/model x" }, { name: "compact", args: "a\nb" }]) {
+      expect(() => engineCommandText(bad)).toThrow(EngineCommandTextError);
+    }
   });
 });
 
