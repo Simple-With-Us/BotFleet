@@ -200,12 +200,16 @@ export function EngineQuotasPanel({
   // with quota stays behind the disclosure below it, so the header area stays
   // short.
   const activeRow = activeInstanceId ? rows.find((row) => row.engine.instanceId === activeInstanceId) ?? null : null;
-  const otherRows = activeRow ? rows.filter((row) => row !== activeRow) : rows;
   // A multi-platform harness reports one quota row per platform it fronts, so
   // the block that normally answers "can this bot run right now" in two bars
   // becomes six and pushes the model list off the panel.  Those engines stay
   // behind the disclosure until it is opened.
   const activeIsWide = activeRow ? MULTI_PLATFORM_ENGINES.has(engineIdFromDriverKind(activeRow.engine.driverKind) ?? "") : false;
+  // Hiding the always-open block for a wide engine only moves its row to the
+  // disclosure -- it must therefore STAY in `otherRows`.  Dropping it here as
+  // well would delete its quota from the panel: invisible in both places, and
+  // with no other engine present the whole panel renders empty.
+  const otherRows = activeRow && !activeIsWide ? rows.filter((row) => row !== activeRow) : rows;
 
   // Worst engine on this Mac, named in the collapsed trigger so the button
   // carries information before it is ever opened.
