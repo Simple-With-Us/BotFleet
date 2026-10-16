@@ -45,6 +45,9 @@ const p=import('./three.mjs'); import {x} from 'node:fs';`), ['./one.mjs','../sh
   assert.throws(() => localSpecifiers('const p=import(path);'), /Computed import/);
   assert.throws(() => localSpecifiers('const p=import(`./template.mjs`);'), /Computed import/);
   assert.throws(() => localSpecifiers("const p=import('./data.json', {with:{type:'json'}});"), /Computed import/);
+  assert.throws(() => localSpecifiers('import `./side-effect.mjs`;'), /Template-literal import/);
+  assert.throws(() => localSpecifiers('import x from `./value.mjs`;'), /Template-literal import/);
+  assert.throws(() => localSpecifiers('export {x} from `./other.mjs`;'), /Template-literal import/);
 });
 
 test('OLD installed stable wrapper runs NEW updater transitive graph without refreshing the machine helper', {skip:process.platform==='win32'}, (t) => {

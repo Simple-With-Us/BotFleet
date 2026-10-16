@@ -15,7 +15,8 @@ const safePath = (path) => {
   return path;
 };
 // Small lexical scanner, not a regex over comments or string contents.
-// Template interpolation is unsupported in the updater module graph.
+// Template interpolation is unsupported in the updater module graph: a
+// template-literal specifier throws instead of bundling silently.
 export function localSpecifiers(text) {
   const tokens = [];
   let i = 0;
@@ -45,6 +46,7 @@ export function localSpecifiers(text) {
     if (token.kind !== 'word' || !['import','export'].includes(token.value) || tokens[t-1]?.value === '.') continue;
     if (next?.value === '.') continue; // import.meta
     if (token.value === 'import' && next?.kind === 'string') { found.push(next.value); continue; }
+    if (token.value === 'import' && next?.kind === 'template') throw new Error('Template-literal import cannot be bundled');
     if (token.value === 'import' && next?.value === '(') {
       if (tokens[t+2]?.kind !== 'string' || tokens[t+3]?.value !== ')') throw new Error('Computed import cannot be bundled');
       found.push(tokens[t+2].value); continue;
@@ -52,6 +54,7 @@ export function localSpecifiers(text) {
     if (token.value === 'export' && !['{','*'].includes(next?.value)) continue;
     for (let n=t+1; n<tokens.length && tokens[n].value !== ';'; n++) {
       if (tokens[n].kind === 'word' && tokens[n].value === 'from' && tokens[n+1]?.kind === 'string') { found.push(tokens[n+1].value); break; }
+      if (tokens[n].kind === 'word' && tokens[n].value === 'from' && tokens[n+1]?.kind === 'template') throw new Error('Template-literal import cannot be bundled');
     }
   }
   return found;
