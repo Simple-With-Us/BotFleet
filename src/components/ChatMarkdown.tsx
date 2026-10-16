@@ -7,7 +7,7 @@
 // fence is very likely complete), then highlights and caches — so the settled
 // bubble, a fresh component instance, mounts straight from cache instead of
 // popping from plain to highlighted.
-import { memo, useEffect, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Check, Copy } from "lucide-react";
@@ -294,127 +294,141 @@ function Spoiler({ children }: { children?: ReactNode }) {
   );
 }
 
+const REMARK_PLUGINS = [remarkGfm, remarkMentions];
+
+const flattenCodeChildren = (n: any): string =>
+  typeof n === "string"
+    ? n
+    : Array.isArray(n)
+      ? n.map(flattenCodeChildren).join("")
+      : n?.props?.children
+        ? flattenCodeChildren(n.props.children)
+        : "";
+
+const STATIC_MARKDOWN_COMPONENTS = {
+  img({ src, alt }: { src?: string; alt?: string }) {
+    // Bot text is untrusted. Remote images fetch on display and can
+    // encode private context in their URLs; render a link requiring
+    // an explicit click instead of making the request automatically.
+    if (src && /^https?:\/\//i.test(src)) {
+      return <a href={src} target="_blank" rel="noopener noreferrer">{alt || "Open external image"}</a>;
+    }
+    if (!src || !/^(?:\/|blob:|data:image\/(?:png|jpeg|gif|webp);base64,)/i.test(src)) {
+      return <span>{alt || "Image unavailable"}</span>;
+    }
+    return (
+      <img
+        src={src}
+        alt={alt ?? ""}
+        loading="lazy"
+        className="max-h-96 max-w-full rounded-lg border border-hairline/30"
+      />
+    );
+  },
+  code({ children }: { children?: ReactNode }) {
+    return (
+      <code className="rounded bg-inset px-1 py-px text-[13px]">{children}</code>
+    );
+  },
+  a({ href, children }: { href?: string; children?: ReactNode }) {
+    const localPath = localFilePath(href);
+    if (localPath) return <LocalFileLink filePath={localPath}>{children}</LocalFileLink>;
+    const handleClick = (e: React.MouseEvent) => {
+      if (href && window.ogb?.openExternal) {
+        e.preventDefault();
+        void window.ogb.openExternal(href);
+      }
+    };
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noreferrer"
+        onClick={handleClick}
+        className="break-words text-accent underline decoration-accent/40 hover:decoration-accent"
+      >
+        {children}
+      </a>
+    );
+  },
+  table({ children }: { children?: ReactNode }) {
+    return (
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse text-[13.5px]">{children}</table>
+      </div>
+    );
+  },
+  th({ children }: { children?: ReactNode }) {
+    return (
+      <th className="border-b border-hairline/40 px-2 py-1.5 text-left font-semibold">{children}</th>
+    );
+  },
+  td({ children }: { children?: ReactNode }) {
+    return <td className="border-b border-hairline/20 px-2 py-1.5 align-top">{children}</td>;
+  },
+  ul({ children }: { children?: ReactNode }) {
+    return <ul className="list-disc space-y-1 pl-5">{children}</ul>;
+  },
+  ol({ children }: { children?: ReactNode }) {
+    return <ol className="list-decimal space-y-1 pl-5">{children}</ol>;
+  },
+  h1({ children }: { children?: ReactNode }) {
+    return <div className="mt-2 text-[16px] font-semibold">{children}</div>;
+  },
+  h2({ children }: { children?: ReactNode }) {
+    return <div className="mt-2 text-[15.5px] font-semibold">{children}</div>;
+  },
+  h3({ children }: { children?: ReactNode }) {
+    return <div className="mt-1.5 font-semibold">{children}</div>;
+  },
+  h4({ children }: { children?: ReactNode }) {
+    return <div className="mt-1.5 font-semibold">{children}</div>;
+  },
+  h5({ children }: { children?: ReactNode }) {
+    return <div className="mt-1.5 text-[14px] font-semibold">{children}</div>;
+  },
+  h6({ children }: { children?: ReactNode }) {
+    return <div className="mt-1.5 text-[13.5px] font-semibold text-ink-secondary">{children}</div>;
+  },
+  blockquote({ children }: { children?: ReactNode }) {
+    return (
+      <blockquote className="border-l-2 border-hairline pl-3 text-ink-secondary">{children}</blockquote>
+    );
+  },
+  del({ children }: { children?: ReactNode }) {
+    return <Spoiler>{children}</Spoiler>;
+  },
+  hr() {
+    return <hr className="border-hairline/40" />;
+  },
+};
+
 function ChatMarkdownComponent({ text, streaming = false }: { text: string; streaming?: boolean }) {
   const content = text.replace(/&nbsp;/g, "\u00A0");
+  const components = useMemo(
+    () => ({
+      ...STATIC_MARKDOWN_COMPONENTS,
+      pre({ children }: { children?: ReactNode }) {
+        // fenced code arrives as <pre><code class="language-x">…</code></pre>
+        const child: any = Array.isArray(children) ? children[0] : children;
+        const className: string = child?.props?.className ?? "";
+        const lang = /language-([\w-]+)/.exec(className)?.[1] ?? "";
+        // children can be a string OR an array of strings/nodes — flatten
+        // strings only, so String() never comma-joins an array
+        const code = flattenCodeChildren(child?.props?.children).replace(/\n$/, "");
+        // a mermaid fence is a picture, not a program: hand it to the
+        // diagram renderer instead of the highlighter
+        if (lang.toLowerCase() === "mermaid") {
+          return <MermaidBlock code={code} streaming={streaming} />;
+        }
+        return <CodeBlock code={code} lang={lang} streaming={streaming} />;
+      },
+    }),
+    [streaming],
+  );
   return (
     <div className="chat-md min-w-0 [&>*+*]:mt-2">
-      <Markdown
-        remarkPlugins={[remarkGfm, remarkMentions]}
-        components={{
-          pre({ children }: { children?: ReactNode }) {
-            // fenced code arrives as <pre><code class="language-x">…</code></pre>
-            const child: any = Array.isArray(children) ? children[0] : children;
-            const className: string = child?.props?.className ?? "";
-            const lang = /language-([\w-]+)/.exec(className)?.[1] ?? "";
-            // children can be a string OR an array of strings/nodes — flatten
-            // strings only, so String() never comma-joins an array
-            const flat = (n: any): string =>
-              typeof n === "string" ? n : Array.isArray(n) ? n.map(flat).join("") : (n?.props?.children ? flat(n.props.children) : "");
-            const code = flat(child?.props?.children).replace(/\n$/, "");
-            // a mermaid fence is a picture, not a program: hand it to the
-            // diagram renderer instead of the highlighter
-            if (lang.toLowerCase() === "mermaid") {
-              return <MermaidBlock code={code} streaming={streaming} />;
-            }
-            return <CodeBlock code={code} lang={lang} streaming={streaming} />;
-          },
-          img({ src, alt }: { src?: string; alt?: string }) {
-            // Bot text is untrusted. Remote images fetch on display and can
-            // encode private context in their URLs; render a link requiring
-            // an explicit click instead of making the request automatically.
-            if (src && /^https?:\/\//i.test(src)) {
-              return <a href={src} target="_blank" rel="noopener noreferrer">{alt || "Open external image"}</a>;
-            }
-            if (!src || !/^(?:\/|blob:|data:image\/(?:png|jpeg|gif|webp);base64,)/i.test(src)) {
-              return <span>{alt || "Image unavailable"}</span>;
-            }
-            return (
-              <img
-                src={src}
-                alt={alt ?? ""}
-                loading="lazy"
-                className="max-h-96 max-w-full rounded-lg border border-hairline/30"
-              />
-            );
-          },
-          code({ children }: { children?: ReactNode }) {
-            return (
-              <code className="rounded bg-inset px-1 py-px text-[13px]">{children}</code>
-            );
-          },
-          a({ href, children }: { href?: string; children?: ReactNode }) {
-            const localPath = localFilePath(href);
-            if (localPath) return <LocalFileLink filePath={localPath}>{children}</LocalFileLink>;
-            const handleClick = (e: React.MouseEvent) => {
-              if (href && window.ogb?.openExternal) {
-                e.preventDefault();
-                void window.ogb.openExternal(href);
-              }
-            };
-            return (
-              <a
-                href={href}
-                target="_blank"
-                rel="noreferrer"
-                onClick={handleClick}
-                className="break-words text-accent underline decoration-accent/40 hover:decoration-accent"
-              >
-                {children}
-              </a>
-            );
-          },
-          table({ children }: { children?: ReactNode }) {
-            return (
-              <div className="overflow-x-auto">
-                <table className="w-full border-collapse text-[13.5px]">{children}</table>
-              </div>
-            );
-          },
-          th({ children }: { children?: ReactNode }) {
-            return (
-              <th className="border-b border-hairline/40 px-2 py-1.5 text-left font-semibold">{children}</th>
-            );
-          },
-          td({ children }: { children?: ReactNode }) {
-            return <td className="border-b border-hairline/20 px-2 py-1.5 align-top">{children}</td>;
-          },
-          ul({ children }: { children?: ReactNode }) {
-            return <ul className="list-disc space-y-1 pl-5">{children}</ul>;
-          },
-          ol({ children }: { children?: ReactNode }) {
-            return <ol className="list-decimal space-y-1 pl-5">{children}</ol>;
-          },
-          h1({ children }: { children?: ReactNode }) {
-            return <div className="mt-2 text-[16px] font-semibold">{children}</div>;
-          },
-          h2({ children }: { children?: ReactNode }) {
-            return <div className="mt-2 text-[15.5px] font-semibold">{children}</div>;
-          },
-          h3({ children }: { children?: ReactNode }) {
-            return <div className="mt-1.5 font-semibold">{children}</div>;
-          },
-          h4({ children }: { children?: ReactNode }) {
-            return <div className="mt-1.5 font-semibold">{children}</div>;
-          },
-          h5({ children }: { children?: ReactNode }) {
-            return <div className="mt-1.5 text-[14px] font-semibold">{children}</div>;
-          },
-          h6({ children }: { children?: ReactNode }) {
-            return <div className="mt-1.5 text-[13.5px] font-semibold text-ink-secondary">{children}</div>;
-          },
-          blockquote({ children }: { children?: ReactNode }) {
-            return (
-              <blockquote className="border-l-2 border-hairline pl-3 text-ink-secondary">{children}</blockquote>
-            );
-          },
-          del({ children }: { children?: ReactNode }) {
-            return <Spoiler>{children}</Spoiler>;
-          },
-          hr() {
-            return <hr className="border-hairline/40" />;
-          },
-        }}
-      >
+      <Markdown remarkPlugins={REMARK_PLUGINS} components={components}>
         {content}
       </Markdown>
     </div>

@@ -22,6 +22,7 @@ const TRIAL_BOX_TTL_SECONDS = 2 * 60 * 60;
 
 function boxFetch(cfg: AppConfig, path: string, opts: RequestInit = {}) {
   return fetch(`${BOX_API}${path}`, {
+    signal: opts.signal ?? AbortSignal.timeout(30_000),
     ...opts,
     headers: {
       authorization: `Bearer ${cfg.box?.token}`,

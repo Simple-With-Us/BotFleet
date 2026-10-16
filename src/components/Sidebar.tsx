@@ -1871,8 +1871,9 @@ export function BotListItem({
           // Motion means something is happening. A resting bot holds a resting
           // pose — N idle rows bobbing at display rate was most of the app's
           // visible-idle CPU (states are keyword-derived, so "working" can be
-          // decorative; busy/unread/motion are the real signals).
-          animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
+          // decorative; busy/motion are the real signals, while unread has its
+          // own badge and would otherwise animate idle background bots forever).
+          animated={Boolean(bot.busy) || (mascotMotion?.kind ?? "none") !== "none"}
         />
         {iconOnly && bot.off === true && <BotOffBadge compact className="absolute -bottom-1 -right-1" />}
         {iconOnly && (

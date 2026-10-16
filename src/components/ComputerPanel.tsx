@@ -600,7 +600,7 @@ export function ComputerPanel({
     };
   }, []);
   useEffect(() => {
-    if (!preview.poll) return;
+    if (!preview.poll || !pageVisible) return;
     const shoot = () => {
       pendingCapture.current ??= (async () => {
         try {
@@ -660,7 +660,7 @@ export function ComputerPanel({
     return () => {
       clearInterval(timer);
     };
-  }, [preview.poll, preview.intervalMs, bot.id]);
+  }, [preview.poll, preview.intervalMs, bot.id, pageVisible]);
 
   // Local VM preview comes directly from Computer Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.

@@ -377,18 +377,20 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
   }, [usageConfig?.ingestUrl]);
 
   React.useEffect(() => {
-    fetch("/api/telemetry/status")
+    const controller = new AbortController();
+    fetch("/api/telemetry/status", { signal: controller.signal })
       .then((res) => res.json())
       .then((data) => {
         setTelemetryStatus(data && typeof data === "object" ? data : null);
         setTelemetryFetchError(null);
       })
-      .catch(() => {
+      .catch((err) => {
+        if (err instanceof Error && err.name === "AbortError") return;
         setTelemetryFetchError("Failed to fetch telemetry status");
       });
 
     const fetchQuotas = () => {
-      fetch("/api/quotas")
+      fetch("/api/quotas", { signal: controller.signal })
         .then((res) => res.json())
         .then((data) => {
           if (data?.ok && Array.isArray(data.cooldowns)) {
@@ -430,8 +432,14 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
         .catch(() => {});
     };
     fetchQuotas();
-    const quotaInterval = setInterval(fetchQuotas, 30_000);
-    return () => clearInterval(quotaInterval);
+    const quotaInterval = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      fetchQuotas();
+    }, 30_000);
+    return () => {
+      controller.abort();
+      clearInterval(quotaInterval);
+    };
   }, []);
   // `doomed` also carries sub-threshold counters and expired half-open
   // entries, both of which dispatch normally. Rendering every row of it as
