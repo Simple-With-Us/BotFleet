@@ -356,6 +356,13 @@ describe("built-in macOS voices", () => {
     await expect(access(dirname(args[1]))).rejects.toThrow();
   });
 
+  it("strips MiniMax pause tags before macOS say synthesizes", async () => {
+    const { speak } = await voice();
+    const record: string[][] = [];
+    await speak(cfg({ provider: "system" }), "Hello there. <#0.5#> Goodbye now.", "Albert", fakeSay(record));
+    expect(record.find((argv) => argv[0] === "-o")!.at(-1)).toBe("Hello there. Goodbye now.");
+  });
+
   it("still demands a picked voice, and says so", async () => {
     const { speak, NoVoiceConfigured } = await voice();
     expect(() => speak(cfg({ provider: "system" }), "hi", undefined, fakeSay([]))).toThrow(NoVoiceConfigured);

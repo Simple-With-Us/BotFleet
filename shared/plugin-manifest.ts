@@ -12,6 +12,12 @@
 // silent contract that means broken things.
 import { z } from "zod";
 
+import {
+  MAX_PLUGIN_NETWORK_ALLOWS,
+  MAX_PLUGIN_NETWORK_ENTRY,
+  parsePluginNetworkAllow,
+} from "./plugin-net-allow.ts";
+
 export const HOST_API_VERSION = 2;
 
 /** Recursive JSON value type.  Mirrors server/schema.ts § JsonValue.
@@ -57,13 +63,17 @@ const SUPPORTED_BOTFLEET_RANGE =
   /^(?:\d+|\d+\.\d+\.\d+|>=\s*\d+|<=\s*\d+|[\^~]\s*\d+\.\d+\.\d+)$/;
 
 /** Capability allowlist for v2.  v1 shipped the three `read.*`
- *  capabilities; v2 adds the event-driven integration scopes:
- *  `events.subscribe` (receive typed host events), `chat.read`
- *  (scoped conversation summaries attached to events), `dispatch.wake`
- *  (request a bot wake or thread continuation), and `connector.reply`
- *  (reserved: send a reply through an approved connector; enforced by
- *  the host, which owns the transport).  Unknown capabilities fail
- *  validation with the field name. */
+ *  capabilities plus `net.hosts` (declared with `needs.network`;
+ *  without it, a host list is not granted); v2 adds the event-driven
+ *  integration scopes: `events.subscribe` (receive typed host events),
+ *  `chat.read` (scoped conversation summaries attached to events),
+ *  `dispatch.wake` (request a bot wake or thread continuation), and
+ *  `connector.reply` (reserved: send a reply through an approved
+ *  connector; enforced by the host, which owns the transport).
+ *  Unknown capabilities fail validation with the field name. */
+/** Declared with `needs.network`.  Without it, a host list is not granted. */
+export const NET_HOSTS_CAPABILITY = "net.hosts";
+
 export const PLUGIN_CAPABILITIES = [
   "read.bots",
   "read.status",
@@ -72,6 +82,7 @@ export const PLUGIN_CAPABILITIES = [
   "chat.read",
   "dispatch.wake",
   "connector.reply",
+  NET_HOSTS_CAPABILITY,
 ] as const;
 export type PluginCapability = typeof PLUGIN_CAPABILITIES[number];
 
@@ -203,6 +214,37 @@ const contributes = z
   })
   .optional();
 
+/** One `needs.network` entry: `host:port`, no scheme, path, or wildcard. */
+const networkAllowEntry = z.string().min(1).max(MAX_PLUGIN_NETWORK_ENTRY).refine(
+  (value) => parsePluginNetworkAllow(value) !== null,
+  { message: 'expected host:port, for example "api.example.com:443"' },
+);
+
+/** Declared needs.  v1 has one: outbound TCP destinations.  An absent
+ *  object means the plugin needs nothing, and the sandbox denies the
+ *  network. */
+const needs = z
+  .object({
+    network: z.array(networkAllowEntry).max(MAX_PLUGIN_NETWORK_ALLOWS).optional().default(() => []),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const seen = new Set<string>();
+    for (const entry of value.network) {
+      const token = parsePluginNetworkAllow(entry)?.token ?? entry;
+      if (seen.has(token)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["network"],
+          message: `duplicate network allow "${token}"`,
+        });
+      }
+      seen.add(token);
+    }
+  })
+  .optional()
+  .default(() => ({ network: [] }));
+
 /** Each capability must be one of PLUGIN_CAPABILITIES.  The enum is the
  *  validator, so the parsed array is already typed as PluginCapability[]
  *  with no cast.  An absent list parses as []. */
@@ -241,6 +283,7 @@ export const pluginManifestSchema = z
     /** Settings schema version.  Bumped when keys change shape; the
      *  host runs the plugin's `migrateSettings` export on upgrade. */
     settingsVersion: z.number().int().min(1).max(1000).optional().default(1),
+    needs,
   })
   .strict()
   .superRefine((value, ctx) => {

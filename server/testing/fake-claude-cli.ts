@@ -70,6 +70,9 @@
 //   FAKE_CLAUDE_QUOTA_GATE  optional file whose creation releases quota mode,
 //                           so integration tests can queue work before settle
 //   FAKE_CLAUDE_REPLY  optional successful assistant text for prose-boundary tests
+//   FAKE_CLAUDE_SLASH_COMMANDS  optional comma-separated list the init frame
+//                        reports as `slash_commands`, the way the real CLI
+//                        lists its built-in, skill and plugin commands
 //   FAKE_CLAUDE_PROMPTS  optional path; every user message this process reads
 //                        from stdin is appended as one JSON line, so a test
 //                        can see what a REUSED process was sent (the dump
@@ -380,8 +383,18 @@ const playTurn = (prompt: JsonValue) => {
     }
   }
 
-  // the real CLI re-announces init on every turn of a live process
-  out({ type: "system", subtype: "init", session_id: sessionId, model });
+  // the real CLI re-announces init on every turn of a live process, with its
+  // catalog of slash commands (FAKE_CLAUDE_SLASH_COMMANDS, comma separated)
+  const initFrame: {
+    type: string;
+    subtype: string;
+    session_id: string;
+    model: string;
+    slash_commands?: string[];
+  } = { type: "system", subtype: "init", session_id: sessionId, model };
+  const slashCommands = process.env.FAKE_CLAUDE_SLASH_COMMANDS;
+  if (slashCommands) initFrame.slash_commands = slashCommands.split(",");
+  out(initFrame);
 
   if (mode === "hang") {
     // stay alive until killed — lets tests exercise interrupt + the
@@ -504,15 +517,28 @@ const playTurn = (prompt: JsonValue) => {
         usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 4 },
       },
     });
+    const helperUsage = { input_tokens: 999, cache_read_input_tokens: 0, output_tokens: 99 };
     out({
       type: "assistant",
       parent_tool_use_id: "task-1",
       message: {
+        id: "msg-helper-1",
         content: [
           { type: "text", text: "HELPER NARRATION" },
           { type: "tool_use", id: "helper-read-1", name: "Read", input: { file_path: "/tmp/helper-target.txt" } },
         ],
-        usage: { input_tokens: 999, cache_read_input_tokens: 0, output_tokens: 99 },
+        usage: helperUsage,
+      },
+    });
+    // The CLI streams one assistant message as more than one frame, and the
+    // later frame repeats that message's usage.  The driver must count it once.
+    out({
+      type: "assistant",
+      parent_tool_use_id: "task-1",
+      message: {
+        id: "msg-helper-1",
+        content: [{ type: "text", text: "HELPER NARRATION" }],
+        usage: helperUsage,
       },
     });
     out({

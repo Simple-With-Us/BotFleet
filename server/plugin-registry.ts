@@ -301,6 +301,7 @@ export function listingFor(
       ...Object.keys(readPluginSettings(baseDir, name).values),
       ...pluginSecretKeys(baseDir, name),
     ].sort(),
+    needs: { network: [...parsed.manifest.needs.network] },
   };
 }
 

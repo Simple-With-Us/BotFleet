@@ -24,6 +24,7 @@ import {
 } from "clutch/dsh/acp";
 
 import type { ModelCatalog, ProviderErrorCode, SendTurnInput } from "../../contracts.ts";
+import { isJsonString } from "../../schema.ts";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -218,7 +219,7 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
         // The declared entry type is a promise the hand-edited file may break,
         // so the id is re-checked as a string here: a numeric or object id
         // would otherwise reach the picker and fail at turn time instead.
-        if (typeof id !== "string" || !id) continue;
+        if (!isJsonString(id) || !id) continue;
         if (seen.has(id)) continue;
         seen.add(id);
         if (isExcludedModelId(id)) continue;
@@ -346,6 +347,14 @@ export const DSH_INIT_TIMEOUT_MS = 120_000;
 
 export const dshSupport = {
   ...clutchDshSupport,
+  // Clutch ships as `clutch`, not `dsh`.  Both run this engine, but they are
+  // NOT interchangeable: `clutch` sets CLUTCH_HOME and runs against
+  // ~/.clutch/dsh with Clutch's own profiles (deepseek-headless,
+  // minimax-headless), while a bare `dsh` runs against ~/.dsh with an
+  // unrelated profile set.  The default stays `dsh` so nothing about spawning
+  // changes; this only makes `clutch` selectable in the Engines picker, which
+  // previously searched the default name alone and so could never offer it.
+  cliAliases: ["clutch"],
   initTimeoutMs: DSH_INIT_TIMEOUT_MS,
   images: true,
   models: STATIC_DSH_MODELS,

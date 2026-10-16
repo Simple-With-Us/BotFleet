@@ -42,6 +42,8 @@ import {
   loadPrepared,
   main,
   parseArguments,
+  resolveUpdateComponentFlags,
+  swapDependencyTree,
   parseHealthBody,
   pendingRecoveryReceiptPath,
   quiesceBootoutLabels,
@@ -109,6 +111,7 @@ test("prepare and apply expose an explicit reusable stage", () => {
       bundle: undefined,
       dependencies: undefined,
       openApplication: true,
+      components: "both",
       progress: undefined,
       runId: undefined,
     },
@@ -120,10 +123,15 @@ test("prepare and apply expose an explicit reusable stage", () => {
     stage: resolve("/tmp/stage"),
     bundle: undefined,
     dependencies: undefined,
+    components: "both",
     openApplication: false,
     progress: undefined,
     runId: undefined,
   });
+  assert.equal(parseArguments(["update", "--server-only"]).components, "server");
+  assert.equal(parseArguments(["update", "--components", "server"]).components, "server");
+  assert.throws(() => parseArguments(["update", "--components", "app"]), /--components app/);
+  assert.deepEqual(resolveUpdateComponentFlags("server"), { mode: "server", updateServer: true, updateApp: false });
   assert.throws(() => parseArguments(["apply"]), /requires --stage/);
   assert.throws(() => parseArguments(["update", "--unknown"]), /Unknown option/);
   assert.throws(() => parseArguments(["prepare", "--bundle", "/tmp/app"]), /supplied together/);
@@ -389,6 +397,7 @@ test("the stable wrapper bootstraps updater policy from the fetched target", asy
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -459,6 +468,7 @@ test("the stable wrapper rejects an unmerged --target before running any of its 
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -513,6 +523,7 @@ test("the stable wrapper resolves a revision-expression --target instead of fetc
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -566,6 +577,7 @@ test("unquiesce ignores update targets and bootstraps the recovery from origin/m
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -624,6 +636,7 @@ test("the stable wrapper resolves env and equals-form targets to the pinned vali
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -677,6 +690,7 @@ test("the stable wrapper builds the commit it validated, even when main moves mi
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -752,6 +766,7 @@ test("the stable wrapper runs with no arguments and no update target", { skip: p
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -795,6 +810,7 @@ test("the stable wrapper detects a linked worktree checkout, where .git is a fil
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -845,6 +861,7 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -976,6 +993,7 @@ test("apply bootstraps the updater recorded in the stage manifest, not a newer o
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -2033,6 +2051,18 @@ test("the app and dependency tree swap together while retaining both prior copie
   assert.equal(await readFile(join(paths.rollbackDependencies, "marker"), "utf8"), "old-deps");
 });
 
+test("a server-only run swaps only the dependency tree and keeps the installed app", async (t) => {
+  const paths = await swapFixture(t);
+  await swapDependencyTree({
+    liveDependencies: paths.liveDependencies,
+    candidateDependencies: paths.candidateDependencies,
+    rollbackDependencies: paths.rollbackDependencies,
+  });
+  assert.equal(await readFile(join(paths.appPath, "marker"), "utf8"), "old-app");
+  assert.equal(await readFile(join(paths.liveDependencies, "marker"), "utf8"), "new-deps");
+  assert.equal(await readFile(join(paths.rollbackDependencies, "marker"), "utf8"), "old-deps");
+});
+
 test("a dependency install rename failure restores the old app and dependencies", async (t) => {
   const paths = await swapFixture(t);
   let calls = 0;
@@ -2163,6 +2193,7 @@ test("the updater runs its entry point when invoked through a symlinked director
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
     "scripts/stage-entries.mjs",
+    "scripts/failed-install-retention.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]);
@@ -2482,6 +2513,7 @@ async function newestGreenFixture(t, { resolver } = {}) {
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
       "scripts/stage-entries.mjs",
+      "scripts/failed-install-retention.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {

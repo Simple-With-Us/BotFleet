@@ -620,7 +620,8 @@ describe("limits", () => {
     const fixture = setup({ text: `Here is the change. ${code} That is all.` });
     const result = await post(fixture, { voice: "vA", voiceSummaryMode: "off" });
     expect(result.status).toBe(200);
-    expect(result.body.utterances).toHaveLength(2);
+    expect(result.body.utterances).toHaveLength(3);
+    expect((result.body.utterances ?? []).join(" ").length).toBeLessThan(MAX_SPEAKABLE_CHARS);
   });
 
   it("refuses projected speech over the character cap for every voice", async () => {
@@ -689,8 +690,8 @@ describe("the spoken script: distilled by default (owner correction, 2026-10-08)
     "Details are in [the rollout doc](https://example.com/docs/rollout.md).",
   ].join("\n");
   const DISTILLED =
-    "The deploy finished. Here is what changed. <#0.3#> First, the A P I timeout was bumped to three point five seconds. " +
-    "<#0.3#> Next, issue seven four nine in the webhook retry loop was fixed. The details are in the rollout doc.";
+    "The deploy finished. Here is what changed. <#0.3#> Bumped the API timeout to 3.5 seconds. " +
+    "<#0.3#> Fixed issue #749 in the webhook retry loop. The details are in the rollout doc.";
 
   it("distills an unset-mode reply for a voice bot and a text-only bot, and speaks the distilled text", async () => {
     for (const owner of [{ voice: "vA", speakReplies: true }, { voice: "vA", speechDevices: ["iphone"] }, { voice: "vA" }]) {
@@ -705,7 +706,7 @@ describe("the spoken script: distilled by default (owner correction, 2026-10-08)
       // MiniMax gets the distilled words, pause tags and all.
       expect(fixture.speakCalls.map((call) => call.text)).toEqual(expected);
       expect(fixture.speakCalls.some((call) => call.text.includes("<#0.3#>"))).toBe(true);
-      expect(fixture.speakCalls.some((call) => call.text.includes("seven four nine"))).toBe(true);
+      expect(fixture.speakCalls.some((call) => call.text.includes("749"))).toBe(true);
       expect(result.body.script).toBe("summary");
       expect(result.body).not.toHaveProperty("spans");
       expect(fixture.row.voiceTextKind).toBe("summary");
@@ -723,11 +724,22 @@ describe("the spoken script: distilled by default (owner correction, 2026-10-08)
       expect(fixture.speakCalls).toHaveLength(0);
       const utterances = result.body.utterances ?? [];
       expect(utterances.join(" ")).not.toContain("<#");
-      expect(utterances.join(" ")).toContain("three point five seconds");
+      expect(utterances.join(" ")).toContain("3.5 seconds");
       expect(result.body.voiceText).toBe(utterances.join(" "));
       expect(result.body.total).toBe(utterances.length);
       expect(result.body.script).toBe("summary");
     }
+  });
+
+  it("strips MiniMax sound tags from Personal Voice utterances", async () => {
+    const withSound =
+      "The deploy finished. (breath) <#0.3#> Bumped the API timeout to 3.5 seconds. (chuckle)";
+    const fixture = setup({ text: REPLY, summary: () => withSound });
+    const result = await post(fixture, { voice: "personal:x" }, { device: "mac", progressive: true });
+    expect(result.status).toBe(200);
+    const spoken = (result.body.utterances ?? []).join(" ");
+    expect(spoken).not.toMatch(/\(breath\)|\(chuckle\)/);
+    expect(spoken).toContain("3.5 seconds");
   });
 
   it("labels the distiller's deterministic fallback as written, with spans for karaoke", async () => {
@@ -805,7 +817,7 @@ describe("the distiller's stand-in and clips of the same text", () => {
     "",
     "Details are in [the rollout doc](https://example.com/docs/rollout.md).",
   ].join("\n");
-  const DISTILLED = "The deploy finished. First, the A P I timeout is now three point five seconds. Next, issue seven four nine is fixed.";
+  const DISTILLED = "The deploy finished. Bumped the API timeout to 3.5 seconds. Fixed issue #749 in the webhook retry loop.";
   const OWNER: AudioOwner = { voice: "vA", speakReplies: true };
   const withWrittenClips = (fixture: ReturnType<typeof setup>) => {
     const written = toUtterances(deterministicSpokenText(REPLY));

@@ -135,7 +135,7 @@ test('visual: plugins manager with installed plugins', async ({ page }) => {
   await expect(heading).toBeVisible();
   await expect(page.getByRole('heading', { name: 'fleet-overview' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'example-widget' })).toBeVisible();
-  const view = page.locator('div.bg-app.p-6').filter({ has: heading });
+  const view = page.locator('aside').filter({ has: heading });
   await expect(view).toHaveScreenshot('plugins-manager.png', {
     ...stableShot,
     threshold: 0.2,

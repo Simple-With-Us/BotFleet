@@ -5,13 +5,13 @@
 // sweeps would turn a recoverable incident into permanent loss.  They are held
 // for as long as a set-aside bots.json or groups.json is waiting in the data
 // folder, which is read from disk on every run so a restart does not forget.
-import { existsSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { cleanupHoldReason } from "./data-faults.ts";
-import { ORPHAN_MAX_AGE_MS, startOrphanTranscriptSweeps } from "./transcript-retention.ts";
+import { IDLE_LIVE_MAX_AGE_MS, ORPHAN_MAX_AGE_MS, startIdleLiveTranscriptSweeps, startOrphanTranscriptSweeps } from "./transcript-retention.ts";
 
 const dirs: string[] = [];
 const tmp = () => {
@@ -125,5 +125,80 @@ describe("the orphan transcript sweep while the roster is on hold", () => {
     vi.advanceTimersByTime(20);
     stop();
     expect(existsSync(log)).toBe(true);
+  });
+});
+
+describe("the idle transcript sweep while the roster is on hold", () => {
+  let eventsDir: string;
+  let nativeDir: string;
+  let log: string;
+
+  beforeEach(() => {
+    eventsDir = tmp();
+    nativeDir = tmp();
+    log = join(nativeDir, "quiet.ndjson");
+    writeFileSync(log, `${"x".repeat(64)}\n`.repeat(40));
+    const old = new Date(Date.now() - IDLE_LIVE_MAX_AGE_MS - 24 * 60 * 60 * 1000);
+    utimesSync(log, old, old);
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("trims an old live thread when nothing holds the sweep", () => {
+    const lines: string[] = [];
+    const before = statSync(log).size;
+    const stop = startIdleLiveTranscriptSweeps(
+      { eventsDir, nativeDir },
+      () => ["quiet"],
+      () => [],
+      (line) => lines.push(line),
+      { initialDelayMs: 10, tailBytes: { native: 200, events: 200, io: 200 } },
+    );
+    vi.advanceTimersByTime(20);
+    stop();
+    expect(statSync(log).size).toBeLessThan(before);
+    expect(lines.join("\n")).toContain("reclaiming");
+  });
+
+  it("leaves the log alone and says why while the sweep is held", () => {
+    const lines: string[] = [];
+    const before = readFileSync(log);
+    const stop = startIdleLiveTranscriptSweeps(
+      { eventsDir, nativeDir },
+      () => ["quiet"],
+      () => [],
+      (line) => lines.push(line),
+      {
+        initialDelayMs: 10,
+        hold: () => "bots.json.corrupt-1790000000000 is waiting to be restored or removed",
+      },
+    );
+    vi.advanceTimersByTime(20);
+    stop();
+    expect(readFileSync(log).equals(before)).toBe(true);
+    expect(lines).toEqual([
+      "[retention] idle transcript sweep skipped: bots.json.corrupt-1790000000000 is waiting to be restored or removed.",
+    ]);
+  });
+
+  it("a dry run logs the inventory row and does not trim", () => {
+    const lines: string[] = [];
+    const before = readFileSync(log);
+    const stop = startIdleLiveTranscriptSweeps(
+      { eventsDir, nativeDir },
+      () => ["quiet"],
+      () => [],
+      (line) => lines.push(line),
+      { initialDelayMs: 10, dryRun: true, tailBytes: { native: 200, events: 200, io: 200 } },
+    );
+    vi.advanceTimersByTime(20);
+    stop();
+    expect(readFileSync(log).equals(before)).toBe(true);
+    expect(lines.some((line) => line.startsWith("[retention] idle-live quiet, age "))).toBe(true);
+    expect(lines.some((line) => line.includes("bytes") && line.includes("file"))).toBe(true);
+    expect(lines.at(-1)).toBe("[retention] Would trim 1 idle transcript log.");
   });
 });

@@ -3,6 +3,8 @@
 // plugin can and cannot reach.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -44,8 +46,13 @@ function inputs(): PluginHostInputs {
   };
 }
 
-function listing(name: string, capabilities: string[] = ["read.bots", "read.status"]): PluginListing {
-  return {
+function listing(
+  name: string,
+  capabilities: string[] = ["read.bots", "read.status"],
+  needs?: PluginListing["needs"],
+  sourcePath = "<test>",
+): PluginListing {
+  const base: PluginListing = {
     name,
     version: "1.0.0",
     description: "sandbox test plugin",
@@ -54,10 +61,12 @@ function listing(name: string, capabilities: string[] = ["read.bots", "read.stat
     enabled: true,
     installedAt: "2026-10-05T00:00:00.000Z",
     updatedAt: "2026-10-05T00:00:00.000Z",
-    source: { kind: "folder", path: "<test>" },
+    source: { kind: "folder", path: sourcePath },
     warnings: [],
     capabilities,
   };
+  if (needs) return { ...base, needs };
+  return base;
 }
 
 function writePlugin(name: string, source: string): void {
@@ -65,8 +74,19 @@ function writePlugin(name: string, source: string): void {
   writeFileSync(join(baseDir, name, "plugin.mjs"), source);
 }
 
-async function load(name: string, capabilities?: string[], callTimeoutMs?: number): Promise<LoadedPlugin> {
-  const result = await loadPlugin(listing(name, capabilities), inputs(), baseDir, { callTimeoutMs });
+async function load(
+  name: string,
+  capabilities?: string[],
+  callTimeoutMs?: number,
+  needs?: PluginListing["needs"],
+  extra?: { firstPartyRoot?: string; zulipRealm?: string; sourcePath?: string },
+): Promise<LoadedPlugin> {
+  const result = await loadPlugin(
+    listing(name, capabilities, needs, extra?.sourcePath),
+    inputs(),
+    baseDir,
+    { callTimeoutMs, firstPartyRoot: extra?.firstPartyRoot, zulipRealm: extra?.zulipRealm },
+  );
   if ("error" in result) throw new Error(result.error);
   started.push(result);
   return result;
@@ -216,6 +236,391 @@ describe("plugin sandbox isolation", () => {
       await removeDirSafe(linkRoot);
       await removeDirSafe(dirname(linkRoot));
       await removeDirSafe(realRoot);
+    }
+  });
+});
+
+function tcpListenPort(address: ReturnType<Server["address"]>): number {
+  if (address === null) throw new Error("test server has no port");
+  if (Object.prototype.toString.call(address) === "[object String]") {
+    throw new Error("test server has no port");
+  }
+  // SAFETY: listen(0, "127.0.0.1") returns AddressInfo.  A string address is a Unix pipe name, which this helper does not open.
+  return (address as AddressInfo).port;
+}
+
+async function listenLocal(onHit: () => void): Promise<{ server: Server; port: number }> {
+  const server = createServer((_req, res) => {
+    onHit();
+    res.end("yes");
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  return { server, port: tcpListenPort(server.address()) };
+}
+
+describe("plugin sandbox egress", () => {
+  it("blocks outbound connect, fetch, udp, dns, and raw tcp bindings", async () => {
+    let hits = 0;
+    const local = await listenLocal(() => {
+      hits += 1;
+    });
+    try {
+      const url = JSON.stringify(`http://127.0.0.1:${local.port}/`);
+      writePlugin("egress", `
+        import net from "node:net";
+        import dgram from "node:dgram";
+        import dns from "node:dns/promises";
+        function tcp(host, port) {
+          return new Promise((resolve) => {
+            let socket;
+            try {
+              socket = net.connect({ host, port, timeout: 500 });
+            } catch (error) {
+              resolve(error.code || "error");
+              return;
+            }
+            const finish = (value) => { socket.destroy(); resolve(value); };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+        }
+        export async function getCardData() {
+          let binding = "open";
+          try { process.binding("tcp_wrap"); }
+          catch (error) { binding = error.code || "error"; }
+          let udp = "open";
+          try {
+            const sock = dgram.createSocket("udp4");
+            udp = await new Promise((resolve) => {
+              try {
+                sock.send(Buffer.from("x"), 53, "1.1.1.1", (error) => {
+                  sock.close();
+                  resolve(error ? (error.code || "error") : "sent");
+                });
+              } catch (error) {
+                sock.close();
+                resolve(error.code || "error");
+              }
+            });
+          } catch (error) {
+            udp = error.code || "error";
+          }
+          let looked = "open";
+          try { await dns.lookup("example.com"); }
+          catch (error) { looked = error.code || "error"; }
+          let fetched = "open";
+          try {
+            const response = await fetch(${url}, { signal: AbortSignal.timeout(800) });
+            fetched = "status " + response.status;
+          } catch (error) {
+            fetched = (error.cause && error.cause.code) || error.code || error.name || "error";
+          }
+          return { result: {
+            binding,
+            udp,
+            looked,
+            fetched,
+            local: await tcp("127.0.0.1", ${local.port}),
+            remote: await tcp("203.0.113.1", 80),
+          } };
+        }
+      `);
+      const plugin = await load("egress", []);
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({
+        binding: "ERR_ACCESS_DENIED",
+        udp: "ERR_ACCESS_DENIED",
+        looked: "ERR_ACCESS_DENIED",
+        fetched: "ERR_ACCESS_DENIED",
+        local: "ERR_ACCESS_DENIED",
+        remote: "ERR_ACCESS_DENIED",
+      });
+      expect(hits).toBe(0);
+    } finally {
+      await new Promise((resolve) => local.server.close(resolve));
+    }
+  });
+
+  it("does not let plugin code widen an empty allowlist", async () => {
+    let hits = 0;
+    const local = await listenLocal(() => {
+      hits += 1;
+    });
+    try {
+      writePlugin("widen", `
+        import net from "node:net";
+        process.emit("message", {
+          type: "load",
+          entryUrl: import.meta.url,
+          networkAllow: ["127.0.0.1:${local.port}"],
+        });
+        export async function getCardData() {
+          return await new Promise((resolve) => {
+            let socket;
+            try {
+              socket = net.connect({ host: "127.0.0.1", port: ${local.port}, timeout: 500 });
+            } catch (error) {
+              resolve({ result: { local: error.code || "error" } });
+              return;
+            }
+            const finish = (local) => { socket.destroy(); resolve({ result: { local } }); };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+        }
+      `);
+      const plugin = await load("widen", []);
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({ local: "ERR_ACCESS_DENIED" });
+      expect(hits).toBe(0);
+    } finally {
+      await new Promise((resolve) => local.server.close(resolve));
+    }
+  });
+
+  it("allows only the declared host and port", async () => {
+    let allowedHits = 0;
+    let blockedHits = 0;
+    const allowed = await listenLocal(() => {
+      allowedHits += 1;
+    });
+    const blocked = await listenLocal(() => {
+      blockedHits += 1;
+    });
+    try {
+      const url = JSON.stringify(`http://127.0.0.1:${allowed.port}/`);
+      writePlugin("allow", `
+        import net from "node:net";
+        function tcp(port) {
+          return new Promise((resolve) => {
+            let socket;
+            try {
+              socket = net.connect({ host: "127.0.0.1", port, timeout: 500 });
+            } catch (error) {
+              resolve(error.code || "error");
+              return;
+            }
+            const finish = (value) => { socket.destroy(); resolve(value); };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+        }
+        export async function getCardData() {
+          let binding = "open";
+          try { process.binding("udp_wrap"); }
+          catch (error) { binding = error.code || "error"; }
+          let body = "";
+          try {
+            const response = await fetch(${url});
+            body = await response.text();
+          } catch (error) {
+            body = error.code || "error";
+          }
+          return { result: {
+            binding,
+            body,
+            allowed: await tcp(${allowed.port}),
+            blocked: await tcp(${blocked.port}),
+          } };
+        }
+      `);
+      const plugin = await load("allow", ["net.hosts"], undefined, { network: [`127.0.0.1:${allowed.port}`] });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({
+        binding: "ERR_ACCESS_DENIED",
+        body: "yes",
+        allowed: "connected",
+        blocked: "ERR_ACCESS_DENIED",
+      });
+      expect(allowedHits).toBeGreaterThan(0);
+      expect(blockedHits).toBe(0);
+    } finally {
+      await new Promise((resolve) => allowed.server.close(resolve));
+      await new Promise((resolve) => blocked.server.close(resolve));
+    }
+  });
+
+  it("does not let a connect getter change the destination after the check", async () => {
+    let allowedConns = 0;
+    let blockedConns = 0;
+    const allowed = await listenLocal(() => {});
+    const blocked = await listenLocal(() => {});
+    allowed.server.on("connection", () => {
+      allowedConns += 1;
+    });
+    blocked.server.on("connection", () => {
+      blockedConns += 1;
+    });
+    try {
+      writePlugin("getter-connect", `
+        import net from "node:net";
+        export function getCardData() {
+          let hostReads = 0;
+          let portReads = 0;
+          const options = {};
+          Object.defineProperty(options, "host", {
+            enumerable: true,
+            get() {
+              hostReads += 1;
+              return hostReads === 1 ? "127.0.0.1" : "203.0.113.9";
+            },
+          });
+          Object.defineProperty(options, "port", {
+            enumerable: true,
+            get() {
+              portReads += 1;
+              return portReads === 1 ? ${allowed.port} : ${blocked.port};
+            },
+          });
+          return new Promise((resolve) => {
+            let socket;
+            try {
+              socket = new net.Socket();
+              socket.connect(options);
+            } catch (error) {
+              resolve({ result: { local: error.code || "error" } });
+              return;
+            }
+            const finish = (value) => {
+              socket.destroy();
+              resolve({ result: { local: value } });
+            };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+        }
+      `);
+      const plugin = await load("getter-connect", ["net.hosts"], undefined, { network: [`127.0.0.1:${allowed.port}`] });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({ local: "connected" });
+      expect(allowedConns).toBeGreaterThan(0);
+      expect(blockedConns).toBe(0);
+    } finally {
+      await new Promise((resolve) => allowed.server.close(resolve));
+      await new Promise((resolve) => blocked.server.close(resolve));
+    }
+  });
+
+  it("drops an invalid needs entry instead of granting it", async () => {
+    let hits = 0;
+    const local = await listenLocal(() => {
+      hits += 1;
+    });
+    try {
+      writePlugin("bogus-needs", `
+        import net from "node:net";
+        export function getCardData() {
+          try {
+            net.connect({ host: "127.0.0.1", port: ${local.port} });
+            return { result: { local: "started" } };
+          } catch (error) {
+            return { result: { local: error.code || "error" } };
+          }
+        }
+      `);
+      const plugin = await load("bogus-needs", ["net.hosts"], undefined, { network: ["*", "https://evil.test/x"] });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({ local: "ERR_ACCESS_DENIED" });
+      expect(hits).toBe(0);
+    } finally {
+      await new Promise((resolve) => local.server.close(resolve));
+    }
+  });
+
+  it("ignores a declared host list when net.hosts is absent", async () => {
+    let hits = 0;
+    const local = await listenLocal(() => {
+      hits += 1;
+    });
+    try {
+      writePlugin("undeclared-cap", `
+        import net from "node:net";
+        export function getCardData() {
+          try {
+            net.connect({ host: "127.0.0.1", port: ${local.port} });
+            return { result: { local: "started" } };
+          } catch (error) {
+            return { result: { local: error.code || "error" } };
+          }
+        }
+      `);
+      const plugin = await load("undeclared-cap", ["read.bots"], undefined, { network: [`127.0.0.1:${local.port}`] });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({ local: "ERR_ACCESS_DENIED" });
+      expect(hits).toBe(0);
+    } finally {
+      await new Promise((resolve) => local.server.close(resolve));
+    }
+  });
+
+  it("allows the shipped Zulip plugin to reach the configured realm host", async () => {
+    let realmHits = 0;
+    let otherHits = 0;
+    const realm = await listenLocal(() => {
+      realmHits += 1;
+    });
+    const other = await listenLocal(() => {
+      otherHits += 1;
+    });
+    const shippedRoot = mkdtempSync(join(tmpdir(), "botfleet-shipped-zulip-"));
+    mkdirSync(join(shippedRoot, "zulip"));
+    try {
+      const realmUrl = JSON.stringify(`http://127.0.0.1:${realm.port}/`);
+      writePlugin("zulip", `
+        import net from "node:net";
+        export async function getCardData() {
+          let body = "";
+          try {
+            const response = await fetch(${realmUrl});
+            body = await response.text();
+          } catch (error) {
+            body = error.code || "error";
+          }
+          const other = await new Promise((resolve) => {
+            let socket;
+            try {
+              socket = net.connect({ host: "127.0.0.1", port: ${other.port}, timeout: 500 });
+            } catch (error) {
+              resolve(error.code || "error");
+              return;
+            }
+            const finish = (value) => { socket.destroy(); resolve(value); };
+            socket.on("connect", () => finish("connected"));
+            socket.on("error", (error) => finish(error.code || "error"));
+            socket.setTimeout(500, () => finish("timeout"));
+          });
+          return { result: { body, other } };
+        }
+      `);
+      const plugin = await load("zulip", [], undefined, undefined, {
+        firstPartyRoot: shippedRoot,
+        sourcePath: join(shippedRoot, "zulip"),
+        zulipRealm: `http://127.0.0.1:${realm.port}`,
+      });
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      if (!card.ok) throw new Error(card.reason);
+      expect(PluginCardResultSchema.parse(card.value).result).toEqual({
+        body: "yes",
+        other: "ERR_ACCESS_DENIED",
+      });
+      expect(realmHits).toBeGreaterThan(0);
+      expect(otherHits).toBe(0);
+    } finally {
+      await new Promise((resolve) => realm.server.close(resolve));
+      await new Promise((resolve) => other.server.close(resolve));
+      await removeDirSafe(shippedRoot);
     }
   });
 });

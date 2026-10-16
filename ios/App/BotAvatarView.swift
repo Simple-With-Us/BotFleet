@@ -5,6 +5,25 @@ import CompanionCore
 /// An agent identity image fetched from the paired computer with the device
 /// bearer token. The mascot is deterministic fallback for missing, stale, or
 /// undecodable attachments, so identity never becomes an empty placeholder.
+/// Bot identity image with the model-provider mark at the lower-right corner.
+/// Use this anywhere a lone `BotAvatarView` would need `.providerBadge` so
+/// position, scale, and the unknown-engine empty state stay consistent.
+struct BotAvatarWithProviderBadge: View {
+    let bot: Bot
+    /// When the avatar sits in a task (or other) thread, pass that thread id
+    /// so the mark follows the task override instead of the bot's primary id.
+    var conversationThreadId: String? = nil
+    let size: CGFloat
+    var state: BotState = .idle
+    var animated = false
+    var comets = false
+
+    var body: some View {
+        BotAvatarView(bot: bot, size: size, state: state, animated: animated, comets: comets)
+            .providerBadge(for: bot, inThread: conversationThreadId, avatarSize: size)
+    }
+}
+
 struct BotAvatarView: View {
     let bot: Bot
     let size: CGFloat

@@ -121,6 +121,8 @@ export const ParentToChildMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("load"),
     entryUrl: z.string(),
+    /** Canonical `host:port` tokens from the manifest.  Empty denies every outbound connection. */
+    networkAllow: z.array(z.string().max(300)).max(32),
   }).strict(),
   z.object({
     type: z.literal("invoke"),
