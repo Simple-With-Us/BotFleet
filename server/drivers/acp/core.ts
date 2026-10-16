@@ -49,9 +49,10 @@ import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
 import {
   acpPromptCeilingRefusal,
   applyAcpPromptBudget,
+  decodeAcpContextCapTokens,
   decodeAcpPromptBudgetBytes,
   describeAcpPromptTrim,
-  resolveAcpPromptBudgetBytes,
+  resolveAcpPromptBudget,
 } from "./prompt-budget.ts";
 
 /**
@@ -155,6 +156,10 @@ export interface AcpConfig {
    * The stable system block and the current user message are never cut to
    * meet it. */
   promptBudgetBytes?: number;
+  /** Working-context cap in tokens (for example 524288 for 512K).  The prompt
+   * budget derives from it, clamped to the model's published window.  Ignored
+   * when `promptBudgetBytes` is set. */
+  contextCapTokens?: number;
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -482,6 +487,7 @@ function decodeAcpConfig(defaultCli: string) {
         ? o.promptIdleMs
         : undefined;
     const promptBudgetBytes = decodeAcpPromptBudgetBytes(o.promptBudgetBytes);
+    const contextCapTokens = decodeAcpContextCapTokens(o.contextCapTokens);
     return {
       cli: typeof o.cli === "string" ? o.cli : defaultCli,
       fullAuto: o.fullAuto === true,
@@ -490,6 +496,7 @@ function decodeAcpConfig(defaultCli: string) {
       ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
       ...(promptIdleMs === undefined ? {} : { promptIdleMs }),
       ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }),
+      ...(contextCapTokens === undefined ? {} : { contextCapTokens }),
     };
   };
 }
@@ -1823,7 +1830,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               : turn.system
                 ? `${turn.system}\n\n${turn.text}`
                 : turn.text;
-            const budgetBytes = resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes);
+            const budgetBytes = resolveAcpPromptBudget({
+              configuredBytes: turnConfig.promptBudgetBytes,
+              capTokens: turnConfig.contextCapTokens,
+              model: resolvedModel ?? turn.model,
+              composed,
+            }).bytes;
             const budgeted = applyAcpPromptBudget({
               composed,
               sections: turn.systemSections,

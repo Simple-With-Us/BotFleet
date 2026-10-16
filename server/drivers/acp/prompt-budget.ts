@@ -13,6 +13,8 @@
 // stay, even when they alone are already over the budget.
 import { z } from "zod";
 
+import { contextWindowFor } from "../../model-context-windows.ts";
+
 import {
   FRESH_PREAMBLE,
   OMITTED_HISTORY,
@@ -444,4 +446,60 @@ export function acpPromptCeilingRefusal(
       + `over the ${kib(ceiling)} hard limit (twice the ${kib(budgetBytes)} budget).  `
       + "Shorten the message, or raise promptBudgetBytes for this bot.",
   };
+}
+
+// ---- token budget ---------------------------------------------------------------
+
+/** Largest accepted context cap, in tokens. */
+export const MAX_ACP_CONTEXT_CAP_TOKENS = 10_000_000;
+
+/** Share of the working context the prompt may use.  The rest is left for the
+ *  model's reply, reasoning and tool results. */
+export const ACP_PROMPT_WINDOW_SHARE = 0.8;
+
+const contextCapSchema = z.number().int().min(1).max(MAX_ACP_CONTEXT_CAP_TOKENS);
+
+/** A positive integer token cap, or undefined (ignored) for anything else. */
+export function decodeAcpContextCapTokens(raw: unknown): number | undefined {
+  const parsed = contextCapSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** A rough token count: ASCII at about 4 characters per token, everything else
+ *  at about 1 token per character.  An estimate, not the model's tokenizer.  It is used to turn a
+ *  token budget into bytes for this prompt, so the ratio adapts to code, prose
+ *  and CJK text alike. */
+export function estimateTokens(text: string): number {
+  let ascii = 0;
+  let other = 0;
+  for (const ch of text) {
+    if (ch.charCodeAt(0) < 128) ascii++;
+    else other++;
+  }
+  return Math.ceil(ascii / 4 + other);
+}
+
+/** The byte budget for one turn.
+ *
+ *  - `configuredBytes` 0 turns the budget off.  A positive value is the old
+ *    override and wins over everything else.
+ *  - Otherwise a `capTokens` working-context cap, clamped to the model's
+ *    published window when it is known, becomes a token budget (80% of it) and
+ *    is converted to bytes with this prompt's own bytes-per-token ratio.
+ *  - With neither, the default 128 KiB applies, as before.  */
+export function resolveAcpPromptBudget(input: {
+  configuredBytes: number | undefined;
+  capTokens: number | undefined;
+  model: string | undefined;
+  composed: string;
+}): { bytes: number | null; basis: "off" | "bytes" | "tokens" | "default"; tokens?: number } {
+  if (input.configuredBytes === 0) return { bytes: null, basis: "off" };
+  if (input.configuredBytes !== undefined) return { bytes: input.configuredBytes, basis: "bytes" };
+  if (input.capTokens === undefined) return { bytes: DEFAULT_ACP_PROMPT_BUDGET_BYTES, basis: "default" };
+  const window = contextWindowFor(input.model);
+  const effective = window === undefined ? input.capTokens : Math.min(input.capTokens, window);
+  const tokens = Math.max(1, Math.floor(effective * ACP_PROMPT_WINDOW_SHARE));
+  const measured = Math.max(1, estimateTokens(input.composed));
+  const ratio = Math.max(1, utf8(input.composed)) / measured;
+  return { bytes: Math.max(1, Math.floor(tokens * ratio)), basis: "tokens", tokens };
 }

@@ -9,7 +9,10 @@ import {
   describeAcpPromptTrim,
   DEFAULT_ACP_PROMPT_BUDGET_BYTES,
   MAX_ACP_PROMPT_BUDGET_BYTES,
+  resolveAcpPromptBudget,
   resolveAcpPromptBudgetBytes,
+  decodeAcpContextCapTokens,
+  estimateTokens,
   type AcpPromptSection,
 } from "./prompt-budget.ts";
 
@@ -452,5 +455,41 @@ describe("section cut priority", () => {
     const composed = compose(parts.map((p) => p.text).join(""), "hi");
     const r = applyAcpPromptBudget({ composed, userText: "hi", sections: parts, budgetBytes: bytes(composed) - 100 });
     expect(r.dropped.sections).toEqual(["mystery-a"]);
+  });
+});
+
+describe("token budget", () => {
+  const prose = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+  const cjk = "这是一个很长的中文句子用来测试预算。".repeat(200);
+
+  it("keeps the default when nothing is set, and promptBudgetBytes still wins", () => {
+    expect(resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: undefined, model: "x", composed: prose }))
+      .toEqual({ bytes: DEFAULT_ACP_PROMPT_BUDGET_BYTES, basis: "default" });
+    expect(resolveAcpPromptBudget({ configuredBytes: 0, capTokens: 1000, model: "x", composed: prose }).bytes).toBeNull();
+    expect(resolveAcpPromptBudget({ configuredBytes: 4096, capTokens: 1000, model: "x", composed: prose }))
+      .toEqual({ bytes: 4096, basis: "bytes" });
+  });
+
+  it("turns a token cap into bytes with the prompt's own ratio, so CJK gets fewer bytes per token", () => {
+    const a = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 10_000, model: undefined, composed: prose });
+    const b = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 10_000, model: undefined, composed: cjk });
+    expect(a.basis).toBe("tokens");
+    expect(a.tokens).toBe(8000);
+    expect(a.bytes!).toBeGreaterThan(b.bytes!);
+    expect(estimateTokens(prose)).toBeLessThan(Buffer.byteLength(prose));
+  });
+
+  it("clamps the cap to a model's published window and never clamps an unknown model", () => {
+    const known = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 5_000_000, model: "MiniMax-M2.7", composed: prose });
+    expect(known.tokens).toBe(Math.floor(204_800 * 0.8));
+    const m3 = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 524_288, model: "MiniMax-M3.1-Flash-Preview", composed: prose });
+    expect(m3.tokens).toBe(Math.floor(524_288 * 0.8));
+    const unknown = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 5_000_000, model: "some-other-model", composed: prose });
+    expect(unknown.tokens).toBe(4_000_000);
+  });
+
+  it("decodes only positive whole token caps", () => {
+    expect(decodeAcpContextCapTokens(524288)).toBe(524288);
+    for (const bad of [0, -1, 1.5, "512k", null, 10_000_001]) expect(decodeAcpContextCapTokens(bad)).toBeUndefined();
   });
 });
