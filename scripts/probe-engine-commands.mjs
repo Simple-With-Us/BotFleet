@@ -66,14 +66,27 @@ const Frame = z
 
 mkdirSync(fixtureDir, { recursive: true });
 const tmpRoot = process.env.HOME ?? "";
+// The wrapper points HOME, CLAUDE_CONFIG_DIR and XDG_CONFIG_HOME at three
+// different directories inside one mktemp root, and the CLI reports whichever
+// it opened.  Scrubbing only HOME leaves the other two as
+// /var/folders/<hash>/T/tmp.XXXX, and that hash is a stable per-user
+// identifier: it stays in the committed fixtures, and in git history, forever.
+const scrubbedRoots = [
+  [process.env.CLAUDE_CONFIG_DIR, "<CONFIG>"],
+  [process.env.XDG_CONFIG_HOME, "<XDG>"],
+  [tmpRoot, "<HOME>"],
+  [cwd, "<CWD>"],
+].filter(([root]) => Boolean(root));
 const mcpConfig = join(cwd, "mcp.json");
 writeFileSync(mcpConfig, JSON.stringify({ mcpServers: {} }));
 
 /** a recorded line with credentials and the throwaway paths taken out */
 function scrub(line) {
   let text = redactSecretsInText(line);
-  if (tmpRoot) text = text.split(tmpRoot).join("<HOME>");
-  text = text.split(cwd).join("<CWD>");
+  // Longest root first: the config and XDG roots sit inside the mktemp
+  // directory that HOME also lives under, so the more specific label has to
+  // win before a shorter one swallows the prefix.
+  for (const [root, label] of scrubbedRoots) text = text.split(root).join(label);
   return text;
 }
 
