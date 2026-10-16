@@ -882,6 +882,21 @@ struct ChatView: View {
 
     private var plusActions: [PlusAction] {
         var out: [PlusAction] = []
+
+        // An Off bot refuses every new turn, so everything in this sheet that
+        // exists to compose one — attachments, dictation, slash commands, a
+        // new task — is dead while it stays Off, and offering it would be a row
+        // that does nothing.  Looking is not composing: Off gates STARTING
+        // work (`shared/bot-power.ts`), and a turn already running is never
+        // interrupted, so the computer is still live.  That is the whole sheet
+        // while the bot is Off, and the + below is the only way to it.
+        if case let .bot(bot) = current, current.isOff {
+            return [PlusAction(
+                id: "computer", systemImage: "display", title: "Watch computer",
+                subtitle: "Live view of what \(bot.name) is doing"
+            ) { showingComputer = true }]
+        }
+
         out.append(PlusAction(
             id: "photo", systemImage: "photo", title: "Photo",
             subtitle: "Attach a photo from your library"
@@ -933,7 +948,8 @@ struct ChatView: View {
             // action replaces was never gated either, so gating it here would
             // take the only remaining way to watch a bot away from anyone whose
             // Mac runs one conversation per channel.  Kept last so the sheet
-            // reads the same as before for everyone who had all four.
+            // reads the same as before for everyone who had all four.  A bot
+            // that is Off never reaches this list — there it is the whole sheet.
             out.append(PlusAction(
                 id: "computer", systemImage: "display", title: "Watch computer",
                 subtitle: "Live view of what \(bot.name) is doing"
@@ -1517,6 +1533,26 @@ struct ChatView: View {
                 .font(.subheadline)
                 .foregroundStyle(Color.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            // The composer's + was the only door into the sheet, and this row
+            // replaces the composer whole.  "Watch computer" used to sit in
+            // the header instead, ungated, so a bot that is Off could still be
+            // watched; without this it could not be reached at all.  Drawn
+            // small so the notice keeps its line, tapped at 44pt.
+            Button {
+                withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus.toggle() }
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Color.secondary)
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(Color.secondary.opacity(0.14)))
+                    .rotationEffect(.degrees(showingPlus ? 45 : 0))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showingPlus ? "Close" : "More")
+
             Button {
                 Task { _ = await session.updateProfile(BotProfilePatch(off: false), for: bot) }
             } label: {
