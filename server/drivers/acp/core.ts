@@ -1392,21 +1392,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // session is still replaying, so this reads ahead of the gate below.
           // It never becomes a transcript item.
           if (u.sessionUpdate === "available_commands_update") {
-            const names = z.array(z.object({ name: z.string() })).safeParse(u.availableCommands);
+            const names = z.array(z.object({ name: z.string() }).passthrough()).safeParse(u.availableCommands);
             if (names.success) announceCommands(threadId, turnId, names.data.map((command) => command.name));
             return;
           }
-          // `p` always carries `update` (and vendor keys); outer strict() would fail every
-          // notification.  `_meta` is looseObject like grok/allowlist — read isReplay only.
-          const replayParams = z
-            .object({
-              _meta: z
-                .looseObject({ isReplay: z.boolean().optional().catch(undefined) })
-                .optional()
-                .catch(undefined),
-            })
-            .safeParse(p);
-          if (!state.promptSent || (replayParams.success && replayParams.data._meta?.isReplay === true)) return;
+          if (!state.promptSent || p._meta?.isReplay === true) return;
           switch (u.sessionUpdate) {
             case "agent_message_chunk": {
               const delta = u.content?.text;

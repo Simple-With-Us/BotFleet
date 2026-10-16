@@ -16,6 +16,8 @@
 
 import type { TurnCommand } from "../contracts.ts";
 
+import { ENGINE_COMMAND_ALLOWLIST_BY_DRIVER } from "./engine-command-allowlists.ts";
+
 export interface EngineCommandSpec {
   /** lowercase, no slash */
   name: string;
@@ -139,7 +141,8 @@ export function isDeniedEngineCommand(name: string): boolean {
  *  proves an entry: docs/verification/slash-commands.md lists what was probed
  *  and what happened, and `scripts/probe-engine-commands.sh` records the
  *  frames under server/drivers/__fixtures__/engine-commands/. */
-export const ENGINE_COMMAND_ALLOWLIST: Readonly<Record<string, readonly EngineCommandSpec[]>> = {};
+export const ENGINE_COMMAND_ALLOWLIST: Readonly<Record<string, readonly EngineCommandSpec[]>> =
+  ENGINE_COMMAND_ALLOWLIST_BY_DRIVER;
 
 /** `major.minor.patch` out of a CLI's version banner ("2.1.284 (Claude Code)"),
  *  or null when it has none. */
@@ -204,11 +207,17 @@ export function neutralizeLeadingSlash(text: string): string {
 export const ENGINE_COMMAND_ARGS_MAX = 500;
 
 /** True when `text` holds a control character or a line separator, which is
- *  what would turn one stdin line into two. */
+ *  what would turn one stdin line into two.
+ *
+ *  U+0085 (NEL) is in the list for the same reason U+2028 and U+2029 are: it is
+ *  a line terminator to a parser that splits on the Unicode line-break set, so
+ *  `/compact x<U+0085>/model y` would reach a CLI as two commands.  Iterating
+ *  with `for...of` gives whole code points, so a surrogate pair is judged once
+ *  rather than as two halves. */
 export function hasControlCharacter(text: string): boolean {
   for (const char of text) {
     const code = char.codePointAt(0) ?? 0;
-    if (code < 0x20 || code === 0x7f || code === 0x2028 || code === 0x2029) return true;
+    if (code < 0x20 || code === 0x7f || code === 0x85 || code === 0x2028 || code === 0x2029) return true;
   }
   return false;
 }

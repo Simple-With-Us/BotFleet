@@ -85,33 +85,29 @@ describe("Linq turn-scoped chat binding", () => {
 
   it("masks a credential in a tagged reply before it is pushed to the phone", async () => {
     // assembled at runtime so no token-shaped literal sits in the source
-    const key = ["sk", "-ant-", "api03-", "TESTONLY", "0123456789abcdef0123456789abcdef"].join("");
+    const key = ["sk", "-test-", "TESTONLY", "0123456789abcdef0123456789abcdef"].join("");
     bindLinqChatToTurn("thread-1", "turn-a", "bot-1", "chat-a");
     const result = await deliverLinqOutboundIfNeeded("thread-1", "bot-1", `[to iMessage]\nThe key is ${key}`, "turn-a");
     expect(result).toEqual({ sent: true });
     expect(linqSendMessage).toHaveBeenCalledWith(
       "chat-a",
-      expect.objectContaining({
-        text: expect.not.stringMatching(/TESTONLY/),
-      }),
+      expect.objectContaining({ text: expect.stringContaining("The key is") }),
     );
     expect(linqSendMessage).toHaveBeenCalledWith(
       "chat-a",
-      expect.objectContaining({
-        text: expect.stringContaining("The key is"),
-      }),
+      expect.objectContaining({ text: expect.not.stringContaining("TESTONLY") }),
     );
   });
 });
 
 describe("Linq command replies", () => {
   it("sends the reply to the chat the command came from, redacted, and stops the typing indicator", async () => {
-    const key = ["sk", "-ant-", "api03-", "TESTONLY", "0123456789abcdef0123456789abcdef"].join("");
+    const key = ["sk", "-test-", "TESTONLY", "0123456789abcdef0123456789abcdef"].join("");
     await expect(sendLinqCommandReply("chat-z", `Conversation: ${key}`)).resolves.toEqual({ sent: true });
     expect(linqSendMessage).toHaveBeenCalledWith(
       "chat-z",
       expect.objectContaining({
-        text: expect.not.stringMatching(/TESTONLY/),
+        text: expect.not.stringContaining("TESTONLY"),
       }),
     );
     expect(linqStopTyping).toHaveBeenCalledWith("chat-z");

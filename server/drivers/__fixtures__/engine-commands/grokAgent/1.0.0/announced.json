@@ -1,0 +1,7 @@
+{
+  "driverKind": "grokAgent",
+  "cliVersion": "1.0.0",
+  "recordedAt": "2026-10-15T08:00:00.000Z",
+  "source": "fake-acp-cli FAKE_ACP_COMMANDS=compact and Grok user-guide /compact",
+  "announced": ["compact", "model", "new", "always-approve"]
+}

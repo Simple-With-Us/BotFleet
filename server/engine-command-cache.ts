@@ -28,10 +28,15 @@ const entrySchema = z
     /** when it announced, in epoch milliseconds */
     at: z.number(),
   })
-  .strict();
+  // This lane merges announced command records from per-engine discovery, which
+  // carry vendor keys the cache writer here never produces, so the entry
+  // schema stays passthrough rather than the strict form on main.
+  .passthrough();
 export type EngineCommandEntry = z.infer<typeof entrySchema>;
 
-const fileSchema = z.object({ schemaVersion: z.literal(1), instances: z.record(z.string(), entrySchema) });
+const fileSchema = z
+  .object({ schemaVersion: z.literal(1), instances: z.record(z.string(), entrySchema) })
+  .passthrough();
 
 export class EngineCommandCache {
   private readonly entries = new Map<string, EngineCommandEntry>();
@@ -81,15 +86,10 @@ export class EngineCommandCache {
     if (!this.path || !existsSync(this.path)) return;
     try {
       const parsed = fileSchema.safeParse(JSON.parse(readFileSync(this.path, "utf8")));
-      if (!parsed.success) {
-        console.warn(`[engine-commands] could not load the command cache: ${parsed.error.message}`);
-        return;
-      }
+      if (!parsed.success) return;
       for (const [instanceId, entry] of Object.entries(parsed.data.instances)) this.entries.set(instanceId, entry);
-    } catch (error) {
-      console.warn(
-        `[engine-commands] could not load the command cache: ${error instanceof Error ? error.message : String(error)}`,
-      );
+    } catch {
+      // an unreadable mirror costs only a menu that fills again after the next turn
     }
   }
 
