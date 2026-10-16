@@ -460,6 +460,7 @@ export const ACP_PROMPT_WINDOW_SHARE = 0.8;
 const contextCapSchema = z.number().int().min(1).max(MAX_ACP_CONTEXT_CAP_TOKENS);
 
 /** A positive integer token cap, or undefined (ignored) for anything else. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Config is an untrusted boundary; the schema immediately validates it.
 export function decodeAcpContextCapTokens(raw: unknown): number | undefined {
   const parsed = contextCapSchema.safeParse(raw);
   return parsed.success ? parsed.data : undefined;
