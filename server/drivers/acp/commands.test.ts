@@ -35,13 +35,13 @@ describe("ACP slash commands (fake agent)", () => {
   let instance: ProviderInstance;
   let recorder: EventRecorder;
 
-  const create = async () => {
+  const create = async (promptBudgetBytes?: number) => {
     instance = await CommandsDriver.create({
       instanceId: "acp-commands-test",
       displayName: "Commands Test",
       environment: {},
       enabled: true,
-      config: { cli: FAKE_CLI, fullAuto: false },
+      config: { cli: FAKE_CLI, fullAuto: false, ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }) },
     });
     recorder = recordEvents(instance.adapter);
   };
@@ -123,6 +123,39 @@ describe("ACP slash commands (fake agent)", () => {
     await instance.adapter.sendTurn({ threadId: "t-acp-shield", text: "/model gpt-x" });
     await recorder.until((e) => e.type === "turn.completed");
     expect(echoed()).toBe(`echo: ${SLASH_NEUTRALIZER}/model gpt-x`);
+  });
+
+  it("keeps ordinary slash-prefixed text shielded while trimming volatile context", async () => {
+    await create(128);
+    const stable = "You are Testy.\n";
+    const volatile = "memory ".repeat(120);
+    await instance.adapter.sendTurn({
+      threadId: "t-acp-budget-text",
+      text: "/not-a-command",
+      system: stable + volatile,
+      systemSections: [
+        { id: "stable", text: stable, volatile: false },
+        { id: "memory", text: volatile, volatile: true },
+      ],
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(echoed()).toContain("Earlier section omitted");
+    expect(echoed()).toContain("/not-a-command");
+    expect(echoed()).not.toContain(volatile);
+  });
+
+  it("sends explicit engine commands directly even with an oversized volatile prompt", async () => {
+    await create(128);
+    const volatile = "memory ".repeat(120);
+    await instance.adapter.sendTurn({
+      threadId: "t-acp-budget-command",
+      text: "ignored",
+      system: volatile,
+      systemSections: [{ id: "memory", text: volatile, volatile: true }],
+      command: { name: "compact", args: "keep the plan" },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(echoed()).toBe("echo: /compact keep the plan");
   });
 
   it("leaves a persona-led turn exactly as before", async () => {
