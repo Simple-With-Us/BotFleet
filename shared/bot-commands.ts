@@ -191,6 +191,9 @@ export function parseMessagingCommand(body: string): MessagingCommandName | null
   if (trimmed.includes("\n") || trimmed.includes("\r")) return null;
   const match = MESSAGING_COMMAND.exec(trimmed);
   if (!match) return null;
-  // SAFETY: the pattern admits only the four names, in any case
-  return match[1].toLowerCase() as MessagingCommandName;
+  const name = match[1].toLowerCase();
+  for (const allowed of MESSAGING_COMMAND_NAMES) {
+    if (allowed === name) return allowed;
+  }
+  return null;
 }
