@@ -5,6 +5,8 @@
 //   * the Node permission model: read access to this script and the
 //     plugin's own folder only, no filesystem writes, no child processes,
 //     no worker threads, no native addons, no WASI, no inspector,
+//   * outbound network denied unless the parent seals an explicit
+//     host:port allowlist from the plugin manifest's `needs.network`,
 //   * a small V8 heap cap, and a per-call deadline enforced by the parent,
 //     which kills this process when a handler overruns.
 //
@@ -27,6 +29,11 @@ import type {
   SandboxHostSnapshot,
 } from "./plugin-sandbox-protocol.ts";
 import type { PluginHost } from "./plugin-types.ts";
+import { installPluginNetworkGuard } from "./plugin-net-guard.ts";
+
+/** Installed before any plugin code runs.  The allowlist stays empty
+ *  until the parent's load message seals it. */
+const networkGuard = installPluginNetworkGuard();
 
 /** What a plugin handler may hand back.  The child re-serializes it, so
  *  the parent only ever receives JSON. */
@@ -42,6 +49,7 @@ interface PluginNamespace {
 }
 
 let handlers: { getCardData: CardHandler | null; runCommand: CommandHandler | null } | null = null;
+let loadStarted = false;
 
 function send(message: ChildToParentMessage): void {
   process.send?.(message);
@@ -114,7 +122,10 @@ function createHost(snapshot: SandboxHostSnapshot): PluginHost {
   return Object.freeze(host);
 }
 
-async function load(entryUrl: string): Promise<void> {
+async function load(entryUrl: string, networkAllow: readonly string[]): Promise<void> {
+  // Seal before import.  Top-level plugin code runs during import, and a
+  // second seal (a fake load message emitted by the plugin) is ignored.
+  networkGuard.seal(networkAllow);
   let namespace: PluginNamespace;
   try {
     namespace = await import(entryUrl);
@@ -204,11 +215,28 @@ function isHostSnapshot(value: unknown): value is SandboxHostSnapshot {
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- parser for the untrusted IPC message
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- shape check for the load message's allowlist
+function parseNetworkAllow(value: unknown): string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 32) return null;
+  const entries: string[] = [];
+  for (const entry of value) {
+    if (Object.prototype.toString.call(entry) !== "[object String]") return null;
+    const text = String(entry);
+    if (text.length > 300) return null;
+    entries.push(text);
+  }
+  return entries;
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- IPC parent messages are untyped; every field is validated before use.
 function parseParentMessage(raw: unknown): ParentToChildMessage | null {
   if (!isPlainObject(raw) || typeof raw.type !== "string") return null;
   if (raw.type === "load") {
     if (typeof raw.entryUrl !== "string") return null;
-    return { type: "load", entryUrl: raw.entryUrl };
+    const networkAllow = parseNetworkAllow(raw.networkAllow);
+    if (!networkAllow) return null;
+    return { type: "load", entryUrl: raw.entryUrl, networkAllow };
   }
   if (raw.type !== "invoke") return null;
   if (typeof raw.id !== "number" || !Number.isInteger(raw.id) || raw.id < 1) return null;
@@ -234,7 +262,9 @@ process.on("message", (raw: unknown) => {
     return;
   }
   if (message.type === "load") {
-    if (handlers === null) void load(message.entryUrl);
+    if (loadStarted) return;
+    loadStarted = true;
+    void load(message.entryUrl, message.networkAllow);
     return;
   }
   void invoke(message);

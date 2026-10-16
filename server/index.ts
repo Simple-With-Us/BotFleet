@@ -389,7 +389,7 @@ import { jobsPrompt, noticeWithoutJobTools } from "./jobs/prompt.ts";
 import { JobRegistry, resolveJobsSettings } from "./jobs/registry.ts";
 import { JobWakeCoordinator } from "./jobs/wake.ts";
 import { ZulipHub } from "./zulip/hub.ts";
-import { cachedVaultReader } from "./zulip/credentials.ts";
+import { cachedVaultReader, resolveRealm } from "./zulip/credentials.ts";
 import { zulipToolsMounted } from "./zulip/mount.ts";
 import { zulipPeerScreenRules } from "./zulip/format.ts";
 import type { ZulipOrigin } from "./zulip/types.ts";
@@ -1055,6 +1055,10 @@ const PLUGIN_PATH_PARAMS = z.tuple([PLUGIN_SLUG]);
 const PLUGIN_ITEM_PATH_PARAMS = z.tuple([PLUGIN_SLUG, PLUGIN_SLUG]);
 
 pluginsModule.initPluginRuntime({
+  zulipRealm: () => {
+    const resolved = resolveRealm(cfg.zulip);
+    return "realm" in resolved ? resolved.realm : undefined;
+  },
   listBots: () => store.bots.map((bot) => ({
     id: bot.id,
     name: bot.name,
