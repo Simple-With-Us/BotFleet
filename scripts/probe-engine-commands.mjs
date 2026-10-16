@@ -34,6 +34,7 @@ import { z } from "zod";
 
 import { CLAUDE_CONTAINMENT_SETTINGS, claudeDisallowedTools } from "../server/drivers/claude.ts";
 import { redactSecretsInText } from "../server/redact.ts";
+import { createPathScrubber } from "./probe-path-scrub.mjs";
 
 const [cli, fixtureDir, cwd] = process.argv.slice(2);
 if (!cli || !fixtureDir || !cwd) {
@@ -65,29 +66,19 @@ const Frame = z
   .passthrough();
 
 mkdirSync(fixtureDir, { recursive: true });
-const tmpRoot = process.env.HOME ?? "";
-// The wrapper points HOME, CLAUDE_CONFIG_DIR and XDG_CONFIG_HOME at three
-// different directories inside one mktemp root, and the CLI reports whichever
-// it opened.  Scrubbing only HOME leaves the other two as
-// /var/folders/<hash>/T/tmp.XXXX, and that hash is a stable per-user
-// identifier: it stays in the committed fixtures, and in git history, forever.
-const scrubbedRoots = [
+// These are siblings in the wrapper, not prefixes of one another.
+const scrubPaths = createPathScrubber([
   [process.env.CLAUDE_CONFIG_DIR, "<CONFIG>"],
   [process.env.XDG_CONFIG_HOME, "<XDG>"],
-  [tmpRoot, "<HOME>"],
+  [process.env.HOME, "<HOME>"],
   [cwd, "<CWD>"],
-].filter(([root]) => Boolean(root));
+]);
 const mcpConfig = join(cwd, "mcp.json");
 writeFileSync(mcpConfig, JSON.stringify({ mcpServers: {} }));
 
 /** a recorded line with credentials and the throwaway paths taken out */
 function scrub(line) {
-  let text = redactSecretsInText(line);
-  // Longest root first: the config and XDG roots sit inside the mktemp
-  // directory that HOME also lives under, so the more specific label has to
-  // win before a shorter one swallows the prefix.
-  for (const [root, label] of scrubbedRoots) text = text.split(root).join(label);
-  return text;
+  return scrubPaths(redactSecretsInText(line));
 }
 
 function runCase({ name, texts }) {
