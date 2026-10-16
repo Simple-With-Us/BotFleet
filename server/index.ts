@@ -3867,8 +3867,10 @@ async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface
   } catch (error) {
     // engineCommandText refuses a name or argument that is not safe to send —
     // a leading slash, a second line, an over-long argument.  Those are the
-    // caller's mistake, not the engine's, and they throw a bare Error, so the
-    // generic status mapping below would read them as a 500 and re-throw.
+    // caller's mistake, not the engine's, and they arrive as an
+    // EngineCommandTextError, which is narrowed here rather than by message so
+    // rewording the sentence cannot silently reclassify it.  The generic status
+    // mapping below would otherwise read it as a 500 and re-throw.
     if (error instanceof EngineCommandTextError) {
       return commandFailure(400, "invalid_args", error.message);
     }
