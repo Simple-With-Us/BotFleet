@@ -228,7 +228,7 @@ export function parseCursorCommandFrontmatter(content: string) {
  *  key it never looks at.  The same reasoning as the `looseObject` on the ACP
  *  `_meta` envelope.  What matters here is that the fields actually read are
  *  strings, which is what `safeParse` below enforces. */
-const cursorFrontmatterSchema = z
+export const cursorFrontmatterSchema = z
   .object({
     name: z.string().optional(),
     description: z.string().optional(),
@@ -236,6 +236,9 @@ const cursorFrontmatterSchema = z
     argument_hint: z.string().optional(),
   })
   .passthrough();
+/** The parsed shape, inferred from the schema rather than written beside it, so
+ *  the static type and the runtime validation cannot drift. */
+export type CursorFrontmatter = z.infer<typeof cursorFrontmatterSchema>;
 
 function readDiscoveredFile(path: string, fallbackName: string): CursorDiscoveredCommand | null {
   let content: string;
@@ -248,7 +251,7 @@ function readDiscoveredFile(path: string, fallbackName: string): CursorDiscovere
   // A file whose frontmatter does not parse is not a command BotFleet can
   // offer; dropping it is the same answer as a denied name.
   if (!parsed.success) return null;
-  const fields = parsed.data;
+  const fields: CursorFrontmatter = parsed.data;
   const rawName = fields.name ?? fallbackName;
   const name = normalizeEngineCommandName(rawName);
   if (name === null || isDeniedEngineCommand(name)) return null;
