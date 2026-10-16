@@ -22,9 +22,19 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { boundText } from "../../shared/item-io.ts";
 import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
-import { splitChatPrompt } from "./prompt-split.ts";
+import { contextWindowFor } from "../model-context-windows.ts";
+import { joinedSystemPrompt, splitChatPrompt } from "./prompt-split.ts";
+import {
+  acpPromptCeilingRefusal,
+  applyAcpPromptBudget,
+  decodeAcpContextCapTokens,
+  decodeAcpPromptBudgetBytes,
+  describeAcpPromptTrim,
+  resolveAcpPromptBudget,
+} from "./acp/prompt-budget.ts";
 import { toolFields } from "../tool-fields.ts";
 import { classifyHttpError, httpErrorFor, type HttpErrorClassification } from "./chat-completions/errors.ts";
 import { runTurnLoop, DEFAULT_TURN_LOOP_BUDGET, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
@@ -237,6 +247,11 @@ export type MinimaxUrlSource = "instance" | "workspace" | "environment" | "defau
 export interface MinimaxConfig {
   url: string;
   urlSource: MinimaxUrlSource;
+  /** Prompt budget override in bytes (0 turns it off).  Same meaning as the
+   *  ACP engines' `promptBudgetBytes`. */
+  promptBudgetBytes?: number;
+  /** Working-context cap in tokens; see `resolveAcpPromptBudget`. */
+  contextCapTokens?: number;
 }
 
 interface LocalMiniMaxConfig {
@@ -259,6 +274,8 @@ const driverConfigSchema = z.object({
   // a workspace-wide endpoint apart from one this instance carries WITHOUT
   // comparing the two values.
   urlSource: z.string().optional(),
+  promptBudgetBytes: z.unknown().optional(),
+  contextCapTokens: z.unknown().optional(),
 });
 
 /** server/config.ts's `WORKSPACE_URL_SOURCE`: the marker instanceConfigs()
@@ -321,6 +338,8 @@ export function loadLocalMiniMaxConfig(home = homedir()): LocalMiniMaxConfig {
 export function decodeMinimaxConfig(raw: unknown): MinimaxConfig {
   const parsed = driverConfigSchema.safeParse(raw ?? {});
   const config = parsed.success ? parsed.data : {};
+  const promptBudgetBytes = decodeAcpPromptBudgetBytes(config.promptBudgetBytes);
+  const contextCapTokens = decodeAcpContextCapTokens(config.contextCapTokens);
   const ownUrl = config.url?.trim();
   const envUrl = process.env.MINIMAX_BASE_URL?.trim();
   // Provenance, decided here once, where all three inputs are still
@@ -335,6 +354,8 @@ export function decodeMinimaxConfig(raw: unknown): MinimaxConfig {
   return {
     url: normalizedApiUrl(ownUrl || envUrl || DEFAULT_URL),
     urlSource,
+    ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }),
+    ...(contextCapTokens === undefined ? {} : { contextCapTokens }),
   };
 }
 
@@ -659,7 +680,42 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       // half rides the newest user message, every request, so the resent
       // prefix stays byte-identical across a memory write (see
       // prompt-split.ts splitChatPrompt).
-      const chat = splitChatPrompt(turn);
+      let chat = splitChatPrompt(turn);
+      // The same prompt budget the ACP engines apply: trim the volatile
+      // system sections (oldest first by priority) when the system prompt plus
+      // this message is past the budget.  The transcript has its own cap above.
+      // A trimmed prompt is sent as one system block, so that turn gives up the
+      // stable/volatile cache split; an untrimmed turn is unchanged.
+      const system = joinedSystemPrompt(turn);
+      let trim: ReturnType<typeof describeAcpPromptTrim> = null;
+      if (system) {
+        const composed = `${system}\n\n${turn.text}`;
+        // No config at all must not inherit the ACP 128 KiB default: a MiniMax
+        // bot has a 1M window.  Without an override or a cap the budget is the
+        // model's own window (80% of it), and off for a model with no known one.
+        const windowTokens = contextWindowFor(model);
+        const unconfigured = config.promptBudgetBytes === undefined && config.contextCapTokens === undefined;
+        const budgetBytes = unconfigured && windowTokens === undefined
+          ? null
+          : resolveAcpPromptBudget({
+              configuredBytes: config.promptBudgetBytes,
+              capTokens: config.contextCapTokens ?? windowTokens,
+              model,
+              composed,
+            }).bytes;
+        const budgeted = applyAcpPromptBudget({
+          composed,
+          sections: turn.systemSections,
+          userText: turn.text,
+          budgetBytes,
+        });
+        const refusal = acpPromptCeilingRefusal(budgeted.text, budgetBytes);
+        if (refusal) throw new Error(refusal.message);
+        trim = describeAcpPromptTrim(budgeted, budgetBytes);
+        if (budgeted.trimmed) {
+          chat = { system: budgeted.text.slice(0, budgeted.text.length - turn.text.length - 2) || undefined, text: turn.text };
+        }
+      }
       const messages: ChatMessage[] = [
         ...(chat.system ? [{ role: "system" as const, content: chat.system }] : []),
         ...cappedTranscript.flatMap((m): ChatMessage[] => {
@@ -690,6 +746,17 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
       emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model });
+      if (trim) {
+        emit({
+          ...base(threadId, turnId),
+          type: "context.injected",
+          itemId: `ctx-${newId()}`,
+          source: "compression",
+          preview: trim.preview,
+          bytes: trim.bytesSaved,
+          io: { text: boundText(trim.text) },
+        });
+      }
 
       // Tool ids this turn has already opened a step for.  The stream
       // announces a call once and then keeps sending argument fragments for

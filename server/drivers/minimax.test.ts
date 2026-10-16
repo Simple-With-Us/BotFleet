@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RuntimeEvent, TurnToolHost } from "../contracts.ts";
+import type { RuntimeEvent, SendTurnInput, TurnToolHost } from "../contracts.ts";
 import { recordEvents } from "../testing/events.ts";
 import { startFakeOpenAiServer } from "../testing/fake-openai-server.ts";
 import { observeRuntimeEvent, resetSentryAiForTests, type SentryAiSink } from "../sentry-ai.ts";
@@ -16,6 +16,7 @@ import {
   loadLocalMiniMaxConfig,
   MinimaxDriver,
   MINIMAX_PRICE_PER_MILLION,
+  type MinimaxConfig,
 } from "./minimax.ts";
 
 /** M3.1's reasoning-effort levels, as MiniMax's OpenAI-compatible API takes
@@ -685,6 +686,116 @@ describe("MinimaxDriver", () => {
     expect(completed).toMatchObject({ ok: true, usage: { input: 12, output: 3 } });
     recorder.stop();
     await instance.dispose();
+  });
+
+  describe("prompt budget", () => {
+    const stable = `STABLE ${"s ".repeat(20)}`;
+    const old = `MEMORY-BLOCK ${"m ".repeat(600)}`;
+    const keep = "MENTION-KEPT";
+    const turnWith = (extra: Partial<SendTurnInput> = {}) => ({
+      threadId: "thread-budget",
+      text: "CURRENT",
+      system: stable + old + keep,
+      systemStable: stable,
+      systemVolatile: old + keep,
+      systemSections: [
+        { id: "persona", text: stable, volatile: false },
+        { id: "memory", text: old, volatile: true },
+        { id: "mentions", text: keep, volatile: true },
+      ],
+      ...extra,
+    });
+    const make = async (config: Partial<MinimaxConfig>, bodies: Array<{ messages: Array<{ role: string; content: string }> }>) => {
+      vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return sse('{"choices":[{"delta":{"content":"ok"}}]}');
+      }));
+      return MinimaxDriver.create({
+        instanceId: "minimax-budget",
+        displayName: "MiniMax",
+        enabled: true,
+        config: decodeMinimaxConfig(config),
+        environment: { MINIMAX_API_KEY: "secret" },
+      });
+    };
+
+    it("sends the prompt untouched when it fits, and emits no Compressing Context row", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({}, bodies);
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(turnWith());
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(bodies[0].messages[0].content).toBe(stable);
+      expect(recorder.events.some((e) => e.type === "context.injected" && e.source === "compression")).toBe(false);
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("with no config, does not trim at 128 KiB: the budget is the model's 1M window", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({}, bodies);
+      const recorder = recordEvents(instance.adapter);
+      const huge = `HUGE-MEMORY ${"x".repeat(300 * 1024)}`;
+      await instance.adapter.sendTurn(turnWith({
+        system: stable + huge + keep,
+        systemVolatile: huge + keep,
+        systemSections: [
+          { id: "persona", text: stable, volatile: false },
+          { id: "memory", text: huge, volatile: true },
+          { id: "mentions", text: keep, volatile: true },
+        ],
+      }));
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(bodies[0].messages)).toContain("HUGE-MEMORY");
+      expect(recorder.events.some((e) => e.type === "context.injected" && e.source === "compression")).toBe(false);
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("trims the volatile sections past promptBudgetBytes and emits the row", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({ promptBudgetBytes: 512 }, bodies);
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(turnWith());
+      await recorder.until((event) => event.type === "turn.completed");
+      const sent = JSON.stringify(bodies[0].messages);
+      expect(sent).not.toContain("MEMORY-BLOCK");
+      expect(sent).toContain(keep);
+      expect(bodies[0].messages.at(-1)).toMatchObject({ role: "user", content: "CURRENT" });
+      expect(recorder.events.find((e) => e.type === "context.injected" && e.source === "compression")).toBeDefined();
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("trims from a contextCapTokens cap alone", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({ contextCapTokens: 200 }, bodies);
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(turnWith());
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(bodies[0].messages)).not.toContain("MEMORY-BLOCK");
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("refuses a turn whose protected text is past the hard ceiling, without calling the API", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({ promptBudgetBytes: 64 }, bodies);
+      const big = `STABLE ${"s ".repeat(400)}`;
+      await expect(
+        instance.adapter.sendTurn(turnWith({
+          system: big + old + keep,
+          systemStable: big,
+          systemSections: [
+            { id: "persona", text: big, volatile: false },
+            { id: "memory", text: old, volatile: true },
+            { id: "mentions", text: keep, volatile: true },
+          ],
+        })),
+      ).rejects.toThrow(/not sent/);
+      expect(bodies).toHaveLength(0);
+      await instance.dispose();
+    });
   });
 
   // Coverage for PR 625 (unattended turns get the 900s wall-clock budget as
