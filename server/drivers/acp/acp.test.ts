@@ -428,6 +428,22 @@ describe("ACP turns (fake CLI)", () => {
     await recorder.until((event) => event.type === "turn.completed");
     const echoed = recorder.events.find((event) => event.type === "item.completed" && event.itemType === "assistant_text");
     expect(echoed && echoed.type === "item.completed" ? echoed.text : "").toContain(`echo: ${stable}${ACP_PROMPT_SECTION_OMITTED}${volNew}\n\n${current}`);
+
+    const row = recorder.events.find((event) => event.type === "context.injected" && event.source === "compression");
+    expect(row).toMatchObject({ type: "context.injected", source: "compression", turnId: expect.any(String), itemId: expect.stringMatching(/^ctx-/) });
+    if (row?.type === "context.injected") {
+      expect(row.preview).toContain("memory");
+      expect(row.bytes).toBeGreaterThan(0);
+      expect((row as { io?: { text?: string } }).io?.text).toContain("Sections dropped: memory");
+      expect(JSON.stringify(row)).not.toContain("alpha");
+    }
+  });
+
+  it("emits no Compressing Context row when the prompt fits", async () => {
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 0 });
+    await instance.adapter.sendTurn({ threadId: "t-fits", text: "hi", system: "SYS" });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(recorder.events.some((event) => event.type === "context.injected")).toBe(false);
   });
 
   it("fails closed when a saved ACP session cannot be resumed", async () => {

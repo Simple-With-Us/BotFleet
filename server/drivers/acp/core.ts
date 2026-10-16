@@ -13,6 +13,7 @@
 // is never a security contract). session/load REPLAYS history as ordinary
 // session/update notifications, so updates are double-gated: nothing emits
 // before the prompt is sent, and `_meta.isReplay` updates are dropped.
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 
 import { z } from "zod";
@@ -47,6 +48,7 @@ import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
 import {
   applyAcpPromptBudget,
   decodeAcpPromptBudgetBytes,
+  describeAcpPromptTrim,
   resolveAcpPromptBudgetBytes,
 } from "./prompt-budget.ts";
 
@@ -1819,13 +1821,28 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               : turn.system
                 ? `${turn.system}\n\n${turn.text}`
                 : turn.text;
+            const budgetBytes = resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes);
             const budgeted = applyAcpPromptBudget({
               composed,
               sections: turn.systemSections,
               userText: turn.text,
-              budgetBytes: resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes),
+              budgetBytes,
             });
             annotatePromptBudget(threadId, turnId, budgeted);
+            const trim = describeAcpPromptTrim(budgeted, budgetBytes);
+            if (trim) {
+              // The "Compressing Context" row.  Names and sizes only.
+              const itemId = `ctx-${randomUUID()}`;
+              emit({
+                ...base(threadId, turnId),
+                type: "context.injected",
+                itemId,
+                source: "compression",
+                preview: trim.preview,
+                bytes: trim.bytesSaved,
+                io: { text: trim.text },
+              });
+            }
             captureTurnPrompt(threadId, turnId, budgeted.text);
             const text = budgeted.text;
             const result = await request(

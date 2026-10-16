@@ -99,3 +99,31 @@ describe("the opened row", () => {
     expect(html).toContain("&lt;img");
   });
 });
+
+describe("the Compressing Context row", () => {
+  const compression: ContextInjectionRef = {
+    id: "ctx-9",
+    source: "compression",
+    preview: "142.0 KiB to 96.1 KiB: dropped 12 earlier turns and memory",
+    bytes: 47000,
+  };
+
+  it("says Compressing Context when closed, with what it saved", () => {
+    const html = renderToStaticMarkup(createElement(ContextInjectionRow, { entry: compression, threadId: "t" }));
+    expect(html).toContain("Compressing Context");
+    expect(html).not.toContain("Context injection ·");
+    expect(html).toContain("dropped 12 earlier turns and memory");
+    expect(html).toContain('aria-expanded="false"');
+  });
+
+  it("opens to the sizes and section names", () => {
+    primeItemIo(
+      { threadId: "t", itemId: "ctx-9" },
+      { status: "loaded", io: { itemId: "ctx-9", at: "x", text: { text: "Budget: 128.0 KiB\nSections dropped: memory", bytes: 40, truncated: false } as never } },
+    );
+    const html = renderToStaticMarkup(createElement(ContextInjectionRow, { entry: compression, threadId: "t", defaultOpen: true }));
+    expect(html).toContain('aria-expanded="true"');
+    expect(html).toContain("Sections dropped: memory");
+    expect(html).toContain("older context was cut");
+  });
+});

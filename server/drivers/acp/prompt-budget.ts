@@ -50,6 +50,14 @@ export interface AcpPromptBytes {
   volatile: number;
 }
 
+/** What a trim took out, by name only.  No prompt text. */
+export interface AcpPromptDropped {
+  /** Replayed history turns removed or replaced by the omission marker. */
+  historyTurns: number;
+  /** Ids of the volatile system sections replaced (for example "memory"). */
+  sections: string[];
+}
+
 export interface AcpPromptBudgetResult {
   text: string;
   /** Stable is the protected system block.  Volatile is every volatile
@@ -59,7 +67,11 @@ export interface AcpPromptBudgetResult {
   before: AcpPromptBytes;
   after: AcpPromptBytes;
   trimmed: boolean;
+  /** What the trim removed.  Empty when nothing was trimmed. */
+  dropped: AcpPromptDropped;
 }
+
+const NOTHING_DROPPED: AcpPromptDropped = { historyTurns: 0, sections: [] };
 
 /** `0` disables the budget.  A positive integer up to the max is a ceiling.
  *  Anything else is ignored so the caller keeps the default. */
@@ -77,6 +89,8 @@ export function resolveAcpPromptBudgetBytes(configured: number | undefined): num
 interface Piece {
   kind: "stable" | "volatile" | "history";
   text: string;
+  /** The section id, for system pieces built from named sections. */
+  id?: string;
 }
 
 interface SplitHistory {
@@ -251,6 +265,7 @@ function systemPieces(systemText: string, sections: readonly AcpPromptSection[] 
     return listed.map((section) => ({
       kind: section.volatile ? "volatile" : "stable",
       text: section.text,
+      id: section.id,
     }));
   }
   return systemText.length > 0 ? [{ kind: "stable", text: systemText }] : [];
@@ -274,7 +289,7 @@ export function applyAcpPromptBudget(input: {
   if (systemText === null) {
     const bytes = utf8(input.composed);
     const whole = { stable: bytes, volatile: 0 };
-    return { text: input.composed, before: whole, after: whole, trimmed: false };
+    return { text: input.composed, before: whole, after: whole, trimmed: false, dropped: NOTHING_DROPPED };
   }
 
   const system = systemPieces(systemText, input.sections);
@@ -285,6 +300,7 @@ export function applyAcpPromptBudget(input: {
     before,
     after: before,
     trimmed: false,
+    dropped: NOTHING_DROPPED,
   });
 
   if (render(system, history, current, userStablePrefix) !== input.composed) return unchanged();
@@ -295,6 +311,8 @@ export function applyAcpPromptBudget(input: {
   const nextHistory = history.map((piece) => ({ ...piece }));
   const finalizedHistory = new Set<number>();
   let trimmed = false;
+  let droppedTurns = 0;
+  const droppedSections: string[] = [];
 
   let totalBytes = composedBytes(nextSystem, nextHistory, current, userStablePrefix);
   while (totalBytes > budget) {
@@ -315,6 +333,7 @@ export function applyAcpPromptBudget(input: {
         totalBytes -= oldBytes + joinOverhead;
       }
       trimmed = true;
+      droppedTurns += 1;
       continue;
     }
     const volatileIndex = nextSystem.findIndex((piece) => piece.kind === "volatile" && shrinks(piece.text));
@@ -324,9 +343,12 @@ export function applyAcpPromptBudget(input: {
     nextSystem[volatileIndex] = {
       kind: "volatile",
       text: replacement,
+      id: nextSystem[volatileIndex].id,
     };
     totalBytes += utf8(replacement) - oldBytes;
     trimmed = true;
+    const sectionId = nextSystem[volatileIndex].id;
+    if (sectionId && !droppedSections.includes(sectionId)) droppedSections.push(sectionId);
   }
 
   if (!trimmed) return unchanged();
@@ -335,5 +357,39 @@ export function applyAcpPromptBudget(input: {
     before,
     after: measure(nextSystem, nextHistory, userStablePrefix),
     trimmed: true,
+    dropped: { historyTurns: droppedTurns, sections: droppedSections },
   };
+}
+
+function kib(bytes: number): string {
+  return bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${bytes} B`;
+}
+
+/** The "Compressing Context" record for a trimmed prompt: one line for the row
+ *  and the expanded text.  Counts, byte sizes and section names only; no prompt
+ *  text.  Null when nothing was trimmed. */
+export function describeAcpPromptTrim(
+  result: AcpPromptBudgetResult,
+  budgetBytes: number | null,
+): { preview: string; text: string; bytesSaved: number } | null {
+  if (!result.trimmed) return null;
+  const before = result.before.stable + result.before.volatile;
+  const after = result.after.stable + result.after.volatile;
+  const { historyTurns, sections } = result.dropped;
+  const parts: string[] = [];
+  if (historyTurns > 0) parts.push(`${historyTurns} earlier ${historyTurns === 1 ? "turn" : "turns"}`);
+  if (sections.length > 0) parts.push(sections.join(", "));
+  const preview = `${kib(before)} to ${kib(after)}${parts.length ? `: dropped ${parts.join(" and ")}` : ""}`;
+  const lines = [
+    "The prompt was over this bot's per-turn budget, so older context was cut before it was sent.",
+    "",
+    `Budget: ${budgetBytes == null ? "none" : kib(budgetBytes)}`,
+    `Before: ${kib(before)}  (protected ${kib(result.before.stable)}, trimmable ${kib(result.before.volatile)})`,
+    `After: ${kib(after)}  (protected ${kib(result.after.stable)}, trimmable ${kib(result.after.volatile)})`,
+    `Earlier turns dropped: ${historyTurns}`,
+    `Sections dropped: ${sections.length ? sections.join(", ") : "none"}`,
+    "",
+    "Each dropped part was replaced by an omission marker.  The system instructions and your message were kept.",
+  ];
+  return { preview, text: lines.join("\n"), bytesSaved: Math.max(0, before - after) };
 }
