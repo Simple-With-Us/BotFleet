@@ -616,14 +616,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             <ModelPicker
               bot={bot}
               contained
-              label={
-                <div>
-                  <div className="text-[15px] font-medium text-ink">Primary Model</div>
-                  <div className="mt-0.5 text-[13px] text-ink-secondary">
-                    Which provider and model this bot runs on
-                  </div>
-                </div>
-              }
+              label={<div className="text-[15px] font-medium text-ink">Primary Model</div>}
             />
             
             <BotFallbackModels bot={bot} onChange={(modelSelection) => patch({ modelSelection })} />

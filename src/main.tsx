@@ -86,6 +86,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "settings-model-picker") {
+  // Visual-spec harness (tests/e2e/settings-model-picker.visual.spec.ts): the
+  // real `ModelPicker` in its contained Settings form, at the panel width where
+  // "Primary Model" and the dropdown used to share one line and wrap.
+  void import("./components/SettingsModelPickerVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "team-map-context") {
   void import("./components/TeamMapPage").then((mod) => {
     const Fixture = mod.TeamMapSharedContextVisualFixture;
