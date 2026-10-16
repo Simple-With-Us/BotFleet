@@ -44,6 +44,7 @@ import {
   SLOW_INIT_LOG_MS,
 } from "./init-deadline.ts";
 import { estimateCatalogCost } from "../../gen-ai-cost.ts";
+import { boundText } from "../../../shared/item-io.ts";
 import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
 import {
   applyAcpPromptBudget,
@@ -1840,7 +1841,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 source: "compression",
                 preview: trim.preview,
                 bytes: trim.bytesSaved,
-                io: { text: trim.text },
+                io: { text: boundText(trim.text) },
               });
             }
             captureTurnPrompt(threadId, turnId, budgeted.text);
