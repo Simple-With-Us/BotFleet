@@ -102,10 +102,11 @@ export function LatestModelRows({
   );
 }
 
-/** "Context": how much of the model's window the bot may fill before BotFleet
- *  compresses the prompt.  The full window is Default (nothing is capped); each
- *  cap the model offers is another choice.  A model with no caps gets no
- *  section.  Same button shape as Effort. */
+/** "Max Input Tokens": how much of the model's window the bot may fill before
+ *  BotFleet compresses the prompt.  Empty is "no limit" (the model's full
+ *  window).  Presets are the caps the model offers, and a custom number is
+ *  accepted up to the window.  It is the one context cap field, stored as
+ *  `modelSelection.contextCap`.  A model with no caps gets no section. */
 export function ContextSection({
   caps,
   windowTokens,
@@ -115,23 +116,31 @@ export function ContextSection({
   className,
 }: {
   caps: readonly number[];
-  /** The model's full window in tokens, when known; only used for the label. */
+  /** The model's full window in tokens, when known; a custom value above it is refused. */
   windowTokens?: number;
-  /** The bot's saved cap; undefined is the full window. */
+  /** The bot's saved cap; undefined is no limit. */
   current: number | undefined;
   onPick: (cap: number | undefined) => void;
   disabled?: boolean;
   className?: string;
 }) {
+  const [text, setText] = useState(current === undefined || caps.includes(current) ? "" : String(current));
+  useEffect(() => setText(current === undefined || caps.includes(current) ? "" : String(current)), [current, caps]);
   if (!caps.length) return null;
+  const parsed = parseMaxOutputInput(text, windowTokens);
+  const invalid = parsed === null;
+  const commitCustom = () => {
+    if (parsed === null || parsed === undefined || parsed === current) return;
+    onPick(parsed);
+  };
   return (
     <div
       role="group"
-      aria-label="Context"
+      aria-label="Max Input Tokens"
       data-context-section
       className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
     >
-      <EngineGroupLabel className="px-1 pb-1.5">Context</EngineGroupLabel>
+      <EngineGroupLabel className="px-1 pb-1.5">Max Input Tokens</EngineGroupLabel>
       <div className="flex flex-wrap gap-1">
         {[undefined, ...caps].map((cap) => {
           const checked = current === cap;
@@ -150,13 +159,35 @@ export function ContextSection({
               )}
             >
               {checked && <Check size={12} className="shrink-0 text-accent" />}
-              {cap === undefined ? (windowTokens ? `${contextCapLabel(windowTokens)} (Default)` : "Default") : contextCapLabel(cap)}
+              {cap === undefined ? (windowTokens ? `No Limit (${contextCapLabel(windowTokens)})` : "No Limit") : contextCapLabel(cap)}
             </button>
           );
         })}
       </div>
+      <input
+        type="text"
+        inputMode="numeric"
+        value={text}
+        placeholder="Custom"
+        disabled={disabled}
+        aria-label="Custom max input tokens"
+        aria-invalid={invalid}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={commitCustom}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commitCustom();
+        }}
+        className={cn(
+          "mt-1.5 w-full rounded-lg border bg-control px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-secondary disabled:cursor-not-allowed disabled:opacity-60",
+          invalid ? "border-red-500/60" : "border-hairline/40",
+        )}
+      />
       <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">
-        {disabled ? "Stop the bot to change context.  " : ""}A smaller cap compresses the prompt sooner.
+        {invalid
+          ? windowTokens
+            ? `Enter a whole number up to ${windowTokens.toLocaleString("en-US")}.`
+            : "Enter a whole number."
+          : (disabled ? "Stop the bot to change this.  " : "") + "A smaller limit compresses the prompt sooner.  Empty is no limit."}
       </p>
     </div>
   );

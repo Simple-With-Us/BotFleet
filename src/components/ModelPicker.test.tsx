@@ -601,23 +601,27 @@ describe("Effort section in the chat model menu", () => {
     const choices = findElements(tree, (element) => element.type === "button");
     expect(choices).toHaveLength(3);
     for (const choice of choices) {
-      // SAFETY: ContextSection creates these buttons with an onClick callback for each cap.
+      // SAFETY: This section creates each button with its own onClick callback.
       (choice.props as { onClick: () => void }).onClick();
     }
     expect(onPick.mock.calls).toEqual([[undefined], ["low"], ["high"]]);
   });
 
-  it("Context: hands each choice's cap to onPick, the full window as undefined, and hides with no caps", () => {
-    const onPick = vi.fn();
-    const tree = ContextSection({ caps: [524_288], windowTokens: 1_000_000, current: undefined, onPick });
-    const choices = findElements(tree, (element) => element.type === "button");
-    expect(choices).toHaveLength(2);
-    for (const choice of choices) {
-      // SAFETY: ContextSection creates these buttons with an onClick callback for each cap.
-      (choice.props as { onClick: () => void }).onClick();
-    }
-    expect(onPick.mock.calls).toEqual([[undefined], [524_288]]);
-    expect(ContextSection({ caps: [], current: undefined, onPick })).toBeNull();
+  it("Max Input Tokens: presets plus a custom field, No Limit first, hidden with no caps", () => {
+    const html = renderToStaticMarkup(
+      createElement(ContextSection, { caps: [524_288], windowTokens: 1_000_000, current: undefined, onPick: () => {} }),
+    );
+    expect(html).toContain("Max Input Tokens");
+    expect(html).toContain("No Limit (1M)");
+    expect(html).toContain(">512K<");
+    expect(html).toContain('placeholder="Custom"');
+    expect(html).toContain("Empty is no limit.");
+    // A saved value that is not a preset shows in the custom field.
+    const custom = renderToStaticMarkup(
+      createElement(ContextSection, { caps: [524_288], windowTokens: 1_000_000, current: 300_000, onPick: () => {} }),
+    );
+    expect(custom).toContain('value="300000"');
+    expect(renderToStaticMarkup(createElement(ContextSection, { caps: [], current: undefined, onPick: () => {} }))).toBe("");
   });
 
   it("Max Output Tokens renders a group with an empty Default field", () => {
