@@ -27,6 +27,12 @@ import {
  *  or replay does not. */
 export const DEFAULT_ACP_PROMPT_BUDGET_BYTES = 128 * 1024;
 
+/** The hard ceiling is this many times the budget.  The budget trims what it
+ *  may; the protected system text and the current message are never cut, so a
+ *  turn can still end up over it.  Past this multiple the turn is refused
+ *  rather than sent. */
+export const ACP_PROMPT_HARD_CEILING_FACTOR = 2;
+
 /** Largest accepted instance setting.  Above this the value is ignored
  *  and the default applies. */
 export const MAX_ACP_PROMPT_BUDGET_BYTES = 8 * 1024 * 1024;
@@ -392,4 +398,24 @@ export function describeAcpPromptTrim(
     "Each dropped part was replaced by an omission marker.  The system instructions and your message were kept.",
   ];
   return { preview, text: lines.join("\n"), bytesSaved: Math.max(0, before - after) };
+}
+
+/** The refusal for a prompt that is still over the hard ceiling after trimming,
+ *  or null when it may be sent.  Names sizes only. */
+export function acpPromptCeilingRefusal(
+  text: string,
+  budgetBytes: number | null,
+): { message: string; bytes: number; ceiling: number } | null {
+  if (budgetBytes == null || budgetBytes <= 0) return null;
+  const ceiling = budgetBytes * ACP_PROMPT_HARD_CEILING_FACTOR;
+  const bytes = utf8(text);
+  if (bytes <= ceiling) return null;
+  return {
+    bytes,
+    ceiling,
+    message:
+      `This turn was not sent: the part that cannot be trimmed (system instructions plus your message) is ${kib(bytes)}, `
+      + `over the ${kib(ceiling)} hard limit (twice the ${kib(budgetBytes)} budget).  `
+      + "Shorten the message, or raise promptBudgetBytes for this bot.",
+  };
 }

@@ -47,6 +47,7 @@ import { estimateCatalogCost } from "../../gen-ai-cost.ts";
 import { boundText } from "../../../shared/item-io.ts";
 import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
 import {
+  acpPromptCeilingRefusal,
   applyAcpPromptBudget,
   decodeAcpPromptBudgetBytes,
   describeAcpPromptTrim,
@@ -1843,6 +1844,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 bytes: trim.bytesSaved,
                 io: { text: boundText(trim.text) },
               });
+            }
+            const refusal = acpPromptCeilingRefusal(budgeted.text, budgetBytes);
+            if (refusal) {
+              // Last resort: protected text alone is far past the budget.  Say
+              // so in the transcript instead of sending a prompt that size.
+              emit({ ...base(threadId, turnId), type: "runtime.error", message: refusal.message });
+              settle(false, "prompt_too_large");
+              return;
             }
             captureTurnPrompt(threadId, turnId, budgeted.text);
             const text = budgeted.text;

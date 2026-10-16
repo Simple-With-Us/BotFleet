@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { buildTurnContext, ROOM_REPLY_PREFIX, TURN_REPLY_CUE } from "../../turn-context.ts";
 import {
   ACP_PROMPT_SECTION_OMITTED,
+  acpPromptCeilingRefusal,
   applyAcpPromptBudget,
   decodeAcpPromptBudgetBytes,
   describeAcpPromptTrim,
@@ -399,5 +400,21 @@ describe("what a trim reports", () => {
     const result = applyAcpPromptBudget({ ...input, budgetBytes: bytes(input.composed) });
     expect(result.dropped).toEqual({ historyTurns: 0, sections: [] });
     expect(describeAcpPromptTrim(result, bytes(input.composed))).toBeNull();
+  });
+});
+
+describe("the hard ceiling", () => {
+  it("allows a prompt up to twice the budget and refuses beyond it, naming sizes only", () => {
+    expect(acpPromptCeilingRefusal("x".repeat(2000), 1000)).toBeNull();
+    const refused = acpPromptCeilingRefusal(`SECRET-${"y".repeat(2100)}`, 1000)!;
+    expect(refused.ceiling).toBe(2000);
+    expect(refused.message).toContain("was not sent");
+    expect(refused.message).toContain("hard limit");
+    expect(refused.message).not.toContain("SECRET");
+  });
+
+  it("never refuses when the budget is off", () => {
+    expect(acpPromptCeilingRefusal("x".repeat(10_000_000), null)).toBeNull();
+    expect(acpPromptCeilingRefusal("x".repeat(10_000_000), 0)).toBeNull();
   });
 });
