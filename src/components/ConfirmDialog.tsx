@@ -7,10 +7,14 @@ export type ConfirmDialogProps = {
   body: ReactNode;
   confirmLabel?: string;
   cancelLabel?: string;
+  /** A third outcome, for a dialog that asks a real question rather than
+   *  "are you sure".  Sits between Cancel and Confirm. */
+  altLabel?: string;
   destructive?: boolean;
   busy?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
+  onAlt?: () => void;
 };
 
 /** In-app stand-in for `window.confirm` on destructive Settings paths. */
@@ -20,16 +24,26 @@ export function ConfirmDialog({
   body,
   confirmLabel = "Confirm",
   cancelLabel = "Cancel",
+  altLabel,
   destructive = true,
   busy = false,
   onCancel,
   onConfirm,
+  onAlt,
 }: ConfirmDialogProps) {
   const confirmRef = useRef<HTMLButtonElement>(null);
+  const altRef = useRef<HTMLButtonElement>(null);
+  // Escape and the Cancel button mean "leave everything as it is", which is
+  // exactly right for a question with a third answer — so the third button is
+  // never the Cancel slot.  It gets its own action instead.
+  const hasAlt = altLabel !== undefined && onAlt !== undefined;
+  // Three ways out means Enter should do the reversible one.  Without an alt
+  // this is the confirm button, so every two-button caller is unchanged.
+  const initialFocus = hasAlt ? altRef : confirmRef;
 
   useEffect(() => {
     if (!open || busy) return;
-    confirmRef.current?.focus();
+    initialFocus.current?.focus();
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -38,7 +52,7 @@ export function ConfirmDialog({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onCancel, busy]);
+  }, [open, onCancel, busy, initialFocus]);
 
   if (!open) return null;
 
@@ -65,7 +79,7 @@ export function ConfirmDialog({
             </p>
           </div>
         </div>
-        <div className="mt-4 flex justify-end gap-2">
+        <div className="mt-4 flex flex-wrap justify-end gap-2">
           <button
             type="button"
             disabled={busy}
@@ -74,8 +88,19 @@ export function ConfirmDialog({
           >
             {cancelLabel}
           </button>
+          {hasAlt && (
+            <button
+              ref={altRef}
+              type="button"
+              disabled={busy}
+              onClick={onAlt}
+              className="rounded-xl px-4 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
+            >
+              {altLabel}
+            </button>
+          )}
           <button
-            ref={confirmRef}
+            ref={hasAlt ? undefined : confirmRef}
             type="button"
             disabled={busy}
             onClick={onConfirm}
