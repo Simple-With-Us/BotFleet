@@ -114,13 +114,14 @@ describe("applyAcpPromptBudget", () => {
     expect(bothHistory.text).toContain("VOLATILE-NEW");
 
     const droppedVolatileToo = compose(
-      stable + ACP_PROMPT_SECTION_OMITTED + "SKILLS-INDEX " + volNew,
+      stable + volOld + "SKILLS-INDEX " + ACP_PROMPT_SECTION_OMITTED,
       `${ACP_PROMPT_SECTION_OMITTED}\n${ACP_PROMPT_SECTION_OMITTED}\n\n${TURN_REPLY_CUE}\n\n${current}`,
     );
     const volatileToo = applyAcpPromptBudget({ ...input, budgetBytes: bytes(droppedVolatileToo) });
     expect(volatileToo.text).toBe(droppedVolatileToo);
-    expect(volatileToo.text).not.toContain("VOLATILE-OLD");
-    expect(volatileToo.text).toContain("VOLATILE-NEW");
+    // the stale mentions note goes before the bot's memory, though memory comes first in the prompt
+    expect(volatileToo.text).toContain("VOLATILE-OLD");
+    expect(volatileToo.text).not.toContain("VOLATILE-NEW");
     expect(volatileToo.text.startsWith(stable)).toBe(true);
     expect(volatileToo.text.endsWith(current)).toBe(true);
   });
@@ -379,15 +380,15 @@ describe("decodeAcpPromptBudgetBytes", () => {
 describe("what a trim reports", () => {
   it("counts dropped history turns and names dropped sections, with no prompt text", () => {
     const input = prompt();
-    const result = applyAcpPromptBudget({ ...input, budgetBytes: bytes(input.composed) - bytes(historyOld) - bytes(volOld) + 60 });
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: 1 });
     expect(result.trimmed).toBe(true);
     expect(result.dropped.historyTurns).toBeGreaterThanOrEqual(1);
-    expect(result.dropped.sections).toContain("memory");
+    expect(result.dropped.sections).toEqual(["mentions", "memory"]);
     const trim = describeAcpPromptTrim(result, 1000)!;
     expect(trim.preview).toMatch(/dropped \d+ earlier turn/);
     expect(trim.preview).toContain("memory");
     expect(trim.text).toContain("Budget:");
-    expect(trim.text).toContain("Sections dropped: memory");
+    expect(trim.text).toContain("Sections dropped: mentions, memory");
     expect(trim.bytesSaved).toBeGreaterThan(0);
     for (const secret of ["ancient", "alpha", "beta", "recent", current]) {
       expect(trim.text).not.toContain(secret);
@@ -416,5 +417,40 @@ describe("the hard ceiling", () => {
   it("never refuses when the budget is off", () => {
     expect(acpPromptCeilingRefusal("x".repeat(10_000_000), null)).toBeNull();
     expect(acpPromptCeilingRefusal("x".repeat(10_000_000), 0)).toBeNull();
+  });
+});
+
+describe("section cut priority", () => {
+  it("cuts mentions, then automation, then skills, then memory, regardless of prompt order", () => {
+    const parts: AcpPromptSection[] = [
+      { id: "persona", text: "PERSONA ", volatile: false },
+      { id: "memory", text: `MEM ${"m".repeat(300)} `, volatile: true },
+      { id: "skill-instructions", text: `SKILL ${"s".repeat(300)} `, volatile: true },
+      { id: "automation", text: `AUTO ${"a".repeat(300)} `, volatile: true },
+      { id: "mentions", text: `MENT ${"n".repeat(300)} `, volatile: true },
+    ];
+    const user = "hello";
+    const composed = compose(parts.map((p) => p.text).join(""), user);
+    const cut = (budget: number) => applyAcpPromptBudget({ composed, userText: user, sections: parts, budgetBytes: budget });
+    const total = bytes(composed);
+    const one = cut(total - 100);
+    expect(one.dropped.sections).toEqual(["mentions"]);
+    expect(one.text).toContain("MEM ");
+    const two = cut(total - 400);
+    expect(two.dropped.sections).toEqual(["mentions", "automation"]);
+    const three = cut(total - 700);
+    expect(three.dropped.sections).toEqual(["mentions", "automation", "skill-instructions"]);
+    expect(three.text).toContain("MEM ");
+    expect(cut(1).dropped.sections).toEqual(["mentions", "automation", "skill-instructions", "memory"]);
+  });
+
+  it("puts a section id it does not know between the stale nudges and memory, then prompt order", () => {
+    const parts: AcpPromptSection[] = [
+      { id: "mystery-a", text: `A ${"a".repeat(300)} `, volatile: true },
+      { id: "mystery-b", text: `B ${"b".repeat(300)} `, volatile: true },
+    ];
+    const composed = compose(parts.map((p) => p.text).join(""), "hi");
+    const r = applyAcpPromptBudget({ composed, userText: "hi", sections: parts, budgetBytes: bytes(composed) - 100 });
+    expect(r.dropped.sections).toEqual(["mystery-a"]);
   });
 });
