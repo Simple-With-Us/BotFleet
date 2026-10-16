@@ -28,6 +28,7 @@ Verification uses these isolated fixtures:
 - [Connector grants](connector-grants.md) — per-bot third-party tool authorization
 - [Saved data faults](saved-data.md) — unreadable bots, rooms, routines and settings files are set aside, never deleted
 - [Bot On/Off switch](bot-off.md) — an Off bot starts nothing new and finishes a running turn
+- [Named tunnel loopback Host](named-tunnel-loopback-host.md) — proves the Access tunnel reaches the harness with loopback Host and documents the mutation gate (BF-2129)
 
 ### Test Fixtures
 

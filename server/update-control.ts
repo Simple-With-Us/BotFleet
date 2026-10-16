@@ -695,7 +695,12 @@ export function launchPlanCommand(plan: LaunchPlan): { command: string; args: st
     ...(plan.launchEnvFilePath
       ? [`set -a && . ${quote(plan.launchEnvFilePath)} && set +a`]
       : []),
-    `exec /bin/bash ${quote(plan.scriptPath)} --progress ${quote(plan.progressPath)} --run-id ${quote(plan.runId)}${forceArg}`,
+    `/bin/bash ${quote(plan.scriptPath)} --progress ${quote(plan.progressPath)} --run-id ${quote(plan.runId)}${forceArg}`,
+    // launchctl submit retries non-zero exits indefinitely. The progress
+    // record (or log fallback) owns failure; the launcher must be one-shot
+    // even if an old machine wrapper crashes before importing its writer.
+    `result=$?; if [ "$result" -ne 0 ]; then echo "Updater launcher exited $result" >&2; fi`,
+    "exit 0",
   ].join("\n");
   return {
     command: "/bin/launchctl",
@@ -1169,7 +1174,7 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       if (pruned.length) {
         console.log(`BotFleet removed ${pruned.length} abandoned update stage(s) under ${deps.updatesDirectory}.`);
       }
-      const failedBundles = pruneFailedInstallBundles(deps.appPath, {
+      const { removed: failedBundles, failures: failedBundleRemovals } = pruneFailedInstallBundles(deps.appPath, {
         listNames: (directory) => {
           try {
             return readdirSync(directory);
@@ -1181,6 +1186,10 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       });
       if (failedBundles.length) {
         console.log(`BotFleet removed ${failedBundles.length} expired failed-install bundle(s) beside ${deps.appPath}.`);
+      }
+      for (const { path, error } of failedBundleRemovals) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`BotFleet could not remove expired failed-install bundle ${path}: ${detail}`);
       }
       pruneRunArtifacts(runsDirectory, { protect: lastRun ? [lastRun.runId] : [] });
     } catch (error) {
@@ -1266,7 +1275,9 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       const startedMs = Date.parse(current.startedAt);
       const ageMs = Number.isFinite(startedMs) ? deps.now().getTime() - startedMs : 0;
       if (ageMs > LAUNCH_GRACE_MS) {
-        settle(null, `The updater never started.${GAP}Check the launchd job log.`);
+        const log = readLogTail(current.logPath);
+        const cause = log.find((line) => /Error|failed|fatal:|refusing/i.test(line));
+        settle(null, `The updater never started.${GAP}${cause ? firstLine(cause) : "Check the launchd job log."}`);
       }
     }
   };

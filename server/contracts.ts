@@ -45,7 +45,7 @@ export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 /** Narrow untrusted API/config input before it becomes a model selection. */
 export function isEffortLevel(value: unknown): value is EffortLevel {
-  return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+  return (EFFORT_LEVELS as readonly unknown[]).includes(value);
 }
 
 // ── model selection ────────────────────────────────────────────────────

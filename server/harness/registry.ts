@@ -1459,7 +1459,7 @@ export class ProviderRegistry {
         const allCatalogCapped =
           catalogIds.length > 0 && catalogIds.every((id) => mergedModels[id]?.capped === true);
         if (wildcard || Object.keys(mergedModels).length > 0 || windowsLabel || minimaxSummary) {
-          const quota = {
+          const mergedQuota = {
             ...driverQuota,
             capped: Boolean(wildcard)
               || allCatalogCapped
@@ -1470,10 +1470,10 @@ export class ProviderRegistry {
             resetsAt: wildcard?.resetsAt ?? driverQuota?.resetsAt,
             error: wildcard?.error ?? driverQuota?.error,
           };
-          if (windowsLabel) quota.windowsLabel = windowsLabel;
-          if (Object.keys(mergedModels).length > 0) quota.models = mergedModels;
-          if (minimaxSummary) quota.minimax = minimaxSummary;
-          snapshot.quota = quota;
+          if (windowsLabel) mergedQuota.windowsLabel = windowsLabel;
+          if (Object.keys(mergedModels).length > 0) mergedQuota.models = mergedModels;
+          if (minimaxSummary) mergedQuota.minimax = minimaxSummary;
+          snapshot.quota = mergedQuota;
         }
       } catch (e) {
         snapshot = { state: "unavailable", reason: e instanceof Error ? e.message : String(e) };

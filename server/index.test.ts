@@ -10056,6 +10056,21 @@ describe("CSRF security hardening", () => {
     expect(result.body).toContain("forbidden: cross-origin request");
   });
 
+  it("refuses mutating API requests that carry Cloudflare tunnel markers", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "content-type": "application/json",
+        "content-length": "2",
+        "cf-ray": "fixture-ray",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("named tunnel");
+  });
+
   it("accepts Origin from the server's own port", async () => {
     const result = await rawRequest({
       method: "POST",

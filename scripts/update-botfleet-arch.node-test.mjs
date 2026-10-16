@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 // The updater bootstraps itself by archiving a fixed set of files out of the
-// commit it is about to install (scripts/update-botfleet.sh) and running that
+// commit it is about to install (scripts/update-botfleet-policy.sh) and running that
 // copy.  The set is a literal list in the shell, so nothing in the JavaScript
 // notices when a new local import is added: the archive is simply missing the
 // file, and `ubf` dies with ERR_MODULE_NOT_FOUND on every Mac at the moment it
@@ -18,9 +18,9 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const LOCAL_IMPORT = /from\s+"(\.[^"]+)"/g;
 
 async function archivedPaths() {
-  const wrapper = await readFile(join(root, "scripts/update-botfleet.sh"), "utf8");
+  const wrapper = await readFile(join(root, "scripts/update-botfleet-policy.sh"), "utf8");
   const archive = wrapper.match(/git -C "\$BOTFLEET_CHECKOUT" archive[^|]*?--\s*((?:[\\\s]+[\w./-]+)+?)\s*\|/);
-  assert.ok(archive, "could not find the `git archive` call in scripts/update-botfleet.sh");
+  assert.ok(archive, "could not find the `git archive` call in scripts/update-botfleet-policy.sh");
   // The paths sit on shell line-continuation lines, so the captured group also
   // contains the backslashes that join them.
   return new Set(archive[1].split(/\s+/).filter((token) => token && !token.includes("\\")));
@@ -40,7 +40,7 @@ test("every module the updater imports locally is in the bootstrap archive", asy
   assert.deepEqual(
     [...new Set(missing)],
     [],
-    "these modules are imported but not archived by scripts/update-botfleet.sh, so a bootstrapped ubf would fail to start on every Mac",
+    "these modules are imported but not archived by scripts/update-botfleet-policy.sh, so a bootstrapped ubf would fail to start on every Mac",
   );
 });
 
