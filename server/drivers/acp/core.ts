@@ -1832,7 +1832,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 : turn.text;
             const budgetBytes = resolveAcpPromptBudget({
               configuredBytes: turnConfig.promptBudgetBytes,
-              capTokens: turnConfig.contextCapTokens,
+              capTokens: turn.contextCapTokens ?? turnConfig.contextCapTokens,
               model: resolvedModel ?? turn.model,
               composed,
             }).bytes;

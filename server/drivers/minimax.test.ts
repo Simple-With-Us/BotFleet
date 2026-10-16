@@ -118,8 +118,10 @@ describe("MinimaxDriver", () => {
           label: "MiniMax M3.1 Flash Preview",
           contextWindow: 1_000_000,
           effortLevels: M31_LEVELS,
+          contextCaps: [524_288],
+          supportsMaxOutput: true,
         },
-        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
+        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },
       ],
     });
     // The retired MiniMax-M3 is neither offered nor priced: it is out of the
@@ -645,8 +647,10 @@ describe("MinimaxDriver", () => {
           label: "MiniMax M3.1 Flash Preview",
           contextWindow: 1_000_000,
           effortLevels: M31_LEVELS,
+          contextCaps: [524_288],
+          supportsMaxOutput: true,
         },
-        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
+        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },
       ],
     });
     await instance.dispose();
@@ -774,6 +778,31 @@ describe("MinimaxDriver", () => {
       await instance.adapter.sendTurn(turnWith());
       await recorder.until((event) => event.type === "turn.completed");
       expect(JSON.stringify(bodies[0].messages)).not.toContain("MEMORY-BLOCK");
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("a turn's contextCapTokens (the bot's picked cap) sizes the budget", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }>; max_completion_tokens?: number }> = [];
+      const instance = await make({}, bodies);
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(turnWith({ contextCapTokens: 200 }));
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(bodies[0].messages)).not.toContain("MEMORY-BLOCK");
+      recorder.stop();
+      await instance.dispose();
+    });
+
+    it("sends max_completion_tokens only when the bot set an output limit", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }>; max_completion_tokens?: number }> = [];
+      const instance = await make({}, bodies);
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(turnWith());
+      await recorder.until((event) => event.type === "turn.completed");
+      expect("max_completion_tokens" in bodies[0]).toBe(false);
+      await instance.adapter.sendTurn(turnWith({ threadId: "thread-max", maxOutputTokens: 8192 }));
+      await recorder.until((event) => event.type === "turn.completed" && event.threadId === "thread-max");
+      expect(bodies[1].max_completion_tokens).toBe(8192);
       recorder.stop();
       await instance.dispose();
     });

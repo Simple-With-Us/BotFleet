@@ -4,7 +4,7 @@ import { api, useStore, type Bot } from "@/state/store";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { BotFallbackModels } from "./BotFallbackModels";
-import { ModelPicker } from "./ModelPicker";
+import { MaxOutputSection, ModelPicker } from "./ModelPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { railAsideClass } from "@/lib/layout-rails";
@@ -33,7 +33,7 @@ import { botCapabilityGates, toolRoundsGate } from "@/lib/bot-settings-gates";
 import { MaxToolRoundsField } from "./MaxToolRoundsField";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { effortLabel } from "@/lib/model-effort";
-import { selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
+import { selectionSupportsMaxOutput, selectionWithMaxOutput, contextCapLabel, selectionContextCaps, selectionEffortLevels, selectionWithContextCap, selectionWithEffort } from "@/lib/model-pick";
 import { CONNECTED_APPS_HEADING, connectedAppsBlurb } from "@/lib/connected-apps-copy";
 import { BotAlwaysAllowCard } from "./BotAlwaysAllowCard";
 
@@ -668,6 +668,49 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               </div>
             );
           })()}
+
+          {(() => {
+            const caps = selectionContextCaps(engine, bot.modelSelection);
+            if (!caps.length) return null;
+            const window = engine?.models.options.find((option) => option.id === bot.modelSelection.model)?.contextWindow;
+            return (
+              <div className="rounded-xl bg-card p-4">
+                <div className="text-[15px] font-medium text-ink">Context</div>
+                <div className="mt-0.5 text-[13px] text-ink-secondary">
+                  How much of the model&apos;s window this bot may fill before the prompt is compressed.
+                </div>
+                <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
+                  {[undefined, ...caps].map((cap, i) => (
+                    <button
+                      key={cap ?? "default"}
+                      aria-pressed={bot.modelSelection.contextCap === cap}
+                      onClick={() => patch({ modelSelection: selectionWithContextCap(bot.modelSelection, cap) })}
+                      className={cn(
+                        "flex-1 py-1.5 text-[13px]",
+                        i > 0 && "border-l border-hairline/40",
+                        bot.modelSelection.contextCap === cap
+                          ? "bg-control text-ink"
+                          : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                      )}
+                    >
+                      {cap === undefined ? (window ? `${contextCapLabel(window)} (Default)` : "Default") : contextCapLabel(cap)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
+
+          {selectionSupportsMaxOutput(engine, bot.modelSelection) && (
+            <div className="rounded-xl bg-card p-4">
+              <MaxOutputSection
+                className="border-0 px-0 pb-0 pt-0"
+                current={bot.modelSelection.maxOutputTokens}
+                windowTokens={engine?.models.options.find((option) => option.id === bot.modelSelection.model)?.contextWindow}
+                onPick={(tokens) => patch({ modelSelection: selectionWithMaxOutput(bot.modelSelection, tokens) })}
+              />
+            </div>
+          )}
 
           {roundsGate.visible && (
             <MaxToolRoundsField

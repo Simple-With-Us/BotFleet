@@ -113,10 +113,14 @@ const MODELS: ModelCatalog = {
       label: "MiniMax M3.1 Flash Preview",
       contextWindow: 1_000_000,
       effortLevels: [...M31_EFFORT_LEVELS],
+      // MiniMax Code offers 512K or 1M.  The API has no such parameter (the
+      // window is fixed), so this is a client-side cap on the prompt budget.
+      contextCaps: [524_288],
+      supportsMaxOutput: true,
     },
     // Explicit `[]`: src/lib/model-effort.ts gives a row with no list the
     // engine-wide one, which is M3.1's.
-    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
+    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },
   ],
 };
 
@@ -484,6 +488,10 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         /** M3.1's `reasoning_effort`.  Set only for a user turn's own rounds;
          *  the utility path (titles, summaries) never passes it. */
         reasoningEffort?: EffortLevel;
+        /** The bot's optional output limit, sent as `max_completion_tokens`
+         *  (MiniMax: "use this field for new integrations").  Absent sends
+         *  nothing, so the model keeps its own limit. */
+        maxOutputTokens?: number;
       },
     ): Promise<{ text: string; reasoning: string; tool_calls?: any[]; usage: TurnUsage | null }> => {
       // When the caller supplies a signal it already carries the request
@@ -507,6 +515,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // https://platform.minimax.io/docs/api-reference/text-openai-api
         // (An undefined value is dropped by JSON.stringify, so Default adds no key.)
         reasoning_effort: opts.reasoningEffort,
+        max_completion_tokens: opts.maxOutputTokens,
       };
       const res = await fetch(`${apiUrl}/chat/completions`, {
         method: "POST",
@@ -694,12 +703,13 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // bot has a 1M window.  Without an override or a cap the budget is the
         // model's own window (80% of it), and off for a model with no known one.
         const windowTokens = contextWindowFor(model);
-        const unconfigured = config.promptBudgetBytes === undefined && config.contextCapTokens === undefined;
+        const unconfigured =
+          config.promptBudgetBytes === undefined && config.contextCapTokens === undefined && turn.contextCapTokens === undefined;
         const budgetBytes = unconfigured && windowTokens === undefined
           ? null
           : resolveAcpPromptBudget({
               configuredBytes: config.promptBudgetBytes,
-              capTokens: config.contextCapTokens ?? windowTokens,
+              capTokens: turn.contextCapTokens ?? config.contextCapTokens ?? windowTokens,
               model,
               composed,
             }).bytes;
@@ -807,6 +817,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
               // the `budget` comment on this turn's runTurnLoop call.
               idleTimeoutMs: turn.unattended ? STREAM_IDLE_TIMEOUT_MS : undefined,
               reasoningEffort,
+              maxOutputTokens: turn.maxOutputTokens,
               // Every raw chunk feeds the loop's idle clock, which is what
               // bounds silence on the interactive path now that its hard
               // ceiling is the loop's default rather than 180s.

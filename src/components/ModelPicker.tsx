@@ -20,7 +20,17 @@ import {
   opensOnLocalModels,
   type LocalModelGroup,
 } from "@/lib/local-models";
-import { pickedSelection, selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
+import {
+  contextCapLabel,
+  pickedSelection,
+  selectionContextCaps,
+  selectionEffortLevels,
+  selectionWithContextCap,
+  parseMaxOutputInput,
+  selectionSupportsMaxOutput,
+  selectionWithEffort,
+  selectionWithMaxOutput,
+} from "@/lib/model-pick";
 import { effortLabel } from "@/lib/model-effort";
 import type { EffortLevel } from "../../server/contracts.ts";
 import { ProviderMark } from "./ProviderIcons";
@@ -89,6 +99,130 @@ export function LatestModelRows({
       })}
       <div className="mx-2 my-1.5 border-t border-hairline/40" role="separator" />
     </>
+  );
+}
+
+/** "Context": how much of the model's window the bot may fill before BotFleet
+ *  compresses the prompt.  The full window is Default (nothing is capped); each
+ *  cap the model offers is another choice.  A model with no caps gets no
+ *  section.  Same button shape as Effort. */
+export function ContextSection({
+  caps,
+  windowTokens,
+  current,
+  onPick,
+  disabled = false,
+  className,
+}: {
+  caps: readonly number[];
+  /** The model's full window in tokens, when known; only used for the label. */
+  windowTokens?: number;
+  /** The bot's saved cap; undefined is the full window. */
+  current: number | undefined;
+  onPick: (cap: number | undefined) => void;
+  disabled?: boolean;
+  className?: string;
+}) {
+  if (!caps.length) return null;
+  return (
+    <div
+      role="group"
+      aria-label="Context"
+      data-context-section
+      className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
+    >
+      <EngineGroupLabel className="px-1 pb-1.5">Context</EngineGroupLabel>
+      <div className="flex flex-wrap gap-1">
+        {[undefined, ...caps].map((cap) => {
+          const checked = current === cap;
+          return (
+            <button
+              key={cap ?? "default"}
+              type="button"
+              aria-pressed={checked}
+              disabled={disabled}
+              onClick={() => onPick(cap)}
+              className={cn(
+                "flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12.5px] disabled:cursor-not-allowed disabled:opacity-60",
+                checked
+                  ? "border-accent/40 bg-control text-ink"
+                  : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink disabled:hover:bg-transparent disabled:hover:text-ink-secondary",
+              )}
+            >
+              {checked && <Check size={12} className="shrink-0 text-accent" />}
+              {cap === undefined ? (windowTokens ? `${contextCapLabel(windowTokens)} (Default)` : "Default") : contextCapLabel(cap)}
+            </button>
+          );
+        })}
+      </div>
+      <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">
+        {disabled ? "Stop the bot to change context.  " : ""}A smaller cap compresses the prompt sooner.
+      </p>
+    </div>
+  );
+}
+
+/** "Max Output Tokens": an optional output limit.  Empty is Default, and
+ *  nothing is sent.  A value commits on Enter or blur; one that is not a whole
+ *  number, or is past the model's window, is flagged and not saved. */
+export function MaxOutputSection({
+  current,
+  windowTokens,
+  onPick,
+  disabled = false,
+  className,
+}: {
+  /** The bot's saved limit; undefined is Default. */
+  current: number | undefined;
+  /** The model's window in tokens, when known; a limit above it is refused. */
+  windowTokens?: number;
+  onPick: (tokens: number | undefined) => void;
+  disabled?: boolean;
+  className?: string;
+}) {
+  const [text, setText] = useState(current === undefined ? "" : String(current));
+  useEffect(() => setText(current === undefined ? "" : String(current)), [current]);
+  const parsed = parseMaxOutputInput(text, windowTokens);
+  const invalid = parsed === null;
+  const commit = () => {
+    if (parsed === null || parsed === current) return;
+    onPick(parsed);
+  };
+  return (
+    <div
+      role="group"
+      aria-label="Max Output Tokens"
+      data-max-output-section
+      className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
+    >
+      <EngineGroupLabel className="px-1 pb-1.5">Max Output Tokens</EngineGroupLabel>
+      <input
+        type="text"
+        inputMode="numeric"
+        value={text}
+        placeholder="Default"
+        disabled={disabled}
+        aria-invalid={invalid}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commit();
+        }}
+        className={cn(
+          "w-full rounded-lg border bg-control px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-secondary disabled:cursor-not-allowed disabled:opacity-60",
+          invalid ? "border-red-500/60" : "border-hairline/40",
+        )}
+      />
+      <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">
+        {invalid
+          ? windowTokens
+            ? `Enter a whole number up to ${windowTokens.toLocaleString("en-US")}.`
+            : "Enter a whole number."
+          : disabled
+            ? "Stop the bot to change this.  Empty uses the model default."
+            : "Empty uses the model default."}
+      </p>
+    </div>
   );
 }
 
@@ -629,6 +763,26 @@ export function ModelPicker({
         disabled={Boolean(bot.busy)}
       />
     ) : null;
+  const contextCaps = contained ? [] : selectionContextCaps(active, selection);
+  const contextSection =
+    effortApplies && contextCaps.length > 0 ? (
+      <ContextSection
+        caps={contextCaps}
+        windowTokens={active?.models.options.find((option) => option.id === selection.model)?.contextWindow}
+        current={selection.contextCap}
+        onPick={(cap) => commit(selectionWithContextCap(selection, cap))}
+        disabled={Boolean(bot.busy)}
+      />
+    ) : null;
+  const maxOutputSection =
+    !contained && effortApplies && selectionSupportsMaxOutput(active, selection) ? (
+      <MaxOutputSection
+        current={selection.maxOutputTokens}
+        windowTokens={active?.models.options.find((option) => option.id === selection.model)?.contextWindow}
+        onPick={(tokens) => commit(selectionWithMaxOutput(selection, tokens))}
+        disabled={Boolean(bot.busy)}
+      />
+    ) : null;
   const chipEffort =
     !contained && selection.effort && effortLevels.includes(selection.effort) ? selection.effort : undefined;
 
@@ -822,6 +976,8 @@ export function ModelPicker({
                   onPick={pick}
                 />
                 {effortSection}
+                {contextSection}
+                {maxOutputSection}
               </>
             ) : railInstance ? (
               <>
@@ -997,6 +1153,8 @@ export function ModelPicker({
                       )}
                     </div>
                     {effortSection}
+                    {contextSection}
+                    {maxOutputSection}
                   </>
                 )}
               </>

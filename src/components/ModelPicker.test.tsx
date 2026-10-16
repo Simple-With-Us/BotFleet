@@ -28,7 +28,7 @@ vi.mock("@/state/store", () => ({
 }));
 
 // Imported after the mock is registered (vitest hoists vi.mock above imports).
-import { EffortSection, LocalModelsPanel, ModelPicker, ModelRow } from "./ModelPicker";
+import { ContextSection, EffortSection, MaxOutputSection, LocalModelsPanel, ModelPicker, ModelRow } from "./ModelPicker";
 
 type Option = InstanceInfo["models"]["options"][number];
 
@@ -600,8 +600,31 @@ describe("Effort section in the chat model menu", () => {
     const tree = EffortSection({ levels: ["low", "high"], current: "low", onPick });
     const choices = findElements(tree, (element) => element.type === "button");
     expect(choices).toHaveLength(3);
-    for (const choice of choices) (choice.props as { onClick: () => void }).onClick();
+    for (const choice of choices) {
+      // SAFETY: ContextSection creates these buttons with an onClick callback for each cap.
+      (choice.props as { onClick: () => void }).onClick();
+    }
     expect(onPick.mock.calls).toEqual([[undefined], ["low"], ["high"]]);
+  });
+
+  it("Context: hands each choice's cap to onPick, the full window as undefined, and hides with no caps", () => {
+    const onPick = vi.fn();
+    const tree = ContextSection({ caps: [524_288], windowTokens: 1_000_000, current: undefined, onPick });
+    const choices = findElements(tree, (element) => element.type === "button");
+    expect(choices).toHaveLength(2);
+    for (const choice of choices) {
+      // SAFETY: ContextSection creates these buttons with an onClick callback for each cap.
+      (choice.props as { onClick: () => void }).onClick();
+    }
+    expect(onPick.mock.calls).toEqual([[undefined], [524_288]]);
+    expect(ContextSection({ caps: [], current: undefined, onPick })).toBeNull();
+  });
+
+  it("Max Output Tokens renders a group with an empty Default field", () => {
+    const html = renderToStaticMarkup(createElement(MaxOutputSection, { current: undefined, windowTokens: 1_000_000, onPick: () => {} }));
+    expect(html).toContain("Max Output Tokens");
+    expect(html).toContain('placeholder="Default"');
+    expect(html).toContain("Empty uses the model default.");
   });
 
   it("renders nothing for a model with no levels", () => {

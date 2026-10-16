@@ -17,6 +17,16 @@ export function selectionForPick(
     const allowed = modelEffortLevels(instance, targetOption, model);
     if (allowed.includes(current.effort)) next.effort = current.effort;
   }
+  // Same for the context cap.
+  if (current.contextCap) {
+    const targetOption = instance.models.options.find((option) => option.id === model);
+    if (targetOption?.contextCaps?.includes(current.contextCap)) next.contextCap = current.contextCap;
+  }
+  // And the output limit.
+  if (current.maxOutputTokens) {
+    const targetOption = instance.models.options.find((option) => option.id === model);
+    if (targetOption?.supportsMaxOutput) next.maxOutputTokens = current.maxOutputTokens;
+  }
   // Fleet Models passes onChange for the primary pill.  Keep that bot's
   // fallbacks so picking a new primary does not wipe the chain.
   if (current.fallbacks?.length) next.fallbacks = current.fallbacks;
@@ -58,4 +68,52 @@ export function selectionWithEffort(
   effort: EffortLevel | undefined,
 ): ModelSelection {
   return { ...current, effort };
+}
+
+/** The context caps (tokens) the selected model offers besides its full window,
+ *  or none when the model has no such choice. */
+export function selectionContextCaps(
+  instance: InstanceInfo | undefined,
+  selection: Pick<ModelSelection, "model">,
+): readonly number[] {
+  return instance?.models.options.find((candidate) => candidate.id === selection.model)?.contextCaps ?? [];
+}
+
+/** What changing only the context cap saves; `undefined` is the full window. */
+export function selectionWithContextCap(current: ModelSelection, cap: number | undefined): ModelSelection {
+  return { ...current, contextCap: cap };
+}
+
+/** "512K", "1M": how a cap or window reads on a button. */
+export function contextCapLabel(tokens: number): string {
+  if (tokens >= 1_000_000 && tokens % 1_000_000 === 0) return `${tokens / 1_000_000}M`;
+  return `${Math.round(tokens / 1024)}K`;
+}
+
+/** Whether the selected model's driver sends a per-bot output limit. */
+export function selectionSupportsMaxOutput(
+  instance: InstanceInfo | undefined,
+  selection: Pick<ModelSelection, "model">,
+): boolean {
+  return instance?.models.options.find((candidate) => candidate.id === selection.model)?.supportsMaxOutput === true;
+}
+
+/** What changing only the output limit saves; `undefined` is the model's own. */
+export function selectionWithMaxOutput(current: ModelSelection, tokens: number | undefined): ModelSelection {
+  return { ...current, maxOutputTokens: tokens };
+}
+
+/** Parse the Max Output Tokens field.  Empty is "use the model default"
+ *  (undefined); anything that is not a whole number of at least 1, or is past
+ *  `windowTokens` when that is known, is invalid (null).  Accepts "8k" and
+ *  "64K" as thousands. */
+export function parseMaxOutputInput(raw: string, windowTokens?: number): number | undefined | null {
+  const text = raw.trim().replace(/,/g, "").toLowerCase();
+  if (!text) return undefined;
+  const match = /^(\d+)(k)?$/.exec(text);
+  if (!match) return null;
+  const value = Number(match[1]) * (match[2] ? 1000 : 1);
+  if (!Number.isSafeInteger(value) || value < 1) return null;
+  if (windowTokens !== undefined && value > windowTokens) return null;
+  return value;
 }
