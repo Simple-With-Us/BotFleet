@@ -7089,7 +7089,11 @@ async function startTurn(
         effort,
         // Only a cap this model's row offers reaches a driver; a stale value
         // from a model the bot has since left is dropped here.
-        ...(!boxCloud && selection.contextCap !== undefined && targetOption?.contextCaps?.includes(selection.contextCap)
+        ...(!boxCloud && selection.contextCap !== undefined &&
+        targetOption?.contextCaps?.length &&
+        (targetOption.contextWindow === undefined
+          ? targetOption.contextCaps.includes(selection.contextCap)
+          : selection.contextCap <= targetOption.contextWindow)
           ? { contextCapTokens: selection.contextCap }
           : {}),
         // An output limit goes out only for a model whose driver sends one, and

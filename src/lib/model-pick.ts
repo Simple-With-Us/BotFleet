@@ -20,7 +20,7 @@ export function selectionForPick(
   // Same for the context cap.
   if (current.contextCap) {
     const targetOption = instance.models.options.find((option) => option.id === model);
-    if (targetOption?.contextCaps?.includes(current.contextCap)) next.contextCap = current.contextCap;
+    if (targetOption?.contextCaps?.length) next.contextCap = current.contextCap;
   }
   // And the output limit.
   if (current.maxOutputTokens) {

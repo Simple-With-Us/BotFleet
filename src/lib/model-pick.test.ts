@@ -138,9 +138,10 @@ describe("context cap", () => {
     expect(selectionWithContextCap({ ...current, contextCap: 524_288 }, undefined).contextCap).toBeUndefined();
   });
 
-  it("keeps the cap on a model pick only when the new model still offers it", () => {
+  it("keeps the cap on a model pick only when the new model offers a cap", () => {
     const current: ModelSelection = { instanceId: "minimax", model: "m31", contextCap: 524_288 };
     expect(selectionForPick(current, MM, "m31").contextCap).toBe(524_288);
+    expect(selectionForPick({ ...current, contextCap: 300_000 }, MM, "m31").contextCap).toBe(300_000);
     expect(selectionForPick(current, MM, "m27").contextCap).toBeUndefined();
   });
 
