@@ -303,6 +303,8 @@ export function queuedMessageCount(ignoreBot?: (botId: string) => boolean): numb
   return [...queues.values()]
     .filter((entry) => !ignoreBot?.(entry.botId))
     .reduce((total, entry) => total + entry.items.length, 0);
+}
+
 /** The ids of the sends waiting on a thread, in arrival order.  The caller
  * reads them before `dropSteeredMessages` so it can forget what it keyed on
  * them (a relayed message's unattended mark). */
@@ -324,8 +326,6 @@ export function dropSteeredMessages(threadId: string): number {
   if (!entry) return 0;
   queues.delete(threadId);
   return entry.items.length;
-}
-
 }
 
 /** Test helper: how many messages remain queued for a thread. */

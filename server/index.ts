@@ -3547,6 +3547,7 @@ async function interruptBot(
     }
     // Cancel all active and queued routine runs for this bot and snooze automated triggers
     // so background webhooks and scheduled routines do not restart it.
+    jobHost?.stopThread(bot.id, interruptLiveThreadId);
     const cancelledRuns = await routines.cancelAllRunsForBot(bot.id);
     routines.snoozeBot(bot.id);
     cancelledRunCount = cancelledRuns.length;
@@ -3554,6 +3555,7 @@ async function interruptBot(
       stopped = true;
     }
   }
+  if (!routines) jobHost?.stopThread(bot.id, interruptLiveThreadId);
   // Latch the stop before anything is awaited.  The driver may settle the
   // turn the instant it is killed, so the turn.completed fold can run
   // before this handler resumes — if the latch were set after the await,
