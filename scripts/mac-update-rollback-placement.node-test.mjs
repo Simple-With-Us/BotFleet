@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  generationBelongsToApp,
   prunablePath,
   resolveRollbackPlacement,
   rollbackGenerationStatus,
@@ -195,9 +194,9 @@ test("generations come from receipts in both placements and a bundle without one
 test("the updater writes the rollback receipt beside whichever bundle it produced", async () => {
   const source = await import("node:fs/promises").then(({ readFile }) =>
     readFile(new URL("./update-botfleet-mac.mjs", import.meta.url), "utf8"));
-  // The receipt path is derived from the rollback path, so both placements
-  // keep a receipt next to the bundle it describes.
-  assert.match(source, /const receiptPath = `\$\{previous\.rollbackPath\}\.json`/);
+  // The receipt path is derived from what this run rolled back: the bundle path
+  // when the app moved, otherwise the dependency rollback path for server-only.
+  assert.match(source, /rollbackReceiptPathForPrevious\(previous\)/);
   assert.match(source, /status: "installing"/);
   assert.match(source, /status: "verified"/);
   // The prior bundle must never be parked in the installed application's folder

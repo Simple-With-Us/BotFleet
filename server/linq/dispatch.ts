@@ -118,6 +118,7 @@ export async function ingestInbound({
   media,
   idempotencyKey,
   signal,
+  senderVerified,
 }: {
   source: "imessage" | "linq";
   bot: BotRecord;
@@ -126,6 +127,9 @@ export async function ingestInbound({
   media?: string[];
   idempotencyKey?: string;
   signal?: AbortSignal;
+  /** True when the inbound path already enforced Linq sender policy, so the
+   *  messages route may run reserved commands. */
+  senderVerified?: boolean;
   /** True when the messages endpoint answered an idempotent replay: the
    *  delivery was accepted before, no new turn starts. */
 }): Promise<{ dispatched: boolean; reason?: string; replayed?: boolean }> {
@@ -143,11 +147,19 @@ export async function ingestInbound({
   const port = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
   const host = process.env.BOTFLEET_HOST ?? `127.0.0.1:${port}`;
   const url = `http://${host}/api/bots/${bot.id}/messages`;
-  const body: Record<string, unknown> = {
+  const body: {
+    text: string;
+    source: "imessage" | "linq";
+    chatId: string;
+    senderVerified?: true;
+    media?: string[];
+    idempotencyKey?: string;
+  } = {
     text: wrapImessageInbound(combined),
     source,
     chatId,
   };
+  if (senderVerified === true) body.senderVerified = true;
   if (media && media.length) body.media = media;
   if (idempotencyKey) body.idempotencyKey = idempotencyKey;
   try {
@@ -162,8 +174,9 @@ export async function ingestInbound({
     }
     // An idempotent replay answers 202 with `replayed: true` but starts no
     // new turn — the caller must not treat it like a fresh dispatch.
+    // SAFETY: harness JSON may include optional `replayed`; only that flag is read.
     const payload = (await res.json().catch(() => ({}))) as { replayed?: unknown };
-    return { dispatched: true, replayed: payload?.replayed === true };
+    return { dispatched: true, replayed: payload.replayed === true };
   } catch (err) {
     return {
       dispatched: false,
@@ -207,8 +220,11 @@ export async function handleLinqInbound(
     bot: bot.bot,
     chatId: msg.chatId,
     text: msg.text,
-    media: msg.media?.map((m) => m.url).filter(Boolean) as string[] | undefined,
+    media: msg.media
+      ?.map((m) => m.url)
+      .filter((url): url is string => Boolean(url)),
     idempotencyKey: msg.messageId,
+    senderVerified: true,
   });
   if (!result.dispatched) {
     void linqStopTyping(msg.chatId).catch(() => undefined);
