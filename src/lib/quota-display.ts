@@ -235,7 +235,21 @@ function bucketFor(window: string | null | undefined): string {
   const raw = window.toLowerCase();
   if (raw.includes("week")) return "weekly";
   if (raw.includes("month")) return "monthly";
-  if (raw === "5h" || raw.includes("5-h") || raw.includes("5 hour") || raw.includes("session")) return "5h";
+  // "5hr" and "5hrs" are the 5-hour window spelled without the dash, and are
+  // exactly what `server/antigravity-quota.ts` and `server/minimax-balance.ts`
+  // emit.  Left out of this test they reach the compact-duration branch below
+  // and come back "hourly", which paints a 5-hour session window as an hourly
+  // allowance -- a different quota with a similar name.
+  if (
+    raw === "5h" ||
+    raw === "5hr" ||
+    raw === "5hrs" ||
+    raw.includes("5-h") ||
+    raw.includes("5 hour") ||
+    raw.includes("session")
+  ) {
+    return "5h";
+  }
   if (raw.includes("day")) return "daily";
   if (raw.includes("hour")) return "hourly";
   // Several engines report the window as a bare duration instead of a name
