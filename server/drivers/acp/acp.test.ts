@@ -434,7 +434,7 @@ describe("ACP turns (fake CLI)", () => {
     if (row?.type === "context.injected") {
       expect(row.preview).toContain("memory");
       expect(row.bytes).toBeGreaterThan(0);
-      expect((row as { io?: { text?: string } }).io?.text).toContain("Sections dropped: memory");
+      expect(row.io?.text?.text).toContain("Sections dropped: memory");
       expect(JSON.stringify(row)).not.toContain("alpha");
     }
   });

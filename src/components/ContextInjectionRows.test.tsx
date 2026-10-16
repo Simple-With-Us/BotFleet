@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { clearItemIoCache, primeItemIo } from "@/lib/item-io";
+import { boundText } from "../../shared/item-io";
 import type { ContextInjectionRef } from "../../shared/context-injection";
 import { ContextInjectionRow, ContextInjectionRows } from "./ContextInjectionRows";
 
@@ -119,7 +120,7 @@ describe("the Compressing Context row", () => {
   it("opens to the sizes and section names", () => {
     primeItemIo(
       { threadId: "t", itemId: "ctx-9" },
-      { status: "loaded", io: { itemId: "ctx-9", at: "x", text: { text: "Budget: 128.0 KiB\nSections dropped: memory", bytes: 40, truncated: false } as never } },
+      { status: "loaded", io: { itemId: "ctx-9", at: "x", text: boundText("Budget: 128.0 KiB\nSections dropped: memory") } },
     );
     const html = renderToStaticMarkup(createElement(ContextInjectionRow, { entry: compression, threadId: "t", defaultOpen: true }));
     expect(html).toContain('aria-expanded="true"');
