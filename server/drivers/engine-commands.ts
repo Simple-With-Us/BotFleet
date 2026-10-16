@@ -213,6 +213,17 @@ export function hasControlCharacter(text: string): boolean {
   return false;
 }
 
+/** The refusal engineCommandText raises for a command it will not put on the
+ *  wire.  A distinct type, because the message is prose a client shows the
+ *  owner and the caller has to tell this apart from an engine failure: a
+ *  refusal is the caller's mistake and answers 400, not 500. */
+export class EngineCommandTextError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EngineCommandTextError";
+  }
+}
+
 /** The one stdin line an engine reads for a command: "/name" plus an optional
  *  single-line argument.  Throws on a name or argument that is not safe to send,
  *  so a caller that skipped validation cannot smuggle a second line or a second
@@ -220,12 +231,14 @@ export function hasControlCharacter(text: string): boolean {
 export function engineCommandText(command: TurnCommand): string {
   const name = normalizeEngineCommandName(command.name);
   if (name === null || name !== command.name || isDeniedEngineCommand(name)) {
-    throw new Error(`"${command.name}" is not a command BotFleet can send`);
+    throw new EngineCommandTextError(`"${command.name}" is not a command BotFleet can send`);
   }
   const args = command.args?.trim() ?? "";
   if (args === "") return `/${name}`;
   if (args.length > ENGINE_COMMAND_ARGS_MAX || args.startsWith("/") || hasControlCharacter(args)) {
-    throw new Error(`the arguments for /${name} must be one line of at most ${ENGINE_COMMAND_ARGS_MAX} characters that does not start with a slash`);
+    throw new EngineCommandTextError(
+      `the arguments for /${name} must be one line of at most ${ENGINE_COMMAND_ARGS_MAX} characters that does not start with a slash`,
+    );
   }
   return `/${name} ${args}`;
 }
