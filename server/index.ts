@@ -89,7 +89,19 @@ import { cwdConfinementError, protectedCwdDirs, realOrResolved, validateBotCwd, 
 import { captureTaskWorkspaceContext, TaskWorkspaceContextError, taskWorkspaceExecutionError } from "./task-workspace-context.ts";
 import type { TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 import { resolveStaticFile } from "./static-files.ts";
-import { attachmentExists, extensionForMime, FILE_MAX_BYTES, IMAGE_MAX_BYTES, isImageMime, readAttachment, saveAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
+import {
+  attachmentExists,
+  DEFAULT_AUDIO_RETENTION_DAYS,
+  extensionForMime,
+  FILE_MAX_BYTES,
+  IMAGE_MAX_BYTES,
+  isImageMime,
+  readAttachment,
+  saveAttachment,
+  saveImage,
+  sweepExpiredAudioAttachments,
+  type SavedAttachment,
+} from "./attachments.ts";
 import { incomingRecording, recordingReview } from "./recorded-message.ts";
 import { openBotFleetDesktop } from "./desktop-open.ts";
 import { IdempotencyCache } from "./idempotency.ts";
@@ -2906,7 +2918,30 @@ setTimeout(() => {
   } catch (error) {
     console.error("[retention] pruneDeadThreads failed", error instanceof Error ? error.message : String(error));
   }
+
+  runAudioRetentionSweep();
 }, 60_000).unref?.();
+
+function runAudioRetentionSweep(): void {
+  try {
+    const retentionDays = cfg.tts?.audioRetentionDays ?? DEFAULT_AUDIO_RETENTION_DAYS;
+    const audioSweep = sweepExpiredAudioAttachments(retentionDays, { dryRun: retentionDryRun });
+    if (audioSweep.removedFiles > 0) {
+      const verb = audioSweep.dryRun ? "would remove" : "removed";
+      const mib = (audioSweep.freedBytes / (1024 * 1024)).toFixed(1);
+      console.log(
+        `[retention] ${verb} ${audioSweep.removedFiles} expired audio attachment(s) (${mib} MiB) older than ${retentionDays} day(s)`,
+      );
+    }
+  } catch (error) {
+    console.error("[retention] sweepExpiredAudioAttachments failed", error instanceof Error ? error.message : String(error));
+  }
+}
+
+setInterval(() => {
+  if (cleanupHoldReason(DATA_DIR)) return;
+  runAudioRetentionSweep();
+}, 24 * 60 * 60 * 1_000).unref?.();
 
 /** A bot as a client may see it: no provider session bookkeeping.
  *
@@ -18488,6 +18523,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (Object.hasOwn(patch, "zulip")) {
         cfg.zulip = loadConfig().zulip;
         zulipHub?.reconcile();
+      }
+      if (patch.tts?.audioRetentionDays !== undefined && !cleanupHoldReason(DATA_DIR)) {
+        runAudioRetentionSweep();
       }
       // VPS mode-switch cleanup (mirrors Local VM at POST /api/local-computer/mode).
       // Runs after the save so the lateImpact→saveConfig window stays await-free

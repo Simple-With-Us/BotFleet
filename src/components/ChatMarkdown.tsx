@@ -296,12 +296,24 @@ function Spoiler({ children }: { children?: ReactNode }) {
 
 const REMARK_PLUGINS = [remarkGfm, remarkMentions];
 
-const flattenCodeChildren = (n: any): string =>
+function hasElementProps(
+  node: unknown,
+): node is { props: { className?: string; children?: unknown } } {
+  return (
+    typeof node === "object" &&
+    node !== null &&
+    "props" in node &&
+    typeof (node as { props: unknown }).props === "object" &&
+    (node as { props: unknown }).props !== null
+  );
+}
+
+const flattenCodeChildren = (n: unknown): string =>
   typeof n === "string"
     ? n
     : Array.isArray(n)
       ? n.map(flattenCodeChildren).join("")
-      : n?.props?.children
+      : hasElementProps(n) && n.props.children !== undefined
         ? flattenCodeChildren(n.props.children)
         : "";
 
@@ -410,12 +422,13 @@ function ChatMarkdownComponent({ text, streaming = false }: { text: string; stre
       ...STATIC_MARKDOWN_COMPONENTS,
       pre({ children }: { children?: ReactNode }) {
         // fenced code arrives as <pre><code class="language-x">…</code></pre>
-        const child: any = Array.isArray(children) ? children[0] : children;
-        const className: string = child?.props?.className ?? "";
+        const first: unknown = Array.isArray(children) ? children[0] : children;
+        const child = hasElementProps(first) ? first : null;
+        const className = typeof child?.props.className === "string" ? child.props.className : "";
         const lang = /language-([\w-]+)/.exec(className)?.[1] ?? "";
         // children can be a string OR an array of strings/nodes — flatten
         // strings only, so String() never comma-joins an array
-        const code = flattenCodeChildren(child?.props?.children).replace(/\n$/, "");
+        const code = flattenCodeChildren(child?.props.children).replace(/\n$/, "");
         // a mermaid fence is a picture, not a program: hand it to the
         // diagram renderer instead of the highlighter
         if (lang.toLowerCase() === "mermaid") {

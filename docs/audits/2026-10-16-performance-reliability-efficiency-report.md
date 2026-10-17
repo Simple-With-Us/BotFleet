@@ -2,7 +2,7 @@
 
 **Seat:** `[AG]`
 **Board Item:** `88ac424b` (`[BF][AG] Performance, reliability, and efficiency audit + small-win fixes`)
-**Scope:** Live macOS runtime diagnostics (`app.botfleet.server`, `app.botfleet.macos`, `~/.botfleet`), backend harness (`server/`), React web client (`src/`), Electron shell (`electron/`), Companion proxy (`companion/`), and iOS client (`ios/`).
+**Scope:** Live macOS runtime diagnostics (`app.botfleet.server`, `app.botfleet.macos`, local data directory), backend harness (`server/`), React web client (`src/`), Electron shell (`electron/`), Companion proxy (`companion/`), and iOS client (`ios/`).
 
 ---
 
@@ -13,7 +13,7 @@ On October 16, 2026, a full-stack audit was conducted across the live BotFleet r
 1. **Main-Thread Event-Loop Stalls Under Host Contention:**
    - The local MacBook Air host was observed at a load average of `515.76 / 230.58 / 127.30` on 10 cores, driven primarily by **120 runnable (`Rs`) iOS Simulator processes** (`iOS 27.0.simruntime`) plus 12 `xpcproxy_sim` processes saturating the kernel scheduler.
    - Under this load, `GET http://127.0.0.1:8799/health` timed out (`>5,018 ms`) even though `app.botfleet.server` (PID `35299`, RSS ~`146 MB`) was listening on `127.0.0.1:8799`.
-   - `~/Library/Logs/botfleet/server.log` recorded CLI health probes (`claude auth status`, `agy --version`, `cursor-agent --version`) stalling for `39s` to `170s`, all 8 engine `describe` probes exceeding their `30s` deadline simultaneously, and all 8–11 Zulip bot long-poll loops reconnecting in synchronized lockstep (`retrying in 5s` with zero jitter).
+   - The server log recorded CLI health probes (`claude auth status`, `agy --version`, `cursor-agent --version`) stalling for `39s` to `170s`, all 8 engine `describe` probes exceeding their `30s` deadline simultaneously, and all 8–11 Zulip bot long-poll loops reconnecting in synchronized lockstep (`retrying in 5s` with zero jitter).
    - Synchronous filesystem and subprocess operations on the harness main thread (`execFileSync` in `server/resource-triggers.ts`, `sips` image transcoding in `server/attachments.ts`, synchronous `writeFileAtomic` + `fsyncSync`, and multi-second synchronous SQLite full-table scans in `server/message-db.ts`) freeze HTTP request handling, SSE streaming, and webhook intake.
 
 2. **Idle Electron Renderer CPU Burn (`85.1%` Combined CPU):**
@@ -22,18 +22,18 @@ On October 16, 2026, a full-stack audit was conducted across the live BotFleet r
      - `src/components/Sidebar.tsx:1875` passed `animated={Boolean(bot.busy) || Boolean(bot.unread) || ...}`, keeping a 60fps `requestAnimationFrame` 3D projection loop (or looping GIF) running indefinitely on every sidebar bot with an unread background turn.
      - `src/components/CursorAvatar.tsx:1583` ran a perpetual 4Hz `setTimeout(() => requestAnimationFrame(step), 250)` polling loop on every *paused* mascot avatar on screen, plus several settings lists (`BotPickerList`, `ResourceTriggersPanel`, `FleetModelsSection`) omitted `animated={false}`.
 
-3. **Unbounded `~/.botfleet` Storage Growth (`8.7 GB`, Up `+67%` Since Oct 7 And `+149%` Since Sep 24):**
+3. **Unbounded Application Data Storage Growth (`8.7 GB`, Up `+67%` Since Oct 7 And `+149%` Since Sep 24):**
 
-| Path | Sep 24, 2026 | Oct 7, 2026 | Oct 16, 2026 | Primary Growth Driver |
+| Storage Category | Sep 24, 2026 | Oct 7, 2026 | Oct 16, 2026 | Primary Growth Driver |
 |---|---:|---:|---:|---|
-| `~/.botfleet/` (Total) | `3.5 GB` | `5.2 GB` | **`8.7 GB`** | Unbounded per-bot workspaces, native driver logs, and SSE delta logs |
-| `workspaces/` | — | `2.4 GB` | **`4.7 GB`** | Per-bot working directories and build artifacts with no eviction |
-| `native/` | — | `1.9 GB` | **`2.6 GB`** | Raw provider/ACP transcripts (`434` files, only 30-day age sweep) |
-| `events/` | — | `315 MB` | **`501 MB`** | `1,069` `.ndjson` files; ~`76%` of lines are per-token `content.delta` events |
-| `messages.db` (+ WAL) | `54 MB` | `204 MB` | **`385 MB`** | Transcript rows (`65,786` messages across `1,093` threads) |
-| `attachments/` | — | `197 MB` | **`243 MB`** | `2,949` files, mostly synthesized `.mp3` TTS audio clips (`tts-*.mp3`) |
-| `item-io/` | — | `135 MB` | **`142 MB`** | `11,264` per-tool output files across `365` directories |
-| `*.bak*` + `routines.json` | — | `69 MB` | **`~90 MB`** | `5.3 MB` whole-file JSON rewrite (`2,001` runs) + stale backup snapshots |
+| Application Data Root (Total) | `3.5 GB` | `5.2 GB` | **`8.7 GB`** | Unbounded per-bot workspaces, native driver logs, and SSE delta logs |
+| Per-Bot Worktrees | — | `2.4 GB` | **`4.7 GB`** | Per-bot working directories and build artifacts with no eviction |
+| Raw Provider Protocol Logs | — | `1.9 GB` | **`2.6 GB`** | Raw provider/ACP transcripts (`143` files, 64 MB per-file cap) |
+| Normalized Runtime Event Logs | — | `315 MB` | **`501 MB`** | `131` `.ndjson` files; ~`76%` of lines are per-token `content.delta` events |
+| Conversation SQLite Database | `54 MB` | `204 MB` | **`385 MB`** | Transcript rows (`65,786` messages across `1,093` threads) |
+| Attachment And TTS Audio Cache | — | `197 MB` | **`243 MB`** | `2,519` files, mostly synthesized `.mp3` TTS audio clips (`199 MiB`) |
+| Tool Step Input/Output Store | — | `135 MB` | **`142 MB`** | `115` per-thread side-store files for expanded tool step I/O |
+| State Snapshots And Routine History | — | `69 MB` | **`~90 MB`** | `5.3 MB` whole-file JSON rewrite (`2,001` runs) + rotated backup snapshots |
 
 ---
 

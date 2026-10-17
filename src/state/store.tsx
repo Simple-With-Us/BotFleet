@@ -558,6 +558,7 @@ export interface ConfigStatus {
     voice: string;
     provider?: "minimax" | "system" | "xai" | "azure";
     optimizedSummary?: boolean;
+    audioRetentionDays?: number;
     pronunciations?: Pronunciation[];
   };
   /** Call-mode STT preference + global vocabulary, mirrored from AppConfig.
@@ -3270,6 +3271,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 // This Mac's own voice: its override, else the shared one.
                 voiceId: voiceForDevice(owner, "mac"),
                 scriptKind: voiceScriptKind(owner),
+                enqueue: true,
               });
             }
           }

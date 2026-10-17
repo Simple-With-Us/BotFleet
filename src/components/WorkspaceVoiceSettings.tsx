@@ -32,7 +32,12 @@ type WorkspaceTts = NonNullable<ConfigStatus["tts"]>;
  * config write (PUT /api/config, its validation) and the existing Try path;
  * tests hand in their own. */
 export interface WorkspaceVoiceDeps {
-  saveConfig(patch: { tts: { voice: string } } | { tts: { pronunciations: Pronunciation[] } }): Promise<ConfigStatus>;
+  saveConfig(
+    patch:
+      | { tts: { voice: string } }
+      | { tts: { pronunciations: Pronunciation[] } }
+      | { tts: { audioRetentionDays: number } },
+  ): Promise<ConfigStatus>;
   speak(text: string, voiceId: string): void;
 }
 
@@ -306,6 +311,77 @@ export function PronunciationSettings({
           Save Pronunciations
         </button>
       </div>
+    </div>
+  );
+}
+
+export const DEFAULT_AUDIO_RETENTION_DAYS = 7;
+
+export const AUDIO_RETENTION_OPTIONS: ReadonlyArray<{ days: number; label: string }> = [
+  { days: 1, label: "1 day" },
+  { days: 2, label: "2 days" },
+  { days: 7, label: "1 week (default)" },
+  { days: 14, label: "2 weeks" },
+  { days: 30, label: "30 days" },
+  { days: 90, label: "90 days" },
+  { days: 0, label: "Forever" },
+];
+
+export const AUDIO_RETENTION_HELP =
+  "How long synthesized voice clips and audio attachments are kept on disk before automatic cleanup.\u00A0 Playing an older reply again re-synthesizes its audio on demand.";
+
+export function AudioRetentionPicker({
+  tts,
+  onConfig,
+  deps = defaultWorkspaceVoiceDeps,
+}: {
+  tts: WorkspaceTts;
+  onConfig: (config: ConfigStatus) => void;
+  deps?: WorkspaceVoiceDeps;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const current = tts.audioRetentionDays ?? DEFAULT_AUDIO_RETENTION_DAYS;
+  const listed = AUDIO_RETENTION_OPTIONS.some((opt) => opt.days === current);
+
+  const save = (raw: string) => {
+    const next = Number(raw);
+    if (!Number.isInteger(next) || next < 0 || next === current) return;
+    setSaving(true);
+    setError(null);
+    deps.saveConfig({ tts: { audioRetentionDays: next } })
+      .then(onConfig)
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setSaving(false));
+  };
+
+  return (
+    <div className="mt-4 border-t border-hairline/40 pt-4" data-testid="audio-retention">
+      <div className="mb-1.5 flex items-center gap-2 text-[13px] font-medium text-ink">
+        <span>Audio File Retention</span>
+        {saving && <Loader2 size={12} className="animate-spin" aria-label="Saving" />}
+      </div>
+      <select
+        value={String(current)}
+        onChange={(e) => save(e.target.value)}
+        disabled={saving}
+        aria-label="Keep audio files for"
+        className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none disabled:opacity-60"
+      >
+        {!listed && (
+          <option value={String(current)}>
+            {current === 1 ? "1 day" : `${current} days`}
+          </option>
+        )}
+        {AUDIO_RETENTION_OPTIONS.map((option) => (
+          <option key={option.days} value={String(option.days)}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+      <p className="mt-1.5 text-[12px] text-ink-secondary">{AUDIO_RETENTION_HELP}</p>
+      {error && <div role="alert" className="mt-1.5 text-[12px] text-danger">{error}</div>}
     </div>
   );
 }
