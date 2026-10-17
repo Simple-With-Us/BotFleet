@@ -56,6 +56,14 @@ export interface ModelSelection {
   model: string;
   /** Optional: no effort means no flag, and the CLI keeps its own default. */
   effort?: EffortLevel;
+  /** Optional working-context cap in tokens (for example 524288 for 512K).
+   *  Absent means the model's full window.  Only honored for a model whose
+   *  catalog row lists it in `contextCaps`. */
+  contextCap?: number;
+  /** Optional output limit in tokens, sent to the provider only when set and
+   *  only for a model whose row has `supportsMaxOutput`.  Absent means the
+   *  model's own limit. */
+  maxOutputTokens?: number;
   /** Optional: a model class this entry floats on ("Latest Sonnet" is
    *  `latest: "sonnet"`).  `model` is still the real slug that runs — the
    *  harness keeps it pointed at the newest member of the class the
@@ -290,6 +298,12 @@ export interface SendTurnInput {
   text: string;
   model?: string;
   effort?: EffortLevel;
+  /** The bot's chosen context cap in tokens, when its model offers one.  A
+   *  driver that budgets the prompt sizes it from this (see `contextCapTokens`
+   *  in the driver config, which this overrides for the turn). */
+  contextCapTokens?: number;
+  /** The bot's output limit in tokens, when its model supports one. */
+  maxOutputTokens?: number;
   resumeCursor?: unknown;
   /** The turn with the conversation so far replayed inline, attached only
    * alongside resumeCursor. A cursor-resuming driver sends it once, on a
@@ -837,6 +851,12 @@ export interface ModelCatalog {
      * When defined, only models with non-empty effortLevels support effort. */
     effortLevels?: readonly EffortLevel[];
     supportsEffort?: boolean;
+    /** Working-context caps (tokens) the picker offers besides the full
+     * window, for a model that is useful below it.  Absent means no choice. */
+    contextCaps?: readonly number[];
+    /** The driver sends a per-bot output limit for this model
+     * (`maxOutputTokens`).  Absent means it does not, and the picker hides it. */
+    supportsMaxOutput?: boolean;
     /** Whether this model can interpret an attached image. Absent inherits the engine gate. */
     images?: boolean;
   }>;

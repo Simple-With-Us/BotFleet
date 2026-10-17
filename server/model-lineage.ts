@@ -176,11 +176,8 @@ export function modelNameFor(models: CatalogLike | undefined, id: string): strin
   return models?.options.find((option) => option.id === id)?.label ?? anyLineageLabel(id) ?? id;
 }
 
-function rawLatest(raw: unknown): { present: boolean; value: unknown } {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { present: false, value: undefined };
-  return Object.hasOwn(raw, "latest")
-    ? { present: true, value: (raw as { latest?: unknown }).latest }
-    : { present: false, value: undefined };
+function rawHasKey(raw: unknown, key: string): boolean {
+  return raw !== null && typeof raw === "object" && !Array.isArray(raw) && Object.hasOwn(raw, key);
 }
 
 function rawFallback(raw: unknown, index: number): unknown {
@@ -257,7 +254,7 @@ function carryLatestChain(
   const open: number[] = [];
   const carries = (index: number) => {
     const entry = incoming[index]!;
-    return entry.latest === undefined && !rawLatest(raws[index]).present;
+    return entry.latest === undefined && !rawHasKey(raws[index], "latest");
   };
   incoming.forEach((entry, index) => {
     const same = saved[index];
@@ -292,6 +289,50 @@ function carryLatestChain(
     out[index] = { ...entry, latest: saved[at]!.latest };
   }
   return out;
+}
+
+const TOKEN_LIMIT_KEYS = ["contextCap", "maxOutputTokens"] as const;
+
+/** A client that predates `contextCap` and `maxOutputTokens` (the shipped iOS
+ *  app decodes only instanceId / model / effort / fallbacks) re-sends a
+ *  selection without them whenever it edits the effort or the fallbacks, and
+ *  `checkedModelSelection` would read that as "clear both".  When an entry
+ *  still names the engine and model of a saved entry, a limit the entry's raw
+ *  body does not mention is kept.  An explicit `null` is how a client that
+ *  knows the fields clears one (the desktop picker sends it), and an entry on
+ *  a different model never inherits a limit that belonged to another model.
+ *
+ *  Pairing is the one `carryLatestChain` starts with: by position when the
+ *  saved entry there names the same target, then the first unpaired saved
+ *  entry that does.  Each saved entry is paired at most once. */
+function carryTokenLimits(
+  incoming: ModelSelection[],
+  raws: unknown[],
+  saved: ModelSelection[],
+): ModelSelection[] {
+  const used = new Set<number>();
+  const paired: Array<ModelSelection | undefined> = incoming.map((entry, index) => {
+    const same = saved[index];
+    if (!same || !sameTarget(same, entry)) return undefined;
+    used.add(index);
+    return same;
+  });
+  incoming.forEach((entry, index) => {
+    if (paired[index]) return;
+    const match = saved.findIndex((candidate, at) => !used.has(at) && sameTarget(candidate, entry));
+    if (match < 0) return;
+    used.add(match);
+    paired[index] = saved[match];
+  });
+  return incoming.map((entry, index) => {
+    const from = paired[index];
+    if (!from) return entry;
+    const next = { ...entry };
+    for (const key of TOKEN_LIMIT_KEYS) {
+      if (from[key] !== undefined && entry[key] === undefined && !rawHasKey(raws[index], key)) next[key] = from[key];
+    }
+    return next;
+  });
 }
 
 /** Why an explicit `latest` on one entry cannot be honoured, or null.  The
@@ -366,6 +407,8 @@ export type LineageWriteResult =
  *    not match the model, or sits on an operator's custom catalog row.
  *  - Carries `latest` forward for clients that do not send it, including a
  *    stale copy of a model the float has since moved past.
+ *  - Carries `contextCap` and `maxOutputTokens` forward the same way, for
+ *    clients that do not send them (an explicit `null` clears one).
  *  - Refuses a retired id with no successor, but only when this write
  *    introduces it: the UI re-sends the whole chain on every edit, and a
  *    saved leftover in one slot must not block editing another.
@@ -390,7 +433,7 @@ export function checkLineageWrite(
     }
   }
   const raws = [raw, ...(selection.fallbacks ?? []).map((_, index) => rawFallback(raw, index))];
-  const carried = carryLatestChain(asked, raws, saved, contextFor);
+  const carried = carryTokenLimits(carryLatestChain(asked, raws, saved, contextFor), raws, saved);
   const incoming: ModelSelection = { ...carried[0]! };
   delete incoming.fallbacks;
   if (selection.fallbacks) incoming.fallbacks = carried.slice(1);

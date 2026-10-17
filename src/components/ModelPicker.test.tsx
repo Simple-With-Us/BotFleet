@@ -28,7 +28,7 @@ vi.mock("@/state/store", () => ({
 }));
 
 // Imported after the mock is registered (vitest hoists vi.mock above imports).
-import { EffortSection, LocalModelsPanel, ModelPicker, ModelRow } from "./ModelPicker";
+import { ContextSection, EffortSection, MaxOutputSection, LocalModelsPanel, ModelPicker, ModelRow } from "./ModelPicker";
 
 type Option = InstanceInfo["models"]["options"][number];
 
@@ -631,8 +631,35 @@ describe("Effort section in the chat model menu", () => {
     const tree = EffortSection({ levels: ["low", "high"], current: "low", onPick });
     const choices = findElements(tree, (element) => element.type === "button");
     expect(choices).toHaveLength(3);
-    for (const choice of choices) (choice.props as { onClick: () => void }).onClick();
+    for (const choice of choices) {
+      // SAFETY: This section creates each button with its own onClick callback.
+      (choice.props as { onClick: () => void }).onClick();
+    }
     expect(onPick.mock.calls).toEqual([[undefined], ["low"], ["high"]]);
+  });
+
+  it("Max Input Tokens: presets plus a custom field, No Limit first, hidden with no caps", () => {
+    const html = renderToStaticMarkup(
+      createElement(ContextSection, { caps: [524_288], windowTokens: 1_000_000, current: undefined, onPick: () => {} }),
+    );
+    expect(html).toContain("Max Input Tokens");
+    expect(html).toContain("No Limit (1M)");
+    expect(html).toContain(">512K<");
+    expect(html).toContain('placeholder="Custom"');
+    expect(html).toContain("Empty is no limit.");
+    // A saved value that is not a preset shows in the custom field.
+    const custom = renderToStaticMarkup(
+      createElement(ContextSection, { caps: [524_288], windowTokens: 1_000_000, current: 300_000, onPick: () => {} }),
+    );
+    expect(custom).toContain('value="300000"');
+    expect(renderToStaticMarkup(createElement(ContextSection, { caps: [], current: undefined, onPick: () => {} }))).toBe("");
+  });
+
+  it("Max Output Tokens renders a group with an empty Default field", () => {
+    const html = renderToStaticMarkup(createElement(MaxOutputSection, { current: undefined, windowTokens: 1_000_000, onPick: () => {} }));
+    expect(html).toContain("Max Output Tokens");
+    expect(html).toContain('placeholder="Default"');
+    expect(html).toContain("Empty uses the model default.");
   });
 
   it("renders nothing for a model with no levels", () => {

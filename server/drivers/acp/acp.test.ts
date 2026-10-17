@@ -553,6 +553,22 @@ describe("ACP turns (fake CLI)", () => {
     expect(row).toBeDefined();
   });
 
+  it("a turn's contextCapTokens overrides the driver config", async () => {
+    await create(GrokAgentDriver, "echo-gated", { contextCapTokens: 10_000_000 });
+    await instance.adapter.sendTurn({
+      threadId: "t-turn-cap",
+      text: "CURRENT",
+      contextCapTokens: 100,
+      system: `STABLE${"s ".repeat(40)}MENT ${"n ".repeat(500)}`,
+      systemSections: [
+        { id: "persona", text: `STABLE${"s ".repeat(40)}`, volatile: false },
+        { id: "mentions", text: `MENT ${"n ".repeat(500)}`, volatile: true },
+      ],
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(recorder.events.find((event) => event.type === "context.injected" && event.source === "compression")).toBeDefined();
+  });
+
   it("emits no Compressing Context row when the prompt fits", async () => {
     await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 0 });
     await instance.adapter.sendTurn({ threadId: "t-fits", text: "hi", system: "SYS" });
