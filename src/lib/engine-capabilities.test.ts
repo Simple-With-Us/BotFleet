@@ -289,15 +289,15 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // (server/drivers/claude.ts, codex.ts, antigravity.ts, and the DSH
     // ACP adapter).  A missing key renders as "-", which reads as
     // "engine cannot do this" — the exact underclaim Codex flagged.
-    for (const id of ["claude", "codex", "antigravity", "deepseek-harness", "minimax"]) {
+    for (const id of ["claude", "codex", "antigravity", "deepseek-harness", "grok", "cursor", "mcode"]) {
       expect(ENGINE_CAPABILITIES[id].capabilities.connectedApps, id).toBe("yes");
     }
   });
 
-  it("marks MiniMax connectedApps as 'yes' — the driver declares composioMcp", () => {
-    // Connected Apps is the Composio bridge, and MiniMax's direct
-    // driver declares composioMcp in server/drivers/minimax.ts.
-    expect(ENGINE_CAPABILITIES.minimax.capabilities.connectedApps).toBe("yes");
+  it("marks MiniMax API connectedApps as 'no' — the direct HTTP driver does not mount composioMcp", () => {
+    // Connected Apps is the Composio bridge, which the ACP/CLI drivers mount
+    // (including MiniMax Code) while the direct HTTP MiniMax driver does not.
+    expect(ENGINE_CAPABILITIES.minimax.capabilities.connectedApps).toBe("no");
   });
 
   it("keeps MiniMax Code a distinct engine row on the same Token Plan", () => {
@@ -322,7 +322,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // engine declares neither.
     expect(mcode.capabilities.connectedApps).toBe("yes");
     expect(mcode.capabilities.imageAttachments).toBe("yes");
-    expect(minimaxEntry.capabilities.connectedApps).toBe("yes");
+    expect(minimaxEntry.capabilities.connectedApps).toBe("no");
     // The matrix lists the ids a live mcode session actually advertises, so
     // the engine's declared models and the picker's rows agree.
     expect(mcode.defaultModels.map((m) => m.id)).toEqual([

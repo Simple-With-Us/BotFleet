@@ -252,31 +252,27 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       imageAttachments: "yes",
       longContext: "yes",
       liveResearch: "yes",
-      crossBotCoordination: "limited",
-      // The Grok driver mounts no Connected Apps channel and no computer-use
-      // channel, and the prose below already recorded the rooms and voice
-      // gaps.  All four are BotFleet gaps on this build, not limits on what
-      // the model can do — hence "no" rather than "unknown" here.
-      connectedApps: "no",
-      roomCoordination: "no",
+      crossBotCoordination: "yes",
+      connectedApps: "yes",
+      roomCoordination: "yes",
       voiceChat: "no",
-      computerUse: "no",
+      computerUse: "yes",
     },
     capabilityNotes: {
       longContext:
         "Grok 4.7 holds half a million tokens in one turn.  Prompts at or above 200,000 tokens bill at the higher long-context rate.",
       crossBotCoordination:
-        "Team tools are mounted, so a Grok bot can ask another bot for work.  The channel is partially built, so treat a long hand-off as less reliable than a direct ask.",
+        "The Grok Build ACP driver mounts BotFleet's team tools, so a Grok bot can delegate work to peers and answer when asked.",
       connectedApps:
-        "The Grok Build driver mounts the Connected Apps bridge, but nobody has run the end-to-end path on a real Grok turn yet.  The cell says not available because that is what a user would hit today, not because the wiring is missing.",
+        "The Grok Build ACP driver mounts the Connected Apps via Composio bridge alongside the team and computer channels.",
       computerUse:
-        "The driver carries the screen channel and the matrix still calls it unavailable, because no turn on this engine has driven another computer's screen yet.  Say the word and it can be audited and flipped.",
+        "The Grok Build ACP driver mounts BotFleet's screen channel so a bot can inspect and drive a desktop under the standard approval cards.",
     },
     whyThisEngine: {
       headline: "Grok 4.7 with long context and live research.",
       prose: [
-        "Grok 4.7 is available on an xAI subscription.  Files, terminal, this computer, web access, image attachments, long context, and live research are available.",
-        "Cross-bot coordination is limited on this build.  Connected apps, rooms, voice chat, and computer use are not available on the Grok engine yet.",
+        "Grok 4.7 is available on an xAI subscription.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, long context, and live research are available.",
+        "Voice chat is not available on the Grok engine yet.",
         "A public xAI API rate card is kept for the what-if projection.  Those rates are a catalog reference, not an invoice.",
       ],
     },
@@ -329,25 +325,23 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       imageAttachments: "yes",
       longContext: "yes",
       crossBotCoordination: "yes",
-      // Recorded gaps, from the prose below: the registry deliberately
-      // treats these as BotFleet work still to do on the Cursor CLI.
-      connectedApps: "no",
-      roomCoordination: "no",
+      connectedApps: "yes",
+      roomCoordination: "yes",
       voiceChat: "no",
-      computerUse: "no",
+      computerUse: "yes",
       liveResearch: "no",
     },
     capabilityNotes: {
       connectedApps:
-        "Cursor's ACP driver does mount the Connected Apps bridge — the same mount Claude and Codex use.  This engine stays marked unavailable because the path has not been walked end to end on a real Cursor turn, and a green cell on an unrun path is how a bot gets told to use a channel that has never worked for it.",
+        "Cursor's ACP driver mounts the Connected Apps via Composio bridge alongside the agents and local-computer channels.",
       computerUse:
-        "The screen channel is mounted for this driver and unaudited on a real turn, so the cell stays unavailable until someone drives another computer's screen with Cursor and can report what happened.",
+        "Cursor's ACP driver mounts BotFleet's screen channel so a bot can drive a desktop under the standard approval cards.",
     },
     whyThisEngine: {
       headline: "Cursor's coding agent, driven over ACP.",
       prose: [
-        "BotFleet drives the Cursor CLI over ACP.  Files, terminal, this computer, web access, image attachments, and long context are available.",
-        "Cross-bot coordination is available.  Connected apps, rooms, voice chat, and computer use are not available on the Cursor engine yet.",
+        "BotFleet drives the Cursor CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
+        "Voice chat and live research are not available on the Cursor engine.",
         "Pricing mode is a Cursor subscription.  BotFleet does not register a separate Cursor API rate.",
       ],
     },
@@ -437,9 +431,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       connectedApps: "yes",
       longContext: "yes",
       computerUse: "yes",
-      // Recorded gaps, from the prose below.
-      crossBotCoordination: "no",
-      roomCoordination: "no",
+      crossBotCoordination: "yes",
+      roomCoordination: "yes",
       voiceChat: "no",
       liveResearch: "no",
     },
@@ -449,13 +442,13 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       computerUse:
         "The Codex driver drives another computer's screen, so clicks and typing arrive as tool calls under the same approval cards as everything else.",
       crossBotCoordination:
-        "Team tools are mounted for this driver and have not been exercised on a Codex turn, so the cell stays unavailable rather than claiming a hand-off nobody has watched work.",
+        "The Codex driver mounts BotFleet's team tools so a Codex bot can delegate work to peers and answer when asked.",
     },
     whyThisEngine: {
       headline: "OpenAI coding models with files, terminal, and computer use.",
       prose: [
-        "Codex runs OpenAI coding models on a ChatGPT subscription.  Files, terminal, this computer, web access, image attachments, connected apps, and long context are available.",
-        "Computer use is available.  Cross-bot coordination, rooms, voice chat, and live research are not available on the Codex engine yet.",
+        "Codex runs OpenAI coding models on a ChatGPT subscription.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
+        "Voice chat and live research are not available on the Codex engine.",
         "Pricing mode is a ChatGPT subscription.  BotFleet does not register a separate OpenAI API rate for this engine.",
       ],
     },
@@ -498,11 +491,10 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       // the matrix used to render "-" here because the registry omitted it.
       connectedApps: "yes",
       liveResearch: "yes",
-      // Recorded gaps, from the prose below.
-      crossBotCoordination: "no",
-      roomCoordination: "no",
+      crossBotCoordination: "yes",
+      roomCoordination: "yes",
       voiceChat: "no",
-      computerUse: "no",
+      computerUse: "yes",
       // Gemini 3.8 Flash and Gemini 3.1 Pro offer a 1M token context window.
       longContext: "yes",
     },
@@ -510,16 +502,16 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       liveResearch:
         "Gemini runs the research pass itself, so a bot can sweep several sources inside one turn and come back with the answer rather than a list of links.",
       computerUse:
-        "The driver mounts the screen channel and this engine has never driven another computer's screen, so the cell stays unavailable until someone does and can report the result.",
+        "The Antigravity driver mounts BotFleet's screen channel so a bot can inspect and drive a desktop under the standard approval cards.",
       crossBotCoordination:
-        "Team tools ride the Antigravity mount but no Antigravity turn has asked a peer for work yet, so the cell stays unavailable rather than guessing from the wiring.",
+        "The Antigravity driver mounts BotFleet's team tools so a Gemini bot can coordinate with peers across the fleet.",
     },
     whyThisEngine: {
       headline: "Gemini models with files, web, images, and live research.",
       prose: [
-        "Antigravity runs Gemini models on a Google AI subscription.  Files, terminal, this computer, web access, image attachments, and connected apps are available.",
+        "Antigravity runs Gemini models on a Google AI subscription.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "Live research is available.  Quota is reported as four windows:  Gemini Models and Third-Party Models, each across a 5-hour period and a weekly period.",
-        "Cross-bot coordination, rooms, voice chat, and computer use are not available on the Antigravity engine yet.  Public Gemini API rates are a catalog reference for the what-if projection, not an invoice.",
+        "Voice chat is not available on the Antigravity engine yet.  Public Gemini API rates are a catalog reference for the what-if projection, not an invoice.",
       ],
     },
     defaultModels: [
@@ -571,7 +563,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       longContext: "yes",
       roomCoordination: "yes",
       voiceChat: "no",
-      computerUse: "no",
+      computerUse: "yes",
       liveResearch: "no",
     },
     capabilityNotes: {
@@ -579,6 +571,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
       longContext:
         "Clutch serves 1M-token context models across DeepSeek V4.1 Flash, DeepSeek V4 Pro, Meta Muse Spark, and MiniMax M3.1 Flash Preview.",
+      computerUse:
+        "The Clutch ACP bridge mounts BotFleet's screen channel so a bot can inspect and drive a desktop under the standard approval cards.",
     },
     whyThisEngine: {
       headline: "DeepSeek, Muse, and MiniMax models through the Clutch bridge.",
@@ -633,27 +627,24 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       crossBotCoordination: "yes",
       roomCoordination: "yes",
       voiceChat: "yes",
-      // The MiniMax driver declares composioMcp, mounting Connected Apps.
-      connectedApps: "yes",
       longContext: "yes",
       // The direct HTTP driver exposes none of these channels.  These are
       // wiring facts, not guesses about what the underlying model can do.
+      connectedApps: "no",
       webAccess: "no",
       imageAttachments: "no",
       computerUse: "no",
       liveResearch: "no",
     },
     capabilityNotes: {
-      connectedApps:
-        "Connected Apps is the Composio bridge, which the MiniMax driver mounts alongside agents and local-computer tools.",
       roomCoordination:
         "Rooms and peers are both mounted here, which makes the MiniMax API engine the one that holds a channel conversation best across the fleet.",
     },
     whyThisEngine: {
       headline: "Files, terminal, rooms, voice, and long context.",
       prose: [
-        "The MiniMax API engine runs on a Token Plan subscription.  Files, terminal, this computer, long context, cross-bot coordination, connected apps, and rooms are available.",
-        "Voice chat is available.",
+        "The MiniMax API engine runs on a Token Plan subscription.  Files, terminal, this computer, long context, cross-bot coordination, and rooms are available.",
+        "Voice chat is available.  Connected apps, web access, image attachments, computer use, and live research are not available on the MiniMax API engine; use MiniMax Code for connected apps, web access, image attachments, and computer use.",
         "Public PAYG API rates are kept for the what-if projection.  They are a catalog reference, not an invoice.",
       ],
     },
@@ -701,9 +692,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       crossBotCoordination: "yes",
       longContext: "yes",
       roomCoordination: "yes",
-      // Recorded gaps, from the prose below.
+      computerUse: "yes",
       voiceChat: "no",
-      computerUse: "no",
       liveResearch: "no",
     },
     capabilityNotes: {
@@ -712,14 +702,14 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       thisComputer:
         "MiniMax Code runs its own CLI on this Mac, so the bot reads and writes the same working folder the rest of the fleet does.",
       computerUse:
-        "The ACP core mounts the screen channel for this driver, and no MiniMax Code turn has used it yet, so the cell stays unavailable instead of claiming a screen a bot has never driven with this engine.",
+        "The ACP core mounts BotFleet's screen channel for this driver so a bot can inspect and drive a desktop under the standard approval cards.",
     },
     whyThisEngine: {
       headline: "MiniMax's own coding CLI, driven over the same Token Plan.",
       prose: [
-        "MiniMax Code runs MiniMax's coding CLI inside BotFleet.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
+        "MiniMax Code runs MiniMax's coding CLI inside BotFleet.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "It signs in with the CLI's own login and draws on the same Token Plan as the MiniMax engine, so the two rows report one subscription.",
-        "Voice chat, computer use, and live research are not available on the MiniMax Code engine yet.",
+        "Voice chat and live research are not available on the MiniMax Code engine yet.",
       ],
     },
     defaultModels: [
@@ -772,7 +762,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       connectedApps: "yes",
       crossBotCoordination: "yes",
       roomCoordination: "yes",
-      computerUse: "no",
+      computerUse: "yes",
       voiceChat: "no",
       webAccess: "no",
       liveResearch: "no",
@@ -788,13 +778,15 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         "Voice lives in Muse Code's own terminal composer and has no session-protocol method, so BotFleet cannot start a voice turn on this engine.",
       thisComputer:
         "Muse Code runs its CLI on this Mac, so the bot reads and writes the same working folder the rest of the fleet does.",
+      computerUse:
+        "The ACP adapter mounts BotFleet's screen channel so a bot can inspect and drive a desktop under the standard approval cards.",
     },
     whyThisEngine: {
       headline: "Meta's coding CLI, over a 1M-token window with no long-context premium.",
       prose: [
-        "Muse Code runs inside BotFleet through Meta's Muse Spark models.  Files, terminal, this computer, image attachments, and long context are available.",
+        "Muse Code runs inside BotFleet through Meta's Muse Spark models.  Files, terminal, this computer, computer use, image attachments, and long context are available.",
         "The model a turn actually uses is your account's startup model, which the engine does not control yet; the matrix names Muse Spark 1.2 because that is the one this driver can point at.",
-        "Connected apps, cross-bot coordination, and rooms are available through the adapter.  Computer use, web access, live research, and voice chat are not available on this engine.",
+        "Connected apps, cross-bot coordination, and rooms are available through the adapter.  Web access, live research, and voice chat are not available on this engine.",
         "Voice chat is not available on this engine.  BotFleet drives Muse Code through a community ACP adapter, because Muse Code speaks its own session protocol rather than ACP.",
         "Signing in needs an API key:  a browser session stored in the Mac keychain is not readable by the adapter, so a keychain-only account cannot run a turn.",
       ],
@@ -822,7 +814,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       connectedApps: "yes",
       crossBotCoordination: "yes",
       roomCoordination: "yes",
-      computerUse: "no",
+      computerUse: "yes",
       imageAttachments: "yes",
       webAccess: "yes",
       longContext: "yes",
@@ -831,13 +823,13 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     },
     capabilityNotes: {
       connectedApps:
-        "The driver declares no MCP opt-out, so the ACP core mounts BotFleet's servers for it.  Connected apps and cross-bot coordination are available.",
+        "The driver declares no MCP opt-out, so the ACP core mounts BotFleet's servers for it.  Connected apps, screen control, and cross-bot coordination are available.",
     },
     whyThisEngine: {
       headline: "Moonshot's coding CLI, driven over ACP.",
       prose: [
-        "BotFleet drives the Kimi CLI over ACP.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
-        "Computer use, voice chat, and live research are not available on this engine.",
+        "BotFleet drives the Kimi CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
+        "Voice chat and live research are not available on this engine.",
         "Pricing for this engine is not recorded in this build.",
       ],
     },
@@ -862,7 +854,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       connectedApps: "yes",
       crossBotCoordination: "yes",
       roomCoordination: "yes",
-      computerUse: "no",
+      computerUse: "yes",
       imageAttachments: "yes",
       webAccess: "yes",
       longContext: "yes",
@@ -876,9 +868,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "Factory's CLI, one engine over several providers' models.",
       prose: [
-        "BotFleet drives the Droid CLI over ACP.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
+        "BotFleet drives the Droid CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "The engine's own catalog spans several providers, which is why its row carries one badge rather than a model-family claim.",
-        "Computer use, voice chat, and live research are not available on this engine.",
+        "Voice chat and live research are not available on this engine.",
         "Pricing for this engine is not recorded in this build.",
       ],
     },
@@ -904,7 +896,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       connectedApps: "yes",
       crossBotCoordination: "yes",
       roomCoordination: "yes",
-      computerUse: "no",
+      computerUse: "yes",
       imageAttachments: "yes",
       webAccess: "yes",
       longContext: "yes",
@@ -918,8 +910,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "The open-source coding CLI, driven over ACP.",
       prose: [
-        "BotFleet drives the OpenCode CLI over ACP.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
-        "Computer use, voice chat, and live research are not available on this engine.",
+        "BotFleet drives the OpenCode CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
+        "Voice chat and live research are not available on this engine.",
         "Pricing for this engine is not recorded in this build.",
       ],
     },
@@ -947,9 +939,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       connectedApps: "yes",
       crossBotCoordination: "yes",
       roomCoordination: "yes",
-      computerUse: "no",
+      computerUse: "yes",
       imageAttachments: "yes",
-      webAccess: "unknown",
+      webAccess: "yes",
       longContext: "no",
       liveResearch: "no",
       voiceChat: "no",
@@ -957,9 +949,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "Qwen Code as a custom host, so you choose the endpoint.",
       prose: [
-        "BotFleet drives the Qwen Code CLI over ACP.  Files, terminal, this computer, image attachments, connected apps, cross-bot coordination, and rooms are available.",
+        "BotFleet drives the Qwen Code CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, and rooms are available.",
         "The model list comes from whichever local host you have configured rather than from a catalog this build ships, so there is no default model to name here.",
-        "Computer use, voice chat, long context, and live research are not available on this engine.  Pricing follows the endpoint you configure.",
+        "Voice chat, long context, and live research are not available on this engine.  Pricing follows the endpoint you configure.",
       ],
     },
     defaultModels: [],
@@ -979,9 +971,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       connectedApps: "yes",
       crossBotCoordination: "yes",
       roomCoordination: "yes",
-      computerUse: "no",
+      computerUse: "yes",
       imageAttachments: "yes",
-      webAccess: "unknown",
+      webAccess: "yes",
       longContext: "no",
       liveResearch: "no",
       voiceChat: "no",
@@ -989,9 +981,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "Hermes as a custom host, so you choose the endpoint.",
       prose: [
-        "BotFleet drives the Hermes CLI over ACP.  Files, terminal, this computer, image attachments, connected apps, cross-bot coordination, and rooms are available.",
+        "BotFleet drives the Hermes CLI over ACP.  Files, terminal, this computer, computer use, web access, image attachments, connected apps, cross-bot coordination, and rooms are available.",
         "The model list comes from whichever local host you have configured, so there is no default model to name here.",
-        "Computer use, voice chat, long context, and live research are not available on this engine.  Pricing follows the endpoint you configure.",
+        "Voice chat, long context, and live research are not available on this engine.  Pricing follows the endpoint you configure.",
       ],
     },
     defaultModels: [],
@@ -1011,23 +1003,23 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       connectedApps: "yes",
       crossBotCoordination: "yes",
       roomCoordination: "yes",
-      computerUse: "no",
+      computerUse: "yes",
       imageAttachments: "yes",
-      webAccess: "unknown",
+      webAccess: "no",
       longContext: "no",
       liveResearch: "no",
       voiceChat: "no",
     },
     capabilityNotes: {
       connectedApps:
-        "pi has no MCP client of its own, so BotFleet mounts its servers through the pi MCP extension as stdio servers.  Connected apps, image attachments, and cross-bot coordination are available.",
+        "pi has no MCP client of its own, so BotFleet mounts its servers through the pi MCP extension as stdio servers.  Connected apps, screen control, image attachments, and cross-bot coordination are available.",
     },
     whyThisEngine: {
       headline: "A custom-host engine whose channels arrive as mounted stdio servers.",
       prose: [
-        "BotFleet drives the pi CLI.  Files, terminal, this computer, image attachments, connected apps, cross-bot coordination, and rooms are available.",
+        "BotFleet drives the pi CLI.  Files, terminal, this computer, computer use, image attachments, connected apps, cross-bot coordination, and rooms are available.",
         "pi takes no MCP client of its own, so every channel reaches it through an extension BotFleet mounts.",
-        "Computer use, voice chat, long context, and live research are not available on this engine.  Pricing follows the endpoint you configure.",
+        "Web access, voice chat, long context, and live research are not available on this engine.  Pricing follows the endpoint you configure.",
       ],
     },
     defaultModels: [],
@@ -1043,7 +1035,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       files: "yes",
       terminal: "yes",
       thisComputer: "yes",
-      connectedApps: "yes",
+      connectedApps: "no",
       computerUse: "no",
       imageAttachments: "no",
       crossBotCoordination: "yes",
@@ -1053,15 +1045,11 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       liveResearch: "no",
       voiceChat: "no",
     },
-    capabilityNotes: {
-      connectedApps:
-        "This driver reaches whatever endpoint you configure — it mounts the agents, local-computer, and Composio channels.",
-    },
     whyThisEngine: {
       headline: "Any OpenAI-compatible endpoint, as a custom host.",
       prose: [
-        "BotFleet drives any OpenAI-compatible endpoint — OpenRouter, Groq, or a local server.  Files, terminal, this computer, connected apps, cross-bot coordination, and rooms are available.",
-        "Computer use, image attachments, web access, long context, live research, and voice chat are not available on this engine.",
+        "BotFleet drives any OpenAI-compatible endpoint — OpenRouter, Groq, or a local server.  Files, terminal, this computer, cross-bot coordination, and rooms are available.",
+        "Connected apps, computer use, image attachments, web access, long context, live research, and voice chat are not available on this engine.",
         "Pricing follows the endpoint you configure rather than a plan this build ships.",
       ],
     },

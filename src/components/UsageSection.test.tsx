@@ -212,68 +212,23 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
     expect(plans.grok).toEqual({ planName: "xAI SuperGrok Heavy", costPerMonth: 99 });
   });
 
-  it("detects engine plans from CodeCaps / Usage Monitor quota windows", () => {
+  it("does not claim to auto-detect subscription billing plans from quota windows", () => {
     const windows = [
       { providerKey: "cursor", planName: "ultra", label: "Cursor Ultra" },
-      { providerKey: "anthropic", planName: "pro", label: "Claude Pro" },
+      { providerKey: "anthropic", planName: "Max", label: "5-Hour" },
       { providerKey: "openai", planName: "plus", label: "ChatGPT Plus" },
       { providerKey: "xai", planName: "super", label: "xAI SuperGrok" },
       { providerKey: "minimax", planName: "starter", label: "MiniMax Token Plan Starter" },
       { providerKey: "google", planName: "ultra", label: "Google AI Ultra" },
     ];
 
-    expect(detectEnginePlanFromWindows("cursor", windows)).toEqual({
-      label: "Cursor Ultra",
-      planName: "Cursor Ultra",
-      costPerMonth: null,
-    });
-    expect(detectEnginePlanFromWindows("claude", windows)).toEqual({
-      label: "Claude Pro ($20/mo)",
-      planName: "Claude Pro",
-      costPerMonth: 20,
-    });
-    expect(detectEnginePlanFromWindows("codex", windows)).toEqual({
-      label: "ChatGPT Plus ($20/mo)",
-      planName: "ChatGPT Plus",
-      costPerMonth: 20,
-    });
-    expect(detectEnginePlanFromWindows("grok", windows)).toEqual({
-      label: "xAI SuperGrok ($30/mo)",
-      planName: "xAI SuperGrok",
-      costPerMonth: 30,
-    });
-    expect(detectEnginePlanFromWindows("minimax", windows)).toEqual({
-      label: "Token Plan Starter ($15/mo)",
-      planName: "MiniMax Token Plan Starter",
-      costPerMonth: 15,
-    });
-    expect(detectEnginePlanFromWindows("antigravity", windows)).toEqual({
-      label: "Google AI Ultra ($105.79/mo)",
-      planName: "Google AI Ultra",
-      costPerMonth: 105.79,
-    });
-
-    const all = autoDetectAllEnginePlans(windows);
-    expect(all.cursor.planName).toBe("Cursor Ultra");
-    expect(all.claude.planName).toBe("Claude Pro");
-    expect(all.codex.planName).toBe("ChatGPT Plus");
-    expect(all.grok.planName).toBe("xAI SuperGrok");
-  });
-
-  it("does not falsely detect Claude Max 5x from duration window label or bare Max plan", () => {
-    const genericMaxWindow = [
-      { providerKey: "anthropic", label: "5-Hour", planName: "Max", usedPercent: 10 },
-    ];
-    expect(detectEnginePlanFromWindows("claude", genericMaxWindow)).toBeNull();
-
-    const explicit20xWindow = [
-      { providerKey: "anthropic", label: "5-Hour", planName: "Claude Max 20x", usedPercent: 10 },
-    ];
-    expect(detectEnginePlanFromWindows("claude", explicit20xWindow)).toEqual({
-      label: "Claude Max 20× ($213.20/mo)",
-      planName: "Claude Max 20×",
-      costPerMonth: 213.2,
-    });
+    expect(detectEnginePlanFromWindows("cursor", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("claude", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("codex", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("grok", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("minimax", windows)).toBeNull();
+    expect(detectEnginePlanFromWindows("antigravity", windows)).toBeNull();
+    expect(autoDetectAllEnginePlans(windows)).toEqual({});
   });
 });
 

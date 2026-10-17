@@ -348,9 +348,9 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
     displayName: "MiniMax",
     supportsMultipleInstances: true,
     // Mirrors the `capabilities` block in `create` below: this driver mounts
-    // agents, local-computer, and Composio tools, with no screen channel
+    // agents and local-computer tools, with no Composio, no screen channel,
     // and no image input.
-    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: true, localComputerMcp: true, images: false },
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
   },
   models: MODELS,
   install: {
@@ -1000,7 +1000,6 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         capabilities: {
           sessionModelSwitch: "in-session",
           agentsMcp: true,
-          composioMcp: true,
           toolLoop: true,
           replaysTranscript: true,
           localComputerMcp: true,

@@ -296,7 +296,7 @@ function Spoiler({ children }: { children?: ReactNode }) {
 
 const REMARK_PLUGINS = [remarkGfm, remarkMentions];
 
-// oxlint-disable-next-line anti-slop/no-runtime-typeof -- Flatten React node children into text for code blocks.
+/* oxlint-disable anti-slop/no-runtime-typeof -- Flatten React node children into text for code blocks. */
 const flattenCodeChildren = (n: ReactNode): string =>
   typeof n === "string"
     ? n
@@ -307,6 +307,7 @@ const flattenCodeChildren = (n: ReactNode): string =>
         : isValidElement<{ children?: ReactNode }>(n)
           ? flattenCodeChildren(n.props.children)
           : "";
+/* oxlint-enable anti-slop/no-runtime-typeof */
 
 const STATIC_MARKDOWN_COMPONENTS = {
   img({ src, alt }: { src?: string; alt?: string }) {
