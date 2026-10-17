@@ -1823,7 +1823,6 @@ describe("agentProxy settings and environment", () => {
       environment: "prod",
       secretPath: "/",
       caCertPath: undefined,
-      allowReadableBrokeredSecrets: false,
     });
 
     const withInfisical = agentProxySettings({
@@ -1842,7 +1841,6 @@ describe("agentProxy settings and environment", () => {
         environment: "dev",
         secretPath: "/agents",
         caCertPath: "/tmp/proxy-ca.crt",
-        allowReadableBrokeredSecrets: true,
       },
     });
     expect(explicit).toEqual({
@@ -1852,7 +1850,6 @@ describe("agentProxy settings and environment", () => {
       environment: "dev",
       secretPath: "/agents",
       caCertPath: "/tmp/proxy-ca.crt",
-      allowReadableBrokeredSecrets: true,
     });
   });
 
@@ -1908,6 +1905,64 @@ describe("agentProxy settings and environment", () => {
     expect(env?.HTTP_PROXY).toBe("http://corp-proxy:8080");
     expect(env?.NO_PROXY).toBe("intranet.example.com");
     expect(env?.HTTPS_PROXY).toBe("http://127.0.0.1:17322");
+  });
+
+  it("lets explicitly configured routing and CA settings win over inherited INFISICAL_* and TLS variables", () => {
+    const cfg: AppConfig = {
+      agentProxy: {
+        enabled: true,
+        address: "proxy.local:18000",
+        projectId: "explicit-proj",
+        environment: "dev",
+        secretPath: "/agents",
+        caCertPath: "/certs/proxy.pem",
+      },
+    };
+    const env = applyAgentProxyEnv(cfg, {
+      INFISICAL_AGENT_PROXY_ADDRESS: "stale.local:1",
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+      SSL_CERT_FILE: "/etc/ssl/ambient.pem",
+      NODE_EXTRA_CA_CERTS: "/etc/ssl/ambient-extra.pem",
+    });
+    expect(env).toMatchObject({
+      HTTPS_PROXY: "http://proxy.local:18000",
+      INFISICAL_AGENT_PROXY_ADDRESS: "proxy.local:18000",
+      INFISICAL_PROJECT_ID: "explicit-proj",
+      INFISICAL_ENVIRONMENT: "dev",
+      INFISICAL_SECRET_PATH: "/agents",
+      SSL_CERT_FILE: "/certs/proxy.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/proxy.pem",
+    });
+  });
+
+  it("keeps an inherited routing id when the proxy only fell back to BotFleet's own Infisical settings", () => {
+    const cfg: AppConfig = {
+      infisical: { projectId: "fallback-proj", environment: "staging", secretPath: "/backend" },
+      agentProxy: { enabled: true },
+    };
+    const inherited = applyAgentProxyEnv(cfg, {
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    expect(inherited).toMatchObject({
+      INFISICAL_PROJECT_ID: "ambient-proj",
+      INFISICAL_ENVIRONMENT: "ambient-env",
+      INFISICAL_SECRET_PATH: "/ambient",
+    });
+    const bare = applyAgentProxyEnv(cfg, {});
+    expect(bare).toMatchObject({
+      INFISICAL_PROJECT_ID: "fallback-proj",
+      INFISICAL_ENVIRONMENT: "staging",
+      INFISICAL_SECRET_PATH: "/backend",
+    });
+  });
+
+  it("rejects unknown agentProxy keys at the config boundary", () => {
+    expect(() => parseConfigPatch({ agentProxy: { enabled: true, typo: true } })).toThrow(/Unrecognized key/);
+    expect(() => parseConfigPatch({ agentProxy: { allowReadableBrokeredSecrets: true } })).toThrow(/Unrecognized key/);
   });
 
   it("persists agentProxy in saveConfig and merges correctly", () => {

@@ -13,6 +13,8 @@ import {
   isProbeTimeout,
   KNOWN_VERSION_MAX_AGE_MS,
   LastKnownAnswer,
+  setSpawnEnvTransform,
+  spawnCli,
 } from "./procs.ts";
 
 type Result = { err: (Error & { timedOut?: boolean; killed?: boolean }) | null; stdout: string };
@@ -334,5 +336,55 @@ describe("elapsedSince", () => {
     const reading = clockReadingAt(50_000, now);
     expect(elapsedSince(reading, now)).toBe(0);
     expect(elapsedSince(reading, { wall: 10_500, mono: 7_500 })).toBe(500);
+  });
+});
+
+describe("setSpawnEnvTransform", () => {
+  afterEach(() => {
+    setSpawnEnvTransform(undefined);
+  });
+
+  const printEnv = ["-e", 'process.stdout.write(process.env.OMB_TRANSFORM_PROBE ?? "unset")'];
+
+  function exec(env: NodeJS.ProcessEnv): Promise<string> {
+    return new Promise((resolve, reject) => {
+      execCli(process.execPath, printEnv, { timeout: 10_000, env }, (err, stdout) =>
+        err ? reject(err) : resolve(stdout),
+      );
+    });
+  }
+
+  function spawned(env: NodeJS.ProcessEnv): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const child = spawnCli(process.execPath, printEnv, { stdio: ["pipe", "pipe", "pipe"], env });
+      let out = "";
+      child.stdout.on("data", (chunk) => { out += String(chunk); });
+      child.on("error", reject);
+      child.on("close", () => resolve(out));
+    });
+  }
+
+  it("leaves the caller's environment alone with no transform registered", async () => {
+    const env = { ...process.env, OMB_TRANSFORM_PROBE: "caller" };
+    expect(await exec(env)).toBe("caller");
+    expect(await spawned(env)).toBe("caller");
+  });
+
+  it("hands the transform the caller's env and runs the child with what it returns", async () => {
+    const seen: Array<NodeJS.ProcessEnv | undefined> = [];
+    setSpawnEnvTransform((env) => {
+      seen.push(env);
+      return { ...(env ?? process.env), OMB_TRANSFORM_PROBE: "transformed" };
+    });
+    const env = { ...process.env, OMB_TRANSFORM_PROBE: "caller" };
+    expect(await exec(env)).toBe("transformed");
+    expect(await spawned(env)).toBe("transformed");
+    expect(seen).toEqual([env, env]);
+  });
+
+  it("keeps the caller's options when the transform declines", async () => {
+    setSpawnEnvTransform(() => undefined);
+    const env = { ...process.env, OMB_TRANSFORM_PROBE: "caller" };
+    expect(await exec(env)).toBe("caller");
   });
 });

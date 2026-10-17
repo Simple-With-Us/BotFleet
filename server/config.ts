@@ -552,8 +552,7 @@ const appConfigSchema = z.object({
     environment: optionalText,
     secretPath: optionalText,
     caCertPath: optionalText,
-    allowReadableBrokeredSecrets: z.boolean().optional(),
-  }).optional(),
+  }).strict().optional(),
   features: featureConfigSchema.optional(),
   conversationMode: z.enum(STORED_CONVERSATION_MODES).optional(),
   busySendDefault: z.enum(BUSY_SEND_DEFAULTS).optional(),
@@ -792,7 +791,6 @@ export interface AppConfig {
     environment?: string;
     secretPath?: string;
     caCertPath?: string;
-    allowReadableBrokeredSecrets?: boolean;
   };
   /** Opt-in product experiments. Every flag defaults to disabled. */
   features?: {
@@ -1179,7 +1177,6 @@ export interface AgentProxySettings {
   environment: string;
   secretPath: string;
   caCertPath?: string;
-  allowReadableBrokeredSecrets: boolean;
 }
 
 /** The explicit toggle for Infisical Agent Proxy.  Off by default. */
@@ -1197,13 +1194,20 @@ export function agentProxySettings(cfg: AppConfig): AgentProxySettings {
     environment: stored.environment?.trim() || cfg.infisical?.environment?.trim() || DEFAULT_AGENT_PROXY_ENVIRONMENT,
     secretPath: stored.secretPath?.trim() || cfg.infisical?.secretPath?.trim() || DEFAULT_AGENT_PROXY_SECRET_PATH,
     caCertPath: stored.caCertPath?.trim() || undefined,
-    allowReadableBrokeredSecrets: stored.allowReadableBrokeredSecrets === true,
   };
 }
 
 /**
  * Injects proxy environment variables into a process environment when
  * Agent Proxy is enabled.  When disabled, returns the input baseEnv untouched.
+ *
+ * Precedence: the proxy URL variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+ * `ALL_PROXY`, `NO_PROXY`) keep whatever the caller already set, so a
+ * deliberate corporate proxy is never silently replaced.  Everything the
+ * operator configured under `agentProxy` (address, routing ids, CA path) wins
+ * over an ambient `INFISICAL_*`, `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS` the
+ * harness happened to inherit.  A routing id that only fell back to
+ * BotFleet's own Infisical settings never displaces an inherited one.
  */
 export function applyAgentProxyEnv(
   cfg: AppConfig,
@@ -1211,6 +1215,7 @@ export function applyAgentProxyEnv(
 ): NodeJS.ProcessEnv | undefined {
   if (!agentProxyEnabled(cfg)) return baseEnv;
   const settings = agentProxySettings(cfg);
+  const stored = cfg.agentProxy ?? {};
   const proxyUrl = `http://${settings.address}`;
   const env: NodeJS.ProcessEnv = { ...(baseEnv ?? process.env) };
   if (!env.HTTP_PROXY && !env.http_proxy) {
@@ -1229,21 +1234,21 @@ export function applyAgentProxyEnv(
     env.NO_PROXY = "localhost,127.0.0.1";
     env.no_proxy = "localhost,127.0.0.1";
   }
-  if (!env.INFISICAL_AGENT_PROXY_ADDRESS) {
-    env.INFISICAL_AGENT_PROXY_ADDRESS = settings.address;
-  }
-  if (settings.projectId && !env.INFISICAL_PROJECT_ID) {
-    env.INFISICAL_PROJECT_ID = settings.projectId;
-  }
-  if (settings.environment && !env.INFISICAL_ENVIRONMENT) {
-    env.INFISICAL_ENVIRONMENT = settings.environment;
-  }
-  if (settings.secretPath && !env.INFISICAL_SECRET_PATH) {
-    env.INFISICAL_SECRET_PATH = settings.secretPath;
+  // The resolved address already folds in an ambient INFISICAL_AGENT_PROXY_ADDRESS
+  // (loadConfig) and the vault knob, and it is what the proxy URLs above are
+  // built from, so the two must never disagree.
+  env.INFISICAL_AGENT_PROXY_ADDRESS = settings.address;
+  const routing: Array<[key: string, resolved: string, explicit: string | undefined]> = [
+    ["INFISICAL_PROJECT_ID", settings.projectId, stored.projectId],
+    ["INFISICAL_ENVIRONMENT", settings.environment, stored.environment],
+    ["INFISICAL_SECRET_PATH", settings.secretPath, stored.secretPath],
+  ];
+  for (const [key, resolved, explicit] of routing) {
+    if (resolved && (explicit?.trim() || !env[key])) env[key] = resolved;
   }
   if (settings.caCertPath) {
-    if (!env.SSL_CERT_FILE) env.SSL_CERT_FILE = settings.caCertPath;
-    if (!env.NODE_EXTRA_CA_CERTS) env.NODE_EXTRA_CA_CERTS = settings.caCertPath;
+    env.SSL_CERT_FILE = settings.caCertPath;
+    env.NODE_EXTRA_CA_CERTS = settings.caCertPath;
   }
   return env;
 }

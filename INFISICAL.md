@@ -93,8 +93,9 @@ When `agentProxy.enabled` is `true` (via Settings or knob `BOTFLEET_AGENT_PROXY_
 - `INFISICAL_SECRET_PATH`: `agentProxy.secretPath` (default `/`)
 - `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`: `agentProxy.caCertPath` (when specified)
 
-When disabled (default), process spawning is completely direct with no proxy interception.
+Precedence: the four proxy URL variables keep whatever the caller already set, so a deliberate corporate proxy is never replaced.  Everything configured under `agentProxy` (address, project, environment, path, CA file) wins over an `INFISICAL_*`, `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS` value the harness inherited.  A project, environment or path that only fell back to BotFleet's own Infisical settings does not displace an inherited one.
 
+The environment is built from the in-memory config the harness already holds (the same `cfg` that Settings saves and vault refreshes update), so a spawn never re-reads `config.json`.  When disabled (default), process spawning is completely direct with no proxy interception.
 
 ## What stays out (deliberately)
 

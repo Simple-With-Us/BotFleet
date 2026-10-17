@@ -59,8 +59,28 @@ const STALL_SLACK_MS = 500;
 const STALL_GRACE_MS = 250;
 import type { Readable, Writable } from "node:stream";
 import { join } from "node:path";
-import { applyAgentProxyEnv, loadConfig } from "./config.ts";
 import { resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
+
+/** Rewrites the environment a child CLI is about to receive.  Returns the
+ * environment to use, or `undefined` to leave the caller's options alone. */
+export type SpawnEnvTransform = (env: NodeJS.ProcessEnv | undefined) => NodeJS.ProcessEnv | undefined;
+
+let spawnEnvTransform: SpawnEnvTransform | undefined;
+
+/** The harness registers its in-memory config here once at boot (Infisical
+ * Agent Proxy routing, server/config.ts `applyAgentProxyEnv`).  procs.ts must
+ * not import config.ts: the shipped mcp-gate and mcp-remote-proxy helpers
+ * bundle this module for `killCliTree`, and config.ts drags the whole harness
+ * graph (Sentry, the packaged build identity) into those bundles.  `undefined`
+ * clears the transform. */
+export function setSpawnEnvTransform(transform: SpawnEnvTransform | undefined): void {
+  spawnEnvTransform = transform;
+}
+
+function withSpawnEnv<T extends { env?: NodeJS.ProcessEnv }>(opts: T): T {
+  const env = spawnEnvTransform?.(opts.env);
+  return env === undefined ? opts : { ...opts, env };
+}
 
 export function resolveCli(cli: string, args: string[] = []): ResolvedSpawn {
   return resolveCliSpawn(cli, args);
@@ -72,17 +92,8 @@ export function spawnCli(
   opts: SpawnOptions,
 ): ChildProcessByStdio<Writable, Readable, Readable> {
   const resolved = resolveCli(cli, args);
-  let optsWithProxy = opts;
-  try {
-    const proxyEnv = applyAgentProxyEnv(loadConfig(), opts.env as NodeJS.ProcessEnv | undefined);
-    if (proxyEnv !== undefined) {
-      optsWithProxy = { ...opts, env: proxyEnv };
-    }
-  } catch {
-    // If config loading is unavailable or throws during early bootstrap/tests, keep original opts
-  }
   const child = spawn(resolved.command, resolved.args, {
-    ...optsWithProxy,
+    ...withSpawnEnv(opts),
     // posix: own process group so kill(-pid) reaps child MCP servers;
     // win32: taskkill /T does the reaping instead (see killCliTree)
     ...(process.platform === "win32" ? { windowsHide: true } : { detached: true }),
@@ -127,16 +138,8 @@ export function execCli(
   // that is genuinely still running.
   const softTimeout = typeof opts.timeout === "number" && opts.timeout > 0 ? opts.timeout : 0;
   const killSignal = opts.killSignal ?? "SIGTERM";
-  const execOpts: ExecFileOptions = { ...opts };
+  const execOpts: ExecFileOptions = { ...withSpawnEnv(opts) };
   delete execOpts.timeout;
-  try {
-    const proxyEnv = applyAgentProxyEnv(loadConfig(), opts.env as NodeJS.ProcessEnv | undefined);
-    if (proxyEnv !== undefined) {
-      execOpts.env = proxyEnv;
-    }
-  } catch {
-    // If config loading is unavailable or throws during early bootstrap/tests, keep original opts
-  }
   let settled = false;
   let timedOut = false;
   let softTimer: ReturnType<typeof setTimeout> | undefined;
