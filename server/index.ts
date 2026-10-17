@@ -2189,6 +2189,9 @@ function checkSelectionEntry(
   return null;
 }
 
+/** A context cap or output limit: a whole number of tokens, 1 to 10,000,000. */
+const TOKEN_LIMIT_SCHEMA = z.number().int().min(1).max(10_000_000);
+
 function checkedModelSelection(
   raw: unknown,
   /** The saved selection this write replaces.  `storedFallbacks` is how many
@@ -2224,20 +2227,18 @@ function checkedModelSelection(
     selection.effort = value.effort;
   }
   if (value.contextCap !== undefined && value.contextCap !== null) {
-    // Number.isInteger is false for every non-number, so no typeof check is needed.
-    const contextCap = Number(value.contextCap);
-    if (!Number.isInteger(value.contextCap) || contextCap < 1 || contextCap > 10_000_000) {
+    const contextCap = TOKEN_LIMIT_SCHEMA.safeParse(value.contextCap);
+    if (!contextCap.success) {
       return { ok: false, status: 400, error: "modelSelection.contextCap must be a whole number of tokens" };
     }
-    selection.contextCap = contextCap;
+    selection.contextCap = contextCap.data;
   }
   if (value.maxOutputTokens !== undefined && value.maxOutputTokens !== null) {
-    // Number.isInteger is false for every non-number, so no typeof check is needed.
-    const maxOutputTokens = Number(value.maxOutputTokens);
-    if (!Number.isInteger(value.maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > 10_000_000) {
+    const maxOutputTokens = TOKEN_LIMIT_SCHEMA.safeParse(value.maxOutputTokens);
+    if (!maxOutputTokens.success) {
       return { ok: false, status: 400, error: "modelSelection.maxOutputTokens must be a whole number of tokens" };
     }
-    selection.maxOutputTokens = maxOutputTokens;
+    selection.maxOutputTokens = maxOutputTokens.data;
   }
   // "Latest <Class>": `null` means pinned (see checkLineageWrite).
   if (value.latest !== undefined && value.latest !== null) {

@@ -9051,6 +9051,23 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
     });
   });
 
+  it("refuses a context cap or output limit that is not a whole number of tokens from 1 to 10,000,000", async () => {
+    await withBot("Limits Refused", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      for (const bad of [0, -5, 1.5, "8k", 10_000_001, true]) {
+        const cap = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, contextCap: bad } });
+        expect(cap.status, `contextCap ${String(bad)}`).toBe(400);
+        expect(cap.body.error).toMatch(/contextCap/);
+        const out = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, maxOutputTokens: bad } });
+        expect(out.status, `maxOutputTokens ${String(bad)}`).toBe(400);
+        expect(out.body.error).toMatch(/maxOutputTokens/);
+      }
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 1, maxOutputTokens: 10_000_000 },
+      })).status).toBe(200);
+    });
+  });
+
   it("keeps a saved context cap and output limit when an older client re-sends the selection without them", async () => {
     await withBot("Limits Older Client", async (bot) => {
       const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };

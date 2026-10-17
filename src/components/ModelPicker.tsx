@@ -188,7 +188,7 @@ export function ContextSection({
           ? windowTokens
             ? `Enter a whole number up to ${windowTokens.toLocaleString("en-US")}.`
             : "Enter a whole number."
-          : (disabled ? "Stop the bot to change this.  " : "") + "A smaller limit compresses the prompt sooner.  Empty is no limit."}
+          : (disabled ? "Stop the bot to change this.\u00A0 " : "") + "A smaller limit compresses the prompt sooner.\u00A0 Empty is no limit."}
       </p>
     </div>
   );
@@ -251,7 +251,7 @@ export function MaxOutputSection({
             ? `Enter a whole number up to ${windowTokens.toLocaleString("en-US")}.`
             : "Enter a whole number."
           : disabled
-            ? "Stop the bot to change this.  Empty uses the model default."
+            ? "Stop the bot to change this.\u00A0 Empty uses the model default."
             : "Empty uses the model default."}
       </p>
     </div>
