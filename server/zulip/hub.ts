@@ -19,7 +19,7 @@
 // a model only between nonce-marked untrusted markers; it is never logged.
 // The log holds ids, roles, decisions and counts.
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 
 import { BOT_OFF_CODE } from "../../shared/bot-power.ts";
 
@@ -53,6 +53,7 @@ import {
 } from "./outbound.ts";
 import { DEFAULT_OWNER_CLIENTS, classify, wakeVerdict, type RouterContext } from "./router.ts";
 import { HANDLED_RING_LIMIT, ZulipStateStore, emptyState, type ZulipBotState } from "./state.ts";
+import { ZULIP_OUTGOING_MAX_ATTEMPTS, ZulipOutgoingSpool } from "./outgoing-spool.ts";
 import type { ZulipIdentity, ZulipMessage, ZulipOrigin, ZulipSettings, ZulipUser } from "./types.ts";
 
 /** Zulip roles a BF bot may hold: moderator (300) and member (400).  An
@@ -158,6 +159,7 @@ export interface ZulipHubDeps {
     eventsTimeoutMs?: number;
     postSpacingMs?: number;
     retryBaseMs?: number;
+    drainBatchSize?: number;
   };
 }
 
@@ -355,12 +357,12 @@ class ZulipSession {
   }
 
   /** True the first time this connection meets `id` above its floor. */
-  firstSighting(id: number): boolean {
-    if (this.floorFromFirstLive) {
+  firstSighting(id: number, allowBelowFloor = false): boolean {
+    if (this.floorFromFirstLive && !allowBelowFloor) {
       this.floor = id - 1;
       this.floorFromFirstLive = false;
     }
-    if (this.floor !== null && id <= this.floor) return false;
+    if (!allowBelowFloor && this.floor !== null && id <= this.floor) return false;
     if (this.seen.has(id)) return false;
     this.remember(id);
     return true;
@@ -382,16 +384,18 @@ class ZulipSession {
     this.dirty = true;
   }
 
-  save(force = false): void {
-    if (!force && !this.dirty) return;
+  save(force = false): boolean {
+    if (!force && !this.dirty) return true;
     this.dirty = false;
     this.savedAt = this.hub.now();
     try {
       this.hub.store.save(this.botId, this.state, this.hub.now());
+      this.status.pending = this.state.pending.length;
+      return true;
     } catch (e) {
       this.hub.log(`[zulip] ${this.role}: could not save state: ${describe(e)}`);
+      return false;
     }
-    this.status.pending = this.state.pending.length;
   }
 
   /** Save a cursor-only change at most once a second.  A wake is always
@@ -696,6 +700,9 @@ export class ZulipHub {
   /** Sessions being stopped.  A replacement for the same bot waits for the
    *  old one to finish, so two sessions never write one bot's state file. */
   private readonly stopping = new Map<string, Promise<void>>();
+  private readonly outgoingSpool: ZulipOutgoingSpool;
+  private readonly outgoingRetry = new Map<string, number>();
+  private outgoingDraining = false;
   private drainTimer?: ReturnType<typeof setInterval>;
   private reconcileTimer?: ReturnType<typeof setInterval>;
   private draining = false;
@@ -707,6 +714,7 @@ export class ZulipHub {
   constructor(deps: ZulipHubDeps) {
     this.deps = deps;
     this.store = new ZulipStateStore(deps.dataDir);
+    this.outgoingSpool = new ZulipOutgoingSpool(deps.dataDir);
     this.backoffMs = deps.timings?.backoffMs ?? BACKOFF_MS;
     this.postSpacingMs = deps.timings?.postSpacingMs ?? 3_000;
     this.sleep = deps.sleep ?? abortableSleep;
@@ -869,8 +877,40 @@ export class ZulipHub {
     for (const session of this.sessions.values()) {
       if (!session.creds) continue;
       out.push(session.creds.key, Buffer.from(`${session.creds.email}:${session.creds.key}`).toString("base64"));
+      if (session.creds.outgoingWebhookToken) out.push(session.creds.outgoingWebhookToken);
     }
     return out;
+  }
+
+  /** Authenticate a native outgoing webhook against the configured role's
+   *  cached credentials.  The POST body is never trusted as message content. */
+  outgoingWebhookAvailability(role: string): "unknown" | "unavailable" | "ready" {
+    const normalized = role.trim().toUpperCase();
+    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    if (!session) return "unknown";
+    return session.creds?.outgoingWebhookToken ? "ready" : "unavailable";
+  }
+
+  authorizeOutgoingWebhook(role: string, botEmail: string, token: string): "ok" | "unknown" | "unavailable" | "unauthorized" {
+    const normalized = role.trim().toUpperCase();
+    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    if (!session) return "unknown";
+    const expected = session.creds?.outgoingWebhookToken;
+    if (!session.creds || !expected) return "unavailable";
+    const left = Buffer.from(expected);
+    const right = Buffer.from(token);
+    if (left.length !== right.length || !timingSafeEqual(left, right)) return "unauthorized";
+    if (session.creds.email.toLowerCase() !== botEmail.trim().toLowerCase()) return "unauthorized";
+    return "ok";
+  }
+
+  /** Add the authenticated bot/message pair to the durable inbound queue. */
+  enqueueOutgoingWebhook(role: string, messageId: number): "accepted" | "duplicate" | "unknown" | "unavailable" {
+    const normalized = role.trim().toUpperCase();
+    const session = [...this.sessions.values()].find((candidate) => candidate.role.toUpperCase() === normalized);
+    if (!session) return "unknown";
+    if (!session.creds?.outgoingWebhookToken) return "unavailable";
+    return this.outgoingSpool.add(session.botId, messageId) ? "accepted" : "duplicate";
   }
 
   /** Jay's Zulip user id, when the settings name a valid one. */
@@ -899,7 +939,7 @@ export class ZulipHub {
 
   /** Classify one message for one bot and queue it when it wakes the bot.
    *  Exposed for the session; nothing else calls it. */
-  handleMessage(session: ZulipSession, message: ZulipMessage): void {
+  handleMessage(session: ZulipSession, message: ZulipMessage, source: "native" | "webhook" = "native"): void {
     if (!session.me || typeof message?.id !== "number") return;
     const state = session.state;
     const id = message.id;
@@ -907,9 +947,12 @@ export class ZulipHub {
     // it, in the handled ring, or waiting in a unit.  Not "at or below the
     // live cursor": Zulip can deliver a lower id after a higher one, and that
     // message would be lost for good (the next backfill starts at the cursor).
-    if (!session.firstSighting(id)) return;
+    if (!session.firstSighting(id, source === "webhook")) return;
     if (session.holds(id)) return;
-    state.cursor = Math.max(state.cursor ?? 0, id);
+    // The webhook queue is an independent delivery lane.  Advancing the
+    // native event cursor from it could skip lower-id native events that had
+    // not reached the queue before a crash or reconnect.
+    if (source === "native") state.cursor = Math.max(state.cursor ?? 0, id);
     session.markDirty();
     const c = classify(message, this.routerContext(session));
     // Jay speaking in a conversation resets its peer chain, mention or not.
@@ -1048,6 +1091,9 @@ export class ZulipHub {
     try {
       do {
         this.redrain = false;
+        void this.drainOutgoingWebhook().catch((error) => {
+          this.log(`[zulip] outgoing webhook drain failed: ${describe(error)}`);
+        });
         await this.finalizeSettled();
         for (const session of this.sessions.values()) {
           if (this.stopped) return;
@@ -1057,6 +1103,129 @@ export class ZulipHub {
     } finally {
       this.draining = false;
     }
+  }
+
+  /** Drain a bounded batch, serially per bot and concurrently across bots.
+   *  Native event queues remain independent, and both paths converge on
+   *  handleMessage's dedup. */
+  private async drainOutgoingWebhook(): Promise<void> {
+    if (this.outgoingDraining) return;
+    this.outgoingDraining = true;
+    try {
+      await this.drainOutgoingWebhookBatch();
+    } finally {
+      this.outgoingDraining = false;
+    }
+  }
+
+  /** A bot with no session may still come back: reconcile rebuilds sessions
+   *  after a restart, on a settings save, and on a slow timer.  Only a bot
+   *  that settings no longer want is gone for good. */
+  private outgoingBotWanted(botId: string): boolean {
+    if (!this.enabled()) return false;
+    const entry = this.settings()?.bots?.[botId];
+    if (!entry || entry.enabled === false) return false;
+    const role = typeof entry.role === "string" ? entry.role.trim() : "";
+    return Boolean(role && validZulipRole(role) && this.deps.botExists(botId));
+  }
+
+  private async drainOutgoingWebhookBatch(): Promise<void> {
+    let rows;
+    try {
+      rows = this.outgoingSpool.pending();
+    } catch (error) {
+      this.log(`[zulip] outgoing webhook queue unavailable: ${describe(error)}`);
+      return;
+    }
+    const now = this.now();
+    const budgetPerSession = Math.max(1, this.deps.timings?.drainBatchSize ?? 16);
+    const groups = new Map<string, typeof rows>();
+    // Settings cannot change inside this synchronous scan, so decide each
+    // sessionless bot once instead of once per spooled row.
+    const wantedBots = new Map<string, boolean>();
+    const botWanted = (botId: string): boolean => {
+      let wanted = wantedBots.get(botId);
+      if (wanted === undefined) {
+        wanted = this.outgoingBotWanted(botId);
+        wantedBots.set(botId, wanted);
+      }
+      return wanted;
+    };
+    for (const row of rows) {
+      const key = `${row.botId}:${row.messageId}`;
+      const session = this.sessions.get(row.botId);
+      if (!session) {
+        if (!botWanted(row.botId)) {
+          // The bot is gone from settings for good; its row can never route.
+          try { this.outgoingSpool.remove(row); } catch { /* already gone */ }
+          this.outgoingRetry.delete(key);
+        } else {
+          // Sessions rebuild after a restart, and Zulip already answered 200
+          // so it will not resend: retain the row and retry once ready.
+          this.outgoingRetry.set(key, now + (this.deps.timings?.retryBaseMs ?? 5_000));
+        }
+        continue;
+      }
+      if ((this.outgoingRetry.get(key) ?? 0) > now) continue;
+      if (!session.ready || !session.client) {
+        this.outgoingRetry.set(key, now + (this.deps.timings?.retryBaseMs ?? 5_000));
+        continue;
+      }
+      const group = groups.get(row.botId) ?? [];
+      if (group.length >= budgetPerSession) continue;
+      group.push(row);
+      groups.set(row.botId, group);
+    }
+
+    await Promise.all([...groups].map(async ([botId, botRows]) => {
+      const session = this.sessions.get(botId);
+      if (!session?.ready || !session.client) return;
+      for (const row of botRows) {
+        const key = `${row.botId}:${row.messageId}`;
+        if (!this.outgoingSpool.has(row)) {
+          try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
+          this.outgoingRetry.delete(key);
+          continue;
+        }
+        try {
+          const message = await session.client.message(row.messageId, {
+            signal: AbortSignal.timeout(8_000),
+            timeoutMs: 4_000,
+          });
+          if (message.id !== row.messageId) throw new Error("Zulip returned a mismatched message id");
+          this.handleMessage(session, message, "webhook");
+          if (!session.save(true)) throw new Error("Zulip state could not be persisted");
+          this.outgoingSpool.remove(row);
+          this.outgoingRetry.delete(key);
+        } catch (error) {
+          const status = statusOf(error);
+          // A missing or explicitly inaccessible message can never be routed;
+          // authentication and rate-limit failures remain durable for retry.
+          if (status === 400 || status === 403 || status === 404) {
+            this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} unavailable (${status})`);
+            try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
+            continue;
+          }
+          let attempts: number;
+          try {
+            attempts = this.outgoingSpool.recordFailure(row);
+          } catch {
+            this.log(`[zulip] ${session.role}: outgoing webhook retry state could not be persisted`);
+            continue;
+          }
+          if (attempts >= ZULIP_OUTGOING_MAX_ATTEMPTS) {
+            this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} abandoned after repeated failures`);
+            try { this.outgoingSpool.remove(row); } catch { /* retained for a later retry */ }
+            this.outgoingRetry.delete(key);
+            continue;
+          }
+          const retryBase = this.deps.timings?.retryBaseMs ?? 5_000;
+          const retryDelay = Math.min(retryBase * (2 ** (attempts - 1)), 5 * 60_000);
+          this.outgoingRetry.set(key, this.now() + retryDelay);
+          this.log(`[zulip] ${session.role}: outgoing webhook message ${row.messageId} deferred`);
+        }
+      }
+    }));
   }
 
   /** Let go of every binding whose turn is over: its own turn completed and

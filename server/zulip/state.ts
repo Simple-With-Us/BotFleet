@@ -16,7 +16,7 @@
 //   - `dms`      when each outbound DM that was not a reply went out: the
 //                per-bot DM rate limit's ledger.
 
-import { chmodSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { z } from "zod";
@@ -139,5 +139,9 @@ export class ZulipStateStore {
       /* best effort: the files themselves are 600 */
     }
     writeFileAtomic(join(this.dir, fileName(botId)), `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    if (process.platform !== "win32") {
+      const fd = openSync(this.dir, "r");
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+    }
   }
 }
