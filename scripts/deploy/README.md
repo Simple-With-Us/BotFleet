@@ -16,7 +16,7 @@ Keep the workflow disabled if token access, project mapping, deployment metadata
 
 ## Checks
 
-`node --test scripts/deploy/vercel-catch-up.test.mjs`
+`node --test scripts/deploy/vercel-catch-up.node-test.mjs`
 
 The dependency-free unit and entrypoint integration tests cover the 3h boundary, last-skipped-merge catch-up, docs-only later commits, failed/canceled attempts, in-flight builds, binding/root drift, malformed provider data, exact-SHA CI, and deployment receipts.  PR runs execute tests without secrets.  Builds run from the repo root so the Vercel root directory is applied once.  CLI is pinned to 64.5.0.
 
