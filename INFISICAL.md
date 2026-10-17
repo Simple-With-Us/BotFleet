@@ -72,6 +72,7 @@ BotFleet is a single-user local harness: the server binds loopback-only (`127.0.
 | `BOTFLEET_SPEND_CEILING_USD` | usage.spendCeilingUsd | float | ≥ 0 |
 | `BOTFLEET_SPEND_CEILING_MIN_PRICED_SHARE` | usage.spendCeilingMinPricedShare | float | 0–1 |
 | `BOTFLEET_AUTO_REVIEW_MAX_PER_TURN` | autoReview.maxReviewsPerTurn | int | 1–500 |
+| `BOTFLEET_TTS_AUDIO_RETENTION_DAYS` | tts.audioRetentionDays | int | 0–365 |
 | `BOTFLEET_INFISICAL_REFRESH_MINUTES` | infisical.refreshMinutes | int | 5–1440 |
 | `BOTFLEET_AGENT_PROXY_ENABLED` | agentProxy.enabled | bool | — |
 | `BOTFLEET_AGENT_PROXY_ADDRESS` | agentProxy.address | string | — |

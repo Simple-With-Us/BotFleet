@@ -938,18 +938,17 @@ test("the stable wrapper does not test for a .git directory to find the checkout
   assert.match(source, /git -C "\$BOTFLEET_CHECKOUT" rev-parse --git-dir/);
 });
 
-test("the up-to-date runtime probe reads the bearer credential from BOTFLEET_OWNER_NONCE only", async () => {
+test("the up-to-date runtime probe prefers BOTFLEET_OWNER_NONCE and falls back to the live owner record", async () => {
   const wrapper = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
   const helper = await readFile(join(scripts, "update-botfleet-runtime-commit.mjs"), "utf8");
   assert.match(wrapper, /update-botfleet-runtime-commit\.mjs/);
   assert.match(wrapper, /BOTFLEET_OWNER_NONCE/);
-  assert.match(wrapper, /BOTFLEET_OWNER_NONCE is required when a harness owner record exists/);
   assert.doesNotMatch(wrapper, /\|\| RUNTIME_COMMIT=""/);
   assert.doesNotMatch(wrapper, /owner\.nonce/);
   assert.doesNotMatch(wrapper, /console\.log\(.*nonce/);
   assert.match(helper, /process\.env\.BOTFLEET_OWNER_NONCE/);
-  assert.doesNotMatch(helper, /owner\.nonce/);
-  assert.match(helper, /BOTFLEET_OWNER_NONCE is required/);
+  assert.match(helper, /owner\.nonce/);
+  assert.match(helper, /BOTFLEET_OWNER_NONCE is required when a harness owner record exists/);
   assert.match(helper, /res\.statusCode === 401 \|\| res\.statusCode === 403/);
   assert.match(helper, /maskedCredentialEnvRef/);
 });

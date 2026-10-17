@@ -93,6 +93,15 @@ describe("parseKnobValue", () => {
     expect(cfg.autoReview).toEqual({ fallbackReviewer: "claude", maxReviewsPerTurn: 12 });
   });
 
+  it("clamps the TTS audio retention days and applies it from the vault", () => {
+    expect(parseKnobValue(spec("tts.audioRetentionDays"), "30")).toBe(30);
+    expect(parseKnobValue(spec("tts.audioRetentionDays"), "-5")).toBe(0);
+    expect(parseKnobValue(spec("tts.audioRetentionDays"), "999")).toBe(365);
+    const cfg: AppConfig = { tts: { voice: "aura-1" } };
+    resolveKnobFields(cfg, new Map([["BOTFLEET_TTS_AUDIO_RETENTION_DAYS", "14"]]));
+    expect(cfg.tts).toEqual({ voice: "aura-1", audioRetentionDays: 14 });
+  });
+
   it("round-trips through the canonical string", () => {
     for (const entry of KNOB_FIELDS) {
       if (entry.kind === "bool") continue;

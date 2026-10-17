@@ -1518,6 +1518,7 @@ export class RoutineManager {
         ) {
           this.options.activateTask?.(run.botId, ownerThreadId);
         }
+        const hotSince = run.hotDeferredAt ?? run.createdAt;
         run.threadId = threadId;
         run.startedAt = this.now();
         run.status = "running";
@@ -1525,7 +1526,6 @@ export class RoutineManager {
         run.hotDeferredAt = undefined;
         this.publishedHoldBuckets.delete(run.id);
         if (hotDeferExpiredReason) {
-          const hotSince = run.hotDeferredAt ?? run.createdAt;
           const waitedMin = Math.max(0, Math.round((this.now() - hotSince) / 60_000));
           this.writeLog(
             `[routines] webhook "${run.routineName}" (${run.id}) waited ${waitedMin} min for a busy host and is dispatching anyway.  ${hotDeferExpiredReason}`,
@@ -1625,7 +1625,20 @@ export class RoutineManager {
   }
 
   handleRuntimeEvent(event: RuntimeEvent, opts?: { fallingOver?: boolean }): RoutineRun | null {
-    const run = this.runs.find((r) => !r.coalescedInto && r.threadId === event.threadId && ["running", "waiting"].includes(r.status));
+    if (
+      event.type !== "session.started" &&
+      event.type !== "request.opened" &&
+      event.type !== "request.resolved" &&
+      event.type !== "runtime.error" &&
+      event.type !== "turn.retrying" &&
+      event.type !== "turn.completed" &&
+      !(event.type === "item.completed" && event.itemType === "assistant_text")
+    ) {
+      return null;
+    }
+    const run = this.runs.find(
+      (r) => !r.coalescedInto && r.threadId === event.threadId && (r.status === "running" || r.status === "waiting"),
+    );
     if (!run) return null;
     run.engineId = event.providerInstanceId ?? event.provider;
     run.driver = event.provider;
@@ -1713,7 +1726,9 @@ export class RoutineManager {
   }
 
   failThread(threadId: string, message: string, code = routineFailureCode(message)) {
-    const run = this.runs.find((r) => !r.coalescedInto && r.threadId === threadId && ["running", "waiting"].includes(r.status));
+    const run = this.runs.find(
+      (r) => !r.coalescedInto && r.threadId === threadId && (r.status === "running" || r.status === "waiting"),
+    );
     if (!run) return;
     this.failRun(run, message, code);
     this.deliverEphemeralFailure(run, message);

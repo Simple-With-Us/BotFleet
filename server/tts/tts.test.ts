@@ -113,6 +113,7 @@ describe("configuration", () => {
       provider: "minimax",
       optimizedSummary: false,
       pronunciations: SEEDED,
+      audioRetentionDays: 7,
     });
     expect(JSON.stringify(described)).not.toContain("sk-secret");
   });
@@ -319,6 +320,7 @@ describe("built-in macOS voices", () => {
       voice: "Albert",
       provider: "system", optimizedSummary: false,
       pronunciations: SEEDED,
+      audioRetentionDays: 7,
     });
   });
 

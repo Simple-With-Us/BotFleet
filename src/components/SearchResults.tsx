@@ -31,14 +31,19 @@ export function SearchResults({ query, onLanded }: { query: string; onLanded: ()
     setHits(null);
     setError(null);
     let alive = true;
+    const controller = new AbortController();
     const t = setTimeout(() => {
-      api(`/api/search?q=${encodeURIComponent(q)}&limit=40`)
+      api(`/api/search?q=${encodeURIComponent(q)}&limit=40`, { signal: controller.signal })
         .then((r: { hits: SearchHit[] }) => alive && (setHits(r.hits), setError(null)))
-        .catch((e: unknown) => alive && setError(e instanceof Error ? e.message : String(e)));
+        .catch((e: unknown) => {
+          if (!alive || controller.signal.aborted) return;
+          setError(e instanceof Error ? e.message : String(e));
+        });
     }, DEBOUNCE_MS);
     return () => {
       alive = false;
       clearTimeout(t);
+      controller.abort();
     };
   }, [q]);
 

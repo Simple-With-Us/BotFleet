@@ -60,13 +60,26 @@ struct BotAvatarView: View {
             guard crop != .mascot, bot.avatarUrl != nil else { return }
             let data = await session.avatarData(forPath: bot.avatarUrl)
             guard !Task.isCancelled else { return }
-            guard let data, let decoded = UIImage(data: data) else {
+            guard let data, let decoded = BotAvatarView.cachedImage(for: data) else {
                 failed = true
                 return
             }
             guard !Task.isCancelled else { return }
             image = decoded
         }
+    }
+
+    private static let avatarImageCache = NSCache<NSData, UIImage>()
+
+    /// Cached decoded UIImage lookup to prevent synchronous PNG re-decoding on @MainActor.  Avoids repeated main-thread decompression across SwiftUI view body updates.
+    static func cachedImage(for data: Data) -> UIImage? {
+        let key = data as NSData
+        if let cached = avatarImageCache.object(forKey: key) {
+            return cached
+        }
+        guard let decoded = UIImage(data: data) else { return nil }
+        avatarImageCache.setObject(decoded, forKey: key)
+        return decoded
     }
 
     private var mask: AnyShape {
@@ -120,7 +133,7 @@ struct RoomAvatarView: View {
             guard room.avatarUrl != nil else { return }
             let data = await session.avatarData(forPath: room.avatarUrl)
             guard !Task.isCancelled else { return }
-            guard let data, let decoded = UIImage(data: data) else {
+            guard let data, let decoded = BotAvatarView.cachedImage(for: data) else {
                 failed = true
                 return
             }

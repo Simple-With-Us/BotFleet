@@ -200,6 +200,16 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     max: 500,
   },
   {
+    id: "tts.audioRetentionDays",
+    label: "TTS audio clip retention days",
+    section: "tts",
+    path: ["audioRetentionDays"],
+    infisicalName: "BOTFLEET_TTS_AUDIO_RETENTION_DAYS",
+    kind: "int",
+    min: 0,
+    max: 365,
+  },
+  {
     id: "infisical.refreshMinutes",
     label: "Infisical refresh cadence",
     section: "infisical",

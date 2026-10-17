@@ -176,6 +176,6 @@ describe("writeThroughKnobs", () => {
     expect(calls.get("BOTFLEET_AGENT_PROXY_PROJECT_ID")).toBe("proj-1");
     expect(calls.get("BOTFLEET_AGENT_PROXY_ENV")).toBe("prod");
     expect(calls.get("BOTFLEET_AGENT_PROXY_PATH")).toBe("/agents");
-    expect(KNOB_FIELDS.length).toBe(21);
+    expect(KNOB_FIELDS.length).toBe(22);
   });
 });

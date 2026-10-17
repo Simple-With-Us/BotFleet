@@ -24,6 +24,9 @@ function ssml(text: string, voice: string): string {
   return `<speak version="1.0" xml:lang="en-US"><voice name="${voice}">${escaped}</voice></speak>`;
 }
 
+export const DEFAULT_AZURE_OUTPUT_FORMAT = "audio-24khz-96kbitrate-mono-mp3";
+export const OPUS_AZURE_OUTPUT_FORMAT = "ogg-24khz-16bit-mono-opus";
+
 export async function verifyKey(key: string, region: string): Promise<VerifyResult> {
   const secret = key.trim();
   const area = region.trim();
@@ -34,7 +37,7 @@ export async function verifyKey(key: string, region: string): Promise<VerifyResu
       headers: {
         "Ocp-Apim-Subscription-Key": secret,
         "Content-Type": "application/ssml+xml",
-        "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        "X-Microsoft-OutputFormat": DEFAULT_AZURE_OUTPUT_FORMAT,
       },
       body: ssml("ok", DEFAULT_VOICE),
       signal: AbortSignal.timeout(15_000),
@@ -51,17 +54,25 @@ export async function verifyKey(key: string, region: string): Promise<VerifyResu
   }
 }
 
-export async function synthesize(text: string, voiceId: string, key: string, region: string): Promise<Audio> {
+export async function synthesize(
+  text: string,
+  voiceId: string,
+  key: string,
+  region: string,
+  options: { format?: "mp3" | "opus" } = {},
+): Promise<Audio> {
   const secret = key.trim();
   const area = region.trim();
   if (!secret || !area) throw new Error("Add an Azure Speech key and region in Connections.");
   const voice = voiceId.trim() || DEFAULT_VOICE;
+  const useOpus = options.format === "opus";
+  const outputFormat = useOpus ? OPUS_AZURE_OUTPUT_FORMAT : DEFAULT_AZURE_OUTPUT_FORMAT;
   const response = await fetch(endpoint(area), {
     method: "POST",
     headers: {
       "Ocp-Apim-Subscription-Key": secret,
       "Content-Type": "application/ssml+xml",
-      "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+      "X-Microsoft-OutputFormat": outputFormat,
     },
     body: ssml(text, voice),
     signal: AbortSignal.timeout(60_000),
@@ -72,5 +83,5 @@ export async function synthesize(text: string, voiceId: string, key: string, reg
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
   recordSpeechUsage("azure", text.length, "provider");
-  return { bytes, mime: "audio/mpeg" };
+  return { bytes, mime: useOpus ? "audio/ogg" : "audio/mpeg" };
 }

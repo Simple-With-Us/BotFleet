@@ -393,7 +393,7 @@ export async function synthesize(
     },
     audio_setting: {
       sample_rate: options.sampleRate ?? 24_000,
-      bitrate: options.bitrate ?? 128_000,
+      bitrate: options.bitrate ?? 64_000,
       format: options.format ?? "mp3",
       channel: 1,
     },
