@@ -27,6 +27,7 @@ import {
   type RuntimeReadiness,
   type UpdateCapabilities,
   type UpdateControl,
+  type UpdateControlDeps,
   type UpdateDrainView,
   type UpdateStatus,
 } from "./update-control.ts";
@@ -105,13 +106,14 @@ function build(
     installedCommit?: string;
     launcher?: "launchd" | "detached";
     exec?: (command: string, args: string[]) => CommandResult;
+    appPath?: string;
   } = {},
 ): Harness {
   const launched: LaunchPlan[] = [];
   const emitted: UpdateStatus[] = [];
   const git: string[][] = [];
   const ran: { command: string; args: string[] }[] = [];
-  const control = createUpdateControl({
+  const controlDeps: Partial<UpdateControlDeps> = {
     installed: {
       version: "1.0.30",
       sourceCommit: options.installedCommit ?? INSTALLED_COMMIT,
@@ -121,6 +123,7 @@ function build(
     stateDirectory: paths.stateDirectory,
     updatesDirectory: paths.updatesDirectory,
     scriptPath: paths.scriptPath,
+    appPath: options.appPath ?? join("/Applications", "BotFleet.app"),
     platform: options.platform ?? "darwin",
     nodeDirectory: "/opt/homebrew/bin",
     now: options.now ?? (() => new Date("2026-09-13T12:00:00.000Z")),
@@ -145,7 +148,9 @@ function build(
     newRunId: () => "run_one",
     emit: (status) => emitted.push(status),
     pollIntervalMs: 50,
-  });
+  };
+  if (options.appPath) controlDeps.appPath = options.appPath;
+  const control = createUpdateControl(controlDeps);
   controls.push(control);
   return { control, launched, emitted, git, ran };
 }
@@ -697,6 +702,9 @@ describe("the launcher", () => {
     expect(args[10]).toContain("export PATH='/opt/homebrew/bin'");
     expect(args[10]).toContain("--progress '/tmp/state/runs/run_one.progress.json'");
     expect(args[10]).toContain("--run-id 'run_one'");
+    expect(args[10]).not.toContain("exec /bin/bash");
+    expect(args[10]).toContain("result=$?");
+    expect(args[10]).toMatch(/exit 0$/);
   });
 
   it("sources harness bearer credentials from a launch env file, not the -c string", () => {
@@ -806,6 +814,7 @@ describe("reconcile on boot", () => {
     const paths = rig();
     writeCurrentRun(paths, "run_prior");
     writeProgress(paths, "run_prior", { step: "startHarness", progress: 0.8 });
+    mkdirSync(join(paths.stateDirectory, "runs"), { recursive: true });
     writeFileSync(join(paths.stateDirectory, "runs", "run_prior.log"), "Prepared bbbbbbbbbbbb\nstarting harness\n");
     const status = build(paths).control.status();
     expect(status.running).toMatchObject({
@@ -1188,6 +1197,19 @@ describe("a run that settles takes its launchd label with it", () => {
     expect(late.ran).toHaveLength(1);
   });
 
+  it("surfaces an import failure from an old wrapper with no progress record", () => {
+    const paths = rig();
+    writeCurrentRun(paths, "run_prior");
+    mkdirSync(join(paths.stateDirectory, "runs"), { recursive: true });
+    writeFileSync(join(paths.stateDirectory, "runs", "run_prior.log"),
+      "node:internal/modules/esm/resolve:241\nError [ERR_MODULE_NOT_FOUND]: Cannot find module failed-install-retention.mjs\n");
+    const harness = build(paths, { now: () => new Date("2026-09-13T12:05:00.000Z") });
+    expect(harness.control.status().lastRun?.message).toContain("ERR_MODULE_NOT_FOUND");
+    expect(harness.ran).toContainEqual({ command: "/bin/launchctl", args: ["remove", "com.jay.botfleet-update"] });
+    harness.control.status();
+    expect(harness.ran).toHaveLength(1);
+  });
+
   it("leaves launchctl alone for a detached fallback run, and off macOS", () => {
     const detached = rig();
     writeCurrentRun(detached, "run_prior", "detached");
@@ -1291,6 +1313,26 @@ describe("sweeping what failed runs leave on disk", () => {
     const paths = rig();
     expect(() => build(paths)).not.toThrow();
     expect(pruneUpdateStages(join(paths.root, "nowhere"))).toEqual([]);
+  });
+
+  it("removes expired failed-install bundles beside the app on boot", () => {
+    const paths = rig();
+    const applications = join(paths.root, "Applications");
+    mkdirSync(applications, { recursive: true });
+    const appPath = join(applications, "BotFleet.app");
+    mkdirSync(appPath);
+    const old = [
+      "BotFleet.app.failed-1000",
+      "BotFleet.app.failed-2000",
+      "BotFleet.app.failed-3000",
+      "BotFleet.app.failed-4000",
+    ];
+    for (const name of old) mkdirSync(join(applications, name));
+    build(paths, { appPath });
+    expect(existsSync(join(applications, "BotFleet.app.failed-1000"))).toBe(false);
+    expect(existsSync(join(applications, "BotFleet.app.failed-2000"))).toBe(true);
+    expect(existsSync(join(applications, "BotFleet.app.failed-3000"))).toBe(true);
+    expect(existsSync(join(applications, "BotFleet.app.failed-4000"))).toBe(true);
   });
 
   it("keeps the newest run logs and forgets the rest, run by run", () => {

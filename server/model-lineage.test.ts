@@ -148,9 +148,12 @@ describe("Claude CLI version gate", () => {
   });
 
   it("names the models an older CLI's own catalog does not list yet", () => {
-    expect([...claudeModelsTooNewFor("2.1.232 (Claude Code)")]).toEqual(["claude-opus-5-5"]);
-    expect([...claudeModelsTooNewFor("2.1.279")]).toEqual(["claude-opus-5-5"]);
-    expect(claudeModelsTooNewFor("2.1.280").size).toBe(0);
+    expect([...claudeModelsTooNewFor("2.1.232 (Claude Code)")].sort()).toEqual(["claude-opus-5-5", "claude-sonnet-5-5"]);
+    expect([...claudeModelsTooNewFor("2.1.279")].sort()).toEqual(["claude-opus-5-5", "claude-sonnet-5-5"]);
+    // Opus 5.5 landed in 2.1.280; Sonnet 5.5 landed in 2.1.284.
+    expect([...claudeModelsTooNewFor("2.1.280")]).toEqual(["claude-sonnet-5-5"]);
+    expect([...claudeModelsTooNewFor("2.1.283")]).toEqual(["claude-sonnet-5-5"]);
+    expect(claudeModelsTooNewFor("2.1.284").size).toBe(0);
     expect(claudeModelsTooNewFor("3.0.0").size).toBe(0);
     expect(claudeModelsTooNewFor(undefined).size).toBe(0);
   });
@@ -163,13 +166,25 @@ describe("Claude CLI version gate", () => {
 
   it("keeps a pinned Opus 5 on Opus 5 for a CLI too old for Opus 5.5, and moves it on a new one", () => {
     const pinned = { instanceId: "claude", model: "claude-opus-5" };
+    const pinnedSonnet = { instanceId: "claude", model: "claude-sonnet-5" };
     const old = gateLineageByCliVersion(claude, "2.1.232 (Claude Code)")!;
     expect(old.offeredIds).not.toContain("claude-opus-5-5");
-    expect(old.offeredIds).toContain("claude-sonnet-5-5");
+    expect(old.offeredIds).not.toContain("claude-sonnet-5-5");
+    expect(old.offeredIds).toContain("claude-sonnet-5");
     expect(reconcileEntry(pinned, old).entry).toBe(pinned);
-    // Latest Opus resolves to what that CLI can run.
+    expect(reconcileEntry(pinnedSonnet, old).entry).toBe(pinnedSonnet);
+    // Latest resolves to what that CLI can run.
     expect(reconcileEntry({ ...pinned, latest: "opus" }, old).entry.model).toBe("claude-opus-5");
-    expect(reconcileEntry(pinned, gateLineageByCliVersion(claude, "2.1.284 (Claude Code)")).entry.model).toBe("claude-opus-5-5");
+    expect(reconcileEntry({ ...pinnedSonnet, latest: "sonnet" }, old).entry.model).toBe("claude-sonnet-5");
+    // 2.1.280 can run Opus 5.5 and still cannot run Sonnet 5.5.
+    const mid = gateLineageByCliVersion(claude, "2.1.280 (Claude Code)")!;
+    expect(mid.offeredIds).toContain("claude-opus-5-5");
+    expect(mid.offeredIds).not.toContain("claude-sonnet-5-5");
+    expect(reconcileEntry(pinned, mid).entry.model).toBe("claude-opus-5-5");
+    expect(reconcileEntry({ ...pinnedSonnet, latest: "sonnet" }, mid).entry.model).toBe("claude-sonnet-5");
+    const current = gateLineageByCliVersion(claude, "2.1.284 (Claude Code)")!;
+    expect(reconcileEntry(pinned, current).entry.model).toBe("claude-opus-5-5");
+    expect(reconcileEntry(pinnedSonnet, current).entry.model).toBe("claude-sonnet-5-5");
   });
 
   it("leaves other engines alone", () => {
@@ -179,12 +194,22 @@ describe("Claude CLI version gate", () => {
 
   it("offers Opus 5 instead of Opus 5.5 in the picker for an older CLI", () => {
     const [old] = presentDescribedInstances([{ ...instances.claude, snapshot: { version: "2.1.232 (Claude Code)" } }]);
-    expect(optionIds(old!.models)).toEqual(expect.arrayContaining(["claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1"]));
+    expect(optionIds(old!.models)).toEqual(expect.arrayContaining(["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"]));
     expect(optionIds(old!.models)).not.toContain("claude-opus-5-5");
-    expect(old!.models.default).toBe("claude-sonnet-5-5");
+    expect(optionIds(old!.models)).not.toContain("claude-sonnet-5-5");
+    expect(old!.models.default).toBe("claude-sonnet-5");
+    const [mid] = presentDescribedInstances([{ ...instances.claude, snapshot: { version: "2.1.280 (Claude Code)" } }]);
+    expect(optionIds(mid!.models)).toContain("claude-opus-5-5");
+    expect(optionIds(mid!.models)).toContain("claude-sonnet-5");
+    expect(optionIds(mid!.models)).not.toContain("claude-sonnet-5-5");
+    expect(optionIds(mid!.models)).not.toContain("claude-opus-5");
+    expect(mid!.models.default).toBe("claude-sonnet-5");
     const [current] = presentDescribedInstances([{ ...instances.claude, snapshot: { version: "2.1.284 (Claude Code)" } }]);
     expect(optionIds(current!.models)).toContain("claude-opus-5-5");
+    expect(optionIds(current!.models)).toContain("claude-sonnet-5-5");
     expect(optionIds(current!.models)).not.toContain("claude-opus-5");
+    expect(optionIds(current!.models)).not.toContain("claude-sonnet-5");
+    expect(current!.models.default).toBe("claude-sonnet-5-5");
   });
 });
 

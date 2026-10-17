@@ -848,7 +848,7 @@ test("the mode flags parse, and contradictory ones are refused", () => {
 test("the wrapper's up-to-date shortcut survives the busy-work flags and nothing else new", { skip: process.platform === "win32" }, async () => {
   // Just the argument loop, lifted out of the wrapper: the full wrapper test
   // needs a real checkout at origin/main, which a linked worktree is not.
-  const wrapper = await readFile(join(dirname(fileURLToPath(import.meta.url)), "update-botfleet.sh"), "utf8");
+  const wrapper = await readFile(join(dirname(fileURLToPath(import.meta.url)), "update-botfleet-policy.sh"), "utf8");
   const start = wrapper.indexOf("SHORTCUT_ARG_INDEX=0");
   const endMarker = '[[ "$EXPECT_SHORTCUT_TARGET" == "0" ]] || UP_TO_DATE_SHORTCUT=0';
   const end = wrapper.indexOf(endMarker) + endMarker.length;

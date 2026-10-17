@@ -32,7 +32,6 @@ struct ChatView: View {
     @State private var showingComputer = false
     @State private var showingVoiceCall = false
     @State private var showingPlus = false
-    @State private var showingCompose = false
     @State private var showingProfile = false
     @State private var showCommandHUD = false
     @State private var pickingPhoto = false
@@ -136,21 +135,7 @@ struct ChatView: View {
     /// `Session` rather than parsing `instanceId`, which is operator-named
     private var currentModelSelection: ModelSelection? {
         guard case let .bot(bot) = current else { return nil }
-        guard let currentTask = bot.tasks?.first(where: { $0.threadId == bot.threadId }) else {
-            // Older harnesses send no task list; the bot-level record is all
-            // there is.
-            return bot.activeModelSelection ?? bot.modelSelection
-        }
-        if let taskSelection = currentTask.modelSelection {
-            return currentTask.activeModelSelection ?? taskSelection
-        }
-        // An inheriting task reads its own last-turn selection, never
-        // `bot.activeModelSelection`: that is the bot's latest turn across
-        // every task, so a fallback on another task would leak into this
-        // header.  The server clears an inheriting task's
-        // `activeModelSelection` when the bot's model changes (`patchBot`
-        // in server/store.ts), so a stale fallback does not outlive it.
-        return currentTask.activeModelSelection ?? bot.modelSelection
+        return BotConversationModelSelection.selection(for: bot, inThread: threadId)
     }
 
     private var currentDriverKind: String? {
@@ -395,14 +380,6 @@ struct ChatView: View {
         }
         .sheet(item: $shareFile) { file in
             ActivityShareSheet(items: [file.url])
-        }
-        .confirmationDialog("New", isPresented: $showingCompose, titleVisibility: .visible) {
-            if case let .bot(bot) = current {
-                Button("New Task") {
-                    Task { await session.createTask(for: bot, title: nil) }
-                }
-            }
-            Button("Cancel", role: .cancel) {}
         }
         .modifier(CloseWhenGone(isGone: chatIsGone, waiting: showingProfile, close: { closeIfGone() }))
     }
@@ -735,8 +712,16 @@ struct ChatView: View {
 
     // MARK: - Header
 
-    /// Solid chrome: back, identity, computer, and (in Projects) compose
-    /// plus opaque thread tabs.  The transcript starts below this block.
+    /// Solid chrome: back and identity, plus opaque thread tabs.  The
+    /// transcript starts below this block.
+    ///
+    /// Nothing sits to the right of the identity.  "New task" and "Watch
+    /// computer" used to live there as two more 44pt glass buttons, and the
+    /// row they shared with the bot's name was so tight that the name
+    /// truncated to "BF…" on a phone — you could not read who you were
+    /// talking to.  Both actions are in the composer's + sheet with a line
+    /// explaining each, so the header keeps the width for the one thing only
+    /// it can say: who this is.
     private var chatHeader: some View {
         VStack(spacing: 8) {
             HStack(alignment: .center) {
@@ -776,18 +761,19 @@ struct ChatView: View {
                             state: BotState.forChat(current, in: session.state),
                             animated: BotState.forChat(current, in: session.state).showsActivity
                         )
-                        .overlay(alignment: .bottomTrailing) {
-                            if let currentDriverKind {
-                                ProviderMarkView(driverKind: currentDriverKind, model: currentModelSelection?.model, size: 21)
-                                    .offset(x: 3, y: 3)
-                            }
-                        }
+                        .providerBadge(for: current, avatarSize: 36)
                         VStack(alignment: .leading, spacing: 1) {
                             HStack(spacing: 6) {
+                                // The name is the one thing in this row that
+                                // cannot be replaced by an icon, so it wins the
+                                // contested width and truncates last.  The
+                                // badge and the connection mark are fixed-size
+                                // and yield instead.
                                 Text(current.name)
                                     .font(.headline.weight(.semibold))
                                     .foregroundStyle(Color.primary)
                                     .lineLimit(1)
+                                    .layoutPriority(1)
                                 if headerShowsBypass { BypassBadge() }
                                 // A label inside the identity button: the
                                 // state reads as part of who you are talking
@@ -810,31 +796,6 @@ struct ChatView: View {
                 .accessibilityLabel(headerProfileAccessibilityLabel)
 
                 Spacer(minLength: 4)
-
-                if case .bot = current {
-                    HStack(spacing: 8) {
-                        if session.config?.allowsMultipleBotThreads == true {
-                            GlassButton(systemImage: "square.and.pencil", size: 44, weight: .medium) {
-                                showingCompose = true
-                            }
-                            .accessibilityLabel("New task")
-                        }
-                        // A voice call talks to the same bot, hands-free.
-                        // The call screen owns its lifecycle: appearing
-                        // starts it, leaving ends it.
-                        GlassButton(systemImage: "phone.fill", size: 44, weight: .medium) {
-                            showingVoiceCall = true
-                        }
-                        .accessibilityLabel("Call \(current.name)")
-                        .accessibilityHint("Start a voice conversation")
-                        GlassButton(systemImage: "display", size: 44, weight: .medium) {
-                            showingComputer = true
-                        }
-                        .accessibilityLabel("Watch \(current.name)'s computer")
-                    }
-                } else {
-                    Color.clear.frame(width: 44, height: 44)
-                }
             }
             .padding(.horizontal, 16)
 
@@ -927,8 +888,18 @@ struct ChatView: View {
         let run: () -> Void
     }
 
+    /// The rows an Off bot loses.  Only the ones that exist to start a turn:
+    /// an Off bot refuses every new turn, so each of these would be a row that
+    /// does nothing.  Everything whose liveness does not depend on Off is
+    /// absent from this set on purpose and survives the filter below.
+    private static let offBotComposingActionIds: Set<String> = [
+        "photo", "file", "dictate", "commands", "paste",
+        "task", "tasks", "routines", "call",
+    ]
+
     private var plusActions: [PlusAction] {
         var out: [PlusAction] = []
+
         out.append(PlusAction(
             id: "photo", systemImage: "photo", title: "Photo",
             subtitle: "Attach a photo from your library"
@@ -961,19 +932,36 @@ struct ChatView: View {
                 subtitle: "Add the copied image or file"
             ) { pasteFromClipboard() })
         }
-        if case let .bot(bot) = current, session.config?.allowsMultipleBotThreads == true {
+        if case let .bot(bot) = current {
+            if session.config?.allowsMultipleBotThreads == true {
+                out.append(PlusAction(
+                    id: "task", systemImage: "plus.square.on.square", title: "New task",
+                    subtitle: "Start a fresh thread with \(bot.name)", disabled: bot.busy == true
+                ) { Task { await session.createTask(for: bot, title: nil) } })
+                out.append(PlusAction(
+                    id: "tasks", systemImage: "square.stack", title: "Tasks",
+                    subtitle: "Switch, rename or remove one"
+                ) { showingTasks = true })
+                out.append(PlusAction(
+                    id: "routines", systemImage: "calendar.badge.clock", title: "Tasks & Routines",
+                    subtitle: "Automate tasks on a schedule"
+                ) { showingRoutines = true })
+            }
+            // A voice call talks to the same bot, hands-free.  The call screen
+            // owns its lifecycle: appearing starts it, leaving ends it.  It
+            // lives here, not in the header, because the header keeps its
+            // width for the bot's name.  Outside the Projects gate too: a
+            // call is one conversation and needs no thread of its own.
             out.append(PlusAction(
-                id: "task", systemImage: "plus.square.on.square", title: "New task",
-                subtitle: "Start a fresh thread with \(bot.name)", disabled: bot.busy == true
-            ) { Task { await session.createTask(for: bot, title: nil) } })
-            out.append(PlusAction(
-                id: "tasks", systemImage: "square.stack", title: "Tasks",
-                subtitle: "Switch, rename or remove one"
-            ) { showingTasks = true })
-            out.append(PlusAction(
-                id: "routines", systemImage: "calendar.badge.clock", title: "Tasks & Routines",
-                subtitle: "Automate tasks on a schedule"
-            ) { showingRoutines = true })
+                id: "call", systemImage: "phone.fill", title: "Call \(bot.name)",
+                subtitle: "Talk hands-free, out loud"
+            ) { showingVoiceCall = true })
+            // Deliberately outside the Projects gate.  The header button this
+            // action replaces was never gated either, so gating it here would
+            // take the only remaining way to watch a bot away from anyone whose
+            // Mac runs one conversation per channel.  Kept last so the sheet
+            // reads the same as before for everyone who had all four.  A bot
+            // that is Off never reaches this list — there it is the whole sheet.
             out.append(PlusAction(
                 id: "computer", systemImage: "display", title: "Watch computer",
                 subtitle: "Live view of what \(bot.name) is doing"
@@ -1030,6 +1018,19 @@ struct ChatView: View {
                 }
             })
         }
+
+        // An Off bot refuses every new turn, so the rows above that only exist
+        // to start one would each be a row that does nothing.  Off gates
+        // STARTING work and never interrupts what is already running
+        // (`shared/bot-power.ts`), so the rows whose liveness does not depend
+        // on Off are deliberately left in: Interrupt is the only control left
+        // that can end a turn — the composer's own Stop sits in the row this
+        // state replaces whole — and a transcript can be read and exported
+        // from a bot that is Off.  Filtering the built list keeps one
+        // definition of each row instead of hand-copying the survivors.
+        if case .bot = current, current.isOff {
+            return out.filter { !Self.offBotComposingActionIds.contains($0.id) }
+        }
         return out
     }
 
@@ -1074,8 +1075,13 @@ struct ChatView: View {
     /// Returns the task carrying the send, so a caller that has to act on
     /// the server's answer (Steer Now) can wait for it instead of guessing
     /// with a sleep.  Callers that do not care discard it.
+    private func busySendDefaultMode() -> String {
+        let raw = session.config?.busySendDefault?.lowercased() ?? "steer"
+        return raw == "queue" ? "queue" : "steer"
+    }
+
     @discardableResult
-    private func submit(_ explicitText: String? = nil) -> Task<Void, Never>? {
+    private func submit(_ explicitText: String? = nil, busyDelivery: String? = nil) -> Task<Void, Never>? {
         // This also cancels an in-flight permission prompt before it can
         // open the microphone after the message has already been sent.
         dictation.stop()
@@ -1107,8 +1113,18 @@ struct ChatView: View {
         )
         let sentText = text
         sending = true
+        var delivery = busyDelivery
+        if delivery == nil, current.busy, case .bot = current, busySendDefaultMode() == "queue" {
+            delivery = "queue"
+        }
         let task = Task {
-            let outcome = await session.send(sentText, to: current, attachments: outgoing, recording: recording)
+            let outcome = await session.send(
+                sentText,
+                to: current,
+                attachments: outgoing,
+                recording: recording,
+                busyDelivery: delivery
+            )
             sending = false
             let transcript = session.state.transcript(forThread: threadId)
             guard ComposerSendRecovery.shouldRestoreClearedDraft(
@@ -1520,7 +1536,7 @@ struct ChatView: View {
                     Label("Steer Now", systemImage: "bolt.fill")
                 }
                 Button {
-                    submit()
+                    submit(busyDelivery: "queue")
                 } label: {
                     Label("Queue Message", systemImage: "clock")
                 }
@@ -1542,6 +1558,26 @@ struct ChatView: View {
                 .font(.subheadline)
                 .foregroundStyle(Color.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            // The composer's + was the only door into the sheet, and this row
+            // replaces the composer whole.  "Watch computer" used to sit in
+            // the header instead, ungated, so a bot that is Off could still be
+            // watched; without this it could not be reached at all.  Drawn
+            // small so the notice keeps its line, tapped at 44pt.
+            Button {
+                withAnimation(reduceMotion ? nil : .snappy(duration: 0.28)) { showingPlus.toggle() }
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Color.secondary)
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(Color.secondary.opacity(0.14)))
+                    .rotationEffect(.degrees(showingPlus ? 45 : 0))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showingPlus ? "Close" : "More")
+
             Button {
                 Task { _ = await session.updateProfile(BotProfilePatch(off: false), for: bot) }
             } label: {
@@ -1771,13 +1807,7 @@ struct MessageRow: View {
     /// mark on its avatar.  Shared with the live reply row so the mark is
     /// already there while the reply is typed.
     static func modelSelection(of bot: Bot, inThread threadId: String) -> ModelSelection? {
-        if let currentTask = bot.tasks?.first(where: { $0.threadId == threadId }) {
-            if let taskSelection = currentTask.modelSelection {
-                return currentTask.activeModelSelection ?? taskSelection
-            }
-            return currentTask.activeModelSelection ?? bot.activeModelSelection ?? bot.modelSelection
-        }
-        return bot.activeModelSelection ?? bot.modelSelection
+        BotConversationModelSelection.selection(for: bot, inThread: threadId)
     }
 
     /// Whether a settled reply from `bot` carries the Read Aloud capsule.
@@ -1790,13 +1820,6 @@ struct MessageRow: View {
         return hasAudio
             || PersonalVoiceContract.isPersonalVoice(voice)
             || config?.canSpeak(agentVoice: voice) == true
-    }
-
-    private var senderDriverKind: String? {
-        guard let selection = senderModelSelection else { return nil }
-        // A cold registry cannot tell whether a named instance runs this model's
-        // native driver or a different one. Do not mislabel the sender's mark.
-        return session.instanceDriverKinds[selection.instanceId]
     }
 
     /// Who this message reads as coming from, in the reader's own words.  The
@@ -1847,13 +1870,7 @@ struct MessageRow: View {
         } else if message.role != .user {
             if let bot = senderBot {
                 if endsRun {
-                    BotAvatarView(bot: bot, size: 28, state: .idle, animated: false)
-                        .overlay(alignment: .bottomTrailing) {
-                            if let senderDriverKind {
-                                ProviderMarkView(driverKind: senderDriverKind, model: senderModelSelection?.model, size: 16)
-                                    .offset(x: 3, y: 3)
-                            }
-                        }
+                    BotAvatarWithProviderBadge(bot: bot, conversationThreadId: chat.threadId, size: 28, state: .idle, animated: false)
                 } else {
                     Color.clear.frame(width: 28, height: 28)
                 }
@@ -2889,14 +2906,7 @@ struct LiveReplyRow: View {
     @ViewBuilder
     private var avatar: some View {
         if let sender {
-            BotAvatarView(bot: sender, size: 28, state: .idle, animated: false)
-                .overlay(alignment: .bottomTrailing) {
-                    if let selection = MessageRow.modelSelection(of: sender, inThread: chat.threadId),
-                       let driverKind = session.instanceDriverKinds[selection.instanceId] {
-                        ProviderMarkView(driverKind: driverKind, model: selection.model, size: 16)
-                            .offset(x: 3, y: 3)
-                    }
-                }
+            BotAvatarWithProviderBadge(bot: sender, conversationThreadId: chat.threadId, size: 28, state: .idle, animated: false)
         } else if case let .room(room) = chat {
             RoomAvatarView(room: room, size: 28, state: .idle, animated: false)
         }

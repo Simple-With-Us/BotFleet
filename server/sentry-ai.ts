@@ -21,6 +21,7 @@
 import type { RuntimeEvent } from "./contracts.ts";
 import { observability } from "./observability.ts";
 import { classifyError } from "./drivers/retry.ts";
+import { isMcodeLockContentionMessage } from "./mcode-lock-contention.ts";
 import { estimateCatalogCost, isCatalogPricedModel } from "./gen-ai-cost.ts";
 import { redactSecrets, redactSecretsInText } from "./redact.ts";
 import { getSentry, isSentryActive, scrubWebhookSecrets } from "./sentry.ts";
@@ -1006,7 +1007,8 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
         event.message.includes("timeout waiting for response") ||
         event.message.includes("initialize timed out") ||
         event.message.includes("the model did not answer within") ||
-        event.message.startsWith(ANTIGRAVITY_POLICY_REFUSAL);
+        event.message.startsWith(ANTIGRAVITY_POLICY_REFUSAL) ||
+        isMcodeLockContentionMessage(event.message);
 
       if (isExpectedNonCrash) {
         sink.addBreadcrumb?.({

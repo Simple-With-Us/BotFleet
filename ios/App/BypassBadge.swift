@@ -13,6 +13,12 @@ struct BypassBadge: View {
         Text("Bypass")
             .font(.system(size: 10, weight: .bold))
             .foregroundStyle(Color.orange)
+            .lineLimit(1)
+            // One short word.  Squeezed next to a bot name it used to wrap to
+            // "Bypa / ss" in two lines, which read as a rendering fault rather
+            // than a permission state.  fixedSize keeps it whole and lets the
+            // name next to it absorb the squeeze instead.
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(Capsule().fill(Color.orange.opacity(0.16)))

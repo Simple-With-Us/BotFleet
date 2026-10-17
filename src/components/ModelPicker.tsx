@@ -669,10 +669,15 @@ export function ModelPicker({
       aria-expanded={open}
       aria-haspopup="dialog"
       className={cn(
-        "flex max-w-full items-center gap-1.5 rounded-full border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover",
+        "flex max-w-full items-center gap-1.5 border border-hairline/40 bg-control/60 py-1 pl-2 pr-2.5 text-[13px] text-ink hover:bg-raised-hover",
+        // The contained trigger now sits on its own line under the label, so
+        // it fills the column and squares its corners. A full-width control
+        // shaped like a chip reads as a button floating in space; the name is
+        // left-aligned so a long model id truncates from the right.
+        contained ? "w-full min-w-0 justify-between rounded-lg py-1.5 pl-2.5 text-left" : "rounded-full",
         // Settings Models chips (no side label) fill their wrap column so
         // long names truncate inside the pill instead of overlapping the next.
-        contained && !label && "w-full min-w-0 justify-between",
+        !contained && "rounded-full",
         // in a narrow chat header fold to a rounded square with just the
         // provider mark; the model name rides the tooltip (a bot with no
         // resolved engine keeps its label — the mark is what would hide it)
@@ -708,8 +713,15 @@ export function ModelPicker({
 
   return (
     <div ref={rootRef} className={cn(contained ? "w-full" : "relative", className)}>
+      {/* Contained (Settings) stacks: label on its own line, the control
+          full width beneath it.  The row layout this replaced squeezed the
+          label and its subtitle into a narrow column beside the trigger, so
+          "Primary Model" wrapped onto two lines and the subtitle broke into a
+          five-word ribbon.  The bot's Settings panel is narrow enough that
+          this happens on every desktop width, so it is a stacked layout and
+          not a min-width that happens to fit. */}
       {contained ? (
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex flex-col gap-3">
           {label}
           {trigger}
         </div>
@@ -842,11 +854,16 @@ export function ModelPicker({
                       {pane === "custom" && !blocked ? "Local models" : engineStatus(railInstance)}
                     </span>
                   </div>
-                  <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-                    {pane === "custom"
-                      ? "Run this bot with a model already on your machine."
-                      : "Choose a model for this bot."}
-                  </div>
+                  {/* Only the local pane keeps a line here, because "run a
+                      model from your own machine" is the one thing about that
+                      pane the rail button does not already say.  The hosted
+                      pane dropped its line: "Choose a model for this bot"
+                      described the list the person was already looking at. */}
+                  {pane === "custom" && (
+                    <div className="mt-0.5 text-[11.5px] text-ink-secondary">
+                      Run this bot with a model already on your machine.
+                    </div>
+                  )}
                   {/* Quotas live on the engine, not the model, so they get one
                       labelled home under the header instead of a cryptic chip
                       repeated down every row. */}

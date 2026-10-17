@@ -1,0 +1,23 @@
+{
+  "driverKind": "cursorAgent",
+  "cliVersion": "1.0.0",
+  "recordedAt": "2026-10-15T12:00:00.000Z",
+  "source": "https://cursor.com/docs/cli/reference/slash-commands and fake-acp-cli command turns",
+  "builtins": [
+    "compress",
+    "summarize",
+    "about",
+    "ask",
+    "debug",
+    "goal",
+    "fork",
+    "rename",
+    "open",
+    "copy",
+    "copy-request-id",
+    "copy-conversation-id",
+    "line-numbers",
+    "show-thinking",
+    "status-indicators"
+  ]
+}

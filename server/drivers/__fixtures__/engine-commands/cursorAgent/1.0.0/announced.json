@@ -1,0 +1,7 @@
+{
+  "driverKind": "cursorAgent",
+  "cliVersion": "1.0.0",
+  "recordedAt": "2026-10-15T12:00:00.000Z",
+  "source": "fake-acp-cli FAKE_ACP_COMMANDS=compress,summarize,ship-check and static discovery",
+  "announced": ["compress", "summarize", "model", "config", "ship-check"]
+}

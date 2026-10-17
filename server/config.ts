@@ -18,6 +18,7 @@ import {
   STORED_CONVERSATION_MODES,
   type ConversationMode,
 } from "../shared/conversation-mode.ts";
+import { BUSY_SEND_DEFAULTS, type BusySendDefault } from "../shared/busy-send-default.ts";
 import {
   ROOM_LABEL_MAX_LENGTH,
   type CustomRoomLabels,
@@ -543,6 +544,7 @@ const appConfigSchema = z.object({
   }).optional(),
   features: featureConfigSchema.optional(),
   conversationMode: z.enum(STORED_CONVERSATION_MODES).optional(),
+  busySendDefault: z.enum(BUSY_SEND_DEFAULTS).optional(),
   terminology: z
     .enum(["channels", "groups", "projects", "apps", "topics", "repos", "custom"])
     .optional(),
@@ -779,6 +781,8 @@ export interface AppConfig {
   };
   /** How the roster and threads are laid out.  Absent means simple. */
   conversationMode?: ConversationMode;
+  /** Default delivery while a bot turn is busy.  Absent means steer-first. */
+  busySendDefault?: BusySendDefault;
   /** What this person calls a room: one of the presets, or "custom" with a
    * word of their own in `terminologyCustom`.  Absent means channels. */
   terminology?: RoomTerminology;
@@ -1851,6 +1855,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   }
   if (checkedPatch.vps !== undefined) disk.vps = normalizeVpsConfig(checkedPatch.vps);
   if (checkedPatch.conversationMode !== undefined) disk.conversationMode = checkedPatch.conversationMode;
+  if (checkedPatch.busySendDefault !== undefined) disk.busySendDefault = checkedPatch.busySendDefault;
   if (checkedPatch.terminology !== undefined) disk.terminology = checkedPatch.terminology;
   if (checkedPatch.terminologyCustom !== undefined) disk.terminologyCustom = checkedPatch.terminologyCustom;
   if (checkedPatch.deleteInstance) {

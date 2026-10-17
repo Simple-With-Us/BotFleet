@@ -86,6 +86,30 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "settings-model-picker") {
+  // Visual-spec harness (tests/e2e/settings-model-picker.visual.spec.ts): the
+  // real `ModelPicker` in its contained Settings form, at the panel width where
+  // "Primary Model" and the dropdown used to share one line and wrap.
+  void import("./components/SettingsModelPickerVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "power-off-confirm") {
+  // Visual-spec harness (tests/e2e/power-off-confirm.visual.spec.ts): the real
+  // ConfirmDialog with the three answers a working bot's power-off asks for, at
+  // the widths where those three long labels have to wrap.
+  void import("./components/PowerOffConfirmVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "team-map-context") {
   void import("./components/TeamMapPage").then((mod) => {
     const Fixture = mod.TeamMapSharedContextVisualFixture;
@@ -302,6 +326,17 @@ if (fixtureParam === "tv-face") {
   // Visual-spec harness (tests/e2e/bypass-warning.visual.spec.ts): the Permission
   // Bypass confirmation dialog, standard, high-risk model and busy.
   void import("./components/BypassPermissionsWarningVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "delegation-card") {
+  // Visual-spec harness (tests/e2e/delegation-card.visual.spec.ts): bot-to-bot
+  // delegation card with the live progress row.
+  void import("./components/DelegationCardVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>

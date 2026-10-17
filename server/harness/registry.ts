@@ -29,6 +29,7 @@ import type {
   ProviderInstance,
   ProviderSnapshot,
 } from "../contracts.ts";
+import { isJsonString } from "../schema.ts";
 
 /** The instance id the default fleet reserves for each driver whose reserved
  * id is not simply its own kind.  `isCustom` — which drives the delete button,
@@ -63,7 +64,13 @@ const RESERVED_INSTANCE_ID = new Map<string, InstanceId>([
   ["opencodeGo", "opencode"],
 ]);
 
+/** Historical ids this driver kind may have shipped with before the rename.
+ *  Both are reserved: an instance on either id is the default fleet, not
+ *  operator-added, and gets no delete button. */
+const RESERVED_OPENCODE_IDS: ReadonlySet<InstanceId> = new Set(["opencode", "opencodeGo"]);
+
 export function isCustomInstance(driverKind: string, instanceId: InstanceId): boolean {
+  if (driverKind === "opencodeGo") return !RESERVED_OPENCODE_IDS.has(instanceId);
   return instanceId !== (RESERVED_INSTANCE_ID.get(driverKind) ?? driverKind);
 }
 
@@ -200,6 +207,24 @@ function cliDefaultOf(driver: AnyProviderDriver | undefined): string | undefined
   }
 }
 
+/** Other command names that run this driver, beyond its default binary.
+ * Empty for every engine whose CLI is named exactly one way, so this stays a
+ * no-op for everything but the engines that actually ship two names. */
+function cliAliasesOf(driver: AnyProviderDriver | undefined): string[] {
+  const aliases = driver?.cliAliases;
+  if (!aliases?.length) return [];
+  // A path or a newline is not a command name; findCliCandidates drops those
+  // too, but keeping the list clean here keeps the cache key honest.
+  return [...new Set(aliases.filter((a): a is string => isJsonString(a) && Boolean(a) && !/[\n\r/\\]/.test(a)))];
+}
+
+/** Every name that runs this driver: the default first, then its aliases. */
+function cliSearchNamesOf(driver: AnyProviderDriver | undefined): string[] {
+  const name = cliDefaultOf(driver);
+  if (!name) return [];
+  return [name, ...cliAliasesOf(driver)];
+}
+
 /** Whether an instance's own `cli` override names something that is there: an
  * absolute path that exists, or a bare name found on the augmented PATH.  The
  * default binary's candidates (`cliCandidates`) say nothing about it: a custom
@@ -270,6 +295,7 @@ export interface DescribedInstance {
   install: unknown;
   cli: string | undefined;
   cliDefault: string | undefined;
+  cliAliases: string[];
   cliCandidates: string[];
   fullAuto: boolean;
   iconUrl?: string;
@@ -804,6 +830,14 @@ export class ProviderRegistry {
     return promise;
   }
 
+  /** The last completed describe's answer for one engine, or null before any
+   *  sweep has finished.  Reads what is already known and never probes, which
+   *  is why the command menu uses it: asking for the menu must not start a
+   *  CLI. */
+  lastDescribed(instanceId: InstanceId): DescribedInstance | null {
+    return this.lastDone?.result.find((info) => info.instanceId === instanceId) ?? null;
+  }
+
   /** Make `result` the last completed describe and tell listeners if it
    * changed anything. */
   private commit(result: DescribedInstance[], answeredAt: number, persist: boolean): void {
@@ -1115,7 +1149,7 @@ export class ProviderRegistry {
       curr.snapshot.state === "available" &&
       curr.snapshot.authenticated === undefined &&
       prev.snapshot.state === "available" &&
-      typeof prev.snapshot.authenticated === "boolean" &&
+      (prev.snapshot.authenticated === true || prev.snapshot.authenticated === false) &&
       authFresh
     ) {
       return { ...curr, snapshot: { ...curr.snapshot, authenticated: prev.snapshot.authenticated } };
@@ -1132,12 +1166,15 @@ export class ProviderRegistry {
   ): DescribedInstance {
     const driver = this.driversByKind.get(entry.shadow?.driverKind ?? entry.live!.driverKind);
     const candidatesFor = (d: AnyProviderDriver | undefined): string[] => {
-      const name = cliDefaultOf(d);
-      if (!name) return [];
-      const cached = candidatesByName.get(name);
+      const names = cliSearchNamesOf(d);
+      if (names.length === 0) return [];
+      // Keyed by the whole set, not the default name: two drivers that share a
+      // default but declare different aliases must not share a cache entry.
+      const key = names.join(" ");
+      const cached = candidatesByName.get(key);
       if (cached) return cached;
-      const found = findCliCandidates(name);
-      candidatesByName.set(name, found);
+      const found = findCliCandidates(names);
+      candidatesByName.set(key, found);
       return found;
     };
     if (entry.shadow) {
@@ -1169,6 +1206,7 @@ export class ProviderRegistry {
         install: driver?.install,
         cli: entry.shadow.cli,
         cliDefault: cliDefaultOf(driver),
+        cliAliases: cliAliasesOf(driver),
         // a shadow is exactly the "your CLI is broken, pick another"
         // case where the detected-path dropdown matters most
         cliCandidates: candidatesFor(driver),
@@ -1212,9 +1250,11 @@ export class ProviderRegistry {
       install: driver?.install,
       cli: this.cliByInstance.get(inst.instanceId),
       cliDefault: cliDefaultOf(driver),
-      // every copy of the driver's default binary on the augmented PATH —
-      // the dropdown's "detected" entries. Snapshotted per describe() so a
-      // newly installed CLI shows up on the next refresh.
+      cliAliases: cliAliasesOf(driver),
+      // every copy of the driver's default binary — or of one of its aliases —
+      // on the augmented PATH, which is the dropdown's "detected" entries.
+      // Snapshotted per describe() so a newly installed CLI shows up on the
+      // next refresh.
       cliCandidates: candidatesFor(driver),
       fullAuto: this.fullAutoByInstance.get(inst.instanceId) ?? false,
       iconUrl: inst.iconUrl,
@@ -1419,7 +1459,7 @@ export class ProviderRegistry {
         const allCatalogCapped =
           catalogIds.length > 0 && catalogIds.every((id) => mergedModels[id]?.capped === true);
         if (wildcard || Object.keys(mergedModels).length > 0 || windowsLabel || minimaxSummary) {
-          snapshot.quota = {
+          const mergedQuota = {
             ...driverQuota,
             capped: Boolean(wildcard)
               || allCatalogCapped
@@ -1429,10 +1469,11 @@ export class ProviderRegistry {
             // signal; the driver's is carried over when there is none.
             resetsAt: wildcard?.resetsAt ?? driverQuota?.resetsAt,
             error: wildcard?.error ?? driverQuota?.error,
-            ...(windowsLabel ? { windowsLabel } : {}),
-            ...(Object.keys(mergedModels).length > 0 ? { models: mergedModels } : {}),
-            ...(minimaxSummary ? { minimax: minimaxSummary } : {}),
           };
+          if (windowsLabel) mergedQuota.windowsLabel = windowsLabel;
+          if (Object.keys(mergedModels).length > 0) mergedQuota.models = mergedModels;
+          if (minimaxSummary) mergedQuota.minimax = minimaxSummary;
+          snapshot.quota = mergedQuota;
         }
       } catch (e) {
         snapshot = { state: "unavailable", reason: e instanceof Error ? e.message : String(e) };
