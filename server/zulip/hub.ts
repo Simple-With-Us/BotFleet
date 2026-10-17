@@ -1140,11 +1140,22 @@ export class ZulipHub {
     const now = this.now();
     const budgetPerSession = Math.max(1, this.deps.timings?.drainBatchSize ?? 16);
     const groups = new Map<string, typeof rows>();
+    // Settings cannot change inside this synchronous scan, so decide each
+    // sessionless bot once instead of once per spooled row.
+    const wantedBots = new Map<string, boolean>();
+    const botWanted = (botId: string): boolean => {
+      let wanted = wantedBots.get(botId);
+      if (wanted === undefined) {
+        wanted = this.outgoingBotWanted(botId);
+        wantedBots.set(botId, wanted);
+      }
+      return wanted;
+    };
     for (const row of rows) {
       const key = `${row.botId}:${row.messageId}`;
       const session = this.sessions.get(row.botId);
       if (!session) {
-        if (!this.outgoingBotWanted(row.botId)) {
+        if (!botWanted(row.botId)) {
           // The bot is gone from settings for good; its row can never route.
           try { this.outgoingSpool.remove(row); } catch { /* already gone */ }
           this.outgoingRetry.delete(key);

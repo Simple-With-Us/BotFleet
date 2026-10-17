@@ -231,6 +231,42 @@ describe("outgoing webhook convergence", () => {
     expect(existsSync(rowFile)).toBe(false);
   });
 
+  it("decides a sessionless bot once per drain however many rows are spooled", async () => {
+    const botExistsCalls: string[] = [];
+    const hub = makeHub({
+      botExists: (botId) => {
+        botExistsCalls.push(botId);
+        return botId.startsWith("bot-");
+      },
+      timings: {
+        coalesceMs: 30,
+        drainIntervalMs: 3_600_000,
+        reconcileIntervalMs: 3_600_000,
+        backoffMs: [30, 60],
+        postSpacingMs: 0,
+        retryBaseMs: 30,
+        eventsTimeoutMs: 5_000,
+      },
+    });
+    await connected(hub);
+    sessionOf(hub).creds!.outgoingWebhookToken = "test-outgoing-token";
+    const rowFiles: string[] = [];
+    for (const label of ["one", "two", "three"]) {
+      const id = fake.postStream(JAY, "builds", "Outgoing webhook", `@**BF-Plumber** memoized ${label}`, "website");
+      expect(hub.enqueueOutgoingWebhook("BF-Plumber", id)).toBe("accepted");
+      rowFiles.push(join(dataDir, "zulip", "outgoing", `bot-plumber-${id}.json`));
+    }
+    settings.bots = {};
+    hub.reconcile();
+    expect(hub.sessionFor("bot-plumber")).toBeUndefined();
+    settings.bots = { "bot-plumber": { role: "BF-Plumber" } };
+    botExistsCalls.length = 0;
+    await hub.drain();
+    // One lookup for the bot, not one per spooled row, and every row survives.
+    expect(botExistsCalls.filter((botId) => botId === "bot-plumber")).toHaveLength(1);
+    for (const rowFile of rowFiles) expect(existsSync(rowFile)).toBe(true);
+  });
+
   it("drops a spooled row for a bot removed from settings", async () => {
     // Quiet intervals: only manual drains run, so each drain below is exact.
     const hub = makeHub({
