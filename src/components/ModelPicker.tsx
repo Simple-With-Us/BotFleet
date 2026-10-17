@@ -788,7 +788,7 @@ export function ModelPicker({
           className={cn(
             "flex overflow-hidden rounded-2xl border border-hairline/50 bg-card",
             widePopover
-              ? "fixed z-50 w-[480px] max-w-[calc(100vw-24px)] shadow-2xl shadow-black/50 outline-none"
+              ? "fixed z-50 w-[480px] max-w-[calc(100vw-24px)] shadow-2xl shadow-black/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
               : contained
               ? "relative mt-3 w-full max-h-[min(420px,50dvh)]"
               : "absolute right-0 top-full z-30 mt-2 w-[420px] min-w-[380px] max-w-[min(640px,calc(100vw-2rem))] max-h-[min(560px,calc(100dvh-7rem))] resize shadow-2xl shadow-black/50",
