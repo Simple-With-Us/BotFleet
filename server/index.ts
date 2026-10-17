@@ -6238,25 +6238,6 @@ bus.subscribe((event: RuntimeEvent) => {
   armHelperFlush();
 });
 
-// The ACP driver cuts context that is over the prompt budget and says so with
-// a `context.injected` event whose source is "compression".  Hang its row under
-// the user message the turn answers, the same place the other injections go.
-bus.subscribe((event: RuntimeEvent) => {
-  if (event.type !== "context.injected" || event.source !== "compression" || !event.itemId) return;
-  try {
-    const stored = store.messagesFor(event.threadId);
-    const target = [...stored].reverse().find((m) => m.role === "user");
-    if (!target || target.contextInjections?.some((ref) => ref.id === event.itemId)) return;
-    store.patchMessage(event.threadId, target.id, {
-      contextInjections: mergeInjectionRefs(target.contextInjections, [
-        { id: event.itemId, source: "compression", preview: event.preview, bytes: event.bytes },
-      ]),
-    });
-  } catch (error) {
-    console.error("context-compression: could not attach", error);
-  }
-});
-
 const providerReloadDelegationDrains = new Set<string>();
 
 // A requesting turn that recorded handoffs settles them here.  A turn that
