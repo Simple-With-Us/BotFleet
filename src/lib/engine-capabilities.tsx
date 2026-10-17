@@ -479,12 +479,12 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         notes: ANTIGRAVITY_ULTRA_NOTE,
       },
       api: {
-        // Gemini 2.5 Pro public API rates.  Cached input is the public
+        // Gemini 3.1 Pro public API rates.  Cached input is the public
         // context-caching tier.  Used only by the what-if projection.
         inputPer1k: 0.00125,
         outputPer1k: 0.01,
         cachedInputPer1k: 0.00031,
-        notes: "Gemini 2.5 Pro public API rates.  Catalog reference for the what-if projection, not an invoice.",
+        notes: "Gemini 3.1 Pro public API rates.  Catalog reference for the what-if projection, not an invoice.",
       },
       notes: "Subscription is the pricing mode.  API rates are a what-if catalog, not an invoice.",
     },
@@ -503,7 +503,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       roomCoordination: "no",
       voiceChat: "no",
       computerUse: "no",
-      // Gemini 2.5 Pro and Flash offer a 1M token context window.
+      // Gemini 3.8 Flash and Gemini 3.1 Pro offer a 1M token context window.
       longContext: "yes",
     },
     capabilityNotes: {
@@ -523,6 +523,13 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       ],
     },
     defaultModels: [
+      { id: "gemini-3.8-flash-high", display: "Gemini 3.8 Flash (High)", ctxTokens: 1_000_000 },
+      { id: "gemini-3.1-pro-high", display: "Gemini 3.1 Pro (High)", ctxTokens: 1_000_000 },
+      { id: "gemini-3.1-pro-low", display: "Gemini 3.1 Pro (Low)", ctxTokens: 1_000_000 },
+      { id: "gemini-3.8-flash-medium", display: "Gemini 3.8 Flash (Medium)", ctxTokens: 1_000_000 },
+      { id: "gemini-3.8-flash-low", display: "Gemini 3.8 Flash (Low)", ctxTokens: 1_000_000 },
+      // Retired 2.5 ids kept at the tail so legacy tasks banked under them still
+      // attribute to Antigravity via uniqueModelToEngineId.
       { id: "gemini-2.5-pro", display: "Gemini 2.5 Pro", ctxTokens: 1_000_000 },
       { id: "gemini-2.5-flash", display: "Gemini 2.5 Flash", ctxTokens: 1_000_000 },
     ],
@@ -561,7 +568,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       // "-" here because the registry omitted it.
       connectedApps: "yes",
       crossBotCoordination: "yes",
-      longContext: "no",
+      longContext: "yes",
       roomCoordination: "yes",
       voiceChat: "no",
       computerUse: "no",
@@ -570,6 +577,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     capabilityNotes: {
       crossBotCoordination:
         "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
+      longContext:
+        "Clutch serves 1M-token context models across DeepSeek V4.1 Flash, DeepSeek V4 Pro, Meta Muse Spark, and MiniMax M3.1 Flash Preview.",
     },
     whyThisEngine: {
       headline: "DeepSeek, Muse, and MiniMax models through the Clutch bridge.",
@@ -579,6 +588,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       ],
     },
     defaultModels: [
+      { id: "DeepSeek-V4.1-Flash", display: "DeepSeek-V4.1-Flash", ctxTokens: 1_000_000 },
+      { id: "DeepSeek-V4-Pro", display: "DeepSeek-V4-Pro", ctxTokens: 1_000_000 },
       { id: "deepseek-chat", display: "DeepSeek Chat", ctxTokens: 64_000 },
       { id: "deepseek-reasoner", display: "DeepSeek Reasoner", ctxTokens: 64_000 },
     ],
@@ -686,21 +697,18 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       // The driver declares `images: true`, so the composer accepts image
       // input on this engine the way it does on the other coding CLIs.
       imageAttachments: "yes",
-      // The ACP core mounts MCP servers for this driver, and composioMcp
-      // answers from that one question — so the Connected Apps channel is
-      // present here even though the direct MiniMax engine does not have it.
       connectedApps: "yes",
       crossBotCoordination: "yes",
       longContext: "yes",
+      roomCoordination: "yes",
       // Recorded gaps, from the prose below.
-      roomCoordination: "no",
       voiceChat: "no",
       computerUse: "no",
       liveResearch: "no",
     },
     capabilityNotes: {
       connectedApps:
-        "The ACP core mounts the Connected Apps bridge for this driver, so the channel is present even though the direct MiniMax engine does not have it.",
+        "The ACP core mounts the Connected Apps bridge for this driver alongside the agents and local-computer channels.",
       thisComputer:
         "MiniMax Code runs its own CLI on this Mac, so the bot reads and writes the same working folder the rest of the fleet does.",
       computerUse:
@@ -709,9 +717,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "MiniMax's own coding CLI, driven over the same Token Plan.",
       prose: [
-        "MiniMax Code runs MiniMax's coding CLI inside BotFleet.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, and long context are available.",
+        "MiniMax Code runs MiniMax's coding CLI inside BotFleet.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "It signs in with the CLI's own login and draws on the same Token Plan as the MiniMax engine, so the two rows report one subscription.",
-        "Rooms, voice chat, computer use, and live research are not available on the MiniMax Code engine yet.",
+        "Voice chat, computer use, and live research are not available on the MiniMax Code engine yet.",
       ],
     },
     defaultModels: [
@@ -816,7 +824,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       roomCoordination: "yes",
       computerUse: "no",
       imageAttachments: "yes",
-      webAccess: "unknown",
+      webAccess: "yes",
       longContext: "yes",
       liveResearch: "no",
       voiceChat: "no",
@@ -828,7 +836,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "Moonshot's coding CLI, driven over ACP.",
       prose: [
-        "BotFleet drives the Kimi CLI over ACP.  Files, terminal, this computer, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
+        "BotFleet drives the Kimi CLI over ACP.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "Computer use, voice chat, and live research are not available on this engine.",
         "Pricing for this engine is not recorded in this build.",
       ],
@@ -856,7 +864,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       roomCoordination: "yes",
       computerUse: "no",
       imageAttachments: "yes",
-      webAccess: "unknown",
+      webAccess: "yes",
       longContext: "yes",
       liveResearch: "no",
       voiceChat: "no",
@@ -868,7 +876,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "Factory's CLI, one engine over several providers' models.",
       prose: [
-        "BotFleet drives the Droid CLI over ACP.  Files, terminal, this computer, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
+        "BotFleet drives the Droid CLI over ACP.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
         "The engine's own catalog spans several providers, which is why its row carries one badge rather than a model-family claim.",
         "Computer use, voice chat, and live research are not available on this engine.",
         "Pricing for this engine is not recorded in this build.",
@@ -898,16 +906,20 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       roomCoordination: "yes",
       computerUse: "no",
       imageAttachments: "yes",
-      webAccess: "unknown",
-      longContext: "no",
+      webAccess: "yes",
+      longContext: "yes",
       liveResearch: "no",
       voiceChat: "no",
+    },
+    capabilityNotes: {
+      longContext:
+        "OpenCode connects to 1M-token context models across Gemini, Claude, and MiniMax.",
     },
     whyThisEngine: {
       headline: "The open-source coding CLI, driven over ACP.",
       prose: [
-        "BotFleet drives the OpenCode CLI over ACP.  Files, terminal, this computer, image attachments, connected apps, cross-bot coordination, and rooms are available.",
-        "Computer use, voice chat, long context, and live research are not available on this engine.",
+        "BotFleet drives the OpenCode CLI over ACP.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, rooms, and long context are available.",
+        "Computer use, voice chat, and live research are not available on this engine.",
         "Pricing for this engine is not recorded in this build.",
       ],
     },
