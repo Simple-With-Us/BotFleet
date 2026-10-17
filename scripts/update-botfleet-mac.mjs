@@ -2389,7 +2389,11 @@ async function scanOpenDirectory(directory) {
  * macOS 14 often prints nothing for that mapping.  `lsof -Fn +D` on a flat
  * directory is the form that image already answers for an open file.
  */
-export async function bundleHolderPids(bundlePath) {
+export function isMacSystemBundleInspector(executable = "") {
+  return executable.trim().startsWith("/System/Library/");
+}
+
+export async function bundleHolderPids(bundlePath, { executableOf = processExecutable } = {}) {
   let root;
   try {
     root = await realpath(bundlePath);
@@ -2413,7 +2417,13 @@ export async function bundleHolderPids(bundlePath) {
   for (const result of usable) {
     for (const pid of result.pids) pids.add(pid);
   }
-  return withoutExitedPids([...pids]);
+  const live = await withoutExitedPids([...pids]);
+  const kept = [];
+  for (const pid of live) {
+    if (isMacSystemBundleInspector(await executableOf(pid))) continue;
+    kept.push(pid);
+  }
+  return kept;
 }
 
 /**
