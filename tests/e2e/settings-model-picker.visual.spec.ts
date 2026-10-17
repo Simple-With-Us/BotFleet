@@ -138,4 +138,36 @@ test.describe('fleet-wide model picker', () => {
       await expect(menu).toHaveCount(0);
     });
   }
+
+  test('re-aligns to the window when it narrows while open', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto('/?fixture=settings-model-picker&wide=1');
+    const trigger = page.locator('[data-testid="settings-model-picker-card"] button[aria-haspopup="dialog"]');
+    await trigger.click();
+    const menu = page.getByRole('dialog', { name: 'Choose Model' });
+    await expect(menu).toBeVisible();
+    await page.setViewportSize({ width: 600, height: 900 });
+    await expect.poll(async () => {
+      const box = await menu.boundingBox();
+      return box ? box.x + box.width : Number.POSITIVE_INFINITY;
+    }).toBeLessThanOrEqual(600 - 11);
+    const box = await menu.boundingBox();
+    const button = await trigger.boundingBox();
+    expect(box!.x).toBeGreaterThanOrEqual(11);
+    expect(box!.y).toBeGreaterThanOrEqual(button!.y + button!.height);
+  });
+
+  test('closes on a click outside the menu and its trigger', async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    await page.goto('/?fixture=settings-model-picker&wide=1');
+    const trigger = page.locator('[data-testid="settings-model-picker-card"] button[aria-haspopup="dialog"]');
+    await trigger.click();
+    const menu = page.getByRole('dialog', { name: 'Choose Model' });
+    await expect(menu).toBeVisible();
+    // A click inside the portaled menu is not "outside" it.
+    await menu.click({ position: { x: 4, y: 4 } });
+    await expect(menu).toBeVisible();
+    await page.mouse.click(2, 898);
+    await expect(menu).toHaveCount(0);
+  });
 });
