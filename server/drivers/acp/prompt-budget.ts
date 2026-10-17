@@ -7,8 +7,8 @@
 // prompt is returned byte for byte.
 //
 // What may go, oldest first: replayed history sections (prior turns, oldest
-// first), then volatile system sections in prompt order (memory before a
-// later mentions note).  Those are the parts that legitimately change
+// first), then volatile system sections by cut priority (stale nudges before
+// the bot's memory; see ACP_SECTION_CUT_PRIORITY).  Those are the parts that legitimately change
 // between turns.  The stable system block and the current user message
 // stay, even when they alone are already over the budget.
 import { z } from "zod";
@@ -32,6 +32,33 @@ export const DEFAULT_ACP_PROMPT_BUDGET_BYTES = 128 * 1024;
  *  turn can still end up over it.  Past this multiple the turn is refused
  *  rather than sent. */
 export const ACP_PROMPT_HARD_CEILING_FACTOR = 2;
+
+/** Which volatile section is cut first when the budget bites: lowest number
+ *  goes first, ties in prompt order.  Replaced the old rule, which cut volatile
+ *  sections in the order they appear in the prompt (so memory always went
+ *  before a later mentions note).  Per-turn nudges and stale lists go before the
+ *  bot's own memory and the instructions a message selected.  Ids not listed
+ *  sit in the middle.
+ *
+ *  `automation` goes last.  It is the untrusted-data framing for a webhook,
+ *  iMessage, Zulip or resource turn, and that turn's payload rides in the
+ *  current message, which is never cut.  Dropping the note first would keep
+ *  the payload and lose the warning, and the note is a few hundred bytes, so
+ *  cutting it early saves almost nothing. */
+export const ACP_SECTION_CUT_PRIORITY: Readonly<Record<string, number>> = {
+  recent: 10,
+  mentions: 20,
+  outstanding: 30,
+  playbooks: 50,
+  "skill-instructions": 60,
+  memory: 70,
+  automation: 80,
+};
+const UNLISTED_SECTION_PRIORITY = 35;
+
+function cutPriority(id: string | undefined): number {
+  return (id && ACP_SECTION_CUT_PRIORITY[id]) || UNLISTED_SECTION_PRIORITY;
+}
 
 /** Largest accepted instance setting.  Above this the value is ignored
  *  and the default applies. */
@@ -342,7 +369,12 @@ export function applyAcpPromptBudget(input: {
       droppedTurns += 1;
       continue;
     }
-    const volatileIndex = nextSystem.findIndex((piece) => piece.kind === "volatile" && shrinks(piece.text));
+    let volatileIndex = -1;
+    for (let i = 0; i < nextSystem.length; i++) {
+      const piece = nextSystem[i]!;
+      if (piece.kind !== "volatile" || !shrinks(piece.text)) continue;
+      if (volatileIndex < 0 || cutPriority(piece.id) < cutPriority(nextSystem[volatileIndex]!.id)) volatileIndex = i;
+    }
     if (volatileIndex < 0) break;
     const oldBytes = utf8(nextSystem[volatileIndex].text);
     const replacement = omittedReplacement(nextSystem[volatileIndex].text);
