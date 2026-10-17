@@ -5,9 +5,9 @@
 //
 // Validation errors render one row per issue.  Each installed plugin is
 // shown as a row that lists its name, version, enabled state, source,
-// declared capabilities, and the titles of any cards or commands it
-// contributes from its manifest — text summaries only, the host does
-// not render plugin-supplied UI here.
+// declared capabilities, the outbound network allowlist, and the titles
+// of any cards or commands it contributes from its manifest — text
+// summaries only, the host does not render plugin-supplied UI here.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUpCircle,
@@ -38,6 +38,7 @@ import {
   type PluginListingSource,
   type PluginsResponse,
 } from "../../server/plugin-types";
+import { NET_HOSTS_CAPABILITY, type JsonValue } from "../../shared/plugin-manifest";
 
 async function openExternalUrl(url: string): Promise<void> {
   if (window.ogb?.openExternal) {
@@ -467,6 +468,7 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
                 onUpdate={() => callAction(plugin.name, "update")}
                 onReload={() => callAction(plugin.name, "reload")}
                 onRemove={() => setConfirmRemove(plugin)}
+                onChanged={refresh}
                 onOpen={() => {
                   setOpenError(null);
                   void openPluginSource(plugin.source).catch((error) => {
@@ -500,7 +502,7 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
   );
 }
 
-function PluginRow({
+export function PluginRow({
   plugin,
   busy,
   onEnable,
@@ -508,6 +510,7 @@ function PluginRow({
   onUpdate,
   onReload,
   onRemove,
+  onChanged,
   onOpen,
 }: {
   plugin: PluginListing;
@@ -517,6 +520,7 @@ function PluginRow({
   onUpdate: () => void;
   onReload: () => void;
   onRemove: () => void;
+  onChanged: () => void;
   onOpen: () => void;
 }) {
   const sourceLabel = useMemo(() => {
@@ -543,6 +547,11 @@ function PluginRow({
           </div>
           <p className="mt-1 text-[13px] text-ink-secondary">{plugin.description}</p>
           <p className="mt-1 text-[12px] text-ink-secondary">Source: {sourceLabel}</p>
+          <p className="mt-1 text-[12px] text-ink-secondary">
+            Outbound network: {plugin.capabilities.includes(NET_HOSTS_CAPABILITY) && plugin.needs?.network.length
+              ? plugin.needs.network.join(", ")
+              : "none"}
+          </p>
           {plugin.capabilities.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-1.5">
               {plugin.capabilities.map((cap) => (
@@ -565,6 +574,15 @@ function PluginRow({
               Commands: /{plugin.contributes.commands.map((cmd) => cmd.name).join(", /")}
             </p>
           ) : null}
+          {plugin.contributes?.eventSubscriptions?.length ? (
+            <p className="mt-1 text-[12px] text-ink-secondary">
+              Events:{" "}
+              {plugin.contributes.eventSubscriptions
+                .map((sub) => `${sub.source}:${sub.kinds.join("+")}`)
+                .join(", ")}
+            </p>
+          ) : null}
+          <PluginDetails plugin={plugin} onChanged={onChanged} />
         </div>
         <div className="flex flex-wrap gap-1.5">
           <button
@@ -621,5 +639,270 @@ function PluginRow({
         </div>
       </div>
     </li>
+  );
+}
+/** Render a setting value into a text input.  Strings pass through;
+ *  finite numbers render numerically; everything else renders empty. */
+function textValue(value: JsonValue | undefined): string {
+  if (isString(value)) return value;
+  if (Number.isFinite(value)) return String(value);
+  return "";
+}
+
+/** Human-readable capability summaries for review.  Rendered from the
+ *  manifest's declared list; unknown capabilities show raw.  A tuple
+ *  list (not a string-keyed map) so the lookup stays a linear scan over
+ *  a closed table. */
+const CAPABILITY_SUMMARIES: ReadonlyArray<readonly [string, string]> = [
+  ["read.bots", "Read bot summaries"],
+  ["read.status", "Read bot status"],
+  ["read.config", "Read allowlisted settings"],
+  ["events.subscribe", "Receive typed host events"],
+  ["chat.read", "See conversation summaries"],
+  ["dispatch.wake", "Request bot wakes"],
+  ["connector.reply", "Reply via approved connectors"],
+];
+
+function capabilitySummary(cap: string): string {
+  return CAPABILITY_SUMMARIES.find(([name]) => name === cap)?.[1] ?? cap;
+}
+
+interface PluginSettingValue {
+  values: Record<string, JsonValue>;
+  settingsVersion: number;
+}
+
+interface PluginHealth {
+  ledger: {
+    pending: number;
+    deadLetter: number;
+    recent: Array<{
+      eventId: string;
+      plugin: string;
+      result: string;
+      at: string;
+      attempts: number;
+      reason?: string;
+    }>;
+  };
+  plugin: { status: string; detail: string };
+}
+
+/** Per-plugin Configure and Health panel.  Host-rendered from the
+ *  manifest schema: the view never runs plugin UI.  Secret values are
+ *  write-only (password inputs, never fetched, never displayed). */
+function PluginDetails({ plugin, onChanged }: { plugin: PluginListing; onChanged: () => void }) {
+  const hasSettings = (plugin.settings?.length ?? 0) > 0;
+  const hasSubs = (plugin.contributes?.eventSubscriptions?.length ?? 0) > 0;
+  const [expanded, setExpanded] = useState(false);
+  const [values, setValues] = useState<Record<string, JsonValue>>({});
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [health, setHealth] = useState<PluginHealth | null>(null);
+
+  if (!hasSettings && !hasSubs) return null;
+
+  const loadSettings = async () => {
+    try {
+      const response = await fetch(`/api/plugins/${plugin.name}/settings`);
+      if (!response.ok) throw new Error(`settings load failed (${response.status})`);
+      // SAFETY: the GET settings route returns the host's validated settings
+      // file verbatim; values are JSON by construction and re-rendered only.
+      const body = (await response.json()) as PluginSettingValue;
+      if (isPlainObject(body.values)) setValues({ ...body.values });
+      setLoaded(true);
+    } catch (error) {
+      setMessage(errorMessage(asObject(error)));
+    }
+  };
+
+  const loadHealth = async () => {
+    try {
+      const response = await fetch(`/api/plugins/${plugin.name}/health`);
+      if (!response.ok) throw new Error(`health load failed (${response.status})`);
+      // SAFETY: the GET health route returns ledger reason codes plus the
+      // plugin's bounded status line; nothing here renders as HTML.
+      const body = (await response.json()) as PluginHealth;
+      setHealth(body);
+    } catch (error) {
+      setMessage(errorMessage(asObject(error)));
+    }
+  };
+
+  const toggle = () => {
+    const next = !expanded;
+    setExpanded(next);
+    setMessage(null);
+    if (next) {
+      if (hasSettings && !loaded) void loadSettings();
+      if (hasSubs) void loadHealth();
+    }
+  };
+
+  const save = async () => {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const payload: Record<string, JsonValue> = {};
+      for (const setting of plugin.settings ?? []) {
+        const value = values[setting.key];
+        // Secret inputs left blank mean "unchanged": never send empties.
+        if (setting.type === "secret") {
+          if (!isString(value) || value.length === 0) continue;
+          payload[setting.key] = value;
+          continue;
+        }
+        if (value !== undefined) payload[setting.key] = value;
+      }
+      const response = await fetch(`/api/plugins/${plugin.name}/settings`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ settings: payload }),
+      });
+      if (!response.ok) {
+        const parsed = await readApiError(response);
+        const issues = parsed?.issues?.map((issue) => `${issue.field}: ${issue.message}`).join("; ");
+        throw new Error(parsed?.error && issues ? `${parsed.error} — ${issues}` : parsed?.error || "save failed");
+      }
+      setMessage("Settings saved.");
+      onChanged();
+    } catch (error) {
+      setMessage(errorMessage(asObject(error)));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const postFor = async (path: string, label: string) => {
+    setMessage(null);
+    try {
+      const response = await fetch(`/api/plugins/${plugin.name}/${path}`, { method: "POST" });
+      if (!response.ok) {
+        const parsed = await readApiError(response);
+        throw new Error(parsed?.error || `${label} failed`);
+      }
+      // SAFETY: the test-event and drain routes return delivery outcomes
+      // (stable result/reason codes); nothing here renders as HTML.
+      const body = (await response.json()) as { outcomes?: Array<{ result: string; reason?: string }> };
+      const summary = (body.outcomes ?? []).map((o) => o.result).join(", ") || "no outcomes";
+      setMessage(`${label}: ${summary}.`);
+      if (hasSubs) await loadHealth();
+    } catch (error) {
+      setMessage(errorMessage(asObject(error)));
+    }
+  };
+
+  return (
+    <div className="mt-2">
+      <button
+        type="button"
+        onClick={toggle}
+        className="rounded-md border border-border bg-raised px-2.5 py-1 text-[12px] hover:bg-app"
+      >
+        {expanded ? "Hide configuration" : "Configure and health"}
+      </button>
+      {expanded ? (
+        <div className="mt-2 rounded-md border border-border bg-app p-3">
+          {hasSettings ? (
+            <div className="flex flex-col gap-2">
+              {plugin.settings?.map((setting) => (
+                <label key={setting.key} className="flex flex-col gap-1 text-[12px]">
+                  <span className="font-medium">
+                    {setting.label}
+                    {setting.required ? " (required)" : ""}
+                    {setting.type === "secret" ? " (secret, write-only)" : ""}
+                    {(plugin.configuredKeys ?? []).includes(setting.key) ? " — set" : ""}
+                  </span>
+                  {setting.description ? (
+                    <span className="text-ink-secondary">{setting.description}</span>
+                  ) : null}
+                  {setting.type === "boolean" ? (
+                    <input
+                      type="checkbox"
+                      checked={values[setting.key] === true}
+                      onChange={(event) => setValues({ ...values, [setting.key]: event.target.checked })}
+                      className="h-4 w-4"
+                    />
+                  ) : (
+                    <input
+                      type={setting.type === "secret" ? "password" : setting.type === "number" ? "number" : "text"}
+                      value={textValue(values[setting.key])}
+                      placeholder={setting.type === "secret" ? "Leave blank to keep the saved value" : ""}
+                      onChange={(event) =>
+                        setValues({
+                          ...values,
+                          [setting.key]: setting.type === "number" ? Number(event.target.value) : event.target.value,
+                        })
+                      }
+                      className="rounded-md border border-border bg-raised px-2.5 py-1.5 text-[12px] focus:border-accent focus:outline-none"
+                    />
+                  )}
+                </label>
+              ))}
+              <div>
+                <button
+                  type="button"
+                  onClick={save}
+                  disabled={saving}
+                  className="rounded-md bg-accent px-3 py-1.5 text-[12px] font-medium text-white disabled:opacity-50"
+                >
+                  {saving ? "Saving…" : "Save settings"}
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {hasSubs ? (
+            <div className="mt-3 border-t border-border pt-3">
+              <div className="mb-2 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => postFor("test-event", "Test event")}
+                  className="rounded-md border border-border bg-raised px-2.5 py-1 text-[12px] hover:bg-app"
+                >
+                  Send test event
+                </button>
+                <button
+                  type="button"
+                  onClick={() => postFor("drain", "Retry drain")}
+                  className="rounded-md border border-border bg-raised px-2.5 py-1 text-[12px] hover:bg-app"
+                >
+                  Drain retries
+                </button>
+              </div>
+              {health ? (
+                <div className="text-[12px]">
+                  <p>
+                    Status: <strong>{health.plugin.status}</strong> — {health.plugin.detail}
+                  </p>
+                  <p className="text-ink-secondary">
+                    Pending: {health.ledger.pending}, dead-letter: {health.ledger.deadLetter}
+                  </p>
+                  {health.ledger.recent.length > 0 ? (
+                    <ul className="mt-1 list-disc pl-5 text-ink-secondary">
+                      {health.ledger.recent.slice(0, 10).map((outcome, idx) => (
+                        <li key={idx}>
+                          <code className="rounded bg-raised px-1">{outcome.eventId}</code> {outcome.result}
+                          {outcome.reason ? ` (${outcome.reason})` : ""} — attempts {outcome.attempts}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-ink-secondary">No deliveries yet.</p>
+                  )}
+                </div>
+              ) : (
+                <p className="text-[12px] text-ink-secondary">Loading health…</p>
+              )}
+              <p className="mt-2 text-[11px] text-ink-secondary">
+                Capabilities:{" "}
+                {plugin.capabilities.map((cap) => capabilitySummary(cap)).join(", ")}
+              </p>
+            </div>
+          ) : null}
+          {message ? <p className="mt-2 text-[12px] text-ink-secondary">{message}</p> : null}
+        </div>
+      ) : null}
+    </div>
   );
 }

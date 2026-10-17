@@ -98,6 +98,18 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "power-off-confirm") {
+  // Visual-spec harness (tests/e2e/power-off-confirm.visual.spec.ts): the real
+  // ConfirmDialog with the three answers a working bot's power-off asks for, at
+  // the widths where those three long labels have to wrap.
+  void import("./components/PowerOffConfirmVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else if (fixtureParam === "team-map-context") {
   void import("./components/TeamMapPage").then((mod) => {
     const Fixture = mod.TeamMapSharedContextVisualFixture;

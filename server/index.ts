@@ -44,6 +44,7 @@ import {
   IMESSAGE_PERSONA_RULE,
   isImessageInboundSource,
   outboundImessageText,
+  TO_IMESSAGE_TAG,
   wrapImessageInbound,
 } from "../shared/imessage-message.ts";
 import {
@@ -111,6 +112,11 @@ import {
   type HeldWork,
   type DrainWindowInput,
 } from "./update-drain.ts";
+import {
+  arrivedViaCloudflareTunnel,
+  isMutatingHarnessApiRequest,
+  NAMED_TUNNEL_MUTATION_FORBIDDEN,
+} from "./named-tunnel-gate.ts";
 import { botOffError, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import {
   BOT_OFF_CODE,
@@ -374,10 +380,13 @@ import {
   dropJobNotices,
   dropJobNoticesForBot,
   dropQueuedForOffBot,
+  dropSteeredMessages,
   pendingJobNotices,
   queueJobNotice,
   queueSteeredMessage,
   queuedMessageCount,
+  queuedMessageCountFor,
+  queuedMessageIds,
   restoreJobNotices,
   drainEveryReadyBatch,
   restoreSteeredEntries,
@@ -428,7 +437,9 @@ import {
 } from "./room-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ITEM_ID_MAX_LENGTH, ItemIoStore } from "./item-io-store.ts";
+import type { ContextInjectionRef } from "../shared/context-injection.ts";
 import {
+  addInjectionRef,
   draftFromReplay,
   draftFromReply,
   draftsFromPromptSections,
@@ -458,11 +469,11 @@ import {
   roomResponders,
   sectionKey,
   Store,
+  type BotRecord,
   type GroupDefaultResponder,
   type GroupRecord,
   type GroupTaskRecord,
   type Message,
-  type BotRecord,
   type TaskRecord,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
@@ -564,8 +575,52 @@ import { createTeamManifest, importedMemberProfile, parseTeamManifest } from "./
 import { readThreadEvents } from "./thread-events.ts";
 import { listenWebhookIngress, webhookCredential, type WebhookIngress } from "./webhook-ingress.ts";
 import { readLinqWebhook } from "./routes/linq-webhook.ts";
+import { createZulipOutgoingWebhookRoute } from "./zulip/webhook.ts";
 import { resolveLinqBinding } from "./linq/dispatch.ts";
-import { bindLinqChatToTurn, deliverLinqOutboundIfNeeded, releaseLinqChat, stopLinqTypingForThread } from "./linq/outbound.ts";
+import { bindLinqChatToTurn, deliverLinqOutboundIfNeeded, releaseLinqChat, sendLinqCommandReply, stopLinqTypingForThread } from "./linq/outbound.ts";
+import {
+  CommandRateLimiter,
+  joinSentences,
+  messagingCommandOf,
+  runServerCommand,
+  validateCommandArgs,
+  type CommandContext,
+  type ServerCommandName,
+  type StatusInput,
+} from "./chat-commands.ts";
+import {
+  buildBotCommands,
+  composerHelpLines,
+  findBotCommand,
+  NO_SESSION_REASON,
+  type CommandEngine,
+} from "./command-registry.ts";
+import { EngineCommandCache } from "./engine-command-cache.ts";
+import {
+  discoverStaticEngineCommands,
+  mergeAnnouncedEngineCommands,
+} from "./drivers/engine-command-discovery.ts";
+import {
+  buildCursorAgentAllowlist,
+  CURSOR_BUILTIN_COMMAND_NAMES,
+  discoverCursorCommandCatalog,
+} from "./drivers/cursor-engine-commands.ts";
+import {
+  ENGINE_COMMAND_ALLOWLIST,
+  EngineCommandTextError,
+  engineCommandText,
+  offeredEngineCommands,
+  type EngineCommandSpec,
+} from "./drivers/engine-commands.ts";
+import {
+  botCommandRequestSchema,
+  COMMAND_SURFACES,
+  MESSAGING_COMMAND_NAMES,
+  type BotCommandErrorCode,
+  type BotCommandRequest,
+  type CommandOrigin,
+  type CommandSurface,
+} from "../shared/bot-commands.ts";
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { ResourceTriggerManager } from "./resource-triggers.ts";
@@ -580,6 +635,10 @@ import {
 } from "./plugin-loader.ts";
 import * as pluginsModule from "./plugins.ts";
 import type { PluginListing } from "./plugin-types.ts";
+import {
+  pluginEventEnvelopeSchema,
+  type PluginChatSummary,
+} from "../shared/plugin-events.ts";
 import { createBotPackageExport } from "./package-export.ts";
 import { installTestParentWatchdog } from "./test-parent-watchdog.ts";
 import { installTimestampedConsole } from "./console-timestamps.ts";
@@ -767,7 +826,7 @@ export const CliCandidatesQuerySchema = z.object({
     .max(4096)
     .default("")
     .transform((raw) => raw.split(",").map((alias) => alias.trim()).filter(Boolean)),
-});
+}).strict();
 
 /** `<streamId>:<seq>` — opaque to clients, and the only thing they need to
  * remember to resume.  Returns null when it belongs to another run. */
@@ -1050,6 +1109,7 @@ bus.subscribe((event: RuntimeEvent) => observeRuntimeEvent(event));
 // are untrusted input; the lifecycle only ever sees parsed values.
 const PLUGIN_INSTALL_BODY = z.object({ source: z.string().trim().min(1).max(4096) }).strip();
 const PLUGIN_COMMAND_BODY = z.object({ args: z.string().max(8192).default("") }).strip();
+const PLUGIN_SETTINGS_BODY = z.object({ settings: z.record(z.string(), z.json()).default({}) }).strip();
 const PLUGIN_SLUG = z.string().min(1).max(64).regex(/^[\w][\w-]*$/);
 const PLUGIN_PATH_PARAMS = z.tuple([PLUGIN_SLUG]);
 const PLUGIN_ITEM_PATH_PARAMS = z.tuple([PLUGIN_SLUG, PLUGIN_SLUG]);
@@ -1094,6 +1154,43 @@ pluginsModule.initPluginRuntime({
   },
 });
 await pluginsModule.bootPluginRuntime();
+
+// ── plugin event platform (host API v2) ───────────────────────────────
+// The host owns every integration transport.  Plugins subscribe to typed
+// envelopes and return routing decisions; they never bind ports, see
+// tokens, or keep event state.  Chat summaries are metadata only (no
+// transcripts): the dispatcher turn reads content under its own
+// authority through the normal thread APIs.
+function listPluginChatSummaries(limit: number): PluginChatSummary[] {
+  const capped = Math.max(0, Math.min(limit, 20));
+  const out: PluginChatSummary[] = [];
+  for (const bot of store.bots.slice(0, capped)) {
+    try {
+      const tasks = store.tasks(bot.id);
+      const threadId = bot.threadId ?? tasks[0]?.threadId ?? bot.id;
+      const tail = store.messagesTail(threadId, 1);
+      const last = tail.messages[tail.messages.length - 1];
+      out.push({
+        botId: bot.id,
+        botName: bot.name,
+        threadId,
+        title: (tasks[0]?.title ?? bot.name ?? bot.id).slice(0, 200),
+        lastActiveAt: new Date(last?.at ?? Date.now()).toISOString(),
+        messageCount: store.messageCountFor(threadId),
+      });
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
+pluginsModule.initPluginChats({ listChatSummaries: listPluginChatSummaries });
+pluginsModule.initPluginDecisionHandler((_pluginName, event, decision) => {
+  // Late retry decisions (after the message's settle window): the hub
+  // re-fetches canonically and queues exactly once.
+  void zulipHub?.applyLatePluginDecision(event, decision).catch(() => {});
+});
 
 // ── peer-agent comms wiring ────────────────────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
@@ -3457,6 +3554,403 @@ async function interruptThreadEverywhere(threadId: string): Promise<InterruptOut
     (instanceId, error) => console.error(`interrupt failed on instance ${instanceId} for thread ${threadId}:`, error),
   );
 }
+/** What `interruptBot` did, or why it refused. */
+type InterruptBotOutcome =
+  | { ok: true; stopped: boolean; refused: boolean; cancelledRuns: number }
+  | { ok: false; status: 409; error: string };
+
+/** Stop everything a bot is doing: the live turn on its in-flight thread (or
+ * the room thread it is busy in), its open approvals, and its queued and
+ * running routine runs, and snooze automatic triggers until the owner's next
+ * message.  The Stop button's route, the typed /stop and the iMessage /stop all
+ * come through here so they cannot drift apart.
+ *
+ * With `expectedThreadId`, a stale request is refused before anything changes:
+ * a Stop aimed at a task the bot has since left must not cancel unrelated
+ * automation or snooze the bot. */
+async function interruptBot(
+  bot: BotRecord,
+  options: { expectedThreadId?: string } = {},
+): Promise<InterruptBotOutcome> {
+  const expectedThreadId = options.expectedThreadId;
+  let stopped = false;
+  let refused = false;
+  let cancelledRunCount = 0;
+  // Validate the target thread before mutating anything: a stale Stop
+  // request must not cancel unrelated automation or snooze the bot.  The
+  // live thread is the room thread when the bot is busy in a group,
+  // otherwise the bot's in-flight (or visible) thread.
+  const interruptBusyGroup = store.groups.find((g) => g.busyBotId === bot.id);
+  const interruptLiveThreadId = interruptBusyGroup
+    ? interruptBusyGroup.threadId
+    : (bot.inflightThreadId ?? bot.threadId);
+  if (expectedThreadId !== undefined && interruptLiveThreadId !== expectedThreadId) {
+    return {
+      ok: false,
+      status: 409,
+      error: interruptBusyGroup
+        ? `this bot is working in channel ${interruptBusyGroup.id}`
+        : "the bot switched tasks before it could be interrupted",
+    };
+  }
+  if (routines) {
+    // Validate routine conflicts before mutating anything: cancelling
+    // first and rejecting after would leave the manual turn the user tried
+    // to stop still running while unrelated automation was already
+    // cancelled and the bot snoozed.
+    if (expectedThreadId !== undefined) {
+      const botRuns = routines.listRuns().filter(
+        (run) =>
+          !run.coalescedInto &&
+          run.botId === bot.id &&
+          ["queued", "running", "waiting"].includes(run.status),
+      );
+      const runInOtherThread = botRuns.find((run) => run.threadId && run.threadId !== expectedThreadId);
+      if (runInOtherThread && !botRuns.some((run) => run.threadId === expectedThreadId)) {
+        return { ok: false, status: 409, error: "this bot is running a routine in another conversation" };
+      }
+    }
+    // Cancel all active and queued routine runs for this bot and snooze automated triggers
+    // so background webhooks and scheduled routines do not restart it.
+    jobHost?.stopThread(bot.id, interruptLiveThreadId);
+    const cancelledRuns = await routines.cancelAllRunsForBot(bot.id);
+    routines.snoozeBot(bot.id);
+    cancelledRunCount = cancelledRuns.length;
+    if (cancelledRuns.length > 0) {
+      stopped = true;
+    }
+  }
+  if (!routines) jobHost?.stopThread(bot.id, interruptLiveThreadId);
+  // Latch the stop before anything is awaited.  The driver may settle the
+  // turn the instant it is killed, so the turn.completed fold can run
+  // before this handler resumes — if the latch were set after the await,
+  // the fold would already have failed over to the next engine.
+  const latchStop = (threadId: string) => {
+    const turnKey = `${bot.id}:${threadId}`;
+    stoppedTurns.add(turnKey);
+    // the user ended this request, so the next message starts the saved
+    // chain from the top rather than resuming mid-chain
+    fallbackAttemptByTurn.delete(turnKey);
+    pendingCredentialFallback.delete(turnKey);
+    pendingMemberFallback.delete(threadId);
+  };
+  // a bot busy in a ROOM is running on the room's thread — stopping it
+  // from its own chat must reach that turn, not just the 1:1 thread
+  // (interruptBusyGroup was already validated against expectedThreadId above)
+  const busyGroup = interruptBusyGroup;
+  if (busyGroup) {
+    latchStop(busyGroup.threadId);
+    const groupOutcome = await interruptThreadEverywhere(busyGroup.threadId);
+    if (groupOutcome.stopped) stopped = true;
+    if (groupOutcome.refused) refused = true;
+    closeOpenApprovals(busyGroup.threadId);
+  }
+  // A turn started on one task keeps running while the user reads another,
+  // so the live thread — not the visible one — is what has to be stopped.
+  const liveThreadId = bot.inflightThreadId ?? bot.threadId;
+  latchStop(liveThreadId);
+  const liveOutcome = await interruptThreadEverywhere(liveThreadId);
+  if (liveOutcome.stopped) stopped = true;
+  if (liveOutcome.refused) refused = true;
+  closeOpenApprovals(liveThreadId);
+  if (liveThreadId !== bot.threadId) closeOpenApprovals(bot.threadId);
+  return { ok: true, stopped, refused, cancelledRuns: cancelledRunCount };
+}
+
+// ── slash commands ─────────────────────────────────────────────────────────
+// The logic lives in server/chat-commands.ts (what a command is and says) and
+// server/command-registry.ts (what a bot is offered); this is the wiring to the
+// store, the engines, the stop path and the stream.
+
+/** What each engine instance last announced as its commands, kept across
+ * restarts (server/engine-command-cache.ts). */
+const engineCommandCache = new EngineCommandCache(join(DATA_DIR, "engine-commands.json"));
+bus.onEngineCommands((event) => {
+  const instanceId = event.providerInstanceId;
+  if (instanceId) {
+    engineCommandCache.record(instanceId, event.names, registry.lastDescribed(instanceId)?.snapshot.version ?? null);
+  }
+});
+
+/** Ten commands per bot per minute over iMessage; the eleventh gets no reply. */
+const messagingCommandLimiter = new CommandRateLimiter();
+
+/** The engine command running on a thread, by the dispatch that started it.
+ * The settle fold reads it to leave a command turn out of failover, titling and
+ * the finished-turn push, and the transcript to mark the rows it produced. */
+const engineCommandTurns = new Map<
+  string,
+  { dispatchId: number; commandId: string; name: string; output: "local" | "model"; surface: CommandSurface }
+>();
+
+/** A bot as a client receives it after its conversation changed: the record,
+ * its messages and its tasks. */
+function botWithThreadView(bot: BotRecord) {
+  return {
+    ...wireBot(bot),
+    messages: store.messagesFor(bot.threadId),
+    activeLeafId: store.activeLeaf(bot.threadId),
+    tasks: store.tasks(bot.id).map(wireTask),
+  };
+}
+
+/** The engine a bot is configured to run, as the command menu needs it.  Reads
+ * what the registry already knows; it never probes. */
+function commandEngineFor(bot: BotRecord): CommandEngine {
+  const task = store.taskByThread(bot.id, bot.threadId);
+  const selection = task?.modelSelection ?? bot.modelSelection;
+  const instance = registry.get(selection.instanceId);
+  const described = registry.lastDescribed(selection.instanceId);
+  const option = instance?.models.options.find((candidate) => candidate.id === selection.model);
+  const levels = instance
+    ? modelEffortLevels({ driverKind: instance.driverKind, capabilities: instance.adapter.capabilities }, option, selection.model)
+    : [];
+  const unavailable = described?.snapshot.state === "unavailable";
+  const cooling = Boolean(quotaCooldowns.get(bot.id, selection.instanceId, selection.model));
+  return {
+    instanceId: selection.instanceId,
+    driverKind: instance?.driverKind ?? "",
+    displayName: described?.displayName ?? instance?.displayName ?? selection.instanceId,
+    model: selection.model,
+    modelLabel: option?.label ?? selection.model,
+    effort: selection.effort ?? null,
+    modelOptionCount: instance?.models.options.length ?? 0,
+    effortLevels: levels,
+    supportsCommands: instance?.adapter.capabilities.engineCommands === true,
+    available: Boolean(instance) && !unavailable && !cooling,
+    cliVersion: described?.snapshot.version ?? null,
+  };
+}
+
+function engineCommandDiscoveryContext(bot: BotRecord): { cwd: string | null; env: NodeJS.ProcessEnv } {
+  const task = store.taskByThread(bot.id, bot.threadId);
+  return { cwd: task?.cwd ?? bot.cwd ?? null, env: process.env };
+}
+
+function announcedEngineCommands(bot: BotRecord, engine: CommandEngine): readonly string[] | null {
+  const ctx = engineCommandDiscoveryContext(bot);
+  const cached = engineCommandCache.get(engine.instanceId, engine.cliVersion);
+  const discovered = discoverStaticEngineCommands(engine.driverKind, ctx);
+  let merged = mergeAnnouncedEngineCommands(cached, discovered);
+  if (engine.driverKind === "cursorAgent") {
+    const catalog = discoverCursorCommandCatalog(ctx);
+    merged = mergeAnnouncedEngineCommands(merged, [...catalog.names, ...CURSOR_BUILTIN_COMMAND_NAMES]);
+  }
+  return merged;
+}
+
+function engineCommandAllowlistFor(
+  bot: BotRecord,
+  engine: CommandEngine,
+): Readonly<Record<string, readonly EngineCommandSpec[]>> {
+  if (engine.driverKind !== "cursorAgent") return ENGINE_COMMAND_ALLOWLIST;
+  const ctx = engineCommandDiscoveryContext(bot);
+  const catalog = discoverCursorCommandCatalog(ctx);
+  const announced = announcedEngineCommands(bot, engine) ?? [];
+  return {
+    ...ENGINE_COMMAND_ALLOWLIST,
+    cursorAgent: buildCursorAgentAllowlist(announced, catalog),
+  };
+}
+
+/** The answer GET /api/bots/:id/commands gives for a bot on a surface. */
+function commandsFor(bot: BotRecord, surface: CommandSurface) {
+  const engine = commandEngineFor(bot);
+  const task = store.taskByThread(bot.id, bot.threadId);
+  return buildBotCommands({
+    botId: bot.id,
+    threadId: bot.threadId,
+    surface,
+    busy: bot.busy === true,
+    engine,
+    allowsMultipleThreads: allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode)),
+    hasSession: Boolean(task?.resumeCursors[engine.instanceId]),
+    announced: announcedEngineCommands(bot, engine),
+    allowlist: engineCommandAllowlistFor(bot, engine),
+  });
+}
+
+/** Drop every message waiting behind the bot's running turn, and forget the
+ * unattended mark a relayed one carried. */
+function dropQueuedMessages(bot: BotRecord): number {
+  for (const queueId of queuedMessageIds(bot.threadId)) relayQueuedMessageIds.delete(queueId);
+  const dropped = dropSteeredMessages(bot.threadId);
+  if (dropped > 0) {
+    const fresh = store.bot(bot.id);
+    if (fresh) broadcast({ kind: "bot", bot: botWithThreadView(fresh) });
+  }
+  return dropped;
+}
+
+/** What /status prints, read from the store and the registry. */
+function statusInputFor(bot: BotRecord): StatusInput {
+  const task = store.taskByThread(bot.id, bot.threadId);
+  const selection = task?.modelSelection ?? bot.modelSelection;
+  const engine = commandEngineFor(bot);
+  const instance = registry.get(selection.instanceId);
+  const option = instance?.models.options.find((candidate) => candidate.id === selection.model);
+  const described = registry.lastDescribed(selection.instanceId);
+  const room = store.groups.find((group) => group.busyBotId === bot.id);
+  return {
+    busy: bot.busy === true,
+    busySince: turnStats.startedAt(bot.inflightThreadId ?? bot.threadId),
+    busyInChannel: room ? room.name : null,
+    now: Date.now(),
+    engineName: engine.displayName,
+    modelLabel: engine.modelLabel,
+    effort: engine.effortLevels.length > 0 ? (selection.effort ?? "default") : null,
+    contextTokens: task?.usage?.lastInput ?? null,
+    contextWindow: option?.contextWindow ?? null,
+    costUsd: task?.usage?.costUsd ?? null,
+    subscription: described?.snapshot.billing === "subscription",
+    queued: queuedMessageCountFor(bot.threadId),
+    title: task?.title ?? "",
+  };
+}
+
+/** Everything a BotFleet command needs from the server. */
+function commandContextFor(bot: BotRecord, origin: CommandOrigin): CommandContext {
+  return {
+    origin,
+    bot: { id: bot.id, name: bot.name, busy: bot.busy === true },
+    simpleMode: !allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode)),
+    stop: async () => {
+      const outcome = await interruptBot(bot);
+      return outcome.ok
+        ? { stopped: outcome.stopped, refused: outcome.refused, cancelledRuns: outcome.cancelledRuns }
+        : { stopped: false, refused: true, cancelledRuns: 0 };
+    },
+    dropQueued: () => dropQueuedMessages(bot),
+    conversationIsEmpty: () => store.messagesFor(bot.threadId).length === 0,
+    conversationTitle: () => store.taskByThread(bot.id, bot.threadId)?.title,
+    startConversation: (title) => {
+      const task = store.createTask(bot.id, title, true);
+      if (!task) return null;
+      const fresh = store.bot(bot.id);
+      if (fresh) broadcast({ kind: "bot", bot: botWithThreadView(fresh) });
+      return { threadId: task.threadId };
+    },
+    status: () => statusInputFor(bot),
+    helpLines: () => composerHelpLines(commandsFor(bot, "desktop")),
+  };
+}
+
+/** A relayed text message that is exactly /stop, /new, /status or /help: run it
+ * here, before any bot reads the text, and answer where it came from.  The Mac
+ * relay sends the tagged reply it finds in the conversation; Linq is answered
+ * directly.  The command's reply is written on the conversation the text
+ * arrived on, so after /new the confirmation still reaches the phone through
+ * the thread the relay already maps. */
+async function runMessagingCommand(
+  bot: BotRecord,
+  name: ServerCommandName,
+  source: "imessage" | "linq",
+  linqChatId: string | undefined,
+): Promise<RouteReply> {
+  const who = `bot=${bot.name} (${bot.id}) source=${source} name=${name}`;
+  if (!messagingCommandLimiter.allow(bot.id)) {
+    console.warn(`[chat-command] ${who} outcome=rate_limited`);
+    return { status: 429, body: { error: "Too many commands.  Wait a minute and try again.", code: "rate_limited" } };
+  }
+  const arrivalThreadId = bot.threadId;
+  const outcome = await runServerCommand(name, commandContextFor(bot, source));
+  const text = outcome.ok ? outcome.reply.text : outcome.error;
+  console.log(`[chat-command] ${who} outcome=${outcome.ok ? "ok" : "refused"}`);
+  const marker = {
+    id: randomUUID(),
+    name,
+    source: "botfleet" as const,
+    role: "reply" as const,
+    surface: source,
+    ok: outcome.ok,
+  };
+  if (source === "imessage") {
+    // the relay polls for tagged bot rows and ignores the HTTP body
+    store.appendMessage(arrivalThreadId, { role: "bot", kind: "text", text: `${TO_IMESSAGE_TAG} ${text}`, command: marker });
+  } else {
+    store.appendMessage(arrivalThreadId, { role: "bot", kind: "text", text, command: marker });
+    if (linqChatId) {
+      const sent = await sendLinqCommandReply(linqChatId, text);
+      if (!sent.sent) console.warn(`[chat-command] ${who} reply not delivered: ${sent.reason ?? "unknown"}`);
+    }
+  }
+  return { status: 200, body: outcome.ok ? { ok: true, command: name } : { ok: true, command: name, refused: true } };
+}
+
+/** An error answer for the commands routes: a sentence in the owner's words and
+ * a code a client can branch on. */
+function commandFailure(status: number, code: BotCommandErrorCode, error: string): RouteReply {
+  return { status, body: { error, code } };
+}
+
+/** POST /api/bots/:id/commands: run one command by its id.  A BotFleet command
+ * is answered here; an engine's own command is dispatched as a turn of its own
+ * and answers when the turn starts, with its output arriving on the stream. */
+async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface: CommandSurface): Promise<RouteReply> {
+  const response = commandsFor(bot, surface);
+  const command = findBotCommand(response, request.id);
+  if (!command) return commandFailure(404, "command_not_found", "That command isn't available for this bot right now.");
+  if (command.invoke === "client") {
+    return commandFailure(
+      400,
+      "client_command",
+      joinSentences([`${command.label} opens a control in the app.`, "It is not sent to the server."]),
+    );
+  }
+  const args = validateCommandArgs(command, request.args);
+  if (!args.ok) return commandFailure(400, "invalid_args", args.error);
+
+  if (command.source === "botfleet") {
+    const name = MESSAGING_COMMAND_NAMES.find((candidate) => candidate === command.name);
+    if (!name) return commandFailure(404, "command_not_found", "That command isn't available for this bot right now.");
+    const outcome = await runServerCommand(name, commandContextFor(bot, surface));
+    if (!outcome.ok) return commandFailure(outcome.status, outcome.code, outcome.error);
+    return { status: 200, body: { ok: true, id: command.id, kind: "reply", reply: outcome.reply, effects: outcome.effects } };
+  }
+
+  // The engine's own command: only on an idle bot, never steered or queued.
+  if (bot.busy) return commandFailure(409, "bot_busy", joinSentences(["Still working.", "Send /stop first."]));
+  if (!command.enabled) {
+    const reason = command.disabledReason ?? "That command is not available right now.";
+    if (reason === NO_SESSION_REASON) return commandFailure(409, "no_session", reason);
+    if (!commandEngineFor(bot).available) return commandFailure(503, "engine_unavailable", reason);
+    return commandFailure(409, "command_disabled", reason);
+  }
+  const engine = commandEngineFor(bot);
+  const allowlist = engineCommandAllowlistFor(bot, engine);
+  const spec = offeredEngineCommands(
+    engine.driverKind,
+    announcedEngineCommands(bot, engine) ?? [],
+    engine.cliVersion,
+    allowlist,
+  ).find((candidate) => candidate.name === command.name);
+  const commandId = randomUUID();
+  const run: EngineCommandRun = { id: commandId, name: command.name, args: args.value, surface, output: spec?.output ?? "local" };
+  try {
+    await startTurn(bot.id, engineCommandText(run), { command: run });
+  } catch (error) {
+    // engineCommandText refuses a name or argument that is not safe to send —
+    // a leading slash, a second line, an over-long argument.  Those are the
+    // caller's mistake, not the engine's, and they arrive as an
+    // EngineCommandTextError, which is narrowed here rather than by message so
+    // rewording the sentence cannot silently reclassify it.  The generic status
+    // mapping below would otherwise read it as a 500 and re-throw.
+    if (error instanceof EngineCommandTextError) {
+      return commandFailure(400, "invalid_args", error.message);
+    }
+    const status = error instanceof Error && "status" in error ? Number(error.status) : 500;
+    const message = error instanceof Error ? error.message : String(error);
+    if (status === 503) return commandFailure(503, "engine_unavailable", message);
+    if (status === 409) return commandFailure(409, "bot_busy", message);
+    throw error;
+  }
+  const invocation = store.messagesFor(bot.threadId).findLast((message) => message.command?.id === commandId);
+  return {
+    status: 202,
+    body: { ok: true, id: command.id, kind: "turn", threadId: bot.threadId, invocationMessageId: invocation?.id ?? "" },
+  };
+}
+
 /** Room turns re-enter the member engine after turn.completed so failover
  * does not race the sequential roster walk. */
 const pendingMemberFallback = new Map<
@@ -4576,12 +5070,19 @@ bus.subscribe((event: RuntimeEvent) => {
       if (event.itemType === "assistant_text") {
         const activeOwner = activeTurnOwners.current(event.threadId);
         const resolvedSelection = activeOwner?.selection ?? (bot?.modelSelection ? { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model } : undefined);
-        const appended = pushMessage({
-          role: "bot",
-          kind: "text",
-          text: event.text,
-          ...(resolvedSelection ? { modelSelection: { instanceId: resolvedSelection.instanceId, model: resolvedSelection.model } } : {}),
-        });
+        const botRow: Omit<Message, "id" | "at"> = { role: "bot", kind: "text", text: event.text };
+        if (resolvedSelection) {
+          botRow.modelSelection = { instanceId: resolvedSelection.instanceId, model: resolvedSelection.model };
+        }
+        // What an engine's own command printed (a report, a summary) is not
+        // conversation: it is drawn as a card under the chip that asked for it
+        // and never replayed to a model.  A command whose output is a model
+        // answer stays an ordinary reply.
+        const commandRun = engineCommandTurns.get(event.threadId);
+        if (commandRun && commandRun.dispatchId === activeOwner?.dispatchId && commandRun.output === "local") {
+          botRow.command = { id: commandRun.commandId, name: commandRun.name, source: "engine", role: "output", surface: commandRun.surface };
+        }
+        const appended = pushMessage(botRow);
         const speakingBot = bot ?? (speaker?.botId ? store.bot(speaker.botId) : store.botByThread(event.threadId));
         if (resolveVoiceSummaryMode(speakingBot) === "always" && appended.text?.trim()) {
           void voiceSummaryFor(event.threadId, appended.id, appended.text, cfg).catch(() => {
@@ -5128,6 +5629,13 @@ bus.subscribe((event: RuntimeEvent) => {
       if (worktreeBotId && settledOwner) {
         releaseTurnWorktreeLease(event.threadId, worktreeBotId, settledOwner.dispatchId);
       }
+      // An engine command (/compact) is not a request the bot failed to answer:
+      // it never fails over to another engine, names nothing, and is not worth
+      // a "finished" push.  The marker belongs to one dispatch, so a leftover
+      // from a dispatch that never started cannot catch the next turn.
+      const commandRun = engineCommandTurns.get(event.threadId);
+      const commandTurn = commandRun !== undefined && commandRun.dispatchId === settledOwner?.dispatchId;
+      if (commandTurn) engineCommandTurns.delete(event.threadId);
       const reply = lastReply.get(event.threadId) ?? "";
       lastReply.delete(event.threadId);
       const lastReported = turnUsage.get(event.threadId);
@@ -5207,7 +5715,7 @@ bus.subscribe((event: RuntimeEvent) => {
       let deferredAutoFallback = false;
       let waitedForProviderReload = false;
       const fallbackHealthReloadGeneration = providerReloadGeneration;
-      if (fallbackBot) {
+      if (fallbackBot && !commandTurn) {
         const fallbackKey = `${fallbackBot.id}:${event.threadId}`;
         const activeMsgs = store.activePath(event.threadId);
         const lastUserIdx = lastTurnStartIndex(activeMsgs);
@@ -5463,7 +5971,7 @@ bus.subscribe((event: RuntimeEvent) => {
             chain: fallbackChain,
             runOn: settledOwner?.computerInputs?.runOn,
           });
-        } else if (routineRun?.status !== "failed") {
+        } else if (routineRun?.status !== "failed" && !commandTurn) {
           // the frame carries the bot's avatar so every desktop client can
           // show the notification under that bot's own face
           notify(buildNotification("done", bot, event.threadId, reply, {
@@ -5744,25 +6252,6 @@ bus.subscribe((event: RuntimeEvent) => {
   }
   for (const publication of helperTracker.observe(event, Date.now())) publishHelperUpdate(publication);
   armHelperFlush();
-});
-
-// The ACP driver cuts context that is over the prompt budget and says so with
-// a `context.injected` event whose source is "compression".  Hang its row under
-// the user message the turn answers, the same place the other injections go.
-bus.subscribe((event: RuntimeEvent) => {
-  if (event.type !== "context.injected" || event.source !== "compression" || !event.itemId) return;
-  try {
-    const stored = store.messagesFor(event.threadId);
-    const target = [...stored].reverse().find((m) => m.role === "user");
-    if (!target || target.contextInjections?.some((ref) => ref.id === event.itemId)) return;
-    store.patchMessage(event.threadId, target.id, {
-      contextInjections: mergeInjectionRefs(target.contextInjections, [
-        { id: event.itemId, source: "compression", preview: event.preview, bytes: event.bytes },
-      ]),
-    });
-  } catch (error) {
-    console.error("context-compression: could not attach", error);
-  }
 });
 
 const providerReloadDelegationDrains = new Set<string>();
@@ -6096,6 +6585,17 @@ function restoreHeldWork(work: HeldWork, context: string) {
  *  background job ended and woke its bot (server/jobs/wake.ts). */
 type TurnAutomationSource = RoutineRunTrigger | "job" | "zulip";
 
+/** One of the engine's own slash commands, as `startTurn` runs it. */
+interface EngineCommandRun {
+  /** ties the invocation row to the rows the command's output produces */
+  id: string;
+  name: string;
+  args?: string;
+  surface: CommandSurface;
+  /** `local`: the CLI answers by itself, and what it prints is not conversation */
+  output: "local" | "model";
+}
+
 async function startTurn(
   botId: string,
   text: string,
@@ -6142,6 +6642,12 @@ async function startTurn(
      *  turn's prompt message, so every re-dispatch of that message (a model
      *  fail-over, a credential card, a boot resume) keeps it. */
     toolPolicy?: ToolPolicy;
+    /** Run one of the engine's own slash commands as this turn (`/compact`).
+     * The turn is the bare command: no persona, memory note, replayed
+     * conversation or quoted reply.  It runs on the task's configured engine
+     * with no fallback chain, and is left out of titling, failover and the
+     * finished-turn push. */
+    command?: EngineCommandRun;
   },
 ) {
   if (runtimeQuiescing) {
@@ -6222,12 +6728,18 @@ async function startTurn(
   // A new task takes its name from its first prompt. For delegations,
   // use only the shared parser's payload, never the sender wrapper or reason.
   // Routine/webhook instructions have their own task names.
-  const titleText = firstTurnTitleText(text, opts?.automationSource, opts?.cardContinuation);
+  // A command names nothing: "/compact" is not what the conversation is about.
+  const titleText = opts?.command ? undefined : firstTurnTitleText(text, opts?.automationSource, opts?.cardContinuation);
   if (titleText) store.titleTaskFromFirstMessage(bot.id, titleText, threadId);
 
   let fallbackPolicy = task.modelSelection ?? bot.modelSelection;
+  // An engine command runs on the engine whose menu offered it, never on a
+  // fallback the quota walk would pick: the same command on another engine is
+  // a different command.
   let selection = opts?.modelSelection
-    ?? quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection;
+    ?? (opts?.command
+      ? { instanceId: fallbackPolicy.instanceId, model: fallbackPolicy.model, effort: fallbackPolicy.effort }
+      : quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection);
   if (opts?.modelSelection) {
     const override = reconcileTurnOverride(selection, lineageContextForInstance(selection.instanceId));
     // A Codex thread keeps the model it started with, so an override the
@@ -6241,7 +6753,7 @@ async function startTurn(
   // a scheduled or manual run decides from its own automation source so a
   // webhook's leftover mark cannot downgrade it.  An explicit flag wins.
   const inheritsUnattended = inheritedUnattended(opts, () => isUnattended(bot.id));
-  selection = unattendedModelDowngrade(selection, {
+  if (!opts?.command) selection = unattendedModelDowngrade(selection, {
     unattended: inheritsUnattended,
     nonThinkingFlash: nonThinkingFlashSelection(selection.instanceId),
     // A card continuation of a job's wake continues the wake, so it keeps
@@ -6394,6 +6906,16 @@ async function startTurn(
   // never paint a blue user bubble.  The model still receives them as the
   // turn prompt via transcriptPromptRole.
   let userMessage = opts?.userMessage;
+  if (!userMessage && opts?.command) {
+    // What the person ran, drawn as a chip rather than a bubble and kept out of
+    // the conversation the model is shown.
+    userMessage = store.appendMessage(threadId, {
+      role: "user",
+      kind: "text",
+      text,
+      command: { id: opts.command.id, name: opts.command.name, source: "engine", role: "invocation", surface: opts.command.surface },
+    });
+  }
   if (!userMessage) {
     const storedRole = opts?.automationSource ? "system" : "user";
     userMessage = opts?.cardContinuation
@@ -6437,7 +6959,7 @@ async function startTurn(
   // strictly limited to the selected branch below.
   const messagesById = new Map(store.messagesFor(threadId).map((message) => [message.id, message]));
   let transcript = activeMessages
-    .filter((m) => m.kind === "text" && m.text && !skipTranscript.has(m.id))
+    .filter((m) => m.kind === "text" && m.text && !m.command && !skipTranscript.has(m.id))
     .slice(-40)
     .map((m) => ({
       role: m.role === "user" || m.role === "system" ? ("user" as const) : ("assistant" as const),
@@ -6466,7 +6988,9 @@ async function startTurn(
       engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript }));
   // the message with a reply's framing and quoted excerpt, as the model gets it
   const replyBase = promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User");
-  const { turnText, resume } = buildTurnContext({
+  // A command is written bare, so the conversation is never replayed in front
+  // of it.  Whether the native session continues is decided the same way.
+  const { turnText, resume } = opts?.command ? { turnText: text, resume: !rewound && !fresh } : buildTurnContext({
     text: replyBase,
     transcript,
     rewound,
@@ -6487,7 +7011,7 @@ async function startTurn(
   // send on a fresh session if the provider refuses that cursor before reading
   // the prompt (server/resume-recovery.ts).  Cursor-resuming drivers consult
   // classifyResumeFailure / mayReplay before using it — never error-text regexes.
-  const recoveryText = resume
+  const recoveryText = resume && !opts?.command
     ? buildTurnContext({
         text: replyBase,
         transcript,
@@ -6541,6 +7065,18 @@ async function startTurn(
   turnUsage.delete(threadId);
   turnStats.begin(threadId);
   turnPromptBytes.delete(threadId);
+  // The settle fold and the transcript read this to treat the turn as a command.
+  if (opts?.command) {
+    engineCommandTurns.set(threadId, {
+      dispatchId: dispatchOwner.dispatchId,
+      commandId: opts.command.id,
+      name: opts.command.name,
+      output: opts.command.output,
+      surface: opts.command.surface,
+    });
+  } else {
+    engineCommandTurns.delete(threadId);
+  }
 
   void (async () => {
     let observedReloadGeneration = providerReloadGeneration;
@@ -7052,15 +7588,15 @@ async function startTurn(
       // model fallback dispatches the same message again.  A card continuation
       // has no stored message, so its rows go under the last one on the active
       // path (server/context-injection.ts `injectionTarget`).
+      const target = () =>
+        injectionTarget({
+          stored: store.messagesFor(threadId),
+          userMessageId: userMessage.id,
+          unstored: opts?.cardContinuation === true,
+          // only a card continuation reads it; skip the walk for every other turn
+          activePath: opts?.cardContinuation === true ? store.activePath(threadId) : [],
+        });
       const recordInjections = (drafts: readonly InjectionDraft[]) => {
-        const target = () =>
-          injectionTarget({
-            stored: store.messagesFor(threadId),
-            userMessageId: userMessage.id,
-            unstored: opts?.cardContinuation === true,
-            // only a card continuation reads it; skip the walk for every other turn
-            activePath: opts?.cardContinuation === true ? store.activePath(threadId) : [],
-          });
         recordContextInjections(
           {
             publish: (event) => bus.publish(event),
@@ -7080,7 +7616,8 @@ async function startTurn(
       };
       // Running jobs and waiting job notices open the turn (taken now, at
       // dispatch, so a notice that landed while the turn was set up rides it).
-      const jobReminder = jobTurnReminder(bot.id, threadId, jobsMounted);
+      // A command takes nothing in front of it, so the notices wait for the next turn.
+      const jobReminder = opts?.command ? { text: "", items: [] } : jobTurnReminder(bot.id, threadId, jobsMounted);
       jobNoticeItems = jobReminder.items;
       const turnInput = {
         threadId,
@@ -7116,6 +7653,20 @@ async function startTurn(
         onReplayRecovered: () => {
           const replay = recoveryText === undefined ? null : draftFromReplay(recoveryText, replyBase, "handoff");
           if (replay) recordInjections([replay]);
+        },
+        // A driver that cut older context to fit the prompt budget has already
+        // published the "Compressing Context" event; this hangs its row under the
+        // message that started THIS turn, not whichever user message is latest
+        // (a follow-up can be stored before the turn's prompt is built).
+        onContextCompressed: (ref: ContextInjectionRef) => {
+          try {
+            const held = target();
+            if (!held) return;
+            const next = addInjectionRef(held.contextInjections, ref);
+            if (next !== held.contextInjections) store.patchMessage(threadId, held.id, { contextInjections: next });
+          } catch (error) {
+            console.error("context-compression: could not attach", error);
+          }
         },
         transcript: driverTranscript,
         // `buildTurnTools` only returns tool surfaces the harness can
@@ -7220,6 +7771,7 @@ async function startTurn(
         // the mentions section describes this turn: identical consecutive
         // tags must still deliver their note (SendTurnInput.mentionTurn)
         mentionTurn: !oneShot && tagged.length > 0,
+        command: opts?.command ? { name: opts.command.name, args: opts.command.args } : undefined,
         integrations,
         cwd,
         autoApprove: bot.autoApprove === true,
@@ -7249,7 +7801,7 @@ async function startTurn(
       // payloads are the stored `system` message.  Steering lines are typed by
       // the person.  Compaction is the provider CLI's own and never passes
       // through the harness.
-      {
+      if (!opts?.command) {
         const drafts: InjectionDraft[] = draftsFromPromptSections(prompt.sections).filter(
           (draft) => draft.source !== "memory" || memoryChangeGate.changed(threadId, draft.text),
         );
@@ -7320,6 +7872,7 @@ async function startTurn(
         return;
       }
       activeTurnOwners.settle(threadId, instanceId);
+      engineCommandTurns.delete(threadId);
       releaseLocalVmThread(threadId, bot.id);
       if (vpsLease) activeVpsThreads.release(vpsLease);
       releaseTurnWorktreeLease(threadId, bot.id, dispatchOwner.dispatchId);
@@ -7756,6 +8309,7 @@ try {
     // on the webhook-only listener (8800) because that is what the public
     // tunnel forwards to; the app server (8799) stays loopback-only.
     routes: {
+      "/zulip/outgoing/*": createZulipOutgoingWebhookRoute(() => zulipHub, beginUpdateAdmission),
       "/api/webhooks/linq": {
         // Auth-first: the route verifies the HMAC before acquiring update
         // admission (see readLinqWebhook), so the ingress handler must not
@@ -12210,14 +12764,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (secFetchSite === "cross-site") {
       return json(res, 403, { error: "forbidden: cross-site request" });
     }
+    const mutatingApiRequest = isMutatingHarnessApiRequest(method, path);
+    // The named Remote Access tunnel forwards with a loopback Host,
+    // so the Host gate alone cannot distinguish a remote Access caller from the
+    // owner.  Block mutating API traffic that carries Cloudflare edge markers
+    // until a dedicated remote-auth seam lands (BF-2129).
+    if (mutatingApiRequest && arrivedViaCloudflareTunnel(req)) {
+      return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
+    }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: "BotFleet is quiescing for an update" });
     }
-    const mutatingApiRequest = path.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(method) &&
-      path !== "/api/runtime/quiesce";
     if (mutatingApiRequest && !NON_JSON_BODY_ROUTES.has(path) && hasRequestBody(req) && !isJsonContentType(req)) {
-      return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
+      // the commands route names its code so a client can branch on it
+      return json(res, 415, /^\/api\/bots\/[\w-]+\/commands$/.test(path)
+        ? { error: UNSUPPORTED_JSON_BODY, code: "unsupported_media_type" }
+        : { error: UNSUPPORTED_JSON_BODY });
     }
     let ownAdmissionActive = false;
     if (mutatingApiRequest) {
@@ -14976,11 +15539,27 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         if (!linqChatId) return json(res, 400, { error: "chatId required for linq source" });
       }
+      // /stop, /new, /status and /help sent as a text message are the owner
+      // talking to BotFleet, not to the bot, so they are answered here before
+      // any bot sees the text: an owner texting "stop" must not depend on a
+      // model noticing the word.  Only an exact command qualifies (see
+      // shared/bot-commands.ts), and over Linq only a sender on the allowed
+      // list: a number open to strangers must not be able to stop the bot,
+      // rotate its conversation or read its spend.  Everything else, including
+      // an engine's own command names, passes on as ordinary text.
+      const messagingCommand =
+        fromImessage || (fromLinq && body.senderVerified === true) ? messagingCommandOf(rawText) : null;
+      if (messagingCommand) {
+        const commandReply = await replyOnce(scopedIdempotencyKey, () =>
+          runMessagingCommand(bot, messagingCommand, fromLinq ? "linq" : "imessage", linqChatId),
+        );
+        return json(res, commandReply.status, commandReply.body);
+      }
       const text = fromImessage ? wrapImessageInbound(rawText) : rawText;
       console.log(`[inbound-message] bot=${bot.name} (${bot.id}) thread=${bot.threadId} origin=${origin} ua=${userAgent} imessage=${fromImessage} len=${text.length}`);
 
       // Server-side loop breaker: drop duplicate echoes of the bot's own recent output
-      const recentBotMessages = store.messagesFor(bot.threadId).slice(-5).filter((msg) => msg.role === "bot" && msg.text);
+      const recentBotMessages = store.messagesFor(bot.threadId).slice(-5).filter((msg) => msg.role === "bot" && msg.text && !msg.command);
       const isSelfEcho = recentBotMessages.some((msg) => {
         const botText = outboundImessageText(msg.text ?? "") ?? msg.text?.trim() ?? "";
         return botText === rawText || (rawText.length > 50 && botText.includes(rawText));
@@ -15340,88 +15919,45 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (expectedThreadId !== undefined && (typeof expectedThreadId !== "string" || !/^[\w-]+$/.test(expectedThreadId))) {
         return json(res, 400, { error: "threadId must be a task id" });
       }
-      let stopped = false;
-      let refused = false;
-      // Validate the target thread before mutating anything: a stale Stop
-      // request must not cancel unrelated automation or snooze the bot.  The
-      // live thread is the room thread when the bot is busy in a group,
-      // otherwise the bot's in-flight (or visible) thread.
-      const interruptBusyGroup = store.groups.find((g) => g.busyBotId === bot.id);
-      const interruptLiveThreadId = interruptBusyGroup
-        ? interruptBusyGroup.threadId
-        : (bot.inflightThreadId ?? bot.threadId);
-      if (expectedThreadId !== undefined && interruptLiveThreadId !== expectedThreadId) {
-        return json(res, 409, {
-          error: interruptBusyGroup
-            ? `this bot is working in channel ${interruptBusyGroup.id}`
-            : "the bot switched tasks before it could be interrupted",
-        });
-      }
-      if (routines) {
-        // Validate routine conflicts before mutating anything: cancelling
-        // first and rejecting after would leave the manual turn the user tried
-        // to stop still running while unrelated automation was already
-        // cancelled and the bot snoozed.
-        if (expectedThreadId !== undefined) {
-          const botRuns = routines.listRuns().filter(
-            (run) =>
-              !run.coalescedInto &&
-              run.botId === bot.id &&
-              ["queued", "running", "waiting"].includes(run.status),
-          );
-          const runInOtherThread = botRuns.find((run) => run.threadId && run.threadId !== expectedThreadId);
-          if (runInOtherThread && !botRuns.some((run) => run.threadId === expectedThreadId)) {
-            return json(res, 409, { error: "this bot is running a routine in another conversation" });
-          }
-        }
-        // Cancel all active and queued routine runs for this bot and snooze automated triggers
-        // so background webhooks and scheduled routines do not restart it.
-        // Recorded handoffs that have not started are cancelled with the
-        // conversation.  A teammate already running keeps its turn.
-        jobHost?.stopThread(bot.id, interruptLiveThreadId);
-        const cancelledRuns = await routines.cancelAllRunsForBot(bot.id);
-        routines.snoozeBot(bot.id);
-        if (cancelledRuns.length > 0) {
-          stopped = true;
-        }
-      }
-      if (!routines) jobHost?.stopThread(bot.id, interruptLiveThreadId);
-      // Latch the stop before anything is awaited.  The driver may settle the
-      // turn the instant it is killed, so the turn.completed fold can run
-      // before this handler resumes — if the latch were set after the await,
-      // the fold would already have failed over to the next engine.
-      const latchStop = (threadId: string) => {
-        const turnKey = `${bot.id}:${threadId}`;
-        stoppedTurns.add(turnKey);
-        // the user ended this request, so the next message starts the saved
-        // chain from the top rather than resuming mid-chain
-        fallbackAttemptByTurn.delete(turnKey);
-        pendingCredentialFallback.delete(turnKey);
-        pendingMemberFallback.delete(threadId);
-      };
-      // a bot busy in a ROOM is running on the room's thread — stopping it
-      // from its own chat must reach that turn, not just the 1:1 thread
-      // (interruptBusyGroup was already validated against expectedThreadId above)
-      const busyGroup = interruptBusyGroup;
-      if (busyGroup) {
-        latchStop(busyGroup.threadId);
-        const groupOutcome = await interruptThreadEverywhere(busyGroup.threadId);
-        if (groupOutcome.stopped) stopped = true;
-        if (groupOutcome.refused) refused = true;
-        closeOpenApprovals(busyGroup.threadId);
-      }
-      // A turn started on one task keeps running while the user reads another,
-      // so the live thread — not the visible one — is what has to be stopped.
-      const liveThreadId = bot.inflightThreadId ?? bot.threadId;
-      latchStop(liveThreadId);
-      const liveOutcome = await interruptThreadEverywhere(liveThreadId);
-      if (liveOutcome.stopped) stopped = true;
-      if (liveOutcome.refused) refused = true;
-      closeOpenApprovals(liveThreadId);
-      if (liveThreadId !== bot.threadId) closeOpenApprovals(bot.threadId);
+      const outcome = await interruptBot(bot, { expectedThreadId });
+      if (!outcome.ok) return json(res, outcome.status, { error: outcome.error });
       // refused only matters when nothing stopped: a driver that threw while another
       // owner succeeded is not something to put in front of the user.
-      return json(res, 200, { ok: true, stopped, refused: refused && !stopped });
+      return json(res, 200, { ok: true, stopped: outcome.stopped, refused: outcome.refused && !outcome.stopped });
+    }
+
+    // ── slash commands: the menu, and the structured way to run one ─────────
+    // GET answers from what the server already knows and never starts, probes
+    // or wakes an engine.  POST takes the id of a command from that answer.
+    m = path.match(/^\/api\/bots\/([\w-]+)\/commands$/);
+    if (m && method === "GET") {
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "No such bot.", code: "bot_not_found" });
+      const surfaceName = url.searchParams.get("surface") ?? "desktop";
+      const surface = COMMAND_SURFACES.find((candidate) => candidate === surfaceName);
+      if (!surface) return json(res, 400, { error: "The surface must be desktop or ios.", code: "invalid_body" });
+      const threadId = url.searchParams.get("threadId");
+      if (threadId !== null && threadId !== bot.threadId) {
+        return json(res, 409, { error: "The bot switched conversations.  Reload and try again.", code: "thread_mismatch" });
+      }
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      return res.end(JSON.stringify(commandsFor(bot, surface)));
+    }
+    if (m && method === "POST") {
+      const parsed = botCommandRequestSchema.safeParse(await readBody(req));
+      if (!parsed.success) return json(res, 400, { error: "The request needs a command id.", code: "invalid_body" });
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "No such bot.", code: "bot_not_found" });
+      const request = parsed.data;
+      const threadId = request.threadId ?? bot.threadId;
+      if (threadId !== bot.threadId) {
+        return json(res, 409, { error: "The bot switched conversations.  Reload and try again.", code: "thread_mismatch" });
+      }
+      const idempotencyKey = idempotencyKeyFrom(request.idempotencyKey);
+      if (idempotencyKey === null) return json(res, 400, { error: IDEMPOTENCY_KEY_ERROR, code: "invalid_body" });
+      const scopedKey = idempotencyKey && `bot:${bot.id}:${threadId}:${idempotencyKey}`;
+      const commandReply = await replyOnce(scopedKey, () => runBotCommand(bot, request, request.surface ?? "desktop"));
+      return json(res, commandReply.status, commandReply.body);
     }
 
     // ── tasks: a bot's separate contexts ────────────────────────────────
@@ -18399,6 +18935,45 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       return json(res, 200, result);
     }
+    const settingsPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/settings$/)?.slice(1));
+    if (settingsPath.success && method === "GET") {
+      const result = pluginsModule.getPluginSettings(settingsPath.data[0]);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    if (settingsPath.success && method === "PUT") {
+      // Secret values are write-only: they land in the host broker and are
+      // never echoed back.  The reply carries names only, via the listing's
+      // configuredKeys.
+      const body = PLUGIN_SETTINGS_BODY.safeParse(await readBody(req));
+      if (!body.success) return json(res, 400, { error: "expected a JSON object with a `settings` map" });
+      const result = await pluginsModule.setPluginSettings(settingsPath.data[0], body.data.settings);
+      if ("error" in result) {
+        const status = result.error.startsWith("no plugin named") ? 404 : 400;
+        return json(res, status, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
+      }
+      return json(res, 200, result);
+    }
+    const healthPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/health$/)?.slice(1));
+    if (healthPath.success && method === "GET") {
+      const result = await pluginsModule.getPluginHealth(healthPath.data[0]);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    const testEventPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/test-event$/)?.slice(1));
+    if (testEventPath.success && method === "POST") {
+      const result = await pluginsModule.emitPluginTestEvent(testEventPath.data[0]);
+      if ("error" in result) {
+        const status = result.error.startsWith("no plugin named") ? 404 : 409;
+        return json(res, status, { error: result.error });
+      }
+      return json(res, 200, { outcomes: result });
+    }
+    const drainPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/drain$/)?.slice(1));
+    if (drainPath.success && method === "POST") {
+      const outcomes = await pluginsModule.drainPluginRetries(drainPath.data[0]);
+      return json(res, 200, { outcomes });
+    }
 
     // Inline credential cards never receive the credential value. Electron
     // saves it through the OS-backed store first; this route only verifies
@@ -18883,6 +19458,44 @@ zulipHub = new ZulipHub({
     store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name: text.slice(0, 200), ok: false } });
   },
   spendBlocked: () => spendBlockedForUnattendedWork("bot"),
+  // Plugin-platform dispatcher routing: when an enabled integration
+  // subscribes to Zulip messages, qualifying DMs and mentions route
+  // through it (usually to the dispatcher inbox) instead of waking the
+  // mentioned bot directly.  Declined or timed-out decisions fall back
+  // to the legacy direct wake; events are never silently dropped.
+  pluginEvents: {
+    isActive: () => pluginsModule.pluginEventSubscribers("zulip").length > 0,
+    decide: async (input) => {
+      const stamp = new Date().toISOString();
+      const raw = {
+        eventId: `zulip:${input.accountId}:${input.messageId}`,
+        type: "zulip.message",
+        source: { platform: "zulip", accountId: input.accountId },
+        occurredAt: stamp,
+        receivedAt: stamp,
+        refs: {
+          messageId: input.messageId,
+          conversationKey: input.conversationKey,
+          realm: input.realm,
+          channel: input.channel,
+          topic: input.topic,
+        },
+        mentions: input.mentions,
+        content: { text: input.contentText.slice(0, 8192), format: "text" },
+        context: { botId: input.botId, wakeReason: input.wakeReason, senderKind: input.senderKind },
+      };
+      const parsed = pluginEventEnvelopeSchema.safeParse(raw);
+      if (!parsed.success) return null;
+      const won = await pluginsModule.decidePluginWake(parsed.data);
+      if (!won) return null;
+      return {
+        targetBotId: won.decision.targetBotId,
+        continueThreadId: won.decision.continueThreadId,
+        rationale: won.decision.rationale,
+        hint: won.decision.replyHint,
+      };
+    },
+  },
 });
 zulipHub.start();
 

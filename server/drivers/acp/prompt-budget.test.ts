@@ -424,7 +424,7 @@ describe("the hard ceiling", () => {
 });
 
 describe("section cut priority", () => {
-  it("cuts mentions, then automation, then skills, then memory, regardless of prompt order", () => {
+  it("cuts mentions, then skills, then memory, and the automation trust note last, regardless of prompt order", () => {
     const parts: AcpPromptSection[] = [
       { id: "persona", text: "PERSONA ", volatile: false },
       { id: "memory", text: `MEM ${"m".repeat(300)} `, volatile: true },
@@ -439,12 +439,15 @@ describe("section cut priority", () => {
     const one = cut(total - 100);
     expect(one.dropped.sections).toEqual(["mentions"]);
     expect(one.text).toContain("MEM ");
+    expect(one.text).toContain("AUTO ");
     const two = cut(total - 400);
-    expect(two.dropped.sections).toEqual(["mentions", "automation"]);
+    expect(two.dropped.sections).toEqual(["mentions", "skill-instructions"]);
+    expect(two.text).toContain("MEM ");
     const three = cut(total - 700);
-    expect(three.dropped.sections).toEqual(["mentions", "automation", "skill-instructions"]);
-    expect(three.text).toContain("MEM ");
-    expect(cut(1).dropped.sections).toEqual(["mentions", "automation", "skill-instructions", "memory"]);
+    expect(three.dropped.sections).toEqual(["mentions", "skill-instructions", "memory"]);
+    // the untrusted-data framing outlives the bot's memory
+    expect(three.text).toContain("AUTO ");
+    expect(cut(1).dropped.sections).toEqual(["mentions", "skill-instructions", "memory", "automation"]);
   });
 
   it("puts a section id it does not know between the stale nudges and memory, then prompt order", () => {

@@ -16,6 +16,14 @@ import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@
 import { computerDestinationDisabledReason, instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { BotPowerToggle } from "./BotPowerToggle";
+import { ConfirmDialog } from "./ConfirmDialog";
+import {
+  BOT_OFF_AFTER_TURN,
+  BOT_OFF_KEEP_ON,
+  BOT_OFF_STOP_AND_POWER_OFF,
+  botOffWhileRunningBody,
+  botOffWhileRunningTitle,
+} from "../../shared/bot-power";
 import { BotSkillsPanel } from "./BotSkillsPanel";
 import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
@@ -343,6 +351,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
   const localSelectable = localComputerSelectable({ capabilities, providerSupportsLocal });
   const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | "bypassLocal" | null>(null);
+  // The switch is held open while this is true, so the bot is still On until
+  // the person has said what should happen to the turn it is running.
+  const [powerOffWhileRunning, setPowerOffWhileRunning] = useState(false);
   const localDisabledReason = localComputerDisabledReason({ capabilities, providerSupportsLocal });
   const autoWouldUseLocal = requiresLocalAutoConsent(
     bot.computers,
@@ -482,7 +493,20 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             />
           </Field>
 
-          <BotPowerToggle off={bot.off === true} onChange={(off) => patch({ off })} />
+          {/* Switching a working bot Off is really two decisions — stop the turn
+              now, or stop it starting from now — and the switch cannot tell
+              which one was meant.  Only a busy bot has a turn to decide about,
+              so only a busy bot is asked, and it stays On until they answer. */}
+          <BotPowerToggle
+            off={bot.off === true}
+            onChange={(off) => {
+              if (off && bot.busy) {
+                setPowerOffWhileRunning(true);
+                return;
+              }
+              patch({ off });
+            }}
+          />
 
           <div className={cn(
             "rounded-xl border p-4",
@@ -998,6 +1022,30 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       botName={bot.name}
       model={bot.modelSelection?.model ?? ""}
       engineId={bot.modelSelection?.instanceId}
+    />
+    <ConfirmDialog
+      open={powerOffWhileRunning}
+      title={botOffWhileRunningTitle(bot.name)}
+      body={botOffWhileRunningBody(bot.name)}
+      confirmLabel={BOT_OFF_STOP_AND_POWER_OFF}
+      cancelLabel={BOT_OFF_KEEP_ON}
+      altLabel={BOT_OFF_AFTER_TURN}
+      onCancel={() => setPowerOffWhileRunning(false)}
+      onAlt={() => {
+        // What Off means on its own: no turn is stopped here.
+        setPowerOffWhileRunning(false);
+        patch({ off: true });
+      }}
+      onConfirm={() => {
+        setPowerOffWhileRunning(false);
+        // Off first, then stop.  The flag is what stops anything else from
+        // starting in the gap, and it is safe to set while a turn runs:
+        // settleWorkForOffBot returns early for a busy bot.  The interrupt
+        // still works afterwards, because it acts on the turn in flight
+        // rather than on the bot being on or off.
+        patch({ off: true });
+        dispatch({ type: "interrupt", botId: bot.id });
+      }}
     />
     </>
   );

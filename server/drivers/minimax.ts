@@ -698,32 +698,46 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       const system = joinedSystemPrompt(turn);
       let trim: ReturnType<typeof describeAcpPromptTrim> = null;
       if (system) {
-        const composed = `${system}\n\n${turn.text}`;
-        // No config at all must not inherit the ACP 128 KiB default: a MiniMax
-        // bot has a 1M window.  Without an override or a cap the budget is the
-        // model's own window (80% of it), and off for a model with no known one.
-        const windowTokens = contextWindowFor(model);
-        const unconfigured =
-          config.promptBudgetBytes === undefined && config.contextCapTokens === undefined && turn.contextCapTokens === undefined;
-        const budgetBytes = unconfigured && windowTokens === undefined
-          ? null
-          : resolveAcpPromptBudget({
-              configuredBytes: config.promptBudgetBytes,
-              capTokens: turn.contextCapTokens ?? config.contextCapTokens ?? windowTokens,
-              model,
-              composed,
-            }).bytes;
-        const budgeted = applyAcpPromptBudget({
-          composed,
-          sections: turn.systemSections,
-          userText: turn.text,
-          budgetBytes,
-        });
-        const refusal = acpPromptCeilingRefusal(budgeted.text, budgetBytes);
-        if (refusal) throw new Error(refusal.message);
-        trim = describeAcpPromptTrim(budgeted, budgetBytes);
-        if (budgeted.trimmed) {
-          chat = { system: budgeted.text.slice(0, budgeted.text.length - turn.text.length - 2) || undefined, text: turn.text };
+        // A refusal throws out of sendTurn before the loop exists, so nothing
+        // would ever settle this turn: release the thread's slot first, or the
+        // next turn on it is refused as "already running".
+        try {
+          const composed = `${system}\n\n${turn.text}`;
+          // No config at all must not inherit the ACP 128 KiB default: a MiniMax
+          // bot has a 1M window.  Without an override or a cap the budget is the
+          // model's own window (80% of it), and off for a model with no known one.
+          const windowTokens = contextWindowFor(model);
+          const unconfigured =
+            config.promptBudgetBytes === undefined && config.contextCapTokens === undefined && turn.contextCapTokens === undefined;
+          const budgetBytes = unconfigured && windowTokens === undefined
+            ? null
+            : resolveAcpPromptBudget({
+                configuredBytes: config.promptBudgetBytes,
+                capTokens: turn.contextCapTokens ?? config.contextCapTokens ?? windowTokens,
+                model,
+                composed,
+              }).bytes;
+          // An untrimmed request carries the volatile half as a framed context
+          // note on the user message (splitChatPrompt), about a hundred bytes the
+          // composed prompt does not have.  Leave room for them when deciding
+          // whether to trim, and judge the hard ceiling on what is really sent.
+          const untrimmedSent = `${chat.system ?? ""}\n\n${chat.text}`;
+          const framingBytes = Math.max(0, Buffer.byteLength(untrimmedSent) - Buffer.byteLength(composed));
+          const budgeted = applyAcpPromptBudget({
+            composed,
+            sections: turn.systemSections,
+            userText: turn.text,
+            budgetBytes: budgetBytes === null ? null : Math.max(1, budgetBytes - framingBytes),
+          });
+          const refusal = acpPromptCeilingRefusal(budgeted.trimmed ? budgeted.text : untrimmedSent, budgetBytes);
+          if (refusal) throw new Error(refusal.message);
+          trim = describeAcpPromptTrim(budgeted, budgetBytes);
+          if (budgeted.trimmed) {
+            chat = { system: budgeted.text.slice(0, budgeted.text.length - turn.text.length - 2) || undefined, text: turn.text };
+          }
+        } catch (error) {
+          active.delete(threadId);
+          throw error;
         }
       }
       const messages: ChatMessage[] = [
@@ -757,15 +771,28 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       emit({ ...base(threadId, turnId), type: "turn.started" });
       emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model });
       if (trim) {
+        const itemId = `ctx-${newId()}`;
         emit({
           ...base(threadId, turnId),
           type: "context.injected",
-          itemId: `ctx-${newId()}`,
+          itemId,
           source: "compression",
           preview: trim.preview,
           bytes: trim.bytesSaved,
           io: { text: boundText(trim.text) },
         });
+        try {
+          // Only the harness knows which message this turn answers, so it
+          // hangs the row there (the ACP driver does the same).
+          turn.onContextCompressed?.({
+            id: itemId,
+            source: "compression",
+            preview: trim.preview,
+            bytes: trim.bytesSaved,
+          });
+        } catch (error) {
+          console.error("minimax: onContextCompressed threw", error);
+        }
       }
 
       // Tool ids this turn has already opened a step for.  The stream
