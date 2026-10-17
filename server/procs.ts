@@ -77,8 +77,22 @@ export function setSpawnEnvTransform(transform: SpawnEnvTransform | undefined): 
   spawnEnvTransform = transform;
 }
 
+let spawnEnvTransformFailureLogged = false;
+
 function withSpawnEnv<T extends { env?: NodeJS.ProcessEnv }>(opts: T): T {
-  const env = spawnEnvTransform?.(opts.env);
+  let env: NodeJS.ProcessEnv | undefined;
+  try {
+    env = spawnEnvTransform?.(opts.env);
+  } catch (error) {
+    // A misbehaving transform must not wedge every spawn and probe: the child
+    // runs with the caller's own environment, and the failure is named once
+    // (the message only, never the environment).
+    if (!spawnEnvTransformFailureLogged) {
+      spawnEnvTransformFailureLogged = true;
+      console.warn(`procs: spawn environment transform failed, spawning with the caller's environment: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return opts;
+  }
   return env === undefined ? opts : { ...opts, env };
 }
 

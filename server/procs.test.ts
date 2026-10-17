@@ -382,6 +382,15 @@ describe("setSpawnEnvTransform", () => {
     expect(seen).toEqual([env, env]);
   });
 
+  it("spawns with the caller's environment when the transform throws", async () => {
+    setSpawnEnvTransform(() => {
+      throw new Error("transform exploded");
+    });
+    const env = { ...process.env, OMB_TRANSFORM_PROBE: "caller" };
+    expect(await exec(env)).toBe("caller");
+    expect(await spawned(env)).toBe("caller");
+  });
+
   it("keeps the caller's options when the transform declines", async () => {
     setSpawnEnvTransform(() => undefined);
     const env = { ...process.env, OMB_TRANSFORM_PROBE: "caller" };
