@@ -13,6 +13,7 @@
 // is never a security contract). session/load REPLAYS history as ordinary
 // session/update notifications, so updates are double-gated: nothing emits
 // before the prompt is sent, and `_meta.isReplay` updates are dropped.
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 
 import { z } from "zod";
@@ -43,11 +44,15 @@ import {
   SLOW_INIT_LOG_MS,
 } from "./init-deadline.ts";
 import { estimateCatalogCost } from "../../gen-ai-cost.ts";
+import { boundText } from "../../../shared/item-io.ts";
 import { annotatePromptBudget, captureTurnPrompt } from "../../sentry-ai.ts";
 import {
+  acpPromptCeilingRefusal,
   applyAcpPromptBudget,
+  decodeAcpContextCapTokens,
   decodeAcpPromptBudgetBytes,
-  resolveAcpPromptBudgetBytes,
+  describeAcpPromptTrim,
+  resolveAcpPromptBudget,
 } from "./prompt-budget.ts";
 
 /**
@@ -152,6 +157,10 @@ export interface AcpConfig {
    * The stable system block and the current user message are never cut to
    * meet it. */
   promptBudgetBytes?: number;
+  /** Working-context cap in tokens (for example 524288 for 512K).  The prompt
+   * budget derives from it, clamped to the model's published window.  Ignored
+   * when `promptBudgetBytes` is set. */
+  contextCapTokens?: number;
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -479,6 +488,7 @@ function decodeAcpConfig(defaultCli: string) {
         ? o.promptIdleMs
         : undefined;
     const promptBudgetBytes = decodeAcpPromptBudgetBytes(o.promptBudgetBytes);
+    const contextCapTokens = decodeAcpContextCapTokens(o.contextCapTokens);
     return {
       cli: typeof o.cli === "string" ? o.cli : defaultCli,
       fullAuto: o.fullAuto === true,
@@ -487,6 +497,7 @@ function decodeAcpConfig(defaultCli: string) {
       ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
       ...(promptIdleMs === undefined ? {} : { promptIdleMs }),
       ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }),
+      ...(contextCapTokens === undefined ? {} : { contextCapTokens }),
     };
   };
 }
@@ -629,7 +640,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // re-enters sendTurn, and the budget has to survive that hop or every
       // attempt would look like the first one.  Mirrors claude.ts, which owns
       // the same shape for the same reason.
-      const retryState = new Map<string, { attempt: number; cancelled: boolean }>();
+      // `compressionAnnounced` outlives a relaunch (the entry is cleared only when the
+      // logical turn settles), so a retried attempt that trims the same prompt
+      // does not publish a second "Compressing Context" row.
+      const retryState = new Map<string, { attempt: number; cancelled: boolean; compressionAnnounced?: boolean }>();
       /** Substitution notices (model pinned to a session variant, etc.) once per thread. */
       const runtimeNoticesByThread = new Map<string, Set<string>>();
       // A relaunch waits real seconds; the fakes in acp.test.ts scale that
@@ -1847,15 +1861,60 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 : turn.text;
             let text: string;
             if (turn.command) {
+              // A command turn is the bare "/name args" the agent parses.  It
+              // is never budgeted, so there is nothing to trim or refuse.
               text = engineCommandText(turn.command);
             } else {
+              const budgetBytes = resolveAcpPromptBudget({
+                configuredBytes: turnConfig.promptBudgetBytes,
+                capTokens: turnConfig.contextCapTokens,
+                model: resolvedModel ?? turn.model,
+                composed,
+              }).bytes;
               const budgeted = applyAcpPromptBudget({
                 composed,
                 sections: turn.systemSections,
                 userText: turn.text,
-                budgetBytes: resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes),
+                budgetBytes,
               });
               annotatePromptBudget(threadId, turnId, budgeted);
+              // The refusal comes first: a turn that is refused was not sent,
+              // so it must not also say context was cut to fit it.
+              const refusal = acpPromptCeilingRefusal(budgeted.text, budgetBytes);
+              if (refusal) {
+                // Last resort: protected text alone is far past the budget.  Say
+                // so in the transcript instead of sending a prompt that size.
+                emit({ ...base(threadId, turnId), type: "runtime.error", message: refusal.message });
+                settle(false, "prompt_too_large");
+                return;
+              }
+              const trim = describeAcpPromptTrim(budgeted, budgetBytes);
+              if (trim && !retry.compressionAnnounced) {
+                // The "Compressing Context" row.  Names and sizes only.  Once
+                // per logical turn: a relaunch trims the same prompt again.
+                retry.compressionAnnounced = true;
+                const itemId = `ctx-${randomUUID()}`;
+                emit({
+                  ...base(threadId, turnId),
+                  type: "context.injected",
+                  itemId,
+                  source: "compression",
+                  preview: trim.preview,
+                  bytes: trim.bytesSaved,
+                  io: { text: boundText(trim.text) },
+                });
+                try {
+                  // Only the harness knows which message this turn answers.
+                  turn.onContextCompressed?.({
+                    id: itemId,
+                    source: "compression",
+                    preview: trim.preview,
+                    bytes: trim.bytesSaved,
+                  });
+                } catch (error) {
+                  console.error("acp: onContextCompressed threw", error);
+                }
+              }
               text = neutralizeLeadingSlash(budgeted.text);
               captureTurnPrompt(threadId, turnId, text);
             }

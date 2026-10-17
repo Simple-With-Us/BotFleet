@@ -34,6 +34,8 @@ export interface ZulipCredentials {
   /** The API key.  Never logged, never put in env. */
   key: string;
   site: string;
+  /** Optional Zulip outgoing-webhook token, kept in memory beside the API key. */
+  outgoingWebhookToken?: string;
   /** Where it came from, for status and error text. */
   source: string;
 }
@@ -230,9 +232,15 @@ export function fileCredentialSource(dir: string): ZulipCredentialSource {
 }
 
 /** The vault names for one role: `BF-Plumber` -> `ZULIP_BF_PLUMBER_*`. */
-export function zulipVaultNames(role: string): { email: string; key: string; site: string } {
-  const stem = `ZULIP_${role.trim().toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
-  return { email: `${stem}_EMAIL`, key: `${stem}_API_KEY`, site: `${stem}_SITE` };
+export function zulipVaultNames(role: string): { email: string; key: string; site: string; outgoingToken: string } {
+  const code = role.trim().toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  const stem = `ZULIP_${code}`;
+  return {
+    email: `${stem}_EMAIL`,
+    key: `${stem}_API_KEY`,
+    site: `${stem}_SITE`,
+    outgoingToken: `ZULIP_OUTGOING_${code}_TOKEN`,
+  };
 }
 
 export const ZULIP_DEFAULT_INFISICAL_PATH = "/zulip";
@@ -244,7 +252,7 @@ export function zulipVaultNamesFor(roles: readonly string[]): string[] {
   for (const role of roles) {
     if (!validZulipRole(role.trim())) continue;
     const n = zulipVaultNames(role);
-    names.add(n.email).add(n.key).add(n.site);
+    names.add(n.email).add(n.key).add(n.site).add(n.outgoingToken);
   }
   return [...names].sort();
 }
@@ -289,7 +297,17 @@ export function infisicalCredentialSource(
       if (missing.length) throw new ZulipCredentialError(`Infisical ${where} has no ${missing.join(" or ")}`, "missing");
       const source = `infisical ${where}`;
       const site = normalizeSite(values.get(names.site)?.trim() || opts.realm);
-      return { ...checkCredentialFields({ email: email!, key: key!, site }, source), source };
+      const outgoingWebhookToken = z.string().regex(/^[\x21-\x7e]+$/).optional()
+        .safeParse(values.get(names.outgoingToken)?.trim() || undefined);
+      // A present-but-malformed webhook token must not take down the bot's own
+      // credentials: drop just the token (the webhook route answers 503
+      // without it) and keep the email/key/site load working.
+      const webhookToken = outgoingWebhookToken.success ? outgoingWebhookToken.data : undefined;
+      return {
+        ...checkCredentialFields({ email: email!, key: key!, site }, source),
+        source,
+        ...(webhookToken ? { outgoingWebhookToken: webhookToken } : {}),
+      };
     },
   };
 }

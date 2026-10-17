@@ -94,7 +94,10 @@ public struct CompanionState: Sendable {
 
     /// `visibleTranscript(forThread:)` with the owning bot's leaf already
     /// resolved, so callers that already hold the bot skip the roster scan.
-    private func visibleTranscript(forThread threadId: String, activeLeafId: String?) -> [Message] {
+    /// Pass `nil` for rooms. Whole-roster passes (the chat list) must use
+    /// this: `bot(forThread:)` walks every bot and task, and calling it per
+    /// thread hung the main thread for ~35s on large fleets (BOTFLEET-3R).
+    public func visibleTranscript(forThread threadId: String, activeLeafId: String?) -> [Message] {
         let all = transcript(forThread: threadId)
         let branch: [Message]
         if let leafId = activeLeafId {

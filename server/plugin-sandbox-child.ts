@@ -40,15 +40,24 @@ const networkGuard = installPluginNetworkGuard();
 type PluginReturn = JsonValue | undefined;
 type CardHandler = (args: { cardId: string; host: PluginHost }) => PluginReturn | Promise<PluginReturn>;
 type CommandHandler = (args: { command: string; args: string; host: PluginHost }) => PluginReturn | Promise<PluginReturn>;
+type EventHandler = (args: { event: JsonValue; host: PluginHost }) => PluginReturn | Promise<PluginReturn>;
+type HealthHandler = (args: { host: PluginHost }) => PluginReturn | Promise<PluginReturn>;
 
-/** The two exports the host looks for on an imported module.  Their
+/** The four exports the host looks for on an imported module.  Their
  *  values are unverified until exportedHandler checks them. */
 interface PluginNamespace {
   getCardData?: JsonValue | Function;
   runCommand?: JsonValue | Function;
+  onEvent?: JsonValue | Function;
+  getHealth?: JsonValue | Function;
 }
 
-let handlers: { getCardData: CardHandler | null; runCommand: CommandHandler | null } | null = null;
+let handlers: {
+  getCardData: CardHandler | null;
+  runCommand: CommandHandler | null;
+  onEvent: EventHandler | null;
+  getHealth: HealthHandler | null;
+} | null = null;
 let loadStarted = false;
 
 function send(message: ChildToParentMessage): void {
@@ -102,7 +111,7 @@ function createHost(snapshot: SandboxHostSnapshot): PluginHost {
     },
   });
   const host: PluginHost = {
-    version: 1,
+    version: 2,
     log: (level, message) => {
       const safeLevel = LOG_LEVELS.find((candidate) => candidate === level) ?? "info";
       // Only the length crosses the boundary.  String() keeps a non-string
@@ -118,6 +127,15 @@ function createHost(snapshot: SandboxHostSnapshot): PluginHost {
       return snapshot.bots.map((bot) => ({ ...bot }));
     },
     config,
+    settings: Object.freeze({
+      get: <T = unknown>(key: string): T | undefined => {
+        const value = snapshot.settings[key];
+        // SAFETY: same contract as config.get above; these are the
+        // plugin's own validated non-secret settings.
+        return (value === undefined ? undefined : cloneJson(value)) as T | undefined;
+      },
+      listKeys: () => Object.keys(snapshot.settings),
+    }),
   };
   return Object.freeze(host);
 }
@@ -135,7 +153,9 @@ async function load(entryUrl: string, networkAllow: readonly string[]): Promise<
   }
   const card = exportedHandler(namespace, "getCardData");
   const command = exportedHandler(namespace, "runCommand");
-  if (card === "invalid" || command === "invalid") {
+  const event = exportedHandler(namespace, "onEvent");
+  const health = exportedHandler(namespace, "getHealth");
+  if (card === "invalid" || command === "invalid" || event === "invalid" || health === "invalid") {
     send({ type: "load_failed", reason: "invalid_exports" });
     return;
   }
@@ -144,8 +164,20 @@ async function load(entryUrl: string, networkAllow: readonly string[]): Promise<
     getCardData: card as CardHandler | null,
     // SAFETY: same as above for the runCommand export.
     runCommand: command as CommandHandler | null,
+    // SAFETY: same as above for the onEvent export.
+    onEvent: event as EventHandler | null,
+    // SAFETY: same as above for the getHealth export.
+    getHealth: health as HealthHandler | null,
   };
-  send({ type: "ready", exports: { getCardData: card !== null, runCommand: command !== null } });
+  send({
+    type: "ready",
+    exports: {
+      getCardData: card !== null,
+      runCommand: command !== null,
+      onEvent: event !== null,
+      getHealth: health !== null,
+    },
+  });
 }
 
 async function runHandler(message: Extract<ParentToChildMessage, { type: "invoke" }>): Promise<PluginReturn | "not_implemented"> {
@@ -153,6 +185,16 @@ async function runHandler(message: Extract<ParentToChildMessage, { type: "invoke
   if (message.handler === "getCardData") {
     if (!handlers?.getCardData) return "not_implemented";
     return handlers.getCardData({ cardId: message.cardId, host });
+  }
+  if (message.handler === "onEvent") {
+    if (!handlers?.onEvent) return "not_implemented";
+    // SAFETY: the event crossed as JSON and was shape-checked on receipt;
+    // the host re-validates the plugin's return, never this input.
+    return handlers.onEvent({ event: message.event as JsonValue, host });
+  }
+  if (message.handler === "getHealth") {
+    if (!handlers?.getHealth) return "not_implemented";
+    return handlers.getHealth({ host });
   }
   if (!handlers?.runCommand) return "not_implemented";
   return handlers.runCommand({ command: message.command, args: message.args, host });
@@ -211,6 +253,7 @@ function isHostSnapshot(value: unknown): value is SandboxHostSnapshot {
     if (!Array.isArray(value.configKeys) || value.configKeys.some((k) => typeof k !== "string")) return false;
   }
   if (!isPlainObject(value.config)) return false;
+  if (!isPlainObject(value.settings)) return false;
   return true;
 }
 
@@ -248,6 +291,21 @@ function parseParentMessage(raw: unknown): ParentToChildMessage | null {
   if (raw.handler === "runCommand") {
     if (typeof raw.command !== "string" || typeof raw.args !== "string") return null;
     return { type: "invoke", id: raw.id, handler: "runCommand", command: raw.command, args: raw.args, host: raw.host };
+  }
+  if (raw.handler === "onEvent") {
+    // The parent builds the event from the shared envelope schema; the
+    // child's return is what gets strict validation.  Keep this check
+    // shallow so envelope growth never breaks the parser.
+    if (!isPlainObject(raw.event) || typeof raw.event.eventId !== "string" || typeof raw.event.type !== "string") {
+      return null;
+    }
+    // SAFETY: parseParentMessage checked eventId and type are strings above;
+    // the parent built this event from the shared envelope schema, and the
+    // child's return is what gets strict validation.
+    return { type: "invoke", id: raw.id, handler: "onEvent", event: raw.event as { eventId: string; type: string }, host: raw.host };
+  }
+  if (raw.handler === "getHealth") {
+    return { type: "invoke", id: raw.id, handler: "getHealth", host: raw.host };
   }
   return null;
 }

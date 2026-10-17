@@ -16,7 +16,7 @@
 //   - `dms`      when each outbound DM that was not a reply went out: the
 //                per-bot DM rate limit's ledger.
 
-import { chmodSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { z } from "zod";
@@ -73,6 +73,10 @@ const itemSchema = z.object({
   content: z.string(),
   timestamp: z.number().catch(0),
   via: z.enum(["mention", "dm", "followed"]).optional().catch(undefined),
+  // Plugin-platform routing: the dispatcher's hint and the role that
+  // routed it.  Absent reads as none, so old state files still parse.
+  pluginHint: z.string().max(2000).optional().catch(undefined),
+  routedFrom: z.string().max(128).optional().catch(undefined),
 });
 const unitSchema = z.object({
   origin: originSchema,
@@ -139,5 +143,9 @@ export class ZulipStateStore {
       /* best effort: the files themselves are 600 */
     }
     writeFileAtomic(join(this.dir, fileName(botId)), `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    if (process.platform !== "win32") {
+      const fd = openSync(this.dir, "r");
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+    }
   }
 }

@@ -486,6 +486,36 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(state.visibleTranscript(forThread: bot.threadId).map(\.id), ["root", "fork", "tail"])
     }
 
+    /// The chat list resolves the leaf from the bot it already holds
+    /// (BOTFLEET-3R); that must match the roster-scanning reader.
+    func testLeafAwareVisibleTranscriptMatchesTheRosterLookup() throws {
+        var state = try hydrated()
+        let bot = try XCTUnwrap(state.bots.first)
+        let root = message("root")
+        var first = message("first", at: 2)
+        first.parentId = root.id
+        var fork = message("fork", at: 3)
+        fork.parentId = root.id
+        state.messages[bot.threadId] = [root, first, fork]
+        state.apply(.thread(threadId: bot.threadId, activeLeafId: fork.id))
+        let live = try XCTUnwrap(state.bot(bot.id))
+
+        XCTAssertEqual(
+            state.visibleTranscript(forThread: bot.threadId, activeLeafId: live.activeLeafId).map(\.id),
+            state.visibleTranscript(forThread: bot.threadId).map(\.id)
+        )
+        XCTAssertEqual(
+            state.visibleTranscript(forThread: bot.threadId, activeLeafId: live.activeLeafId).map(\.id),
+            ["root", "fork"]
+        )
+
+        state.messages["room-thread"] = [message("r1"), message("r2", at: 2)]
+        XCTAssertEqual(
+            state.visibleTranscript(forThread: "room-thread", activeLeafId: nil).map(\.id),
+            state.visibleTranscript(forThread: "room-thread").map(\.id)
+        )
+    }
+
     func testVersionsAreUserMessagesWithTheSameParent() {
         var state = CompanionState()
         let root = message("root")

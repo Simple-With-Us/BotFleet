@@ -4,7 +4,8 @@
 // Local models are not a row under each engine: when any are configured the
 // rail grows one "Local Models" entry that lists them all, and when none are
 // there is nothing to show.
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Check, ChevronDown, Search } from "lucide-react";
 import { useStore, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
 import { filterCustomModels, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
@@ -304,6 +305,13 @@ export function ModelRow({
     windowsLabel?: string;
   };
 }) {
+  const contextLabel = option.contextWindow
+    ? option.contextWindow >= 1_000_000
+      ? `${Math.floor(option.contextWindow / 1_000_000)}M`
+      : `${Math.floor(option.contextWindow / 1_000)}K`
+    : null;
+  const normalizedBadge = option.badge?.replace(/^(\d+(?:\.\d+)?[MK])\s+Context$/i, "$1");
+  const badge = normalizedBadge === contextLabel ? null : normalizedBadge;
   return (
     <button
       type="button"
@@ -348,18 +356,16 @@ export function ModelRow({
               className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
               title={`${option.contextWindow.toLocaleString()} tokens max`}
             >
-              {option.contextWindow >= 1000000
-                ? `${Math.floor(option.contextWindow / 1000000)}M`
-                : `${Math.floor(option.contextWindow / 1000)}K`}
+              {contextLabel}
             </span>
           )}
-          {option.badge && (
+          {badge && (
             <span
               className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
-              title={option.badgeTitle ?? option.badge}
-              aria-label={option.badgeTitle ?? option.badge}
+              title={option.badgeTitle ?? badge}
+              aria-label={option.badgeTitle ?? badge}
             >
-              {option.badge}
+              {badge}
             </span>
           )}
           {quota?.capped && (
@@ -468,6 +474,7 @@ export function ModelPicker({
   bot,
   className,
   contained = false,
+  widePopover = false,
   label,
   selection: propSelection,
   onChange,
@@ -479,6 +486,8 @@ export function ModelPicker({
   /** Expand the menu in-flow under the trigger so it cannot overflow a
    * narrow parent (the Bot profile sidebar). */
   contained?: boolean;
+  /** Fleet-wide cards have room for a menu wider than their trigger. */
+  widePopover?: boolean;
   label?: ReactNode;
   selection?: ModelSelection;
   onChange?: (selection: ModelSelection) => void;
@@ -494,6 +503,37 @@ export function ModelPicker({
   const [query, setQuery] = useState("");
   const [showAll, setShowAll] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [popoverPosition, setPopoverPosition] = useState({ left: 12, top: 12 });
+  // The wide menu is fixed-positioned so a clipping card cannot cut it off.
+  // It mounts inside the nearest modal dialog (Settings) when there is one, so
+  // that dialog's Tab trap still sees its controls, and on the body otherwise.
+  const [popoverHost, setPopoverHost] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!open || !widePopover) return;
+    setPopoverHost(rootRef.current?.closest<HTMLElement>('[role="dialog"][aria-modal="true"]') ?? document.body);
+    const align = () => {
+      const root = rootRef.current?.getBoundingClientRect();
+      if (!root) return;
+      const width = Math.min(480, Math.max(0, window.innerWidth - 24));
+      setPopoverPosition({
+        left: Math.max(12, Math.min(root.left, window.innerWidth - 12 - width)),
+        top: root.bottom + 8,
+      });
+    };
+    align();
+    window.addEventListener("resize", align);
+    window.addEventListener("scroll", align, true);
+    return () => {
+      window.removeEventListener("resize", align);
+      window.removeEventListener("scroll", align, true);
+    };
+  }, [open, widePopover]);
+  // Tab from the trigger must land in the menu, which no longer follows the
+  // trigger in document order once it is fixed-positioned and portaled.
+  useLayoutEffect(() => {
+    if (open && widePopover && popoverHost) contentRef.current?.focus({ preventScroll: true });
+  }, [open, widePopover, popoverHost]);
 
   const selection = propSelection || bot.modelSelection;
   const active = state.instances.find((instance) => instance.instanceId === selection.instanceId);
@@ -517,7 +557,7 @@ export function ModelPicker({
     if (!open) return;
     const closeOnOutsideClick = (event: MouseEvent) => {
       const clickedNode = event.target instanceof Node ? event.target : null;
-      if (!rootRef.current?.contains(clickedNode)) setOpen(false);
+      if (!rootRef.current?.contains(clickedNode) && !contentRef.current?.contains(clickedNode)) setOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
@@ -712,7 +752,7 @@ export function ModelPicker({
   );
 
   return (
-    <div ref={rootRef} className={cn(contained ? "w-full" : "relative", className)}>
+    <div ref={rootRef} className={cn(contained ? "relative w-full" : "relative", className)}>
       {/* Contained (Settings) stacks: label on its own line, the control
           full width beneath it.  The row layout this replaced squeezed the
           label and its subtitle into a narrow column beside the trigger, so
@@ -737,14 +777,19 @@ export function ModelPicker({
         />
       )}
 
-      {open && (
-        <div
+      {open && (() => {
+        const content = <div
+          ref={contentRef}
           data-model-picker-content
           role="dialog"
           aria-label="Choose Model"
+          tabIndex={widePopover ? -1 : undefined}
+          style={widePopover ? { ...popoverPosition, maxHeight: `min(560px, calc(100dvh - ${popoverPosition.top + 12}px))` } : undefined}
           className={cn(
             "flex overflow-hidden rounded-2xl border border-hairline/50 bg-card",
-            contained
+            widePopover
+              ? "fixed z-50 w-[480px] max-w-[calc(100vw-24px)] shadow-2xl shadow-black/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              : contained
               ? "relative mt-3 w-full max-h-[min(420px,50dvh)]"
               : "absolute right-0 top-full z-30 mt-2 w-[420px] min-w-[380px] max-w-[min(640px,calc(100vw-2rem))] max-h-[min(560px,calc(100dvh-7rem))] resize shadow-2xl shadow-black/50",
           )}
@@ -1004,8 +1049,11 @@ export function ModelPicker({
               <div className="px-4 py-5 text-[13px] text-ink-secondary">No model providers are available.</div>
             )}
           </div>
-        </div>
-      )}
+        </div>;
+        if (!widePopover || globalThis.document === undefined) return content;
+        // The host is resolved in a layout effect, so this null never paints.
+        return popoverHost ? createPortal(content, popoverHost) : null;
+      })()}
     </div>
   );
 }
