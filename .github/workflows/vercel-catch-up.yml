@@ -54,7 +54,7 @@ jobs:
           node-version: '24'
       - name: Load deploy token from shared Fleet-OPS secret scope
         env:
-          INFISICAL_prj_m5bk3D75HzKZfIVSM3OmMx7WYwKz: 8dae6d03-8f12-48b2-adf3-e5c1b881c8c5
+          INFISICAL_PROJECT_ID: 8dae6d03-8f12-48b2-adf3-e5c1b881c8c5
           INFISICAL_ENVIRONMENT: prod
           INFISICAL_SECRET_PATH: /
           INFISICAL_NAMES: VERCEL_TOKEN

@@ -68,6 +68,7 @@ APP = "botfleet"
 # also runs its full matrix weekly so documentation-only fast paths cannot
 # conceal dependency or runner drift between code changes.
 CRON_SCHEDULES = {
+    "Vercel production catch-up": "41 * * * *",
     "CI": "17 9 * * 1",
     "iOS TestFlight ship (GitHub-hosted macOS)": "18,48 * * * *",
 }
@@ -83,6 +84,7 @@ CRON_SCHEDULES = {
 # in a couple of minutes; override per-workflow below for anything slower.
 DEFAULT_CHECKIN_MARGIN_MINUTES = 15
 CRON_CHECKIN_MARGIN_OVERRIDES = {
+    "Vercel production catch-up": 75,
     # ci.yml's longest job has timeout-minutes: 25; +20 for queueing, the
     # classifier, and this reporter's own dispatch/run time.
     "CI": 45,

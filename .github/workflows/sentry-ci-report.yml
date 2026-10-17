@@ -71,6 +71,7 @@ name: Sentry CI Report
 on:
   workflow_run:
     workflows:
+      - Vercel production catch-up
       # Names must match the `name:` field of workflow files exactly —
       # a stale entry here silently disables alerting for that pipeline.
       - CI
