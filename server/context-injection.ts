@@ -137,6 +137,21 @@ export function mergeInjectionRefs(
   return [...(earlier ?? []), ...added].slice(-MAX_CONTEXT_INJECTIONS_PER_TURN);
 }
 
+/** A message's injections with `ref` appended, or the SAME array back when the
+ * message already holds it.  "Holds it" is the id, or the same source, size and
+ * preview as `dropRecorded` reads it: a model fallback dispatches one message
+ * again, and its second "Compressing Context" row would say what the first
+ * already did. */
+export function addInjectionRef(
+  earlier: readonly ContextInjectionRef[] | undefined,
+  ref: ContextInjectionRef,
+): ContextInjectionRef[] {
+  if (earlier?.some((held) => held.id === ref.id || (held.source === ref.source && held.bytes === ref.bytes && held.preview === ref.preview))) {
+    return earlier as ContextInjectionRef[];
+  }
+  return mergeInjectionRefs(earlier, [ref]);
+}
+
 /** The message the chat hangs a turn's injection rows under.
  *
  * Normally the stored message that started the turn.  A card continuation has

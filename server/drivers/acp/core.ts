@@ -633,7 +633,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // re-enters sendTurn, and the budget has to survive that hop or every
       // attempt would look like the first one.  Mirrors claude.ts, which owns
       // the same shape for the same reason.
-      const retryState = new Map<string, { attempt: number; cancelled: boolean }>();
+      // `compressionAnnounced` outlives a relaunch (the entry is cleared only when the
+      // logical turn settles), so a retried attempt that trims the same prompt
+      // does not publish a second "Compressing Context" row.
+      const retryState = new Map<string, { attempt: number; cancelled: boolean; compressionAnnounced?: boolean }>();
       /** Substitution notices (model pinned to a session variant, etc.) once per thread. */
       const runtimeNoticesByThread = new Map<string, Set<string>>();
       // A relaunch waits real seconds; the fakes in acp.test.ts scale that
@@ -1863,9 +1866,21 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 budgetBytes,
               });
               annotatePromptBudget(threadId, turnId, budgeted);
+              // The refusal comes first: a turn that is refused was not sent,
+              // so it must not also say context was cut to fit it.
+              const refusal = acpPromptCeilingRefusal(budgeted.text, budgetBytes);
+              if (refusal) {
+                // Last resort: protected text alone is far past the budget.  Say
+                // so in the transcript instead of sending a prompt that size.
+                emit({ ...base(threadId, turnId), type: "runtime.error", message: refusal.message });
+                settle(false, "prompt_too_large");
+                return;
+              }
               const trim = describeAcpPromptTrim(budgeted, budgetBytes);
-              if (trim) {
-                // The "Compressing Context" row.  Names and sizes only.
+              if (trim && !retry.compressionAnnounced) {
+                // The "Compressing Context" row.  Names and sizes only.  Once
+                // per logical turn: a relaunch trims the same prompt again.
+                retry.compressionAnnounced = true;
                 const itemId = `ctx-${randomUUID()}`;
                 emit({
                   ...base(threadId, turnId),
@@ -1876,14 +1891,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   bytes: trim.bytesSaved,
                   io: { text: boundText(trim.text) },
                 });
-              }
-              const refusal = acpPromptCeilingRefusal(budgeted.text, budgetBytes);
-              if (refusal) {
-                // Last resort: protected text alone is far past the budget.  Say
-                // so in the transcript instead of sending a prompt that size.
-                emit({ ...base(threadId, turnId), type: "runtime.error", message: refusal.message });
-                settle(false, "prompt_too_large");
-                return;
+                try {
+                  // Only the harness knows which message this turn answers.
+                  turn.onContextCompressed?.({
+                    id: itemId,
+                    source: "compression",
+                    preview: trim.preview,
+                    bytes: trim.bytesSaved,
+                  });
+                } catch (error) {
+                  console.error("acp: onContextCompressed threw", error);
+                }
               }
               text = neutralizeLeadingSlash(budgeted.text);
               captureTurnPrompt(threadId, turnId, text);
