@@ -30,6 +30,7 @@ struct ChatView: View {
     @State private var showingTasks = false
     @State private var showingRoutines = false
     @State private var showingComputer = false
+    @State private var showingVoiceCall = false
     @State private var showingPlus = false
     @State private var showingProfile = false
     @State private var showCommandHUD = false
@@ -276,11 +277,18 @@ struct ChatView: View {
         .navigationDestination(isPresented: $showingComputer) {
             if case let .bot(bot) = current { ComputerView(bot: bot) }
         }
+        .navigationDestination(isPresented: $showingVoiceCall) {
+            VoiceCallView(call: VoiceCall(chat: current, botName: current.name, session: session))
+        }
         .task(id: threadId) {
             if current.unread { await session.markRead(current) }
 #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("-open-plus") { showingPlus = true }
             if ProcessInfo.processInfo.arguments.contains("-open-profile") { showingProfile = true }
+            // Opens the voice call screen directly (with -voice-fixture, on
+            // the scripted session) for layout verification without tapping
+            // through chat.
+            if ProcessInfo.processInfo.arguments.contains("-open-voice-call") { showingVoiceCall = true }
             // Raises the keyboard on open, for checking that the composer
             // clears it: the transcript has to stay visible above the
             // keyboard rather than behind it.
@@ -886,7 +894,7 @@ struct ChatView: View {
     /// absent from this set on purpose and survives the filter below.
     private static let offBotComposingActionIds: Set<String> = [
         "photo", "file", "dictate", "commands", "paste",
-        "task", "tasks", "routines",
+        "task", "tasks", "routines", "call",
     ]
 
     private var plusActions: [PlusAction] {
@@ -939,6 +947,15 @@ struct ChatView: View {
                     subtitle: "Automate tasks on a schedule"
                 ) { showingRoutines = true })
             }
+            // A voice call talks to the same bot, hands-free.  The call screen
+            // owns its lifecycle: appearing starts it, leaving ends it.  It
+            // lives here, not in the header, because the header keeps its
+            // width for the bot's name.  Outside the Projects gate too: a
+            // call is one conversation and needs no thread of its own.
+            out.append(PlusAction(
+                id: "call", systemImage: "phone.fill", title: "Call \(bot.name)",
+                subtitle: "Talk hands-free, out loud"
+            ) { showingVoiceCall = true })
             // Deliberately outside the Projects gate.  The header button this
             // action replaces was never gated either, so gating it here would
             // take the only remaining way to watch a bot away from anyone whose
