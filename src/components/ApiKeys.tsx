@@ -95,7 +95,8 @@ const CREDENTIALS: Record<
   deepseek: {
     label: "DeepSeek API key (balance display only)",
     placeholder: "sk-…",
-    description: "Used only to display your account balance under the DeepSeek engine row. Never sent to the engine itself, so the harness works without it.",
+    description:
+      "Used only to display your DeepSeek remaining balance under the DeepSeek engine row.  MiniMax (MM) and MiniMax Code (MC) operate on subscriptions, not API.  Never sent to the engine itself, so the harness works without it.",
     href: "https://platform.deepseek.com/api_keys",
     linkLabel: "Open the DeepSeek API key page",
     optional: true,

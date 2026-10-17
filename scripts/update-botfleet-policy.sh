@@ -202,15 +202,15 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
       if [[ "$IS_UP_TO_DATE" == "1" ]]; then
         OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/harness-owner.json"
         if [[ -f "$OWNER_FILE" ]]; then
-          # The bearer credential is never read from harness-owner.json in this
-          # wrapper: it must arrive via BOTFLEET_OWNER_NONCE.  A live owner
-          # record means the harness was adopted, so a missing or rejected
-          # credential must fail fast instead of pretending the runtime check
-          # passed.  The helper reads only the port from the owner file and
-          # writes just a commit SHA to stdout.
-          : "${BOTFLEET_OWNER_NONCE:?BotFleet updater: BOTFLEET_OWNER_NONCE is required when a harness owner record exists.}"
+          # Prefer BOTFLEET_OWNER_NONCE and fall back to the live owner record
+          # inside update-botfleet-runtime-commit.mjs so terminal ubf runs and
+          # older launchers work.  A missing, malformed, or rejected credential
+          # (exit 2 or 3) fails fast; an unreachable runtime (exit 1) disables
+          # the shortcut so the updater starts or repairs the harness.
           RUNTIME_PROBE_ERR="$(mktemp "${TMPDIR:-/tmp}/botfleet-runtime-probe.XXXXXX")"
-          if ! RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" BOTFLEET_OWNER_NONCE="$BOTFLEET_OWNER_NONCE" "$NODE_BIN" "$SCRIPT_DIR/update-botfleet-runtime-commit.mjs" 2>"$RUNTIME_PROBE_ERR"); then
+          RUNTIME_PROBE_STATUS=0
+          RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" BOTFLEET_OWNER_NONCE="${BOTFLEET_OWNER_NONCE:-}" "$NODE_BIN" "$SCRIPT_DIR/update-botfleet-runtime-commit.mjs" 2>"$RUNTIME_PROBE_ERR") || RUNTIME_PROBE_STATUS=$?
+          if [[ "$RUNTIME_PROBE_STATUS" == "2" || "$RUNTIME_PROBE_STATUS" == "3" ]]; then
             if [[ -s "$RUNTIME_PROBE_ERR" ]]; then
               cat "$RUNTIME_PROBE_ERR" >&2
             fi
@@ -219,7 +219,7 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
             exit 1
           fi
           rm -f "$RUNTIME_PROBE_ERR"
-          if [[ "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
+          if [[ "$RUNTIME_PROBE_STATUS" != "0" ]] || [[ "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
             IS_UP_TO_DATE=0
           fi
         fi

@@ -131,7 +131,16 @@ export const SCRIPT_CHANGED = "This reply's spoken text changed while it was bei
 /** Per-voice clip lists kept on one message besides the owner's own. */
 export const MAX_EXTRA_VOICE_SLOTS = 4;
 
-const SUPPORTED_MIME = new Set(["audio/mpeg", "audio/wav"]);
+const SUPPORTED_MIME = new Set([
+  "audio/mpeg",
+  "audio/wav",
+  "audio/ogg",
+  "audio/opus",
+  "audio/mp4",
+  "audio/x-m4a",
+  "audio/aac",
+  "audio/webm",
+]);
 
 export interface AudioOwner {
   voice?: string;

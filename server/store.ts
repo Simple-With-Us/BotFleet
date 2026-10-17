@@ -986,6 +986,18 @@ class ThreadCache {
     }
   }
 
+  recordAppend(threadId: string): void {
+    if (!this.map.has(threadId)) return;
+    this.retained += 1;
+    while (this.map.size > 1 && (this.map.size > this.limit || this.retained > this.maxMessages)) {
+      const oldest = this.map.keys().next().value;
+      if (oldest === undefined || oldest === threadId) break;
+      const victim = this.map.get(oldest);
+      if (victim) this.retained -= victim.messages.length;
+      this.map.delete(oldest);
+    }
+  }
+
   delete(threadId: string): void {
     const existing = this.map.get(threadId);
     if (existing) this.retained -= existing.messages.length;
@@ -1921,6 +1933,7 @@ export class Store {
     const full: Message = { id: newId(), at: Date.now(), parentId: t.activeLeafId, ...redactBotAuthored(message) };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
+    this.threads.recordAppend(threadId);
     t.activeLeafId = full.id;
     if (full.kind === "screen") {
       for (const pruned of this.pruneScreenFrames(t)) {
@@ -2005,6 +2018,7 @@ export class Store {
     };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
+    this.threads.recordAppend(threadId);
     t.activeLeafId = full.id;
     this.emit({ type: "message", threadId, message: full });
     return full;

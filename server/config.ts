@@ -341,6 +341,7 @@ const appConfigSchema = z.object({
     provider: z.enum(TTS_PROVIDERS).optional(),
     ladder: z.array(z.enum(HOSTED_TTS_PROVIDERS)).max(HOSTED_TTS_PROVIDERS.length).optional(),
     optimizedSummary: z.boolean().optional(),
+    audioRetentionDays: z.number().int().min(0).max(3650).optional(),
     pronunciations: pronunciationListSchema.optional(),
     credentialStorage: externalCredentialStorage,
   }).strict().optional(),
@@ -595,6 +596,7 @@ export interface AppConfig {
     provider?: (typeof TTS_PROVIDERS)[number];
     ladder?: Array<(typeof HOSTED_TTS_PROVIDERS)[number]>;
     optimizedSummary?: boolean;
+    audioRetentionDays?: number;
     pronunciations?: Pronunciation[];
     credentialStorage?: "external";
   };

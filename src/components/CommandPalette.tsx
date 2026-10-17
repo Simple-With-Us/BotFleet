@@ -63,14 +63,19 @@ export function CommandPalette({ onOpenChange }: { onOpenChange?: (open: boolean
     // debounce and request for this query are pending.
     setMessageHits([]);
     let alive = true;
+    const controller = new AbortController();
     const timer = setTimeout(() => {
-      api(`/api/search?q=${encodeURIComponent(q)}&limit=12`)
+      api(`/api/search?q=${encodeURIComponent(q)}&limit=12`, { signal: controller.signal })
         .then((result: { hits?: SearchHit[] }) => alive && setMessageHits(result.hits ?? []))
-        .catch(() => alive && setMessageHits([]));
+        .catch(() => {
+          if (!alive || controller.signal.aborted) return;
+          setMessageHits([]);
+        });
     }, 150);
     return () => {
       alive = false;
       clearTimeout(timer);
+      controller.abort();
     };
   }, [open, q]);
 

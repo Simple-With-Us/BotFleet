@@ -257,7 +257,7 @@ function BotModelRow({ bot }: { bot: Bot }) {
   return (
     <div className="flex flex-col gap-3 border-t border-hairline/40 py-3 first:border-t-0 sm:flex-row sm:items-start">
       <div className="flex min-w-0 shrink-0 items-center gap-2 sm:w-44">
-        <BotAvatar bot={bot} size={28} />
+        <BotAvatar bot={bot} size={28} animated={false} />
         <div className="min-w-0">
           <div className="truncate text-[14px] font-medium text-ink" title={bot.name}>{bot.name}</div>
           {bot.title && (

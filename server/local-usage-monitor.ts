@@ -189,9 +189,17 @@ export async function readLocalQuotaSnapshot(
     if (!stat.isFile() || stat.size > MAX_BYTES || (process.getuid && stat.uid !== process.getuid())) {
       return empty({ state: "unreadable" });
     }
-    const buffer = Buffer.alloc(MAX_BYTES + 1);
+    const initialCapacity = Math.min(MAX_BYTES + 1, Math.max(4096, stat.size + 1024));
+    let buffer = Buffer.allocUnsafe(initialCapacity);
     let size = 0;
     while (size <= MAX_BYTES) {
+      if (size === buffer.length) {
+        const nextCapacity = Math.min(MAX_BYTES + 1, buffer.length * 2);
+        if (nextCapacity <= buffer.length) break;
+        const grown = Buffer.allocUnsafe(nextCapacity);
+        buffer.copy(grown, 0, 0, size);
+        buffer = grown;
+      }
       const { bytesRead } = await file.read(buffer, size, buffer.length - size, null);
       if (bytesRead === 0) break;
       size += bytesRead;
