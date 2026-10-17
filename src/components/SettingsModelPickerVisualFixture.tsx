@@ -62,15 +62,17 @@ export default function SettingsModelPickerVisualFixture() {
     [],
   );
 
+  const wide = new URLSearchParams(window.location.search).has("wide");
   return (
     <StoreContext.Provider value={value}>
       {/* The Settings panel is narrower than the window, which is why this
           width is pinned rather than left to the viewport. */}
-      <div data-testid="settings-model-picker-panel" className="w-[380px] bg-app p-4">
+      <div data-testid="settings-model-picker-panel" className={wide ? "ml-auto w-[220px] overflow-hidden bg-app p-4" : "w-[380px] bg-app p-4"}>
         <div data-testid="settings-model-picker-card" className="rounded-xl bg-card p-4 flex flex-col gap-4">
           <ModelPicker
             bot={bot}
             contained
+            widePopover={wide}
             label={<div className="text-[15px] font-medium text-ink">Primary Model</div>}
           />
         </div>

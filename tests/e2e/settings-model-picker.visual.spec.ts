@@ -106,3 +106,28 @@ test.describe('the Settings model picker stacks label above dropdown', () => {
     expect(box.triggerHeight).toBeGreaterThan(box.oneLineHeight);
   });
 });
+test.describe('fleet-wide model picker', () => {
+  for (const width of [1440, 800, 390]) {
+    test(`uses available width and stays on screen at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await page.goto('/?fixture=settings-model-picker&wide=1');
+      const trigger = page.locator('[data-testid="settings-model-picker-card"] button[aria-haspopup="dialog"]');
+      await trigger.click();
+      const menu = page.getByRole('dialog', { name: 'Choose Model' });
+      const box = await menu.boundingBox();
+      const button = await trigger.boundingBox();
+      expect(box).not.toBeNull();
+      expect(button).not.toBeNull();
+      expect(box!.width).toBeGreaterThan(350);
+      expect(box!.width).toBeGreaterThan(button!.width);
+      expect(box!.x).toBeGreaterThanOrEqual(11);
+      expect(box!.x + box!.width).toBeLessThanOrEqual(width - 11);
+      expect(box!.y).toBeGreaterThanOrEqual(button!.y + button!.height);
+      // The fixture deliberately clips its parent. The portaled menu must
+      // remain visible and interactive outside that card.
+      await expect(menu.getByRole('button', { name: /Claude Sonnet/ })).toBeVisible();
+      await page.keyboard.press('Escape');
+      await expect(menu).toHaveCount(0);
+    });
+  }
+});
