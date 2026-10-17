@@ -2224,16 +2224,20 @@ function checkedModelSelection(
     selection.effort = value.effort;
   }
   if (value.contextCap !== undefined && value.contextCap !== null) {
-    if (typeof value.contextCap !== "number" || !Number.isInteger(value.contextCap) || value.contextCap < 1 || value.contextCap > 10_000_000) {
+    // Number.isInteger is false for every non-number, so no typeof check is needed.
+    const contextCap = Number(value.contextCap);
+    if (!Number.isInteger(value.contextCap) || contextCap < 1 || contextCap > 10_000_000) {
       return { ok: false, status: 400, error: "modelSelection.contextCap must be a whole number of tokens" };
     }
-    selection.contextCap = value.contextCap;
+    selection.contextCap = contextCap;
   }
   if (value.maxOutputTokens !== undefined && value.maxOutputTokens !== null) {
-    if (typeof value.maxOutputTokens !== "number" || !Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 1 || value.maxOutputTokens > 10_000_000) {
+    // Number.isInteger is false for every non-number, so no typeof check is needed.
+    const maxOutputTokens = Number(value.maxOutputTokens);
+    if (!Number.isInteger(value.maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > 10_000_000) {
       return { ok: false, status: 400, error: "modelSelection.maxOutputTokens must be a whole number of tokens" };
     }
-    selection.maxOutputTokens = value.maxOutputTokens;
+    selection.maxOutputTokens = maxOutputTokens;
   }
   // "Latest <Class>": `null` means pinned (see checkLineageWrite).
   if (value.latest !== undefined && value.latest !== null) {

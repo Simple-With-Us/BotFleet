@@ -71,6 +71,7 @@ function render(
     initialRailId?: string | null;
     selection?: Bot["modelSelection"];
     contained?: boolean;
+    widePopover?: boolean;
     bot?: Bot;
   } = {},
 ): string {
@@ -365,6 +366,18 @@ describe("usage reads once at the top, naming the real window", () => {
   });
 });
 
+describe("fleet-wide model menus", () => {
+  it("opens wider than its trigger while the sidebar remains in flow", () => {
+    const wide = render([claude()], { widePopover: true });
+    expect(wide).toContain("w-[480px]");
+    expect(wide).toContain("max-w-[calc(100vw-24px)]");
+    expect(wide).toContain("fixed z-50");
+    const sidebar = render([claude()]);
+    expect(sidebar).toContain("relative mt-3 w-full");
+    expect(sidebar).not.toContain("w-[480px]");
+  });
+});
+
 describe("a model row keeps its name readable beside its tags", () => {
   // The owner's screenshots: "Highspeed" and "DeepSeek-V" rendered as a
   // vertical column of single characters because the label was `flex-1`
@@ -386,6 +399,24 @@ describe("a model row keeps its name readable beside its tags", () => {
     // never force the row wider than the pane holding it.
     expect(html).toContain("min-w-[min(9rem,100%)]");
     expect(html).toContain("flex-wrap");
+  });
+
+  it("shows a context size only once without a redundant Context word", () => {
+    const html = renderToStaticMarkup(
+      <ModelRow option={{ id: "muse-spark-1.3", label: "Muse Spark 1.3", contextWindow: 1_048_576, badge: "1M Context" }}
+        current={false} defaultId="" onPick={() => {}} />,
+    );
+    expect(html.match(/>1M</g)).toHaveLength(1);
+    expect(html).not.toContain("1M Context");
+  });
+
+  it("keeps a badge-only context size compact", () => {
+    const html = renderToStaticMarkup(
+      <ModelRow option={{ id: "custom", label: "Custom", badge: "1M Context" }}
+        current={false} defaultId="" onPick={() => {}} />,
+    );
+    expect(html).toContain(">1M<");
+    expect(html).not.toContain("1M Context");
   });
 
   it("renders the full slug in the title when the visible name is clipped", () => {
