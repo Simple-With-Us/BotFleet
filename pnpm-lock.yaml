@@ -249,6 +249,9 @@ importers:
       '@assistant-ui/react-ui':
         specifier: ^0.2.1
         version: 0.2.1(@assistant-ui/react-markdown@0.14.21(@assistant-ui/react@0.15.28(@opentelemetry/api@1.9.1)(@opentelemetry/sdk-trace-base@2.12.0(@opentelemetry/api@1.9.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(use-sync-external-store@1.6.0(react@19.3.0)))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(supports-color@10.2.2))(@assistant-ui/react@0.15.28(@opentelemetry/api@1.9.1)(@opentelemetry/sdk-trace-base@2.12.0(@opentelemetry/api@1.9.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(use-sync-external-store@1.6.0(react@19.3.0)))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(use-sync-external-store@1.6.0(react@19.3.0))
+      '@assistant-ui/store':
+        specifier: ^0.3.21
+        version: 0.3.21(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
       '@oxlint/plugins':
         specifier: 1.87.0
         version: 1.87.0
@@ -448,10 +451,10 @@ packages:
       '@types/react-dom':
         optional: true
 
-  '@assistant-ui/store@0.3.19':
-    resolution: {integrity: sha512-lxmbfbQCBx7ijIQYmP2OQJMa1aUCvRkvb/Y09fmbkxIhYAcNhSIRcINALe940dGtia+cGn63m8HxYNVoJEcFqg==}
+  '@assistant-ui/store@0.3.21':
+    resolution: {integrity: sha512-E24wfzEHWmXBAB770AuN1ZJgyP4sK+aFPUyVJw5NmjP2rRJXghRYKehECt7PUTwpXgMqmILO2jXMUkFXzfQuyg==}
     peerDependencies:
-      '@assistant-ui/tap': ^0.9.22
+      '@assistant-ui/tap': ^0.9.23
       '@types/react': '*'
       react: ^18 || ^19
     peerDependenciesMeta:
@@ -8816,9 +8819,9 @@ snapshots:
       zod: 4.6.6
     optional: true
 
-  '@assistant-ui/core@0.3.29(@assistant-ui/store@0.3.19(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0))(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@opentelemetry/api@1.9.1)(@opentelemetry/sdk-trace-base@2.12.0(@opentelemetry/api@1.9.1))(@types/react@19.3.0)(react@19.3.0)':
+  '@assistant-ui/core@0.3.29(@assistant-ui/store@0.3.21(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0))(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@opentelemetry/api@1.9.1)(@opentelemetry/sdk-trace-base@2.12.0(@opentelemetry/api@1.9.1))(@types/react@19.3.0)(react@19.3.0)':
     dependencies:
-      '@assistant-ui/store': 0.3.19(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
+      '@assistant-ui/store': 0.3.21(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
       '@assistant-ui/tap': 0.9.23(@types/react@19.3.0)(react@19.3.0)
       assistant-cloud: 0.2.7(@opentelemetry/api@1.9.1)(@opentelemetry/sdk-trace-base@2.12.0(@opentelemetry/api@1.9.1))
       assistant-stream: 0.3.52
@@ -8874,8 +8877,8 @@ snapshots:
 
   '@assistant-ui/react@0.15.28(@opentelemetry/api@1.9.1)(@opentelemetry/sdk-trace-base@2.12.0(@opentelemetry/api@1.9.1))(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(use-sync-external-store@1.6.0(react@19.3.0))':
     dependencies:
-      '@assistant-ui/core': 0.3.29(@assistant-ui/store@0.3.19(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0))(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@opentelemetry/api@1.9.1)(@opentelemetry/sdk-trace-base@2.12.0(@opentelemetry/api@1.9.1))(@types/react@19.3.0)(react@19.3.0)
-      '@assistant-ui/store': 0.3.19(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
+      '@assistant-ui/core': 0.3.29(@assistant-ui/store@0.3.21(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0))(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@opentelemetry/api@1.9.1)(@opentelemetry/sdk-trace-base@2.12.0(@opentelemetry/api@1.9.1))(@types/react@19.3.0)(react@19.3.0)
+      '@assistant-ui/store': 0.3.21(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)
       '@assistant-ui/tap': 0.9.23(@types/react@19.3.0)(react@19.3.0)
       assistant-cloud: 0.2.7(@opentelemetry/api@1.9.1)(@opentelemetry/sdk-trace-base@2.12.0(@opentelemetry/api@1.9.1))
       assistant-stream: 0.3.52
@@ -8899,7 +8902,7 @@ snapshots:
       - redis
       - use-sync-external-store
 
-  '@assistant-ui/store@0.3.19(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)':
+  '@assistant-ui/store@0.3.21(@assistant-ui/tap@0.9.23(@types/react@19.3.0)(react@19.3.0))(@types/react@19.3.0)(react@19.3.0)':
     dependencies:
       '@assistant-ui/tap': 0.9.23(@types/react@19.3.0)(react@19.3.0)
     optionalDependencies:
