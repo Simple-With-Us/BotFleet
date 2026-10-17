@@ -38,15 +38,21 @@ export const ACP_PROMPT_HARD_CEILING_FACTOR = 2;
  *  sections in the order they appear in the prompt (so memory always went
  *  before a later mentions note).  Per-turn nudges and stale lists go before the
  *  bot's own memory and the instructions a message selected.  Ids not listed
- *  sit in the middle. */
+ *  sit in the middle.
+ *
+ *  `automation` goes last.  It is the untrusted-data framing for a webhook,
+ *  iMessage, Zulip or resource turn, and that turn's payload rides in the
+ *  current message, which is never cut.  Dropping the note first would keep
+ *  the payload and lose the warning, and the note is a few hundred bytes, so
+ *  cutting it early saves almost nothing. */
 export const ACP_SECTION_CUT_PRIORITY: Readonly<Record<string, number>> = {
   recent: 10,
   mentions: 20,
   outstanding: 30,
-  automation: 40,
   playbooks: 50,
   "skill-instructions": 60,
   memory: 70,
+  automation: 80,
 };
 const UNLISTED_SECTION_PRIORITY = 35;
 
