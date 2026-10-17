@@ -7,7 +7,7 @@
 // fence is very likely complete), then highlights and caches — so the settled
 // bubble, a fresh component instance, mounts straight from cache instead of
 // popping from plain to highlighted.
-import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
+import { isValidElement, memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Check, Copy } from "lucide-react";
@@ -296,24 +296,12 @@ function Spoiler({ children }: { children?: ReactNode }) {
 
 const REMARK_PLUGINS = [remarkGfm, remarkMentions];
 
-function hasElementProps(
-  node: unknown,
-): node is { props: { className?: string; children?: unknown } } {
-  return (
-    typeof node === "object" &&
-    node !== null &&
-    "props" in node &&
-    typeof (node as { props: unknown }).props === "object" &&
-    (node as { props: unknown }).props !== null
-  );
-}
-
-const flattenCodeChildren = (n: unknown): string =>
+const flattenCodeChildren = (n: ReactNode): string =>
   typeof n === "string"
     ? n
     : Array.isArray(n)
       ? n.map(flattenCodeChildren).join("")
-      : hasElementProps(n) && n.props.children !== undefined
+      : isValidElement<{ children?: ReactNode }>(n)
         ? flattenCodeChildren(n.props.children)
         : "";
 
@@ -422,9 +410,9 @@ function ChatMarkdownComponent({ text, streaming = false }: { text: string; stre
       ...STATIC_MARKDOWN_COMPONENTS,
       pre({ children }: { children?: ReactNode }) {
         // fenced code arrives as <pre><code class="language-x">…</code></pre>
-        const first: unknown = Array.isArray(children) ? children[0] : children;
-        const child = hasElementProps(first) ? first : null;
-        const className = typeof child?.props.className === "string" ? child.props.className : "";
+        const first = Array.isArray(children) ? children[0] : children;
+        const child = isValidElement<{ className?: string; children?: ReactNode }>(first) ? first : null;
+        const className = child?.props.className ?? "";
         const lang = /language-([\w-]+)/.exec(className)?.[1] ?? "";
         // children can be a string OR an array of strings/nodes — flatten
         // strings only, so String() never comma-joins an array

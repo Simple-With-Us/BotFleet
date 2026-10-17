@@ -185,6 +185,7 @@ function VoiceCard() {
       <VoiceSettings
         bot={bot}
         onPatch={(patch) => setBot((current) => applyBotPatch(current, patch))}
+        showAudioRetention={false}
       />
     </div>
   );

@@ -114,9 +114,11 @@ function clientPlatform(): ClientPlatform {
 export function VoiceSettings({
   bot,
   onPatch,
+  showAudioRetention = true,
 }: {
   bot: Bot;
   onPatch: (patch: VoiceSettingsPatch) => void;
+  showAudioRetention?: boolean;
 }) {
   const { state, dispatch } = useStore();
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
@@ -1038,7 +1040,9 @@ export function VoiceSettings({
       <PronunciationSettings tts={tts} onConfig={(config) => dispatch({ type: "configStatus", config })} />
 
       {/* ── Audio File Retention (workspace) ── */}
-      <AudioRetentionPicker tts={tts} onConfig={(config) => dispatch({ type: "configStatus", config })} />
+      {showAudioRetention && (
+        <AudioRetentionPicker tts={tts} onConfig={(config) => dispatch({ type: "configStatus", config })} />
+      )}
 
       {/* ── Speech to Text ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">
