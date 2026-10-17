@@ -37,6 +37,7 @@ import {
   harnessBootstrapPlist,
   harnessLaunchdLabel,
   isExpectedBotFleetProcess,
+  isMacSystemBundleInspector,
   launchAgentPlistLabel,
   launchdExitReason,
   loadPrepared,
@@ -3022,6 +3023,19 @@ test("only a launchd job that has exited counts as a crash; one that is still bo
     "a print that fails says nothing; the timeout is the backstop");
 });
 
+test("isMacSystemBundleInspector recognizes /System/Library/ XPC services like ThemeWidgetControlViewService", () => {
+  assert.equal(
+    isMacSystemBundleInspector(
+      "/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService",
+    ),
+    true,
+  );
+  assert.equal(isMacSystemBundleInspector("/Applications/BotFleet.app/Contents/MacOS/BotFleet"), false);
+  assert.equal(isMacSystemBundleInspector("/usr/libexec/unrelated-daemon"), false);
+  assert.equal(isMacSystemBundleInspector(""), false);
+});
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
