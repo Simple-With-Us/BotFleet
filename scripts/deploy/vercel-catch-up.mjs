@@ -10,7 +10,8 @@ const SHA = /^[a-f0-9]{40}$/;
 const ACTIVE = new Set(['QUEUED', 'INITIALIZING', 'BUILDING']);
 const STATES = new Set([...ACTIVE, 'READY', 'ERROR', 'CANCELED']);
 function must(ok, message) { if (!ok) throw new Error(message); }
-function object(x) { return x !== null && typeof x === 'object' && !Array.isArray(x); }
+function isString(x) { return Object.prototype.toString.call(x) === "[object String]"; }
+function object(x) { return x !== null && Object.prototype.toString.call(x) === "[object Object]" && !Array.isArray(x); }
 export function deploymentSha(d) {
   const values = [d.gitSource?.sha, d.meta?.githubCommitSha, d.meta?.fleetCommitSha].filter(Boolean);
   must(values.length > 0 && values.every(x => SHA.test(x) && x === values[0]), 'Deployment commit missing or conflicting');
@@ -48,7 +49,7 @@ export function classify({ deployments, baseline, target, now, changed, projectI
   return { deploy: true, reason: 'eligible main differs from production', target };
 }
 export function assertCi(runs, names, sha) {
-  must(Array.isArray(runs) && Array.isArray(names) && names.length > 0 && names.every(n => typeof n === 'string' && n), 'Invalid CI runs or workflow configuration');
+  must(Array.isArray(runs) && Array.isArray(names) && names.length > 0 && names.every(n => isString(n) && n), 'Invalid CI runs or workflow configuration');
   for (const name of names) {
     const candidates = runs.filter(r => r.name === name && r.head_sha === sha && r.head_branch === 'main' && ['push', 'workflow_dispatch'].includes(r.event)).sort((a, b) => b.id - a.id);
     must(candidates.length > 0 && candidates[0].status === 'completed' && candidates[0].conclusion === 'success', `Exact-main CI not successful: ${name}`);
@@ -57,7 +58,7 @@ export function assertCi(runs, names, sha) {
 export function assertReceipt(d, config, sha) {
   must(object(d) && d.projectId === config.projectId && d.target === 'production' && d.readyState === 'READY', 'Deployment is not READY production for this project');
   must(deploymentSha(d) === sha, 'Deployment SHA mismatch');
-  must(typeof d.url === 'string' && /^[a-zA-Z0-9.-]+\.vercel\.app$/.test(d.url), 'Invalid deployment URL');
+  must(isString(d.url) && /^[a-zA-Z0-9.-]+\.vercel\.app$/.test(d.url), 'Invalid deployment URL');
   return `https://${d.url}`;
 }
 function git(args) { return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
@@ -77,7 +78,7 @@ async function main() {
   if (process.argv[2] === 'receipt') {
     const result = JSON.parse(readFileSync(process.argv[3], 'utf8'));
     const id = result.id ?? result.uid ?? result.deployment?.id ?? result.data?.id ?? result.data?.deployment?.id;
-    must(typeof id === 'string' && /^dpl_[A-Za-z0-9]+$/.test(id), 'CLI returned no deployment ID');
+    must(isString(id) && /^dpl_[A-Za-z0-9]+$/.test(id), 'CLI returned no deployment ID');
     const url = assertReceipt(await read(`/v13/deployments/${id}?withGitRepoInfo=true`), config, target);
     const project = await read(`/v9/projects/${config.projectId}`);
     assertProject(project, config);
@@ -95,7 +96,7 @@ async function main() {
   const project = await read(`/v9/projects/${config.projectId}`);
   assertProject(project, config);
   const baselineId = project.targets?.production?.id ?? project.targets?.production?.uid;
-  must(typeof baselineId === 'string' && /^dpl_[A-Za-z0-9]+$/.test(baselineId), 'No current production target');
+  must(isString(baselineId) && /^dpl_[A-Za-z0-9]+$/.test(baselineId), 'No current production target');
   const baseline = await read(`/v13/deployments/${baselineId}?withGitRepoInfo=true`);
   must(baseline.projectId === config.projectId, 'Wrong production baseline project');
   const history = await read(`/v7/deployments?projectId=${config.projectId}&target=production&limit=100`);
