@@ -135,7 +135,11 @@ export function createWebhookIngressHandler(
       // letting the throw escape the receiver and hang the connection.
       return json(res, 400, { error: "Malformed request URL" });
     }
-    const entry = Object.prototype.hasOwnProperty.call(routes, url.pathname) ? routes[url.pathname] : undefined;
+    const entry = Object.prototype.hasOwnProperty.call(routes, url.pathname)
+      ? routes[url.pathname]
+      : !url.search && !url.hash && /^\/zulip\/outgoing\/[A-Z0-9][A-Z0-9_-]{0,47}$/.test(url.pathname)
+        ? routes["/zulip/outgoing/*"]
+        : undefined;
     if (entry) {
       if (req.method !== "POST") return json(res, 405, { error: "Webhooks accept POST requests" });
       const route = typeof entry === "function" ? entry : entry.handler;

@@ -195,7 +195,9 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
     );
     const port = await freePortBlock([0, 1]);
     base = `http://127.0.0.1:${port}`;
-    child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
+    // Permission wiring must not wait on the runner's real hot-host admission.
+    // The scheduler's load shedding has separate deterministic unit coverage.
+    child = spawnDetached(process.execPath, ["--import", join(SERVER_DIR, "testing", "cool-host-loader.mjs"), join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
       env: {
         ...(process.env.PATH ? { PATH: process.env.PATH } : {}),

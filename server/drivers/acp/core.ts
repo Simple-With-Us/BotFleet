@@ -85,6 +85,7 @@ import { augmentedPath } from "../../env-path.ts";
 // packaged server dir entirely. See server/proxy-paths.ts.
 import { appendNative } from "../native.ts";
 import { turnStdioMcpServers } from "../turn-mcp.ts";
+import { engineCommandText, neutralizeLeadingSlash, normalizeAnnouncedCommands } from "../engine-commands.ts";
 import { getBool } from "../../feature-flags.ts";
 import type { JsonValue } from "../../schema.ts";
 import {
@@ -632,7 +633,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       // re-enters sendTurn, and the budget has to survive that hop or every
       // attempt would look like the first one.  Mirrors claude.ts, which owns
       // the same shape for the same reason.
-      const retryState = new Map<string, { attempt: number; cancelled: boolean }>();
+      // `compressionAnnounced` outlives a relaunch (the entry is cleared only when the
+      // logical turn settles), so a retried attempt that trims the same prompt
+      // does not publish a second "Compressing Context" row.
+      const retryState = new Map<string, { attempt: number; cancelled: boolean; compressionAnnounced?: boolean }>();
       /** Substitution notices (model pinned to a session variant, etc.) once per thread. */
       const runtimeNoticesByThread = new Map<string, Set<string>>();
       // A relaunch waits real seconds; the fakes in acp.test.ts scale that
@@ -686,6 +690,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         turnId,
         createdAt: new Date().toISOString(),
       });
+      /** The agent's slash-command catalog (`available_commands_update`), kept
+       *  per instance so the same list is announced once, not once a turn. */
+      let announcedCommands = "";
+      const announceCommands = (threadId: string, turnId: string, raw: readonly string[]) => {
+        const names = normalizeAnnouncedCommands(raw);
+        const key = names.join(",");
+        if (key === announcedCommands) return;
+        announcedCommands = key;
+        emit({ ...base(threadId, turnId), type: "engine.commands", names, origin: "acp-available-commands" });
+      };
 
       const sendTurn = async (turn: SendTurnInput) => {
         const { threadId } = turn;
@@ -1146,6 +1160,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (state.settled || state.retrying || state.deadlineTerminating) return false;
           if (retry.cancelled || preflightCancelled || disposed) return false;
           if (state.sawOutput) return false;
+          // a command turn is never replayed: a relaunch could run it twice
+          if (turn.command) return false;
           if (retry.attempt >= RETRY_MAX_ATTEMPTS - 1) return false;
           const verdict = classifyError(failure);
           if (!verdict.transient) return false;
@@ -1377,8 +1393,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // native log but never normalized: the prompt result is the settle.
           if (msg.method !== "session/update") return;
           const p = msg.params ?? {};
-          if (!state.promptSent || p._meta?.isReplay === true) return;
           const u = p.update ?? {};
+          // Agents announce their commands right after session/new or
+          // session/load, before the prompt goes out and while a resumed
+          // session is still replaying, so this reads ahead of the gate below.
+          // It never becomes a transcript item.
+          if (u.sessionUpdate === "available_commands_update") {
+            const names = z.array(z.object({ name: z.string() }).passthrough()).safeParse(u.availableCommands);
+            if (names.success) announceCommands(threadId, turnId, names.data.map((command) => command.name));
+            return;
+          }
+          if (!state.promptSent || p._meta?.isReplay === true) return;
           switch (u.sessionUpdate) {
             case "agent_message_chunk": {
               const delta = u.content?.text;
@@ -1818,43 +1843,69 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // Budget the prompt about to be sent.  This does not decide
             // whether the system prompt is inlined on resume.  Under the
             // ceiling the composed text is unchanged.
+            // A command turn is written as the agent parses it: the bare
+            // "/name args" with no persona in front.  Every other turn is
+            // shielded so a leading slash in the composed text cannot run as a
+            // command (the persona normally leads, so this is a second lock).
             const composed = support.buildPromptText
               ? support.buildPromptText(turn)
               : turn.system
                 ? `${turn.system}\n\n${turn.text}`
                 : turn.text;
-            const budgetBytes = resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes);
-            const budgeted = applyAcpPromptBudget({
-              composed,
-              sections: turn.systemSections,
-              userText: turn.text,
-              budgetBytes,
-            });
-            annotatePromptBudget(threadId, turnId, budgeted);
-            const trim = describeAcpPromptTrim(budgeted, budgetBytes);
-            if (trim) {
-              // The "Compressing Context" row.  Names and sizes only.
-              const itemId = `ctx-${randomUUID()}`;
-              emit({
-                ...base(threadId, turnId),
-                type: "context.injected",
-                itemId,
-                source: "compression",
-                preview: trim.preview,
-                bytes: trim.bytesSaved,
-                io: { text: boundText(trim.text) },
+            let text: string;
+            if (turn.command) {
+              // A command turn is the bare "/name args" the agent parses.  It
+              // is never budgeted, so there is nothing to trim or refuse.
+              text = engineCommandText(turn.command);
+            } else {
+              const budgetBytes = resolveAcpPromptBudgetBytes(turnConfig.promptBudgetBytes);
+              const budgeted = applyAcpPromptBudget({
+                composed,
+                sections: turn.systemSections,
+                userText: turn.text,
+                budgetBytes,
               });
+              annotatePromptBudget(threadId, turnId, budgeted);
+              // The refusal comes first: a turn that is refused was not sent,
+              // so it must not also say context was cut to fit it.
+              const refusal = acpPromptCeilingRefusal(budgeted.text, budgetBytes);
+              if (refusal) {
+                // Last resort: protected text alone is far past the budget.  Say
+                // so in the transcript instead of sending a prompt that size.
+                emit({ ...base(threadId, turnId), type: "runtime.error", message: refusal.message });
+                settle(false, "prompt_too_large");
+                return;
+              }
+              const trim = describeAcpPromptTrim(budgeted, budgetBytes);
+              if (trim && !retry.compressionAnnounced) {
+                // The "Compressing Context" row.  Names and sizes only.  Once
+                // per logical turn: a relaunch trims the same prompt again.
+                retry.compressionAnnounced = true;
+                const itemId = `ctx-${randomUUID()}`;
+                emit({
+                  ...base(threadId, turnId),
+                  type: "context.injected",
+                  itemId,
+                  source: "compression",
+                  preview: trim.preview,
+                  bytes: trim.bytesSaved,
+                  io: { text: boundText(trim.text) },
+                });
+                try {
+                  // Only the harness knows which message this turn answers.
+                  turn.onContextCompressed?.({
+                    id: itemId,
+                    source: "compression",
+                    preview: trim.preview,
+                    bytes: trim.bytesSaved,
+                  });
+                } catch (error) {
+                  console.error("acp: onContextCompressed threw", error);
+                }
+              }
+              text = neutralizeLeadingSlash(budgeted.text);
+              captureTurnPrompt(threadId, turnId, text);
             }
-            const refusal = acpPromptCeilingRefusal(budgeted.text, budgetBytes);
-            if (refusal) {
-              // Last resort: protected text alone is far past the budget.  Say
-              // so in the transcript instead of sending a prompt that size.
-              emit({ ...base(threadId, turnId), type: "runtime.error", message: refusal.message });
-              settle(false, "prompt_too_large");
-              return;
-            }
-            captureTurnPrompt(threadId, turnId, budgeted.text);
-            const text = budgeted.text;
             const result = await request(
               "session/prompt",
               {
@@ -2074,6 +2125,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             asksWhenHeld: true,
             // Holds a routine's command allowlist (allowlist.ts), or refuses it.
             toolPolicy: Boolean(support.allowlist),
+            // Explicit engine commands run directly, outside the ordinary prompt budget.
+            engineCommands: true,
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

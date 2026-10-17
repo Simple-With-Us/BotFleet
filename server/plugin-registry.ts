@@ -14,6 +14,7 @@ import { join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import { parsePluginManifest } from "../shared/plugin-manifest.ts";
+import { pluginSecretKeys, readPluginSettings } from "./plugin-secrets.ts";
 import {
   PluginRegistrySchema,
   type PluginRegistry,
@@ -285,6 +286,22 @@ export function listingFor(
     warnings: entry.warnings,
     capabilities: parsed.manifest.capabilities,
     contributes: parsed.manifest.contributes,
+    settings: parsed.manifest.settings.map((setting) => ({
+      key: setting.key,
+      label: setting.label,
+      type: setting.type,
+      required: setting.required,
+      hasDefault: setting.default !== undefined,
+      description: setting.description,
+    })),
+    settingsVersion: parsed.manifest.settingsVersion,
+    // Names only: secret values are never listed.  A secret key appears
+    // here when the broker holds a value for it.
+    configuredKeys: [
+      ...Object.keys(readPluginSettings(baseDir, name).values),
+      ...pluginSecretKeys(baseDir, name),
+    ].sort(),
+    needs: { network: [...parsed.manifest.needs.network] },
   };
 }
 
