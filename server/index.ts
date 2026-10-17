@@ -112,6 +112,11 @@ import {
   type HeldWork,
   type DrainWindowInput,
 } from "./update-drain.ts";
+import {
+  arrivedViaCloudflareTunnel,
+  isMutatingHarnessApiRequest,
+  NAMED_TUNNEL_MUTATION_FORBIDDEN,
+} from "./named-tunnel-gate.ts";
 import { botOffError, botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import {
   BOT_OFF_CODE,
@@ -393,7 +398,7 @@ import { jobsPrompt, noticeWithoutJobTools } from "./jobs/prompt.ts";
 import { JobRegistry, resolveJobsSettings } from "./jobs/registry.ts";
 import { JobWakeCoordinator } from "./jobs/wake.ts";
 import { ZulipHub } from "./zulip/hub.ts";
-import { cachedVaultReader, resolveRealm } from "./zulip/credentials.ts";
+import { cachedVaultReader } from "./zulip/credentials.ts";
 import { zulipToolsMounted } from "./zulip/mount.ts";
 import { zulipPeerScreenRules } from "./zulip/format.ts";
 import type { ZulipOrigin } from "./zulip/types.ts";
@@ -568,6 +573,7 @@ import { createTeamManifest, importedMemberProfile, parseTeamManifest } from "./
 import { readThreadEvents } from "./thread-events.ts";
 import { listenWebhookIngress, webhookCredential, type WebhookIngress } from "./webhook-ingress.ts";
 import { readLinqWebhook } from "./routes/linq-webhook.ts";
+import { createZulipOutgoingWebhookRoute } from "./zulip/webhook.ts";
 import { resolveLinqBinding } from "./linq/dispatch.ts";
 import { bindLinqChatToTurn, deliverLinqOutboundIfNeeded, releaseLinqChat, sendLinqCommandReply, stopLinqTypingForThread } from "./linq/outbound.ts";
 import {
@@ -588,7 +594,22 @@ import {
   type CommandEngine,
 } from "./command-registry.ts";
 import { EngineCommandCache } from "./engine-command-cache.ts";
-import { EngineCommandTextError, engineCommandText, offeredEngineCommands } from "./drivers/engine-commands.ts";
+import {
+  discoverStaticEngineCommands,
+  mergeAnnouncedEngineCommands,
+} from "./drivers/engine-command-discovery.ts";
+import {
+  buildCursorAgentAllowlist,
+  CURSOR_BUILTIN_COMMAND_NAMES,
+  discoverCursorCommandCatalog,
+} from "./drivers/cursor-engine-commands.ts";
+import {
+  ENGINE_COMMAND_ALLOWLIST,
+  EngineCommandTextError,
+  engineCommandText,
+  offeredEngineCommands,
+  type EngineCommandSpec,
+} from "./drivers/engine-commands.ts";
 import {
   botCommandRequestSchema,
   COMMAND_SURFACES,
@@ -803,7 +824,7 @@ export const CliCandidatesQuerySchema = z.object({
     .max(4096)
     .default("")
     .transform((raw) => raw.split(",").map((alias) => alias.trim()).filter(Boolean)),
-});
+}).strict();
 
 /** `<streamId>:<seq>` — opaque to clients, and the only thing they need to
  * remember to resume.  Returns null when it belongs to another run. */
@@ -1092,10 +1113,6 @@ const PLUGIN_PATH_PARAMS = z.tuple([PLUGIN_SLUG]);
 const PLUGIN_ITEM_PATH_PARAMS = z.tuple([PLUGIN_SLUG, PLUGIN_SLUG]);
 
 pluginsModule.initPluginRuntime({
-  zulipRealm: () => {
-    const resolved = resolveRealm(cfg.zulip);
-    return "realm" in resolved ? resolved.realm : undefined;
-  },
   listBots: () => store.bots.map((bot) => ({
     id: bot.id,
     name: bot.name,
@@ -3689,6 +3706,37 @@ function commandEngineFor(bot: BotRecord): CommandEngine {
   };
 }
 
+function engineCommandDiscoveryContext(bot: BotRecord): { cwd: string | null; env: NodeJS.ProcessEnv } {
+  const task = store.taskByThread(bot.id, bot.threadId);
+  return { cwd: task?.cwd ?? bot.cwd ?? null, env: process.env };
+}
+
+function announcedEngineCommands(bot: BotRecord, engine: CommandEngine): readonly string[] | null {
+  const ctx = engineCommandDiscoveryContext(bot);
+  const cached = engineCommandCache.get(engine.instanceId, engine.cliVersion);
+  const discovered = discoverStaticEngineCommands(engine.driverKind, ctx);
+  let merged = mergeAnnouncedEngineCommands(cached, discovered);
+  if (engine.driverKind === "cursorAgent") {
+    const catalog = discoverCursorCommandCatalog(ctx);
+    merged = mergeAnnouncedEngineCommands(merged, [...catalog.names, ...CURSOR_BUILTIN_COMMAND_NAMES]);
+  }
+  return merged;
+}
+
+function engineCommandAllowlistFor(
+  bot: BotRecord,
+  engine: CommandEngine,
+): Readonly<Record<string, readonly EngineCommandSpec[]>> {
+  if (engine.driverKind !== "cursorAgent") return ENGINE_COMMAND_ALLOWLIST;
+  const ctx = engineCommandDiscoveryContext(bot);
+  const catalog = discoverCursorCommandCatalog(ctx);
+  const announced = announcedEngineCommands(bot, engine) ?? [];
+  return {
+    ...ENGINE_COMMAND_ALLOWLIST,
+    cursorAgent: buildCursorAgentAllowlist(announced, catalog),
+  };
+}
+
 /** The answer GET /api/bots/:id/commands gives for a bot on a surface. */
 function commandsFor(bot: BotRecord, surface: CommandSurface) {
   const engine = commandEngineFor(bot);
@@ -3701,7 +3749,8 @@ function commandsFor(bot: BotRecord, surface: CommandSurface) {
     engine,
     allowsMultipleThreads: allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode)),
     hasSession: Boolean(task?.resumeCursors[engine.instanceId]),
-    announced: engineCommandCache.get(engine.instanceId, engine.cliVersion),
+    announced: announcedEngineCommands(bot, engine),
+    allowlist: engineCommandAllowlistFor(bot, engine),
   });
 }
 
@@ -3852,18 +3901,24 @@ async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface
     return commandFailure(409, "command_disabled", reason);
   }
   const engine = commandEngineFor(bot);
-  const spec = offeredEngineCommands(engine.driverKind, engineCommandCache.get(engine.instanceId, engine.cliVersion) ?? [], engine.cliVersion)
-    .find((candidate) => candidate.name === command.name);
+  const allowlist = engineCommandAllowlistFor(bot, engine);
+  const spec = offeredEngineCommands(
+    engine.driverKind,
+    announcedEngineCommands(bot, engine) ?? [],
+    engine.cliVersion,
+    allowlist,
+  ).find((candidate) => candidate.name === command.name);
   const commandId = randomUUID();
-  const output = spec && spec.output === "model" ? "model" : "local";
-  const run: EngineCommandRun = { id: commandId, name: command.name, args: args.value, surface, output };
+  const run: EngineCommandRun = { id: commandId, name: command.name, args: args.value, surface, output: spec?.output ?? "local" };
   try {
     await startTurn(bot.id, engineCommandText(run), { command: run });
   } catch (error) {
     // engineCommandText refuses a name or argument that is not safe to send —
     // a leading slash, a second line, an over-long argument.  Those are the
-    // caller's mistake, not the engine's, and they throw a bare Error, so the
-    // generic status mapping below would read them as a 500 and re-throw.
+    // caller's mistake, not the engine's, and they arrive as an
+    // EngineCommandTextError, which is narrowed here rather than by message so
+    // rewording the sentence cannot silently reclassify it.  The generic status
+    // mapping below would otherwise read it as a 500 and re-throw.
     if (error instanceof EngineCommandTextError) {
       return commandFailure(400, "invalid_args", error.message);
     }
@@ -3876,13 +3931,7 @@ async function runBotCommand(bot: BotRecord, request: BotCommandRequest, surface
   const invocation = store.messagesFor(bot.threadId).findLast((message) => message.command?.id === commandId);
   return {
     status: 202,
-    body: {
-      ok: true,
-      id: command.id,
-      kind: "turn",
-      threadId: bot.threadId,
-      invocationMessageId: invocation ? invocation.id : "",
-    },
+    body: { ok: true, id: command.id, kind: "turn", threadId: bot.threadId, invocationMessageId: invocation?.id ?? "" },
   };
 }
 
@@ -8211,6 +8260,7 @@ try {
     // on the webhook-only listener (8800) because that is what the public
     // tunnel forwards to; the app server (8799) stays loopback-only.
     routes: {
+      "/zulip/outgoing/*": createZulipOutgoingWebhookRoute(() => zulipHub, beginUpdateAdmission),
       "/api/webhooks/linq": {
         // Auth-first: the route verifies the HMAC before acquiring update
         // admission (see readLinqWebhook), so the ingress handler must not
@@ -12665,12 +12715,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (secFetchSite === "cross-site") {
       return json(res, 403, { error: "forbidden: cross-site request" });
     }
+    const mutatingApiRequest = isMutatingHarnessApiRequest(method, path);
+    // The named Remote Access tunnel forwards with a loopback Host,
+    // so the Host gate alone cannot distinguish a remote Access caller from the
+    // owner.  Block mutating API traffic that carries Cloudflare edge markers
+    // until a dedicated remote-auth seam lands (BF-2129).
+    if (mutatingApiRequest && arrivedViaCloudflareTunnel(req)) {
+      return json(res, 403, { error: NAMED_TUNNEL_MUTATION_FORBIDDEN });
+    }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: "BotFleet is quiescing for an update" });
     }
-    const mutatingApiRequest = path.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(method) &&
-      path !== "/api/runtime/quiesce";
     if (mutatingApiRequest && !NON_JSON_BODY_ROUTES.has(path) && hasRequestBody(req) && !isJsonContentType(req)) {
       // the commands route names its code so a client can branch on it
       return json(res, 415, /^\/api\/bots\/[\w-]+\/commands$/.test(path)

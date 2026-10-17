@@ -347,5 +347,100 @@ reset_fail_ledger
 # this point can still exit without ever touching the log file.
 rotate_log_if_large
 
+# --- the Infisical machine identity --------------------------------------
+# Read out of the fleet's own secret file, and nothing else out of it.
+#
+# This one credential is deliberately not in the vault -- a lock cannot hold
+# its own key -- and not in config.json, which is plaintext, because it can
+# read every name in the project.  That leaves exactly one place a
+# launchd-started harness can get it, and without it the harness comes up
+# "Infisical is not configured" and silently drops every vault-backed
+# credential: the speech-to-speech keys, Zulip's per-role keys, the lot.
+#
+# The desktop app can also replay the identity into a running harness, but
+# only while it is attached -- `before-quit` stops the replay on purpose,
+# because the always-on harness outlives it.  A crash, an update, or a manual
+# restart therefore leaves nothing to restore it, which is exactly when it
+# is most needed.
+#
+# The Node server never opens the file.  This wrapper is the launchd entry
+# point, and it copies only the machine-identity pair into the environment
+# loadConfig() already prefers.  The values are extracted rather than sourced:
+# `ps eww` prints a process environment and that file holds every fleet secret,
+# so only the identity belongs in this process.  When both halves are already
+# in the environment, the file is not opened.  A missing or unreadable file is
+# not fatal -- the harness still starts, and the desktop app can still supply
+# the identity in memory.
+#
+# An empty string must not be exported.  loadConfig() treats a defined env var
+# as present (`process.env[name] !== undefined`), so INFISICAL_CLIENT_ID=""
+# would hide config.json and the INFISICAL_UNIVERSAL_AUTH_* aliases.  A half
+# pair would do the same to one side.  Apply the file only when it yields both
+# halves, and only into names that are still empty.  Documented handoff keys
+# (INFISICAL_CLIENT_*) win; the automation names are the fallback the Mac file
+# actually uses.
+global_secret() {
+  local name="$1" file="$HOME/.secrets/global-api-keys" line
+  # A directory at this path is "readable" but cannot be read line by line.
+  # Treat anything that is not a regular file as "no identity", and keep going.
+  [ -f "$file" ] && [ -r "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$name="*)
+        line="${line#"$name="}"
+        # Strip one layer of wrapping quotes if the file uses them.
+        case "$line" in
+          \"*\") line="${line#\"}"; line="${line%\"}" ;;
+          \'*\') line="${line#\'}"; line="${line%\'}" ;;
+        esac
+        printf '%s' "$line"
+        return 0
+        ;;
+    esac
+  done < "$file"
+  return 0
+}
+
+# First non-empty file value among the given names.  Always exits 0 so a
+# missing name cannot trip `set -e` and take the harness down with it.
+first_file_secret() {
+  local name value
+  for name in "$@"; do
+    value="$(global_secret "$name")"
+    if [ -n "$value" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done
+  return 0
+}
+
+load_infisical_identity() {
+  local file_id="" file_secret=""
+  if [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
+    export INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
+    return 0
+  fi
+  [ -f "$HOME/.secrets/global-api-keys" ] && [ -r "$HOME/.secrets/global-api-keys" ] || return 0
+  file_id="$(first_file_secret INFISICAL_CLIENT_ID INFISICAL_AUTOMATION_CLIENT_ID)"
+  file_secret="$(first_file_secret INFISICAL_CLIENT_SECRET INFISICAL_AUTOMATION_CLIENT_SECRET)"
+  if [ -n "$file_id" ] && [ -n "$file_secret" ]; then
+    if [ -z "${INFISICAL_CLIENT_ID:-}" ]; then
+      INFISICAL_CLIENT_ID="$file_id"
+    fi
+    if [ -z "${INFISICAL_CLIENT_SECRET:-}" ]; then
+      INFISICAL_CLIENT_SECRET="$file_secret"
+    fi
+  fi
+  if [ -n "${INFISICAL_CLIENT_ID:-}" ]; then
+    export INFISICAL_CLIENT_ID
+  fi
+  if [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
+    export INFISICAL_CLIENT_SECRET
+  fi
+}
+
+load_infisical_identity
+
 cd "$ROOT"
 exec "$NODE" --experimental-strip-types server/index.ts

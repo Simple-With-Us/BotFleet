@@ -22,7 +22,7 @@ describe("buildNotification", () => {
 
   it("masks a credential in the body before it is clipped and pushed", () => {
     // assembled at runtime so no token-shaped literal sits in the source
-    const key = ["sk", "-ant-", "api03-", "TESTONLY", "0123456789abcdef0123456789abcdef"].join("");
+    const key = ["sk-test", "-TESTONLY-", "0123456789abcdef0123456789abcdef"].join("");
     const finished = buildNotification("done", bot, "thread-1", `Rotated it. The new key is ${key} and it works.`);
     expect(finished?.body).not.toContain(key);
     expect(finished?.body).not.toContain("TESTONLY");

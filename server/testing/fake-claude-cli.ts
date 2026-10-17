@@ -385,16 +385,9 @@ const playTurn = (prompt: JsonValue) => {
 
   // the real CLI re-announces init on every turn of a live process, with its
   // catalog of slash commands (FAKE_CLAUDE_SLASH_COMMANDS, comma separated)
-  const initFrame: {
-    type: string;
-    subtype: string;
-    session_id: string;
-    model: string;
-    slash_commands?: string[];
-  } = { type: "system", subtype: "init", session_id: sessionId, model };
+  const init = { type: "system", subtype: "init", session_id: sessionId, model };
   const slashCommands = process.env.FAKE_CLAUDE_SLASH_COMMANDS;
-  if (slashCommands) initFrame.slash_commands = slashCommands.split(",");
-  out(initFrame);
+  out(slashCommands ? { ...init, slash_commands: slashCommands.split(",") } : init);
 
   if (mode === "hang") {
     // stay alive until killed — lets tests exercise interrupt + the
