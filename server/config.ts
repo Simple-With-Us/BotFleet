@@ -542,6 +542,18 @@ const appConfigSchema = z.object({
     credentialStorage: externalCredentialStorage,
     refreshMinutes: z.number().int().min(5).max(1440).optional(),
   }).optional(),
+  // Infisical Agent Proxy settings. Off by default. When enabled, agent CLIs
+  // and child processes route through the local Infisical Agent Proxy
+  // daemon (HTTP_PROXY/HTTPS_PROXY/NO_PROXY and TLS CA certificate injection).
+  agentProxy: z.object({
+    enabled: z.boolean().optional(),
+    address: optionalText,
+    projectId: optionalText,
+    environment: optionalText,
+    secretPath: optionalText,
+    caCertPath: optionalText,
+    allowReadableBrokeredSecrets: z.boolean().optional(),
+  }).optional(),
   features: featureConfigSchema.optional(),
   conversationMode: z.enum(STORED_CONVERSATION_MODES).optional(),
   busySendDefault: z.enum(BUSY_SEND_DEFAULTS).optional(),
@@ -771,6 +783,16 @@ export interface AppConfig {
     clientSecret?: string;
     credentialStorage?: "external";
     refreshMinutes?: number;
+  };
+  /** Infisical Agent Proxy settings. Off by default. */
+  agentProxy?: {
+    enabled?: boolean;
+    address?: string;
+    projectId?: string;
+    environment?: string;
+    secretPath?: string;
+    caCertPath?: string;
+    allowReadableBrokeredSecrets?: boolean;
   };
   /** Opt-in product experiments. Every flag defaults to disabled. */
   features?: {
@@ -1144,6 +1166,86 @@ export function infisicalSettings(cfg: AppConfig): InfisicalSettings {
         ? Math.min(Math.max(Math.trunc(refresh), 5), 1440)
         : DEFAULT_INFISICAL_REFRESH_MINUTES,
   };
+}
+
+export const DEFAULT_AGENT_PROXY_ADDRESS = "127.0.0.1:17322";
+export const DEFAULT_AGENT_PROXY_ENVIRONMENT = "prod";
+export const DEFAULT_AGENT_PROXY_SECRET_PATH = "/";
+
+export interface AgentProxySettings {
+  enabled: boolean;
+  address: string;
+  projectId: string;
+  environment: string;
+  secretPath: string;
+  caCertPath?: string;
+  allowReadableBrokeredSecrets: boolean;
+}
+
+/** The explicit toggle for Infisical Agent Proxy.  Off by default. */
+export function agentProxyEnabled(cfg: AppConfig): boolean {
+  return cfg.agentProxy?.enabled === true;
+}
+
+/** Resolve stored Agent Proxy settings against defaults. */
+export function agentProxySettings(cfg: AppConfig): AgentProxySettings {
+  const stored = cfg.agentProxy ?? {};
+  return {
+    enabled: agentProxyEnabled(cfg),
+    address: stored.address?.trim() || DEFAULT_AGENT_PROXY_ADDRESS,
+    projectId: stored.projectId?.trim() || cfg.infisical?.projectId?.trim() || "",
+    environment: stored.environment?.trim() || cfg.infisical?.environment?.trim() || DEFAULT_AGENT_PROXY_ENVIRONMENT,
+    secretPath: stored.secretPath?.trim() || cfg.infisical?.secretPath?.trim() || DEFAULT_AGENT_PROXY_SECRET_PATH,
+    caCertPath: stored.caCertPath?.trim() || undefined,
+    allowReadableBrokeredSecrets: stored.allowReadableBrokeredSecrets === true,
+  };
+}
+
+/**
+ * Injects proxy environment variables into a process environment when
+ * Agent Proxy is enabled.  When disabled, returns the input baseEnv untouched.
+ */
+export function applyAgentProxyEnv(
+  cfg: AppConfig,
+  baseEnv?: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv | undefined {
+  if (!agentProxyEnabled(cfg)) return baseEnv;
+  const settings = agentProxySettings(cfg);
+  const proxyUrl = `http://${settings.address}`;
+  const env: NodeJS.ProcessEnv = { ...(baseEnv ?? process.env) };
+  if (!env.HTTP_PROXY && !env.http_proxy) {
+    env.HTTP_PROXY = proxyUrl;
+    env.http_proxy = proxyUrl;
+  }
+  if (!env.HTTPS_PROXY && !env.https_proxy) {
+    env.HTTPS_PROXY = proxyUrl;
+    env.https_proxy = proxyUrl;
+  }
+  if (!env.ALL_PROXY && !env.all_proxy) {
+    env.ALL_PROXY = proxyUrl;
+    env.all_proxy = proxyUrl;
+  }
+  if (!env.NO_PROXY && !env.no_proxy) {
+    env.NO_PROXY = "localhost,127.0.0.1";
+    env.no_proxy = "localhost,127.0.0.1";
+  }
+  if (!env.INFISICAL_AGENT_PROXY_ADDRESS) {
+    env.INFISICAL_AGENT_PROXY_ADDRESS = settings.address;
+  }
+  if (settings.projectId && !env.INFISICAL_PROJECT_ID) {
+    env.INFISICAL_PROJECT_ID = settings.projectId;
+  }
+  if (settings.environment && !env.INFISICAL_ENVIRONMENT) {
+    env.INFISICAL_ENVIRONMENT = settings.environment;
+  }
+  if (settings.secretPath && !env.INFISICAL_SECRET_PATH) {
+    env.INFISICAL_SECRET_PATH = settings.secretPath;
+  }
+  if (settings.caCertPath) {
+    if (!env.SSL_CERT_FILE) env.SSL_CERT_FILE = settings.caCertPath;
+    if (!env.NODE_EXTRA_CA_CERTS) env.NODE_EXTRA_CA_CERTS = settings.caCertPath;
+  }
+  return env;
 }
 
 export function localVmMaxInstances(cfg: AppConfig): number {
@@ -1543,6 +1645,22 @@ export function loadConfig(): AppConfig {
     const name = names.find((candidate) => process.env[candidate] !== undefined);
     if (name !== undefined) cfg.infisical[field] = process.env[name];
   }
+  cfg.agentProxy = { ...cfg.agentProxy };
+  if (process.env.INFISICAL_AGENT_PROXY_ENABLED !== undefined) {
+    const raw = process.env.INFISICAL_AGENT_PROXY_ENABLED.trim().toLowerCase();
+    cfg.agentProxy.enabled = raw === "true" || raw === "1" || raw === "yes";
+  }
+  const proxyFields: Array<[field: "address" | "projectId" | "environment" | "secretPath" | "caCertPath", names: string[]]> = [
+    ["address", ["INFISICAL_AGENT_PROXY_ADDRESS"]],
+    ["projectId", ["INFISICAL_AGENT_PROXY_PROJECT_ID"]],
+    ["environment", ["INFISICAL_AGENT_PROXY_ENV", "INFISICAL_AGENT_PROXY_ENVIRONMENT"]],
+    ["secretPath", ["INFISICAL_AGENT_PROXY_PATH", "INFISICAL_AGENT_PROXY_SECRET_PATH"]],
+    ["caCertPath", ["INFISICAL_AGENT_PROXY_CA_CERT_PATH", "INFISICAL_AGENT_PROXY_CA_CERT"]],
+  ];
+  for (const [field, names] of proxyFields) {
+    const name = names.find((candidate) => process.env[candidate] !== undefined);
+    if (name !== undefined) cfg.agentProxy[field] = process.env[name];
+  }
   // One resolution point, last: whatever the store holds for a mapped name
   // overwrites what env and file just agreed on, and the provenance of every
   // mapped field is recorded for the Secrets card.  With no store configured
@@ -1827,7 +1945,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // resolve from the file when the vault is off, so a save that never
   // reaches disk breaks the vault-over-file contract for exactly the knobs
   // this rollout manages.
-  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
+  for (const key of ["xai", "gemini", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "azureSpeech", "metaSpeech", "groq", "assemblyai", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "agentProxy", "botDefaults", "imessageLinq", "zulip", "autoReview", "sts"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);

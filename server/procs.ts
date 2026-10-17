@@ -59,6 +59,7 @@ const STALL_SLACK_MS = 500;
 const STALL_GRACE_MS = 250;
 import type { Readable, Writable } from "node:stream";
 import { join } from "node:path";
+import { applyAgentProxyEnv, loadConfig } from "./config.ts";
 import { resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
 
 export function resolveCli(cli: string, args: string[] = []): ResolvedSpawn {
@@ -71,8 +72,17 @@ export function spawnCli(
   opts: SpawnOptions,
 ): ChildProcessByStdio<Writable, Readable, Readable> {
   const resolved = resolveCli(cli, args);
+  let optsWithProxy = opts;
+  try {
+    const proxyEnv = applyAgentProxyEnv(loadConfig(), opts.env as NodeJS.ProcessEnv | undefined);
+    if (proxyEnv !== undefined) {
+      optsWithProxy = { ...opts, env: proxyEnv };
+    }
+  } catch {
+    // If config loading is unavailable or throws during early bootstrap/tests, keep original opts
+  }
   const child = spawn(resolved.command, resolved.args, {
-    ...opts,
+    ...optsWithProxy,
     // posix: own process group so kill(-pid) reaps child MCP servers;
     // win32: taskkill /T does the reaping instead (see killCliTree)
     ...(process.platform === "win32" ? { windowsHide: true } : { detached: true }),
@@ -119,6 +129,14 @@ export function execCli(
   const killSignal = opts.killSignal ?? "SIGTERM";
   const execOpts: ExecFileOptions = { ...opts };
   delete execOpts.timeout;
+  try {
+    const proxyEnv = applyAgentProxyEnv(loadConfig(), opts.env as NodeJS.ProcessEnv | undefined);
+    if (proxyEnv !== undefined) {
+      execOpts.env = proxyEnv;
+    }
+  } catch {
+    // If config loading is unavailable or throws during early bootstrap/tests, keep original opts
+  }
   let settled = false;
   let timedOut = false;
   let softTimer: ReturnType<typeof setTimeout> | undefined;
