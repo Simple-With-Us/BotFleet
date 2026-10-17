@@ -3970,7 +3970,7 @@ extension CompanionState {
                 return ChatSummary(
                     chat: chat,
                     preview: Self.preview(of: last),
-                    lastActivity: latestActivity(for: chat),
+                    lastActivity: latestActivity(for: chat, newest: last),
                     pinned: Self.pinned(chat)
                 )
             }
@@ -3988,18 +3988,28 @@ extension CompanionState {
 
     /// Newest loaded message across this chat's threads. Other tasks may
     /// not be hydrated yet; `latestActivity` still reads their stamps.
+    ///
+    /// Runs for every chat on every chat-list render, so it resolves the
+    /// active leaf from the bot already in hand instead of letting
+    /// `visibleTranscript(forThread:)` scan the whole roster per thread
+    /// (BOTFLEET-3R). Rooms have no branching leaf.
     func newestLoadedMessage(for chat: Chat) -> Message? {
         var candidates = [Message]()
         switch chat {
         case let .bot(bot):
-            if let last = visibleTranscript(forThread: bot.threadId).last { candidates.append(last) }
+            let leaf = bot.activeLeafId
+            if let last = visibleTranscript(forThread: bot.threadId, activeLeafId: leaf).last {
+                candidates.append(last)
+            }
             for task in bot.tasks ?? [] {
-                if let last = visibleTranscript(forThread: task.threadId).last ?? task.lastMessage {
+                if let last = visibleTranscript(forThread: task.threadId, activeLeafId: leaf).last ?? task.lastMessage {
                     candidates.append(last)
                 }
             }
         case let .room(room):
-            if let last = visibleTranscript(forThread: room.threadId).last { candidates.append(last) }
+            if let last = visibleTranscript(forThread: room.threadId, activeLeafId: nil).last {
+                candidates.append(last)
+            }
         }
         return candidates.max { $0.at < $1.at }
     }
@@ -4008,7 +4018,13 @@ extension CompanionState {
     /// `lastActivity`, so an unread update on a background task does not
     /// keep showing yesterday from the currently selected thread.
     func latestActivity(for chat: Chat) -> Double {
-        let fromMessages = newestLoadedMessage(for: chat)?.at
+        latestActivity(for: chat, newest: newestLoadedMessage(for: chat))
+    }
+
+    /// `latestActivity(for:)` with the newest loaded message already found,
+    /// so `chatSummaries` walks each chat's transcripts once, not twice.
+    func latestActivity(for chat: Chat, newest: Message?) -> Double {
+        let fromMessages = newest?.at
         switch chat {
         case let .bot(bot):
             let taskActivities = (bot.tasks ?? []).map { $0.lastActivity ?? $0.createdAt }
