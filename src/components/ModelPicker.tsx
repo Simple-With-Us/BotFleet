@@ -505,8 +505,13 @@ export function ModelPicker({
   const rootRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const [popoverPosition, setPopoverPosition] = useState({ left: 12, top: 12 });
+  // The wide menu is fixed-positioned so a clipping card cannot cut it off.
+  // It mounts inside the nearest modal dialog (Settings) when there is one, so
+  // that dialog's Tab trap still sees its controls, and on the body otherwise.
+  const [popoverHost, setPopoverHost] = useState<HTMLElement | null>(null);
   useLayoutEffect(() => {
     if (!open || !widePopover) return;
+    setPopoverHost(rootRef.current?.closest<HTMLElement>('[role="dialog"][aria-modal="true"]') ?? document.body);
     const align = () => {
       const root = rootRef.current?.getBoundingClientRect();
       if (!root) return;
@@ -524,7 +529,11 @@ export function ModelPicker({
       window.removeEventListener("scroll", align, true);
     };
   }, [open, widePopover]);
-
+  // Tab from the trigger must land in the menu, which no longer follows the
+  // trigger in document order once it is fixed-positioned and portaled.
+  useLayoutEffect(() => {
+    if (open && widePopover && popoverHost) contentRef.current?.focus({ preventScroll: true });
+  }, [open, widePopover, popoverHost]);
 
   const selection = propSelection || bot.modelSelection;
   const active = state.instances.find((instance) => instance.instanceId === selection.instanceId);
@@ -774,11 +783,12 @@ export function ModelPicker({
           data-model-picker-content
           role="dialog"
           aria-label="Choose Model"
+          tabIndex={widePopover ? -1 : undefined}
           style={widePopover ? { ...popoverPosition, maxHeight: `min(560px, calc(100dvh - ${popoverPosition.top + 12}px))` } : undefined}
           className={cn(
             "flex overflow-hidden rounded-2xl border border-hairline/50 bg-card",
             widePopover
-              ? "fixed z-50 w-[480px] max-w-[calc(100vw-24px)] shadow-2xl shadow-black/50"
+              ? "fixed z-50 w-[480px] max-w-[calc(100vw-24px)] shadow-2xl shadow-black/50 outline-none"
               : contained
               ? "relative mt-3 w-full max-h-[min(420px,50dvh)]"
               : "absolute right-0 top-full z-30 mt-2 w-[420px] min-w-[380px] max-w-[min(640px,calc(100vw-2rem))] max-h-[min(560px,calc(100dvh-7rem))] resize shadow-2xl shadow-black/50",
@@ -1040,7 +1050,9 @@ export function ModelPicker({
             )}
           </div>
         </div>;
-        return widePopover && globalThis.document !== undefined ? createPortal(content, globalThis.document.body) : content;
+        if (!widePopover || globalThis.document === undefined) return content;
+        // The host is resolved in a layout effect, so this null never paints.
+        return popoverHost ? createPortal(content, popoverHost) : null;
       })()}
     </div>
   );

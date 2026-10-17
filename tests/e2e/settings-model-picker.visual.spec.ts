@@ -126,6 +126,14 @@ test.describe('fleet-wide model picker', () => {
       // The fixture deliberately clips its parent. The portaled menu must
       // remain visible and interactive outside that card.
       await expect(menu.getByRole('button', { name: /Claude Sonnet/ })).toBeVisible();
+      // The menu mounts inside the modal dialog, not on the body, so that
+      // dialog's Tab trap (which only walks its own subtree) still reaches it.
+      await expect(page.locator('[aria-modal="true"] [data-model-picker-content]')).toHaveCount(1);
+      // Opening moves focus into the menu, and Tab keeps it there.
+      const focusInMenu = () => menu.evaluate((node) => node.contains(document.activeElement));
+      expect(await focusInMenu()).toBe(true);
+      await page.keyboard.press('Tab');
+      expect(await focusInMenu()).toBe(true);
       await page.keyboard.press('Escape');
       await expect(menu).toHaveCount(0);
     });

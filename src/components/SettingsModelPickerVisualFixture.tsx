@@ -67,7 +67,15 @@ export default function SettingsModelPickerVisualFixture() {
     <StoreContext.Provider value={value}>
       {/* The Settings panel is narrower than the window, which is why this
           width is pinned rather than left to the viewport. */}
-      <div data-testid="settings-model-picker-panel" className={wide ? "ml-auto w-[220px] overflow-hidden bg-app p-4" : "w-[380px] bg-app p-4"}>
+      {/* Wide mode also stands in for the Settings modal: a clipping,
+          aria-modal dialog that owns the Tab trap the wide menu must stay in. */}
+      <div
+        data-testid="settings-model-picker-panel"
+        role={wide ? "dialog" : undefined}
+        aria-modal={wide ? true : undefined}
+        aria-label={wide ? "Fixture settings" : undefined}
+        className={wide ? "ml-auto w-[220px] overflow-hidden bg-app p-4" : "w-[380px] bg-app p-4"}
+      >
         <div data-testid="settings-model-picker-card" className="rounded-xl bg-card p-4 flex flex-col gap-4">
           <ModelPicker
             bot={bot}
