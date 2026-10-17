@@ -228,6 +228,10 @@ describe("outgoing webhook convergence", () => {
     await hub.drain();
     await waitFor(() => turns.length === 1, "retained row routed after rebuild");
     expect(turns[0]?.text).toContain("retained row");
+    // The native queue can start the turn before the asynchronous outgoing
+    // drain has persisted its state and removed the spool row. Wait for that
+    // completion instead of racing filesystem latency on Windows.
+    await waitFor(() => !existsSync(rowFile), "retained spool row removed after replay");
     expect(existsSync(rowFile)).toBe(false);
   });
 
