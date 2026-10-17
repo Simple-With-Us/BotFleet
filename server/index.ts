@@ -633,6 +633,10 @@ import {
 } from "./plugin-loader.ts";
 import * as pluginsModule from "./plugins.ts";
 import type { PluginListing } from "./plugin-types.ts";
+import {
+  pluginEventEnvelopeSchema,
+  type PluginChatSummary,
+} from "../shared/plugin-events.ts";
 import { createBotPackageExport } from "./package-export.ts";
 import { installTestParentWatchdog } from "./test-parent-watchdog.ts";
 import { installTimestampedConsole } from "./console-timestamps.ts";
@@ -1103,6 +1107,7 @@ bus.subscribe((event: RuntimeEvent) => observeRuntimeEvent(event));
 // are untrusted input; the lifecycle only ever sees parsed values.
 const PLUGIN_INSTALL_BODY = z.object({ source: z.string().trim().min(1).max(4096) }).strip();
 const PLUGIN_COMMAND_BODY = z.object({ args: z.string().max(8192).default("") }).strip();
+const PLUGIN_SETTINGS_BODY = z.object({ settings: z.record(z.string(), z.json()).default({}) }).strip();
 const PLUGIN_SLUG = z.string().min(1).max(64).regex(/^[\w][\w-]*$/);
 const PLUGIN_PATH_PARAMS = z.tuple([PLUGIN_SLUG]);
 const PLUGIN_ITEM_PATH_PARAMS = z.tuple([PLUGIN_SLUG, PLUGIN_SLUG]);
@@ -1147,6 +1152,43 @@ pluginsModule.initPluginRuntime({
   },
 });
 await pluginsModule.bootPluginRuntime();
+
+// ── plugin event platform (host API v2) ───────────────────────────────
+// The host owns every integration transport.  Plugins subscribe to typed
+// envelopes and return routing decisions; they never bind ports, see
+// tokens, or keep event state.  Chat summaries are metadata only (no
+// transcripts): the dispatcher turn reads content under its own
+// authority through the normal thread APIs.
+function listPluginChatSummaries(limit: number): PluginChatSummary[] {
+  const capped = Math.max(0, Math.min(limit, 20));
+  const out: PluginChatSummary[] = [];
+  for (const bot of store.bots.slice(0, capped)) {
+    try {
+      const tasks = store.tasks(bot.id);
+      const threadId = bot.threadId ?? tasks[0]?.threadId ?? bot.id;
+      const tail = store.messagesTail(threadId, 1);
+      const last = tail.messages[tail.messages.length - 1];
+      out.push({
+        botId: bot.id,
+        botName: bot.name,
+        threadId,
+        title: (tasks[0]?.title ?? bot.name ?? bot.id).slice(0, 200),
+        lastActiveAt: new Date(last?.at ?? Date.now()).toISOString(),
+        messageCount: store.messageCountFor(threadId),
+      });
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
+pluginsModule.initPluginChats({ listChatSummaries: listPluginChatSummaries });
+pluginsModule.initPluginDecisionHandler((_pluginName, event, decision) => {
+  // Late retry decisions (after the message's settle window): the hub
+  // re-fetches canonically and queues exactly once.
+  void zulipHub?.applyLatePluginDecision(event, decision).catch(() => {});
+});
 
 // ── peer-agent comms wiring ────────────────────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
@@ -18844,6 +18886,45 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       return json(res, 200, result);
     }
+    const settingsPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/settings$/)?.slice(1));
+    if (settingsPath.success && method === "GET") {
+      const result = pluginsModule.getPluginSettings(settingsPath.data[0]);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    if (settingsPath.success && method === "PUT") {
+      // Secret values are write-only: they land in the host broker and are
+      // never echoed back.  The reply carries names only, via the listing's
+      // configuredKeys.
+      const body = PLUGIN_SETTINGS_BODY.safeParse(await readBody(req));
+      if (!body.success) return json(res, 400, { error: "expected a JSON object with a `settings` map" });
+      const result = await pluginsModule.setPluginSettings(settingsPath.data[0], body.data.settings);
+      if ("error" in result) {
+        const status = result.error.startsWith("no plugin named") ? 404 : 400;
+        return json(res, status, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
+      }
+      return json(res, 200, result);
+    }
+    const healthPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/health$/)?.slice(1));
+    if (healthPath.success && method === "GET") {
+      const result = await pluginsModule.getPluginHealth(healthPath.data[0]);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    const testEventPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/test-event$/)?.slice(1));
+    if (testEventPath.success && method === "POST") {
+      const result = await pluginsModule.emitPluginTestEvent(testEventPath.data[0]);
+      if ("error" in result) {
+        const status = result.error.startsWith("no plugin named") ? 404 : 409;
+        return json(res, status, { error: result.error });
+      }
+      return json(res, 200, { outcomes: result });
+    }
+    const drainPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/drain$/)?.slice(1));
+    if (drainPath.success && method === "POST") {
+      const outcomes = await pluginsModule.drainPluginRetries(drainPath.data[0]);
+      return json(res, 200, { outcomes });
+    }
 
     // Inline credential cards never receive the credential value. Electron
     // saves it through the OS-backed store first; this route only verifies
@@ -19328,6 +19409,44 @@ zulipHub = new ZulipHub({
     store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name: text.slice(0, 200), ok: false } });
   },
   spendBlocked: () => spendBlockedForUnattendedWork("bot"),
+  // Plugin-platform dispatcher routing: when an enabled integration
+  // subscribes to Zulip messages, qualifying DMs and mentions route
+  // through it (usually to the dispatcher inbox) instead of waking the
+  // mentioned bot directly.  Declined or timed-out decisions fall back
+  // to the legacy direct wake; events are never silently dropped.
+  pluginEvents: {
+    isActive: () => pluginsModule.pluginEventSubscribers("zulip").length > 0,
+    decide: async (input) => {
+      const stamp = new Date().toISOString();
+      const raw = {
+        eventId: `zulip:${input.accountId}:${input.messageId}`,
+        type: "zulip.message",
+        source: { platform: "zulip", accountId: input.accountId },
+        occurredAt: stamp,
+        receivedAt: stamp,
+        refs: {
+          messageId: input.messageId,
+          conversationKey: input.conversationKey,
+          realm: input.realm,
+          channel: input.channel,
+          topic: input.topic,
+        },
+        mentions: input.mentions,
+        content: { text: input.contentText.slice(0, 8192), format: "text" },
+        context: { botId: input.botId, wakeReason: input.wakeReason, senderKind: input.senderKind },
+      };
+      const parsed = pluginEventEnvelopeSchema.safeParse(raw);
+      if (!parsed.success) return null;
+      const won = await pluginsModule.decidePluginWake(parsed.data);
+      if (!won) return null;
+      return {
+        targetBotId: won.decision.targetBotId,
+        continueThreadId: won.decision.continueThreadId,
+        rationale: won.decision.rationale,
+        hint: won.decision.replyHint,
+      };
+    },
+  },
 });
 zulipHub.start();
 

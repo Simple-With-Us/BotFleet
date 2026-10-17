@@ -73,6 +73,10 @@ const itemSchema = z.object({
   content: z.string(),
   timestamp: z.number().catch(0),
   via: z.enum(["mention", "dm", "followed"]).optional().catch(undefined),
+  // Plugin-platform routing: the dispatcher's hint and the role that
+  // routed it.  Absent reads as none, so old state files still parse.
+  pluginHint: z.string().max(2000).optional().catch(undefined),
+  routedFrom: z.string().max(128).optional().catch(undefined),
 });
 const unitSchema = z.object({
   origin: originSchema,
