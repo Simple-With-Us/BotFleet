@@ -1,6 +1,6 @@
 # Vercel 3h production catch-up
 
-This publisher compares current main with the last actually promoted production SHA.  It does not compare only the latest two incoming commits, so a skipped site change is not lost behind a later docs-only merge.  Hourly reconciliation retries eligible latest main after the 3h window even when nobody pushes again.  CI completion also triggers reconciliation.  Scheduled runs can arrive late; this is a retry cadence, not an exact deployment deadline.
+This publisher compares current main with the last actually promoted production SHA.  It does not compare only the latest two incoming commits, so a skipped site change is not lost behind a later docs-only merge.  Hourly reconciliation retries eligible latest main after the 3h window even when nobody pushes again.  CI completion also triggers reconciliation.  A run that finds an exact-main CI workflow still in progress skips with `deploy=false` instead of failing, because the last configured workflow to finish triggers the gate again; a failed or missing exact-main run still refuses.  Scheduled runs can arrive late; this is a retry cadence, not an exact deployment deadline.
 
 The workflow is off until the repository variable `VERCEL_CATCH_UP_ENABLED` is exactly `true`.  There is no force or cooldown bypass input.  A shared concurrency group serializes main publishing.  A second gate after the local build checks for superseded main, an in-flight production build, and a new provider attempt before uploading once.
 

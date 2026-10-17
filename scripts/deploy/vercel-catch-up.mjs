@@ -48,11 +48,24 @@ export function classify({ deployments, baseline, target, now, changed, projectI
   if (!changed(deployed, target)) return { deploy: false, reason: 'no site changes since deployed SHA' };
   return { deploy: true, reason: 'eligible main differs from production', target };
 }
-export function assertCi(runs, names, sha) {
+function validCiInputs(runs, names) {
   must(Array.isArray(runs) && Array.isArray(names) && names.length > 0 && names.every(n => isString(n) && n), 'Invalid CI runs or workflow configuration');
+}
+function latestCiRun(runs, name, sha) {
+  return runs.filter(r => r.name === name && r.head_sha === sha && r.head_branch === 'main' && ['push', 'workflow_dispatch'].includes(r.event)).sort((a, b) => b.id - a.id)[0];
+}
+// Workflows whose latest exact-main run exists but has not finished.  Each
+// configured workflow triggers this job when it completes, so the last one to
+// finish re-runs the gate; a missing run is left for assertCi to refuse.
+export function pendingCi(runs, names, sha) {
+  validCiInputs(runs, names);
+  return names.filter(name => { const latest = latestCiRun(runs, name, sha); return Boolean(latest) && latest.status !== 'completed'; });
+}
+export function assertCi(runs, names, sha) {
+  validCiInputs(runs, names);
   for (const name of names) {
-    const candidates = runs.filter(r => r.name === name && r.head_sha === sha && r.head_branch === 'main' && ['push', 'workflow_dispatch'].includes(r.event)).sort((a, b) => b.id - a.id);
-    must(candidates.length > 0 && candidates[0].status === 'completed' && candidates[0].conclusion === 'success', `Exact-main CI not successful: ${name}`);
+    const latest = latestCiRun(runs, name, sha);
+    must(Boolean(latest) && latest.status === 'completed' && latest.conclusion === 'success', `Exact-main CI not successful: ${name}`);
   }
 }
 export function assertReceipt(d, config, sha) {
@@ -104,14 +117,16 @@ async function main() {
   // The newest page is enough only if its oldest row is outside the window.
   const oldest = Math.min(...history.deployments.map(d => d.createdAt ?? d.created));
   must(!history.pagination?.next || oldest < Date.now() - COOLDOWN_MS, 'Deployment history truncated inside cooldown window');
-  const decision = classify({ deployments: history.deployments, baseline, target, projectId: config.projectId, now: Date.now(), changed: (from, to) => {
+  let decision = classify({ deployments: history.deployments, baseline, target, projectId: config.projectId, now: Date.now(), changed: (from, to) => {
     must(git(['merge-base', from, to]) === from, 'Deployed SHA is not an ancestor of main; investigate before deploying');
     return git(['diff', '--name-only', from, to, '--', ...config.watch]).length > 0;
   } });
   if (decision.deploy) {
     const ci = await gh(`/actions/runs?head_sha=${target}&per_page=100`);
     must(!ci.total_count || ci.total_count <= 100, 'CI run history truncated');
-    assertCi(ci.workflow_runs, config.ciWorkflows, target);
+    const pending = pendingCi(ci.workflow_runs, config.ciWorkflows, target);
+    if (pending.length > 0) decision = { deploy: false, reason: `exact-main CI still running: ${pending.join(', ')}`, target };
+    else assertCi(ci.workflow_runs, config.ciWorkflows, target);
   }
   console.log(JSON.stringify(decision));
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `deploy=${decision.deploy}\n`);

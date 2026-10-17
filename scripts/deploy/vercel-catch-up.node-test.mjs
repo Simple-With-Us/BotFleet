@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { COOLDOWN_MS, classify, assertProject, assertCi, assertReceipt, deploymentSha, request } from './vercel-catch-up.mjs';
+import { COOLDOWN_MS, classify, assertProject, assertCi, pendingCi, assertReceipt, deploymentSha, request } from './vercel-catch-up.mjs';
 const A = 'a'.repeat(40), B = 'b'.repeat(40), now = 1_800_000_000_000;
 const config = { projectId: 'prj_test', teamId: 'team_test', repoId: 17, rootDirectory: 'site' };
 const baseline = { projectId: 'prj_test', target: 'production', readyState: 'READY', created: now - COOLDOWN_MS - 1, gitSource: { sha: A }, url: 'test.vercel.app' };
@@ -42,6 +42,18 @@ test('CI requires latest exact main successful trusted event', () => {
  for (const change of [{head_sha:A},{event:'pull_request'},{status:'in_progress'},{conclusion:'failure'},{conclusion:'skipped'}]) assert.throws(() => assertCi([{...good,...change}],['CI'],B));
  assert.throws(() => assertCi([good,{...good,id:2,conclusion:'failure'}],['CI'],B));
  assert.throws(() => assertCi([good],['CI','Site CI'],B));
+});
+test('a still-running exact-main workflow is pending, not a refusal or a pass', () => {
+ const good = {id:1,name:'CI',head_sha:B,head_branch:'main',event:'push',status:'completed',conclusion:'success'};
+ const lint = {...good,id:2,name:'Node CI'};
+ assert.deepEqual(pendingCi([good,lint],['CI','Node CI'],B),[]);
+ for (const status of ['queued','in_progress','waiting','requested','pending']) assert.deepEqual(pendingCi([{...good,status,conclusion:null},lint],['CI','Node CI'],B),['CI']);
+ assert.deepEqual(pendingCi([{...good,status:'completed',conclusion:'failure'},lint],['CI','Node CI'],B),[]);
+ assert.deepEqual(pendingCi([good,{...good,id:3,status:'in_progress',conclusion:null},lint],['CI','Node CI'],B),['CI']);
+ assert.deepEqual(pendingCi([{...good,head_sha:A,status:'in_progress'},lint],['CI','Node CI'],B),[]);
+ assert.deepEqual(pendingCi([lint],['CI','Node CI'],B),[]);
+ assert.throws(() => pendingCi([],[],B));
+ assert.throws(() => pendingCi(null,['CI'],B));
 });
 test('receipt verifies project/target/sha/READY/url, not CLI exit code', () => {
  assert.equal(assertReceipt(baseline,config,A),'https://test.vercel.app');
@@ -85,6 +97,8 @@ test('entrypoint reconciles skipped site changes behind docs, rechecks and verif
   let result=execute('prepare');assert.equal(result.status,0,result.stderr);assert.equal(readFileSync(output,'utf8'),'deploy=true\n');
   fixture.head=A;result=execute();assert.equal(result.status,0,result.stderr);assert.equal(readFileSync(output,'utf8'),'deploy=false\n');fixture.head=latest;
   fixture.ci.workflow_runs[0].conclusion='failure';result=execute();assert.equal(result.status,1);assert.match(result.stderr,/Exact-main CI/);fixture.ci.workflow_runs[0].conclusion='success';
+  fixture.ci.workflow_runs[0].status='in_progress';fixture.ci.workflow_runs[0].conclusion=null;result=execute();assert.equal(result.status,0,result.stderr);assert.equal(readFileSync(output,'utf8'),'deploy=false\n');assert.match(result.stdout,/CI still running: CI/);fixture.ci.workflow_runs[0].status='completed';fixture.ci.workflow_runs[0].conclusion='success';
+  fixture.ci.workflow_runs=[];result=execute();assert.equal(result.status,1);assert.match(result.stderr,/Exact-main CI/);fixture.ci.workflow_runs=[{id:1,name:'CI',head_sha:latest,head_branch:'main',event:'push',status:'completed',conclusion:'success'}];
   fixture.history.pagination.next=1;fixture.history.deployments[0].created=Date.now()-1;result=execute();assert.equal(result.status,1);assert.match(result.stderr,/history truncated/);fixture.history.pagination={};
   fixture.baseline.gitSource.sha=latest;result=execute('receipt',receipt);assert.equal(result.status,0,result.stderr);assert.match(result.stdout,/https:\/\/test.vercel.app/);
   fixture.project.targets.production.id='dpl_other';result=execute('receipt',receipt);assert.equal(result.status,1);assert.match(result.stderr,/current production target/);
