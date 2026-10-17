@@ -9,7 +9,10 @@ import {
   describeAcpPromptTrim,
   DEFAULT_ACP_PROMPT_BUDGET_BYTES,
   MAX_ACP_PROMPT_BUDGET_BYTES,
+  resolveAcpPromptBudget,
   resolveAcpPromptBudgetBytes,
+  decodeAcpContextCapTokens,
+  estimateTokens,
   type AcpPromptSection,
 } from "./prompt-budget.ts";
 
@@ -114,13 +117,14 @@ describe("applyAcpPromptBudget", () => {
     expect(bothHistory.text).toContain("VOLATILE-NEW");
 
     const droppedVolatileToo = compose(
-      stable + ACP_PROMPT_SECTION_OMITTED + "SKILLS-INDEX " + volNew,
+      stable + volOld + "SKILLS-INDEX " + ACP_PROMPT_SECTION_OMITTED,
       `${ACP_PROMPT_SECTION_OMITTED}\n${ACP_PROMPT_SECTION_OMITTED}\n\n${TURN_REPLY_CUE}\n\n${current}`,
     );
     const volatileToo = applyAcpPromptBudget({ ...input, budgetBytes: bytes(droppedVolatileToo) });
     expect(volatileToo.text).toBe(droppedVolatileToo);
-    expect(volatileToo.text).not.toContain("VOLATILE-OLD");
-    expect(volatileToo.text).toContain("VOLATILE-NEW");
+    // the stale mentions note goes before the bot's memory, though memory comes first in the prompt
+    expect(volatileToo.text).toContain("VOLATILE-OLD");
+    expect(volatileToo.text).not.toContain("VOLATILE-NEW");
     expect(volatileToo.text.startsWith(stable)).toBe(true);
     expect(volatileToo.text.endsWith(current)).toBe(true);
   });
@@ -379,15 +383,15 @@ describe("decodeAcpPromptBudgetBytes", () => {
 describe("what a trim reports", () => {
   it("counts dropped history turns and names dropped sections, with no prompt text", () => {
     const input = prompt();
-    const result = applyAcpPromptBudget({ ...input, budgetBytes: bytes(input.composed) - bytes(historyOld) - bytes(volOld) + 60 });
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: 1 });
     expect(result.trimmed).toBe(true);
     expect(result.dropped.historyTurns).toBeGreaterThanOrEqual(1);
-    expect(result.dropped.sections).toContain("memory");
+    expect(result.dropped.sections).toEqual(["mentions", "memory"]);
     const trim = describeAcpPromptTrim(result, 1000)!;
     expect(trim.preview).toMatch(/dropped \d+ earlier turn/);
     expect(trim.preview).toContain("memory");
     expect(trim.text).toContain("Budget:");
-    expect(trim.text).toContain("Sections dropped: memory");
+    expect(trim.text).toContain("Sections dropped: mentions, memory");
     expect(trim.bytesSaved).toBeGreaterThan(0);
     for (const secret of ["ancient", "alpha", "beta", "recent", current]) {
       expect(trim.text).not.toContain(secret);
@@ -416,5 +420,95 @@ describe("the hard ceiling", () => {
   it("never refuses when the budget is off", () => {
     expect(acpPromptCeilingRefusal("x".repeat(10_000_000), null)).toBeNull();
     expect(acpPromptCeilingRefusal("x".repeat(10_000_000), 0)).toBeNull();
+  });
+});
+
+describe("section cut priority", () => {
+  it("cuts mentions, then skills, then memory, and the automation trust note last, regardless of prompt order", () => {
+    const parts: AcpPromptSection[] = [
+      { id: "persona", text: "PERSONA ", volatile: false },
+      { id: "memory", text: `MEM ${"m".repeat(300)} `, volatile: true },
+      { id: "skill-instructions", text: `SKILL ${"s".repeat(300)} `, volatile: true },
+      { id: "automation", text: `AUTO ${"a".repeat(300)} `, volatile: true },
+      { id: "mentions", text: `MENT ${"n".repeat(300)} `, volatile: true },
+    ];
+    const user = "hello";
+    const composed = compose(parts.map((p) => p.text).join(""), user);
+    const cut = (budget: number) => applyAcpPromptBudget({ composed, userText: user, sections: parts, budgetBytes: budget });
+    const total = bytes(composed);
+    const one = cut(total - 100);
+    expect(one.dropped.sections).toEqual(["mentions"]);
+    expect(one.text).toContain("MEM ");
+    expect(one.text).toContain("AUTO ");
+    const two = cut(total - 400);
+    expect(two.dropped.sections).toEqual(["mentions", "skill-instructions"]);
+    expect(two.text).toContain("MEM ");
+    const three = cut(total - 700);
+    expect(three.dropped.sections).toEqual(["mentions", "skill-instructions", "memory"]);
+    // the untrusted-data framing outlives the bot's memory
+    expect(three.text).toContain("AUTO ");
+    expect(cut(1).dropped.sections).toEqual(["mentions", "skill-instructions", "memory", "automation"]);
+  });
+
+  it("puts a section id it does not know between the stale nudges and memory, then prompt order", () => {
+    const parts: AcpPromptSection[] = [
+      { id: "mystery-a", text: `A ${"a".repeat(300)} `, volatile: true },
+      { id: "mystery-b", text: `B ${"b".repeat(300)} `, volatile: true },
+    ];
+    const composed = compose(parts.map((p) => p.text).join(""), "hi");
+    const r = applyAcpPromptBudget({ composed, userText: "hi", sections: parts, budgetBytes: bytes(composed) - 100 });
+    expect(r.dropped.sections).toEqual(["mystery-a"]);
+  });
+});
+
+describe("token budget", () => {
+  const prose = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+  const cyrillic = "Быстрая коричневая лиса прыгает через ленивую собаку. ".repeat(200);
+  const cjk = "这是一个很长的中文句子用来测试预算。".repeat(200);
+  const code = '{"id":[1,2,3],"name":"x_y","ok":true,"nested":{"a":null}}\n'.repeat(200);
+
+  it("keeps the default when nothing is set, and promptBudgetBytes still wins", () => {
+    expect(resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: undefined, model: "x", composed: prose }))
+      .toEqual({ bytes: DEFAULT_ACP_PROMPT_BUDGET_BYTES, basis: "default" });
+    expect(resolveAcpPromptBudget({ configuredBytes: 0, capTokens: 1000, model: "x", composed: prose }).bytes).toBeNull();
+    expect(resolveAcpPromptBudget({ configuredBytes: 4096, capTokens: 1000, model: "x", composed: prose }))
+      .toEqual({ bytes: 4096, basis: "bytes" });
+  });
+
+  it("turns a token cap into bytes with the prompt's own ratio, so non-ASCII text gets fewer bytes per token", () => {
+    const budget = (composed: string) =>
+      resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 10_000, model: undefined, composed });
+    const a = budget(prose);
+    const b = budget(cyrillic);
+    const c = budget(cjk);
+    expect(a.basis).toBe("tokens");
+    expect(a.tokens).toBe(8000);
+    expect(a.bytes!).toBeGreaterThan(b.bytes!);
+    // CJK is 3 bytes for about 1 token, so it can never get more bytes than ASCII does.
+    expect(a.bytes!).toBeGreaterThanOrEqual(c.bytes!);
+    expect(estimateTokens(prose)).toBeLessThan(Buffer.byteLength(prose));
+  });
+
+  it("estimates code and JSON at no fewer than 1 token per 3 bytes, so a code-heavy prompt stays inside the window", () => {
+    expect(estimateTokens(code)).toBeGreaterThanOrEqual(Math.ceil(Buffer.byteLength(code) / 3));
+    const r = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 10_000, model: undefined, composed: code });
+    // 8000 budgeted tokens at the real-world code density of about 3 bytes per token.
+    expect(r.bytes!).toBeLessThanOrEqual(8000 * 3);
+  });
+
+  it("clamps the cap to a model's published window and never clamps an unknown model", () => {
+    const known = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 5_000_000, model: "MiniMax-M2.7", composed: prose });
+    expect(known.tokens).toBe(Math.floor(204_800 * 0.8));
+    const m3 = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 524_288, model: "MiniMax-M3.1-Flash-Preview", composed: prose });
+    expect(m3.tokens).toBe(Math.floor(524_288 * 0.8));
+    const thinking = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 5_000_000, model: "MiniMax-M2.7-highspeed-thinking", composed: prose });
+    expect(thinking.tokens).toBe(Math.floor(204_800 * 0.8));
+    const unknown = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 5_000_000, model: "some-other-model", composed: prose });
+    expect(unknown.tokens).toBe(4_000_000);
+  });
+
+  it("decodes only positive whole token caps", () => {
+    expect(decodeAcpContextCapTokens(524288)).toBe(524288);
+    for (const bad of [0, -1, 1.5, "512k", null, 10_000_001]) expect(decodeAcpContextCapTokens(bad)).toBeUndefined();
   });
 });

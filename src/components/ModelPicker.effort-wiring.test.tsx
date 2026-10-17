@@ -2,7 +2,7 @@
 // through the picker's own wiring rather than by reading its source.
 //
 // The Vite test environment is `node` and the repo carries no DOM library, so
-// there is no click to make.  Instead the three hooks `ModelPicker` calls are
+// there is no click to make.  Instead the hooks `ModelPicker` calls are
 // stubbed (state stays at its initial value, effects never run) so the
 // component function can be called directly.  It returns its element tree, and
 // the Effort section's `onPick` in that tree is the very handler a click on a
@@ -22,6 +22,7 @@ vi.mock("react", async (importOriginal) => {
     useState: (initial: unknown) => [typeof initial === "function" ? (initial as () => unknown)() : initial, () => {}],
     useRef: (initial: unknown) => ({ current: initial }),
     useEffect: () => {},
+    useLayoutEffect: () => {},
   };
 });
 

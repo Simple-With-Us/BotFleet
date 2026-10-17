@@ -22,9 +22,19 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
+import { boundText } from "../../shared/item-io.ts";
 import type { ReviewPrompt } from "../../shared/auto-review.ts";
 import { appendNative } from "./native.ts";
-import { splitChatPrompt } from "./prompt-split.ts";
+import { contextWindowFor } from "../model-context-windows.ts";
+import { joinedSystemPrompt, splitChatPrompt } from "./prompt-split.ts";
+import {
+  acpPromptCeilingRefusal,
+  applyAcpPromptBudget,
+  decodeAcpContextCapTokens,
+  decodeAcpPromptBudgetBytes,
+  describeAcpPromptTrim,
+  resolveAcpPromptBudget,
+} from "./acp/prompt-budget.ts";
 import { toolFields } from "../tool-fields.ts";
 import { classifyHttpError, httpErrorFor, type HttpErrorClassification } from "./chat-completions/errors.ts";
 import { runTurnLoop, DEFAULT_TURN_LOOP_BUDGET, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
@@ -103,10 +113,14 @@ const MODELS: ModelCatalog = {
       label: "MiniMax M3.1 Flash Preview",
       contextWindow: 1_000_000,
       effortLevels: [...M31_EFFORT_LEVELS],
+      // MiniMax Code offers 512K or 1M.  The API has no such parameter (the
+      // window is fixed), so this is a client-side cap on the prompt budget.
+      contextCaps: [524_288],
+      supportsMaxOutput: true,
     },
     // Explicit `[]`: src/lib/model-effort.ts gives a row with no list the
     // engine-wide one, which is M3.1's.
-    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
+    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },
   ],
 };
 
@@ -237,6 +251,11 @@ export type MinimaxUrlSource = "instance" | "workspace" | "environment" | "defau
 export interface MinimaxConfig {
   url: string;
   urlSource: MinimaxUrlSource;
+  /** Prompt budget override in bytes (0 turns it off).  Same meaning as the
+   *  ACP engines' `promptBudgetBytes`. */
+  promptBudgetBytes?: number;
+  /** Working-context cap in tokens; see `resolveAcpPromptBudget`. */
+  contextCapTokens?: number;
 }
 
 interface LocalMiniMaxConfig {
@@ -259,6 +278,8 @@ const driverConfigSchema = z.object({
   // a workspace-wide endpoint apart from one this instance carries WITHOUT
   // comparing the two values.
   urlSource: z.string().optional(),
+  promptBudgetBytes: z.unknown().optional(),
+  contextCapTokens: z.unknown().optional(),
 });
 
 /** server/config.ts's `WORKSPACE_URL_SOURCE`: the marker instanceConfigs()
@@ -321,6 +342,8 @@ export function loadLocalMiniMaxConfig(home = homedir()): LocalMiniMaxConfig {
 export function decodeMinimaxConfig(raw: unknown): MinimaxConfig {
   const parsed = driverConfigSchema.safeParse(raw ?? {});
   const config = parsed.success ? parsed.data : {};
+  const promptBudgetBytes = decodeAcpPromptBudgetBytes(config.promptBudgetBytes);
+  const contextCapTokens = decodeAcpContextCapTokens(config.contextCapTokens);
   const ownUrl = config.url?.trim();
   const envUrl = process.env.MINIMAX_BASE_URL?.trim();
   // Provenance, decided here once, where all three inputs are still
@@ -335,6 +358,8 @@ export function decodeMinimaxConfig(raw: unknown): MinimaxConfig {
   return {
     url: normalizedApiUrl(ownUrl || envUrl || DEFAULT_URL),
     urlSource,
+    ...(promptBudgetBytes === undefined ? {} : { promptBudgetBytes }),
+    ...(contextCapTokens === undefined ? {} : { contextCapTokens }),
   };
 }
 
@@ -463,6 +488,10 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         /** M3.1's `reasoning_effort`.  Set only for a user turn's own rounds;
          *  the utility path (titles, summaries) never passes it. */
         reasoningEffort?: EffortLevel;
+        /** The bot's optional output limit, sent as `max_completion_tokens`
+         *  (MiniMax: "use this field for new integrations").  Absent sends
+         *  nothing, so the model keeps its own limit. */
+        maxOutputTokens?: number;
       },
     ): Promise<{ text: string; reasoning: string; tool_calls?: any[]; usage: TurnUsage | null }> => {
       // When the caller supplies a signal it already carries the request
@@ -486,6 +515,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // https://platform.minimax.io/docs/api-reference/text-openai-api
         // (An undefined value is dropped by JSON.stringify, so Default adds no key.)
         reasoning_effort: opts.reasoningEffort,
+        max_completion_tokens: opts.maxOutputTokens,
       };
       const res = await fetch(`${apiUrl}/chat/completions`, {
         method: "POST",
@@ -659,7 +689,57 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       // half rides the newest user message, every request, so the resent
       // prefix stays byte-identical across a memory write (see
       // prompt-split.ts splitChatPrompt).
-      const chat = splitChatPrompt(turn);
+      let chat = splitChatPrompt(turn);
+      // The same prompt budget the ACP engines apply: trim the volatile
+      // system sections (oldest first by priority) when the system prompt plus
+      // this message is past the budget.  The transcript has its own cap above.
+      // A trimmed prompt is sent as one system block, so that turn gives up the
+      // stable/volatile cache split; an untrimmed turn is unchanged.
+      const system = joinedSystemPrompt(turn);
+      let trim: ReturnType<typeof describeAcpPromptTrim> = null;
+      if (system) {
+        // A refusal throws out of sendTurn before the loop exists, so nothing
+        // would ever settle this turn: release the thread's slot first, or the
+        // next turn on it is refused as "already running".
+        try {
+          const composed = `${system}\n\n${turn.text}`;
+          // No config at all must not inherit the ACP 128 KiB default: a MiniMax
+          // bot has a 1M window.  Without an override or a cap the budget is the
+          // model's own window (80% of it), and off for a model with no known one.
+          const windowTokens = contextWindowFor(model);
+          const unconfigured =
+            config.promptBudgetBytes === undefined && config.contextCapTokens === undefined && turn.contextCapTokens === undefined;
+          const budgetBytes = unconfigured && windowTokens === undefined
+            ? null
+            : resolveAcpPromptBudget({
+                configuredBytes: config.promptBudgetBytes,
+                capTokens: turn.contextCapTokens ?? config.contextCapTokens ?? windowTokens,
+                model,
+                composed,
+              }).bytes;
+          // An untrimmed request carries the volatile half as a framed context
+          // note on the user message (splitChatPrompt), about a hundred bytes the
+          // composed prompt does not have.  Leave room for them when deciding
+          // whether to trim, and judge the hard ceiling on what is really sent.
+          const untrimmedSent = `${chat.system ?? ""}\n\n${chat.text}`;
+          const framingBytes = Math.max(0, Buffer.byteLength(untrimmedSent) - Buffer.byteLength(composed));
+          const budgeted = applyAcpPromptBudget({
+            composed,
+            sections: turn.systemSections,
+            userText: turn.text,
+            budgetBytes: budgetBytes === null ? null : Math.max(1, budgetBytes - framingBytes),
+          });
+          const refusal = acpPromptCeilingRefusal(budgeted.trimmed ? budgeted.text : untrimmedSent, budgetBytes);
+          if (refusal) throw new Error(refusal.message);
+          trim = describeAcpPromptTrim(budgeted, budgetBytes);
+          if (budgeted.trimmed) {
+            chat = { system: budgeted.text.slice(0, budgeted.text.length - turn.text.length - 2) || undefined, text: turn.text };
+          }
+        } catch (error) {
+          active.delete(threadId);
+          throw error;
+        }
+      }
       const messages: ChatMessage[] = [
         ...(chat.system ? [{ role: "system" as const, content: chat.system }] : []),
         ...cappedTranscript.flatMap((m): ChatMessage[] => {
@@ -690,6 +770,30 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
       emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model });
+      if (trim) {
+        const itemId = `ctx-${newId()}`;
+        emit({
+          ...base(threadId, turnId),
+          type: "context.injected",
+          itemId,
+          source: "compression",
+          preview: trim.preview,
+          bytes: trim.bytesSaved,
+          io: { text: boundText(trim.text) },
+        });
+        try {
+          // Only the harness knows which message this turn answers, so it
+          // hangs the row there (the ACP driver does the same).
+          turn.onContextCompressed?.({
+            id: itemId,
+            source: "compression",
+            preview: trim.preview,
+            bytes: trim.bytesSaved,
+          });
+        } catch (error) {
+          console.error("minimax: onContextCompressed threw", error);
+        }
+      }
 
       // Tool ids this turn has already opened a step for.  The stream
       // announces a call once and then keeps sending argument fragments for
@@ -740,6 +844,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
               // the `budget` comment on this turn's runTurnLoop call.
               idleTimeoutMs: turn.unattended ? STREAM_IDLE_TIMEOUT_MS : undefined,
               reasoningEffort,
+              maxOutputTokens: turn.maxOutputTokens,
               // Every raw chunk feeds the loop's idle clock, which is what
               // bounds silence on the interactive path now that its hard
               // ceiling is the loop's default rather than 180s.

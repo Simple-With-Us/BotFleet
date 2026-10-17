@@ -18,11 +18,15 @@ jobs:
   autofix:
     if: >
       (github.event.issue.pull_request || github.event.pull_request) &&
-      contains(fromJSON('["bot", "Bot"]'), github.event.comment.user.type || github.event.review.user.type || '')
+      (github.event.issue.state == 'open' || github.event.pull_request.state == 'open') &&
+      (
+        (github.event_name == 'pull_request_review' && contains(fromJSON('["bot", "Bot"]'), github.event.review.user.type)) ||
+        (github.event_name != 'pull_request_review' && contains(fromJSON('["bot", "Bot"]'), github.event.comment.user.type))
+      )
     permissions:
       contents: write
       pull-requests: read
-    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@2e671004afff99a69565aa70853d5bd7a276c667
+    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@3fac4c3cff1450c238da2285cb178529da64d51d
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       AUTOFIX_GITHUB_APP_PRIVATE_KEY: ${{ secrets.SWU_AUTOFIX_GITHUB_APP_PRIVATE_KEY }}

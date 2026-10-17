@@ -13,6 +13,9 @@ vi.mock("./ModelPicker", async () => {
   };
 });
 
+// oxlint-disable-next-line anti-slop/no-module-mocking -- SSR fallback-list tests need a fixed empty catalog without mounting the app store.
+vi.mock("@/state/store", () => ({ useStore: () => ({ state: { instances: [] } }) }));
+
 import { BotFallbackModels } from "./BotFallbackModels";
 import type { Bot } from "@/state/store";
 

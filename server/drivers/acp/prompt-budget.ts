@@ -7,11 +7,13 @@
 // prompt is returned byte for byte.
 //
 // What may go, oldest first: replayed history sections (prior turns, oldest
-// first), then volatile system sections in prompt order (memory before a
-// later mentions note).  Those are the parts that legitimately change
+// first), then volatile system sections by cut priority (stale nudges before
+// the bot's memory; see ACP_SECTION_CUT_PRIORITY).  Those are the parts that legitimately change
 // between turns.  The stable system block and the current user message
 // stay, even when they alone are already over the budget.
 import { z } from "zod";
+
+import { contextWindowFor } from "../../model-context-windows.ts";
 
 import {
   FRESH_PREAMBLE,
@@ -32,6 +34,33 @@ export const DEFAULT_ACP_PROMPT_BUDGET_BYTES = 128 * 1024;
  *  turn can still end up over it.  Past this multiple the turn is refused
  *  rather than sent. */
 export const ACP_PROMPT_HARD_CEILING_FACTOR = 2;
+
+/** Which volatile section is cut first when the budget bites: lowest number
+ *  goes first, ties in prompt order.  Replaced the old rule, which cut volatile
+ *  sections in the order they appear in the prompt (so memory always went
+ *  before a later mentions note).  Per-turn nudges and stale lists go before the
+ *  bot's own memory and the instructions a message selected.  Ids not listed
+ *  sit in the middle.
+ *
+ *  `automation` goes last.  It is the untrusted-data framing for a webhook,
+ *  iMessage, Zulip or resource turn, and that turn's payload rides in the
+ *  current message, which is never cut.  Dropping the note first would keep
+ *  the payload and lose the warning, and the note is a few hundred bytes, so
+ *  cutting it early saves almost nothing. */
+export const ACP_SECTION_CUT_PRIORITY: Readonly<Record<string, number>> = {
+  recent: 10,
+  mentions: 20,
+  outstanding: 30,
+  playbooks: 50,
+  "skill-instructions": 60,
+  memory: 70,
+  automation: 80,
+};
+const UNLISTED_SECTION_PRIORITY = 35;
+
+function cutPriority(id: string | undefined): number {
+  return (id && ACP_SECTION_CUT_PRIORITY[id]) || UNLISTED_SECTION_PRIORITY;
+}
 
 /** Largest accepted instance setting.  Above this the value is ignored
  *  and the default applies. */
@@ -342,7 +371,12 @@ export function applyAcpPromptBudget(input: {
       droppedTurns += 1;
       continue;
     }
-    const volatileIndex = nextSystem.findIndex((piece) => piece.kind === "volatile" && shrinks(piece.text));
+    let volatileIndex = -1;
+    for (let i = 0; i < nextSystem.length; i++) {
+      const piece = nextSystem[i]!;
+      if (piece.kind !== "volatile" || !shrinks(piece.text)) continue;
+      if (volatileIndex < 0 || cutPriority(piece.id) < cutPriority(nextSystem[volatileIndex]!.id)) volatileIndex = i;
+    }
     if (volatileIndex < 0) break;
     const oldBytes = utf8(nextSystem[volatileIndex].text);
     const replacement = omittedReplacement(nextSystem[volatileIndex].text);
@@ -418,4 +452,69 @@ export function acpPromptCeilingRefusal(
       + `over the ${kib(ceiling)} hard limit (twice the ${kib(budgetBytes)} budget).  `
       + "Shorten the message, or raise promptBudgetBytes for this bot.",
   };
+}
+
+// ---- token budget ---------------------------------------------------------------
+
+/** Largest accepted context cap, in tokens. */
+export const MAX_ACP_CONTEXT_CAP_TOKENS = 10_000_000;
+
+/** Share of the working context the prompt may use.  The rest is left for the
+ *  model's reply, reasoning and tool results. */
+export const ACP_PROMPT_WINDOW_SHARE = 0.8;
+
+const contextCapSchema = z.number().int().min(1).max(MAX_ACP_CONTEXT_CAP_TOKENS);
+
+/** A positive integer token cap, or undefined (ignored) for anything else. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Config is an untrusted boundary; the schema immediately validates it.
+export function decodeAcpContextCapTokens(raw: unknown): number | undefined {
+  const parsed = contextCapSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** ASCII characters per token assumed by `estimateTokens`.  English prose runs
+ *  near 4, but source code and JSON, which fill most of an agent prompt, run
+ *  near 3.  The estimate sizes a hard prompt budget, so it errs toward more
+ *  tokens: at 4 a code-heavy prompt budgeted to 80% of the window could pass
+ *  the window itself, and the 20% reserve is for the reply, not for this error. */
+export const ASCII_CHARS_PER_TOKEN = 3;
+
+/** A rough, deliberately high token count: ASCII at `ASCII_CHARS_PER_TOKEN`
+ *  characters per token, everything else at about 1 token per character.  An
+ *  estimate, not the model's tokenizer.  It is used to turn a token budget into
+ *  bytes for this prompt, so the ratio adapts to code, prose and non-ASCII
+ *  text alike. */
+export function estimateTokens(text: string): number {
+  let ascii = 0;
+  let other = 0;
+  for (const ch of text) {
+    if (ch.charCodeAt(0) < 128) ascii++;
+    else other++;
+  }
+  return Math.ceil(ascii / ASCII_CHARS_PER_TOKEN + other);
+}
+
+/** The byte budget for one turn.
+ *
+ *  - `configuredBytes` 0 turns the budget off.  A positive value is the old
+ *    override and wins over everything else.
+ *  - Otherwise a `capTokens` working-context cap, clamped to the model's
+ *    published window when it is known, becomes a token budget (80% of it) and
+ *    is converted to bytes with this prompt's own bytes-per-token ratio.
+ *  - With neither, the default 128 KiB applies, as before.  */
+export function resolveAcpPromptBudget(input: {
+  configuredBytes: number | undefined;
+  capTokens: number | undefined;
+  model: string | undefined;
+  composed: string;
+}): { bytes: number | null; basis: "off" | "bytes" | "tokens" | "default"; tokens?: number } {
+  if (input.configuredBytes === 0) return { bytes: null, basis: "off" };
+  if (input.configuredBytes !== undefined) return { bytes: input.configuredBytes, basis: "bytes" };
+  if (input.capTokens === undefined) return { bytes: DEFAULT_ACP_PROMPT_BUDGET_BYTES, basis: "default" };
+  const window = contextWindowFor(input.model);
+  const effective = window === undefined ? input.capTokens : Math.min(input.capTokens, window);
+  const tokens = Math.max(1, Math.floor(effective * ACP_PROMPT_WINDOW_SHARE));
+  const measured = Math.max(1, estimateTokens(input.composed));
+  const ratio = Math.max(1, utf8(input.composed)) / measured;
+  return { bytes: Math.max(1, Math.floor(tokens * ratio)), basis: "tokens", tokens };
 }

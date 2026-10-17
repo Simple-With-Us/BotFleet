@@ -178,6 +178,14 @@ struct ChatListView: View {
     private var roster: some View {
         GeometryReader { geo in
             let waiting = waitingChats
+            // Whole-fleet work: build the summaries once per render, never
+            // per row (BOTFLEET-3R).
+            let all = session.state.chatSummaries
+            let roomRows = roomSummaries(in: all)
+            let botRows = botSummaries(in: all)
+            let botChatRows = botChatSummaries(in: all)
+            let matches = chats(in: all)
+            let showingBotChats = query.isEmpty && botChatsExpanded && !botChatRows.isEmpty
             VStack(spacing: 0) {
                 header
                 StatusBanner()
@@ -187,12 +195,12 @@ struct ChatListView: View {
                         if query.isEmpty {
                             sectionToggle(
                                 title: roomTerms.plural,
-                                count: roomSummaries.count,
+                                count: roomRows.count,
                                 expanded: $roomsExpanded
                             )
                             .padding(.top, 2)
                             if roomsExpanded {
-                                ForEach(Array(roomSummaries.enumerated()), id: \.element.id) { index, summary in
+                                ForEach(Array(roomRows.enumerated()), id: \.element.id) { index, summary in
                                     chatOpener(for: summary.chat) {
                                         ChatRow(
                                             chat: summary.chat,
@@ -200,7 +208,7 @@ struct ChatListView: View {
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
                                             waiting: waiting.contains(summary.chat.id),
-                                            last: index == roomSummaries.count - 1 && !botsExpanded && customSectionNames.isEmpty && !showingBotChats
+                                            last: index == roomRows.count - 1 && !botsExpanded && customSectionNames.isEmpty && !showingBotChats
                                         )
                                     }
                                 }
@@ -215,7 +223,7 @@ struct ChatListView: View {
 
                             sectionToggle(
                                 title: session.config?.primaryPlural ?? "Bots",
-                                count: botSummaries.count,
+                                count: botRows.count,
                                 expanded: $botsExpanded
                             )
                             .padding(.top, 14)
@@ -246,7 +254,7 @@ struct ChatListView: View {
                                 .padding(.bottom, 4)
                         }
 
-                        let rows = query.isEmpty ? (botsExpanded ? botSummaries : []) : chats
+                        let rows = query.isEmpty ? (botsExpanded ? botRows : []) : matches
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, summary in
                             chatOpener(for: summary.chat) {
                                 ChatRow(
@@ -272,7 +280,7 @@ struct ChatListView: View {
 
                         if query.isEmpty {
                             ForEach(customSectionNames, id: \.self) { section in
-                                let sectionRows = summaries(forSection: section)
+                                let sectionRows = summaries(forSection: section, in: all)
                                 if !sectionRows.isEmpty {
                                     let isExpanded = sectionBinding(for: section)
                                     sectionToggle(
@@ -310,15 +318,15 @@ struct ChatListView: View {
                             }
                         }
 
-                        if query.isEmpty, !botChatSummaries.isEmpty {
+                        if query.isEmpty, !botChatRows.isEmpty {
                             sectionToggle(
                                 title: "Bot Chats",
-                                count: botChatSummaries.count,
+                                count: botChatRows.count,
                                 expanded: $botChatsExpanded
                             )
                             .padding(.top, 14)
                             if botChatsExpanded {
-                                ForEach(Array(botChatSummaries.enumerated()), id: \.element.id) { index, summary in
+                                ForEach(Array(botChatRows.enumerated()), id: \.element.id) { index, summary in
                                     chatOpener(for: summary.chat) {
                                         ChatRow(
                                             chat: summary.chat,
@@ -326,7 +334,7 @@ struct ChatListView: View {
                                             at: summary.lastActivity,
                                             state: BotState.forChat(summary.chat, in: session.state),
                                             waiting: waiting.contains(summary.chat.id),
-                                            last: index == botChatSummaries.count - 1
+                                            last: index == botChatRows.count - 1
                                         )
                                     }
                                 }
@@ -343,8 +351,8 @@ struct ChatListView: View {
                 .refreshable { await session.refresh() }
                 .overlay {
                     if query.isEmpty
-                        ? botSummaries.isEmpty && roomSummaries.isEmpty && botChatSummaries.isEmpty && searchHits.isEmpty
-                        : chats.isEmpty && searchHits.isEmpty
+                        ? botRows.isEmpty && roomRows.isEmpty && botChatRows.isEmpty && searchHits.isEmpty
+                        : matches.isEmpty && searchHits.isEmpty
                     {
                         ContentUnavailableView(
                             query.isEmpty ? "No chats yet" : "Nothing matches",
@@ -583,9 +591,16 @@ struct ChatListView: View {
 
     // MARK: - Data
 
+    // `chatSummaries` walks every chat's transcripts.  Read it once per render
+    // (see `roster`) and filter that copy — reading it per row, as these
+    // helpers once did, hung the main thread for ~35s (BOTFLEET-3R).
+
     private var chats: [ChatSummary] {
-        let all = session.state.chatSummaries
-        guard !query.isEmpty else { return botSummaries }
+        chats(in: session.state.chatSummaries)
+    }
+
+    private func chats(in all: [ChatSummary]) -> [ChatSummary] {
+        guard !query.isEmpty else { return botSummaries(in: all) }
         return all.filter {
             $0.chat.name.localizedCaseInsensitiveContains(query)
                 || $0.chat.subtitle.localizedCaseInsensitiveContains(query)
@@ -598,16 +613,16 @@ struct ChatListView: View {
         return section.isEmpty
     }
 
-    private var botSummaries: [ChatSummary] {
-        session.state.chatSummaries.filter { 
+    private func botSummaries(in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter { 
             if case .bot = $0.chat { return isUnsectioned($0.chat) }
             return false 
         }
     }
 
     /// User rooms only.  Bot-to-bot DMs sit in Bot Chats, like the Mac sidebar.
-    private var roomSummaries: [ChatSummary] {
-        session.state.chatSummaries.filter {
+    private func roomSummaries(in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter {
             if case .room = $0.chat { return !$0.chat.isBotToBot && isUnsectioned($0.chat) }
             return false
         }
@@ -623,8 +638,8 @@ struct ChatListView: View {
         )
     }
 
-    private func summaries(forSection section: String) -> [ChatSummary] {
-        session.state.chatSummaries.filter {
+    private func summaries(forSection section: String, in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter {
             !$0.chat.isBotToBot && $0.chat.section?.trimmingCharacters(in: .whitespacesAndNewlines) == section
         }
     }
@@ -662,12 +677,8 @@ struct ChatListView: View {
         )
     }
 
-    private var botChatSummaries: [ChatSummary] {
-        session.state.chatSummaries.filter(\.chat.isBotToBot)
-    }
-
-    private var showingBotChats: Bool {
-        query.isEmpty && botChatsExpanded && !botChatSummaries.isEmpty
+    private func botChatSummaries(in all: [ChatSummary]) -> [ChatSummary] {
+        all.filter(\.chat.isBotToBot)
     }
 
     private func nestedTasks(for chat: Chat) -> [BotTask] {
