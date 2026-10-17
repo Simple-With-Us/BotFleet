@@ -7,8 +7,8 @@
 // prompt is returned byte for byte.
 //
 // What may go, oldest first: replayed history sections (prior turns, oldest
-// first), then volatile system sections in prompt order (memory before a
-// later mentions note).  Those are the parts that legitimately change
+// first), then volatile system sections by cut priority (stale nudges before
+// the bot's memory; see ACP_SECTION_CUT_PRIORITY).  Those are the parts that legitimately change
 // between turns.  The stable system block and the current user message
 // stay, even when they alone are already over the budget.
 import { z } from "zod";
@@ -26,6 +26,39 @@ import {
  *  KB) plus the current message fits, and a pathological volatile block
  *  or replay does not. */
 export const DEFAULT_ACP_PROMPT_BUDGET_BYTES = 128 * 1024;
+
+/** The hard ceiling is this many times the budget.  The budget trims what it
+ *  may; the protected system text and the current message are never cut, so a
+ *  turn can still end up over it.  Past this multiple the turn is refused
+ *  rather than sent. */
+export const ACP_PROMPT_HARD_CEILING_FACTOR = 2;
+
+/** Which volatile section is cut first when the budget bites: lowest number
+ *  goes first, ties in prompt order.  Replaced the old rule, which cut volatile
+ *  sections in the order they appear in the prompt (so memory always went
+ *  before a later mentions note).  Per-turn nudges and stale lists go before the
+ *  bot's own memory and the instructions a message selected.  Ids not listed
+ *  sit in the middle.
+ *
+ *  `automation` goes last.  It is the untrusted-data framing for a webhook,
+ *  iMessage, Zulip or resource turn, and that turn's payload rides in the
+ *  current message, which is never cut.  Dropping the note first would keep
+ *  the payload and lose the warning, and the note is a few hundred bytes, so
+ *  cutting it early saves almost nothing. */
+export const ACP_SECTION_CUT_PRIORITY: Readonly<Record<string, number>> = {
+  recent: 10,
+  mentions: 20,
+  outstanding: 30,
+  playbooks: 50,
+  "skill-instructions": 60,
+  memory: 70,
+  automation: 80,
+};
+const UNLISTED_SECTION_PRIORITY = 35;
+
+function cutPriority(id: string | undefined): number {
+  return (id && ACP_SECTION_CUT_PRIORITY[id]) || UNLISTED_SECTION_PRIORITY;
+}
 
 /** Largest accepted instance setting.  Above this the value is ignored
  *  and the default applies. */
@@ -50,6 +83,14 @@ export interface AcpPromptBytes {
   volatile: number;
 }
 
+/** What a trim took out, by name only.  No prompt text. */
+export interface AcpPromptDropped {
+  /** Replayed history turns removed or replaced by the omission marker. */
+  historyTurns: number;
+  /** Ids of the volatile system sections replaced (for example "memory"). */
+  sections: string[];
+}
+
 export interface AcpPromptBudgetResult {
   text: string;
   /** Stable is the protected system block.  Volatile is every volatile
@@ -59,7 +100,11 @@ export interface AcpPromptBudgetResult {
   before: AcpPromptBytes;
   after: AcpPromptBytes;
   trimmed: boolean;
+  /** What the trim removed.  Empty when nothing was trimmed. */
+  dropped: AcpPromptDropped;
 }
+
+const NOTHING_DROPPED: AcpPromptDropped = { historyTurns: 0, sections: [] };
 
 /** `0` disables the budget.  A positive integer up to the max is a ceiling.
  *  Anything else is ignored so the caller keeps the default. */
@@ -77,6 +122,8 @@ export function resolveAcpPromptBudgetBytes(configured: number | undefined): num
 interface Piece {
   kind: "stable" | "volatile" | "history";
   text: string;
+  /** The section id, for system pieces built from named sections. */
+  id?: string;
 }
 
 interface SplitHistory {
@@ -251,6 +298,7 @@ function systemPieces(systemText: string, sections: readonly AcpPromptSection[] 
     return listed.map((section) => ({
       kind: section.volatile ? "volatile" : "stable",
       text: section.text,
+      id: section.id,
     }));
   }
   return systemText.length > 0 ? [{ kind: "stable", text: systemText }] : [];
@@ -274,7 +322,7 @@ export function applyAcpPromptBudget(input: {
   if (systemText === null) {
     const bytes = utf8(input.composed);
     const whole = { stable: bytes, volatile: 0 };
-    return { text: input.composed, before: whole, after: whole, trimmed: false };
+    return { text: input.composed, before: whole, after: whole, trimmed: false, dropped: NOTHING_DROPPED };
   }
 
   const system = systemPieces(systemText, input.sections);
@@ -285,6 +333,7 @@ export function applyAcpPromptBudget(input: {
     before,
     after: before,
     trimmed: false,
+    dropped: NOTHING_DROPPED,
   });
 
   if (render(system, history, current, userStablePrefix) !== input.composed) return unchanged();
@@ -295,6 +344,8 @@ export function applyAcpPromptBudget(input: {
   const nextHistory = history.map((piece) => ({ ...piece }));
   const finalizedHistory = new Set<number>();
   let trimmed = false;
+  let droppedTurns = 0;
+  const droppedSections: string[] = [];
 
   let totalBytes = composedBytes(nextSystem, nextHistory, current, userStablePrefix);
   while (totalBytes > budget) {
@@ -315,18 +366,27 @@ export function applyAcpPromptBudget(input: {
         totalBytes -= oldBytes + joinOverhead;
       }
       trimmed = true;
+      droppedTurns += 1;
       continue;
     }
-    const volatileIndex = nextSystem.findIndex((piece) => piece.kind === "volatile" && shrinks(piece.text));
+    let volatileIndex = -1;
+    for (let i = 0; i < nextSystem.length; i++) {
+      const piece = nextSystem[i]!;
+      if (piece.kind !== "volatile" || !shrinks(piece.text)) continue;
+      if (volatileIndex < 0 || cutPriority(piece.id) < cutPriority(nextSystem[volatileIndex]!.id)) volatileIndex = i;
+    }
     if (volatileIndex < 0) break;
     const oldBytes = utf8(nextSystem[volatileIndex].text);
     const replacement = omittedReplacement(nextSystem[volatileIndex].text);
     nextSystem[volatileIndex] = {
       kind: "volatile",
       text: replacement,
+      id: nextSystem[volatileIndex].id,
     };
     totalBytes += utf8(replacement) - oldBytes;
     trimmed = true;
+    const sectionId = nextSystem[volatileIndex].id;
+    if (sectionId && !droppedSections.includes(sectionId)) droppedSections.push(sectionId);
   }
 
   if (!trimmed) return unchanged();
@@ -335,5 +395,59 @@ export function applyAcpPromptBudget(input: {
     before,
     after: measure(nextSystem, nextHistory, userStablePrefix),
     trimmed: true,
+    dropped: { historyTurns: droppedTurns, sections: droppedSections },
+  };
+}
+
+function kib(bytes: number): string {
+  return bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${bytes} B`;
+}
+
+/** The "Compressing Context" record for a trimmed prompt: one line for the row
+ *  and the expanded text.  Counts, byte sizes and section names only; no prompt
+ *  text.  Null when nothing was trimmed. */
+export function describeAcpPromptTrim(
+  result: AcpPromptBudgetResult,
+  budgetBytes: number | null,
+): { preview: string; text: string; bytesSaved: number } | null {
+  if (!result.trimmed) return null;
+  const before = result.before.stable + result.before.volatile;
+  const after = result.after.stable + result.after.volatile;
+  const { historyTurns, sections } = result.dropped;
+  const parts: string[] = [];
+  if (historyTurns > 0) parts.push(`${historyTurns} earlier ${historyTurns === 1 ? "turn" : "turns"}`);
+  if (sections.length > 0) parts.push(sections.join(", "));
+  const preview = `${kib(before)} to ${kib(after)}${parts.length ? `: dropped ${parts.join(" and ")}` : ""}`;
+  const lines = [
+    "The prompt was over this bot's per-turn budget, so older context was cut before it was sent.",
+    "",
+    `Budget: ${budgetBytes == null ? "none" : kib(budgetBytes)}`,
+    `Before: ${kib(before)}  (protected ${kib(result.before.stable)}, trimmable ${kib(result.before.volatile)})`,
+    `After: ${kib(after)}  (protected ${kib(result.after.stable)}, trimmable ${kib(result.after.volatile)})`,
+    `Earlier turns dropped: ${historyTurns}`,
+    `Sections dropped: ${sections.length ? sections.join(", ") : "none"}`,
+    "",
+    "Each dropped part was replaced by an omission marker.  The system instructions and your message were kept.",
+  ];
+  return { preview, text: lines.join("\n"), bytesSaved: Math.max(0, before - after) };
+}
+
+/** The refusal for a prompt that is still over the hard ceiling after trimming,
+ *  or null when it may be sent.  Names sizes only. */
+export function acpPromptCeilingRefusal(
+  text: string,
+  budgetBytes: number | null,
+): { message: string; bytes: number; ceiling: number } | null {
+  if (budgetBytes == null || budgetBytes <= 0) return null;
+  const ceiling = budgetBytes * ACP_PROMPT_HARD_CEILING_FACTOR;
+  const bytes = utf8(text);
+  if (bytes <= ceiling) return null;
+  return {
+    bytes,
+    ceiling,
+    message:
+      `This turn was not sent: the part that cannot be trimmed (system instructions plus your message) is ${kib(bytes)}, `
+      + `over the ${kib(ceiling)} hard limit (twice the ${kib(budgetBytes)} budget).  `
+      + "Shorten the message, or raise promptBudgetBytes for this bot.",
   };
 }

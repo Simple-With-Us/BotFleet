@@ -381,7 +381,7 @@ test("safeStorage export runs only when the installed app is the legacy identity
 });
 
 test("the stable wrapper bootstraps updater policy from the fetched target", async () => {
-  const source = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
   assert.match(source, /BOOTSTRAP_REF="\$\{BOTFLEET_UPDATE_TARGET:-origin\/main\}"/);
   assert.match(source, /elif \[\[ "\$arg" == "--target" \]\]/);
   assert.match(source, /elif \[\[ "\$arg" == --target=\* \]\]/);
@@ -411,7 +411,7 @@ test("the stable wrapper bootstraps updater policy from the fetched target", asy
 });
 
 test("forced updates refresh the selected bootstrap ref before archiving it", async () => {
-  const source = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
   const forceCheck = source.indexOf('if [[ "${BOTFLEET_FORCE:-}" == "1" ]]');
   const targetSelection = source.indexOf('BOOTSTRAP_REF="${BOTFLEET_UPDATE_TARGET:-origin/main}"');
   const targetOverride = source.indexOf('BOOTSTRAP_REF="$arg"');
@@ -432,7 +432,7 @@ test("forced updates refresh the selected bootstrap ref before archiving it", as
 });
 
 test("the stable wrapper enforces origin/main ancestry before archiving or executing the bootstrap target", async () => {
-  const source = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
   const fetch = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin "$BOOTSTRAP_FETCH_REF"');
   const mainRefresh = source.indexOf('git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin main', fetch);
   const resolve = source.indexOf('BOOTSTRAP_COMMIT="$(git -C "$BOTFLEET_CHECKOUT" rev-parse --verify "${BOOTSTRAP_REF}^{commit}"', fetch);
@@ -494,7 +494,7 @@ test("the stable wrapper rejects an unmerged --target before running any of its 
   await git(checkout, ["config", "user.name", "Test"]);
 
   const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1" };
-  const rejected = await run("bash", [join(scripts, "update-botfleet.sh"), "--target", "origin/evil"], { env, allowFailure: true });
+  const rejected = await run("bash", [join(scripts, "update-botfleet-policy.sh"), "--target", "origin/evil"], { env, allowFailure: true });
   assert.equal(rejected.code, 1, "an unmerged --target must be rejected");
   assert.match(rejected.stderr, /not reachable from origin\/main/);
   const mainCommit = (await run("git", ["-C", checkout, "rev-parse", "origin/main"])).stdout.trim();
@@ -504,7 +504,7 @@ test("the stable wrapper rejects an unmerged --target before running any of its 
   assert.notEqual(merged.code, 0, "the fixture's evil ref must actually be unmerged");
   assert.equal(await readFile(marker, "utf8").catch(() => null), null, "no archived updater code ran");
 
-  const accepted = await run("bash", [join(scripts, "update-botfleet.sh"), "--target", "origin/main"], { env, allowFailure: true });
+  const accepted = await run("bash", [join(scripts, "update-botfleet-policy.sh"), "--target", "origin/main"], { env, allowFailure: true });
   assert.equal(accepted.code, 0, `a merged --target still bootstraps: ${accepted.stderr}`);
   assert.equal(await readFile(marker, "utf8"), "main", "the archived updater from the merged target ran");
 });
@@ -546,7 +546,7 @@ test("the stable wrapper resolves a revision-expression --target instead of fetc
   const olderCommit = (await git(remote, ["rev-parse", "main~1"])).stdout.trim();
   const newerCommit = (await git(remote, ["rev-parse", "main"])).stdout.trim();
 
-  const wrapper = join(scripts, "update-botfleet.sh");
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
   const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1" };
   // origin/main~1 is not a fetchable refspec.  Fetching it verbatim fails and
   // falls through to the checkout's installed (newer) updater; the wrapper must
@@ -602,7 +602,7 @@ test("unquiesce ignores update targets and bootstraps the recovery from origin/m
   await git(remote, ["checkout", "main"]);
   await git(fixture, ["clone", "remote", "checkout"]);
 
-  const wrapper = join(scripts, "update-botfleet.sh");
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
   const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1", BOTFLEET_UPDATE_TARGET: "origin/fenced" };
   // The recovery action must release admission even while the environment
   // names the unmerged ref: it bootstraps origin/main's updater instead.
@@ -659,7 +659,7 @@ test("the stable wrapper resolves env and equals-form targets to the pinned vali
   await git(fixture, ["clone", "remote", "checkout"]);
   const envTargetCommit = (await git(checkout, ["rev-parse", "origin/env-target"])).stdout.trim();
   const mainCommit = (await git(checkout, ["rev-parse", "origin/main"])).stdout.trim();
-  const wrapper = join(scripts, "update-botfleet.sh");
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
   const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1", BOTFLEET_UPDATE_TARGET: "origin/env-target" };
 
   const envRun = await run("bash", [wrapper], { env, allowFailure: true });
@@ -706,7 +706,7 @@ test("the stable wrapper builds the commit it validated, even when main moves mi
   await git(remote, ["commit", "-m", "updater"]);
   const validatedCommit = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
   await git(fixture, ["clone", "remote", "checkout"]);
-  const wrapper = join(scripts, "update-botfleet.sh");
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
   // The stub updater advances origin/main and re-fetches it, exactly the
   // window in which resolveTarget() would resolve a newer main than the
   // policy the wrapper archived.  The run must still build the validated
@@ -741,7 +741,7 @@ test("resolveTarget accepts a full commit SHA on main", async () => {
 });
 
 test("the stable wrapper expands UPDATER_ARGS with the bash 3.2 safe form", async () => {
-  const source = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
   // Stock macOS /bin/bash is 3.2, where expanding an EMPTY array under
   // `set -u` fails with "unbound variable". That kills the no-argument
   // in-app update path (electron/updater.mjs spawns the wrapper with no
@@ -788,7 +788,7 @@ test("the stable wrapper runs with no arguments and no update target", { skip: p
   // guarded expansion; on bash 3.2 it exercises the path that used to exit
   // with "unbound variable" before the updater ran.  The bootstrapped
   // updater receives the validated commit, not the symbolic origin/main.
-  const result = await run("bash", [join(scripts, "update-botfleet.sh")], {
+  const result = await run("bash", [join(scripts, "update-botfleet-policy.sh")], {
     env: { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1" },
     allowFailure: true,
   });
@@ -829,7 +829,7 @@ test("the stable wrapper detects a linked worktree checkout, where .git is a fil
   // is a gitdir pointer file rather than a directory.
   await git(primary, ["worktree", "add", "--detach", checkout, "origin/main"]);
   assert.ok((await stat(join(checkout, ".git"))).isFile(), "the fixture checkout's .git must be a file");
-  const wrapper = join(scripts, "update-botfleet.sh");
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
 
   // Up-to-date check: the worktree is already at origin/main, so an unforced
   // run must short-circuit instead of running any updater.
@@ -890,7 +890,7 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
   const stage = join(fixture, "stage");
   await mkdir(stage, { recursive: true });
   await writeFile(join(stage, "prepared.json"), JSON.stringify({ sourceCommit: mainCommit }));
-  const wrapper = join(scripts, "update-botfleet.sh");
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
   // No BOTFLEET_FORCE anywhere below: every run sees HEAD == origin/main.
   const invoke = async (args, extraEnv = {}) => {
     await rm(marker, { force: true });
@@ -933,13 +933,13 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
 });
 
 test("the stable wrapper does not test for a .git directory to find the checkout", async () => {
-  const source = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const source = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
   assert.doesNotMatch(source, /-d "\$BOTFLEET_CHECKOUT\/\.git"/);
   assert.match(source, /git -C "\$BOTFLEET_CHECKOUT" rev-parse --git-dir/);
 });
 
 test("the up-to-date runtime probe reads the bearer credential from BOTFLEET_OWNER_NONCE only", async () => {
-  const wrapper = await readFile(join(scripts, "update-botfleet.sh"), "utf8");
+  const wrapper = await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8");
   const helper = await readFile(join(scripts, "update-botfleet-runtime-commit.mjs"), "utf8");
   assert.match(wrapper, /update-botfleet-runtime-commit\.mjs/);
   assert.match(wrapper, /BOTFLEET_OWNER_NONCE/);
@@ -1030,7 +1030,7 @@ test("apply bootstraps the updater recorded in the stage manifest, not a newer o
   assert.notEqual(advancedCommit, preparedCommit);
 
   const env = { BOTFLEET_CHECKOUT: checkout, BOTFLEET_FORCE: "1", BOTFLEET_UPDATE_TARGET: "" };
-  const wrapper = join(scripts, "update-botfleet.sh");
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
   const applied = await run("bash", [wrapper, "apply", "--stage", stage], { env, allowFailure: true });
   assert.equal(applied.code, 0, `apply bootstraps: ${applied.stderr}`);
   assert.equal(
@@ -2546,7 +2546,7 @@ async function newestGreenFixture(t, { resolver } = {}) {
   await git(remote, ["commit", "-m", "tip"]);
   const tip = (await git(remote, ["rev-parse", "HEAD"])).stdout.trim();
   await git(fixture, ["clone", "remote", "checkout"]);
-  const wrapper = join(scripts, "update-botfleet.sh");
+  const wrapper = join(scripts, "update-botfleet-policy.sh");
   const invoke = async (args, env = {}) => {
     await rm(marker, { force: true });
     await rm(selectLog, { force: true });
@@ -2687,7 +2687,7 @@ test("an explanation left in the caller's environment is not believed", wrapperO
 });
 
 test("the selection runs after the tip is fetched and before anything is archived for execution", async () => {
-  const source = (await readFile(join(scripts, "update-botfleet.sh"), "utf8")).replace(/\r\n/g, "\n");
+  const source = (await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8")).replace(/\r\n/g, "\n");
   const bootstrapDir = source.indexOf('BOOTSTRAP_DIR="$(mktemp -d');
   const selection = source.indexOf('SELECT_NEWEST_GREEN=0');
   const tipFetch = source.indexOf('fetch --quiet origin main 2>/dev/null; then\n      SELECT_TIP');
@@ -2767,7 +2767,7 @@ test("the selection gives up long before the harness decides a run never started
   const grace = Number(/const LAUNCH_GRACE_MS = ([\d_]+)/.exec(control)?.[1]?.replaceAll("_", ""));
   assert.ok(grace > 0, "the harness's launch grace is still where this test looks for it");
 
-  const wrapper = (await readFile(join(scripts, "update-botfleet.sh"), "utf8")).replace(/\r\n/g, "\n");
+  const wrapper = (await readFile(join(scripts, "update-botfleet-policy.sh"), "utf8")).replace(/\r\n/g, "\n");
   const watchdog = Number(/\}, (\d+)\);\n\s+try \{/.exec(wrapper)?.[1]);
   assert.ok(watchdog > 0 && watchdog <= grace / 2, `the wrapper's watchdog (${watchdog}ms) must be at most half of ${grace}ms`);
 
