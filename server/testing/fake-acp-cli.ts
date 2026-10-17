@@ -39,6 +39,11 @@
 //                     file exists — a deterministic busy window for the
 //                     steer-queue e2e, with the echo pinning exactly what a
 //                     drained turn was sent)
+//   FAKE_ACP_COMMANDS  comma-separated command names.  The agent announces
+//                     them in an `available_commands_update` right after
+//                     session/new and session/load, before any prompt, and
+//                     marks the one after session/load as replayed history
+//                     when FAKE_ACP_COMMANDS_REPLAY is set.
 //   FAKE_ACP_DUMP   path to write {argv, env} as JSON, so a test can assert
 //                   argv shape (agent/stdio flags) and env hygiene
 //   FAKE_ACP_MODELS      comma-separated model ids. Enables the opencode-shaped
@@ -95,6 +100,21 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { z } from "zod";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
+
+/** The agent's catalog of slash commands, announced the way ACP agents do:
+ *  a session/update notification, before any prompt. */
+const announceCommands = (replayed: boolean): void => {
+  const names = (process.env.FAKE_ACP_COMMANDS ?? "").split(",").filter(Boolean);
+  if (names.length === 0) return;
+  const sessionId = "fake-acp-session";
+  const update = {
+    sessionUpdate: "available_commands_update",
+    availableCommands: names.map((name) => ({ name, description: `fake ${name}` })),
+  };
+  const params = replayed ? { sessionId, _meta: { isReplay: true }, update } : { sessionId, update };
+  out({ jsonrpc: "2.0", method: "session/update", params });
+};
+
 const LINGERING_CHILD_MODES = new Set(["cancel-exits-with-child", "exit-with-lingering-child", "happy-with-lingering-child"]);
 /** Spawn the SIGTERM-ignoring MCP-shaped descendant, once, in this CLI's
  * process group, and call `ready` once it has installed its SIGTERM handler.
@@ -279,6 +299,11 @@ if (argv[0] === "models" || argv.includes("--list-models")) {
 // twice, then answered once".  FAKE_ACP_PARTIAL_FAILS instead streams a chunk
 // and THEN dies, which the replay-safety guard must refuse to retry.
 let failAfterChunk = false;
+// FAKE_ACP_FAIL_AT_PROMPT defers the same 503 death to the session/prompt
+// request, so the child boots and answers every setup call first.  That is the
+// shape of a failure after the harness has budgeted and sent the prompt but
+// before any output: the one a relaunch retries with the prompt built twice.
+let failAtPrompt = false;
 if (process.env.FAKE_ACP_TRANSIENTS && process.env.FAKE_ACP_STATE) {
   let launched = 0;
   try {
@@ -289,6 +314,8 @@ if (process.env.FAKE_ACP_TRANSIENTS && process.env.FAKE_ACP_STATE) {
   if (launched < quota) {
     if (process.env.FAKE_ACP_PARTIAL_FAILS) {
       failAfterChunk = true;
+    } else if (process.env.FAKE_ACP_FAIL_AT_PROMPT) {
+      failAtPrompt = true;
     } else {
       process.stderr.write("fake-acp: HTTP 503 service temporarily unavailable\n");
       process.exit(5);
@@ -486,6 +513,7 @@ function handle(msg: any, resumed = false) {
         ...(opts ? { configOptions: opts } : {}),
         ...(mdls ? { models: mdls } : {}),
       });
+      announceCommands(false);
       break;
     }
     case "session/load":
@@ -501,6 +529,7 @@ function handle(msg: any, resumed = false) {
       const opts = configOptions();
       const mdls = sessionModels();
       result(msg.id, { ...(opts ? { configOptions: opts } : {}), ...(mdls ? { models: mdls } : {}) });
+      announceCommands(process.env.FAKE_ACP_COMMANDS_REPLAY === "1");
       break;
     }
     // per-session settings (droid sets model/autonomy here, not via argv).
@@ -596,6 +625,10 @@ function handle(msg: any, resumed = false) {
       break;
     }
     case "session/prompt": {
+      if (failAtPrompt) {
+        process.stderr.write("fake-acp: HTTP 503 service temporarily unavailable\n");
+        process.exit(5);
+      }
       if (LINGERING_CHILD_MODES.has(mode) && !lingeringChildReady) {
         if (mode === "cancel-exits-with-child") {
           // The prompt hangs from here on, so there is nothing to hold back.

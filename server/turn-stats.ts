@@ -65,6 +65,12 @@ export class TurnStatsTracker {
     this.now = now;
   }
 
+  /** When the turn in flight on `threadId` began, in epoch milliseconds, or
+   *  null when none is being timed.  Read-only: it is what /status prints. */
+  startedAt(threadId: string): number | null {
+    return this.live.get(threadId)?.at ?? null;
+  }
+
   /** A turn was dispatched.  Replaces any leftover entry for the thread. */
   begin(threadId: string, at = this.now()): void {
     this.live.set(threadId, {

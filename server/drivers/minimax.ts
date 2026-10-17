@@ -747,15 +747,28 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       emit({ ...base(threadId, turnId), type: "turn.started" });
       emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model });
       if (trim) {
+        const itemId = `ctx-${newId()}`;
         emit({
           ...base(threadId, turnId),
           type: "context.injected",
-          itemId: `ctx-${newId()}`,
+          itemId,
           source: "compression",
           preview: trim.preview,
           bytes: trim.bytesSaved,
           io: { text: boundText(trim.text) },
         });
+        try {
+          // Only the harness knows which message this turn answers, so it
+          // hangs the row there (the ACP driver does the same).
+          turn.onContextCompressed?.({
+            id: itemId,
+            source: "compression",
+            preview: trim.preview,
+            bytes: trim.bytesSaved,
+          });
+        } catch (error) {
+          console.error("minimax: onContextCompressed threw", error);
+        }
       }
 
       // Tool ids this turn has already opened a step for.  The stream

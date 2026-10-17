@@ -14,12 +14,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ensureDirs } from "../../config.ts";
 import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
+import type { ContextInjectionRef } from "../../../shared/context-injection.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { expectLaunchedAs, inheritHarnessIdentity, readEngineDump } from "../../testing/launch-identity.ts";
 import { MODEL_REJECTED_STOP_REASON } from "../../model-fallback.ts";
 import { classifyError } from "../retry.ts";
 import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
-import { ACP_PROMPT_SECTION_OMITTED } from "./prompt-budget.ts";
+import {
+  ACP_PROMPT_SECTION_OMITTED,
+  acpPromptCeilingRefusal,
+  applyAcpPromptBudget,
+  describeAcpPromptTrim,
+} from "./prompt-budget.ts";
 import { GrokAgentDriver } from "./grok.ts";
 import { DshAgentDriver } from "./dsh.ts";
 import { KimiAgentDriver } from "./kimi.ts";
@@ -372,6 +378,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_COST;
     delete process.env.FAKE_ACP_TRANSIENTS;
     delete process.env.FAKE_ACP_PARTIAL_FAILS;
+    delete process.env.FAKE_ACP_FAIL_AT_PROMPT;
     delete process.env.FAKE_ACP_LATE_INPUT_AT;
     delete process.env.FAKE_ACP_STATE;
     delete process.env.FAKE_ACP_RETRY_SCALE;
@@ -415,9 +422,11 @@ describe("ACP turns (fake CLI)", () => {
     const volOld = `VOLATILE-OLD ${"alpha ".repeat(400)}`;
     const volNew = "VOLATILE-NEW kept";
     const current = "CURRENT USER MESSAGE";
+    const compressed: ContextInjectionRef[] = [];
     await instance.adapter.sendTurn({
       threadId: "t-budget",
       text: current,
+      onContextCompressed: (ref) => void compressed.push(ref),
       system: stable + volOld + volNew,
       systemSections: [
         { id: "persona", text: stable, volatile: false },
@@ -436,7 +445,80 @@ describe("ACP turns (fake CLI)", () => {
       expect(row.bytes).toBeGreaterThan(0);
       expect(row.io?.text?.text).toContain("Sections dropped: memory");
       expect(JSON.stringify(row)).not.toContain("alpha");
+      // the harness hears the same row, once, so it can hang it under the
+      // message that started THIS turn
+      expect(compressed).toEqual([{ id: row.itemId, source: "compression", preview: row.preview, bytes: row.bytes }]);
     }
+  });
+
+  // A system prompt whose oldest volatile section the budget can drop.  The
+  // sections concatenate to the system text exactly, which the budget requires.
+  const BUDGET_STABLE = "STABLE-BLOCK";
+  const BUDGET_OLD = `VOLATILE-OLD ${"alpha ".repeat(400)}`;
+  const BUDGET_NEW = "VOLATILE-NEW kept";
+  const BUDGET_SYSTEM = BUDGET_STABLE + BUDGET_OLD + BUDGET_NEW;
+  const BUDGET_SECTIONS = [
+    { id: "persona", text: BUDGET_STABLE, volatile: false },
+    { id: "memory", text: BUDGET_OLD, volatile: true },
+    { id: "mentions", text: BUDGET_NEW, volatile: true },
+  ];
+
+  // A relaunch after a transient failure builds the same prompt again, and the
+  // trim row for the turn must not be published a second time.
+  it("announces the trim once when the turn is relaunched after a transient failure", async () => {
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_FAIL_AT_PROMPT = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches-budget-retry");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 512 });
+    const compressed: ContextInjectionRef[] = [];
+    await instance.adapter.sendTurn({
+      threadId: "t-budget-retry",
+      text: "CURRENT USER MESSAGE",
+      onContextCompressed: (ref) => void compressed.push(ref),
+      system: BUDGET_SYSTEM,
+      systemSections: BUDGET_SECTIONS,
+    });
+
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true, 25_000);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
+    // the prompt was built on both attempts, but the row is the turn's, once
+    const rows = recorder.events.filter((e) => e.type === "context.injected" && e.source === "compression");
+    expect(rows).toHaveLength(1);
+    expect(compressed).toHaveLength(1);
+  }, 40_000);
+
+  it("refuses an over-ceiling turn without also announcing a trim it did not send", async () => {
+    const dump = join(scratch, "ceiling-trim-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = dump;
+    await create(GrokAgentDriver, "echo-gated", { promptBudgetBytes: 512 });
+    const compressed: ContextInjectionRef[] = [];
+    // The memory section is droppable, so the budget does cut; the message
+    // itself is past twice the budget, so the turn is refused anyway.
+    const huge = `HUGE ${"z".repeat(2000)}`;
+    const budgeted = applyAcpPromptBudget({
+      composed: `${BUDGET_SYSTEM}\n\n${huge}`,
+      sections: BUDGET_SECTIONS,
+      userText: huge,
+      budgetBytes: 512,
+    });
+    // the precondition: this input trims AND is still over the ceiling
+    expect(describeAcpPromptTrim(budgeted, 512)).not.toBeNull();
+    expect(acpPromptCeilingRefusal(budgeted.text, 512)).not.toBeNull();
+    await instance.adapter.sendTurn({
+      threadId: "t-ceiling-trim",
+      text: huge,
+      onContextCompressed: (ref) => void compressed.push(ref),
+      system: BUDGET_SYSTEM,
+      systemSections: BUDGET_SECTIONS,
+    });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_too_large" });
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(true);
+    expect(recorder.events.some((event) => event.type === "context.injected")).toBe(false);
+    expect(compressed).toHaveLength(0);
+    const methods = JSON.parse(readFileSync(dump, "utf8")) as string[];
+    expect(methods).not.toContain("session/prompt");
   });
 
   it("refuses a turn whose untrimmable text is over the hard ceiling, with a visible error", async () => {

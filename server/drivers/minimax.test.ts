@@ -756,13 +756,18 @@ describe("MinimaxDriver", () => {
       const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
       const instance = await make({ promptBudgetBytes: 512 }, bodies);
       const recorder = recordEvents(instance.adapter);
-      await instance.adapter.sendTurn(turnWith());
+      const compressed: Array<{ id: string; source: string; preview: string; bytes: number }> = [];
+      await instance.adapter.sendTurn(turnWith({ onContextCompressed: (ref) => void compressed.push(ref) }));
       await recorder.until((event) => event.type === "turn.completed");
       const sent = JSON.stringify(bodies[0].messages);
       expect(sent).not.toContain("MEMORY-BLOCK");
       expect(sent).toContain(keep);
       expect(bodies[0].messages.at(-1)).toMatchObject({ role: "user", content: "CURRENT" });
-      expect(recorder.events.find((e) => e.type === "context.injected" && e.source === "compression")).toBeDefined();
+      const row = recorder.events.find((e) => e.type === "context.injected" && e.source === "compression");
+      expect(row).toBeDefined();
+      // the harness hears the same row once, to hang it under the turn's message
+      expect(compressed).toHaveLength(1);
+      expect(compressed[0]).toMatchObject({ source: "compression", id: row && "itemId" in row ? row.itemId : undefined });
       recorder.stop();
       await instance.dispose();
     });
