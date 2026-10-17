@@ -251,14 +251,16 @@ export function detectEnginePlanFromWindows(
       if (/\bpro\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("pro")) ?? null;
     }
     if (engineId === "claude") {
-      if (/20x|20×|max_20|\b20\b/i.test(raw)) {
+      const planRaw = (w.planName ?? "").toLowerCase();
+      if (/20x|20×|max_20\b/i.test(planRaw)) {
         return options.find((o) => o.planName.toLowerCase().includes("20")) ?? null;
       }
-      if (/5x|5×|max_5|\b5\b/i.test(raw)) {
+      if (/5x|5×|max_5\b/i.test(planRaw)) {
         return options.find((o) => o.planName.toLowerCase().includes("5")) ?? null;
       }
-      if (/\bpro\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("pro")) ?? null;
-      if (/\bteam\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("team")) ?? null;
+      if (/\bpro\b/i.test(planRaw)) return options.find((o) => o.planName.toLowerCase().includes("pro")) ?? null;
+      if (/\bteam\b/i.test(planRaw)) return options.find((o) => o.planName.toLowerCase().includes("team")) ?? null;
+      if (/\bmax\b/i.test(planRaw)) return null;
     }
     if (engineId === "codex") {
       if (/lite|pro_lite/i.test(raw)) {

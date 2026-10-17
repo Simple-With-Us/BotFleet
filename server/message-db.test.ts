@@ -12,6 +12,7 @@ import {
   pruneDeadThreads,
   readThread,
   readThreadTail,
+  readThreadsTail,
   runningHelperRows,
   searchMessages,
   setActiveLeaf,
@@ -393,5 +394,30 @@ describe("message-db", () => {
     expect(path.at(-1)?.text).toBe("edited");
     // both branches survive in the tree
     expect(reloaded.messagesFor(bot.threadId).filter((m) => m.parentId === first.parentId)).toHaveLength(2);
+  });
+
+  it("readThreadsTail batch loads tails for multiple threads in chronological order", () => {
+    for (let i = 0; i < 5; i++) insertMessage("batch1", msg(`b1-${i}`, `batch1 text ${i}`));
+    for (let i = 0; i < 3; i++) insertMessage("batch2", msg(`b2-${i}`, `batch2 text ${i}`));
+    insertMessage("batch3", msg("b3-0", "only one"));
+
+    const tails = readThreadsTail(["batch1", "batch2", "batch3", "empty"], 2);
+    expect(tails.get("empty")).toEqual([]);
+    expect(tails.get("batch3")?.map((m) => m.id)).toEqual(["b3-0"]);
+    expect(tails.get("batch2")?.map((m) => m.id)).toEqual(["b2-1", "b2-2"]);
+    expect(tails.get("batch1")?.map((m) => m.id)).toEqual(["b1-3", "b1-4"]);
+
+    // empty threadIds list returns empty map
+    expect(readThreadsTail([], 10).size).toBe(0);
+  });
+
+  it("searchMessages filters by role in SQL and supports content JSON", () => {
+    insertMessage("role-test", msg("user-1", "special keyword in user turn", { role: "user" }));
+    insertMessage("role-test", msg("bot-1", "special keyword in bot turn", { role: "bot" }));
+    insertMessage("role-test", msg("sys-1", "special keyword in system turn", { role: "system" }));
+
+    // User and bot messages match; system messages are filtered out in SQL
+    const hits = searchMessages("special keyword");
+    expect(hits.map((h) => h.messageId).sort()).toEqual(["bot-1", "user-1"]);
   });
 });

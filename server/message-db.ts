@@ -180,6 +180,38 @@ export function readThreadTail(threadId: string, legacyFile: string, limit: numb
   return importLegacy(threadId, legacyFile);
 }
 
+/** Read the newest `limit` messages for multiple threads in one batched query.
+ * Uses a window function to partition by thread_id and order by rowid so
+ * only the tail rows are returned in chronological order. */
+export function readThreadsTail(threadIds: readonly string[], limit: number): Map<string, Message[]> {
+  const result = new Map<string, Message[]>();
+  for (const id of threadIds) {
+    result.set(id, []);
+  }
+  const uniqueIds = Array.from(new Set(threadIds));
+  if (uniqueIds.length === 0 || limit <= 0) return result;
+
+  const placeholders = uniqueIds.map(() => "?").join(", ");
+  const statement = db().prepare(
+    "SELECT thread_id, json FROM (" +
+      "SELECT thread_id, rowid AS seq, json, ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY rowid DESC) AS rn " +
+      `FROM messages WHERE thread_id IN (${placeholders})` +
+    ") WHERE rn <= ? ORDER BY thread_id, seq ASC",
+  );
+  // SAFETY: query returns `thread_id` and `json`, both TEXT columns on `messages`.
+  const rows = statement.all(...uniqueIds, limit) as Array<{ thread_id: string; json: string }>;
+  for (const row of rows) {
+    const list = result.get(row.thread_id);
+    const msg = rowToMessage(row);
+    if (list) {
+      list.push(msg);
+    } else {
+      result.set(row.thread_id, [msg]);
+    }
+  }
+  return result;
+}
+
 function importLegacy(threadId: string, legacyFile: string): ThreadRows {
   let messages: Message[] = [];
   let activeLeafId: string | null = null;
@@ -466,16 +498,18 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
   if (!needle) return [];
   // escape LIKE wildcards so a literal % or _ in the query stays literal
   const pattern = `%${needle.replace(/([\\%_])/g, "\\$1")}%`;
-  // text messages by their text; activity chips by the tool name — "which
+  // text messages by their text/content; activity chips by the tool name — "which
   // bot ran that migration" is a tool-name question. The chip's name lives
   // in the row's json; a JSON1 extract keeps this one query.
   const scope = threadId ? "thread_id = ? AND " : "";
   const statement = db().prepare(
-    "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
-      `WHERE ${scope}((kind = 'text' AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE '\\') ` +
+    "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.content') AS content, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
+      `WHERE ${scope}json_extract(json, '$.role') IN ('user', 'bot') ` +
+      "  AND ((lower(COALESCE(text, json_extract(json, '$.content'), '')) LIKE ? ESCAPE '\\') " +
       "   OR (kind = 'activity' AND tool_name IS NOT NULL AND lower(tool_name) LIKE ? ESCAPE '\\')) " +
       "ORDER BY at DESC LIMIT ?",
   );
+  // SAFETY: query returns columns from `messages` and JSON1 extractions.
   const rows = (threadId
     ? statement.all(threadId, pattern, pattern, limit)
     : statement.all(pattern, pattern, limit)) as Array<{
@@ -485,11 +519,12 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
     role: string;
     kind: string;
     text: string | null;
+    content: string | null;
     tool_name: string | null;
     from_name: string | null;
   }>;
   return rows.map((row) => {
-    const haystack = row.kind === "activity" ? (row.tool_name ?? "") : (row.text ?? "");
+    const haystack = row.kind === "activity" ? (row.tool_name ?? "") : (row.text ?? row.content ?? "");
     const hitAt = Math.max(0, haystack.toLowerCase().indexOf(needle));
     const start = Math.max(0, hitAt - 60);
     const end = Math.min(haystack.length, hitAt + needle.length + 90);

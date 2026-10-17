@@ -116,9 +116,9 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
     displayName: "OpenAI-compatible (OpenRouter / Groq)",
     supportsMultipleInstances: true,
     access: "custom",
-    // Mirrors the `capabilities` block in `create` below: agents + this
-    // computer only, with no Composio bridge, screen channel, or image input.
-    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
+    // Mirrors the `capabilities` block in `create` below: agents, this computer,
+    // and Composio, with no screen channel or image input.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: true, localComputerMcp: true, images: false },
   },
   models: DEFAULT_MODELS,
   // No CLI to install — the "install" is getting a free API key.
@@ -578,6 +578,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         capabilities: {
           sessionModelSwitch: "in-session",
           agentsMcp: true,
+          composioMcp: true,
           toolLoop: true,
           localComputerMcp: true,
           replaysTranscript: true,

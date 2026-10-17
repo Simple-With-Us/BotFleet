@@ -234,6 +234,47 @@ export function unpricedTurnCount(spend: EngineSpend | undefined): number {
   return (spend?.unpricedTurns5h ?? 0) + (spend?.unpricedTurns7d ?? 0);
 }
 
+export interface UsageDetailLine {
+  label: string;
+  value: string;
+  exhausted: boolean;
+  group: "window" | "external";
+}
+
+/** Construct detail lines for the Clutch row: DeepSeek Remaining Balance and the MiniMax subscription note. */
+export function buildClutchDetailLines(deepseekRow?: {
+  balanceUsd?: number | null;
+  grantedUsd?: number | null;
+  toppedUpUsd?: number | null;
+  availability?: string | null;
+  error?: string | null;
+} | null): UsageDetailLine[] {
+  const lines: UsageDetailLine[] = [];
+  if (deepseekRow && !deepseekRow.error && deepseekRow.balanceUsd != null) {
+    lines.push({
+      label: "DeepSeek Remaining Balance",
+      value: formatUsdBalance(deepseekRow.balanceUsd),
+      exhausted: deepseekRow.availability === "exhausted" || deepseekRow.balanceUsd <= 0,
+      group: "external",
+    });
+  }
+  lines.push({
+    label: "MiniMax (MM & MC)",
+    value: "Subscription (not API)",
+    exhausted: false,
+    group: "external",
+  });
+  if (deepseekRow && !deepseekRow.error && deepseekRow.grantedUsd != null && deepseekRow.toppedUpUsd != null) {
+    lines.push({
+      label: "Granted / Topped Up",
+      value: `$${deepseekRow.grantedUsd.toFixed(2)} granted · $${deepseekRow.toppedUpUsd.toFixed(2)} topped up`,
+      exhausted: false,
+      group: "external",
+    });
+  }
+  return lines;
+}
+
 function formatSpendUsd(amount: number): string {
   if (!amount || amount === 0) return "$0.00";
   if (amount < 0.01) return `<$0.01 ($${amount.toFixed(4)})`;
@@ -981,20 +1022,16 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                 group: "external" as const,
               });
             }
-            if (isDeepSeek && deepseekRow && !deepseekRow.error && deepseekRow.balanceUsd != null) {
-              detailLines.unshift({
-                label: "Remaining Balance",
-                value: formatUsdBalance(deepseekRow.balanceUsd),
-                exhausted: deepseekRow.availability === "exhausted" || deepseekRow.balanceUsd <= 0,
-                group: "external" as const,
-              });
-              if (deepseekRow.grantedUsd != null && deepseekRow.toppedUpUsd != null) {
-                detailLines.push({
-                  label: "Granted / Topped Up",
-                  value: `$${deepseekRow.grantedUsd.toFixed(2)} granted · $${deepseekRow.toppedUpUsd.toFixed(2)} topped up`,
-                  exhausted: false,
-                  group: "external" as const,
-                });
+            if (isDeepSeek) {
+              const clutchLines = buildClutchDetailLines(deepseekRow);
+              const balanceLine = clutchLines.find((l) => l.label === "DeepSeek Remaining Balance");
+              if (balanceLine) {
+                detailLines.unshift(balanceLine);
+              }
+              for (const line of clutchLines) {
+                if (line.label !== "DeepSeek Remaining Balance") {
+                  detailLines.push(line);
+                }
               }
             }
             const unpriced = unpricedTurnCount(spend);

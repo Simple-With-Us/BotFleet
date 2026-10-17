@@ -347,12 +347,10 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
   metadata: {
     displayName: "MiniMax",
     supportsMultipleInstances: true,
-    // Mirrors the `capabilities` block in `create` below, including what it
-    // does NOT declare: this driver mounts agents + local-computer tools and
-    // no Composio bridge, no screen channel, and no image input.  That
-    // absence is the reason the matrix shows connected apps as unavailable
-    // here while MiniMax Code shows them as available.
-    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
+    // Mirrors the `capabilities` block in `create` below: this driver mounts
+    // agents, local-computer, and Composio tools, with no screen channel
+    // and no image input.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: true, localComputerMcp: true, images: false },
   },
   models: MODELS,
   install: {
@@ -1002,6 +1000,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         capabilities: {
           sessionModelSwitch: "in-session",
           agentsMcp: true,
+          composioMcp: true,
           toolLoop: true,
           replaysTranscript: true,
           localComputerMcp: true,

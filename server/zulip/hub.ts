@@ -447,7 +447,12 @@ class ZulipSession {
 
   /** Wait the next backoff step.  False when the session was stopped. */
   private async backoff(reason: string, signal: AbortSignal): Promise<boolean> {
-    const wait = this.hub.backoffMs[Math.min(this.failures, this.hub.backoffMs.length - 1)]!;
+    const baseWait = this.hub.backoffMs[Math.min(this.failures, this.hub.backoffMs.length - 1)]!;
+    const jitter =
+      this.hub.sleep === abortableSleep && !this.hub.deps.timings?.backoffMs
+        ? 0.75 + Math.random() * 0.5
+        : 1;
+    const wait = Math.round(baseWait * jitter);
     this.failures += 1;
     this.setStatus("reconnecting", `${reason}; retrying in ${Math.round(wait / 1000)}s`);
     try {

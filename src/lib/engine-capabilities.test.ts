@@ -289,20 +289,15 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // (server/drivers/claude.ts, codex.ts, antigravity.ts, and the DSH
     // ACP adapter).  A missing key renders as "-", which reads as
     // "engine cannot do this" — the exact underclaim Codex flagged.
-    for (const id of ["claude", "codex", "antigravity", "deepseek-harness"]) {
+    for (const id of ["claude", "codex", "antigravity", "deepseek-harness", "minimax"]) {
       expect(ENGINE_CAPABILITIES[id].capabilities.connectedApps, id).toBe("yes");
     }
   });
 
-  it("marks MiniMax connectedApps as 'no' — the driver has no composioMcp", () => {
+  it("marks MiniMax connectedApps as 'yes' — the driver declares composioMcp", () => {
     // Connected Apps is the Composio bridge, and MiniMax's direct
-    // driver declares no composioMcp in server/drivers/minimax.ts
-    // (Claude, Codex, Antigravity, pi, and the DSH ACP adapter all
-    // declare it).  'limited' still implied a partial channel that does
-    // not exist; driving this Mac is the thisComputer row
-    // (localComputerMcp), a different thing.  Pin 'no' so a future edit
-    // cannot silently regress the matrix to overclaim.
-    expect(ENGINE_CAPABILITIES.minimax.capabilities.connectedApps).toBe("no");
+    // driver declares composioMcp in server/drivers/minimax.ts.
+    expect(ENGINE_CAPABILITIES.minimax.capabilities.connectedApps).toBe("yes");
   });
 
   it("keeps MiniMax Code a distinct engine row on the same Token Plan", () => {
@@ -327,7 +322,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // engine declares neither.
     expect(mcode.capabilities.connectedApps).toBe("yes");
     expect(mcode.capabilities.imageAttachments).toBe("yes");
-    expect(minimaxEntry.capabilities.connectedApps).toBe("no");
+    expect(minimaxEntry.capabilities.connectedApps).toBe("yes");
     // The matrix lists the ids a live mcode session actually advertises, so
     // the engine's declared models and the picker's rows agree.
     expect(mcode.defaultModels.map((m) => m.id)).toEqual([

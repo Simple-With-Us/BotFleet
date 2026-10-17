@@ -11,7 +11,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { UsageWhatIfProjection, apiEquivalentCost, projectionRows } from "./UsageWhatIfProjection.tsx";
 import { ENGINE_CAPABILITIES, uniqueModelToEngineId } from "@/lib/engine-capabilities.tsx";
-import { DoomedPairArraySchema, hasEngineSpendActivity, hidesIdleUnavailableEngineRow, unpricedTurnCount } from "./UsageSection.tsx";
+import { DoomedPairArraySchema, buildClutchDetailLines, hasEngineSpendActivity, hidesIdleUnavailableEngineRow, unpricedTurnCount } from "./UsageSection.tsx";
 import type { DoomedPair, RedundantChain } from "./UsageSection.tsx";
 
 describe("uniqueModelToEngineId", () => {
@@ -258,6 +258,57 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
     expect(all.claude.planName).toBe("Claude Pro");
     expect(all.codex.planName).toBe("ChatGPT Plus");
     expect(all.grok.planName).toBe("xAI SuperGrok");
+  });
+
+  it("does not falsely detect Claude Max 5x from duration window label or bare Max plan", () => {
+    const genericMaxWindow = [
+      { providerKey: "anthropic", label: "5-Hour", planName: "Max", usedPercent: 10 },
+    ];
+    expect(detectEnginePlanFromWindows("claude", genericMaxWindow)).toBeNull();
+
+    const explicit20xWindow = [
+      { providerKey: "anthropic", label: "5-Hour", planName: "Claude Max 20x", usedPercent: 10 },
+    ];
+    expect(detectEnginePlanFromWindows("claude", explicit20xWindow)).toEqual({
+      label: "Claude Max 20× ($213.20/mo)",
+      planName: "Claude Max 20×",
+      costPerMonth: 213.2,
+    });
+  });
+});
+
+describe("Clutch / DeepSeek remaining balance and MiniMax subscription note", () => {
+  it("verifies DeepSeek Remaining Balance and Subscription (not API) for MiniMax (MM & MC)", () => {
+    const lines = buildClutchDetailLines({
+      balanceUsd: 12.34,
+      availability: "available",
+      grantedUsd: 10,
+      toppedUpUsd: 5,
+    });
+    expect(lines).toContainEqual({
+      label: "DeepSeek Remaining Balance",
+      value: "$12.34 remaining",
+      exhausted: false,
+      group: "external",
+    });
+    expect(lines).toContainEqual({
+      label: "MiniMax (MM & MC)",
+      value: "Subscription (not API)",
+      exhausted: false,
+      group: "external",
+    });
+  });
+
+  it("includes MiniMax (MM & MC) subscription note when DeepSeek balance is missing", () => {
+    const lines = buildClutchDetailLines(null);
+    expect(lines).toEqual([
+      {
+        label: "MiniMax (MM & MC)",
+        value: "Subscription (not API)",
+        exhausted: false,
+        group: "external",
+      },
+    ]);
   });
 });
 

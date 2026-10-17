@@ -18525,7 +18525,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         zulipHub?.reconcile();
       }
       if (patch.tts?.audioRetentionDays !== undefined && !cleanupHoldReason(DATA_DIR)) {
-        runAudioRetentionSweep();
+        setImmediate(() => runAudioRetentionSweep());
       }
       // VPS mode-switch cleanup (mirrors Local VM at POST /api/local-computer/mode).
       // Runs after the save so the lateImpact→saveConfig window stays await-free

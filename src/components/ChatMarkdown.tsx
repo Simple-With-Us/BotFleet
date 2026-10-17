@@ -7,7 +7,7 @@
 // fence is very likely complete), then highlights and caches — so the settled
 // bubble, a fresh component instance, mounts straight from cache instead of
 // popping from plain to highlighted.
-import { isValidElement, memo, useEffect, useMemo, useState, type ReactNode } from "react";
+import { isValidElement, memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Check, Copy } from "lucide-react";
@@ -296,14 +296,17 @@ function Spoiler({ children }: { children?: ReactNode }) {
 
 const REMARK_PLUGINS = [remarkGfm, remarkMentions];
 
+// oxlint-disable-next-line anti-slop/no-runtime-typeof -- Flatten React node children into text for code blocks.
 const flattenCodeChildren = (n: ReactNode): string =>
   typeof n === "string"
     ? n
-    : Array.isArray(n)
-      ? n.map(flattenCodeChildren).join("")
-      : isValidElement<{ children?: ReactNode }>(n)
-        ? flattenCodeChildren(n.props.children)
-        : "";
+    : typeof n === "number"
+      ? String(n)
+      : Array.isArray(n)
+        ? n.map(flattenCodeChildren).join("")
+        : isValidElement<{ children?: ReactNode }>(n)
+          ? flattenCodeChildren(n.props.children)
+          : "";
 
 const STATIC_MARKDOWN_COMPONENTS = {
   img({ src, alt }: { src?: string; alt?: string }) {
@@ -403,8 +406,47 @@ const STATIC_MARKDOWN_COMPONENTS = {
   },
 };
 
+const STREAMING_THROTTLE_MS = 64;
+
+/**
+ * Throttle streaming Markdown text updates at 64 ms intervals so rapid token deltas
+ * do not re-run markdown AST parsing on every animation frame.  Static text or initial
+ * renders update immediately with zero latency.
+ */
+function useThrottledStreamingText(text: string, streaming: boolean): string {
+  const [renderedText, setRenderedText] = useState(text);
+  const lastRenderedTimeRef = useRef(Date.now());
+  const pendingTextRef = useRef(text);
+  pendingTextRef.current = text;
+
+  useEffect(() => {
+    if (!streaming) {
+      setRenderedText(text);
+      lastRenderedTimeRef.current = Date.now();
+      return;
+    }
+
+    const elapsed = Date.now() - lastRenderedTimeRef.current;
+    if (elapsed >= STREAMING_THROTTLE_MS) {
+      setRenderedText(text);
+      lastRenderedTimeRef.current = Date.now();
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      setRenderedText(pendingTextRef.current);
+      lastRenderedTimeRef.current = Date.now();
+    }, STREAMING_THROTTLE_MS - elapsed);
+
+    return () => clearTimeout(timeout);
+  }, [text, streaming]);
+
+  return streaming ? renderedText : text;
+}
+
 function ChatMarkdownComponent({ text, streaming = false }: { text: string; streaming?: boolean }) {
-  const content = text.replace(/&nbsp;/g, "\u00A0");
+  const displayText = useThrottledStreamingText(text, streaming);
+  const content = displayText.replace(/&nbsp;/g, "\u00A0");
   const components = useMemo(
     () => ({
       ...STATIC_MARKDOWN_COMPONENTS,
