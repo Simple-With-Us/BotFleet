@@ -1040,7 +1040,7 @@ export function ModelPicker({
             )}
           </div>
         </div>;
-        return widePopover && typeof document !== "undefined" ? createPortal(content, document.body) : content;
+        return widePopover && globalThis.document !== undefined ? createPortal(content, globalThis.document.body) : content;
       })()}
     </div>
   );
