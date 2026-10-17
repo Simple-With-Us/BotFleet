@@ -460,7 +460,9 @@ describe("section cut priority", () => {
 
 describe("token budget", () => {
   const prose = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+  const cyrillic = "Быстрая коричневая лиса прыгает через ленивую собаку. ".repeat(200);
   const cjk = "这是一个很长的中文句子用来测试预算。".repeat(200);
+  const code = '{"id":[1,2,3],"name":"x_y","ok":true,"nested":{"a":null}}\n'.repeat(200);
 
   it("keeps the default when nothing is set, and promptBudgetBytes still wins", () => {
     expect(resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: undefined, model: "x", composed: prose }))
@@ -470,13 +472,25 @@ describe("token budget", () => {
       .toEqual({ bytes: 4096, basis: "bytes" });
   });
 
-  it("turns a token cap into bytes with the prompt's own ratio, so CJK gets fewer bytes per token", () => {
-    const a = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 10_000, model: undefined, composed: prose });
-    const b = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 10_000, model: undefined, composed: cjk });
+  it("turns a token cap into bytes with the prompt's own ratio, so non-ASCII text gets fewer bytes per token", () => {
+    const budget = (composed: string) =>
+      resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 10_000, model: undefined, composed });
+    const a = budget(prose);
+    const b = budget(cyrillic);
+    const c = budget(cjk);
     expect(a.basis).toBe("tokens");
     expect(a.tokens).toBe(8000);
     expect(a.bytes!).toBeGreaterThan(b.bytes!);
+    // CJK is 3 bytes for about 1 token, so it can never get more bytes than ASCII does.
+    expect(a.bytes!).toBeGreaterThanOrEqual(c.bytes!);
     expect(estimateTokens(prose)).toBeLessThan(Buffer.byteLength(prose));
+  });
+
+  it("estimates code and JSON at no fewer than 1 token per 3 bytes, so a code-heavy prompt stays inside the window", () => {
+    expect(estimateTokens(code)).toBeGreaterThanOrEqual(Math.ceil(Buffer.byteLength(code) / 3));
+    const r = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 10_000, model: undefined, composed: code });
+    // 8000 budgeted tokens at the real-world code density of about 3 bytes per token.
+    expect(r.bytes!).toBeLessThanOrEqual(8000 * 3);
   });
 
   it("clamps the cap to a model's published window and never clamps an unknown model", () => {
@@ -484,6 +498,8 @@ describe("token budget", () => {
     expect(known.tokens).toBe(Math.floor(204_800 * 0.8));
     const m3 = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 524_288, model: "MiniMax-M3.1-Flash-Preview", composed: prose });
     expect(m3.tokens).toBe(Math.floor(524_288 * 0.8));
+    const thinking = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 5_000_000, model: "MiniMax-M2.7-highspeed-thinking", composed: prose });
+    expect(thinking.tokens).toBe(Math.floor(204_800 * 0.8));
     const unknown = resolveAcpPromptBudget({ configuredBytes: undefined, capTokens: 5_000_000, model: "some-other-model", composed: prose });
     expect(unknown.tokens).toBe(4_000_000);
   });
