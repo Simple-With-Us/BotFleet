@@ -65,6 +65,16 @@ final class SpeechDictation: ObservableObject {
         }
     }
 
+    /// Start capturing without toggling.
+    ///
+    /// `toggle` is the composer's control and a toggle is wrong for a voice
+    /// call: the call opens the microphone again at the end of every turn, and
+    /// a toggle would close it instead whenever the recognizer happened to have
+    /// stopped on its own.  Same work, no inversion.
+    func startCapturing(base: String) {
+        start(base: base)
+    }
+
     private func start(base: String) {
         guard !isListening, !isStarting else { return }
         guard recordedWAV == nil else {

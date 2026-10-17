@@ -444,6 +444,13 @@ export class FakeZulip {
         .map((message) => this.wireFor(message, user.user_id));
       return send(200, { result: "success", messages: found });
     }
+    const oneMessage = req.method === "GET" ? /^messages\/(\d+)$/.exec(path) : null;
+    if (oneMessage) {
+      const id = Number(oneMessage[1]);
+      const found = this.messages.find((message) => message.id === id && message.recipients.includes(user.user_id));
+      if (!found) return send(404, { result: "error", msg: "Message not found", code: "MESSAGE_NOT_FOUND" });
+      return send(200, { result: "success", message: this.wireFor(found, user.user_id) });
+    }
     if (req.method === "GET" && path === "users/me/subscriptions") {
       const left = this.unsubscribed.get(user.user_id) ?? new Set<string>();
       const subscriptions = [...this.streams.entries()]

@@ -47,18 +47,19 @@ export function pruneFailedInstallBundles(appPath, options = {}) {
   const { keep = FAILED_INSTALL_KEEP, listNames, remove } = options;
   const bundleName = basename(appPath);
   const appDir = dirname(appPath);
-  if (!bundleName) return [];
+  if (!bundleName) return { removed: [], failures: [] };
   const present = listNames(appDir);
   const removed = [];
+  const failures = [];
   for (const name of failedInstallBundlesToPrune(present, bundleName, keep)) {
     const path = join(appDir, name);
     if (dirname(path) !== appDir) continue;
     try {
       remove(path);
       removed.push(path);
-    } catch {
-      /* in use, or not ours to remove */
+    } catch (error) {
+      failures.push({ path, error });
     }
   }
-  return removed;
+  return { removed, failures };
 }
