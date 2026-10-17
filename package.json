@@ -91,7 +91,7 @@
     "test:server-start": "node --test scripts/botfleet-server-start.node-test.mjs scripts/launchd/harness-watchdog.node-test.mjs",
     "postinstall": "node scripts/compile-clutch-dep.mjs",
     "test:cred-sync": "node --test scripts/sync-cli-credentials.node-test.mjs",
-    "test:kody-autofix": "node --test .github/autofix/kody-pilot.node-test.mjs",
+    "test:kody-autofix": "node --test .github/autofix/kody-pilot.node-test.mjs scripts/autofix-workflows.node-test.mjs",
     "build:shared": "tsc -p tsconfig.shared.build.json --emitDeclarationOnly --outDir dist-shared-types && node scripts/bundle-shared.mjs"
   },
   "dependencies": {
