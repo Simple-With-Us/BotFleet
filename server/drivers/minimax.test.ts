@@ -772,6 +772,56 @@ describe("MinimaxDriver", () => {
       await instance.dispose();
     });
 
+    it("counts the volatile-context framing the request carries, so a prompt that only fits unframed still trims", async () => {
+      const composedBytes = Buffer.byteLength(`${stable + old + keep}\n\nCURRENT`);
+      // just over the composed prompt: it fits as composed, but the request also
+      // carries the framed context note (about a hundred bytes), which does not
+      const tight: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const tightInstance = await make({ promptBudgetBytes: composedBytes + 10 }, tight);
+      const tightRecorder = recordEvents(tightInstance.adapter);
+      await tightInstance.adapter.sendTurn(turnWith());
+      await tightRecorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(tight[0].messages)).not.toContain("MEMORY-BLOCK");
+      expect(tightRecorder.events.some((e) => e.type === "context.injected" && e.source === "compression")).toBe(true);
+      tightRecorder.stop();
+      await tightInstance.dispose();
+      // with room for the framing the same turn is sent whole
+      const roomy: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const roomyInstance = await make({ promptBudgetBytes: composedBytes + 400 }, roomy);
+      const roomyRecorder = recordEvents(roomyInstance.adapter);
+      await roomyInstance.adapter.sendTurn(turnWith());
+      await roomyRecorder.until((event) => event.type === "turn.completed");
+      expect(JSON.stringify(roomy[0].messages)).toContain("MEMORY-BLOCK");
+      expect(roomyRecorder.events.some((e) => e.type === "context.injected" && e.source === "compression")).toBe(false);
+      roomyRecorder.stop();
+      await roomyInstance.dispose();
+    });
+
+    it("frees the thread after a refused turn, so the next turn on it is not 'already running'", async () => {
+      const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      const instance = await make({ promptBudgetBytes: 64 }, bodies);
+      const recorder = recordEvents(instance.adapter);
+      const big = `STABLE ${"s ".repeat(400)}`;
+      await expect(
+        instance.adapter.sendTurn(turnWith({
+          system: big + old + keep,
+          systemStable: big,
+          systemSections: [
+            { id: "persona", text: big, volatile: false },
+            { id: "memory", text: old, volatile: true },
+            { id: "mentions", text: keep, volatile: true },
+          ],
+        })),
+      ).rejects.toThrow(/not sent/);
+      expect(bodies).toHaveLength(0);
+      // same thread, now a prompt with no system block, which no budget applies to
+      await instance.adapter.sendTurn({ threadId: "thread-budget", text: "again" });
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(bodies).toHaveLength(1);
+      recorder.stop();
+      await instance.dispose();
+    });
+
     it("trims from a contextCapTokens cap alone", async () => {
       const bodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
       const instance = await make({ contextCapTokens: 200 }, bodies);
