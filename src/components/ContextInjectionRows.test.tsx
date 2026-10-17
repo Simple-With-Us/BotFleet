@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { clearItemIoCache, primeItemIo } from "@/lib/item-io";
+import { boundText } from "../../shared/item-io";
 import type { ContextInjectionRef } from "../../shared/context-injection";
 import { ContextInjectionRow, ContextInjectionRows } from "./ContextInjectionRows";
 
@@ -97,5 +98,33 @@ describe("the opened row", () => {
     const html = open(memory);
     expect(html).not.toContain("<img");
     expect(html).toContain("&lt;img");
+  });
+});
+
+describe("the Compressing Context row", () => {
+  const compression: ContextInjectionRef = {
+    id: "ctx-9",
+    source: "compression",
+    preview: "142.0 KiB to 96.1 KiB: dropped 12 earlier turns and memory",
+    bytes: 47000,
+  };
+
+  it("says Compressing Context when closed, with what it saved", () => {
+    const html = renderToStaticMarkup(createElement(ContextInjectionRow, { entry: compression, threadId: "t" }));
+    expect(html).toContain("Compressing Context");
+    expect(html).not.toContain("Context injection ·");
+    expect(html).toContain("dropped 12 earlier turns and memory");
+    expect(html).toContain('aria-expanded="false"');
+  });
+
+  it("opens to the sizes and section names", () => {
+    primeItemIo(
+      { threadId: "t", itemId: "ctx-9" },
+      { status: "loaded", io: { itemId: "ctx-9", at: "x", text: boundText("Budget: 128.0 KiB\nSections dropped: memory") } },
+    );
+    const html = renderToStaticMarkup(createElement(ContextInjectionRow, { entry: compression, threadId: "t", defaultOpen: true }));
+    expect(html).toContain('aria-expanded="true"');
+    expect(html).toContain("Sections dropped: memory");
+    expect(html).toContain("older context was cut");
   });
 });

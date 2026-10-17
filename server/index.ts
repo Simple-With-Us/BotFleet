@@ -437,7 +437,9 @@ import {
 } from "./room-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ITEM_ID_MAX_LENGTH, ItemIoStore } from "./item-io-store.ts";
+import type { ContextInjectionRef } from "../shared/context-injection.ts";
 import {
+  addInjectionRef,
   draftFromReplay,
   draftFromReply,
   draftsFromPromptSections,
@@ -7570,15 +7572,15 @@ async function startTurn(
       // model fallback dispatches the same message again.  A card continuation
       // has no stored message, so its rows go under the last one on the active
       // path (server/context-injection.ts `injectionTarget`).
+      const target = () =>
+        injectionTarget({
+          stored: store.messagesFor(threadId),
+          userMessageId: userMessage.id,
+          unstored: opts?.cardContinuation === true,
+          // only a card continuation reads it; skip the walk for every other turn
+          activePath: opts?.cardContinuation === true ? store.activePath(threadId) : [],
+        });
       const recordInjections = (drafts: readonly InjectionDraft[]) => {
-        const target = () =>
-          injectionTarget({
-            stored: store.messagesFor(threadId),
-            userMessageId: userMessage.id,
-            unstored: opts?.cardContinuation === true,
-            // only a card continuation reads it; skip the walk for every other turn
-            activePath: opts?.cardContinuation === true ? store.activePath(threadId) : [],
-          });
         recordContextInjections(
           {
             publish: (event) => bus.publish(event),
@@ -7618,6 +7620,20 @@ async function startTurn(
         onReplayRecovered: () => {
           const replay = recoveryText === undefined ? null : draftFromReplay(recoveryText, replyBase, "handoff");
           if (replay) recordInjections([replay]);
+        },
+        // A driver that cut older context to fit the prompt budget has already
+        // published the "Compressing Context" event; this hangs its row under the
+        // message that started THIS turn, not whichever user message is latest
+        // (a follow-up can be stored before the turn's prompt is built).
+        onContextCompressed: (ref: ContextInjectionRef) => {
+          try {
+            const held = target();
+            if (!held) return;
+            const next = addInjectionRef(held.contextInjections, ref);
+            if (next !== held.contextInjections) store.patchMessage(threadId, held.id, { contextInjections: next });
+          } catch (error) {
+            console.error("context-compression: could not attach", error);
+          }
         },
         transcript: driverTranscript,
         // `buildTurnTools` only returns tool surfaces the harness can

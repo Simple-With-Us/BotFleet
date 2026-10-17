@@ -299,6 +299,11 @@ if (argv[0] === "models" || argv.includes("--list-models")) {
 // twice, then answered once".  FAKE_ACP_PARTIAL_FAILS instead streams a chunk
 // and THEN dies, which the replay-safety guard must refuse to retry.
 let failAfterChunk = false;
+// FAKE_ACP_FAIL_AT_PROMPT defers the same 503 death to the session/prompt
+// request, so the child boots and answers every setup call first.  That is the
+// shape of a failure after the harness has budgeted and sent the prompt but
+// before any output: the one a relaunch retries with the prompt built twice.
+let failAtPrompt = false;
 if (process.env.FAKE_ACP_TRANSIENTS && process.env.FAKE_ACP_STATE) {
   let launched = 0;
   try {
@@ -309,6 +314,8 @@ if (process.env.FAKE_ACP_TRANSIENTS && process.env.FAKE_ACP_STATE) {
   if (launched < quota) {
     if (process.env.FAKE_ACP_PARTIAL_FAILS) {
       failAfterChunk = true;
+    } else if (process.env.FAKE_ACP_FAIL_AT_PROMPT) {
+      failAtPrompt = true;
     } else {
       process.stderr.write("fake-acp: HTTP 503 service temporarily unavailable\n");
       process.exit(5);
@@ -618,6 +625,10 @@ function handle(msg: any, resumed = false) {
       break;
     }
     case "session/prompt": {
+      if (failAtPrompt) {
+        process.stderr.write("fake-acp: HTTP 503 service temporarily unavailable\n");
+        process.exit(5);
+      }
       if (LINGERING_CHILD_MODES.has(mode) && !lingeringChildReady) {
         if (mode === "cancel-exits-with-child") {
           // The prompt hangs from here on, so there is nothing to hold back.

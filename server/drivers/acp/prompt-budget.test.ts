@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import { buildTurnContext, ROOM_REPLY_PREFIX, TURN_REPLY_CUE } from "../../turn-context.ts";
 import {
   ACP_PROMPT_SECTION_OMITTED,
+  acpPromptCeilingRefusal,
   applyAcpPromptBudget,
   decodeAcpPromptBudgetBytes,
+  describeAcpPromptTrim,
   DEFAULT_ACP_PROMPT_BUDGET_BYTES,
   MAX_ACP_PROMPT_BUDGET_BYTES,
   resolveAcpPromptBudgetBytes,
@@ -371,5 +373,48 @@ describe("decodeAcpPromptBudgetBytes", () => {
     expect(resolveAcpPromptBudgetBytes(undefined)).toBe(DEFAULT_ACP_PROMPT_BUDGET_BYTES);
     expect(resolveAcpPromptBudgetBytes(0)).toBeNull();
     expect(resolveAcpPromptBudgetBytes(2048)).toBe(2048);
+  });
+});
+
+describe("what a trim reports", () => {
+  it("counts dropped history turns and names dropped sections, with no prompt text", () => {
+    const input = prompt();
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: bytes(input.composed) - bytes(historyOld) - bytes(volOld) + 60 });
+    expect(result.trimmed).toBe(true);
+    expect(result.dropped.historyTurns).toBeGreaterThanOrEqual(1);
+    expect(result.dropped.sections).toContain("memory");
+    const trim = describeAcpPromptTrim(result, 1000)!;
+    expect(trim.preview).toMatch(/dropped \d+ earlier turn/);
+    expect(trim.preview).toContain("memory");
+    expect(trim.text).toContain("Budget:");
+    expect(trim.text).toContain("Sections dropped: memory");
+    expect(trim.bytesSaved).toBeGreaterThan(0);
+    for (const secret of ["ancient", "alpha", "beta", "recent", current]) {
+      expect(trim.text).not.toContain(secret);
+      expect(trim.preview).not.toContain(secret);
+    }
+  });
+
+  it("reports nothing for a prompt that fit", () => {
+    const input = prompt();
+    const result = applyAcpPromptBudget({ ...input, budgetBytes: bytes(input.composed) });
+    expect(result.dropped).toEqual({ historyTurns: 0, sections: [] });
+    expect(describeAcpPromptTrim(result, bytes(input.composed))).toBeNull();
+  });
+});
+
+describe("the hard ceiling", () => {
+  it("allows a prompt up to twice the budget and refuses beyond it, naming sizes only", () => {
+    expect(acpPromptCeilingRefusal("x".repeat(2000), 1000)).toBeNull();
+    const refused = acpPromptCeilingRefusal(`SECRET-${"y".repeat(2100)}`, 1000)!;
+    expect(refused.ceiling).toBe(2000);
+    expect(refused.message).toContain("was not sent");
+    expect(refused.message).toContain("hard limit");
+    expect(refused.message).not.toContain("SECRET");
+  });
+
+  it("never refuses when the budget is off", () => {
+    expect(acpPromptCeilingRefusal("x".repeat(10_000_000), null)).toBeNull();
+    expect(acpPromptCeilingRefusal("x".repeat(10_000_000), 0)).toBeNull();
   });
 });
