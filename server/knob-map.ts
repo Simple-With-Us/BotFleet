@@ -209,6 +209,46 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     min: 5,
     max: 1440,
   },
+  {
+    id: "agentProxy.enabled",
+    label: "Agent proxy enabled",
+    section: "agentProxy",
+    path: ["enabled"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_ENABLED",
+    kind: "bool",
+  },
+  {
+    id: "agentProxy.address",
+    label: "Agent proxy address",
+    section: "agentProxy",
+    path: ["address"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_ADDRESS",
+    kind: "string",
+  },
+  {
+    id: "agentProxy.projectId",
+    label: "Agent proxy project ID",
+    section: "agentProxy",
+    path: ["projectId"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_PROJECT_ID",
+    kind: "string",
+  },
+  {
+    id: "agentProxy.environment",
+    label: "Agent proxy environment",
+    section: "agentProxy",
+    path: ["environment"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_ENV",
+    kind: "string",
+  },
+  {
+    id: "agentProxy.secretPath",
+    label: "Agent proxy secret path",
+    section: "agentProxy",
+    path: ["secretPath"],
+    infisicalName: "BOTFLEET_AGENT_PROXY_PATH",
+    kind: "string",
+  },
 ] as const;
 
 /** Every Infisical name this process will accept as a knob, built once from

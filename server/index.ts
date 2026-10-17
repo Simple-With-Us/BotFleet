@@ -256,6 +256,7 @@ import {
 import { waitForComputerCall } from "./computer-call-gate.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
 import {
+  applyAgentProxyEnv,
   ensureDirs,
   instanceConfigs,
   loadConfig,
@@ -303,7 +304,7 @@ import { cleanupHoldReason, listDataFaults, registerLeftOverSetAsideFiles } from
 import { ComputerControl } from "./computer-control.ts";
 import { findCliCandidates, resetPathCache } from "./env-path.ts";
 import { cliProbeEnvironment } from "./cli-probe-env.ts";
-import { describeSpawnFailure, execCli } from "./procs.ts";
+import { describeSpawnFailure, execCli, setSpawnEnvTransform } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
 import { modelEffortLevels } from "../src/lib/model-effort.ts";
 import type { LineageContext } from "../shared/model-lineage.ts";
@@ -961,6 +962,10 @@ const updateDrain = new UpdateDrain({
   log: (line) => console.warn(line),
 });
 const cfg = loadConfig();
+// Agent CLIs spawn with the Infisical Agent Proxy environment when it is on.  Read
+// from the in-memory `cfg` (mutated in place on every save and vault refresh), so a
+// spawn never re-reads config.json.
+setSpawnEnvTransform((env) => applyAgentProxyEnv(cfg, env));
 // bootComplete is declared above createUpdateControl (BOTFLEET-2M). Flipped
 // once at the end of this file when everything a secret change might rebuild
 // exists; a snapshot that lands before then is applied to `cfg` only.
