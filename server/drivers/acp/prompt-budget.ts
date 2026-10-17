@@ -466,10 +466,18 @@ export function decodeAcpContextCapTokens(raw: unknown): number | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
-/** A rough token count: ASCII at about 4 characters per token, everything else
- *  at about 1 token per character.  An estimate, not the model's tokenizer.  It is used to turn a
- *  token budget into bytes for this prompt, so the ratio adapts to code, prose
- *  and CJK text alike. */
+/** ASCII characters per token assumed by `estimateTokens`.  English prose runs
+ *  near 4, but source code and JSON, which fill most of an agent prompt, run
+ *  near 3.  The estimate sizes a hard prompt budget, so it errs toward more
+ *  tokens: at 4 a code-heavy prompt budgeted to 80% of the window could pass
+ *  the window itself, and the 20% reserve is for the reply, not for this error. */
+export const ASCII_CHARS_PER_TOKEN = 3;
+
+/** A rough, deliberately high token count: ASCII at `ASCII_CHARS_PER_TOKEN`
+ *  characters per token, everything else at about 1 token per character.  An
+ *  estimate, not the model's tokenizer.  It is used to turn a token budget into
+ *  bytes for this prompt, so the ratio adapts to code, prose and non-ASCII
+ *  text alike. */
 export function estimateTokens(text: string): number {
   let ascii = 0;
   let other = 0;
@@ -477,7 +485,7 @@ export function estimateTokens(text: string): number {
     if (ch.charCodeAt(0) < 128) ascii++;
     else other++;
   }
-  return Math.ceil(ascii / 4 + other);
+  return Math.ceil(ascii / ASCII_CHARS_PER_TOKEN + other);
 }
 
 /** The byte budget for one turn.

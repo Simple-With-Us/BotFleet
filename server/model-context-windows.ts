@@ -20,8 +20,13 @@ const WINDOWS: ReadonlyMap<string, number> = new Map([
 ]);
 
 /** The published window for a model id, or undefined when it is not known.
- *  Matches the id exactly, ignoring case. */
+ *  Matches the id exactly, ignoring case, after dropping a trailing
+ *  `-thinking`: the mcode engine lists its models that way (for example
+ *  `MiniMax-M3.1-Flash-Preview-thinking`), and the variant has the same window
+ *  as the base model.  This mirrors `catalogMinimaxPriceKey` in
+ *  gen-ai-cost.ts. */
 export function contextWindowFor(model: string | undefined | null): number | undefined {
   if (!model) return undefined;
-  return WINDOWS.get(model.trim().toLowerCase());
+  const id = model.trim().toLowerCase();
+  return WINDOWS.get(id) ?? WINDOWS.get(id.replace(/-thinking$/, ""));
 }
