@@ -800,7 +800,7 @@ export function ModelPicker({
       <ContextSection
         caps={contextCaps}
         windowTokens={active?.models.options.find((option) => option.id === selection.model)?.contextWindow}
-        current={selection.contextCap}
+        current={selection.contextCap ?? undefined}
         onPick={(cap) => commit(selectionWithContextCap(selection, cap))}
         disabled={Boolean(bot.busy)}
       />
@@ -808,7 +808,7 @@ export function ModelPicker({
   const maxOutputSection =
     !contained && effortApplies && selectionSupportsMaxOutput(active, selection) ? (
       <MaxOutputSection
-        current={selection.maxOutputTokens}
+        current={selection.maxOutputTokens ?? undefined}
         windowTokens={active?.models.options.find((option) => option.id === selection.model)?.contextWindow}
         onPick={(tokens) => commit(selectionWithMaxOutput(selection, tokens))}
         disabled={Boolean(bot.busy)}

@@ -17,15 +17,21 @@ export function selectionForPick(
     const allowed = modelEffortLevels(instance, targetOption, model);
     if (allowed.includes(current.effort)) next.effort = current.effort;
   }
-  // Same for the context cap.
-  if (current.contextCap) {
-    const targetOption = instance.models.options.find((option) => option.id === model);
-    if (targetOption?.contextCaps?.length) next.contextCap = current.contextCap;
+  // Same for the context cap and the output limit, but only a value the new
+  // model would still send: startTurn drops a cap the row does not offer and
+  // either value past the model's window, so carrying one over would save a
+  // limit that never runs and shows as invalid in the picker.
+  const targetOption = instance.models.options.find((option) => option.id === model);
+  if (current.contextCap && targetOption?.contextCaps?.length) {
+    const fits = targetOption.contextWindow === undefined
+      ? targetOption.contextCaps.includes(current.contextCap)
+      : current.contextCap <= targetOption.contextWindow;
+    if (fits) next.contextCap = current.contextCap;
   }
-  // And the output limit.
-  if (current.maxOutputTokens) {
-    const targetOption = instance.models.options.find((option) => option.id === model);
-    if (targetOption?.supportsMaxOutput) next.maxOutputTokens = current.maxOutputTokens;
+  if (current.maxOutputTokens && targetOption?.supportsMaxOutput) {
+    if (targetOption.contextWindow === undefined || current.maxOutputTokens <= targetOption.contextWindow) {
+      next.maxOutputTokens = current.maxOutputTokens;
+    }
   }
   // Fleet Models passes onChange for the primary pill.  Keep that bot's
   // fallbacks so picking a new primary does not wipe the chain.
@@ -79,9 +85,12 @@ export function selectionContextCaps(
   return instance?.models.options.find((candidate) => candidate.id === selection.model)?.contextCaps ?? [];
 }
 
-/** What changing only the context cap saves; `undefined` is the full window. */
+/** What changing only the context cap saves; `undefined` is the full window.
+ *  Clearing sends an explicit `null` rather than dropping the key: the harness
+ *  keeps a saved cap for a client that never sends the field (the shipped iOS
+ *  app), so a dropped key would not clear it. */
 export function selectionWithContextCap(current: ModelSelection, cap: number | undefined): ModelSelection {
-  return { ...current, contextCap: cap };
+  return { ...current, contextCap: cap ?? null };
 }
 
 /** "512K", "1M": how a cap or window reads on a button. */
@@ -98,9 +107,11 @@ export function selectionSupportsMaxOutput(
   return instance?.models.options.find((candidate) => candidate.id === selection.model)?.supportsMaxOutput === true;
 }
 
-/** What changing only the output limit saves; `undefined` is the model's own. */
+/** What changing only the output limit saves; `undefined` is the model's own.
+ *  Clearing sends an explicit `null`, for the reason `selectionWithContextCap`
+ *  gives. */
 export function selectionWithMaxOutput(current: ModelSelection, tokens: number | undefined): ModelSelection {
-  return { ...current, maxOutputTokens: tokens };
+  return { ...current, maxOutputTokens: tokens ?? null };
 }
 
 /** Parse the Max Output Tokens field.  Empty is "use the model default"

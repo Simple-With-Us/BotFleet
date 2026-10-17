@@ -76,14 +76,14 @@ export function ModelSettings({
             <ContextSection
               caps={caps}
               windowTokens={windowTokens}
-              current={selection.contextCap}
+              current={selection.contextCap ?? undefined}
               onPick={(cap) => onChange(selectionWithContextCap(selection, cap))}
               disabled={disabled}
             />
           )}
           {selectionSupportsMaxOutput(instance, selection) && (
             <MaxOutputSection
-              current={selection.maxOutputTokens}
+              current={selection.maxOutputTokens ?? undefined}
               windowTokens={windowTokens}
               onPick={(tokens) => onChange(selectionWithMaxOutput(selection, tokens))}
               disabled={disabled}

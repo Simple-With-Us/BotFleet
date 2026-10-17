@@ -261,10 +261,13 @@ export interface ModelSelection {
   /** Always the real slug that runs, also for a "Latest <Class>" entry. */
   model: string;
   effort?: EffortLevel;
-  /** Working-context cap in tokens; absent is the model's full window. */
-  contextCap?: number;
-  /** Output limit in tokens; absent leaves the model's own limit. */
-  maxOutputTokens?: number;
+  /** Working-context cap in tokens; absent is the model's full window.  `null`
+   *  is how a write clears a saved cap (an absent key keeps it for older
+   *  clients), and the harness never sends it back. */
+  contextCap?: number | null;
+  /** Output limit in tokens; absent leaves the model's own limit.  `null`
+   *  clears a saved limit, like `contextCap`. */
+  maxOutputTokens?: number | null;
   /** The model class this entry floats on ("sonnet" = Latest Sonnet); see
    *  shared/model-lineage.ts.  The picker sends `null` when a person picks
    *  a pinned model, so the harness does not carry an older float forward. */

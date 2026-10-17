@@ -135,7 +135,11 @@ describe("context cap", () => {
   it("saves only the cap and keeps the rest of the selection", () => {
     const current: ModelSelection = { instanceId: "minimax", model: "m31", effort: "high" };
     expect(selectionWithContextCap(current, 524_288)).toEqual({ ...current, contextCap: 524_288 });
-    expect(selectionWithContextCap({ ...current, contextCap: 524_288 }, undefined).contextCap).toBeUndefined();
+    // Clearing sends an explicit null: the harness keeps a saved cap for a
+    // client that omits the key (the shipped iOS app), so a dropped key would
+    // not clear it.
+    expect(selectionWithContextCap({ ...current, contextCap: 524_288 }, undefined).contextCap).toBeNull();
+    expect(JSON.parse(JSON.stringify(selectionWithContextCap({ ...current, contextCap: 524_288 }, undefined)))).toHaveProperty("contextCap", null);
   });
 
   it("keeps the cap on a model pick only when the new model offers a cap", () => {
@@ -143,6 +147,25 @@ describe("context cap", () => {
     expect(selectionForPick(current, MM, "m31").contextCap).toBe(524_288);
     expect(selectionForPick({ ...current, contextCap: 300_000 }, MM, "m31").contextCap).toBe(300_000);
     expect(selectionForPick(current, MM, "m27").contextCap).toBeUndefined();
+  });
+
+  it("drops a cap the new model would not send: past its window, or not in its list when the window is unknown", () => {
+    const inst: InstanceInfo = {
+      ...MM,
+      models: {
+        default: "big",
+        options: [
+          { id: "big", label: "Big", contextWindow: 1_000_000, contextCaps: [524_288] },
+          { id: "small", label: "Small", contextWindow: 262_144, contextCaps: [131_072] },
+          { id: "open", label: "Open", contextCaps: [131_072] },
+        ],
+      },
+    };
+    const current: ModelSelection = { instanceId: "minimax", model: "big", contextCap: 524_288 };
+    expect(selectionForPick(current, inst, "small").contextCap).toBeUndefined();
+    expect(selectionForPick(current, inst, "open").contextCap).toBeUndefined();
+    expect(selectionForPick({ ...current, contextCap: 131_072 }, inst, "small").contextCap).toBe(131_072);
+    expect(selectionForPick({ ...current, contextCap: 131_072 }, inst, "open").contextCap).toBe(131_072);
   });
 
   it("labels caps the way MiniMax Code does", () => {
@@ -173,6 +196,26 @@ describe("max output tokens", () => {
     const cur: ModelSelection = { instanceId: "mm", model: "a", maxOutputTokens: 8192 };
     expect(selectionForPick(cur, inst, "a").maxOutputTokens).toBe(8192);
     expect(selectionForPick(cur, inst, "b").maxOutputTokens).toBeUndefined();
-    expect(selectionWithMaxOutput(cur, undefined).maxOutputTokens).toBeUndefined();
+    expect(selectionWithMaxOutput(cur, undefined).maxOutputTokens).toBeNull();
+    expect(JSON.parse(JSON.stringify(selectionWithMaxOutput(cur, undefined)))).toHaveProperty("maxOutputTokens", null);
+  });
+
+  it("does not carry a limit over to a model whose window is smaller than it", () => {
+    const inst: InstanceInfo = {
+      instanceId: "mm", driverKind: "minimax", displayName: "MiniMax", snapshot: { state: "available" },
+      models: {
+        default: "big",
+        options: [
+          { id: "big", label: "Big", contextWindow: 1_000_000, supportsMaxOutput: true },
+          { id: "small", label: "Small", contextWindow: 204_800, supportsMaxOutput: true },
+          { id: "unknown", label: "Unknown", supportsMaxOutput: true },
+        ],
+      },
+    };
+    const cur: ModelSelection = { instanceId: "mm", model: "big", maxOutputTokens: 300_000 };
+    expect(selectionForPick(cur, inst, "small").maxOutputTokens).toBeUndefined();
+    expect(selectionForPick({ ...cur, maxOutputTokens: 204_800 }, inst, "small").maxOutputTokens).toBe(204_800);
+    // A model with no known window cannot say the limit is too big, so it stays.
+    expect(selectionForPick(cur, inst, "unknown").maxOutputTokens).toBe(300_000);
   });
 });
