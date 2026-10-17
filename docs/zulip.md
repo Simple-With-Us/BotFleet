@@ -140,6 +140,34 @@ Zulip delivers every event to every queue registered for a user.  If two process
 
 All three are offered only to a bot whose Zulip session is connected, never in a dry run, and only on a turn that may speak for the bot: a Zulip turn (or a continuation of one), a scheduled owner-authored routine, or a turn Jay is attending in BotFleet.  Webhook, manually replayed routine, iMessage, Linq, resource and job turns, and a peer-invoked (`ask_bot`) turn, get none of them (`server/zulip/mount.ts`).  On the MCP lane the agents proxy publishes them when the harness sets `OMB_ZULIP=1`, the turn's comms grant carries the same bit, and `/api/internal/zulip/{reply,post,follow}` refuses a grant without it and takes the caller's identity from the grant, never from the arguments.  On the HTTP lane the tool host bakes the identity in at dispatch.
 
+## Dispatcher Routing via the Plugin Platform
+
+The hub can route qualifying DMs and mentions through an installed
+integration instead of waking the mentioned bot directly.  The
+reference integration is the optional `zulip-wake` plugin
+(`docs/plugins/zulip-plugin/`); the framework is
+`docs/plugins/EVENT-PLATFORM.md`.
+
+- With no Zulip plugin installed and enabled, everything above runs
+  unchanged: the mentioned bot wakes directly.
+- With `zulip-wake` enabled, a qualifying message is offered to the
+  plugin as a typed envelope (already authenticated, canonically
+  fetched, deduplicated).  The plugin returns a dispatcher target —
+  usually the Director bot's inbox — with source context and the
+  scoped chat listing, and the host starts the dispatcher turn on the
+  dispatcher's own session, reusing the unit machinery (coalescing,
+  budgets, retries, bindings, auto-reply).  The dispatcher decides
+  where the message belongs and replies through the connector under
+  the correct identity.
+- A declined, timed-out, or unknown-target decision falls back to the
+  legacy direct wake.  Nothing is queued twice and nothing is dropped:
+  ownership is claimed before the decision awaits, and late retry
+  decisions re-fetch canonically and queue exactly once.
+- Configure the dispatcher bot id, peer routing, and followed-topic
+  routing in Plugins → Configure and health.  Health shows pending,
+  dead-letter, and recent outcomes as reason codes; Send test event
+  exercises the full path without touching Zulip.
+
 ## Tests
 
 `server/zulip/*.test.ts` run against `server/testing/fake-zulip-server.ts`, a `node:http` fake with real event queues, Basic auth, `BAD_EVENT_QUEUE_ID`, mention flags computed outside code and quotes, channel ids, subscriptions, `user_topics` with `user_topic` events, member deactivation, and 429 injection.  `pnpm vitest run server/zulip` runs them; `pnpm test` picks them up with the rest.

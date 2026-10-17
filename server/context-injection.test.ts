@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   MemoryChangeGate,
+  addInjectionRef,
   draftFromReplay,
   draftFromReply,
   draftsFromPromptSections,
@@ -347,5 +348,27 @@ describe("a card continuation", () => {
     );
     expect(recorded).toMatchObject({ source: "continuation", bytes: Buffer.byteLength(note, "utf8") });
     expect(events[0]).toMatchObject({ type: "context.injected", source: "continuation", io: { text: { text: note } } });
+  });
+});
+
+describe("addInjectionRef", () => {
+  const row: ContextInjectionRef = { id: "ctx-1", source: "compression", preview: "142.0 KiB to 96.1 KiB: dropped 12 earlier turns", bytes: 47_000 };
+
+  it("appends the row to a message that has none, or other rows", () => {
+    expect(addInjectionRef(undefined, row)).toEqual([row]);
+    const memory: ContextInjectionRef = { id: "ctx-0", source: "memory", preview: "MEMORY.md", bytes: 10 };
+    expect(addInjectionRef([memory], row)).toEqual([memory, row]);
+  });
+
+  it("hands back the same array for the row it already holds, by id", () => {
+    const held = [row];
+    expect(addInjectionRef(held, { ...row })).toBe(held);
+  });
+
+  it("hands back the same array for a second row that reads the same, as a model fallback produces", () => {
+    const held = [row];
+    expect(addInjectionRef(held, { ...row, id: "ctx-2" })).toBe(held);
+    // a row of a different size says something new
+    expect(addInjectionRef(held, { ...row, id: "ctx-3", bytes: 48_000 })).toHaveLength(2);
   });
 });
