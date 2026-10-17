@@ -269,7 +269,7 @@ function BotModelRow({ bot }: { bot: Bot }) {
       <div className="flex min-w-0 flex-1 flex-wrap items-start gap-2">
         <div className={CHIP}>
           <ChipLabel>Primary</ChipLabel>
-          <ModelPicker bot={bot} contained selection={bot.modelSelection} onChange={savePrimary} />
+          <ModelPicker bot={bot} contained widePopover selection={bot.modelSelection} onChange={savePrimary} />
         </div>
 
         {/* Never fewer places than the bot stores: a chain longer than the cap
@@ -305,6 +305,7 @@ function BotModelRow({ bot }: { bot: Bot }) {
                   <ModelPicker
                     bot={bot}
                     contained
+                    widePopover
                     selection={fallback}
                     onChange={(selection) => setFallback(index, selection)}
                   />

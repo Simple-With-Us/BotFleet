@@ -5,6 +5,7 @@ import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { BotFallbackModels } from "./BotFallbackModels";
 import { ModelPicker } from "./ModelPicker";
+import { ModelSettings } from "./ModelSettings";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { railAsideClass } from "@/lib/layout-rails";
@@ -692,6 +693,14 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               </div>
             );
           })()}
+
+          <ModelSettings
+            instance={engine}
+            selection={bot.modelSelection}
+            showEffort={false}
+            disabled={Boolean(bot.busy)}
+            onChange={(modelSelection) => patch({ modelSelection })}
+          />
 
           {roundsGate.visible && (
             <MaxToolRoundsField

@@ -229,6 +229,11 @@ export function selectionForFallbackPick(pick: ModelSelection): ModelSelection {
     instanceId: pick.instanceId,
     model: pick.model,
     effort: pick.effort,
+    // The fallback's own context cap and output limit run with it, like its
+    // effort.  Both are gated per model at dispatch, so one that the fallback
+    // model does not offer is dropped there.
+    ...(pick.contextCap !== undefined ? { contextCap: pick.contextCap } : {}),
+    ...(pick.maxOutputTokens !== undefined ? { maxOutputTokens: pick.maxOutputTokens } : {}),
     ...(pick.latest ? { latest: pick.latest } : {}),
   };
 }

@@ -2201,6 +2201,9 @@ function checkSelectionEntry(
   return null;
 }
 
+/** A context cap or output limit: a whole number of tokens, 1 to 10,000,000. */
+const TOKEN_LIMIT_SCHEMA = z.number().int().min(1).max(10_000_000);
+
 function checkedModelSelection(
   raw: unknown,
   /** The saved selection this write replaces.  `storedFallbacks` is how many
@@ -2218,7 +2221,7 @@ function checkedModelSelection(
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, status: 400, error: "modelSelection must be an object" };
   }
-  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown; latest?: unknown };
+  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown; contextCap?: unknown; maxOutputTokens?: unknown; latest?: unknown };
   if (typeof value.instanceId !== "string" || !value.instanceId.trim()) {
     return { ok: false, status: 400, error: "modelSelection.instanceId is required" };
   }
@@ -2234,6 +2237,20 @@ function checkedModelSelection(
       return { ok: false, status: 400, error: `effort "${String(value.effort)}" is not recognized` };
     }
     selection.effort = value.effort;
+  }
+  if (value.contextCap !== undefined && value.contextCap !== null) {
+    const contextCap = TOKEN_LIMIT_SCHEMA.safeParse(value.contextCap);
+    if (!contextCap.success) {
+      return { ok: false, status: 400, error: "modelSelection.contextCap must be a whole number of tokens" };
+    }
+    selection.contextCap = contextCap.data;
+  }
+  if (value.maxOutputTokens !== undefined && value.maxOutputTokens !== null) {
+    const maxOutputTokens = TOKEN_LIMIT_SCHEMA.safeParse(value.maxOutputTokens);
+    if (!maxOutputTokens.success) {
+      return { ok: false, status: 400, error: "modelSelection.maxOutputTokens must be a whole number of tokens" };
+    }
+    selection.maxOutputTokens = maxOutputTokens.data;
   }
   // "Latest <Class>": `null` means pinned (see checkLineageWrite).
   if (value.latest !== undefined && value.latest !== null) {
@@ -2302,6 +2319,8 @@ function checkedModelSelection(
     selection.instanceId !== current.selection.instanceId ||
     selection.model !== current.selection.model ||
     selection.effort !== current.selection.effort ||
+    selection.contextCap !== current.selection.contextCap ||
+    selection.maxOutputTokens !== current.selection.maxOutputTokens ||
     JSON.stringify(selection.fallbacks) !== JSON.stringify(current.selection.fallbacks)
   );
   if (current?.busy && changed) {
@@ -4975,6 +4994,8 @@ async function launchFallbackTurn(input: {
         instanceId: following.instanceId,
         model: following.model,
         effort: following.effort,
+        ...(following.contextCap !== undefined ? { contextCap: following.contextCap } : {}),
+        ...(following.maxOutputTokens !== undefined ? { maxOutputTokens: following.maxOutputTokens } : {}),
       };
       fallbackAttemptByTurn.set(key, following.nextUsed);
       store.patchBot(botId, { activeModelSelection: nextSelection });
@@ -7643,6 +7664,23 @@ async function startTurn(
         text: jobReminder.text ? `${jobReminder.text}\n\n${turnText}` : turnText,
         model,
         effort,
+        // Only a cap this model's row offers reaches a driver; a stale value
+        // from a model the bot has since left is dropped here.
+        ...(!boxCloud && selection.contextCap !== undefined &&
+        targetOption?.contextCaps?.length &&
+        (targetOption.contextWindow === undefined
+          ? targetOption.contextCaps.includes(selection.contextCap)
+          : selection.contextCap <= targetOption.contextWindow)
+          ? { contextCapTokens: selection.contextCap }
+          : {}),
+        // An output limit goes out only for a model whose driver sends one, and
+        // never above the model's own window when the catalog knows it.
+        ...(!boxCloud &&
+        selection.maxOutputTokens !== undefined &&
+        targetOption?.supportsMaxOutput &&
+        (targetOption.contextWindow === undefined || selection.maxOutputTokens <= targetOption.contextWindow)
+          ? { maxOutputTokens: selection.maxOutputTokens }
+          : {}),
         // a rewound thread never resumes the abandoned branch's session
         // the active task's own session — another task's cursor would
         // resume the wrong conversation and defeat the context bubble

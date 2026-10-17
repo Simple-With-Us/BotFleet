@@ -4,7 +4,8 @@
 // Local models are not a row under each engine: when any are configured the
 // rail grows one "Local Models" entry that lists them all, and when none are
 // there is nothing to show.
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Check, ChevronDown, Search } from "lucide-react";
 import { useStore, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
 import { filterCustomModels, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
@@ -20,7 +21,17 @@ import {
   opensOnLocalModels,
   type LocalModelGroup,
 } from "@/lib/local-models";
-import { pickedSelection, selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
+import {
+  contextCapLabel,
+  pickedSelection,
+  selectionContextCaps,
+  selectionEffortLevels,
+  selectionWithContextCap,
+  parseMaxOutputInput,
+  selectionSupportsMaxOutput,
+  selectionWithEffort,
+  selectionWithMaxOutput,
+} from "@/lib/model-pick";
 import { effortLabel } from "@/lib/model-effort";
 import type { EffortLevel } from "../../server/contracts.ts";
 import { ProviderMark } from "./ProviderIcons";
@@ -89,6 +100,161 @@ export function LatestModelRows({
       })}
       <div className="mx-2 my-1.5 border-t border-hairline/40" role="separator" />
     </>
+  );
+}
+
+/** "Max Input Tokens": how much of the model's window the bot may fill before
+ *  BotFleet compresses the prompt.  Empty is "no limit" (the model's full
+ *  window).  Presets are the caps the model offers, and a custom number is
+ *  accepted up to the window.  It is the one context cap field, stored as
+ *  `modelSelection.contextCap`.  A model with no caps gets no section. */
+export function ContextSection({
+  caps,
+  windowTokens,
+  current,
+  onPick,
+  disabled = false,
+  className,
+}: {
+  caps: readonly number[];
+  /** The model's full window in tokens, when known; a custom value above it is refused. */
+  windowTokens?: number;
+  /** The bot's saved cap; undefined is no limit. */
+  current: number | undefined;
+  onPick: (cap: number | undefined) => void;
+  disabled?: boolean;
+  className?: string;
+}) {
+  const [text, setText] = useState(current === undefined || caps.includes(current) ? "" : String(current));
+  useEffect(() => setText(current === undefined || caps.includes(current) ? "" : String(current)), [current, caps]);
+  if (!caps.length) return null;
+  const parsed = parseMaxOutputInput(text, windowTokens);
+  const invalid = parsed === null;
+  const commitCustom = () => {
+    if (parsed === null || parsed === undefined || parsed === current) return;
+    onPick(parsed);
+  };
+  return (
+    <div
+      role="group"
+      aria-label="Max Input Tokens"
+      data-context-section
+      className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
+    >
+      <EngineGroupLabel className="px-1 pb-1.5">Max Input Tokens</EngineGroupLabel>
+      <div className="flex flex-wrap gap-1">
+        {[undefined, ...caps].map((cap) => {
+          const checked = current === cap;
+          return (
+            <button
+              key={cap ?? "default"}
+              type="button"
+              aria-pressed={checked}
+              disabled={disabled}
+              onClick={() => onPick(cap)}
+              className={cn(
+                "flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12.5px] disabled:cursor-not-allowed disabled:opacity-60",
+                checked
+                  ? "border-accent/40 bg-control text-ink"
+                  : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink disabled:hover:bg-transparent disabled:hover:text-ink-secondary",
+              )}
+            >
+              {checked && <Check size={12} className="shrink-0 text-accent" />}
+              {cap === undefined ? (windowTokens ? `No Limit (${contextCapLabel(windowTokens)})` : "No Limit") : contextCapLabel(cap)}
+            </button>
+          );
+        })}
+      </div>
+      <input
+        type="text"
+        inputMode="numeric"
+        value={text}
+        placeholder="Custom"
+        disabled={disabled}
+        aria-label="Custom max input tokens"
+        aria-invalid={invalid}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={commitCustom}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commitCustom();
+        }}
+        className={cn(
+          "mt-1.5 w-full rounded-lg border bg-control px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-secondary disabled:cursor-not-allowed disabled:opacity-60",
+          invalid ? "border-red-500/60" : "border-hairline/40",
+        )}
+      />
+      <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">
+        {invalid
+          ? windowTokens
+            ? `Enter a whole number up to ${windowTokens.toLocaleString("en-US")}.`
+            : "Enter a whole number."
+          : (disabled ? "Stop the bot to change this.\u00A0 " : "") + "A smaller limit compresses the prompt sooner.\u00A0 Empty is no limit."}
+      </p>
+    </div>
+  );
+}
+
+/** "Max Output Tokens": an optional output limit.  Empty is Default, and
+ *  nothing is sent.  A value commits on Enter or blur; one that is not a whole
+ *  number, or is past the model's window, is flagged and not saved. */
+export function MaxOutputSection({
+  current,
+  windowTokens,
+  onPick,
+  disabled = false,
+  className,
+}: {
+  /** The bot's saved limit; undefined is Default. */
+  current: number | undefined;
+  /** The model's window in tokens, when known; a limit above it is refused. */
+  windowTokens?: number;
+  onPick: (tokens: number | undefined) => void;
+  disabled?: boolean;
+  className?: string;
+}) {
+  const [text, setText] = useState(current === undefined ? "" : String(current));
+  useEffect(() => setText(current === undefined ? "" : String(current)), [current]);
+  const parsed = parseMaxOutputInput(text, windowTokens);
+  const invalid = parsed === null;
+  const commit = () => {
+    if (parsed === null || parsed === current) return;
+    onPick(parsed);
+  };
+  return (
+    <div
+      role="group"
+      aria-label="Max Output Tokens"
+      data-max-output-section
+      className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
+    >
+      <EngineGroupLabel className="px-1 pb-1.5">Max Output Tokens</EngineGroupLabel>
+      <input
+        type="text"
+        inputMode="numeric"
+        value={text}
+        placeholder="Default"
+        disabled={disabled}
+        aria-invalid={invalid}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commit();
+        }}
+        className={cn(
+          "w-full rounded-lg border bg-control px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-secondary disabled:cursor-not-allowed disabled:opacity-60",
+          invalid ? "border-red-500/60" : "border-hairline/40",
+        )}
+      />
+      <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">
+        {invalid
+          ? windowTokens
+            ? `Enter a whole number up to ${windowTokens.toLocaleString("en-US")}.`
+            : "Enter a whole number."
+          : disabled
+            ? "Stop the bot to change this.\u00A0 Empty uses the model default."
+            : "Empty uses the model default."}
+      </p>
+    </div>
   );
 }
 
@@ -304,6 +470,13 @@ export function ModelRow({
     windowsLabel?: string;
   };
 }) {
+  const contextLabel = option.contextWindow
+    ? option.contextWindow >= 1_000_000
+      ? `${Math.floor(option.contextWindow / 1_000_000)}M`
+      : `${Math.floor(option.contextWindow / 1_000)}K`
+    : null;
+  const normalizedBadge = option.badge?.replace(/^(\d+(?:\.\d+)?[MK])\s+Context$/i, "$1");
+  const badge = normalizedBadge === contextLabel ? null : normalizedBadge;
   return (
     <button
       type="button"
@@ -348,18 +521,16 @@ export function ModelRow({
               className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
               title={`${option.contextWindow.toLocaleString()} tokens max`}
             >
-              {option.contextWindow >= 1000000
-                ? `${Math.floor(option.contextWindow / 1000000)}M`
-                : `${Math.floor(option.contextWindow / 1000)}K`}
+              {contextLabel}
             </span>
           )}
-          {option.badge && (
+          {badge && (
             <span
               className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
-              title={option.badgeTitle ?? option.badge}
-              aria-label={option.badgeTitle ?? option.badge}
+              title={option.badgeTitle ?? badge}
+              aria-label={option.badgeTitle ?? badge}
             >
-              {option.badge}
+              {badge}
             </span>
           )}
           {quota?.capped && (
@@ -468,6 +639,7 @@ export function ModelPicker({
   bot,
   className,
   contained = false,
+  widePopover = false,
   label,
   selection: propSelection,
   onChange,
@@ -479,6 +651,8 @@ export function ModelPicker({
   /** Expand the menu in-flow under the trigger so it cannot overflow a
    * narrow parent (the Bot profile sidebar). */
   contained?: boolean;
+  /** Fleet-wide cards have room for a menu wider than their trigger. */
+  widePopover?: boolean;
   label?: ReactNode;
   selection?: ModelSelection;
   onChange?: (selection: ModelSelection) => void;
@@ -494,6 +668,37 @@ export function ModelPicker({
   const [query, setQuery] = useState("");
   const [showAll, setShowAll] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [popoverPosition, setPopoverPosition] = useState({ left: 12, top: 12 });
+  // The wide menu is fixed-positioned so a clipping card cannot cut it off.
+  // It mounts inside the nearest modal dialog (Settings) when there is one, so
+  // that dialog's Tab trap still sees its controls, and on the body otherwise.
+  const [popoverHost, setPopoverHost] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!open || !widePopover) return;
+    setPopoverHost(rootRef.current?.closest<HTMLElement>('[role="dialog"][aria-modal="true"]') ?? document.body);
+    const align = () => {
+      const root = rootRef.current?.getBoundingClientRect();
+      if (!root) return;
+      const width = Math.min(480, Math.max(0, window.innerWidth - 24));
+      setPopoverPosition({
+        left: Math.max(12, Math.min(root.left, window.innerWidth - 12 - width)),
+        top: root.bottom + 8,
+      });
+    };
+    align();
+    window.addEventListener("resize", align);
+    window.addEventListener("scroll", align, true);
+    return () => {
+      window.removeEventListener("resize", align);
+      window.removeEventListener("scroll", align, true);
+    };
+  }, [open, widePopover]);
+  // Tab from the trigger must land in the menu, which no longer follows the
+  // trigger in document order once it is fixed-positioned and portaled.
+  useLayoutEffect(() => {
+    if (open && widePopover && popoverHost) contentRef.current?.focus({ preventScroll: true });
+  }, [open, widePopover, popoverHost]);
 
   const selection = propSelection || bot.modelSelection;
   const active = state.instances.find((instance) => instance.instanceId === selection.instanceId);
@@ -517,7 +722,7 @@ export function ModelPicker({
     if (!open) return;
     const closeOnOutsideClick = (event: MouseEvent) => {
       const clickedNode = event.target instanceof Node ? event.target : null;
-      if (!rootRef.current?.contains(clickedNode)) setOpen(false);
+      if (!rootRef.current?.contains(clickedNode) && !contentRef.current?.contains(clickedNode)) setOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
@@ -629,6 +834,26 @@ export function ModelPicker({
         disabled={Boolean(bot.busy)}
       />
     ) : null;
+  const contextCaps = contained ? [] : selectionContextCaps(active, selection);
+  const contextSection =
+    effortApplies && contextCaps.length > 0 ? (
+      <ContextSection
+        caps={contextCaps}
+        windowTokens={active?.models.options.find((option) => option.id === selection.model)?.contextWindow}
+        current={selection.contextCap ?? undefined}
+        onPick={(cap) => commit(selectionWithContextCap(selection, cap))}
+        disabled={Boolean(bot.busy)}
+      />
+    ) : null;
+  const maxOutputSection =
+    !contained && effortApplies && selectionSupportsMaxOutput(active, selection) ? (
+      <MaxOutputSection
+        current={selection.maxOutputTokens ?? undefined}
+        windowTokens={active?.models.options.find((option) => option.id === selection.model)?.contextWindow}
+        onPick={(tokens) => commit(selectionWithMaxOutput(selection, tokens))}
+        disabled={Boolean(bot.busy)}
+      />
+    ) : null;
   const chipEffort =
     !contained && selection.effort && effortLevels.includes(selection.effort) ? selection.effort : undefined;
 
@@ -712,7 +937,7 @@ export function ModelPicker({
   );
 
   return (
-    <div ref={rootRef} className={cn(contained ? "w-full" : "relative", className)}>
+    <div ref={rootRef} className={cn(contained ? "relative w-full" : "relative", className)}>
       {/* Contained (Settings) stacks: label on its own line, the control
           full width beneath it.  The row layout this replaced squeezed the
           label and its subtitle into a narrow column beside the trigger, so
@@ -737,14 +962,19 @@ export function ModelPicker({
         />
       )}
 
-      {open && (
-        <div
+      {open && (() => {
+        const content = <div
+          ref={contentRef}
           data-model-picker-content
           role="dialog"
           aria-label="Choose Model"
+          tabIndex={widePopover ? -1 : undefined}
+          style={widePopover ? { ...popoverPosition, maxHeight: `min(560px, calc(100dvh - ${popoverPosition.top + 12}px))` } : undefined}
           className={cn(
             "flex overflow-hidden rounded-2xl border border-hairline/50 bg-card",
-            contained
+            widePopover
+              ? "fixed z-50 w-[480px] max-w-[calc(100vw-24px)] shadow-2xl shadow-black/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              : contained
               ? "relative mt-3 w-full max-h-[min(420px,50dvh)]"
               : "absolute right-0 top-full z-30 mt-2 w-[420px] min-w-[380px] max-w-[min(640px,calc(100vw-2rem))] max-h-[min(560px,calc(100dvh-7rem))] resize shadow-2xl shadow-black/50",
           )}
@@ -822,6 +1052,8 @@ export function ModelPicker({
                   onPick={pick}
                 />
                 {effortSection}
+                {contextSection}
+                {maxOutputSection}
               </>
             ) : railInstance ? (
               <>
@@ -997,6 +1229,8 @@ export function ModelPicker({
                       )}
                     </div>
                     {effortSection}
+                    {contextSection}
+                    {maxOutputSection}
                   </>
                 )}
               </>
@@ -1004,8 +1238,11 @@ export function ModelPicker({
               <div className="px-4 py-5 text-[13px] text-ink-secondary">No model providers are available.</div>
             )}
           </div>
-        </div>
-      )}
+        </div>;
+        if (!widePopover || globalThis.document === undefined) return content;
+        // The host is resolved in a layout effect, so this null never paints.
+        return popoverHost ? createPortal(content, popoverHost) : null;
+      })()}
     </div>
   );
 }

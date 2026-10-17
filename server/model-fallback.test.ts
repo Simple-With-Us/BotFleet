@@ -405,6 +405,13 @@ describe("selectTurnFallback", () => {
     });
   });
 
+  it("carries a fallback's own context cap and output limit, and adds neither when unset", () => {
+    expect(
+      selectionForFallbackPick({ instanceId: "minimax", model: "m", effort: "high", contextCap: 524_288, maxOutputTokens: 8192 }),
+    ).toEqual({ instanceId: "minimax", model: "m", effort: "high", contextCap: 524_288, maxOutputTokens: 8192 });
+    expect("contextCap" in selectionForFallbackPick({ instanceId: "minimax", model: "m" })).toBe(false);
+  });
+
   it("cancelled or interrupted does not fail over", () => {
     const afterUser: FallbackScanMessage[] = [{ role: "bot", kind: "activity", tool: { name: "Bash" } }];
     expect(decide(afterUser, { ok: false, stopReason: "cancelled" })).toBeUndefined();
