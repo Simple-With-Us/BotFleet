@@ -39,6 +39,10 @@ export interface ZulipInboundItem {
   /** Why it woke the bot: an @-mention, a 1:1 DM, or a new message in a
    *  topic the bot follows.  Absent on units saved before follows existed. */
   via?: "mention" | "dm" | "followed";
+  /** Plugin-platform routing hint for the dispatcher turn, and the role
+   *  that routed it.  Untrusted input; the prompt wraps it as such. */
+  pluginHint?: string;
+  routedFrom?: string;
 }
 
 /** One unit of work: every message for one origin that arrived before the

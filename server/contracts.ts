@@ -9,7 +9,7 @@ import type { ComputerMount } from "./computer-grants.ts";
 import type { ToolPolicy } from "./tool-policy.ts";
 import type { SubagentSnapshot } from "../shared/helpers.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
-import type { ContextSource } from "../shared/context-injection.ts";
+import type { ContextInjectionRef, ContextSource } from "../shared/context-injection.ts";
 import type { ItemIoCapture } from "../shared/item-io.ts";
 import type { ReviewHook, ReviewPrompt } from "../shared/auto-review.ts";
 import type { ToolScope } from "../shared/tool-scope.ts";
@@ -309,6 +309,13 @@ export interface SendTurnInput {
    * that cannot rebuild does not call it, and a throw here must not fail the
    * turn. */
   onReplayRecovered?: () => void;
+  /** Called at most once per logical turn by a driver that cut older context
+   * to fit the prompt budget (the ACP driver), right after it publishes the
+   * `context.injected` event for the cut.  The ref is the row's own record:
+   * the harness hangs it under the message that started this turn, which only
+   * it knows.  A relaunch after a transient failure does not call it again.
+   * Never required, and a throw here must not fail the turn. */
+  onContextCompressed?: (ref: ContextInjectionRef) => void;
   /** Prior turns for transcript-replay providers (API-backed drivers).
    *  Each entry may carry tool call and result metadata so the executor
    *  can replay a multi-step turn that has already been settled: the
