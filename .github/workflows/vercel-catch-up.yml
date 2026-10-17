@@ -59,8 +59,8 @@ jobs:
           INFISICAL_SECRET_PATH: /
           INFISICAL_NAMES: VERCEL_TOKEN
           INFISICAL_REQUIRED: VERCEL_TOKEN
-          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
-          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_AUTOMATION_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_AUTOMATION_CLIENT_SECRET }}
         run: node scripts/infisical-fetch.mjs
       - name: Check binding, deployed SHA, cooldown and exact-main CI
         id: gate
