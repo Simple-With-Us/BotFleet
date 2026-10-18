@@ -138,6 +138,8 @@ public enum DatabaseError: LocalizedError, Equatable {
     }
 }
 
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 /// Native Swift SQLite persistence engine with WAL mode and FTS5 full-text search.
 /// Replaces flat JSON transcript parsing and fsyncSync file rewrites with sub-millisecond
 /// transactional reads, concurrent background writes, and instant snippet search.
@@ -273,10 +275,10 @@ public actor DatabaseService {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (thread.id as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 2, (thread.title as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (thread.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (thread.title as NSString).utf8String, -1, SQLITE_TRANSIENT)
         if let botId = thread.botId {
-            sqlite3_bind_text(stmt, 3, (botId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 3, (botId as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 3)
         }
@@ -302,7 +304,7 @@ public actor DatabaseService {
 
         sqlite3_bind_int(stmt, 1, Int32(limit))
         if let botId = botId {
-            sqlite3_bind_text(stmt, 2, (botId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 2, (botId as NSString).utf8String, -1, SQLITE_TRANSIENT)
         }
 
         var results: [ThreadRecord] = []
@@ -326,7 +328,7 @@ public actor DatabaseService {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
         }
@@ -346,21 +348,21 @@ public actor DatabaseService {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (message.id as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 2, (message.threadId as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 3, (message.role as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 4, (message.kind as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 5, (message.content as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (message.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (message.threadId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, (message.role as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 4, (message.kind as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 5, (message.content as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_double(stmt, 6, message.createdAt)
 
         if let model = message.model {
-            sqlite3_bind_text(stmt, 7, (model as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 7, (model as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 7)
         }
 
         if let leaf = message.activeLeafId {
-            sqlite3_bind_text(stmt, 8, (leaf as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 8, (leaf as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 8)
         }
@@ -369,14 +371,17 @@ public actor DatabaseService {
             throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
         }
 
-        // Update thread updated_at timestamp
+        // Update thread updated_at timestamp inside the same logical write
         let updateThreadSql = "UPDATE threads SET updated_at = ?1 WHERE id = ?2;"
         var updateStmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, updateThreadSql, -1, &updateStmt, nil) == SQLITE_OK {
-            sqlite3_bind_double(updateStmt, 1, message.createdAt)
-            sqlite3_bind_text(updateStmt, 2, (message.threadId as NSString).utf8String, -1, nil)
-            _ = sqlite3_step(updateStmt)
-            sqlite3_finalize(updateStmt)
+        guard sqlite3_prepare_v2(db, updateThreadSql, -1, &updateStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(updateStmt) }
+        sqlite3_bind_double(updateStmt, 1, message.createdAt)
+        sqlite3_bind_text(updateStmt, 2, (message.threadId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(updateStmt) == SQLITE_DONE else {
+            throw DatabaseError.stepFailed(String(cString: sqlite3_errmsg(db)))
         }
     }
 
@@ -392,7 +397,7 @@ public actor DatabaseService {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (threadId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (threadId as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 2, Int32(limit))
         if let before = before {
             sqlite3_bind_double(stmt, 3, before)
@@ -462,10 +467,10 @@ public actor DatabaseService {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (formattedQuery as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (formattedQuery as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 2, Int32(limit))
         if let threadId = threadId {
-            sqlite3_bind_text(stmt, 3, (threadId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 3, (threadId as NSString).utf8String, -1, SQLITE_TRANSIENT)
         }
 
         var results: [DatabaseSearchResult] = []
@@ -501,10 +506,10 @@ public actor DatabaseService {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (run.id as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 2, (run.routineId as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 3, (run.botId as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 4, (run.status as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (run.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (run.routineId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, (run.botId as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 4, (run.status as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_double(stmt, 5, run.startedAt)
 
         if let completed = run.completedAt {
@@ -514,7 +519,7 @@ public actor DatabaseService {
         }
 
         if let err = run.error {
-            sqlite3_bind_text(stmt, 7, (err as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 7, (err as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 7)
         }
@@ -533,7 +538,7 @@ public actor DatabaseService {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (routineId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (routineId as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 2, Int32(limit))
 
         var results: [RoutineRunRecord] = []
@@ -573,10 +578,10 @@ public actor DatabaseService {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (delivery.id as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 2, (delivery.webhookId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (delivery.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (delivery.webhookId as NSString).utf8String, -1, SQLITE_TRANSIENT)
         if let botId = delivery.botId {
-            sqlite3_bind_text(stmt, 3, (botId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 3, (botId as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 3)
         }
@@ -587,12 +592,12 @@ public actor DatabaseService {
         }
         sqlite3_bind_double(stmt, 5, delivery.deliveredAt)
         if let payload = delivery.payload {
-            sqlite3_bind_text(stmt, 6, (payload as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 6, (payload as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 6)
         }
         if let response = delivery.response {
-            sqlite3_bind_text(stmt, 7, (response as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 7, (response as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 7)
         }
@@ -611,7 +616,7 @@ public actor DatabaseService {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (webhookId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (webhookId as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 2, Int32(limit))
 
         var results: [WebhookDeliveryRecord] = []
