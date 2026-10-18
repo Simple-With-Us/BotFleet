@@ -15,19 +15,64 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # BF-2259: autofix runs (1) whenever a comment or review body carries an
+  # explicit `@autofix` mention, or (2) once automatically, on the PR's first
+  # review from Sentry, Kody, or Codex that recommends changes.  These bots
+  # always submit reviews with state COMMENTED (verified across recent PRs:
+  # they never use CHANGES_REQUESTED), so "recommends changes" means a
+  # non-empty review body from one of them.  Later reviews no longer start
+  # runs.  WHO may invoke is still decided by the reusable's allowed_bots
+  # policy (this repo's .autofix.yml), not here.
+  decide:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          REVIEWER: ${{ github.event.review.user.login }}
+        run: |
+          set -euo pipefail
+          body=$(jq -r '(.review // .comment).body // ""' "$GITHUB_EVENT_PATH")
+          if grep -q '@autofix' <<< "$body"; then
+            echo "tagged invocation"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          state=$(jq -r '.review.state // ""' "$GITHUB_EVENT_PATH")
+          if [ "$EVENT_NAME" = "pull_request_review" ] \
+            && [ "$REVIEWER" = "kody-ai[bot]" -o "$REVIEWER" = "chatgpt-codex-connector[bot]" -o "$REVIEWER" = "sentry[bot]" ] \
+            && { [ "$state" = "changes_requested" ] || { [ "$state" = "commented" ] && [ -n "${body//[[:space:]]/}" ]; }; }; then
+            # This event's review is already in the list, so "first such
+            # review" means it is the only change-recommending review from
+            # one of these reviewers on the PR.
+            total=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" \
+              --jq '[.[] | select((.user.login == "kody-ai[bot]" or .user.login == "chatgpt-codex-connector[bot]" or .user.login == "sentry[bot]") and (.state == "CHANGES_REQUESTED" or (.state == "COMMENTED" and ((.body // "") | gsub("\\s"; "") | length) > 0)))] | length')
+            if [ "$total" -le 1 ]; then
+              echo "first change-recommending review (by $REVIEWER)"
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "change-recommending review #$total - only the first starts a run; tag @autofix to request another"
+          fi
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
   autofix:
+    needs: decide
     if: >
+      needs.decide.outputs.run == 'true' &&
       (github.event.issue.pull_request || github.event.pull_request) &&
-      (github.event.issue.state == 'open' || github.event.pull_request.state == 'open') &&
-      (
-        (github.event_name == 'pull_request_review' && contains(fromJSON('["bot", "Bot"]'), github.event.review.user.type)) ||
-        (github.event_name != 'pull_request_review' && contains(fromJSON('["bot", "Bot"]'), github.event.comment.user.type))
-      )
+      (github.event.issue.state == 'open' || github.event.pull_request.state == 'open')
     permissions:
       contents: write
       pull-requests: read
       actions: read
-    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@b634b5113a3293e3b6f7f534abc3594f92c3c900
+    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml@00def8545947e21ffe285ea67c1812c7bd321dfc
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       AUTOFIX_GITHUB_APP_PRIVATE_KEY: ${{ secrets.SWU_AUTOFIX_GITHUB_APP_PRIVATE_KEY }}
