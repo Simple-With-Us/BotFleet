@@ -24,14 +24,19 @@ const ReceiptSchema = z.object({
 }).strict();
 
 const SentryProjectSchema = z.object({ slug: z.string() }).passthrough();
+// Sentry answers an unset field with null, not by omitting it.  The ship's own
+// sentry-cli upload creates this release first, with no ref, so the first read
+// here is {"ref": null}; a strict optional string rejected it as invalid JSON
+// and turned every ship red.  Unnamed deploys of other pipelines also carry
+// {"name": null}.
 const SentryReleaseSchema = z.object({
-  ref: z.string().optional(),
+  ref: z.string().nullish(),
   projects: z.array(SentryProjectSchema).optional(),
 }).passthrough();
 const SentryDeploySchema = z.object({
   id: z.union([z.string(), z.number()]),
-  environment: z.string().optional(),
-  name: z.string().optional(),
+  environment: z.string().nullish(),
+  name: z.string().nullish(),
 }).passthrough();
 
 function parseApi(schema, raw) {
