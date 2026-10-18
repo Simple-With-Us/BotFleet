@@ -2033,13 +2033,30 @@ ipcMain.handle("sts:status", () => ({
   gemini: Boolean(geminiCredential(secureCredentials)),
 }));
 
-ipcMain.handle("sts:xai-token", () =>
-  mintXaiRealtimeToken(xaiCredential(secureCredentials)),
-);
+// A call session being opened is the one measurable thing about its cost: the
+// audio flows from the renderer to the vendor and never through this process.
+// The harness holds the Usage Monitor connection, so it is told, and the call
+// never waits on it or fails because of it.
+function reportStsSession(provider) {
+  void fetch(`http://127.0.0.1:${SERVER_PORT}/api/sts/session-started`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ provider }),
+    signal: AbortSignal.timeout(3000),
+  }).catch(() => {});
+}
 
-ipcMain.handle("sts:gemini-token", () =>
-  mintGeminiLiveToken(geminiCredential(secureCredentials)),
-);
+ipcMain.handle("sts:xai-token", async () => {
+  const minted = await mintXaiRealtimeToken(xaiCredential(secureCredentials));
+  reportStsSession("xai");
+  return minted;
+});
+
+ipcMain.handle("sts:gemini-token", async () => {
+  const minted = await mintGeminiLiveToken(geminiCredential(secureCredentials));
+  reportStsSession("gemini");
+  return minted;
+});
 
 const CREDENTIAL_PATCH = {
   composioApiKey: (value) => ({ composio: { apiKey: value } }),

@@ -164,7 +164,24 @@ export type RuntimeEvent = RuntimeEventBase &
          * context-occupancy figure (session/update `usage_update`), never a
          * real input/output split, so a driver that only knows one side
          * omits the other rather than reporting a fabricated 0. */
-        usage?: { input: number; output?: number; cachedInput?: number };
+        usage?: {
+          input: number;
+          output?: number;
+          cachedInput?: number;
+          /** Cache writes, 5 minute TTL (or a TTL the engine did not break
+           * down).  Like `cachedInput`, a SUBSET of `input`: a driver that
+           * names them keeps `input` the whole context sent, and telemetry
+           * subtracts them back out to price them at the cache-write rate. */
+          cacheWrite5m?: number;
+          /** Cache writes to the 1 hour cache; a subset of `input` as well. */
+          cacheWrite1h?: number;
+          /** The reasoning share of `output` (already inside it, never added
+           * again), for the engines that report it. */
+          reasoning?: number;
+        };
+        /** The model the provider says served the turn, when it says (an
+         * alias or a fallback can differ from the one requested). */
+        servedModel?: string;
       }
     | {
         type: "item.started";

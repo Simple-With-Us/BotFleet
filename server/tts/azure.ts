@@ -82,6 +82,6 @@ export async function synthesize(
     throw new Error(`Azure Speech failed (HTTP ${response.status}).`);
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
-  recordSpeechUsage("azure", text.length, "provider");
+  recordSpeechUsage("azure", text.length, "provider", { service: "azure-neural-tts" });
   return { bytes, mime: useOpus ? "audio/ogg" : "audio/mpeg" };
 }

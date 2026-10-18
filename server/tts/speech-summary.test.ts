@@ -15,6 +15,7 @@ import {
   voiceSummarySystemPrompt,
 } from "./speech-summary.ts";
 import { DEFAULT_PRONUNCIATIONS } from "../../shared/pronunciations.ts";
+import { telemetry } from "../telemetry.ts";
 
 describe("summarizeForVoice", () => {
   const originalFetch = globalThis.fetch;
@@ -72,6 +73,47 @@ describe("summarizeForVoice", () => {
     });
     const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
     expect(body.messages[0]).toEqual({ role: "system", content: prompt });
+  });
+
+  it("reports each distiller call's tokens to Usage Monitor, usable rewrite or not (BF-2435)", async () => {
+    const track = vi.spyOn(telemetry, "trackAux").mockImplementation(() => {});
+    const fetchSpy = vi.fn()
+      // flash answers but is cut off: billed, and the verdict is a fallback
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          model: "deepseek-v4.1-flash",
+          choices: [{ message: { content: "partial" }, finish_reason: "length" }],
+          usage: { prompt_tokens: 1000, completion_tokens: 500, prompt_cache_hit_tokens: 900 },
+        }),
+      });
+    globalThis.fetch = fetchSpy;
+
+    const result = await summarizeForVoiceDetailed("Run the `SQL` migration in src/db/migrate.ts before the deploy, then check the logs.", { key: "k" });
+
+    expect(result.source).toBe("fallback");
+    expect(track).toHaveBeenCalledTimes(1);
+    expect(track.mock.calls[0]![0]).toMatchObject({
+      kind: "speech-summary",
+      provider: "deepseek",
+      service: "deepseek-v4.1-flash",
+      unit: "token",
+      ai: {
+        model: { requested: "deepseek-flash", served: "deepseek-v4.1-flash" },
+        tokens: { input: 100, output: 500, cacheRead: 900 },
+        billingMode: "payg",
+      },
+    });
+  });
+
+  it("reports nothing when the response carries no usage", async () => {
+    const track = vi.spyOn(telemetry, "trackAux").mockImplementation(() => {});
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "Merged commit in server dot t s." } }] }),
+    });
+    await summarizeForVoice("Merged f44865ae in src/server.ts", "fake-key");
+    expect(track).not.toHaveBeenCalled();
   });
 
   it("normalizes deepseek endpoints properly", () => {

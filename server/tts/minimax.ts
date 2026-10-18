@@ -420,6 +420,6 @@ export async function synthesize(
   const format = parsed.extra_info?.audio_format ?? body.audio_setting.format;
   const mime = format === "wav" ? "audio/wav" : format === "pcm" ? "audio/pcm" : "audio/mpeg";
   if (bytes.length) recordSpeechUsage("minimax", parsed.extra_info?.usage_characters ?? trimmed.length,
-    Number.isSafeInteger(parsed.extra_info?.usage_characters) ? "provider" : "submitted");
+    Number.isSafeInteger(parsed.extra_info?.usage_characters) ? "provider" : "submitted", { service: MODEL });
   return { bytes, mime };
 }

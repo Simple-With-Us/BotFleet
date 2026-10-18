@@ -375,14 +375,52 @@ function startsUnsolicitedTurn(frame: { type?: unknown; subtype?: unknown; state
   return frame.type === "system" && (frame.subtype === "init" || frame.subtype === "task_notification");
 }
 
-type TurnUsage = { input: number; output: number; cachedInput?: number };
+type TurnUsage = {
+  input: number;
+  output: number;
+  cachedInput?: number;
+  /** Cache writes (5 minute TTL, or a TTL the CLI did not break down).  Like
+   *  `cachedInput`, a subset of `input`, so `input` still reads as the whole
+   *  context the turn sent. */
+  cacheWrite5m?: number;
+  /** Cache writes to the 1 hour cache; also a subset of `input`. */
+  cacheWrite1h?: number;
+};
 
-/** Two reported usages as one, keeping the cache share when either has it. */
+/** The slice of the CLI's `usage` object the cache-write split reads. */
+type CliUsage = {
+  cache_creation_input_tokens?: number;
+  cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number };
+};
+
+/** The cache-write share of one Anthropic `usage` object, split by TTL.
+ * `cache_creation` carries the 5 minute and 1 hour figures.  An older CLI
+ * reports only the flat `cache_creation_input_tokens`, which files under 5
+ * minutes (the shared usage schema's rule for a TTL nobody reported).  Empty
+ * when the usage reported no cache write. */
+export function cacheWritesOf(usage: CliUsage | undefined): { cacheWrite5m?: number; cacheWrite1h?: number } {
+  const count = (value: number | undefined) => (value != null && Number.isFinite(value) && value > 0 ? Math.round(value) : 0);
+  const fiveMinutes = count(usage?.cache_creation?.ephemeral_5m_input_tokens);
+  const oneHour = count(usage?.cache_creation?.ephemeral_1h_input_tokens);
+  const writes: { cacheWrite5m?: number; cacheWrite1h?: number } = {};
+  if (fiveMinutes > 0 || oneHour > 0) {
+    if (fiveMinutes > 0) writes.cacheWrite5m = fiveMinutes;
+    if (oneHour > 0) writes.cacheWrite1h = oneHour;
+    return writes;
+  }
+  const flat = count(usage?.cache_creation_input_tokens);
+  if (flat > 0) writes.cacheWrite5m = flat;
+  return writes;
+}
+
+/** Two reported usages as one, keeping the cache shares when either has them. */
 function sumUsage(a: TurnUsage | undefined, b: TurnUsage | undefined): TurnUsage | undefined {
   if (!a) return b;
   if (!b) return a;
   const usage: TurnUsage = { input: a.input + b.input, output: a.output + b.output };
   if (a.cachedInput !== undefined || b.cachedInput !== undefined) usage.cachedInput = (a.cachedInput ?? 0) + (b.cachedInput ?? 0);
+  if (a.cacheWrite5m !== undefined || b.cacheWrite5m !== undefined) usage.cacheWrite5m = (a.cacheWrite5m ?? 0) + (b.cacheWrite5m ?? 0);
+  if (a.cacheWrite1h !== undefined || b.cacheWrite1h !== undefined) usage.cacheWrite1h = (a.cacheWrite1h ?? 0) + (b.cacheWrite1h ?? 0);
   return usage;
 }
 
@@ -978,6 +1016,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         /** Usage summed over this turn's own CLI results (each result's
          *  usage is that CLI turn's alone). */
         usage?: TurnUsage;
+        /** The model the provider says answered (the assistant frame's
+         *  `model`), which can differ from the one requested: an alias, a
+         *  fallback, a dated snapshot.  Last non-helper frame wins. */
+        servedModel?: string;
         /** Highest helper-token total already counted for one assistant
          *  message id.  Streamed frames repeat that message's usage. */
         helperUsage: Map<string, number>;
@@ -1523,6 +1565,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // A settled turn owns no retry budget. Retained CLI sessions may run
         // many later turns on this thread, and each must start fresh.
         retryState.delete(threadId);
+        // Spread as an object or as nothing: absent unless the provider said.
+        const servedModel = t.servedModel ? { servedModel: t.servedModel } : undefined;
         emit({
           ...base(threadId, t.turnId),
           type: "turn.completed",
@@ -1533,6 +1577,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // total_cost_usd is the equivalent API price, not a cash charge.
           ...(cost != null ? { billingMode: "estimated" as const } : {}),
           ...(usage ? { usage } : {}),
+          ...servedModel,
         });
         if (session.child.exitCode === null && !session.closing) armIdle(threadId);
       };
@@ -1767,6 +1812,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "assistant": {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
+            // `<synthetic>` is the CLI's own placeholder for an error reply,
+            // not a model that served anything.
+            if (!helperOf && session.turn && typeof msg.model === "string" && msg.model && msg.model !== "<synthetic>") {
+              session.turn.servedModel = msg.model;
+            }
             if (!helperOf && session.turn && isModelRejectionFrame(o, text)) {
               // Not an assistant reply: an error the turn failed on.  It must
               // reach the transcript as an error row, never as bot text, so
@@ -1867,13 +1917,23 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             break;
           case "result": {
+            // The cache writes by TTL (or the flat figure of an older CLI).
+            // `input` takes the sum of whichever form arrived, so a CLI that
+            // sends only the TTL split, with the flat total null or zero, does
+            // not leave the writes out of the context while still naming them.
+            const cacheWrites = o.usage ? cacheWritesOf(o.usage) : {};
+            const cacheWritten = (cacheWrites.cacheWrite5m ?? 0) + (cacheWrites.cacheWrite1h ?? 0);
             const resultUsage: TurnUsage | undefined = o.usage
               ? {
-                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
+                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + cacheWritten,
                   output: o.usage.output_tokens || 0,
                   ...(typeof o.usage.cache_read_input_tokens === "number"
                     ? { cachedInput: o.usage.cache_read_input_tokens }
                     : {}),
+                  // Cache writes stay inside `input` (the context meter reads
+                  // the whole figure) but are named, so telemetry can bill
+                  // them at the write rate instead of the plain input rate.
+                  ...cacheWrites,
                 }
               : undefined;
             const t = session.turn;
