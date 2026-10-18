@@ -282,6 +282,18 @@ only these two paths feed it an identity — and `server/secret-map.ts` has
 no `infisical.*` row for exactly the reason above: the vault's own
 credentials cannot be one of the things the vault resolves.
 
+The environment path has exactly one sanctioned injector:
+`scripts/botfleet-server-start.sh`, the launchd entry point, which may
+extract `INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET` (canonical names
+first, `INFISICAL_AUTOMATION_*` aliases only as fallback) from the
+`chmod 600` handoff file at process start, and only for values the
+environment does not already set.  It reads the two names line by line and
+never sources the file, so the Node server still receives its identity
+through the environment alone — the handoff file is never opened by
+product code, and the pair is never moved into a LaunchAgent plist, where
+the client secret would sit same-user-readable in a new location for no
+reduction in exposure.
+
 ## The Migration Script
 
 `scripts/infisical-migrate.mjs` is a one-way seeding helper an operator runs
