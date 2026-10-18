@@ -24,7 +24,7 @@ jobs:
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.type == 'Bot' &&
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@99d372dcd7f600611c7b2b83a6f8eb2d31d6ecad
+    uses: Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@31659885f58f08e129b6dc092f3493d7cdb74a11
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       # Pass only secrets the reusable declares (MINIMAX_API_KEY, and GH_PAT,
@@ -33,6 +33,7 @@ jobs:
       # reusable pushes with GITHUB_TOKEN, so CI does not re-run on an autofix
       # commit;  re-push to re-trigger it (owner 2026-10-11:  no fleet workflow
       # acts as the owner's account).
+      USAGE_INGEST_TOKEN: ${{ secrets.USAGE_INGEST_TOKEN }}
     with:
       prompt: |
         You are the fleet's autofix bot.  A review bot (Codex, Kody, or Cursor) just reviewed this pull request.
