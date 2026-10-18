@@ -510,16 +510,21 @@ describe("OpenCode sign-in probe on a busy host", () => {
     expect(budget).toBeLessThanOrEqual(60_000);
   });
 
+  // Unknown either way;  only execCli's own `timedOut` mark (or its hard-deadline
+  // text) lets the sentence say the budget ran out, as procs.ts's isProbeTimeout
+  // does.  A kill or signal without it is reported as stopped.
   it.each([
-    ["an execFile kill", execFileKill],
-    ["execCli's deadline", execCliDeadline],
-    ["execCli's hard deadline", () => Object.assign(new Error("`opencode` did not exit within 20000ms"), { killed: true })],
-    ["the error runOpenCodeModels wraps it in", () => new Error("", { cause: execCliDeadline() })],
-    ["a signal from outside", () => Object.assign(new Error("Command failed: opencode models\n"), { signal: "SIGKILL", code: null })],
-  ])("reads %s as unknown, never as not signed in", async (_name, make) => {
+    ["execCli's deadline", execCliDeadline, "timed out after"],
+    ["execCli's hard deadline", () => Object.assign(new Error("`opencode` did not exit within 20000ms"), { killed: true }), "timed out after"],
+    ["the error runOpenCodeModels wraps it in", () => new Error("", { cause: execCliDeadline() }), "timed out after"],
+    ["an execFile kill", execFileKill, "was stopped by SIGTERM before it answered"],
+    ["a signal from outside", () => Object.assign(new Error("Command failed: opencode models\n"), { signal: "SIGKILL", code: null }), "was stopped by SIGKILL before it answered"],
+    ["a kill that names no signal", () => Object.assign(new Error("Command failed: opencode models\n"), { killed: true }), "was stopped before it answered"],
+  ])("reads %s as unknown, never as not signed in", async (_name, make, said) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await expect(canListOpenCodeModels({}, "slow-opencode", failing(make))).resolves.toBeUndefined();
     expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(said));
   });
 
   it("still reads a CLI that answered without a list as not signed in", async () => {

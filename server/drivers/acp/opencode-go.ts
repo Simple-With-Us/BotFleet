@@ -218,17 +218,19 @@ export function openCodeModelProbeDeadline(load: HostLoad | null = readHostLoad(
  *
  *  A probe that ran out of time, or was killed or signalled before it could exit
  *  on its own, never said whether anything is signed in;  on a saturated host
- *  that is the usual failure, with the CLI itself fine.  `runOpenCodeModels`
- *  wraps execCli's error, so its flags live on `cause`;  a double that rejects
- *  with a bare execFile-shaped error (`killed`, `SIGTERM`) is read the same way.
- *  A CLI that exited by itself, even non-zero, has answered. */
+ *  that is the usual failure, with the CLI itself fine.  Only execCli's own
+ *  `timedOut` mark is evidence that THIS budget ran out (`isProbeTimeout`);  a
+ *  child that was killed or signalled without it did not answer either, but it
+ *  is reported as stopped, not as slow.  `runOpenCodeModels` wraps execCli's
+ *  error, so those flags live on `cause`.  A CLI that exited by itself, even
+ *  non-zero, has answered. */
 function unansweredProbe(error: ProbeTimeoutError): { ranOutOfTime: boolean; signal: string | null } | null {
   const candidates: Array<ProbeTimeoutError | null> = [error, error.cause instanceof Error ? error.cause : null];
   for (const candidate of candidates) {
     if (!candidate) continue;
     const stoppedBy = candidate.signal || null;
-    if (isProbeTimeout(candidate) || candidate.killed === true) return { ranOutOfTime: true, signal: stoppedBy };
-    if (stoppedBy) return { ranOutOfTime: false, signal: stoppedBy };
+    if (isProbeTimeout(candidate)) return { ranOutOfTime: true, signal: stoppedBy };
+    if (candidate.killed === true || stoppedBy) return { ranOutOfTime: false, signal: stoppedBy };
   }
   return null;
 }
@@ -242,7 +244,7 @@ function describeUnansweredProbe(
 ): string {
   return how.ranOutOfTime
     ? `OpenCode's model probe timed out ${describeInitDeadline(deadline)}`
-    : `OpenCode's model probe was stopped by ${how.signal} before it answered`;
+    : `OpenCode's model probe was stopped${how.signal ? ` by ${how.signal}` : ""} before it answered`;
 }
 
 function runOpenCodeModels(
