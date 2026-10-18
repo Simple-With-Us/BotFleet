@@ -61,6 +61,25 @@ describe("aiTokensFromChatUsage", () => {
     ).toEqual({ input: 200, output: 5, cacheRead: 100, cacheWrite5m: 200 });
   });
 
+  it("strips extra provider fields without dropping known billed usage", () => {
+    const parsed = ChatUsageSchema.parse({
+      prompt_tokens: 1000,
+      completion_tokens: 300,
+      total_tokens: 1300,
+      prompt_cache_miss_tokens: 400,
+      prompt_tokens_details: { cached_tokens: 600, audio_tokens: 0 },
+      completion_tokens_details: { reasoning_tokens: 120, accepted_prediction_tokens: 0 },
+    });
+
+    expect(parsed).not.toHaveProperty("total_tokens");
+    expect(parsed).not.toHaveProperty("prompt_cache_miss_tokens");
+    expect(parsed.prompt_tokens_details).toEqual({ cached_tokens: 600 });
+    expect(parsed.completion_tokens_details).toEqual({ reasoning_tokens: 120 });
+    const tokens = aiTokensFromChatUsage(parsed);
+    expect(tokens).toEqual({ input: 400, output: 300, cacheRead: 600, reasoning: 120 });
+    expect(aiUsageTotalTokens(tokens)).toBe(1300);
+  });
+
   it("reads a malformed field as absent without losing the rest", () => {
     expect(chat({ prompt_tokens: "lots", completion_tokens: 12 })).toEqual({ output: 12 });
     expect(chat({ prompt_tokens: -4, completion_tokens: 12, prompt_tokens_details: "nope" })).toEqual({ output: 12 });
