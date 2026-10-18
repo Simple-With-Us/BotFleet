@@ -31,16 +31,16 @@ function passedSecrets(yml) {
 
 test("claude-code-autofix.yml passes only secrets the codex reusable declares", () => {
   const yml = read(".github/workflows/claude-code-autofix.yml");
-  // codex-autofix-reusable.yml declares MINIMAX_API_KEY and an ignored GH_PAT.  Passing
+  // codex-autofix-reusable.yml declares MINIMAX_API_KEY, an optional USAGE_INGEST_TOKEN (UM-1593 metering) and an ignored GH_PAT.  Passing
   // GH_ADMIN_PAT failed every run with "Invalid secret, GH_ADMIN_PAT is not defined in the
   // referenced workflow" (run 39054950004), and no fleet workflow may act as the owner.
-  assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY"]);
+  assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "USAGE_INGEST_TOKEN"]);
   assert.doesNotMatch(yml, /secrets\.GH_ADMIN_PAT/);
 });
 
 test("autofix.yml passes only secrets the pr-autofix reusable declares", () => {
   const yml = read(".github/workflows/autofix.yml");
-  assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "AUTOFIX_GITHUB_APP_PRIVATE_KEY"]);
+  assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "AUTOFIX_GITHUB_APP_PRIVATE_KEY", "USAGE_INGEST_TOKEN"]);
 });
 
 test("both autofix callers pin their reusable workflow to a full commit SHA", () => {
