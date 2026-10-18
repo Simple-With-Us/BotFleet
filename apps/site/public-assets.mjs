@@ -20,6 +20,7 @@ export const PUBLIC_ASSETS = [
   "icon-transparent-1024.png",
   "logo-256.png",
   "swu-logo-wide.webp",
+  "swu-logo-wide-dark.webp",
   "wide-banner-transparent.png",
   "wide-banner.png",
   ".well-known/apple-app-site-association",
