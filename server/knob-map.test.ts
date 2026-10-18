@@ -105,6 +105,11 @@ describe("parseKnobValue", () => {
   it("round-trips through the canonical string", () => {
     for (const entry of KNOB_FIELDS) {
       if (entry.kind === "bool") continue;
+      if (entry.kind === "string") {
+        const text = "sample-value";
+        expect(parseKnobValue(entry, text)).toBe(text);
+        continue;
+      }
       // An in-bounds value for THIS spec: the midpoint when both bounds
       // exist, otherwise just above the floor.  Out-of-bounds values clamp
       // by design (see the clamping test above), so they cannot round-trip.
@@ -193,11 +198,37 @@ describe("the snapshot filter", () => {
       ]),
       ["BOTFLEET_JOBS_DEFAULT_MINUTES", "PATH", "SOME_RANDOM_ROW"],
     );
-    const cfg: AppConfig = { jobs: { defaultMinutes: 60 } };
     // The snapshot is published through the shared filter; knobs resolve off
     // whatever it kept.  Reach it the way loadConfig() does.
+    const cfg: AppConfig = { jobs: { defaultMinutes: 60 } };
     resolveKnobFields(cfg, infisicalSnapshot());
     expect(cfg.jobs?.defaultMinutes).toBe(30);
+  });
+
+  it("applies agent proxy knobs from the vault", () => {
+    const cfg: AppConfig = { agentProxy: { enabled: false, address: "localhost:17322" } };
+    resolveKnobFields(
+      cfg,
+      new Map([
+        ["BOTFLEET_AGENT_PROXY_ENABLED", "true"],
+        ["BOTFLEET_AGENT_PROXY_ADDRESS", "127.0.0.1:17322"],
+        ["BOTFLEET_AGENT_PROXY_PROJECT_ID", "test-project-123"],
+        ["BOTFLEET_AGENT_PROXY_ENV", "prod"],
+        ["BOTFLEET_AGENT_PROXY_PATH", "/nested"],
+      ]),
+    );
+    expect(cfg.agentProxy).toEqual({
+      enabled: true,
+      address: "127.0.0.1:17322",
+      projectId: "test-project-123",
+      environment: "prod",
+      secretPath: "/nested",
+    });
+    expect(knobSource("agentProxy.enabled")).toBe("infisical");
+    expect(knobSource("agentProxy.address")).toBe("infisical");
+    expect(knobSource("agentProxy.projectId")).toBe("infisical");
+    expect(knobSource("agentProxy.environment")).toBe("infisical");
+    expect(knobSource("agentProxy.secretPath")).toBe("infisical");
   });
 });
 

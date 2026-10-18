@@ -74,8 +74,29 @@ BotFleet is a single-user local harness: the server binds loopback-only (`127.0.
 | `BOTFLEET_AUTO_REVIEW_MAX_PER_TURN` | autoReview.maxReviewsPerTurn | int | 1–500 |
 | `BOTFLEET_TTS_AUDIO_RETENTION_DAYS` | tts.audioRetentionDays | int | 0–365 |
 | `BOTFLEET_INFISICAL_REFRESH_MINUTES` | infisical.refreshMinutes | int | 5–1440 |
+| `BOTFLEET_AGENT_PROXY_ENABLED` | agentProxy.enabled | bool | — |
+| `BOTFLEET_AGENT_PROXY_ADDRESS` | agentProxy.address | string | — |
+| `BOTFLEET_AGENT_PROXY_PROJECT_ID` | agentProxy.projectId | string | — |
+| `BOTFLEET_AGENT_PROXY_ENV` | agentProxy.environment | string | — |
+| `BOTFLEET_AGENT_PROXY_PATH` | agentProxy.secretPath | string | — |
 
 Knob values are parsed from their vault strings and clamped to the bounds above; an unparsable value is logged and ignored.  Knob values are not secrets — they are already visible in Settings and `GET /api/config` — so only ids and counts travel the status views.
+
+### Infisical Agent Proxy (optional)
+
+BotFleet can route child agent CLIs and process turns through a local or network Infisical Agent Proxy daemon (`infisical secrets agent-proxy start`).
+When `agentProxy.enabled` is `true` (via Settings or knob `BOTFLEET_AGENT_PROXY_ENABLED=true`), spawned CLIs receive:
+- `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`: `http://<address>` (default `http://127.0.0.1:17322`)
+- `NO_PROXY`: `localhost,127.0.0.1`
+- `INFISICAL_AGENT_PROXY_ADDRESS`: `<address>`
+- `INFISICAL_PROJECT_ID`: `agentProxy.projectId` (defaults to BotFleet's project ID)
+- `INFISICAL_ENVIRONMENT`: `agentProxy.environment` (default `prod`)
+- `INFISICAL_SECRET_PATH`: `agentProxy.secretPath` (default `/`)
+- `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`: `agentProxy.caCertPath` (when specified)
+
+Precedence: the four proxy URL variables keep whatever the caller already set, so a deliberate corporate proxy is never replaced.  Everything configured under `agentProxy` (address, project, environment, path, CA file) wins over an `INFISICAL_*`, `SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS` value the harness inherited.  A project, environment or path that only fell back to BotFleet's own Infisical settings does not displace an inherited one.
+
+The environment is built from the in-memory config the harness already holds (the same `cfg` that Settings saves and vault refreshes update), so a spawn never re-reads `config.json`.  When disabled (default), process spawning is completely direct with no proxy interception.
 
 ## What stays out (deliberately)
 
