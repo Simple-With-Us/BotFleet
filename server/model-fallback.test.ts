@@ -405,6 +405,13 @@ describe("selectTurnFallback", () => {
     });
   });
 
+  it("carries a fallback's own context cap and output limit, and adds neither when unset", () => {
+    expect(
+      selectionForFallbackPick({ instanceId: "minimax", model: "m", effort: "high", contextCap: 524_288, maxOutputTokens: 8192 }),
+    ).toEqual({ instanceId: "minimax", model: "m", effort: "high", contextCap: 524_288, maxOutputTokens: 8192 });
+    expect("contextCap" in selectionForFallbackPick({ instanceId: "minimax", model: "m" })).toBe(false);
+  });
+
   it("cancelled or interrupted does not fail over", () => {
     const afterUser: FallbackScanMessage[] = [{ role: "bot", kind: "activity", tool: { name: "Bash" } }];
     expect(decide(afterUser, { ok: false, stopReason: "cancelled" })).toBeUndefined();
@@ -1045,6 +1052,35 @@ describe("QuotaCooldownRegistry", () => {
     expect(cd).toBeDefined();
     expect(cd?.resetsAt).toBe(now + DEFAULT_QUOTA_COOLDOWN_TTL_MS);
     expect(registry.get("bot1", "antigravity", "gemini-3.8-flash-high", now + DEFAULT_QUOTA_COOLDOWN_TTL_MS + 1)).toBeUndefined();
+  });
+
+  it("skips redundant disk writes when recordInstanceCap or clear makes no state change", () => {
+    const file = `${tmpdir()}/quota-cooldowns-dedup-${Date.now()}.json`;
+    const registry = new QuotaCooldownRegistry();
+    const writes: string[] = [];
+    registry.enablePersist(file, (_path, json) => {
+      writes.push(json);
+    });
+    const resetsAt = Date.now() + 60_000;
+    registry.recordInstanceCap("antigravity", "gemini-3.8-pro-high", {
+      resetsAt,
+      error: "exhausted",
+      source: "antigravity-usage",
+    });
+    expect(writes).toHaveLength(1);
+
+    // Repeated poll with identical resetsAt/error/source should not re-write the file
+    registry.recordInstanceCap("antigravity", "gemini-3.8-pro-high", {
+      resetsAt,
+      error: "exhausted",
+      source: "antigravity-usage",
+    });
+    expect(writes).toHaveLength(1);
+
+    // Clearing a non-existent bot cooldown should not write to disk either
+    registry.clear("non-existent-bot");
+    registry.clear("non-existent-bot", "antigravity", "gemini-3.8-pro-high");
+    expect(writes).toHaveLength(1);
   });
 });
 

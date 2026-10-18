@@ -227,21 +227,23 @@ function readWindowState() {
   }
 }
 
-function writeWindowState(win) {
+async function writeWindowState(win) {
   if (!win || win.isDestroyed()) return;
+  let payload;
+  try {
+    payload = JSON.stringify({ bounds: win.getNormalBounds(), maximized: win.isMaximized() });
+  } catch {
+    return;
+  }
   const file = windowStateFile();
   const temporary = `${file}.${process.pid}.tmp`;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(
-      temporary,
-      JSON.stringify({ bounds: win.getNormalBounds(), maximized: win.isMaximized() }),
-      { mode: 0o600 },
-    );
-    fs.renameSync(temporary, file);
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    await fs.promises.writeFile(temporary, payload, { mode: 0o600 });
+    await fs.promises.rename(temporary, file);
   } catch (error) {
     try {
-      fs.rmSync(temporary, { force: true });
+      await fs.promises.rm(temporary, { force: true });
     } catch {}
     slog(`window state save failed: ${error?.message ?? error}`);
   }
@@ -252,7 +254,7 @@ function installWindowStatePersistence(win) {
   const flush = () => {
     if (timer) clearTimeout(timer);
     timer = null;
-    writeWindowState(win);
+    void writeWindowState(win);
   };
   const schedule = () => {
     if (timer) clearTimeout(timer);
@@ -1673,7 +1675,8 @@ ipcMain.handle("screen:frame", async (_event, options) => {
       : sources.length > 1
         ? sources[1]
         : sources[0];
-  return target?.thumbnail.toDataURL() ?? null;
+  if (!target) return null;
+  return `data:image/jpeg;base64,${target.thumbnail.toJPEG(75).toString("base64")}`;
 });
 
 // Onboarding permission checks. Status reads are free; the mic request

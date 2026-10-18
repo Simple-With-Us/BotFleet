@@ -8935,7 +8935,7 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
 });
 
 describe("model lineage over HTTP: saved selections move forward, never aliased", () => {
-  type Saved = { instanceId: string; model: string; latest?: string; fallbacks?: Saved[] };
+  type Saved = { instanceId: string; model: string; latest?: string; contextCap?: number; maxOutputTokens?: number; fallbacks?: Saved[] };
   // A describe records each engine's CLI version; until the Claude CLI has
   // reported one, nothing on a Claude engine is moved.  The fixture CLI
   // reports 2.1.232, older than 2.1.280 (Opus 5.5) and 2.1.284 (Sonnet 5.5),
@@ -9048,6 +9048,87 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       });
       expect(bad.status).toBe(400);
       expect(bad.body.error).toMatch(/latest/);
+    });
+  });
+
+  it("refuses a context cap or output limit that is not a whole number of tokens from 1 to 10,000,000", async () => {
+    await withBot("Limits Refused", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      for (const bad of [0, -5, 1.5, "8k", 10_000_001, true]) {
+        const cap = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, contextCap: bad } });
+        expect(cap.status, `contextCap ${String(bad)}`).toBe(400);
+        expect(cap.body.error).toMatch(/contextCap/);
+        const out = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { ...sonnet, maxOutputTokens: bad } });
+        expect(out.status, `maxOutputTokens ${String(bad)}`).toBe(400);
+        expect(out.body.error).toMatch(/maxOutputTokens/);
+      }
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 1, maxOutputTokens: 10_000_000 },
+      })).status).toBe(200);
+    });
+  });
+
+  it("keeps a saved context cap and output limit when an older client re-sends the selection without them", async () => {
+    await withBot("Limits Older Client", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          ...sonnet,
+          contextCap: 524_288,
+          maxOutputTokens: 8192,
+          fallbacks: [{ instanceId: "claude2", model: "claude-opus-5", maxOutputTokens: 4096 }],
+        },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ contextCap: 524_288, maxOutputTokens: 8192 });
+
+      // The shipped iOS app decodes instanceId, model, effort and fallbacks
+      // only, so an effort edit from the phone re-sends exactly that.
+      const phone = await api("PATCH", `/api/bots/${bot.id}/profile`, {
+        modelSelection: { ...sonnet, effort: "high", fallbacks: [{ instanceId: "claude2", model: "claude-opus-5" }] },
+      });
+      expect(phone.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        effort: "high",
+        contextCap: 524_288,
+        maxOutputTokens: 8192,
+        fallbacks: [{ instanceId: "claude2", model: "claude-opus-5", maxOutputTokens: 4096 }],
+      });
+    });
+  });
+
+  it("clears a context cap and output limit on an explicit null, and drops them on another model", async () => {
+    await withBot("Limits Cleared", async (bot) => {
+      const sonnet = { instanceId: "claude", model: "claude-sonnet-5" };
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 524_288, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+
+      // The desktop picker's "No Limit" and an emptied Max Output field.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: null, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+      const capCleared = await selectionOf(bot.id);
+      expect(capCleared?.contextCap).toBeUndefined();
+      expect(capCleared).toMatchObject({ maxOutputTokens: 8192 });
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: null, maxOutputTokens: null },
+      })).status).toBe(200);
+      const bothCleared = await selectionOf(bot.id);
+      expect(bothCleared?.contextCap).toBeUndefined();
+      expect(bothCleared?.maxOutputTokens).toBeUndefined();
+
+      // Limits belong to the model they were set on.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...sonnet, contextCap: 524_288, maxOutputTokens: 8192 },
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+      })).status).toBe(200);
+      const moved = await selectionOf(bot.id);
+      expect(moved).toMatchObject({ model: "claude-opus-5" });
+      expect(moved?.contextCap).toBeUndefined();
+      expect(moved?.maxOutputTokens).toBeUndefined();
     });
   });
 

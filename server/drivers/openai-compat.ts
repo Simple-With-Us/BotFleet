@@ -116,8 +116,8 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
     displayName: "OpenAI-compatible (OpenRouter / Groq)",
     supportsMultipleInstances: true,
     access: "custom",
-    // Mirrors the `capabilities` block in `create` below: agents + this
-    // computer only, with no Composio bridge, screen channel, or image input.
+    // Mirrors the `capabilities` block in `create` below: agents and this
+    // computer, with no Composio, screen channel, or image input.
     channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
   },
   models: DEFAULT_MODELS,

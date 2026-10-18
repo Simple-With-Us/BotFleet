@@ -229,6 +229,11 @@ export function selectionForFallbackPick(pick: ModelSelection): ModelSelection {
     instanceId: pick.instanceId,
     model: pick.model,
     effort: pick.effort,
+    // The fallback's own context cap and output limit run with it, like its
+    // effort.  Both are gated per model at dispatch, so one that the fallback
+    // model does not offer is dropped there.
+    ...(pick.contextCap !== undefined ? { contextCap: pick.contextCap } : {}),
+    ...(pick.maxOutputTokens !== undefined ? { maxOutputTokens: pick.maxOutputTokens } : {}),
     ...(pick.latest ? { latest: pick.latest } : {}),
   };
 }
@@ -911,16 +916,29 @@ export class QuotaCooldownRegistry {
     const resetsAt = opts.source === "antigravity-usage"
       ? (opts.resetsAt ?? null)
       : (opts.resetsAt != null ? opts.resetsAt : (recordedAt + DEFAULT_QUOTA_COOLDOWN_TTL_MS));
+    const error = opts.error ?? "Session limit or usage cap reached";
+    const key = `*:${instanceId}:${model}`;
+    const existing = this.cooldowns.get(key);
+    if (
+      existing &&
+      !this.isExpired(existing, recordedAt) &&
+      (opts.resetsAt !== undefined || opts.source === "antigravity-usage") &&
+      existing.resetsAt === resetsAt &&
+      existing.error === error &&
+      existing.source === opts.source
+    ) {
+      return;
+    }
     const cd: BotQuotaCooldown = {
       botId: "*",
       instanceId,
       model,
       resetsAt,
-      error: opts.error ?? "Session limit or usage cap reached",
+      error,
       recordedAt,
       source: opts.source,
     };
-    this.cooldowns.set(`*:${instanceId}:${model}`, cd);
+    this.cooldowns.set(key, cd);
     this.persist();
   }
 
@@ -962,16 +980,19 @@ export class QuotaCooldownRegistry {
 
   clear(botId: string, instanceId?: string, model?: string): void {
     if (instanceId && model) {
-      this.cooldowns.delete(`${botId}:${instanceId}:${model}`);
-      this.persist();
+      if (this.cooldowns.delete(`${botId}:${instanceId}:${model}`)) {
+        this.persist();
+      }
       return;
     }
+    let changed = false;
     for (const key of this.cooldowns.keys()) {
       if (key.startsWith(`${botId}:`)) {
         this.cooldowns.delete(key);
+        changed = true;
       }
     }
-    this.persist();
+    if (changed) this.persist();
   }
 
   clearWhere(predicate: (cooldown: BotQuotaCooldown) => boolean): void {

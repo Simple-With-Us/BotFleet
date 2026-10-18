@@ -289,19 +289,14 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // (server/drivers/claude.ts, codex.ts, antigravity.ts, and the DSH
     // ACP adapter).  A missing key renders as "-", which reads as
     // "engine cannot do this" — the exact underclaim Codex flagged.
-    for (const id of ["claude", "codex", "antigravity", "deepseek-harness"]) {
+    for (const id of ["claude", "codex", "antigravity", "deepseek-harness", "grok", "cursor", "mcode"]) {
       expect(ENGINE_CAPABILITIES[id].capabilities.connectedApps, id).toBe("yes");
     }
   });
 
-  it("marks MiniMax connectedApps as 'no' — the driver has no composioMcp", () => {
-    // Connected Apps is the Composio bridge, and MiniMax's direct
-    // driver declares no composioMcp in server/drivers/minimax.ts
-    // (Claude, Codex, Antigravity, pi, and the DSH ACP adapter all
-    // declare it).  'limited' still implied a partial channel that does
-    // not exist; driving this Mac is the thisComputer row
-    // (localComputerMcp), a different thing.  Pin 'no' so a future edit
-    // cannot silently regress the matrix to overclaim.
+  it("marks MiniMax API connectedApps as 'no' — the direct HTTP driver does not mount composioMcp", () => {
+    // Connected Apps is the Composio bridge, which the ACP/CLI drivers mount
+    // (including MiniMax Code) while the direct HTTP MiniMax driver does not.
     expect(ENGINE_CAPABILITIES.minimax.capabilities.connectedApps).toBe("no");
   });
 
@@ -532,6 +527,12 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     // BILLED at — a separate column, and the reason this test exists.
     expect(engineAccessLabel(entry)).toBe("CLI");
     expect(entry.capabilities.imageAttachments).toBe("yes");
+    expect(entry.capabilities.longContext).toBe("yes");
+    expect(entry.defaultModels[0]).toEqual({
+      id: "DeepSeek-V4.1-Flash",
+      display: "DeepSeek-V4.1-Flash",
+      ctxTokens: 1_000_000,
+    });
     const copy = [
       entry.pricing.notes ?? "",
       entry.pricing.api.notes ?? "",
@@ -553,6 +554,20 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     expect(pricingModeLabel(entry.pricing).toLowerCase()).not.toContain("bundled");
   });
 
+  it("leads Antigravity with Gemini 3.8 Flash and 3.1 Pro and marks longContext on OpenCode, Muse, and Clutch", () => {
+    const ag = ENGINE_CAPABILITIES.antigravity;
+    expect(ag.defaultModels[0]).toEqual({
+      id: "gemini-3.8-flash-high",
+      display: "Gemini 3.8 Flash (High)",
+      ctxTokens: 1_000_000,
+    });
+    expect(ag.defaultModels.map((m) => m.id)).toContain("gemini-3.1-pro-high");
+    expect(ENGINE_CAPABILITIES["deepseek-harness"].capabilities.longContext).toBe("yes");
+    expect(ENGINE_CAPABILITIES.opencode.capabilities.longContext).toBe("yes");
+    expect(ENGINE_CAPABILITIES.muse.capabilities.longContext).toBe("yes");
+    expect(ENGINE_CAPABILITIES.mcode.capabilities.roomCoordination).toBe("yes");
+  });
+
   it("keeps access separate from billing", () => {
     // Access names the driver BotFleet ships, so an engine whose only driver
     // is a harness CLI reads "CLI" even when the vendor also sells an API.
@@ -563,3 +578,4 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     expect(pricingModeLabel(ENGINE_CAPABILITIES.minimax.pricing)).toContain("Subscription + API");
   });
 });
+

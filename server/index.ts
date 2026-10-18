@@ -89,7 +89,19 @@ import { cwdConfinementError, protectedCwdDirs, realOrResolved, validateBotCwd, 
 import { captureTaskWorkspaceContext, TaskWorkspaceContextError, taskWorkspaceExecutionError } from "./task-workspace-context.ts";
 import type { TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 import { resolveStaticFile } from "./static-files.ts";
-import { attachmentExists, extensionForMime, FILE_MAX_BYTES, IMAGE_MAX_BYTES, isImageMime, readAttachment, saveAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
+import {
+  attachmentExists,
+  DEFAULT_AUDIO_RETENTION_DAYS,
+  extensionForMime,
+  FILE_MAX_BYTES,
+  IMAGE_MAX_BYTES,
+  isImageMime,
+  readAttachment,
+  saveAttachment,
+  saveImage,
+  sweepExpiredAudioAttachments,
+  type SavedAttachment,
+} from "./attachments.ts";
 import { incomingRecording, recordingReview } from "./recorded-message.ts";
 import { openBotFleetDesktop } from "./desktop-open.ts";
 import { IdempotencyCache } from "./idempotency.ts";
@@ -256,6 +268,7 @@ import {
 import { waitForComputerCall } from "./computer-call-gate.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
 import {
+  applyAgentProxyEnv,
   ensureDirs,
   instanceConfigs,
   loadConfig,
@@ -303,7 +316,7 @@ import { cleanupHoldReason, listDataFaults, registerLeftOverSetAsideFiles } from
 import { ComputerControl } from "./computer-control.ts";
 import { findCliCandidates, resetPathCache } from "./env-path.ts";
 import { cliProbeEnvironment } from "./cli-probe-env.ts";
-import { describeSpawnFailure, execCli } from "./procs.ts";
+import { describeSpawnFailure, execCli, setSpawnEnvTransform } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
 import { modelEffortLevels } from "../src/lib/model-effort.ts";
 import type { LineageContext } from "../shared/model-lineage.ts";
@@ -961,6 +974,10 @@ const updateDrain = new UpdateDrain({
   log: (line) => console.warn(line),
 });
 const cfg = loadConfig();
+// Agent CLIs spawn with the Infisical Agent Proxy environment when it is on.  Read
+// from the in-memory `cfg` (mutated in place on every save and vault refresh), so a
+// spawn never re-reads config.json.
+setSpawnEnvTransform((env) => applyAgentProxyEnv(cfg, env));
 // bootComplete is declared above createUpdateControl (BOTFLEET-2M). Flipped
 // once at the end of this file when everything a secret change might rebuild
 // exists; a snapshot that lands before then is applied to `cfg` only.
@@ -2189,6 +2206,9 @@ function checkSelectionEntry(
   return null;
 }
 
+/** A context cap or output limit: a whole number of tokens, 1 to 10,000,000. */
+const TOKEN_LIMIT_SCHEMA = z.number().int().min(1).max(10_000_000);
+
 function checkedModelSelection(
   raw: unknown,
   /** The saved selection this write replaces.  `storedFallbacks` is how many
@@ -2206,7 +2226,7 @@ function checkedModelSelection(
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, status: 400, error: "modelSelection must be an object" };
   }
-  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown; latest?: unknown };
+  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown; contextCap?: unknown; maxOutputTokens?: unknown; latest?: unknown };
   if (typeof value.instanceId !== "string" || !value.instanceId.trim()) {
     return { ok: false, status: 400, error: "modelSelection.instanceId is required" };
   }
@@ -2222,6 +2242,20 @@ function checkedModelSelection(
       return { ok: false, status: 400, error: `effort "${String(value.effort)}" is not recognized` };
     }
     selection.effort = value.effort;
+  }
+  if (value.contextCap !== undefined && value.contextCap !== null) {
+    const contextCap = TOKEN_LIMIT_SCHEMA.safeParse(value.contextCap);
+    if (!contextCap.success) {
+      return { ok: false, status: 400, error: "modelSelection.contextCap must be a whole number of tokens" };
+    }
+    selection.contextCap = contextCap.data;
+  }
+  if (value.maxOutputTokens !== undefined && value.maxOutputTokens !== null) {
+    const maxOutputTokens = TOKEN_LIMIT_SCHEMA.safeParse(value.maxOutputTokens);
+    if (!maxOutputTokens.success) {
+      return { ok: false, status: 400, error: "modelSelection.maxOutputTokens must be a whole number of tokens" };
+    }
+    selection.maxOutputTokens = maxOutputTokens.data;
   }
   // "Latest <Class>": `null` means pinned (see checkLineageWrite).
   if (value.latest !== undefined && value.latest !== null) {
@@ -2290,6 +2324,8 @@ function checkedModelSelection(
     selection.instanceId !== current.selection.instanceId ||
     selection.model !== current.selection.model ||
     selection.effort !== current.selection.effort ||
+    selection.contextCap !== current.selection.contextCap ||
+    selection.maxOutputTokens !== current.selection.maxOutputTokens ||
     JSON.stringify(selection.fallbacks) !== JSON.stringify(current.selection.fallbacks)
   );
   if (current?.busy && changed) {
@@ -2956,7 +2992,30 @@ setTimeout(() => {
   } catch (error) {
     console.error("[retention] pruneDeadThreads failed", error instanceof Error ? error.message : String(error));
   }
+
+  runAudioRetentionSweep();
 }, 60_000).unref?.();
+
+function runAudioRetentionSweep(): void {
+  try {
+    const retentionDays = cfg.tts?.audioRetentionDays ?? DEFAULT_AUDIO_RETENTION_DAYS;
+    const audioSweep = sweepExpiredAudioAttachments(retentionDays, { dryRun: retentionDryRun });
+    if (audioSweep.removedFiles > 0) {
+      const verb = audioSweep.dryRun ? "would remove" : "removed";
+      const mib = (audioSweep.freedBytes / (1024 * 1024)).toFixed(1);
+      console.log(
+        `[retention] ${verb} ${audioSweep.removedFiles} expired audio attachment(s) (${mib} MiB) older than ${retentionDays} day(s)`,
+      );
+    }
+  } catch (error) {
+    console.error("[retention] sweepExpiredAudioAttachments failed", error instanceof Error ? error.message : String(error));
+  }
+}
+
+setInterval(() => {
+  if (cleanupHoldReason(DATA_DIR)) return;
+  runAudioRetentionSweep();
+}, 24 * 60 * 60 * 1_000).unref?.();
 
 /** A bot as a client may see it: no provider session bookkeeping.
  *
@@ -4940,6 +4999,8 @@ async function launchFallbackTurn(input: {
         instanceId: following.instanceId,
         model: following.model,
         effort: following.effort,
+        ...(following.contextCap !== undefined ? { contextCap: following.contextCap } : {}),
+        ...(following.maxOutputTokens !== undefined ? { maxOutputTokens: following.maxOutputTokens } : {}),
       };
       fallbackAttemptByTurn.set(key, following.nextUsed);
       store.patchBot(botId, { activeModelSelection: nextSelection });
@@ -7608,6 +7669,23 @@ async function startTurn(
         text: jobReminder.text ? `${jobReminder.text}\n\n${turnText}` : turnText,
         model,
         effort,
+        // Only a cap this model's row offers reaches a driver; a stale value
+        // from a model the bot has since left is dropped here.
+        ...(!boxCloud && selection.contextCap !== undefined &&
+        targetOption?.contextCaps?.length &&
+        (targetOption.contextWindow === undefined
+          ? targetOption.contextCaps.includes(selection.contextCap)
+          : selection.contextCap <= targetOption.contextWindow)
+          ? { contextCapTokens: selection.contextCap }
+          : {}),
+        // An output limit goes out only for a model whose driver sends one, and
+        // never above the model's own window when the catalog knows it.
+        ...(!boxCloud &&
+        selection.maxOutputTokens !== undefined &&
+        targetOption?.supportsMaxOutput &&
+        (targetOption.contextWindow === undefined || selection.maxOutputTokens <= targetOption.contextWindow)
+          ? { maxOutputTokens: selection.maxOutputTokens }
+          : {}),
         // a rewound thread never resumes the abandoned branch's session
         // the active task's own session — another task's cursor would
         // resume the wrong conversation and defeat the context bubble
@@ -18559,6 +18637,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (Object.hasOwn(patch, "zulip")) {
         cfg.zulip = loadConfig().zulip;
         zulipHub?.reconcile();
+      }
+      if (patch.tts?.audioRetentionDays !== undefined && !cleanupHoldReason(DATA_DIR)) {
+        setImmediate(() => runAudioRetentionSweep());
       }
       // VPS mode-switch cleanup (mirrors Local VM at POST /api/local-computer/mode).
       // Runs after the save so the lateImpact→saveConfig window stays await-free
