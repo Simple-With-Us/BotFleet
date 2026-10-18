@@ -115,10 +115,18 @@ describe("MinimaxDriver", () => {
       options: [
         {
           id: "MiniMax-M3.1-Flash-Preview",
-          label: "MiniMax M3.1 Flash Preview",
+          label: "MiniMax M3.1 Flash Preview (512K)",
+          contextWindow: 524_288,
+          effortLevels: M31_LEVELS,
+          defaultEffort: "max",
+          supportsMaxOutput: true,
+        },
+        {
+          id: "MiniMax-M3.1-Flash-Preview-1M",
+          label: "MiniMax M3.1 Flash Preview (1M)",
           contextWindow: 1_000_000,
           effortLevels: M31_LEVELS,
-          contextCaps: [524_288],
+          defaultEffort: "max",
           supportsMaxOutput: true,
         },
         { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },
@@ -610,9 +618,14 @@ describe("MinimaxDriver", () => {
     });
 
     await instance.refreshModels?.();
-    expect(instance.models.options.map((o) => o.id)).toEqual(["MiniMax-M3.1-Flash-Preview", "MiniMax-Next"]);
+    expect(instance.models.options.map((o) => o.id)).toEqual([
+      "MiniMax-M3.1-Flash-Preview",
+      "MiniMax-M3.1-Flash-Preview-1M",
+      "MiniMax-Next",
+    ]);
     // a model already in the static catalog keeps its hand-written label
-    expect(instance.models.options.find((o) => o.id === "MiniMax-M3.1-Flash-Preview")?.label).toBe("MiniMax M3.1 Flash Preview");
+    expect(instance.models.options.find((o) => o.id === "MiniMax-M3.1-Flash-Preview")?.label).toBe("MiniMax M3.1 Flash Preview (512K)");
+    expect(instance.models.options.find((o) => o.id === "MiniMax-M3.1-Flash-Preview-1M")?.label).toBe("MiniMax M3.1 Flash Preview (1M)");
     // a genuinely new model gets its id as the label rather than nothing
     expect(instance.models.options.find((o) => o.id === "MiniMax-Next")?.label).toBe("MiniMax-Next");
     // a retired id the API still serves does not reappear at all: a live
@@ -644,10 +657,18 @@ describe("MinimaxDriver", () => {
       options: [
         {
           id: "MiniMax-M3.1-Flash-Preview",
-          label: "MiniMax M3.1 Flash Preview",
+          label: "MiniMax M3.1 Flash Preview (512K)",
+          contextWindow: 524_288,
+          effortLevels: M31_LEVELS,
+          defaultEffort: "max",
+          supportsMaxOutput: true,
+        },
+        {
+          id: "MiniMax-M3.1-Flash-Preview-1M",
+          label: "MiniMax M3.1 Flash Preview (1M)",
           contextWindow: 1_000_000,
           effortLevels: M31_LEVELS,
-          contextCaps: [524_288],
+          defaultEffort: "max",
           supportsMaxOutput: true,
         },
         { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [], supportsMaxOutput: true },

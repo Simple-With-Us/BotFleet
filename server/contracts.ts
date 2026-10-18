@@ -867,6 +867,8 @@ export interface ModelCatalog {
     /** Effort levels this specific model supports, if any.
      * When defined, only models with non-empty effortLevels support effort. */
     effortLevels?: readonly EffortLevel[];
+    /** The default effort level for this model when none is explicitly selected. */
+    defaultEffort?: EffortLevel;
     supportsEffort?: boolean;
     /** Working-context caps (tokens) the picker offers besides the full
      * window, for a model that is useful below it.  Absent means no choice. */

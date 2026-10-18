@@ -8,6 +8,7 @@ import type { InstanceInfo, ModelSelection } from "@/state/store";
 import { cn } from "@/lib/cn";
 import {
   selectionContextCaps,
+  selectionDefaultEffort,
   selectionEffortLevels,
   selectionSupportsMaxOutput,
   selectionWithContextCap,
@@ -47,6 +48,7 @@ export function ModelSettings({
   const [open, setOpen] = useState(initialOpen);
   if (!modelSettingsAvailable(instance, selection, showEffort)) return null;
   const levels = showEffort ? selectionEffortLevels(instance, selection) : [];
+  const defaultEffort = showEffort ? selectionDefaultEffort(instance, selection) : undefined;
   const caps = selectionContextCaps(instance, selection);
   const windowTokens = instance?.models.options.find((option) => option.id === selection.model)?.contextWindow;
   return (
@@ -66,6 +68,7 @@ export function ModelSettings({
           {levels.length > 0 && (
             <EffortSection
               levels={levels}
+              defaultEffort={defaultEffort}
               current={selection.effort}
               onPick={(level) => onChange(selectionWithEffort(selection, level))}
               disabled={disabled}

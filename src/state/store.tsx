@@ -838,6 +838,7 @@ export interface InstanceInfo {
        * without a tooltip and a screen-reader hint. */
       badgeTitle?: string;
       effortLevels?: readonly EffortLevel[];
+      defaultEffort?: EffortLevel;
       supportsEffort?: boolean;
       contextCaps?: readonly number[];
       supportsMaxOutput?: boolean;

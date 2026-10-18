@@ -110,12 +110,18 @@ const MODELS: ModelCatalog = {
   options: [
     {
       id: "MiniMax-M3.1-Flash-Preview",
-      label: "MiniMax M3.1 Flash Preview",
+      label: "MiniMax M3.1 Flash Preview (512K)",
+      contextWindow: 524_288,
+      effortLevels: [...M31_EFFORT_LEVELS],
+      defaultEffort: "max",
+      supportsMaxOutput: true,
+    },
+    {
+      id: "MiniMax-M3.1-Flash-Preview-1M",
+      label: "MiniMax M3.1 Flash Preview (1M)",
       contextWindow: 1_000_000,
       effortLevels: [...M31_EFFORT_LEVELS],
-      // MiniMax Code offers 512K or 1M.  The API has no such parameter (the
-      // window is fixed), so this is a client-side cap on the prompt budget.
-      contextCaps: [524_288],
+      defaultEffort: "max",
       supportsMaxOutput: true,
     },
     // Explicit `[]`: src/lib/model-effort.ts gives a row with no list the
@@ -144,7 +150,8 @@ const MODELS: ModelCatalog = {
  *  against the pricing page above as the maintenance cost of having a
  *  cost column at all. */
 export const MINIMAX_PRICE_PER_MILLION: ChatCompletionsPriceTable = {
-  "MiniMax-M3.1-Flash-Preview": [
+  "MiniMax-M3.1-Flash-Preview": [{ input: 0.3, output: 1.2, cachedInput: 0.06 }],
+  "MiniMax-M3.1-Flash-Preview-1M": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
   ],
@@ -499,8 +506,9 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       // with no signal — generateText for titles and summaries — keep the
       // driver's own 180s ceiling.
       const signal = opts.signal ?? AbortSignal.timeout(180_000);
+      const upstreamModel = model.replace(/-1M$/i, "");
       const body = {
-        model,
+        model: upstreamModel,
         messages,
         stream: opts.stream,
         reasoning_split: true,
@@ -1039,7 +1047,23 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           label: known?.label ?? id,
           contextWindow: known?.contextWindow,
           effortLevels: known?.effortLevels ?? [],
+          defaultEffort: known?.defaultEffort,
+          supportsMaxOutput: known?.supportsMaxOutput,
         });
+        if (id === "MiniMax-M3.1-Flash-Preview") {
+          const m1 = MODELS.options.find((m) => m.id === "MiniMax-M3.1-Flash-Preview-1M");
+          if (m1 && !seen.has(m1.id)) {
+            seen.add(m1.id);
+            options.push({
+              id: m1.id,
+              label: m1.label,
+              contextWindow: m1.contextWindow,
+              effortLevels: m1.effortLevels ?? [],
+              defaultEffort: m1.defaultEffort,
+              supportsMaxOutput: m1.supportsMaxOutput,
+            });
+          }
+        }
       }
       if (options.length === 0) return; // an empty or malformed list keeps the current catalog
       const keptDefault = options.find((o) => o.id === models.default)?.id;

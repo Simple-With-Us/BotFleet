@@ -30,7 +30,8 @@ export interface MinimaxPriceTier {
 export type MinimaxPriceTable = Record<string, MinimaxPriceTier[] | null>;
 
 export const MINIMAX_PRICE_PER_MILLION = {
-  "MiniMax-M3.1-Flash-Preview": [
+  "MiniMax-M3.1-Flash-Preview": [{ input: 0.3, output: 1.2, cachedInput: 0.06 }],
+  "MiniMax-M3.1-Flash-Preview-1M": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
   ],
@@ -64,7 +65,8 @@ type MinimaxDisplayLabel = { model: string; badge: string };
 // server/drivers/minimax.ts documents.
 // oxlint-disable-next-line anti-slop/no-known-value-widening
 const DISPLAY: Record<string, MinimaxDisplayLabel> = {
-  "MiniMax-M3.1-Flash-Preview": { model: "MiniMax M3.1 Flash Preview", badge: "Default · ≤512K ctx" },
+  "MiniMax-M3.1-Flash-Preview": { model: "MiniMax M3.1 Flash Preview (512K)", badge: "Default · 512K ctx" },
+  "MiniMax-M3.1-Flash-Preview-1M": { model: "MiniMax M3.1 Flash Preview (1M)", badge: "1M ctx" },
   "MiniMax-M2.7-highspeed": { model: "MiniMax M2.7 Highspeed", badge: "API" },
 };
 

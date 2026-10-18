@@ -8,7 +8,8 @@
 // client-side cap (Claude Code auto-compact window, Codex model_context_window),
 // not a request parameter.
 const WINDOWS: ReadonlyMap<string, number> = new Map([
-  ["minimax-m3.1-flash-preview", 1_000_000],
+  ["minimax-m3.1-flash-preview", 524_288],
+  ["minimax-m3.1-flash-preview-1m", 1_000_000],
   ["minimax-m3", 1_000_000],
   ["minimax-m2.7", 204_800],
   ["minimax-m2.7-highspeed", 204_800],
@@ -28,5 +29,9 @@ const WINDOWS: ReadonlyMap<string, number> = new Map([
 export function contextWindowFor(model: string | undefined | null): number | undefined {
   if (!model) return undefined;
   const id = model.trim().toLowerCase();
-  return WINDOWS.get(id) ?? WINDOWS.get(id.replace(/-thinking$/, ""));
+  return (
+    WINDOWS.get(id) ??
+    WINDOWS.get(id.replace(/-thinking$/, "")) ??
+    WINDOWS.get(id.replace(/-thinking(-1m)$/, "$1"))
+  );
 }

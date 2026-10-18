@@ -638,6 +638,25 @@ describe("Effort section in the chat model menu", () => {
     expect(onPick.mock.calls).toEqual([[undefined], ["low"], ["high"]]);
   });
 
+  it("renders (default: max) in the header and omits the Default button when defaultEffort is provided", () => {
+    const onPick = vi.fn();
+    const tree = EffortSection({
+      levels: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "max",
+      current: undefined,
+      onPick,
+    });
+    const choices = findElements(tree, (element) => element.type === "button");
+    expect(choices).toHaveLength(5);
+    const html = renderToStaticMarkup(tree as any);
+    expect(html).toContain("Effort");
+    expect(html).toContain("(default: max)");
+    const maxButton = choices.find((c) => (c.props as any)["aria-pressed"] === true);
+    expect(maxButton).toBeDefined();
+    (choices[0].props as { onClick: () => void }).onClick();
+    expect(onPick).toHaveBeenCalledWith("low");
+  });
+
   it("Max Input Tokens: presets plus a custom field, No Limit first, hidden with no caps", () => {
     const html = renderToStaticMarkup(
       createElement(ContextSection, { caps: [524_288], windowTokens: 1_000_000, current: undefined, onPick: () => {} }),
