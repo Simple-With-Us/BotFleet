@@ -4,7 +4,10 @@
 // nothing the receiver's strict schema would refuse.
 import { describe, expect, it } from "vitest";
 
-import { aiTokensFromChatUsage, aiTokensFromTurn, aiUsageTotalTokens, cleanAiUsage } from "./ai-usage.ts";
+import { aiTokensFromChatUsage, aiTokensFromTurn, aiUsageTotalTokens, ChatUsageSchema, cleanAiUsage } from "./ai-usage.ts";
+
+/** What the caller does with a provider response before the helper sees it. */
+const chat = (raw: Parameters<typeof ChatUsageSchema.safeParse>[0]) => aiTokensFromChatUsage(ChatUsageSchema.safeParse(raw).data);
 
 describe("aiTokensFromTurn", () => {
   it("splits BotFleet's whole-context input into uncached input and the cache buckets", () => {
@@ -33,7 +36,7 @@ describe("aiTokensFromTurn", () => {
 
 describe("aiTokensFromChatUsage", () => {
   it("reads an OpenAI-style usage object, taking the cached share out of prompt_tokens", () => {
-    const tokens = aiTokensFromChatUsage({
+    const tokens = chat({
       prompt_tokens: 1000,
       completion_tokens: 300,
       prompt_tokens_details: { cached_tokens: 600 },
@@ -45,7 +48,7 @@ describe("aiTokensFromChatUsage", () => {
   });
 
   it("reads DeepSeek's prompt_cache_hit_tokens", () => {
-    expect(aiTokensFromChatUsage({ prompt_tokens: 500, completion_tokens: 50, prompt_cache_hit_tokens: 450 })).toEqual({
+    expect(chat({ prompt_tokens: 500, completion_tokens: 50, prompt_cache_hit_tokens: 450 })).toEqual({
       input: 50,
       output: 50,
       cacheRead: 450,
@@ -54,13 +57,19 @@ describe("aiTokensFromChatUsage", () => {
 
   it("reads an OpenRouter cache write as a 5 minute write, out of input", () => {
     expect(
-      aiTokensFromChatUsage({ prompt_tokens: 500, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 100, cache_write_tokens: 200 } }),
+      chat({ prompt_tokens: 500, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 100, cache_write_tokens: 200 } }),
     ).toEqual({ input: 200, output: 5, cacheRead: 100, cacheWrite5m: 200 });
   });
 
+  it("reads a malformed field as absent without losing the rest", () => {
+    expect(chat({ prompt_tokens: "lots", completion_tokens: 12 })).toEqual({ output: 12 });
+    expect(chat({ prompt_tokens: -4, completion_tokens: 12, prompt_tokens_details: "nope" })).toEqual({ output: 12 });
+    expect(chat("not an object")).toEqual({});
+  });
+
   it("is empty for a response with no usage", () => {
-    expect(aiTokensFromChatUsage(undefined)).toEqual({});
-    expect(aiTokensFromChatUsage({})).toEqual({});
+    expect(chat(undefined)).toEqual({});
+    expect(chat({})).toEqual({});
   });
 });
 

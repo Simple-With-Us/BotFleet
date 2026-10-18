@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { Pronunciation } from "../../shared/pronunciations.ts";
 import { utterancesWithSpans } from "../../shared/speech-spans.ts";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
-import { aiTokensFromChatUsage } from "../ai-usage.ts";
+import { aiTokensFromChatUsage, ChatUsageSchema } from "../ai-usage.ts";
 import { telemetry } from "../telemetry.ts";
 import { sanitizeForTTSByLine } from "./minimax.ts";
 
@@ -23,7 +23,7 @@ export const DeepSeekChatResponseSchema = z.object({
   created: z.number().optional(),
   model: z.string().optional(),
   choices: z.array(DeepSeekChatChoiceSchema).optional(),
-  usage: z.record(z.string(), z.unknown()).optional(),
+  usage: ChatUsageSchema.optional().catch(undefined),
 });
 
 export type DeepSeekChatResponse = z.infer<typeof DeepSeekChatResponseSchema>;

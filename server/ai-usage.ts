@@ -108,7 +108,7 @@ export function aiTokensFromTurn(report: TurnTokenReport): AiUsageTokens {
 // string or a negative where a count belongs loses that field, not the whole
 // object, and an unexpected shape reads as "no usage" rather than as zeros.
 const count = z.number().finite().nonnegative().optional().catch(undefined);
-const ChatUsageSchema = z.object({
+export const ChatUsageSchema = z.object({
   prompt_tokens: count,
   completion_tokens: count,
   prompt_cache_hit_tokens: count,
@@ -116,13 +116,15 @@ const ChatUsageSchema = z.object({
   completion_tokens_details: z.object({ reasoning_tokens: count }).optional().catch(undefined),
 });
 
+/** A provider `usage` object that has been through `ChatUsageSchema`. */
+export type ChatUsage = z.output<typeof ChatUsageSchema>;
+
 /** The canonical tokens of an OpenAI Chat Completions style `usage` object
  * (also DeepSeek, MiniMax, xAI, OpenRouter): `prompt_tokens` includes the
- * cached share, `completion_tokens` includes reasoning. */
-export function aiTokensFromChatUsage(usage: object | null | undefined): AiUsageTokens {
-  const parsed = ChatUsageSchema.safeParse(usage);
-  if (!parsed.success) return {};
-  const raw = parsed.data;
+ * cached share, `completion_tokens` includes reasoning.  The caller parses the
+ * provider response with `ChatUsageSchema` first. */
+export function aiTokensFromChatUsage(raw: ChatUsage | undefined): AiUsageTokens {
+  if (!raw) return {};
   const prompt = tokenCount(raw.prompt_tokens);
   const cacheRead = Math.min(
     prompt,
