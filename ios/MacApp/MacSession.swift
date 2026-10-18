@@ -136,9 +136,10 @@ public final class MacSession: ObservableObject {
 
         status = .connecting
 
-        guard let url = URL(string: "http://\(host):\(port)"),
+        let normalizedHost = Connection.urlHost(host)
+        guard let url = URL(string: "http://\(normalizedHost):\(port)"),
               let endpoint = CompanionEndpoint(url: url.absoluteString, kind: .lan, priority: 1) else {
-            status = .failed("Invalid server URL: http://\(host):\(port)")
+            status = .failed("Invalid server URL: http://\(normalizedHost):\(port)")
             return
         }
 
@@ -189,16 +190,19 @@ public final class MacSession: ObservableObject {
             } catch {
                 if Task.isCancelled { break }
                 reconnectAttempt += 1
-                let backoff = min(Double(reconnectAttempt) * 1.5, 10.0)
+                let baseBackoff = min(Double(reconnectAttempt) * 1.5, 10.0)
+                let jitter = Double.random(in: -0.2...0.2) * baseBackoff
+                let backoff = max(1.0, baseBackoff + jitter)
                 status = .failed("Connection lost. Retrying in \(Int(backoff))s…")
                 try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
             }
         }
     }
 
-    public func sendMessage(_ text: String) async {
-        guard let client = client, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        guard let threadId = activeThreadId else { return }
+    @discardableResult
+    public func sendMessage(_ text: String) async -> Bool {
+        guard let client = client, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard let threadId = activeThreadId else { return false }
         isSending = true
         defer { isSending = false }
 
@@ -210,6 +214,7 @@ public final class MacSession: ObservableObject {
                     threadId: threadId,
                     idempotencyKey: UUID().uuidString
                 )
+                return true
             } else if let room = activeRoom {
                 _ = try await client.send(
                     text: text,
@@ -217,9 +222,13 @@ public final class MacSession: ObservableObject {
                     threadId: threadId,
                     idempotencyKey: UUID().uuidString
                 )
+                return true
             }
+            return false
         } catch {
             print("Failed to send turn: \(error)")
+            status = .failed("Send failed: \(error.localizedDescription)")
+            return false
         }
     }
 

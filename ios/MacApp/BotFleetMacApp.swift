@@ -59,7 +59,7 @@ struct BotFleetMacApp: App {
                     TextField("Host", text: $session.host)
                         .frame(width: 120)
                     Text(":")
-                    TextField("Port", value: $session.port, format: .number)
+                    TextField("Port", value: $session.port, format: .number.grouping(.never))
                         .frame(width: 70)
                 }
 

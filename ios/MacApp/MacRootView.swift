@@ -405,8 +405,12 @@ struct MacComposerBar: View {
             } else {
                 Button(action: {
                     let text = inputText
-                    inputText = ""
-                    Task { await session.sendMessage(text) }
+                    Task {
+                        let sent = await session.sendMessage(text)
+                        if sent {
+                            inputText = ""
+                        }
+                    }
                 }) {
                     Image(systemName: "arrow.up.circle.fill")
                         .resizable()
