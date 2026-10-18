@@ -71,8 +71,30 @@ test("autofix callers keep their least-privilege and fork guards", () => {
   const autofix = read(".github/workflows/autofix.yml");
   assert.match(autofix, /^permissions: \{\}\s*$/m, "autofix.yml grants nothing at workflow level");
   assert.match(autofix, /^ {6}contents: write\n {6}pull-requests: read\n/m);
-  assert.match(autofix, /github\.event_name == 'pull_request_review' && contains\(fromJSON\('\["bot", "Bot"\]'\), github\.event\.review\.user\.type\)/);
-  assert.match(autofix, /github\.event_name != 'pull_request_review' && contains\(fromJSON\('\["bot", "Bot"\]'\), github\.event\.comment\.user\.type\)/);
+  // The caller delegates identity enforcement to the pinned reusable.  Its
+  // local gate must still control invocation and reject closed/non-PR events.
+  assert.match(autofix, /^ {4}needs: decide$/m);
+  assert.ok(autofix.includes("needs.decide.outputs.run == 'true' &&"));
+  assert.ok(autofix.includes("(github.event.issue.pull_request || github.event.pull_request) &&"));
+  assert.ok(autofix.includes("(github.event.issue.state == 'open' || github.event.pull_request.state == 'open')"));
+  assert.match(autofix, /^ {6}run: \$\{\{ steps\.gate\.outputs\.run \}\}$/m);
+  assert.ok(autofix.includes('grep -q \'@autofix\' <<< "$body"'));
+  for (const reviewer of ["kody-ai[bot]", "chatgpt-codex-connector[bot]", "sentry[bot]"]) {
+    assert.ok(autofix.includes(`"$REVIEWER" = "${reviewer}"`), `automatic reviews include ${reviewer}`);
+  }
+  assert.ok(autofix.includes('[ "$EVENT_NAME" = "pull_request_review" ]'));
+  assert.ok(autofix.includes('[ "$total" -le 1 ]'));
+  assert.ok(autofix.includes('echo "run=false" >> "$GITHUB_OUTPUT"'));
+
+  // Pin the declared policy, without claiming this proves the external
+  // reusable's actor guard or its support for human tagged invocations.
+  const allowed = read(".autofix.yml").split("\n")
+    .map((line) => /^\s*-\s+([^#]+?)\s*(?:#.*)?$/.exec(line)?.[1])
+    .filter(Boolean);
+  assert.deepEqual(allowed, [
+    "jaywedgeworth22", "kody-ai[bot]", "chatgpt-codex-connector[bot]",
+    "sentry[bot]", "github-actions[bot]", "sonarcloud[bot]", "codacy-production[bot]",
+  ]);
 
   const claude = read(".github/workflows/claude-code-autofix.yml");
   assert.match(claude, /github\.event\.review\.user\.type == 'Bot'/);
