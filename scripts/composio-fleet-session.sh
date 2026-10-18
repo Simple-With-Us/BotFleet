@@ -22,7 +22,7 @@
 #
 # API key resolution order:
 #   1. $COMPOSIO_API_KEY env
-#   2. ~/.secrets/global-api-keys (line `COMPOSIO_API_KEY="ak_..."`)
+#   2. `fleet-secrets get COMPOSIO_API_KEY` (Mac, when the helper is installed)
 
 set -euo pipefail
 
@@ -50,12 +50,17 @@ resolve_api_key() {
   if [[ -n "${COMPOSIO_API_KEY:-}" ]]; then
     printf "%s" "$COMPOSIO_API_KEY"; return 0
   fi
-  local key_file="$HOME/.secrets/global-api-keys"
-  if [[ ! -r "$key_file" ]]; then
-    echo "COMPOSIO_API_KEY not set and $key_file unreadable" >&2
+  if ! command -v fleet-secrets &>/dev/null; then
+    echo "COMPOSIO_API_KEY not set and fleet-secrets is not installed" >&2
     return 1
   fi
-  grep -oE '^COMPOSIO_API_KEY="[^"]+"' "$key_file" | head -1 | sed 's/COMPOSIO_API_KEY="//;s/"$//'
+  local key
+  key="$(fleet-secrets get COMPOSIO_API_KEY 2>/dev/null)" || key=""
+  if [[ -z "$key" ]]; then
+    echo "COMPOSIO_API_KEY not set and fleet-secrets get returned nothing" >&2
+    return 1
+  fi
+  printf "%s" "$key"
 }
 
 mint_session() {

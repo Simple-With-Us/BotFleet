@@ -1,7 +1,7 @@
 ---
 name: secret-handoff
 description: >-
-  Fleet secret handling — handoff file, Infisical, Coolify token split, grep trap, leak response. Load BEFORE any command that might touch a credential, before reading ~/.secrets, Infisical, .env, or vault output, and before debugging auth. Trigger even when the user does not say "secret."
+  Fleet secret handling — fleet-secrets, Infisical, Coolify token split, grep trap, leak response. Load BEFORE any command that might touch a credential, before reading ~/.secrets, Infisical, .env, or vault output, and before debugging auth. Trigger even when the user does not say "secret."
 ---
 
 # Secret handoff (MONET)
@@ -17,36 +17,43 @@ Load `~/.claude/skills/secret-safety/SKILL.md` as well when that file exists.  T
 
 **Redact in the same command that touches the secret.**  If you are deciding whether output is safe to show, you are already too late — it is in the transcript.
 
-## One canonical handoff file
+## Reading fleet secrets on the Mac
 
-`/Users/jay/.secrets/global-api-keys` (no extension).  There is no `global-api-keys.env` to use.  The superseded sibling is a recovery net, not a source.
+Use `fleet-secrets` (reads Infisical Fleet-OPS `prod`).  Nothing may read the flat file `~/.secrets/global-api-keys` any more (OPS-818).
+
+```bash
+fleet-secrets names                 # key names only
+fleet-secrets get NAME              # one value on stdout, no newline; exit 3 if absent
+fleet-secrets run --only A,B -- CMD # exec CMD with just those keys as env vars
+fleet-secrets doctor                # booleans and counts only
+```
 
 Cloud: `GET https://mac.jays.services/files/key-names` with the same Bearer as `/files` (`MAC_COLLAB_TOKEN`).  Use names-only lookup; runtime keys are managed via Infisical per app.
 
-Infisical (the app's own project, prod) is the source of truth for **deployed app runtime** secrets.  The handoff file is operator convenience and may go stale.  Copy cross-app keys into the consuming Infisical project (store-to-store), do not teach the app to read the handoff file.
+Infisical (the app's own project, prod) is the source of truth for **deployed app runtime** secrets.  Copy cross-app keys into the consuming Infisical project (store-to-store), do not teach the app to call `fleet-secrets`.
 
 Owner drops a `chmod 600` file and gives you the path.  Never print the value.  Prefer scoped, revocable credentials.  Remind the owner they can revoke when the task is done.
 
-## Handoff-file grep trap (2026-08-14)
+## Grep trap (2026-08-14)
 
 A tool result that contains even one `KEY=value` line has leaked.
 
 Forbidden:
 
 ```bash
-cat ~/.secrets/global-api-keys
-grep '^[A-Z0-9_]+=' ~/.secrets/global-api-keys
-grep '^ADMIN' ~/.secrets/global-api-keys
+cat ~/.secrets/<any file>
+grep '^[A-Z0-9_]+=' ~/.secrets/<any file>
 rg TOKEN ~/.secrets/
-# Read / open-file / less / bat on that path
+fleet-secrets get NAME              # on a real key, just to look at it
+# Read / open-file / less / bat on any ~/.secrets path
 ```
 
 Allowed:
 
 ```bash
-grep -oE '^[A-Z][A-Z0-9_]*' ~/.secrets/global-api-keys | sort -u
+fleet-secrets names
 
-TOKEN="$(grep -m1 '^SOME_KEY=' ~/.secrets/global-api-keys | cut -d= -f2- | tr -d '"')"
+TOKEN="$(fleet-secrets get SOME_KEY)" || exit $?
 some-command 2>&1 | sed "s/${TOKEN}/[REDACTED]/g"
 ```
 
@@ -78,7 +85,7 @@ Never put `COOLIFY_AGENTS` into Infisical as app `COOLIFY_API_TOKEN`.  Prefer en
 Do not declare a Cloudflare credential dead without a real resource call.
 
 1. `/user/tokens/verify` only understands **user-owned** tokens.  Account-owned tokens 401 there by design — use `/accounts/{id}/tokens/verify` or `GET /zones`.
-2. Global API Key "9103 Unknown X-Auth-Key" can mean the **wrong email**, not a dead key.  This fleet has multiple Cloudflare logins.  Try the pairing in AGENT-SYNC / the handoff file's CLOUDFLARE section (names only) before concluding.
+2. Global API Key "9103 Unknown X-Auth-Key" can mean the **wrong email**, not a dead key.  This fleet has multiple Cloudflare logins.  Try the pairing in AGENT-SYNC / the CLOUDFLARE names from `fleet-secrets names` before concluding.
 
 Empty `success:true` on a filtered Bearer call means "valid, not scoped to that filter," not dead.  Prefer `CLOUDFLARE_FLEET_API_TOKEN` for ordinary work.
 

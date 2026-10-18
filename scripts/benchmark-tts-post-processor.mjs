@@ -12,29 +12,35 @@
  *   node scripts/benchmark-tts-post-processor.mjs --minimax   # Only test MiniMax models
  */
 
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
-// 1. Load keys securely from ~/.secrets/global-api-keys if available
-const secretsPath = join(homedir(), ".secrets", "global-api-keys");
-const secrets = {};
-try {
-  const content = readFileSync(secretsPath, "utf8");
-  for (const line of content.split("\n")) {
-    const match = line.match(/^([A-Z0-9_]+)=(.*)$/);
-    if (match) {
-      secrets[match[1]] = match[2].trim().replace(/^["']|["']$/g, "");
-    }
+// 1. Keys come from the environment first, then from `fleet-secrets get NAME`
+//    (Mac, Infisical Fleet-OPS).  The value is captured and never printed; a
+//    missing helper or an absent key just means "not set".
+function fleetSecret(name) {
+  try {
+    return execFileSync("fleet-secrets", ["get", name], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 20_000,
+    }).trim();
+  } catch {
+    return "";
   }
-} catch {
-  // Rely on process.env
 }
 
-const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY || secrets["MINIMAX_API_KEY"];
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || secrets["DEEPSEEK_API_KEY_AGENT_BAR"] || secrets["SHELLULAR2_DEEPSEEK_API_KEY"];
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || secrets["CT_OPENROUTER_API_KEY"];
+function secret(...names) {
+  for (const name of names) {
+    const value = process.env[name] || fleetSecret(name);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+const MINIMAX_API_KEY = secret("MINIMAX_API_KEY");
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || secret("DEEPSEEK_API_KEY_AGENT_BAR", "SHELLULAR2_DEEPSEEK_API_KEY");
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || secret("CT_OPENROUTER_API_KEY");
 
 // 2. Standard Test Fixture (Realistic technical PR merge output)
 const SAMPLE_INPUT = `What I merged this run

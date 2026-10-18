@@ -262,8 +262,9 @@ test("the root is resolved physically so a pointer is not mistaken for a path", 
 // --- Infisical machine identity ----------------------------------------------
 //
 // launchd does not inherit a desktop session, so the only identity the harness
-// can recover after a restart is the pair in the fleet handoff file.  These
-// tests use a private HOME and a node stub that records only fixture-prefixed
+// can recover after a restart is the pair `fleet-secrets get` returns.  These
+// tests use a private HOME with a fake $HOME/.local/bin/fleet-secrets (backed by
+// a plain NAME=value file inside the fixture) and a node stub that records only fixture-prefixed
 // values (anything else is reported as "other") so a real secret can never
 // land in the assertion output.
 
@@ -311,12 +312,13 @@ function identityFixture() {
   mkdirSync(join(serverRoot, "node_modules", "yaml"), { recursive: true });
   writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
   const home = join(dir, "home");
-  mkdirSync(join(home, ".secrets"), { recursive: true });
+  mkdirSync(join(home, ".local", "bin"), { recursive: true });
   return {
     dir,
     serverRoot,
     home,
-    keys: join(home, ".secrets", "global-api-keys"),
+    keys: join(dir, "fake-store"),
+    bin: join(home, ".local", "bin", "fleet-secrets"),
     report: join(dir, "env-report"),
     node: writeIdentityNode(dir),
     ledger: join(dir, "ledger"),
@@ -324,8 +326,22 @@ function identityFixture() {
   };
 }
 
+// Installs a fake `fleet-secrets` whose `get NAME` prints the value of the first
+// NAME=value line in the fixture store (no quote stripping, like the real one)
+// and exits 3 when the name is absent.
 function writeKeys(fixture, body) {
   writeFileSync(fixture.keys, body.endsWith("\n") ? body : `${body}\n`, { mode: 0o600 });
+  installFakeFleetSecrets(fixture, [
+    "#!/bin/sh",
+    '[ "$1" = get ] || exit 2',
+    `line="$(grep -m1 "^$2=" ${JSON.stringify(fixture.keys)})" || exit 3`,
+    'printf "%s" "${line#*=}"',
+  ].join("\n"));
+}
+
+function installFakeFleetSecrets(fixture, script) {
+  writeFileSync(fixture.bin, `${script}\n`);
+  chmodSync(fixture.bin, 0o755);
 }
 
 function runIdentity(fixture, extraEnv = {}) {
@@ -378,14 +394,14 @@ test("the Infisical identity banner is 7-bit ASCII", () => {
   assert.equal([...line].some((ch) => ch.charCodeAt(0) > 127), false);
 });
 
-test("documented handoff names are exported and wrapping quotes are stripped", () => {
+test("documented names are fetched and exported, and nothing else is", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
       fixture,
       [
-        'INFISICAL_CLIENT_ID="fixture-canonical-id"',
-        "INFISICAL_CLIENT_SECRET='fixture-canonical-secret'",
+        "INFISICAL_CLIENT_ID=fixture-canonical-id",
+        "INFISICAL_CLIENT_SECRET=fixture-canonical-secret",
         "UNRELATED_TOKEN=fixture-should-not-leak",
       ].join("\n"),
     );
@@ -441,7 +457,7 @@ test("a blank documented line falls through to the automation name", () => {
       [
         "INFISICAL_CLIENT_ID=",
         "INFISICAL_AUTOMATION_CLIENT_ID=fixture-auto-id",
-        'INFISICAL_CLIENT_SECRET=""',
+        "INFISICAL_CLIENT_SECRET=",
         "INFISICAL_AUTOMATION_CLIENT_SECRET=fixture-auto-secret",
       ].join("\n"),
     );
@@ -453,7 +469,7 @@ test("a blank documented line falls through to the automation name", () => {
   }
 });
 
-test("a handoff file with no identity does not export empty strings", () => {
+test("a store with no identity does not export empty strings", () => {
   const fixture = identityFixture();
   try {
     writeKeys(fixture, "OTHER_TOKEN=fixture-unrelated\n");
@@ -470,7 +486,7 @@ test("a handoff file with no identity does not export empty strings", () => {
   }
 });
 
-test("a half pair in the handoff file is not exported", () => {
+test("a half pair from fleet-secrets is not exported", () => {
   const fixture = identityFixture();
   try {
     writeKeys(fixture, "INFISICAL_CLIENT_ID=fixture-only-id\n");
@@ -482,7 +498,7 @@ test("a half pair in the handoff file is not exported", () => {
   }
 });
 
-test("an identity already in the environment is not replaced by the handoff file", () => {
+test("an identity already in the environment is not replaced by fleet-secrets", () => {
   const fixture = identityFixture();
   try {
     writeKeys(
@@ -500,7 +516,7 @@ test("an identity already in the environment is not replaced by the handoff file
   }
 });
 
-test("a missing handoff file still forwards an identity the environment already holds", () => {
+test("a missing fleet-secrets still forwards an identity the environment already holds", () => {
   const fixture = identityFixture();
   try {
     const got = identityReport(fixture, runIdentity(fixture, {
@@ -514,10 +530,10 @@ test("a missing handoff file still forwards an identity the environment already 
   }
 });
 
-test("a directory where the handoff file should be does not stop the harness", () => {
+test("a failing fleet-secrets does not stop the harness", () => {
   const fixture = identityFixture();
   try {
-    mkdirSync(fixture.keys);
+    installFakeFleetSecrets(fixture, "#!/bin/sh\nexit 4");
     const got = identityReport(fixture, runIdentity(fixture));
     assert.equal(got.INFISICAL_CLIENT_ID, "unset");
     assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
