@@ -240,6 +240,8 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_PROMPTS;
     delete process.env.FAKE_CLAUDE_LIFECYCLE;
     delete process.env.FAKE_CLAUDE_RESULT_MARK;
+    delete process.env.FAKE_CLAUDE_CACHE_WRITE;
+    delete process.env.FAKE_CLAUDE_SERVED_MODEL;
     delete process.env.FAKE_CLAUDE_GATE;
     delete process.env.FAKE_CLAUDE_COST_DIR;
     delete process.env.ANTHROPIC_API_KEY;
@@ -290,6 +292,31 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       usage: { input: 12, output: 5, cachedInput: 2 },
     });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("names the cache writes by TTL and the served model, inside an input that still reads whole", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "ttl";
+    process.env.FAKE_CLAUDE_SERVED_MODEL = "claude-sonnet-5-20261001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-ttl", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // 10 plain + 2 cache read + 7 cache write = 19 context tokens; the writes
+    // stay inside `input` (the context meter) and are named for telemetry
+    expect(recorder.events.at(-1)).toMatchObject({
+      type: "turn.completed",
+      usage: { input: 19, output: 5, cachedInput: 2, cacheWrite5m: 3, cacheWrite1h: 4 },
+      servedModel: "claude-sonnet-5-20261001",
+    });
+  });
+
+  it("files a flat cache-creation figure from an older CLI under the 5 minute cache", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "flat";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-flat", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const done = recorder.events.at(-1) as Extract<RuntimeEvent, { type: "turn.completed" }>;
+    expect(done.usage).toEqual({ input: 19, output: 5, cachedInput: 2, cacheWrite5m: 7 });
+    expect(done.servedModel).toBeUndefined();
   });
 
   it("attaches a step's whole input and output to its events, and leaves the headline the row shows alone", async () => {

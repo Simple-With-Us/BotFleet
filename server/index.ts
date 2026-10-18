@@ -161,7 +161,7 @@ import {
 } from "./turn-worktree-admission.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
 import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
-import { telemetry } from "./telemetry.ts";
+import { telemetry, turnUsageDetail } from "./telemetry.ts";
 import { usageQuotaPoller } from "./usage-quota.ts";
 import { getDeepSeekBalance } from "./deepseek-balance.ts";
 import { rollingSpendTracker } from "./rolling-spend.ts";
@@ -501,6 +501,7 @@ import { mintStsToken, type StsProvider } from "../shared/sts-tokens.ts";
 import {
   StsMintThrottle,
   stsKeyStatus,
+  stsSessionTelemetry,
   stsStatusBody,
   stsTokenRequest,
   stsUnavailableReason,
@@ -5998,6 +5999,7 @@ bus.subscribe((event: RuntimeEvent) => {
           inputTokens: tokens?.input,
           outputTokens: tokens?.output,
           cachedInputTokens: tokens?.cachedInput,
+          ...turnUsageDetail(event, turnTiming, launchIdentityFor(bot, event.threadId).seat),
           costUsd: event.cost ?? null,
           billingMode: event.billingMode,
           latencyMs: settledOwner?.latencyMs,
@@ -6059,6 +6061,7 @@ bus.subscribe((event: RuntimeEvent) => {
             inputTokens: tokens?.input,
             outputTokens: tokens?.output,
             cachedInputTokens: tokens?.cachedInput,
+            ...turnUsageDetail(event, undefined, launchIdentityFor(roomBot, event.threadId).seat),
             costUsd: event.cost ?? null,
             billingMode: event.billingMode,
             latencyMs: settledOwner?.latencyMs,
@@ -17698,11 +17701,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 429, { error: "Wait a moment before asking for another call token." });
       }
       try {
-        return json(res, 200, await mintStsToken(provider, apiKey));
+        const minted = await mintStsToken(provider, apiKey);
+        telemetry.trackAux(stsSessionTelemetry(provider));
+        return json(res, 200, minted);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Could not start a voice call.";
         return json(res, 502, { error: message });
       }
+    }
+    // The desktop app mints call tokens itself (electron/main.mjs `sts:*`),
+    // in a process that has no Usage Monitor connection, so it tells this one
+    // a session began.  Not on the companion allowlist: a paired phone mints
+    // through /api/sts/token above, which reports for it.
+    if (method === "POST" && path === "/api/sts/session-started") {
+      const parsed = stsTokenRequest.safeParse(await readBody(req));
+      if (!parsed.success) return json(res, 400, { error: "Unknown speech-to-speech provider." });
+      telemetry.trackAux(stsSessionTelemetry(parsed.data.provider));
+      return json(res, 200, { ok: true });
     }
     // Check For Updates Automatically.  One boolean that lives in /api/config
     // beside the API keys, so it gets its own route and the paired phone never
