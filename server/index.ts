@@ -134,6 +134,7 @@ import {
   BOT_OFF_CODE,
   BOT_OFF_REFUSAL,
   botIsOff,
+  botOffPeersRefusal,
   botOffRoomNotice,
 } from "../shared/bot-power.ts";
 import { createUpdateControl, packagedInstalledAt } from "./update-control.ts";
@@ -8663,9 +8664,6 @@ export function executeListRoutinesRequest(input: {
   };
 }
 
-/** What coordinate_bots answers for a peer that is switched Off. */
-const BOT_OFF_PEER_REFUSAL = Object.freeze({ status: 403, body: Object.freeze({ error: "that bot is off" }) });
-
 /** The HTTP body for coordinate_bots.  Unknown keys are refused. */
 const coordinateBotsBodySchema = z.object({
   fromBotId: z.string().optional(),
@@ -8714,9 +8712,19 @@ export function executeCoordinateBotsRequest(input: {
   if (!jobHost) return { status: 503, body: { error: "the job runtime is not ready" } };
   const from = store.bot(input.fromBotId);
   if (!from) return { status: 404, body: { error: "no such bot" } };
+  // Every Off peer is named, once, so the asker can tell which of them said
+  // no.  The whole request is refused, before anything is recorded for any
+  // bot it named, so any other refusal (hidden, another section, no such
+  // bot) is listed by the job host when it is sent again without them.
+  const offPeers = new Map<string, string>();
+  let namedOthers = 0;
   for (const rawId of input.botIds) {
     const target = peerByToken(rawId);
-    if (target && botIsOff(target)) return BOT_OFF_PEER_REFUSAL;
+    if (target && botIsOff(target)) offPeers.set(target.id, target.name);
+    else namedOthers += 1;
+  }
+  if (offPeers.size > 0) {
+    return { status: 403, body: { error: botOffPeersRefusal([...offPeers.values()], namedOthers > 0) } };
   }
   const fromThreadId = String(input.fromThreadId ?? from.threadId);
   return jobHost.coordinate({
