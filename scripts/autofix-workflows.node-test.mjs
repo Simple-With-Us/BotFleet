@@ -56,6 +56,16 @@ test("both autofix callers pin their reusable workflow to a full commit SHA", ()
   }
 });
 
+test("PR Autofix is not pinned to a reusable revision that deadlocks", () => {
+  // 2e671004 (AI-Fleet-Coordinator #520) up to its #611 gave the reusable job the same concurrency
+  // group the caller holds, so GitHub cancelled every run as a deadlock before a step ran
+  // (runs 39012365598, 39054950194).  #611 merged as c525150d.
+  const ref = read(".github/workflows/autofix.yml").match(/pr-autofix-reusable\.yml@([0-9a-f]+)/)?.[1] ?? "";
+  for (const bad of ["2e671004", "3fac4c3c"]) {
+    assert.ok(!ref.startsWith(bad), `pr-autofix-reusable.yml is pinned to deadlocking ${bad}`);
+  }
+});
+
 test("autofix callers keep their least-privilege and fork guards", () => {
   const autofix = read(".github/workflows/autofix.yml");
   assert.match(autofix, /^permissions: \{\}\s*$/m, "autofix.yml grants nothing at workflow level");
