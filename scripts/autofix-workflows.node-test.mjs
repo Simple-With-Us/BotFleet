@@ -83,6 +83,11 @@ test("autofix callers keep their least-privilege and fork guards", () => {
     assert.ok(autofix.includes(`"$REVIEWER" = "${reviewer}"`), `automatic reviews include ${reviewer}`);
   }
   assert.ok(autofix.includes('[ "$EVENT_NAME" = "pull_request_review" ]'));
+  // Current state-gate wiring only: this does not establish that inline-only
+  // COMMENTED findings are recognized.  That functional gap remains separate.
+  assert.ok(autofix.includes('[ "$state" = "changes_requested" ]'));
+  assert.ok(autofix.includes('[ "$state" = "commented" ]'));
+  assert.ok(autofix.includes('[ -n "${body//[[:space:]]/}" ]'));
   assert.ok(autofix.includes('[ "$total" -le 1 ]'));
   assert.ok(autofix.includes('echo "run=false" >> "$GITHUB_OUTPUT"'));
 
