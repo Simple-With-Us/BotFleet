@@ -196,7 +196,7 @@ describe("job host", () => {
       message: "still going?",
       depth: 0,
     });
-    expect(off.body.error).toBe("that bot is switched off");
+    expect(off.body.error).toBe("Helper is switched off");
     expect(starts).toEqual([]);
 
     store.patchBot(target.id, { off: false });
@@ -209,6 +209,99 @@ describe("job host", () => {
     });
     expect(String(hop.body.error)).toContain("one hop");
     expect(starts).toEqual([]);
+  });
+
+  it("names the bot and the state in every refusal, and lists each bot that said no", () => {
+    // A handoff can name several bots.  When none takes it the asker has to
+    // see every one that refused and why, not only the first, or it fixes one
+    // and learns about the next a round later.
+    const { from } = setup();
+    const sleepy = store.createBot({ name: "Sleepy" }, { seedMessages: false });
+    const archived = store.createBot({ name: "Archived" }, { seedMessages: false });
+    const outsider = store.createBot({ name: "Outsider", section: "Ops" }, { seedMessages: false });
+    store.patchBot(sleepy.id, { off: true });
+    store.patchBot(archived.id, { hidden: true });
+
+    const refused = host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: [sleepy.id, "@Archived", outsider.id, "Ghost"],
+      message: "anyone free?",
+      depth: 0,
+    });
+    expect(refused.body.assignments).toBeUndefined();
+    expect(refused.body.error).toBe(
+      "Sleepy is switched off; Archived is hidden; Outsider belongs to a different section; no such bot: Ghost",
+    );
+    expect(starts).toEqual([]);
+
+    // A bot told to hand work to itself is named in the refusal too.
+    const alone = host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: [from.id],
+      message: "me?",
+      depth: 0,
+    });
+    expect(alone.body.error).toBe("Asker cannot hand work to itself");
+  });
+
+  it("hands work to the bots that can take it and says which did not, and why", () => {
+    const { from, target } = setup();
+    const sleepy = store.createBot({ name: "Sleepy" }, { seedMessages: false });
+    store.patchBot(sleepy.id, { off: true });
+
+    const handed = host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: [target.id, sleepy.id, "Ghost"],
+      message: "split it",
+      depth: 0,
+    });
+    expect(handed.body.assignments?.map((row) => row.botId)).toEqual([target.id]);
+    expect(handed.body.errors).toEqual(["Sleepy is switched off", "no such bot: Ghost"]);
+    // The MCP lane shows the model only the message, so the refusals live there too.
+    expect(handed.body.message).toBe(
+      "Handed to @Helper.  The result comes back on this conversation when the work finishes.  Not handed off: Sleepy is switched off; no such bot: Ghost.",
+    );
+    expect(store.messagesFor(from.threadId).some((message) => message.tool?.name === "Handed to @Sleepy")).toBe(false);
+  });
+
+  it("says nothing about refusals when every bot took the work", () => {
+    const { from, target } = setup();
+    const handed = host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: [target.id],
+      message: "just you",
+      depth: 0,
+    });
+    expect(handed.body.errors).toBeUndefined();
+    expect(handed.body.message).not.toContain("Not handed off");
+  });
+
+  it("names the bot when a queued handoff is refused at dispatch because it was switched off meanwhile", async () => {
+    const { from, target } = setup();
+    const handed = host.coordinate({
+      fromBotId: from.id,
+      fromThreadId: from.threadId,
+      botIds: [target.id],
+      message: "later",
+      depth: 0,
+    });
+    const childId = handed.body.assignments?.[0]?.id;
+    store.patchBot(target.id, { off: true });
+    host.onTurnSettled(from.threadId, true, "asking now");
+    await viWait(() => host.status(from.id, from.threadId, childId).body.assignment?.status === "failed");
+    expect(host.status(from.id, from.threadId, childId).body.assignment).toMatchObject({
+      status: "failed",
+      outcome: "refused",
+      outcomeDetail: "Helper is switched off",
+    });
+    // The peer never ran; the asker is woken with the refusal, by name.
+    expect(starts.filter((start) => start.botId === target.id)).toEqual([]);
+    await viWait(() => starts.some((start) => start.botId === from.id));
+    expect(starts.find((start) => start.botId === from.id)?.text).toContain("refused] Helper is switched off");
   });
 
   it("honors a legacy ask_bot grant for coordinate_bots", async () => {

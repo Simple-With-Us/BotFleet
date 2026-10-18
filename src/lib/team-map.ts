@@ -1,7 +1,11 @@
+import { botIsOff } from "../../shared/bot-power";
+
 export interface TeamMapBot {
   id: string;
   name: string;
   hidden?: boolean;
+  /** The bot's On/Off switch (shared/bot-power.ts).  True = Off. */
+  off?: boolean;
   section?: string;
   chiefOfStaff?: boolean;
   busy?: boolean;
@@ -102,5 +106,9 @@ export function teamMapStatus(bot: TeamMapBot): TeamMapStatus {
   if (bot.activity === "waiting-on-you") return { label: "Waiting for you", tone: "warning" };
   if (bot.activity === "dead" || bot.activity === "no-signal") return { label: "No signal", tone: "danger" };
   if (bot.busy || bot.activity === "working") return { label: "Working", tone: "success" };
+  // Off replaces only the resting "Ready".  A turn that was already running
+  // when the switch flipped finishes (it shows Working until it does), and a
+  // card or a dead process still needs the person; none of that is hidden.
+  if (botIsOff(bot)) return { label: "Off", tone: "idle" };
   return { label: "Ready", tone: "idle" };
 }

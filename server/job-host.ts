@@ -10,7 +10,8 @@ import { existsSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 
-import { botIsOff } from "../shared/bot-power.ts";
+import { botIsOff, botOffPeerRefusal } from "../shared/bot-power.ts";
+import { joinRefusals } from "../shared/peer-refusals.ts";
 import { getOrCreateChannel, mirrorExchange, type CommsBus } from "./comms-visibility.ts";
 import { DATA_DIR } from "./config.ts";
 import { requestPeerApproval, type ApprovalBus } from "./peer-approval.ts";
@@ -160,17 +161,19 @@ export function createJobHost(deps: JobHostDeps): JobHost {
   const runner: TurnRunner = {
     validate(assignment) {
       const target = deps.store.bot(assignment.assignee.botId);
-      if (!target) return "no such bot";
-      if (target.hidden) return "that bot is hidden";
-      if (botIsOff(target)) return "that bot is switched off";
+      // Every reason names the bot it is about: a handoff can name several,
+      // and a reason that says only "that bot" cannot be told apart.
+      if (!target) return `Bot ${assignment.assignee.botId} no longer exists`;
+      if (target.hidden) return `${target.name} is hidden`;
+      if (botIsOff(target)) return botOffPeerRefusal(target.name);
       if (deps.snoozed(target.id)) return "that bot was stopped";
       const requesterId = assignment.requester.botId;
       const requester = requesterId ? deps.store.bot(requesterId) : undefined;
       if (requester && sectionKey(requester.section) !== sectionKey(target.section)) {
-        return "that bot belongs to a different section";
+        return `${target.name} belongs to a different section`;
       }
       if (requester && assignment.requester.threadId && !deps.store.threadBelongsToBot(requester.id, assignment.requester.threadId)) {
-        return "source thread does not belong to sender";
+        return `The source thread does not belong to ${requester.name}`;
       }
       return undefined;
     },
@@ -376,7 +379,7 @@ export function createJobHost(deps: JobHostDeps): JobHost {
   function destinationFor(target: BotRecord, thread: "standing" | "new", title: string): { ok: true; threadId: string; kind: "standing_thread" | "work_thread" } | { ok: false; reason: string } {
     if (thread === "standing") return { ok: true, threadId: target.threadId, kind: "standing_thread" };
     const task = deps.store.createTask(target.id, title.slice(0, 80), false);
-    if (!task) return { ok: false, reason: "a new thread could not be opened" };
+    if (!task) return { ok: false, reason: `A new thread could not be opened for ${target.name}` };
     return { ok: true, threadId: task.threadId, kind: "work_thread" };
   }
 
@@ -444,7 +447,7 @@ export function createJobHost(deps: JobHostDeps): JobHost {
       const from = deps.store.bot(input.fromBotId);
       if (!from) return { status: 404, body: { error: "no such bot" } };
       if (!deps.store.threadBelongsToBot(from.id, input.fromThreadId)) {
-        return { status: 403, body: { error: "source thread does not belong to sender" } };
+        return { status: 403, body: { error: `The source thread does not belong to ${from.name}` } };
       }
       const message = input.message.trim();
       if (!message || input.botIds.length === 0) {
@@ -472,7 +475,7 @@ export function createJobHost(deps: JobHostDeps): JobHost {
         if (seen.has(target.id)) continue;
         seen.add(target.id);
         if (target.id === from.id) {
-          errors.push("a bot cannot hand work to itself");
+          errors.push(`${target.name} cannot hand work to itself`);
           continue;
         }
         const where = destinationFor(target, input.thread ?? "standing", input.reason || message);
@@ -514,7 +517,7 @@ export function createJobHost(deps: JobHostDeps): JobHost {
       // Written now, started only after this turn settles.  Stop can still
       // cancel anything that has not started, and a crash finds the rows.
       if (assignments.length === 0) {
-        return { status: 200, body: { error: errors[0] ?? "nothing was handed off" } };
+        return { status: 200, body: { error: joinRefusals(errors) || "nothing was handed off" } };
       }
       const names = assignments.map((row) => `@${String(row.botName)}`).join(", ");
       const reply = input.reply ?? "resume";
@@ -522,7 +525,12 @@ export function createJobHost(deps: JobHostDeps): JobHost {
         ? `Sent to ${names}.  Nothing comes back.`
         : `Handed to ${names}.  The result comes back on this conversation when the work finishes.`;
       const body: JobHostBody = { assignments, message: messageBack };
-      if (errors.length) body.errors = errors;
+      if (errors.length) {
+        // Said in the message too, because the MCP lane hands the model only
+        // the message: a bot that was turned away must not read as handed to.
+        body.errors = errors;
+        body.message = `${messageBack}  Not handed off: ${joinRefusals(errors)}.`;
+      }
       return { status: 200, body };
     },
     status(fromBotId, fromThreadId, id) {

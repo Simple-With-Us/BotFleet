@@ -52,4 +52,24 @@ describe("team map projection", () => {
       tone: "warning",
     });
   });
+
+  it("calls a switched-off bot Off, not Ready", () => {
+    expect(teamMapStatus({ id: "x", name: "X", off: true })).toEqual({ label: "Off", tone: "idle" });
+    expect(teamMapStatus({ id: "x", name: "X", off: true, activity: "idle" })).toEqual({ label: "Off", tone: "idle" });
+    // On stays Ready, whether the field is absent or false.
+    expect(teamMapStatus({ id: "x", name: "X" })).toEqual({ label: "Ready", tone: "idle" });
+    expect(teamMapStatus({ id: "x", name: "X", off: false })).toEqual({ label: "Ready", tone: "idle" });
+  });
+
+  it("keeps what an Off bot is still doing or needs ahead of Off", () => {
+    // Off never interrupts a running turn, so it shows Working until the turn
+    // ends; a card waiting on the person and a dead process are not hidden.
+    expect(teamMapStatus({ id: "x", name: "X", off: true, busy: true })).toEqual({ label: "Working", tone: "success" });
+    expect(teamMapStatus({ id: "x", name: "X", off: true, activity: "working" })).toEqual({ label: "Working", tone: "success" });
+    expect(teamMapStatus({ id: "x", name: "X", off: true, activity: "waiting-on-you" })).toEqual({
+      label: "Waiting for you",
+      tone: "warning",
+    });
+    expect(teamMapStatus({ id: "x", name: "X", off: true, activity: "dead" })).toEqual({ label: "No signal", tone: "danger" });
+  });
 });
