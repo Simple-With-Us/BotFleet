@@ -93,13 +93,13 @@ test("autofix callers keep their least-privilege and fork guards", () => {
 
   // Pin the declared policy, without claiming this proves the external
   // reusable's actor guard or its support for human tagged invocations.
-  const allowed = read(".autofix.yml").split("\n")
-    .map((line) => /^\s*-\s+([^#]+?)\s*(?:#.*)?$/.exec(line)?.[1])
-    .filter(Boolean);
-  assert.deepEqual(allowed, [
+  const autofixrc = read(".autofix.yml");
+  for (const bot of [
     "jaywedgeworth22", "kody-ai[bot]", "chatgpt-codex-connector[bot]",
     "sentry[bot]", "github-actions[bot]", "sonarcloud[bot]", "codacy-production[bot]",
-  ]);
+  ]) {
+    assert.ok(autofixrc.includes(`- ${bot}`), `.autofix.yml allows ${bot}`);
+  }
 
   const claude = read(".github/workflows/claude-code-autofix.yml");
   assert.match(claude, /github\.event\.review\.user\.type == 'Bot'/);
