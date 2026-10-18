@@ -348,7 +348,7 @@ reset_fail_ledger
 rotate_log_if_large
 
 # --- the Infisical machine identity --------------------------------------
-# Read out of the fleet's own secret file, and nothing else out of it.
+# Recovered through `fleet-secrets get`, and nothing else out of it.
 #
 # This one credential is deliberately not in the vault -- a lock cannot hold
 # its own key -- and not in config.json, which is plaintext, because it can
@@ -363,50 +363,41 @@ rotate_log_if_large
 # restart therefore leaves nothing to restore it, which is exactly when it
 # is most needed.
 #
-# The Node server never opens the file.  This wrapper is the launchd entry
+# The Node server never calls fleet-secrets.  This wrapper is the launchd entry
 # point, and it copies only the machine-identity pair into the environment
-# loadConfig() already prefers.  The values are extracted rather than sourced:
-# `ps eww` prints a process environment and that file holds every fleet secret,
-# so only the identity belongs in this process.  When both halves are already
-# in the environment, the file is not opened.  A missing or unreadable file is
-# not fatal -- the harness still starts, and the desktop app can still supply
-# the identity in memory.
+# loadConfig() already prefers.  The values are fetched one name at a time
+# rather than injected wholesale (`fleet-secrets run` would also refuse every
+# INFISICAL_* name):  `ps eww` prints a process environment and Fleet-OPS holds
+# every fleet secret, so only the identity belongs in this process.  When both
+# halves are already in the environment, nothing is fetched.  A missing helper
+# or a failed fetch is not fatal -- the harness still starts, and the desktop
+# app can still supply the identity in memory.
+#
+# The helper is addressed by its absolute path, $HOME/.local/bin/fleet-secrets,
+# because a LaunchAgent's PATH is minimal.  It authenticates from the login
+# Keychain machine identity (see INFISICAL.md in AI-Fleet-Coordinator).
 #
 # An empty string must not be exported.  loadConfig() treats a defined env var
 # as present (`process.env[name] !== undefined`), so INFISICAL_CLIENT_ID=""
 # would hide config.json and the INFISICAL_UNIVERSAL_AUTH_* aliases.  A half
-# pair would do the same to one side.  Apply the file only when it yields both
-# halves, and only into names that are still empty.  Documented handoff keys
-# (INFISICAL_CLIENT_*) win; the automation names are the fallback the Mac file
-# actually uses.
-global_secret() {
-  local name="$1" file="$HOME/.secrets/global-api-keys" line
-  # A directory at this path is "readable" but cannot be read line by line.
-  # Treat anything that is not a regular file as "no identity", and keep going.
-  [ -f "$file" ] && [ -r "$file" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      "$name="*)
-        line="${line#"$name="}"
-        # Strip one layer of wrapping quotes if the file uses them.
-        case "$line" in
-          \"*\") line="${line#\"}"; line="${line%\"}" ;;
-          \'*\') line="${line#\'}"; line="${line%\'}" ;;
-        esac
-        printf '%s' "$line"
-        return 0
-        ;;
-    esac
-  done < "$file"
+# pair would do the same to one side.  Apply the fetched values only when they
+# yield both halves, and only into names that are still empty.  Documented
+# keys (INFISICAL_CLIENT_*) win;  the automation names are the fallback.
+fleet_secret() {
+  local name="$1" bin="$HOME/.local/bin/fleet-secrets"
+  # Anything but an executable file is "no identity"; keep going.
+  [ -f "$bin" ] && [ -x "$bin" ] || return 0
+  # The value goes to stdout only; errors are dropped so no fragment is shown.
+  "$bin" get "$name" 2>/dev/null | tr -d '\r' || true
   return 0
 }
 
-# First non-empty file value among the given names.  Always exits 0 so a
+# First non-empty fetched value among the given names.  Always exits 0 so a
 # missing name cannot trip `set -e` and take the harness down with it.
-first_file_secret() {
+first_fleet_secret() {
   local name value
   for name in "$@"; do
-    value="$(global_secret "$name")"
+    value="$(fleet_secret "$name")"
     if [ -n "$value" ]; then
       printf '%s' "$value"
       return 0
@@ -416,20 +407,20 @@ first_file_secret() {
 }
 
 load_infisical_identity() {
-  local file_id="" file_secret=""
+  local fetched_id="" fetched_secret=""
   if [ -n "${INFISICAL_CLIENT_ID:-}" ] && [ -n "${INFISICAL_CLIENT_SECRET:-}" ]; then
     export INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
     return 0
   fi
-  [ -f "$HOME/.secrets/global-api-keys" ] && [ -r "$HOME/.secrets/global-api-keys" ] || return 0
-  file_id="$(first_file_secret INFISICAL_CLIENT_ID INFISICAL_AUTOMATION_CLIENT_ID)"
-  file_secret="$(first_file_secret INFISICAL_CLIENT_SECRET INFISICAL_AUTOMATION_CLIENT_SECRET)"
-  if [ -n "$file_id" ] && [ -n "$file_secret" ]; then
+  [ -f "$HOME/.local/bin/fleet-secrets" ] && [ -x "$HOME/.local/bin/fleet-secrets" ] || return 0
+  fetched_id="$(first_fleet_secret INFISICAL_CLIENT_ID INFISICAL_AUTOMATION_CLIENT_ID)"
+  fetched_secret="$(first_fleet_secret INFISICAL_CLIENT_SECRET INFISICAL_AUTOMATION_CLIENT_SECRET)"
+  if [ -n "$fetched_id" ] && [ -n "$fetched_secret" ]; then
     if [ -z "${INFISICAL_CLIENT_ID:-}" ]; then
-      INFISICAL_CLIENT_ID="$file_id"
+      INFISICAL_CLIENT_ID="$fetched_id"
     fi
     if [ -z "${INFISICAL_CLIENT_SECRET:-}" ]; then
-      INFISICAL_CLIENT_SECRET="$file_secret"
+      INFISICAL_CLIENT_SECRET="$fetched_secret"
     fi
   fi
   if [ -n "${INFISICAL_CLIENT_ID:-}" ]; then

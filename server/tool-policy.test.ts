@@ -190,7 +190,7 @@ describe("evaluateCommand: attacks", () => {
     denied(`${AGENT_SYNC} whoami --json 2>&1`);
     denied(`${AGENT_SYNC} whoami --json &>/tmp/PWNED`);
     denied(`${AGENT_SYNC} whoami --json >| /tmp/PWNED`);
-    denied(`/usr/bin/tail -n 50 < /Users/jay/.secrets/global-api-keys`);
+    denied(`/usr/bin/tail -n 50 < /Users/jay/.secrets/example-credentials`);
     denied(`/usr/bin/tail -n 50 <<< x`);
   });
 
@@ -299,7 +299,7 @@ describe("evaluateCommand: attacks", () => {
   });
 
   it("refuses a path flag naming any other file", () => {
-    denied(`${AGENT_SYNC} dm --owner --body-file /Users/jay/.secrets/global-api-keys`);
+    denied(`${AGENT_SYNC} dm --owner --body-file /Users/jay/.secrets/example-credentials`);
     denied(`${AGENT_SYNC} dm --owner --body-file /Users/jay/apps/state/open-loops/../../../.secrets/x`);
     denied(`${OPEN_LOOPS} send --dm-file /tmp/dm.md`);
   });
@@ -314,16 +314,16 @@ describe("evaluateCommand: attacks", () => {
     denied(`/Users/jay/.local/bin/echo-note "one" "two"`);
     denied(`/Users/jay/.local/bin/needs-owner file --by BF-DEPLOYER --question q`);
     // an argparse fromfile word
-    denied("/usr/bin/tail -n 50 @/Users/jay/.secrets/global-api-keys");
+    denied("/usr/bin/tail -n 50 @/Users/jay/.secrets/example-credentials");
     denied(`/Users/jay/.local/bin/echo-note @/etc/passwd`);
     denied(`/Users/jay/.local/bin/needs-owner file --question @/etc/passwd`);
   });
 
   it("refuses a positional word naming any file but the declared one", () => {
     // the hole a bare positional count leaves:  tail would read any file
-    denied("/usr/bin/tail -n 50 /Users/jay/.secrets/global-api-keys");
+    denied("/usr/bin/tail -n 50 /Users/jay/.secrets/example-credentials");
     denied("/usr/bin/tail -n 200 /etc/passwd");
-    denied("/usr/bin/tail -n 50 /Users/jay/Library/Logs/../../.secrets/global-api-keys");
+    denied("/usr/bin/tail -n 50 /Users/jay/Library/Logs/../../.secrets/example-credentials");
     expect(evaluateCommand(p, "/usr/bin/tail -n 50 /Users/jay/Library/Logs/fleet-work-backup.log")).toMatchObject({ ok: true });
     expect(evaluateCommand(p, `/Users/jay/.local/bin/echo-note "a note"`)).toMatchObject({ ok: true });
   });
@@ -335,7 +335,7 @@ describe("evaluateCommand: attacks", () => {
   });
 
   it("names only the program in a denial, never its arguments", () => {
-    const decision = denied(`${AGENT_SYNC} whoami --json; cat /Users/jay/.secrets/global-api-keys`);
+    const decision = denied(`${AGENT_SYNC} whoami --json; cat /Users/jay/.secrets/example-credentials`);
     expect(decision.name).toBe("agent-sync");
     expect(JSON.stringify(decision)).not.toContain("secrets");
   });
@@ -414,7 +414,7 @@ describe("files", () => {
   it("reads only write paths and read paths", () => {
     expect(evaluateRead(policy(), DM_FILE)).toMatchObject({ ok: true });
     expect(evaluateRead(policy(), "/Users/jay/apps/state/open-loops/facts-today.json")).toMatchObject({ ok: true });
-    expect(evaluateRead(policy(), "/Users/jay/.secrets/global-api-keys").ok).toBe(false);
+    expect(evaluateRead(policy(), "/Users/jay/.secrets/example-credentials").ok).toBe(false);
     expect(evaluateRead(policy(), "/etc/hosts").ok).toBe(false);
   });
 
@@ -467,7 +467,7 @@ describe("sanitizeToolPolicy", () => {
     ["a relative positional path", { mode: "allowlist", commands: [{ argv0: "/bin/x", args: [{ value: "path", paths: ["log.txt"] }] }] }],
     ["a path flag naming a credential file", { mode: "allowlist", commands: [{ argv0: "/bin/x", flags: { "--a": { value: "path", paths: ["/Users/jay/.ssh/id_ed25519"] } } }] }],
     ["a path flag naming a dotfile", { mode: "allowlist", commands: [{ argv0: "/bin/x", flags: { "--a": { value: "path", paths: ["/Users/jay/.zshrc"] } } }] }],
-    ["a positional path under a credential directory", { mode: "allowlist", commands: [{ argv0: "/usr/bin/tail", args: [{ value: "path", paths: ["/Users/jay/.secrets/global-api-keys"] }] }] }],
+    ["a positional path under a credential directory", { mode: "allowlist", commands: [{ argv0: "/usr/bin/tail", args: [{ value: "path", paths: ["/Users/jay/.secrets/example-credentials"] }] }] }],
     ["a positional path under LaunchAgents", { mode: "allowlist", commands: [{ argv0: "/bin/cat", args: [{ value: "path", paths: ["/Users/jay/Library/LaunchAgents/x.plist"] }] }] }],
     ["a read path in a dot directory", { mode: "allowlist", commands: [], readPaths: ["/Users/jay/.grok/auth.json"] }],
     ["a read path under a credential directory", { mode: "allowlist", commands: [], readPaths: ["/Users/jay/.config/gh/hosts.yml"] }],

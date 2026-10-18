@@ -351,7 +351,7 @@ describe("the realm", () => {
 describe("auto-approve", () => {
   it("treats the fleet secrets folder and every zuliprc as sensitive", () => {
     expect(looksSensitive("cat ~/.secrets/Zulip/BF-Fixer-zuliprc")).toBe(true);
-    expect(looksSensitive("/Users/jay/.secrets/global-api-keys")).toBe(true);
+    expect(looksSensitive("/Users/jay/.secrets/example-credentials")).toBe(true);
     expect(looksSensitive("ls /tmp/BF-Plumber-zuliprc")).toBe(true);
     expect(looksSensitive("src/secrets-panel.tsx")).toBe(false);
   });
