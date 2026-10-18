@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: app.botfleet
   deploymentTarget:
     iOS: '27.0'
+    macOS: '14.0'
   createIntermediateGroups: true
   projectFormat: xcode16_3
   xcodeVersion: '27.0'
@@ -12,6 +13,7 @@ settings:
   base:
     SWIFT_VERSION: '5.9'
     IPHONEOS_DEPLOYMENT_TARGET: '27.0'
+    MACOSX_DEPLOYMENT_TARGET: '14.0'
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: CC8UTF7ATG
     ENABLE_USER_SCRIPT_SANDBOXING: YES
@@ -167,6 +169,34 @@ targets:
       properties:
         com.apple.security.application-groups:
         - group.app.botfleet
+  BotFleetMac:
+    type: application
+    platform: macOS
+    sources:
+    - path: MacApp
+    - path: Assets.xcassets
+    dependencies:
+    - package: CompanionCore
+      product: CompanionCore
+    - package: Sentry
+      product: Sentry
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.macos
+        DEVELOPMENT_TEAM: CC8UTF7ATG
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "1.0.30"
+        CURRENT_PROJECT_VERSION: "202609010933"
+        SWIFT_VERSION: '5.9'
+        MACOSX_DEPLOYMENT_TARGET: '14.0'
+        ENABLE_ON_DEMAND_RESOURCES: false
+        COMBINE_HIDPI_IMAGES: YES
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_CFBundleDisplayName: BotFleet
+    info:
+      path: MacApp/Info.plist
+    entitlements:
+      path: MacApp/BotFleetMac.entitlements
 schemes:
   BotFleet:
     build:
@@ -177,3 +207,12 @@ schemes:
       config: Debug
     archive:
       config: Release
+  BotFleetMac:
+    build:
+      targets:
+        BotFleetMac: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+
