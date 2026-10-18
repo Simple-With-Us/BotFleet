@@ -1,5 +1,11 @@
 allowed_bots:
+  # BF-2259: the owner invokes autofix with an `@autofix` mention on a PR;
+  # a first changes-requested review from Sentry, Kody, or Codex starts one
+  # automatic run.
+  - jaywedgeworth22
   - kody-ai[bot]
+  - chatgpt-codex-connector[bot]
+  - sentry[bot]
   - github-actions[bot]
   - sonarcloud[bot]
   - codacy-production[bot]
