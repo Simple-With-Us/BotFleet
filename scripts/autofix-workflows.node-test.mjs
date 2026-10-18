@@ -10,8 +10,9 @@ import test from "node:test";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+// Windows CI checks files out with CRLF line endings;  the assertions below are written for LF.
 function read(rel) {
-  return readFileSync(join(ROOT, rel), "utf8");
+  return readFileSync(join(ROOT, rel), "utf8").replace(/\r\n/g, "\n");
 }
 
 // Secret names passed under the job's `secrets:` map (six-space keys, comments skipped).
