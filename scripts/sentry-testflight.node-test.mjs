@@ -121,8 +121,11 @@ test('ship receipt follows recorded success only after exact ASC readiness; skip
   assert.match(ship,/needs.ship.outputs.sentry_receipt != ''/);
   assert.match(ship,/needs.ship.outputs.sentry_receipt_error == 'true'/);
   assert.match(ship,/uses: .\/.github\/workflows\/sentry-testflight.yml/);
-  // The reporter is part of the ship, so an edit to it must run the ship (it is the only way to exercise it).
-  assert.match(ship,/paths:[\s\S]*?- '\.github\/workflows\/sentry-testflight\.yml'[\s\S]*?workflow_dispatch:/);
+  // The reporter is part of the ship, so an edit to any of its files must run the ship (the only way to exercise it).
+  const shipPaths=ship.slice(ship.indexOf('paths:'),ship.indexOf('workflow_dispatch:'));
+  for (const file of ['.github/workflows/sentry-testflight.yml','scripts/sentry-report-testflight.mjs','scripts/sentry-testflight-receipt.mjs']) {
+    assert.ok(shipPaths.includes(`- '${file}'`),`${file} must be in the ship push paths`);
+  }
   assert.doesNotMatch(ship,/--force-ship/);
 });
 
@@ -133,6 +136,21 @@ test('wrong-project releases and malformed API payloads cannot produce deploymen
     assert.deepEqual(calls,['GET']);
   }
   await assert.rejects(reportTestFlight(receipt(),{token:'fixture-value',runId:'123',fetchImpl:async ()=>new Response('private response not JSON')}),error=>error.message==='Sentry returned invalid JSON');
+});
+
+test('a release the ship already created (ref and url null) is updated, then the deploy is recorded', async () => {
+  // The ship's sentry-cli upload creates the release before this reporter runs, and Sentry
+  // reports its unset fields as null (live shape probed for app.botfleet.ios@1.0.114+202610180148).
+  const calls=[];
+  const result=await reportTestFlight(receipt(),{token:'fixture-value',runId:'123',fetchImpl:async (url,options)=>{
+    const deploys=String(url).includes('/deploys/');
+    calls.push(`${options.method}${deploys?' deploys':' release'}`);
+    if (options.method==='GET') return deploys?Response.json([{id:'9',environment:'staging',name:null}]):Response.json({ref:null,url:null,dateReleased:null,projects:[{slug:'botfleet'}]});
+    if (options.method==='PUT') return Response.json({});
+    return Response.json({id:'10',environment:'production',name:'ios-testflight:202610060212'});
+  }});
+  assert.deepEqual(calls,['GET release','PUT release','GET deploys','POST deploys']);
+  assert.deepEqual(result,{release:'app.botfleet.ios@1.0.79+202610060212',deployId:'10',alreadyRecorded:false});
 });
 
 test('CLI malformed JSON error does not echo provided input or token', () => {

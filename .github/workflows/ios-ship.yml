@@ -34,6 +34,8 @@ on:
       - 'ios/**'
       - '.github/workflows/ios-ship.yml'
       - '.github/workflows/sentry-testflight.yml'
+      - 'scripts/sentry-report-testflight.mjs'
+      - 'scripts/sentry-testflight-receipt.mjs'
       - 'scripts/ios-fleet/**'
       - 'scripts/ios-ship-testflight.sh'
       - 'scripts/ios-appstore-gm-prepare.sh'
