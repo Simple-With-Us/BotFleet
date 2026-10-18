@@ -112,12 +112,17 @@ test('ship receipt follows recorded success only after exact ASC readiness; skip
   const workflow=read('.github/workflows/sentry-testflight.yml');
   assert.match(workflow,/workflow_call:/); assert.doesNotMatch(workflow,/workflow_run:|workflow_dispatch:|continue-on-error|exit 0/);
   assert.match(workflow,/required: SENTRY_AUTH_TOKEN/);
+  // The root postinstall needs esbuild (a devDependency), so a bare `--prod` install exits 1 and
+  // turns every successful upload red.  Pin the flag so a dependency bump cannot bring it back.
+  assert.match(workflow,/run: pnpm install --frozen-lockfile --prod --ignore-scripts\n/);
   assert.match(workflow,/receipt.sourceCommit !== process.env.GITHUB_SHA/);
   assert.match(workflow,/SENTRY_RECEIPT_ERROR === "true"\) throw new Error/);
   const ship=read('.github/workflows/ios-ship.yml');
   assert.match(ship,/needs.ship.outputs.sentry_receipt != ''/);
   assert.match(ship,/needs.ship.outputs.sentry_receipt_error == 'true'/);
   assert.match(ship,/uses: .\/.github\/workflows\/sentry-testflight.yml/);
+  // The reporter is part of the ship, so an edit to it must run the ship (it is the only way to exercise it).
+  assert.match(ship,/paths:[\s\S]*?- '\.github\/workflows\/sentry-testflight\.yml'[\s\S]*?workflow_dispatch:/);
   assert.doesNotMatch(ship,/--force-ship/);
 });
 
