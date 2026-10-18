@@ -39,8 +39,13 @@ jobs:
         with:
           node-version: "24"
           cache: pnpm
+      # --ignore-scripts is load-bearing.  The root `postinstall` compiles the
+      # clutch dependency with esbuild, and esbuild is a devDependency that
+      # `--prod` leaves out, so the script exits 1 and this job went red after
+      # every successful upload.  The reporter imports only zod, the receipt
+      # module and node builtins, so it needs no install script.
       - name: Install reporter dependencies
-        run: pnpm install --frozen-lockfile --prod
+        run: pnpm install --frozen-lockfile --prod --ignore-scripts
       - name: Validate the distribution receipt before loading credentials
         env:
           SENTRY_DEPLOY_RECEIPT: ${{ inputs.receipt }}

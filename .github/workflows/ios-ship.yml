@@ -33,6 +33,7 @@ on:
     paths:
       - 'ios/**'
       - '.github/workflows/ios-ship.yml'
+      - '.github/workflows/sentry-testflight.yml'
       - 'scripts/ios-fleet/**'
       - 'scripts/ios-ship-testflight.sh'
       - 'scripts/ios-appstore-gm-prepare.sh'
