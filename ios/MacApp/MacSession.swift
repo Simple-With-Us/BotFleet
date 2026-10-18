@@ -32,11 +32,16 @@ public enum MacConnectionStatus: Equatable {
     }
 }
 
+public enum SidebarSelection: Hashable, Sendable {
+    case bot(String)
+    case room(String)
+}
+
 @MainActor
 public final class MacSession: ObservableObject {
     @Published public var state: CompanionState = CompanionState()
     @Published public var status: MacConnectionStatus = .disconnected
-    @Published public var selectedBotId: String?
+    @Published public var selection: SidebarSelection?
     @Published public var selectedThreadId: String?
     @Published public var isSending: Bool = false
     @Published public var host: String = "127.0.0.1"
@@ -48,26 +53,79 @@ public final class MacSession: ObservableObject {
 
     public init() {}
 
+    public var selectedBotId: String? {
+        get {
+            if case .bot(let id) = selection { return id }
+            return nil
+        }
+        set {
+            if let id = newValue {
+                selection = .bot(id)
+            } else if case .bot = selection {
+                selection = nil
+            }
+        }
+    }
+
+    public var selectedRoomId: String? {
+        get {
+            if case .room(let id) = selection { return id }
+            return nil
+        }
+        set {
+            if let id = newValue {
+                selection = .room(id)
+            } else if case .room = selection {
+                selection = nil
+            }
+        }
+    }
+
     public var activeBot: Bot? {
-        guard let id = selectedBotId else { return state.bots.first }
-        return state.bots.first(where: { $0.id == id }) ?? state.bots.first
+        if let id = selectedBotId {
+            return state.bots.first(where: { $0.id == id })
+        }
+        if selection == nil {
+            return state.bots.first
+        }
+        return nil
+    }
+
+    public var activeRoom: Room? {
+        guard let id = selectedRoomId else { return nil }
+        return state.rooms.first(where: { $0.id == id })
+    }
+
+    public var activeTitle: String {
+        if let bot = activeBot { return bot.name }
+        if let room = activeRoom { return room.name }
+        return "BotFleet"
+    }
+
+    public var activeSubtitle: String {
+        if let bot = activeBot { return bot.modelSelection.model }
+        if let room = activeRoom { return "\(room.memberIds.count) members" }
+        return ""
+    }
+
+    public var activeThreadId: String? {
+        if let selected = selectedThreadId { return selected }
+        if let room = activeRoom { return room.threadId }
+        return activeBot?.threadId
     }
 
     public var activeMessages: [Message] {
-        guard let bot = activeBot else { return [] }
-        let threadKey = selectedThreadId ?? bot.id
+        guard let threadKey = activeThreadId else { return [] }
         return state.messages[threadKey] ?? []
     }
 
     public var activeStreamingText: String? {
-        guard let bot = activeBot else { return nil }
-        let threadKey = selectedThreadId ?? bot.id
+        guard let threadKey = activeThreadId else { return nil }
         return state.streaming[threadKey]
     }
 
     public var activeReasoningText: String? {
-        guard let bot = activeBot else { return nil }
-        let threadKey = selectedThreadId ?? bot.id
+        guard let threadKey = activeThreadId else { return nil }
         return state.reasoning[threadKey]
     }
 
@@ -77,16 +135,21 @@ public final class MacSession: ObservableObject {
         disconnect()
 
         status = .connecting
+
+        guard let url = URL(string: "http://\(host):\(port)"),
+              let endpoint = CompanionEndpoint(url: url.absoluteString, kind: .lan, priority: 1) else {
+            status = .failed("Invalid server URL: http://\(host):\(port)")
+            return
+        }
+
         let connection = Connection(
             name: "Local Mac",
             host: host,
             port: port,
-            activeEndpoint: CompanionEndpoint(url: "http://\(host):\(port)", kind: .lan, priority: 1),
-            endpoints: [
-                CompanionEndpoint(url: "http://\(host):\(port)", kind: .lan, priority: 1)!
-            ],
+            activeEndpoint: endpoint,
+            endpoints: [endpoint],
             allowedRouteKinds: [.lan, .bonjour, .hosted],
-            allowedLocalRouteURLs: ["http://\(host):\(port)"]
+            allowedLocalRouteURLs: [endpoint.url]
         )
 
         // Local loopback does not require a bearer token in dev mode
@@ -111,8 +174,8 @@ public final class MacSession: ObservableObject {
                 // Fetch initial fleet roster snapshot
                 let fleet = try await client.fleet()
                 self.state.hydrate(fleet)
-                if self.selectedBotId == nil, let first = fleet.bots.first {
-                    self.selectedBotId = first.id
+                if self.selection == nil, let first = fleet.bots.first {
+                    self.selection = .bot(first.id)
                 }
                 self.status = .connected(endpoint: endpoint)
                 self.reconnectAttempt = 0
@@ -134,28 +197,41 @@ public final class MacSession: ObservableObject {
     }
 
     public func sendMessage(_ text: String) async {
-        guard let client = client, let bot = activeBot, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let threadId = selectedThreadId ?? bot.id
+        guard let client = client, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard let threadId = activeThreadId else { return }
         isSending = true
         defer { isSending = false }
 
         do {
-            _ = try await client.send(
-                text: text,
-                toBot: bot.id,
-                threadId: threadId,
-                idempotencyKey: UUID().uuidString
-            )
+            if let bot = activeBot {
+                _ = try await client.send(
+                    text: text,
+                    toBot: bot.id,
+                    threadId: threadId,
+                    idempotencyKey: UUID().uuidString
+                )
+            } else if let room = activeRoom {
+                _ = try await client.send(
+                    text: text,
+                    toRoom: room.id,
+                    threadId: threadId,
+                    idempotencyKey: UUID().uuidString
+                )
+            }
         } catch {
             print("Failed to send turn: \(error)")
         }
     }
 
     public func stopActiveTurn() async {
-        guard let client = client, let bot = activeBot else { return }
-        let threadId = selectedThreadId ?? bot.id
+        guard let client = client else { return }
+        guard let threadId = activeThreadId else { return }
         do {
-            try await client.interrupt(botId: bot.id, threadId: threadId)
+            if let bot = activeBot {
+                try await client.interrupt(botId: bot.id, threadId: threadId)
+            } else if let room = activeRoom {
+                try await client.interrupt(groupId: room.id, threadId: threadId)
+            }
         } catch {
             print("Failed to steer turn: \(error)")
         }

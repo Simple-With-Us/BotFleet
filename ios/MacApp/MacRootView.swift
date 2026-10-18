@@ -18,7 +18,7 @@ public struct MacRootView: View {
         } detail: {
             MacDetailChatView(inputText: $inputText)
         }
-        .navigationTitle(session.activeBot?.name ?? "BotFleet")
+        .navigationTitle(session.activeTitle)
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 HStack(spacing: 6) {
@@ -47,7 +47,7 @@ struct MacSidebarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            List(selection: $session.selectedBotId) {
+            List(selection: $session.selection) {
                 Section("Bots") {
                     if session.state.bots.isEmpty {
                         Text("No bots loaded")
@@ -57,7 +57,7 @@ struct MacSidebarView: View {
                     } else {
                         ForEach(session.state.bots) { bot in
                             MacBotRowView(bot: bot)
-                                .tag(bot.id)
+                                .tag(SidebarSelection.bot(bot.id))
                         }
                     }
                 }
@@ -71,7 +71,7 @@ struct MacSidebarView: View {
                                 Text(room.name)
                                     .font(.body)
                             }
-                            .tag(room.id)
+                            .tag(SidebarSelection.room(room.id))
                         }
                     }
                 }
@@ -150,14 +150,16 @@ struct MacThreadListView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let bot = session.activeBot {
+            if session.activeThreadId != nil {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(bot.name)
+                        Text(session.activeTitle)
                             .font(.headline)
-                        Text(bot.modelSelection.model)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        if !session.activeSubtitle.isEmpty {
+                            Text(session.activeSubtitle)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
                     Spacer()
                 }
@@ -172,7 +174,7 @@ struct MacThreadListView: View {
                         }
                     }
 
-                    if let jobs = session.state.jobsByThread[bot.id], !jobs.isEmpty {
+                    if let threadId = session.activeThreadId, let jobs = session.state.jobsByThread[threadId], !jobs.isEmpty {
                         Section("Background Jobs") {
                             ForEach(jobs) { job in
                                 HStack {
@@ -194,7 +196,7 @@ struct MacThreadListView: View {
                     Image(systemName: "sidebar.left")
                         .font(.largeTitle)
                         .foregroundColor(.secondary)
-                    Text("Select a bot")
+                    Text("Select a conversation")
                         .font(.title3)
                         .foregroundColor(.secondary)
                     Spacer()
@@ -213,7 +215,7 @@ struct MacDetailChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if let bot = session.activeBot {
+            if session.activeThreadId != nil {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 16) {
@@ -227,7 +229,7 @@ struct MacDetailChatView: View {
                             }
 
                             if let streaming = session.activeStreamingText, !streaming.isEmpty {
-                                MacStreamingBubbleView(botName: bot.name, text: streaming)
+                                MacStreamingBubbleView(botName: session.activeTitle, text: streaming)
                                     .id("streaming-anchor")
                             }
                         }
@@ -255,10 +257,10 @@ struct MacDetailChatView: View {
                     Image(systemName: "message")
                         .font(.system(size: 40))
                         .foregroundColor(.secondary)
-                    Text("No Bot Selected")
+                    Text("No Conversation Selected")
                         .font(.title2)
                         .foregroundColor(.secondary)
-                    Text("Choose a bot from the sidebar to view transcripts and start a conversation.")
+                    Text("Choose a bot or room from the sidebar to view transcripts and start a conversation.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
