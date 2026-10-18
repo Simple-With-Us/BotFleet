@@ -640,19 +640,25 @@ describe("Effort section in the chat model menu", () => {
 
   it("renders (default: max) in the header and omits the Default button when defaultEffort is provided", () => {
     const onPick = vi.fn();
-    const tree = EffortSection({
-      levels: ["low", "medium", "high", "xhigh", "max"],
-      defaultEffort: "max",
+    const props = {
+      // SAFETY: literal effort levels for test fixture.
+      levels: ["low", "medium", "high", "xhigh", "max"] as const,
+      // SAFETY: literal effort level for test fixture.
+      defaultEffort: "max" as const,
       current: undefined,
       onPick,
-    });
-    const choices = findElements(tree, (element) => element.type === "button");
-    expect(choices).toHaveLength(5);
-    const html = renderToStaticMarkup(tree as any);
+    };
+    const element = createElement(EffortSection, props);
+    const html = renderToStaticMarkup(element);
     expect(html).toContain("Effort");
     expect(html).toContain("(default: max)");
-    const maxButton = choices.find((c) => (c.props as any)["aria-pressed"] === true);
+    const tree = EffortSection(props);
+    const choices = findElements(tree, (el) => el.type === "button");
+    expect(choices).toHaveLength(5);
+    // SAFETY: EffortSection renders buttons with aria-pressed boolean props.
+    const maxButton = choices.find((c) => (c.props as { "aria-pressed"?: boolean })["aria-pressed"] === true);
     expect(maxButton).toBeDefined();
+    // SAFETY: EffortSection renders each button with an onClick callback.
     (choices[0].props as { onClick: () => void }).onClick();
     expect(onPick).toHaveBeenCalledWith("low");
   });
