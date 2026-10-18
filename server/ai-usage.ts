@@ -107,6 +107,12 @@ export function aiTokensFromTurn(report: TurnTokenReport): AiUsageTokens {
 // door.  Each field is lenient on its own (`.catch`): a provider that sends a
 // string or a negative where a count belongs loses that field, not the whole
 // object, and an unexpected shape reads as "no usage" rather than as zeros.
+// This is deliberately a partial provider schema: unknown keys are stripped,
+// not rejected or forwarded.  Providers also send total_tokens, cache-miss
+// aggregates and extra detail fields that this accounting path does not use.
+// Strict rejection would make the caller's catch(undefined) discard valid
+// billed usage merely because an unrelated provider field was added.
+// Only validated, explicitly mapped buckets reach the strict outbound ai block.
 const count = z.number().finite().nonnegative().optional().catch(undefined);
 export const ChatUsageSchema = z.object({
   prompt_tokens: count,
