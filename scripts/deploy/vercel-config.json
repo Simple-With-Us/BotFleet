@@ -1,0 +1,15 @@
+{
+  "repository": "Simple-With-Us/BotFleet",
+  "teamId": "team_l3mWAejl1E08y8ijku5DpBE6",
+  "projectId": "prj_m5bk3D75HzKZfIVSM3OmMx7WYwKz",
+  "repoId": 1349857130,
+  "rootDirectory": "apps/site",
+  "ciWorkflows": [
+    "CI",
+    "Node CI"
+  ],
+  "watch": [
+    "apps/site/**",
+    ".vercelignore"
+  ]
+}
