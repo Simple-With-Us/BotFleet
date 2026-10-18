@@ -24,7 +24,7 @@ jobs:
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.type == 'Bot' &&
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml@31659885f58f08e129b6dc092f3493d7cdb74a11
+    uses: Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml@070fdbfacadbd9e90cbb54098123df7d3fef737f
     secrets:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       # Pass only secrets the reusable declares (MINIMAX_API_KEY, and GH_PAT,
