@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { modelEffortLevels, modelSupportsEffort } from "./model-effort";
+import { modelDefaultEffort, modelEffortLevels, modelSupportsEffort } from "./model-effort";
 
 describe("modelEffortLevels", () => {
   it("returns empty when engine has no effort capabilities", () => {
@@ -126,5 +126,26 @@ describe("modelEffortLevels", () => {
     expect(modelEffortLevels(dsh, { id: "MiniMax-M2.7-highspeed" })).toEqual([]);
     // DeepSeek rows keep the engine-wide list.
     expect(modelEffortLevels(dsh, { id: "DeepSeek-V4.1-Flash" })).toEqual(["none", "high", "max"]);
+  });
+});
+
+describe("modelDefaultEffort", () => {
+  it("returns defaultEffort from modelOption when present", () => {
+    expect(modelDefaultEffort(null, { id: "test", defaultEffort: "high" })).toBe("high");
+  });
+
+  it("defaults to max for MiniMax M3.1 models", () => {
+    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-Preview" })).toBe("max");
+    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-Preview-1M" })).toBe("max");
+    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-Preview-thinking" })).toBe("max");
+    expect(modelDefaultEffort(null, { id: "MiniMax-M3.1-Flash-Preview-thinking-1M" })).toBe("max");
+  });
+
+  it("returns undefined when effortLevels is empty", () => {
+    expect(modelDefaultEffort(null, { id: "MiniMax-M2.7-highspeed", effortLevels: [] })).toBeUndefined();
+  });
+
+  it("returns undefined when model has no effort support", () => {
+    expect(modelDefaultEffort(null, { id: "gpt-4o" })).toBeUndefined();
   });
 });

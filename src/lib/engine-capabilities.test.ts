@@ -327,6 +327,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // the engine's declared models and the picker's rows agree.
     expect(mcode.defaultModels.map((m) => m.id)).toEqual([
       "MiniMax-M3.1-Flash-Preview-thinking",
+      "MiniMax-M3.1-Flash-Preview-thinking-1M",
       "MiniMax-M2.7-highspeed-thinking",
     ]);
     // The flash preview tier is the one a current mcode install defaults to,
@@ -336,6 +337,9 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(mcode.defaultModels[0].id).toBe("MiniMax-M3.1-Flash-Preview-thinking");
     expect(
       mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-Preview-thinking")?.ctxTokens,
+    ).toBe(524_288);
+    expect(
+      mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-Preview-thinking-1M")?.ctxTokens,
     ).toBe(1_000_000);
   });
 

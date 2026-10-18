@@ -25,6 +25,7 @@ import {
   contextCapLabel,
   pickedSelection,
   selectionContextCaps,
+  selectionDefaultEffort,
   selectionEffortLevels,
   selectionWithContextCap,
   parseMaxOutputInput,
@@ -265,12 +266,14 @@ export function MaxOutputSection({
  *  announces the two controls the same way. */
 export function EffortSection({
   levels,
+  defaultEffort,
   current,
   onPick,
   disabled = false,
   className,
 }: {
   levels: readonly EffortLevel[];
+  defaultEffort?: EffortLevel;
   /** The bot's saved effort; undefined is Default. */
   current: EffortLevel | undefined;
   onPick: (level: EffortLevel | undefined) => void;
@@ -280,6 +283,8 @@ export function EffortSection({
   className?: string;
 }) {
   if (!levels.length) return null;
+  const showExplicitDefault = defaultEffort === undefined;
+  const choices = showExplicitDefault ? ([undefined, ...levels] as const) : levels;
   return (
     <div
       role="group"
@@ -287,10 +292,15 @@ export function EffortSection({
       data-effort-section
       className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
     >
-      <EngineGroupLabel className="px-1 pb-1.5">Effort</EngineGroupLabel>
+      <EngineGroupLabel className="px-1 pb-1.5">
+        Effort
+        {defaultEffort ? (
+          <span className="normal-case tracking-normal"> (default: {effortLabel(defaultEffort).toLowerCase()})</span>
+        ) : null}
+      </EngineGroupLabel>
       <div className="flex flex-wrap gap-1">
-        {([undefined, ...levels] as const).map((level) => {
-          const checked = current === level;
+        {choices.map((level) => {
+          const checked = current === level || (current === undefined && level === defaultEffort);
           return (
             <button
               key={level ?? "default"}
@@ -822,6 +832,7 @@ export function ModelPicker({
   // never shows the current model's effort under that engine's name.  Settings
   // pickers (`contained`) have the Reasoning control beside them.
   const effortLevels = contained ? [] : selectionEffortLevels(active, selection);
+  const defaultEffort = contained ? undefined : selectionDefaultEffort(active, selection);
   const effortApplies = localView
     ? opensOnLocalModels(localGroups, active, selection)
     : !blocked && railInstance?.instanceId === selection.instanceId;
@@ -829,6 +840,7 @@ export function ModelPicker({
     effortApplies && effortLevels.length > 0 ? (
       <EffortSection
         levels={effortLevels}
+        defaultEffort={defaultEffort}
         current={selection.effort}
         onPick={pickEffort}
         disabled={Boolean(bot.busy)}

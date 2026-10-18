@@ -13,6 +13,8 @@ describe("catalog MiniMax keys", () => {
   it("maps picker ids, thinking suffixes, and DSH wire names", () => {
     expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-Preview")).toBe("MiniMax-M3.1-Flash-Preview");
     expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-Preview-thinking")).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-Preview-1M")).toBe("MiniMax-M3.1-Flash-Preview-1M");
+    expect(catalogMinimaxPriceKey("MiniMax-M3.1-Flash-Preview-thinking-1M")).toBe("MiniMax-M3.1-Flash-Preview-1M");
     expect(catalogMinimaxPriceKey("MiniMax-M2.7-highspeed")).toBe("MiniMax-M2.7-highspeed");
     expect(catalogMinimaxPriceKey("MiniMax-M2.7-highspeed-thinking")).toBe("MiniMax-M2.7-highspeed");
     expect(catalogMinimaxPriceKey("MiniMax-M2.7")).toBe("MiniMax-M2.7");

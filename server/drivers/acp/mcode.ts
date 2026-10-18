@@ -39,8 +39,17 @@ export const STATIC_MCODE_MODELS: ModelCatalog = {
   options: [
     {
       id: "MiniMax-M3.1-Flash-Preview-thinking",
-      label: "MiniMax M3.1 Flash Preview · thinking",
+      label: "MiniMax M3.1 Flash Preview · thinking (512K)",
+      contextWindow: 524_288,
       effortLevels: [...MCODE_M31_EFFORT_LEVELS],
+      defaultEffort: "max",
+    },
+    {
+      id: "MiniMax-M3.1-Flash-Preview-thinking-1M",
+      label: "MiniMax M3.1 Flash Preview · thinking (1M)",
+      contextWindow: 1_000_000,
+      effortLevels: [...MCODE_M31_EFFORT_LEVELS],
+      defaultEffort: "max",
     },
     // Explicit `[]`, not an omitted field: src/lib/model-effort.ts falls back
     // to the engine-wide list for a row that declares none, and this engine's
@@ -144,16 +153,19 @@ export function readMcodeModelCatalog(
       readFileSync(join(mcodeDataDir(environment), "config.yaml"), "utf8"),
     );
     const configured = bareModelId(settings.defaultModel);
+    const window = settings.defaultModelContextWindow;
+    if (typeof window === "number" && window > 0) contextWindow = window;
     if (configured) {
       const variant = settings.defaultModelVariant;
-      const folded =
+      let folded =
         typeof variant === "string" && variant.trim() ? `${configured}-${variant.trim()}` : configured;
+      if (contextWindow && contextWindow >= 1_000_000 && ids.has(`${folded}-1M`)) {
+        folded = `${folded}-1M`;
+      }
       // Only a default that is actually on offer is adopted; one that is not
       // would send every turn to a row the picker never showed.
       if (ids.has(folded)) preferred = folded;
     }
-    const window = settings.defaultModelContextWindow;
-    if (typeof window === "number" && window > 0) contextWindow = window;
   } catch {
     // No config, unreadable, or unparseable: the shipped catalog stands.
   }
@@ -374,7 +386,7 @@ export function mcodeModelOptionValue(model: string, advertised: unknown): strin
   ) as { options?: Array<{ value?: unknown; name?: unknown }> } | undefined;
   if (!modelOption) return null;
   const available = Array.isArray(modelOption.options) ? modelOption.options : [];
-  const wanted = model.trim().toLowerCase();
+  const wanted = model.trim().toLowerCase().replace(/-1m$/, "");
   for (const option of available) {
     const decoded = parseMcodeModelValue(option?.value);
     if (decoded && mcodePickerId(decoded).toLowerCase() === wanted && typeof option?.value === "string") {

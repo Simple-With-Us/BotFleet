@@ -49,6 +49,7 @@ describe("STATIC_MCODE_MODELS", () => {
     expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
     expect(STATIC_MCODE_MODELS.options.map((o) => o.id)).toEqual([
       "MiniMax-M3.1-Flash-Preview-thinking",
+      "MiniMax-M3.1-Flash-Preview-thinking-1M",
       "MiniMax-M2.7-highspeed-thinking",
     ]);
   });
@@ -117,7 +118,7 @@ describe("readMcodeModelCatalog", () => {
       ].join("\n"),
     );
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
-    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking-1M");
     expect(catalog.options.find((o) => o.id === catalog.default)?.contextWindow).toBe(1_000_000);
   });
 

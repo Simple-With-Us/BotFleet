@@ -3,7 +3,7 @@
 // Local Models list — so a local model is saved exactly like any other model.
 import type { InstanceInfo, ModelSelection } from "@/state/store";
 import type { EffortLevel } from "../../server/contracts.ts";
-import { modelEffortLevels } from "./model-effort";
+import { modelDefaultEffort, modelEffortLevels } from "./model-effort";
 
 export function selectionForPick(
   current: ModelSelection,
@@ -63,6 +63,15 @@ export function selectionEffortLevels(
 ): readonly EffortLevel[] {
   const option = instance?.models.options.find((candidate) => candidate.id === selection.model);
   return modelEffortLevels(instance, option, selection.model);
+}
+
+/** The default reasoning effort level for the selected model on `instance`, if any. */
+export function selectionDefaultEffort(
+  instance: InstanceInfo | undefined,
+  selection: Pick<ModelSelection, "model">,
+): EffortLevel | undefined {
+  const option = instance?.models.options.find((candidate) => candidate.id === selection.model);
+  return modelDefaultEffort(instance, option, selection.model);
 }
 
 /** What changing only the effort saves.  The rest of the selection rides along
