@@ -1917,9 +1917,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             break;
           case "result": {
+            // The cache writes by TTL (or the flat figure of an older CLI).
+            // `input` takes the sum of whichever form arrived, so a CLI that
+            // sends only the TTL split, with the flat total null or zero, does
+            // not leave the writes out of the context while still naming them.
+            const cacheWrites = o.usage ? cacheWritesOf(o.usage) : {};
+            const cacheWritten = (cacheWrites.cacheWrite5m ?? 0) + (cacheWrites.cacheWrite1h ?? 0);
             const resultUsage: TurnUsage | undefined = o.usage
               ? {
-                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
+                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + cacheWritten,
                   output: o.usage.output_tokens || 0,
                   ...(typeof o.usage.cache_read_input_tokens === "number"
                     ? { cachedInput: o.usage.cache_read_input_tokens }
@@ -1927,7 +1933,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   // Cache writes stay inside `input` (the context meter reads
                   // the whole figure) but are named, so telemetry can bill
                   // them at the write rate instead of the plain input rate.
-                  ...cacheWritesOf(o.usage),
+                  ...cacheWrites,
                 }
               : undefined;
             const t = session.turn;

@@ -309,6 +309,22 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     });
   });
 
+  it("keeps the writes inside input when a CLI sends only the TTL split and no flat total", async () => {
+    process.env.FAKE_CLAUDE_CACHE_WRITE = "split";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-split", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    // 10 plain + 2 cache read + (3 + 4) cache write: without the writes in
+    // `input`, telemetry would subtract them from an input that never held them
+    expect((recorder.events.at(-1) as Extract<RuntimeEvent, { type: "turn.completed" }>).usage).toEqual({
+      input: 19,
+      output: 5,
+      cachedInput: 2,
+      cacheWrite5m: 3,
+      cacheWrite1h: 4,
+    });
+  });
+
   it("files a flat cache-creation figure from an older CLI under the 5 minute cache", async () => {
     process.env.FAKE_CLAUDE_CACHE_WRITE = "flat";
     await create();

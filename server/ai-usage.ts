@@ -20,6 +20,8 @@
 //   cacheWrite1h  input written to a 1 hour cache
 //   reasoning     the reasoning share of `output`; informational, never added
 
+import { z } from "zod";
+
 export interface AiUsageTokens {
   input?: number;
   output?: number;
@@ -101,11 +103,26 @@ export function aiTokensFromTurn(report: TurnTokenReport): AiUsageTokens {
   return tokens;
 }
 
+// A provider's `usage` object is an external response, so it is parsed at the
+// door.  Each field is lenient on its own (`.catch`): a provider that sends a
+// string or a negative where a count belongs loses that field, not the whole
+// object, and an unexpected shape reads as "no usage" rather than as zeros.
+const count = z.number().finite().nonnegative().optional().catch(undefined);
+const ChatUsageSchema = z.object({
+  prompt_tokens: count,
+  completion_tokens: count,
+  prompt_cache_hit_tokens: count,
+  prompt_tokens_details: z.object({ cached_tokens: count, cache_write_tokens: count }).optional().catch(undefined),
+  completion_tokens_details: z.object({ reasoning_tokens: count }).optional().catch(undefined),
+});
+
 /** The canonical tokens of an OpenAI Chat Completions style `usage` object
  * (also DeepSeek, MiniMax, xAI, OpenRouter): `prompt_tokens` includes the
  * cached share, `completion_tokens` includes reasoning. */
-export function aiTokensFromChatUsage(usage: Record<string, any> | null | undefined): AiUsageTokens {
-  const raw = usage ?? {};
+export function aiTokensFromChatUsage(usage: object | null | undefined): AiUsageTokens {
+  const parsed = ChatUsageSchema.safeParse(usage);
+  if (!parsed.success) return {};
+  const raw = parsed.data;
   const prompt = tokenCount(raw.prompt_tokens);
   const cacheRead = Math.min(
     prompt,

@@ -44,7 +44,7 @@
 //                        result reports it in queued_turn_count, and it then
 //                        runs as a turn of its own; FAKE_CLAUDE_GATE, when
 //                        set, holds each turn until that file exists)
-//   FAKE_CLAUDE_CACHE_WRITE  ttl | flat — adds cache-creation figures to the
+//   FAKE_CLAUDE_CACHE_WRITE  ttl | flat | split — adds cache-creation figures to the
 //                      happy-path result (see the usage block below);
 //                      FAKE_CLAUDE_SERVED_MODEL names the assistant frame's model
 //   FAKE_CLAUDE_LIFECYCLE  1 (default) | 0 — whether to report
@@ -629,10 +629,12 @@ const playTurn = (prompt: JsonValue) => {
 
   // FAKE_CLAUDE_CACHE_WRITE=ttl reports the split cache writes the CLI gives
   // (3 in the 5 minute cache, 4 in the 1 hour cache); =flat reports only the
-  // old flat figure (7).
+  // old flat figure (7); =split reports ONLY the TTL split, no flat total.
   const cacheWrite: Record<string, unknown> = {};
-  if (process.env.FAKE_CLAUDE_CACHE_WRITE) cacheWrite.cache_creation_input_tokens = 7;
-  if (process.env.FAKE_CLAUDE_CACHE_WRITE === "ttl") {
+  if (process.env.FAKE_CLAUDE_CACHE_WRITE === "ttl" || process.env.FAKE_CLAUDE_CACHE_WRITE === "flat") {
+    cacheWrite.cache_creation_input_tokens = 7;
+  }
+  if (process.env.FAKE_CLAUDE_CACHE_WRITE === "ttl" || process.env.FAKE_CLAUDE_CACHE_WRITE === "split") {
     cacheWrite.cache_creation = { ephemeral_5m_input_tokens: 3, ephemeral_1h_input_tokens: 4 };
   }
   const finish = () => {
