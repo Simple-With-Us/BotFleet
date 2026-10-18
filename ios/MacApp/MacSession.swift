@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import CoreVideo
 import CompanionCore
 
 public enum MacConnectionStatus: Equatable {
@@ -46,6 +47,12 @@ public final class MacSession: ObservableObject {
     @Published public var isSending: Bool = false
     @Published public var host: String = "127.0.0.1"
     @Published public var port: Int = 8799
+
+    // CUA Live Stream state
+    @Published public var showCuaViewer: Bool = false
+    @Published public var isCuaStreaming: Bool = false
+    @Published public var cuaPixelBuffer: CVPixelBuffer?
+    @Published public var cuaStatusMessage: String?
 
     private var client: CompanionClient?
     private var streamTask: Task<Void, Never>?
@@ -243,6 +250,43 @@ public final class MacSession: ObservableObject {
             }
         } catch {
             print("Failed to steer turn: \(error)")
+        }
+    }
+
+    // MARK: - CUA Stream Controls
+
+    public func toggleCuaStreaming() {
+        if isCuaStreaming {
+            stopCuaStreaming()
+        } else {
+            startCuaStreaming()
+        }
+    }
+
+    public func startCuaStreaming() {
+        Task {
+            do {
+                cuaStatusMessage = "Starting ScreenCaptureKit stream…"
+                try await ScreenStreamActor.shared.startStreaming { [weak self] buffer in
+                    Task { @MainActor [weak self] in
+                        self?.cuaPixelBuffer = buffer
+                    }
+                }
+                isCuaStreaming = true
+                cuaStatusMessage = "Streaming live desktop via Metal"
+            } catch {
+                cuaStatusMessage = "Stream error: \(error.localizedDescription)"
+                isCuaStreaming = false
+            }
+        }
+    }
+
+    public func stopCuaStreaming() {
+        Task {
+            await ScreenStreamActor.shared.stopStreaming()
+            isCuaStreaming = false
+            cuaPixelBuffer = nil
+            cuaStatusMessage = "Stream stopped"
         }
     }
 }
