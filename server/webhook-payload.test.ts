@@ -5,6 +5,7 @@ import {
   isAscWebhookPayload,
   isCoolifyWebhookPayload,
   isGithubWebhookPayload,
+  isMergedPullRequestPayload,
   isPagerDutyWebhookPayload,
   isSentryWebhookPayload,
   serializeWebhookPayload,
@@ -1006,6 +1007,33 @@ describe("slimWebhookPayload", () => {
     const slim = slimWebhookPayload(pdSelfUrlOnly) as Record<string, JsonValue>;
     const incident = slim.incident as Record<string, JsonValue>;
     expect(incident.html_url).toBe("https://api.pagerduty.com/incidents/PD-SELF-1");
+  });
+});
+
+describe("isMergedPullRequestPayload", () => {
+  const closed = (pullRequest: JsonValue): JsonValue => ({ action: "closed", pull_request: pullRequest });
+
+  it("accepts a closed pull request that merged, by flag or by merge timestamp", () => {
+    expect(isMergedPullRequestPayload(closed({ merged: true }))).toBe(true);
+    expect(isMergedPullRequestPayload(closed({ merged_at: "2026-10-18T21:00:00Z" }))).toBe(true);
+    expect(isMergedPullRequestPayload(closed({ merged: true, merged_at: "2026-10-18T21:00:00Z" }))).toBe(true);
+  });
+
+  it("rejects a pull request closed without merging, however GitHub spells it", () => {
+    expect(isMergedPullRequestPayload(closed({ merged: false }))).toBe(false);
+    expect(isMergedPullRequestPayload(closed({ merged: false, merged_at: null }))).toBe(false);
+    expect(isMergedPullRequestPayload(closed({ merged_at: "" }))).toBe(false);
+    expect(isMergedPullRequestPayload(closed({}))).toBe(false);
+    expect(isMergedPullRequestPayload({ action: "closed" })).toBe(false);
+  });
+
+  it("rejects every other action, even on a merged pull request, and payloads of the wrong shape", () => {
+    expect(isMergedPullRequestPayload({ action: "synchronize", pull_request: { merged: true } })).toBe(false);
+    expect(isMergedPullRequestPayload({ pull_request: { merged: true } })).toBe(false);
+    expect(isMergedPullRequestPayload({ action: "completed", check_run: { conclusion: "failure" } })).toBe(false);
+    expect(isMergedPullRequestPayload("closed")).toBe(false);
+    expect(isMergedPullRequestPayload([{ action: "closed", pull_request: { merged: true } }])).toBe(false);
+    expect(isMergedPullRequestPayload(null)).toBe(false);
   });
 });
 

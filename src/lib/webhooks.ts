@@ -17,6 +17,12 @@ export interface WebhookTrigger {
   verifiedAt?: number;
   verificationSample?: WebhookVerificationSample;
   eventTypes?: string[];
+  /** Runs only when a GitHub pull request is merged; every other delivery is
+   * filtered before a run exists. */
+  mergedPullRequestsOnly?: boolean;
+  /** Deliveries filtered at ingress, counted since the count began. */
+  ignoredCount?: number;
+  lastIgnoredAt?: number;
   /** Minutes this webhook stays quiet after it runs.  Requests that arrive
    * inside the gap wait and go into one turn when it closes. */
   minGapMinutes?: number;
@@ -31,6 +37,7 @@ export interface WebhookTriggerInput {
   enabled?: boolean;
   verificationPending?: boolean;
   eventTypes?: string[];
+  mergedPullRequestsOnly?: boolean;
   minGapMinutes?: number;
   oneShotWake?: boolean;
 }

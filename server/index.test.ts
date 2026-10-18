@@ -5411,6 +5411,71 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("narrows a webhook to merged pull requests through PATCH and filters the rest without starting a run", async () => {
+    const bots = await api("GET", "/api/bots");
+    const created = await api("POST", "/api/webhooks", {
+      name: "Compiler",
+      prompt: "Verify the merge.",
+      botId: bots.body.bots[0].id,
+      runOn: "bot",
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.webhook.mergedPullRequestsOnly).toBeUndefined();
+    const webhookId: string = created.body.webhook.id;
+    const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet" };
+    const deliver = (event: string, deliveryId: string, body: string) => fetch(created.body.credential.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-github-event": event, "x-github-delivery": deliveryId },
+      body,
+    });
+
+    const patched = await api("PATCH", `/api/webhooks/${webhookId}`, { mergedPullRequestsOnly: true });
+    expect(patched.status).toBe(200);
+    expect(patched.body.webhook).toMatchObject({ id: webhookId, name: "Compiler", mergedPullRequestsOnly: true });
+
+    const checkRun = await deliver(
+      "check_run",
+      "gh-check-run",
+      JSON.stringify({ repository, action: "completed", check_run: { status: "completed", conclusion: "failure" } }),
+    );
+    expect(checkRun.status).toBe(202);
+    expect(await checkRun.json()).toMatchObject({ accepted: true, ignored: true });
+    const unmerged = await deliver(
+      "pull_request",
+      "gh-pr-unmerged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: false, merged_at: null } }),
+    );
+    expect(await unmerged.json()).toMatchObject({ accepted: true, ignored: true });
+    const beforeMerge = await api("GET", "/api/routines");
+    expect(beforeMerge.body.runs.filter((run: { webhookId?: string }) => run.webhookId === webhookId)).toEqual([]);
+
+    const merged = await deliver(
+      "pull_request",
+      "gh-pr-merged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: true, merged_at: "2026-10-18T21:00:00Z" } }),
+    );
+    expect(merged.status).toBe(202);
+    const mergedBody = await merged.json();
+    expect(mergedBody).toMatchObject({ accepted: true, duplicate: false, runId: expect.any(String) });
+    expect(mergedBody).not.toHaveProperty("ignored");
+    const receipts = await api("GET", "/api/routines");
+    const run = receipts.body.runs.find((candidate: { deliveryId?: string }) => candidate.deliveryId === "gh-pr-merged");
+    expect(run).toMatchObject({ triggerSource: "webhook", webhookId, routineName: "Compiler" });
+    // This test is about filtering, not about what the bot does with the run.
+    await api("POST", `/api/routine-runs/${run.id}/cancel`);
+
+    const listed = await api("GET", "/api/webhooks");
+    expect(listed.body.webhooks.find((webhook: { id: string }) => webhook.id === webhookId)).toMatchObject({
+      mergedPullRequestsOnly: true,
+      deliveryCount: 1,
+      ignoredCount: 2,
+    });
+
+    const cleared = await api("PATCH", `/api/webhooks/${webhookId}`, { mergedPullRequestsOnly: false });
+    expect(cleared.body.webhook.mergedPullRequestsOnly).toBeUndefined();
+    expect((await api("DELETE", `/api/webhooks/${webhookId}`)).status).toBe(200);
+  });
+
   it("stores OpenCode Go credentials as a configured-only status", async () => {
     const put = await api("PUT", "/api/config", { opencodeGo: { apiKey: "opencode-secret" } });
     expect(put.status).toBe(200);
