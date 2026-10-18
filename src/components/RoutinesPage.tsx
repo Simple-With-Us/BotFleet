@@ -107,6 +107,7 @@ const webhookResponse = z.object({
     verificationPending: z.boolean().optional(), verifiedAt: z.number().optional(),
     verificationSample: z.object({ receivedAt: z.number(), eventName: z.string().optional(), contentType: z.string().optional(), preview: z.string() }).strict().optional(),
     eventTypes: z.array(z.string()).optional(), minGapMinutes: z.number().optional(), oneShotWake: z.boolean().optional(),
+    mergedPullRequestsOnly: z.boolean().optional(), ignoredCount: z.number().optional(), lastIgnoredAt: z.number().optional(),
   }).strict(),
 }).strict();
 

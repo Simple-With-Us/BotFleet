@@ -46,6 +46,7 @@ A passing run shows:
 - **Manual and scheduled runs:** Both paths record in the central run log with status
 - **Central run logs:** List/Calendar views show all historical runs
 - **Bot-scoped routines:** Routines stay visible only to their owning bot's members
+- **Merged-pull-requests-only webhooks:** A webhook with `mergedPullRequestsOnly` runs only for a GitHub `pull_request` delivery whose action is `closed` and whose pull request merged.  Every other delivery (a pull request closed without merging, any other action, a `check_run`) answers `202` with `ignored: true`, creates no run, and adds one to the webhook's `ignoredCount`.  Turn it on or off with `PATCH /api/webhooks/<id>` and `{"mergedPullRequestsOnly": true}`.  Covered by `server/webhooks.test.ts`, `server/webhook-ingress.test.ts` and `server/webhook-payload.test.ts`: `pnpm vitest run server/webhooks.test.ts server/webhook-ingress.test.ts server/webhook-payload.test.ts`
 
 ## Cleanup
 

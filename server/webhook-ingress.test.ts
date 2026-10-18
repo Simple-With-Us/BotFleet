@@ -261,6 +261,62 @@ describe("webhook-only ingress", () => {
     expect(recorded).toBeLessThanOrEqual(10);
     expect(recorded).toBeGreaterThan(0);
   });
+
+  // BF-2459: the Compiler's GitHub hook sends the event name in X-GitHub-Event.
+  it("answers 202 and starts no run for GitHub deliveries a merged-pull-requests-only webhook filters", async () => {
+    const compiler = manager.create({
+      name: "Compiler",
+      prompt: "Verify the merge.",
+      botId: "maus-1",
+      mergedPullRequestsOnly: true,
+    });
+    const url = webhookCredential(ingress.baseUrl, compiler.webhook.endpointId, compiler.secret).url;
+    const repository = { full_name: "Simple-With-Us/BotFleet", name: "BotFleet" };
+    const send = (event: string, deliveryId: string, body: string) =>
+      fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-github-event": event, "x-github-delivery": deliveryId },
+        body,
+      });
+    const before = queued.length;
+
+    const checkRun = await send(
+      "check_run",
+      "gh-check-run",
+      JSON.stringify({ repository, action: "completed", check_run: { status: "completed", conclusion: "failure" } }),
+    );
+    expect(checkRun.status).toBe(202);
+    expect(await checkRun.json()).toEqual({ accepted: true, deliveryId: "gh-check-run", duplicate: false, ignored: true });
+
+    const unmerged = await send(
+      "pull_request",
+      "gh-pr-unmerged",
+      JSON.stringify({ repository, action: "closed", pull_request: { number: 7, merged: false, merged_at: null } }),
+    );
+    expect(unmerged.status).toBe(202);
+    expect(await unmerged.json()).toMatchObject({ accepted: true, ignored: true });
+    expect(queued).toHaveLength(before);
+
+    const mergedPr = await send(
+      "pull_request",
+      "gh-pr-merged",
+      JSON.stringify({
+        repository,
+        action: "closed",
+        pull_request: { number: 7, merged: true, merged_at: "2026-10-18T21:00:00Z" },
+      }),
+    );
+    expect(mergedPr.status).toBe(202);
+    const body = await mergedPr.json();
+    expect(body).toMatchObject({ accepted: true, duplicate: false, deliveryId: "gh-pr-merged", runId: expect.any(String) });
+    expect(body).not.toHaveProperty("ignored");
+    expect(queued).toHaveLength(before + 1);
+    expect(queued.at(-1)?.prompt).toContain("Event: pull_request");
+    expect(manager.list().find((webhook) => webhook.id === compiler.webhook.id)).toMatchObject({
+      deliveryCount: 1,
+      ignoredCount: 2,
+    });
+  });
 });
 
 describe("webhook-only ingress fixed routes", () => {
