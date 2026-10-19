@@ -559,7 +559,7 @@ const appConfigSchema = z.object({
   //
   // Every field is optional and every ABSENT field means the conservative
   // choice, so an existing config file keeps its behaviour with no migration.
-  // The two `allowRemote*` gates default to false because the path they guard
+  // `allowRemoteDesktopLaunch` defaults to false because the path it guards
   // reaches this Mac from a phone: the Companion sidecar replays a device
   // request to 127.0.0.1, which satisfies the loopback-only check in the
   // harness by construction (companion/src/proxy.ts says so in its header).
