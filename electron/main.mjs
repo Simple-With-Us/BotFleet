@@ -84,8 +84,10 @@ import {
   resolveCompanionControlPlaneURL,
 } from "./companion-account-service.mjs";
 import capabilitiesModule from "./capabilities.cjs";
+import appInfoModule from "./app-info.cjs";
 
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
+const { appRuntimeInfo, appRuntimeSummary } = appInfoModule;
 let updateCredentialPreparationPath;
 try {
   updateCredentialPreparationPath = updateCredentialReceiptPath(process.argv);
@@ -2001,6 +2003,18 @@ ipcMain.handle("desktop:capabilities", async () =>
     localConnection: await cuaReady,
   }),
 );
+
+// Which build is running, for the settings panel. Answered from the live
+// process, so it always describes the app the user is actually looking at
+// rather than whatever was last installed.
+ipcMain.handle("desktop:app-info", () => {
+  const info = appRuntimeInfo({
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    harness: app.isPackaged ? `${serverMode}:${SERVER_PORT}` : "dev",
+  });
+  return { ...info, summary: appRuntimeSummary(info) };
+});
 
 ipcMain.handle("assemblyai:status", () => ({
   configured: Boolean(assemblyAICredential(secureCredentials)),

@@ -110,11 +110,28 @@ type SkillRecordingPayload = {
     code?: "load-failed" | "renderer-gone";
   }
 
+  /** The build the running process reports. `build` is the trailing
+   *  component of `version` under the 1.0.<commit_count> scheme, and is null
+   *  when the version is not plain x.y.z. */
+  interface AppRuntimeInfo {
+    version: string;
+    build: string | null;
+    platform: string;
+    arch: string;
+    electron: string;
+    node: string;
+    packaged: boolean;
+    harness: string | null;
+    /** The same fields on one line, ready to copy into a bug report. */
+    summary: string;
+  }
+
   interface Window {
     ogb?: {
       platform: NodeJS.Platform;
       getCapabilities(): Promise<DesktopCapabilities>;
       onCapabilitiesChanged(cb: (capabilities: DesktopCapabilities) => void): () => void;
+      appInfo?(): Promise<AppRuntimeInfo>;
       companionAccount?: {
         state(): Promise<CompanionAccountState>;
         requestCode(email: string): Promise<CompanionAccountState>;
