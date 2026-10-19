@@ -18,6 +18,21 @@
 set -euo pipefail
 
 ROOT="${BOTFLEET_COMPANION_ROOT:-$HOME/apps/botfleet-companion}"
+# The runtime root is the release store's pointer, not a git checkout.
+#
+# A checkout is a mutable working tree: a seat's branch can delete files the
+# sidecar still imports, and an update rewrites the tree under a running
+# process.  A promoted release is immutable and named by the commit it holds,
+# and the pointer at ~/.botfleet/current is the only thing that moves when
+# the sidecar changes version.  The pointer wins when it exists;
+# BOTFLEET_COMPANION_ROOT still overrides it, and the legacy checkout path
+# stays the fallback for a machine that has never promoted a release.
+if [ -z "${BOTFLEET_COMPANION_ROOT:-}" ]; then
+  COMPANION_STORE_POINTER="$HOME/.botfleet/current"
+  if [ -e "$COMPANION_STORE_POINTER" ] || [ -L "$COMPANION_STORE_POINTER" ]; then
+    ROOT="$COMPANION_STORE_POINTER"
+  fi
+fi
 PORT="${BOTFLEET_COMPANION_PORT:-8810}"
 CONTROL_PORT="${BOTFLEET_COMPANION_CONTROL_PORT:-8811}"
 HARNESS_PORT="${BOTFLEET_HARNESS_PORT:-8799}"
