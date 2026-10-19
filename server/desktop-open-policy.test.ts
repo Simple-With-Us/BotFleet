@@ -37,11 +37,14 @@ describe("remoteDesktopLaunchAllowed", () => {
   });
 
   it("is off for anything that is not exactly true", () => {
-    expect(remoteDesktopLaunchAllowed({ server: { allowRemoteDesktopLaunch: false } })).toBe(false);
-    // A stored file is data, not a contract; a truthy-looking string must not
-    // become permission.
-    expect(remoteDesktopLaunchAllowed({ server: { allowRemoteDesktopLaunch: "true" as never } })).toBe(false);
-    expect(remoteDesktopLaunchAllowed({ server: { allowRemoteDesktopLaunch: 1 as never } })).toBe(false);
+    // A stored config file is data, not a contract: it can hold whatever was
+    // written into it.  These are built by parsing rather than by casting, so
+    // the test can feed the function genuinely wrong types without asserting
+    // them into shape first — which is the whole point of the case.
+    for (const raw of ['"true"', "1", "{}", "[]", "null"]) {
+      const cfg = JSON.parse(`{"server":{"allowRemoteDesktopLaunch":${raw}}}`);
+      expect(remoteDesktopLaunchAllowed(cfg), raw).toBe(false);
+    }
   });
 
   it("is on only when the owner said so", () => {
