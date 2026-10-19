@@ -12,7 +12,7 @@ The app is native Swift and uses XcodeGen; EAS commands do not apply.
 
 ## Hosted TestFlight (primary)
 
-Merges that touch `ios/**` (or the ship scripts) run `.github/workflows/ios-ship.yml` on GitHub-hosted `macos-latest`.  The job maps existing `APPLE_API_*` and `IOS_CERT_*` repository secrets, installs or creates the App Store profiles named in `ios/appstore-profiles.json`, then calls `scripts/ios-ship-testflight.sh` with `IOS_MANUAL_SIGN=1`.  Marketing stays on the `1.0.N` train (`+1` on every rebuild).  `CURRENT_PROJECT_VERSION` is UTC `YYYYMMDDHHMM`.  Do not mint a new API key.
+Merges that touch `ios/**` (or the ship scripts) run `.github/workflows/ios-ship.yml` on GitHub-hosted `macos-latest`.  The job maps existing `APPLE_API_*` and `IOS_CERT_*` repository secrets, installs or creates the App Store profiles named in `ios/appstore-profiles.json`, then calls `scripts/ios-ship-testflight.sh` with `IOS_MANUAL_SIGN=1`.  Marketing and build both come from the repo's commit count (`1.0.<commit_count>` and `<commit_count>`), so the pair always describes one number.  Do not mint a new API key.
 
 ### App Group on App Store profiles
 
@@ -25,7 +25,7 @@ The Mac wrapper remains a fallback when the hosted job cannot run.  It prefers `
 1. Run `swift test` from `ios/` and the repository test suite.
 2. Generate the Xcode project with `xcodegen generate` from `ios/` (hosted ships do this in CI; the `.xcodeproj` is gitignored).
 3. Team `CC8UTF7ATG` is already set as `DEVELOPMENT_TEAM` in `project.yml`.
-4. Hosted ships stamp `MARKETING_VERSION` `1.0.N` (`+1` per rebuild) and `CURRENT_PROJECT_VERSION` as UTC `YYYYMMDDHHMM`.  Do not hand-edit those for a hosted upload.
+4. Hosted ships stamp `MARKETING_VERSION` `1.0.<commit_count>` and `CURRENT_PROJECT_VERSION` `<commit_count>`, both from the commit that is being built.  Do not hand-edit those for a hosted upload.
 5. Archive a generic iOS device build and validate it in Xcode Organizer only when using the manual fallback.
 6. Upload to App Store Connect and distribute to internal TestFlight testers first (hosted ships upload in CI).
 7. Complete a real-iPhone pass for pairing, Bonjour permission, Keychain restore (including an install upgraded from an OpenMausBot-era build:  its token moves from the old keychain service on first launch and the phone must stay paired), Tailscale, optional hosted HTTPS, approvals, background/foreground reconciliation, sign-out/revocation, and transcript sharing.
