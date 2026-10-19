@@ -2407,6 +2407,11 @@ function setupApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  // A deliberate shutdown writes a sentinel so launchd's periodic tick leaves
+  // the harness alone.  Launching the app is the documented way back, so clear
+  // it first — before anything here tries to reach a server, so the request
+  // below is never made against a marker that says "stay down".
+  clearHarnessShutdownMarker();
   if (wantsSafeStorageExport(process.argv)) {
     try {
       const result = await readSecureCredentials({
@@ -2681,15 +2686,43 @@ function serverPersistsOnExit() {
 // Fire and forget by design: this runs during quit, the app is going away
 // regardless, and the harness's own reply is not something anyone is left to
 // read.  A refused connection means it was already gone.
+//
+// SERVER_PORT, not process.env.OMB_PORT: OMB_PORT is what this process hands
+// a harness it forks itself, and it is unset whenever we attached to one that
+// launchd started.  SERVER_PORT is the port we actually talked to, and it is
+// already a number — reading it also removes the NaN case a non-numeric OMB_PORT
+// would produce here.
 function requestAttachedHarnessShutdown() {
-  const port = Number(process.env.OMB_PORT ?? 8799);
-  return fetch(`http://127.0.0.1:${port}/api/system/shutdown`, {
+  return fetch(`http://127.0.0.1:${SERVER_PORT}/api/system/shutdown`, {
     method: "POST",
     // The route is loopback-only, and the bound address is loopback-only too,
     // so a short ceiling is enough; it exists so a wedged harness cannot hold
     // the app open past CUA_STOP_TIMEOUT_MS.
     signal: AbortSignal.timeout(2000),
   }).then((res) => res.text()).catch(() => "");
+}
+
+// Clear the "stopped on purpose" sentinel when the app starts, which is the
+// other half of what POST /api/system/shutdown promises: the marker text and
+// the docs both say "launch the BotFleet app to let it come back", and without
+// this the app would launch into a permanently blocked harness.
+//
+// Safe to do unconditionally on launch, and the ordering is the reason.  The
+// launchd wrapper reads this marker itself and exits 0 while it exists, so a
+// periodic tick never reaches the harness and never runs this code.  This only
+// runs when a person actually opened the app -- BotFleet is not a login item,
+// and even if it became one, the wrapper would still be the thing refusing to
+// start a server, which is the decision we want to honour only on a real
+// launch.  A manual run of the wrapper clears it too, so there are two ways
+// back and neither depends on the other.
+function clearHarnessShutdownMarker() {
+  const marker = path.join(process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet"), "stopped.marker");
+  try {
+    fs.rmSync(marker, { force: true });
+  } catch {
+    // Already gone, or a path we cannot touch.  Either way the app launching
+    // is the intent, and the wrapper treats a missing marker as "start".
+  }
 }
 
 app.on("before-quit", (e) => {

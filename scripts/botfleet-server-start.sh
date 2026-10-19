@@ -24,7 +24,7 @@ ROOT="${BOTFLEET_SERVER_ROOT:-$HOME/apps/botfleet-server}"
 # which path they are in cannot be compared.
 # If this fails, do NOT let `set -e` abort here: at this point in the script
 # fail_or_stop_storm does not exist yet, so an abort here would exit non-zero
-# with no ledger record and no operator message — the one failure that bypasses
+# with no ledger record and no operator message -- the one failure that bypasses
 # the machinery that exists to report failures.  The half-resolved state is
 # carried and reported through the real channel below, once that function is
 # defined.
@@ -40,7 +40,7 @@ if [ -d "$ROOT" ]; then
   fi
 elif [ -L "$ROOT" ] || [ -e "$ROOT" ]; then
   # It exists but is not a directory.  For a symlink root this is a DANGLING
-  # `current` pointer, because `test -d` follows symlinks — so the branch above
+  # `current` pointer, because `test -d` follows symlinks -- so the branch above
   # never sees it, and without this the operator gets only preflight's
   # "missing $ROOT/server/index.ts" plus a generic "run pnpm install" that
   # reinstalls IN PLACE and cannot recreate a release that has been deleted.
@@ -76,7 +76,7 @@ FAIL_STORM_THRESHOLD="${BOTFLEET_FAIL_STORM_THRESHOLD:-20}"
 #
 # Without it there is no such thing as a quiet shutdown on this Mac.  The
 # launchd agent carries KeepAlive.SuccessfulExit=false and StartInterval=300,
-# so a clean exit is not resurrected by the first pair of settings — but the
+# so a clean exit is not resurrected by the first pair of settings -- but the
 # five-minute tick still runs this script, a closed port still reads as a
 # crash, and the harness comes back.  Whoever turned the server off would find
 # it on again a few minutes later with nothing in the logs to explain it.
@@ -86,7 +86,7 @@ FAIL_STORM_THRESHOLD="${BOTFLEET_FAIL_STORM_THRESHOLD:-20}"
 # check it is documented to be.
 #
 # Only the launchd path respects the marker.  A person running this script by
-# hand is asking for the server, so that clears the marker and starts — which
+# hand is asking for the server, so that clears the marker and starts -- which
 # is the recovery path when someone stops it and then changes their mind.
 SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/stopped.marker}"
 LAUNCHD_SERVICE_NAME="${XPC_SERVICE_NAME:-}"
@@ -282,7 +282,7 @@ preflight() {
 probe_imports() {
   local probe_log
   probe_log="$(mktemp "${TMPDIR:-/tmp}/botfleet-probe.XXXXXX")"
-  # Probe packages the harness loads at boot — not only yaml — plus the config
+  # Probe packages the harness loads at boot -- not only yaml -- plus the config
   # module (side-effect free) so a partial install missing any of these still
   # triggers the one-shot heal before exec'ing server/index.ts.
   if (cd "$ROOT" && "$NODE" --experimental-strip-types -e "
@@ -345,7 +345,7 @@ fi
 # `|| true` is load-bearing under `set -e`: the function returns 1 to mean
 # "carry on and start the harness", and an unguarded bare call would abort the
 # whole script on exactly the ordinary, marker-absent path.  The exit 0 inside
-# the function still exits — that is an `exit`, not a return status.
+# the function still exits -- that is an `exit`, not a return status.
 honour_shutdown_marker || true
 
 # --heal-only must prepare the checkout even when the currently running
