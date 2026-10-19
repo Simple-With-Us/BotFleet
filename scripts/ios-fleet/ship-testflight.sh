@@ -229,25 +229,22 @@ load_secrets() {
     fi
     logerr "ASC_KEY_* unusable and APPLE_API_KEY_P8_BASE64 did not decode to a PEM"
   fi
-  local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" lower p8
+  local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" p8
   [[ -n "$kid" ]] || kid="$(fs_get ASC_KEY_ID /asc)" || kid=""
   [[ -n "$iss" ]] || iss="$(fs_get ASC_ISSUER_ID /asc)" || iss=""
   if [[ -z "$kid" || -z "$iss" ]]; then
     log "ASC credentials missing: set ASC_KEY_ID/ASC_ISSUER_ID/ASC_KEY_PATH or add ASC_KEY_ID and ASC_ISSUER_ID to Infisical /asc"
     return 0
   fi
-  # /asc holds one key (ASC_KEY_P8);  an environment key id that differs from
-  # it takes its PEM from the per-key folder /authkey-<id lowercase>-p8.
+  # /asc holds one key.  A key id from the environment that differs from it
+  # has no Infisical copy:  fail with a clear message rather than guess.
   p8=""
   if [[ "$kid" == "$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)" ]]; then
     p8="$(fs_get ASC_KEY_P8 /asc)" || p8=""
   fi
   if [[ -z "$p8" ]]; then
-    lower="$(printf '%s' "$kid" | tr '[:upper:]' '[:lower:]')"
-    if ! p8="$(fs_get "AUTHKEY_${kid}" "/authkey-${lower}-p8")"; then
-      log "missing the .p8 for ${kid} in Infisical /asc ASC_KEY_P8 or /authkey-${lower}-p8"
-      return 0
-    fi
+    log "no .p8 for key ${kid}: Infisical /asc ASC_KEY_P8 holds a different key (or is unreadable);  set ASC_KEY_PATH to a file for this key"
+    return 0
   fi
   asc_tmp_dir
   ( umask 077; printf '%s\n' "$p8" > "${ASC_TMP_DIR}/AuthKey_${kid}.p8" )
@@ -1038,7 +1035,7 @@ fi
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
   [[ -f "$UPLOAD_ONLY_IPA" ]] || die "package not found: $UPLOAD_ONLY_IPA"
-  [[ "$AUTH_MODE" == "api_key" ]] || die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH (env) or Infisical /appstore-connect + /authkey-<id>-p8"
+  [[ "$AUTH_MODE" == "api_key" ]] || die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
   link_private_key "$ASC_KEY_PATH" "$ASC_KEY_ID"
   log "uploading existing package via altool (api key)"
   set +e

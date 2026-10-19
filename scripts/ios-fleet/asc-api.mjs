@@ -125,10 +125,9 @@ function resolveCredential() {
   const kid = envKeyId || fleetSecretsGet("ASC_KEY_ID", "/asc");
   const iss = envIssuer || fleetSecretsGet("ASC_ISSUER_ID", "/asc");
   if (kid && iss) {
-    // /asc holds one key (ASC_KEY_P8).  When the environment names another
-    // key id, the per-key folder /authkey-<id lowercase>-p8 holds its PEM.
-    let pem = kid === fleetSecretsGet("ASC_KEY_ID", "/asc") ? fleetSecretsGet("ASC_KEY_P8", "/asc") : "";
-    if (!pem) pem = fleetSecretsGet(`AUTHKEY_${kid}`, `/authkey-${kid.toLowerCase()}-p8`);
+    // /asc holds one key.  An environment key id that differs from it has no
+    // Infisical copy, so it falls through to source 3 or the "tried" message.
+    const pem = kid === fleetSecretsGet("ASC_KEY_ID", "/asc") ? fleetSecretsGet("ASC_KEY_P8", "/asc") : "";
     if (pem.includes("-----BEGIN ")) {
       return { keyId: kid.trim(), issuerId: iss.trim(), privateKeyPem: `${pem}\n`, source: "Infisical (fleet-secrets)" };
     }
