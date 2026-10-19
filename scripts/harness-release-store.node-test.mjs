@@ -872,7 +872,12 @@ test("staging exports a commit and leaves the source repository untouched", asyn
   const before = await run("git", ["-C", repo, "status", "--porcelain"]);
   const staging = await stageRelease({ commit, repo, env, install: false });
   assert.equal(staging, stagingPath(commit, env));
-  assert.equal(await readFile(join(staging, "server/index.ts"), "utf8"), "export const staged = true;\n");
+  // Line endings are the platform's business: git applies the checkout's
+  // eol conversion when it exports, so a Windows runner hands back CRLF for
+  // the same content.  The export is about the CONTENT, so the comparison
+  // normalizes the ending instead of pinning one platform's convention.
+  const exported = await readFile(join(staging, "server/index.ts"), "utf8");
+  assert.equal(exported.replace(/\r\n/g, "\n"), "export const staged = true;\n");
   // The export must not have left a working tree behind, and the source
   // repository must be exactly as it was.
   const after = await run("git", ["-C", repo, "status", "--porcelain"]);
