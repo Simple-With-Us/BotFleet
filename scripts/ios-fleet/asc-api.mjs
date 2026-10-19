@@ -6,7 +6,10 @@
  * Auth: resolves ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH from the first
  * source that is actually present (never prints values):
  *   1. ASC_KEY_* in the environment (DealDex's ios-ship.yml exports these)
- *   2. ~/.secrets/appstore-connect.env (the local-Mac file)
+ *   2. Infisical Fleet-OPS through `fleet-secrets` (the Mac): ASC_KEY_ID and
+ *      ASC_ISSUER_ID from /appstore-connect, the .p8 PEM from
+ *      /authkey-<key id lowercase>-p8 AUTHKEY_<KEY_ID>, kept in memory only
+ *      (AFC-359: nothing reads ~/.secrets)
  *   3. APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64
  *      (the names BotFleet's ios-ship.yml exports from Infisical; the p8 is
  *      base64, so it is decoded into a 0600 temp file and removed on exit)
@@ -28,17 +31,19 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-function loadEnvFile(path) {
-  const text = readFileSync(path, "utf8");
-  const env = {};
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) continue;
-    env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+// Reads one value from Infisical Fleet-OPS through fleet-secrets.  Returns ""
+// when absent or unreadable;  never prints the value or the tool's stderr.
+// FLEET_SECRETS_BIN is the test seam.
+function fleetSecretsGet(name, folder) {
+  const bin = process.env.FLEET_SECRETS_BIN || join(homedir(), ".local", "bin", "fleet-secrets");
+  try {
+    return execFileSync(bin, ["get", name, "--path", folder], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).replace(/\n$/, "");
+  } catch {
+    return "";
   }
-  return env;
 }
 
 function base64url(input) {
@@ -48,9 +53,9 @@ function base64url(input) {
 // ---------------------------------------------------------------------------
 // CREDENTIAL RESOLUTION
 // ---------------------------------------------------------------------------
-// WHY THIS IS NOT JUST "~/.secrets/appstore-connect.env" (fixed 2026-10-02):
+// WHY THERE ARE SEVERAL SOURCES (fixed 2026-10-02):
 // .github/workflows/ios-ship.yml runs on a GitHub-hosted macos-latest runner,
-// which has no ~/.secrets directory at all.  The credential reaches that
+// which has no Infisical machine identity or fleet-secrets.  The credential reaches that
 // runner as THREE ENVIRONMENT VARIABLES -- APPLE_API_KEY_ID,
 // APPLE_API_ISSUER_ID and APPLE_API_KEY_P8_BASE64 -- exported into $GITHUB_ENV
 // by .github/actions/infisical-secrets.  Reading only the file meant the key
@@ -115,13 +120,15 @@ function resolveCredential() {
     if (got) return got;
   }
 
-  // 2) The local-Mac env file.
-  const envPath = join(homedir(), ".secrets", "appstore-connect.env");
-  if (existsSync(envPath)) {
-    const fileEnv = loadEnvFile(envPath);
-    if (fileEnv.ASC_KEY_ID && fileEnv.ASC_ISSUER_ID && fileEnv.ASC_KEY_PATH && existsSync(fileEnv.ASC_KEY_PATH)) {
-      const got = fromFile(fileEnv.ASC_KEY_ID, fileEnv.ASC_ISSUER_ID, fileEnv.ASC_KEY_PATH, envPath);
-      if (got) return got;
+  // 2) The Mac: Infisical Fleet-OPS through fleet-secrets, in memory only.
+  //    A hosted runner has no fleet-secrets, so this finds nothing there and
+  //    falls through to 3.
+  const kid = envKeyId || fleetSecretsGet("ASC_KEY_ID", "/appstore-connect");
+  const iss = envIssuer || fleetSecretsGet("ASC_ISSUER_ID", "/appstore-connect");
+  if (kid && iss) {
+    const pem = fleetSecretsGet(`AUTHKEY_${kid}`, `/authkey-${kid.toLowerCase()}-p8`);
+    if (pem.includes("-----BEGIN ")) {
+      return { keyId: kid.trim(), issuerId: iss.trim(), privateKeyPem: `${pem}\n`, source: "Infisical (fleet-secrets)" };
     }
   }
 
@@ -640,7 +647,7 @@ async function main() {
     console.error(
       "asc-auth: no App Store Connect credential found. Tried, in order:\n" +
       "  1) ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH in the environment\n" +
-      "  2) ~/.secrets/appstore-connect.env\n" +
+      "  2) Infisical /appstore-connect + /authkey-<id>-p8 (fleet-secrets)\n" +
       "  3) APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64 in the environment"
     );
     process.exit(1);

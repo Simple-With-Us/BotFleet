@@ -61,7 +61,7 @@ export function validZulipRole(role: string): boolean {
 }
 
 export interface ZulipCredentialSource {
-  /** A short, secret-free description for status ("file ~/.secrets/…"). */
+  /** A short, secret-free description for status ("file <credentialDir>/…"). */
   describe(role: string): string;
   /** The role's credentials.  Throws ZulipCredentialError ("missing" when
    *  the role is simply not set up there). */

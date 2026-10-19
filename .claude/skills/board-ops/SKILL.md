@@ -28,7 +28,7 @@ board show <id>
 
 `<id>` is a Linear identifier (`BF-123`), a full legacy board id, or the first eight or more hex characters of a legacy board id.  Every output line ends with the identifier — use it from then on.
 
-The CLI loads credentials itself (Fleet app env under `~/.secrets/Linear/`).  The secret must never appear on a command line, in `ps`, or in a transcript.  Do not use a personal Linear connector or Composio to write: they act as Jay, not as a seat.
+The CLI loads credentials itself (the Fleet app credentials from Infisical Fleet-OPS via `fleet-secrets`).  The secret must never appear on a command line, in `ps`, or in a transcript.  Do not use a personal Linear connector or Composio to write: they act as Jay, not as a seat.
 
 When the agent-sync MCP mounts Linear tools, `linear_list`, `linear_show`, `linear_claim`, `linear_comment`, `linear_file`, and `linear_status` are equivalent read/write surfaces for the same Fleet app identity.
 

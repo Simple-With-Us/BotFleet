@@ -15,8 +15,8 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 #   IOS_CERT_P12_BASE64, IOS_CERT_PASSWORD (all required -- the ship fails
 #   without them), plus SENTRY_DSN and SENTRY_AUTH_TOKEN (best-effort, with
 #   a synced GitHub secret as GH_FALLBACK_*; an inert Sentry beats a red ship).
-# scripts/ios-appstore-gm-prepare.sh maps the five signing names onto
-# ~/.secrets/appstore-connect.env and imports the Distribution identity.
+# scripts/ios-appstore-gm-prepare.sh checks the five signing names and imports
+# the Distribution identity;  the ship step reads the APPLE_API_* names directly.
 # Hosted ships use MANUAL Release signing: scripts/ios-install-appstore-profiles.sh
 # reuses or creates IOS_APP_STORE profiles over the App Store Connect API
 # (asc-api.mjs ensure-appstore-profiles), installs them, and archives with the
