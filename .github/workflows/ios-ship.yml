@@ -25,7 +25,8 @@ name: iOS TestFlight ship (GitHub-hosted macOS)
 #
 # The in-repo wrapper prefers scripts/ios-fleet/, then
 # /Users/jay/apps/ios-fleet. App key `botfleet`, bundle `app.botfleet.ios`,
-# team `CC8UTF7ATG`. Marketing train is 1.0.N; build is UTC YYYYMMDDHHMM.
+# team `CC8UTF7ATG`. Versioning is 1.0.<commit count>, and CFBundleVersion is
+# that same integer (owner 2026-10-18); UTC timestamps are retired.
 
 on:
   push:
