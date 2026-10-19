@@ -57,25 +57,54 @@ pushes off.
     Infisical and is read through `fleet-secrets` at runtime, so the staged
     `~/.secrets/AuthKey_*.p8` files are no longer load-bearing for this path.
 
+## Review findings
+
+Two review bots found real defects in the first version of this change, both
+in the same shape as the bug it was fixing:  a value that looked fine and
+silently removed the key.
+
+1.  **The failure cache was stamped when the read STARTED.**  `readVault`
+    captured `now` before the subprocess ran and stored that in the cache
+    entry.  A read that takes longer than the retry window therefore left an
+    already-expired entry behind, and the next caller ran another full
+    blocking read — `refreshConfig` asks for the key stamp and then the key
+    config, so one refresh could block for nearly 100 s.  The entry is now
+    stamped when the read finishes, so the read's own duration never counts
+    against the retry window.  The regression test fails on the old stamping
+    with two vault reads where there should be one.
+
+2.  **A fractional read ceiling threw instead of timing out.**  The override
+    accepted any finite positive number, and Node's `execFileSync` rejects a
+    fractional timeout with `ERR_OUT_OF_RANGE`.  The read threw, the catch
+    swallowed it, and the key vanished — the exact "no key" outcome the
+    ceiling exists to prevent.  Both knobs now go through one
+    `positiveIntegerEnv` helper that honours only a finite, positive integer.
+
 ## Files
 
 -  `companion/src/apns.ts` — `APNS_VAULT_READ_BUDGET_MS`,
-    `APNS_VAULT_READ_TIMEOUT_MS`, `vaultReadTimeoutMs()`, and the ceiling
+    `APNS_VAULT_READ_TIMEOUT_MS`, `positiveIntegerEnv()`, `vaultReadTimeoutMs()`,
+    `vaultRetryMs()`, the completion stamp in `readVault`, and the ceiling
     `fleetSecretsGet` uses.
--  `companion/src/apns.test.ts` — the ordering invariant, the override, and
-    the refusal of a non-positive override.
+-  `companion/src/apns.test.ts` — the ordering invariant, the override, the
+    refusal of a non-positive or fractional override, and the slow-failed-read
+    regression.
 
 ## Verification
 
--  `pnpm vitest run companion/src/apns.test.ts` — 133 passed (1 file), before
-    and after the change.
+-  `pnpm vitest run companion/src/apns.test.ts` — 135 passed (1 file).
 -  `pnpm typecheck` — clean.
+-  `pnpm lint` — baseline check passed.
+-  The slow-failed-read regression test was run against the old stamping and
+    fails there (`expected [ Array(2) ] to have a length of 1 but got 2`), so
+    it tests the defect and not the new code.
 -  Credential probe against the live Apple endpoint, using the lane's own
     `loadApnsConfig()`:  the sidecar resolved `keyId HSJ98QN95V` from
     `Infisical APNS_KEY_P8`, signed a provider token, and Apple answered
     **400 BadDeviceToken** for a non-existent device.  A refused key answers
     403 `InvalidProviderToken`; 400 is authentication succeeding and the
     device being unknown.  Nothing was delivered — the probe uses 64 zeroes.
+
 
 ## Next steps
 

@@ -3364,6 +3364,33 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     }
   });
 
+  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a whole number of milliseconds", () => {
+    // Node's execFileSync rejects a fractional timeout with ERR_OUT_OF_RANGE:
+    // the read throws, the catch swallows it, and the key silently vanishes
+    // — the same "no key" outcome the ceiling exists to prevent.
+    for (const bad of ["0.5", "1.5", "30000.25"]) {
+      process.env.APNS_VAULT_READ_TIMEOUT_MS = bad;
+      resetApnsKeyCache();
+      process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+      expect(loadApnsConfig()?.p8).toContain("BEGIN PRIVATE KEY");
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("does not read the vault again straight after a slow failed read", () => {
+    // The failure is cached from the moment the read FINISHED.  A read that
+    // outlasts the retry window used to leave an already-expired entry
+    // behind, so the next caller — `refreshConfig` asks for the stamp and
+    // then the config — ran a second full blocking read instead of the
+    // cached answer.
+    const calls = join(dir, "calls");
+    process.env.APNS_VAULT_RETRY_MS = "100";
+    process.env.APNS_VAULT_READ_TIMEOUT_MS = "300";
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" >> '${calls}'\nsleep 1\nexit 3`);
+    expect(loadApnsConfig()).toBeNull();
+    expect(apnsKeyStamp()).toBeNull();
+    expect(readFileSync(calls, "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
   it.skipIf(process.platform === "win32")("keeps the last good key id when only the id read fails, and stamps the id", () => {
     const pem = testP8();
     const ok = `case "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;

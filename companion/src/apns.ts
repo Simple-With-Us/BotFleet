@@ -50,7 +50,9 @@ function fleetSecretsBin(): string {
  * per window is enough to notice a rotation without a process per tick. */
 export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
 /** A failed read is retried sooner: a Mac that was still booting should not
- * keep pushes off for a whole window. */
+ *  keep pushes off for a whole window.  The window is measured from the moment
+ *  the read FINISHED, so a read that runs longer than the window cannot expire
+ *  its own failure entry and trigger an immediate second blocking read. */
 export const APNS_VAULT_RETRY_MS = 30_000;
 
 /** The slowest `fleet-secrets` read measured on the fleet Mac (2026-10-19):
@@ -69,15 +71,28 @@ export const APNS_VAULT_READ_BUDGET_MS = 16_600;
  * slower network without letting a wedged read hang the key path. */
 export const APNS_VAULT_READ_TIMEOUT_MS = 3 * APNS_VAULT_READ_BUDGET_MS;
 
-/** The read ceiling actually used, overridable for a slower vault.
+/** A finite, positive integer from the environment, or the fallback.
  *
- * Only a finite, positive number is honoured:  `Number("-1")` is a number, so
- * a negative override would otherwise become a timeout that fires instantly
- * and reads as "no key" again — the exact failure this ceiling exists to
- * remove. */
+ * Both failure modes here are the same one:  the value stops being a sensible
+ * timeout and the read stops working, which the sidecar reads as "no key" and
+ * turns APNs pushes off.  `Number("-1")` is a number, so a negative value
+ * sails through a `|| fallback` and becomes a timeout that fires instantly.
+ * `Number("0.5")` is a number too, and Node's `execFileSync` rejects a
+ * fractional timeout with ERR_OUT_OF_RANGE — so the read throws, the catch
+ * swallows it, and the key silently disappears. */
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const configured = Number(process.env[name]);
+  return Number.isInteger(configured) && configured > 0 ? configured : fallback;
+}
+
+/** The read ceiling actually used, overridable for a slower vault. */
 function vaultReadTimeoutMs(): number {
-  const configured = Number(process.env.APNS_VAULT_READ_TIMEOUT_MS);
-  return Number.isFinite(configured) && configured > 0 ? configured : APNS_VAULT_READ_TIMEOUT_MS;
+  return positiveIntegerEnv("APNS_VAULT_READ_TIMEOUT_MS", APNS_VAULT_READ_TIMEOUT_MS);
+}
+
+/** The retry window actually used, overridable for a slower vault. */
+function vaultRetryMs(): number {
+  return positiveIntegerEnv("APNS_VAULT_RETRY_MS", APNS_VAULT_RETRY_MS);
 }
 
 interface VaultKey {
@@ -117,23 +132,30 @@ function sharedKeyId(): string | null {
 
 function readVault(now = Date.now()): VaultKey {
   const pin = pinnedKeyId() ?? "";
-  if (vaultKey && vaultKey.pin === pin && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : APNS_VAULT_RETRY_MS)) {
+  const retryMs = vaultRetryMs();
+  if (vaultKey && vaultKey.pin === pin && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : retryMs)) {
     return vaultKey;
   }
   const p8 = fleetSecretsGet(apnsVaultName(pin || undefined));
+  // The entry is stamped when the read FINISHED, not when it started.  A read
+  // that runs longer than the retry window would otherwise leave an
+  // already-expired entry behind, and the very next caller — `refreshConfig`
+  // asks for the stamp and then the config — would run another full blocking
+  // read instead of the cached answer.
+  const completedAt = Date.now();
   if (p8 === null && vaultKey && vaultKey.pin === pin && vaultKey.p8) {
     // A transient failure keeps the last good key (pushes keep flowing) and
     // is retried after the short window rather than the long one.
-    vaultKey = { ...vaultKey, at: now - (APNS_VAULT_CACHE_MS - APNS_VAULT_RETRY_MS) };
+    vaultKey = { ...vaultKey, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) };
     return vaultKey;
   }
   if (pin || p8 === null) {
-    vaultKey = { pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: now };
+    vaultKey = { pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: completedAt };
     return vaultKey;
   }
   const id = sharedKeyId();
   if (id) {
-    vaultKey = { pin, keyId: id, p8, at: now };
+    vaultKey = { pin, keyId: id, p8, at: completedAt };
     return vaultKey;
   }
   // The PEM read but its id did not:  keep the last good id for the same
@@ -141,7 +163,7 @@ function readVault(now = Date.now()): VaultKey {
   // either way.  The id is part of the stamp, so a fault Apple records
   // against a wrong fallback id clears once the real id is read.
   const keyId = vaultKey && vaultKey.pin === pin && vaultKey.p8 === p8 ? vaultKey.keyId : SHARED_APNS_KEY_ID;
-  vaultKey = { pin, keyId, p8, at: now - (APNS_VAULT_CACHE_MS - APNS_VAULT_RETRY_MS) };
+  vaultKey = { pin, keyId, p8, at: completedAt - (APNS_VAULT_CACHE_MS - retryMs) };
   return vaultKey;
 }
 
