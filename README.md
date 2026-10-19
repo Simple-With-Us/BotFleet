@@ -110,7 +110,7 @@ See the [OpenMausBot repository](https://github.com/milind-soni/OpenMausBot) for
 
 ## Quick start
 
-**Released builds ([latest](https://github.com/Simple-With-Us/BotFleet/releases/latest)):** the harness server is embedded, so no separate server setup is required.  Desktop numbering matches iOS (`1.0.x`).  This page always points at the latest packaged assets rather than a frozen tag, so it tracks whatever is actually published.
+**Released builds ([latest](https://github.com/Simple-With-Us/BotFleet/releases/latest)):** the harness server is embedded, so no separate server setup is required.  This page always points at the latest packaged assets rather than a frozen tag, so it tracks whatever is actually published.  The exact versions are in the table below — desktop and iOS are numbered independently.
 
 | | Download | Install |
 |---|---|---|
