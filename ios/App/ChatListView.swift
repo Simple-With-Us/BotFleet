@@ -34,6 +34,9 @@ struct ChatListView: View {
     @FocusState private var searchFocused: Bool
     /// Drives the live-session "Open BotFleet on Mac" header control.
     @State private var isOpeningMacApp = false
+    /// Raising the desktop is a physical action on a computer the person is
+    /// not holding, so it is confirmed before it is sent.
+    @State private var confirmingOpenMacApp = false
     /// The chat a long-press asked to delete, while its confirmation is up.
     @State private var pendingDelete: Chat?
     /// The chat Move To Section is choosing a section for.
@@ -149,6 +152,18 @@ struct ChatListView: View {
                 showingNewGroup = true
             }
             Button("Cancel", role: .cancel) {}
+        }
+        .confirmationDialog(
+            "Open BotFleet on Mac?",
+            isPresented: $confirmingOpenMacApp,
+            titleVisibility: .visible
+        ) {
+            Button("Open BotFleet") {
+                Task { await openMacApp() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(openMacConfirmationMessage(session.connection?.name))
         }
         .modifier(rosterManagement)
         .task(id: query) {
@@ -428,25 +443,31 @@ struct ChatListView: View {
             // running, so the phone stays .live and the offline status banner
             // — the action's other home — is hidden.  A live session needs
             // its own entry point.
+            //
+            // The control used to be a bare `macwindow` glyph, which told a
+            // sighted person nothing about what it did; it now carries the
+            // words "Open on Mac", and the words stand in for the confirmation
+            // a tap no longer implies by itself.
             if sessionIsLive, session.connection != nil {
                 Button {
-                    Task { await openMacApp() }
+                    confirmingOpenMacApp = true
                 } label: {
                     Group {
                         if isOpeningMacApp {
-                            ProgressView()
-                                .controlSize(.small)
+                            ProgressView("Opening on Mac…")
+                                .font(.system(size: 13, weight: .medium))
                         } else {
-                            Image(systemName: "macwindow")
-                                .font(.system(size: 18, weight: .medium))
+                            Label("Open on Mac", systemImage: "macwindow")
+                                .font(.system(size: 13, weight: .medium))
                         }
                     }
                     .foregroundStyle(Color.primary)
-                    .frame(width: 44, height: 44)
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 44)
                 }
                 .buttonStyle(.plain)
                 .glassCapsule()
-                .accessibilityLabel("Open BotFleet on Mac")
+                .accessibilityLabel(isOpeningMacApp ? "Opening BotFleet on Mac" : "Open BotFleet on Mac")
                 .disabled(isOpeningMacApp)
             }
 
@@ -489,7 +510,7 @@ struct ChatListView: View {
             // An unauthorized failure already flips the session to
             // .unauthorized, whose banner explains itself — don't also alert.
             if case .live = session.status {
-                session.actionError = "Could not open BotFleet on Mac.  Check that your Mac is awake and reachable."
+                session.actionError = openMacFailureCopy(error)
             }
         }
     }
@@ -1229,6 +1250,9 @@ struct StatusBanner: View {
     @EnvironmentObject private var session: Session
     @State private var isOpening = false
     @State private var openError: String?
+    /// Raising the desktop is a physical action on a computer the person is
+    /// not holding, so it is confirmed before it is sent.
+    @State private var confirmingOpenMac = false
 
     var body: some View {
         Group {
@@ -1244,27 +1268,22 @@ struct StatusBanner: View {
             case let .offline(reason):
                 VStack(spacing: 6) {
                     banner(reason, systemImage: "wifi.slash", tint: .orange)
-
-                    if session.connection != nil {
-                        if isOpening {
-                            banner("Opening BotFleet on Mac…", systemImage: "arrow.triangle.2.circlepath", tint: .secondary)
-                        } else if let openError {
-                            banner(openError, systemImage: "exclamationmark.triangle", tint: .red) {
-                                Task { await openMacApp() }
-                            }
-                        } else {
-                            banner("Open BotFleet on Mac", systemImage: "macwindow", tint: .secondary) {
-                                Task { await openMacApp() }
-                            }
-                        }
-                    }
+                    openMacBanner
                 }
             case .macOffline:
-                // No `openMacApp` follow-up here on purpose: that call goes
-                // through the same paired route that has been failing with
-                // gateway errors, so it would just fail the same way.  The
-                // banner's default tap already retries via `session.refresh()`.
-                banner("Your Mac is not running BotFleet", systemImage: "wifi.slash", tint: .orange)
+                // This used to be deliberately left without an "open on Mac"
+                // follow-up: the call went out over the same route that was
+                // failing with gateway errors, so offering it only produced a
+                // second failure.  That objection no longer holds — the
+                // harness now answers a refused launch with the wording that
+                // names the setting to change, so the button is the way a
+                // person finds out why.  The banner above still refreshes the
+                // connection on a default tap; this second one asks the Mac to
+                // come up.
+                VStack(spacing: 6) {
+                    banner("Your Mac is not running BotFleet", systemImage: "wifi.slash", tint: .orange)
+                    openMacBanner
+                }
             case .unauthorized:
                 banner("This phone was unpaired on the computer.", systemImage: "lock.slash", tint: .red)
             }
@@ -1274,6 +1293,38 @@ struct StatusBanner: View {
         .animation(.default, value: openError)
         .onChange(of: session.status) { _ in
             openError = nil
+        }
+        .confirmationDialog(
+            "Open BotFleet on Mac?",
+            isPresented: $confirmingOpenMac,
+            titleVisibility: .visible
+        ) {
+            Button("Open BotFleet") {
+                Task { await openMacApp() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(openMacConfirmationMessage(session.connection?.name))
+        }
+    }
+
+    /// The launch control's second home, shared by the offline and
+    /// Mac-offline banners.  It confirms rather than sends, and says why a
+    /// launch was refused when the harness says so.
+    @ViewBuilder
+    private var openMacBanner: some View {
+        if session.connection != nil {
+            if isOpening {
+                banner("Opening BotFleet on Mac…", systemImage: "arrow.triangle.2.circlepath", tint: .secondary)
+            } else if let openError {
+                banner(openError, systemImage: "exclamationmark.triangle", tint: .red) {
+                    confirmingOpenMac = true
+                }
+            } else {
+                banner("Open BotFleet on Mac", systemImage: "macwindow", tint: .secondary) {
+                    confirmingOpenMac = true
+                }
+            }
         }
     }
 
@@ -1305,10 +1356,32 @@ struct StatusBanner: View {
             try await session.openDesktopApp()
             await session.refresh()
         } catch {
-            openError = "Could not open BotFleet on Mac.  Check that your Mac is awake and reachable."
+            openError = openMacFailureCopy(error)
         }
         isOpening = false
     }
+}
+
+/// What the confirmation says, wherever it is shown: what will happen, on
+/// which computer, and where the toggle that governs it lives.
+fileprivate func openMacConfirmationMessage(_ computerName: String?) -> String {
+    let computer = computerName ?? "your Mac"
+    return "This will launch the BotFleet desktop window on your Mac (\(computer)).\u{00A0} Remote desktop launch can be managed in Mac settings."
+}
+
+/// One failure string for both call sites, so the header and the offline
+/// banner never disagree.  The harness's own refusal — "Opening the desktop
+/// app from iOS is disabled in Mac settings", or the not-from-this-computer
+/// refusal — is the only copy that names what to change, so it passes
+/// through under a lead-in, the way `Session.swift` already frames a server
+/// message.  Only a failure with no server wording falls back to the generic
+/// transport advice.
+fileprivate func openMacFailureCopy(_ error: Error) -> String {
+    let lead = "Could not open BotFleet on Mac."
+    if let api = error as? APIError, let message = api.errorDescription, !message.isEmpty {
+        return "\(lead)\u{00A0} \(message)"
+    }
+    return "\(lead)\u{00A0} Check that your Mac is awake and reachable."
 }
 
 struct SearchHitRow: View {
