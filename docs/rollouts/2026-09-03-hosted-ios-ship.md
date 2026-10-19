@@ -1,5 +1,10 @@
 # 2026-09-03 — Hosted macos-latest iOS TestFlight ship
 
+> **Superseded 2026-10-18.**  The UTC `YYYYMMDDHHMM` build stamp described
+> here is retired.  The fleet now takes both numbers from the repo's commit
+> count:  marketing `1.0.<commit_count>`, build `<commit_count>`.  This file
+> stays as the record of what was done on 2026-09-03.
+
 ## Summary
 
 BotFleet TestFlight now follows the Congress.Trade / DealDex / Socratic.Trade hosted path:  GitHub-hosted `macos-latest`, push path filter on `ios/**`, optional schedule and dispatch, vendored `scripts/ios-fleet`, `force_ship` left at the script default.
