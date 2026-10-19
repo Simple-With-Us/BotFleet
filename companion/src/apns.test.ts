@@ -16,6 +16,8 @@ import {
   loadApnsConfig,
   resetApnsKeyCache,
   SHARED_APNS_KEY_ID,
+  APNS_VAULT_READ_BUDGET_MS,
+  APNS_VAULT_READ_TIMEOUT_MS,
   apnsPayload,
   classifyHttpResponse,
   classifyTransportError,
@@ -3325,6 +3327,41 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     );
     expect(loadApnsConfig()?.keyId).toBe(SHARED_APNS_KEY_ID);
     expect(SHARED_APNS_KEY_ID).toBe("HSJ98QN95V");
+  });
+
+  // The read ceiling is the difference between "the vault answered" and "the
+  // sidecar turned pushes off".  A ceiling below the vault's own latency does
+  // not slow the sidecar down, it removes the key:  the read is killed, the
+  // failure looks like "no key", and APNs stays off.  These three tests pin
+  // the ceiling above the measured worst case, the override that widens it,
+  // and the refusal to honour a nonsense override.
+  it.skipIf(process.platform === "win32")("keeps the read ceiling above the slowest measured vault read", () => {
+    // Measured on the fleet Mac:  3.6-5.3 s warm, 16.6 s cold cache.  The
+    // ceiling is derived from the measurement, and this asserts the ordering
+    // that keeps it true if either number is retuned:  a ceiling at or below
+    // the budget is the defect, not a style choice.
+    expect(APNS_VAULT_READ_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * APNS_VAULT_READ_BUDGET_MS);
+    expect(APNS_VAULT_READ_TIMEOUT_MS).toBeGreaterThan(16_600);
+  });
+
+  it.skipIf(process.platform === "win32")("honours a narrowed read ceiling from the environment", () => {
+    // A ceiling of 1 ms kills the read before the fake can answer, which is
+    // exactly how a slow vault looks to the sidecar.
+    process.env.APNS_VAULT_READ_TIMEOUT_MS = "1";
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    expect(loadApnsConfig()).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")("ignores a read ceiling that is not a positive number", () => {
+    // `Number("-1")` is a number, so a negative override would otherwise
+    // become a ceiling that fires instantly — the failure this ceiling
+    // exists to remove, reintroduced through the override.
+    for (const bad of ["0", "-1", "-5000", "not-a-number", ""]) {
+      process.env.APNS_VAULT_READ_TIMEOUT_MS = bad;
+      resetApnsKeyCache();
+      process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+      expect(loadApnsConfig()?.p8).toContain("BEGIN PRIVATE KEY");
+    }
   });
 
   it.skipIf(process.platform === "win32")("keeps the last good key id when only the id read fails, and stamps the id", () => {

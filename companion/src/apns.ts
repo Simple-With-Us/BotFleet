@@ -53,6 +53,33 @@ export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
  * keep pushes off for a whole window. */
 export const APNS_VAULT_RETRY_MS = 30_000;
 
+/** The slowest `fleet-secrets` read measured on the fleet Mac (2026-10-19):
+ *  3.6-5.3 s warm, 16.6 s with a cold cache.  The ceiling below is derived
+ *  from this number rather than picked by feel, so re-measuring retunes the
+ *  guard instead of leaving a magic constant behind. */
+export const APNS_VAULT_READ_BUDGET_MS = 16_600;
+
+/** How long one `fleet-secrets` read may take before it counts as failed.
+ *
+ * The read is an Infisical round-trip, not a local file read.  A ceiling below
+ * the vault's own latency does not slow the sidecar down — it removes the
+ * key:  the read is killed, the failure looks like "no key", and the sidecar
+ * turns APNs pushes OFF.  That is exactly what the old 10 s ceiling did to a
+ * cold-cache read.  Three times the measured worst case leaves room for a
+ * slower network without letting a wedged read hang the key path. */
+export const APNS_VAULT_READ_TIMEOUT_MS = 3 * APNS_VAULT_READ_BUDGET_MS;
+
+/** The read ceiling actually used, overridable for a slower vault.
+ *
+ * Only a finite, positive number is honoured:  `Number("-1")` is a number, so
+ * a negative override would otherwise become a timeout that fires instantly
+ * and reads as "no key" again — the exact failure this ceiling exists to
+ * remove. */
+function vaultReadTimeoutMs(): number {
+  const configured = Number(process.env.APNS_VAULT_READ_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : APNS_VAULT_READ_TIMEOUT_MS;
+}
+
 interface VaultKey {
   /** The pinned key id this read was for, or "" for the shared key. */
   pin: string;
@@ -73,7 +100,7 @@ function fleetSecretsGet(name: string): string | null {
     const out = execFileSync(fleetSecretsBin(), ["get", name], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-      timeout: 10_000,
+      timeout: vaultReadTimeoutMs(),
     });
     return out.replace(/\n$/, "");
   } catch {
