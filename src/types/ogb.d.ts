@@ -110,12 +110,11 @@ type SkillRecordingPayload = {
     code?: "load-failed" | "renderer-gone";
   }
 
-  /** The build the running process reports. `build` is the trailing
-   *  component of `version` under the 1.0.<commit_count> scheme, and is null
-   *  when the version is not plain x.y.z. */
+  /** The build the running process reports.  There is deliberately no build
+   *  number field: the Mac app carries a hand-maintained semver, so its patch
+   *  component is not a build anyone can look up.  `version` is the truth. */
   interface AppRuntimeInfo {
     version: string;
-    build: string | null;
     platform: string;
     arch: string;
     electron: string;

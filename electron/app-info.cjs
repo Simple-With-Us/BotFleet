@@ -1,24 +1,26 @@
 // Which build is actually running, in a shape the renderer can print.
 //
-// The app ships under the 1.0.<commit_count> scheme (see
-// scripts/ios-fleet/ship-testflight.sh), so the version string already carries
-// the build number: the part after the last dot. We still parse it out rather
-// than showing the raw string, because "which commit am I on" is the question
-// this answers, and 1.0.<commit_count> is unreadable at a glance.
+// One thing this file deliberately does NOT do: call the patch component of the
+// version a "build number".  That trick is only valid for the iOS client, which
+// ships as 1.0.<commit_count> (scripts/ios-fleet/ship-testflight.sh).  The Mac
+// app does not — it carries a hand-maintained semver, and its latest release is
+// v0.1.38 — so its "31" is a patch number somebody typed, not a build anybody
+// can go and look for.  Printing `build 31` would be confidently wrong, which is
+// worse than printing nothing.  A real commit identity has to be stamped into
+// the Mac bundle at build time; until that exists, the version is the truth and
+// this file reports it plainly.
 //
 // Every field is derived from values Electron hands us. Nothing here reads the
 // filesystem or the network, so it is safe to call from a settings panel that
 // renders before the server is up.
 
-const VERSION_PATTERN = /^(\d+)\.(\d+)\.(\d+)$/;
-
-/** The trailing component of a semantic version, or null when the version is
- *  not plain `x.y.z` (a dev build reading package.json verbatim, or a
- *  prerelease string). We would rather show "—" than a number that is not a
- *  build number. */
-function buildNumberFromVersion(version) {
-  const match = VERSION_PATTERN.exec(String(version ?? "").trim());
-  return match ? match[3] : null;
+/** Trim a version to something safe to render, never inventing a value. */
+function cleanVersion(version) {
+  const raw = String(version ?? "").trim();
+  if (!raw) return "unknown";
+  // package.json versions are plain semver; an Electron release build prefixes
+  // them with "v". Keep the caller's value rather than guessing at a scheme.
+  return raw.length <= 64 ? raw : raw.slice(0, 64);
 }
 
 function appRuntimeInfo({
@@ -30,12 +32,8 @@ function appRuntimeInfo({
   packaged = false,
   harness = null,
 } = {}) {
-  const clean = String(version ?? "").trim();
   return {
-    // "unknown" rather than "0.0.0": a missing version must never render as
-    // build 0, which reads like a real build someone could go looking for.
-    version: clean || "unknown",
-    build: clean ? buildNumberFromVersion(clean) : null,
+    version: cleanVersion(version),
     platform,
     arch,
     electron,
@@ -46,16 +44,18 @@ function appRuntimeInfo({
 }
 
 /** The one line the settings panel prints, e.g.
- *  "1.0.1284  ·  build 1284  ·  electron 38.1.0  ·  darwin arm64".
+ *  "v1.0.31  ·  electron 44.7.2  ·  node 22.14.0  ·  darwin arm64".
  *  Kept plain so it can go straight to the clipboard for a bug report. */
 function appRuntimeSummary(info) {
   if (!info) return "";
   const parts = [info.version];
-  if (info.build) parts.push(`build ${info.build}`);
   if (info.electron) parts.push(`electron ${info.electron}`);
   if (info.node) parts.push(`node ${info.node}`);
   const platform = info.platform && info.arch ? `${info.platform} ${info.arch}` : info.platform;
   if (platform) parts.push(platform);
+  if (info.harness) parts.push(info.harness);
+  // "dev" is the harness value for an unpackaged run, and it is the difference
+  // between "my build is broken" and "that is the source tree, not a release".
   if (!info.packaged) parts.push("dev build");
   return parts.filter(Boolean).join("  ·  ");
 }
@@ -63,5 +63,5 @@ function appRuntimeSummary(info) {
 module.exports = {
   appRuntimeInfo,
   appRuntimeSummary,
-  buildNumberFromVersion,
+  cleanVersion,
 };
