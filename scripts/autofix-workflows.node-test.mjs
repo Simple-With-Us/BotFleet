@@ -29,9 +29,9 @@ function passedSecrets(yml) {
   return names;
 }
 
-test("claude-code-autofix.yml passes only secrets the codex reusable declares", () => {
+test("claude-code-autofix.yml passes only secrets the Claude reusable declares", () => {
   const yml = read(".github/workflows/claude-code-autofix.yml");
-  // codex-autofix-reusable.yml declares MINIMAX_API_KEY, an optional USAGE_INGEST_TOKEN (UM-1593 metering) and an ignored GH_PAT.  Passing
+  // claude-code-autofix-reusable.yml declares MINIMAX_API_KEY, an optional USAGE_INGEST_TOKEN (UM-1593 metering) and an ignored GH_PAT.  Passing
   // GH_ADMIN_PAT failed every run with "Invalid secret, GH_ADMIN_PAT is not defined in the
   // referenced workflow" (run 39054950004), and no fleet workflow may act as the owner.
   assert.deepEqual(passedSecrets(yml), ["MINIMAX_API_KEY", "USAGE_INGEST_TOKEN"]);
@@ -46,7 +46,7 @@ test("autofix.yml passes only secrets the pr-autofix reusable declares", () => {
 test("both autofix callers pin their reusable workflow to a full commit SHA", () => {
   const pins = [
     [".github/workflows/autofix.yml", "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/pr-autofix-reusable.yml"],
-    [".github/workflows/claude-code-autofix.yml", "Simple-With-Us/congress-trading-shared/.github/workflows/codex-autofix-reusable.yml"],
+    [".github/workflows/claude-code-autofix.yml", "Simple-With-Us/AI-Fleet-Coordinator/.github/workflows/claude-code-autofix-reusable.yml"],
   ];
   for (const [file, callee] of pins) {
     const uses = read(file).match(/^ {4}uses:\s*(\S+)\s*$/m);
