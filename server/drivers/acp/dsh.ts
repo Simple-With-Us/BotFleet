@@ -77,6 +77,17 @@ export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
 export const DSH_DEEPSEEK_PRO_MODEL = "DeepSeek-V4-Pro";
 export const DSH_DEEPSEEK_FLASH_MODEL = "DeepSeek-V4.1-Flash";
 
+/** The DSH-hosted MiniMax M3.1 Flash row.  The installed dsh engine dropped
+ *  the `-Preview` suffix (it now declares `minimax/MiniMax-M3.1-Flash`), and
+ *  Clutch's model matching has no MiniMax alias family, so sending the old
+ *  `MiniMax-M3.1-Flash-Preview` spelling failed every turn with "unknown
+ *  model".  The retired spelling is excluded below and saved dsh selections
+ *  are rewritten onto this id by `retired-model-ids.ts`.  mcode and the native
+ *  MiniMax HTTP driver still use the Preview id and are untouched. */
+export const DSH_MINIMAX_M31_FLASH_MODEL = "MiniMax-M3.1-Flash";
+/** The pre-rename spelling of {@link DSH_MINIMAX_M31_FLASH_MODEL}. */
+export const DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL = "MiniMax-M3.1-Flash-Preview";
+
 export const STATIC_DSH_MODELS: ModelCatalog = {
   default: DSH_DEEPSEEK_FLASH_MODEL,
   options: [
@@ -99,13 +110,18 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
         `Text and reasoning only — lacks vision. Switch to ${DSH_DEEPSEEK_FLASH_MODEL} to attach an image.`,
     },
     {
-      id: "MiniMax-M3.1-Flash-Preview",
-      label: "MiniMax-M3.1-Flash-Preview",
+      id: DSH_MINIMAX_M31_FLASH_MODEL,
+      label: DSH_MINIMAX_M31_FLASH_MODEL,
       images: true,
       contextWindow: 1_000_000,
-      badge: "Preview",
+      badge: "Token Plan",
       badgeTitle:
         "Frontier multimodal coding model with a 1M context window. MiniMax offers it through Token Plan and MiniMax Code, so it needs a Token Plan key.",
+      // Clutch's per-model effort table still keys M3.1 by the retired
+      // Preview id, so it cannot vouch for any level on this id.  An explicit
+      // `[]` keeps the engine-wide DeepSeek levels off this row rather than
+      // offering a level dsh would refuse.
+      effortLevels: [],
     },
     {
       id: "MiniMax-M2.7-highspeed",
@@ -124,7 +140,7 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
  *  the live read below and the static fallback agree on what is excluded. */
 const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   "MiniMax-M2.7",
-  // Superseded by MiniMax-M3.1-Flash-Preview.  Dropping it from the static
+  // Superseded by MiniMax-M3.1-Flash.  Dropping it from the static
   // options is not enough: a settings file written while M3 shipped still
   // declares it, and the live-catalog union below would re-add it.
   "MiniMax-M3",
@@ -134,6 +150,10 @@ const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   // `deepseek-v4-pro` is deliberately absent: it is still declared, and
   // `dshSameModel` folds it onto `DeepSeek-V4-Pro` row without a duplicate.
   "deepseek-v4-flash",
+  // Renamed to MiniMax-M3.1-Flash by the installed engine.  A settings file
+  // written before the rename still declares it, and the union below would
+  // re-add a row the engine refuses at turn time.
+  DSH_RETIRED_MINIMAX_M31_PREVIEW_MODEL,
 ];
 
 /** The installed engine declares the models it can actually serve in its own

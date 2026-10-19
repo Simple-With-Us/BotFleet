@@ -73,7 +73,7 @@ describe("DSH vision route migration", () => {
       fallbacks: [
         { instanceId: "claude", model: "DeepSeek-V4-Pro" },
         { instanceId: "dsh", model: "DeepSeek-V4-Pro", effort: "none" },
-        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
       ],
     };
     expect(dshVisionSelection(original)).toEqual({
@@ -81,7 +81,7 @@ describe("DSH vision route migration", () => {
       fallbacks: [
         { instanceId: "claude", model: "DeepSeek-V4-Pro" },
         { instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "none" },
-        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
       ],
     });
     expect(original.model).toBe("DeepSeek-V4-Pro");
@@ -1104,7 +1104,7 @@ describe("inheritedUnattended", () => {
 
 describe("non-thinking Flash catalog", () => {
   it("is a DSH row and not an mcode picker row", () => {
-    expect(STATIC_DSH_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash-Preview")).toBe(true);
+    expect(STATIC_DSH_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash")).toBe(true);
     expect(STATIC_MCODE_MODELS.options.some((option) => option.id === "MiniMax-M3.1-Flash-Preview")).toBe(false);
     expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
   });
@@ -1207,7 +1207,7 @@ describe("unattendedModelDowngrade", () => {
       model: "MiniMax-M3.1-Flash-Preview-thinking",
       effort: "max",
     };
-    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" };
+    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash" };
     expect(
       unattendedModelDowngrade(thinking, {
         automationSource: "webhook",
@@ -1240,7 +1240,7 @@ describe("unattendedModelDowngrade", () => {
     const levelsFor = (model: string) =>
       STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
     const thinking: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" };
-    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" };
+    const live = { instanceId: "dsh", model: "MiniMax-M3.1-Flash" };
     const base = { driverKind: "mcodeAgent" as const, effortLevels: levelsFor, nonThinkingFlash: live };
     expect(unattendedModelDowngrade(thinking, base)).toEqual(thinking);
     expect(
@@ -1253,7 +1253,7 @@ describe("unattendedModelDowngrade", () => {
       unattendedModelDowngrade(thinking, {
         ...base,
         automationSource: "webhook",
-        isCooling: (instanceId, model) => instanceId === "dsh" && model === "MiniMax-M3.1-Flash-Preview",
+        isCooling: (instanceId, model) => instanceId === "dsh" && model === "MiniMax-M3.1-Flash",
       }),
     ).toEqual({ ...thinking, effort: "low" });
   });
