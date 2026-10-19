@@ -81,11 +81,11 @@ function fleetSecretsGet(name: string): string | null {
   }
 }
 
-/** The key id Infisical names for the shared key, or the built-in default
- * when the read fails or does not look like an Apple key id. */
-function sharedKeyId(): string {
+/** The key id Infisical names for the shared key, or null when the read
+ * fails or does not look like an Apple key id. */
+function sharedKeyId(): string | null {
   const id = fleetSecretsGet(SHARED_APNS_KEY_ID_NAME)?.trim();
-  return id && /^[A-Z0-9]{10}$/.test(id) ? id : SHARED_APNS_KEY_ID;
+  return id && /^[A-Z0-9]{10}$/.test(id) ? id : null;
 }
 
 function readVault(now = Date.now()): VaultKey {
@@ -100,8 +100,21 @@ function readVault(now = Date.now()): VaultKey {
     vaultKey = { ...vaultKey, at: now - (APNS_VAULT_CACHE_MS - APNS_VAULT_RETRY_MS) };
     return vaultKey;
   }
-  const keyId = pin || (p8 === null ? SHARED_APNS_KEY_ID : sharedKeyId());
-  vaultKey = { pin, keyId, p8, at: now };
+  if (pin || p8 === null) {
+    vaultKey = { pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: now };
+    return vaultKey;
+  }
+  const id = sharedKeyId();
+  if (id) {
+    vaultKey = { pin, keyId: id, p8, at: now };
+    return vaultKey;
+  }
+  // The PEM read but its id did not:  keep the last good id for the same
+  // key, otherwise use the built-in id, and retry after the short window
+  // either way.  The id is part of the stamp, so a fault Apple records
+  // against a wrong fallback id clears once the real id is read.
+  const keyId = vaultKey && vaultKey.pin === pin && vaultKey.p8 === p8 ? vaultKey.keyId : SHARED_APNS_KEY_ID;
+  vaultKey = { pin, keyId, p8, at: now - (APNS_VAULT_CACHE_MS - APNS_VAULT_RETRY_MS) };
   return vaultKey;
 }
 
@@ -150,7 +163,9 @@ function resolveP8(): { p8: string; origin: string; keyId: string } | null {
 export function apnsKeyStamp(): string | null {
   const got = resolveP8();
   if (!got) return null;
-  const digest = createHash("sha256").update(got.p8).digest("hex").slice(0, 16);
+  // The key id is hashed with the PEM:  the same PEM under a different id is
+  // a different signing identity to Apple.
+  const digest = createHash("sha256").update(`${got.keyId}\n${got.p8}`).digest("hex").slice(0, 16);
   return `${apnsKeySource()}:${digest}`;
 }
 

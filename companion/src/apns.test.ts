@@ -3327,6 +3327,29 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     expect(SHARED_APNS_KEY_ID).toBe("HSJ98QN95V");
   });
 
+  it.skipIf(process.platform === "win32")("keeps the last good key id when only the id read fails, and stamps the id", () => {
+    const pem = testP8();
+    const ok = `case "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
+    const noId = `case "$2" in\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(ok);
+    const good = apnsKeyStamp();
+    expect(loadApnsConfig()?.keyId).toBe("ROTATED001");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(noId);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
+      expect(loadApnsConfig()?.keyId).toBe("ROTATED001");
+      expect(apnsKeyStamp()).toBe(good);
+      // A cold start with no id falls back to the built-in id, and the stamp
+      // differs, so a fault recorded under it does not outlive the real id.
+      resetApnsKeyCache();
+      expect(loadApnsConfig()?.keyId).toBe(SHARED_APNS_KEY_ID);
+      expect(apnsKeyStamp()).not.toBe(good);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("uses the shared key id with an injected APNS_P8 and no pinned id", () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
     process.env.APNS_P8 = testP8();
