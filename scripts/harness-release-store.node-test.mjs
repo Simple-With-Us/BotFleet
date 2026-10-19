@@ -18,6 +18,7 @@ import {
   releasePath,
   releasesRoot,
   resolveCurrent,
+  stageRelease,
   stagingPath,
   stagingRoot,
   validateReleaseManifest,
@@ -840,4 +841,79 @@ test("retention breaks ties on directory mtime, not commit name", async (t) => {
   await swapCurrent({ commit: A, env });
   const listed = await listReleases(env);
   assert.deepEqual(listed, [B, A], "same promotedAt must order by mtime, not SHA");
+});
+
+/**
+ * A tiny git repository with one commit, used to prove that staging reads a
+ * commit without touching a working tree.
+ */
+async function sourceRepo(t, { files = { "server/index.ts": "export const ok = true;\n" } } = {}) {
+  const repo = await mkdtemp(join(tmpdir(), "bf-release-source-"));
+  t.after(async () => { await rm(repo, { recursive: true, force: true }); });
+  await run("git", ["init", "-q", repo]);
+  await run("git", ["-C", repo, "config", "user.email", "release@example.invalid"]);
+  await run("git", ["-C", repo, "config", "user.name", "Release Test"]);
+  for (const [name, content] of Object.entries(files)) {
+    const target = join(repo, name);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, content);
+  }
+  await run("git", ["-C", repo, "add", "-A"]);
+  await run("git", ["-C", repo, "commit", "-q", "-m", "source"]);
+  const { stdout } = await run("git", ["-C", repo, "rev-parse", "HEAD"]);
+  return { repo, commit: stdout.trim() };
+}
+
+test("staging exports a commit and leaves the source repository untouched", async (t) => {
+  const { env } = await store(t);
+  const { repo, commit } = await sourceRepo(t, {
+    files: { "server/index.ts": "export const staged = true;\n", "package.json": "{}\n" },
+  });
+  const before = await run("git", ["-C", repo, "status", "--porcelain"]);
+  const staging = await stageRelease({ commit, repo, env, install: false });
+  assert.equal(staging, stagingPath(commit, env));
+  assert.equal(await readFile(join(staging, "server/index.ts"), "utf8"), "export const staged = true;\n");
+  // The export must not have left a working tree behind, and the source
+  // repository must be exactly as it was.
+  const after = await run("git", ["-C", repo, "status", "--porcelain"]);
+  assert.equal(after.stdout, before.stdout);
+  assert.equal(after.stdout.trim(), "");
+  // No archive left behind in the staged tree.
+  assert.equal((await readdir(staging)).some((name) => name.endsWith(".tar")), false);
+});
+
+test("staging refuses anything that is not a full commit", async (t) => {
+  const { env } = await store(t);
+  for (const bad of ["main", "abc1234", "HEAD", ""]) {
+    await assert.rejects(
+      () => stageRelease({ commit: bad, repo: "/tmp", env, install: false }),
+      /non-commit|Refusing/,
+      `"${bad}" must be refused`,
+    );
+  }
+});
+
+test("staging names the reason when the commit is not in the source repository", async (t) => {
+  const { env } = await store(t);
+  const { repo } = await sourceRepo(t);
+  await assert.rejects(
+    () => stageRelease({ commit: "d".repeat(40), repo, env, install: false }),
+    /Could not export/,
+  );
+});
+
+test("a staged commit promotes into an immutable release and the pointer moves to it", async (t) => {
+  const { env } = await store(t);
+  const { repo, commit } = await sourceRepo(t);
+  await stageRelease({ commit, repo, env, install: false });
+  const promoted = await promoteStaging({ commit, env });
+  assert.equal(promoted, releasePath(commit, env));
+  assert.equal(await isReleaseDirectory(promoted), true);
+  await swapCurrent({ commit, env });
+  assert.equal(await currentCommit(env), commit);
+  // resolveCurrent answers the PHYSICAL path by design: the fingerprint and
+  // bundle-identity checks refuse a symlinked root, so the pointer is a
+  // launchd-level indirection and everything that reasons about the tree
+  // resolves it first.
+  assert.equal(await resolveCurrent(env), await realpath(promoted));
 });

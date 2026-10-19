@@ -7,7 +7,7 @@
 // scripts/botfleet-server-start.sh and docs/audits/2026-09-24-efficiency-audit.md OP10.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -605,4 +605,84 @@ test("no marker means the tick behaves exactly as before", () => {
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
+});
+
+// --- The store pointer is the runtime root ------------------------------------
+//
+// A checkout is a mutable working tree, and three separate failures came from
+// it: an update rewrote it under a live server, a seat's branch deleted files
+// the harness still imported, and the janitor removed its node_modules from
+// under a serving process.  A promoted release is immutable, and the pointer
+// at ~/.botfleet/current is the only thing that changes when the harness
+// moves to a new version.
+//
+// The launcher must therefore prefer the store pointer when one exists, and
+// must still fall back to the legacy checkout path on a machine that has
+// never promoted a release, so a fresh install is not broken by this change.
+
+test("the store pointer is the runtime root when it exists", () => {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-server-start-pointer-"));
+  const storeHome = join(dir, "home");
+  const releaseDir = join(storeHome, ".botfleet", "releases", "a".repeat(40));
+  mkdirSync(join(releaseDir, "server"), { recursive: true });
+  writeFileSync(join(releaseDir, "server", "index.ts"), "// fake entry\n");
+  mkdirSync(join(releaseDir, "node_modules", "yaml"), { recursive: true });
+  const pointer = join(storeHome, ".botfleet", "current");
+  symlinkSync(releaseDir, pointer);
+
+  // The stub node prints its working directory, so the assertion is on the
+  // directory the harness would actually run from.
+  const stamp = join(dir, "cwd.txt");
+  const node = join(dir, "fake-node");
+  writeFileSync(node, `#!/bin/bash\npwd -P > "${stamp}"\necho fake\n`);
+  chmodSync(node, 0o755);
+
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const result = spawnSync("bash", [SCRIPT], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: storeHome,
+      // No BOTFLEET_SERVER_ROOT: the launcher must find the pointer itself.
+      BOTFLEET_PORT: String(port),
+      BOTFLEET_NODE: node,
+      BOTFLEET_PNPM: join(dir, "pnpm-does-not-exist"),
+      BOTFLEET_HEAL_STAMP: join(dir, "heal-stamp"),
+      BOTFLEET_FAIL_LEDGER: join(dir, "ledger"),
+      BOTFLEET_SHUTDOWN_MARKER: join(dir, "stopped.marker"),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  // The physical release directory, not the pointer and not a checkout.
+  assert.equal(readFileSync(stamp, "utf8").trim(), realpathSync(releaseDir));
+});
+
+test("without a store pointer the legacy checkout path still works", () => {
+  const dir = mkdtempSync(join(tmpdir(), "botfleet-server-start-nopointer-"));
+  const serverRoot = join(dir, "root");
+  mkdirSync(join(serverRoot, "server"), { recursive: true });
+  writeFileSync(join(serverRoot, "server", "index.ts"), "// fake entry\n");
+  mkdirSync(join(serverRoot, "node_modules", "yaml"), { recursive: true });
+  const stamp = join(dir, "cwd.txt");
+  const node = join(dir, "fake-node");
+  writeFileSync(node, `#!/bin/bash\npwd -P > "${stamp}"\necho fake\n`);
+  chmodSync(node, 0o755);
+
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const result = spawnSync("bash", [SCRIPT], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: join(dir, "home"),
+      BOTFLEET_SERVER_ROOT: serverRoot,
+      BOTFLEET_PORT: String(port),
+      BOTFLEET_NODE: node,
+      BOTFLEET_PNPM: join(dir, "pnpm-does-not-exist"),
+      BOTFLEET_HEAL_STAMP: join(dir, "heal-stamp"),
+      BOTFLEET_FAIL_LEDGER: join(dir, "ledger"),
+      BOTFLEET_SHUTDOWN_MARKER: join(dir, "stopped.marker"),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFileSync(stamp, "utf8").trim(), realpathSync(serverRoot));
 });
