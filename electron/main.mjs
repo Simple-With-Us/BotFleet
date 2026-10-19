@@ -2421,6 +2421,11 @@ function setupApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  // A deliberate shutdown writes a sentinel so launchd's periodic tick leaves
+  // the harness alone.  Launching the app is the documented way back, so clear
+  // it first — before anything here tries to reach a server, so the request
+  // below is never made against a marker that says "stay down".
+  clearHarnessShutdownMarker();
   if (wantsSafeStorageExport(process.argv)) {
     try {
       const result = await readSecureCredentials({
@@ -2664,6 +2669,76 @@ const requestSignalQuit = () => {
 process.once("SIGINT", requestSignalQuit);
 process.once("SIGTERM", requestSignalQuit);
 
+// Whether the always-on harness should outlive this window.
+//
+// This reads the config file directly rather than importing the server's
+// config module: main.mjs is plain ESM and server/config.ts is TypeScript, and
+// pulling a transpile step into the Electron entry point to read one boolean
+// is not a trade worth making.  The field is a plain boolean with one
+// documented default, so reading it is safe; a malformed or missing file
+// falls back to the same answer as an absent field.
+//
+// Absent means TRUE on purpose.  The harness is launchd-supervised and is
+// documented as always-on, and every paired phone depends on it still
+// answering after the window closes, so "not configured" must never be read
+// as "shut it all down".  Turning it off is always a deliberate act.
+function serverPersistsOnExit() {
+  try {
+    const dir = process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet");
+    const parsed = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
+    return parsed?.server?.persistOnExit !== false;
+  } catch {
+    return true;
+  }
+}
+
+// Ask the harness we are attached to stop cleanly, so it writes the sentinel
+// the launchd wrapper reads.  Without that marker the five-minute tick treats
+// the exit as a crash and brings the harness straight back, which is what
+// makes a quiet "shut it down" impossible today.
+//
+// Fire and forget by design: this runs during quit, the app is going away
+// regardless, and the harness's own reply is not something anyone is left to
+// read.  A refused connection means it was already gone.
+//
+// SERVER_PORT, not process.env.OMB_PORT: OMB_PORT is what this process hands
+// a harness it forks itself, and it is unset whenever we attached to one that
+// launchd started.  SERVER_PORT is the port we actually talked to, and it is
+// already a number — reading it also removes the NaN case a non-numeric OMB_PORT
+// would produce here.
+function requestAttachedHarnessShutdown() {
+  return fetch(`http://127.0.0.1:${SERVER_PORT}/api/system/shutdown`, {
+    method: "POST",
+    // The route is loopback-only, and the bound address is loopback-only too,
+    // so a short ceiling is enough; it exists so a wedged harness cannot hold
+    // the app open past CUA_STOP_TIMEOUT_MS.
+    signal: AbortSignal.timeout(2000),
+  }).then((res) => res.text()).catch(() => "");
+}
+
+// Clear the "stopped on purpose" sentinel when the app starts, which is the
+// other half of what POST /api/system/shutdown promises: the marker text and
+// the docs both say "launch the BotFleet app to let it come back", and without
+// this the app would launch into a permanently blocked harness.
+//
+// Safe to do unconditionally on launch, and the ordering is the reason.  The
+// launchd wrapper reads this marker itself and exits 0 while it exists, so a
+// periodic tick never reaches the harness and never runs this code.  This only
+// runs when a person actually opened the app -- BotFleet is not a login item,
+// and even if it became one, the wrapper would still be the thing refusing to
+// start a server, which is the decision we want to honour only on a real
+// launch.  A manual run of the wrapper clears it too, so there are two ways
+// back and neither depends on the other.
+function clearHarnessShutdownMarker() {
+  const marker = path.join(process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet"), "stopped.marker");
+  try {
+    fs.rmSync(marker, { force: true });
+  } catch {
+    // Already gone, or a path we cannot touch.  Either way the app launching
+    // is the intent, and the wrapper treats a missing marker as "start".
+  }
+}
+
 app.on("before-quit", (e) => {
   credentialRestoreStopped = true;
   clearTimeout(credentialRestoreTimer);
@@ -2673,6 +2748,12 @@ app.on("before-quit", (e) => {
     // serverProc is null when attached — the always-on harness outlives us.
     serverProc?.kill();
   } catch {}
+  // …unless the owner asked for the harness to go down with the window.  Only
+  // meaningful when we did not spawn it ourselves: a child we own is already
+  // killed above, and asking the harness to shut down would be asking a process
+  // that is already dead.  See serverPersistsOnExit() for why absent means yes.
+  const stopAttachedHarness =
+    serverProc || serverPersistsOnExit() ? Promise.resolve() : requestAttachedHarnessShutdown();
   try {
     uiShim?.close();
   } catch {}
@@ -2692,6 +2773,10 @@ app.on("before-quit", (e) => {
       // Shut the connector down first, then the sidecar, without changing the
       // remembered toggle the next launch will restore.
       stopDesktopCompanion({ remember: false }).catch(() => {}),
+      // Asked for, not forced, and it does not outrank the app exiting: a
+      // harness that is already gone answers with a refused connection, which
+      // is a perfectly good outcome for something we are shutting down anyway.
+      stopAttachedHarness.catch(() => {}),
     ]),
     new Promise((resolve) => setTimeout(resolve, CUA_STOP_TIMEOUT_MS).unref()),
   ]);

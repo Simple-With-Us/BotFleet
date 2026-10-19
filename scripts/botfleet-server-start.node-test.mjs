@@ -29,10 +29,10 @@ function makeFixture({ withDependencies = false } = {}) {
   // (18799 was tried) collided with something else already listening on
   // it, making health() see a false positive and every test past it fail.
   const port = 20000 + Math.floor(Math.random() * 20000);
-  return { dir, serverRoot, ledger: join(dir, "ledger"), port };
+  return { dir, serverRoot, ledger: join(dir, "ledger"), marker: join(dir, "stopped.marker"), port };
 }
 
-function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = "/bin/echo" } = {}) {
+function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = "/bin/echo", xpcServiceName = "" } = {}) {
   return spawnSync("bash", [SCRIPT, ...args], {
     encoding: "utf8",
     env: {
@@ -45,6 +45,15 @@ function run(fixture, { threshold = 20, windowSeconds = 3600, args = [], node = 
       BOTFLEET_FAIL_LEDGER: fixture.ledger,
       BOTFLEET_FAIL_STORM_THRESHOLD: String(threshold),
       BOTFLEET_FAIL_WINDOW_SECONDS: String(windowSeconds),
+      // Always a fixture-local marker, never the real ~/.botfleet one: a test
+      // that could see the owner's actual shutdown sentinel would both read
+      // his state and be able to clear it.
+      BOTFLEET_SHUTDOWN_MARKER: fixture.marker,
+      // Explicit rather than inherited: every other test in this file models
+      // a person or a generic launchd run, not this specific agent, and an
+      // XPC_SERVICE_NAME leaking in from the shell would silently change which
+      // branch they take.
+      XPC_SERVICE_NAME: xpcServiceName,
     },
   });
 }
@@ -537,6 +546,62 @@ test("a failing fleet-secrets does not stop the harness", () => {
     const got = identityReport(fixture, runIdentity(fixture));
     assert.equal(got.INFISICAL_CLIENT_ID, "unset");
     assert.equal(got.INFISICAL_CLIENT_SECRET, "unset");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+// --- the intentional-shutdown sentinel (BF-2489) --------------------------
+//
+// The behavior that matters: with StartInterval=300 and
+// KeepAlive.SuccessfulExit=false, a harness that exits cleanly is still run
+// again five minutes later, and a closed port reads as a crash.  So "shut it
+// down" from inside the app cannot stick on its own — the wrapper has to know
+// the stop was deliberate, and the only way it can know is a file.
+
+test("a shutdown marker makes the launchd tick exit 0 without starting anything", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.marker, "stopped on purpose\n");
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout + result.stderr, /shut down on purpose/);
+    // It must not have fallen through and tried to boot a harness.
+    assert.doesNotMatch(result.stdout, /Starting server|exec .*node/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the launchd tick leaves the marker in place", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.marker, "stopped on purpose\n");
+    run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.ok(existsSync(fixture.marker), "the marker must survive the tick, or the next one would restart it");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("a manual run clears the marker and starts, which is the way back", () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(fixture.marker, "stopped on purpose\n");
+    const result = run(fixture, { xpcServiceName: "" });
+    assert.ok(!existsSync(fixture.marker), "a person asking for the server must not be blocked by the sentinel");
+    assert.match(result.stdout + result.stderr, /treating it as a deliberate start/);
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("no marker means the tick behaves exactly as before", () => {
+  const fixture = makeFixture();
+  try {
+    const result = run(fixture, { xpcServiceName: "app.botfleet.server" });
+    assert.doesNotMatch(result.stdout + result.stderr, /shut down on purpose/);
+    assert.ok(!existsSync(fixture.marker), "the script must not invent a marker");
   } finally {
     rmSync(fixture.dir, { recursive: true, force: true });
   }
