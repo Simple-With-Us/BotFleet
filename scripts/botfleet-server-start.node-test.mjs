@@ -7,9 +7,9 @@
 // scripts/botfleet-server-start.sh and docs/audits/2026-09-24-efficiency-audit.md OP10.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -607,6 +607,21 @@ test("no marker means the tick behaves exactly as before", () => {
   }
 });
 
+/**
+ * Compare two paths for "the same directory" without comparing dialects.
+ *
+ * The launcher runs under the platform's shell, and on Windows that shell
+ * reports a path in its own dialect (`/c/Users/...`) while Node reports the
+ * native one (`C:\\Users\\...`).  They name the same directory, so a test
+ * that compares the strings fails on Windows for a reason that has nothing
+ * to do with the behavior under test.  So the comparison is on the TAIL of
+ * the path, with the separators and the case normalized.
+ */
+function samePathTail(actual, expectedTail) {
+  const normalize = (value) => String(value).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return normalize(actual).endsWith(normalize(expectedTail));
+}
+
 // --- The store pointer is the runtime root ------------------------------------
 //
 // A checkout is a mutable working tree, and three separate failures came from
@@ -654,7 +669,10 @@ test("the store pointer is the runtime root when it exists", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   // The physical release directory, not the pointer and not a checkout.
-  assert.equal(readFileSync(stamp, "utf8").trim(), realpathSync(releaseDir));
+  assert.ok(
+    samePathTail(readFileSync(stamp, "utf8").trim(), `.botfleet/releases/${"a".repeat(40)}`),
+    `the harness must run from the release, not the pointer: ${readFileSync(stamp, "utf8").trim()}`,
+  );
 });
 
 test("without a store pointer the legacy checkout path still works", () => {
@@ -684,5 +702,8 @@ test("without a store pointer the legacy checkout path still works", () => {
     },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(readFileSync(stamp, "utf8").trim(), realpathSync(serverRoot));
+  assert.ok(
+    samePathTail(readFileSync(stamp, "utf8").trim(), `/${basename(serverRoot)}`),
+    `the harness must still run from the legacy checkout path: ${readFileSync(stamp, "utf8").trim()}`,
+  );
 });
