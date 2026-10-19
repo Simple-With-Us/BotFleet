@@ -10,7 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 
 import {
   SHUTDOWN_MARKER_PATH,
@@ -68,7 +68,10 @@ describe("the shutdown marker", () => {
     // tree under the system temp dir, so a path outside tmpdir() would mean
     // that redirection stopped applying.
     expect(markerPath.startsWith(tmpdir())).toBe(true);
-    expect(markerPath.endsWith("/stopped.marker")).toBe(true);
+    // basename(), not a literal "/stopped.marker": the path is built with
+    // node:path join(), so on Windows it ends with a backslash and a
+    // hard-coded forward slash fails there while passing on macOS and Linux.
+    expect(basename(markerPath)).toBe("stopped.marker");
   });
 
   it("does not exist until something asks for it", () => {
