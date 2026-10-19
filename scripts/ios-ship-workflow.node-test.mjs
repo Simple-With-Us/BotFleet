@@ -199,8 +199,12 @@ test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
   const ship = read("scripts/ios-fleet/ship-testflight.sh");
-  assert.match(ship, /MARKETING_VERSION\s+= 1\.0\.<seq>/);
-  assert.match(ship, /CURRENT_PROJECT_VERSION = <UTC YYYYMMDDHHMM>/);
+  // The fleet scheme (owner 2026-10-18): both values come from the repo
+  // commit count.  Assert the mechanism, not the retired seq-plus-timestamp
+  // shape this branch removes.
+  assert.match(ship, /MARKETING_VERSION\s+= 1\.0\.<commit_count>/);
+  assert.match(ship, /CURRENT_PROJECT_VERSION = <commit_count>/);
+  assert.match(ship, /rev-list --count HEAD/);
   assert.match(ship, /botfleet/);
   assert.match(ship, /DEFAULT_MIN_INTERVAL_SEC=3600/);
   assert.match(ship, /FORCE_SHIP=0/);
