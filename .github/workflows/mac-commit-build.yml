@@ -65,8 +65,7 @@ jobs:
       - id: pin
         run: |
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          node scripts/stamp-commit-version.mjs .
-          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "version=$(node scripts/stamp-commit-version.mjs .)" >> "$GITHUB_OUTPUT"
 
   mac:
     name: Signed arm64 bundle (${{ needs.pin.outputs.sha }})
@@ -81,10 +80,10 @@ jobs:
           # this job re-checks out independently.
           fetch-depth: 0
           persist-credentials: false
-      - name: Stamp the commit-count version
-        # Deterministic from the commit, so this job and the pin job land on the
-        # same number without either having to pass it along.
-        run: node scripts/stamp-commit-version.mjs .
+      - name: Resolve the pinned version
+        # GITHUB_ENV, not a step env: the packaging step that needs this runs
+        # later in the job, and a step-scoped value would not reach it.
+        run: echo "BOTFLEET_BUILD_VERSION=${{ needs.pin.outputs.version }}" >> "$GITHUB_ENV"
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -133,7 +132,8 @@ jobs:
         run: |
           pnpm package:mac:local \
             -c.mac.identity="Jay Wedgeworth, LLC (CC8UTF7ATG)" \
-            -c.mac.timestamp=none
+            -c.mac.timestamp=none \
+            -c.extraMetadata.version="$BOTFLEET_BUILD_VERSION"
 
       - name: "Gate: signature, team, and a packaged server that starts"
         run: |
