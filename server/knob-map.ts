@@ -231,22 +231,29 @@ export const KNOB_FIELDS: readonly KnobFieldSpec[] = [
     // Off unless the owner says otherwise.  The phone's Open-on-Mac button
     // and nothing else in the fleet depends on this, so it is the knob most
     // worth being able to flip without a deploy.
+    //
+    // `server.persistOnExit` is deliberately NOT a row, and the reason is the
+    // difference between where this table's values end up and where that one
+    // is read.  A knob here is resolved by the harness into in-memory `cfg`,
+    // and `writeThroughKnobs` tombstones the field so `saveConfig` leaves it
+    // out of config.json — the vault owns it.  `persistOnExit` has exactly one
+    // consumer, `serverPersistsOnExit()` in electron/main.mjs, and that reads
+    // config.json off disk before the harness has been consulted; Electron
+    // cannot import this TypeScript module.  A row here would therefore look
+    // settable and do nothing: set it in the vault and the harness resolves
+    // `false` in memory, while Electron still sees an absent field, reads
+    // `undefined !== false`, and keeps the harness alive on quit.
+    //
+    // It is also the wrong shape for a knob.  This table is fleet-wide, and
+    // "quit should tear the harness down" is a per-Mac decision that would
+    // then apply to every machine sharing the project.  As a plain field in
+    // ~/.botfleet/config.json it is per-Mac, survives saves, and is read by
+    // the one process that acts on it.
     id: "server.allowRemoteDesktopLaunch",
     label: "Allow remote desktop launch",
     section: "server",
     path: ["allowRemoteDesktopLaunch"],
     infisicalName: "BOTFLEET_SERVER_ALLOW_REMOTE_DESKTOP_LAUNCH",
-    kind: "bool",
-  },
-  {
-    // Whether the harness outlives the desktop window.  The stored default is
-    // true (see server/config.ts); this row only says where an admin reaches
-    // it, and does not carry the default itself.
-    id: "server.persistOnExit",
-    label: "Keep the server running after the app quits",
-    section: "server",
-    path: ["persistOnExit"],
-    infisicalName: "BOTFLEET_SERVER_PERSIST_ON_EXIT",
     kind: "bool",
   },
   {
