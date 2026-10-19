@@ -3295,7 +3295,7 @@ describe("APNs signing key source (AFC-359: nothing reads ~/.secrets)", () => {
     resetApnsKeyCache();
   });
 
-  it("reads AUTHKEY_<KEY_ID> through fleet-secrets and never a file under the home folder", () => {
+  it.skipIf(process.platform === "win32")("reads AUTHKEY_<KEY_ID> through fleet-secrets and never a file under the home folder", () => {
     const argsFile = join(dir, "args");
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" > '${argsFile}'\n${pemScript(testP8())}`);
     process.env.APNS_KEY_ID = "KEY1234567";
@@ -3306,7 +3306,7 @@ describe("APNs signing key source (AFC-359: nothing reads ~/.secrets)", () => {
     expect(apnsKeySource()).toBe("Infisical AUTHKEY_KEY1234567");
   });
 
-  it("stamps the key with a digest, so a rotated key changes the stamp", () => {
+  it.skipIf(process.platform === "win32")("stamps the key with a digest, so a rotated key changes the stamp", () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
     const first = apnsKeyStamp();
     expect(first).toMatch(/^Infisical AUTHKEY_N3949G7CN6:[0-9a-f]{16}$/);
@@ -3315,7 +3315,7 @@ describe("APNs signing key source (AFC-359: nothing reads ~/.secrets)", () => {
     expect(apnsKeyStamp()).not.toBe(first);
   });
 
-  it("keeps the last good key through a transient fleet-secrets failure", () => {
+  it.skipIf(process.platform === "win32")("keeps the last good key through a transient fleet-secrets failure", () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
     const good = loadApnsConfig();
     expect(good?.p8).toContain("BEGIN PRIVATE KEY");
