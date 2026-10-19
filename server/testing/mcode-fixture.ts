@@ -12,7 +12,7 @@
 // Used by server/drivers/acp/mcode-launch-seat.test.ts, which skips when
 // `mcode` is not installed (CI has none).
 import { execFile } from "node:child_process";
-import { accessSync, chmodSync, constants, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { userInfo } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -212,8 +212,8 @@ export interface McpEntry {
 export interface McodeFixture {
   /** The directory mcode treats as its data directory (`MINIMAX_DATA_DIR`). */
   dataDir: string;
-  /** A home directory for the engine child, so a tool that reads `~/.secrets`
-   *  reads the fixture's and never the account's. */
+  /** A home directory for the engine child, so a tool that reads the home
+   *  folder reads the fixture's and never the account's. */
   home: string;
 }
 
@@ -265,15 +265,23 @@ export async function writeMcodeFixture(input: {
   return { dataDir, home };
 }
 
-/** Write the credential file `agent-sync` reads for a seat's bot
- *  (`<home>/.secrets/Zulip/<fileName>`, mode 600), pointing at a fake realm.
- *  The key is a fixture's. */
-export function writeZuliprc(input: { home: string; fileName: string; email: string; key: string; site: string }): void {
-  const dir = join(input.home, ".secrets", "Zulip");
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, input.fileName);
-  writeFileSync(path, `[api]\nemail=${input.email}\nkey=${input.key}\nsite=${input.site}\n`);
-  chmodSync(path, 0o600);
+/** The environment that hands `agent-sync mcp` a seat's bot credentials,
+ *  pointing at a fake realm:  `ZULIP_<CODE>_EMAIL` and `ZULIP_<CODE>_API_KEY`
+ *  for each bot (CODE is the seat with hyphens as underscores) and
+ *  `ZULIP_SITE`, which is how an MCP server is given a key now that no
+ *  credential folder is read (AFC-359).  `AGENT_SYNC_INFISICAL=0` keeps it from
+ *  asking the real vault for anything else.  The keys are a fixture's. */
+export function zulipCredentialEnv(input: {
+  site: string;
+  bots: ReadonlyArray<{ seat: string; email: string; key: string }>;
+}): Record<string, string> {
+  const env: Record<string, string> = { ZULIP_SITE: input.site, AGENT_SYNC_INFISICAL: "0" };
+  for (const bot of input.bots) {
+    const code = bot.seat.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+    env[`ZULIP_${code}_EMAIL`] = bot.email;
+    env[`ZULIP_${code}_API_KEY`] = bot.key;
+  }
+  return env;
 }
 
 /** Run one ordinary `mcode exec` session:  not launched by BotFleet, so its

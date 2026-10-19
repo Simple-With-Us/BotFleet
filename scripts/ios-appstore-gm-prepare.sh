@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Prepare a GitHub-hosted macOS runner to archive BotFleet for TestFlight.
 # Validates the existing BotFleet Actions secret names (the ship step reads the
-# APPLE_API_* names straight from the environment;  nothing is written under
-# ~/.secrets, AFC-359), then imports the iOS Distribution identity.
+# APPLE_API_* names straight from the environment;  nothing is written to
+# the retired secrets folder, AFC-359), then imports the iOS Distribution identity.
 # Never prints secret values.  Fail closed on a beta macOS host.
 # Canonical siblings: Congress.Trade / DealDex / Socratic.Trade
 # scripts/ios-appstore-gm-prepare.sh

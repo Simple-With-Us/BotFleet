@@ -192,7 +192,7 @@ asc_tmp_dir() {
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
 # exported ASC_* vars are discarded with the subshell). Sets AUTH_MODE to
 # "api_key" or "none". Never prints secret values.
-# Order (AFC-359: nothing reads ~/.secrets):
+# Order (AFC-359: the retired secrets folder is never read):
 #   1. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH already in the environment
 #   2. CI: the APPLE_API_* names the ship workflow exports from Infisical
 #   3. Mac: Infisical Fleet-OPS through fleet-secrets, /asc ASC_KEY_ID,

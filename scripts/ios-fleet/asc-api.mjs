@@ -8,7 +8,7 @@
  *   1. ASC_KEY_* in the environment (DealDex's ios-ship.yml exports these)
  *   2. Infisical Fleet-OPS through `fleet-secrets` (the Mac): /asc holds
  *      ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 (the PEM), kept in memory
- *      only (AFC-359: nothing reads ~/.secrets)
+ *      only (AFC-359: the retired secrets folder is never read)
  *   3. APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64
  *      (the names BotFleet's ios-ship.yml exports from Infisical; the p8 is
  *      base64, so it is decoded into a 0600 temp file and removed on exit)
