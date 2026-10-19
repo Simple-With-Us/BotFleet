@@ -14,6 +14,7 @@ import {
   McodeAgentDriver,
   mcodeAuthenticated,
   mcodeDataDir,
+  mcodeModelForValue,
   mcodeModelOptionValue,
   mcodePickerId,
   parseMcodeModelValue,
@@ -92,6 +93,42 @@ describe("STATIC_MCODE_MODELS", () => {
       expect(mcodeModelOptionValue(option.id, advertised)).toEqual(expect.any(String));
     }
   });
+
+  it("resolves the shipped Flash rows against a CLI that dropped the Preview name (BOTFLEET-4D)", () => {
+    // A newer mcode advertises the GA model as `MiniMax-M3.1-Flash`.  Bots keep
+    // the saved Preview-spelled picker id, so it must still match.
+    const advertised = [
+      {
+        id: "model",
+        options: [
+          { value: "m:minimax:MiniMax-M3.1-Flash:v:", name: "M3.1-Flash" },
+          { value: "m:minimax:MiniMax-M3.1-Flash:v:thinking", name: "M3.1-Flash · thinking" },
+          { value: "m:minimax:MiniMax-M3:v:", name: "M3" },
+          { value: "m:minimax:MiniMax-M3:v:thinking", name: "M3 · thinking" },
+        ],
+      },
+    ];
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview-thinking", advertised)).toBe(
+      "m:minimax:MiniMax-M3.1-Flash:v:thinking",
+    );
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview-thinking-1M", advertised)).toBe(
+      "m:minimax:MiniMax-M3.1-Flash:v:thinking",
+    );
+    // The new spelling also resolves, and the non-thinking row stays distinct.
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-thinking", advertised)).toBe(
+      "m:minimax:MiniMax-M3.1-Flash:v:thinking",
+    );
+    expect(() => mcodeModelOptionValue("MiniMax-M2.7-highspeed-thinking", advertised)).toThrow(/does not offer/);
+  });
+
+  it("maps a renamed advertised value back to the shipped picker id", () => {
+    expect(mcodeModelForValue("m:minimax:MiniMax-M3.1-Flash:v:thinking")).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(mcodeModelForValue("m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking")).toBe(
+      "MiniMax-M3.1-Flash-Preview-thinking",
+    );
+    expect(mcodeModelForValue("m:minimax:MiniMax-M3:v:thinking")).toBe("MiniMax-M3-thinking");
+    expect(mcodeModelForValue("not-a-value")).toBeNull();
+  });
 });
 
 describe("readMcodeModelCatalog", () => {
@@ -120,6 +157,18 @@ describe("readMcodeModelCatalog", () => {
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
     expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking-1M");
     expect(catalog.options.find((o) => o.id === catalog.default)?.contextWindow).toBe(1_000_000);
+  });
+
+  it("adopts a config default spelled with the renamed MiniMax-M3.1-Flash id", () => {
+    writeConfig(
+      dataDir,
+      [
+        "defaultModel: minimax/MiniMax-M3.1-Flash",
+        "defaultModelVariant: thinking",
+        "defaultModelContextWindow: 1000000",
+      ].join("\n"),
+    );
+    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3.1-Flash-Preview-thinking-1M");
   });
 
   it("never adopts a default that is not on offer", () => {
