@@ -66,6 +66,12 @@ function readVaultP8(keyId: string, now = Date.now()): string | null {
   } catch {
     p8 = null;
   }
+  if (p8 === null && vaultKey && vaultKey.keyId === keyId && vaultKey.p8) {
+    // A transient failure keeps the last good key (pushes keep flowing) and
+    // is retried after the short window rather than the long one.
+    vaultKey = { keyId, p8: vaultKey.p8, at: now - (APNS_VAULT_CACHE_MS - APNS_VAULT_RETRY_MS) };
+    return vaultKey.p8;
+  }
   vaultKey = { keyId, p8, at: now };
   return p8;
 }
@@ -105,6 +111,10 @@ function resolveP8(): { p8: string; origin: string } | null {
  * source is part of it because `APNS_P8_PATH` or `APNS_P8` can move the
  * key: pointing the sidecar at a different key is a key change, and a fault
  * recorded against the old one must not survive it. */
+// The stamp format changed from `<path>:<mtime>:<size>` in AFC-359.  A key
+// fault persisted before the upgrade therefore never matches and is cleared
+// once on load:  the safe direction, since a key that is still bad is simply
+// re-recorded by the next push Apple refuses.
 export function apnsKeyStamp(): string | null {
   const got = resolveP8();
   if (!got) return null;

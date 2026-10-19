@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   alertIsBlocking,
   apnsJwt,
+  APNS_VAULT_CACHE_MS,
+  APNS_VAULT_RETRY_MS,
   apnsKeySource,
   apnsKeyStamp,
   loadApnsConfig,
@@ -3311,6 +3313,23 @@ describe("APNs signing key source (AFC-359: nothing reads ~/.secrets)", () => {
     resetApnsKeyCache();
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
     expect(apnsKeyStamp()).not.toBe(first);
+  });
+
+  it("keeps the last good key through a transient fleet-secrets failure", () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    const good = loadApnsConfig();
+    expect(good?.p8).toContain("BEGIN PRIVATE KEY");
+    // Fail every later read and let the retry window pass.
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
+      expect(loadApnsConfig()?.p8).toBe(good?.p8);
+      vi.setSystemTime(Date.now() + APNS_VAULT_RETRY_MS + 1);
+      expect(loadApnsConfig()?.p8).toBe(good?.p8);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reads as no key when fleet-secrets fails", () => {
