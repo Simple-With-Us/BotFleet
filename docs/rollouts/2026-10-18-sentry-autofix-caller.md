@@ -20,7 +20,7 @@ BotFleet changes only its Claude caller pin and adds a regression guard for the 
 
 Full local application gates are NOT RUN in this isolated connector fixture.  The repository uses pnpm; this list explicitly distinguishes the generic handoff commands from its actual checks:
 
-- `npm run lint`: NOT RUN; the repository's hosted `pnpm lint` check passed on `5f6328ec5cdb0c1a82e5fbe2d3ac124a729680f8`.
+- `npm run lint`: NOT RUN; the hosted changed-file and baseline-ratchet lint checks (`node scripts/lint-pr-gate.mjs` and `node scripts/check-lint-baseline.mjs --baseline-ref`) passed on `5f6328ec5cdb0c1a82e5fbe2d3ac124a729680f8`.
 - `npx tsc --noEmit`: NOT RUN; BotFleet's actual command is `pnpm typecheck`, which checks both application and server projects.
 - `npm test`: NOT RUN; the complete `pnpm test` chain is running in hosted CI on Ubuntu, macOS, and Windows.
 - `npm run build`: NOT RUN locally; the hosted package/smoke job passed on the same head, while full matrix jobs are still running.
