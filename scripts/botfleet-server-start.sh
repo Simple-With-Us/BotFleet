@@ -72,6 +72,43 @@ FAIL_LEDGER="${BOTFLEET_FAIL_LEDGER:-$HOME/Library/Caches/BotFleet/server-start-
 FAIL_WINDOW_SECONDS="${BOTFLEET_FAIL_WINDOW_SECONDS:-3600}"
 FAIL_STORM_THRESHOLD="${BOTFLEET_FAIL_STORM_THRESHOLD:-20}"
 
+# The "stopped on purpose" sentinel, written by POST /api/system/shutdown.
+#
+# Without it there is no such thing as a quiet shutdown on this Mac.  The
+# launchd agent carries KeepAlive.SuccessfulExit=false and StartInterval=300,
+# so a clean exit is not resurrected by the first pair of settings — but the
+# five-minute tick still runs this script, a closed port still reads as a
+# crash, and the harness comes back.  Whoever turned the server off would find
+# it on again a few minutes later with nothing in the logs to explain it.
+#
+# Exiting 0 here is what keeps the tick quiet: SuccessfulExit=false means
+# launchd leaves a clean exit alone, and the periodic run stays the cheap health
+# check it is documented to be.
+#
+# Only the launchd path respects the marker.  A person running this script by
+# hand is asking for the server, so that clears the marker and starts — which
+# is the recovery path when someone stops it and then changes their mind.
+SHUTDOWN_MARKER="${BOTFLEET_SHUTDOWN_MARKER:-${OMB_DATA_DIR:-$HOME/.botfleet}/stopped.marker}"
+LAUNCHD_SERVICE_NAME="${XPC_SERVICE_NAME:-}"
+
+# True when launchd invoked us rather than a person.
+invoked_by_launchd() {
+  [ -n "$LAUNCHD_SERVICE_NAME" ]
+}
+
+# Exit 0 if the harness was stopped on purpose.  Returns 1 to carry on.
+honour_shutdown_marker() {
+  [ -f "$SHUTDOWN_MARKER" ] || return 1
+  if ! invoked_by_launchd; then
+    log "stopped.marker present but this run is not from launchd; treating it as a deliberate start"
+    rm -f "$SHUTDOWN_MARKER"
+    return 1
+  fi
+  log "stopped.marker present ($SHUTDOWN_MARKER); the harness was shut down on purpose and stays down."
+  log "Delete that file, or launch the BotFleet app, to let it come back."
+  exit 0
+}
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [--heal-only]
@@ -300,6 +337,16 @@ elif [ "$#" -gt 0 ]; then
   usage >&2
   exit 2
 fi
+
+# Before anything else: a deliberate stop is a deliberate stop, even when the
+# harness happens to still be healthy.  Checking it ahead of the health
+# shortcut is what makes the marker authoritative rather than advisory.
+#
+# `|| true` is load-bearing under `set -e`: the function returns 1 to mean
+# "carry on and start the harness", and an unguarded bare call would abort the
+# whole script on exactly the ordinary, marker-absent path.  The exit 0 inside
+# the function still exits — that is an `exit`, not a return status.
+honour_shutdown_marker || true
 
 # --heal-only must prepare the checkout even when the currently running
 # harness is healthy (e.g. during an update while the old process still
