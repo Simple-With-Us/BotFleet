@@ -59,7 +59,7 @@ test('report uses exact Cocoa release, source refs, scoped project and honest di
   const api=fakeAPI();
   const result=await reportTestFlight(receipt(), {token:'fixture-value',runId:'123',fetchImpl:api.fetchImpl});
   assert.equal(result.deployId,'123'); assert.equal(api.calls.length,4);
-  assert.deepEqual(api.calls[1].body.refs,[{repository:'jaywedgeworth22/BotFleet',commit:sha}]);
+  assert.deepEqual(api.calls[1].body.refs,[{repository:'Simple-With-Us/BotFleet',commit:sha}]);
   assert.equal(api.calls[1].body.version,receipt().release);
   assert.match(api.calls[0].url,/app.botfleet.ios%401.0.79%2B202610060212/);
   assert.deepEqual(api.calls[3].body.projects,['botfleet']);
@@ -90,6 +90,55 @@ test('API/transport failures are loud and never retry an ambiguous write or prin
     assert.equal(api.calls.length,failAt);
   }
   await assert.rejects(reportTestFlight(receipt(),{token:'fixture-value',runId:'123',fetchImpl:()=>{throw Error('secret bearer value');}}),error=>!error.message.includes('secret bearer'));
+});
+
+// A stale repository name is not a syntax error: Sentry accepts the request and
+// rejects the whole write with HTTP 400 {"refs":["Invalid repository names: ..."]},
+// which turned every main push red while the TestFlight upload itself succeeded.
+// Pin the one name Sentry has registered, and pin the single-constant shape, so a
+// future transfer cannot reintroduce a second spelling behind a stale comment.
+test('refs carry exactly the repository name Sentry has registered, with no second spelling', async () => {
+  const api=fakeAPI();
+  await reportTestFlight(receipt(), {token:'fixture-value',runId:'123',fetchImpl:api.fetchImpl});
+  const refs=api.calls[1].body.refs;
+  assert.equal(refs.length,1);
+  assert.equal(refs[0].repository,'Simple-With-Us/BotFleet');
+  assert.ok(!/jaywedgeworth22\//.test(JSON.stringify(api.calls[1].body)),'no pre-transfer repository name may reach Sentry');
+  const source=read('scripts/sentry-report-testflight.mjs');
+  assert.ok(!source.includes('SENTRY_REPOSITORY'),'a second repository constant is how the two names drifted apart');
+});
+
+// Discarding the response body is what cost three fixes: each cleared one layer
+// and the same bare "HTTP 400" hid the next.  Sentry's own validation error must
+// be visible -- but a non-JSON body (gateway page, proxy string) is the shape
+// that can echo something sensitive, so it stays suppressed.
+test('a failed write reports the JSON reason Sentry gave, with credentials scrubbed', async () => {
+  const token='sntr_fixture_token_value';
+  const jsonFailure=async (url,options)=>{
+    if (options.method==='GET'&&url.endsWith('/deploys/')) return Response.json([]);
+    if (options.method==='GET') return Response.json({ref:null,projects:[{slug:'botfleet'}]});
+    return new Response(JSON.stringify({refs:[`Invalid repository names: ${token}`],detail:`token ${token}`}),
+      {status:400,headers:{'Content-Type':'application/json'}});
+  };
+  await assert.rejects(
+    reportTestFlight(receipt(),{token,runId:'123',fetchImpl:jsonFailure}),
+    error=>/HTTP 400/.test(error.message)
+      &&/Invalid repository names/.test(error.message)
+      &&!error.message.includes(token),
+  );
+
+  const opaqueBody='<html>upstream failed for token '+token+'</html>';
+  const opaqueFailure=async (url,options)=>{
+    if (options.method==='GET'&&url.endsWith('/deploys/')) return Response.json([]);
+    if (options.method==='GET') return Response.json({ref:null,projects:[{slug:'botfleet'}]});
+    return new Response(opaqueBody,{status:400});
+  };
+  await assert.rejects(
+    reportTestFlight(receipt(),{token,runId:'123',fetchImpl:opaqueFailure}),
+    error=>/HTTP 400/.test(error.message)
+      &&!error.message.includes(token)
+      &&!error.message.includes('upstream failed'),
+  );
 });
 
 test('ship receipt follows recorded success only after exact ASC readiness; skipped states produce none', () => {
