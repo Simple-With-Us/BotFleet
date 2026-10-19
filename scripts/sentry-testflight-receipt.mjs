@@ -14,6 +14,14 @@ import { fileURLToPath } from "node:url";
 const BUNDLE_ID = "app.botfleet.ios";
 const READY_STATES = new Set(["IN_BETA_TESTING", "READY_FOR_BETA_TESTING"]);
 
+// Since #1251 the ship script sets CFBundleVersion to the repo commit count
+// (1.0.<commit_count>), not the retired 12-digit YYYYMMDDHHMM UTC stamp.  This
+// predicate is the ONLY definition of that contract: the zod ReceiptSchema in
+// sentry-report-testflight.mjs imports it, so the hand-written parser and the
+// schema cannot drift apart the way three separate literals did when #1251
+// landed.  Commit counts are positive integers with no leading zero.
+export const BUILD_NUMBER_PATTERN = /^[1-9]\d*$/;
+
 /* oxlint-disable anti-slop/no-runtime-typeof -- hand-written boundary parse; zod is not installed on the ios-ship runner (see comment above). */
 function isPlainObject(value) {
   return Object.prototype.toString.call(value) === "[object Object]";
@@ -24,7 +32,7 @@ function isString(value) {
 }
 
 export function parseReadyFile(value) {
-  if (!isPlainObject(value) || value.ok !== true || !isString(value.version) || !/^\d{12}$/.test(value.version) ||
+  if (!isPlainObject(value) || value.ok !== true || !isString(value.version) || !BUILD_NUMBER_PATTERN.test(value.version) ||
       !isString(value.buildId) || !/^[A-Za-z0-9-]{1,64}$/.test(value.buildId) ||
       !READY_STATES.has(value.internalBuildState)) {
     throw new Error("Invalid verified TestFlight receipt");
@@ -43,7 +51,7 @@ export function validateReceipt(receipt) {
       receipt.milestone !== "testflight-ready" ||
       receipt.bundleId !== BUNDLE_ID ||
       !/^1\.0\.\d+$/.test(receipt.marketingVersion) ||
-      !/^\d{12}$/.test(receipt.buildNumber) ||
+      !BUILD_NUMBER_PATTERN.test(receipt.buildNumber) ||
       !/^[a-f0-9]{40}$/.test(receipt.sourceCommit) ||
       /^0+$/.test(receipt.sourceCommit) ||
       !/^[A-Za-z0-9-]{1,64}$/.test(receipt.ascBuildId) ||
