@@ -8,7 +8,7 @@ def main():
     secret = os.environ.get('FLEET_ADMIN_SECRET') or os.environ.get('FLEET_AUTH_SECRET')
     if not secret:
         # AFC-359: Infisical Fleet-OPS /fleetlink-auth through fleet-secrets;
-        # nothing is read from ~/.secrets.  Never log the value or stderr.
+        # nothing is read from the retired secrets folder.  Never log the value or stderr.
         bin_path = os.environ.get('FLEET_SECRETS_BIN') or str(pathlib.Path.home()/'.local/bin/fleet-secrets')
         try:
             r = subprocess.run([bin_path, 'get', 'FLEET_ADMIN_SECRET', '--path', '/fleetlink-auth'],

@@ -20,7 +20,7 @@ export interface ApnsConfig {
 }
 
 /** The Infisical name of an APNs signing key: the Fleet-OPS root holds one
- * `AUTHKEY_<KEY_ID>` per Apple key (AFC-359: nothing reads `~/.secrets`). */
+ * `AUTHKEY_<KEY_ID>` per Apple key (AFC-359: the retired secrets folder is never read). */
 export function apnsVaultName(keyId: string): string {
   return `AUTHKEY_${keyId}`;
 }

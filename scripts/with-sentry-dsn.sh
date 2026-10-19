@@ -6,7 +6,7 @@
 #
 # Resolution order per name: already-exported environment variable ->
 # `fleet-secrets get NAME --path /botfleet-sentry` (Infisical Fleet-OPS prod;
-# AFC-359: nothing reads ~/.secrets any more) -> the `infisical` CLI (only if
+# AFC-359: the retired secrets folder is never read) -> the `infisical` CLI (only if
 # it is on PATH and already logged in -- this script never runs `infisical
 # login`).  A value found for SENTRY_DSN but not VITE_SENTRY_DSN is copied
 # across, since they are meant to be the same DSN.

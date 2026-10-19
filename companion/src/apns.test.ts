@@ -3265,7 +3265,7 @@ describe("diskKeyFaultStore", () => {
   });
 });
 
-describe("APNs signing key source (AFC-359: nothing reads ~/.secrets)", () => {
+describe("APNs signing key source (AFC-359: the retired secrets folder is never read)", () => {
   const saved = { ...process.env };
   let dir = "";
 
