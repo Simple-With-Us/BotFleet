@@ -70,7 +70,9 @@
 # fleet runners).
 #
 # Secrets (never printed):
-#   ~/.secrets/appstore-connect.env  (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH)
+#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_PATH  (env first, e.g. CI; else Infisical via
+#   `fleet-secrets get`: /asc ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8, written to a
+#   0600 temp file and deleted on exit)
 #   or Xcode-signed-in session for destination=upload export
 #   SENTRY_AUTH_TOKEN  (dSYM + Size Analysis upload; env or `fleet-secrets get`)
 #   SENTRY_DSN         (injected into xcodebuild so Cocoa plist $(SENTRY_DSN) is set)
@@ -91,7 +93,17 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
 FLEET_DIR="$(cd "$(dirname "$0")" && pwd)"
 APPS_JSON="${FLEET_DIR}/apps.json"
 TEAM_ID="CC8UTF7ATG"
-SECRETS_ENV="${HOME}/.secrets/appstore-connect.env"
+# AFC-359: App Store Connect credentials come from the environment (CI sets them) or
+# Infisical Fleet-OPS via fleet-secrets.  Nothing is read from the old secrets folder.
+FLEET_SECRETS_BIN="${FLEET_SECRETS:-${HOME}/.local/bin/fleet-secrets}"
+ASC_TMP_DIR=""
+cleanup_asc_tmp() {
+  if [[ -n "${ASC_TMP_DIR:-}" ]]; then
+    rm -rf "$ASC_TMP_DIR" 2>/dev/null || true
+  fi
+  ASC_TMP_DIR=""
+}
+trap cleanup_asc_tmp EXIT
 # 1 hour — owner 2026-08-14: ship unbuilt iOS updates as often as once per hour.
 # Not Apple compute; local/process hygiene. Cron ticks twice an hour so a
 # trailing merge inside the window is picked up on the next eligible tick.
@@ -160,52 +172,89 @@ resolve_project() {
   return 1
 }
 
+# fs_get NAME FOLDER -> value on stdout (never logged); non-zero when absent.
+fs_get() {
+  local v bin="$FLEET_SECRETS_BIN"
+  [[ -x "$bin" ]] || bin="$(command -v fleet-secrets 2>/dev/null || true)"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  v="$("$bin" get "$1" --path "$2" 2>/dev/null </dev/null)" || return 1
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
+}
+
+# Make the temp directory that holds a materialised .p8 (0700), once.
+asc_tmp_dir() {
+  if [[ -z "$ASC_TMP_DIR" ]]; then
+    ASC_TMP_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/asc-key.XXXXXX")"
+  fi
+}
+
 # Load ASC credentials into the CURRENT shell (must not run inside $(...) or the
 # exported ASC_* vars are discarded with the subshell). Sets AUTH_MODE to
 # "api_key" or "none". Never prints secret values.
+# Order (AFC-359: nothing reads ~/.secrets):
+#   1. ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH already in the environment
+#   2. CI: the APPLE_API_* names the ship workflow exports from Infisical
+#   3. Mac: Infisical Fleet-OPS through fleet-secrets, /asc ASC_KEY_ID,
+#      ASC_ISSUER_ID and ASC_KEY_P8, written to a 0600 temp file and removed
+#      on exit.
 load_secrets() {
   AUTH_MODE="none"
-  if [[ -f "$SECRETS_ENV" ]]; then
-    # shellcheck disable=SC1090
-    set -a
-    # shellcheck source=/dev/null
-    source "$SECRETS_ENV"
-    set +a
-  fi
-  # CI FALLBACK (2026-10-02). A GitHub-hosted macos-latest runner has no
-  # ~/.secrets directory, so ios-appstore-gm-prepare.sh normally synthesises
-  # the env file from the APPLE_API_* names it exported from Infisical. When
-  # that file is missing or its ASC_KEY_PATH points at a file that is not
-  # there, fall back to those names directly: decode the base64 p8 into a 0600
-  # file under ~/.secrets and export the ASC_* trio that altool (and
-  # asc-api.mjs) expect. Never prints a value.
-  if [[ -z "${ASC_KEY_ID:-}" || -z "${ASC_ISSUER_ID:-}" || -z "${ASC_KEY_PATH:-}" || ! -f "${ASC_KEY_PATH:-/nonexistent}" ]]; then
-    if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
-      local ci_dir="${HOME}/.secrets" ci_key="${HOME}/.secrets/AuthKey.p8"
-      mkdir -p "$ci_dir"
-      chmod 700 "$ci_dir"
-      local decoded=1
-      case "$APPLE_API_KEY_P8_BASE64" in
-        *BEGIN*) printf '%s\n' "$APPLE_API_KEY_P8_BASE64" > "$ci_key" ;;
-        *) printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$ci_key" 2>/dev/null || decoded=0 ;;
-      esac
-      if [[ "$decoded" -eq 1 ]] && grep -q "BEGIN " "$ci_key" 2>/dev/null; then
-        chmod 600 "$ci_key"
-        export ASC_KEY_ID="$APPLE_API_KEY_ID"
-        export ASC_ISSUER_ID="$APPLE_API_ISSUER_ID"
-        export ASC_KEY_PATH="$ci_key"
-      else
-        logerr "ASC_KEY_* unusable and APPLE_API_KEY_P8_BASE64 did not decode to a PEM"
-      fi
-    fi
-  fi
   if [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" ]]; then
-    if [[ -f "$ASC_KEY_PATH" ]]; then
+    if [[ -f "${ASC_KEY_PATH/#\~/$HOME}" ]]; then
       AUTH_MODE="api_key"
       return 0
     fi
     log "ASC_KEY_PATH set but file missing (not printing path contents)"
   fi
+  # CI FALLBACK (2026-10-02). A GitHub-hosted macos-latest runner exports the
+  # APPLE_API_* names from Infisical. Decode the base64 p8 into a 0600 file in
+  # a private temp directory and export the ASC_* trio that altool (and
+  # asc-api.mjs) expect. Never prints a value.
+  if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
+    asc_tmp_dir
+    local ci_key="${ASC_TMP_DIR}/AuthKey_${APPLE_API_KEY_ID}.p8" decoded=1
+    case "$APPLE_API_KEY_P8_BASE64" in
+      *BEGIN*) ( umask 077; printf '%s\n' "$APPLE_API_KEY_P8_BASE64" > "$ci_key" ) ;;
+      *) ( umask 077; printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$ci_key" ) 2>/dev/null || decoded=0 ;;
+    esac
+    if [[ "$decoded" -eq 1 ]] && grep -q "BEGIN " "$ci_key" 2>/dev/null; then
+      chmod 600 "$ci_key"
+      export ASC_KEY_ID="$APPLE_API_KEY_ID"
+      export ASC_ISSUER_ID="$APPLE_API_ISSUER_ID"
+      export ASC_KEY_PATH="$ci_key"
+      export API_PRIVATE_KEYS_DIR="$ASC_TMP_DIR"
+      AUTH_MODE="api_key"
+      return 0
+    fi
+    logerr "ASC_KEY_* unusable and APPLE_API_KEY_P8_BASE64 did not decode to a PEM"
+  fi
+  local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" p8 asc_kid
+  asc_kid="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
+  [[ -n "$kid" ]] || kid="$asc_kid"
+  [[ -n "$iss" ]] || iss="$(fs_get ASC_ISSUER_ID /asc)" || iss=""
+  if [[ -z "$kid" || -z "$iss" ]]; then
+    log "ASC credentials missing: set ASC_KEY_ID/ASC_ISSUER_ID/ASC_KEY_PATH or add ASC_KEY_ID and ASC_ISSUER_ID to Infisical /asc"
+    return 0
+  fi
+  # /asc holds one key.  A key id from the environment that differs from it
+  # has no Infisical copy:  fail with a clear message rather than guess.
+  p8=""
+  if [[ "$kid" == "$asc_kid" ]]; then
+    p8="$(fs_get ASC_KEY_P8 /asc)" || p8=""
+  fi
+  if [[ -z "$p8" ]]; then
+    log "no .p8 for key ${kid}: Infisical /asc ASC_KEY_P8 holds a different key (or is unreadable);  set ASC_KEY_PATH to a file for this key"
+    return 0
+  fi
+  asc_tmp_dir
+  ( umask 077; printf '%s\n' "$p8" > "${ASC_TMP_DIR}/AuthKey_${kid}.p8" )
+  chmod 600 "${ASC_TMP_DIR}/AuthKey_${kid}.p8"
+  p8=""
+  export ASC_KEY_ID="$kid" ASC_ISSUER_ID="$iss" ASC_KEY_PATH="${ASC_TMP_DIR}/AuthKey_${kid}.p8"
+  # altool searches API_PRIVATE_KEYS_DIR first, so no symlink into ~/.appstoreconnect is needed.
+  export API_PRIVATE_KEYS_DIR="$ASC_TMP_DIR"
+  AUTH_MODE="api_key"
   return 0
 }
 
@@ -214,8 +263,9 @@ load_secrets() {
 # exported ASC_* names -- it checks each source asc-api.mjs knows about.
 asc_credential_available() {
   [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" && -f "${ASC_KEY_PATH:-/nonexistent}" ]] && return 0
-  [[ -f "$SECRETS_ENV" ]] && return 0
   [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]] && return 0
+  [[ -x "$FLEET_SECRETS_BIN" ]] && return 0
+  command -v fleet-secrets >/dev/null 2>&1 && return 0
   return 1
 }
 
@@ -352,12 +402,20 @@ sentry_org_mismatch_hint() {
 }
 
 link_private_key() {
-  # altool / iTMSTransporter look for AuthKey_<id>.p8 in standard dirs.
+  # altool / iTMSTransporter look for AuthKey_<id>.p8 in standard dirs.  When
+  # load_secrets wrote a temp key it also set API_PRIVATE_KEYS_DIR, so there is
+  # nothing to link (and a symlink to a deleted temp file would dangle).
   local key_path="$1" key_id="$2"
+  if [[ -n "${ASC_TMP_DIR:-}" && "$key_path" == "${ASC_TMP_DIR}/"* ]]; then
+    return 0
+  fi
   local dest_dir="${HOME}/.appstoreconnect/private_keys"
   mkdir -p "$dest_dir"
   chmod 700 "$dest_dir"
   local dest="${dest_dir}/AuthKey_${key_id}.p8"
+  if [[ -L "$dest" && ! -e "$dest" ]]; then
+    rm -f "$dest"
+  fi
   if [[ ! -e "$dest" ]]; then
     ln -sf "$key_path" "$dest"
   fi
@@ -504,7 +562,7 @@ resolve_seq_floor() {
   (${STATE_DIR}/build-seq-${APP_KEY}.txt) and no ${prefix}.N in project.pbxproj.
   Shipping now would very likely reuse a build number and be rejected as a duplicate.
   Fix one of these, then re-run:
-    1) restore ASC access: check ${SECRETS_ENV} and that 'node' is on PATH, then
+    1) restore ASC access: check the ASC_* env or Infisical /asc (fleet-secrets) and that 'node' is on PATH, then
        run: node ${FLEET_DIR}/asc-api.mjs latest-build-seq ${BUNDLE_ID} ${prefix} ${PLATFORM} ${APPLE_ID}
      2) or pass the number explicitly:  --version ${prefix}.<N>   (NOT --build <N>:
         --version picks the marketing version and lets CFBundleVersion stay an
@@ -978,7 +1036,7 @@ fi
 
 if [[ -n "$UPLOAD_ONLY_IPA" ]]; then
   [[ -f "$UPLOAD_ONLY_IPA" ]] || die "package not found: $UPLOAD_ONLY_IPA"
-  [[ "$AUTH_MODE" == "api_key" ]] || die "upload-only requires ~/.secrets/appstore-connect.env with ASC_KEY_*"
+  [[ "$AUTH_MODE" == "api_key" ]] || die "upload-only requires ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH (env) or Infisical /asc (ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8)"
   link_private_key "$ASC_KEY_PATH" "$ASC_KEY_ID"
   log "uploading existing package via altool (api key)"
   set +e
@@ -1099,7 +1157,7 @@ acquire_archive_lock() {
     sleep 10
   done
   # shellcheck disable=SC2064
-  trap "rmdir '$ARCHIVE_LOCK_DIR' 2>/dev/null || true" EXIT
+  trap "rmdir '$ARCHIVE_LOCK_DIR' 2>/dev/null || true; cleanup_asc_tmp" EXIT
 }
 release_archive_lock() {
   rmdir "$ARCHIVE_LOCK_DIR" 2>/dev/null || true
@@ -1348,9 +1406,9 @@ if [[ "$AUTH_MODE" != "api_key" ]]; then
   log "Upload blocked: no App Store Connect API key."
   log "Owner handoff:"
   log "  1) Create ASC API key (App Manager+) in App Store Connect"
-  log "  2) Save .p8 as ~/.secrets/AuthKey_<KEY_ID>.p8 (chmod 600)"
-  log "  3) Copy ${FLEET_DIR}/appstore-connect.env.example -> ~/.secrets/appstore-connect.env"
-  log "  4) Fill ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH; chmod 600 the env file"
+  log "  2) Store ASC_KEY_ID and ASC_ISSUER_ID in Infisical Fleet-OPS /asc"
+  log "  3) Store the .p8 as ASC_KEY_P8 in Infisical /asc"
+  log "  4) Or export ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH for this run"
   log "  5) Re-run: bash $0 $APP_KEY --upload-only \"$PACKAGE\""
   log "Also ensure App Store Connect has an app record for ${BUNDLE_ID}."
   exit 3

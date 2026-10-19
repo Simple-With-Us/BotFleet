@@ -1,14 +1,20 @@
 import { generateKeyPairSync } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { constants as http2Constants, type ClientHttp2Session } from "node:http2";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   alertIsBlocking,
   apnsJwt,
+  APNS_VAULT_CACHE_MS,
+  APNS_VAULT_RETRY_MS,
+  apnsKeySource,
+  apnsKeyStamp,
+  loadApnsConfig,
+  resetApnsKeyCache,
   apnsPayload,
   classifyHttpResponse,
   classifyTransportError,
@@ -46,6 +52,14 @@ import {
   type PersistedKeyFault,
   watchHttp2SessionLifecycle,
 } from "./apns.ts";
+
+// The default key source reads Infisical through the fleet CLI.  A test must
+// never reach the real vault, so the binary points at nothing unless a test
+// installs its own fake.
+beforeEach(() => {
+  process.env.FLEET_SECRETS_BIN = "/nonexistent/fleet-bin";
+  resetApnsKeyCache();
+});
 
 function testP8(): string {
   const { privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
@@ -3248,5 +3262,91 @@ describe("diskKeyFaultStore", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("APNs signing key source (AFC-359: nothing reads ~/.secrets)", () => {
+  const saved = { ...process.env };
+  let dir = "";
+
+  function fakeFleetSecrets(body: string): string {
+    const bin = join(dir, "fleet-secrets");
+    writeFileSync(bin, `#!/bin/sh\n${body}\n`);
+    chmodSync(bin, 0o755);
+    return bin;
+  }
+
+  function pemScript(pem: string): string {
+    return `cat <<'PEM'\n${pem}PEM`;
+  }
+
+  beforeEach(() => {
+    process.env = { ...saved };
+    delete process.env.APNS_P8;
+    delete process.env.APNS_P8_PATH;
+    delete process.env.APNS_KEY_ID;
+    dir = mkdtempSync(join(tmpdir(), "apns-key-"));
+    resetApnsKeyCache();
+  });
+
+  afterEach(() => {
+    process.env = { ...saved };
+    rmSync(dir, { recursive: true, force: true });
+    resetApnsKeyCache();
+  });
+
+  it.skipIf(process.platform === "win32")("reads AUTHKEY_<KEY_ID> through fleet-secrets and never a file under the home folder", () => {
+    const argsFile = join(dir, "args");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(`echo "$@" > '${argsFile}'\n${pemScript(testP8())}`);
+    process.env.APNS_KEY_ID = "KEY1234567";
+    const config = loadApnsConfig();
+    expect(config?.keyId).toBe("KEY1234567");
+    expect(config?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(readFileSync(argsFile, "utf8").trim()).toBe("get AUTHKEY_KEY1234567");
+    expect(apnsKeySource()).toBe("Infisical AUTHKEY_KEY1234567");
+  });
+
+  it.skipIf(process.platform === "win32")("stamps the key with a digest, so a rotated key changes the stamp", () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    const first = apnsKeyStamp();
+    expect(first).toMatch(/^Infisical AUTHKEY_N3949G7CN6:[0-9a-f]{16}$/);
+    resetApnsKeyCache();
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    expect(apnsKeyStamp()).not.toBe(first);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the last good key through a transient fleet-secrets failure", () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
+    const good = loadApnsConfig();
+    expect(good?.p8).toContain("BEGIN PRIVATE KEY");
+    // Fail every later read and let the retry window pass.
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
+      expect(loadApnsConfig()?.p8).toBe(good?.p8);
+      vi.setSystemTime(Date.now() + APNS_VAULT_RETRY_MS + 1);
+      expect(loadApnsConfig()?.p8).toBe(good?.p8);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads as no key when fleet-secrets fails", () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    expect(loadApnsConfig()).toBeNull();
+    expect(apnsKeyStamp()).toBeNull();
+  });
+
+  it("prefers APNS_P8 and then APNS_P8_PATH over Infisical", () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    process.env.APNS_P8 = testP8();
+    expect(loadApnsConfig()?.p8).toContain("BEGIN PRIVATE KEY");
+    delete process.env.APNS_P8;
+    const file = join(dir, "AuthKey.p8");
+    writeFileSync(file, testP8(), { mode: 0o600 });
+    process.env.APNS_P8_PATH = file;
+    expect(loadApnsConfig()?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(apnsKeySource()).toBe(file);
   });
 });

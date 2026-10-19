@@ -3,6 +3,7 @@
 // leaves this process; tests inject sendImpl.
 import { connect as http2Connect, constants as http2Constants, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
 import { createHash, createPrivateKey, sign as cryptoSign } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -18,39 +19,116 @@ export interface ApnsConfig {
   production: boolean;
 }
 
-/** Where the signing key lives.  The path, never the contents. */
-export function apnsKeyPath(): string {
-  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
-  return process.env.APNS_P8_PATH?.trim() || join(homedir(), ".secrets", `AuthKey_${keyId}.p8`);
+/** The Infisical name of an APNs signing key: the Fleet-OPS root holds one
+ * `AUTHKEY_<KEY_ID>` per Apple key (AFC-359: nothing reads `~/.secrets`). */
+export function apnsVaultName(keyId: string): string {
+  return `AUTHKEY_${keyId}`;
 }
 
-/** A fingerprint of the key FILE — its path, modification time and size,
- * never a byte of the key itself.  Cheap enough to take every few minutes,
- * and enough to notice a rotated .p8 that kept its path.  The path is part
- * of it because `APNS_P8_PATH` can move the key: pointing the sidecar at a
- * different file is a key change, and a fault recorded against the old one
- * must not survive it. */
-export function apnsKeyStamp(path = apnsKeyPath()): string | null {
-  try {
-    const info = statSync(path);
-    return `${path}:${info.mtimeMs}:${info.size}`;
-  } catch {
-    return null;
+/** The `fleet-secrets` binary.  `FLEET_SECRETS_BIN` is the test seam. */
+function fleetSecretsBin(): string {
+  return process.env.FLEET_SECRETS_BIN?.trim() || join(homedir(), ".local", "bin", "fleet-secrets");
+}
+
+/** How long a key read from Infisical is trusted before it is read again.
+ * The sidecar re-checks the key every few minutes; one `fleet-secrets` call
+ * per window is enough to notice a rotation without a process per tick. */
+export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
+/** A failed read is retried sooner: a Mac that was still booting should not
+ * keep pushes off for a whole window. */
+export const APNS_VAULT_RETRY_MS = 30_000;
+
+interface VaultKey {
+  keyId: string;
+  p8: string | null;
+  at: number;
+}
+
+let vaultKey: VaultKey | null = null;
+
+/** Test seam: forget the cached Infisical read. */
+export function resetApnsKeyCache(): void {
+  vaultKey = null;
+}
+
+function readVaultP8(keyId: string, now = Date.now()): string | null {
+  if (vaultKey && vaultKey.keyId === keyId && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : APNS_VAULT_RETRY_MS)) {
+    return vaultKey.p8;
   }
+  let p8: string | null = null;
+  try {
+    const out = execFileSync(fleetSecretsBin(), ["get", apnsVaultName(keyId)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+    });
+    p8 = out.replace(/\n$/, "");
+  } catch {
+    p8 = null;
+  }
+  if (p8 === null && vaultKey && vaultKey.keyId === keyId && vaultKey.p8) {
+    // A transient failure keeps the last good key (pushes keep flowing) and
+    // is retried after the short window rather than the long one.
+    vaultKey = { keyId, p8: vaultKey.p8, at: now - (APNS_VAULT_CACHE_MS - APNS_VAULT_RETRY_MS) };
+    return vaultKey.p8;
+  }
+  vaultKey = { keyId, p8, at: now };
+  return p8;
+}
+
+/** Where the signing key comes from, as text for status lines.  Never the
+ * contents.  Order: `APNS_P8` (the PEM itself, for a host that injects it),
+ * then `APNS_P8_PATH` (an explicit file), then Infisical (`fleet-secrets get
+ * AUTHKEY_<KEY_ID>`). */
+export function apnsKeySource(): string {
+  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
+  if (process.env.APNS_P8?.trim()) return "APNS_P8 environment";
+  const explicit = process.env.APNS_P8_PATH?.trim();
+  if (explicit) return explicit;
+  return `Infisical ${apnsVaultName(keyId)}`;
+}
+
+function resolveP8(): { p8: string; origin: string } | null {
+  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
+  const inline = process.env.APNS_P8?.trim();
+  if (inline) return { p8: inline, origin: "env" };
+  const explicit = process.env.APNS_P8_PATH?.trim();
+  if (explicit) {
+    try {
+      if (!existsSync(explicit)) return null;
+      return { p8: readFileSync(explicit, "utf8"), origin: `${explicit}:${statSync(explicit).mtimeMs}` };
+    } catch {
+      return null;
+    }
+  }
+  const p8 = readVaultP8(keyId);
+  return p8 ? { p8, origin: "vault" } : null;
+}
+
+/** A fingerprint of the key — where it came from plus a one-way digest of
+ * the PEM, never a byte of the key itself.  Cheap enough to take every few
+ * minutes, and enough to notice a rotated .p8 that kept its name.  The
+ * source is part of it because `APNS_P8_PATH` or `APNS_P8` can move the
+ * key: pointing the sidecar at a different key is a key change, and a fault
+ * recorded against the old one must not survive it. */
+// The stamp format changed from `<path>:<mtime>:<size>` in AFC-359.  A key
+// fault persisted before the upgrade therefore never matches and is cleared
+// once on load:  the safe direction, since a key that is still bad is simply
+// re-recorded by the next push Apple refuses.
+export function apnsKeyStamp(): string | null {
+  const got = resolveP8();
+  if (!got) return null;
+  const digest = createHash("sha256").update(got.p8).digest("hex").slice(0, 16);
+  return `${apnsKeySource()}:${digest}`;
 }
 
 export function loadApnsConfig(): ApnsConfig | null {
   const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
   const teamId = process.env.APNS_TEAM_ID?.trim() || "CC8UTF7ATG";
   const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet.ios";
-  const p8Path = apnsKeyPath();
-  if (!existsSync(p8Path)) return null;
-  let p8: string;
-  try {
-    p8 = readFileSync(p8Path, "utf8");
-  } catch {
-    return null;
-  }
+  const got = resolveP8();
+  if (!got) return null;
+  const p8 = got.p8;
   if (!p8.includes("BEGIN PRIVATE KEY")) return null;
   return {
     keyId,
@@ -2302,7 +2380,7 @@ export function watchHarnessNotifications(options: {
       health.rejectKey(persistedFault.at, persistedFault.reason, persistedFault.errorTimestamp);
       console.warn(
         `companion: APNs pushes stay off — Apple refused this signing key (${persistedFault.reason}) ` +
-          `and the key file has not changed since.  Replace ${apnsKeyPath()} to turn them back on.`,
+          `and the key has not changed since.  Replace ${apnsKeySource()} to turn them back on.`,
       );
     } else {
       // A different file, or no file at all: the verdict was about a key we
