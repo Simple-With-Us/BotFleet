@@ -211,7 +211,11 @@ test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   assert.match(ship, /MANUAL_SIGN/);
   assert.match(ship, /ios-install-appstore-profiles\.sh/);
   assert.match(ship, /write_manual_export_plists/);
-  assert.match(ship, /date -u \+%Y%m%d%H%M/);
+  // The retired UTC stamp must not come back: no build number is minted from
+  // the clock, and there is no timestamp fallback for the case where the
+  // commit count cannot be read.
+  assert.doesNotMatch(ship, /date -u \+%Y%m%d%H%M/);
+  assert.doesNotMatch(ship, /utc_build_stamp/);
   assert.match(ship, /-allowProvisioningUpdates/);
 
   const profileMap = JSON.parse(read("ios/appstore-profiles.json"));

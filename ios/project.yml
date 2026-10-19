@@ -48,8 +48,12 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.ios
         DEVELOPMENT_TEAM: CC8UTF7ATG
         CODE_SIGN_STYLE: Automatic
-        MARKETING_VERSION: "1.0.2135"
-        CURRENT_PROJECT_VERSION: "2135"
+        # RECORD OF WHAT SHIPPED, not the source of truth for what ships next:
+        # the ship script passes both values on the xcodebuild command line, and
+        # reads this one as the build-number FLOOR, so it must stay below the
+        # commit count of any commit that can ship.
+        MARKETING_VERSION: "1.0.2132"
+        CURRENT_PROJECT_VERSION: "2132"
         SWIFT_VERSION: '5.9'
         TARGETED_DEVICE_FAMILY: '1,2'
         SUPPORTS_MACCATALYST: false
@@ -142,8 +146,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.ios.widgets
         DEVELOPMENT_TEAM: CC8UTF7ATG
         CODE_SIGN_STYLE: Automatic
-        MARKETING_VERSION: "1.0.2135"
-        CURRENT_PROJECT_VERSION: "2135"
+        MARKETING_VERSION: "1.0.2132"
+        CURRENT_PROJECT_VERSION: "2132"
         SWIFT_VERSION: '5.9'
         TARGETED_DEVICE_FAMILY: '1,2'
         ENABLE_ON_DEMAND_RESOURCES: false
@@ -185,8 +189,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.macos
         DEVELOPMENT_TEAM: CC8UTF7ATG
         CODE_SIGN_STYLE: Automatic
-        MARKETING_VERSION: "1.0.2135"
-        CURRENT_PROJECT_VERSION: "2135"
+        MARKETING_VERSION: "1.0.2132"
+        CURRENT_PROJECT_VERSION: "2132"
         SWIFT_VERSION: '5.9'
         MACOSX_DEPLOYMENT_TARGET: '14.0'
         ENABLE_ON_DEMAND_RESOURCES: false
