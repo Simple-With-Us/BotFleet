@@ -229,8 +229,9 @@ load_secrets() {
     fi
     logerr "ASC_KEY_* unusable and APPLE_API_KEY_P8_BASE64 did not decode to a PEM"
   fi
-  local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" p8
-  [[ -n "$kid" ]] || kid="$(fs_get ASC_KEY_ID /asc)" || kid=""
+  local kid="${ASC_KEY_ID:-}" iss="${ASC_ISSUER_ID:-}" p8 asc_kid
+  asc_kid="$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)"
+  [[ -n "$kid" ]] || kid="$asc_kid"
   [[ -n "$iss" ]] || iss="$(fs_get ASC_ISSUER_ID /asc)" || iss=""
   if [[ -z "$kid" || -z "$iss" ]]; then
     log "ASC credentials missing: set ASC_KEY_ID/ASC_ISSUER_ID/ASC_KEY_PATH or add ASC_KEY_ID and ASC_ISSUER_ID to Infisical /asc"
@@ -239,7 +240,7 @@ load_secrets() {
   # /asc holds one key.  A key id from the environment that differs from it
   # has no Infisical copy:  fail with a clear message rather than guess.
   p8=""
-  if [[ "$kid" == "$(fs_get ASC_KEY_ID /asc 2>/dev/null || true)" ]]; then
+  if [[ "$kid" == "$asc_kid" ]]; then
     p8="$(fs_get ASC_KEY_P8 /asc)" || p8=""
   fi
   if [[ -z "$p8" ]]; then

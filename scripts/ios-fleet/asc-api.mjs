@@ -122,12 +122,13 @@ function resolveCredential() {
   // 2) The Mac: Infisical Fleet-OPS through fleet-secrets, in memory only.
   //    A hosted runner has no fleet-secrets, so this finds nothing there and
   //    falls through to 3.
-  const kid = envKeyId || fleetSecretsGet("ASC_KEY_ID", "/asc");
+  const ascKid = fleetSecretsGet("ASC_KEY_ID", "/asc");
+  const kid = envKeyId || ascKid;
   const iss = envIssuer || fleetSecretsGet("ASC_ISSUER_ID", "/asc");
   if (kid && iss) {
     // /asc holds one key.  An environment key id that differs from it has no
     // Infisical copy, so it falls through to source 3 or the "tried" message.
-    const pem = kid === fleetSecretsGet("ASC_KEY_ID", "/asc") ? fleetSecretsGet("ASC_KEY_P8", "/asc") : "";
+    const pem = kid === ascKid ? fleetSecretsGet("ASC_KEY_P8", "/asc") : "";
     if (pem.includes("-----BEGIN ")) {
       return { keyId: kid.trim(), issuerId: iss.trim(), privateKeyPem: `${pem}\n`, source: "Infisical (fleet-secrets)" };
     }
