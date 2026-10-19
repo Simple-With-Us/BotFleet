@@ -19,10 +19,25 @@ export interface ApnsConfig {
   production: boolean;
 }
 
-/** The Infisical name of an APNs signing key: the Fleet-OPS root holds one
- * `AUTHKEY_<KEY_ID>` per Apple key (AFC-359: the retired secrets folder is never read). */
-export function apnsVaultName(keyId: string): string {
-  return `AUTHKEY_${keyId}`;
+/** The fleet's shared APNs key (Simple With Us team CC8UTF7ATG), used when
+ * neither the environment nor Infisical names another one (AFC-359). */
+export const SHARED_APNS_KEY_ID = "HSJ98QN95V";
+/** Fleet-OPS root names of the shared key:  references into `/apns`, so a
+ * rotation there reaches the sidecar without a code change. */
+export const SHARED_APNS_KEY_ID_NAME = "APNS_KEY_ID";
+export const SHARED_APNS_P8_NAME = "APNS_KEY_P8";
+
+/** The Infisical name of an APNs signing key.  With no key id it is the
+ * shared key (`APNS_KEY_P8`);  a key pinned by `APNS_KEY_ID` in the
+ * environment is read as `AUTHKEY_<KEY_ID>`, one per Apple key (AFC-359: the
+ * retired secrets folder is never read). */
+export function apnsVaultName(keyId?: string): string {
+  return keyId ? `AUTHKEY_${keyId}` : SHARED_APNS_P8_NAME;
+}
+
+/** The key id pinned in the environment, if any. */
+function pinnedKeyId(): string | undefined {
+  return process.env.APNS_KEY_ID?.trim() || undefined;
 }
 
 /** The `fleet-secrets` binary.  `FLEET_SECRETS_BIN` is the test seam. */
@@ -39,6 +54,8 @@ export const APNS_VAULT_CACHE_MS = 4 * 60 * 1000;
 export const APNS_VAULT_RETRY_MS = 30_000;
 
 interface VaultKey {
+  /** The pinned key id this read was for, or "" for the shared key. */
+  pin: string;
   keyId: string;
   p8: string | null;
   at: number;
@@ -51,58 +68,86 @@ export function resetApnsKeyCache(): void {
   vaultKey = null;
 }
 
-function readVaultP8(keyId: string, now = Date.now()): string | null {
-  if (vaultKey && vaultKey.keyId === keyId && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : APNS_VAULT_RETRY_MS)) {
-    return vaultKey.p8;
-  }
-  let p8: string | null = null;
+function fleetSecretsGet(name: string): string | null {
   try {
-    const out = execFileSync(fleetSecretsBin(), ["get", apnsVaultName(keyId)], {
+    const out = execFileSync(fleetSecretsBin(), ["get", name], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 10_000,
     });
-    p8 = out.replace(/\n$/, "");
+    return out.replace(/\n$/, "");
   } catch {
-    p8 = null;
+    return null;
   }
-  if (p8 === null && vaultKey && vaultKey.keyId === keyId && vaultKey.p8) {
+}
+
+/** The key id Infisical names for the shared key, or null when the read
+ * fails or does not look like an Apple key id. */
+function sharedKeyId(): string | null {
+  const id = fleetSecretsGet(SHARED_APNS_KEY_ID_NAME)?.trim();
+  return id && /^[A-Z0-9]{10}$/.test(id) ? id : null;
+}
+
+function readVault(now = Date.now()): VaultKey {
+  const pin = pinnedKeyId() ?? "";
+  if (vaultKey && vaultKey.pin === pin && now - vaultKey.at < (vaultKey.p8 ? APNS_VAULT_CACHE_MS : APNS_VAULT_RETRY_MS)) {
+    return vaultKey;
+  }
+  const p8 = fleetSecretsGet(apnsVaultName(pin || undefined));
+  if (p8 === null && vaultKey && vaultKey.pin === pin && vaultKey.p8) {
     // A transient failure keeps the last good key (pushes keep flowing) and
     // is retried after the short window rather than the long one.
-    vaultKey = { keyId, p8: vaultKey.p8, at: now - (APNS_VAULT_CACHE_MS - APNS_VAULT_RETRY_MS) };
-    return vaultKey.p8;
+    vaultKey = { ...vaultKey, at: now - (APNS_VAULT_CACHE_MS - APNS_VAULT_RETRY_MS) };
+    return vaultKey;
   }
-  vaultKey = { keyId, p8, at: now };
-  return p8;
+  if (pin || p8 === null) {
+    vaultKey = { pin, keyId: pin || SHARED_APNS_KEY_ID, p8, at: now };
+    return vaultKey;
+  }
+  const id = sharedKeyId();
+  if (id) {
+    vaultKey = { pin, keyId: id, p8, at: now };
+    return vaultKey;
+  }
+  // The PEM read but its id did not:  keep the last good id for the same
+  // key, otherwise use the built-in id, and retry after the short window
+  // either way.  The id is part of the stamp, so a fault Apple records
+  // against a wrong fallback id clears once the real id is read.
+  const keyId = vaultKey && vaultKey.pin === pin && vaultKey.p8 === p8 ? vaultKey.keyId : SHARED_APNS_KEY_ID;
+  vaultKey = { pin, keyId, p8, at: now - (APNS_VAULT_CACHE_MS - APNS_VAULT_RETRY_MS) };
+  return vaultKey;
 }
 
 /** Where the signing key comes from, as text for status lines.  Never the
  * contents.  Order: `APNS_P8` (the PEM itself, for a host that injects it),
- * then `APNS_P8_PATH` (an explicit file), then Infisical (`fleet-secrets get
- * AUTHKEY_<KEY_ID>`). */
+ * then `APNS_P8_PATH` (an explicit file), then Infisical:  `AUTHKEY_<KEY_ID>`
+ * when `APNS_KEY_ID` pins a key, otherwise the shared `APNS_KEY_P8`. */
 export function apnsKeySource(): string {
-  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
   if (process.env.APNS_P8?.trim()) return "APNS_P8 environment";
   const explicit = process.env.APNS_P8_PATH?.trim();
   if (explicit) return explicit;
-  return `Infisical ${apnsVaultName(keyId)}`;
+  return `Infisical ${apnsVaultName(pinnedKeyId())}`;
 }
 
-function resolveP8(): { p8: string; origin: string } | null {
-  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
+function resolveP8(): { p8: string; origin: string; keyId: string } | null {
+  const pinned = pinnedKeyId();
   const inline = process.env.APNS_P8?.trim();
-  if (inline) return { p8: inline, origin: "env" };
+  if (inline) return { p8: inline, origin: "env", keyId: pinned ?? SHARED_APNS_KEY_ID };
   const explicit = process.env.APNS_P8_PATH?.trim();
   if (explicit) {
     try {
       if (!existsSync(explicit)) return null;
-      return { p8: readFileSync(explicit, "utf8"), origin: `${explicit}:${statSync(explicit).mtimeMs}` };
+      return {
+        p8: readFileSync(explicit, "utf8"),
+        origin: `${explicit}:${statSync(explicit).mtimeMs}`,
+        keyId: pinned ?? SHARED_APNS_KEY_ID,
+      };
     } catch {
       return null;
     }
   }
-  const p8 = readVaultP8(keyId);
-  return p8 ? { p8, origin: "vault" } : null;
+  const got = readVault();
+  return got.p8 ? { p8: got.p8, origin: "vault", keyId: got.keyId } : null;
 }
 
 /** A fingerprint of the key — where it came from plus a one-way digest of
@@ -118,17 +163,18 @@ function resolveP8(): { p8: string; origin: string } | null {
 export function apnsKeyStamp(): string | null {
   const got = resolveP8();
   if (!got) return null;
-  const digest = createHash("sha256").update(got.p8).digest("hex").slice(0, 16);
+  // The key id is hashed with the PEM:  the same PEM under a different id is
+  // a different signing identity to Apple.
+  const digest = createHash("sha256").update(`${got.keyId}\n${got.p8}`).digest("hex").slice(0, 16);
   return `${apnsKeySource()}:${digest}`;
 }
 
 export function loadApnsConfig(): ApnsConfig | null {
-  const keyId = process.env.APNS_KEY_ID?.trim() || "N3949G7CN6";
   const teamId = process.env.APNS_TEAM_ID?.trim() || "CC8UTF7ATG";
   const bundleId = process.env.APNS_BUNDLE_ID?.trim() || "app.botfleet.ios";
   const got = resolveP8();
   if (!got) return null;
-  const p8 = got.p8;
+  const { p8, keyId } = got;
   if (!p8.includes("BEGIN PRIVATE KEY")) return null;
   return {
     keyId,

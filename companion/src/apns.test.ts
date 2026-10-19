@@ -15,6 +15,7 @@ import {
   apnsKeyStamp,
   loadApnsConfig,
   resetApnsKeyCache,
+  SHARED_APNS_KEY_ID,
   apnsPayload,
   classifyHttpResponse,
   classifyTransportError,
@@ -3306,10 +3307,59 @@ describe("APNs signing key source (AFC-359: the retired secrets folder is never 
     expect(apnsKeySource()).toBe("Infisical AUTHKEY_KEY1234567");
   });
 
+  it.skipIf(process.platform === "win32")("reads the shared key from APNS_KEY_P8 and its id from APNS_KEY_ID by default", () => {
+    const argsFile = join(dir, "args");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
+      `echo "$@" >> '${argsFile}'\ncase "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(testP8())}\n ;;\n  *) exit 3 ;;\nesac`,
+    );
+    const config = loadApnsConfig();
+    expect(config?.keyId).toBe("ROTATED001");
+    expect(config?.p8).toContain("BEGIN PRIVATE KEY");
+    expect(readFileSync(argsFile, "utf8").trim().split("\n")).toEqual(["get APNS_KEY_P8", "get APNS_KEY_ID"]);
+    expect(apnsKeySource()).toBe("Infisical APNS_KEY_P8");
+  });
+
+  it.skipIf(process.platform === "win32")("falls back to the shared key id when Infisical has no usable APNS_KEY_ID", () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(
+      `case "$2" in\n  APNS_KEY_P8) ${pemScript(testP8())}\n ;;\n  *) exit 3 ;;\nesac`,
+    );
+    expect(loadApnsConfig()?.keyId).toBe(SHARED_APNS_KEY_ID);
+    expect(SHARED_APNS_KEY_ID).toBe("HSJ98QN95V");
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the last good key id when only the id read fails, and stamps the id", () => {
+    const pem = testP8();
+    const ok = `case "$2" in\n  APNS_KEY_ID) echo ROTATED001 ;;\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
+    const noId = `case "$2" in\n  APNS_KEY_P8) ${pemScript(pem)}\n ;;\n  *) exit 3 ;;\nesac`;
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(ok);
+    const good = apnsKeyStamp();
+    expect(loadApnsConfig()?.keyId).toBe("ROTATED001");
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(noId);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + APNS_VAULT_CACHE_MS + 1);
+      expect(loadApnsConfig()?.keyId).toBe("ROTATED001");
+      expect(apnsKeyStamp()).toBe(good);
+      // A cold start with no id falls back to the built-in id, and the stamp
+      // differs, so a fault recorded under it does not outlive the real id.
+      resetApnsKeyCache();
+      expect(loadApnsConfig()?.keyId).toBe(SHARED_APNS_KEY_ID);
+      expect(apnsKeyStamp()).not.toBe(good);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the shared key id with an injected APNS_P8 and no pinned id", () => {
+    process.env.FLEET_SECRETS_BIN = fakeFleetSecrets("exit 3");
+    process.env.APNS_P8 = testP8();
+    expect(loadApnsConfig()?.keyId).toBe("HSJ98QN95V");
+  });
+
   it.skipIf(process.platform === "win32")("stamps the key with a digest, so a rotated key changes the stamp", () => {
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
     const first = apnsKeyStamp();
-    expect(first).toMatch(/^Infisical AUTHKEY_N3949G7CN6:[0-9a-f]{16}$/);
+    expect(first).toMatch(/^Infisical APNS_KEY_P8:[0-9a-f]{16}$/);
     resetApnsKeyCache();
     process.env.FLEET_SECRETS_BIN = fakeFleetSecrets(pemScript(testP8()));
     expect(apnsKeyStamp()).not.toBe(first);
