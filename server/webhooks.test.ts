@@ -477,7 +477,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "requested",
         workflow_run: { id: 12345, status: "queued" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const requestedResult = h.manager.receive(compileHook.endpointId, compileSecret, requestedEvent);
@@ -596,7 +596,7 @@ describe("WebhookManager", () => {
           status: "completed",
           conclusion: "failure",
         },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const completedCheckResult = h.manager.receive(compileHook.endpointId, compileSecret, completedCheckEvent);
@@ -612,7 +612,7 @@ describe("WebhookManager", () => {
           id: 54322,
           status: "in_progress",
         },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const activeCheckResult = h.manager.receive(compileHook.endpointId, compileSecret, activeCheckEvent);
@@ -628,7 +628,7 @@ describe("WebhookManager", () => {
           status: "completed",
           conclusion: "success",
         },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const successfulCheckResult = h.manager.receive(compileHook.endpointId, compileSecret, successfulCheckEvent);
@@ -801,7 +801,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "opened",
         pull_request: { id: 111, merged: false },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const prOpenResult = h.manager.receive(compileHook.endpointId, compileSecret, prOpenEvent);
@@ -812,7 +812,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "closed",
         pull_request: { id: 112, merged: false },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const prUnmergedClosedResult = h.manager.receive(compileHook.endpointId, compileSecret, prUnmergedClosedEvent);
@@ -823,7 +823,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "closed",
         pull_request: { id: 113, merged: true, merged_at: "2026-09-24T09:00:00Z" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const prMergedClosedResult = h.manager.receive(compileHook.endpointId, compileSecret, prMergedClosedEvent);
@@ -866,7 +866,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "completed",
         check_suite: { id: 701, status: "completed", conclusion: "success" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     expect(h.manager.receive(compileHook.endpointId, compileSecret, successfulSuiteEvent)).toMatchObject({ ignored: true });
@@ -876,7 +876,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "completed",
         check_suite: { id: 702, status: "completed", conclusion: "failure" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const failedSuiteResult = h.manager.receive(compileHook.endpointId, compileSecret, failedSuiteEvent);
@@ -888,7 +888,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "in_progress",
         workflow_job: { id: 801, status: "in_progress" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     expect(h.manager.receive(compileHook.endpointId, compileSecret, inProgressJobEvent)).toMatchObject({ ignored: true });
@@ -898,7 +898,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "completed",
         workflow_job: { id: 802, status: "completed", conclusion: "failure" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const failedJobResult = h.manager.receive(compileHook.endpointId, compileSecret, failedJobEvent);
@@ -933,7 +933,7 @@ describe("WebhookManager", () => {
       payload: {
         state: "pending",
         sha: "abc1234",
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const pendingStatusResult = h.manager.receive(compileHook.endpointId, compileSecret, pendingStatusEvent);
@@ -944,7 +944,7 @@ describe("WebhookManager", () => {
       payload: {
         state: "success",
         sha: "abc1234",
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const successStatusResult = h.manager.receive(compileHook.endpointId, compileSecret, successStatusEvent);
@@ -955,7 +955,7 @@ describe("WebhookManager", () => {
       payload: {
         state: "failure",
         sha: "abc1234",
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade", name: "Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade", name: "Socratic-Trade" },
       },
     };
     const failureStatusResult = h.manager.receive(compileHook.endpointId, compileSecret, failureStatusEvent);
@@ -1100,7 +1100,7 @@ describe("WebhookManager", () => {
       deliveryId: "push-1",
       payload: {
         ref: "refs/heads/main",
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     const pushResult = h.manager.receive(compileHook.endpointId, compileSecret, pushEvent);
@@ -1582,7 +1582,7 @@ describe("WebhookManager", () => {
         action: "edited",
         sender: { login: "github-actions[bot]" },
         issue: { number: 171, title: "Align analytics endpoint schemas", state: "closed" },
-        repository: { full_name: "jaywedgeworth22/congress-trading-shared" },
+        repository: { full_name: "Simple-With-Us/congress-trading-shared" },
       },
     };
     const botIssueResult = h.manager.receive(deployerHook.endpointId, deployerSecret, botIssueEdit);
@@ -1614,7 +1614,7 @@ describe("WebhookManager", () => {
         sender: { login: "jaywedgeworth22" },
         assignee: { login: "BF-Deployer" },
         issue: { number: 172, title: "Please help deploy this", state: "open" },
-        repository: { full_name: "jaywedgeworth22/Socratic.Trade" },
+        repository: { full_name: "Simple-With-Us/Socratic-Trade" },
       },
     };
     const deployerAssignResult = h.manager.receive(deployerHook.endpointId, deployerSecret, humanIssueAssign);
@@ -1628,7 +1628,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "opened",
         pull_request: { number: 10, draft: true, state: "open" },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     expect(h.manager.receive(deployerHook.endpointId, deployerSecret, draftPr)).toMatchObject({ ignored: true });
@@ -1639,7 +1639,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "closed",
         pull_request: { number: 11, draft: false, state: "closed", merged: false },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     expect(h.manager.receive(deployerHook.endpointId, deployerSecret, unmergedClosedPr)).toMatchObject({ ignored: true });
@@ -1650,7 +1650,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "closed",
         pull_request: { number: 12, draft: false, state: "closed", merged: true, merged_at: "2026-09-28T07:00:00Z" },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     const mergedResult = h.manager.receive(deployerHook.endpointId, deployerSecret, mergedClosedPr);
@@ -1674,7 +1674,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "created",
         check_run: { id: 100, status: "in_progress", conclusion: null },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     expect(h.manager.receive(deployerHook.endpointId, deployerSecret, inProgressCheck)).toMatchObject({ ignored: true });
@@ -1685,7 +1685,7 @@ describe("WebhookManager", () => {
       payload: {
         action: "completed",
         check_run: { id: 101, status: "completed", conclusion: "success" },
-        repository: { full_name: "jaywedgeworth22/BotFleet" },
+        repository: { full_name: "Simple-With-Us/BotFleet" },
       },
     };
     const deployerCompletedCheckResult = h.manager.receive(deployerHook.endpointId, deployerSecret, completedCheck);
