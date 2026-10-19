@@ -47,6 +47,19 @@ function parseApi(schema, raw) {
   return parsed.data;
 }
 
+// JSON.parse accepts a scalar or an array as readily as an object, and neither is
+// a Sentry field-level error map.  Only a plain object counts as a reportable
+// validation body.
+function parseJsonObject(body) {
+  const value = parseJson(body);
+  return value && !Array.isArray(value) ? value : null;
+}
+
+function parseJson(body) {
+  try { return JSON.parse(body); }
+  catch { return null; }
+}
+
 // Sentry puts the actionable reason in the error body ("Invalid repository
 // names: ...", a field-level validation map).  Discarding it is what made this
 // cost three fixes: each one cleared a layer and hid the next behind the same
@@ -59,14 +72,14 @@ async function describeFailure(response, token) {
   try { body = await response.text(); }
   catch { return ""; }
   if (!body?.trim()) return "";
-  let parsed;
-  try { parsed = JSON.parse(body); }
-  catch { return ""; }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return "";
+  // Parse at the boundary once.  Sentry's field-level errors are a JSON object;
+  // an array, a scalar or unparseable text is not one, and is not reported.
+  const parsed = parseJsonObject(body);
+  if (!parsed) return "";
   const scrubbed = JSON.stringify(parsed)
     .split(token)
     .join("[redacted]")
-    .replace(/bearer\s+[\w.\-]+/gi, "bearer [redacted]")
+    .replace(/bearer\s+[\w.-]+/gi, "bearer [redacted]")
     .replace(/(["']?(?:token|secret|authorization|dsn|password)["']?\s*[:=]\s*)["']?[^"',}\s]+/gi, "$1[redacted]");
   return `: ${scrubbed.replace(/\s+/g, " ").slice(0, 300)}`;
 }
