@@ -105,3 +105,23 @@ test("autofix callers keep their least-privilege and fork guards", () => {
   assert.match(claude, /github\.event\.review\.user\.type == 'Bot'/);
   assert.match(claude, /github\.event\.pull_request\.head\.repo\.full_name == github\.repository/);
 });
+
+test("Claude Autofix keeps the Sentry-capable pin and same-repository bot gate", () => {
+  const claude = read(".github/workflows/claude-code-autofix.yml");
+  // AFC #657 was inspected: only sentry and sentry[bot] were added to the
+  // prior bot list.  Do not override that reviewed policy or restore the old pin.
+  assert.match(
+    claude,
+    /claude-code-autofix-reusable\.yml@c79c7840d4d3d71bffad08067ce4a1084f0bbb34/,
+  );
+  assert.doesNotMatch(claude, /^\s+allowed_bots:/m);
+  const guard = claude.match(/^ {4}if: >-\n([\s\S]*?)^ {4}uses:/m)?.[1];
+  assert.ok(guard, "Claude Autofix has a job-level guard");
+  assert.equal(
+    guard.replace(/\s+/g, " ").trim(),
+    "github.event_name == 'workflow_dispatch' || " +
+      "(github.event_name == 'pull_request_review' && " +
+      "github.event.review.user.type == 'Bot' && " +
+      "github.event.pull_request.head.repo.full_name == github.repository)",
+  );
+});
