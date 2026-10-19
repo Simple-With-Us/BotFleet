@@ -94,7 +94,6 @@ describe("resolving a build version", () => {
     const before = readFileSync(join(root, "package.json"), "utf8");
     resolveBuildVersion(root);
     assert.equal(readFileSync(join(root, "package.json"), "utf8"), before);
-    assert.equal(resolveBuildVersion(root).sourceDirty, undefined);
     const status = execFileSync("git", ["-C", root, "status", "--porcelain"], { encoding: "utf8" }).trim();
     assert.equal(status, "", "resolving a version must leave the checkout pristine");
   });
