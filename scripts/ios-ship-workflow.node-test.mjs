@@ -274,7 +274,7 @@ test("asc-api.mjs resolves its credential from all three sources", () => {
   // Source 1: ASC_* already exported.  Source 2: Infisical through fleet-secrets (AFC-359).
   // Source 3: the APPLE_API_* names ios-ship.yml exports from Infisical.
   assert.match(asc, /process\.env\.ASC_KEY_ID/);
-  assert.match(asc, /fleetSecretsGet\("ASC_KEY_ID", "\/appstore-connect"\)/);
+  assert.match(asc, /fleetSecretsGet\("ASC_KEY_ID", "\/asc"\)/);
   assert.doesNotMatch(asc, /homedir\(\), "\.secrets"/);
   assert.match(asc, /APPLE_API_KEY_P8_BASE64/);
   // The base64 p8 is materialized privately and unlinked on exit.

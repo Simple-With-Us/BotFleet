@@ -14,9 +14,8 @@ Hosted signing comes from existing repo Actions secrets
 `IOS_CERT_P12_BASE64`, `IOS_CERT_PASSWORD`).  `scripts/ios-appstore-gm-prepare.sh`
 checks the p8 and imports the Distribution identity (the ship step decodes
 the APPLE_API_* names into a private temp file).  On Jay's Mac the ASC key
-comes from Infisical Fleet-OPS (`/appstore-connect` `ASC_KEY_ID` and
-`ASC_ISSUER_ID`, the .p8 in `/authkey-<key id lowercase>-p8`) through
-`fleet-secrets`.  Do not mint a new App Store Connect key.  CI invokes the
+comes from Infisical Fleet-OPS `/asc` (`ASC_KEY_ID`, `ASC_ISSUER_ID`,
+`ASC_KEY_P8`) through `fleet-secrets`.  Do not mint a new App Store Connect key.  CI invokes the
 wrapper with no extra flags.
 
 The `.xcodeproj` is gitignored; hosted ships must run `xcodegen generate`

@@ -6,10 +6,9 @@
  * Auth: resolves ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH from the first
  * source that is actually present (never prints values):
  *   1. ASC_KEY_* in the environment (DealDex's ios-ship.yml exports these)
- *   2. Infisical Fleet-OPS through `fleet-secrets` (the Mac): ASC_KEY_ID and
- *      ASC_ISSUER_ID from /appstore-connect, the .p8 PEM from
- *      /authkey-<key id lowercase>-p8 AUTHKEY_<KEY_ID>, kept in memory only
- *      (AFC-359: nothing reads ~/.secrets)
+ *   2. Infisical Fleet-OPS through `fleet-secrets` (the Mac): /asc holds
+ *      ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 (the PEM), kept in memory
+ *      only (AFC-359: nothing reads ~/.secrets)
  *   3. APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64
  *      (the names BotFleet's ios-ship.yml exports from Infisical; the p8 is
  *      base64, so it is decoded into a 0600 temp file and removed on exit)
@@ -123,10 +122,13 @@ function resolveCredential() {
   // 2) The Mac: Infisical Fleet-OPS through fleet-secrets, in memory only.
   //    A hosted runner has no fleet-secrets, so this finds nothing there and
   //    falls through to 3.
-  const kid = envKeyId || fleetSecretsGet("ASC_KEY_ID", "/appstore-connect");
-  const iss = envIssuer || fleetSecretsGet("ASC_ISSUER_ID", "/appstore-connect");
+  const kid = envKeyId || fleetSecretsGet("ASC_KEY_ID", "/asc");
+  const iss = envIssuer || fleetSecretsGet("ASC_ISSUER_ID", "/asc");
   if (kid && iss) {
-    const pem = fleetSecretsGet(`AUTHKEY_${kid}`, `/authkey-${kid.toLowerCase()}-p8`);
+    // /asc holds one key (ASC_KEY_P8).  When the environment names another
+    // key id, the per-key folder /authkey-<id lowercase>-p8 holds its PEM.
+    let pem = kid === fleetSecretsGet("ASC_KEY_ID", "/asc") ? fleetSecretsGet("ASC_KEY_P8", "/asc") : "";
+    if (!pem) pem = fleetSecretsGet(`AUTHKEY_${kid}`, `/authkey-${kid.toLowerCase()}-p8`);
     if (pem.includes("-----BEGIN ")) {
       return { keyId: kid.trim(), issuerId: iss.trim(), privateKeyPem: `${pem}\n`, source: "Infisical (fleet-secrets)" };
     }
@@ -647,7 +649,7 @@ async function main() {
     console.error(
       "asc-auth: no App Store Connect credential found. Tried, in order:\n" +
       "  1) ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH in the environment\n" +
-      "  2) Infisical /appstore-connect + /authkey-<id>-p8 (fleet-secrets)\n" +
+      "  2) Infisical /asc (fleet-secrets)\n" +
       "  3) APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64 in the environment"
     );
     process.exit(1);
