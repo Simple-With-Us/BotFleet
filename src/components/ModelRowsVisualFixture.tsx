@@ -30,8 +30,8 @@ const ROWS: Option[] = [
     id: "MiniMax-M3.1-Flash",
     label: "MiniMax M3.1 Flash · thinking",
     contextWindow: 1_000_000,
-    badge: "Preview",
-    badgeTitle: "Preview build — expect churn.",
+    badge: "Stable",
+    badgeTitle: "Generally available, not a preview build.",
   },
   {
     id: "MiniMax-M2.7-Highspeed-thinking",
