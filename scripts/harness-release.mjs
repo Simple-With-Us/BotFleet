@@ -126,9 +126,15 @@ async function main() {
   }
 
   if (command === "swap") {
-    const displaced = await swapCurrent({ commit, env });
+    const result = await swapCurrent({ commit, env });
     process.stdout.write(`current: ${releasePath(commit, env)}\n`);
-    if (displaced) process.stdout.write(`previous release kept: ${displaced?.path ?? displaced}\n`);
+    // swapCurrent answers { activated, previous, atomic }.  `previous` is the
+    // release that was displaced, and it is null when nothing was displaced
+    // (the first activation), so it is checked rather than printed blindly.
+    if (result.previous) process.stdout.write(`previous release kept: ${result.previous}\n`);
+    if (!result.atomic) {
+      process.stdout.write("the pointer swap was not atomic; the old release was put back\n");
+    }
     return 0;
   }
 
@@ -142,9 +148,9 @@ async function main() {
     });
     const path = await promoteStaging({ commit, env });
     process.stdout.write(`promoted: ${path}\n`);
-    const displaced = await swapCurrent({ commit, env });
+    const result = await swapCurrent({ commit, env });
     process.stdout.write(`current: ${releasePath(commit, env)}\n`);
-    if (displaced) process.stdout.write(`previous release kept: ${displaced?.path ?? displaced}\n`);
+    if (result.previous) process.stdout.write(`previous release kept: ${result.previous}\n`);
     process.stdout.write("restart the harness to run the new release (launchctl kickstart -k gui/$(id -u)/app.botfleet.server)\n");
     return 0;
   }

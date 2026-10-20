@@ -6,10 +6,8 @@ checkout.
 
 ## What "the always-on checkout" meant
 
-The always-on Mac harness runs from `~/apps/botfleet-server`, which was a
-**linked git worktree of the human's own tree** (`~/Code/BotFleet`,
-registered as `.git/worktrees/botfleet-server`), checked out at a detached
-`origin/main`.  The LaunchAgent's wrapper `exec`ed
+The always-on Mac harness ran from a **linked git worktree of the human's
+own tree**, checked out at a detached `origin/main`.  The LaunchAgent's wrapper `exec`ed
 `node --experimental-strip-types server/index.ts` out of it, so the
 process serving the UI, the phones, the webhook receiver, and the Zulip
 listener was running code out of a working tree that any seat could
@@ -62,9 +60,8 @@ that has never promoted a release.  `BOTFLEET_SERVER_ROOT` still wins,
 so tests and operators can point it elsewhere.
 
 **The agent points at the pointer.**  `scripts/launchd/app.botfleet.server.plist`
-sets `BOTFLEET_SERVER_ROOT=/Users/jay/.botfleet/current` and moves
-`WorkingDirectory` to `/Users/jay/.botfleet` — the store root, which
-always exists, rather than the pointer, because launchd refuses to start
+sets `BOTFLEET_SERVER_ROOT` to the store's `current` pointer and moves
+`WorkingDirectory` to the store root, which always exists, rather than the pointer, because launchd refuses to start
 a job whose working directory does not exist, and a missing pointer must
 fail inside the launcher (with its own message) rather than silently
 leaving the job unloaded.
@@ -109,8 +106,8 @@ rather than an outage.
    not use the store's staging path.  Until `ubf` promotes and swaps,
    the store is operator-driven: one command, then a restart.
 2. The updater's own `CHECKOUT` default still points at
-   `~/apps/botfleet-server`.  That is a build source, not a runtime
-   root, so it is not a daily-operation dependency — but it should move
-   to the same immutable story eventually.
-3. `~/apps/botfleet-server` is now a build source only.  It can be
+   the deployment checkout.  That is a build source, not a runtime root,
+   so it is not a daily-operation dependency — but it should move to the
+   same immutable story eventually.
+3. The deployment checkout is now a build source only.  It can be
    retired once the updater prepares releases from fetched objects.

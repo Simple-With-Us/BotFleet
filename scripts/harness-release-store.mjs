@@ -299,6 +299,18 @@ export async function stageRelease({
       "not-a-commit",
     );
   }
+  // A commit that is already a release is not staged again.  Promoting it
+  // would fail with `already-released` AFTER a full dependency install, so
+  // the check has to come first: the install is the expensive part, and the
+  // staging tree it leaves behind is a leftover nobody asked for.
+  if (await isReleaseDirectory(releasePath(commit, env))) {
+    throw new ResolutionError(
+      `Commit ${commit.slice(0, 12)} is already a release at ${releasePath(commit, env)}; nothing to stage.  ` +
+        "Point the pointer at it with `swap`, or pick a different commit.",
+      "already-released",
+      { releasePath: releasePath(commit, env) },
+    );
+  }
   const source = repo || env.BOTFLEET_RELEASE_SOURCE_REPO || "";
   if (!source) {
     throw new ResolutionError(

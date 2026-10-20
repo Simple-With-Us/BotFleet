@@ -922,3 +922,19 @@ test("a staged commit promotes into an immutable release and the pointer moves t
   // resolves it first.
   assert.equal(await resolveCurrent(env), await realpath(promoted));
 });
+
+test("staging refuses a commit that is already a release, before installing anything", async (t) => {
+  const { env } = await store(t);
+  const { repo, commit } = await sourceRepo(t);
+  await stageRelease({ commit, repo, env, install: false });
+  await promoteStaging({ commit, env });
+  // The install is the expensive part, so the refusal has to come before it:
+  // promoting an already-released commit would fail only AFTER a full
+  // dependency install, and would leave a staging tree behind.
+  await assert.rejects(
+    () => stageRelease({ commit, repo, env, install: false }),
+    /already a release/,
+  );
+  // And no staging tree is left behind by the refusal.
+  await assert.rejects(() => stat(stagingPath(commit, env)), /ENOENT/);
+});
