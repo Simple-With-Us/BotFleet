@@ -43,6 +43,16 @@ describe("isRetiredModelId", () => {
     expect(isRetiredModelId("MiniMax-M3")).toBe(true);
     expect(isRetiredModelId("MiniMax-M3.1-Flash-Preview")).toBe(false);
   });
+
+  it("scopes the M3.1 Flash Preview retirement to dsh", () => {
+    expect(isRetiredModelId("MiniMax-M3.1-Flash-Preview", "dsh")).toBe(true);
+    expect(isRetiredModelId("MiniMax-M3.1-Flash-Preview", "minimax")).toBe(false);
+    expect(isRetiredModelId("MiniMax-M3.1-Flash", "dsh")).toBe(false);
+    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-Preview", "dsh")).toBe("MiniMax-M3.1-Flash");
+    expect(rewriteRetiredModelId("MiniMax-M3.1-Flash-Preview", "minimax")).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(rewriteRetiredModelId("MiniMax-M3", "dsh")).toBe("MiniMax-M3.1-Flash");
+    expect(rewriteRetiredModelId("MiniMax-M3", "minimax")).toBe("MiniMax-M3.1-Flash-Preview");
+  });
 });
 
 describe("rewriteModelSelection", () => {
@@ -58,7 +68,8 @@ describe("rewriteModelSelection", () => {
     expect(changed).toBe(true);
     expect(selection).toEqual({
       instanceId: "dsh",
-      model: "MiniMax-M3.1-Flash-Preview",
+      // dsh's own M3.1 spelling: its engine dropped the Preview suffix.
+      model: "MiniMax-M3.1-Flash",
       fallbacks: [
         { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
         { instanceId: "grok", model: "grok-4.6" },
@@ -86,12 +97,37 @@ describe("rewriteModelSelection", () => {
     });
   });
 
+  it("moves a saved dsh M3.1 Flash Preview selection onto the id dsh offers (BOTFLEET-4E)", () => {
+    const { selection, changed } = rewriteModelSelection({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash-Preview",
+      effort: "high",
+      fallbacks: [
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" },
+      ],
+    });
+    expect(changed).toBe(true);
+    expect(selection).toEqual({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash",
+      effort: "high",
+      fallbacks: [
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash" },
+        // The native MiniMax driver and mcode still serve the Preview ids.
+        { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
+        { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" },
+      ],
+    });
+  });
+
   it("preserves effort and reports unchanged when nothing is retired", () => {
     const input = {
       instanceId: "mcode",
       model: "MiniMax-M3.1-Flash-Preview-thinking",
       effort: "high" as const,
-      fallbacks: [{ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" }],
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" }],
     };
     const { selection, changed } = rewriteModelSelection(input);
     expect(changed).toBe(false);
