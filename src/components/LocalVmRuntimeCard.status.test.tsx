@@ -55,8 +55,13 @@ const storeValue = {
   flushBotPatches: async () => {},
   refreshInstances: async () => {},
 };
-const mountCard = (providers = config.botDefaults!.computerProviders!) => {
-  const testConfig = { ...config, botDefaults: { ...config.botDefaults, computerProviders: providers } } as ConfigStatus;
+const mountCard = (
+  providers: NonNullable<NonNullable<ConfigStatus["botDefaults"]>["computerProviders"]> = config.botDefaults!.computerProviders!,
+) => {
+  const testConfig: ConfigStatus = {
+    ...config,
+    botDefaults: { ...config.botDefaults, computerProviders: providers },
+  };
   return createElement(StoreContext.Provider, { value: { ...storeValue, state: { ...initialState, config: testConfig } } }, createElement(LocalVmRuntimeCard));
 };
 
@@ -103,12 +108,12 @@ async function flush() {
 }
 
 /** Mount the card against `payload` and return what a person can read. */
-async function readCard(payload: unknown, providers?: NonNullable<ConfigStatus["botDefaults"]>["computerProviders"]) {
-  globalThis.fetch = (async () =>
+async function readCard(payload: Record<string, unknown> | null, providers?: NonNullable<NonNullable<ConfigStatus["botDefaults"]>["computerProviders"]>) {
+  globalThis.fetch = async () =>
     new Response(JSON.stringify(payload), {
       status: 200,
       headers: { "content-type": "application/json" },
-    })) as typeof fetch;
+    });
   host = document.createElement("div");
   document.body.appendChild(host);
   root = createRoot(host);
@@ -156,9 +161,9 @@ describe("LocalVmRuntimeCard with the daemon up and no image yet", () => {
 
 describe("LocalVmRuntimeCard when the status check itself fails", () => {
   it("says the status is unavailable and shows the real reason, never a generic headline", async () => {
-    globalThis.fetch = (async () => {
+    globalThis.fetch = async () => {
       throw new TypeError("Load failed");
-    }) as typeof fetch;
+    };
     host = document.createElement("div");
     document.body.appendChild(host);
     root = createRoot(host);
