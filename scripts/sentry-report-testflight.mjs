@@ -50,9 +50,11 @@ function parseApi(schema, raw) {
 // JSON.parse accepts a scalar or an array as readily as an object, and neither is
 // a Sentry field-level error map.  Only a plain object counts as a reportable
 // validation body.
+const validationBodySchema = z.record(z.string(), z.unknown());
+
 function parseJsonObject(body) {
-  const value = parseJson(body);
-  return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  const parsed = validationBodySchema.safeParse(parseJson(body));
+  return parsed.success ? parsed.data : null;
 }
 
 function parseJson(body) {
