@@ -12,13 +12,15 @@ export interface ControlDeps<T extends ControlTarget> {
 
 export class ControlConflict extends Error {}
 
+export interface ShutdownReservation { release(): void }
+
 /** Reserve shutdown before its first await.  All callbacks are synchronous. */
 export function reserveSystemShutdown(options: {
   guard(): void;
   activeWorkCount(): number;
   fence(): void;
   unfence(): void;
-}): { release(): void } {
+}): ShutdownReservation {
   options.guard();
   const count = options.activeWorkCount();
   if (count > 0) throw new ControlConflict(`${count} active operation(s) must finish before the server can stop`);

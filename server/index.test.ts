@@ -714,7 +714,10 @@ describe("harness HTTP API", () => {
       headers: { "content-type": "application/json", "content-length": "2" } });
     held.on("error", () => {});
     held.write("{");
-    const active = async () => ((await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json()) as { activeWorkCount: number }).activeWorkCount;
+    const active = async () => {
+      const runtime = await (await fetch(`${BASE}/api/runtime`, { headers: authorization })).json();
+      return z.object({ activeWorkCount: z.number() }).parse(runtime).activeWorkCount;
+    };
     try {
       await expect.poll(active).toBe(1);
       const refused = await api("POST", "/api/system/control/stop", {});
