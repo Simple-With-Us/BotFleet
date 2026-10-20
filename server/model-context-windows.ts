@@ -9,10 +9,17 @@
 // not a request parameter.
 //
 // The keys are the live catalog ids in lower case.  MiniMax renamed the M3.1
-// Flash rows, and the rename did not move a window: the 512K row and the 1M
-// row keep the sizes the tables above publish.
+// Flash rows, and the rename did not move a window: the model publishes a
+// fixed 1M window, and the 512K in the native driver's own catalog row is the
+// client-side cap the picker offers, not a smaller model.
+//
+// Both rows therefore map to 1M here.  The dsh catalog declares
+// `MiniMax-M3.1-Flash` with a 1M window, so a table entry of 524,288 for
+// that shared id would clamp a dsh turn's own configured budget down by
+// about half; `resolveAcpPromptBudget` treats this table as the clamp
+// authority, so the published window is what belongs in it.
 const WINDOWS: ReadonlyMap<string, number> = new Map([
-  ["minimax-m3.1-flash", 524_288],
+  ["minimax-m3.1-flash", 1_000_000],
   ["minimax-m3.1-flash-1m", 1_000_000],
   ["minimax-m3", 1_000_000],
   ["minimax-m2.7", 204_800],
