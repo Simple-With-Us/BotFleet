@@ -6,10 +6,18 @@ import ServiceManagement
 final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let api = ControlAPI()
     private let startup = StartupPolicy()
+    private let persistence = PersistencePolicy()
+    private let offlineDocker = OfflineDockerVM()
+    private let offlineVMHelper = OfflineVMHelper()
     private var item: NSStatusItem?
     private let menu = NSMenu()
     private var status: ControlStatus?
     private var persistOnExit: Bool?
+    private var installedServerState: InstalledServerState = .unknown
+    private var apiUnavailable = false
+    private var offlineVMs: OfflineDockerState = .unavailable
+    private var helperVMs: [LocalVM]?
+    private var vmProblem: String?
     private var isLoading = false
     private var isBusy = false
     private var problem: String?
@@ -60,11 +68,32 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             do {
                 status = try await api.status()
                 persistOnExit = status?.persistOnExit
+                installedServerState = .running
+                apiUnavailable = false
+                offlineVMs = .unavailable
+                helperVMs = nil
+                vmProblem = nil
                 problem = nil
             } catch {
                 status = nil
-                persistOnExit = nil
-                problem = error.localizedDescription
+                installedServerState = await Task.detached(priority: .userInitiated) { self.startup.installedServerState }.value
+                apiUnavailable = (error as? ControlAPIError) == .unavailable
+                persistOnExit = installedServerState == .stopped && apiUnavailable ? persistence.value : nil
+                if installedServerState == .stopped && apiUnavailable {
+                    if offlineVMHelper.available {
+                        do {
+                            helperVMs = try await Task.detached(priority: .userInitiated) { try self.offlineVMHelper.status() }.value
+                            vmProblem = nil
+                        } catch {
+                            helperVMs = nil
+                            vmProblem = error.localizedDescription
+                        }
+                    } else { helperVMs = nil; vmProblem = nil }
+                    offlineVMs = helperVMs == nil
+                        ? await Task.detached(priority: .userInitiated) { self.offlineDocker.inspect() }.value
+                        : .unavailable
+                } else { offlineVMs = .unavailable; helperVMs = nil; vmProblem = nil }
+                problem = apiUnavailable && installedServerState == .stopped ? nil : error.localizedDescription
             }
             isLoading = false
             rebuildMenu()
@@ -88,20 +117,47 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             add("Local VMs: \(status.runningVMCount) running of \(status.localVms.count)")
             for vm in status.localVms { add("  \(vm.name): \(vm.state ?? (vm.running ? "running" : "unknown"))") }
         } else {
-            add("Server: offline or unknown")
-            add("Local VMs: unknown while server is offline")
+            if apiUnavailable && installedServerState == .stopped { add("Server: stopped") }
+            else if installedServerState == .notInstalled { add("Server: not installed") }
+            else if installedServerState == .running { add("Server: unresponsive") }
+            else { add("Server: unknown") }
+            if apiUnavailable && installedServerState == .stopped, let helperVMs {
+                let running = helperVMs.filter(\.running).count
+                add("Local VMs: \(running) running of \(helperVMs.count)")
+                for vm in helperVMs { add("  \(vm.name): \(vm.state ?? "unknown")") }
+            } else if apiUnavailable && installedServerState == .stopped,
+               case .local(let vms) = offlineVMs {
+                add("Local VMs (Docker): \(offlineVMs.runningCount) running of \(vms.count)")
+                if vms.isEmpty { add("  Managed Docker VMs: none found") }
+                for vm in vms { add("  \(vm.name): \(vm.running ? "running" : "stopped")") }
+            } else { add("Local VMs: unknown while server is offline") }
         }
         if let problem { add("Error: \(problem)") }
+        if let vmProblem { add("Local VM: \(vmProblem)") }
         if status?.sharedVM?.state == "stopped" { add("Local VM requires recreation in BotFleet") }
         if !startup.supportsPolicy { add("Update BotFleet to manage server startup") }
         menu.addItem(.separator())
-        add("Start Server", selector: #selector(startServer), enabled: ready && startup.supportsPolicy && status == nil)
+        add("Start Server", selector: #selector(startServer), enabled: ready && startup.supportsPolicy && apiUnavailable && installedServerState == .stopped)
         add("Stop Server And Local VMs…", selector: #selector(stopServer), enabled: ready && status != nil)
         add("Start Local VM", selector: #selector(startVM), enabled: ready && status?.canStartSharedVM == true)
-        add("Stop Local VMs…", selector: #selector(stopVMs), enabled: ready && status?.runningVMCount ?? 0 > 0)
+        let canCreateOffline = apiUnavailable && installedServerState == .stopped
+            && offlineVMHelper.available && helperVMs?.first(where: { $0.key == "shared" })?.state == "missing"
+        add("Create Local VM (Stopped)…", selector: #selector(createStoppedVM), enabled: ready && canCreateOffline)
+        let offlineRunning = helperVMs?.contains(where: \.running) == true
+        add("Stop Local VMs…", selector: #selector(stopVMs), enabled: ready && (((status?.runningVMCount ?? 0) > 0) ||
+            (apiUnavailable && installedServerState == .stopped && offlineVMHelper.available && offlineRunning)))
+        if status == nil && apiUnavailable && installedServerState == .stopped {
+            if !offlineVMHelper.available { add("Update BotFleet Control to manage Local VMs offline") }
+        }
         menu.addItem(.separator())
-        add("Keep Server Running After Quitting BotFleet", selector: #selector(togglePersist), enabled: ready && persistOnExit != nil,
-            state: persistOnExit == true ? .on : .off)
+        add("Keep Server Running After Quitting BotFleet", selector: #selector(togglePersist),
+            enabled: ready && persistOnExit != nil && (status != nil || (apiUnavailable && installedServerState == .stopped)),
+            state: persistOnExit == nil ? .mixed : (persistOnExit == true ? .on : .off))
+        if status == nil && apiUnavailable && installedServerState == .stopped && persistOnExit == nil {
+            add("Server preference: not set locally")
+            add("Set Keep Running: On", selector: #selector(setOfflinePersistOn), enabled: ready)
+            add("Set Keep Running: Off", selector: #selector(setOfflinePersistOff), enabled: ready)
+        }
         add("Start Server At Login", selector: #selector(toggleStartup), enabled: ready && startup.supportsPolicy,
             state: startup.loginPolicy == .legacy ? .mixed : (startup.startsAtLogin ? .on : .off))
         if startup.loginPolicy == .legacy { add("Login startup: legacy behavior") }
@@ -121,7 +177,14 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { @MainActor in
             do {
                 try await action()
-                if !refresh { status = nil; persistOnExit = nil }
+                if !refresh {
+                    status = nil
+                    persistOnExit = nil
+                    installedServerState = .unknown
+                    apiUnavailable = false
+                    helperVMs = nil
+                    offlineVMs = .unavailable
+                }
             }
             catch { problem = error.localizedDescription; showError(error.localizedDescription) }
             isBusy = false
@@ -149,7 +212,7 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func startServer() {
-        run { [self] in try startup.startServer() }
+        run { [self] in try await Task.detached(priority: .userInitiated) { try self.startup.startServer() }.value }
     }
 
     @objc private func stopServer() {
@@ -162,18 +225,50 @@ final class ControlApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func startVM() { run { [self] in try await api.startVM() } }
 
+    @objc private func createStoppedVM() {
+        guard apiUnavailable && installedServerState == .stopped,
+              confirm("Create Local VM in Stopped State?", "This creates a managed Local VM without starting it.  The server stays stopped.") else { return }
+        run { [self] in
+            guard startup.installedServerState == .stopped else { throw OfflineVMHelperError.refused("BotFleet Server is no longer stopped.") }
+            _ = try await Task.detached(priority: .userInitiated) { try self.offlineVMHelper.createStopped() }.value
+        }
+    }
+
     @objc private func stopVMs() {
         guard confirm("Stop Local VMs?", "Running local VMs will stop.  The server will refuse while bots or leases are busy.") else { return }
-        run { [self] in try await api.stopVMs() }
+        if status != nil {
+            run { [self] in try await api.stopVMs() }
+        } else if apiUnavailable && installedServerState == .stopped {
+            run { [self] in
+                guard startup.installedServerState == .stopped else { throw OfflineVMHelperError.refused("BotFleet Server is no longer stopped.") }
+                _ = try await Task.detached(priority: .userInitiated) { try self.offlineVMHelper.stop() }.value
+            }
+        }
     }
 
     @objc private func togglePersist() {
-        guard let current = persistOnExit else { return }
-        run { [self] in try await api.setPersistOnExit(!current) }
+        guard let persistOnExit else { return }
+        let next = !persistOnExit
+        if status != nil {
+            run { [self] in try await api.setPersistOnExit(next) }
+        } else if apiUnavailable && installedServerState == .stopped {
+            run { [self] in try persistence.set(next) }
+        }
+    }
+
+    @objc private func setOfflinePersistOn() {
+        guard apiUnavailable && installedServerState == .stopped else { return }
+        run { [self] in try persistence.set(true) }
+    }
+
+    @objc private func setOfflinePersistOff() {
+        guard apiUnavailable && installedServerState == .stopped else { return }
+        run { [self] in try persistence.set(false) }
     }
 
     @objc private func toggleStartup() {
-        run { [self] in try startup.setStartsAtLogin(!startup.startsAtLogin) }
+        let next = !startup.startsAtLogin
+        run { [self] in try await Task.detached(priority: .userInitiated) { try self.startup.setStartsAtLogin(next) }.value }
     }
 
     @objc private func toggleControlLogin() {

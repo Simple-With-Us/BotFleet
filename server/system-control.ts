@@ -6,7 +6,7 @@ export interface ControlDeps<T extends ControlTarget> {
   status(target: T): Promise<{ container: string }>;
   owner(target: T): string | undefined;
   busy(): boolean;
-  action(action: "stop" | "run", target: T): Promise<void>;
+  action(action: "stop" | "run" | "start", target: T): Promise<void>;
   afterStop(target: T): void;
 }
 
@@ -79,11 +79,11 @@ export function createSystemControl<T extends ControlTarget>(deps: ControlDeps<T
       if (!shared) throw new ControlConflict("the shared Local VM is unavailable");
       const state = await deps.status(shared);
       if (state.container === "running") return { key: shared.key, name: shared.label, running: true, state: "running" };
-      if (state.container !== "missing") {
+      if (state.container !== "missing" && state.container !== "created") {
         throw new ControlConflict("This Local VM cannot safely resume.  Recreate it in Computer settings; its disk has been preserved.");
       }
       guard(targets);
-      await deps.action("run", shared);
+      await deps.action(state.container === "created" ? "start" : "run", shared);
       return { key: shared.key, name: shared.label, running: true, state: "running" };
     },
   };

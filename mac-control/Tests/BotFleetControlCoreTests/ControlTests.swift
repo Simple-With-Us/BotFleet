@@ -41,6 +41,12 @@ final class ControlTests: XCTestCase {
         }
         let missing = try await ControlAPI(session: mockSession()).status()
         XCTAssertTrue(missing.canStartSharedVM)
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/api/health" { return (200, Data(#"{"app":"botfleet","pid":42,"ready":true}"#.utf8)) }
+            return (200, Data(#"{"activeBotCount":0,"persistOnExit":true,"localVms":[{"key":"shared","name":"Shared Local VM","running":false,"state":"created"}]}"#.utf8))
+        }
+        let created = try await ControlAPI(session: mockSession()).status()
+        XCTAssertTrue(created.canStartSharedVM)
     }
 
     func testBusyRefusalIsSurfaced() async {
@@ -84,6 +90,88 @@ final class ControlTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/startup-enabled.marker").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".botfleet/startup-disabled.marker").path))
         XCTAssertEqual(runner.calls, ["/usr/sbin/sysctl -n kern.bootsessionuuid", "/usr/sbin/sysctl -n kern.bootsessionuuid"])
+    }
+
+    func testInstalledServerDistinguishesStoppedAndRunningWithoutStarting() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let runner = MockCommands()
+        let policy = StartupPolicy(home: home, commands: runner, uid: 501)
+        XCTAssertEqual(policy.installedServerState, .notInstalled)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("Library/LaunchAgents"), withIntermediateDirectories: true)
+        try Data().write(to: home.appendingPathComponent("Library/LaunchAgents/app.botfleet.server.plist"))
+        XCTAssertEqual(policy.installedServerState, .stopped)
+        runner.launchctlListing = "PID\tStatus\tLabel\n742\t0\tapp.botfleet.server"
+        XCTAssertEqual(policy.installedServerState, .running)
+        XCTAssertEqual(runner.calls, ["/bin/launchctl list", "/bin/launchctl list"])
+    }
+
+    func testOfflinePersistencePolicyUsesStrictAtomicPrivateBoolean() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let policy = PersistencePolicy(home: home, environment: [:])
+        XCTAssertNil(policy.value)
+        try policy.set(false)
+        XCTAssertEqual(policy.value, false)
+        let path = home.appendingPathComponent(".botfleet/persist-on-exit.policy")
+        XCTAssertEqual(try String(contentsOf: path), "false\n")
+        let mode = try FileManager.default.attributesOfItem(atPath: path.path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(mode?.intValue, 0o600)
+        try policy.set(true)
+        XCTAssertEqual(policy.value, true)
+        XCTAssertEqual(try String(contentsOf: path), "true\n")
+        try Data("not-a-boolean\n".utf8).write(to: path)
+        XCTAssertNil(policy.value)
+    }
+
+    func testOfflineDockerInspectionOnlyCountsOwnLabeledContainersOnLocalSocket() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let binary = directory.appendingPathComponent("docker")
+        try Data().write(to: binary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: binary.path)
+        let runner = DockerCommands()
+        runner.listing = "botfleet-computer-jay\nother-service\n"
+        runner.inspection = "1\t1\tshared\tfalse"
+        let inspector = OfflineDockerVM(commands: runner, environment: [:], executable: binary.path, username: "jay")
+        XCTAssertEqual(inspector.inspect(), .local([OfflineVM(name: "botfleet-computer-jay", running: false)]))
+        XCTAssertEqual(runner.calls.count, 3)
+        XCTAssertFalse(runner.calls.contains { $0.last == "other-service" })
+        runner.host = "tcp://remote.example:2375"
+        XCTAssertEqual(inspector.inspect(), .unavailable)
+        XCTAssertEqual(runner.calls.count, 4)
+        runner.calls = []
+        let overridden = OfflineDockerVM(commands: runner, environment: ["DOCKER_HOST": "tcp://remote.example:2375"], executable: binary.path, username: "jay")
+        XCTAssertEqual(overridden.inspect(), .unavailable)
+        XCTAssertTrue(runner.calls.isEmpty)
+    }
+
+    func testOfflineHelperRequiresInstalledBundleAndConfirmsCreatedState() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let node = directory.appendingPathComponent("node")
+        let script = directory.appendingPathComponent("botfleet-vm-control.mjs")
+        try Data().write(to: node)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: node.path)
+        let runner = HelperCommands()
+        let helper = OfflineVMHelper(script: script, node: node.path, commands: runner)
+        XCTAssertFalse(helper.available)
+        XCTAssertThrowsError(try helper.status())
+        try Data().write(to: script)
+        XCTAssertTrue(helper.available)
+        runner.response = #"{"ok":true,"localVms":[{"key":"shared","name":"shared","running":false,"state":"missing"}]}"#
+        XCTAssertEqual(try helper.status().first?.state, "missing")
+        XCTAssertEqual(runner.lastTimeout, 20)
+        XCTAssertThrowsError(try helper.createStopped())
+        runner.response = #"{"ok":true,"localVms":[{"key":"shared","name":"shared","running":false,"state":"created"}]}"#
+        XCTAssertEqual(try helper.createStopped().first?.state, "created")
+        XCTAssertEqual(runner.lastTimeout, 300)
+        runner.response = #"{"ok":false,"error":"server still running"}"#
+        XCTAssertThrowsError(try helper.stop()) { error in
+            XCTAssertEqual(error.localizedDescription, "server still running")
+        }
     }
 
     func testStartServerUsesNonKillingKickstartOnlyAfterMarkerAndAgentCheck() throws {
@@ -135,12 +223,40 @@ private final class MockCommands: CommandRunning {
     let boot = "4F9389E9-AFE4-42C8-AE2C-7FEEDBA31B6C"
     var calls: [String] = []
     var failKickstart = false
+    var launchctlListing = "PID\tStatus\tLabel\n-\t0\tother.service"
     func run(_ executable: String, _ arguments: [String]) throws -> String {
         calls.append(([executable] + arguments).joined(separator: " "))
         if executable == "/usr/sbin/sysctl" { return boot }
+        if arguments == ["list"] { return launchctlListing }
         if arguments.first == "print" { throw StartupPolicyError.commandFailed }
         if failKickstart && arguments.first == "kickstart" { throw StartupPolicyError.commandFailed }
         return ""
+    }
+}
+
+private final class DockerCommands: CommandRunning {
+    var host = "unix:///tmp/docker.sock"
+    var listing = ""
+    var inspection = ""
+    var calls: [[String]] = []
+    func run(_ executable: String, _ arguments: [String]) throws -> String {
+        calls.append(arguments)
+        switch arguments.first {
+        case "context": return host
+        case "ps": return listing
+        case "inspect": return inspection
+        default: throw StartupPolicyError.commandFailed
+        }
+    }
+}
+
+private final class HelperCommands: CommandRunning {
+    var response = ""
+    var lastTimeout: TimeInterval = 0
+    func run(_ executable: String, _ arguments: [String]) throws -> String { response }
+    func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
+        lastTimeout = timeout
+        return response
     }
 }
 

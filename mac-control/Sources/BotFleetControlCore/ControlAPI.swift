@@ -14,7 +14,7 @@ public struct ControlStatus: Decodable, Equatable {
 
     public var runningVMCount: Int { localVms.filter(\.running).count }
     public var sharedVM: LocalVM? { localVms.first { $0.key == "shared" } }
-    public var canStartSharedVM: Bool { sharedVM?.state == "missing" }
+    public var canStartSharedVM: Bool { ["missing", "created"].contains(sharedVM?.state ?? "") }
 }
 
 public enum ControlAPIError: LocalizedError, Equatable {

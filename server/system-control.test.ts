@@ -6,7 +6,7 @@ function fixture() {
   const states = new Map([["shared", "running"], ["bot:a", "running"]]);
   let busy = false;
   let owner: string | undefined;
-  const action = vi.fn(async (kind: "stop" | "run", target: (typeof targets)[number]) => {
+  const action = vi.fn(async (kind: "stop" | "run" | "start", target: (typeof targets)[number]) => {
     states.set(target.key, kind === "stop" ? "stopped" : "running");
   });
   const control = createSystemControl({
@@ -80,6 +80,13 @@ describe("system control", () => {
     f.states.set("shared", "stopped");
     await expect(f.control.startShared()).rejects.toThrow(/Recreate it in Computer settings/);
     expect(f.action).not.toHaveBeenCalled();
+  });
+
+  it("starts a never-started shared VM without recreating it", async () => {
+    const f = fixture();
+    f.states.set("shared", "created");
+    await expect(f.control.startShared()).resolves.toMatchObject({ key: "shared", running: true });
+    expect(f.action.mock.calls.map(([kind]) => kind)).toEqual(["start"]);
   });
 
   it("reports a partial stop failure", async () => {

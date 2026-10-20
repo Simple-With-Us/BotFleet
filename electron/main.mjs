@@ -33,6 +33,7 @@ import {
 import { openBlankTerminal } from "./terminal-launch.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
 import { readConfigFile, updateConfigFile } from "./config-file-lock.mjs";
+import { readPersistOnExitPolicy } from "./persist-on-exit-policy.mjs";
 import { buildDiagnosticsReport, decodeLogTail, diagnosticsFileName } from "./diagnostics.mjs";
 import {
   assertExternalWorkspaceCredentialMarkers,
@@ -2701,6 +2702,8 @@ process.once("SIGTERM", requestSignalQuit);
 function serverPersistsOnExit() {
   try {
     const dir = process.env.OMB_DATA_DIR ?? path.join(os.homedir(), ".botfleet");
+    const policy = readPersistOnExitPolicy(dir);
+    if (policy !== null) return policy;
     const parsed = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
     return parsed?.server?.persistOnExit !== false;
   } catch {

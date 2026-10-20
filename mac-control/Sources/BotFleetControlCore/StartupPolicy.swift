@@ -2,22 +2,52 @@ import Foundation
 
 public protocol CommandRunning {
     func run(_ executable: String, _ arguments: [String]) throws -> String
+    func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String
+}
+
+public struct CommandExitError: LocalizedError {
+    public let output: String
+    public var errorDescription: String? { "The system command failed." }
+}
+
+public extension CommandRunning {
+    func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
+        try run(executable, arguments)
+    }
 }
 
 public struct ProcessCommandRunner: CommandRunning {
     public init() {}
     public func run(_ executable: String, _ arguments: [String]) throws -> String {
+        try run(executable, arguments, timeout: 15)
+    }
+    public func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         let output = Pipe()
         process.standardOutput = output
-        process.standardError = output
+        process.standardError = FileHandle.nullDevice
+        let readerDone = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        var data = Data()
+        process.terminationHandler = { _ in finished.signal() }
         try process.run()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { throw StartupPolicyError.commandFailed }
-        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        DispatchQueue.global(qos: .utility).async {
+            data = output.fileHandleForReading.readDataToEndOfFile()
+            readerDone.signal()
+        }
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            if process.isRunning { process.terminate() }
+            if finished.wait(timeout: .now() + 2) == .timedOut && process.isRunning {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+            throw StartupPolicyError.commandFailed
+        }
+        guard readerDone.wait(timeout: .now() + 2) == .success else { throw StartupPolicyError.commandFailed }
+        let result = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationStatus == 0 else { throw CommandExitError(output: result) }
+        return result
     }
 }
 
@@ -41,6 +71,13 @@ public enum ServerLoginPolicy: Equatable {
     case legacy
     case enabled
     case disabled
+}
+
+public enum InstalledServerState: Equatable {
+    case notInstalled
+    case stopped
+    case running
+    case unknown
 }
 
 public final class StartupPolicy {
@@ -80,6 +117,19 @@ public final class StartupPolicy {
     }
 
     public var startsAtLogin: Bool { loginPolicy == .enabled }
+
+    public var installedServerState: InstalledServerState {
+        guard files.fileExists(atPath: agent.path) else { return .notInstalled }
+        let listing: String
+        do { listing = try commands.run("/bin/launchctl", ["list"]) }
+        catch { return .unknown }
+        let row = listing.split(separator: "\n").first { line in
+            line.split(whereSeparator: \.isWhitespace).last == "app.botfleet.server"
+        }
+        guard let row else { return .stopped }
+        let pid = row.split(whereSeparator: \.isWhitespace).first ?? "-"
+        return UInt32(pid) == nil ? .stopped : .running
+    }
 
     public func setStartsAtLogin(_ enabled: Bool) throws {
         guard supportsPolicy else { throw StartupPolicyError.updateRequired }

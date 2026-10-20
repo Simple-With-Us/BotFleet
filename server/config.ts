@@ -7,6 +7,7 @@ import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 
 import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
+import { readPersistOnExitPolicy, writePersistOnExitPolicy } from "../electron/persist-on-exit-policy.mjs";
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
 import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
@@ -1638,6 +1639,10 @@ export function loadConfig(): AppConfig {
   const stored = readStoredConfig(configPath);
   reportStoredConfig(configPath, stored.problem);
   const cfg: AppConfig = stored.config;
+  const persistOnExitPolicy = readPersistOnExitPolicy(DATA_DIR);
+  if (persistOnExitPolicy !== null) {
+    cfg.server = { ...cfg.server, persistOnExit: persistOnExitPolicy };
+  }
   // these secrets OS-encrypted and hands them to this process as env at
   // spawn, leaving config.json without the plaintext field — so the file
   // value is the dev-mode (no desktop shell) fallback, not the primary.
@@ -1966,6 +1971,9 @@ export function saveConfig(
     }
     return merged;
   }, { mode: 0o600, onSetAside: reportConfigSetAside });
+  if (checkedPatch.server?.persistOnExit !== undefined) {
+    writePersistOnExitPolicy(DATA_DIR, checkedPatch.server.persistOnExit);
+  }
 }
 
 /** updateConfigFile renamed an unusable config.json aside just before replacing it.  Say so in the

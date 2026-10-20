@@ -14821,6 +14821,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           localVmLifecycleBusy.add(target.key);
           try {
             await containerComputerAction(action, undefined, undefined, target);
+            if (action === "run" || action === "start") localVmIdleFor(target).touch();
           } finally {
             localVmLifecycleBusy.delete(target.key);
           }
@@ -16543,7 +16544,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         for (const target of affectedTargets) {
           const status = await containerComputerStatus(undefined, undefined, target).catch(() => null);
-          if (status?.container === "running" || status?.container === "stopped") {
+          if (status?.container === "running" || status?.container === "created" || status?.container === "stopped") {
             await containerComputerAction("remove", undefined, undefined, target);
           }
           // The idle backstop is keyed by target too; leaving it armed on a

@@ -45,6 +45,7 @@ import {
   boxGatewayUrl,
   computerProxyEnv,
   containerComputerAction,
+  createStoppedSharedLocalVm,
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
@@ -996,6 +997,69 @@ describe("containerComputerAction", () => {
 
     await expect(containerComputerAction("start", fake.run, "linux")).rejects.toThrow("cannot safely resume");
     expect(fake.calls).not.toContain(`docker start ${CONTAINER}`);
+  });
+
+  it("starts only a never-started managed desktop with verified safety fields", async () => {
+    let started = false;
+    const calls: string[] = [];
+    const fake: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      calls.push(key);
+      if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
+      if (key === "/usr/bin/which podman") throw new Error("missing");
+      if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
+      if (key === `docker inspect ${CONTAINER}`) {
+        return { stdout: readyInspect({ State: started ? { Running: true } : { Running: false, Status: "created" } }) };
+      }
+      if (key === `docker start ${CONTAINER}`) {
+        started = true;
+        return { stdout: `${CONTAINER}\n` };
+      }
+      throw new Error(`fixture probe unavailable: ${key}`);
+    };
+    const created = await containerComputerStatus(fake, "linux");
+    expect(created).toMatchObject({ container: "created", imageMatches: true, managed: true,
+      network: "loopback", security: "hardened", persistence: "durable" });
+    await containerComputerAction("start", fake, "linux");
+    expect(calls).toContain(`docker start ${CONTAINER}`);
+    expect(calls.some((call) => call.startsWith("docker rm ") || call.startsWith("docker run "))).toBe(false);
+  });
+
+  it("provisions a fresh shared VM with Docker create only", async () => {
+    const commands: string[][] = [];
+    let failCreate = false;
+    const fake: CommandRunner = async (command, args) => {
+      commands.push([command, ...args]);
+      const key = [command, ...args].join(" ");
+      if (key === `docker image inspect --format {{json .Config.Labels}} ${IMAGE}`) return { stdout: JSON.stringify({
+        [MANAGED_LABEL]: "1", [DRIVER_LABEL]: CUA_DRIVER_VERSION,
+        [BASE_IMAGE_LABEL]: BASE_IMAGE_DIGEST, [IMAGE_LAYER_LABEL]: IMAGE_LAYER_VERSION,
+      }) };
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "8 17179869184\n" };
+      if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "OrbStack\n" };
+      if (args[0] === "create") {
+        if (failCreate) throw new Error(`Docker rejected ${args.join(" ")}`);
+        return { stdout: "new-container-id\n" };
+      }
+      throw new Error(`unexpected command: ${key}`);
+    };
+
+    await createStoppedSharedLocalVm(fake, "darwin");
+
+    const mutations = commands.filter((args) => ["create", "start", "run", "rm", "pull", "build"].includes(args[1] ?? ""));
+    expect(mutations).toHaveLength(1);
+    const create = mutations[0]!;
+    expect(create.slice(0, 2)).toEqual(["docker", "create"]);
+    expect(create).toContain(`${MANAGED_LABEL}=1`);
+    expect(create).toContain(`${TARGET_LABEL}=shared`);
+    expect(create).toContain(`type=bind,source=${VM_WORKSPACE_DIR},target=${VM_WORKSPACE_GUEST}`);
+    expect(create).toContain(IMAGE);
+    expect(create).not.toContain("-d");
+    failCreate = true;
+    await expect(createStoppedSharedLocalVm(fake, "darwin")).rejects.toThrow(
+      /^Docker could not create the stopped Local VM; check the local daemon and available resources$/,
+    );
   });
 });
 
