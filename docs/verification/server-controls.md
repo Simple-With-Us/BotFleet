@@ -34,7 +34,7 @@ The controller has no Dock icon.  **Hide Menu Bar Icon** leaves it running; reop
 
 **Keep Server Running After Quitting BotFleet** writes the existing server setting through its normal configuration API and Infisical policy.  It requires a running, compatible server.
 
-**Start Server At Login** is a local operating-system startup preference.  The tracked wrapper honors `startup-disabled.marker` and a `startup-session` boot identity in the BotFleet data directory.  Disabling login startup preserves crash recovery for a server deliberately started during the current boot.  The next boot receives a different identity and stays down until an explicit launch.  Turning the preference on does not start a server immediately.
+**Start Server At Login** is a local operating-system startup preference.  The tracked wrapper honors `startup-enabled.marker`, `startup-disabled.marker` and a `startup-session` boot identity in the BotFleet data directory.  Disabling login startup preserves crash recovery for a server deliberately started during the current boot.  The next boot receives a different identity and stays down until an explicit launch.  Explicit enablement allows launchd to clear a stop from a previous boot; a stop during the current boot remains in force.  Turning the preference on does not start a server immediately.  With neither policy marker, the original durable-stop behavior remains.
 
 The controller refuses startup changes when the installed wrapper lacks the V1 policy capability.  Upgrading the app alone does not install the tracked wrapper; operators must review and update the existing `~/apps/botfleet-server-start.sh` separately.
 
