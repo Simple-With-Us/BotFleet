@@ -68,7 +68,10 @@ function flag(args, name) {
  */
 function restartHint(env) {
   const effectiveRoot = env.BOTFLEET_RELEASES_ROOT || join(env.HOME ?? "", ".botfleet");
-  const job = basename(effectiveRoot) === "botfleet-companion" ? "app.botfleet.companion" : "app.botfleet.server";
+  // Case-folded: a volume can be case-insensitive, so a store root named
+  // "BotFleet-Companion" is the companion's store, and comparing it
+  // case-sensitively would name the wrong job.
+  const job = basename(effectiveRoot).toLowerCase() === "botfleet-companion" ? "app.botfleet.companion" : "app.botfleet.server";
   return `restart ${job} to pick the new release up (launchctl kickstart -k gui/$(id -u)/${job})`;
 }
 

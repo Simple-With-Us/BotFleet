@@ -951,7 +951,7 @@ test("the CLI names the job that runs the store it acted on", async (t) => {
     // A promoted release is read-only, so the tree cannot be removed
     // directly: the store's own discard path restores write permission
     // first, which is the same thing an operator does to reclaim disk.
-    for (const root of [join(dir, "botfleet-companion"), join(dir, "botfleet")]) {
+    for (const root of [join(dir, "botfleet-companion"), join(dir, "botfleet"), join(dir, "mixed", "BotFleet-Companion")]) {
       const env = { ...process.env, BOTFLEET_RELEASES_ROOT: root };
       for (const commit of await listReleases(env)) {
         await discardRelease(commit, env).catch(() => {});
@@ -982,4 +982,15 @@ test("the CLI names the job that runs the store it acted on", async (t) => {
   await promoteStaging({ commit, env: { ...process.env, ...harnessEnv } });
   const harness = await runCli(["swap", commit, "--store", harnessRoot]);
   assert.match(harness.stdout, /app\.botfleet\.server/);
+
+  // Case-folded: a case-insensitive volume can hold the store under a
+  // different case, and that is still the companion's store.  It lives
+  // under its own parent, because on a case-insensitive filesystem a
+  // directory that differs only in case is the SAME directory.
+  const mixedRoot = join(dir, "mixed", "BotFleet-Companion");
+  const mixedEnv = { BOTFLEET_RELEASES_ROOT: mixedRoot };
+  await stageRelease({ commit, repo, env: { ...process.env, ...mixedEnv }, install: false });
+  await promoteStaging({ commit, env: { ...process.env, ...mixedEnv } });
+  const mixed = await runCli(["swap", commit, "--store", mixedRoot]);
+  assert.match(mixed.stdout, /app\.botfleet\.companion/);
 });
