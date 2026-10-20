@@ -66,6 +66,17 @@ a job whose working directory does not exist, and a missing pointer must
 fail inside the launcher (with its own message) rather than silently
 leaving the job unloaded.
 
+**The sidecar gets its own store.**  The Companion sidecar ran out of a
+linked worktree too, and it versions independently of the harness: it is
+re-pointed after merges, and it was the sidecar that was still carrying a
+revoked key because its checkout was a hundred commits behind.  It points
+at the same store but its own namespace — its own pointer and its own
+release directory — so promoting a harness release cannot change what the
+sidecar runs, and the two roll back independently.  A shared pointer was a
+real mistake once: with both programs reading one pointer, promoting a new
+harness release silently replaced the sidecar's code.  `harness-release.mjs
+--store <root>` names which namespace a command acts on.
+
 ## The shape after this
 
 ```
@@ -111,3 +122,6 @@ rather than an outage.
    same immutable story eventually.
 3. The deployment checkout is now a build source only.  It can be
    retired once the updater prepares releases from fetched objects.
+4. `activate` always installs dependencies.  A release without them cannot
+   start, and a promoted release is read-only, so nothing could repair it —
+   which is the outage the store exists to prevent.
