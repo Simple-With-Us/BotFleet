@@ -139,6 +139,22 @@ test('a failed write reports the JSON reason Sentry gave, with credentials scrub
       &&!error.message.includes(token)
       &&!error.message.includes('upstream failed'),
   );
+
+  // A JSON array (or scalar) body is not the object shape Sentry documents:
+  // the plain-object gate must keep it out of the error the same way (Kody
+  // review, PR #1252) - nothing fails today if the schema weakens to z.unknown().
+  const arrayFailure=async (url,options)=>{
+    if (options.method==='GET'&&url.endsWith('/deploys/')) return Response.json([]);
+    if (options.method==='GET') return Response.json({ref:null,projects:[{slug:'botfleet'}]});
+    return new Response(JSON.stringify([`Invalid repository names: ${token}`]),
+      {status:400,headers:{'Content-Type':'application/json'}});
+  };
+  await assert.rejects(
+    reportTestFlight(receipt(),{token,runId:'123',fetchImpl:arrayFailure}),
+    error=>/HTTP 400/.test(error.message)
+      &&!error.message.includes(token)
+      &&!/Invalid repository names/.test(error.message),
+  );
 });
 
 test('ship receipt follows recorded success only after exact ASC readiness; skipped states produce none', () => {
